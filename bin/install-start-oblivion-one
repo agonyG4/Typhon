@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source_script="$script_dir/start-oblivion-one"
+source_tty_script="$script_dir/start-oblivion-one-tty"
+
+usage() {
+    cat <<EOF
+install-start-oblivion-one
+
+Installs the start-oblivion-one terminal launcher.
+
+Usage:
+  ./bin/install-start-oblivion-one                     # installs to ~/.local/bin
+  ./bin/install-start-oblivion-one --system            # installs to /usr/local/bin
+  ./bin/install-start-oblivion-one --sddm-session      # installs the SDDM Wayland session entry
+  ./bin/install-start-oblivion-one --sddm-session --target-dir DIR
+  ./bin/install-start-oblivion-one --sddm-session --perf-log
+  ./bin/install-start-oblivion-one --input-permissions # grants native input access
+EOF
+}
+
+install_sddm_session() {
+    local target_dir="/usr/share/wayland-sessions"
+    local perf_log=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --target-dir)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    echo "install-start-oblivion-one: --target-dir needs a directory" >&2
+                    exit 1
+                fi
+                target_dir="$1"
+                ;;
+            --perf-log)
+                perf_log=1
+                ;;
+            *)
+                echo "install-start-oblivion-one: unknown --sddm-session option '$1'" >&2
+                exit 1
+                ;;
+        esac
+        shift
+    done
+
+    local desktop_file="$target_dir/oblivion-one.desktop"
+    local perf_env=""
+    if [[ "$perf_log" == "1" ]]; then
+        perf_env=" OBLIVION_ONE_PERF_LOG=1"
+    fi
+    local desktop_contents
+    desktop_contents="$(cat <<EOF
+[Desktop Entry]
+Name=Oblivion One
+Comment=Oblivion One native Wayland compositor session
+Exec=env OBLIVION_ONE_PROFILE=release OBLIVION_ONE_OUTPUT=native OBLIVION_ONE_MODE=1920x1080@165 OBLIVION_ONE_SDDM_SESSION=1 OBLIVION_ONE_LOG=info${perf_env} $source_script
+Type=Application
+DesktopNames=OblivionOne
+Keywords=wayland;compositor;desktop;
+EOF
+)"
+
+    if [[ "$target_dir" == /usr/* || "$target_dir" == /etc/* ]]; then
+        local tmp_file
+        tmp_file="$(mktemp)"
+        printf '%s\n' "$desktop_contents" >"$tmp_file"
+        if [[ "${EUID:-$(id -u)}" == "0" ]]; then
+            exec install -Dm644 "$tmp_file" "$desktop_file"
+        elif command -v pkexec >/dev/null 2>&1; then
+            exec pkexec install -Dm644 "$tmp_file" "$desktop_file"
+        fi
+        exec sudo install -Dm644 "$tmp_file" "$desktop_file"
+    fi
+
+    mkdir -p -- "$target_dir"
+    printf '%s\n' "$desktop_contents" >"$desktop_file"
+    echo "Installed SDDM session: $desktop_file"
+}
+
+case "${1:-}" in
+    -h|--help|help)
+        usage
+        exit 0
+        ;;
+    --system)
+        target="/usr/local/bin/start-oblivion-one"
+        tty_target="/usr/local/bin/start-oblivion-one-tty"
+        if command -v pkexec >/dev/null 2>&1; then
+            pkexec install -Dm755 "$source_script" "$target"
+            exec pkexec install -Dm755 "$source_tty_script" "$tty_target"
+        fi
+        sudo install -Dm755 "$source_script" "$target"
+        exec sudo install -Dm755 "$source_tty_script" "$tty_target"
+        ;;
+    --sddm-session)
+        shift
+        install_sddm_session "$@"
+        ;;
+    --input-permissions)
+        user_name="${2:-${SUDO_USER:-${USER:-$(id -un)}}}"
+        if ! id "$user_name" >/dev/null 2>&1; then
+            echo "install-start-oblivion-one: user '$user_name' does not exist" >&2
+            exit 1
+        fi
+        if ! getent group input >/dev/null 2>&1; then
+            echo "install-start-oblivion-one: group 'input' does not exist" >&2
+            exit 1
+        fi
+        if id -nG "$user_name" | tr ' ' '\n' | grep -qx input; then
+            echo "User '$user_name' is already in group 'input'."
+            exit 0
+        fi
+        echo "Adding '$user_name' to group 'input' for native keyboard/mouse access."
+        echo "You must log out and log back in before the SDDM/native session sees this group."
+        if command -v pkexec >/dev/null 2>&1; then
+            exec pkexec gpasswd -a "$user_name" input
+        fi
+        exec sudo gpasswd -a "$user_name" input
+        ;;
+    "")
+        target="${HOME}/.local/bin/start-oblivion-one"
+        tty_target="${HOME}/.local/bin/start-oblivion-one-tty"
+        mkdir -p "$(dirname -- "$target")"
+        ln -sfn "$source_script" "$target"
+        ln -sfn "$source_tty_script" "$tty_target"
+        chmod +x "$source_script"
+        chmod +x "$source_tty_script"
+        echo "Installed: $target -> $source_script"
+        echo "Installed: $tty_target -> $source_tty_script"
+        echo "Open it with: start-oblivion-one"
+        echo "Open TTY/native with: start-oblivion-one-tty"
+        ;;
+    *)
+        echo "install-start-oblivion-one: unknown option '$1'" >&2
+        usage >&2
+        exit 1
+        ;;
+esac

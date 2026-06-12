@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_path="${BASH_SOURCE[0]}"
+while [[ -L "$script_path" ]]; do
+    script_dir="$(CDPATH= cd -- "$(dirname -- "$script_path")" && pwd)"
+    link_target="$(readlink -- "$script_path")"
+    if [[ "$link_target" == /* ]]; then
+        script_path="$link_target"
+    else
+        script_path="$script_dir/$link_target"
+    fi
+done
+script_dir="$(CDPATH= cd -- "$(dirname -- "$script_path")" && pwd)"
+
+export OBLIVION_ONE_OUTPUT="${OBLIVION_ONE_OUTPUT:-native}"
+export OBLIVION_ONE_PROFILE="${OBLIVION_ONE_PROFILE:-release}"
+export OBLIVION_ONE_SOCKET="${OBLIVION_ONE_SOCKET:-oblivion-one-tty}"
+export OBLIVION_ONE_MODE="${OBLIVION_ONE_MODE:-1920x1080@165}"
+
+exec "$script_dir/start-oblivion-one" "$@"

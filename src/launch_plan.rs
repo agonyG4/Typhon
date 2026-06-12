@@ -1,0 +1,226 @@
+use std::path::{Path, PathBuf};
+
+use crate::{DEFAULT_APP, DesktopOptions, NestedOptions, paths::shell_quote};
+
+pub(crate) const ENV_WRITER_SCRIPT: &str = r#"set -eu
+: "${OBLIVION_ONE_ENV_FILE:?}"
+wayland_display="${GAMESCOPE_WAYLAND_DISPLAY:-${WAYLAND_DISPLAY:-}}"
+gamescope_display="${GAMESCOPE_WAYLAND_DISPLAY:-}"
+export WAYLAND_DISPLAY="$wayland_display"
+if [ -n "$gamescope_display" ]; then
+  export GAMESCOPE_WAYLAND_DISPLAY="$gamescope_display"
+else
+  unset GAMESCOPE_WAYLAND_DISPLAY
+fi
+export DISPLAY="${DISPLAY:-}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}"
+export OBLIVION_ONE_SESSION_ID="${OBLIVION_ONE_SESSION_ID:-nested}"
+{
+  printf 'WAYLAND_DISPLAY=%s\n' "$wayland_display"
+  printf 'GAMESCOPE_WAYLAND_DISPLAY=%s\n' "$gamescope_display"
+  printf 'DISPLAY=%s\n' "$DISPLAY"
+  printf 'XDG_RUNTIME_DIR=%s\n' "$XDG_RUNTIME_DIR"
+  printf 'OBLIVION_ONE_SESSION_ID=%s\n' "$OBLIVION_ONE_SESSION_ID"
+} > "$OBLIVION_ONE_ENV_FILE"
+exec "$@"
+"#;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HyprlandLaunchPlan {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env_file: PathBuf,
+    pub config_file: PathBuf,
+    pub wrapper_file: PathBuf,
+    pub session_id: String,
+    pub config_contents: String,
+    pub wrapper_contents: String,
+}
+
+impl HyprlandLaunchPlan {
+    pub fn new(options: DesktopOptions) -> Self {
+        let env_file = options.state_dir.join("session.env");
+        let config_file = options.state_dir.join("hyprland.conf");
+        let wrapper_file = options.state_dir.join("session-wrapper.sh");
+        let session_id = "nested".to_string();
+        let app = vec![
+            options.executable.to_string_lossy().into_owned(),
+            "prototype".to_string(),
+            "--inside-de".to_string(),
+        ];
+        let exec_command = env_runner_command(&wrapper_file, &env_file, &session_id, &app);
+        let config_contents = hyprland_config_contents(
+            options.width,
+            options.height,
+            options.refresh,
+            &exec_command,
+        );
+
+        Self {
+            program: "Hyprland".to_string(),
+            args: vec![
+                "--config".to_string(),
+                config_file.to_string_lossy().into_owned(),
+            ],
+            env_file,
+            config_file,
+            wrapper_file,
+            session_id,
+            config_contents,
+            wrapper_contents: ENV_WRITER_SCRIPT.to_string(),
+        }
+    }
+
+    pub fn display_command(&self) -> String {
+        std::iter::once(shell_quote(&self.program))
+            .chain(self.args.iter().map(|arg| shell_quote(arg)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NestedLaunchPlan {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env_file: PathBuf,
+    pub session_id: String,
+}
+
+impl NestedLaunchPlan {
+    pub fn new(mut options: NestedOptions) -> Self {
+        if options.app.is_empty() {
+            options.app.push(DEFAULT_APP.to_string());
+        }
+
+        let env_file = options.state_dir.join("session.env");
+        let session_id = "nested".to_string();
+        let mut args = vec![
+            "-W".to_string(),
+            options.width.to_string(),
+            "-H".to_string(),
+            options.height.to_string(),
+            "-r".to_string(),
+            options.refresh.to_string(),
+            "--".to_string(),
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            ENV_WRITER_SCRIPT.to_string(),
+            "oblivion-one-child".to_string(),
+        ];
+        args.extend(options.app);
+
+        Self {
+            program: "gamescope".to_string(),
+            args,
+            env_file,
+            session_id,
+        }
+    }
+
+    pub fn env_pairs(&self) -> [(&'static str, String); 2] {
+        [
+            (
+                "OBLIVION_ONE_ENV_FILE",
+                self.env_file.to_string_lossy().into_owned(),
+            ),
+            ("OBLIVION_ONE_SESSION_ID", self.session_id.clone()),
+        ]
+    }
+
+    pub fn display_command(&self) -> String {
+        std::iter::once(shell_quote(&self.program))
+            .chain(self.args.iter().map(|arg| shell_quote(arg)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+fn env_runner_command(
+    wrapper_file: &Path,
+    env_file: &Path,
+    session_id: &str,
+    app: &[String],
+) -> String {
+    [
+        vec![
+            "env".to_string(),
+            format!(
+                "OBLIVION_ONE_ENV_FILE={}",
+                shell_quote(&env_file.to_string_lossy())
+            ),
+            format!("OBLIVION_ONE_SESSION_ID={}", shell_quote(session_id)),
+            "/bin/sh".to_string(),
+            shell_quote(&wrapper_file.to_string_lossy()),
+        ],
+        app.iter().map(|arg| shell_quote(arg)).collect(),
+    ]
+    .concat()
+    .join(" ")
+}
+
+fn hyprland_config_contents(width: u32, height: u32, refresh: u32, exec_command: &str) -> String {
+    format!(
+        r#"autogenerated = 1
+monitor = ,{width}x{height}@{refresh},0x0,1
+
+env = XDG_CURRENT_DESKTOP,OblivionOne
+env = XDG_SESSION_DESKTOP,OblivionOne
+env = XDG_SESSION_TYPE,wayland
+env = GDK_BACKEND,wayland
+env = QT_QPA_PLATFORM,wayland
+env = SDL_VIDEODRIVER,wayland
+env = CLUTTER_BACKEND,wayland
+env = ELECTRON_OZONE_PLATFORM_HINT,wayland
+env = MOZ_ENABLE_WAYLAND,1
+env = OBLIVION_ONE_DE,1
+
+exec-once = {exec_command}
+
+input {{
+    kb_layout = br
+    kb_variant = abnt2
+    follow_mouse = 1
+    sensitivity = 0
+    touchpad {{
+        natural_scroll = false
+    }}
+}}
+
+general {{
+    gaps_in = 6
+    gaps_out = 12
+    border_size = 1
+    layout = dwindle
+    resize_on_border = true
+}}
+
+decoration {{
+    rounding = 8
+}}
+
+misc {{
+    disable_hyprland_logo = true
+    disable_splash_rendering = true
+    focus_on_activate = true
+    middle_click_paste = false
+}}
+
+windowrule {{
+    name = oblivion-floating-default
+    match:class = .*
+    float = yes
+    center = yes
+}}
+
+$mainMod = SUPER
+bindm = $mainMod, mouse:272, movewindow
+bindm = $mainMod, mouse:273, resizewindow
+bind = $mainMod, V, togglefloating
+bind = $mainMod, F, fullscreen, 0
+bind = $mainMod, C, killactive
+bind = $mainMod, ESCAPE, exit
+bind = $mainMod, RETURN, exec, kitty --class OblivionOneTerminal
+"#
+    )
+}

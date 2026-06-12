@@ -1,0 +1,333 @@
+use std::{fmt, io, sync::Arc};
+
+use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1;
+use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_manager_v1;
+use wayland_protocols::wp::{
+    fractional_scale::v1::server::wp_fractional_scale_manager_v1,
+    presentation_time::server::wp_presentation, viewporter::server::wp_viewporter,
+};
+use wayland_protocols::xdg::shell::server::xdg_wm_base;
+use wayland_server::{
+    Display, DisplayHandle, ListeningSocket,
+    protocol::{
+        wl_compositor, wl_data_device_manager, wl_output, wl_seat, wl_shm, wl_subcompositor,
+    },
+};
+
+use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
+use crate::syncobj::DrmSyncobjDevice;
+use crate::wayland_drm::server::wl_drm;
+
+use super::{CompositorState, RenderGenerationCause, RenderableSurface, ShellDockItem, color};
+
+#[derive(Debug)]
+pub struct OwnCompositorServer {
+    pub(super) display: Display<CompositorState>,
+    pub(super) socket: ListeningSocket,
+    pub(super) socket_name: String,
+    pub(super) state: CompositorState,
+}
+
+impl OwnCompositorServer {
+    pub fn bind(socket_name: impl Into<String>) -> Result<Self, CompositorError> {
+        Self::bind_with_gpu_buffers(socket_name, true)
+    }
+
+    pub fn bind_cpu_composition(socket_name: impl Into<String>) -> Result<Self, CompositorError> {
+        Self::bind_with_gpu_buffers(socket_name, false)
+    }
+
+    fn bind_with_gpu_buffers(
+        socket_name: impl Into<String>,
+        gpu_buffers_enabled: bool,
+    ) -> Result<Self, CompositorError> {
+        let socket_name = socket_name.into();
+        let display =
+            Display::new().map_err(|error| CompositorError::DisplayInit(error.to_string()))?;
+        let syncobj_device = DrmSyncobjDevice::open_available();
+        register_minimum_globals(
+            &display.handle(),
+            syncobj_device.is_some(),
+            gpu_buffers_enabled,
+        );
+        let socket = ListeningSocket::bind(&socket_name)
+            .map_err(|error| CompositorError::Bind(error.to_string()))?;
+
+        Ok(Self {
+            display,
+            socket,
+            socket_name,
+            state: CompositorState::new(syncobj_device),
+        })
+    }
+
+    pub fn socket_name(&self) -> &str {
+        &self.socket_name
+    }
+
+    pub fn accepted_clients(&self) -> usize {
+        self.state.accepted_clients
+    }
+
+    pub fn xdg_toplevels(&self) -> usize {
+        self.state.xdg_toplevels
+    }
+
+    pub fn last_app_id(&self) -> Option<&str> {
+        self.state.last_app_id.as_deref()
+    }
+
+    pub fn xdg_popups(&self) -> usize {
+        self.state.xdg_popups
+    }
+
+    pub fn renderable_surfaces(&self) -> &[RenderableSurface] {
+        &self.state.renderable_surfaces
+    }
+
+    pub fn render_generation(&self) -> u64 {
+        self.state.render_generation
+    }
+
+    pub fn render_generation_cause(&self) -> RenderGenerationCause {
+        self.state.render_generation_cause()
+    }
+
+    pub fn has_pending_frame_callbacks(&self) -> bool {
+        self.state.has_pending_frame_callbacks()
+    }
+
+    pub fn has_only_pending_surface_frame_callbacks(&self) -> bool {
+        self.state.has_only_pending_surface_frame_callbacks()
+    }
+
+    pub fn has_pending_frame_prepare_work(&self) -> bool {
+        self.state.has_pending_frame_prepare_work()
+    }
+
+    pub fn has_pending_frame_work(&self) -> bool {
+        self.state.has_pending_frame_work()
+    }
+
+    pub fn shell_dock_items(&self) -> Vec<ShellDockItem> {
+        self.state.shell_dock_items()
+    }
+
+    pub fn set_dmabuf_feedback(
+        &mut self,
+        feedback: EglGlesDmabufFeedback,
+        main_device: Option<u64>,
+        main_device_path: Option<String>,
+    ) {
+        self.state
+            .set_dmabuf_feedback(feedback, main_device, main_device_path);
+        let _ = self.display.flush_clients();
+    }
+
+    pub fn set_output_size(&mut self, width: u32, height: u32) -> bool {
+        let changed = self.state.set_output_size(width, height);
+        let _ = self.display.flush_clients();
+        changed
+    }
+
+    pub fn set_output_scale_factor(&mut self, scale_factor: f64) -> bool {
+        let changed = self.state.set_output_scale_factor(scale_factor);
+        let _ = self.display.flush_clients();
+        changed
+    }
+
+    pub fn set_output_refresh_hz(&mut self, refresh_hz: u32) -> bool {
+        let changed = self.state.set_output_refresh_hz(refresh_hz);
+        let _ = self.display.flush_clients();
+        changed
+    }
+
+    pub fn send_keyboard_key(&mut self, key: u32, pressed: bool) {
+        self.state.send_keyboard_key(key, pressed);
+        let _ = self.display.flush_clients();
+    }
+
+    pub fn send_pointer_motion(&mut self, x: f64, y: f64) {
+        self.state.send_pointer_motion(x, y);
+        let _ = self.display.flush_clients();
+    }
+
+    pub fn send_pointer_button(&mut self, button: u32, pressed: bool) {
+        self.state.send_pointer_button(button, pressed);
+        let _ = self.display.flush_clients();
+    }
+
+    pub fn send_pointer_axis(&mut self, horizontal: f64, vertical: f64) {
+        self.state.send_pointer_axis(horizontal, vertical);
+        let _ = self.display.flush_clients();
+    }
+
+    pub fn begin_window_move_at(&mut self, x: f64, y: f64) -> bool {
+        let started = self.state.begin_window_move_at(x, y);
+        let _ = self.display.flush_clients();
+        started
+    }
+
+    pub fn begin_window_resize_at(&mut self, x: f64, y: f64) -> bool {
+        let started = self.state.begin_window_resize_at(x, y);
+        let _ = self.display.flush_clients();
+        started
+    }
+
+    pub fn begin_window_frame_action_at(&mut self, x: f64, y: f64) -> bool {
+        let started = self.state.begin_window_frame_action_at(x, y);
+        let _ = self.display.flush_clients();
+        started
+    }
+
+    pub fn update_window_interaction(&mut self, x: f64, y: f64) -> bool {
+        let updated = self.state.update_window_interaction(x, y);
+        let _ = self.display.flush_clients();
+        updated
+    }
+
+    pub fn end_window_interaction(&mut self) {
+        self.state.end_window_interaction();
+        let _ = self.display.flush_clients();
+    }
+
+    pub fn window_interaction_active(&self) -> bool {
+        self.state.window_interaction_active()
+    }
+
+    pub fn resize_focused_window_to(&mut self, width: u32, height: u32) -> bool {
+        let resized = self.state.resize_focused_window_to(width, height);
+        let _ = self.display.flush_clients();
+        resized
+    }
+
+    pub fn minimize_focused_window(&mut self) -> bool {
+        let minimized = self.state.minimize_focused_window();
+        let _ = self.display.flush_clients();
+        minimized
+    }
+
+    pub fn restore_next_minimized_window(&mut self) -> bool {
+        let restored = self.state.restore_next_minimized_window();
+        let _ = self.display.flush_clients();
+        restored
+    }
+
+    pub fn activate_window(&mut self, surface_id: u32) -> bool {
+        let activated = self.state.activate_root_window(surface_id);
+        let _ = self.display.flush_clients();
+        activated
+    }
+
+    pub fn toggle_maximize_focused_window(&mut self) -> bool {
+        let changed = self.state.toggle_maximize_focused_window();
+        let _ = self.display.flush_clients();
+        changed
+    }
+
+    pub fn toggle_fullscreen_focused_window(&mut self) -> bool {
+        let changed = self.state.toggle_fullscreen_focused_window();
+        let _ = self.display.flush_clients();
+        changed
+    }
+
+    pub fn prepare_frame(&mut self) {
+        self.state.commit_ready_explicit_sync_buffers();
+        color::flush_pending_color_info(&mut self.state);
+        self.state.flush_pending_resize_configure();
+        let _ = self.display.flush_clients();
+    }
+
+    pub fn finish_frame(&mut self) {
+        self.state.release_pending_buffers();
+        self.state.complete_pending_frame_callbacks();
+        self.state.complete_pending_presentation_feedbacks();
+        let _ = self.display.flush_clients();
+    }
+
+    pub fn present_frame(&mut self) {
+        self.prepare_frame();
+        self.finish_frame();
+    }
+
+    pub fn tick(&mut self) -> Result<usize, CompositorError> {
+        let mut accepted = 0;
+        while let Some(stream) = self.socket.accept()? {
+            let mut handle = self.display.handle();
+            handle.insert_client(stream, Arc::new(()))?;
+            accepted += 1;
+        }
+
+        self.state.accepted_clients += accepted;
+        self.display.dispatch_clients(&mut self.state)?;
+        self.display.flush_clients()?;
+        Ok(accepted)
+    }
+}
+
+fn register_minimum_globals(
+    display: &DisplayHandle,
+    syncobj_available: bool,
+    gpu_buffers_enabled: bool,
+) {
+    display.create_global::<CompositorState, wl_compositor::WlCompositor, _>(6, ());
+    display.create_global::<CompositorState, wl_subcompositor::WlSubcompositor, _>(1, ());
+    display.create_global::<CompositorState, wl_data_device_manager::WlDataDeviceManager, _>(3, ());
+    display.create_global::<CompositorState, wl_shm::WlShm, _>(2, ());
+    display.create_global::<CompositorState, wp_viewporter::WpViewporter, _>(1, ());
+    display.create_global::<
+        CompositorState,
+        wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+        _,
+    >(1, ());
+    display.create_global::<CompositorState, wp_presentation::WpPresentation, _>(2, ());
+    color::register_color_management_global(display);
+    if gpu_buffers_enabled {
+        display.create_global::<CompositorState, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _>(4, ());
+        if syncobj_available {
+            display.create_global::<
+                CompositorState,
+                wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1,
+                _,
+            >(1, ());
+        }
+        display.create_global::<CompositorState, wl_drm::WlDrm, _>(2, ());
+    }
+    display.create_global::<CompositorState, xdg_wm_base::XdgWmBase, _>(6, ());
+    display.create_global::<CompositorState, wl_output::WlOutput, _>(4, ());
+    display.create_global::<CompositorState, wl_seat::WlSeat, _>(7, ());
+}
+
+#[derive(Debug)]
+pub enum CompositorError {
+    DisplayInit(String),
+    Bind(String),
+    Io(io::Error),
+}
+
+impl fmt::Display for CompositorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DisplayInit(error) => {
+                write!(formatter, "failed to initialize Wayland display: {error}")
+            }
+            Self::Bind(error) => write!(formatter, "failed to bind Wayland socket: {error}"),
+            Self::Io(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for CompositorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::DisplayInit(_) | Self::Bind(_) => None,
+        }
+    }
+}
+
+impl From<io::Error> for CompositorError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}

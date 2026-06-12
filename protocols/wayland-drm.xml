@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="drm">
+  <interface name="wl_drm" version="2">
+    <enum name="error">
+      <entry name="authenticate_fail" value="0"/>
+      <entry name="invalid_format" value="1"/>
+      <entry name="invalid_name" value="2"/>
+    </enum>
+
+    <request name="authenticate">
+      <arg name="id" type="uint"/>
+    </request>
+
+    <request name="create_buffer">
+      <arg name="id" type="new_id" interface="wl_buffer"/>
+      <arg name="name" type="uint"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+      <arg name="stride" type="uint"/>
+      <arg name="format" type="uint"/>
+    </request>
+
+    <request name="create_planar_buffer">
+      <arg name="id" type="new_id" interface="wl_buffer"/>
+      <arg name="name" type="uint"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+      <arg name="format" type="uint"/>
+      <arg name="offset0" type="int"/>
+      <arg name="stride0" type="int"/>
+      <arg name="offset1" type="int"/>
+      <arg name="stride1" type="int"/>
+      <arg name="offset2" type="int"/>
+      <arg name="stride2" type="int"/>
+    </request>
+
+    <event name="device">
+      <arg name="name" type="string"/>
+    </event>
+
+    <event name="format">
+      <arg name="format" type="uint"/>
+    </event>
+
+    <event name="authenticated"/>
+
+    <enum name="capability" since="2">
+      <entry name="prime" value="1"/>
+    </enum>
+
+    <event name="capabilities" since="2">
+      <arg name="value" type="uint"/>
+    </event>
+
+    <request name="create_prime_buffer" since="2">
+      <arg name="id" type="new_id" interface="wl_buffer"/>
+      <arg name="name" type="fd"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+      <arg name="format" type="uint"/>
+      <arg name="offset0" type="int"/>
+      <arg name="stride0" type="int"/>
+      <arg name="offset1" type="int"/>
+      <arg name="stride1" type="int"/>
+      <arg name="offset2" type="int"/>
+      <arg name="stride2" type="int"/>
+    </request>
+  </interface>
+</protocol>
