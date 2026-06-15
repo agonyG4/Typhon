@@ -37,6 +37,38 @@ fn cpu_composition_registry_omits_gpu_buffer_globals() {
 }
 
 #[test]
+fn default_registry_omits_unsupported_gaming_protocol_stubs() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let result = read_registry_globals(&socket_path);
+    stop_test_server(running, server_thread);
+
+    let globals = result.unwrap();
+    assert!(!globals.contains(&"zwp_relative_pointer_manager_v1".to_string()));
+    assert!(!globals.contains(&"zwp_pointer_constraints_v1".to_string()));
+    assert!(!globals.contains(&"zwp_idle_inhibit_manager_v1".to_string()));
+}
+
+#[test]
+fn native_base_registry_can_publish_gpu_buffer_globals_after_backend_is_known() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.enable_gpu_buffer_protocols();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let result = read_registry_globals(&socket_path);
+    stop_test_server(running, server_thread);
+
+    let globals = result.unwrap();
+    assert!(globals.contains(&"zwp_linux_dmabuf_v1".to_string()));
+    assert!(globals.contains(&"wl_drm".to_string()));
+}
+
+#[test]
 fn presentation_feedback_request_does_not_panic_server_tick() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -65,6 +97,13 @@ fn presentation_feedback_for_committed_buffer_is_presented_on_present_frame() {
 
     assert_eq!(state.presentation_discarded_count, 0);
     assert_eq!(state.presentation_presented_count, 1);
+    assert_eq!(
+        state.presentation_kind,
+        Some(
+            client_wp_presentation_feedback::Kind::Vsync
+                | client_wp_presentation_feedback::Kind::HwClock
+        )
+    );
 }
 
 #[test]

@@ -258,12 +258,30 @@ also reports native-session readiness: runtime dir, KMS/render devices,
 connected output, seat/libinput/GBM/EGL prerequisites, and whether the current
 raw input fallback can open `/dev/input/event*`.
 
-This path is still experimental. The native backend now prefers
-`libseat` for both DRM device ownership and libinput keyboard/pointer input,
-with direct DRM, direct libinput, and raw evdev kept as fallback/debug paths.
-It now attempts a GBM/KMS pageflip scanout path before falling back to the older
-KMS dumb framebuffer. The GBM path still fills scanout buffers from the CPU
-scene renderer; the next performance milestone is rendering the scene with
-EGL/GLES directly into GBM buffers, then driving frame callbacks from real
-pageflip completion with output revoke/resume handling and cursor-plane/damage
-hardening.
+This path is still experimental. The native backend now prefers `libseat` for
+both DRM device ownership and libinput keyboard/pointer input, with direct DRM,
+direct libinput, and raw evdev kept as fallback/debug paths. In `auto` scanout
+mode it now tries `native-egl-gbm` first: the shared EGL/GLES scene renderer
+draws into a GBM-backed EGL surface, locks the rendered front buffer, caches a
+DRM framebuffer ID for that BO, and presents it through KMS pageflip. Set
+`OBLIVION_ONE_SCANOUT_BACKEND=auto` for startup fallback from GPU to CPU/dumb,
+`gpu` or `native-egl-gbm` to require the GPU path, `gbm-cpu-write` or `cpu` to
+force the GBM CPU-write fallback, and `dumb` for the KMS dumb framebuffer
+fallback. Legacy scanout values such as `gbm` and `gbm-egl` still select the
+CPU-write fallback for compatibility.
+
+Native app GPU policy is derived after the active scanout backend is known:
+`OBLIVION_ONE_NATIVE_APP_GPU=auto` or unset accelerates apps only on
+`native-egl-gbm`, `gpu` requires that compatible backend, and `cpu` forces the
+software recovery profile. The startup command now runs after the socket,
+backend, feedback, initial modeset, and input backend are ready:
+
+```sh
+./bin/start-oblivion-one-tty -- kitty
+```
+
+Startup fallback is limited to backend creation and initial paint. Runtime GPU
+failures are fatal with structured diagnostics and a CPU restart command, for
+example `OBLIVION_ONE_SCANOUT_BACKEND=cpu OBLIVION_ONE_NATIVE_APP_GPU=cpu`.
+Real TTY/KMS hardware validation is still required before treating the native
+session as production-ready.

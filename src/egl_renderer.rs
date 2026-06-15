@@ -1,4 +1,4 @@
-use std::{collections::HashMap, error::Error, ffi::c_void, io, ptr, sync::Arc};
+use std::{collections::HashMap, error::Error, ffi::c_void, io, os::fd::AsRawFd, ptr, sync::Arc};
 
 use glow::HasContext;
 use khronos_egl as egl;
@@ -9,6 +9,7 @@ use oblivion_one::{
     },
     render_backend::{
         RenderBackendProfile,
+        buffer::DmabufBufferHandle,
         egl_gles::{EGL_LINUX_DMA_BUF_EXT, EglGlesDmabufFeedback, EglGlesDmabufImportAttributes},
     },
 };
@@ -20,7 +21,7 @@ use winit::{
 };
 
 mod damage;
-mod dmabuf;
+pub(crate) mod dmabuf;
 mod geometry;
 mod program;
 
@@ -34,19 +35,29 @@ use geometry::{
 };
 use program::create_texture_program;
 
-type RendererResult<T> = Result<T, Box<dyn Error>>;
-type EglInstance = egl::DynamicInstance<egl::EGL1_5>;
+pub(crate) type RendererResult<T> = Result<T, Box<dyn Error>>;
+pub(crate) type EglInstance = egl::DynamicInstance<egl::EGL1_5>;
 type GlTexture = <glow::Context as HasContext>::Texture;
 type GlProgram = <glow::Context as HasContext>::Program;
 type GlBuffer = <glow::Context as HasContext>::Buffer;
 type GlVertexArray = <glow::Context as HasContext>::VertexArray;
-type GlEglImageTargetTexture2DOes = unsafe extern "system" fn(u32, *mut c_void);
-type EglSwapBuffersWithDamage = unsafe extern "system" fn(
+pub(crate) type GlEglImageTargetTexture2DOes = unsafe extern "system" fn(u32, *mut c_void);
+pub(crate) type EglSwapBuffersWithDamage = unsafe extern "system" fn(
     egl::EGLDisplay,
     egl::EGLSurface,
     *const egl::Int,
     egl::Int,
 ) -> egl::Boolean;
+const MAX_CACHED_DMABUF_RESOURCES_PER_SURFACE: usize = 4;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GlesSceneFrameStats {
+    pub scene_rebuilt: bool,
+    pub shm_upload_bytes: usize,
+    pub dmabuf_imports: usize,
+    pub dmabuf_reuses: usize,
+    pub dmabuf_import_failures: usize,
+}
 
 pub struct EglSceneDrawRequest<'a> {
     pub width: u32,
@@ -64,6 +75,14 @@ pub struct EglGlesFrameRenderer {
     egl_context: egl::Context,
     egl_surface: egl::Surface,
     wl_egl_surface: WlEglSurface,
+    scene: GlesSceneRenderer,
+    swap_buffers_with_damage: Option<EglSwapBuffersWithDamage>,
+    dmabuf_feedback: EglGlesDmabufFeedback,
+    dmabuf_main_device: Option<u64>,
+    dmabuf_main_device_path: Option<String>,
+}
+
+pub(crate) struct GlesSceneRenderer {
     gl: glow::Context,
     program: GlProgram,
     vertex_array: GlVertexArray,
@@ -80,15 +99,20 @@ pub struct EglGlesFrameRenderer {
     cursor_resource: Option<EglImageResource>,
     shell_overlay_resource: Option<EglImageResource>,
     surface_resources: HashMap<u32, EglSurfaceResource>,
+    dmabuf_resource_cache: HashMap<DmabufResourceKey, EglImageResource>,
     active_surface_ids: Vec<u32>,
     failed_surface_generations: HashMap<u32, u64>,
     frame_resources: HashMap<compositor::ServerFrameColor, EglImageResource>,
     egl_image_target_texture_2d: Option<GlEglImageTargetTexture2DOes>,
-    swap_buffers_with_damage: Option<EglSwapBuffersWithDamage>,
     damage_tracker: EglOutputDamageTracker,
-    dmabuf_feedback: EglGlesDmabufFeedback,
-    dmabuf_main_device: Option<u64>,
-    dmabuf_main_device_path: Option<String>,
+    frame_stats: GlesSceneFrameStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GlesRendererInfo {
+    pub vendor: String,
+    pub renderer: String,
+    pub version: String,
 }
 
 impl EglGlesFrameRenderer {
@@ -126,6 +150,88 @@ impl EglGlesFrameRenderer {
             eprintln!("oblivion-one compositor: EGL swap interval unavailable: {error}");
         }
 
+        let egl_image_target_texture_2d =
+            load_egl_image_target_texture_2d(&egl).or_else(|| {
+                eprintln!(
+                    "oblivion-one compositor: GL_OES_EGL_image entry point unavailable; dmabuf surfaces will be skipped"
+                );
+                None
+        });
+        let scene =
+            GlesSceneRenderer::new_current(&egl, width, height, egl_image_target_texture_2d)?;
+        let swap_buffers_with_damage = load_swap_buffers_with_damage(&egl, egl_display);
+        let dmabuf_feedback = query_egl_dmabuf_feedback(&egl, egl_display);
+        let (dmabuf_main_device_path, dmabuf_main_device) =
+            match query_egl_main_device(&egl, egl_display) {
+                Some((path, main_device)) => (Some(path), Some(main_device)),
+                None => (None, None),
+            };
+
+        let vendor = unsafe { scene.gl.get_parameter_string(glow::VENDOR) };
+        let renderer = unsafe { scene.gl.get_parameter_string(glow::RENDERER) };
+        let version = unsafe { scene.gl.get_parameter_string(glow::VERSION) };
+        eprintln!(
+            "oblivion-one compositor: EGL/GLES renderer active: {vendor} {renderer} ({version}, profile {})",
+            RenderBackendProfile::egl_gles().kind.as_str()
+        );
+
+        Ok(Self {
+            egl,
+            egl_display,
+            egl_context,
+            egl_surface,
+            wl_egl_surface,
+            scene,
+            swap_buffers_with_damage,
+            dmabuf_feedback,
+            dmabuf_main_device,
+            dmabuf_main_device_path,
+        })
+    }
+
+    pub fn dmabuf_feedback(&self) -> &EglGlesDmabufFeedback {
+        &self.dmabuf_feedback
+    }
+
+    pub const fn dmabuf_main_device(&self) -> Option<u64> {
+        self.dmabuf_main_device
+    }
+
+    pub fn dmabuf_main_device_path(&self) -> Option<&str> {
+        self.dmabuf_main_device_path.as_deref()
+    }
+
+    pub fn draw_scene(&mut self, request: EglSceneDrawRequest<'_>) -> RendererResult<()> {
+        let width = request.width.max(1);
+        let height = request.height.max(1);
+        if self.scene.current_size() != (width, height) {
+            self.wl_egl_surface
+                .resize(width as i32, height as i32, 0, 0);
+        }
+        let damage = self
+            .scene
+            .draw_scene(&self.egl, self.egl_display, request)?;
+        self.swap_buffers(damage)
+    }
+
+    fn swap_buffers(&self, damage: EglOutputDamage) -> RendererResult<()> {
+        egl_swap_buffers_with_damage(
+            &self.egl,
+            self.egl_display,
+            self.egl_surface,
+            self.swap_buffers_with_damage,
+            damage,
+        )
+    }
+}
+
+impl GlesSceneRenderer {
+    pub(crate) fn new_current(
+        egl: &EglInstance,
+        width: u32,
+        height: u32,
+        egl_image_target_texture_2d: Option<GlEglImageTargetTexture2DOes>,
+    ) -> RendererResult<Self> {
         let gl = unsafe {
             glow::Context::from_loader_function(|name| {
                 egl.get_proc_address(name)
@@ -165,35 +271,7 @@ impl EglGlesFrameRenderer {
             gl.viewport(0, 0, width as i32, height as i32);
         }
 
-        let egl_image_target_texture_2d =
-            load_egl_image_target_texture_2d(&egl).or_else(|| {
-                eprintln!(
-                    "oblivion-one compositor: GL_OES_EGL_image entry point unavailable; dmabuf surfaces will be skipped"
-                );
-                None
-        });
-        let swap_buffers_with_damage = load_swap_buffers_with_damage(&egl, egl_display);
-        let dmabuf_feedback = query_egl_dmabuf_feedback(&egl, egl_display);
-        let (dmabuf_main_device_path, dmabuf_main_device) =
-            match query_egl_main_device(&egl, egl_display) {
-                Some((path, main_device)) => (Some(path), Some(main_device)),
-                None => (None, None),
-            };
-
-        let vendor = unsafe { gl.get_parameter_string(glow::VENDOR) };
-        let renderer = unsafe { gl.get_parameter_string(glow::RENDERER) };
-        let version = unsafe { gl.get_parameter_string(glow::VERSION) };
-        eprintln!(
-            "oblivion-one compositor: EGL/GLES renderer active: {vendor} {renderer} ({version}, profile {})",
-            RenderBackendProfile::egl_gles().kind.as_str()
-        );
-
         Ok(Self {
-            egl,
-            egl_display,
-            egl_context,
-            egl_surface,
-            wl_egl_surface,
             gl,
             program,
             vertex_array,
@@ -210,31 +288,38 @@ impl EglGlesFrameRenderer {
             cursor_resource: None,
             shell_overlay_resource: None,
             surface_resources: HashMap::new(),
+            dmabuf_resource_cache: HashMap::new(),
             active_surface_ids: Vec::new(),
             failed_surface_generations: HashMap::new(),
             frame_resources: HashMap::new(),
             egl_image_target_texture_2d,
-            swap_buffers_with_damage,
             damage_tracker: EglOutputDamageTracker::default(),
-            dmabuf_feedback,
-            dmabuf_main_device,
-            dmabuf_main_device_path,
+            frame_stats: GlesSceneFrameStats::default(),
         })
     }
 
-    pub fn dmabuf_feedback(&self) -> &EglGlesDmabufFeedback {
-        &self.dmabuf_feedback
+    pub(crate) const fn current_size(&self) -> (u32, u32) {
+        self.current_size
     }
 
-    pub const fn dmabuf_main_device(&self) -> Option<u64> {
-        self.dmabuf_main_device
+    pub(crate) const fn last_frame_stats(&self) -> GlesSceneFrameStats {
+        self.frame_stats
     }
 
-    pub fn dmabuf_main_device_path(&self) -> Option<&str> {
-        self.dmabuf_main_device_path.as_deref()
+    pub(crate) fn renderer_info(&self) -> GlesRendererInfo {
+        GlesRendererInfo {
+            vendor: unsafe { self.gl.get_parameter_string(glow::VENDOR) },
+            renderer: unsafe { self.gl.get_parameter_string(glow::RENDERER) },
+            version: unsafe { self.gl.get_parameter_string(glow::VERSION) },
+        }
     }
 
-    pub fn draw_scene(&mut self, request: EglSceneDrawRequest<'_>) -> RendererResult<()> {
+    pub(crate) fn draw_scene(
+        &mut self,
+        egl: &EglInstance,
+        egl_display: egl::Display,
+        request: EglSceneDrawRequest<'_>,
+    ) -> RendererResult<EglOutputDamage> {
         let EglSceneDrawRequest {
             width,
             height,
@@ -249,17 +334,24 @@ impl EglGlesFrameRenderer {
         let output_scale_key = compositor::output_scale_key(output_scale);
         let scaled_visual_state =
             compositor::scale_desktop_visual_state(visual_state, output_scale);
-        self.ensure_output_size(width, height)?;
-        self.ensure_wallpaper_resource(width, height)?;
+        self.frame_stats = GlesSceneFrameStats::default();
+        self.ensure_output_size(egl, egl_display, width, height)?;
+        self.ensure_wallpaper_resource(egl, egl_display, width, height)?;
         self.ensure_frame_resources()?;
         if scaled_visual_state.cursor.is_some() {
-            self.ensure_cursor_resource()?;
+            self.ensure_cursor_resource(egl, egl_display)?;
         }
-        self.ensure_shell_overlay_resource(shell_overlay)?;
-        self.sync_surface_resources(surfaces)?;
+        self.ensure_shell_overlay_resource(egl, egl_display, shell_overlay)?;
+        self.sync_surface_resources(egl, egl_display, surfaces)?;
 
-        let scene_changed =
-            !self.scene_cache_is_current(width, height, content_generation, output_scale_key);
+        let surface_signatures = egl_scene_surface_signatures(surfaces);
+        let scene_changed = !self.scene_cache_is_current(
+            width,
+            height,
+            content_generation,
+            output_scale_key,
+            &surface_signatures,
+        );
         let shell_overlay_damage = shell_overlay.and_then(shell_overlay_damage_state);
         let output_damage = self.damage_tracker.damage_for_frame(
             width,
@@ -270,6 +362,7 @@ impl EglGlesFrameRenderer {
         );
 
         if scene_changed {
+            self.frame_stats.scene_rebuilt = true;
             self.rebuild_scene_commands(
                 width,
                 height,
@@ -277,25 +370,31 @@ impl EglGlesFrameRenderer {
                 content_generation,
                 output_scale,
                 output_scale_key,
+                &surface_signatures,
             );
         }
         self.rebuild_overlay_commands(width, height, scaled_visual_state, shell_overlay);
-        self.present_textured_layers(output_damage)
+        self.draw_textured_layers()?;
+        Ok(output_damage)
     }
 
-    fn ensure_output_size(&mut self, width: u32, height: u32) -> RendererResult<()> {
+    fn ensure_output_size(
+        &mut self,
+        egl: &EglInstance,
+        egl_display: egl::Display,
+        width: u32,
+        height: u32,
+    ) -> RendererResult<()> {
         if self.current_size == (width, height) {
             return Ok(());
         }
 
-        self.wl_egl_surface
-            .resize(width as i32, height as i32, 0, 0);
         self.current_size = (width, height);
         if let Some(resource) = self.wallpaper_resource.take() {
-            destroy_image_resource(&self.gl, &self.egl, self.egl_display, resource);
+            destroy_image_resource(&self.gl, egl, egl_display, resource);
         }
         if let Some(resource) = self.shell_overlay_resource.take() {
-            destroy_image_resource(&self.gl, &self.egl, self.egl_display, resource);
+            destroy_image_resource(&self.gl, egl, egl_display, resource);
         }
         self.scene_cache_key = None;
         unsafe {
@@ -304,7 +403,13 @@ impl EglGlesFrameRenderer {
         Ok(())
     }
 
-    fn ensure_wallpaper_resource(&mut self, width: u32, height: u32) -> RendererResult<()> {
+    fn ensure_wallpaper_resource(
+        &mut self,
+        egl: &EglInstance,
+        egl_display: egl::Display,
+        width: u32,
+        height: u32,
+    ) -> RendererResult<()> {
         if self
             .wallpaper_resource
             .as_ref()
@@ -325,14 +430,18 @@ impl EglGlesFrameRenderer {
             &mut self.texture_upload_rgba,
         );
         if let Some(old) = self.wallpaper_resource.take() {
-            destroy_image_resource(&self.gl, &self.egl, self.egl_display, old);
+            destroy_image_resource(&self.gl, egl, egl_display, old);
         }
         resource.generation = 1;
         self.wallpaper_resource = Some(resource);
         Ok(())
     }
 
-    fn ensure_cursor_resource(&mut self) -> RendererResult<()> {
+    fn ensure_cursor_resource(
+        &mut self,
+        egl: &EglInstance,
+        egl_display: egl::Display,
+    ) -> RendererResult<()> {
         let (width, height) = cursor_texture_size();
         if width == 0 || height == 0 {
             return Ok(());
@@ -355,7 +464,7 @@ impl EglGlesFrameRenderer {
             &mut self.texture_upload_rgba,
         );
         if let Some(old) = self.cursor_resource.take() {
-            destroy_image_resource(&self.gl, &self.egl, self.egl_display, old);
+            destroy_image_resource(&self.gl, egl, egl_display, old);
         }
         resource.generation = 1;
         self.cursor_resource = Some(resource);
@@ -364,11 +473,13 @@ impl EglGlesFrameRenderer {
 
     fn ensure_shell_overlay_resource(
         &mut self,
+        egl: &EglInstance,
+        egl_display: egl::Display,
         shell_overlay: Option<&ShellOverlayImage>,
     ) -> RendererResult<()> {
         let Some(shell_overlay) = shell_overlay else {
             if let Some(old) = self.shell_overlay_resource.take() {
-                destroy_image_resource(&self.gl, &self.egl, self.egl_display, old);
+                destroy_image_resource(&self.gl, egl, egl_display, old);
             }
             return Ok(());
         };
@@ -377,7 +488,7 @@ impl EglGlesFrameRenderer {
         }
         if shell_overlay.content_bounds().is_none() {
             if let Some(old) = self.shell_overlay_resource.take() {
-                destroy_image_resource(&self.gl, &self.egl, self.egl_display, old);
+                destroy_image_resource(&self.gl, egl, egl_display, old);
             }
             return Ok(());
         }
@@ -387,7 +498,7 @@ impl EglGlesFrameRenderer {
             .is_none_or(|resource| resource.size != (shell_overlay.width, shell_overlay.height));
         if update {
             if let Some(old) = self.shell_overlay_resource.take() {
-                destroy_image_resource(&self.gl, &self.egl, self.egl_display, old);
+                destroy_image_resource(&self.gl, egl, egl_display, old);
             }
             self.shell_overlay_resource = Some(create_uploaded_resource(
                 &self.gl,
@@ -432,7 +543,12 @@ impl EglGlesFrameRenderer {
         Ok(())
     }
 
-    fn sync_surface_resources(&mut self, surfaces: &[RenderableSurface]) -> RendererResult<()> {
+    fn sync_surface_resources(
+        &mut self,
+        egl: &EglInstance,
+        egl_display: egl::Display,
+        surfaces: &[RenderableSurface],
+    ) -> RendererResult<()> {
         self.active_surface_ids.clear();
         self.active_surface_ids
             .extend(surfaces.iter().map(|surface| surface.surface_id));
@@ -447,8 +563,9 @@ impl EglGlesFrameRenderer {
             .collect::<Vec<_>>();
         for surface_id in stale_ids {
             if let Some(resource) = self.surface_resources.remove(&surface_id) {
-                destroy_surface_resource(&self.gl, &self.egl, self.egl_display, resource);
+                destroy_surface_resource(&self.gl, egl, egl_display, resource);
             }
+            self.destroy_cached_dmabufs_for_surface(egl, egl_display, surface_id);
             self.failed_surface_generations.remove(&surface_id);
         }
 
@@ -461,38 +578,74 @@ impl EglGlesFrameRenderer {
                 });
             match update {
                 EglSurfaceResourceUpdate::Reuse => continue,
+                EglSurfaceResourceUpdate::ReuseDmabuf => {
+                    if let Some(resource) = self.surface_resources.get_mut(&surface.surface_id) {
+                        resource.image.generation = surface.generation;
+                    }
+                    self.frame_stats.dmabuf_reuses =
+                        self.frame_stats.dmabuf_reuses.saturating_add(1);
+                    continue;
+                }
                 EglSurfaceResourceUpdate::UploadDamage => {
                     if let Some(resource) = self.surface_resources.get_mut(&surface.surface_id) {
-                        resource.write_shm_damage(&self.gl, surface, &mut self.texture_upload_rgba);
+                        self.frame_stats.shm_upload_bytes = self
+                            .frame_stats
+                            .shm_upload_bytes
+                            .saturating_add(resource.write_shm_damage(
+                                &self.gl,
+                                surface,
+                                &mut self.texture_upload_rgba,
+                            ));
                     }
+                    continue;
+                }
+                EglSurfaceResourceUpdate::Recreate if surface.dmabuf_handle().is_some() => {
+                    self.switch_dmabuf_surface_resource(egl, egl_display, surface)?;
                     continue;
                 }
                 EglSurfaceResourceUpdate::Recreate => {}
                 EglSurfaceResourceUpdate::UnsupportedBuffer => {
                     if let Some(resource) = self.surface_resources.remove(&surface.surface_id) {
-                        destroy_surface_resource(&self.gl, &self.egl, self.egl_display, resource);
+                        destroy_surface_resource(&self.gl, egl, egl_display, resource);
                     }
+                    self.destroy_cached_dmabufs_for_surface(egl, egl_display, surface.surface_id);
                     continue;
                 }
             }
 
             if let Some(old) = self.surface_resources.remove(&surface.surface_id) {
-                destroy_surface_resource(&self.gl, &self.egl, self.egl_display, old);
+                destroy_surface_resource(&self.gl, egl, egl_display, old);
+            }
+            if surface.dmabuf_handle().is_none() {
+                self.destroy_cached_dmabufs_for_surface(egl, egl_display, surface.surface_id);
             }
 
             match create_surface_resource(
                 &self.gl,
-                &self.egl,
-                self.egl_display,
+                egl,
+                egl_display,
                 self.egl_image_target_texture_2d,
                 surface,
                 &mut self.texture_upload_rgba,
             ) {
                 Ok(resource) => {
+                    if surface.cpu_pixels().is_some() {
+                        self.frame_stats.shm_upload_bytes = self
+                            .frame_stats
+                            .shm_upload_bytes
+                            .saturating_add(surface_upload_byte_len(surface));
+                    } else if surface.dmabuf_handle().is_some() {
+                        self.frame_stats.dmabuf_imports =
+                            self.frame_stats.dmabuf_imports.saturating_add(1);
+                    }
                     self.failed_surface_generations.remove(&surface.surface_id);
                     self.surface_resources.insert(surface.surface_id, resource);
                 }
                 Err(error) => {
+                    if surface.dmabuf_handle().is_some() {
+                        self.frame_stats.dmabuf_import_failures =
+                            self.frame_stats.dmabuf_import_failures.saturating_add(1);
+                    }
                     let should_log = self
                         .failed_surface_generations
                         .get(&surface.surface_id)
@@ -512,17 +665,144 @@ impl EglGlesFrameRenderer {
         Ok(())
     }
 
+    fn switch_dmabuf_surface_resource(
+        &mut self,
+        egl: &EglInstance,
+        egl_display: egl::Display,
+        surface: &RenderableSurface,
+    ) -> RendererResult<()> {
+        let Some(key) = DmabufResourceKey::from_surface(surface) else {
+            return Ok(());
+        };
+
+        if let Some(mut image) = self.dmabuf_resource_cache.remove(&key) {
+            image.generation = surface.generation;
+            self.frame_stats.dmabuf_reuses = self.frame_stats.dmabuf_reuses.saturating_add(1);
+            if let Some(old) = self.surface_resources.insert(
+                surface.surface_id,
+                EglSurfaceResource {
+                    image,
+                    dmabuf_key: Some(key),
+                },
+            ) {
+                self.cache_or_destroy_dmabuf_resource(egl, egl_display, surface.surface_id, old);
+            }
+            return Ok(());
+        }
+
+        let Some(old) = self.surface_resources.remove(&surface.surface_id) else {
+            let resource = create_surface_resource(
+                &self.gl,
+                egl,
+                egl_display,
+                self.egl_image_target_texture_2d,
+                surface,
+                &mut self.texture_upload_rgba,
+            )?;
+            self.frame_stats.dmabuf_imports = self.frame_stats.dmabuf_imports.saturating_add(1);
+            self.surface_resources.insert(surface.surface_id, resource);
+            return Ok(());
+        };
+        self.cache_or_destroy_dmabuf_resource(egl, egl_display, surface.surface_id, old);
+
+        let resource = create_surface_resource(
+            &self.gl,
+            egl,
+            egl_display,
+            self.egl_image_target_texture_2d,
+            surface,
+            &mut self.texture_upload_rgba,
+        )?;
+        self.frame_stats.dmabuf_imports = self.frame_stats.dmabuf_imports.saturating_add(1);
+        self.surface_resources.insert(surface.surface_id, resource);
+        Ok(())
+    }
+
+    fn cache_or_destroy_dmabuf_resource(
+        &mut self,
+        egl: &EglInstance,
+        egl_display: egl::Display,
+        surface_id: u32,
+        resource: EglSurfaceResource,
+    ) {
+        let Some(key) = resource.dmabuf_key else {
+            destroy_surface_resource(&self.gl, egl, egl_display, resource);
+            return;
+        };
+
+        self.prune_cached_dmabufs_for_surface(egl, egl_display, surface_id);
+        self.dmabuf_resource_cache.insert(key, resource.image);
+    }
+
+    fn prune_cached_dmabufs_for_surface(
+        &mut self,
+        egl: &EglInstance,
+        egl_display: egl::Display,
+        surface_id: u32,
+    ) {
+        let cached = self
+            .dmabuf_resource_cache
+            .keys()
+            .filter(|key| key.surface_id == surface_id)
+            .count();
+        if cached < MAX_CACHED_DMABUF_RESOURCES_PER_SURFACE {
+            return;
+        }
+        let Some(key) = self
+            .dmabuf_resource_cache
+            .keys()
+            .find(|key| key.surface_id == surface_id)
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(resource) = self.dmabuf_resource_cache.remove(&key) {
+            destroy_image_resource(&self.gl, egl, egl_display, resource);
+        }
+    }
+
+    fn destroy_cached_dmabufs_for_surface(
+        &mut self,
+        egl: &EglInstance,
+        egl_display: egl::Display,
+        surface_id: u32,
+    ) {
+        let keys = self
+            .dmabuf_resource_cache
+            .keys()
+            .filter(|key| key.surface_id == surface_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(resource) = self.dmabuf_resource_cache.remove(&key) {
+                destroy_image_resource(&self.gl, egl, egl_display, resource);
+            }
+        }
+    }
+
     fn scene_cache_is_current(
         &self,
         width: u32,
         height: u32,
         content_generation: u64,
         output_scale_key: u32,
+        surface_signatures: &[EglSceneSurfaceSignature],
     ) -> bool {
-        self.scene_cache_key
-            .is_some_and(|key| key.is_current(width, height, content_generation, output_scale_key))
+        self.scene_cache_key.is_some_and(|key| {
+            key.is_current(
+                width,
+                height,
+                content_generation,
+                output_scale_key,
+                surface_signatures,
+            )
+        })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "hot EGL command rebuild path passes borrowed frame state directly to avoid transient config allocation"
+    )]
     fn rebuild_scene_commands(
         &mut self,
         width: u32,
@@ -531,6 +811,7 @@ impl EglGlesFrameRenderer {
         content_generation: u64,
         output_scale: f64,
         output_scale_key: u32,
+        surface_signatures: &[EglSceneSurfaceSignature],
     ) {
         self.vertices.clear();
         self.commands.clear();
@@ -583,6 +864,7 @@ impl EglGlesFrameRenderer {
             height,
             content_generation,
             output_scale_key,
+            surface_signatures,
         ));
     }
 
@@ -649,7 +931,7 @@ impl EglGlesFrameRenderer {
         );
     }
 
-    fn present_textured_layers(&mut self, damage: EglOutputDamage) -> RendererResult<()> {
+    fn draw_textured_layers(&mut self) -> RendererResult<()> {
         unsafe {
             self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
             self.gl.clear(glow::COLOR_BUFFER_BIT);
@@ -665,38 +947,7 @@ impl EglGlesFrameRenderer {
             self.gl.bind_vertex_array(None);
             self.gl.bind_texture(glow::TEXTURE_2D, None);
         }
-        self.swap_buffers(damage)?;
         Ok(())
-    }
-
-    fn swap_buffers(&self, damage: EglOutputDamage) -> RendererResult<()> {
-        let Some(swap_buffers_with_damage) = self.swap_buffers_with_damage else {
-            self.egl.swap_buffers(self.egl_display, self.egl_surface)?;
-            return Ok(());
-        };
-        let Some(rects) = damage.to_egl_rects() else {
-            self.egl.swap_buffers(self.egl_display, self.egl_surface)?;
-            return Ok(());
-        };
-
-        let ok = unsafe {
-            swap_buffers_with_damage(
-                self.egl_display.as_ptr(),
-                self.egl_surface.as_ptr(),
-                rects.as_ptr(),
-                rects.rect_count() as egl::Int,
-            )
-        };
-        if ok == egl::TRUE {
-            Ok(())
-        } else {
-            Err(self
-                .egl
-                .get_error()
-                .map(|error| io::Error::other(format!("eglSwapBuffersWithDamage failed: {error}")))
-                .unwrap_or_else(|| io::Error::other("eglSwapBuffersWithDamage failed"))
-                .into())
-        }
     }
 
     fn draw_command_batch(&mut self, scene: bool) -> RendererResult<()> {
@@ -765,24 +1016,25 @@ impl EglGlesFrameRenderer {
                 .map(|resource| resource.texture),
         }
     }
-}
 
-impl Drop for EglGlesFrameRenderer {
-    fn drop(&mut self) {
+    pub(crate) fn destroy(&mut self, egl: &EglInstance, egl_display: egl::Display) {
         if let Some(resource) = self.wallpaper_resource.take() {
-            destroy_image_resource(&self.gl, &self.egl, self.egl_display, resource);
+            destroy_image_resource(&self.gl, egl, egl_display, resource);
         }
         if let Some(resource) = self.cursor_resource.take() {
-            destroy_image_resource(&self.gl, &self.egl, self.egl_display, resource);
+            destroy_image_resource(&self.gl, egl, egl_display, resource);
         }
         if let Some(resource) = self.shell_overlay_resource.take() {
-            destroy_image_resource(&self.gl, &self.egl, self.egl_display, resource);
+            destroy_image_resource(&self.gl, egl, egl_display, resource);
         }
         for (_, resource) in self.frame_resources.drain() {
-            destroy_image_resource(&self.gl, &self.egl, self.egl_display, resource);
+            destroy_image_resource(&self.gl, egl, egl_display, resource);
         }
         for (_, resource) in self.surface_resources.drain() {
-            destroy_surface_resource(&self.gl, &self.egl, self.egl_display, resource);
+            destroy_surface_resource(&self.gl, egl, egl_display, resource);
+        }
+        for (_, resource) in self.dmabuf_resource_cache.drain() {
+            destroy_image_resource(&self.gl, egl, egl_display, resource);
         }
 
         unsafe {
@@ -790,6 +1042,12 @@ impl Drop for EglGlesFrameRenderer {
             self.gl.delete_vertex_array(self.vertex_array);
             self.gl.delete_program(self.program);
         }
+    }
+}
+
+impl Drop for EglGlesFrameRenderer {
+    fn drop(&mut self) {
+        self.scene.destroy(&self.egl, self.egl_display);
         let _ = self.egl.make_current(self.egl_display, None, None, None);
         let _ = self.egl.destroy_surface(self.egl_display, self.egl_surface);
         let _ = self.egl.destroy_context(self.egl_display, self.egl_context);
@@ -806,6 +1064,7 @@ struct EglImageResource {
 
 struct EglSurfaceResource {
     image: EglImageResource,
+    dmabuf_key: Option<DmabufResourceKey>,
 }
 
 impl EglSurfaceResource {
@@ -820,6 +1079,13 @@ impl EglSurfaceResource {
         if surface.cpu_pixels().is_some() && self.image.egl_image.is_none() {
             return EglSurfaceResourceUpdate::UploadDamage;
         }
+        if surface
+            .dmabuf_handle()
+            .and_then(|_| DmabufResourceKey::from_surface(surface))
+            .is_some_and(|key| self.dmabuf_key.as_ref() == Some(&key))
+        {
+            return EglSurfaceResourceUpdate::ReuseDmabuf;
+        }
         if surface.dmabuf_handle().is_some() {
             return EglSurfaceResourceUpdate::Recreate;
         }
@@ -831,18 +1097,70 @@ impl EglSurfaceResource {
         gl: &glow::Context,
         surface: &RenderableSurface,
         upload_rgba: &mut Vec<u8>,
-    ) {
-        write_surface_pixels_to_resource(gl, &self.image, surface, false, upload_rgba);
+    ) -> usize {
+        let upload_bytes =
+            write_surface_pixels_to_resource(gl, &self.image, surface, false, upload_rgba);
         self.image.generation = surface.generation;
+        upload_bytes
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EglSurfaceResourceUpdate {
     Reuse,
+    ReuseDmabuf,
     UploadDamage,
     Recreate,
     UnsupportedBuffer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DmabufResourceKey {
+    surface_id: u32,
+    width: u32,
+    height: u32,
+    format: u32,
+    planes: Vec<DmabufPlaneKey>,
+}
+
+impl DmabufResourceKey {
+    fn from_surface(surface: &RenderableSurface) -> Option<Self> {
+        Self::from_handle(surface.surface_id, surface.dmabuf_handle()?)
+    }
+
+    fn from_handle(surface_id: u32, handle: &DmabufBufferHandle) -> Option<Self> {
+        let size = handle.size();
+        let planes = handle
+            .planes()
+            .iter()
+            .map(|plane| {
+                let descriptor = plane.descriptor();
+                Some(DmabufPlaneKey {
+                    fd: plane.fd().as_raw_fd(),
+                    plane_index: descriptor.plane_index,
+                    offset: descriptor.offset,
+                    stride: descriptor.stride,
+                    modifier: descriptor.modifier.0,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            surface_id,
+            width: size.width,
+            height: size.height,
+            format: handle.format().as_fourcc(),
+            planes,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DmabufPlaneKey {
+    fd: i32,
+    plane_index: u32,
+    offset: u32,
+    stride: u32,
+    modifier: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -851,30 +1169,110 @@ struct EglSceneCacheKey {
     height: u32,
     content_generation: u64,
     output_scale_key: u32,
+    surface_signature_hash: u64,
 }
 
 impl EglSceneCacheKey {
-    const fn new(width: u32, height: u32, content_generation: u64, output_scale_key: u32) -> Self {
+    fn new(
+        width: u32,
+        height: u32,
+        content_generation: u64,
+        output_scale_key: u32,
+        surface_signatures: &[EglSceneSurfaceSignature],
+    ) -> Self {
         Self {
             width,
             height,
             content_generation,
             output_scale_key,
+            surface_signature_hash: egl_scene_surface_signature_hash(surface_signatures),
         }
     }
 
-    const fn is_current(
+    fn is_current(
         self,
         width: u32,
         height: u32,
         content_generation: u64,
         output_scale_key: u32,
+        surface_signatures: &[EglSceneSurfaceSignature],
     ) -> bool {
         self.width == width
             && self.height == height
             && self.content_generation == content_generation
             && self.output_scale_key == output_scale_key
+            && self.surface_signature_hash == egl_scene_surface_signature_hash(surface_signatures)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EglSceneSurfaceSignature {
+    surface_id: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    generation: u64,
+}
+
+impl EglSceneSurfaceSignature {
+    const fn new(
+        surface_id: u32,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        generation: u64,
+    ) -> Self {
+        Self {
+            surface_id,
+            x,
+            y,
+            width,
+            height,
+            generation,
+        }
+    }
+}
+
+fn egl_scene_surface_signatures(surfaces: &[RenderableSurface]) -> Vec<EglSceneSurfaceSignature> {
+    surfaces
+        .iter()
+        .map(|surface| {
+            EglSceneSurfaceSignature::new(
+                surface.surface_id,
+                surface.x,
+                surface.y,
+                surface.width,
+                surface.height,
+                surface.generation,
+            )
+        })
+        .collect()
+}
+
+fn egl_scene_surface_signature_hash(signatures: &[EglSceneSurfaceSignature]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for signature in signatures {
+        hash = fnv1a_u64(hash, u64::from(signature.surface_id));
+        hash = fnv1a_u64(hash, signature.x as u32 as u64);
+        hash = fnv1a_u64(hash, signature.y as u32 as u64);
+        hash = fnv1a_u64(hash, u64::from(signature.width));
+        hash = fnv1a_u64(hash, u64::from(signature.height));
+        hash = fnv1a_u64(hash, signature.generation);
+    }
+    hash
+}
+
+const fn fnv1a_u64(hash: u64, value: u64) -> u64 {
+    (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3)
+}
+
+fn surface_upload_byte_len(surface: &RenderableSurface) -> usize {
+    let size = surface.buffer_size();
+    (size.width as usize)
+        .saturating_mul(size.height as usize)
+        .saturating_mul(4)
 }
 
 fn create_surface_resource(
@@ -904,7 +1302,10 @@ fn create_surface_resource(
         return Err(io::Error::other("surface has no importable buffer").into());
     };
 
-    Ok(EglSurfaceResource { image })
+    Ok(EglSurfaceResource {
+        image,
+        dmabuf_key: DmabufResourceKey::from_surface(surface),
+    })
 }
 
 fn create_uploaded_resource(
@@ -990,7 +1391,7 @@ fn write_surface_pixels_to_resource(
     surface: &RenderableSurface,
     force_full_upload: bool,
     upload_rgba: &mut Vec<u8>,
-) {
+) -> usize {
     if force_full_upload
         || surface.damage.is_full()
         || surface
@@ -998,20 +1399,20 @@ fn write_surface_pixels_to_resource(
             .covers_surface(surface.buffer_size().width, surface.buffer_size().height)
     {
         let Some(pixels) = surface.cpu_pixels() else {
-            return;
+            return 0;
         };
         let buffer_size = surface.buffer_size();
-        write_argb_pixels_to_resource(
+        return write_argb_pixels_to_resource(
             gl,
             resource,
             SurfaceDamageRect::full(buffer_size.width, buffer_size.height),
             pixels,
             upload_rgba,
         );
-        return;
     }
 
     let buffer_size = surface.buffer_size();
+    let mut uploaded_bytes = 0usize;
     for rect in surface
         .damage
         .clipped_rects(buffer_size.width, buffer_size.height)
@@ -1022,8 +1423,14 @@ fn write_surface_pixels_to_resource(
         if !pack_surface_rect_rgba(surface, rect, upload_rgba) {
             continue;
         }
-        write_rgba_bytes_to_resource(gl, resource, rect, upload_rgba);
+        uploaded_bytes = uploaded_bytes.saturating_add(write_rgba_bytes_to_resource(
+            gl,
+            resource,
+            rect,
+            upload_rgba,
+        ));
     }
+    uploaded_bytes
 }
 
 fn write_argb_pixels_to_resource(
@@ -1032,9 +1439,9 @@ fn write_argb_pixels_to_resource(
     rect: SurfaceDamageRect,
     pixels: &[u32],
     upload_rgba: &mut Vec<u8>,
-) {
+) -> usize {
     pack_argb_pixels_rgba(pixels, upload_rgba);
-    write_rgba_bytes_to_resource(gl, resource, rect, upload_rgba);
+    write_rgba_bytes_to_resource(gl, resource, rect, upload_rgba)
 }
 
 fn shell_overlay_damage_state(
@@ -1063,7 +1470,7 @@ fn write_rgba_bytes_to_resource(
     resource: &EglImageResource,
     rect: SurfaceDamageRect,
     rgba: &[u8],
-) {
+) -> usize {
     unsafe {
         gl.bind_texture(glow::TEXTURE_2D, Some(resource.texture));
         gl.tex_sub_image_2d(
@@ -1078,6 +1485,9 @@ fn write_rgba_bytes_to_resource(
             glow::PixelUnpackData::Slice(Some(rgba)),
         );
     }
+    (rect.width as usize)
+        .saturating_mul(rect.height as usize)
+        .saturating_mul(4)
 }
 
 fn pack_argb_pixels_rgba(pixels: &[u32], output: &mut Vec<u8>) {
@@ -1218,7 +1628,10 @@ fn wayland_handles_for_window(
     ))
 }
 
-fn choose_egl_config(egl: &EglInstance, display: egl::Display) -> RendererResult<egl::Config> {
+pub(crate) fn choose_egl_config(
+    egl: &EglInstance,
+    display: egl::Display,
+) -> RendererResult<egl::Config> {
     let attributes = [
         egl::SURFACE_TYPE,
         egl::WINDOW_BIT,
@@ -1238,7 +1651,31 @@ fn choose_egl_config(egl: &EglInstance, display: egl::Display) -> RendererResult
         .ok_or_else(|| io::Error::other("EGL has no GLES window config").into())
 }
 
-fn create_gles_context(
+pub(crate) fn choose_native_egl_config(
+    egl: &EglInstance,
+    display: egl::Display,
+    native_visual_id: u32,
+) -> RendererResult<egl::Config> {
+    let attributes = [
+        egl::SURFACE_TYPE,
+        egl::WINDOW_BIT,
+        egl::RENDERABLE_TYPE,
+        egl::OPENGL_ES2_BIT | egl::OPENGL_ES3_BIT,
+        egl::RED_SIZE,
+        8,
+        egl::GREEN_SIZE,
+        8,
+        egl::BLUE_SIZE,
+        8,
+        egl::NATIVE_VISUAL_ID,
+        native_visual_id as egl::Int,
+        egl::NONE,
+    ];
+    egl.choose_first_config(display, &attributes)?
+        .ok_or_else(|| io::Error::other("EGL has no GLES GBM window config").into())
+}
+
+pub(crate) fn create_gles_context(
     egl: &EglInstance,
     display: egl::Display,
     config: egl::Config,
@@ -1259,14 +1696,16 @@ fn create_gles_context(
     }
 }
 
-fn load_egl_image_target_texture_2d(egl: &EglInstance) -> Option<GlEglImageTargetTexture2DOes> {
+pub(crate) fn load_egl_image_target_texture_2d(
+    egl: &EglInstance,
+) -> Option<GlEglImageTargetTexture2DOes> {
     let symbol = egl.get_proc_address("glEGLImageTargetTexture2DOES")?;
     Some(unsafe {
         std::mem::transmute::<extern "system" fn(), GlEglImageTargetTexture2DOes>(symbol)
     })
 }
 
-fn load_swap_buffers_with_damage(
+pub(crate) fn load_swap_buffers_with_damage(
     egl: &EglInstance,
     display: egl::Display,
 ) -> Option<EglSwapBuffersWithDamage> {
@@ -1285,9 +1724,47 @@ fn load_swap_buffers_with_damage(
     Some(unsafe { std::mem::transmute::<extern "system" fn(), EglSwapBuffersWithDamage>(symbol) })
 }
 
+pub(crate) fn egl_swap_buffers_with_damage(
+    egl: &EglInstance,
+    display: egl::Display,
+    surface: egl::Surface,
+    swap_buffers_with_damage: Option<EglSwapBuffersWithDamage>,
+    damage: EglOutputDamage,
+) -> RendererResult<()> {
+    let Some(swap_buffers_with_damage) = swap_buffers_with_damage else {
+        egl.swap_buffers(display, surface)?;
+        return Ok(());
+    };
+    let Some(rects) = damage.to_egl_rects() else {
+        egl.swap_buffers(display, surface)?;
+        return Ok(());
+    };
+
+    let ok = unsafe {
+        swap_buffers_with_damage(
+            display.as_ptr(),
+            surface.as_ptr(),
+            rects.as_ptr(),
+            rects.rect_count() as egl::Int,
+        )
+    };
+    if ok == egl::TRUE {
+        Ok(())
+    } else {
+        Err(egl
+            .get_error()
+            .map(|error| io::Error::other(format!("eglSwapBuffersWithDamage failed: {error}")))
+            .unwrap_or_else(|| io::Error::other("eglSwapBuffersWithDamage failed"))
+            .into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oblivion_one::render_backend::buffer::{
+        BufferSize, DmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
+    };
 
     #[test]
     fn output_damage_tracker_uses_full_damage_for_first_or_scene_frame() {
@@ -1398,5 +1875,61 @@ mod tests {
         pack_argb_pixels_rgba(&[0x1122_3344, 0xaa55_6677], &mut packed);
 
         assert_eq!(packed, vec![0x22, 0x33, 0x44, 0x11, 0x55, 0x66, 0x77, 0xaa]);
+    }
+
+    #[test]
+    fn scene_cache_key_invalidates_when_surface_geometry_changes() {
+        let initial_signature = EglSceneSurfaceSignature::new(7, 10, 20, 800, 600, 1);
+        let resized_signature = EglSceneSurfaceSignature::new(7, 10, 20, 420, 320, 1);
+        let key = EglSceneCacheKey::new(1280, 800, 9, 120, &[initial_signature]);
+
+        assert!(key.is_current(1280, 800, 9, 120, &[initial_signature]));
+        assert!(!key.is_current(1280, 800, 9, 120, &[resized_signature]));
+    }
+
+    #[test]
+    fn dmabuf_resource_key_matches_same_handle_for_surface() {
+        let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+
+        assert_eq!(
+            DmabufResourceKey::from_handle(7, &handle),
+            DmabufResourceKey::from_handle(7, &handle)
+        );
+    }
+
+    #[test]
+    fn dmabuf_resource_key_separates_swapchain_buffers() {
+        let first = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+        let second = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+
+        assert_ne!(
+            DmabufResourceKey::from_handle(7, &first),
+            DmabufResourceKey::from_handle(7, &second)
+        );
+    }
+
+    fn test_dmabuf_handle(
+        width: u32,
+        height: u32,
+        stride: u32,
+        modifier: DrmModifier,
+    ) -> DmabufBufferHandle {
+        let fd = std::fs::File::open("/dev/null")
+            .expect("/dev/null exists for dmabuf identity tests")
+            .into();
+        DmabufBufferHandle::new(
+            BufferSize::new(width, height).expect("test dmabuf size is non-zero"),
+            DrmFormat::Xrgb8888,
+            vec![DmabufPlane::new(
+                fd,
+                DmabufPlaneDescriptor {
+                    plane_index: 0,
+                    offset: 0,
+                    stride,
+                    modifier,
+                },
+            )],
+        )
+        .expect("test dmabuf metadata is valid")
     }
 }

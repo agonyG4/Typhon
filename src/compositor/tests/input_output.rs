@@ -1,6 +1,136 @@
 use super::*;
 
 #[test]
+fn pointer_motion_sample_preserves_relative_deltas_in_compositor_state() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    let relative = RelativePointerMotion {
+        dx: 4.0,
+        dy: -2.0,
+        dx_unaccelerated: 7.0,
+        dy_unaccelerated: -3.5,
+    };
+
+    server.send_pointer_motion_sample(PointerMotionSample {
+        timestamp_usec: 123_456,
+        absolute: Some(OutputPosition { x: 40.0, y: 20.0 }),
+        relative: Some(relative),
+    });
+
+    assert_eq!(server.state.last_pointer_x, 40.0);
+    assert_eq!(server.state.last_pointer_y, 20.0);
+    assert_eq!(server.state.last_relative_pointer_motion, Some(relative));
+    assert_eq!(server.state.last_pointer_motion_usec, Some(123_456));
+}
+
+#[test]
+fn relative_pointer_resource_receives_timestamped_motion_for_focused_surface() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        relative_pointer: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let relative = RelativePointerMotion {
+        dx: 3.25,
+        dy: -1.5,
+        dx_unaccelerated: 4.75,
+        dy_unaccelerated: -2.25,
+    };
+
+    let state = create_focused_toplevel_and_receive_relative_pointer_motion(
+        &socket_path,
+        &commands,
+        PointerMotionSample {
+            timestamp_usec: 0x1_0000_0002,
+            absolute: None,
+            relative: Some(relative),
+        },
+    )
+    .unwrap();
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    assert_eq!(state.relative_motion_count, 1);
+    assert_eq!(state.relative_motion_utime, Some(0x1_0000_0002));
+    assert_eq!(state.relative_motion_dx, Some(relative.dx));
+    assert_eq!(state.relative_motion_dy, Some(relative.dy));
+    assert_eq!(
+        state.relative_motion_dx_unaccel,
+        Some(relative.dx_unaccelerated)
+    );
+    assert_eq!(
+        state.relative_motion_dy_unaccel,
+        Some(relative.dy_unaccelerated)
+    );
+}
+
+#[test]
+fn locked_pointer_constraint_suppresses_absolute_motion_but_keeps_relative_motion() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        relative_pointer: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let relative = RelativePointerMotion {
+        dx: 9.0,
+        dy: -8.0,
+        dx_unaccelerated: 11.0,
+        dy_unaccelerated: -10.0,
+    };
+
+    let state = create_locked_focused_toplevel_and_receive_pointer_motion_sample(
+        &socket_path,
+        &commands,
+        PointerMotionSample {
+            timestamp_usec: 77,
+            absolute: Some(OutputPosition { x: 160.0, y: 90.0 }),
+            relative: Some(relative),
+        },
+    )
+    .unwrap();
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    assert_eq!(state.relative_motion_count, 1);
+    assert_eq!(state.relative_motion_dx, Some(relative.dx));
+    assert_eq!(
+        state.relative_motion_dx_unaccel,
+        Some(relative.dx_unaccelerated)
+    );
+    assert!(!state.pointer_motion);
+    assert_eq!(state.pointer_surface_x, None);
+    assert_eq!(state.pointer_surface_y, None);
+}
+
+#[test]
+fn idle_inhibit_capability_registers_protocol_and_tracks_inhibitor() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        idle_inhibit: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let inhibited =
+        create_idle_inhibitor_for_surface_and_capture_state(&socket_path, &commands).unwrap();
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    assert!(inhibited);
+}
+
+#[test]
 fn wayland_client_surface_commit_sends_output_enter() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

@@ -73,6 +73,23 @@ fn wayland_client_receives_configured_renderer_dmabuf_feedback() {
 }
 
 #[test]
+fn dmabuf_feedback_replacement_clears_stale_main_device_identity() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    server.set_dmabuf_feedback(
+        EglGlesDmabufFeedback::linear_argb_xrgb(),
+        Some(0x1122_3344_5566_7788),
+        Some("/dev/dri/renderD128".to_string()),
+    );
+
+    server.set_dmabuf_feedback(EglGlesDmabufFeedback::new(Vec::new()), None, None);
+
+    assert_eq!(server.state.dmabuf_main_device, 0);
+    assert_eq!(server.state.dmabuf_main_device_path, None);
+    assert!(server.state.dmabuf_feedback.formats().is_empty());
+}
+
+#[test]
 fn wayland_client_receives_wl_drm_compatibility_events() {
     let socket_name = unique_socket_name();
     let mut server = OwnCompositorServer::bind(&socket_name).unwrap();

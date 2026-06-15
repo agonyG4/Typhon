@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use super::shell::{ShellOverlayImage, blend_shell_overlay_argb};
 use super::{RenderableSurface, RenderableSurfaceDamage, SurfaceDamageRect};
+use crate::render_backend::buffer::{BufferSize, SurfaceBufferSource};
 
 pub const NESTED_OUTPUT_BACKGROUND: u32 = 0xff08_0a0e;
 pub const CURSOR_FILL: u32 = 0xffff_ffff;
@@ -13,6 +14,7 @@ pub const SERVER_FRAME_BORDER_COLOR: u32 = 0xff0a_0d12;
 pub const SERVER_FRAME_TITLEBAR_COLOR: u32 = 0xff1a_2029;
 pub const SERVER_FRAME_SEPARATOR_COLOR: u32 = 0xff2e_3644;
 pub const OUTPUT_SCALE_DENOMINATOR: u32 = 120;
+pub const MAX_BUFFER_AGE: u32 = 4;
 
 const WALLPAPER_TOP_LEFT: Rgb = Rgb::new(18, 21, 28);
 const WALLPAPER_TOP_RIGHT: Rgb = Rgb::new(20, 58, 54);
@@ -72,6 +74,24 @@ impl DesktopSceneRebuildKind {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BufferAge {
+    #[default]
+    Reset,
+    Age(u32),
+    Unknown,
+}
+
+impl BufferAge {
+    pub const fn normalized(self) -> Self {
+        match self {
+            Self::Age(0) => Self::Reset,
+            Self::Age(age) if age > MAX_BUFFER_AGE => Self::Age(MAX_BUFFER_AGE),
+            age => age,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DesktopFrameCopyKind {
     #[default]
     None,
@@ -89,6 +109,78 @@ impl DesktopFrameCopyKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DamageDebugStats {
+    pub kind: DesktopSceneRebuildKind,
+    pub rect_count: u32,
+    pub damaged_area: u32,
+    pub frame_area: u32,
+}
+
+impl DamageDebugStats {
+    pub fn full(frame_width: u32, frame_height: u32) -> Self {
+        let frame_area = frame_width.saturating_mul(frame_height);
+        Self {
+            kind: DesktopSceneRebuildKind::Full,
+            rect_count: (frame_area > 0) as u32,
+            damaged_area: frame_area,
+            frame_area,
+        }
+    }
+
+    pub fn partial<const N: usize>(
+        frame_width: u32,
+        frame_height: u32,
+        rects: [Option<SurfaceDamageRect>; N],
+    ) -> Self {
+        let mut rect_count = 0;
+        let mut damaged_area = 0u32;
+        for rect in rects.into_iter().flatten() {
+            rect_count += 1;
+            damaged_area = damaged_area.saturating_add(rect.width.saturating_mul(rect.height));
+        }
+        Self {
+            kind: if rect_count == 0 {
+                DesktopSceneRebuildKind::None
+            } else {
+                DesktopSceneRebuildKind::Partial
+            },
+            rect_count,
+            damaged_area,
+            frame_area: frame_width.saturating_mul(frame_height),
+        }
+    }
+
+    pub fn coverage_percent(self) -> u32 {
+        if self.frame_area == 0 {
+            return 0;
+        }
+        self.damaged_area.saturating_mul(100) / self.frame_area
+    }
+
+    fn from_output_rects(frame_width: u32, frame_height: u32, rects: &[OutputRect]) -> Self {
+        let mut rect_count = 0;
+        let mut damaged_area = 0u32;
+        for rect in rects {
+            if rect.width == 0 || rect.height == 0 {
+                continue;
+            }
+            rect_count += 1;
+            damaged_area = damaged_area.saturating_add(rect.width.saturating_mul(rect.height));
+        }
+        Self {
+            kind: if rect_count == 0 {
+                DesktopSceneRebuildKind::None
+            } else {
+                DesktopSceneRebuildKind::Partial
+            },
+            rect_count,
+            damaged_area,
+            frame_area: frame_width.saturating_mul(frame_height),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SceneSurfaceSnapshot {
     surface_id: u32,
@@ -96,6 +188,69 @@ struct SceneSurfaceSnapshot {
     target: SurfaceTargetRect,
     buffer_width: u32,
     buffer_height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderSceneElement {
+    id: RenderSceneElementId,
+    kind: RenderSceneElementKind,
+    target: SurfaceTargetRect,
+    generation: u64,
+    buffer_size: BufferSize,
+    buffer_source: SurfaceBufferSource,
+    damage: RenderableSurfaceDamage,
+}
+
+impl RenderSceneElement {
+    pub fn from_surface(surface: &RenderableSurface, target: SurfaceTargetRect) -> Self {
+        Self {
+            id: RenderSceneElementId::Surface(surface.surface_id),
+            kind: RenderSceneElementKind::ClientSurface,
+            target,
+            generation: surface.generation,
+            buffer_size: surface.buffer_size(),
+            buffer_source: surface.buffer_source(),
+            damage: surface.damage.clone(),
+        }
+    }
+
+    pub const fn id(&self) -> RenderSceneElementId {
+        self.id
+    }
+
+    pub const fn kind(&self) -> RenderSceneElementKind {
+        self.kind
+    }
+
+    pub const fn target(&self) -> SurfaceTargetRect {
+        self.target
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub const fn buffer_size(&self) -> BufferSize {
+        self.buffer_size
+    }
+
+    pub const fn buffer_source(&self) -> SurfaceBufferSource {
+        self.buffer_source
+    }
+
+    pub const fn damage(&self) -> &RenderableSurfaceDamage {
+        &self.damage
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RenderSceneElementId {
+    Surface(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderSceneElementKind {
+    ClientSurface,
 }
 
 struct SceneFullRebuild<'a> {
@@ -124,6 +279,7 @@ pub struct DesktopSceneRenderer {
     last_rebuild_damage_rects: Vec<OutputRect>,
     last_rebuild_kind: DesktopSceneRebuildKind,
     last_frame_copy_kind: DesktopFrameCopyKind,
+    last_damage_debug_stats: DamageDebugStats,
     reusable_frame_key: Option<ReusableFrameKey>,
 }
 
@@ -151,6 +307,7 @@ impl DesktopSceneRenderer {
             surfaces,
             self.scene_content_generation + 1,
             1.0,
+            BufferAge::Age(1),
         );
         self.copy_scene_to_frame(frame, frame_width, frame_height);
         if let Some((cursor_x, cursor_y)) = visual_state.cursor {
@@ -167,7 +324,14 @@ impl DesktopSceneRenderer {
         content_generation: u64,
         visual_state: DesktopVisualState,
     ) {
-        self.rebuild_scene(frame_width, frame_height, surfaces, content_generation, 1.0);
+        self.rebuild_scene(
+            frame_width,
+            frame_height,
+            surfaces,
+            content_generation,
+            1.0,
+            BufferAge::Age(1),
+        );
         self.copy_scene_to_frame(frame, frame_width, frame_height);
         if let Some((cursor_x, cursor_y)) = visual_state.cursor {
             draw_cursor(frame, frame_width, frame_height, cursor_x, cursor_y);
@@ -175,14 +339,27 @@ impl DesktopSceneRenderer {
     }
 
     pub fn compose_request(&mut self, request: DesktopComposeRequest<'_>) {
-        self.compose_request_internal(request, false);
+        self.compose_request_internal(request, false, BufferAge::Age(1));
     }
 
     pub fn compose_reusing_frame(&mut self, request: DesktopComposeRequest<'_>) {
-        self.compose_request_internal(request, true);
+        self.compose_request_internal(request, true, BufferAge::Age(1));
     }
 
-    fn compose_request_internal(&mut self, request: DesktopComposeRequest<'_>, reuse_frame: bool) {
+    pub fn compose_request_with_buffer_age(
+        &mut self,
+        request: DesktopComposeRequest<'_>,
+        buffer_age: BufferAge,
+    ) {
+        self.compose_request_internal(request, true, buffer_age);
+    }
+
+    fn compose_request_internal(
+        &mut self,
+        request: DesktopComposeRequest<'_>,
+        reuse_frame: bool,
+        buffer_age: BufferAge,
+    ) {
         let DesktopComposeRequest {
             frame,
             frame_width,
@@ -200,6 +377,7 @@ impl DesktopSceneRenderer {
             surfaces,
             content_generation,
             output_scale,
+            buffer_age,
         );
         let output_scale_key = output_scale_key(output_scale);
         let shell_overlay_generation = shell_overlay.map(|overlay| overlay.generation);
@@ -264,6 +442,10 @@ impl DesktopSceneRenderer {
         self.last_frame_copy_kind
     }
 
+    pub fn last_damage_debug_stats(&self) -> DamageDebugStats {
+        self.last_damage_debug_stats
+    }
+
     fn rebuild_scene(
         &mut self,
         frame_width: u32,
@@ -271,6 +453,7 @@ impl DesktopSceneRenderer {
         surfaces: &[RenderableSurface],
         content_generation: u64,
         output_scale: f64,
+        buffer_age: BufferAge,
     ) {
         self.ensure_wallpaper(frame_width, frame_height);
         let output_scale_key = output_scale_key(output_scale);
@@ -283,18 +466,22 @@ impl DesktopSceneRenderer {
         if scene_ready && self.scene_content_generation == content_generation {
             self.last_rebuild_damage_rects.clear();
             self.last_rebuild_kind = DesktopSceneRebuildKind::None;
+            self.last_damage_debug_stats = DamageDebugStats::partial(frame_width, frame_height, []);
             return;
         }
 
-        let snapshots = scene_surface_snapshots(surfaces, output_scale);
+        let elements = render_scene_elements_for_surfaces(surfaces, output_scale);
+        let snapshots = scene_surface_snapshots_from_elements(&elements);
         if scene_ready
-            && self.rebuild_scene_from_damage(
+            && self.rebuild_scene_from_age(
                 frame_width,
                 frame_height,
                 surfaces,
                 content_generation,
                 output_scale,
+                &elements,
                 &snapshots,
+                buffer_age,
             )
         {
             return;
@@ -311,18 +498,23 @@ impl DesktopSceneRenderer {
         });
     }
 
-    fn rebuild_scene_from_damage(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "hot scene rebuild path passes borrowed frame state directly to avoid transient config allocation"
+    )]
+    fn rebuild_scene_from_old_snapshots(
         &mut self,
         frame_width: u32,
         frame_height: u32,
         surfaces: &[RenderableSurface],
         content_generation: u64,
         output_scale: f64,
+        elements: &[RenderSceneElement],
         snapshots: &[SceneSurfaceSnapshot],
     ) -> bool {
         let Some(damage_rects) = partial_scene_damage_rects(
             &self.scene_surface_snapshots,
-            surfaces,
+            elements,
             snapshots,
             frame_width,
             frame_height,
@@ -335,6 +527,7 @@ impl DesktopSceneRenderer {
             self.scene_surface_snapshots = snapshots.to_vec();
             self.last_rebuild_damage_rects.clear();
             self.last_rebuild_kind = DesktopSceneRebuildKind::None;
+            self.last_damage_debug_stats = DamageDebugStats::partial(frame_width, frame_height, []);
             return true;
         }
 
@@ -361,7 +554,41 @@ impl DesktopSceneRenderer {
         self.last_rebuild_damage_rects = damage_rects;
         self.scene_generation = self.scene_generation.saturating_add(1);
         self.last_rebuild_kind = DesktopSceneRebuildKind::Partial;
+        self.last_damage_debug_stats = DamageDebugStats::from_output_rects(
+            frame_width,
+            frame_height,
+            &self.last_rebuild_damage_rects,
+        );
         true
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "hot scene rebuild path passes borrowed frame state directly to avoid transient config allocation"
+    )]
+    fn rebuild_scene_from_age(
+        &mut self,
+        frame_width: u32,
+        frame_height: u32,
+        surfaces: &[RenderableSurface],
+        content_generation: u64,
+        output_scale: f64,
+        elements: &[RenderSceneElement],
+        snapshots: &[SceneSurfaceSnapshot],
+        buffer_age: BufferAge,
+    ) -> bool {
+        match buffer_age.normalized() {
+            BufferAge::Reset | BufferAge::Unknown => false,
+            BufferAge::Age(_) => self.rebuild_scene_from_old_snapshots(
+                frame_width,
+                frame_height,
+                surfaces,
+                content_generation,
+                output_scale,
+                elements,
+                snapshots,
+            ),
+        }
     }
 
     fn rebuild_full_scene(&mut self, rebuild: SceneFullRebuild<'_>) {
@@ -397,6 +624,7 @@ impl DesktopSceneRenderer {
         self.last_rebuild_damage_rects.clear();
         self.scene_generation = self.scene_generation.saturating_add(1);
         self.last_rebuild_kind = DesktopSceneRebuildKind::Full;
+        self.last_damage_debug_stats = DamageDebugStats::full(frame_width, frame_height);
     }
 
     fn copy_scene_to_frame(&mut self, frame: &mut [u32], frame_width: u32, frame_height: u32) {
@@ -559,18 +787,35 @@ fn scene_surface_snapshots(
     surfaces: &[RenderableSurface],
     output_scale: f64,
 ) -> Vec<SceneSurfaceSnapshot> {
+    let elements = render_scene_elements_for_surfaces(surfaces, output_scale);
+    scene_surface_snapshots_from_elements(&elements)
+}
+
+pub fn render_scene_elements_for_surfaces(
+    surfaces: &[RenderableSurface],
+    output_scale: f64,
+) -> Vec<RenderSceneElement> {
     let targets = surface_target_rects(surfaces, output_scale);
     surfaces
         .iter()
         .zip(targets)
-        .map(|(surface, target)| {
-            let buffer_size = surface.buffer_size();
+        .map(|(surface, target)| RenderSceneElement::from_surface(surface, target))
+        .collect()
+}
+
+fn scene_surface_snapshots_from_elements(
+    elements: &[RenderSceneElement],
+) -> Vec<SceneSurfaceSnapshot> {
+    elements
+        .iter()
+        .map(|element| {
+            let RenderSceneElementId::Surface(surface_id) = element.id;
             SceneSurfaceSnapshot {
-                surface_id: surface.surface_id,
-                generation: surface.generation,
-                target,
-                buffer_width: buffer_size.width,
-                buffer_height: buffer_size.height,
+                surface_id,
+                generation: element.generation,
+                target: element.target,
+                buffer_width: element.buffer_size.width,
+                buffer_height: element.buffer_size.height,
             }
         })
         .collect()
@@ -596,20 +841,20 @@ fn surface_target_rects(
 
 fn partial_scene_damage_rects(
     previous_snapshots: &[SceneSurfaceSnapshot],
-    surfaces: &[RenderableSurface],
+    elements: &[RenderSceneElement],
     snapshots: &[SceneSurfaceSnapshot],
     frame_width: u32,
     frame_height: u32,
 ) -> Option<Vec<OutputRect>> {
-    if previous_snapshots.len() != snapshots.len() || surfaces.len() != snapshots.len() {
+    if previous_snapshots.len() != snapshots.len() || elements.len() != snapshots.len() {
         return None;
     }
 
     let mut damage_rects = Vec::new();
-    for ((previous, surface), snapshot) in previous_snapshots
+    for ((previous, element), snapshot) in previous_snapshots
         .iter()
         .copied()
-        .zip(surfaces)
+        .zip(elements)
         .zip(snapshots.iter().copied())
     {
         if previous.surface_id != snapshot.surface_id {
@@ -617,29 +862,19 @@ fn partial_scene_damage_rects(
         }
 
         if previous.target != snapshot.target {
-            if let Some(rects) = resize_preview_target_damage_rects(
-                surface,
-                previous.target,
-                snapshot.target,
-                frame_width,
-                frame_height,
-            ) {
-                damage_rects.extend(rects);
-            } else {
-                if let Some(rect) = previous
-                    .target
-                    .output_rect()
-                    .clipped_to_output(frame_width, frame_height)
-                {
-                    damage_rects.push(rect);
-                }
-                if let Some(rect) = snapshot
-                    .target
-                    .output_rect()
-                    .clipped_to_output(frame_width, frame_height)
-                {
-                    damage_rects.push(rect);
-                }
+            if let Some(rect) = previous
+                .target
+                .output_rect()
+                .clipped_to_output(frame_width, frame_height)
+            {
+                damage_rects.push(rect);
+            }
+            if let Some(rect) = snapshot
+                .target
+                .output_rect()
+                .clipped_to_output(frame_width, frame_height)
+            {
+                damage_rects.push(rect);
             }
             continue;
         }
@@ -661,7 +896,7 @@ fn partial_scene_damage_rects(
             continue;
         }
 
-        match &surface.damage {
+        match &element.damage {
             RenderableSurfaceDamage::Full => {
                 if let Some(rect) = snapshot
                     .target
@@ -672,12 +907,11 @@ fn partial_scene_damage_rects(
                 }
             }
             RenderableSurfaceDamage::Partial(_) => {
-                let buffer_size = surface.buffer_size();
-                for rect in surface
+                for rect in element
                     .damage
-                    .clipped_rects(buffer_size.width, buffer_size.height)
+                    .clipped_rects(element.buffer_size.width, element.buffer_size.height)
                 {
-                    let Some(rect) = output_damage_rect_for_surface(surface, snapshot.target, rect)
+                    let Some(rect) = output_damage_rect_for_element(element, snapshot.target, rect)
                         .and_then(|rect| rect.clipped_to_output(frame_width, frame_height))
                     else {
                         continue;
@@ -691,88 +925,8 @@ fn partial_scene_damage_rects(
     Some(coalesce_output_rects(damage_rects))
 }
 
-fn resize_preview_target_damage_rects(
-    surface: &RenderableSurface,
-    previous: SurfaceTargetRect,
-    current: SurfaceTargetRect,
-    frame_width: u32,
-    frame_height: u32,
-) -> Option<Vec<OutputRect>> {
-    let preview = surface.resize_preview?;
-    if preview.anchor_right || preview.anchor_bottom {
-        return None;
-    }
-    if previous.x != current.x || previous.y != current.y {
-        return None;
-    }
-
-    let previous = previous.output_rect();
-    let current = current.output_rect();
-    let output = OutputRect::full(frame_width, frame_height);
-    let rects = rect_symmetric_difference(previous, current)
-        .into_iter()
-        .filter_map(|rect| rect.intersection(output))
-        .collect::<Vec<_>>();
-    Some(rects)
-}
-
-fn rect_symmetric_difference(left: OutputRect, right: OutputRect) -> Vec<OutputRect> {
-    let mut rects = rect_difference(left, right);
-    rects.extend(rect_difference(right, left));
-    rects
-}
-
-fn rect_difference(source: OutputRect, cut: OutputRect) -> Vec<OutputRect> {
-    let Some(overlap) = source.intersection(cut) else {
-        return vec![source];
-    };
-
-    let mut rects = Vec::new();
-    push_output_rect(
-        &mut rects,
-        source.left(),
-        source.top(),
-        source.right(),
-        overlap.top(),
-    );
-    push_output_rect(
-        &mut rects,
-        source.left(),
-        overlap.bottom(),
-        source.right(),
-        source.bottom(),
-    );
-    push_output_rect(
-        &mut rects,
-        source.left(),
-        overlap.top(),
-        overlap.left(),
-        overlap.bottom(),
-    );
-    push_output_rect(
-        &mut rects,
-        overlap.right(),
-        overlap.top(),
-        source.right(),
-        overlap.bottom(),
-    );
-    rects
-}
-
-fn push_output_rect(rects: &mut Vec<OutputRect>, left: i64, top: i64, right: i64, bottom: i64) {
-    if right <= left || bottom <= top {
-        return;
-    }
-    rects.push(OutputRect {
-        x: left.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-        y: top.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-        width: u32::try_from(right.saturating_sub(left)).unwrap_or(u32::MAX),
-        height: u32::try_from(bottom.saturating_sub(top)).unwrap_or(u32::MAX),
-    });
-}
-
-fn output_damage_rect_for_surface(
-    surface: &RenderableSurface,
+fn output_damage_rect_for_element(
+    element: &RenderSceneElement,
     target: SurfaceTargetRect,
     rect: SurfaceDamageRect,
 ) -> Option<OutputRect> {
@@ -780,7 +934,7 @@ fn output_damage_rect_for_surface(
         return None;
     }
 
-    let buffer_size = surface.buffer_size();
+    let buffer_size = element.buffer_size;
     let left = scale_damage_floor(rect.x, buffer_size.width, target.width)?;
     let top = scale_damage_floor(rect.y, buffer_size.height, target.height)?;
     let right = scale_damage_ceil(
@@ -834,7 +988,7 @@ pub struct ServerFrameRect {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SurfaceTargetRect {
+pub struct SurfaceTargetRect {
     x: i32,
     y: i32,
     width: u32,
@@ -842,6 +996,31 @@ struct SurfaceTargetRect {
 }
 
 impl SurfaceTargetRect {
+    pub const fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    pub const fn x(self) -> i32 {
+        self.x
+    }
+
+    pub const fn y(self) -> i32 {
+        self.y
+    }
+
+    pub const fn width(self) -> u32 {
+        self.width
+    }
+
+    pub const fn height(self) -> u32 {
+        self.height
+    }
+
     const fn output_rect(self) -> OutputRect {
         OutputRect {
             x: self.x,
@@ -1886,7 +2065,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_scene_renderer_resize_growth_repairs_only_exposed_edges() {
+    fn desktop_scene_renderer_resize_growth_repairs_rescaled_bounds() {
         let mut renderer = DesktopSceneRenderer::default();
         let mut frame = vec![0; 96 * 96];
         let initial_surface = RenderableSurface {
@@ -1944,23 +2123,15 @@ mod tests {
             renderer.last_frame_copy_kind(),
             DesktopFrameCopyKind::Partial
         );
-        assert_eq!(renderer.last_rebuild_damage_rects.len(), 2);
+        assert_eq!(renderer.last_rebuild_damage_rects.len(), 1);
         assert_eq!(
             renderer.last_rebuild_damage_rects,
-            vec![
-                OutputRect {
-                    x: FIRST_SURFACE_OFFSET.0,
-                    y: FIRST_SURFACE_OFFSET.1 + 4,
-                    width: 8,
-                    height: 2,
-                },
-                OutputRect {
-                    x: FIRST_SURFACE_OFFSET.0 + 4,
-                    y: FIRST_SURFACE_OFFSET.1,
-                    width: 4,
-                    height: 4,
-                },
-            ]
+            vec![OutputRect {
+                x: FIRST_SURFACE_OFFSET.0,
+                y: FIRST_SURFACE_OFFSET.1,
+                width: 8,
+                height: 6,
+            }]
         );
     }
 
@@ -2024,6 +2195,10 @@ mod tests {
         assert_eq!(frame[73 * 96 + 73], 0xff00_ff00);
         assert_eq!(frame[72 * 96 + 72], 0xffff_0000);
         assert_eq!(frame[72 * 96 + 73], 0xffff_0000);
+        let stats = renderer.last_damage_debug_stats();
+        assert_eq!(stats.kind, DesktopSceneRebuildKind::Partial);
+        assert_eq!(stats.rect_count, 1);
+        assert!(stats.damaged_area < stats.frame_area);
     }
 
     #[test]
@@ -2098,6 +2273,154 @@ mod tests {
         );
         assert_eq!(frame[73 * 96 + 73], 0xff00_ff00);
         assert_eq!(frame[72 * 96 + 72], 0xffff_0000);
+    }
+
+    #[test]
+    fn buffer_age_zero_normalizes_to_reset() {
+        assert_eq!(BufferAge::Age(0).normalized(), BufferAge::Reset);
+        assert_eq!(
+            BufferAge::Age(99).normalized(),
+            BufferAge::Age(MAX_BUFFER_AGE)
+        );
+    }
+
+    #[test]
+    fn render_scene_elements_for_surfaces_preserve_damage_and_buffer_source() {
+        let surface = RenderableSurface {
+            surface_id: 7,
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 2,
+            placement: SurfacePlacement::root(),
+            resize_preview: None,
+            generation: 3,
+            buffer: shm_buffer(8, 4, vec![0xffff_0000; 8 * 4]),
+            damage: crate::compositor::RenderableSurfaceDamage::Partial(vec![
+                crate::compositor::SurfaceDamageRect {
+                    x: 2,
+                    y: 1,
+                    width: 2,
+                    height: 1,
+                },
+            ]),
+        };
+
+        let elements = render_scene_elements_for_surfaces(std::slice::from_ref(&surface), 1.0);
+
+        assert_eq!(
+            elements,
+            vec![RenderSceneElement::from_surface(
+                &surface,
+                SurfaceTargetRect {
+                    x: FIRST_SURFACE_OFFSET.0,
+                    y: FIRST_SURFACE_OFFSET.1,
+                    width: 4,
+                    height: 2,
+                },
+            )]
+        );
+    }
+
+    #[test]
+    fn damage_debug_stats_report_full_frame_area() {
+        let stats = DamageDebugStats::full(1920, 1080);
+
+        assert_eq!(stats.kind, DesktopSceneRebuildKind::Full);
+        assert_eq!(stats.rect_count, 1);
+        assert_eq!(stats.damaged_area, 1920 * 1080);
+        assert_eq!(stats.frame_area, 1920 * 1080);
+        assert_eq!(stats.coverage_percent(), 100);
+    }
+
+    #[test]
+    fn damage_debug_stats_report_partial_coverage() {
+        let stats = DamageDebugStats::partial(
+            100,
+            100,
+            [
+                Some(SurfaceDamageRect {
+                    x: 0,
+                    y: 0,
+                    width: 20,
+                    height: 10,
+                }),
+                Some(SurfaceDamageRect {
+                    x: 80,
+                    y: 80,
+                    width: 10,
+                    height: 10,
+                }),
+                None,
+                None,
+            ],
+        );
+
+        assert_eq!(stats.kind, DesktopSceneRebuildKind::Partial);
+        assert_eq!(stats.rect_count, 2);
+        assert_eq!(stats.damaged_area, 300);
+        assert_eq!(stats.coverage_percent(), 3);
+    }
+
+    #[test]
+    fn desktop_scene_renderer_buffer_age_reset_forces_full_rebuild() {
+        let mut renderer = DesktopSceneRenderer::default();
+        let mut frame = vec![0; 96 * 96];
+        let initial_surface = RenderableSurface {
+            surface_id: 7,
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+            placement: SurfacePlacement::root(),
+            resize_preview: None,
+            generation: 1,
+            buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+
+        renderer.compose_request_with_buffer_age(
+            DesktopComposeRequest {
+                frame: &mut frame,
+                frame_width: 96,
+                frame_height: 96,
+                output_scale: 1.0,
+                surfaces: std::slice::from_ref(&initial_surface),
+                content_generation: 1,
+                visual_state: DesktopVisualState::wallpaper_only(),
+                shell_overlay: None,
+            },
+            BufferAge::Reset,
+        );
+
+        let updated_surface = RenderableSurface {
+            generation: 2,
+            damage: crate::compositor::RenderableSurfaceDamage::Partial(vec![
+                crate::compositor::SurfaceDamageRect {
+                    x: 1,
+                    y: 1,
+                    width: 1,
+                    height: 1,
+                },
+            ]),
+            ..initial_surface
+        };
+        renderer.compose_request_with_buffer_age(
+            DesktopComposeRequest {
+                frame: &mut frame,
+                frame_width: 96,
+                frame_height: 96,
+                output_scale: 1.0,
+                surfaces: &[updated_surface],
+                content_generation: 2,
+                visual_state: DesktopVisualState::wallpaper_only(),
+                shell_overlay: None,
+            },
+            BufferAge::Reset,
+        );
+
+        assert_eq!(renderer.last_rebuild_kind(), DesktopSceneRebuildKind::Full);
+        assert_eq!(renderer.last_frame_copy_kind(), DesktopFrameCopyKind::Full);
     }
 
     #[test]

@@ -23,6 +23,66 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for CompositorState {
     }
 }
 
+impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for CompositorState {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+        request: zxdg_decoration_manager_v1::Request,
+        _data: &(),
+        _dhandle: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            zxdg_decoration_manager_v1::Request::GetToplevelDecoration { id, toplevel } => {
+                let Some(data) = toplevel.data::<XdgToplevelData>() else {
+                    return;
+                };
+                let decoration = data_init.init(
+                    id,
+                    XdgToplevelData {
+                        surface: data.surface.clone(),
+                    },
+                );
+                send_client_side_decoration_configure(&decoration);
+            }
+            zxdg_decoration_manager_v1::Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, XdgToplevelData>
+    for CompositorState
+{
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        resource: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+        request: zxdg_toplevel_decoration_v1::Request,
+        _data: &XdgToplevelData,
+        _dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            zxdg_toplevel_decoration_v1::Request::SetMode { .. }
+            | zxdg_toplevel_decoration_v1::Request::UnsetMode => {
+                send_client_side_decoration_configure(resource);
+            }
+            zxdg_toplevel_decoration_v1::Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+fn send_client_side_decoration_configure(
+    decoration: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+) {
+    let _ = decoration.send_event(zxdg_toplevel_decoration_v1::Event::Configure {
+        mode: WEnum::Value(zxdg_toplevel_decoration_v1::Mode::ClientSide),
+    });
+}
+
 impl Dispatch<xdg_positioner::XdgPositioner, Arc<Mutex<XdgPositionerState>>> for CompositorState {
     fn request(
         _state: &mut Self,

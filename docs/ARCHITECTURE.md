@@ -131,9 +131,24 @@ and draw only the cursor overlay. Same-layout surface commits with explicit
 partial damage repair only the damaged output rectangles in the cached scene,
 redrawing intersecting surfaces in stacking order. Layout, size, scale, stacking,
 and full-damage changes still fall back to a conservative full scene rebuild.
-Native scanout can convert only damaged rectangles into the retained staging
-buffer or dumb-framebuffer mapping; the current GBM path still submits the full
-staging buffer through `gbm_bo_write`.
+Native scanout now has three explicit paths. `native-egl-gbm` is the normal
+target in `auto`: the shared `GlesSceneRenderer` draws the same wallpaper,
+surface, frame, cursor, and shell-overlay layers used by nested EGL/GLES into a
+GBM-backed EGL window surface, then KMS pageflips the locked GBM front buffer.
+`gbm-cpu-write` is the retained diagnostic fallback: it converts damaged CPU
+scene rectangles into a staging buffer but still submits the full staging BO via
+`gbm_bo_write`. `dumb-framebuffer` remains the last-resort KMS mapping path.
+Legacy environment aliases such as `gbm` and `gbm-egl` continue to select the
+CPU-write fallback for compatibility.
+
+For native output, optional GPU buffer protocols are bound after the active
+scanout backend is known. The base Wayland socket starts without
+`zwp_linux_dmabuf_v1`, explicit sync, or `wl_drm`; those globals are published
+only when the final backend is `native-egl-gbm`. If `auto` falls back to
+`gbm-cpu-write` or `dumb-framebuffer`, new clients see a CPU-safe registry and
+the app launch profile resolves to software unless the user explicitly asked
+for CPU already. An explicit `OBLIVION_ONE_NATIVE_APP_GPU=gpu` fails on those
+CPU backends instead of silently degrading.
 
 The `render_backend` module records graphics capabilities explicitly:
 `egl-gles` is the main GPU target for dmabuf import, feedback, explicit sync,
@@ -146,8 +161,10 @@ Committed client content is also typed at this boundary:
 compositor no longer treats every surface as an unconditional `Vec<u32>`.
 The EGL/GLES import contract now builds dmabuf EGL import attributes that never
 require CPU pixels. The runtime renderer owns the actual EGLImage import and
-texture lifetime. The next graphics-hardening step is richer dmabuf feedback and
-explicit sync, not another CPU fallback.
+texture lifetime for both nested and native GPU composition. Explicit sync is
+present in the protocol/buffer lifecycle and still needs real native GPU
+hardware validation before claiming driver-complete synchronization behavior;
+direct scanout remains a planned optimization, not an enabled scanout path.
 
 The remaining gap before using normal desktop apps comfortably is protocol and
 WM breadth: real floating placement/move/resize, richer focus policy, and then

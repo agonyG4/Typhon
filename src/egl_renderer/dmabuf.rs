@@ -35,7 +35,7 @@ const EGL_DEVICE_EXT: egl::Int = 0x322c;
 const EGL_DRM_DEVICE_FILE_EXT: egl::Int = 0x3233;
 const EGL_DRM_RENDER_NODE_FILE_EXT: egl::Int = 0x3377;
 
-pub(super) fn query_egl_dmabuf_feedback(
+pub(crate) fn query_egl_dmabuf_feedback(
     egl: &EglInstance,
     display: egl::Display,
 ) -> EglGlesDmabufFeedback {
@@ -253,7 +253,7 @@ fn load_dmabuf_modifier_queries(
     })
 }
 
-pub(super) fn query_egl_main_device(
+pub(crate) fn query_egl_main_device(
     egl: &EglInstance,
     display: egl::Display,
 ) -> Option<(String, u64)> {

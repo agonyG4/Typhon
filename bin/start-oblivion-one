@@ -41,6 +41,8 @@ Environment:
   OBLIVION_ONE_OUTPUT    auto, nested, or native (default: auto)
   OBLIVION_ONE_MODE      native KMS mode: auto, preferred, highres, highrr, or WIDTHxHEIGHT@HZ
   OBLIVION_ONE_CURSOR    native cursor backend: auto, hardware, or software
+  OBLIVION_ONE_SCANOUT_BACKEND native scanout: auto, gpu/native-egl-gbm, gbm-cpu-write/cpu, or dumb
+  OBLIVION_ONE_NATIVE_APP_GPU  native apps: auto derives from active scanout, gpu requires native-egl-gbm, cpu for recovery
   OBLIVION_ONE_PROFILE   auto, debug, or release (default: auto; native uses release)
   OBLIVION_ONE_PERF_LOG  set to 1/true/debug to emit structured native perf logs
   OBLIVION_ONE_LOG_FILE  native-session log path (default: ~/.local/state/oblivion-one/session.log)

@@ -10,6 +10,7 @@ exodus = { path = "Exodus" }
 bytemuck = "1.25.0"
 drm-ffi = "0.9.1"
 drm-sys = "0.8.1"
+futures-lite = "2.6.1"
 glow = "0.17.0"
 gbm = "0.18.0"
 input = { version = "0.10.0", features = ["libinput_1_30"] }
@@ -19,13 +20,14 @@ libc = "0.2.186"
 serde_json = "1.0"
 softbuffer = "0.4.6"
 unicode-normalization = "0.1"
-wayland-protocols = { version = "0.32.12", features = ["client", "server", "staging"] }
+wayland-protocols = { version = "0.32.12", features = ["client", "server", "staging", "unstable"] }
 wayland-backend = "0.3.15"
 wayland-server = "0.31.13"
 wayland-egl = "0.32.11"
 wayland-scanner = "0.31.10"
 wayland-sys = "0.31.11"
 winit = "0.30.12"
+zbus = { version = "5.16.0", default-features = false, features = ["async-io"] }
 
 [dev-dependencies]
 wayland-client = "0.31.14"

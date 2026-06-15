@@ -2,13 +2,13 @@ use khronos_egl as egl;
 use oblivion_one::compositor::{DesktopVisualState, SurfaceDamageRect, cursor_texture_size};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum EglOutputDamage {
+pub(crate) enum EglOutputDamage {
     Full { width: u32, height: u32 },
     Rects([Option<SurfaceDamageRect>; 8]),
 }
 
 impl EglOutputDamage {
-    pub(super) const fn full(width: u32, height: u32) -> Self {
+    pub(crate) const fn full(width: u32, height: u32) -> Self {
         Self::Full { width, height }
     }
 
@@ -30,7 +30,7 @@ impl EglOutputDamage {
         Self::Rects(rects.values)
     }
 
-    pub(super) fn to_egl_rects(self) -> Option<EglDamageRects> {
+    pub(crate) fn to_egl_rects(self) -> Option<EglDamageRects> {
         match self {
             Self::Full { width, height } => Some(EglDamageRects::single([
                 0,
@@ -58,7 +58,7 @@ impl EglOutputDamage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct EglDamageRects {
+pub(crate) struct EglDamageRects {
     values: [egl::Int; 32],
     value_count: usize,
 }
@@ -95,11 +95,11 @@ impl EglDamageRects {
         self.value_count == 0
     }
 
-    pub(super) const fn rect_count(self) -> usize {
+    pub(crate) const fn rect_count(self) -> usize {
         self.value_count / 4
     }
 
-    pub(super) fn as_ptr(&self) -> *const egl::Int {
+    pub(crate) fn as_ptr(&self) -> *const egl::Int {
         self.values.as_ptr()
     }
 

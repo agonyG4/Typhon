@@ -16,14 +16,30 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::egl_renderer::dmabuf::{query_egl_dmabuf_feedback, query_egl_main_device};
+use crate::egl_renderer::{EglInstance, EglSwapBuffersWithDamage};
+use crate::egl_renderer::{
+    EglSceneDrawRequest, GlEglImageTargetTexture2DOes, GlesSceneFrameStats, GlesSceneRenderer,
+    choose_egl_config, choose_native_egl_config, create_gles_context, egl_swap_buffers_with_damage,
+    load_egl_image_target_texture_2d, load_swap_buffers_with_damage,
+};
+use gbm::AsRaw as GbmAsRaw;
+use khronos_egl as egl;
 use oblivion_one::compositor::{
     DesktopComposeRequest, DesktopFrameCopyKind, DesktopSceneRebuildKind, DesktopSceneRenderer,
-    DesktopVisualState, OwnCompositorServer, RenderGenerationCause, RenderableSurface,
-    ShellDockItem, ShellOverlayRenderer, ShellOverlayState, ShellTopbarModel, SpotlightModel,
-    cursor_texture_pixels, cursor_texture_size, dock_item_at, surface_origins,
+    DesktopVisualState, OutputPosition as CompositorOutputPosition, OwnCompositorServer,
+    PointerMotionSample as CompositorPointerMotionSample,
+    RelativePointerMotion as CompositorRelativePointerMotion, RenderGenerationCause,
+    RenderSceneElement, RenderSceneElementId, RenderableSurface, ShellDockItem,
+    ShellOverlayRenderer, ShellOverlayState, ShellTopbarModel, SpotlightModel,
+    cursor_texture_pixels, cursor_texture_size, dock_item_at, render_scene_elements_for_surfaces,
 };
+use oblivion_one::render_backend::egl_gles::EglGlesDmabufFeedback;
 use oblivion_one::session::NativeSessionProbe;
-use oblivion_one::spawn_cpu_compositor_app;
+use oblivion_one::{
+    CompositorAppGpuPreference, EffectiveCompositorAppGpuPolicy, shell_quote,
+    spawn_compositor_app_with_policy,
+};
 
 type NativeResult<T> = Result<T, Box<dyn Error>>;
 
@@ -144,6 +160,86 @@ struct NativeAppLaunchPerf {
     pid: u32,
     spawn_us: u64,
     started_at: Instant,
+    gpu_policy: EffectiveCompositorAppGpuPolicy,
+    source: NativeLaunchSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeLaunchSource {
+    Startup,
+    Spotlight,
+}
+
+impl NativeLaunchSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Spotlight => "spotlight",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeLaunchRequest {
+    argv: Vec<String>,
+    program: String,
+    command: String,
+    gpu_policy: EffectiveCompositorAppGpuPolicy,
+    source: NativeLaunchSource,
+}
+
+fn resolve_native_app_gpu_policy(
+    preference: CompositorAppGpuPreference,
+    scanout: NativeScanoutKind,
+) -> io::Result<EffectiveCompositorAppGpuPolicy> {
+    match (preference, scanout) {
+        (CompositorAppGpuPreference::CpuOnly, _) => Ok(EffectiveCompositorAppGpuPolicy::CpuOnly),
+        (CompositorAppGpuPreference::Accelerated, NativeScanoutKind::NativeEglGbm) => {
+            Ok(EffectiveCompositorAppGpuPolicy::Accelerated)
+        }
+        (CompositorAppGpuPreference::Accelerated, scanout) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "OBLIVION_ONE_NATIVE_APP_GPU=gpu requires native-egl-gbm, but active backend is {}",
+                scanout.metric_name()
+            ),
+        )),
+        (CompositorAppGpuPreference::Auto, NativeScanoutKind::NativeEglGbm) => {
+            Ok(EffectiveCompositorAppGpuPolicy::Accelerated)
+        }
+        (CompositorAppGpuPreference::Auto, _) => Ok(EffectiveCompositorAppGpuPolicy::CpuOnly),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeRuntimeStage {
+    DrainPageFlipEvents,
+    Present,
+}
+
+impl NativeRuntimeStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DrainPageFlipEvents => "drain_page_flip_events",
+            Self::Present => "present",
+        }
+    }
+}
+
+fn native_runtime_error(
+    stage: NativeRuntimeStage,
+    backend: NativeScanoutKind,
+    crtc_id: u32,
+    frame_index: u64,
+    source: io::Error,
+) -> io::Error {
+    io::Error::other(format!(
+        "fatal native GPU runtime error stage={} backend={} crtc={} frame={} recovery=\"OBLIVION_ONE_SCANOUT_BACKEND=cpu OBLIVION_ONE_NATIVE_APP_GPU=cpu ./bin/start-oblivion-one-tty -- <app>\" cause={source}",
+        stage.as_str(),
+        backend.metric_name(),
+        crtc_id,
+        frame_index,
+    ))
 }
 
 #[derive(Debug)]
@@ -429,18 +525,54 @@ impl NativeOutputBootstrap {
         let connector =
             connected_connector_for_card(kms_device.as_deref(), Path::new("/sys/class/drm"));
         let kms_resources = query_kms_resources(kms_device.as_deref());
+        let render_device = kms_device
+            .as_deref()
+            .and_then(|path| {
+                matching_render_node_for_card(
+                    path,
+                    Path::new("/sys/class/drm"),
+                    Path::new("/dev/dri"),
+                )
+            })
+            .or_else(|| first_dri_node("renderD"));
         Self {
             runtime_dir: std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
             kms_device,
-            render_device: first_dri_node("renderD"),
+            render_device,
             connector,
             kms_resources,
         }
     }
 }
 
-pub fn run(mut server: OwnCompositorServer, app: Vec<String>) -> NativeResult<()> {
+fn matching_render_node_for_card(
+    kms_device: &Path,
+    drm_sysfs_root: &Path,
+    dri_device_root: &Path,
+) -> Option<PathBuf> {
+    let card_name = kms_device.file_name()?.to_str()?;
+    let drm_dir = drm_sysfs_root.join(card_name).join("device").join("drm");
+    let mut render_nodes = fs::read_dir(drm_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            name.starts_with("renderD")
+                .then(|| dri_device_root.join(name))
+        })
+        .collect::<Vec<_>>();
+    render_nodes.sort();
+    render_nodes.into_iter().next()
+}
+
+pub fn run(
+    mut server: OwnCompositorServer,
+    app: Vec<String>,
+    app_gpu_preference: CompositorAppGpuPreference,
+) -> NativeResult<()> {
     let perf = NativePerfLogger::from_env();
+    let startup_app = (!app.is_empty()).then_some(app);
     let bootstrap = NativeOutputBootstrap::discover();
     let session_probe = NativeSessionProbe::detect();
     let vrr_preference = NativeVrrPreference::from_env();
@@ -554,12 +686,12 @@ pub fn run(mut server: OwnCompositorServer, app: Vec<String>) -> NativeResult<()
     for warning in session_probe.plan.warnings() {
         eprintln!("native session: {warning}");
     }
-    if !app.is_empty() {
-        println!("startup app command deferred until native scanout is ready: {app:?}");
+    if let Some(command) = startup_app.as_ref() {
+        println!("startup app command deferred until native scanout is ready: {command:?}");
         perf.log("app.deferred", || {
             vec![
-                NativePerfField::usize("argc", app.len()),
-                NativePerfField::str("command", app.join(" ")),
+                NativePerfField::usize("argc", command.len()),
+                NativePerfField::str("command", command.join(" ")),
             ]
         });
     }
@@ -578,6 +710,8 @@ pub fn run(mut server: OwnCompositorServer, app: Vec<String>) -> NativeResult<()
         )
         .into());
     };
+
+    probe_native_egl_gbm_device(&bootstrap, &perf);
 
     let seat_session = open_native_seat_session(&session_probe);
     let drm_plan = NativeDrmBackendPlan::choose(NativeDrmBackendChoice {
@@ -631,9 +765,12 @@ pub fn run(mut server: OwnCompositorServer, app: Vec<String>) -> NativeResult<()
         scanout_plan.primary.as_str()
     );
     let scanout_target = scanout_plan.primary.as_str();
-    let mut scanout =
-        NativeScanoutBackend::open(scanout_plan, kms.file(), target.width, target.height)?;
-    println!("native scanout backend active: {}", scanout.kind().as_str());
+    let mut scanout = NativeScanoutBackend::open(
+        scanout_plan.clone(),
+        kms.file(),
+        target.width,
+        target.height,
+    )?;
     perf.log("native.backend", || {
         vec![
             NativePerfField::str("drm", kms.kind().as_str()),
@@ -701,13 +838,70 @@ pub fn run(mut server: OwnCompositorServer, app: Vec<String>) -> NativeResult<()
         original_crtc,
     );
     let initial_damage = NativeOutputDamage::full_output(target.width, target.height);
-    let initial_paint = scanout.paint_server_frame(
+    let initial_paint = match scanout.paint_server_frame(
         &mut frame_renderer,
         &server,
         &input_state,
         cursor_render_mode,
         &initial_damage,
-    )?;
+    ) {
+        Ok(paint) => paint,
+        Err(error) if scanout.kind() == NativeScanoutKind::NativeEglGbm => {
+            let fallback_plan = scanout_plan.after_failed(scanout.kind());
+            if fallback_plan.primary == NativeScanoutKind::Unavailable {
+                return Err(error.into());
+            }
+            eprintln!(
+                "native scanout: initial native EGL/GBM paint failed: {error}; trying {} fallback",
+                fallback_plan.primary.as_str()
+            );
+            perf.log("native.backend_fallback", || {
+                vec![
+                    NativePerfField::str("failed", NativeScanoutKind::NativeEglGbm.as_str()),
+                    NativePerfField::str("fallback", fallback_plan.primary.as_str()),
+                    NativePerfField::str("error", error.to_string()),
+                ]
+            });
+            drop(scanout);
+            scanout =
+                NativeScanoutBackend::open(fallback_plan, kms.file(), target.width, target.height)?;
+            scanout.paint_server_frame(
+                &mut frame_renderer,
+                &server,
+                &input_state,
+                cursor_render_mode,
+                &initial_damage,
+            )?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    println!("native scanout backend active: {}", scanout.kind().as_str());
+    let effective_app_gpu_policy =
+        resolve_native_app_gpu_policy(app_gpu_preference, scanout.kind())?;
+    if scanout.supports_gpu_buffer_protocols() {
+        server.enable_gpu_buffer_protocols();
+    }
+    apply_native_scanout_feedback(&mut server, &scanout);
+    println!("native app GPU preference: {}", app_gpu_preference.as_str());
+    println!(
+        "native app GPU policy effective: {}",
+        effective_app_gpu_policy.as_str()
+    );
+    println!(
+        "native app GPU policy reason: active_scanout={}",
+        scanout.kind().metric_name()
+    );
+    perf.log("native.app_gpu_policy", || {
+        vec![
+            NativePerfField::str("preference", app_gpu_preference.as_str()),
+            NativePerfField::str("effective", effective_app_gpu_policy.as_str()),
+            NativePerfField::str("active_scanout", scanout.kind().metric_name()),
+            NativePerfField::bool(
+                "gpu_buffer_protocols",
+                server.gpu_buffer_protocols_enabled(),
+            ),
+        ]
+    });
     perf.log("native.frame", || {
         let mut fields = initial_paint.fields();
         fields.extend(initial_damage.fields());
@@ -821,9 +1015,30 @@ pub fn run(mut server: OwnCompositorServer, app: Vec<String>) -> NativeResult<()
     let mut known_toplevels = server.xdg_toplevels();
     let mut pending_launches = VecDeque::<NativeAppLaunchPerf>::new();
     let mut resize_perf = NativeResizePerfState::default();
+    if let Some(command) = startup_app
+        && let Some(launch) = launch_native_shell_command(
+            &server,
+            command,
+            effective_app_gpu_policy,
+            NativeLaunchSource::Startup,
+        )?
+    {
+        log_native_app_spawn(perf, &launch);
+        pending_launches.push_back(launch);
+    }
     loop {
         let pageflip_drain_start = Instant::now();
-        let pageflip_completed = scanout.drain_page_flip_events(kms.file().as_raw_fd())?;
+        let pageflip_completed = scanout
+            .drain_page_flip_events(kms.file().as_raw_fd())
+            .map_err(|error| {
+                native_runtime_error(
+                    NativeRuntimeStage::DrainPageFlipEvents,
+                    scanout.kind(),
+                    target.crtc_id,
+                    frame_index,
+                    error,
+                )
+            })?;
         let pageflip_drain_us = elapsed_micros(pageflip_drain_start);
         if pageflip_completed {
             let finish_frame_start = Instant::now();
@@ -839,9 +1054,21 @@ pub fn run(mut server: OwnCompositorServer, app: Vec<String>) -> NativeResult<()
         }
 
         let present_start = Instant::now();
-        scanout.present(kms.file().as_fd(), target.crtc_id)?;
+        scanout
+            .present(kms.file().as_fd(), target.crtc_id)
+            .map_err(|error| {
+                native_runtime_error(
+                    NativeRuntimeStage::Present,
+                    scanout.kind(),
+                    target.crtc_id,
+                    frame_index,
+                    error,
+                )
+            })?;
         let present_us = elapsed_micros(present_start);
-        let tick_blocked_by_pageflip = scanout.page_flip_pending();
+        let pageflip_pending_at_tick = scanout.page_flip_pending();
+        let tick_blocked_by_pageflip =
+            !native_dispatch_clients_while_pageflip_pending(pageflip_pending_at_tick);
         let tick_start = Instant::now();
         let accepted = if tick_blocked_by_pageflip {
             0
@@ -862,6 +1089,7 @@ pub fn run(mut server: OwnCompositorServer, app: Vec<String>) -> NativeResult<()
                         vec![
                             NativePerfField::str("program", launch.program.clone()),
                             NativePerfField::str("command", launch.command.clone()),
+                            NativePerfField::str("source", launch.source.as_str()),
                             NativePerfField::u64("pid", u64::from(launch.pid)),
                             NativePerfField::str("app_id", app_id.clone()),
                             NativePerfField::u64("spawn_us", launch.spawn_us),
@@ -925,21 +1153,14 @@ pub fn run(mut server: OwnCompositorServer, app: Vec<String>) -> NativeResult<()
                 perf,
                 &mut resize_perf,
                 cursor_render_mode,
+                effective_app_gpu_policy,
             )?;
             if application.exit_requested {
                 println!("native input exit requested; shutting down cleanly");
                 return Ok(());
             }
             if let Some(launch) = application.launch {
-                perf.log("app.spawn", || {
-                    vec![
-                        NativePerfField::str("program", launch.program.clone()),
-                        NativePerfField::str("command", launch.command.clone()),
-                        NativePerfField::u64("pid", u64::from(launch.pid)),
-                        NativePerfField::u64("spawn_us", launch.spawn_us),
-                        NativePerfField::str("app_policy", "cpu-compositor"),
-                    ]
-                });
+                log_native_app_spawn(perf, &launch);
                 pending_launches.push_back(launch);
             }
             if effect_requested_redraw && !application.redraw_requested {
@@ -989,62 +1210,104 @@ pub fn run(mut server: OwnCompositorServer, app: Vec<String>) -> NativeResult<()
                 render_generation_cause,
                 render_generation_changed,
             );
-            let cpu_before = perf
-                .enabled()
-                .then(NativeProcessCpuSample::read_current)
-                .flatten();
-            let paint_stats = scanout.paint_server_frame(
-                &mut frame_renderer,
-                &server,
-                &input_state,
-                cursor_render_mode,
-                &output_damage,
-            )?;
-            let cpu_after = perf
-                .enabled()
-                .then(NativeProcessCpuSample::read_current)
-                .flatten();
-            let (cpu_user_us, cpu_system_us) = cpu_before
-                .zip(cpu_after)
-                .map(|(before, after)| after.delta_us_since(before))
-                .unwrap_or((0, 0));
-            let repaint_present_start = Instant::now();
-            scanout.present(kms.file().as_fd(), target.crtc_id)?;
-            let repaint_present_us = elapsed_micros(repaint_present_start);
-            frame_index = frame_index.saturating_add(1);
-            perf.log("native.frame", || {
-                let mut fields = paint_stats.fields();
-                fields.extend(output_damage.fields());
-                fields.extend([
-                    NativePerfField::u64("index", frame_index),
-                    NativePerfField::str("phase", "repaint"),
-                    NativePerfField::str("mode", mode_label.clone()),
-                    NativePerfField::str("cursor", cursor_render_mode.as_str()),
-                    NativePerfField::u64("refresh_hz", u64::from(frame_pacing.refresh_hz)),
-                    NativePerfField::usize("surfaces", server.renderable_surfaces().len()),
-                    NativePerfField::u64("render_generation", render_generation),
-                    NativePerfField::bool("render_changed", render_generation_changed),
-                    NativePerfField::str("render_cause", render_cause),
-                    NativePerfField::u64("tick_us", tick_us),
-                    NativePerfField::bool("tick_blocked_by_pageflip", tick_blocked_by_pageflip),
-                    NativePerfField::u64("input_drain_us", input_drain_us),
-                    NativePerfField::usize("raw_input_events", raw_input_events),
-                    NativePerfField::usize("coalesced_input_events", coalesced_input_events),
-                    NativePerfField::u64("pageflip_drain_us", pageflip_drain_us),
-                    NativePerfField::bool("pageflip_completed", pageflip_completed),
-                    NativePerfField::u64("present_us", present_us),
-                    NativePerfField::u64("repaint_present_us", repaint_present_us),
-                    NativePerfField::u64("cpu_user_us", cpu_user_us),
-                    NativePerfField::u64("cpu_system_us", cpu_system_us),
-                    NativePerfField::bool("pending_frame_work", pending_frame_work),
-                    NativePerfField::bool("redraw_requested", redraw_requested),
-                    NativePerfField::usize("skipped_input_repaints", skipped_input_repaints),
-                    NativePerfField::usize("accepted_clients", accepted),
-                ]);
-                fields
-            });
-            last_render_generation = render_generation;
-            last_renderable_surfaces = server.renderable_surfaces().to_vec();
+            let skip_empty_visible_damage = output_damage.is_empty()
+                && render_generation_changed
+                && accepted == 0
+                && !redraw_requested;
+            if skip_empty_visible_damage {
+                perf.log("native.frame_skip", || {
+                    let mut fields = output_damage.fields().to_vec();
+                    fields.extend([
+                        NativePerfField::str("reason", "empty_visible_damage"),
+                        NativePerfField::usize("skipped_input_repaints", skipped_input_repaints),
+                        NativePerfField::u64("tick_us", tick_us),
+                        NativePerfField::bool("tick_blocked_by_pageflip", tick_blocked_by_pageflip),
+                        NativePerfField::bool("pageflip_pending_at_tick", pageflip_pending_at_tick),
+                        NativePerfField::u64("input_drain_us", input_drain_us),
+                        NativePerfField::usize("raw_input_events", raw_input_events),
+                        NativePerfField::usize("coalesced_input_events", coalesced_input_events),
+                        NativePerfField::u64("pageflip_drain_us", pageflip_drain_us),
+                        NativePerfField::bool("pageflip_completed", pageflip_completed),
+                        NativePerfField::u64("present_us", present_us),
+                        NativePerfField::u64("render_generation", render_generation),
+                        NativePerfField::str("render_cause", render_cause),
+                        NativePerfField::bool("pending_frame_work", pending_frame_work),
+                    ]);
+                    fields
+                });
+                if pending_frame_work {
+                    let finish_frame_start = Instant::now();
+                    server.finish_frame();
+                    perf.log("native.finish_frame", || {
+                        vec![
+                            NativePerfField::str("reason", "empty_visible_damage"),
+                            NativePerfField::u64("elapsed_us", elapsed_micros(finish_frame_start)),
+                            NativePerfField::usize("surfaces", server.renderable_surfaces().len()),
+                            NativePerfField::u64("render_generation", server.render_generation()),
+                        ]
+                    });
+                }
+                last_render_generation = render_generation;
+                last_renderable_surfaces = server.renderable_surfaces().to_vec();
+            } else {
+                let cpu_before = perf
+                    .enabled()
+                    .then(NativeProcessCpuSample::read_current)
+                    .flatten();
+                let paint_stats = scanout.paint_server_frame(
+                    &mut frame_renderer,
+                    &server,
+                    &input_state,
+                    cursor_render_mode,
+                    &output_damage,
+                )?;
+                let cpu_after = perf
+                    .enabled()
+                    .then(NativeProcessCpuSample::read_current)
+                    .flatten();
+                let (cpu_user_us, cpu_system_us) = cpu_before
+                    .zip(cpu_after)
+                    .map(|(before, after)| after.delta_us_since(before))
+                    .unwrap_or((0, 0));
+                let repaint_present_start = Instant::now();
+                scanout.present(kms.file().as_fd(), target.crtc_id)?;
+                let repaint_present_us = elapsed_micros(repaint_present_start);
+                frame_index = frame_index.saturating_add(1);
+                perf.log("native.frame", || {
+                    let mut fields = paint_stats.fields();
+                    fields.extend(output_damage.fields());
+                    fields.extend([
+                        NativePerfField::u64("index", frame_index),
+                        NativePerfField::str("phase", "repaint"),
+                        NativePerfField::str("mode", mode_label.clone()),
+                        NativePerfField::str("cursor", cursor_render_mode.as_str()),
+                        NativePerfField::u64("refresh_hz", u64::from(frame_pacing.refresh_hz)),
+                        NativePerfField::usize("surfaces", server.renderable_surfaces().len()),
+                        NativePerfField::u64("render_generation", render_generation),
+                        NativePerfField::bool("render_changed", render_generation_changed),
+                        NativePerfField::str("render_cause", render_cause),
+                        NativePerfField::u64("tick_us", tick_us),
+                        NativePerfField::bool("tick_blocked_by_pageflip", tick_blocked_by_pageflip),
+                        NativePerfField::bool("pageflip_pending_at_tick", pageflip_pending_at_tick),
+                        NativePerfField::u64("input_drain_us", input_drain_us),
+                        NativePerfField::usize("raw_input_events", raw_input_events),
+                        NativePerfField::usize("coalesced_input_events", coalesced_input_events),
+                        NativePerfField::u64("pageflip_drain_us", pageflip_drain_us),
+                        NativePerfField::bool("pageflip_completed", pageflip_completed),
+                        NativePerfField::u64("present_us", present_us),
+                        NativePerfField::u64("repaint_present_us", repaint_present_us),
+                        NativePerfField::u64("cpu_user_us", cpu_user_us),
+                        NativePerfField::u64("cpu_system_us", cpu_system_us),
+                        NativePerfField::bool("pending_frame_work", pending_frame_work),
+                        NativePerfField::bool("redraw_requested", redraw_requested),
+                        NativePerfField::usize("skipped_input_repaints", skipped_input_repaints),
+                        NativePerfField::usize("accepted_clients", accepted),
+                    ]);
+                    fields
+                });
+                last_render_generation = render_generation;
+                last_renderable_surfaces = server.renderable_surfaces().to_vec();
+            }
         } else if repaint_decision.protocol_only_present {
             perf.log("native.frame_skip", || {
                 vec![
@@ -1052,6 +1315,7 @@ pub fn run(mut server: OwnCompositorServer, app: Vec<String>) -> NativeResult<()
                     NativePerfField::usize("skipped_input_repaints", skipped_input_repaints),
                     NativePerfField::u64("tick_us", tick_us),
                     NativePerfField::bool("tick_blocked_by_pageflip", tick_blocked_by_pageflip),
+                    NativePerfField::bool("pageflip_pending_at_tick", pageflip_pending_at_tick),
                     NativePerfField::u64("input_drain_us", input_drain_us),
                     NativePerfField::usize("raw_input_events", raw_input_events),
                     NativePerfField::usize("coalesced_input_events", coalesced_input_events),
@@ -1078,6 +1342,7 @@ pub fn run(mut server: OwnCompositorServer, app: Vec<String>) -> NativeResult<()
                     NativePerfField::usize("skipped_input_repaints", skipped_input_repaints),
                     NativePerfField::u64("tick_us", tick_us),
                     NativePerfField::bool("tick_blocked_by_pageflip", tick_blocked_by_pageflip),
+                    NativePerfField::bool("pageflip_pending_at_tick", pageflip_pending_at_tick),
                     NativePerfField::u64("input_drain_us", input_drain_us),
                     NativePerfField::usize("raw_input_events", raw_input_events),
                     NativePerfField::usize("coalesced_input_events", coalesced_input_events),
@@ -1097,6 +1362,7 @@ pub fn run(mut server: OwnCompositorServer, app: Vec<String>) -> NativeResult<()
                     NativePerfField::usize("skipped_input_repaints", skipped_input_repaints),
                     NativePerfField::u64("tick_us", tick_us),
                     NativePerfField::bool("tick_blocked_by_pageflip", tick_blocked_by_pageflip),
+                    NativePerfField::bool("pageflip_pending_at_tick", pageflip_pending_at_tick),
                     NativePerfField::u64("input_drain_us", input_drain_us),
                     NativePerfField::usize("raw_input_events", raw_input_events),
                     NativePerfField::usize("coalesced_input_events", coalesced_input_events),
@@ -1155,6 +1421,11 @@ struct NativeRepaintInputs {
 struct NativeRepaintDecision {
     repaint: bool,
     protocol_only_present: bool,
+}
+
+fn native_dispatch_clients_while_pageflip_pending(page_flip_pending: bool) -> bool {
+    let _ = page_flip_pending;
+    true
 }
 
 fn native_repaint_decision(inputs: NativeRepaintInputs) -> NativeRepaintDecision {
@@ -1346,6 +1617,37 @@ impl NativeFrameRenderer {
             frame_copy_kind: self.scene_renderer.last_frame_copy_kind(),
         }
     }
+
+    fn egl_scene_draw_request<'a>(
+        &'a mut self,
+        width: u32,
+        height: u32,
+        server: &'a OwnCompositorServer,
+        input_state: &NativeInputState,
+        cursor_mode: NativeCursorRenderMode,
+    ) -> EglSceneDrawRequest<'a> {
+        let shell_state = ShellOverlayState {
+            topbar: ShellTopbarModel::visible("Oblivion One").with_trailing_text("Super+Space"),
+            dock_items: server.shell_dock_items(),
+            spotlight: input_state.spotlight().clone(),
+            generation: input_state.shell_generation(),
+        };
+        let shell_overlay = self
+            .shell_overlay_renderer
+            .render(width, height, &shell_state);
+        EglSceneDrawRequest {
+            width,
+            height,
+            surfaces: server.renderable_surfaces(),
+            content_generation: native_scene_content_generation(
+                server.render_generation(),
+                shell_overlay.generation,
+            ),
+            visual_state: input_state.desktop_visual_state(cursor_mode),
+            output_scale: 1.0,
+            shell_overlay: Some(shell_overlay),
+        }
+    }
 }
 
 struct NativeRenderedFrame<'a> {
@@ -1490,11 +1792,91 @@ impl NativePointerButtonEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+struct RelativeMotion {
+    dx: f64,
+    dy: f64,
+    dx_unaccelerated: f64,
+    dy_unaccelerated: f64,
+}
+
+impl RelativeMotion {
+    const fn accelerated_only(dx: f64, dy: f64) -> Self {
+        Self {
+            dx,
+            dy,
+            dx_unaccelerated: dx,
+            dy_unaccelerated: dy,
+        }
+    }
+
+    const fn is_zero(self) -> bool {
+        self.dx == 0.0
+            && self.dy == 0.0
+            && self.dx_unaccelerated == 0.0
+            && self.dy_unaccelerated == 0.0
+    }
+
+    const fn add(self, other: Self) -> Self {
+        Self {
+            dx: self.dx + other.dx,
+            dy: self.dy + other.dy,
+            dx_unaccelerated: self.dx_unaccelerated + other.dx_unaccelerated,
+            dy_unaccelerated: self.dy_unaccelerated + other.dy_unaccelerated,
+        }
+    }
+}
+
+impl From<RelativeMotion> for CompositorRelativePointerMotion {
+    fn from(motion: RelativeMotion) -> Self {
+        Self {
+            dx: motion.dx,
+            dy: motion.dy,
+            dx_unaccelerated: motion.dx_unaccelerated,
+            dy_unaccelerated: motion.dy_unaccelerated,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PointerMotionSample {
+    timestamp_usec: u64,
+    absolute: Option<(f64, f64)>,
+    relative: Option<RelativeMotion>,
+}
+
+impl PointerMotionSample {
+    const fn relative(timestamp_usec: u64, relative: RelativeMotion) -> Self {
+        Self {
+            timestamp_usec,
+            absolute: None,
+            relative: Some(relative),
+        }
+    }
+
+    const fn absolute(timestamp_usec: u64, x: f64, y: f64) -> Self {
+        Self {
+            timestamp_usec,
+            absolute: Some((x, y)),
+            relative: None,
+        }
+    }
+
+    fn coalesce(self, other: Self) -> Option<Self> {
+        match (self.absolute, self.relative, other.absolute, other.relative) {
+            (None, Some(left), None, Some(right)) => {
+                Some(Self::relative(other.timestamp_usec, left.add(right)))
+            }
+            (Some(_), None, Some((x, y)), None) => Some(Self::absolute(other.timestamp_usec, x, y)),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum NativeHardwareInputEvent {
     Key { code: u16, value: i32 },
     PointerButton { button: u32, pressed: bool },
-    PointerMotion { dx: f64, dy: f64 },
-    PointerAbsolute { x: f64, y: f64 },
+    PointerMotion(PointerMotionSample),
     PointerAxis { horizontal: f64, vertical: f64 },
 }
 
@@ -1524,14 +1906,14 @@ impl NativeHardwareInputEvent {
                 value: event.value,
             }),
             EV_REL => match event.code {
-                REL_X => Some(Self::PointerMotion {
-                    dx: f64::from(event.value),
-                    dy: 0.0,
-                }),
-                REL_Y => Some(Self::PointerMotion {
-                    dx: 0.0,
-                    dy: f64::from(event.value),
-                }),
+                REL_X => Some(Self::PointerMotion(PointerMotionSample::relative(
+                    linux_input_event_time_usec(event),
+                    RelativeMotion::accelerated_only(f64::from(event.value), 0.0),
+                ))),
+                REL_Y => Some(Self::PointerMotion(PointerMotionSample::relative(
+                    linux_input_event_time_usec(event),
+                    RelativeMotion::accelerated_only(0.0, f64::from(event.value)),
+                ))),
                 REL_WHEEL => Some(Self::PointerAxis {
                     horizontal: 0.0,
                     vertical: -f64::from(event.value) * WAYLAND_SCROLL_LINE_DISTANCE,
@@ -1556,6 +1938,8 @@ struct NativeInputEffect {
     cursor_position: Option<(i32, i32)>,
     keyboard_events: Vec<NativeKeyboardEvent>,
     pointer_motion: Option<(f64, f64)>,
+    pointer_motion_usec: Option<u64>,
+    relative_motion: Option<RelativeMotion>,
     pointer_buttons: Vec<NativePointerButtonEvent>,
     pointer_axis: Option<(f64, f64)>,
     window_actions: Vec<NativeWindowAction>,
@@ -1598,6 +1982,7 @@ struct NativeInputState {
     super_pressed: bool,
     shift_pressed: bool,
     window_interaction_active: bool,
+    keyboard_shortcuts_inhibited: bool,
     forwarded_control_keys: Vec<u16>,
     suppressed_window_shortcut_keys: Vec<u16>,
     spotlight: SpotlightModel,
@@ -1616,6 +2001,7 @@ impl NativeInputState {
             super_pressed: false,
             shift_pressed: false,
             window_interaction_active: false,
+            keyboard_shortcuts_inhibited: false,
             forwarded_control_keys: Vec::new(),
             suppressed_window_shortcut_keys: Vec::new(),
             spotlight: SpotlightModel::default(),
@@ -1638,6 +2024,11 @@ impl NativeInputState {
 
     const fn spotlight(&self) -> &SpotlightModel {
         &self.spotlight
+    }
+
+    #[cfg(test)]
+    fn set_keyboard_shortcuts_inhibited(&mut self, inhibited: bool) {
+        self.keyboard_shortcuts_inhibited = inhibited;
     }
 
     fn cursor_position(&self) -> (i32, i32) {
@@ -1663,12 +2054,7 @@ impl NativeInputState {
             NativeHardwareInputEvent::PointerButton { button, pressed } => {
                 self.handle_pointer_button(button, pressed)
             }
-            NativeHardwareInputEvent::PointerMotion { dx, dy } => {
-                self.handle_pointer_motion_delta(dx, dy)
-            }
-            NativeHardwareInputEvent::PointerAbsolute { x, y } => {
-                self.handle_pointer_absolute(x, y)
-            }
+            NativeHardwareInputEvent::PointerMotion(sample) => self.handle_pointer_motion(sample),
             NativeHardwareInputEvent::PointerAxis {
                 horizontal,
                 vertical,
@@ -1694,6 +2080,12 @@ impl NativeInputState {
 
         if is_alt_key(code) {
             self.alt_pressed = pressed;
+            if self.keyboard_shortcuts_inhibited && !repeated {
+                effect
+                    .keyboard_events
+                    .push(NativeKeyboardEvent::new(code, pressed));
+                effect.request_redraw();
+            }
             if !pressed && self.window_interaction_active {
                 self.window_interaction_active = false;
                 effect
@@ -1706,6 +2098,12 @@ impl NativeInputState {
 
         if is_super_key(code) {
             self.super_pressed = pressed;
+            if self.keyboard_shortcuts_inhibited && !repeated {
+                effect
+                    .keyboard_events
+                    .push(NativeKeyboardEvent::new(code, pressed));
+                effect.request_redraw();
+            }
             return effect;
         }
 
@@ -1733,6 +2131,16 @@ impl NativeInputState {
 
         if pressed && !repeated && self.alt_pressed && code == KEY_P {
             effect.exit_requested = true;
+            return effect;
+        }
+
+        if self.keyboard_shortcuts_inhibited && !self.spotlight_visible() {
+            if !repeated {
+                effect
+                    .keyboard_events
+                    .push(NativeKeyboardEvent::new(code, pressed));
+                effect.request_redraw();
+            }
             return effect;
         }
 
@@ -1857,10 +2265,20 @@ impl NativeInputState {
         effect
     }
 
-    fn handle_pointer_motion_delta(&mut self, dx: f64, dy: f64) -> NativeInputEffect {
+    fn handle_pointer_motion(&mut self, sample: PointerMotionSample) -> NativeInputEffect {
         let mut effect = NativeInputEffect::default();
-        self.cursor_x = (self.cursor_x + dx).clamp(0.0, f64::from(self.output_width - 1));
-        self.cursor_y = (self.cursor_y + dy).clamp(0.0, f64::from(self.output_height - 1));
+        effect.pointer_motion_usec = Some(sample.timestamp_usec);
+        if let Some(relative) = sample.relative {
+            effect.relative_motion = (!relative.is_zero()).then_some(relative);
+            self.cursor_x =
+                (self.cursor_x + relative.dx).clamp(0.0, f64::from(self.output_width - 1));
+            self.cursor_y =
+                (self.cursor_y + relative.dy).clamp(0.0, f64::from(self.output_height - 1));
+        }
+        if let Some((x, y)) = sample.absolute {
+            self.cursor_x = x.clamp(0.0, f64::from(self.output_width - 1));
+            self.cursor_y = y.clamp(0.0, f64::from(self.output_height - 1));
+        }
         if !self.spotlight_visible() {
             if self.window_interaction_active {
                 effect
@@ -1878,25 +2296,12 @@ impl NativeInputState {
         effect
     }
 
-    fn handle_pointer_absolute(&mut self, x: f64, y: f64) -> NativeInputEffect {
-        let mut effect = NativeInputEffect::default();
-        self.cursor_x = x.clamp(0.0, f64::from(self.output_width - 1));
-        self.cursor_y = y.clamp(0.0, f64::from(self.output_height - 1));
-        if !self.spotlight_visible() {
-            if self.window_interaction_active {
-                effect
-                    .window_actions
-                    .push(NativeWindowAction::UpdateInteraction {
-                        x: self.cursor_x,
-                        y: self.cursor_y,
-                    });
-                effect.request_visual_redraw();
-            } else {
-                effect.pointer_motion = Some((self.cursor_x, self.cursor_y));
-            }
-        }
-        effect.mark_cursor_moved(self.cursor_x, self.cursor_y);
-        effect
+    #[cfg(test)]
+    fn handle_pointer_motion_delta(&mut self, dx: f64, dy: f64) -> NativeInputEffect {
+        self.handle_pointer_motion(PointerMotionSample::relative(
+            0,
+            RelativeMotion::accelerated_only(dx, dy),
+        ))
     }
 
     fn handle_pointer_axis(&mut self, horizontal: f64, vertical: f64) -> NativeInputEffect {
@@ -2126,6 +2531,12 @@ struct LinuxInputEvent {
     type_: u16,
     code: u16,
     value: i32,
+}
+
+fn linux_input_event_time_usec(event: LinuxInputEvent) -> u64 {
+    let seconds = u64::try_from(event._time.tv_sec).unwrap_or(0);
+    let micros = u64::try_from(event._time.tv_usec).unwrap_or(0);
+    seconds.saturating_mul(1_000_000).saturating_add(micros)
 }
 
 fn open_native_seat_session(session_probe: &NativeSessionProbe) -> Option<NativeSeatSession> {
@@ -2888,7 +3299,9 @@ fn hardware_input_event_from_libinput(
 ) -> Option<NativeHardwareInputEvent> {
     use input::event::keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait};
     #[allow(deprecated)]
-    use input::event::pointer::{Axis, ButtonState, PointerEvent, PointerScrollEvent};
+    use input::event::pointer::{
+        Axis, ButtonState, PointerEvent, PointerEventTrait, PointerScrollEvent,
+    };
 
     match event {
         input::Event::Keyboard(KeyboardEvent::Key(event)) => {
@@ -2899,18 +3312,24 @@ fn hardware_input_event_from_libinput(
             };
             Some(NativeHardwareInputEvent::Key { code, value })
         }
-        input::Event::Pointer(PointerEvent::Motion(event)) => {
-            Some(NativeHardwareInputEvent::PointerMotion {
-                dx: event.dx(),
-                dy: event.dy(),
-            })
-        }
-        input::Event::Pointer(PointerEvent::MotionAbsolute(event)) => {
-            Some(NativeHardwareInputEvent::PointerAbsolute {
-                x: event.absolute_x_transformed(output_width),
-                y: event.absolute_y_transformed(output_height),
-            })
-        }
+        input::Event::Pointer(PointerEvent::Motion(event)) => Some(
+            NativeHardwareInputEvent::PointerMotion(PointerMotionSample::relative(
+                event.time_usec(),
+                RelativeMotion {
+                    dx: event.dx(),
+                    dy: event.dy(),
+                    dx_unaccelerated: event.dx_unaccelerated(),
+                    dy_unaccelerated: event.dy_unaccelerated(),
+                },
+            )),
+        ),
+        input::Event::Pointer(PointerEvent::MotionAbsolute(event)) => Some(
+            NativeHardwareInputEvent::PointerMotion(PointerMotionSample::absolute(
+                event.time_usec(),
+                event.absolute_x_transformed(output_width),
+                event.absolute_y_transformed(output_height),
+            )),
+        ),
         input::Event::Pointer(PointerEvent::Button(event)) => {
             Some(NativeHardwareInputEvent::PointerButton {
                 button: event.button(),
@@ -2979,8 +3398,7 @@ where
 
 #[derive(Debug, Clone, Copy)]
 enum PendingPointerMotion {
-    Relative { dx: f64, dy: f64 },
-    Absolute { x: f64, y: f64 },
+    Sample(PointerMotionSample),
 }
 
 fn coalesce_pointer_motion_events(
@@ -2991,35 +3409,19 @@ fn coalesce_pointer_motion_events(
 
     for event in events {
         match event {
-            NativeHardwareInputEvent::PointerMotion { dx, dy } => match pending_motion {
-                Some(PendingPointerMotion::Relative {
-                    dx: pending_dx,
-                    dy: pending_dy,
-                }) => {
-                    pending_motion = Some(PendingPointerMotion::Relative {
-                        dx: pending_dx + dx,
-                        dy: pending_dy + dy,
-                    });
+            NativeHardwareInputEvent::PointerMotion(sample) => match pending_motion {
+                Some(PendingPointerMotion::Sample(pending_sample)) => {
+                    if let Some(coalesced_sample) = pending_sample.coalesce(sample) {
+                        pending_motion = Some(PendingPointerMotion::Sample(coalesced_sample));
+                    } else {
+                        flush_pending_pointer_motion(
+                            &mut coalesced,
+                            PendingPointerMotion::Sample(pending_sample),
+                        );
+                        pending_motion = Some(PendingPointerMotion::Sample(sample));
+                    }
                 }
-                Some(pending) => {
-                    flush_pending_pointer_motion(&mut coalesced, pending);
-                    pending_motion = Some(PendingPointerMotion::Relative { dx, dy });
-                }
-                None => {
-                    pending_motion = Some(PendingPointerMotion::Relative { dx, dy });
-                }
-            },
-            NativeHardwareInputEvent::PointerAbsolute { x, y } => match pending_motion {
-                Some(PendingPointerMotion::Absolute { .. }) => {
-                    pending_motion = Some(PendingPointerMotion::Absolute { x, y });
-                }
-                Some(pending) => {
-                    flush_pending_pointer_motion(&mut coalesced, pending);
-                    pending_motion = Some(PendingPointerMotion::Absolute { x, y });
-                }
-                None => {
-                    pending_motion = Some(PendingPointerMotion::Absolute { x, y });
-                }
+                None => pending_motion = Some(PendingPointerMotion::Sample(sample)),
             },
             event => {
                 if let Some(pending) = pending_motion.take() {
@@ -3042,11 +3444,8 @@ fn flush_pending_pointer_motion(
     pending: PendingPointerMotion,
 ) {
     match pending {
-        PendingPointerMotion::Relative { dx, dy } => {
-            events.push(NativeHardwareInputEvent::PointerMotion { dx, dy });
-        }
-        PendingPointerMotion::Absolute { x, y } => {
-            events.push(NativeHardwareInputEvent::PointerAbsolute { x, y });
+        PendingPointerMotion::Sample(sample) => {
+            events.push(NativeHardwareInputEvent::PointerMotion(sample));
         }
     }
 }
@@ -3197,6 +3596,7 @@ fn apply_native_input_effect(
     perf: NativePerfLogger,
     resize_perf: &mut NativeResizePerfState,
     cursor_mode: NativeCursorRenderMode,
+    app_gpu_policy: EffectiveCompositorAppGpuPolicy,
 ) -> NativeResult<NativeInputApplication> {
     let mut application = NativeInputApplication {
         redraw_requested: effect.requires_frame_repaint(cursor_mode),
@@ -3206,8 +3606,14 @@ fn apply_native_input_effect(
     for event in effect.keyboard_events {
         server.send_keyboard_key(event.key, event.pressed);
     }
-    if let Some((x, y)) = effect.pointer_motion {
-        server.send_pointer_motion(x, y);
+    if effect.pointer_motion.is_some() || effect.relative_motion.is_some() {
+        server.send_pointer_motion_sample(CompositorPointerMotionSample {
+            timestamp_usec: effect.pointer_motion_usec.unwrap_or(0),
+            absolute: effect
+                .pointer_motion
+                .map(|(x, y)| CompositorOutputPosition { x, y }),
+            relative: effect.relative_motion.map(Into::into),
+        });
     }
     for event in effect.pointer_buttons {
         if event.pressed && event.button == u32::from(BTN_LEFT) {
@@ -3233,7 +3639,12 @@ fn apply_native_input_effect(
             apply_native_window_action(action, server, perf, resize_perf);
     }
     if let Some(command) = effect.launch_command {
-        application.launch = launch_native_shell_command(server, command)?;
+        application.launch = launch_native_shell_command(
+            server,
+            command,
+            app_gpu_policy,
+            NativeLaunchSource::Spotlight,
+        )?;
     }
     Ok(application)
 }
@@ -3272,33 +3683,77 @@ fn apply_native_window_action(
 fn launch_native_shell_command(
     server: &OwnCompositorServer,
     command: Vec<String>,
+    app_gpu_policy: EffectiveCompositorAppGpuPolicy,
+    source: NativeLaunchSource,
 ) -> NativeResult<Option<NativeAppLaunchPerf>> {
-    let Some(program) = command.first().cloned() else {
+    let Some(request) = native_launch_request(command, app_gpu_policy, source) else {
         return Ok(None);
     };
     let socket_name = server.socket_name().to_string();
-    let command_label = command.join(" ");
     let spawn_start = Instant::now();
-    match spawn_cpu_compositor_app(&socket_name, &command) {
+    let spawn_result =
+        spawn_compositor_app_with_policy(&socket_name, &request.argv, request.gpu_policy);
+    match spawn_result {
         Ok(Some(pid)) => {
             let spawn_us = elapsed_micros(spawn_start);
             println!(
-                "spawned `{program}` from native Spotlight on Oblivion Wayland socket `{socket_name}` as pid {pid}"
+                "spawned `{}` from native {} on Oblivion Wayland socket `{socket_name}` as pid {pid} (gpu policy {})",
+                request.program,
+                request.source.as_str(),
+                request.gpu_policy.as_str()
             );
             Ok(Some(NativeAppLaunchPerf {
-                program,
-                command: command_label,
+                program: request.program,
+                command: request.command,
                 pid,
                 spawn_us,
                 started_at: spawn_start,
+                gpu_policy: request.gpu_policy,
+                source: request.source,
             }))
         }
         Ok(None) => Ok(None),
         Err(error) => Err(io::Error::other(format!(
-            "failed to spawn `{program}` from native Spotlight: {error}"
+            "failed to spawn `{}` from native {} with app policy {}: {error}",
+            request.program,
+            request.source.as_str(),
+            request.gpu_policy.as_str()
         ))
         .into()),
     }
+}
+
+fn native_launch_request(
+    command: Vec<String>,
+    gpu_policy: EffectiveCompositorAppGpuPolicy,
+    source: NativeLaunchSource,
+) -> Option<NativeLaunchRequest> {
+    let program = command.first()?.clone();
+    let command_label = command
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(NativeLaunchRequest {
+        argv: command,
+        program,
+        command: command_label,
+        gpu_policy,
+        source,
+    })
+}
+
+fn log_native_app_spawn(perf: NativePerfLogger, launch: &NativeAppLaunchPerf) {
+    perf.log("app.spawn", || {
+        vec![
+            NativePerfField::str("program", launch.program.clone()),
+            NativePerfField::str("command", launch.command.clone()),
+            NativePerfField::str("source", launch.source.as_str()),
+            NativePerfField::u64("pid", u64::from(launch.pid)),
+            NativePerfField::u64("spawn_us", launch.spawn_us),
+            NativePerfField::str("app_policy", launch.gpu_policy.as_str()),
+        ]
+    });
 }
 
 fn first_dri_node(prefix: &str) -> Option<PathBuf> {
@@ -3500,7 +3955,8 @@ fn drm_mode_name(mode: &drm_sys::drm_mode_modeinfo) -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeScanoutKind {
-    GbmEglPageFlip,
+    NativeEglGbm,
+    GbmCpuWritePageFlip,
     DumbFramebuffer,
     Unavailable,
 }
@@ -3508,8 +3964,18 @@ enum NativeScanoutKind {
 impl NativeScanoutKind {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::GbmEglPageFlip => "GBM/KMS pageflip",
+            Self::NativeEglGbm => "native EGL/GLES GBM pageflip",
+            Self::GbmCpuWritePageFlip => "GBM CPU-write pageflip",
             Self::DumbFramebuffer => "KMS dumb framebuffer",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    const fn metric_name(self) -> &'static str {
+        match self {
+            Self::NativeEglGbm => "native-egl-gbm",
+            Self::GbmCpuWritePageFlip => "gbm-cpu-write-pageflip",
+            Self::DumbFramebuffer => "dumb-framebuffer",
             Self::Unavailable => "unavailable",
         }
     }
@@ -3523,6 +3989,12 @@ struct NativePaintStats {
     bytes: usize,
     copy_bytes: usize,
     write_bytes: usize,
+    gpu_draw_us: u64,
+    egl_swap_us: u64,
+    shm_upload_bytes: usize,
+    dmabuf_imports: usize,
+    dmabuf_reuses: usize,
+    dmabuf_import_failures: usize,
     scene_rebuild: DesktopSceneRebuildKind,
     frame_copy: DesktopFrameCopyKind,
     total_us: u64,
@@ -3534,12 +4006,20 @@ struct NativePaintStats {
 impl NativePaintStats {
     fn fields(self) -> Vec<NativePerfField> {
         vec![
+            NativePerfField::str("backend", self.backend.metric_name()),
             NativePerfField::str("scanout", self.backend.as_str()),
             NativePerfField::u64("width", u64::from(self.width)),
             NativePerfField::u64("height", u64::from(self.height)),
             NativePerfField::usize("bytes", self.bytes),
             NativePerfField::usize("copy_bytes", self.copy_bytes),
+            NativePerfField::usize("full_frame_cpu_copy_bytes", self.copy_bytes),
             NativePerfField::usize("write_bytes", self.write_bytes),
+            NativePerfField::u64("gpu_draw_us", self.gpu_draw_us),
+            NativePerfField::u64("egl_swap_us", self.egl_swap_us),
+            NativePerfField::usize("shm_upload_bytes", self.shm_upload_bytes),
+            NativePerfField::usize("dmabuf_imports", self.dmabuf_imports),
+            NativePerfField::usize("dmabuf_reuses", self.dmabuf_reuses),
+            NativePerfField::usize("dmabuf_import_failures", self.dmabuf_import_failures),
             NativePerfField::str("scene_rebuild", self.scene_rebuild.as_str()),
             NativePerfField::str("frame_copy", self.frame_copy.as_str()),
             NativePerfField::u64("paint_us", self.total_us),
@@ -3616,6 +4096,10 @@ impl NativeOutputDamage {
         }
     }
 
+    fn is_empty(&self) -> bool {
+        self.kind == NativeDamageKind::Empty || self.rects.is_empty() || self.pixels == 0
+    }
+
     fn summary(&self) -> NativeDamageSummary {
         NativeDamageSummary {
             kind: self.kind,
@@ -3675,15 +4159,17 @@ struct NativeDamageRect {
 }
 
 impl NativeDamageRect {
-    fn from_surface_bounds(surface: &RenderableSurface, origin: (i32, i32)) -> Option<Self> {
-        (surface.width > 0 && surface.height > 0).then_some(Self {
-            x: origin.0,
-            y: origin.1,
-            width: surface.width,
-            height: surface.height,
+    fn from_render_element_bounds(element: &RenderSceneElement) -> Option<Self> {
+        let target = element.target();
+        (target.width() > 0 && target.height() > 0).then_some(Self {
+            x: target.x(),
+            y: target.y(),
+            width: target.width(),
+            height: target.height(),
         })
     }
 
+    #[cfg(test)]
     fn from_surface_damage(
         surface: &RenderableSurface,
         origin: (i32, i32),
@@ -3713,6 +4199,40 @@ impl NativeDamageRect {
         Some(Self {
             x: i32_saturating_add_u32(origin.0, left),
             y: i32_saturating_add_u32(origin.1, top),
+            width: right - left,
+            height: bottom - top,
+        })
+    }
+
+    fn from_render_element_damage(
+        element: &RenderSceneElement,
+        rect: oblivion_one::compositor::SurfaceDamageRect,
+    ) -> Option<Self> {
+        let target = element.target();
+        if target.width() == 0 || target.height() == 0 {
+            return None;
+        }
+
+        let buffer_size = element.buffer_size();
+        let left = scale_damage_floor(rect.x, buffer_size.width, target.width())?;
+        let top = scale_damage_floor(rect.y, buffer_size.height, target.height())?;
+        let right = scale_damage_ceil(
+            rect.x.saturating_add(rect.width),
+            buffer_size.width,
+            target.width(),
+        )?;
+        let bottom = scale_damage_ceil(
+            rect.y.saturating_add(rect.height),
+            buffer_size.height,
+            target.height(),
+        )?;
+        if right <= left || bottom <= top {
+            return None;
+        }
+
+        Some(Self {
+            x: i32_saturating_add_u32(target.x(), left),
+            y: i32_saturating_add_u32(target.y(), top),
             width: right - left,
             height: bottom - top,
         })
@@ -3769,89 +4289,6 @@ impl NativeDamageRect {
     }
 }
 
-fn native_rect_symmetric_difference(
-    left: NativeDamageRect,
-    right: NativeDamageRect,
-) -> Vec<NativeDamageRect> {
-    let mut rects = native_rect_difference(left, right);
-    rects.extend(native_rect_difference(right, left));
-    rects
-}
-
-fn native_rect_difference(
-    source: NativeDamageRect,
-    cut: NativeDamageRect,
-) -> Vec<NativeDamageRect> {
-    let Some(overlap) = native_rect_intersection(source, cut) else {
-        return vec![source];
-    };
-
-    let mut rects = Vec::new();
-    push_native_damage_rect(
-        &mut rects,
-        source.left(),
-        source.top(),
-        source.right(),
-        overlap.top(),
-    );
-    push_native_damage_rect(
-        &mut rects,
-        source.left(),
-        overlap.bottom(),
-        source.right(),
-        source.bottom(),
-    );
-    push_native_damage_rect(
-        &mut rects,
-        source.left(),
-        overlap.top(),
-        overlap.left(),
-        overlap.bottom(),
-    );
-    push_native_damage_rect(
-        &mut rects,
-        overlap.right(),
-        overlap.top(),
-        source.right(),
-        overlap.bottom(),
-    );
-    rects
-}
-
-fn native_rect_intersection(
-    left: NativeDamageRect,
-    right: NativeDamageRect,
-) -> Option<NativeDamageRect> {
-    let left_edge = left.left().max(right.left());
-    let top = left.top().max(right.top());
-    let right_edge = left.right().min(right.right());
-    let bottom = left.bottom().min(right.bottom());
-    (right_edge > left_edge && bottom > top).then_some(NativeDamageRect {
-        x: left_edge.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-        y: top.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-        width: u32::try_from(right_edge.saturating_sub(left_edge)).unwrap_or(u32::MAX),
-        height: u32::try_from(bottom.saturating_sub(top)).unwrap_or(u32::MAX),
-    })
-}
-
-fn push_native_damage_rect(
-    rects: &mut Vec<NativeDamageRect>,
-    left: i64,
-    top: i64,
-    right: i64,
-    bottom: i64,
-) {
-    if right <= left || bottom <= top {
-        return;
-    }
-    rects.push(NativeDamageRect {
-        x: left.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-        y: top.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-        width: u32::try_from(right.saturating_sub(left)).unwrap_or(u32::MAX),
-        height: u32::try_from(bottom.saturating_sub(top)).unwrap_or(u32::MAX),
-    });
-}
-
 fn coalesce_native_damage_rects(rects: Vec<NativeDamageRect>) -> Vec<NativeDamageRect> {
     let mut coalesced = Vec::<NativeDamageRect>::new();
     'next_rect: for rect in rects {
@@ -3901,10 +4338,18 @@ impl NativeDamageAccumulator {
         output_height: u32,
         surfaces: &[RenderableSurface],
     ) -> Self {
+        let elements = render_scene_elements_for_surfaces(surfaces, 1.0);
+        Self::from_render_elements(output_width, output_height, &elements)
+    }
+
+    fn from_render_elements(
+        output_width: u32,
+        output_height: u32,
+        elements: &[RenderSceneElement],
+    ) -> Self {
         let mut accumulator = Self::for_output(output_width, output_height);
-        let origins = surface_origins(surfaces);
-        for (surface, origin) in surfaces.iter().zip(origins) {
-            accumulator.add_surface(surface, origin);
+        for element in elements {
+            accumulator.add_render_element(element);
         }
         accumulator
     }
@@ -3915,54 +4360,34 @@ impl NativeDamageAccumulator {
         previous_surfaces: &[RenderableSurface],
         current_surfaces: &[RenderableSurface],
     ) -> Self {
-        let mut previous_rects = HashMap::new();
-        for (surface, origin) in previous_surfaces
-            .iter()
-            .zip(surface_origins(previous_surfaces))
-        {
-            if let Some(rect) = NativeDamageRect::from_surface_bounds(surface, origin)
-                .and_then(|rect| rect.clipped_to_output(output_width, output_height))
-            {
-                previous_rects.insert(surface.surface_id, rect);
-            }
-        }
+        let previous_elements = render_scene_elements_for_surfaces(previous_surfaces, 1.0);
+        let current_elements = render_scene_elements_for_surfaces(current_surfaces, 1.0);
+        Self::from_render_element_bounds_changes(
+            output_width,
+            output_height,
+            &previous_elements,
+            &current_elements,
+        )
+    }
 
-        let mut current_rects = HashMap::new();
-        let mut top_left_resize_previews = HashMap::new();
-        for (surface, origin) in current_surfaces
-            .iter()
-            .zip(surface_origins(current_surfaces))
-        {
-            if let Some(rect) = NativeDamageRect::from_surface_bounds(surface, origin)
-                .and_then(|rect| rect.clipped_to_output(output_width, output_height))
-            {
-                if surface
-                    .resize_preview
-                    .is_some_and(|preview| !preview.anchor_right && !preview.anchor_bottom)
-                {
-                    top_left_resize_previews.insert(surface.surface_id, true);
-                }
-                current_rects.insert(surface.surface_id, rect);
-            }
-        }
+    fn from_render_element_bounds_changes(
+        output_width: u32,
+        output_height: u32,
+        previous_elements: &[RenderSceneElement],
+        current_elements: &[RenderSceneElement],
+    ) -> Self {
+        let previous_rects =
+            native_element_bounds_by_id(output_width, output_height, previous_elements);
+        let current_rects =
+            native_element_bounds_by_id(output_width, output_height, current_elements);
 
         let mut accumulator = Self::for_output(output_width, output_height);
         for (surface_id, previous_rect) in &previous_rects {
             let current_rect = current_rects.get(surface_id).copied();
             if current_rect != Some(*previous_rect) {
                 if let Some(current_rect) = current_rect {
-                    if top_left_resize_previews.contains_key(surface_id)
-                        && previous_rect.x == current_rect.x
-                        && previous_rect.y == current_rect.y
-                    {
-                        accumulator.rects.extend(native_rect_symmetric_difference(
-                            *previous_rect,
-                            current_rect,
-                        ));
-                    } else {
-                        accumulator.rects.push(*previous_rect);
-                        accumulator.rects.push(current_rect);
-                    }
+                    accumulator.rects.push(*previous_rect);
+                    accumulator.rects.push(current_rect);
                 } else {
                     accumulator.rects.push(*previous_rect);
                 }
@@ -3976,6 +4401,7 @@ impl NativeDamageAccumulator {
         accumulator
     }
 
+    #[cfg(test)]
     fn add_surface(&mut self, surface: &RenderableSurface, origin: (i32, i32)) {
         let buffer_size = surface.buffer_size();
         for rect in surface
@@ -3983,6 +4409,21 @@ impl NativeDamageAccumulator {
             .clipped_rects(buffer_size.width, buffer_size.height)
         {
             let Some(rect) = NativeDamageRect::from_surface_damage(surface, origin, rect)
+                .and_then(|rect| rect.clipped_to_output(self.output_width, self.output_height))
+            else {
+                continue;
+            };
+            self.rects.push(rect);
+        }
+    }
+
+    fn add_render_element(&mut self, element: &RenderSceneElement) {
+        let buffer_size = element.buffer_size();
+        for rect in element
+            .damage()
+            .clipped_rects(buffer_size.width, buffer_size.height)
+        {
+            let Some(rect) = NativeDamageRect::from_render_element_damage(element, rect)
                 .and_then(|rect| rect.clipped_to_output(self.output_width, self.output_height))
             else {
                 continue;
@@ -4019,6 +4460,21 @@ impl NativeDamageAccumulator {
     fn into_output_damage(self) -> NativeOutputDamage {
         NativeOutputDamage::surface_damage(self.rects)
     }
+}
+
+fn native_element_bounds_by_id(
+    output_width: u32,
+    output_height: u32,
+    elements: &[RenderSceneElement],
+) -> HashMap<RenderSceneElementId, NativeDamageRect> {
+    elements
+        .iter()
+        .filter_map(|element| {
+            let rect = NativeDamageRect::from_render_element_bounds(element)?
+                .clipped_to_output(output_width, output_height)?;
+            Some((element.id(), rect))
+        })
+        .collect()
 }
 
 fn native_output_damage_for_repaint(
@@ -4253,20 +4709,15 @@ fn native_cursor_argb_bytes(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeScanoutPreference {
     Auto,
-    GbmEglPageFlip,
+    NativeEglGbm,
+    GbmCpuWritePageFlip,
     DumbFramebuffer,
 }
 
 impl NativeScanoutPreference {
     fn from_env() -> Self {
         match std::env::var("OBLIVION_ONE_SCANOUT_BACKEND") {
-            Ok(value) if matches!(value.as_str(), "gbm" | "egl" | "pageflip" | "gbm-egl") => {
-                Self::GbmEglPageFlip
-            }
-            Ok(value) if matches!(value.as_str(), "dumb" | "framebuffer" | "legacy") => {
-                Self::DumbFramebuffer
-            }
-            Ok(value) if value == "auto" => Self::Auto,
+            Ok(value) if Self::is_known_value(&value) => Self::parse(&value),
             Ok(value) => {
                 eprintln!(
                     "native scanout: unknown OBLIVION_ONE_SCANOUT_BACKEND={value:?}; using auto"
@@ -4275,6 +4726,55 @@ impl NativeScanoutPreference {
             }
             Err(_) => Self::Auto,
         }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "auto" => Self::Auto,
+            "gpu" | "native" | "native-gpu" | "native-egl-gbm" | "egl-gbm" | "gles-gbm"
+            | "egl-gles-gbm" => Self::NativeEglGbm,
+            "gbm-cpu-write"
+            | "gbm-cpu-write-pageflip"
+            | "cpu-gbm-write"
+            | "cpu-gbm-pageflip"
+            | "cpu"
+            | "cpu-gbm"
+            | "gbm"
+            | "egl"
+            | "pageflip"
+            | "gbm-egl"
+            | "gbm-egl-pageflip" => Self::GbmCpuWritePageFlip,
+            "dumb" | "framebuffer" | "legacy" => Self::DumbFramebuffer,
+            _ => Self::Auto,
+        }
+    }
+
+    fn is_known_value(value: &str) -> bool {
+        matches!(
+            value,
+            "auto"
+                | "gpu"
+                | "native"
+                | "native-gpu"
+                | "native-egl-gbm"
+                | "egl-gbm"
+                | "gles-gbm"
+                | "egl-gles-gbm"
+                | "gbm-cpu-write"
+                | "gbm-cpu-write-pageflip"
+                | "cpu-gbm-write"
+                | "cpu-gbm-pageflip"
+                | "cpu"
+                | "cpu-gbm"
+                | "gbm"
+                | "egl"
+                | "pageflip"
+                | "gbm-egl"
+                | "gbm-egl-pageflip"
+                | "dumb"
+                | "framebuffer"
+                | "legacy"
+        )
     }
 }
 
@@ -4295,15 +4795,24 @@ struct NativeScanoutPlan {
 impl NativeScanoutPlan {
     fn choose(choice: NativeScanoutChoice) -> Self {
         match choice.preference {
-            NativeScanoutPreference::GbmEglPageFlip
+            NativeScanoutPreference::NativeEglGbm
                 if choice.gbm_available && choice.egl_available && choice.page_flip_available =>
             {
                 Self {
-                    primary: NativeScanoutKind::GbmEglPageFlip,
+                    primary: NativeScanoutKind::NativeEglGbm,
                     fallbacks: Vec::new(),
                 }
             }
-            NativeScanoutPreference::GbmEglPageFlip => Self::unavailable(),
+            NativeScanoutPreference::NativeEglGbm => Self::unavailable(),
+            NativeScanoutPreference::GbmCpuWritePageFlip
+                if choice.gbm_available && choice.page_flip_available =>
+            {
+                Self {
+                    primary: NativeScanoutKind::GbmCpuWritePageFlip,
+                    fallbacks: Vec::new(),
+                }
+            }
+            NativeScanoutPreference::GbmCpuWritePageFlip => Self::unavailable(),
             NativeScanoutPreference::DumbFramebuffer => Self {
                 primary: NativeScanoutKind::DumbFramebuffer,
                 fallbacks: Vec::new(),
@@ -4312,7 +4821,16 @@ impl NativeScanoutPlan {
                 if choice.gbm_available && choice.egl_available && choice.page_flip_available =>
             {
                 Self {
-                    primary: NativeScanoutKind::GbmEglPageFlip,
+                    primary: NativeScanoutKind::NativeEglGbm,
+                    fallbacks: vec![
+                        NativeScanoutKind::GbmCpuWritePageFlip,
+                        NativeScanoutKind::DumbFramebuffer,
+                    ],
+                }
+            }
+            NativeScanoutPreference::Auto if choice.gbm_available && choice.page_flip_available => {
+                Self {
+                    primary: NativeScanoutKind::GbmCpuWritePageFlip,
                     fallbacks: vec![NativeScanoutKind::DumbFramebuffer],
                 }
             }
@@ -4333,9 +4851,26 @@ impl NativeScanoutPlan {
     fn candidates(&self) -> impl Iterator<Item = NativeScanoutKind> + '_ {
         std::iter::once(self.primary).chain(self.fallbacks.iter().copied())
     }
+
+    fn after_failed(&self, failed: NativeScanoutKind) -> Self {
+        let mut remaining = self
+            .candidates()
+            .skip_while(|candidate| *candidate != failed)
+            .skip(1)
+            .collect::<Vec<_>>();
+        if remaining.is_empty() {
+            return Self::unavailable();
+        }
+        let primary = remaining.remove(0);
+        Self {
+            primary,
+            fallbacks: remaining,
+        }
+    }
 }
 
 enum NativeScanoutBackend {
+    NativeEglGbm(Box<NativeEglGbmScanout>),
     Gbm(NativeGbmScanout),
     Dumb(DumbFramebuffer),
 }
@@ -4365,7 +4900,17 @@ impl NativeScanoutBackend {
         height: u32,
     ) -> io::Result<Self> {
         match kind {
-            NativeScanoutKind::GbmEglPageFlip => {
+            NativeScanoutKind::NativeEglGbm => {
+                if native_test_fail_native_egl_gbm_enabled() {
+                    return Err(io::Error::other(
+                        "native EGL/GBM failure injected by OBLIVION_ONE_TEST_FAIL_NATIVE_EGL_GBM",
+                    ));
+                }
+                Ok(Self::NativeEglGbm(Box::new(NativeEglGbmScanout::create(
+                    kms, width, height,
+                )?)))
+            }
+            NativeScanoutKind::GbmCpuWritePageFlip => {
                 Ok(Self::Gbm(NativeGbmScanout::create(kms, width, height)?))
             }
             NativeScanoutKind::DumbFramebuffer => {
@@ -4379,9 +4924,14 @@ impl NativeScanoutBackend {
 
     const fn kind(&self) -> NativeScanoutKind {
         match self {
-            Self::Gbm(_) => NativeScanoutKind::GbmEglPageFlip,
+            Self::NativeEglGbm(_) => NativeScanoutKind::NativeEglGbm,
+            Self::Gbm(_) => NativeScanoutKind::GbmCpuWritePageFlip,
             Self::Dumb(_) => NativeScanoutKind::DumbFramebuffer,
         }
+    }
+
+    const fn supports_gpu_buffer_protocols(&self) -> bool {
+        matches!(self, Self::NativeEglGbm(_))
     }
 
     fn paint_server_frame(
@@ -4393,6 +4943,9 @@ impl NativeScanoutBackend {
         damage: &NativeOutputDamage,
     ) -> io::Result<NativePaintStats> {
         match self {
+            Self::NativeEglGbm(scanout) => {
+                scanout.paint_server_frame(renderer, server, input_state, cursor_mode)
+            }
             Self::Gbm(scanout) => {
                 scanout.paint_server_frame(renderer, server, input_state, cursor_mode, damage)
             }
@@ -4404,33 +4957,40 @@ impl NativeScanoutBackend {
 
     fn fb_id(&self) -> u32 {
         match self {
+            Self::NativeEglGbm(scanout) => scanout.fb_id(),
             Self::Gbm(scanout) => scanout.fb_id(),
             Self::Dumb(framebuffer) => framebuffer.fb_id,
         }
     }
 
     fn finish_initial_scanout(&mut self) {
-        if let Self::Gbm(scanout) = self {
-            scanout.finish_initial_scanout();
+        match self {
+            Self::NativeEglGbm(scanout) => scanout.finish_initial_scanout(),
+            Self::Gbm(scanout) => scanout.finish_initial_scanout(),
+            Self::Dumb(_) => {}
         }
     }
 
     fn present(&mut self, fd: BorrowedFd<'_>, crtc_id: u32) -> io::Result<()> {
-        if let Self::Gbm(scanout) = self {
-            scanout.present(fd, crtc_id)?;
+        match self {
+            Self::NativeEglGbm(scanout) => scanout.present(fd, crtc_id)?,
+            Self::Gbm(scanout) => scanout.present(fd, crtc_id)?,
+            Self::Dumb(_) => {}
         }
         Ok(())
     }
 
     fn drain_page_flip_events(&mut self, fd: RawFd) -> io::Result<bool> {
-        if let Self::Gbm(scanout) = self {
-            return scanout.drain_page_flip_events(fd);
+        match self {
+            Self::NativeEglGbm(scanout) => scanout.drain_page_flip_events(fd),
+            Self::Gbm(scanout) => scanout.drain_page_flip_events(fd),
+            Self::Dumb(_) => Ok(false),
         }
-        Ok(false)
     }
 
     fn page_flip_pending(&self) -> bool {
         match self {
+            Self::NativeEglGbm(scanout) => scanout.page_flip_pending(),
             Self::Gbm(scanout) => scanout.page_flip_pending(),
             Self::Dumb(_) => false,
         }
@@ -4439,6 +4999,35 @@ impl NativeScanoutBackend {
     fn frames_complete_immediately(&self) -> bool {
         matches!(self, Self::Dumb(_))
     }
+
+    fn dmabuf_feedback(&self) -> EglGlesDmabufFeedback {
+        match self {
+            Self::NativeEglGbm(scanout) => scanout.dmabuf_feedback.clone(),
+            Self::Gbm(_) | Self::Dumb(_) => EglGlesDmabufFeedback::new(Vec::new()),
+        }
+    }
+
+    fn dmabuf_main_device(&self) -> Option<u64> {
+        match self {
+            Self::NativeEglGbm(scanout) => scanout.dmabuf_main_device,
+            Self::Gbm(_) | Self::Dumb(_) => None,
+        }
+    }
+
+    fn dmabuf_main_device_path(&self) -> Option<String> {
+        match self {
+            Self::NativeEglGbm(scanout) => scanout.dmabuf_main_device_path.clone(),
+            Self::Gbm(_) | Self::Dumb(_) => None,
+        }
+    }
+}
+
+fn apply_native_scanout_feedback(server: &mut OwnCompositorServer, scanout: &NativeScanoutBackend) {
+    server.set_dmabuf_feedback(
+        scanout.dmabuf_feedback(),
+        scanout.dmabuf_main_device(),
+        scanout.dmabuf_main_device_path(),
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4470,6 +5059,432 @@ impl NativePageFlipState {
         self.pending = false;
         was_pending
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativePageFlipBuffers<T> {
+    current: Option<T>,
+    ready: Option<T>,
+    pending: Option<T>,
+}
+
+impl<T> Default for NativePageFlipBuffers<T> {
+    fn default() -> Self {
+        Self {
+            current: None,
+            ready: None,
+            pending: None,
+        }
+    }
+}
+
+impl<T> NativePageFlipBuffers<T> {
+    fn set_ready(&mut self, buffer: T) {
+        self.ready = Some(buffer);
+    }
+
+    fn ready_or_current(&self) -> Option<&T> {
+        self.ready.as_ref().or(self.current.as_ref())
+    }
+
+    fn finish_initial_scanout(&mut self) {
+        if let Some(buffer) = self.ready.take() {
+            self.current = Some(buffer);
+        }
+    }
+
+    fn take_ready(&mut self) -> Option<T> {
+        self.ready.take()
+    }
+
+    fn restore_ready(&mut self, buffer: T) {
+        self.ready = Some(buffer);
+    }
+
+    fn set_pending(&mut self, buffer: T) {
+        self.pending = Some(buffer);
+    }
+
+    fn complete_page_flip(&mut self) -> bool {
+        let Some(buffer) = self.pending.take() else {
+            return false;
+        };
+        self.current = Some(buffer);
+        true
+    }
+}
+
+struct NativeEglGbmScanout {
+    _device: gbm::Device<OwnedFd>,
+    surface: gbm::Surface<()>,
+    fd: RawFd,
+    width: u32,
+    height: u32,
+    egl: EglInstance,
+    egl_display: egl::Display,
+    egl_context: egl::Context,
+    egl_surface: egl::Surface,
+    scene: GlesSceneRenderer,
+    swap_buffers_with_damage: Option<EglSwapBuffersWithDamage>,
+    dmabuf_feedback: EglGlesDmabufFeedback,
+    dmabuf_main_device: Option<u64>,
+    dmabuf_main_device_path: Option<String>,
+    framebuffer_cache: NativeGbmFramebufferCache,
+    buffers: NativePageFlipBuffers<NativePresentedGbmBuffer>,
+    page_flip: NativePageFlipState,
+}
+
+// A locked GBM front buffer must stay alive while KMS may scan it out. Ready is
+// not on KMS yet, pending is waiting for the DRM event, and current is the last
+// completed pageflip/modeset buffer. Dropping this value releases the GBM BO
+// back to the surface, so transitions are driven only by modeset/pageflip state.
+struct NativePresentedGbmBuffer {
+    _bo: gbm::BufferObject<()>,
+    fb_id: u32,
+}
+
+#[derive(Debug, Default)]
+struct NativeGbmFramebufferCache {
+    entries: HashMap<NativeGbmFramebufferMetadata, u32>,
+}
+
+impl NativeGbmFramebufferCache {
+    fn fb_id_for(&mut self, fd: BorrowedFd<'_>, bo: &gbm::BufferObject<()>) -> io::Result<u32> {
+        let metadata = NativeGbmFramebufferMetadata::from_bo(bo);
+        if let Some(fb_id) = self.entries.get(&metadata) {
+            return Ok(*fb_id);
+        }
+        let fb_id = add_gbm_framebuffer(fd, bo)?;
+        self.entries.insert(metadata, fb_id);
+        Ok(fb_id)
+    }
+
+    fn clear(&mut self, fd: BorrowedFd<'_>) {
+        for (_, fb_id) in self.entries.drain() {
+            let _ = drm_ffi::mode::rm_fb(fd, fb_id);
+        }
+    }
+}
+
+impl NativeEglGbmScanout {
+    fn create(kms: &fs::File, width: u32, height: u32) -> io::Result<Self> {
+        let gbm_fd = duplicate_fd_cloexec(kms.as_raw_fd()).map_err(io::Error::from_raw_os_error)?;
+        let device = gbm::Device::new(gbm_fd)?;
+        let usage = gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING;
+        if !device.is_format_supported(gbm::Format::Xrgb8888, usage) {
+            return Err(io::Error::other(
+                "GBM device does not support renderable XRGB8888 scanout surfaces",
+            ));
+        }
+        let surface = device.create_surface(width, height, gbm::Format::Xrgb8888, usage)?;
+
+        let egl = unsafe { EglInstance::load_required() }.map_err(native_egl_io_error)?;
+        const EGL_PLATFORM_GBM_KHR: egl::Enum = 0x31d7;
+        // EGL_PLATFORM_GBM_KHR requires a gbm_device pointer, not a DRM fd cast
+        // to a pointer. The GBM device is kept alive by NativeEglGbmScanout.
+        let egl_display = match unsafe {
+            egl.get_platform_display(
+                EGL_PLATFORM_GBM_KHR,
+                device.as_raw_mut() as egl::NativeDisplayType,
+                &[egl::ATTRIB_NONE],
+            )
+        } {
+            Ok(display) => display,
+            Err(error) => return Err(native_egl_io_error(error)),
+        };
+        if let Err(error) = egl.initialize(egl_display) {
+            let _ = egl.terminate(egl_display);
+            return Err(native_egl_io_error(error));
+        }
+        if let Err(error) = egl.bind_api(egl::OPENGL_ES_API) {
+            let _ = egl.terminate(egl_display);
+            return Err(native_egl_io_error(error));
+        }
+        let egl_config =
+            match choose_native_egl_config(&egl, egl_display, gbm::Format::Xrgb8888 as u32) {
+                Ok(config) => config,
+                Err(error) => {
+                    let _ = egl.terminate(egl_display);
+                    return Err(native_egl_io_error(error));
+                }
+            };
+        let egl_context = match create_gles_context(&egl, egl_display, egl_config) {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = egl.terminate(egl_display);
+                return Err(native_egl_io_error(error));
+            }
+        };
+        let egl_surface = match unsafe {
+            egl.create_platform_window_surface(
+                egl_display,
+                egl_config,
+                surface.as_raw_mut() as egl::NativeWindowType,
+                &[egl::ATTRIB_NONE],
+            )
+        } {
+            Ok(surface) => surface,
+            Err(error) => {
+                let _ = egl.destroy_context(egl_display, egl_context);
+                let _ = egl.terminate(egl_display);
+                return Err(native_egl_io_error(error));
+            }
+        };
+        if let Err(error) = egl.make_current(
+            egl_display,
+            Some(egl_surface),
+            Some(egl_surface),
+            Some(egl_context),
+        ) {
+            let _ = egl.destroy_surface(egl_display, egl_surface);
+            let _ = egl.destroy_context(egl_display, egl_context);
+            let _ = egl.terminate(egl_display);
+            return Err(native_egl_io_error(error));
+        }
+        if let Err(error) = egl.swap_interval(egl_display, 1) {
+            eprintln!("native EGL/GBM: EGL swap interval unavailable: {error}");
+        }
+
+        let egl_image_target_texture_2d: Option<GlEglImageTargetTexture2DOes> =
+            load_egl_image_target_texture_2d(&egl).or_else(|| {
+                eprintln!(
+                    "native EGL/GBM: GL_OES_EGL_image entry point unavailable; dmabuf surfaces will be skipped"
+                );
+                None
+            });
+        let scene = match GlesSceneRenderer::new_current(
+            &egl,
+            width,
+            height,
+            egl_image_target_texture_2d,
+        ) {
+            Ok(scene) => scene,
+            Err(error) => {
+                let _ = egl.make_current(egl_display, None, None, None);
+                let _ = egl.destroy_surface(egl_display, egl_surface);
+                let _ = egl.destroy_context(egl_display, egl_context);
+                let _ = egl.terminate(egl_display);
+                return Err(native_egl_io_error(error));
+            }
+        };
+        let swap_buffers_with_damage = load_swap_buffers_with_damage(&egl, egl_display);
+        let dmabuf_feedback = query_egl_dmabuf_feedback(&egl, egl_display);
+        let (dmabuf_main_device_path, dmabuf_main_device) =
+            match query_egl_main_device(&egl, egl_display) {
+                Some((path, main_device)) => (Some(path), Some(main_device)),
+                None => (None, None),
+            };
+        let vendor = egl
+            .query_string(Some(egl_display), egl::VENDOR)
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "unknown".to_string());
+        let version = egl
+            .query_string(Some(egl_display), egl::VERSION)
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "unknown".to_string());
+        let gl_info = scene.renderer_info();
+        println!(
+            "native EGL/GBM renderer active: EGL {vendor} {version}; GL {} {} ({}) on {}",
+            gl_info.vendor,
+            gl_info.renderer,
+            gl_info.version,
+            device.backend_name()
+        );
+
+        Ok(Self {
+            _device: device,
+            surface,
+            fd: kms.as_raw_fd(),
+            width,
+            height,
+            egl,
+            egl_display,
+            egl_context,
+            egl_surface,
+            scene,
+            swap_buffers_with_damage,
+            dmabuf_feedback,
+            dmabuf_main_device,
+            dmabuf_main_device_path,
+            framebuffer_cache: NativeGbmFramebufferCache::default(),
+            buffers: NativePageFlipBuffers::default(),
+            page_flip: NativePageFlipState::default(),
+        })
+    }
+
+    fn paint_server_frame(
+        &mut self,
+        renderer: &mut NativeFrameRenderer,
+        server: &OwnCompositorServer,
+        input_state: &NativeInputState,
+        cursor_mode: NativeCursorRenderMode,
+    ) -> io::Result<NativePaintStats> {
+        if !self.surface.has_free_buffers() {
+            return Err(io::Error::other(
+                "native EGL/GBM surface has no free buffers",
+            ));
+        }
+
+        let total_start = Instant::now();
+        self.egl
+            .make_current(
+                self.egl_display,
+                Some(self.egl_surface),
+                Some(self.egl_surface),
+                Some(self.egl_context),
+            )
+            .map_err(native_egl_io_error)?;
+        let request = renderer.egl_scene_draw_request(
+            self.width,
+            self.height,
+            server,
+            input_state,
+            cursor_mode,
+        );
+        let draw_start = Instant::now();
+        let output_damage = self
+            .scene
+            .draw_scene(&self.egl, self.egl_display, request)
+            .map_err(native_egl_io_error)?;
+        let draw_us = elapsed_micros(draw_start);
+        let scene_stats = self.scene.last_frame_stats();
+        let swap_start = Instant::now();
+        egl_swap_buffers_with_damage(
+            &self.egl,
+            self.egl_display,
+            self.egl_surface,
+            self.swap_buffers_with_damage,
+            output_damage,
+        )
+        .map_err(native_egl_io_error)?;
+        let swap_us = elapsed_micros(swap_start);
+        let bo = unsafe { self.surface.lock_front_buffer() }.map_err(|error| {
+            io::Error::other(format!("failed to lock GBM front buffer: {error}"))
+        })?;
+        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        let fb_id = self.framebuffer_cache.fb_id_for(fd, &bo)?;
+        self.buffers
+            .set_ready(NativePresentedGbmBuffer { _bo: bo, fb_id });
+        Ok(native_egl_gbm_paint_stats(
+            self.width,
+            self.height,
+            draw_us,
+            swap_us,
+            elapsed_micros(total_start),
+            scene_stats,
+        ))
+    }
+
+    fn fb_id(&self) -> u32 {
+        self.buffers
+            .ready_or_current()
+            .map(|buffer| buffer.fb_id)
+            .unwrap_or(0)
+    }
+
+    fn finish_initial_scanout(&mut self) {
+        self.buffers.finish_initial_scanout();
+    }
+
+    fn present(&mut self, fd: BorrowedFd<'_>, crtc_id: u32) -> io::Result<()> {
+        if !self.page_flip.can_schedule() {
+            return Ok(());
+        }
+        let Some(buffer) = self.buffers.take_ready() else {
+            return Ok(());
+        };
+        self.page_flip
+            .mark_scheduled()
+            .map_err(|_| io::Error::other("native page flip is already pending"))?;
+        match drm_ffi::mode::page_flip(
+            fd,
+            crtc_id,
+            buffer.fb_id,
+            drm_sys::DRM_MODE_PAGE_FLIP_EVENT,
+            0,
+        ) {
+            Ok(()) => {
+                self.buffers.set_pending(buffer);
+                Ok(())
+            }
+            Err(error) => {
+                self.page_flip.mark_presented();
+                self.buffers.restore_ready(buffer);
+                Err(error)
+            }
+        }
+    }
+
+    fn drain_page_flip_events(&mut self, fd: RawFd) -> io::Result<bool> {
+        let completed = drain_drm_page_flip_events(fd)?;
+        if completed == 0 {
+            return Ok(false);
+        }
+        let had_pending = self.buffers.complete_page_flip();
+        Ok(self.page_flip.mark_presented() || had_pending)
+    }
+
+    fn page_flip_pending(&self) -> bool {
+        !self.page_flip.can_schedule()
+    }
+}
+
+impl Drop for NativeEglGbmScanout {
+    fn drop(&mut self) {
+        // GL textures/EGLImages are destroyed while the context is current.
+        // DRM framebuffer IDs are removed before the locked GBM BO guards drop.
+        let _ = self.egl.make_current(
+            self.egl_display,
+            Some(self.egl_surface),
+            Some(self.egl_surface),
+            Some(self.egl_context),
+        );
+        self.scene.destroy(&self.egl, self.egl_display);
+        let _ = self.egl.make_current(self.egl_display, None, None, None);
+        let _ = self.egl.destroy_surface(self.egl_display, self.egl_surface);
+        let _ = self.egl.destroy_context(self.egl_display, self.egl_context);
+        let _ = self.egl.terminate(self.egl_display);
+        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        self.framebuffer_cache.clear(fd);
+    }
+}
+
+fn native_egl_gbm_paint_stats(
+    width: u32,
+    height: u32,
+    draw_us: u64,
+    swap_us: u64,
+    total_us: u64,
+    scene_stats: GlesSceneFrameStats,
+) -> NativePaintStats {
+    NativePaintStats {
+        backend: NativeScanoutKind::NativeEglGbm,
+        width,
+        height,
+        bytes: 0,
+        copy_bytes: 0,
+        write_bytes: 0,
+        gpu_draw_us: draw_us,
+        egl_swap_us: swap_us,
+        shm_upload_bytes: scene_stats.shm_upload_bytes,
+        dmabuf_imports: scene_stats.dmabuf_imports,
+        dmabuf_reuses: scene_stats.dmabuf_reuses,
+        dmabuf_import_failures: scene_stats.dmabuf_import_failures,
+        scene_rebuild: if scene_stats.scene_rebuilt {
+            DesktopSceneRebuildKind::Full
+        } else {
+            DesktopSceneRebuildKind::None
+        },
+        frame_copy: DesktopFrameCopyKind::None,
+        total_us,
+        render_us: draw_us,
+        copy_us: 0,
+        write_us: 0,
+    }
+}
+
+fn native_egl_io_error(error: impl std::fmt::Display) -> io::Error {
+    io::Error::other(error.to_string())
 }
 
 struct NativeGbmScanout {
@@ -4568,12 +5583,18 @@ impl NativeGbmScanout {
         let write_us = elapsed_micros(write_start);
         self.ready_index = Some(index);
         Ok(NativePaintStats {
-            backend: NativeScanoutKind::GbmEglPageFlip,
+            backend: NativeScanoutKind::GbmCpuWritePageFlip,
             width: self.width,
             height: self.height,
             bytes: byte_len,
             copy_bytes,
             write_bytes: byte_len,
+            gpu_draw_us: 0,
+            egl_swap_us: 0,
+            shm_upload_bytes: 0,
+            dmabuf_imports: 0,
+            dmabuf_reuses: 0,
+            dmabuf_import_failures: 0,
             scene_rebuild: rendered.scene_rebuild_kind,
             frame_copy: rendered.frame_copy_kind,
             total_us: elapsed_micros(total_start),
@@ -4668,7 +5689,7 @@ impl Drop for NativeGbmScanout {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct NativeGbmFramebufferMetadata {
     width: u32,
     height: u32,
@@ -4874,6 +5895,12 @@ impl DumbFramebuffer {
             bytes: self.size,
             copy_bytes,
             write_bytes: 0,
+            gpu_draw_us: 0,
+            egl_swap_us: 0,
+            shm_upload_bytes: 0,
+            dmabuf_imports: 0,
+            dmabuf_reuses: 0,
+            dmabuf_import_failures: 0,
             scene_rebuild: rendered.scene_rebuild_kind,
             frame_copy: rendered.frame_copy_kind,
             total_us: elapsed_micros(total_start),
@@ -4937,6 +5964,173 @@ impl Drop for CrtcRestore {
             );
         }
     }
+}
+
+fn probe_native_egl_gbm_device(bootstrap: &NativeOutputBootstrap, perf: &NativePerfLogger) {
+    if bootstrap.kms_device.is_none() || bootstrap.render_device.is_none() {
+        perf.log("native.egl_probe", || {
+            vec![
+                NativePerfField::str("status", "skipped"),
+                NativePerfField::str("reason", "missing_kms_or_render_device"),
+            ]
+        });
+        return;
+    }
+
+    let kms_device = bootstrap.kms_device.as_deref().unwrap();
+    let render_device = bootstrap.render_device.as_deref().unwrap();
+
+    let egl = match unsafe { egl::DynamicInstance::<egl::EGL1_5>::load_required() } {
+        Ok(egl) => egl,
+        Err(e) => {
+            perf.log("native.egl_probe", || {
+                vec![
+                    NativePerfField::str("status", "failed"),
+                    NativePerfField::str("reason", "egl_load_failed"),
+                    NativePerfField::str("error", e.to_string()),
+                ]
+            });
+            return;
+        }
+    };
+
+    let display_fd = match OpenOptions::new().read(true).write(true).open(kms_device) {
+        Ok(fd) => fd,
+        Err(e) => {
+            perf.log("native.egl_probe", || {
+                vec![
+                    NativePerfField::str("status", "failed"),
+                    NativePerfField::str("reason", "kms_device_open_failed"),
+                    NativePerfField::str("device", kms_device.display().to_string()),
+                    NativePerfField::str("error", e.to_string()),
+                ]
+            });
+            return;
+        }
+    };
+    let gbm_device = match gbm::Device::new(display_fd) {
+        Ok(device) => device,
+        Err(e) => {
+            perf.log("native.egl_probe", || {
+                vec![
+                    NativePerfField::str("status", "failed"),
+                    NativePerfField::str("reason", "gbm_device_create_failed"),
+                    NativePerfField::str("device", kms_device.display().to_string()),
+                    NativePerfField::str("error", e.to_string()),
+                ]
+            });
+            return;
+        }
+    };
+
+    const EGL_PLATFORM_GBM_KHR: egl::Enum = 0x31d7;
+    // The GBM platform native display is the gbm_device pointer. Passing the
+    // integer DRM fd as a pointer makes the probe succeed/fail for the wrong
+    // reason on different EGL stacks.
+    let display = match unsafe {
+        egl.get_platform_display(
+            EGL_PLATFORM_GBM_KHR,
+            gbm_device.as_raw_mut() as egl::NativeDisplayType,
+            &[egl::ATTRIB_NONE],
+        )
+    } {
+        Ok(display) => display,
+        Err(_) => {
+            perf.log("native.egl_probe", || {
+                vec![
+                    NativePerfField::str("status", "failed"),
+                    NativePerfField::str("reason", "get_platform_display_failed"),
+                ]
+            });
+            return;
+        }
+    };
+
+    let (major, minor) = match egl.initialize(display) {
+        Ok(version) => version,
+        Err(_) => {
+            perf.log("native.egl_probe", || {
+                vec![
+                    NativePerfField::str("status", "failed"),
+                    NativePerfField::str("reason", "egl_initialize_failed"),
+                ]
+            });
+            let _ = egl.terminate(display);
+            return;
+        }
+    };
+
+    let vendor_str = egl
+        .query_string(Some(display), egl::VENDOR)
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let version_str = egl
+        .query_string(Some(display), egl::VERSION)
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext_str = egl
+        .query_string(Some(display), egl::EXTENSIONS)
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let has_dmabuf_import = ext_str.contains("EGL_EXT_image_dma_buf_import");
+    let has_dmabuf_import_modifiers = ext_str.contains("EGL_EXT_image_dma_buf_import_modifiers");
+    let has_native_fence_sync =
+        ext_str.contains("EGL_ANDROID_native_fence_sync") || ext_str.contains("EGL_KHR_fence_sync");
+    let has_surfaceless = ext_str.contains("EGL_KHR_surfaceless_context");
+    let has_pbuffer = ext_str.contains("EGL_KHR_pbuffer_context");
+
+    let config_count = egl.get_config_count(display).unwrap_or_default();
+    let has_config = choose_egl_config(&egl, display).is_ok();
+    let has_native_xrgb_config =
+        choose_native_egl_config(&egl, display, gbm::Format::Xrgb8888 as u32).is_ok();
+
+    let feedback = query_egl_dmabuf_feedback(&egl, display);
+    let (main_device_path, main_device) = query_egl_main_device(&egl, display)
+        .map(|(path, device)| (Some(path), Some(device)))
+        .unwrap_or((None, None));
+
+    let table_format_count = feedback.format_table_formats().len();
+    let tranche_format_count = feedback.formats().len();
+    let has_nvidia_modifiers = feedback
+        .formats()
+        .iter()
+        .any(|f| (f.modifier.0 & 0xff00_0000_0000_0000) == 0x0300_0000_0000_0000);
+
+    perf.log("native.egl_probe", || {
+        vec![
+            NativePerfField::str("status", "success"),
+            NativePerfField::str("vendor", &vendor_str),
+            NativePerfField::str("version", &version_str),
+            NativePerfField::str("kms_device", kms_device.display().to_string()),
+            NativePerfField::str("render_device", render_device.display().to_string()),
+            NativePerfField::u64("major", major as u64),
+            NativePerfField::u64("minor", minor as u64),
+            NativePerfField::bool("has_config", has_config),
+            NativePerfField::bool("has_native_xrgb_config", has_native_xrgb_config),
+            NativePerfField::u64("config_count", config_count as u64),
+            NativePerfField::bool("dmabuf_import", has_dmabuf_import),
+            NativePerfField::bool("dmabuf_import_modifiers", has_dmabuf_import_modifiers),
+            NativePerfField::bool("native_fence_sync", has_native_fence_sync),
+            NativePerfField::bool("surfaceless_context", has_surfaceless),
+            NativePerfField::bool("pbuffer_context", has_pbuffer),
+            NativePerfField::u64("table_format_count", table_format_count as u64),
+            NativePerfField::u64("tranche_format_count", tranche_format_count as u64),
+            NativePerfField::bool("has_nvidia_modifiers", has_nvidia_modifiers),
+            NativePerfField::str(
+                "main_device",
+                main_device
+                    .map(|d| d.to_string())
+                    .unwrap_or("none".to_string()),
+            ),
+            NativePerfField::str(
+                "main_device_path",
+                main_device_path.unwrap_or("none".to_string()),
+            ),
+        ]
+    });
+
+    let _ = egl.terminate(display);
 }
 
 #[cfg(test)]
@@ -5102,6 +6296,13 @@ fn native_scanout_forced() -> bool {
     std::env::var_os("OBLIVION_ONE_NATIVE_SCANOUT").is_some_and(|value| value == "1")
 }
 
+fn native_test_fail_native_egl_gbm_enabled() -> bool {
+    if !cfg!(any(test, debug_assertions)) {
+        return false;
+    }
+    std::env::var_os("OBLIVION_ONE_TEST_FAIL_NATIVE_EGL_GBM").is_some_and(|value| value == "1")
+}
+
 fn connected_connector_for_card(
     kms_device: Option<&Path>,
     sysfs_drm_root: &Path,
@@ -5170,9 +6371,10 @@ mod tests {
     use super::*;
     use oblivion_one::compositor::{
         DesktopVisualState, RenderableSurfaceDamage, SurfaceDamageRect, SurfacePlacement,
-        compose_nested_output,
+        compose_nested_output, render_scene_elements_for_surfaces, surface_origins,
     };
     use oblivion_one::render_backend::buffer::{BufferSize, CommittedSurfaceBuffer};
+    use oblivion_one::{CompositorAppGpuPreference, EffectiveCompositorAppGpuPolicy};
 
     #[test]
     fn connected_connector_for_card_prefers_connected_matching_card_output() {
@@ -5201,6 +6403,28 @@ mod tests {
         assert_eq!(connector.enabled.as_deref(), Some("enabled"));
         assert_eq!(connector.preferred_mode(), Some("1920x1080"));
         assert_eq!(connector.vrr_capable, Some(true));
+    }
+
+    #[test]
+    fn matching_render_node_for_card_uses_same_drm_device_directory() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("native-render-node-tests")
+            .join(std::process::id().to_string());
+        let sysfs = root.join("sys");
+        let dri = root.join("dev").join("dri");
+        let drm_dir = sysfs.join("card2").join("device").join("drm");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&drm_dir).unwrap();
+        fs::create_dir_all(&dri).unwrap();
+        fs::create_dir_all(drm_dir.join("renderD130")).unwrap();
+        fs::create_dir_all(drm_dir.join("card2")).unwrap();
+
+        let render = matching_render_node_for_card(Path::new("/dev/dri/card2"), &sysfs, &dri);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(render, Some(dri.join("renderD130")));
     }
 
     #[test]
@@ -5269,14 +6493,135 @@ mod tests {
             &[
                 NativePerfField::str("program", "zen browser"),
                 NativePerfField::u64("pid", 4242),
-                NativePerfField::bool("gpu", false),
+                NativePerfField::str("app_policy", "accelerated"),
             ],
         );
 
         assert_eq!(
             line,
-            "perf app.spawn program=\"zen browser\" pid=4242 gpu=false"
+            "perf app.spawn program=\"zen browser\" pid=4242 app_policy=accelerated"
         );
+    }
+
+    #[test]
+    fn native_app_gpu_preference_parses_explicit_values() {
+        assert_eq!(
+            CompositorAppGpuPreference::from_native_env_value(None),
+            CompositorAppGpuPreference::Auto
+        );
+        assert_eq!(
+            CompositorAppGpuPreference::parse("accelerated"),
+            CompositorAppGpuPreference::Accelerated
+        );
+        assert_eq!(
+            CompositorAppGpuPreference::parse("gpu"),
+            CompositorAppGpuPreference::Accelerated
+        );
+        assert_eq!(
+            CompositorAppGpuPreference::parse("auto"),
+            CompositorAppGpuPreference::Auto
+        );
+        assert_eq!(
+            CompositorAppGpuPreference::parse("cpu"),
+            CompositorAppGpuPreference::CpuOnly
+        );
+        assert_eq!(
+            CompositorAppGpuPreference::parse("software"),
+            CompositorAppGpuPreference::CpuOnly
+        );
+        assert_eq!(
+            CompositorAppGpuPreference::parse("unknown"),
+            CompositorAppGpuPreference::Auto
+        );
+    }
+
+    #[test]
+    fn native_app_gpu_policy_resolves_from_active_scanout_backend() {
+        assert_eq!(
+            resolve_native_app_gpu_policy(
+                CompositorAppGpuPreference::Auto,
+                NativeScanoutKind::NativeEglGbm,
+            )
+            .unwrap(),
+            EffectiveCompositorAppGpuPolicy::Accelerated
+        );
+        assert_eq!(
+            resolve_native_app_gpu_policy(
+                CompositorAppGpuPreference::Auto,
+                NativeScanoutKind::GbmCpuWritePageFlip,
+            )
+            .unwrap(),
+            EffectiveCompositorAppGpuPolicy::CpuOnly
+        );
+        assert_eq!(
+            resolve_native_app_gpu_policy(
+                CompositorAppGpuPreference::CpuOnly,
+                NativeScanoutKind::NativeEglGbm,
+            )
+            .unwrap(),
+            EffectiveCompositorAppGpuPolicy::CpuOnly
+        );
+        assert!(
+            resolve_native_app_gpu_policy(
+                CompositorAppGpuPreference::Accelerated,
+                NativeScanoutKind::DumbFramebuffer,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn native_launch_request_ignores_empty_command() {
+        assert_eq!(
+            native_launch_request(
+                Vec::new(),
+                EffectiveCompositorAppGpuPolicy::CpuOnly,
+                NativeLaunchSource::Startup,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn native_launch_request_preserves_args_policy_and_source() {
+        let request = native_launch_request(
+            vec![
+                "kitty".to_string(),
+                "--title".to_string(),
+                "two words".to_string(),
+            ],
+            EffectiveCompositorAppGpuPolicy::Accelerated,
+            NativeLaunchSource::Startup,
+        )
+        .unwrap();
+
+        assert_eq!(request.program, "kitty");
+        assert_eq!(request.command, "kitty --title 'two words'");
+        assert_eq!(request.argv[2], "two words");
+        assert_eq!(
+            request.gpu_policy,
+            EffectiveCompositorAppGpuPolicy::Accelerated
+        );
+        assert_eq!(request.source, NativeLaunchSource::Startup);
+    }
+
+    #[test]
+    fn native_runtime_error_includes_stage_backend_frame_and_recovery_command() {
+        let error = native_runtime_error(
+            NativeRuntimeStage::Present,
+            NativeScanoutKind::NativeEglGbm,
+            42,
+            1842,
+            io::Error::other("page flip failed"),
+        );
+        let message = error.to_string();
+
+        assert!(message.contains("fatal native GPU runtime error"));
+        assert!(message.contains("stage=present"));
+        assert!(message.contains("backend=native-egl-gbm"));
+        assert!(message.contains("crtc=42"));
+        assert!(message.contains("frame=1842"));
+        assert!(message.contains("OBLIVION_ONE_SCANOUT_BACKEND=cpu"));
     }
 
     #[test]
@@ -5325,6 +6670,36 @@ mod tests {
             }]
         );
         assert_eq!(damage.summary().pixels, 600);
+    }
+
+    #[test]
+    fn native_damage_accumulator_maps_render_scene_element_damage_to_output() {
+        let surface = test_renderable_surface(
+            2,
+            0,
+            0,
+            100,
+            50,
+            RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 10,
+                y: 5,
+                width: 30,
+                height: 20,
+            }]),
+        );
+        let elements = render_scene_elements_for_surfaces(std::slice::from_ref(&surface), 1.0);
+
+        let damage = NativeDamageAccumulator::from_render_elements(200, 120, &elements);
+
+        assert_eq!(
+            damage.rects(),
+            &[NativeDamageRect {
+                x: 82,
+                y: 77,
+                width: 30,
+                height: 20,
+            }]
+        );
     }
 
     #[test]
@@ -5399,7 +6774,42 @@ mod tests {
     }
 
     #[test]
-    fn native_output_damage_for_window_resize_coalesces_nested_old_new_bounds() {
+    fn native_damage_accumulator_render_element_bounds_changes_cover_old_and_new_targets() {
+        let previous = test_renderable_surface(7, 0, 0, 120, 80, RenderableSurfaceDamage::Full);
+        let current = test_renderable_surface(7, 200, 100, 120, 80, RenderableSurfaceDamage::Full);
+        let previous_elements =
+            render_scene_elements_for_surfaces(std::slice::from_ref(&previous), 1.0);
+        let current_elements =
+            render_scene_elements_for_surfaces(std::slice::from_ref(&current), 1.0);
+
+        let damage = NativeDamageAccumulator::from_render_element_bounds_changes(
+            400,
+            300,
+            &previous_elements,
+            &current_elements,
+        );
+
+        assert_eq!(
+            damage.rects(),
+            &[
+                NativeDamageRect {
+                    x: 72,
+                    y: 72,
+                    width: 120,
+                    height: 80,
+                },
+                NativeDamageRect {
+                    x: 272,
+                    y: 172,
+                    width: 120,
+                    height: 80,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn native_output_damage_for_window_resize_covers_rescaled_bounds() {
         let previous = test_renderable_surface(7, 0, 0, 300, 200, RenderableSurfaceDamage::Full);
         let current = RenderableSurface {
             width: 340,
@@ -5426,20 +6836,12 @@ mod tests {
         assert_eq!(damage.kind, NativeDamageKind::SurfaceDamage);
         assert_eq!(
             damage.rects,
-            vec![
-                NativeDamageRect {
-                    x: origin.0,
-                    y: origin.1 + 200,
-                    width: 340,
-                    height: 30,
-                },
-                NativeDamageRect {
-                    x: origin.0 + 300,
-                    y: origin.1,
-                    width: 40,
-                    height: 200,
-                },
-            ]
+            vec![NativeDamageRect {
+                x: origin.0,
+                y: origin.1,
+                width: 340,
+                height: 230,
+            }]
         );
     }
 
@@ -5663,7 +7065,7 @@ mod tests {
     }
 
     #[test]
-    fn native_scanout_plan_prefers_gbm_pageflip_when_ready() {
+    fn native_scanout_plan_prefers_native_egl_gbm_when_ready() {
         let plan = NativeScanoutPlan::choose(NativeScanoutChoice {
             preference: NativeScanoutPreference::Auto,
             gbm_available: true,
@@ -5671,12 +7073,142 @@ mod tests {
             page_flip_available: true,
         });
 
-        assert_eq!(plan.primary, NativeScanoutKind::GbmEglPageFlip);
+        assert_eq!(plan.primary, NativeScanoutKind::NativeEglGbm);
+        assert_eq!(
+            plan.fallbacks,
+            vec![
+                NativeScanoutKind::GbmCpuWritePageFlip,
+                NativeScanoutKind::DumbFramebuffer
+            ]
+        );
+    }
+
+    #[test]
+    fn native_scanout_plan_can_force_gpu_without_cpu_fallback() {
+        let plan = NativeScanoutPlan::choose(NativeScanoutChoice {
+            preference: NativeScanoutPreference::NativeEglGbm,
+            gbm_available: true,
+            egl_available: true,
+            page_flip_available: true,
+        });
+
+        assert_eq!(plan.primary, NativeScanoutKind::NativeEglGbm);
+        assert!(plan.fallbacks.is_empty());
+    }
+
+    #[test]
+    fn native_scanout_plan_rejects_forced_gpu_without_egl() {
+        let plan = NativeScanoutPlan::choose(NativeScanoutChoice {
+            preference: NativeScanoutPreference::NativeEglGbm,
+            gbm_available: true,
+            egl_available: false,
+            page_flip_available: true,
+        });
+
+        assert_eq!(plan.primary, NativeScanoutKind::Unavailable);
+        assert!(plan.fallbacks.is_empty());
+    }
+
+    #[test]
+    fn native_scanout_plan_fallback_after_gpu_failure_preserves_remaining_candidates() {
+        let plan = NativeScanoutPlan::choose(NativeScanoutChoice {
+            preference: NativeScanoutPreference::Auto,
+            gbm_available: true,
+            egl_available: true,
+            page_flip_available: true,
+        })
+        .after_failed(NativeScanoutKind::NativeEglGbm);
+
+        assert_eq!(plan.primary, NativeScanoutKind::GbmCpuWritePageFlip);
         assert_eq!(plan.fallbacks, vec![NativeScanoutKind::DumbFramebuffer]);
     }
 
     #[test]
-    fn native_scanout_plan_uses_dumb_framebuffer_without_egl() {
+    fn native_scanout_kind_names_cpu_write_gbm_backend_honestly() {
+        assert_eq!(
+            NativeScanoutKind::GbmCpuWritePageFlip.as_str(),
+            "GBM CPU-write pageflip"
+        );
+    }
+
+    #[test]
+    fn injected_native_egl_gbm_open_failure_returns_clear_error_before_kms_use() {
+        let previous = std::env::var_os("OBLIVION_ONE_TEST_FAIL_NATIVE_EGL_GBM");
+        unsafe {
+            std::env::set_var("OBLIVION_ONE_TEST_FAIL_NATIVE_EGL_GBM", "1");
+        }
+        let file = fs::File::open("Cargo.toml").unwrap();
+
+        let error =
+            match NativeScanoutBackend::open_kind(NativeScanoutKind::NativeEglGbm, &file, 1, 1) {
+                Ok(_) => panic!("injected native EGL/GBM failure should fail before KMS use"),
+                Err(error) => error,
+            };
+
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("OBLIVION_ONE_TEST_FAIL_NATIVE_EGL_GBM", value);
+            },
+            None => unsafe {
+                std::env::remove_var("OBLIVION_ONE_TEST_FAIL_NATIVE_EGL_GBM");
+            },
+        }
+        assert!(
+            error
+                .to_string()
+                .contains("OBLIVION_ONE_TEST_FAIL_NATIVE_EGL_GBM")
+        );
+    }
+
+    #[test]
+    fn auto_gpu_open_failure_next_cpu_candidate_resolves_apps_to_cpu() {
+        let plan = NativeScanoutPlan::choose(NativeScanoutChoice {
+            preference: NativeScanoutPreference::Auto,
+            gbm_available: true,
+            egl_available: true,
+            page_flip_available: true,
+        });
+
+        let fallback = plan.after_failed(NativeScanoutKind::NativeEglGbm);
+
+        assert_eq!(fallback.primary, NativeScanoutKind::GbmCpuWritePageFlip);
+        assert_eq!(
+            resolve_native_app_gpu_policy(CompositorAppGpuPreference::Auto, fallback.primary)
+                .unwrap(),
+            EffectiveCompositorAppGpuPolicy::CpuOnly
+        );
+    }
+
+    #[test]
+    fn native_scanout_preference_keeps_legacy_gbm_egl_alias_for_cpu_write_backend() {
+        assert_eq!(
+            NativeScanoutPreference::parse("gbm-egl"),
+            NativeScanoutPreference::GbmCpuWritePageFlip
+        );
+    }
+
+    #[test]
+    fn native_scanout_preference_accepts_canonical_cpu_write_backend_name() {
+        assert_eq!(
+            NativeScanoutPreference::parse("gbm-cpu-write"),
+            NativeScanoutPreference::GbmCpuWritePageFlip
+        );
+    }
+
+    #[test]
+    fn native_scanout_preference_accepts_canonical_gpu_backend_name() {
+        assert_eq!(
+            NativeScanoutPreference::parse("native-egl-gbm"),
+            NativeScanoutPreference::NativeEglGbm
+        );
+        assert_eq!(
+            NativeScanoutPreference::parse("gpu"),
+            NativeScanoutPreference::NativeEglGbm
+        );
+    }
+
+    #[test]
+    fn native_scanout_plan_uses_cpu_gbm_fallback_without_egl() {
         let plan = NativeScanoutPlan::choose(NativeScanoutChoice {
             preference: NativeScanoutPreference::Auto,
             gbm_available: true,
@@ -5684,8 +7216,8 @@ mod tests {
             page_flip_available: true,
         });
 
-        assert_eq!(plan.primary, NativeScanoutKind::DumbFramebuffer);
-        assert!(plan.fallbacks.is_empty());
+        assert_eq!(plan.primary, NativeScanoutKind::GbmCpuWritePageFlip);
+        assert_eq!(plan.fallbacks, vec![NativeScanoutKind::DumbFramebuffer]);
     }
 
     #[test]
@@ -5702,6 +7234,31 @@ mod tests {
         assert!(state.mark_presented());
         assert!(state.can_schedule());
         assert!(!state.mark_presented());
+    }
+
+    #[test]
+    fn native_pageflip_buffers_promote_ready_to_pending_to_current() {
+        let mut buffers = NativePageFlipBuffers::default();
+
+        buffers.set_ready(10);
+        assert_eq!(buffers.ready_or_current(), Some(&10));
+        assert_eq!(buffers.take_ready(), Some(10));
+        buffers.set_pending(10);
+        assert!(buffers.complete_page_flip());
+        assert_eq!(buffers.ready_or_current(), Some(&10));
+
+        assert!(!buffers.complete_page_flip());
+    }
+
+    #[test]
+    fn native_pageflip_buffers_finish_initial_scanout_promotes_ready() {
+        let mut buffers = NativePageFlipBuffers::default();
+
+        buffers.set_ready(20);
+        buffers.finish_initial_scanout();
+
+        assert_eq!(buffers.ready_or_current(), Some(&20));
+        assert_eq!(buffers.take_ready(), None);
     }
 
     #[test]
@@ -5906,6 +7463,38 @@ mod tests {
     }
 
     #[test]
+    fn native_input_shortcut_inhibition_forwards_window_shortcuts_to_client() {
+        let mut input = NativeInputState::new(320, 200);
+        input.set_keyboard_shortcuts_inhibited(true);
+
+        let alt = input.handle_key_event(KEY_LEFTALT, 1);
+        let fullscreen = input.handle_key_event(KEY_F11, 1);
+
+        assert_eq!(
+            alt.keyboard_events,
+            vec![NativeKeyboardEvent::new(KEY_LEFTALT, true)]
+        );
+        assert!(alt.window_actions.is_empty());
+        assert_eq!(
+            fullscreen.keyboard_events,
+            vec![NativeKeyboardEvent::new(KEY_F11, true)]
+        );
+        assert!(fullscreen.window_actions.is_empty());
+    }
+
+    #[test]
+    fn native_input_shortcut_inhibition_keeps_emergency_exit_shortcut() {
+        let mut input = NativeInputState::new(320, 200);
+        input.set_keyboard_shortcuts_inhibited(true);
+        input.handle_key_event(KEY_LEFTALT, 1);
+
+        let effect = input.handle_key_event(KEY_P, 1);
+
+        assert!(effect.exit_requested);
+        assert!(effect.keyboard_events.is_empty());
+    }
+
+    #[test]
     fn native_input_backend_plan_prefers_libseat_libinput_when_available() {
         let plan = NativeInputBackendPlan::choose(NativeInputBackendChoice {
             preference: NativeInputBackendPreference::Auto,
@@ -5981,10 +7570,9 @@ mod tests {
     fn native_input_state_handles_normalized_relative_motion() {
         let mut input = NativeInputState::new(320, 200);
 
-        let effect = input.handle_hardware_input_event(NativeHardwareInputEvent::PointerMotion {
-            dx: 12.0,
-            dy: -4.0,
-        });
+        let effect = input.handle_hardware_input_event(NativeHardwareInputEvent::PointerMotion(
+            PointerMotionSample::relative(10, RelativeMotion::accelerated_only(12.0, -4.0)),
+        ));
 
         assert_eq!(effect.pointer_motion, Some((172.0, 96.0)));
         assert!(effect.redraw_requested);
@@ -5994,10 +7582,9 @@ mod tests {
     fn native_input_pointer_motion_can_skip_frame_repaint_with_hardware_cursor() {
         let mut input = NativeInputState::new(320, 200);
 
-        let effect = input.handle_hardware_input_event(NativeHardwareInputEvent::PointerMotion {
-            dx: 12.0,
-            dy: -4.0,
-        });
+        let effect = input.handle_hardware_input_event(NativeHardwareInputEvent::PointerMotion(
+            PointerMotionSample::relative(10, RelativeMotion::accelerated_only(12.0, -4.0)),
+        ));
 
         assert_eq!(effect.pointer_motion, Some((172.0, 96.0)));
         assert!(!effect.requires_frame_repaint(NativeCursorRenderMode::Hardware));
@@ -6049,10 +7636,9 @@ mod tests {
         input.handle_key_event(KEY_LEFTALT, 1);
         input.handle_pointer_button(u32::from(BTN_LEFT), true);
 
-        let effect = input.handle_hardware_input_event(NativeHardwareInputEvent::PointerMotion {
-            dx: 12.0,
-            dy: -4.0,
-        });
+        let effect = input.handle_hardware_input_event(NativeHardwareInputEvent::PointerMotion(
+            PointerMotionSample::relative(10, RelativeMotion::accelerated_only(12.0, -4.0)),
+        ));
 
         assert_eq!(
             effect.window_actions,
@@ -6253,37 +7839,103 @@ mod tests {
     #[test]
     fn native_input_coalesces_consecutive_relative_motion_events() {
         let events = coalesce_pointer_motion_events(vec![
-            NativeHardwareInputEvent::PointerMotion { dx: 1.0, dy: 0.0 },
-            NativeHardwareInputEvent::PointerMotion { dx: 0.0, dy: 2.0 },
-            NativeHardwareInputEvent::PointerMotion { dx: 3.0, dy: 4.0 },
+            NativeHardwareInputEvent::PointerMotion(PointerMotionSample::relative(
+                10,
+                RelativeMotion {
+                    dx: 1.0,
+                    dy: 0.0,
+                    dx_unaccelerated: 2.0,
+                    dy_unaccelerated: 0.0,
+                },
+            )),
+            NativeHardwareInputEvent::PointerMotion(PointerMotionSample::relative(
+                20,
+                RelativeMotion {
+                    dx: 0.0,
+                    dy: 2.0,
+                    dx_unaccelerated: 0.0,
+                    dy_unaccelerated: 3.0,
+                },
+            )),
+            NativeHardwareInputEvent::PointerMotion(PointerMotionSample::relative(
+                30,
+                RelativeMotion {
+                    dx: 3.0,
+                    dy: 4.0,
+                    dx_unaccelerated: 5.0,
+                    dy_unaccelerated: 6.0,
+                },
+            )),
         ]);
 
         assert_eq!(
             events,
-            vec![NativeHardwareInputEvent::PointerMotion { dx: 4.0, dy: 6.0 }]
+            vec![NativeHardwareInputEvent::PointerMotion(
+                PointerMotionSample::relative(
+                    30,
+                    RelativeMotion {
+                        dx: 4.0,
+                        dy: 6.0,
+                        dx_unaccelerated: 7.0,
+                        dy_unaccelerated: 9.0,
+                    },
+                )
+            )]
         );
+    }
+
+    #[test]
+    fn native_pointer_motion_sample_keeps_relative_delta_when_cursor_clamps_at_edge() {
+        let mut input = NativeInputState::new(320, 200);
+        let sample = PointerMotionSample::relative(
+            42,
+            RelativeMotion {
+                dx: 1_000.0,
+                dy: -1_000.0,
+                dx_unaccelerated: 1_200.0,
+                dy_unaccelerated: -1_200.0,
+            },
+        );
+
+        let effect =
+            input.handle_hardware_input_event(NativeHardwareInputEvent::PointerMotion(sample));
+
+        assert_eq!(effect.pointer_motion, Some((319.0, 0.0)));
+        assert_eq!(effect.relative_motion, Some(sample.relative.unwrap()));
     }
 
     #[test]
     fn native_input_coalescing_preserves_button_boundaries() {
         let events = coalesce_pointer_motion_events(vec![
-            NativeHardwareInputEvent::PointerMotion { dx: 1.0, dy: 0.0 },
+            NativeHardwareInputEvent::PointerMotion(PointerMotionSample::relative(
+                10,
+                RelativeMotion::accelerated_only(1.0, 0.0),
+            )),
             NativeHardwareInputEvent::PointerButton {
                 button: u32::from(BTN_LEFT),
                 pressed: true,
             },
-            NativeHardwareInputEvent::PointerMotion { dx: 0.0, dy: 2.0 },
+            NativeHardwareInputEvent::PointerMotion(PointerMotionSample::relative(
+                20,
+                RelativeMotion::accelerated_only(0.0, 2.0),
+            )),
         ]);
 
         assert_eq!(
             events,
             vec![
-                NativeHardwareInputEvent::PointerMotion { dx: 1.0, dy: 0.0 },
+                NativeHardwareInputEvent::PointerMotion(PointerMotionSample::relative(
+                    10,
+                    RelativeMotion::accelerated_only(1.0, 0.0),
+                )),
                 NativeHardwareInputEvent::PointerButton {
                     button: u32::from(BTN_LEFT),
                     pressed: true,
                 },
-                NativeHardwareInputEvent::PointerMotion { dx: 0.0, dy: 2.0 },
+                NativeHardwareInputEvent::PointerMotion(PointerMotionSample::relative(
+                    20,
+                    RelativeMotion::accelerated_only(0.0, 2.0),
+                )),
             ]
         );
     }
@@ -6291,13 +7943,15 @@ mod tests {
     #[test]
     fn native_input_coalesces_consecutive_absolute_motion_to_latest_position() {
         let events = coalesce_pointer_motion_events(vec![
-            NativeHardwareInputEvent::PointerAbsolute { x: 12.0, y: 30.0 },
-            NativeHardwareInputEvent::PointerAbsolute { x: 18.0, y: 35.0 },
+            NativeHardwareInputEvent::PointerMotion(PointerMotionSample::absolute(10, 12.0, 30.0)),
+            NativeHardwareInputEvent::PointerMotion(PointerMotionSample::absolute(20, 18.0, 35.0)),
         ]);
 
         assert_eq!(
             events,
-            vec![NativeHardwareInputEvent::PointerAbsolute { x: 18.0, y: 35.0 }]
+            vec![NativeHardwareInputEvent::PointerMotion(
+                PointerMotionSample::absolute(20, 18.0, 35.0)
+            )]
         );
     }
 
@@ -6434,6 +8088,12 @@ mod tests {
                 protocol_only_present: false,
             }
         );
+    }
+
+    #[test]
+    fn native_dispatch_policy_keeps_wayland_clients_live_while_pageflip_is_pending() {
+        assert!(native_dispatch_clients_while_pageflip_pending(false));
+        assert!(native_dispatch_clients_while_pageflip_pending(true));
     }
 
     #[test]

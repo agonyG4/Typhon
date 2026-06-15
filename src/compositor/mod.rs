@@ -7,6 +7,10 @@ use std::{
     time::Instant,
 };
 
+use wayland_protocols::ext::data_control::v1::server::{
+    ext_data_control_device_v1, ext_data_control_manager_v1, ext_data_control_offer_v1,
+    ext_data_control_source_v1,
+};
 use wayland_protocols::wp::linux_dmabuf::zv1::server::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
 };
@@ -16,11 +20,21 @@ use wayland_protocols::wp::linux_drm_syncobj::v1::server::{
 };
 use wayland_protocols::wp::{
     fractional_scale::v1::server::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1},
+    idle_inhibit::zv1::server::{zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1},
+    pointer_constraints::zv1::server::{
+        zwp_confined_pointer_v1, zwp_locked_pointer_v1, zwp_pointer_constraints_v1,
+    },
     presentation_time::server::{wp_presentation, wp_presentation_feedback},
+    primary_selection::zv1::server::{
+        zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1,
+        zwp_primary_selection_offer_v1, zwp_primary_selection_source_v1,
+    },
+    relative_pointer::zv1::server::{zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1},
     viewporter::server::{wp_viewport, wp_viewporter},
 };
-use wayland_protocols::xdg::shell::server::{
-    xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
+use wayland_protocols::xdg::{
+    decoration::zv1::server::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1},
+    shell::server::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base},
 };
 use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
@@ -42,6 +56,7 @@ use crate::wayland_drm::server::wl_drm;
 mod color;
 mod dmabuf;
 mod explicit_sync;
+mod idle;
 mod input;
 mod interaction;
 mod output;
@@ -50,6 +65,7 @@ mod popup;
 mod protocols;
 mod render;
 mod runtime_files;
+mod selection;
 mod server;
 mod shell;
 mod shm;
@@ -70,9 +86,14 @@ use explicit_sync::{
     SYNCOBJ_SURFACE_ERROR_NO_SURFACE, SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER,
     SyncobjSurfaceState, SyncobjTimelineData, presentation_timestamp,
 };
+pub use idle::{IdleManager, IdleState};
 use input::{
     InputSerial, KeyboardModifierState, send_keyboard_initial_state,
     send_pointer_frame_if_supported, wayland_event_time,
+};
+pub use input::{
+    OutputPosition, PointerConstraintMode, PointerConstraintState, PointerMotionSample,
+    RelativePointerMotion,
 };
 use interaction::{
     PendingResizeCommit, PendingResizeConfigure, PointerPress, PointerTarget, ResizeEdges,
@@ -84,19 +105,25 @@ use output::{
     OutputRefreshRate, OutputScale, OutputSize, send_output_description,
     send_output_done_if_supported, send_output_mode, send_output_scale,
 };
-pub use plan::{ArchitectureLayer, CompositorArchitecture, CompositorPlan, ProtocolGlobal};
+pub use plan::{
+    ArchitectureLayer, CompositorArchitecture, CompositorPlan, InputProtocolCapabilities,
+    ProtocolGlobal,
+};
 use popup::{
     PopupAnchorRect, PopupConstraintAdjustment, PopupEdges, PopupRect, XdgPositionerState,
     XdgWindowGeometry,
 };
 pub use render::{
-    DesktopComposeRequest, DesktopFrameCopyKind, DesktopSceneRebuildKind, DesktopSceneRenderer,
-    DesktopVisualState, NESTED_OUTPUT_BACKGROUND, ServerFrameColor, compose_nested_output,
-    cursor_texture_pixels, cursor_texture_size, draw_wallpaper, output_scale_key,
-    scale_desktop_visual_state, scale_logical_coordinate, scale_logical_extent,
-    server_frame_rects_by_surface, server_frame_rects_for_surface, surface_origin, surface_origins,
+    BufferAge, DesktopComposeRequest, DesktopFrameCopyKind, DesktopSceneRebuildKind,
+    DesktopSceneRenderer, DesktopVisualState, NESTED_OUTPUT_BACKGROUND, RenderSceneElement,
+    RenderSceneElementId, RenderSceneElementKind, ServerFrameColor, SurfaceTargetRect,
+    compose_nested_output, cursor_texture_pixels, cursor_texture_size, draw_wallpaper,
+    output_scale_key, render_scene_elements_for_surfaces, scale_desktop_visual_state,
+    scale_logical_coordinate, scale_logical_extent, server_frame_rects_by_surface,
+    server_frame_rects_for_surface, surface_origin, surface_origins,
 };
 use runtime_files::{compositor_debug_surface_logging_enabled, unique_runtime_file_path};
+pub use selection::{SelectionOfferRecord, SelectionState};
 pub use server::{CompositorError, OwnCompositorServer};
 pub use shell::{
     ShellDockItem, ShellLaunchSuggestion, ShellOverlayBounds, ShellOverlayImage,
@@ -179,6 +206,9 @@ pub struct CompositorState {
     fractional_scale_resources: HashMap<u32, Vec<wp_fractional_scale_v1::WpFractionalScaleV1>>,
     keyboard_resources: Vec<wl_keyboard::WlKeyboard>,
     pointer_resources: Vec<wl_pointer::WlPointer>,
+    relative_pointer_resources: Vec<zwp_relative_pointer_v1::ZwpRelativePointerV1>,
+    idle_inhibitor_resources: Vec<zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1>,
+    idle_manager: IdleManager,
     output_size: OutputSize,
     output_scale: OutputScale,
     output_refresh: OutputRefreshRate,
@@ -186,6 +216,7 @@ pub struct CompositorState {
     keyboard_surface: Option<wl_surface::WlSurface>,
     keyboard_modifiers: KeyboardModifierState,
     pointer_surface: Option<wl_surface::WlSurface>,
+    pointer_constraint: PointerConstraintState,
     pointer_entered_surfaces: Vec<(wl_pointer::WlPointer, wl_surface::WlSurface)>,
     cursor_surface_ids: HashSet<u32>,
     surface_placements: HashMap<u32, SurfacePlacement>,
@@ -200,6 +231,8 @@ pub struct CompositorState {
     pending_resize_commits: HashMap<u32, PendingResizeCommit>,
     last_pointer_x: f64,
     last_pointer_y: f64,
+    last_pointer_motion_usec: Option<u64>,
+    last_relative_pointer_motion: Option<RelativePointerMotion>,
     last_pointer_press: Option<PointerPress>,
     recent_input_serials: Vec<InputSerial>,
     active_dmabuf_buffers: HashMap<u32, SurfaceBufferRelease>,
@@ -266,12 +299,8 @@ impl CompositorState {
         main_device_path: Option<String>,
     ) {
         self.dmabuf_feedback = feedback;
-        if let Some(main_device) = main_device.filter(|device| *device != 0) {
-            self.dmabuf_main_device = main_device;
-        }
-        if let Some(main_device_path) = main_device_path.filter(|path| !path.is_empty()) {
-            self.dmabuf_main_device_path = Some(main_device_path);
-        }
+        self.dmabuf_main_device = main_device.filter(|device| *device != 0).unwrap_or(0);
+        self.dmabuf_main_device_path = main_device_path.filter(|path| !path.is_empty());
     }
 
     fn set_output_size(&mut self, width: u32, height: u32) -> bool {
@@ -295,6 +324,7 @@ impl CompositorState {
         self.output_scale = output_scale;
         self.send_output_scale_to_bound_outputs();
         self.send_fractional_scale_to_bound_surfaces();
+        self.advance_render_generation(RenderGenerationCause::OutputChange);
         true
     }
 
@@ -544,6 +574,7 @@ impl CompositorState {
             .is_some_and(|surface| compositor_surface_id(surface) == surface_id)
         {
             self.pointer_surface = None;
+            self.clear_pointer_constraint();
         }
         self.pointer_entered_surfaces
             .retain(|(_, surface)| compositor_surface_id(surface) != surface_id);
@@ -738,6 +769,106 @@ impl CompositorState {
         }
     }
 
+    fn send_pointer_motion_sample(&mut self, sample: PointerMotionSample) {
+        self.last_pointer_motion_usec = Some(sample.timestamp_usec);
+        if let Some(relative) = sample.relative {
+            self.last_relative_pointer_motion = Some(relative);
+            self.send_relative_pointer_motion(sample.timestamp_usec, relative);
+        }
+        if let Some(position) = sample.absolute {
+            let locked_surface_id = self
+                .pointer_surface
+                .as_ref()
+                .map(compositor_surface_id)
+                .filter(|surface_id| self.pointer_constraint.filters_absolute_motion(*surface_id));
+            if locked_surface_id.is_none() {
+                self.send_pointer_motion(position.x, position.y);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn activate_pointer_constraint_for_focused_surface(
+        &mut self,
+        mode: PointerConstraintMode,
+    ) -> bool {
+        let Some(surface) = self.pointer_surface.as_ref() else {
+            return false;
+        };
+        self.pointer_constraint
+            .activate(mode, compositor_surface_id(surface));
+        true
+    }
+
+    fn clear_pointer_constraint(&mut self) {
+        self.pointer_constraint.clear();
+    }
+
+    fn add_idle_inhibitor(&mut self, inhibitor: zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1) {
+        self.idle_inhibitor_resources.push(inhibitor);
+        self.idle_manager.inhibit();
+    }
+
+    fn remove_idle_inhibitor(&mut self, inhibitor: &zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1) {
+        let before = self.idle_inhibitor_resources.len();
+        self.idle_inhibitor_resources
+            .retain(|resource| !same_wayland_resource(resource, inhibitor));
+        if self.idle_inhibitor_resources.len() != before {
+            self.idle_manager.uninhibit();
+        }
+    }
+
+    pub fn idle_inhibited(&mut self) -> bool {
+        self.idle_inhibitor_resources.retain(Resource::is_alive);
+        if self.idle_inhibitor_resources.is_empty() {
+            while self.idle_manager.is_inhibited() {
+                self.idle_manager.uninhibit();
+            }
+        }
+        self.idle_manager.is_inhibited()
+    }
+
+    fn add_relative_pointer_resource(
+        &mut self,
+        pointer: zwp_relative_pointer_v1::ZwpRelativePointerV1,
+    ) {
+        self.relative_pointer_resources.push(pointer);
+    }
+
+    fn remove_relative_pointer_resource(
+        &mut self,
+        pointer: &zwp_relative_pointer_v1::ZwpRelativePointerV1,
+    ) {
+        self.relative_pointer_resources
+            .retain(|resource| !same_wayland_resource(resource, pointer));
+    }
+
+    fn send_relative_pointer_motion(&mut self, timestamp_usec: u64, motion: RelativePointerMotion) {
+        if motion.is_zero() {
+            return;
+        }
+        let Some(surface) = self.pointer_surface.clone() else {
+            return;
+        };
+        self.relative_pointer_resources.retain(Resource::is_alive);
+        let utime_hi = (timestamp_usec >> 32) as u32;
+        let utime_lo = (timestamp_usec & 0xffff_ffff) as u32;
+        for pointer in self
+            .relative_pointer_resources
+            .iter()
+            .filter(|pointer| resource_belongs_to_surface_client(*pointer, &surface))
+        {
+            pointer.relative_motion(
+                utime_hi,
+                utime_lo,
+                motion.dx,
+                motion.dy,
+                motion.dx_unaccelerated,
+                motion.dy_unaccelerated,
+            );
+        }
+    }
+
     fn send_pointer_button(&mut self, button: u32, pressed: bool) {
         let target = self.pointer_target_at(self.last_pointer_x, self.last_pointer_y);
         if pressed
@@ -894,6 +1025,20 @@ impl CompositorState {
         let surface_size = pending.surface_size.unwrap_or(buffer_size);
         let width = surface_size.width;
         let height = surface_size.height;
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: commit surface {surface_id} buffer={}x{} surface={}x{} offset={},{} shm={} dmabuf={} pending_resize={:?}",
+                buffer_width,
+                buffer_height,
+                width,
+                height,
+                pending.x,
+                pending.y,
+                pending.data.is_shm(),
+                pending.data.is_dmabuf(),
+                self.pending_resize_commits.get(&surface_id),
+            );
+        }
         if let Some(root_surface_id) = self.minimized_root_surface_id_for_surface(surface_id) {
             let damage = damage.normalized_for_surface(buffer_width, buffer_height);
             if self
@@ -1063,10 +1208,34 @@ impl CompositorState {
             return false;
         }
 
-        let surface_size = match current.surface_size_for_state(surface_size, buffer_scale) {
-            Ok(surface_size) => surface_size,
-            Err(_) => buffer_size,
-        };
+        let requested_surface_size =
+            match current.surface_size_for_state(surface_size, buffer_scale) {
+                Ok(surface_size) => surface_size,
+                Err(_) => buffer_size,
+            };
+        let resize_pending = self.pending_resize_commits.contains_key(&surface_id);
+        let surface_size = damage_only_rendered_surface_size(
+            BufferSize {
+                width: existing.width,
+                height: existing.height,
+            },
+            requested_surface_size,
+            resize_pending,
+        );
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: damage-only commit surface {surface_id} buffer={}x{} requested_surface={}x{} applied_surface={}x{} shm={} dmabuf={} pending_resize={:?}",
+                buffer_width,
+                buffer_height,
+                requested_surface_size.width,
+                requested_surface_size.height,
+                surface_size.width,
+                surface_size.height,
+                current.data.is_shm(),
+                current.data.is_dmabuf(),
+                self.pending_resize_commits.get(&surface_id),
+            );
+        }
         existing.x = current.x;
         existing.y = current.y;
         existing.width = surface_size.width;
@@ -2329,61 +2498,6 @@ impl CompositorState {
             return false;
         }
         self.pending_resize_configure = Some(pending);
-        self.preview_resize_root_window_to(surface_id, width, height, placement, edges);
-        true
-    }
-
-    fn preview_resize_root_window_to(
-        &mut self,
-        surface_id: u32,
-        width: u32,
-        height: u32,
-        placement: SurfacePlacement,
-        edges: ResizeEdges,
-    ) -> bool {
-        if self
-            .toplevel_surfaces
-            .get(&surface_id)
-            .is_some_and(|toplevel| toplevel.window.is_minimized())
-        {
-            return false;
-        }
-        if self.surface_placement(surface_id) != placement {
-            self.store_surface_placement(surface_id, placement);
-        }
-        let Some(index) = self
-            .renderable_surfaces
-            .iter()
-            .position(|surface| surface.surface_id == surface_id)
-        else {
-            return false;
-        };
-        let surface = &self.renderable_surfaces[index];
-        if surface.width == width && surface.height == height && surface.placement == placement {
-            return false;
-        }
-
-        let generation = self.advance_render_generation(RenderGenerationCause::WindowResize);
-        let surface = &mut self.renderable_surfaces[index];
-        let committed_width = surface
-            .resize_preview
-            .map(|preview| preview.committed_width)
-            .unwrap_or(surface.width);
-        let committed_height = surface
-            .resize_preview
-            .map(|preview| preview.committed_height)
-            .unwrap_or(surface.height);
-        surface.width = width;
-        surface.height = height;
-        surface.placement = placement;
-        surface.resize_preview = Some(ResizePreview {
-            committed_width,
-            committed_height,
-            anchor_right: edges.left,
-            anchor_bottom: edges.top,
-        });
-        surface.generation = generation;
-        surface.damage = RenderableSurfaceDamage::Full;
         true
     }
 
@@ -2391,6 +2505,13 @@ impl CompositorState {
         let Some(pending) = self.pending_resize_configure.take() else {
             return false;
         };
+        if self
+            .pending_resize_commits
+            .contains_key(&pending.surface_id)
+        {
+            self.pending_resize_configure = Some(pending);
+            return false;
+        }
         self.send_resize_configure_to(
             pending.surface_id,
             pending.width,
@@ -2448,6 +2569,14 @@ impl CompositorState {
         )
     }
 
+    fn pending_resize_configure_is_flushable(&self) -> bool {
+        self.pending_resize_configure.is_some_and(|pending| {
+            !self
+                .pending_resize_commits
+                .contains_key(&pending.surface_id)
+        })
+    }
+
     fn send_resize_configure_to(
         &mut self,
         surface_id: u32,
@@ -2457,8 +2586,9 @@ impl CompositorState {
         edges: ResizeEdges,
         resizing: bool,
     ) -> bool {
+        let resizing_states = [xdg_toplevel::State::Resizing];
         let states = if resizing {
-            &[xdg_toplevel::State::Resizing][..]
+            &resizing_states[..]
         } else {
             &[][..]
         };
@@ -2477,6 +2607,17 @@ impl CompositorState {
         .resize_commit(serial);
         self.sent_resize_commits
             .insert((surface_id, serial), resize);
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: resize configure surface {surface_id} serial={serial} size={}x{} placement={},{} edges={:?} resizing={}",
+                resize.width,
+                resize.height,
+                resize.placement.local_x,
+                resize.placement.local_y,
+                resize.edges,
+                resizing,
+            );
+        }
         true
     }
 
@@ -2529,6 +2670,17 @@ impl CompositorState {
                 *sent_surface_id != surface_id || *sent_serial > serial
             });
         if let Some(resize) = resize {
+            if compositor_debug_surface_logging_enabled() {
+                eprintln!(
+                    "oblivion-one compositor: ack resize surface {surface_id} serial={serial} matched_serial={} size={}x{} placement={},{} edges={:?}",
+                    resize.serial,
+                    resize.width,
+                    resize.height,
+                    resize.placement.local_x,
+                    resize.placement.local_y,
+                    resize.edges,
+                );
+            }
             self.pending_resize_commits.insert(surface_id, resize);
         }
     }
@@ -2858,13 +3010,13 @@ impl CompositorState {
     }
 
     fn has_pending_frame_prepare_work(&self) -> bool {
-        self.pending_resize_configure.is_some()
+        self.pending_resize_configure_is_flushable()
             || !self.pending_explicit_sync_commits.is_empty()
             || !self.pending_color_info.is_empty()
     }
 
     fn has_pending_frame_work(&self) -> bool {
-        self.pending_resize_configure.is_some()
+        self.pending_resize_configure_is_flushable()
             || self.has_pending_frame_callbacks()
             || !self.pending_presentation_feedbacks.is_empty()
     }
@@ -2896,7 +3048,7 @@ impl CompositorState {
                 self.output_refresh.presentation_refresh_nsec(),
                 (sequence >> 32) as u32,
                 sequence as u32,
-                wp_presentation_feedback::Kind::empty(),
+                wp_presentation_feedback::Kind::Vsync | wp_presentation_feedback::Kind::HwClock,
             );
         }
     }
@@ -2949,6 +3101,14 @@ impl CompositorState {
         }
         self.pending_explicit_sync_commits = waiting;
     }
+}
+
+fn damage_only_rendered_surface_size(
+    existing: BufferSize,
+    requested: BufferSize,
+    resize_pending: bool,
+) -> BufferSize {
+    if resize_pending { existing } else { requested }
 }
 
 fn resource_belongs_to_surface_client<R>(resource: &R, surface: &wl_surface::WlSurface) -> bool

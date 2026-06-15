@@ -12,10 +12,11 @@ mod nested_renderer;
 mod prototype;
 
 use oblivion_one::{
-    DEFAULT_APP, DesktopOptions, HyprlandLaunchPlan, NestedBackend, NestedLaunchPlan,
-    NestedOptions,
+    CompositorAppGpuPreference, DEFAULT_APP, DesktopOptions, HyprlandLaunchPlan, NestedBackend,
+    NestedLaunchPlan, NestedOptions,
     compositor::{CompositorPlan, OwnCompositorServer},
     default_state_dir, discover_tools, export_lines, parse_session_env,
+    portal::PortalRuntime,
     session::NativeSessionProbe,
 };
 
@@ -44,6 +45,7 @@ fn run() -> AppResult<()> {
         Mode::Run(command) => run_app(command),
         Mode::Env => print_env(),
         Mode::Smoke => smoke(),
+        Mode::Portal(options) => portal(options),
         Mode::Prototype { inside_de } => prototype::run_prototype(inside_de),
     }
 }
@@ -58,7 +60,14 @@ enum Mode {
     Run(Vec<String>),
     Env,
     Smoke,
+    Portal(PortalCliOptions),
     Prototype { inside_de: bool },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PortalCliOptions {
+    check_only: bool,
+    install_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +156,7 @@ fn parse_args(args: Vec<String>) -> Result<Mode, io::Error> {
         "de" | "desktop" => parse_desktop_args(&args[1..]).map(Mode::Desktop),
         "env" => Ok(Mode::Env),
         "smoke" => Ok(Mode::Smoke),
+        "portal" => parse_portal_args(&args[1..]).map(Mode::Portal),
         "prototype" | "proto" => parse_prototype_args(&args[1..]),
         "run" => {
             let command = if args.len() > 1 {
@@ -159,6 +169,18 @@ fn parse_args(args: Vec<String>) -> Result<Mode, io::Error> {
         "nested" => parse_nested_args(&args[1..]).map(Mode::Nested),
         other => Err(invalid_input(format!("unknown command `{other}`"))),
     }
+}
+
+fn parse_portal_args(args: &[String]) -> Result<PortalCliOptions, io::Error> {
+    let mut options = PortalCliOptions::default();
+    for arg in args {
+        match arg.as_str() {
+            "--check" => options.check_only = true,
+            "--install" => options.install_only = true,
+            other => return Err(invalid_input(format!("unknown portal option `{other}`"))),
+        }
+    }
+    Ok(options)
 }
 
 fn parse_compositor_args(args: &[String]) -> Result<CompositorCliOptions, io::Error> {
@@ -396,6 +418,7 @@ fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
     println!("external compositor: {}", plan.uses_external_compositor());
     println!("renderer preference: {}", options.renderer.as_str());
     println!("output backend: {}", output_backend.as_str());
+    let native_app_gpu_preference = CompositorAppGpuPreference::from_native_env();
     let protocol_names = compositor_protocol_names_for_output_backend(&plan, output_backend);
     println!("protocols: {}", protocol_names.join(", "));
     println!("command: {}", plan.command_preview());
@@ -403,8 +426,8 @@ fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
     let server = match output_backend {
         ResolvedCompositorOutputBackend::Nested => OwnCompositorServer::bind(&options.socket_name)?,
         ResolvedCompositorOutputBackend::Native => {
-            println!("gpu buffer protocols: disabled for native CPU scanout");
-            OwnCompositorServer::bind_cpu_composition(&options.socket_name)?
+            println!("gpu buffer protocols: deferred until the native scanout backend is known");
+            OwnCompositorServer::bind_native_base(&options.socket_name)?
         }
     };
     println!("Wayland socket bound: {}", server.socket_name());
@@ -421,7 +444,9 @@ fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
             );
             nested_output::run(server, options.renderer, options.app)
         }
-        ResolvedCompositorOutputBackend::Native => native_output::run(server, options.app),
+        ResolvedCompositorOutputBackend::Native => {
+            native_output::run(server, options.app, native_app_gpu_preference)
+        }
     }
 }
 
@@ -563,6 +588,19 @@ fn smoke() -> AppResult<()> {
         gamescope_plan.display_command()
     );
     Ok(())
+}
+
+fn portal(options: PortalCliOptions) -> AppResult<()> {
+    let runtime = PortalRuntime::for_current_process(default_state_dir())?;
+    runtime.install()?;
+    if options.check_only || options.install_only {
+        println!("Oblivion portal backend");
+        println!("service: {}", runtime.service_path().display());
+        println!("portal: {}", runtime.portal_path().display());
+        println!("dbus name: {}", oblivion_one::portal::BACKEND_BUS_NAME);
+        return Ok(());
+    }
+    oblivion_one::portal::run_backend().map_err(Into::into)
 }
 
 fn doctor() -> AppResult<()> {
@@ -810,6 +848,45 @@ mod tests {
         assert_eq!(
             resolve_compositor_output_backend(CompositorOutputBackend::Auto, true),
             ResolvedCompositorOutputBackend::Nested
+        );
+    }
+
+    #[test]
+    fn native_output_defers_gpu_buffer_protocols_until_backend_is_known() {
+        let protocols = compositor_protocol_names_for_output_backend(
+            &CompositorPlan::new("oblivion-one-test"),
+            ResolvedCompositorOutputBackend::Native,
+        );
+
+        assert!(protocols.contains(&"wl_shm"));
+        assert!(!protocols.contains(&"zwp_linux_dmabuf_v1"));
+        assert!(!protocols.contains(&"wp_linux_drm_syncobj_manager_v1"));
+        assert!(!protocols.contains(&"wl_drm"));
+    }
+
+    #[test]
+    fn native_cpu_output_omits_gpu_buffer_protocols() {
+        let protocols = compositor_protocol_names_for_output_backend(
+            &CompositorPlan::new("oblivion-one-test"),
+            ResolvedCompositorOutputBackend::Native,
+        );
+
+        assert!(protocols.contains(&"wl_shm"));
+        assert!(!protocols.contains(&"zwp_linux_dmabuf_v1"));
+        assert!(!protocols.contains(&"wp_linux_drm_syncobj_manager_v1"));
+        assert!(!protocols.contains(&"wl_drm"));
+    }
+
+    #[test]
+    fn parse_portal_check_mode() {
+        let mode = parse_args(vec!["portal".to_string(), "--check".to_string()]).unwrap();
+
+        assert_eq!(
+            mode,
+            Mode::Portal(PortalCliOptions {
+                check_only: true,
+                install_only: false,
+            })
         );
     }
 

@@ -143,6 +143,19 @@ impl GlobalDispatch<wp_presentation::WpPresentation, ()> for CompositorState {
     }
 }
 
+impl GlobalDispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for CompositorState {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
 impl GlobalDispatch<wl_drm::WlDrm, ()> for CompositorState {
     fn bind(
         state: &mut Self,

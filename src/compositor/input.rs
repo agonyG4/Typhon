@@ -27,6 +27,96 @@ pub(super) struct InputSerial {
     pub(super) surface: wl_surface::WlSurface,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct OutputPosition {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RelativePointerMotion {
+    pub dx: f64,
+    pub dy: f64,
+    pub dx_unaccelerated: f64,
+    pub dy_unaccelerated: f64,
+}
+
+impl RelativePointerMotion {
+    pub fn is_zero(self) -> bool {
+        self.dx == 0.0
+            && self.dy == 0.0
+            && self.dx_unaccelerated == 0.0
+            && self.dy_unaccelerated == 0.0
+    }
+
+    pub fn from_absolute_delta(dx: f64, dy: f64) -> Option<Self> {
+        if dx == 0.0 && dy == 0.0 {
+            return None;
+        }
+        Some(Self {
+            dx,
+            dy,
+            dx_unaccelerated: dx,
+            dy_unaccelerated: dy,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PointerMotionSample {
+    pub timestamp_usec: u64,
+    pub absolute: Option<OutputPosition>,
+    pub relative: Option<RelativePointerMotion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum PointerConstraintMode {
+    None,
+    Confined,
+    Locked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct PointerConstraintState {
+    mode: PointerConstraintMode,
+    surface_id: Option<u32>,
+}
+
+impl Default for PointerConstraintState {
+    fn default() -> Self {
+        Self {
+            mode: PointerConstraintMode::None,
+            surface_id: None,
+        }
+    }
+}
+
+impl PointerConstraintState {
+    #[allow(dead_code)]
+    pub fn activate(&mut self, mode: PointerConstraintMode, surface_id: u32) {
+        self.mode = mode;
+        self.surface_id = Some(surface_id);
+    }
+
+    #[allow(dead_code)]
+    pub fn clear(&mut self) {
+        self.mode = PointerConstraintMode::None;
+        self.surface_id = None;
+    }
+
+    #[allow(dead_code)]
+    pub const fn mode(self) -> PointerConstraintMode {
+        self.mode
+    }
+
+    #[allow(dead_code)]
+    pub fn filters_absolute_motion(self, surface_id: u32) -> bool {
+        self.surface_id == Some(surface_id) && matches!(self.mode, PointerConstraintMode::Locked)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct KeyboardModifierState {
     shift_left: bool,
@@ -272,5 +362,44 @@ mod tests {
             "pc+us+inet(evdev)+compose:ralt"
         );
         assert!(keymap_contents(&config).contains("include \"pc+us+inet(evdev)+compose:ralt\""));
+    }
+
+    #[test]
+    fn relative_pointer_motion_uses_absolute_delta_for_both_tracks() {
+        let motion = RelativePointerMotion::from_absolute_delta(4.0, -2.5).unwrap();
+
+        assert_eq!(motion.dx, 4.0);
+        assert_eq!(motion.dy, -2.5);
+        assert_eq!(motion.dx_unaccelerated, 4.0);
+        assert_eq!(motion.dy_unaccelerated, -2.5);
+        assert!(RelativePointerMotion::from_absolute_delta(0.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn relative_pointer_motion_detects_zero_across_both_tracks() {
+        assert!(RelativePointerMotion::default().is_zero());
+        assert!(
+            !RelativePointerMotion {
+                dx: 0.0,
+                dy: 0.0,
+                dx_unaccelerated: 0.25,
+                dy_unaccelerated: 0.0,
+            }
+            .is_zero()
+        );
+    }
+
+    #[test]
+    fn pointer_constraint_locked_surface_filters_absolute_motion() {
+        let mut state = PointerConstraintState::default();
+
+        state.activate(PointerConstraintMode::Confined, 42);
+        assert!(!state.filters_absolute_motion(42));
+        state.activate(PointerConstraintMode::Locked, 42);
+
+        assert!(state.filters_absolute_motion(42));
+        assert!(!state.filters_absolute_motion(7));
+        state.clear();
+        assert_eq!(state.mode(), PointerConstraintMode::None);
     }
 }

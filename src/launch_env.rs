@@ -5,7 +5,11 @@ use std::{
     process::Command,
 };
 
-use crate::{default_state_dir, paths::shell_quote};
+use crate::{
+    default_state_dir,
+    paths::shell_quote,
+    portal::{PortalRuntime, prepend_data_dir},
+};
 
 const SESSION_ENV_KEYS: &[&str] = &[
     "WAYLAND_DISPLAY",
@@ -32,9 +36,59 @@ pub struct CompositorAppEnvironment {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CompositorAppGpuPolicy {
+pub enum CompositorAppGpuPreference {
+    Auto,
     Accelerated,
     CpuOnly,
+}
+
+impl CompositorAppGpuPreference {
+    pub fn from_native_env() -> Self {
+        Self::from_native_env_value(env::var("OBLIVION_ONE_NATIVE_APP_GPU").ok().as_deref())
+    }
+
+    pub fn from_native_env_value(value: Option<&str>) -> Self {
+        value.map(Self::parse).unwrap_or(Self::Auto)
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "cpu" | "software" | "sw" | "0" | "false" => Self::CpuOnly,
+            "gpu" | "accelerated" | "1" | "true" => Self::Accelerated,
+            "auto" => Self::Auto,
+            _ => Self::Auto,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Accelerated => "accelerated",
+            Self::CpuOnly => "cpu",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveCompositorAppGpuPolicy {
+    Accelerated,
+    CpuOnly,
+}
+
+impl EffectiveCompositorAppGpuPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accelerated => "accelerated",
+            Self::CpuOnly => "cpu",
+        }
+    }
+
+    pub const fn is_accelerated(self) -> bool {
+        match self {
+            Self::Accelerated => true,
+            Self::CpuOnly => false,
+        }
+    }
 }
 
 impl CompositorAppEnvironment {
@@ -63,7 +117,7 @@ pub fn configure_compositor_app_command(command: &mut Command, socket_name: &str
     configure_compositor_app_command_with_environment_and_policy(
         command,
         &environment,
-        CompositorAppGpuPolicy::Accelerated,
+        EffectiveCompositorAppGpuPolicy::Accelerated,
     );
 }
 
@@ -72,7 +126,7 @@ pub fn configure_cpu_compositor_app_command(command: &mut Command, socket_name: 
     configure_compositor_app_command_with_environment_and_policy(
         command,
         &environment,
-        CompositorAppGpuPolicy::CpuOnly,
+        EffectiveCompositorAppGpuPolicy::CpuOnly,
     );
 }
 
@@ -83,14 +137,14 @@ pub fn configure_compositor_app_command_with_environment(
     configure_compositor_app_command_with_environment_and_policy(
         command,
         environment,
-        CompositorAppGpuPolicy::Accelerated,
+        EffectiveCompositorAppGpuPolicy::Accelerated,
     );
 }
 
 fn configure_compositor_app_command_with_environment_and_policy(
     command: &mut Command,
     environment: &CompositorAppEnvironment,
-    gpu_policy: CompositorAppGpuPolicy,
+    gpu_policy: EffectiveCompositorAppGpuPolicy,
 ) {
     remove_host_desktop_activation_environment(command);
     apply_nested_app_runtime_guards(command);
@@ -101,7 +155,7 @@ fn configure_compositor_app_command_with_environment_and_policy(
     command.env("ELECTRON_OZONE_PLATFORM_HINT", "wayland");
     command.env("MOZ_ENABLE_WAYLAND", "1");
     command.env("OBLIVION_ONE_DE", "1");
-    if gpu_policy == CompositorAppGpuPolicy::CpuOnly {
+    if gpu_policy == EffectiveCompositorAppGpuPolicy::CpuOnly {
         apply_cpu_composition_app_runtime_guards(command);
     }
 
@@ -130,17 +184,25 @@ pub fn compositor_app_args_for(_program: &str, args: &[String]) -> Vec<String> {
 }
 
 pub fn compositor_app_spawn_argv(app: &[String], private_dbus: bool) -> Option<Vec<String>> {
-    compositor_app_spawn_argv_with_policy(app, private_dbus, CompositorAppGpuPolicy::Accelerated)
+    compositor_app_spawn_argv_with_policy(
+        app,
+        private_dbus,
+        EffectiveCompositorAppGpuPolicy::Accelerated,
+    )
 }
 
 pub fn compositor_cpu_app_spawn_argv(app: &[String], private_dbus: bool) -> Option<Vec<String>> {
-    compositor_app_spawn_argv_with_policy(app, private_dbus, CompositorAppGpuPolicy::CpuOnly)
+    compositor_app_spawn_argv_with_policy(
+        app,
+        private_dbus,
+        EffectiveCompositorAppGpuPolicy::CpuOnly,
+    )
 }
 
 fn compositor_app_spawn_argv_with_policy(
     app: &[String],
     private_dbus: bool,
-    gpu_policy: CompositorAppGpuPolicy,
+    gpu_policy: EffectiveCompositorAppGpuPolicy,
 ) -> Option<Vec<String>> {
     let app = strip_desktop_field_code_args(app);
     if app.is_empty() {
@@ -155,6 +217,7 @@ pub fn spawn_compositor_app(socket_name: &str, app: &[String]) -> io::Result<Opt
         return Ok(None);
     };
     ensure_compositor_app_profile_dirs(&argv)?;
+    install_oblivion_portal_runtime()?;
     let Some((program, args)) = argv.split_first() else {
         return Ok(None);
     };
@@ -172,6 +235,7 @@ pub fn spawn_cpu_compositor_app(socket_name: &str, app: &[String]) -> io::Result
         return Ok(None);
     };
     ensure_compositor_app_profile_dirs(&argv)?;
+    install_oblivion_portal_runtime()?;
     let Some((program, args)) = argv.split_first() else {
         return Ok(None);
     };
@@ -181,6 +245,17 @@ pub fn spawn_cpu_compositor_app(socket_name: &str, app: &[String]) -> io::Result
     configure_cpu_compositor_app_command(&mut child, socket_name);
     let child = child.spawn()?;
     Ok(Some(child.id()))
+}
+
+pub fn spawn_compositor_app_with_policy(
+    socket_name: &str,
+    app: &[String],
+    gpu_policy: EffectiveCompositorAppGpuPolicy,
+) -> io::Result<Option<u32>> {
+    match gpu_policy {
+        EffectiveCompositorAppGpuPolicy::Accelerated => spawn_compositor_app(socket_name, app),
+        EffectiveCompositorAppGpuPolicy::CpuOnly => spawn_cpu_compositor_app(socket_name, app),
+    }
 }
 
 pub fn parse_session_env(contents: &str) -> HashMap<String, String> {
@@ -305,6 +380,18 @@ fn remove_host_desktop_activation_environment(command: &mut Command) {
 }
 
 fn apply_nested_app_runtime_guards(command: &mut Command) {
+    let runtime = current_portal_runtime();
+    command.env(
+        "XDG_DESKTOP_PORTAL_DIR",
+        runtime.portal_dir().to_string_lossy().into_owned(),
+    );
+    command.env(
+        "XDG_DATA_DIRS",
+        prepend_data_dir(
+            &runtime.data_dir(),
+            env::var("XDG_DATA_DIRS").ok().as_deref(),
+        ),
+    );
     command.env("GTK_USE_PORTAL", "0");
     command.env("GIO_USE_PORTALS", "0");
     command.env("QT_NO_USE_PORTAL", "1");
@@ -313,6 +400,15 @@ fn apply_nested_app_runtime_guards(command: &mut Command) {
     command.env("GIO_USE_VFS", "local");
     command.env("GVFS_DISABLE_FUSE", "1");
     command.env("DISABLE_LSFG", "1");
+}
+
+fn current_portal_runtime() -> PortalRuntime {
+    PortalRuntime::for_current_process(default_state_dir())
+        .unwrap_or_else(|_| PortalRuntime::new(default_state_dir(), PathBuf::from("oblivion-one")))
+}
+
+fn install_oblivion_portal_runtime() -> io::Result<()> {
+    current_portal_runtime().install()
 }
 
 fn apply_cpu_composition_app_runtime_guards(command: &mut Command) {
@@ -339,7 +435,7 @@ fn is_desktop_field_code_arg(arg: &str) -> bool {
 
 fn isolate_single_instance_app_argv(
     app: &[String],
-    gpu_policy: CompositorAppGpuPolicy,
+    gpu_policy: EffectiveCompositorAppGpuPolicy,
 ) -> Vec<String> {
     let Some(program) = app.first() else {
         return Vec::new();
@@ -377,7 +473,7 @@ fn gecko_browser_argv(app: &[String], app_name: &str) -> Vec<String> {
 fn chromium_browser_argv(
     app: &[String],
     app_name: &str,
-    gpu_policy: CompositorAppGpuPolicy,
+    gpu_policy: EffectiveCompositorAppGpuPolicy,
 ) -> Vec<String> {
     let mut argv = Vec::with_capacity(app.len() + 11);
     argv.push(app[0].clone());
@@ -407,8 +503,8 @@ fn chromium_browser_argv(
     ]
     .into_iter()
     .chain(match gpu_policy {
-        CompositorAppGpuPolicy::Accelerated => accelerated_args.as_slice().iter().copied(),
-        CompositorAppGpuPolicy::CpuOnly => cpu_args.as_slice().iter().copied(),
+        EffectiveCompositorAppGpuPolicy::Accelerated => accelerated_args.as_slice().iter().copied(),
+        EffectiveCompositorAppGpuPolicy::CpuOnly => cpu_args.as_slice().iter().copied(),
     });
     for arg in browser_args {
         if !app.iter().any(|existing| existing == arg) {

@@ -1,12 +1,20 @@
 use std::{fmt, io, sync::Arc};
 
+use wayland_protocols::ext::data_control::v1::server::ext_data_control_manager_v1;
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1;
 use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_manager_v1;
 use wayland_protocols::wp::{
     fractional_scale::v1::server::wp_fractional_scale_manager_v1,
-    presentation_time::server::wp_presentation, viewporter::server::wp_viewporter,
+    idle_inhibit::zv1::server::zwp_idle_inhibit_manager_v1,
+    pointer_constraints::zv1::server::zwp_pointer_constraints_v1,
+    presentation_time::server::wp_presentation,
+    primary_selection::zv1::server::zwp_primary_selection_device_manager_v1,
+    relative_pointer::zv1::server::zwp_relative_pointer_manager_v1,
+    viewporter::server::wp_viewporter,
 };
-use wayland_protocols::xdg::shell::server::xdg_wm_base;
+use wayland_protocols::xdg::{
+    decoration::zv1::server::zxdg_decoration_manager_v1, shell::server::xdg_wm_base,
+};
 use wayland_server::{
     Display, DisplayHandle, ListeningSocket,
     protocol::{
@@ -18,7 +26,10 @@ use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
 
-use super::{CompositorState, RenderGenerationCause, RenderableSurface, ShellDockItem, color};
+use super::{
+    CompositorState, InputProtocolCapabilities, RenderGenerationCause, RenderableSurface,
+    ShellDockItem, color, input::PointerMotionSample,
+};
 
 #[derive(Debug)]
 pub struct OwnCompositorServer {
@@ -26,6 +37,7 @@ pub struct OwnCompositorServer {
     pub(super) socket: ListeningSocket,
     pub(super) socket_name: String,
     pub(super) state: CompositorState,
+    gpu_buffer_protocols_enabled: bool,
 }
 
 impl OwnCompositorServer {
@@ -37,9 +49,33 @@ impl OwnCompositorServer {
         Self::bind_with_gpu_buffers(socket_name, false)
     }
 
+    pub fn bind_native_base(socket_name: impl Into<String>) -> Result<Self, CompositorError> {
+        Self::bind_with_gpu_buffers(socket_name, false)
+    }
+
+    #[cfg(test)]
+    pub(super) fn bind_with_input_capabilities(
+        socket_name: impl Into<String>,
+        input_capabilities: InputProtocolCapabilities,
+    ) -> Result<Self, CompositorError> {
+        Self::bind_with_gpu_buffers_and_input_capabilities(socket_name, false, input_capabilities)
+    }
+
     fn bind_with_gpu_buffers(
         socket_name: impl Into<String>,
         gpu_buffers_enabled: bool,
+    ) -> Result<Self, CompositorError> {
+        Self::bind_with_gpu_buffers_and_input_capabilities(
+            socket_name,
+            gpu_buffers_enabled,
+            InputProtocolCapabilities::desktop_baseline(),
+        )
+    }
+
+    fn bind_with_gpu_buffers_and_input_capabilities(
+        socket_name: impl Into<String>,
+        gpu_buffers_enabled: bool,
+        input_capabilities: InputProtocolCapabilities,
     ) -> Result<Self, CompositorError> {
         let socket_name = socket_name.into();
         let display =
@@ -49,6 +85,7 @@ impl OwnCompositorServer {
             &display.handle(),
             syncobj_device.is_some(),
             gpu_buffers_enabled,
+            input_capabilities,
         );
         let socket = ListeningSocket::bind(&socket_name)
             .map_err(|error| CompositorError::Bind(error.to_string()))?;
@@ -58,7 +95,20 @@ impl OwnCompositorServer {
             socket,
             socket_name,
             state: CompositorState::new(syncobj_device),
+            gpu_buffer_protocols_enabled: gpu_buffers_enabled,
         })
+    }
+
+    pub fn enable_gpu_buffer_protocols(&mut self) {
+        if self.gpu_buffer_protocols_enabled {
+            return;
+        }
+        register_gpu_buffer_globals(&self.display.handle(), self.state.syncobj_device.is_some());
+        self.gpu_buffer_protocols_enabled = true;
+    }
+
+    pub const fn gpu_buffer_protocols_enabled(&self) -> bool {
+        self.gpu_buffer_protocols_enabled
     }
 
     pub fn socket_name(&self) -> &str {
@@ -149,6 +199,11 @@ impl OwnCompositorServer {
 
     pub fn send_pointer_motion(&mut self, x: f64, y: f64) {
         self.state.send_pointer_motion(x, y);
+        let _ = self.display.flush_clients();
+    }
+
+    pub fn send_pointer_motion_sample(&mut self, sample: PointerMotionSample) {
+        self.state.send_pointer_motion_sample(sample);
         let _ = self.display.flush_clients();
     }
 
@@ -269,6 +324,7 @@ fn register_minimum_globals(
     display: &DisplayHandle,
     syncobj_available: bool,
     gpu_buffers_enabled: bool,
+    input_capabilities: InputProtocolCapabilities,
 ) {
     display.create_global::<CompositorState, wl_compositor::WlCompositor, _>(6, ());
     display.create_global::<CompositorState, wl_subcompositor::WlSubcompositor, _>(1, ());
@@ -282,20 +338,60 @@ fn register_minimum_globals(
     >(1, ());
     display.create_global::<CompositorState, wp_presentation::WpPresentation, _>(2, ());
     color::register_color_management_global(display);
+    if input_capabilities.relative_pointer {
+        display.create_global::<
+            CompositorState,
+            zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
+            _,
+        >(1, ());
+    }
+    if input_capabilities.pointer_constraints {
+        display.create_global::<
+            CompositorState,
+            zwp_pointer_constraints_v1::ZwpPointerConstraintsV1,
+            _,
+        >(1, ());
+    }
+    if input_capabilities.idle_inhibit {
+        display.create_global::<
+            CompositorState,
+            zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
+            _,
+        >(1, ());
+    }
+    display.create_global::<
+        CompositorState,
+        zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
+        _,
+    >(1, ());
+    display
+        .create_global::<CompositorState, ext_data_control_manager_v1::ExtDataControlManagerV1, _>(
+            1,
+            (),
+        );
+    display
+        .create_global::<CompositorState, zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _>(
+            1,
+            (),
+        );
     if gpu_buffers_enabled {
-        display.create_global::<CompositorState, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _>(4, ());
-        if syncobj_available {
-            display.create_global::<
-                CompositorState,
-                wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1,
-                _,
-            >(1, ());
-        }
-        display.create_global::<CompositorState, wl_drm::WlDrm, _>(2, ());
+        register_gpu_buffer_globals(display, syncobj_available);
     }
     display.create_global::<CompositorState, xdg_wm_base::XdgWmBase, _>(6, ());
     display.create_global::<CompositorState, wl_output::WlOutput, _>(4, ());
     display.create_global::<CompositorState, wl_seat::WlSeat, _>(7, ());
+}
+
+fn register_gpu_buffer_globals(display: &DisplayHandle, syncobj_available: bool) {
+    display.create_global::<CompositorState, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _>(4, ());
+    if syncobj_available {
+        display.create_global::<
+            CompositorState,
+            wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1,
+            _,
+        >(1, ());
+    }
+    display.create_global::<CompositorState, wl_drm::WlDrm, _>(2, ());
 }
 
 #[derive(Debug)]

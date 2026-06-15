@@ -211,11 +211,44 @@ fn resize_drag_coalesces_pointer_updates_until_present_frame() {
     let origins = render::surface_origins(server.renderable_surfaces());
 
     let state = state.unwrap();
+    assert_eq!(state.toplevel_configure_count, 3);
+    assert_eq!(state.toplevel_width, 340);
+    assert_eq!(state.toplevel_height, 230);
+    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Resizing));
+    assert_eq!(origins.first().copied(), Some(render::FIRST_SURFACE_OFFSET));
+}
+
+#[test]
+fn resize_drag_configure_reports_resizing_state_while_active() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_buffered_toplevel_then_active_resize_configure(&socket_path, &commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let state = state.unwrap();
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Resizing));
+}
+
+#[test]
+fn resize_drag_waits_for_client_commit_before_next_configure() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_buffered_toplevel_then_resize_drag_without_client_commit_between_frames(
+        &socket_path,
+        &commands,
+    );
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let state = state.unwrap();
     assert_eq!(state.toplevel_configure_count, 2);
     assert_eq!(state.toplevel_width, 340);
     assert_eq!(state.toplevel_height, 230);
-    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Resizing));
-    assert_eq!(origins.first().copied(), Some(render::FIRST_SURFACE_OFFSET));
 }
 
 #[test]
@@ -271,7 +304,7 @@ fn prepare_frame_flushes_queued_resize_configure_before_present_frame() {
 }
 
 #[test]
-fn resize_drag_previews_renderable_target_before_client_commit() {
+fn resize_drag_keeps_committed_renderable_until_client_commit() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -295,11 +328,11 @@ fn resize_drag_previews_renderable_target_before_client_commit() {
     let server = stop_controllable_test_server(commands, server_thread);
 
     assert_eq!(server.renderable_surfaces().len(), 1);
-    assert_eq!(server.renderable_surfaces()[0].width, 340);
-    assert_eq!(server.renderable_surfaces()[0].height, 230);
+    assert_eq!(server.renderable_surfaces()[0].width, 300);
+    assert_eq!(server.renderable_surfaces()[0].height, 200);
     assert_eq!(
         server.render_generation_cause(),
-        RenderGenerationCause::WindowResize
+        RenderGenerationCause::SurfaceCommit
     );
 }
 
@@ -406,6 +439,27 @@ fn pending_resize_commit_waits_for_committed_size_matching_configure() {
 }
 
 #[test]
+fn damage_only_commit_preserves_rendered_size_while_resize_is_pending() {
+    let existing = BufferSize {
+        width: 300,
+        height: 200,
+    };
+    let requested = BufferSize {
+        width: 900,
+        height: 600,
+    };
+
+    assert_eq!(
+        damage_only_rendered_surface_size(existing, requested, true),
+        existing
+    );
+    assert_eq!(
+        damage_only_rendered_surface_size(existing, requested, false),
+        requested
+    );
+}
+
+#[test]
 fn resize_drag_end_clears_resizing_state() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -467,7 +521,7 @@ fn csd_buffer_margin_resize_release_keeps_configure_at_window_geometry() {
 }
 
 #[test]
-fn resize_configure_without_client_commit_advances_render_generation_for_preview() {
+fn resize_configure_without_client_commit_does_not_advance_render_generation() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -481,7 +535,7 @@ fn resize_configure_without_client_commit_advances_render_generation_for_preview
         .unwrap();
     let _server = stop_controllable_test_server(commands, server_thread);
 
-    assert!(after_resize > before_resize);
+    assert_eq!(after_resize, before_resize);
 }
 
 #[test]
@@ -557,7 +611,7 @@ fn frame_corner_resize_click_with_tiny_motion_does_not_resize_window() {
 }
 
 #[test]
-fn left_edge_resize_shrink_previews_old_buffer_with_right_edge_anchored() {
+fn left_edge_resize_shrink_waits_for_client_commit_before_moving_surface() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -573,12 +627,12 @@ fn left_edge_resize_shrink_previews_old_buffer_with_right_edge_anchored() {
 
     assert_eq!(state.toplevel_width, 260);
     assert_eq!(state.toplevel_height, 200);
-    assert_eq!(server.renderable_surfaces()[0].width, 260);
+    assert_eq!(server.renderable_surfaces()[0].width, 300);
     assert_eq!(server.renderable_surfaces()[0].height, 200);
     assert_eq!(
         origins.first().copied(),
         Some((
-            render::FIRST_SURFACE_OFFSET.0 + 40,
+            render::FIRST_SURFACE_OFFSET.0,
             render::FIRST_SURFACE_OFFSET.1,
         ))
     );

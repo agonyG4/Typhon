@@ -5,6 +5,7 @@ mod launch_env;
 mod launch_plan;
 mod options;
 mod paths;
+pub mod portal;
 mod prototype_scene;
 pub mod render_backend;
 pub mod session;
@@ -413,11 +414,22 @@ mod tests {
             "GIO_LAUNCHED_DESKTOP_FILE_PID",
             "HYPRLAND_INSTANCE_SIGNATURE",
             "AT_SPI_BUS_ADDRESS",
-            "XDG_DESKTOP_PORTAL_DIR",
             "GTK_MODULES",
         ] {
             assert_eq!(env.get(key), Some(&None), "{key} should be removed");
         }
+        assert!(
+            env.get("XDG_DESKTOP_PORTAL_DIR")
+                .and_then(Option::as_deref)
+                .is_some_and(
+                    |path| path.ends_with("oblivion-one/portal-share/xdg-desktop-portal/portals")
+                )
+        );
+        assert!(
+            env.get("XDG_DATA_DIRS")
+                .and_then(Option::as_deref)
+                .is_some_and(|path| path.contains("oblivion-one/portal-share"))
+        );
     }
 
     #[test]
@@ -671,6 +683,69 @@ mod tests {
                 .get("OBLIVION_ONE_APP_DIR")
                 .is_some_and(|path| path.ends_with("/oblivion-one/apps/browser"))
         );
+    }
+
+    #[test]
+    fn portal_runtime_files_describe_oblivion_backend() {
+        let runtime = portal::PortalRuntime::new(
+            PathBuf::from("/tmp/oblivion-one-test"),
+            PathBuf::from("/opt/oblivion-one/bin/oblivion-one"),
+        );
+
+        assert_eq!(
+            runtime.portal_dir(),
+            PathBuf::from("/tmp/oblivion-one-test/portal-share/xdg-desktop-portal/portals")
+        );
+        assert!(runtime.portal_contents().contains("UseIn=OblivionOne"));
+        assert!(
+            runtime
+                .portal_contents()
+                .contains("org.freedesktop.impl.portal.Settings")
+        );
+        assert!(
+            runtime
+                .portal_contents()
+                .contains("org.freedesktop.impl.portal.Notification")
+        );
+        assert!(
+            runtime
+                .portal_contents()
+                .contains("org.freedesktop.impl.portal.Access")
+        );
+        assert!(
+            runtime
+                .service_contents()
+                .contains("Name=org.freedesktop.impl.portal.desktop.oblivion")
+        );
+        assert!(
+            runtime
+                .service_contents()
+                .contains("Exec=/opt/oblivion-one/bin/oblivion-one portal")
+        );
+        assert!(
+            runtime
+                .config_contents()
+                .contains("org.freedesktop.impl.portal.Settings=oblivion")
+        );
+        assert!(
+            runtime
+                .config_contents()
+                .contains("org.freedesktop.impl.portal.Access=oblivion")
+        );
+        assert!(runtime.config_contents().contains("default=none"));
+    }
+
+    #[test]
+    fn portal_settings_filter_appearance_namespace() {
+        let values = portal::settings_for_namespaces(&["org.freedesktop.appearance".to_string()]);
+
+        assert_eq!(
+            values
+                .get("org.freedesktop.appearance")
+                .and_then(|namespace| namespace.get("color-scheme")),
+            Some(&portal::PortalSettingValue::U32(1))
+        );
+        assert!(!values.contains_key("org.unknown"));
     }
 
     #[test]

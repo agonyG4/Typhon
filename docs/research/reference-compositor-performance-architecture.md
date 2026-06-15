@@ -45,12 +45,14 @@ The architecture contract is:
   opens native scanout, opens libseat/libinput where possible, handles cursor
   mode, drains input, paints the server frame, and calls pageflip.
 
-The native hot path today is still not equivalent to the target renderer
-contract:
+The native hot path now has the target renderer shape in code, but still needs
+real TTY/KMS validation:
 
-1. The native GBM scanout path renders a CPU frame, converts/copies it into a
-   staging buffer, writes the whole buffer into a GBM BO, then pageflips
-   (`src/native_output.rs:3685-3728`).
+1. The `native-egl-gbm` scanout path renders with GLES into a GBM-backed EGL
+   surface, locks the GBM front buffer, caches a DRM framebuffer ID for that BO,
+   and pageflips through KMS. The retained `gbm-cpu-write` fallback still
+   renders a CPU frame, converts/copies it into a staging buffer, writes the
+   whole buffer into a GBM BO, then pageflips.
 2. Plain pointer motion can avoid a frame repaint when the native hardware
    cursor path is active. The input effect still marks a redraw internally, but
    `requires_frame_repaint()` suppresses it for cursor-only hardware motion
@@ -164,8 +166,8 @@ state without needing to copy KWin's full architecture in one jump.
 
 | Gap | Reference | Suggested Oblivion implementation | Risk | Recommended order |
 | --- | --- | --- | --- | --- |
-| Native renderer ownership is split between `render_backend` target capabilities and `native_output.rs` CPU scanout implementation. | KWin DRM EGL layer owns GBM/EGL render targets and imports framebuffers; Hyprland's renderer commits output state after damage/direct-scanout decisions. | Create a native EGL/GBM renderer boundary under `src/render_backend/` or a sibling `src/native_renderer/` that owns GBM render targets, framebuffer import, damage submission, fences, and scanout stats. Keep `native_output.rs` as session/event orchestration. | High: touches DRM, EGL, buffer lifetime, and fallback behavior. | 4 |
-| Native GBM path renders full CPU frames and writes whole buffers. | KWin `EglGbmLayerSurface` renders to GBM swapchain slots and imports buffers; Hyprland renders GPU passes and adds output damage. | Replace `NativeGbmScanout::paint_server_frame()` with EGL/GLES render into GBM-compatible targets. Keep dumb framebuffer and current CPU GBM write as explicit fallback modes. | High: regressions can blank native session. Needs rollback env var. | 5 |
+| Native renderer ownership is still partly inside `native_output.rs`, though scene rendering is now shared. | KWin DRM EGL layer owns GBM/EGL render targets and imports framebuffers; Hyprland's renderer commits output state after damage/direct-scanout decisions. | Move the new `NativeEglGbmScanout`, framebuffer cache, and pageflip buffer ownership into a smaller native-render target module after hardware validation. Keep `native_output.rs` as session/event orchestration. | Medium-high: mostly file/module ownership now, but regressions can still blank native session. | 4 |
+| Native CPU GBM fallback renders full CPU frames and writes whole buffers. | KWin `EglGbmLayerSurface` renders to GBM swapchain slots and imports buffers; Hyprland renders GPU passes and adds output damage. | Keep `native-egl-gbm` as the normal path and retain dumb framebuffer plus CPU GBM write as explicit rollback modes until TTY evidence is stable. | High: fallback must remain available while GPU path is proven. | 5 |
 | Damage tracking exists for committed surfaces and nested EGL cursor/overlay, but native scanout does not consume region damage. | Hyprland `damageSurface`/`damageWindow`/`damageBox`; KWin `SurfaceItem::addDamage`; Shoji source damage vectors and output trackers. | Add a native `OutputDamageAccumulator`: surface commit damage, old/new window bounds, resize frame bounds, shell overlay rects, software cursor rects, and full-output invalidation reasons. Feed it to native renderer and perf logs. | Medium: incorrect damage causes stale pixels. Start with full-damage fallback on overflow/unknown. | 2 |
 | Cursor plane is now present, but cursor ownership still lives inside the native loop and software fallback damage is not integrated with native output damage. | Hyprland pointer manager owns hardware/software fallback and damages cursor box only; KWin has separate cursor layer concepts in backend layers. | Keep current `NativeHardwareCursor`, but move cursor-plane policy into the native renderer/output layer. When hardware cursor fails, add old/new cursor rects to the native damage accumulator instead of treating cursor as part of a full frame. | Medium: cursor loss/flicker under modeset or failed move. | 1 |
 | Direct scanout / overlay is declared as a target capability but not implemented in native output. | Hyprland attempts direct scanout before normal render; KWin gates scanout import on output layer, modeset, GPU, color, source rect, and transform. | Implement a conservative `DirectScanoutCandidate` contract: one fullscreen opaque dmabuf surface, matching output transform/scale/format/modifier, no shell overlays, no software cursor, no active effects, no pending color transforms. Add "why rejected" perf logging before enabling by default. | High: wrong gating can produce black frames, stale shell, bad colors, or security leaks. | 6 |
@@ -254,14 +256,19 @@ Validation:
 
 ### Phase 4: Native EGL/GBM render target
 
-Move the main native render path from CPU frame -> staging -> `bo.write()` to
-GPU render target -> framebuffer import -> pageflip.
+Status: implemented in code, pending real TTY/KMS hardware validation.
 
-Do this behind an explicit backend choice:
+The main native render path moved from CPU frame -> staging -> `bo.write()` to
+GPU render target -> framebuffer import/cache -> pageflip.
 
-- `OBLIVION_ONE_SCANOUT_BACKEND=gbm-egl-pageflip` for new path;
-- `OBLIVION_ONE_SCANOUT_BACKEND=gbm-cpu-pageflip` or equivalent for current
-  CPU GBM write fallback;
+Backend choices:
+
+- `OBLIVION_ONE_SCANOUT_BACKEND=auto` tries `native-egl-gbm`,
+  `gbm-cpu-write`, then `dumb`;
+- `OBLIVION_ONE_SCANOUT_BACKEND=gpu` or `native-egl-gbm` requires native
+  EGL/GBM;
+- `OBLIVION_ONE_SCANOUT_BACKEND=gbm-cpu-write` or `cpu` forces the CPU GBM
+  write fallback, with `gbm` and `gbm-egl` retained as legacy aliases;
 - dumb framebuffer fallback remains diagnostic.
 
 Important boundary:

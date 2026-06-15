@@ -27,7 +27,11 @@ TTY such as `Ctrl+Alt+F3`; it still refuses native scanout from an existing
 graphical session unless `OBLIVION_ONE_NATIVE_SCANOUT=1` is set.
 
 The Rust CLI then binds the Oblivion-owned Wayland socket and enters
-`src/native_output.rs`.
+`src/native_output.rs`. For native output the socket is bound with only the base
+Wayland globals first. After the scanout backend is opened and any startup
+fallback has settled, the compositor resolves the effective app GPU policy and
+publishes `linux-dmabuf`, explicit-sync, and `wl_drm` only when the active
+backend is `native-egl-gbm`.
 
 ## Native Session Diagnostics
 
@@ -42,10 +46,12 @@ The Rust CLI then binds the Oblivion-owned Wayland socket and enters
 
 The diagnosis separates host prerequisites from implementation readiness. A
 machine can report `host prerequisites available; backend still experimental`
-when libseat/libinput/GBM are installed, because `src/native_output.rs` now
-uses a shared libseat session for input and DRM device ownership and attempts a
-GBM/KMS pageflip scanout path, but the GBM path still fills buffers through the
-CPU scene renderer instead of rendering with EGL/GLES directly into GBM.
+when libseat/libinput/GBM/EGL are installed, because real TTY/KMS validation is
+still required. `src/native_output.rs` now uses a shared libseat session for
+input and DRM device ownership and, in `auto`, attempts native EGL/GLES
+composition into a GBM surface before falling back to the explicitly named
+`gbm-cpu-write` pageflip path. Legacy names such as `gbm` and `gbm-egl` remain
+aliases for that CPU-write fallback.
 
 ## Native Backend Today
 
@@ -58,15 +64,19 @@ The native backend currently:
   `WIDTHxHEIGHT@HZ` selects an exact resolution with nearest refresh fallback;
 - opens DRM through the shared libseat session when available, with a direct DRM
   fallback kept for development sessions;
-- prefers a GBM/KMS pageflip scanout path with writable XRGB8888 scanout
-  buffers, falling back to a simple KMS dumb framebuffer if GBM scanout is not
-  available;
+- prefers `native-egl-gbm` scanout in `auto`: a GBM surface with
+  `SCANOUT|RENDERING`, an EGLDisplay created from the `gbm_device`, the shared
+  GLES scene renderer, `eglSwapBuffers`, `gbm_surface_lock_front_buffer`, a DRM
+  framebuffer cache keyed by GBM BO metadata, and KMS pageflip;
+- keeps `gbm-cpu-write` as an explicit fallback/debug path with writable
+  XRGB8888 scanout buffers, and falls back further to a simple KMS dumb
+  framebuffer when GBM scanout is not available;
 - attempts a GBM-backed DRM hardware cursor by default
   (`OBLIVION_ONE_CURSOR=auto`) and omits cursor pixels from full frame
   repaints while that path is active; set `OBLIVION_ONE_CURSOR=software` to
   force the older software cursor path for comparison;
-- renders the compositor scene through the CPU scene path into the active
-  scanout buffer;
+- renders normal native GPU frames through GLES. The CPU scene renderer is still
+  used by `gbm-cpu-write` and dumb-framebuffer fallback modes;
 - prefers `libseat + libinput udev` for keyboard, pointer motion, buttons, and
   scroll;
 - suspends/resumes libinput when the libseat input owner receives
@@ -93,13 +103,20 @@ The native backend currently:
   commits from window movement, pending frame work, accepted clients, partial
   scene repair, partial frame copies, and full-output fallbacks. `copy_bytes`
   records how much of the ARGB frame was converted into scanout memory, while
-  `write_bytes` records how much was submitted to the scanout backend. When
-  native input or no-damage visible frame callbacks do not change local visuals,
+  `write_bytes` records how much was submitted to the scanout backend. The
+  `backend` field distinguishes `native-egl-gbm`,
+  `gbm-cpu-write-pageflip`, and `dumb-framebuffer`. GPU frames report
+  `write_bytes=0`, `full_frame_cpu_copy_bytes=0`, `gpu_draw_us`,
+  `egl_swap_us`, `shm_upload_bytes`, and dmabuf import/reuse/failure counts.
+  When native input or
+  no-damage visible frame callbacks do not change local visuals,
   `perf native.frame_skip` records the skipped repaint batch. GBM pageflip
   pacing also logs `native.finish_frame reason=pageflip_complete` when DRM
   confirms that a queued pageflip completed, and `native.frame_skip
-  reason=pageflip_pending` when the native loop intentionally holds new
-  client dispatch/repaint work behind an outstanding pageflip.
+  reason=pageflip_pending` when repaint is held behind an outstanding
+  pageflip. Wayland client dispatch is still serviced while a pageflip is
+  pending, and native frame logs include `pageflip_pending_at_tick` for that
+  state.
 - repairs the cached CPU scene from explicit same-layout surface damage instead
   of rebuilding every client surface on every small `wl_surface` commit. Bounds
   changes for the same surface, such as interactive move/resize, now repair the
@@ -107,9 +124,9 @@ The native backend currently:
   dumb-framebuffer scanout copy is also damage-limited. The GBM scanout staging
   copy is damage-limited and falls back to one full-frame copy when overlapping
   damage rects would copy more than the output. Window movement and resize
-  damage old and new surface bounds instead of the whole output.
-  `gbm_bo_write` still submits the full staging buffer until native EGL/GLES
-  rendering replaces this CPU write path.
+  damage old and new surface bounds instead of the whole output. `gbm_bo_write`
+  is now limited to the explicit CPU-write fallback and is not used by
+  `native-egl-gbm` frames.
 - previews interactive resize with a compositor-owned target geometry while
   waiting for the client commit. Left/top edge resizes keep the opposite edge
   visually anchored. If the committed client buffer is smaller than the preview
@@ -132,6 +149,45 @@ Keyboard clients receive an XKB keymap generated from
 The native emergency exit shortcut is `Alt+P`. `Ctrl+C` is forwarded to clients
 again, so terminals and shells inside the session can use it normally.
 
+## Backend Selection
+
+- `OBLIVION_ONE_SCANOUT_BACKEND=auto` (default): try `native-egl-gbm`, then
+  `gbm-cpu-write`, then `dumb`.
+- `OBLIVION_ONE_SCANOUT_BACKEND=gpu` or `native-egl-gbm`: require native
+  EGL/GLES over GBM/KMS and fail if it cannot be created.
+- `OBLIVION_ONE_SCANOUT_BACKEND=cpu` or `gbm-cpu-write`: force the old GBM
+  CPU-write pageflip path. Legacy `gbm`, `egl`, `pageflip`, `gbm-egl`, and
+  `gbm-egl-pageflip` values remain aliases for this fallback.
+- `OBLIVION_ONE_SCANOUT_BACKEND=dumb`: force the KMS dumb framebuffer fallback.
+- `OBLIVION_ONE_NATIVE_APP_GPU=auto` or unset: derive the app profile from the
+  active backend. `native-egl-gbm` launches accelerated apps; CPU-write and dumb
+  launch apps with the software recovery profile.
+- `OBLIVION_ONE_NATIVE_APP_GPU=gpu`: require `native-egl-gbm`. If startup
+  fallback lands on CPU/dumb, session startup fails with a clear error instead
+  of silently converting the override to CPU.
+- `OBLIVION_ONE_NATIVE_APP_GPU=cpu`: force compositor-launched apps into the
+  software recovery profile even when `native-egl-gbm` is active.
+
+The initial app command is launched exactly once after the Wayland socket,
+scanout backend, effective feedback/protocols, initial modeset, and input
+backend are ready:
+
+```sh
+./bin/start-oblivion-one-tty -- kitty
+```
+
+Spotlight launches and the initial command use the same spawn path and the same
+effective app GPU policy. Their perf events carry `source=startup` or
+`source=spotlight`.
+
+Startup fallback and runtime recovery are different. `auto` can fall back from
+`native-egl-gbm` to CPU/dumb while opening the backend or painting the first
+frame. After the session is presenting frames, EGL swap, GBM lock, framebuffer,
+pageflip, and DRM event failures are treated as fatal runtime errors with
+structured diagnostics and an explicit CPU restart recommendation. The
+compositor does not remove already-published Wayland globals or hot-swap to a
+CPU backend mid-pageflip.
+
 ## Production Gaps
 
 This is not yet a Hyprland/KWin-class native compositor backend. The next
@@ -139,16 +195,18 @@ architecture milestones are:
 
 - remove direct DRM/input fallbacks after the libseat path is stable under real
   SDDM/VT switching;
-- replace CPU-filled GBM buffers with EGL/GLES rendering into GBM render
-  targets;
+- harden EGL/GBM rendering under real SDDM/TTY hardware runs across drivers;
 - make the loop wake from DRM/libinput readiness instead of polling DRM and
   sleeping from the current refresh-derived timer approximation;
+- complete protocol-owned pointer constraints and keyboard-shortcuts-inhibit
+  activation before advertising them in normal sessions;
 - parse DRM pageflip timestamps/sequences for precise presentation feedback;
 - add VRR capability detection and a conservative `off/on/fullscreen` policy;
 - centralize output suspend/resume and device revoke handling in the session
   abstraction;
-- add a tight-damage software cursor fallback and retained output damage for
-  resize, shell overlay, and GBM/EGL-native presentation.
+- add a tight-damage software cursor fallback, fd-driven scheduling, suspend
+  recovery, direct scanout, and driver-specific validation for GBM/EGL-native
+  presentation.
 
 Research notes for the current native push live in:
 
@@ -174,6 +232,7 @@ OBLIVION_ONE_DRY_RUN=1 ./bin/start-oblivion-one
 env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u DISPLAY OBLIVION_ONE_DRY_RUN=1 ./bin/start-oblivion-one-tty
 OBLIVION_ONE_PERF_LOG=1 start-oblivion-one-tty
 OBLIVION_ONE_CURSOR=software OBLIVION_ONE_PERF_LOG=1 start-oblivion-one-tty
+OBLIVION_ONE_TEST_FAIL_NATIVE_EGL_GBM=1 OBLIVION_ONE_SCANOUT_BACKEND=auto ./bin/start-oblivion-one-tty -- kitty
 grep '^perf ' ~/.local/state/oblivion-one/session.log
 ./bin/install-start-oblivion-one --sddm-session --target-dir target/sddm-smoke --perf-log
 cargo run -- doctor
@@ -191,3 +250,18 @@ cargo build --release
 ./bin/install-start-oblivion-one --sddm-session
 ./bin/install-start-oblivion-one --sddm-session --perf-log # verbose performance run
 ```
+
+Manual TTY/KMS validation still needs to cover:
+
+- modes: 1920x1080@60, 1920x1080 high refresh, 2560x1440 where available, and
+  4K where available;
+- drivers: AMD Mesa, Intel Mesa, and the local NVIDIA stack when present;
+- clients: a simple SHM client, an EGL Wayland client, GTK, Qt/Qt Quick,
+  Firefox/Zen, Chromium/Electron, and video playback;
+- interactions: move, resize from each edge, maximize/restore, fullscreen,
+  minimize/restore, popups, rapid commits, hardware/software cursor modes,
+  VT/session switch, and shutdown during pageflip activity;
+- metrics: `backend=native-egl-gbm`, `write_bytes=0`,
+  `full_frame_cpu_copy_bytes=0`, non-llvmpipe GL renderer unless intentionally
+  testing software EGL, pageflip completion logs, bounded framebuffer cache
+  growth, and stable memory use.

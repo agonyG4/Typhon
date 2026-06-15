@@ -1,5 +1,6 @@
 pub mod buffer;
 pub mod egl_gles;
+pub mod native_egl_gbm;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderBackendKind {
@@ -52,6 +53,198 @@ pub enum RenderCapability {
     MultiGpuImport,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameFlags(u32);
+
+impl FrameFlags {
+    pub const ALLOW_PRIMARY_PLANE_SCANOUT: Self = Self(1 << 0);
+    pub const ALLOW_PRIMARY_PLANE_SCANOUT_ANY: Self = Self(1 << 1);
+    pub const ALLOW_OVERLAY_PLANE_SCANOUT: Self = Self(1 << 2);
+    pub const ALLOW_CURSOR_PLANE_SCANOUT: Self = Self(1 << 3);
+    pub const SKIP_CURSOR_ONLY_UPDATES: Self = Self(1 << 4);
+    pub const ALLOW_SCANOUT: Self = Self(
+        Self::ALLOW_PRIMARY_PLANE_SCANOUT.0
+            | Self::ALLOW_OVERLAY_PLANE_SCANOUT.0
+            | Self::ALLOW_CURSOR_PLANE_SCANOUT.0,
+    );
+    pub const DEFAULT: Self = Self::ALLOW_SCANOUT;
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameRenderPolicy {
+    pub flags: FrameFlags,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorCompositionMode {
+    HardwarePlane,
+    Composited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HardwareCursorPlan {
+    pub max_width: u32,
+    pub max_height: u32,
+    pub mode: CursorCompositionMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameAction {
+    Idle,
+    Render,
+    WaitForPageFlip,
+    FinishFrame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameScheduler {
+    refresh_interval_nsec: u64,
+    has_work: bool,
+    render_submitted_at_nsec: Option<u64>,
+    page_flip_at_nsec: Option<u64>,
+    finish_ready: bool,
+}
+
+impl FrameScheduler {
+    pub fn new(refresh_interval_nsec: u64) -> Self {
+        Self {
+            refresh_interval_nsec: refresh_interval_nsec.max(1),
+            has_work: false,
+            render_submitted_at_nsec: None,
+            page_flip_at_nsec: None,
+            finish_ready: false,
+        }
+    }
+
+    pub fn note_frame_work(&mut self, _now_nsec: u64) {
+        self.has_work = true;
+    }
+
+    pub fn note_render_submitted(&mut self, now_nsec: u64) {
+        self.render_submitted_at_nsec = Some(now_nsec);
+    }
+
+    pub fn note_page_flip(&mut self, now_nsec: u64) {
+        self.page_flip_at_nsec = Some(now_nsec);
+        self.finish_ready = true;
+    }
+
+    pub fn next_action(&mut self, now_nsec: u64) -> FrameAction {
+        if self.finish_ready {
+            self.has_work = false;
+            self.render_submitted_at_nsec = None;
+            self.page_flip_at_nsec = None;
+            self.finish_ready = false;
+            return FrameAction::FinishFrame;
+        }
+
+        if let Some(submitted_at) = self.render_submitted_at_nsec {
+            if self.page_flip_at_nsec.is_some()
+                || now_nsec.saturating_sub(submitted_at) >= self.refresh_interval_nsec
+            {
+                self.finish_ready = true;
+                return self.next_action(now_nsec);
+            }
+            return FrameAction::WaitForPageFlip;
+        }
+
+        if self.has_work {
+            FrameAction::Render
+        } else {
+            FrameAction::Idle
+        }
+    }
+}
+
+impl HardwareCursorPlan {
+    pub fn choose(
+        policy: FrameRenderPolicy,
+        cursor_width: u32,
+        cursor_height: u32,
+        max_width: u32,
+        max_height: u32,
+    ) -> Self {
+        let cursor_fits = cursor_width > 0
+            && cursor_height > 0
+            && cursor_width <= max_width
+            && cursor_height <= max_height;
+        let mode = if policy.allows_cursor_plane() && cursor_fits {
+            CursorCompositionMode::HardwarePlane
+        } else {
+            CursorCompositionMode::Composited
+        };
+        Self {
+            max_width,
+            max_height,
+            mode,
+        }
+    }
+
+    pub const fn uses_hardware_plane(self) -> bool {
+        matches!(self.mode, CursorCompositionMode::HardwarePlane)
+    }
+}
+
+impl FrameRenderPolicy {
+    pub const fn composited_only() -> Self {
+        Self {
+            flags: FrameFlags::empty(),
+        }
+    }
+
+    pub const fn smithay_default() -> Self {
+        Self {
+            flags: FrameFlags::DEFAULT,
+        }
+    }
+
+    pub fn for_backend(backend: &RenderBackendProfile) -> Self {
+        let mut flags = FrameFlags::DEFAULT;
+        if !backend.supports(RenderCapability::DirectScanout) {
+            flags = flags
+                .without(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT)
+                .without(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY)
+                .without(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
+        }
+        Self { flags }
+    }
+
+    pub const fn allows_cursor_plane(self) -> bool {
+        self.flags.contains(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT)
+    }
+
+    pub const fn allows_primary_scanout(self) -> bool {
+        self.flags.contains(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT)
+            || self
+                .flags
+                .contains(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY)
+    }
+
+    pub const fn allows_overlay_scanout(self) -> bool {
+        self.flags.contains(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderBackendProfile {
     pub kind: RenderBackendKind,
@@ -71,7 +264,6 @@ impl RenderBackendProfile {
                 RenderCapability::ModifierAwareDmabufImport,
                 RenderCapability::DmabufFeedback,
                 RenderCapability::ExplicitSync,
-                RenderCapability::DirectScanout,
                 RenderCapability::MultiGpuImport,
             ],
         }
@@ -128,6 +320,7 @@ mod tests {
         assert_eq!(backend.preferred_api, GpuApi::GlGles);
         assert!(backend.supports(RenderCapability::ModifierAwareDmabufImport));
         assert!(backend.supports(RenderCapability::ExplicitSync));
+        assert!(!backend.supports(RenderCapability::DirectScanout));
     }
 
     #[test]
@@ -191,5 +384,125 @@ mod tests {
             ],
         };
         assert!(!browser_gpu_acceleration_ready(&incomplete_backend));
+    }
+
+    #[test]
+    fn frame_flags_match_smithay_scanout_defaults() {
+        let flags = FrameFlags::DEFAULT;
+
+        assert!(flags.contains(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT));
+        assert!(flags.contains(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT));
+        assert!(flags.contains(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT));
+        assert!(!flags.contains(FrameFlags::SKIP_CURSOR_ONLY_UPDATES));
+    }
+
+    #[test]
+    fn frame_render_policy_disables_surface_scanout_without_backend_capability() {
+        let policy = FrameRenderPolicy::for_backend(&RenderBackendProfile::egl_gles());
+
+        assert!(!policy.allows_primary_scanout());
+        assert!(!policy.allows_overlay_scanout());
+        assert!(policy.allows_cursor_plane());
+    }
+
+    #[test]
+    fn native_egl_gbm_plan_accepts_render_scene_elements_for_gpu_composition() {
+        use crate::compositor::{
+            RenderableSurface, RenderableSurfaceDamage, SurfacePlacement,
+            render_scene_elements_for_surfaces,
+        };
+
+        let surface = RenderableSurface {
+            surface_id: 7,
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+            placement: SurfacePlacement::root(),
+            resize_preview: None,
+            generation: 1,
+            buffer: buffer::CommittedSurfaceBuffer::shm_snapshot(
+                buffer::BufferSize::new(2, 2).unwrap(),
+                vec![0xff00_0000; 4],
+            ),
+            damage: RenderableSurfaceDamage::full(),
+        };
+        let elements = render_scene_elements_for_surfaces(std::slice::from_ref(&surface), 1.0);
+
+        let plan = native_egl_gbm::NativeEglGbmFramePlan::for_elements(
+            RenderBackendProfile::egl_gles(),
+            FrameRenderPolicy::for_backend(&RenderBackendProfile::egl_gles()),
+            &elements,
+        );
+
+        assert_eq!(plan.element_count, 1);
+        assert_eq!(plan.shm_uploads, 1);
+        assert_eq!(plan.dmabuf_imports, 0);
+        assert_eq!(
+            plan.composition_mode,
+            native_egl_gbm::NativeEglGbmCompositionMode::GpuComposition
+        );
+        assert!(!plan.direct_scanout_enabled);
+    }
+
+    #[test]
+    fn hardware_cursor_plan_uses_cursor_plane_only_when_cursor_fits() {
+        let policy = FrameRenderPolicy::smithay_default();
+
+        let small = HardwareCursorPlan::choose(policy, 32, 32, 64, 64);
+        let large = HardwareCursorPlan::choose(policy, 128, 32, 64, 64);
+
+        assert!(small.uses_hardware_plane());
+        assert!(!large.uses_hardware_plane());
+    }
+
+    #[test]
+    fn hardware_cursor_plan_falls_back_when_policy_disables_cursor_plane() {
+        let policy = FrameRenderPolicy::composited_only();
+
+        let plan = HardwareCursorPlan::choose(policy, 32, 32, 64, 64);
+
+        assert_eq!(plan.mode, CursorCompositionMode::Composited);
+    }
+
+    #[test]
+    fn frame_scheduler_waits_for_work_before_rendering() {
+        let mut scheduler = FrameScheduler::new(16_666_667);
+
+        assert_eq!(scheduler.next_action(0), FrameAction::Idle);
+        scheduler.note_frame_work(1);
+        assert_eq!(scheduler.next_action(1), FrameAction::Render);
+    }
+
+    #[test]
+    fn frame_scheduler_reports_presented_only_after_pageflip() {
+        let mut scheduler = FrameScheduler::new(16_666_667);
+
+        scheduler.note_frame_work(0);
+        assert_eq!(scheduler.next_action(0), FrameAction::Render);
+        scheduler.note_render_submitted(1_000_000);
+
+        assert_eq!(
+            scheduler.next_action(2_000_000),
+            FrameAction::WaitForPageFlip
+        );
+        scheduler.note_page_flip(16_666_667);
+        assert_eq!(scheduler.next_action(16_666_668), FrameAction::FinishFrame);
+        assert_eq!(scheduler.next_action(16_666_669), FrameAction::Idle);
+    }
+
+    #[test]
+    fn frame_scheduler_uses_refresh_deadline_when_pageflip_is_missing() {
+        let mut scheduler = FrameScheduler::new(16_666_667);
+
+        scheduler.note_frame_work(0);
+        assert_eq!(scheduler.next_action(0), FrameAction::Render);
+        scheduler.note_render_submitted(1_000_000);
+
+        assert_eq!(
+            scheduler.next_action(17_666_666),
+            FrameAction::WaitForPageFlip
+        );
+        assert_eq!(scheduler.next_action(17_666_667), FrameAction::FinishFrame);
     }
 }

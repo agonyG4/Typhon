@@ -6,8 +6,9 @@ Status: installable for testing; not yet production-grade
 
 `bin/install-start-oblivion-one --sddm-session` can install the Wayland session
 entry and the launcher now runs native sessions from the release binary by
-default. This makes SDDM testing reproducible, but the native backend still uses
-a transitional CPU-filled GBM/dumb scanout path.
+default. This makes SDDM testing reproducible. The native backend now has a
+`native-egl-gbm` GPU scanout path, but it is still experimental until real
+TTY/KMS runs validate it across local hardware and drivers.
 
 `oblivion-one doctor` reports the current native-session matrix: runtime dir,
 KMS/render devices, connected output, seat/libinput/GBM/EGL prerequisites, and
@@ -25,8 +26,21 @@ Current limits:
   DRM fallback remains for diagnostics;
 - KMS mode selection now supports `OBLIVION_ONE_MODE` and the installed
   SDDM/TTY paths default to `1920x1080@165` for this test cycle;
-- native scanout now attempts GBM/KMS pageflips, but the GBM buffers are still
-  filled by the CPU renderer and may fall back to a KMS dumb framebuffer;
+- native scanout now tries `native-egl-gbm` first in `auto`. That path renders
+  with the shared EGL/GLES scene renderer into a GBM-backed EGL surface, locks
+  the GBM front buffer, and pageflips the cached DRM framebuffer. The
+  `gbm-cpu-write` and KMS dumb framebuffer paths remain explicit fallback/debug
+  modes. Legacy values such as `gbm` and `gbm-egl` still select the CPU-write
+  path;
+- startup fallback is limited to backend creation and the first paint before
+  clients are launched. Once the session is running, GPU scanout failures are
+  fatal runtime errors with stage/backend/frame diagnostics and a recommended
+  restart command such as
+  `OBLIVION_ONE_SCANOUT_BACKEND=cpu OBLIVION_ONE_NATIVE_APP_GPU=cpu`;
+- native app GPU policy is resolved from the active backend. CPU-write and dumb
+  fallback sessions do not publish GPU buffer globals and default apps to the
+  software profile; `OBLIVION_ONE_NATIVE_APP_GPU=gpu` requires
+  `native-egl-gbm`;
 - active wakeups, `wl_output.mode`, and presentation feedback follow the
   selected KMS refresh rate. On GBM/KMS, frame callbacks, buffer releases, and
   presentation feedback are now completed after DRM pageflip completion, but
@@ -43,9 +57,9 @@ Current limits:
 
 Expected direction:
 
-Move from CPU-filled GBM buffers to EGL/GLES rendering into GBM targets and wire
-output revoke/resume before treating SDDM performance as comparable to KWin,
-Hyprland, or other mature compositors.
+Validate native EGL/GLES over GBM/KMS on real TTY sessions, then wire output
+revoke/resume, fd-driven scheduling, and direct scanout before treating SDDM
+performance as comparable to KWin, Hyprland, or other mature compositors.
 
 ## Brave/Chromium Vulkan warning on Wayland
 
