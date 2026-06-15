@@ -12,8 +12,6 @@ fn compositor_plan_advertises_minimum_real_client_protocols() {
         "wp_fractional_scale_manager_v1",
         "wp_presentation",
         "wp_color_manager_v1",
-        "zwp_primary_selection_device_manager_v1",
-        "ext_data_control_manager_v1",
         "zxdg_decoration_manager_v1",
         "zwp_linux_dmabuf_v1",
         "wp_linux_drm_syncobj_manager_v1",
@@ -24,6 +22,71 @@ fn compositor_plan_advertises_minimum_real_client_protocols() {
     ];
 
     assert_eq!(plan.protocol_names().as_slice(), expected.as_slice());
+}
+
+#[test]
+fn safe_selection_profile_hides_unimplemented_selection_protocols() {
+    let protocols = client_protocols_for_capabilities(
+        InputProtocolCapabilities::desktop_baseline(),
+        SelectionProtocolCapabilities::safe_baseline(),
+    );
+    let names: Vec<_> = protocols.into_iter().map(ProtocolGlobal::name).collect();
+
+    assert!(!names.contains(&"wl_data_device_manager"));
+    assert!(!names.contains(&"zwp_primary_selection_device_manager_v1"));
+    assert!(!names.contains(&"ext_data_control_manager_v1"));
+}
+
+#[test]
+fn clipboard_ready_profile_advertises_only_core_clipboard_selection() {
+    let protocols = client_protocols_for_capabilities(
+        InputProtocolCapabilities::desktop_baseline(),
+        SelectionProtocolCapabilities {
+            clipboard: true,
+            primary_selection: false,
+            data_control: false,
+        },
+    );
+    let names: Vec<_> = protocols.into_iter().map(ProtocolGlobal::name).collect();
+
+    assert!(names.contains(&"wl_data_device_manager"));
+    assert!(!names.contains(&"zwp_primary_selection_device_manager_v1"));
+    assert!(!names.contains(&"ext_data_control_manager_v1"));
+}
+
+#[test]
+fn default_plan_advertises_core_clipboard_but_not_unimplemented_selection_protocols() {
+    let protocols = CompositorPlan::new("oblivion-one-test").protocol_names();
+
+    assert!(protocols.contains(&"wl_data_device_manager"));
+    assert!(!protocols.contains(&"zwp_primary_selection_device_manager_v1"));
+    assert!(!protocols.contains(&"ext_data_control_manager_v1"));
+}
+
+#[test]
+fn protocol_capability_policy_does_not_duplicate_globals() {
+    let protocols = client_protocols_for_capabilities(
+        InputProtocolCapabilities {
+            relative_pointer: true,
+            pointer_constraints: true,
+            keyboard_shortcuts_inhibit: false,
+            idle_inhibit: true,
+        },
+        SelectionProtocolCapabilities {
+            clipboard: true,
+            primary_selection: true,
+            data_control: true,
+        },
+    );
+    let names: Vec<_> = protocols.into_iter().map(ProtocolGlobal::name).collect();
+
+    for name in &names {
+        assert_eq!(
+            names.iter().filter(|candidate| *candidate == name).count(),
+            1,
+            "duplicated global {name}"
+        );
+    }
 }
 
 #[test]

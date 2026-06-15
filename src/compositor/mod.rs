@@ -2,9 +2,14 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     io,
-    os::fd::OwnedFd,
+    os::fd::{AsFd, OwnedFd},
     sync::{Arc, Mutex},
     time::Instant,
+};
+
+pub use clipboard_bridge::{
+    ClipboardBridge, ClipboardBridgeError, ClipboardBridgeEvent, HostClipboardOfferId,
+    NoopClipboardBridge,
 };
 
 use wayland_protocols::ext::data_control::v1::server::{
@@ -38,10 +43,11 @@ use wayland_protocols::xdg::{
 };
 use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
+    backend::{ClientId, ObjectId},
     protocol::{
         wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
-        wl_data_source, wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat, wl_shm,
-        wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
+        wl_data_offer, wl_data_source, wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat,
+        wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
     },
 };
 
@@ -53,6 +59,7 @@ use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
 
+mod clipboard_bridge;
 mod color;
 mod dmabuf;
 mod explicit_sync;
@@ -107,7 +114,7 @@ use output::{
 };
 pub use plan::{
     ArchitectureLayer, CompositorArchitecture, CompositorPlan, InputProtocolCapabilities,
-    ProtocolGlobal,
+    ProtocolGlobal, SelectionProtocolCapabilities, client_protocols_for_capabilities,
 };
 use popup::{
     PopupAnchorRect, PopupConstraintAdjustment, PopupEdges, PopupRect, XdgPositionerState,
@@ -253,9 +260,73 @@ pub struct CompositorState {
     dmabuf_main_device: u64,
     dmabuf_main_device_path: Option<String>,
     syncobj_device: Option<DrmSyncobjDevice>,
+    clipboard_bridge: Option<Box<dyn ClipboardBridge>>,
+    selection_state: SelectionState,
+    data_sources: HashMap<ObjectId, ClipboardDataSource>,
+    data_devices: Vec<ClipboardDataDevice>,
+    data_offers: HashMap<ObjectId, ClipboardDataOffer>,
+    active_clipboard: Option<ActiveClipboard>,
+    next_clipboard_generation: u64,
     popup_surfaces: HashMap<u32, PopupSurface>,
     popup_grab_stack: Vec<u32>,
     pending_color_info: Vec<color::PendingColorInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct DataSourceData {
+    client_id: ClientId,
+}
+
+#[derive(Debug, Clone)]
+struct DataDeviceData {
+    client_id: ClientId,
+    seat_id: ObjectId,
+}
+
+#[derive(Debug, Clone)]
+struct DataOfferData {
+    target_client_id: ClientId,
+    source_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ClipboardDataSource {
+    source: wl_data_source::WlDataSource,
+    client_id: ClientId,
+    mime_types: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ClipboardDataDevice {
+    device: wl_data_device::WlDataDevice,
+    client_id: ClientId,
+    seat_id: ObjectId,
+}
+
+#[derive(Debug, Clone)]
+struct ClipboardDataOffer {
+    offer: wl_data_offer::WlDataOffer,
+    target_client_id: ClientId,
+    source_generation: u64,
+    mime_types: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveClipboard {
+    generation: u64,
+    source: ClipboardSourceBackend,
+    mime_types: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+enum ClipboardSourceBackend {
+    InternalWayland {
+        source: wl_data_source::WlDataSource,
+        client_id: ClientId,
+    },
+    HostBridge {
+        offer_id: HostClipboardOfferId,
+    },
 }
 
 impl CompositorState {
@@ -270,6 +341,7 @@ impl CompositorState {
                 .unwrap_or(0),
             dmabuf_main_device_path: default_dmabuf_device.map(|device| device.path),
             syncobj_device,
+            clipboard_bridge: Some(Box::new(NoopClipboardBridge)),
             ..Self::default()
         }
     }
@@ -368,6 +440,19 @@ impl CompositorState {
         self.focused_surface = Some(surface);
     }
 
+    fn focused_client_id(&self) -> Option<ClientId> {
+        self.focused_surface
+            .as_ref()
+            .and_then(Resource::client)
+            .map(|client| client.id())
+    }
+
+    fn client_has_focus(&self, client_id: &ClientId) -> bool {
+        self.focused_client_id()
+            .as_ref()
+            .is_some_and(|focused_client_id| focused_client_id == client_id)
+    }
+
     fn remember_input_serial(&mut self, serial: u32, surface: wl_surface::WlSurface) {
         self.recent_input_serials
             .retain(|input| input.serial != serial);
@@ -391,6 +476,322 @@ impl CompositorState {
         self.recent_input_serials
             .iter()
             .any(|input| input.serial == serial && input.surface.id().same_client_as(&surface.id()))
+    }
+
+    fn client_has_recent_input_serial(&self, client_id: &ClientId, serial: u32) -> bool {
+        self.recent_input_serials.iter().any(|input| {
+            input.serial == serial
+                && input
+                    .surface
+                    .client()
+                    .is_some_and(|client| client.id() == *client_id)
+        })
+    }
+
+    fn register_data_source(&mut self, source: wl_data_source::WlDataSource, client_id: ClientId) {
+        self.selection_state.begin_source(source.id().protocol_id());
+        self.data_sources.insert(
+            source.id(),
+            ClipboardDataSource {
+                source,
+                client_id,
+                mime_types: Vec::new(),
+            },
+        );
+    }
+
+    fn offer_data_source_mime_type(
+        &mut self,
+        source: &wl_data_source::WlDataSource,
+        mime_type: String,
+    ) {
+        self.selection_state
+            .offer_source_mime_type(source.id().protocol_id(), mime_type.clone());
+        let Some(binding) = self.data_sources.get_mut(&source.id()) else {
+            return;
+        };
+        if mime_type.is_empty()
+            || mime_type.len() > 4096
+            || binding.mime_types.len() >= 128
+            || binding
+                .mime_types
+                .iter()
+                .any(|existing| existing == &mime_type)
+        {
+            return;
+        }
+        binding.mime_types.push(mime_type);
+    }
+
+    fn remove_data_source(&mut self, source: &wl_data_source::WlDataSource) {
+        self.data_sources.remove(&source.id());
+        self.selection_state
+            .remove_source(source.id().protocol_id());
+        if self
+            .active_clipboard
+            .as_ref()
+            .is_some_and(|selection| match &selection.source {
+                ClipboardSourceBackend::InternalWayland {
+                    source: active_source,
+                    ..
+                } => same_wayland_resource(active_source, source),
+                ClipboardSourceBackend::HostBridge { .. } => false,
+            })
+        {
+            self.active_clipboard = None;
+            self.next_clipboard_generation = self.next_clipboard_generation.saturating_add(1);
+            if let Some(bridge) = self.clipboard_bridge.as_mut() {
+                let _ = bridge.clear_internal_selection();
+            }
+            self.data_offers.clear();
+            self.publish_clipboard_to_focused_client();
+        }
+    }
+
+    fn register_data_device(
+        &mut self,
+        device: wl_data_device::WlDataDevice,
+        client_id: ClientId,
+        seat_id: ObjectId,
+    ) {
+        self.data_devices
+            .retain(|binding| binding.device.is_alive());
+        self.data_devices.push(ClipboardDataDevice {
+            device: device.clone(),
+            client_id: client_id.clone(),
+            seat_id,
+        });
+        if self.client_has_focus(&client_id) {
+            self.publish_clipboard_to_data_device(&device);
+        }
+    }
+
+    fn remove_data_device(&mut self, device: &wl_data_device::WlDataDevice) {
+        self.data_devices
+            .retain(|binding| !same_wayland_resource(&binding.device, device));
+        self.data_offers.retain(|_, offer| {
+            offer.offer.is_alive() && !offer.offer.id().same_client_as(&device.id())
+        });
+    }
+
+    fn set_clipboard_selection(
+        &mut self,
+        client_id: &ClientId,
+        source: Option<wl_data_source::WlDataSource>,
+        serial: u32,
+    ) -> bool {
+        if !self.client_has_focus(client_id)
+            || !self.client_has_recent_input_serial(client_id, serial)
+        {
+            return false;
+        }
+
+        let Some(source) = source else {
+            self.active_clipboard = None;
+            self.selection_state.clear_clipboard_selection();
+            self.next_clipboard_generation = self.next_clipboard_generation.saturating_add(1);
+            if let Some(bridge) = self.clipboard_bridge.as_mut() {
+                let _ = bridge.clear_internal_selection();
+            }
+            self.data_offers.clear();
+            self.publish_clipboard_to_focused_client();
+            return true;
+        };
+
+        let Some(binding) = self.data_sources.get(&source.id()).cloned() else {
+            return false;
+        };
+        if binding.client_id != *client_id || !source.is_alive() || binding.mime_types.is_empty() {
+            return false;
+        }
+
+        if let Some(previous) = self.active_clipboard.as_ref() {
+            if let ClipboardSourceBackend::InternalWayland {
+                source: previous_source,
+                ..
+            } = &previous.source
+                && !same_wayland_resource(previous_source, &source)
+                && previous_source.is_alive()
+            {
+                previous_source.cancelled();
+            }
+        }
+
+        self.next_clipboard_generation = self.next_clipboard_generation.saturating_add(1);
+        let generation = self.next_clipboard_generation;
+        self.selection_state
+            .set_clipboard_selection_from_source(source.id().protocol_id());
+        self.active_clipboard = Some(ActiveClipboard {
+            generation,
+            source: ClipboardSourceBackend::InternalWayland {
+                source: binding.source,
+                client_id: binding.client_id,
+            },
+            mime_types: binding.mime_types.clone(),
+        });
+        if let Some(bridge) = self.clipboard_bridge.as_mut() {
+            let _ = bridge.publish_internal_selection(generation, binding.mime_types);
+        }
+        self.data_offers.clear();
+        self.publish_clipboard_to_focused_client();
+        true
+    }
+
+    fn install_host_clipboard_selection(
+        &mut self,
+        offer_id: HostClipboardOfferId,
+        mime_types: Vec<String>,
+    ) {
+        let mime_types = normalize_selection_mime_types(mime_types);
+        if mime_types.is_empty() {
+            self.clear_host_clipboard_selection();
+            return;
+        }
+        self.next_clipboard_generation = self.next_clipboard_generation.saturating_add(1);
+        self.active_clipboard = Some(ActiveClipboard {
+            generation: self.next_clipboard_generation,
+            source: ClipboardSourceBackend::HostBridge { offer_id },
+            mime_types,
+        });
+        self.data_offers.clear();
+        self.publish_clipboard_to_focused_client();
+    }
+
+    fn clear_host_clipboard_selection(&mut self) {
+        self.next_clipboard_generation = self.next_clipboard_generation.saturating_add(1);
+        if self.active_clipboard.as_ref().is_some_and(|selection| {
+            matches!(selection.source, ClipboardSourceBackend::HostBridge { .. })
+        }) {
+            self.active_clipboard = None;
+            self.data_offers.clear();
+            self.publish_clipboard_to_focused_client();
+        }
+    }
+
+    fn poll_clipboard_bridge(&mut self) {
+        let Some(bridge) = self.clipboard_bridge.as_mut() else {
+            return;
+        };
+        let events = bridge.poll_events();
+        for event in events {
+            match event {
+                ClipboardBridgeEvent::HostSelectionChanged {
+                    offer_id,
+                    mime_types,
+                } => self.install_host_clipboard_selection(offer_id, mime_types),
+                ClipboardBridgeEvent::HostSelectionCleared => self.clear_host_clipboard_selection(),
+            }
+        }
+    }
+
+    fn publish_clipboard_to_focused_client(&mut self) {
+        let Some(client_id) = self.focused_client_id() else {
+            return;
+        };
+        let devices = self
+            .data_devices
+            .iter()
+            .filter(|binding| {
+                binding.client_id == client_id
+                    && binding.device.is_alive()
+                    && binding.seat_id.interface().name == "wl_seat"
+            })
+            .map(|binding| binding.device.clone())
+            .collect::<Vec<_>>();
+        for device in devices {
+            self.publish_clipboard_to_data_device(&device);
+        }
+    }
+
+    fn publish_clipboard_to_data_device(&mut self, device: &wl_data_device::WlDataDevice) {
+        if !device.is_alive() {
+            return;
+        }
+        let Some(selection) = self.active_clipboard.clone() else {
+            let _ = device.send_event(wl_data_device::Event::Selection { id: None });
+            return;
+        };
+        if selection.mime_types.is_empty() {
+            let _ = device.send_event(wl_data_device::Event::Selection { id: None });
+            return;
+        }
+        let Some(client) = device.client() else {
+            return;
+        };
+        let Some(handle) = device.handle().upgrade() else {
+            return;
+        };
+        let display = DisplayHandle::from(handle);
+        let Ok(offer) = client
+            .create_resource::<wl_data_offer::WlDataOffer, DataOfferData, CompositorState>(
+                &display,
+                device.version().min(3),
+                DataOfferData {
+                    target_client_id: client.id(),
+                    source_generation: selection.generation,
+                },
+            )
+        else {
+            return;
+        };
+
+        self.data_offers.insert(
+            offer.id(),
+            ClipboardDataOffer {
+                offer: offer.clone(),
+                target_client_id: client.id(),
+                source_generation: selection.generation,
+                mime_types: selection.mime_types.clone(),
+            },
+        );
+        let _ = device.send_event(wl_data_device::Event::DataOffer { id: offer.clone() });
+        for mime_type in selection.mime_types {
+            let _ = offer.send_event(wl_data_offer::Event::Offer { mime_type });
+        }
+        let _ = device.send_event(wl_data_device::Event::Selection { id: Some(offer) });
+    }
+
+    fn receive_clipboard_offer(
+        &mut self,
+        offer: &wl_data_offer::WlDataOffer,
+        client_id: &ClientId,
+        source_generation: u64,
+        mime_type: String,
+        fd: OwnedFd,
+    ) {
+        let Some(binding) = self.data_offers.get(&offer.id()) else {
+            return;
+        };
+        let Some(selection) = self.active_clipboard.as_ref() else {
+            return;
+        };
+        if binding.target_client_id != *client_id
+            || binding.source_generation != selection.generation
+            || source_generation != selection.generation
+            || !binding.mime_types.iter().any(|mime| mime == &mime_type)
+        {
+            return;
+        }
+        match &selection.source {
+            ClipboardSourceBackend::InternalWayland { source, client_id } => {
+                let active_source_client_matches = self
+                    .data_sources
+                    .get(&source.id())
+                    .is_some_and(|registered| registered.client_id == *client_id);
+                if !active_source_client_matches || !source.is_alive() {
+                    return;
+                }
+                let _ = source.send_event(wl_data_source::Event::Send {
+                    mime_type,
+                    fd: fd.as_fd(),
+                });
+            }
+            ClipboardSourceBackend::HostBridge { offer_id } => {
+                if let Some(bridge) = self.clipboard_bridge.as_mut() {
+                    let _ = bridge.request_host_data(*offer_id, mime_type, fd);
+                }
+            }
+        }
     }
 
     fn register_surface_resource(&mut self, surface_id: u32, surface: wl_surface::WlSurface) {
@@ -698,6 +1099,7 @@ impl CompositorState {
             });
         }
         self.keyboard_surface = Some(surface.clone());
+        self.publish_clipboard_to_focused_client();
     }
 
     fn send_keyboard_modifiers(&mut self, surface: &wl_surface::WlSurface, serial: u32) {
@@ -3254,6 +3656,25 @@ fn same_surface_resource(left: &wl_surface::WlSurface, right: &wl_surface::WlSur
 
 fn same_buffer_resource(left: &wl_buffer::WlBuffer, right: &wl_buffer::WlBuffer) -> bool {
     same_wayland_resource(left, right)
+}
+
+fn normalize_selection_mime_types(mime_types: Vec<String>) -> Vec<String> {
+    const MAX_SOURCE_MIME_TYPES: usize = 128;
+    const MAX_MIME_TYPE_LEN: usize = 4096;
+    let mut normalized = Vec::new();
+    for mime_type in mime_types {
+        if mime_type.is_empty()
+            || mime_type.len() > MAX_MIME_TYPE_LEN
+            || normalized.iter().any(|existing| existing == &mime_type)
+        {
+            continue;
+        }
+        normalized.push(mime_type);
+        if normalized.len() >= MAX_SOURCE_MIME_TYPES {
+            break;
+        }
+    }
+    normalized
 }
 
 #[allow(clippy::too_many_arguments)]

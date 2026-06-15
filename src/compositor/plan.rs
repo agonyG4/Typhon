@@ -68,17 +68,39 @@ impl InputProtocolCapabilities {
     }
 }
 
-pub const BASE_CLIENT_PROTOCOLS: [ProtocolGlobal; 17] = [
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionProtocolCapabilities {
+    pub clipboard: bool,
+    pub primary_selection: bool,
+    pub data_control: bool,
+}
+
+impl SelectionProtocolCapabilities {
+    pub const fn safe_baseline() -> Self {
+        Self {
+            clipboard: false,
+            primary_selection: false,
+            data_control: false,
+        }
+    }
+
+    pub const fn core_clipboard() -> Self {
+        Self {
+            clipboard: true,
+            primary_selection: false,
+            data_control: false,
+        }
+    }
+}
+
+pub const BASE_CLIENT_PROTOCOLS: [ProtocolGlobal; 14] = [
     ProtocolGlobal::WlCompositor,
     ProtocolGlobal::WlSubcompositor,
-    ProtocolGlobal::WlDataDeviceManager,
     ProtocolGlobal::WlShm,
     ProtocolGlobal::WpViewporter,
     ProtocolGlobal::WpFractionalScale,
     ProtocolGlobal::WpPresentation,
     ProtocolGlobal::WpColorManagement,
-    ProtocolGlobal::WpPrimarySelection,
-    ProtocolGlobal::ExtDataControl,
     ProtocolGlobal::XdgDecoration,
     ProtocolGlobal::LinuxDmabuf,
     ProtocolGlobal::LinuxDrmSyncobj,
@@ -89,20 +111,35 @@ pub const BASE_CLIENT_PROTOCOLS: [ProtocolGlobal; 17] = [
 ];
 
 pub fn client_protocols_for_capabilities(
-    capabilities: InputProtocolCapabilities,
+    input_capabilities: InputProtocolCapabilities,
+    selection_capabilities: SelectionProtocolCapabilities,
 ) -> Vec<ProtocolGlobal> {
     let mut protocols = BASE_CLIENT_PROTOCOLS.to_vec();
+    let selection_insert_at = protocols
+        .iter()
+        .position(|protocol| *protocol == ProtocolGlobal::WlShm)
+        .unwrap_or(protocols.len());
+    if selection_capabilities.data_control {
+        protocols.insert(selection_insert_at, ProtocolGlobal::ExtDataControl);
+    }
+    if selection_capabilities.primary_selection {
+        protocols.insert(selection_insert_at, ProtocolGlobal::WpPrimarySelection);
+    }
+    if selection_capabilities.clipboard {
+        protocols.insert(selection_insert_at, ProtocolGlobal::WlDataDeviceManager);
+    }
+
     let insert_at = protocols
         .iter()
-        .position(|protocol| *protocol == ProtocolGlobal::WpPrimarySelection)
+        .position(|protocol| *protocol == ProtocolGlobal::XdgDecoration)
         .unwrap_or(protocols.len());
-    if capabilities.pointer_constraints {
+    if input_capabilities.pointer_constraints {
         protocols.insert(insert_at, ProtocolGlobal::WpPointerConstraints);
     }
-    if capabilities.relative_pointer {
+    if input_capabilities.relative_pointer {
         protocols.insert(insert_at, ProtocolGlobal::WpRelativePointer);
     }
-    if capabilities.idle_inhibit {
+    if input_capabilities.idle_inhibit {
         protocols.insert(insert_at, ProtocolGlobal::WpIdleInhibit);
     }
     protocols
@@ -191,9 +228,12 @@ impl CompositorPlan {
     }
 
     pub fn protocol_names(&self) -> Vec<&'static str> {
-        client_protocols_for_capabilities(InputProtocolCapabilities::desktop_baseline())
-            .into_iter()
-            .map(ProtocolGlobal::name)
-            .collect()
+        client_protocols_for_capabilities(
+            InputProtocolCapabilities::desktop_baseline(),
+            SelectionProtocolCapabilities::core_clipboard(),
+        )
+        .into_iter()
+        .map(ProtocolGlobal::name)
+        .collect()
     }
 }

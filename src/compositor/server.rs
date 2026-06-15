@@ -28,7 +28,7 @@ use crate::wayland_drm::server::wl_drm;
 
 use super::{
     CompositorState, InputProtocolCapabilities, RenderGenerationCause, RenderableSurface,
-    ShellDockItem, color, input::PointerMotionSample,
+    SelectionProtocolCapabilities, ShellDockItem, color, input::PointerMotionSample,
 };
 
 #[derive(Debug)]
@@ -58,24 +58,59 @@ impl OwnCompositorServer {
         socket_name: impl Into<String>,
         input_capabilities: InputProtocolCapabilities,
     ) -> Result<Self, CompositorError> {
-        Self::bind_with_gpu_buffers_and_input_capabilities(socket_name, false, input_capabilities)
+        Self::bind_with_gpu_buffers_and_capabilities(
+            socket_name,
+            false,
+            input_capabilities,
+            SelectionProtocolCapabilities::core_clipboard(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn bind_with_selection_capabilities(
+        socket_name: impl Into<String>,
+        selection_capabilities: SelectionProtocolCapabilities,
+    ) -> Result<Self, CompositorError> {
+        Self::bind_with_gpu_buffers_and_capabilities(
+            socket_name,
+            false,
+            InputProtocolCapabilities::desktop_baseline(),
+            selection_capabilities,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn bind_with_clipboard_bridge(
+        socket_name: impl Into<String>,
+        clipboard_bridge: Box<dyn super::ClipboardBridge>,
+    ) -> Result<Self, CompositorError> {
+        let mut server = Self::bind_with_gpu_buffers_and_capabilities(
+            socket_name,
+            false,
+            InputProtocolCapabilities::desktop_baseline(),
+            SelectionProtocolCapabilities::core_clipboard(),
+        )?;
+        server.state.clipboard_bridge = Some(clipboard_bridge);
+        Ok(server)
     }
 
     fn bind_with_gpu_buffers(
         socket_name: impl Into<String>,
         gpu_buffers_enabled: bool,
     ) -> Result<Self, CompositorError> {
-        Self::bind_with_gpu_buffers_and_input_capabilities(
+        Self::bind_with_gpu_buffers_and_capabilities(
             socket_name,
             gpu_buffers_enabled,
             InputProtocolCapabilities::desktop_baseline(),
+            SelectionProtocolCapabilities::core_clipboard(),
         )
     }
 
-    fn bind_with_gpu_buffers_and_input_capabilities(
+    fn bind_with_gpu_buffers_and_capabilities(
         socket_name: impl Into<String>,
         gpu_buffers_enabled: bool,
         input_capabilities: InputProtocolCapabilities,
+        selection_capabilities: SelectionProtocolCapabilities,
     ) -> Result<Self, CompositorError> {
         let socket_name = socket_name.into();
         let display =
@@ -86,6 +121,7 @@ impl OwnCompositorServer {
             syncobj_device.is_some(),
             gpu_buffers_enabled,
             input_capabilities,
+            selection_capabilities,
         );
         let socket = ListeningSocket::bind(&socket_name)
             .map_err(|error| CompositorError::Bind(error.to_string()))?;
@@ -314,7 +350,9 @@ impl OwnCompositorServer {
         }
 
         self.state.accepted_clients += accepted;
+        self.state.poll_clipboard_bridge();
         self.display.dispatch_clients(&mut self.state)?;
+        self.state.poll_clipboard_bridge();
         self.display.flush_clients()?;
         Ok(accepted)
     }
@@ -325,10 +363,16 @@ fn register_minimum_globals(
     syncobj_available: bool,
     gpu_buffers_enabled: bool,
     input_capabilities: InputProtocolCapabilities,
+    selection_capabilities: SelectionProtocolCapabilities,
 ) {
     display.create_global::<CompositorState, wl_compositor::WlCompositor, _>(6, ());
     display.create_global::<CompositorState, wl_subcompositor::WlSubcompositor, _>(1, ());
-    display.create_global::<CompositorState, wl_data_device_manager::WlDataDeviceManager, _>(3, ());
+    if selection_capabilities.clipboard {
+        display.create_global::<CompositorState, wl_data_device_manager::WlDataDeviceManager, _>(
+            3,
+            (),
+        );
+    }
     display.create_global::<CompositorState, wl_shm::WlShm, _>(2, ());
     display.create_global::<CompositorState, wp_viewporter::WpViewporter, _>(1, ());
     display.create_global::<
@@ -359,16 +403,20 @@ fn register_minimum_globals(
             _,
         >(1, ());
     }
-    display.create_global::<
-        CompositorState,
-        zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
-        _,
-    >(1, ());
-    display
-        .create_global::<CompositorState, ext_data_control_manager_v1::ExtDataControlManagerV1, _>(
-            1,
-            (),
-        );
+    if selection_capabilities.primary_selection {
+        display.create_global::<
+            CompositorState,
+            zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
+            _,
+        >(1, ());
+    }
+    if selection_capabilities.data_control {
+        display.create_global::<
+            CompositorState,
+            ext_data_control_manager_v1::ExtDataControlManagerV1,
+            _,
+        >(1, ());
+    }
     display
         .create_global::<CompositorState, zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _>(
             1,

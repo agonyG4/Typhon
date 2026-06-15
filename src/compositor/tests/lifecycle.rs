@@ -53,6 +53,94 @@ fn default_registry_omits_unsupported_gaming_protocol_stubs() {
 }
 
 #[test]
+fn default_registry_advertises_core_clipboard_only() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let result = read_registry_globals(&socket_path);
+    stop_test_server(running, server_thread);
+
+    let globals = result.unwrap();
+    assert!(globals.contains(&"wl_data_device_manager".to_string()));
+    assert!(!globals.contains(&"zwp_primary_selection_device_manager_v1".to_string()));
+    assert!(!globals.contains(&"ext_data_control_manager_v1".to_string()));
+}
+
+#[test]
+fn clipboard_ready_registry_advertises_only_core_clipboard_selection() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_with_selection_capabilities(
+        &socket_name,
+        SelectionProtocolCapabilities {
+            clipboard: true,
+            primary_selection: false,
+            data_control: false,
+        },
+    )
+    .unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let result = read_registry_globals(&socket_path);
+    stop_test_server(running, server_thread);
+
+    let globals = result.unwrap();
+    assert!(globals.contains(&"wl_data_device_manager".to_string()));
+    assert!(!globals.contains(&"zwp_primary_selection_device_manager_v1".to_string()));
+    assert!(!globals.contains(&"ext_data_control_manager_v1".to_string()));
+}
+
+#[test]
+fn native_and_cpu_base_registries_share_core_clipboard_policy() {
+    let cpu_socket_name = unique_socket_name();
+    let cpu_server = OwnCompositorServer::bind_cpu_composition(&cpu_socket_name).unwrap();
+    let cpu_socket_path = runtime_socket_path(&cpu_socket_name);
+    let (cpu_running, cpu_server_thread) = spawn_test_server(cpu_server);
+
+    let cpu_result = read_registry_globals(&cpu_socket_path);
+    stop_test_server(cpu_running, cpu_server_thread);
+
+    let native_socket_name = unique_socket_name();
+    let native_server = OwnCompositorServer::bind_native_base(&native_socket_name).unwrap();
+    let native_socket_path = runtime_socket_path(&native_socket_name);
+    let (native_running, native_server_thread) = spawn_test_server(native_server);
+
+    let native_result = read_registry_globals(&native_socket_path);
+    stop_test_server(native_running, native_server_thread);
+
+    for globals in [cpu_result.unwrap(), native_result.unwrap()] {
+        assert!(globals.contains(&"wl_data_device_manager".to_string()));
+        assert!(!globals.contains(&"zwp_primary_selection_device_manager_v1".to_string()));
+        assert!(!globals.contains(&"ext_data_control_manager_v1".to_string()));
+    }
+}
+
+#[test]
+fn default_registry_does_not_publish_duplicate_globals() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let result = read_registry_globals(&socket_path);
+    stop_test_server(running, server_thread);
+
+    let globals = result.unwrap();
+    for name in &globals {
+        assert_eq!(
+            globals
+                .iter()
+                .filter(|candidate| *candidate == name)
+                .count(),
+            1,
+            "duplicated global {name}"
+        );
+    }
+}
+
+#[test]
 fn native_base_registry_can_publish_gpu_buffer_globals_after_backend_is_known() {
     let socket_name = unique_socket_name();
     let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();

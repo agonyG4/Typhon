@@ -4,12 +4,16 @@ use crate::render_backend::egl_gles::EglGlesDmabufFormat;
 use crate::syncobj::DrmSyncobjTimeline;
 use crate::wayland_drm::client::wl_drm as client_wl_drm;
 use std::{
+    collections::VecDeque,
     fs::{self, File, OpenOptions},
-    io::{Seek, SeekFrom, Write},
-    os::{fd::AsFd, unix::net::UnixStream},
+    io::{Read, Seek, SeekFrom, Write},
+    os::{
+        fd::{AsFd, FromRawFd, OwnedFd},
+        unix::net::UnixStream,
+    },
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Sender},
     },
@@ -23,6 +27,7 @@ use wayland_client::{
         wl_buffer as client_wl_buffer, wl_callback as client_wl_callback,
         wl_compositor as client_wl_compositor, wl_data_device as client_wl_data_device,
         wl_data_device_manager as client_wl_data_device_manager,
+        wl_data_offer as client_wl_data_offer,
         wl_data_source as client_wl_data_source, wl_keyboard as client_wl_keyboard,
         wl_output as client_wl_output, wl_pointer as client_wl_pointer,
         wl_region as client_wl_region, wl_registry, wl_seat as client_wl_seat,
@@ -71,6 +76,7 @@ struct RegistryTestState {
     frame_done: bool,
     frame_done_time: Option<u32>,
     keyboard_key: bool,
+    keyboard_key_serial: Option<u32>,
     keyboard_keys: Vec<u32>,
     keyboard_keymap: bool,
     keyboard_mods_depressed: Vec<u32>,
@@ -147,6 +153,10 @@ struct RegistryTestState {
     presentation_discarded_count: usize,
     presentation_kind: Option<client_wp_presentation_feedback::Kind>,
     fractional_preferred_scales: Vec<u32>,
+    data_device_selection_offer: Option<client_wl_data_offer::WlDataOffer>,
+    data_offer_mime_types: Vec<String>,
+    data_source_send_mime_types: Vec<String>,
+    data_source_cancelled: bool,
 }
 
 impl RegistryTestState {
@@ -247,25 +257,64 @@ impl Dispatch<client_wl_data_device_manager::WlDataDeviceManager, ()> for Regist
 
 impl Dispatch<client_wl_data_device::WlDataDevice, ()> for RegistryTestState {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _proxy: &client_wl_data_device::WlDataDevice,
-        _event: client_wl_data_device::Event,
+        event: client_wl_data_device::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
+        match event {
+            client_wl_data_device::Event::DataOffer { .. } => {}
+            client_wl_data_device::Event::Selection { id } => {
+                state.data_device_selection_offer = id;
+            }
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(
+        RegistryTestState,
+        client_wl_data_device::WlDataDevice,
+        [0 => (client_wl_data_offer::WlDataOffer, ())]
+    );
+}
+
+impl Dispatch<client_wl_data_offer::WlDataOffer, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_wl_data_offer::WlDataOffer,
+        event: client_wl_data_offer::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let client_wl_data_offer::Event::Offer { mime_type } = event {
+            state.data_offer_mime_types.push(mime_type);
+        }
     }
 }
 
 impl Dispatch<client_wl_data_source::WlDataSource, ()> for RegistryTestState {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _proxy: &client_wl_data_source::WlDataSource,
-        _event: client_wl_data_source::Event,
+        event: client_wl_data_source::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
+        match event {
+            client_wl_data_source::Event::Send { mime_type, fd } => {
+                state.data_source_send_mime_types.push(mime_type);
+                let mut file = File::from(fd);
+                let _ = file.write_all(b"clipboard payload");
+            }
+            client_wl_data_source::Event::Cancelled => {
+                state.data_source_cancelled = true;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -362,8 +411,9 @@ impl Dispatch<client_wl_keyboard::WlKeyboard, ()> for RegistryTestState {
                 state.keyboard_leave_count += 1;
             }
             client_wl_keyboard::Event::Keymap { .. } => state.keyboard_keymap = true,
-            client_wl_keyboard::Event::Key { key, .. } => {
+            client_wl_keyboard::Event::Key { serial, key, .. } => {
                 state.keyboard_key = true;
+                state.keyboard_key_serial = Some(serial);
                 state.keyboard_keys.push(key);
             }
             client_wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
@@ -2754,6 +2804,205 @@ fn create_client_data_device(socket_path: &PathBuf) -> Result<(), Box<dyn std::e
     connection.flush()?;
     connection.roundtrip()?;
     Ok(())
+}
+
+fn forward_clipboard_between_two_clients(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<(RegistryTestState, RegistryTestState, String), Box<dyn std::error::Error>> {
+    let source_stream = UnixStream::connect(socket_path)?;
+    let source_connection = Connection::from_socket(source_stream)?;
+    let (source_globals, mut source_queue) =
+        registry_queue_init::<RegistryTestState>(&source_connection)?;
+    let source_qh = source_queue.handle();
+
+    let source_compositor: client_wl_compositor::WlCompositor =
+        source_globals.bind(&source_qh, 1..=6, ())?;
+    let source_wm_base: client_xdg_wm_base::XdgWmBase =
+        source_globals.bind(&source_qh, 1..=6, ())?;
+    let source_seat: client_wl_seat::WlSeat = source_globals.bind(&source_qh, 1..=7, ())?;
+    let source_manager: client_wl_data_device_manager::WlDataDeviceManager =
+        source_globals.bind(&source_qh, 1..=3, ())?;
+    let _source_keyboard = source_seat.get_keyboard(&source_qh, ());
+    let source_data_source = source_manager.create_data_source(&source_qh, ());
+    source_data_source.offer("text/plain".to_string());
+    source_data_source.offer("text/html".to_string());
+    let source_data_device = source_manager.get_data_device(&source_seat, &source_qh, ());
+    let source_surface = source_compositor.create_surface(&source_qh, ());
+    let source_xdg_surface = source_wm_base.get_xdg_surface(&source_surface, &source_qh, ());
+    let _source_toplevel = source_xdg_surface.get_toplevel(&source_qh, ());
+    source_surface.commit();
+    source_connection.flush()?;
+
+    let mut source_state = RegistryTestState::default();
+    source_queue.roundtrip(&mut source_state)?;
+    commands.send(ServerCommand::KeyboardKey {
+        key: 30,
+        pressed: true,
+    })?;
+    wait_for_server_commands(commands);
+    source_queue.roundtrip(&mut source_state)?;
+    let serial = source_state
+        .keyboard_key_serial
+        .ok_or_else(|| io::Error::other("keyboard serial was not delivered"))?;
+    source_data_device.set_selection(Some(&source_data_source), serial);
+    source_connection.flush()?;
+    source_connection.roundtrip()?;
+
+    let target_stream = UnixStream::connect(socket_path)?;
+    let target_connection = Connection::from_socket(target_stream)?;
+    let (target_globals, mut target_queue) =
+        registry_queue_init::<RegistryTestState>(&target_connection)?;
+    let target_qh = target_queue.handle();
+
+    let target_compositor: client_wl_compositor::WlCompositor =
+        target_globals.bind(&target_qh, 1..=6, ())?;
+    let target_wm_base: client_xdg_wm_base::XdgWmBase =
+        target_globals.bind(&target_qh, 1..=6, ())?;
+    let target_seat: client_wl_seat::WlSeat = target_globals.bind(&target_qh, 1..=7, ())?;
+    let target_manager: client_wl_data_device_manager::WlDataDeviceManager =
+        target_globals.bind(&target_qh, 1..=3, ())?;
+    let _target_keyboard = target_seat.get_keyboard(&target_qh, ());
+    let target_surface = target_compositor.create_surface(&target_qh, ());
+    let target_xdg_surface = target_wm_base.get_xdg_surface(&target_surface, &target_qh, ());
+    let _target_toplevel = target_xdg_surface.get_toplevel(&target_qh, ());
+    target_surface.commit();
+    target_connection.flush()?;
+
+    let mut target_state = RegistryTestState::default();
+    target_queue.roundtrip(&mut target_state)?;
+    let _target_data_device = target_manager.get_data_device(&target_seat, &target_qh, ());
+    target_connection.flush()?;
+    target_queue.roundtrip(&mut target_state)?;
+
+    let offer = target_state
+        .data_device_selection_offer
+        .clone()
+        .ok_or_else(|| io::Error::other("target did not receive a clipboard selection offer"))?;
+    let (read_fd, write_fd) = owned_pipe()?;
+    offer.receive("text/plain".to_string(), write_fd.as_fd());
+    target_connection.flush()?;
+    drop(write_fd);
+    target_connection.roundtrip()?;
+    source_queue.roundtrip(&mut source_state)?;
+
+    let mut received = String::new();
+    File::from(read_fd).read_to_string(&mut received)?;
+
+    Ok((source_state, target_state, received))
+}
+
+fn receive_host_clipboard_from_bridge(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<(RegistryTestState, String), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let manager: client_wl_data_device_manager::WlDataDeviceManager =
+        globals.bind(&qh, 1..=3, ())?;
+    let _keyboard = seat.get_keyboard(&qh, ());
+    let _device = manager.get_data_device(&seat, &qh, ());
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::KeyboardKey {
+        key: 30,
+        pressed: true,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let offer = state
+        .data_device_selection_offer
+        .clone()
+        .ok_or_else(|| io::Error::other("target did not receive host clipboard offer"))?;
+    let (read_fd, write_fd) = owned_pipe()?;
+    offer.receive("text/plain".to_string(), write_fd.as_fd());
+    connection.flush()?;
+    drop(write_fd);
+    connection.roundtrip()?;
+
+    let mut received = String::new();
+    File::from(read_fd).read_to_string(&mut received)?;
+    Ok((state, received))
+}
+
+#[derive(Debug)]
+struct ScriptedClipboardBridge {
+    events: VecDeque<ClipboardBridgeEvent>,
+    host_payload: &'static [u8],
+    requests: Arc<Mutex<Vec<(HostClipboardOfferId, String)>>>,
+}
+
+impl ScriptedClipboardBridge {
+    fn with_host_selection(
+        offer_id: HostClipboardOfferId,
+        mime_types: Vec<String>,
+        host_payload: &'static [u8],
+        requests: Arc<Mutex<Vec<(HostClipboardOfferId, String)>>>,
+    ) -> Self {
+        Self {
+            events: VecDeque::from([ClipboardBridgeEvent::HostSelectionChanged {
+                offer_id,
+                mime_types,
+            }]),
+            host_payload,
+            requests,
+        }
+    }
+}
+
+impl ClipboardBridge for ScriptedClipboardBridge {
+    fn poll_events(&mut self) -> Vec<ClipboardBridgeEvent> {
+        self.events.drain(..).collect()
+    }
+
+    fn request_host_data(
+        &mut self,
+        offer_id: HostClipboardOfferId,
+        mime_type: String,
+        fd: OwnedFd,
+    ) -> Result<(), ClipboardBridgeError> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push((offer_id, mime_type));
+        File::from(fd)
+            .write_all(self.host_payload)
+            .map_err(|_| ClipboardBridgeError::Unavailable)
+    }
+
+    fn publish_internal_selection(
+        &mut self,
+        _generation: u64,
+        _mime_types: Vec<String>,
+    ) -> Result<(), ClipboardBridgeError> {
+        Ok(())
+    }
+
+    fn clear_internal_selection(&mut self) -> Result<(), ClipboardBridgeError> {
+        Ok(())
+    }
+}
+
+fn owned_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
 fn create_dmabuf_candidate_and_expect_created(

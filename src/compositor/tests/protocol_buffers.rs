@@ -1,9 +1,17 @@
 use super::*;
 
 #[test]
-fn wayland_client_can_create_data_device_on_oblivion_server() {
+fn clipboard_ready_wayland_client_can_create_data_device() {
     let socket_name = unique_socket_name();
-    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let server = OwnCompositorServer::bind_with_selection_capabilities(
+        &socket_name,
+        SelectionProtocolCapabilities {
+            clipboard: true,
+            primary_selection: false,
+            data_control: false,
+        },
+    )
+    .unwrap();
     let socket_path = runtime_socket_path(&socket_name);
     let (running, server_thread) = spawn_test_server(server);
 
@@ -11,6 +19,91 @@ fn wayland_client_can_create_data_device_on_oblivion_server() {
     stop_test_server(running, server_thread);
 
     result.unwrap();
+}
+
+#[test]
+fn clipboard_ready_wayland_clients_transfer_selection_without_compositor_buffering() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_with_selection_capabilities(
+        &socket_name,
+        SelectionProtocolCapabilities {
+            clipboard: true,
+            primary_selection: false,
+            data_control: false,
+        },
+    )
+    .unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let result = forward_clipboard_between_two_clients(&socket_path, &commands);
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    let (source_state, target_state, received) = result.unwrap();
+    assert_eq!(
+        target_state.data_offer_mime_types,
+        ["text/plain", "text/html"]
+    );
+    assert_eq!(source_state.data_source_send_mime_types, ["text/plain"]);
+    assert_eq!(received, "clipboard payload");
+}
+
+#[test]
+fn clipboard_source_disconnect_clears_focused_target_selection() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_with_selection_capabilities(
+        &socket_name,
+        SelectionProtocolCapabilities {
+            clipboard: true,
+            primary_selection: false,
+            data_control: false,
+        },
+    )
+    .unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let result = disconnect_clipboard_source_after_target_offer(&socket_path, &commands);
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    let target_state = result.unwrap();
+    assert!(
+        target_state.data_device_selection_offer.is_none(),
+        "target should receive selection(None) when the source client disconnects"
+    );
+}
+
+#[test]
+fn host_bridge_selection_is_offered_to_focused_wayland_client() {
+    let socket_name = unique_socket_name();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let bridge = ScriptedClipboardBridge::with_host_selection(
+        HostClipboardOfferId(99),
+        vec!["text/plain".to_string(), "text/html".to_string()],
+        b"host clipboard payload",
+        Arc::clone(&requests),
+    );
+    let server =
+        OwnCompositorServer::bind_with_clipboard_bridge(&socket_name, Box::new(bridge)).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let result = receive_host_clipboard_from_bridge(&socket_path, &commands);
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    let (target_state, received) = result.unwrap();
+    assert_eq!(
+        target_state.data_offer_mime_types,
+        ["text/plain", "text/html"]
+    );
+    assert_eq!(received, "host clipboard payload");
+    assert_eq!(
+        requests.lock().unwrap().as_slice(),
+        &[(HostClipboardOfferId(99), "text/plain".to_string())]
+    );
 }
 
 #[test]
