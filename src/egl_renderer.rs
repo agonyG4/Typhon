@@ -835,8 +835,14 @@ impl GlesSceneRenderer {
                     &mut self.commands,
                     EglDrawLayer::Solid(rect.color),
                     EglRect::new(
-                        compositor::scale_logical_coordinate(rect.x, output_scale) as f32,
-                        compositor::scale_logical_coordinate(rect.y, output_scale) as f32,
+                        compositor::scale_logical_coordinate(
+                            origin_x.saturating_add(rect.x),
+                            output_scale,
+                        ) as f32,
+                        compositor::scale_logical_coordinate(
+                            origin_y.saturating_add(rect.y),
+                            output_scale,
+                        ) as f32,
                         compositor::scale_logical_extent(rect.width, output_scale) as f32,
                         compositor::scale_logical_extent(rect.height, output_scale) as f32,
                     ),
@@ -844,15 +850,28 @@ impl GlesSceneRenderer {
                     height,
                 );
             }
-            push_draw_command(
+            let visual_target = compositor::SurfaceTargetRect::new(
+                compositor::scale_logical_coordinate(origin_x, output_scale),
+                compositor::scale_logical_coordinate(origin_y, output_scale),
+                compositor::scale_logical_extent(surface.width, output_scale),
+                compositor::scale_logical_extent(surface.height, output_scale),
+            );
+            let render_plan = compositor::surface_render_plan(surface, visual_target);
+            push_draw_command_with_uv(
                 &mut self.vertices,
                 &mut self.commands,
                 EglDrawLayer::Surface(surface.surface_id),
                 EglRect::new(
-                    compositor::scale_logical_coordinate(origin_x, output_scale) as f32,
-                    compositor::scale_logical_coordinate(origin_y, output_scale) as f32,
-                    compositor::scale_logical_extent(surface.width, output_scale) as f32,
-                    compositor::scale_logical_extent(surface.height, output_scale) as f32,
+                    render_plan.content_target.x() as f32,
+                    render_plan.content_target.y() as f32,
+                    render_plan.content_target.width() as f32,
+                    render_plan.content_target.height() as f32,
+                ),
+                EglUvRect::new(
+                    render_plan.content_uv.left,
+                    render_plan.content_uv.top,
+                    render_plan.content_uv.right,
+                    render_plan.content_uv.bottom,
                 ),
                 width,
                 height,
@@ -1212,41 +1231,36 @@ struct EglSceneSurfaceSignature {
     y: i32,
     width: u32,
     height: u32,
+    preview_committed_width: u32,
+    preview_committed_height: u32,
+    preview_anchor_bits: u32,
     generation: u64,
-}
-
-impl EglSceneSurfaceSignature {
-    const fn new(
-        surface_id: u32,
-        x: i32,
-        y: i32,
-        width: u32,
-        height: u32,
-        generation: u64,
-    ) -> Self {
-        Self {
-            surface_id,
-            x,
-            y,
-            width,
-            height,
-            generation,
-        }
-    }
 }
 
 fn egl_scene_surface_signatures(surfaces: &[RenderableSurface]) -> Vec<EglSceneSurfaceSignature> {
     surfaces
         .iter()
         .map(|surface| {
-            EglSceneSurfaceSignature::new(
-                surface.surface_id,
-                surface.x,
-                surface.y,
-                surface.width,
-                surface.height,
-                surface.generation,
-            )
+            let preview = surface.resize_preview;
+            EglSceneSurfaceSignature {
+                surface_id: surface.surface_id,
+                x: surface.x,
+                y: surface.y,
+                width: surface.width,
+                height: surface.height,
+                preview_committed_width: preview
+                    .map(|preview| preview.committed_width)
+                    .unwrap_or(0),
+                preview_committed_height: preview
+                    .map(|preview| preview.committed_height)
+                    .unwrap_or(0),
+                preview_anchor_bits: preview
+                    .map(|preview| {
+                        u32::from(preview.anchor_right) | (u32::from(preview.anchor_bottom) << 1)
+                    })
+                    .unwrap_or(0),
+                generation: surface.generation,
+            }
         })
         .collect()
 }
@@ -1259,6 +1273,9 @@ fn egl_scene_surface_signature_hash(signatures: &[EglSceneSurfaceSignature]) -> 
         hash = fnv1a_u64(hash, signature.y as u32 as u64);
         hash = fnv1a_u64(hash, u64::from(signature.width));
         hash = fnv1a_u64(hash, u64::from(signature.height));
+        hash = fnv1a_u64(hash, u64::from(signature.preview_committed_width));
+        hash = fnv1a_u64(hash, u64::from(signature.preview_committed_height));
+        hash = fnv1a_u64(hash, u64::from(signature.preview_anchor_bits));
         hash = fnv1a_u64(hash, signature.generation);
     }
     hash
@@ -1879,12 +1896,50 @@ mod tests {
 
     #[test]
     fn scene_cache_key_invalidates_when_surface_geometry_changes() {
-        let initial_signature = EglSceneSurfaceSignature::new(7, 10, 20, 800, 600, 1);
-        let resized_signature = EglSceneSurfaceSignature::new(7, 10, 20, 420, 320, 1);
+        let initial_signature = EglSceneSurfaceSignature {
+            surface_id: 7,
+            x: 10,
+            y: 20,
+            width: 800,
+            height: 600,
+            preview_committed_width: 0,
+            preview_committed_height: 0,
+            preview_anchor_bits: 0,
+            generation: 1,
+        };
+        let resized_signature = EglSceneSurfaceSignature {
+            width: 420,
+            height: 320,
+            ..initial_signature
+        };
         let key = EglSceneCacheKey::new(1280, 800, 9, 120, &[initial_signature]);
 
         assert!(key.is_current(1280, 800, 9, 120, &[initial_signature]));
         assert!(!key.is_current(1280, 800, 9, 120, &[resized_signature]));
+    }
+
+    #[test]
+    fn scene_cache_key_invalidates_when_resize_preview_crop_changes() {
+        let initial_signature = EglSceneSurfaceSignature {
+            surface_id: 7,
+            x: 10,
+            y: 20,
+            width: 800,
+            height: 600,
+            preview_committed_width: 800,
+            preview_committed_height: 600,
+            preview_anchor_bits: 0,
+            generation: 1,
+        };
+        let cropped_signature = EglSceneSurfaceSignature {
+            preview_committed_width: 640,
+            preview_committed_height: 480,
+            preview_anchor_bits: 3,
+            ..initial_signature
+        };
+        let key = EglSceneCacheKey::new(1280, 800, 9, 120, &[initial_signature]);
+
+        assert!(!key.is_current(1280, 800, 9, 120, &[cropped_signature]));
     }
 
     #[test]

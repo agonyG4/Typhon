@@ -34,6 +34,7 @@ development session.
 
 Usage:
   start-oblivion-one [-- compositor args...]
+  start-oblivion-one --width 1920 --height 1080 --refresh 165 -- zen-browser
 
 Environment:
   OBLIVION_ONE_SOCKET    Wayland socket name (default: oblivion-one-sddm)
@@ -50,7 +51,11 @@ Environment:
 Examples:
   start-oblivion-one
   OBLIVION_ONE_PROFILE=release start-oblivion-one
+  start-oblivion-one --width 1600 --height 900 --refresh 165 -- zen-browser
   start-oblivion-one -- pavucontrol
+
+--width/--height/--refresh are forwarded to the Rust compositor and apply to
+nested output only. Native KMS mode selection uses OBLIVION_ONE_MODE.
 EOF
 }
 

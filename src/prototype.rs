@@ -20,6 +20,7 @@ use winit::{
 };
 
 type PrototypeResult<T> = Result<T, Box<dyn Error>>;
+const WINDOW_SHADOWS_ENABLED: bool = false;
 
 pub fn run_prototype(inside_de: bool) -> PrototypeResult<()> {
     let event_loop = EventLoop::new()?;
@@ -410,13 +411,15 @@ fn render_scene(
             continue;
         }
         let is_active = index == scene.active_window;
-        let shadow = Rect::new(
-            window.rect.x + 14,
-            window.rect.y + 18,
-            window.rect.width,
-            window.rect.height,
-        );
-        frame.fill_rounded(shadow, 24, Rgba(0, 0, 0, 80));
+        if WINDOW_SHADOWS_ENABLED {
+            let shadow = Rect::new(
+                window.rect.x + 14,
+                window.rect.y + 18,
+                window.rect.width,
+                window.rect.height,
+            );
+            frame.fill_rounded(shadow, 24, Rgba(0, 0, 0, 80));
+        }
 
         let body = if is_active {
             Rgba(28, 33, 44, 246)
@@ -783,4 +786,41 @@ fn blend(base: u32, overlay: Rgba) -> u32 {
     let blue = (overlay.2 as u32 * alpha + base_blue * inv_alpha) / 255;
 
     0xff00_0000 | (red << 16) | (green << 8) | blue
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prototype_rendering_does_not_emit_window_shadow_pixels() {
+        let scene = PrototypeScene::new(PROTOTYPE_WIDTH, PROTOTYPE_HEIGHT);
+        let mut rendered = vec![0; (PROTOTYPE_WIDTH * PROTOTYPE_HEIGHT) as usize];
+        let mut wallpaper = vec![0; (PROTOTYPE_WIDTH * PROTOTYPE_HEIGHT) as usize];
+        let mut rendered_frame = Frame {
+            pixels: &mut rendered,
+            width: PROTOTYPE_WIDTH,
+            height: PROTOTYPE_HEIGHT,
+        };
+        render_scene(
+            &mut rendered_frame,
+            &scene,
+            &PrototypeRuntimeState::default(),
+            0,
+        );
+        let mut wallpaper_frame = Frame {
+            pixels: &mut wallpaper,
+            width: PROTOTYPE_WIDTH,
+            height: PROTOTYPE_HEIGHT,
+        };
+        wallpaper_frame.clear(Rgba(8, 10, 14, 255));
+        draw_wallpaper(&mut wallpaper_frame);
+
+        let window = &scene.windows[1];
+        let shadow_only_x = window.rect.x + window.rect.width as i32 + 10;
+        let shadow_only_y = window.rect.y + 80;
+        let index = shadow_only_y as usize * PROTOTYPE_WIDTH as usize + shadow_only_x as usize;
+
+        assert_eq!(rendered[index], wallpaper[index]);
+    }
 }

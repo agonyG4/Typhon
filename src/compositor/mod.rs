@@ -120,7 +120,7 @@ pub use render::{
     compose_nested_output, cursor_texture_pixels, cursor_texture_size, draw_wallpaper,
     output_scale_key, render_scene_elements_for_surfaces, scale_desktop_visual_state,
     scale_logical_coordinate, scale_logical_extent, server_frame_rects_by_surface,
-    server_frame_rects_for_surface, surface_origin, surface_origins,
+    server_frame_rects_for_surface, surface_origin, surface_origins, surface_render_plan,
 };
 use runtime_files::{compositor_debug_surface_logging_enabled, unique_runtime_file_path};
 pub use selection::{SelectionOfferRecord, SelectionState};
@@ -143,6 +143,7 @@ use window_state::{ToplevelMode, WindowGeometry, WindowState, xdg_toplevel_state
 
 const MIN_WINDOW_WIDTH: u32 = 160;
 const MIN_WINDOW_HEIGHT: u32 = 120;
+const MAX_SENT_RESIZE_COMMITS_PER_SURFACE: usize = 32;
 const WL_SEAT_NAME_SINCE: u32 = 2;
 #[cfg(test)]
 const DRM_FORMAT_ARGB8888: u32 = DrmFormat::ARGB8888_FOURCC;
@@ -1085,6 +1086,8 @@ impl CompositorState {
             {
                 return;
             }
+            let visual_placement = existing.placement;
+            self.store_surface_placement(surface_id, visual_placement);
         } else {
             let damage = damage.normalized_for_surface(buffer_width, buffer_height);
             let surface =
@@ -1632,6 +1635,7 @@ impl CompositorState {
                 xdg_surface,
                 toplevel,
                 window: WindowState::default(),
+                constraints: Default::default(),
             },
         );
         self.set_surface_placement(surface_id, SurfacePlacement::root());
@@ -2480,11 +2484,17 @@ impl CompositorState {
         placement: SurfacePlacement,
         edges: ResizeEdges,
     ) -> bool {
-        let width = width.max(MIN_WINDOW_WIDTH);
-        let height = height.max(MIN_WINDOW_HEIGHT);
         if !self.toplevel_surfaces.contains_key(&surface_id) {
             return false;
         };
+        let geometry = self.clamp_resize_geometry(
+            surface_id,
+            WindowGeometry::new(placement, width, height),
+            edges,
+        );
+        let width = geometry.width;
+        let height = geometry.height;
+        let placement = geometry.placement;
         let pending = PendingResizeConfigure {
             surface_id,
             width,
@@ -2498,6 +2508,102 @@ impl CompositorState {
             return false;
         }
         self.pending_resize_configure = Some(pending);
+        self.preview_resize_root_window_to(surface_id, width, height, placement, edges)
+    }
+
+    fn clamp_resize_geometry(
+        &self,
+        surface_id: u32,
+        geometry: WindowGeometry,
+        edges: ResizeEdges,
+    ) -> WindowGeometry {
+        let width = self.clamp_toplevel_width(surface_id, geometry.width);
+        let height = self.clamp_toplevel_height(surface_id, geometry.height);
+        let mut placement = geometry.placement;
+        if edges.left && width != geometry.width {
+            let requested_right = placement
+                .local_x
+                .saturating_add(i32::try_from(geometry.width).unwrap_or(i32::MAX));
+            placement.local_x =
+                requested_right.saturating_sub(i32::try_from(width).unwrap_or(i32::MAX));
+        }
+        if edges.top && height != geometry.height {
+            let requested_bottom = placement
+                .local_y
+                .saturating_add(i32::try_from(geometry.height).unwrap_or(i32::MAX));
+            placement.local_y =
+                requested_bottom.saturating_sub(i32::try_from(height).unwrap_or(i32::MAX));
+        }
+
+        WindowGeometry::new(placement, width, height)
+    }
+
+    fn clamp_toplevel_width(&self, surface_id: u32, width: u32) -> u32 {
+        let constraints = self.toplevel_constraints(surface_id);
+        let min_width = constraints.min_width.unwrap_or(MIN_WINDOW_WIDTH);
+        let mut clamped = width.max(min_width);
+        if let Some(max_width) = constraints.max_width {
+            clamped = clamped.min(max_width.max(min_width));
+        }
+        clamped
+    }
+
+    fn clamp_toplevel_height(&self, surface_id: u32, height: u32) -> u32 {
+        let constraints = self.toplevel_constraints(surface_id);
+        let min_height = constraints.min_height.unwrap_or(MIN_WINDOW_HEIGHT);
+        let mut clamped = height.max(min_height);
+        if let Some(max_height) = constraints.max_height {
+            clamped = clamped.min(max_height.max(min_height));
+        }
+        clamped
+    }
+
+    fn toplevel_constraints(&self, surface_id: u32) -> ToplevelSizeConstraints {
+        self.toplevel_surfaces
+            .get(&surface_id)
+            .map(|toplevel| toplevel.constraints)
+            .unwrap_or_default()
+    }
+
+    fn preview_resize_root_window_to(
+        &mut self,
+        surface_id: u32,
+        width: u32,
+        height: u32,
+        placement: SurfacePlacement,
+        edges: ResizeEdges,
+    ) -> bool {
+        let Some(surface) = self
+            .renderable_surfaces
+            .iter_mut()
+            .find(|surface| surface.surface_id == surface_id)
+        else {
+            return false;
+        };
+        if surface.width == width && surface.height == height && surface.placement == placement {
+            return false;
+        }
+
+        let committed_width = surface
+            .resize_preview
+            .map(|preview| preview.committed_width)
+            .unwrap_or(surface.width);
+        let committed_height = surface
+            .resize_preview
+            .map(|preview| preview.committed_height)
+            .unwrap_or(surface.height);
+        surface.width = width;
+        surface.height = height;
+        surface.placement = placement;
+        surface.resize_preview = Some(ResizePreview {
+            committed_width,
+            committed_height,
+            anchor_right: edges.left,
+            anchor_bottom: edges.top,
+        });
+        surface.damage = RenderableSurfaceDamage::Full;
+        self.store_surface_placement(surface_id, placement);
+        self.advance_render_generation(RenderGenerationCause::WindowResize);
         true
     }
 
@@ -2505,13 +2611,6 @@ impl CompositorState {
         let Some(pending) = self.pending_resize_configure.take() else {
             return false;
         };
-        if self
-            .pending_resize_commits
-            .contains_key(&pending.surface_id)
-        {
-            self.pending_resize_configure = Some(pending);
-            return false;
-        }
         self.send_resize_configure_to(
             pending.surface_id,
             pending.width,
@@ -2523,7 +2622,7 @@ impl CompositorState {
     }
 
     fn send_resize_end_configure(&mut self, surface_id: u32, edges: ResizeEdges) -> bool {
-        if let Some(pending) = self.pending_resize_configure {
+        if let Some(pending) = self.pending_resize_configure.take() {
             return self.send_resize_configure_to(
                 pending.surface_id,
                 pending.width,
@@ -2570,11 +2669,7 @@ impl CompositorState {
     }
 
     fn pending_resize_configure_is_flushable(&self) -> bool {
-        self.pending_resize_configure.is_some_and(|pending| {
-            !self
-                .pending_resize_commits
-                .contains_key(&pending.surface_id)
-        })
+        self.pending_resize_configure.is_some()
     }
 
     fn send_resize_configure_to(
@@ -2586,6 +2681,14 @@ impl CompositorState {
         edges: ResizeEdges,
         resizing: bool,
     ) -> bool {
+        let geometry = self.clamp_resize_geometry(
+            surface_id,
+            WindowGeometry::new(placement, width, height),
+            edges,
+        );
+        let width = geometry.width;
+        let height = geometry.height;
+        let placement = geometry.placement;
         let resizing_states = [xdg_toplevel::State::Resizing];
         let states = if resizing {
             &resizing_states[..]
@@ -2607,6 +2710,7 @@ impl CompositorState {
         .resize_commit(serial);
         self.sent_resize_commits
             .insert((surface_id, serial), resize);
+        self.prune_sent_resize_commits(surface_id);
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
                 "oblivion-one compositor: resize configure surface {surface_id} serial={serial} size={}x{} placement={},{} edges={:?} resizing={}",
@@ -2619,6 +2723,24 @@ impl CompositorState {
             );
         }
         true
+    }
+
+    fn prune_sent_resize_commits(&mut self, surface_id: u32) {
+        let mut serials = self
+            .sent_resize_commits
+            .keys()
+            .filter_map(|(sent_surface_id, serial)| {
+                (*sent_surface_id == surface_id).then_some(*serial)
+            })
+            .collect::<Vec<_>>();
+        if serials.len() <= MAX_SENT_RESIZE_COMMITS_PER_SURFACE {
+            return;
+        }
+        serials.sort_unstable();
+        let remove_count = serials.len() - MAX_SENT_RESIZE_COMMITS_PER_SURFACE;
+        for serial in serials.into_iter().take(remove_count) {
+            self.sent_resize_commits.remove(&(surface_id, serial));
+        }
     }
 
     fn latest_sent_resize_commit(&self, surface_id: u32) -> Option<PendingResizeCommit> {
@@ -2697,8 +2819,8 @@ impl CompositorState {
         height: u32,
         states: &[xdg_toplevel::State],
     ) -> Option<u32> {
-        let width = width.max(MIN_WINDOW_WIDTH);
-        let height = height.max(MIN_WINDOW_HEIGHT);
+        let width = self.clamp_toplevel_width(surface_id, width);
+        let height = self.clamp_toplevel_height(surface_id, height);
         let toplevel = self.toplevel_surfaces.get(&surface_id).cloned()?;
 
         let _ = toplevel
@@ -3145,6 +3267,9 @@ fn update_renderable_surface_buffer(
     generation: u64,
     damage: RenderableSurfaceDamage,
 ) -> io::Result<()> {
+    let previous_preview = surface.resize_preview;
+    let previous_visual = previous_preview
+        .map(|_| WindowGeometry::new(surface.placement, surface.width, surface.height));
     if pending.data.is_shm()
         && surface.buffer_size() == buffer_size
         && let Some(pixels) = surface.shm_pixels_mut()
@@ -3161,6 +3286,19 @@ fn update_renderable_surface_buffer(
     surface.resize_preview = None;
     surface.generation = generation;
     surface.damage = damage;
+    if let Some(visual) = previous_visual
+        && (visual.width != width || visual.height != height || visual.placement != placement)
+    {
+        surface.width = visual.width;
+        surface.height = visual.height;
+        surface.placement = visual.placement;
+        surface.resize_preview = Some(ResizePreview {
+            committed_width: width,
+            committed_height: height,
+            anchor_right: previous_preview.is_some_and(|preview| preview.anchor_right),
+            anchor_bottom: previous_preview.is_some_and(|preview| preview.anchor_bottom),
+        });
+    }
     Ok(())
 }
 

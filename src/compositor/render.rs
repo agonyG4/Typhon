@@ -13,6 +13,8 @@ pub const SERVER_FRAME_BORDER_THICKNESS: i32 = 6;
 pub const SERVER_FRAME_BORDER_COLOR: u32 = 0xff0a_0d12;
 pub const SERVER_FRAME_TITLEBAR_COLOR: u32 = 0xff1a_2029;
 pub const SERVER_FRAME_SEPARATOR_COLOR: u32 = 0xff2e_3644;
+pub const RESIZE_PREVIEW_BACKDROP_COLOR: u32 = 0xff10_141c;
+pub const RESIZE_PREVIEW_OUTLINE_COLOR: u32 = 0xff7f_8ea3;
 pub const OUTPUT_SCALE_DENOMINATOR: u32 = 120;
 pub const MAX_BUFFER_AGE: u32 = 4;
 
@@ -762,7 +764,9 @@ fn draw_client_surfaces_scaled_with_snapshots(
 ) {
     for (surface, snapshot) in surfaces.iter().zip(snapshots) {
         for rect in server_frame_rects_for_surface(surface) {
-            let rect = scale_server_frame_rect(*rect, output_scale);
+            let mut rect = scale_server_frame_rect(rect, output_scale);
+            rect.x = snapshot.target.x.saturating_add(rect.x);
+            rect.y = snapshot.target.y.saturating_add(rect.y);
             match clip {
                 Some(clip) => fill_rect_clipped(frame, frame_width, frame_height, rect, clip),
                 None => fill_rect(frame, frame_width, frame_height, rect),
@@ -964,16 +968,26 @@ pub enum ServerFrameColor {
     Border,
     Titlebar,
     Separator,
+    ResizePreviewBackdrop,
+    ResizePreviewOutline,
 }
 
 impl ServerFrameColor {
-    pub const ALL: [Self; 3] = [Self::Border, Self::Titlebar, Self::Separator];
+    pub const ALL: [Self; 5] = [
+        Self::Border,
+        Self::Titlebar,
+        Self::Separator,
+        Self::ResizePreviewBackdrop,
+        Self::ResizePreviewOutline,
+    ];
 
     pub const fn pixel(self) -> u32 {
         match self {
             Self::Border => SERVER_FRAME_BORDER_COLOR,
             Self::Titlebar => SERVER_FRAME_TITLEBAR_COLOR,
             Self::Separator => SERVER_FRAME_SEPARATOR_COLOR,
+            Self::ResizePreviewBackdrop => RESIZE_PREVIEW_BACKDROP_COLOR,
+            Self::ResizePreviewOutline => RESIZE_PREVIEW_OUTLINE_COLOR,
         }
     }
 }
@@ -1028,6 +1042,132 @@ impl SurfaceTargetRect {
             width: self.width,
             height: self.height,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfaceUvRect {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+impl SurfaceUvRect {
+    pub const FULL: Self = Self {
+        left: 0.0,
+        top: 0.0,
+        right: 1.0,
+        bottom: 1.0,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfaceRenderPlan {
+    pub visual_target: SurfaceTargetRect,
+    pub content_target: SurfaceTargetRect,
+    pub content_uv: SurfaceUvRect,
+    pub preview_active: bool,
+}
+
+pub fn surface_render_plan(
+    surface: &RenderableSurface,
+    visual_target: SurfaceTargetRect,
+) -> SurfaceRenderPlan {
+    let Some(preview) = surface.resize_preview else {
+        return SurfaceRenderPlan {
+            visual_target,
+            content_target: visual_target,
+            content_uv: SurfaceUvRect::FULL,
+            preview_active: false,
+        };
+    };
+
+    let horizontal = preview_axis_plan(
+        preview.committed_width,
+        surface.width,
+        visual_target.width,
+        preview.anchor_right,
+    );
+    let vertical = preview_axis_plan(
+        preview.committed_height,
+        surface.height,
+        visual_target.height,
+        preview.anchor_bottom,
+    );
+
+    SurfaceRenderPlan {
+        visual_target,
+        content_target: SurfaceTargetRect {
+            x: visual_target.x.saturating_add(horizontal.offset),
+            y: visual_target.y.saturating_add(vertical.offset),
+            width: horizontal.extent,
+            height: vertical.extent,
+        },
+        content_uv: SurfaceUvRect {
+            left: horizontal.uv_start,
+            top: vertical.uv_start,
+            right: horizontal.uv_end,
+            bottom: vertical.uv_end,
+        },
+        preview_active: true,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreviewAxisPlan {
+    offset: i32,
+    extent: u32,
+    uv_start: f32,
+    uv_end: f32,
+}
+
+fn preview_axis_plan(
+    committed_extent: u32,
+    visual_extent: u32,
+    target_extent: u32,
+    anchor_far: bool,
+) -> PreviewAxisPlan {
+    if committed_extent == 0 || visual_extent == 0 || target_extent == 0 {
+        return PreviewAxisPlan {
+            offset: 0,
+            extent: 0,
+            uv_start: 0.0,
+            uv_end: 1.0,
+        };
+    }
+
+    if committed_extent <= visual_extent {
+        let extent = u32::try_from(
+            u64::from(committed_extent).saturating_mul(u64::from(target_extent))
+                / u64::from(visual_extent),
+        )
+        .unwrap_or(u32::MAX)
+        .clamp(1, target_extent);
+        let offset = if anchor_far && extent < target_extent {
+            i32::try_from(target_extent - extent).unwrap_or(i32::MAX)
+        } else {
+            0
+        };
+        return PreviewAxisPlan {
+            offset,
+            extent,
+            uv_start: 0.0,
+            uv_end: 1.0,
+        };
+    }
+
+    let span = (visual_extent as f32 / committed_extent as f32).clamp(0.0, 1.0);
+    let (uv_start, uv_end) = if anchor_far {
+        (1.0 - span, 1.0)
+    } else {
+        (0.0, span)
+    };
+    PreviewAxisPlan {
+        offset: 0,
+        extent: target_extent,
+        uv_start,
+        uv_end,
     }
 }
 
@@ -1135,12 +1275,60 @@ fn coalesce_output_rects(rects: Vec<OutputRect>) -> Vec<OutputRect> {
 pub fn server_frame_rects_by_surface(surfaces: &[RenderableSurface]) -> Vec<Vec<ServerFrameRect>> {
     surfaces
         .iter()
-        .map(|surface| server_frame_rects_for_surface(surface).to_vec())
+        .map(server_frame_rects_for_surface)
         .collect()
 }
 
-pub fn server_frame_rects_for_surface(_surface: &RenderableSurface) -> &'static [ServerFrameRect] {
-    &[]
+pub fn server_frame_rects_for_surface(surface: &RenderableSurface) -> Vec<ServerFrameRect> {
+    if surface.resize_preview.is_none() {
+        return Vec::new();
+    }
+
+    let width = surface.width;
+    let height = surface.height;
+    let outline = 1;
+    let mut rects = vec![ServerFrameRect {
+        color: ServerFrameColor::ResizePreviewBackdrop,
+        x: 0,
+        y: 0,
+        width,
+        height,
+    }];
+    if width == 0 || height == 0 {
+        return rects;
+    }
+
+    rects.extend([
+        ServerFrameRect {
+            color: ServerFrameColor::ResizePreviewOutline,
+            x: 0,
+            y: 0,
+            width,
+            height: outline,
+        },
+        ServerFrameRect {
+            color: ServerFrameColor::ResizePreviewOutline,
+            x: 0,
+            y: i32::try_from(height.saturating_sub(outline)).unwrap_or(i32::MAX),
+            width,
+            height: outline,
+        },
+        ServerFrameRect {
+            color: ServerFrameColor::ResizePreviewOutline,
+            x: 0,
+            y: 0,
+            width: outline,
+            height,
+        },
+        ServerFrameRect {
+            color: ServerFrameColor::ResizePreviewOutline,
+            x: i32::try_from(width.saturating_sub(outline)).unwrap_or(i32::MAX),
+            y: 0,
+            width: outline,
+            height,
+        },
+    ]);
+    rects
 }
 
 pub fn surface_origins(surfaces: &[RenderableSurface]) -> Vec<(i32, i32)> {
@@ -1484,7 +1672,8 @@ fn blit_surface_to_rect_clipped(
     let Some(surface_pixels) = surface.cpu_pixels() else {
         return;
     };
-    let target = resize_preview_content_target(surface, target);
+    let plan = surface_render_plan(surface, target);
+    let target = plan.content_target;
     let output_clip = match clip {
         Some(clip) => {
             let Some(clip) = clip.clipped_to_output(frame_width, frame_height) else {
@@ -1515,7 +1704,10 @@ fn blit_surface_to_rect_clipped(
         return;
     }
 
-    if buffer_size.width == target.width && buffer_size.height == target.height {
+    if plan.content_uv == SurfaceUvRect::FULL
+        && buffer_size.width == target.width
+        && buffer_size.height == target.height
+    {
         let row_width = (end_x - start_x) as usize;
         let source_x = (start_x - i64::from(target.x)) as usize;
         for row_y in start_y..end_y {
@@ -1542,11 +1734,20 @@ fn blit_surface_to_rect_clipped(
 
     let target_width = target.width as i64;
     let target_height = target.height as i64;
+    let uv_left = plan.content_uv.left.clamp(0.0, 1.0);
+    let uv_top = plan.content_uv.top.clamp(0.0, 1.0);
+    let uv_width = (plan.content_uv.right - plan.content_uv.left)
+        .abs()
+        .clamp(0.0, 1.0);
+    let uv_height = (plan.content_uv.bottom - plan.content_uv.top)
+        .abs()
+        .clamp(0.0, 1.0);
     for row_y in start_y..end_y {
         let local_y = row_y - i64::from(target.y);
-        let source_y = ((local_y * i64::from(buffer_size.height)) / target_height)
-            .clamp(0, i64::from(buffer_size.height.saturating_sub(1)))
-            as usize;
+        let source_y = ((uv_top * buffer_size.height as f32)
+            + (local_y as f32 / target_height as f32) * uv_height * buffer_size.height as f32)
+            .floor() as i64;
+        let source_y = source_y.clamp(0, i64::from(buffer_size.height.saturating_sub(1))) as usize;
         let target_start = row_y as usize * frame_width + start_x as usize;
         let Some(target_row) =
             frame.get_mut(target_start..target_start + (end_x - start_x) as usize)
@@ -1555,50 +1756,17 @@ fn blit_surface_to_rect_clipped(
         };
         for (column, target_pixel) in target_row.iter_mut().enumerate() {
             let local_x = (start_x - i64::from(target.x)) + column as i64;
-            let source_x = ((local_x * i64::from(buffer_size.width)) / target_width)
-                .clamp(0, i64::from(buffer_size.width.saturating_sub(1)))
-                as usize;
+            let source_x = ((uv_left * buffer_size.width as f32)
+                + (local_x as f32 / target_width as f32) * uv_width * buffer_size.width as f32)
+                .floor() as i64;
+            let source_x =
+                source_x.clamp(0, i64::from(buffer_size.width.saturating_sub(1))) as usize;
             let source_index = source_y * buffer_width + source_x;
             if let Some(source) = surface_pixels.get(source_index).copied() {
                 *target_pixel = blend_premultiplied_argb_over_opaque(source, *target_pixel);
             }
         }
     }
-}
-
-fn resize_preview_content_target(
-    surface: &RenderableSurface,
-    target: SurfaceTargetRect,
-) -> SurfaceTargetRect {
-    let Some(preview) = surface.resize_preview else {
-        return target;
-    };
-    let width = preview_content_extent(preview.committed_width, surface.width, target.width);
-    let height = preview_content_extent(preview.committed_height, surface.height, target.height);
-    SurfaceTargetRect {
-        x: if preview.anchor_right && width < target.width {
-            i32_saturating_add_u32(target.x, target.width - width)
-        } else {
-            target.x
-        },
-        y: if preview.anchor_bottom && height < target.height {
-            i32_saturating_add_u32(target.y, target.height - height)
-        } else {
-            target.y
-        },
-        width,
-        height,
-    }
-}
-
-fn preview_content_extent(committed: u32, current: u32, target_extent: u32) -> u32 {
-    if committed >= current || current == 0 {
-        return target_extent;
-    }
-    let scaled = u64::from(committed).saturating_mul(u64::from(target_extent)) / u64::from(current);
-    u32::try_from(scaled)
-        .unwrap_or(u32::MAX)
-        .clamp(1, target_extent)
 }
 
 fn copy_wallpaper_rect_to_scene(
@@ -1987,14 +2155,6 @@ mod tests {
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
         let mut frame = vec![0; 96 * 96];
-        let mut wallpaper = vec![0; 96 * 96];
-        compose_nested_output(
-            &mut wallpaper,
-            96,
-            96,
-            &[],
-            DesktopVisualState::wallpaper_only(),
-        );
 
         compose_nested_output(
             &mut frame,
@@ -2007,8 +2167,67 @@ mod tests {
         let row = FIRST_SURFACE_OFFSET.1 as usize * 96 + FIRST_SURFACE_OFFSET.0 as usize;
         assert_eq!(frame[row], 0xffff_0000);
         assert_eq!(frame[row + 1], 0xffff_0000);
-        assert_eq!(frame[row + 2], wallpaper[row + 2]);
-        assert_eq!(frame[row + 3], wallpaper[row + 3]);
+        assert_eq!(frame[row + 2], RESIZE_PREVIEW_OUTLINE_COLOR);
+        assert_eq!(frame[row + 3], RESIZE_PREVIEW_OUTLINE_COLOR);
+    }
+
+    #[test]
+    fn resize_preview_shrink_crops_stale_content_without_scaling() {
+        let surface = RenderableSurface {
+            surface_id: 7,
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 1,
+            placement: SurfacePlacement::root(),
+            resize_preview: Some(crate::compositor::ResizePreview {
+                committed_width: 4,
+                committed_height: 1,
+                anchor_right: false,
+                anchor_bottom: false,
+            }),
+            generation: 1,
+            buffer: shm_buffer(
+                4,
+                1,
+                vec![0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff],
+            ),
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+        let mut frame = vec![0; 96 * 96];
+
+        compose_nested_output(
+            &mut frame,
+            96,
+            96,
+            std::slice::from_ref(&surface),
+            DesktopVisualState::wallpaper_only(),
+        );
+
+        let row = FIRST_SURFACE_OFFSET.1 as usize * 96 + FIRST_SURFACE_OFFSET.0 as usize;
+        assert_eq!(frame[row], 0xffff_0000);
+        assert_eq!(frame[row + 1], 0xff00_ff00);
+
+        let anchored_right = RenderableSurface {
+            resize_preview: Some(crate::compositor::ResizePreview {
+                committed_width: 4,
+                committed_height: 1,
+                anchor_right: true,
+                anchor_bottom: false,
+            }),
+            ..surface
+        };
+        let mut right_frame = vec![0; 96 * 96];
+        compose_nested_output(
+            &mut right_frame,
+            96,
+            96,
+            &[anchored_right],
+            DesktopVisualState::wallpaper_only(),
+        );
+
+        assert_eq!(right_frame[row], 0xff00_00ff);
+        assert_eq!(right_frame[row + 1], 0xffff_ffff);
     }
 
     #[test]

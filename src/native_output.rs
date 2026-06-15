@@ -2266,8 +2266,10 @@ impl NativeInputState {
     }
 
     fn handle_pointer_motion(&mut self, sample: PointerMotionSample) -> NativeInputEffect {
-        let mut effect = NativeInputEffect::default();
-        effect.pointer_motion_usec = Some(sample.timestamp_usec);
+        let mut effect = NativeInputEffect {
+            pointer_motion_usec: Some(sample.timestamp_usec),
+            ..NativeInputEffect::default()
+        };
         if let Some(relative) = sample.relative {
             effect.relative_motion = (!relative.is_zero()).then_some(relative);
             self.cursor_x =
@@ -4401,6 +4403,12 @@ impl NativeDamageAccumulator {
         accumulator
     }
 
+    fn extend(&mut self, other: Self) {
+        debug_assert_eq!(self.output_width, other.output_width);
+        debug_assert_eq!(self.output_height, other.output_height);
+        self.rects.extend(other.rects);
+    }
+
     #[cfg(test)]
     fn add_surface(&mut self, surface: &RenderableSurface, origin: (i32, i32)) {
         let buffer_size = surface.buffer_size();
@@ -4486,7 +4494,14 @@ fn native_output_damage_for_repaint(
     render_generation_changed: bool,
 ) -> NativeOutputDamage {
     if render_generation_changed && cause.uses_surface_damage() {
-        NativeDamageAccumulator::from_surfaces(width, height, surfaces).into_output_damage()
+        let mut damage = NativeDamageAccumulator::from_surfaces(width, height, surfaces);
+        damage.extend(NativeDamageAccumulator::from_surface_bounds_changes(
+            width,
+            height,
+            previous_surfaces,
+            surfaces,
+        ));
+        damage.into_output_damage()
     } else if render_generation_changed
         && matches!(
             cause,
@@ -6841,6 +6856,39 @@ mod tests {
                 y: origin.1,
                 width: 340,
                 height: 230,
+            }]
+        );
+    }
+
+    #[test]
+    fn native_output_damage_for_surface_commit_bounds_change_covers_old_and_new_bounds() {
+        let previous = test_renderable_surface(7, 0, 0, 300, 200, RenderableSurfaceDamage::Full);
+        let current = RenderableSurface {
+            width: 260,
+            height: 200,
+            placement: SurfacePlacement::root_at(40, 0),
+            damage: RenderableSurfaceDamage::Full,
+            ..test_renderable_surface(7, 0, 0, 300, 200, RenderableSurfaceDamage::Full)
+        };
+        let previous_origin = surface_origins(std::slice::from_ref(&previous))[0];
+
+        let damage = native_output_damage_for_repaint(
+            640,
+            480,
+            std::slice::from_ref(&previous),
+            std::slice::from_ref(&current),
+            RenderGenerationCause::SurfaceCommit,
+            true,
+        );
+
+        assert_eq!(damage.kind, NativeDamageKind::SurfaceDamage);
+        assert_eq!(
+            damage.rects,
+            vec![NativeDamageRect {
+                x: previous_origin.0,
+                y: previous_origin.1,
+                width: 300,
+                height: 200,
             }]
         );
     }

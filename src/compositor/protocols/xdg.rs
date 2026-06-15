@@ -306,6 +306,28 @@ impl Dispatch<xdg_toplevel::XdgToplevel, XdgToplevelData> for CompositorState {
             xdg_toplevel::Request::SetMinimized => {
                 state.minimize_root_window(compositor_surface_id(&data.surface));
             }
+            xdg_toplevel::Request::SetMinSize { width, height } => {
+                let surface_id = compositor_surface_id(&data.surface);
+                if let Some(toplevel) = state.toplevel_surfaces.get_mut(&surface_id) {
+                    toplevel.constraints.min_width = u32::try_from(width)
+                        .ok()
+                        .and_then(|width| (width > 0).then_some(width));
+                    toplevel.constraints.min_height = u32::try_from(height)
+                        .ok()
+                        .and_then(|height| (height > 0).then_some(height));
+                }
+            }
+            xdg_toplevel::Request::SetMaxSize { width, height } => {
+                let surface_id = compositor_surface_id(&data.surface);
+                if let Some(toplevel) = state.toplevel_surfaces.get_mut(&surface_id) {
+                    toplevel.constraints.max_width = u32::try_from(width)
+                        .ok()
+                        .and_then(|width| (width > 0).then_some(width));
+                    toplevel.constraints.max_height = u32::try_from(height)
+                        .ok()
+                        .and_then(|height| (height > 0).then_some(height));
+                }
+            }
             _ => {}
         }
     }

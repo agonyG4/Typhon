@@ -230,6 +230,39 @@ fn wayland_client_receives_updated_output_mode_after_resize() {
 }
 
 #[test]
+fn wayland_client_receives_selected_output_refresh() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = bind_output_then_set_output_refresh(&socket_path, &commands, 165);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let state = state.unwrap();
+    assert!(state.output_mode_count >= 2);
+    assert_eq!(state.output_refresh_millihertz, 165_000);
+}
+
+#[test]
+fn output_resize_preserves_selected_refresh() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state =
+        bind_output_then_set_output_refresh_and_size(&socket_path, &commands, 165, 1600, 900);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let state = state.unwrap();
+    assert!(state.output_mode_count >= 3);
+    assert_eq!(state.output_width, 1600);
+    assert_eq!(state.output_height, 900);
+    assert_eq!(state.output_refresh_millihertz, 165_000);
+}
+
+#[test]
 fn wayland_client_receives_fractional_scale_updates_after_output_scale_change() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

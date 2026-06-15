@@ -48,11 +48,8 @@ impl Dispatch<zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for CompositorS
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        match request {
-            zwp_relative_pointer_v1::Request::Destroy => {
-                state.remove_relative_pointer_resource(resource);
-            }
-            _ => {}
+        if let zwp_relative_pointer_v1::Request::Destroy = request {
+            state.remove_relative_pointer_resource(resource);
         }
     }
 }
@@ -163,11 +160,8 @@ impl Dispatch<zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1, ()> for CompositorState
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        match request {
-            zwp_idle_inhibitor_v1::Request::Destroy => {
-                state.remove_idle_inhibitor(resource);
-            }
-            _ => {}
+        if let zwp_idle_inhibitor_v1::Request::Destroy = request {
+            state.remove_idle_inhibitor(resource);
         }
     }
 }

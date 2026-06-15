@@ -37,7 +37,15 @@ send GPU buffers. CPU rendering remains available only as a fallback/debug path:
 ```sh
 ./bin/oblivion-one compositor --renderer=gpu
 ./bin/oblivion-one compositor --renderer=cpu
+./bin/oblivion-one compositor --width 1920 --height 1080 --refresh 165 -- zen-browser
 ```
+
+On `oblivion-one compositor --output nested`, `--width` and `--height` are the
+initial logical nested-output size and `--refresh` is the requested nested
+output refresh advertised to Wayland clients. The nested window remains
+host-paced: requesting `165` Hz advertises `165000` mHz and uses a 6.06 ms
+active scheduling interval, but physical presentation is still limited by the
+host compositor and the monitor where the window lives.
 
 To launch a client against the Oblivion-owned socket:
 
@@ -138,6 +146,10 @@ Done:
 - The EGL/GLES renderer detects `EGL_KHR/EXT_swap_buffers_with_damage` and uses
   output damage when available, falling back to normal `eglSwapBuffers` when the
   driver does not expose it.
+- Compositor-owned window shadows are intentionally disabled in active render
+  paths for now. Interactive resize uses only a neutral preview backdrop and a
+  simple outline; full shadows, rounded-corner masking, blur, and server-side
+  decoration polish are deferred to the window-decoration milestone.
 - Runtime Vulkan/WGPU support was removed from the current product path. The
   renderer architecture still routes through backend capability profiles so a
   future Vulkan backend can be added without moving WM policy into graphics code.
@@ -153,7 +165,8 @@ Done:
   on resize or client render generation changes instead of recomputing the
   whole scene in an unbounded loop.
 - The event loop idles at a lower cadence without mapped client surfaces and
-  switches back to frame cadence while apps, interactions, or redraws are active.
+  switches back to the configured refresh-derived cadence while apps,
+  interactions, pending frame work, or redraws are active.
 - Buffer frame callbacks are completed after the nested output presents a frame,
   which paces clients instead of letting them redraw in a tight loop.
 - `compositor -- app args...` launches a process on the Oblivion socket instead
@@ -167,7 +180,9 @@ Done:
   enter/motion/button events into the focused xdg surface.
 - Basic real-client floating move/resize: hold `Alt` and drag with the left
   mouse button to move a mapped root window, or the right mouse button to resize
-  it through `xdg_toplevel.configure`.
+  it. Resize visual geometry follows pointer motion immediately while
+  `xdg_toplevel.configure` and browser commits catch up asynchronously. Stale
+  client content is cropped or left at committed size instead of being stretched.
 - Basic real-client window state: xdg-toplevel minimize, maximize, fullscreen,
   and restore are tracked by the compositor and exposed through temporary
   `Alt` keyboard lab shortcuts.
@@ -257,6 +272,18 @@ inspect the exact command before selecting the SDDM entry. `oblivion-one doctor`
 also reports native-session readiness: runtime dir, KMS/render devices,
 connected output, seat/libinput/GBM/EGL prerequisites, and whether the current
 raw input fallback can open `/dev/input/event*`.
+
+For nested development from an existing desktop, the launcher forwards nested
+output sizing directly to the compositor:
+
+```sh
+./bin/start-oblivion-one --width 1600 --height 900 --refresh 165 -- zen-browser
+```
+
+Those flags configure only the nested host window. Native SDDM/TTY mode
+selection remains under `OBLIVION_ONE_MODE`, for example
+`OBLIVION_ONE_MODE=1920x1080@165`. Use `hyprctl monitors` on Hyprland hosts to
+check the monitor refresh that can physically pace the nested window.
 
 This path is still experimental. The native backend now prefers `libseat` for
 both DRM device ownership and libinput keyboard/pointer input, with direct DRM,

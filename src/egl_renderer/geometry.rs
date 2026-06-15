@@ -38,6 +38,15 @@ impl EglUvRect {
         bottom: 1.0,
     };
 
+    pub(super) const fn new(left: f32, top: f32, right: f32, bottom: f32) -> Self {
+        Self {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
     pub(super) fn from_pixel_bounds(
         x: u32,
         y: u32,

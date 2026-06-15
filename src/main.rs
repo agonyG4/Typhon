@@ -76,6 +76,8 @@ struct CompositorCliOptions {
     check_only: bool,
     renderer: nested_renderer::OutputRendererPreference,
     output_backend: CompositorOutputBackend,
+    nested_output: nested_output::NestedOutputConfig,
+    nested_output_explicit: bool,
     app: Vec<String>,
 }
 
@@ -86,9 +88,21 @@ impl Default for CompositorCliOptions {
             check_only: false,
             renderer: nested_renderer::OutputRendererPreference::Gpu,
             output_backend: CompositorOutputBackend::Auto,
+            nested_output: nested_output::NestedOutputConfig::default(),
+            nested_output_explicit: false,
             app: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompositorRuntimeOptions {
+    socket_name: String,
+    check_only: bool,
+    renderer: nested_renderer::OutputRendererPreference,
+    output_backend: ResolvedCompositorOutputBackend,
+    nested_output: nested_output::NestedOutputConfig,
+    app: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +150,28 @@ fn resolve_compositor_output_backend(
         CompositorOutputBackend::Nested => ResolvedCompositorOutputBackend::Nested,
         CompositorOutputBackend::Native => ResolvedCompositorOutputBackend::Native,
     }
+}
+
+fn resolve_compositor_runtime_options(
+    options: CompositorCliOptions,
+    host_display_available: bool,
+) -> Result<CompositorRuntimeOptions, io::Error> {
+    let output_backend =
+        resolve_compositor_output_backend(options.output_backend, host_display_available);
+    if output_backend == ResolvedCompositorOutputBackend::Native && options.nested_output_explicit {
+        return Err(invalid_input(
+            "--width, --height, and --refresh configure the nested host output. For native KMS mode selection, use OBLIVION_ONE_MODE.",
+        ));
+    }
+
+    Ok(CompositorRuntimeOptions {
+        socket_name: options.socket_name,
+        check_only: options.check_only,
+        renderer: options.renderer,
+        output_backend,
+        nested_output: options.nested_output,
+        app: options.app,
+    })
 }
 
 fn host_display_available() -> bool {
@@ -219,6 +255,21 @@ fn parse_compositor_args(args: &[String]) -> Result<CompositorCliOptions, io::Er
                 };
                 options.output_backend = parse_output_backend_arg(output)?;
             }
+            "--width" => {
+                index += 1;
+                options.nested_output.width = parse_nested_width_arg(args.get(index))?;
+                options.nested_output_explicit = true;
+            }
+            "--height" => {
+                index += 1;
+                options.nested_output.height = parse_nested_height_arg(args.get(index))?;
+                options.nested_output_explicit = true;
+            }
+            "--refresh" => {
+                index += 1;
+                options.nested_output.refresh_hz = parse_nested_refresh_arg(args.get(index))?;
+                options.nested_output_explicit = true;
+            }
             value if value.starts_with("--socket=") => {
                 options.socket_name = value["--socket=".len()..].to_string();
             }
@@ -227,6 +278,20 @@ fn parse_compositor_args(args: &[String]) -> Result<CompositorCliOptions, io::Er
             }
             value if value.starts_with("--output=") => {
                 options.output_backend = parse_output_backend_arg(&value["--output=".len()..])?;
+            }
+            value if value.starts_with("--width=") => {
+                options.nested_output.width = parse_nested_width_value(&value["--width=".len()..])?;
+                options.nested_output_explicit = true;
+            }
+            value if value.starts_with("--height=") => {
+                options.nested_output.height =
+                    parse_nested_height_value(&value["--height=".len()..])?;
+                options.nested_output_explicit = true;
+            }
+            value if value.starts_with("--refresh=") => {
+                options.nested_output.refresh_hz =
+                    parse_nested_refresh_value(&value["--refresh=".len()..])?;
+                options.nested_output_explicit = true;
             }
             other => {
                 return Err(invalid_input(format!(
@@ -255,6 +320,55 @@ fn parse_renderer_arg(value: &str) -> Result<nested_renderer::OutputRendererPref
             "--renderer expects `auto`, `gpu`, or `cpu`, got `{value}`"
         ))
     })
+}
+
+fn parse_nested_width_arg(value: Option<&String>) -> Result<u32, io::Error> {
+    let Some(value) = value else {
+        return Err(invalid_input("--width needs a value"));
+    };
+    parse_nested_width_value(value)
+}
+
+fn parse_nested_height_arg(value: Option<&String>) -> Result<u32, io::Error> {
+    let Some(value) = value else {
+        return Err(invalid_input("--height needs a value"));
+    };
+    parse_nested_height_value(value)
+}
+
+fn parse_nested_refresh_arg(value: Option<&String>) -> Result<u32, io::Error> {
+    let Some(value) = value else {
+        return Err(invalid_input("--refresh needs a value"));
+    };
+    parse_nested_refresh_value(value)
+}
+
+fn parse_nested_width_value(value: &str) -> Result<u32, io::Error> {
+    parse_u32_value_in_range("--width", value, 320, 16_384, "")
+}
+
+fn parse_nested_height_value(value: &str) -> Result<u32, io::Error> {
+    parse_u32_value_in_range("--height", value, 240, 16_384, "")
+}
+
+fn parse_nested_refresh_value(value: &str) -> Result<u32, io::Error> {
+    parse_u32_value_in_range("--refresh", value, 24, 1_000, " Hz")
+}
+
+fn parse_u32_value_in_range(
+    name: &str,
+    value: &str,
+    min: u32,
+    max: u32,
+    unit: &str,
+) -> Result<u32, io::Error> {
+    let parsed = parse_u32_value(name, value)?;
+    if !(min..=max).contains(&parsed) {
+        return Err(invalid_input(format!(
+            "{name} must be between {min} and {max}{unit}, got {parsed}"
+        )));
+    }
+    Ok(parsed)
 }
 
 fn parse_desktop_args(args: &[String]) -> Result<DesktopOptions, io::Error> {
@@ -410,9 +524,9 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 }
 
 fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
+    let options = resolve_compositor_runtime_options(options, host_display_available())?;
     let plan = CompositorPlan::new(&options.socket_name);
-    let output_backend =
-        resolve_compositor_output_backend(options.output_backend, host_display_available());
+    let output_backend = options.output_backend;
     println!("Oblivion One compositor");
     println!("socket: {}", plan.socket_name);
     println!("external compositor: {}", plan.uses_external_compositor());
@@ -442,7 +556,7 @@ fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
             println!(
                 "Spotlight is built into that nested output window: press Super+Space or Ctrl+Space."
             );
-            nested_output::run(server, options.renderer, options.app)
+            nested_output::run(server, options.renderer, options.nested_output, options.app)
         }
         ResolvedCompositorOutputBackend::Native => {
             native_output::run(server, options.app, native_app_gpu_preference)
@@ -706,7 +820,7 @@ fn print_help() {
 
 Usage:
   oblivion-one doctor
-  oblivion-one compositor [--check] [--socket oblivion-one-0] [--renderer auto|gpu|cpu] [--output auto|nested|native] [-- app args...]
+  oblivion-one compositor [--check] [--socket oblivion-one-0] [--renderer auto|gpu|cpu] [--output auto|nested|native] [--width 1280] [--height 800] [--refresh 60] [-- app args...]
   oblivion-one de [--backend oblivion|hyprland|gamescope] [--width 1280] [--height 720] [--refresh 60]
   oblivion-one smoke
   oblivion-one prototype
@@ -718,6 +832,7 @@ Examples:
   cargo run -- doctor
   cargo run -- compositor --check
   cargo run -- compositor -- wayland-info
+  cargo run -- compositor --width 1920 --height 1080 --refresh 165 -- zen-browser
   cargo run -- compositor -- kitty --single-instance=no --session=none --class OblivionOneKitty
   cargo run -- compositor -- brave
   cargo run -- de
@@ -727,6 +842,7 @@ Examples:
 
 Compositor starts Oblivion One's own Wayland server path.
 Output auto uses nested under an existing display and native without one.
+Compositor --width/--height/--refresh configure the nested host output only; native KMS mode selection uses OBLIVION_ONE_MODE.
 Its production renderer is GPU/EGL/GLES. CPU remains a fallback/debug renderer.
 Owned compositor app launches are Wayland-only by default; X11 compatibility must go through an Oblivion-owned XWayland bridge.
 DE is currently legacy lab glue while the owned compositor is built.
@@ -779,6 +895,8 @@ mod tests {
                 check_only: true,
                 renderer: nested_renderer::OutputRendererPreference::Gpu,
                 output_backend: CompositorOutputBackend::Auto,
+                nested_output: nested_output::NestedOutputConfig::default(),
+                nested_output_explicit: false,
                 app: Vec::new(),
             })
         );
@@ -833,6 +951,192 @@ mod tests {
             panic!("expected compositor mode");
         };
         assert_eq!(options.output_backend, CompositorOutputBackend::Native);
+    }
+
+    #[test]
+    fn parse_own_compositor_nested_output_options() {
+        let mode = parse_args(vec![
+            "compositor".to_string(),
+            "--width".to_string(),
+            "1920".to_string(),
+            "--height".to_string(),
+            "1080".to_string(),
+            "--refresh".to_string(),
+            "165".to_string(),
+        ])
+        .unwrap();
+
+        let Mode::Compositor(options) = mode else {
+            panic!("expected compositor mode");
+        };
+        assert_eq!(
+            options.nested_output,
+            nested_output::NestedOutputConfig {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 165,
+            }
+        );
+        assert!(options.nested_output_explicit);
+    }
+
+    #[test]
+    fn parse_own_compositor_nested_output_equals_options() {
+        let mode = parse_args(vec![
+            "compositor".to_string(),
+            "--width=1920".to_string(),
+            "--height=1080".to_string(),
+            "--refresh=165".to_string(),
+        ])
+        .unwrap();
+
+        let Mode::Compositor(options) = mode else {
+            panic!("expected compositor mode");
+        };
+        assert_eq!(
+            options.nested_output,
+            nested_output::NestedOutputConfig {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 165,
+            }
+        );
+        assert!(options.nested_output_explicit);
+    }
+
+    #[test]
+    fn parse_own_compositor_nested_options_stop_at_app_delimiter() {
+        let mode = parse_args(vec![
+            "compositor".to_string(),
+            "--width".to_string(),
+            "1600".to_string(),
+            "--height".to_string(),
+            "900".to_string(),
+            "--refresh".to_string(),
+            "165".to_string(),
+            "--".to_string(),
+            "zen-browser".to_string(),
+            "--width".to_string(),
+            "800".to_string(),
+        ])
+        .unwrap();
+
+        let Mode::Compositor(options) = mode else {
+            panic!("expected compositor mode");
+        };
+        assert_eq!(
+            options.nested_output,
+            nested_output::NestedOutputConfig {
+                width: 1600,
+                height: 900,
+                refresh_hz: 165,
+            }
+        );
+        assert_eq!(
+            options.app,
+            vec![
+                "zen-browser".to_string(),
+                "--width".to_string(),
+                "800".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_own_compositor_rejects_invalid_nested_output_options() {
+        for (option, value, expected) in [
+            ("--width", "0", "--width must be between 320 and 16384"),
+            ("--height", "0", "--height must be between 240 and 16384"),
+            ("--refresh", "0", "--refresh must be between 24 and 1000 Hz"),
+            ("--width", "abc", "--width expects a positive integer"),
+            (
+                "--height",
+                "20000",
+                "--height must be between 240 and 16384",
+            ),
+            (
+                "--refresh",
+                "2000",
+                "--refresh must be between 24 and 1000 Hz",
+            ),
+        ] {
+            let error = parse_args(vec![
+                "compositor".to_string(),
+                option.to_string(),
+                value.to_string(),
+            ])
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "{option} {value} produced {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_own_compositor_rejects_missing_nested_output_option_values() {
+        for option in ["--width", "--height", "--refresh"] {
+            let error = parse_args(vec!["compositor".to_string(), option.to_string()]).unwrap_err();
+            assert!(
+                error.to_string().contains(option),
+                "{option} produced {error}"
+            );
+            assert!(error.to_string().contains("needs a value"));
+        }
+    }
+
+    #[test]
+    fn native_compositor_rejects_explicit_nested_output_options() {
+        let options = parse_compositor_args(&[
+            "--output".to_string(),
+            "native".to_string(),
+            "--width".to_string(),
+            "1920".to_string(),
+        ])
+        .unwrap();
+
+        let error = resolve_compositor_runtime_options(options, true).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("configure the nested host output")
+        );
+        assert!(error.to_string().contains("OBLIVION_ONE_MODE"));
+    }
+
+    #[test]
+    fn auto_compositor_allows_nested_output_options_when_host_display_is_available() {
+        let options = parse_compositor_args(&[
+            "--width".to_string(),
+            "1920".to_string(),
+            "--height".to_string(),
+            "1080".to_string(),
+            "--refresh".to_string(),
+            "165".to_string(),
+        ])
+        .unwrap();
+
+        let runtime = resolve_compositor_runtime_options(options, true).unwrap();
+
+        assert_eq!(
+            runtime.output_backend,
+            ResolvedCompositorOutputBackend::Nested
+        );
+        assert_eq!(runtime.nested_output.refresh_hz, 165);
+    }
+
+    #[test]
+    fn auto_compositor_rejects_nested_output_options_when_it_resolves_to_native() {
+        let options = parse_compositor_args(&["--width".to_string(), "1920".to_string()]).unwrap();
+
+        let error = resolve_compositor_runtime_options(options, false).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("configure the nested host output")
+        );
     }
 
     #[test]
@@ -944,6 +1248,8 @@ mod tests {
                 check_only: false,
                 renderer: nested_renderer::OutputRendererPreference::Gpu,
                 output_backend: CompositorOutputBackend::Auto,
+                nested_output: nested_output::NestedOutputConfig::default(),
+                nested_output_explicit: false,
                 app: vec![
                     "kitty".to_string(),
                     "--class".to_string(),

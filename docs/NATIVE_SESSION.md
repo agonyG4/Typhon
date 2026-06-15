@@ -19,6 +19,19 @@ sets the desktop/session environment, publishes activation variables to
 systemd user and D-Bus when those tools are available, and logs native-session
 startup to `~/.local/state/oblivion-one/session.log`.
 
+When a host display is present, the launcher chooses nested output and forwards
+compositor sizing flags without shell-side parsing:
+
+```sh
+./bin/start-oblivion-one --width 1600 --height 900 --refresh 165 -- zen-browser
+```
+
+The nested flags configure the initial logical host-window size and requested
+nested refresh. The compositor advertises that refresh to Wayland clients and
+uses it for active wakeup timing, but real presentation remains paced by the
+host compositor and the monitor. On Hyprland hosts, `hyprctl monitors` is the
+quick check for the monitor refresh underneath the nested window.
+
 `bin/start-oblivion-one-tty` is the TTY-oriented entry point. It forces
 `OBLIVION_ONE_OUTPUT=native`, `OBLIVION_ONE_PROFILE=release`, and the
 `oblivion-one-tty` socket. It also defaults `OBLIVION_ONE_MODE` to
@@ -61,7 +74,9 @@ The native backend currently:
 - selects KMS modes through `OBLIVION_ONE_MODE`: `auto`/`highres` prefer the
   largest resolution and then highest refresh, `highrr` prefers highest refresh
   and then largest resolution, `preferred` keeps the kernel's first mode, and
-  `WIDTHxHEIGHT@HZ` selects an exact resolution with nearest refresh fallback;
+  `WIDTHxHEIGHT@HZ` selects an exact resolution with nearest refresh fallback.
+  Native mode selection is separate from nested `--width`, `--height`, and
+  `--refresh` flags;
 - opens DRM through the shared libseat session when available, with a direct DRM
   fallback kept for development sessions;
 - prefers `native-egl-gbm` scanout in `auto`: a GBM surface with
@@ -77,6 +92,9 @@ The native backend currently:
   force the older software cursor path for comparison;
 - renders normal native GPU frames through GLES. The CPU scene renderer is still
   used by `gbm-cpu-write` and dumb-framebuffer fallback modes;
+- keeps compositor-owned window shadows disabled. Native damage and scene bounds
+  include client content plus temporary resize preview backdrop/outline only;
+  shadow extents are not generated or tracked in the active paths;
 - prefers `libseat + libinput udev` for keyboard, pointer motion, buttons, and
   scroll;
 - suspends/resumes libinput when the libseat input owner receives
@@ -124,20 +142,23 @@ The native backend currently:
   dumb-framebuffer scanout copy is also damage-limited. The GBM scanout staging
   copy is damage-limited and falls back to one full-frame copy when overlapping
   damage rects would copy more than the output. Window movement and resize
-  damage old and new surface bounds instead of the whole output. `gbm_bo_write`
-  is now limited to the explicit CPU-write fallback and is not used by
-  `native-egl-gbm` frames.
-- previews interactive resize with a compositor-owned target geometry while
-  waiting for the client commit. Left/top edge resizes keep the opposite edge
-  visually anchored. If the committed client buffer is smaller than the preview
-  target, the CPU renderer does not upscale the stale buffer; it leaves the
-  newly exposed region to the desktop background until a compatible commit
-  arrives. Native `prepare_frame` flushes queued resize configure events before
-  repaint/present, so browser clients can start producing the matching buffer a
-  frame earlier. On the GBM/KMS path, buffer releases, frame callbacks, and
+  damage old and new surface bounds instead of the whole output. Client commits
+  that change logical bounds also combine commit damage with old/new bounds so a
+  stale previous rectangle is repainted. `gbm_bo_write` is now limited to the
+  explicit CPU-write fallback and is not used by `native-egl-gbm` frames.
+- previews interactive resize with compositor-owned target geometry while
+  waiting for client commits. Left/top edge resizes keep the opposite edge
+  visually anchored. The shared CPU/GLES render plan draws stale client content
+  at committed size without upscaling; when the visual target is smaller than
+  committed content, it crops the sampled source UVs instead of squeezing the
+  buffer. Temporary preview backdrop and outline layers show the pointer-
+  following target until a compatible commit arrives. Native `prepare_frame`
+  flushes the latest queued resize configure without waiting for an older
+  resize commit, so slow clients reduce content freshness rather than pointer
+  responsiveness. On the GBM/KMS path, buffer releases, frame callbacks, and
   presentation feedback now wait for DRM pageflip completion instead of being
   completed immediately after pageflip submission. The xdg configure/ACK path
-  still decides the committed client size.
+  still decides the committed client size; ACK alone does not replace content.
 - keeps minimized toplevels hidden across later client commits. Hidden commits
   update the minimized surface snapshot so restore shows the latest buffer
   without letting active browsers redraw themselves back into the visible scene.

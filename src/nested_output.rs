@@ -21,27 +21,45 @@ use winit::{
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, KeyCode, PhysicalKey},
+    monitor::MonitorHandle,
     window::{Window, WindowAttributes, WindowId},
 };
 
 type OutputResult<T> = Result<T, Box<dyn Error>>;
 
 const NESTED_OUTPUT_HOST_CURSOR: bool = true;
-const ACTIVE_WAKEUP_INTERVAL: Duration = Duration::from_millis(16);
 const IDLE_WAKEUP_INTERVAL: Duration = Duration::from_millis(80);
 const INPUT_RESPONSE_WAKEUP_INTERVAL: Duration = Duration::from_millis(1);
 const INPUT_RESPONSE_FAST_PATH_DURATION: Duration = Duration::from_millis(48);
 const REDRAW_REQUEST_RETRY_INTERVAL: Duration = Duration::from_millis(48);
 const WAYLAND_SCROLL_LINE_DISTANCE: f64 = 15.0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NestedOutputConfig {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_hz: u32,
+}
+
+impl Default for NestedOutputConfig {
+    fn default() -> Self {
+        Self {
+            width: 1280,
+            height: 800,
+            refresh_hz: 60,
+        }
+    }
+}
+
 pub fn run(
     server: OwnCompositorServer,
     renderer_preference: OutputRendererPreference,
+    config: NestedOutputConfig,
     app_command: Vec<String>,
 ) -> OutputResult<()> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = NestedOutputApp::new(server, renderer_preference, app_command);
+    let mut app = NestedOutputApp::new(server, renderer_preference, config, app_command);
     event_loop.run_app(&mut app)?;
     app.shutdown_output();
     if let Some(error) = app.take_fatal_error() {
@@ -58,6 +76,8 @@ struct NestedOutputApp {
     renderer: DesktopSceneRenderer,
     shell_overlay_renderer: ShellOverlayRenderer,
     renderer_preference: OutputRendererPreference,
+    config: NestedOutputConfig,
+    active_wakeup_interval: Duration,
     app_command: Vec<String>,
     app_launched: bool,
     spotlight: SpotlightModel,
@@ -79,16 +99,30 @@ struct NestedOutputApp {
     redraw_pending: bool,
     redraw_requested_at: Option<Instant>,
     input_response_until: Option<Instant>,
+    perf: NestedPerfCounters,
+    host_monitor_refresh_millihz: Option<u32>,
     fatal_error: Option<String>,
     shutdown_reason: ShutdownReason,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct NestedPerfCounters {
+    redraw_requests: u64,
+    presented_frames: u64,
+    redraw_coalesced: u64,
+    idle_wakeups: u64,
+    active_wakeups: u64,
+    last_log_at: Option<Instant>,
 }
 
 impl NestedOutputApp {
     fn new(
         server: OwnCompositorServer,
         renderer_preference: OutputRendererPreference,
+        config: NestedOutputConfig,
         app_command: Vec<String>,
     ) -> Self {
+        let (cursor_x, cursor_y) = nested_output_initial_cursor(config);
         Self {
             server,
             window: None,
@@ -96,6 +130,8 @@ impl NestedOutputApp {
             renderer: DesktopSceneRenderer::default(),
             shell_overlay_renderer: ShellOverlayRenderer::default(),
             renderer_preference,
+            config,
+            active_wakeup_interval: refresh_interval(config.refresh_hz),
             app_command,
             app_launched: false,
             spotlight: SpotlightModel::default(),
@@ -104,10 +140,10 @@ impl NestedOutputApp {
             last_toplevel_count: 0,
             last_popup_count: 0,
             last_surface_count: 0,
-            cursor_x: 640,
-            cursor_y: 400,
-            cursor_physical_x: 640,
-            cursor_physical_y: 400,
+            cursor_x,
+            cursor_y,
+            cursor_physical_x: cursor_x,
+            cursor_physical_y: cursor_y,
             alt_pressed: false,
             ctrl_pressed: false,
             super_pressed: false,
@@ -117,6 +153,8 @@ impl NestedOutputApp {
             redraw_pending: false,
             redraw_requested_at: None,
             input_response_until: None,
+            perf: NestedPerfCounters::default(),
+            host_monitor_refresh_millihz: None,
             fatal_error: None,
             shutdown_reason: ShutdownReason::EventLoopExited,
         }
@@ -143,6 +181,7 @@ impl NestedOutputApp {
     fn request_redraw(&mut self) {
         let now = Instant::now();
         if !should_issue_redraw_request(self.redraw_pending, self.redraw_requested_at, now) {
+            self.perf.redraw_coalesced = self.perf.redraw_coalesced.saturating_add(1);
             return;
         }
 
@@ -156,6 +195,7 @@ impl NestedOutputApp {
                 );
             }
             window.request_redraw();
+            self.perf.redraw_requests = self.perf.redraw_requests.saturating_add(1);
             self.redraw_pending = true;
             self.redraw_requested_at = Some(now);
         }
@@ -245,12 +285,14 @@ impl NestedOutputApp {
                 self.server.renderable_surfaces().len()
             );
         }
+        self.perf.presented_frames = self.perf.presented_frames.saturating_add(1);
         self.server.finish_frame();
         Ok(())
     }
 
     fn next_wakeup_interval(&self) -> Duration {
         nested_output_wakeup_interval(
+            self.active_wakeup_interval,
             !self.server.renderable_surfaces().is_empty(),
             self.window_interaction_active || self.server.window_interaction_active(),
             self.redraw_pending,
@@ -265,6 +307,42 @@ impl NestedOutputApp {
 
     fn input_response_fast_path_active(&self, now: Instant) -> bool {
         self.input_response_until.is_some_and(|until| now <= until)
+    }
+
+    fn record_wakeup_interval(&mut self, interval: Duration) {
+        if interval == IDLE_WAKEUP_INTERVAL {
+            self.perf.idle_wakeups = self.perf.idle_wakeups.saturating_add(1);
+        } else {
+            self.perf.active_wakeups = self.perf.active_wakeups.saturating_add(1);
+        }
+    }
+
+    fn maybe_log_perf(&mut self, now: Instant) {
+        if !nested_perf_logging_enabled() {
+            return;
+        }
+        let should_log = self.perf.last_log_at.is_none_or(|last_log_at| {
+            now.saturating_duration_since(last_log_at) >= Duration::from_secs(2)
+        });
+        if !should_log {
+            return;
+        }
+        self.perf.last_log_at = Some(now);
+        let host_refresh = self
+            .host_monitor_refresh_millihz
+            .map(|refresh| refresh.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        eprintln!(
+            "perf nested.timing nested_target_refresh_hz={} nested_target_interval_us={} nested_redraw_requests={} nested_presented_frames={} nested_redraw_coalesced={} nested_idle_wakeups={} nested_active_wakeups={} host_monitor_refresh_millihz={}",
+            self.config.refresh_hz,
+            self.active_wakeup_interval.as_micros(),
+            self.perf.redraw_requests,
+            self.perf.presented_frames,
+            self.perf.redraw_coalesced,
+            self.perf.idle_wakeups,
+            self.perf.active_wakeups,
+            host_refresh
+        );
     }
 
     fn send_client_keyboard_key(&mut self, key: u32, pressed: bool) {
@@ -482,10 +560,18 @@ impl ApplicationHandler for NestedOutputApp {
             return;
         }
 
+        println!(
+            "nested output requested: {}x{} logical @ {} Hz",
+            self.config.width, self.config.height, self.config.refresh_hz
+        );
+        self.server.set_output_refresh_hz(self.config.refresh_hz);
         let attributes = WindowAttributes::default()
             .with_title("Oblivion One")
-            .with_inner_size(LogicalSize::new(1280, 800))
-            .with_min_inner_size(LogicalSize::new(900, 560))
+            .with_inner_size(LogicalSize::new(self.config.width, self.config.height))
+            .with_min_inner_size({
+                let (width, height) = nested_output_minimum_size(self.config);
+                LogicalSize::new(width, height)
+            })
             .with_transparent(false)
             .with_resizable(true);
 
@@ -500,7 +586,19 @@ impl ApplicationHandler for NestedOutputApp {
             }
         };
         window.set_cursor_visible(nested_output_uses_host_cursor());
+        self.host_monitor_refresh_millihz =
+            report_host_monitor_refresh(window.current_monitor().as_ref(), self.config.refresh_hz);
         self.sync_output_geometry_for_window(window.as_ref());
+        let scale_factor = output_scale_for_window(window.as_ref());
+        let size = window.inner_size();
+        let (cursor_physical_x, cursor_physical_y) = nested_output_initial_cursor_physical(
+            self.config,
+            scale_factor,
+            size.width,
+            size.height,
+        );
+        self.cursor_physical_x = cursor_physical_x;
+        self.cursor_physical_y = cursor_physical_y;
 
         let output_renderer =
             match NestedOutputRenderer::new(Arc::clone(&window), self.renderer_preference) {
@@ -544,9 +642,11 @@ impl ApplicationHandler for NestedOutputApp {
         if self.server.has_pending_frame_prepare_work() || self.server.has_pending_frame_work() {
             self.request_redraw();
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now() + self.next_wakeup_interval(),
-        ));
+        let now = Instant::now();
+        let interval = self.next_wakeup_interval();
+        self.record_wakeup_interval(interval);
+        self.maybe_log_perf(now);
+        event_loop.set_control_flow(ControlFlow::WaitUntil(now + interval));
     }
 
     fn window_event(
@@ -898,6 +998,64 @@ fn logical_coordinate_from_physical(physical: f64, scale_factor: f64) -> f64 {
     physical / sanitize_output_scale(scale_factor)
 }
 
+const fn refresh_interval(refresh_hz: u32) -> Duration {
+    Duration::from_nanos(1_000_000_000_u64 / refresh_hz as u64)
+}
+
+const fn nested_output_minimum_size(config: NestedOutputConfig) -> (u32, u32) {
+    (min_u32(config.width, 640), min_u32(config.height, 360))
+}
+
+const fn min_u32(left: u32, right: u32) -> u32 {
+    if left < right { left } else { right }
+}
+
+const fn nested_output_initial_cursor(config: NestedOutputConfig) -> (i32, i32) {
+    ((config.width / 2) as i32, (config.height / 2) as i32)
+}
+
+fn nested_output_initial_cursor_physical(
+    config: NestedOutputConfig,
+    scale_factor: f64,
+    physical_width: u32,
+    physical_height: u32,
+) -> (i32, i32) {
+    let (cursor_x, cursor_y) = nested_output_initial_cursor(config);
+    (
+        logical_coordinate_to_physical(cursor_x, scale_factor)
+            .clamp(0, physical_width.saturating_sub(1) as i32),
+        logical_coordinate_to_physical(cursor_y, scale_factor)
+            .clamp(0, physical_height.saturating_sub(1) as i32),
+    )
+}
+
+fn logical_coordinate_to_physical(logical: i32, scale_factor: f64) -> i32 {
+    (f64::from(logical.max(0)) * sanitize_output_scale(scale_factor)).round() as i32
+}
+
+fn report_host_monitor_refresh(
+    monitor: Option<&MonitorHandle>,
+    requested_refresh_hz: u32,
+) -> Option<u32> {
+    let Some(refresh_millihertz) = monitor.and_then(MonitorHandle::refresh_rate_millihertz) else {
+        println!("host monitor refresh: unknown");
+        return None;
+    };
+
+    println!(
+        "host monitor refresh: {}.{:03} Hz",
+        refresh_millihertz / 1_000,
+        refresh_millihertz % 1_000
+    );
+    if refresh_millihertz < requested_refresh_hz.saturating_mul(1_000) {
+        println!(
+            "requested nested refresh is {requested_refresh_hz} Hz, but the current host monitor reports {} Hz; actual presentation will be host-limited",
+            refresh_millihertz / 1_000
+        );
+    }
+    Some(refresh_millihertz)
+}
+
 fn debug_surface_logging_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("OBLIVION_ONE_DEBUG_SURFACES").is_some())
@@ -906,6 +1064,14 @@ fn debug_surface_logging_enabled() -> bool {
 fn debug_frame_logging_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("OBLIVION_ONE_DEBUG_FRAMES").is_some())
+}
+
+fn nested_perf_logging_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("OBLIVION_ONE_PERF_LOG")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "debug" | "DEBUG"))
+    })
 }
 
 const fn nested_visual_state(cursor_x: i32, cursor_y: i32) -> DesktopVisualState {
@@ -917,6 +1083,7 @@ const fn nested_visual_state(cursor_x: i32, cursor_y: i32) -> DesktopVisualState
 }
 
 const fn nested_output_wakeup_interval(
+    active_interval: Duration,
     has_renderable_surfaces: bool,
     interaction_active: bool,
     redraw_pending: bool,
@@ -927,7 +1094,7 @@ const fn nested_output_wakeup_interval(
         INPUT_RESPONSE_WAKEUP_INTERVAL
     } else if has_renderable_surfaces || interaction_active || redraw_pending || pending_frame_work
     {
-        ACTIVE_WAKEUP_INTERVAL
+        active_interval
     } else {
         IDLE_WAKEUP_INTERVAL
     }
@@ -1185,16 +1352,108 @@ mod tests {
 
     #[test]
     fn nested_output_uses_active_wakeup_while_frame_work_is_pending() {
+        let active_interval = refresh_interval(165);
         assert_eq!(
-            nested_output_wakeup_interval(false, false, false, true, false),
-            ACTIVE_WAKEUP_INTERVAL
+            nested_output_wakeup_interval(active_interval, false, false, false, true, false),
+            active_interval
+        );
+    }
+
+    #[test]
+    fn refresh_interval_uses_exact_nanosecond_division() {
+        assert_eq!(refresh_interval(60), Duration::from_nanos(16_666_666));
+        assert_eq!(refresh_interval(120), Duration::from_nanos(8_333_333));
+        assert_eq!(refresh_interval(144), Duration::from_nanos(6_944_444));
+        assert_eq!(refresh_interval(165), Duration::from_nanos(6_060_606));
+        assert_eq!(refresh_interval(240), Duration::from_nanos(4_166_666));
+    }
+
+    #[test]
+    fn nested_output_config_uses_validated_defaults() {
+        assert_eq!(
+            NestedOutputConfig::default(),
+            NestedOutputConfig {
+                width: 1280,
+                height: 800,
+                refresh_hz: 60,
+            }
+        );
+    }
+
+    #[test]
+    fn nested_output_minimum_size_never_exceeds_requested_size() {
+        assert_eq!(
+            nested_output_minimum_size(NestedOutputConfig {
+                width: 320,
+                height: 240,
+                refresh_hz: 60,
+            }),
+            (320, 240)
+        );
+        assert_eq!(
+            nested_output_minimum_size(NestedOutputConfig {
+                width: 1600,
+                height: 900,
+                refresh_hz: 165,
+            }),
+            (640, 360)
+        );
+    }
+
+    #[test]
+    fn nested_output_cursor_starts_at_configured_center() {
+        assert_eq!(
+            nested_output_initial_cursor(NestedOutputConfig {
+                width: 1600,
+                height: 900,
+                refresh_hz: 165,
+            }),
+            (800, 450)
+        );
+    }
+
+    #[test]
+    fn nested_output_initial_cursor_physical_uses_host_scale() {
+        assert_eq!(
+            nested_output_initial_cursor_physical(
+                NestedOutputConfig {
+                    width: 1600,
+                    height: 900,
+                    refresh_hz: 165,
+                },
+                1.5,
+                2400,
+                1350
+            ),
+            (1200, 675)
+        );
+    }
+
+    #[test]
+    fn nested_output_wakeup_uses_configured_active_interval() {
+        let active_interval = refresh_interval(165);
+        assert_eq!(
+            nested_output_wakeup_interval(active_interval, false, false, false, false, false),
+            IDLE_WAKEUP_INTERVAL
+        );
+        assert_eq!(
+            nested_output_wakeup_interval(active_interval, true, false, false, false, false),
+            active_interval
+        );
+        assert_eq!(
+            nested_output_wakeup_interval(active_interval, false, true, false, false, false),
+            active_interval
+        );
+        assert_eq!(
+            nested_output_wakeup_interval(active_interval, false, false, true, false, false),
+            active_interval
         );
     }
 
     #[test]
     fn nested_output_uses_fast_wakeup_while_waiting_for_input_response() {
         assert_eq!(
-            nested_output_wakeup_interval(false, false, false, false, true),
+            nested_output_wakeup_interval(refresh_interval(165), false, false, false, false, true),
             Duration::from_millis(1)
         );
     }
@@ -1379,21 +1638,22 @@ mod tests {
 
     #[test]
     fn nested_output_uses_active_wakeup_only_when_work_is_pending() {
+        let active_interval = refresh_interval(120);
         assert_eq!(
-            nested_output_wakeup_interval(false, false, false, false, false),
+            nested_output_wakeup_interval(active_interval, false, false, false, false, false),
             IDLE_WAKEUP_INTERVAL
         );
         assert_eq!(
-            nested_output_wakeup_interval(true, false, false, false, false),
-            ACTIVE_WAKEUP_INTERVAL
+            nested_output_wakeup_interval(active_interval, true, false, false, false, false),
+            active_interval
         );
         assert_eq!(
-            nested_output_wakeup_interval(false, true, false, false, false),
-            ACTIVE_WAKEUP_INTERVAL
+            nested_output_wakeup_interval(active_interval, false, true, false, false, false),
+            active_interval
         );
         assert_eq!(
-            nested_output_wakeup_interval(false, false, true, false, false),
-            ACTIVE_WAKEUP_INTERVAL
+            nested_output_wakeup_interval(active_interval, false, false, true, false, false),
+            active_interval
         );
     }
 

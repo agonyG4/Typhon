@@ -32,6 +32,9 @@ Current limits:
   `gbm-cpu-write` and KMS dumb framebuffer paths remain explicit fallback/debug
   modes. Legacy values such as `gbm` and `gbm-egl` still select the CPU-write
   path;
+- compositor-owned window shadows are disabled. Resize feedback is intentionally
+  plain: a temporary backdrop and outline show the compositor-owned visual
+  target while decorations/shadows remain deferred to a later milestone;
 - startup fallback is limited to backend creation and the first paint before
   clients are launched. Once the session is running, GPU scanout failures are
   fatal runtime errors with stage/backend/frame diagnostics and a recommended
@@ -49,9 +52,16 @@ Current limits:
   source;
 - VRR is not implemented yet: the compositor does not query `vrr_capable`, set
   the DRM `VRR_ENABLED` property, or expose an `off/on/fullscreen` policy;
-- interactive resize now keeps resize commits tied to compatible client sizes
-  and promotes the latest acked resize serial, but Zen/Gecko still needs live
-  TTY validation against NVIDIA and real browser buffers;
+- interactive resize now moves compositor visual geometry immediately, allows
+  multiple bounded resize configures in flight, crops stale content rather than
+  stretching it, and damages old/new bounds even when a browser commit changes
+  logical size. Zen/Gecko still need live TTY validation against NVIDIA and real
+  browser buffers;
+- nested output size and refresh are configurable through
+  `start-oblivion-one --width W --height H --refresh R -- app`, but the selected
+  nested refresh is a target advertised to clients and used for scheduling.
+  Actual physical presentation can still be capped by the host compositor,
+  host monitor refresh, or application rendering cadence;
 - output revoke/suspend/resume handling is not yet centralized around pageflip
   recovery.
 

@@ -97,7 +97,7 @@ fn normalize_refresh_hz(refresh_hz: u32) -> u32 {
     if refresh_hz == 0 {
         DEFAULT_OUTPUT_REFRESH_HZ
     } else {
-        refresh_hz.clamp(30, 360)
+        refresh_hz.clamp(24, 1_000)
     }
 }
 
@@ -185,5 +185,13 @@ mod tests {
 
         assert_eq!(refresh.wl_output_millihertz(), 60_000);
         assert_eq!(refresh.presentation_refresh_nsec(), 16_666_666);
+    }
+
+    #[test]
+    fn output_refresh_rate_accepts_nested_cli_range() {
+        let refresh = OutputRefreshRate::from_hz(1_000);
+
+        assert_eq!(refresh.wl_output_millihertz(), 1_000_000);
+        assert_eq!(refresh.presentation_refresh_nsec(), 1_000_000);
     }
 }

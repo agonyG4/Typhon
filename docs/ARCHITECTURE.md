@@ -99,6 +99,18 @@ from CPU memory when committed, but same-size commits track
 GPU texture rectangles. Narrow damaged rectangles are packed densely before GL
 texture upload, so the upload does not carry full-window row padding.
 
+The owned nested output is configured through
+`oblivion-one compositor --output nested --width W --height H --refresh R`.
+`W` and `H` are initial logical host-window dimensions; after the user resizes
+the host window, the compositor follows the actual Winit window size and updates
+`wl_output.mode` size without forcing the window back to the CLI dimensions.
+`R` is validated as a numeric target refresh, stored in `NestedOutputConfig`,
+advertised through `wl_output.mode` as millihertz, and used to derive the active
+wakeup interval with integer nanosecond division. This target remains
+host-paced: unchanged scenes do not render merely because the interval elapsed,
+and the host compositor/monitor can still cap physical presentation below the
+advertised nested refresh.
+
 The compositor advertises `zwp_linux_dmabuf_v1` version 3 with ARGB/XRGB linear
 and implicit modifiers. Async `create` still uses the protocol's non-fatal
 `failed` event, but `create_immed` creates `wl_buffer` resources carrying typed
@@ -109,6 +121,10 @@ binds them as GL textures through `GL_OES_EGL_image`.
 Committed dmabuf buffers stay owned by the compositor until the surface commits
 a replacement buffer or is destroyed, so the client cannot recycle a buffer that
 is still backing an active GL texture.
+Window shadows are disabled in all active compositor render paths. The current
+window visual model treats visible bounds as client content plus temporary
+resize preview backdrop/outline only; shadow extents do not participate in hit
+testing, damage, scene bounds, or GPU command generation.
 Clients receive `wl_surface.frame.done` after the nested output presents a frame,
 and the registry now includes `wl_subcompositor`, `wl_data_device_manager`, one
 `wl_output`, plus a pointer/keyboard-capable `wl_seat`. Keyboard clients can
@@ -131,6 +147,9 @@ and draw only the cursor overlay. Same-layout surface commits with explicit
 partial damage repair only the damaged output rectangles in the cached scene,
 redrawing intersecting surfaces in stacking order. Layout, size, scale, stacking,
 and full-damage changes still fall back to a conservative full scene rebuild.
+When a client commit changes logical window bounds, native output damage now
+combines committed surface damage with old/new visible bounds so stale pixels
+from the previous rectangle are repainted.
 Native scanout now has three explicit paths. `native-egl-gbm` is the normal
 target in `auto`: the shared `GlesSceneRenderer` draws the same wallpaper,
 surface, frame, cursor, and shell-overlay layers used by nested EGL/GLES into a

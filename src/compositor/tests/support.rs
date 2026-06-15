@@ -111,6 +111,7 @@ struct RegistryTestState {
     output_description: bool,
     output_width: i32,
     output_height: i32,
+    output_refresh_millihertz: i32,
     seat_name: bool,
     seat_has_pointer: bool,
     surface_configured: bool,
@@ -297,10 +298,16 @@ impl Dispatch<client_wl_output::WlOutput, ()> for RegistryTestState {
             client_wl_output::Event::Done => {
                 state.output_done = true;
             }
-            client_wl_output::Event::Mode { width, height, .. } => {
+            client_wl_output::Event::Mode {
+                width,
+                height,
+                refresh,
+                ..
+            } => {
                 state.output_mode_count += 1;
                 state.output_width = width;
                 state.output_height = height;
+                state.output_refresh_millihertz = refresh;
             }
             client_wl_output::Event::Scale { .. } => {
                 state.output_scale_count += 1;
@@ -456,24 +463,22 @@ impl Dispatch<client_zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for Regi
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
-        match event {
-            client_zwp_relative_pointer_v1::Event::RelativeMotion {
-                utime_hi,
-                utime_lo,
-                dx,
-                dy,
-                dx_unaccel,
-                dy_unaccel,
-            } => {
-                state.relative_motion_count += 1;
-                state.relative_motion_utime =
-                    Some((u64::from(utime_hi) << 32) | u64::from(utime_lo));
-                state.relative_motion_dx = Some(dx);
-                state.relative_motion_dy = Some(dy);
-                state.relative_motion_dx_unaccel = Some(dx_unaccel);
-                state.relative_motion_dy_unaccel = Some(dy_unaccel);
-            }
-            _ => {}
+        if let client_zwp_relative_pointer_v1::Event::RelativeMotion {
+            utime_hi,
+            utime_lo,
+            dx,
+            dy,
+            dx_unaccel,
+            dy_unaccel,
+        } = event
+        {
+            state.relative_motion_count += 1;
+            state.relative_motion_utime =
+                Some((u64::from(utime_hi) << 32) | u64::from(utime_lo));
+            state.relative_motion_dx = Some(dx);
+            state.relative_motion_dy = Some(dy);
+            state.relative_motion_dx_unaccel = Some(dx_unaccel);
+            state.relative_motion_dy_unaccel = Some(dy_unaccel);
         }
     }
 }
@@ -2571,6 +2576,53 @@ fn bind_output_then_set_output_size(
     Ok(state)
 }
 
+fn bind_output_then_set_output_refresh(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    refresh_hz: u32,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let _output: client_wl_output::WlOutput = globals.bind(&qh, 1..=4, ())?;
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::SetOutputRefresh { refresh_hz })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    Ok(state)
+}
+
+fn bind_output_then_set_output_refresh_and_size(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    refresh_hz: u32,
+    width: u32,
+    height: u32,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let _output: client_wl_output::WlOutput = globals.bind(&qh, 1..=4, ())?;
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::SetOutputRefresh { refresh_hz })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::SetOutputSize { width, height })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    Ok(state)
+}
+
 fn create_fractional_scale_surface_then_set_output_scale(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
@@ -3258,6 +3310,40 @@ fn create_toplevel_with_custom_input_subsurface_and_click_overlap(
         button: 0x110,
         pressed: true,
     })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    Ok(state)
+}
+
+fn create_min_size_toplevel_then_shrink_resize_before_client_commit(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let (surface, _xdg_surface, toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 320, 220)?;
+    toplevel.set_min_size(280, 180);
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::BeginFrameAction {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 324.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 224.0,
+    })?;
+    commands.send(ServerCommand::UpdateInteraction {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 214.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 114.0,
+    })?;
+    commands.send(ServerCommand::PresentFrame)?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     Ok(state)
@@ -4267,6 +4353,7 @@ enum ServerCommand {
     EndInteraction,
     ResizeFocusedTo { width: u32, height: u32 },
     SetOutputSize { width: u32, height: u32 },
+    SetOutputRefresh { refresh_hz: u32 },
     SetOutputScale { scale_factor: f64 },
     MinimizeFocused,
     RestoreNextMinimized,
@@ -4339,6 +4426,9 @@ fn spawn_controllable_test_server(
                     }
                     ServerCommand::SetOutputSize { width, height } => {
                         server.set_output_size(width, height);
+                    }
+                    ServerCommand::SetOutputRefresh { refresh_hz } => {
+                        server.set_output_refresh_hz(refresh_hz);
                     }
                     ServerCommand::SetOutputScale { scale_factor } => {
                         server.set_output_scale_factor(scale_factor);

@@ -21,12 +21,21 @@ use super::{
     window_state::WindowState,
 };
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ToplevelSizeConstraints {
+    pub(super) min_width: Option<u32>,
+    pub(super) min_height: Option<u32>,
+    pub(super) max_width: Option<u32>,
+    pub(super) max_height: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ToplevelSurface {
     pub(super) app_id: Option<String>,
     pub(super) xdg_surface: xdg_surface::XdgSurface,
     pub(super) toplevel: xdg_toplevel::XdgToplevel,
     pub(super) window: WindowState,
+    pub(super) constraints: ToplevelSizeConstraints,
 }
 
 #[derive(Debug, Clone)]

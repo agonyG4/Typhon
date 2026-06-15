@@ -61,6 +61,42 @@ fn start_launcher_uses_nested_output_when_host_display_is_available() {
 }
 
 #[test]
+fn start_launcher_forwards_nested_output_size_and_refresh_before_app_args() {
+    let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new(repo_dir.join("bin/start-oblivion-one"))
+        .env("OBLIVION_ONE_DRY_RUN", "1")
+        .env("WAYLAND_DISPLAY", "wayland-test")
+        .env_remove("DISPLAY")
+        .args([
+            "--width",
+            "1920",
+            "--height",
+            "1080",
+            "--refresh",
+            "165",
+            "--",
+            "zen-browser",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("start launcher should run");
+
+    assert!(
+        output.status.success(),
+        "launcher failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--output nested"));
+    assert!(stdout.contains("--width 1920"));
+    assert!(stdout.contains("--height 1080"));
+    assert!(stdout.contains("--refresh 165"));
+    assert!(stdout.contains("-- zen-browser"));
+    assert!(stdout.find("--refresh 165").unwrap() < stdout.find("-- zen-browser").unwrap());
+}
+
+#[test]
 fn start_launcher_blocks_manual_native_output_inside_host_display() {
     let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(repo_dir.join("bin/start-oblivion-one"))

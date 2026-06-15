@@ -233,7 +233,7 @@ fn resize_drag_configure_reports_resizing_state_while_active() {
 }
 
 #[test]
-fn resize_drag_waits_for_client_commit_before_next_configure() {
+fn resize_drag_sends_next_configure_without_waiting_for_client_commit() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -246,9 +246,9 @@ fn resize_drag_waits_for_client_commit_before_next_configure() {
     let _server = stop_controllable_test_server(commands, server_thread);
 
     let state = state.unwrap();
-    assert_eq!(state.toplevel_configure_count, 2);
-    assert_eq!(state.toplevel_width, 340);
-    assert_eq!(state.toplevel_height, 230);
+    assert_eq!(state.toplevel_configure_count, 3);
+    assert_eq!(state.toplevel_width, 380);
+    assert_eq!(state.toplevel_height, 260);
 }
 
 #[test]
@@ -304,7 +304,7 @@ fn prepare_frame_flushes_queued_resize_configure_before_present_frame() {
 }
 
 #[test]
-fn resize_drag_keeps_committed_renderable_until_client_commit() {
+fn resize_drag_updates_visual_target_before_client_commit() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -327,12 +327,23 @@ fn resize_drag_keeps_committed_renderable_until_client_commit() {
     wait_for_server_commands(&commands);
     let server = stop_controllable_test_server(commands, server_thread);
 
+    let surface = &server.renderable_surfaces()[0];
     assert_eq!(server.renderable_surfaces().len(), 1);
-    assert_eq!(server.renderable_surfaces()[0].width, 300);
-    assert_eq!(server.renderable_surfaces()[0].height, 200);
+    assert_eq!(surface.width, 340);
+    assert_eq!(surface.height, 230);
+    assert_eq!(surface.generation, 1);
+    assert_eq!(
+        surface.resize_preview,
+        Some(ResizePreview {
+            committed_width: 300,
+            committed_height: 200,
+            anchor_right: false,
+            anchor_bottom: false,
+        })
+    );
     assert_eq!(
         server.render_generation_cause(),
-        RenderGenerationCause::SurfaceCommit
+        RenderGenerationCause::WindowResize
     );
 }
 
@@ -521,7 +532,7 @@ fn csd_buffer_margin_resize_release_keeps_configure_at_window_geometry() {
 }
 
 #[test]
-fn resize_configure_without_client_commit_does_not_advance_render_generation() {
+fn resize_preview_without_client_commit_advances_render_generation() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -535,7 +546,7 @@ fn resize_configure_without_client_commit_does_not_advance_render_generation() {
         .unwrap();
     let _server = stop_controllable_test_server(commands, server_thread);
 
-    assert_eq!(after_resize, before_resize);
+    assert!(after_resize > before_resize);
 }
 
 #[test]
@@ -611,7 +622,7 @@ fn frame_corner_resize_click_with_tiny_motion_does_not_resize_window() {
 }
 
 #[test]
-fn left_edge_resize_shrink_waits_for_client_commit_before_moving_surface() {
+fn left_edge_resize_shrink_updates_visual_target_before_client_commit() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -627,12 +638,12 @@ fn left_edge_resize_shrink_waits_for_client_commit_before_moving_surface() {
 
     assert_eq!(state.toplevel_width, 260);
     assert_eq!(state.toplevel_height, 200);
-    assert_eq!(server.renderable_surfaces()[0].width, 300);
+    assert_eq!(server.renderable_surfaces()[0].width, 260);
     assert_eq!(server.renderable_surfaces()[0].height, 200);
     assert_eq!(
         origins.first().copied(),
         Some((
-            render::FIRST_SURFACE_OFFSET.0,
+            render::FIRST_SURFACE_OFFSET.0 + 40,
             render::FIRST_SURFACE_OFFSET.1,
         ))
     );
@@ -640,6 +651,27 @@ fn left_edge_resize_shrink_waits_for_client_commit_before_moving_surface() {
         origins[0].0 + server.renderable_surfaces()[0].width as i32,
         render::FIRST_SURFACE_OFFSET.0 + 300
     );
+}
+
+#[test]
+fn resize_preview_clamps_to_toplevel_min_size_before_client_commit() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state =
+        create_min_size_toplevel_then_shrink_resize_before_client_commit(&socket_path, &commands)
+            .unwrap();
+    let server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(state.toplevel_width, 280);
+    assert_eq!(state.toplevel_height, 180);
+    let surface = server
+        .renderable_surfaces()
+        .first()
+        .expect("toplevel should remain renderable");
+    assert_eq!((surface.width, surface.height), (280, 180));
 }
 
 #[test]
