@@ -66,6 +66,19 @@ impl InputProtocolCapabilities {
             idle_inhibit: false,
         }
     }
+
+    pub const fn nested_winit() -> Self {
+        Self {
+            relative_pointer: true,
+            pointer_constraints: true,
+            keyboard_shortcuts_inhibit: false,
+            idle_inhibit: false,
+        }
+    }
+
+    pub const fn native_base() -> Self {
+        Self::desktop_baseline()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

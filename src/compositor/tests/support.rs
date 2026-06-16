@@ -21,7 +21,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use wayland_client::{
-    Connection, Dispatch, Proxy, QueueHandle, WEnum,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
     globals::{GlobalListContents, registry_queue_init},
     protocol::{
         wl_buffer as client_wl_buffer, wl_callback as client_wl_callback,
@@ -54,6 +54,11 @@ use wayland_protocols::wp::idle_inhibit::zv1::client::{
     zwp_idle_inhibit_manager_v1 as client_zwp_idle_inhibit_manager_v1,
     zwp_idle_inhibitor_v1 as client_zwp_idle_inhibitor_v1,
 };
+use wayland_protocols::wp::pointer_constraints::zv1::client::{
+    zwp_confined_pointer_v1 as client_zwp_confined_pointer_v1,
+    zwp_locked_pointer_v1 as client_zwp_locked_pointer_v1,
+    zwp_pointer_constraints_v1 as client_zwp_pointer_constraints_v1,
+};
 use wayland_protocols::wp::presentation_time::client::{
     wp_presentation as client_wp_presentation,
     wp_presentation_feedback as client_wp_presentation_feedback,
@@ -79,12 +84,15 @@ struct RegistryTestState {
     keyboard_key_serial: Option<u32>,
     keyboard_keys: Vec<u32>,
     keyboard_keymap: bool,
+    keyboard_keymap_bytes: Vec<u8>,
+    keyboard_keymap_size: u32,
     keyboard_mods_depressed: Vec<u32>,
     keyboard_repeat_info: bool,
     pointer_enter: bool,
     pointer_enter_count: usize,
     pointer_leave_count: usize,
     pointer_enter_serial: Option<u32>,
+    pointer_enter_serials: Vec<(u32, u32)>,
     pointer_motion: bool,
     pointer_button: bool,
     pointer_button_serial: Option<u32>,
@@ -95,6 +103,9 @@ struct RegistryTestState {
     pointer_vertical_axis: Option<f64>,
     pointer_horizontal_axis: Option<f64>,
     pointer_frame_count: usize,
+    pointer_enter_frame_count: usize,
+    pointer_enter_without_frame_count: usize,
+    pointer_event_log: Vec<&'static str>,
     pointer_surface_x: Option<f64>,
     pointer_surface_y: Option<f64>,
     relative_motion_count: usize,
@@ -103,11 +114,18 @@ struct RegistryTestState {
     relative_motion_dy: Option<f64>,
     relative_motion_dx_unaccel: Option<f64>,
     relative_motion_dy_unaccel: Option<f64>,
+    relative_motion_resource_ids: Vec<u32>,
+    locked_count: usize,
+    unlocked_count: usize,
+    confined_count: usize,
+    unconfined_count: usize,
     parent_surface_id: Option<u32>,
     child_surface_id: Option<u32>,
+    second_child_surface_id: Option<u32>,
     keyboard_enter_surface_id: Option<u32>,
     keyboard_enter_count: usize,
     keyboard_leave_count: usize,
+    keyboard_event_log: Vec<&'static str>,
     surface_enter_count: usize,
     seat_has_keyboard: bool,
     output_done: bool,
@@ -121,6 +139,8 @@ struct RegistryTestState {
     seat_name: bool,
     seat_has_pointer: bool,
     surface_configured: bool,
+    surface_configure_count: usize,
+    surface_configure_serials: Vec<u32>,
     popup_configured: bool,
     popup_configure_count: usize,
     popup_repositioned_token: Option<u32>,
@@ -157,6 +177,25 @@ struct RegistryTestState {
     data_offer_mime_types: Vec<String>,
     data_source_send_mime_types: Vec<String>,
     data_source_cancelled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct XdgRoleSnapshot {
+    surface_registered: bool,
+    configured: bool,
+    toplevel_count: usize,
+    toplevel_registered: bool,
+    popup_count: usize,
+    window_geometry_present: bool,
+    placement: Option<SurfacePlacement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderableSurfaceSnapshot {
+    surface_id: u32,
+    width: u32,
+    height: u32,
+    parent_surface_id: Option<u32>,
 }
 
 impl RegistryTestState {
@@ -406,18 +445,29 @@ impl Dispatch<client_wl_keyboard::WlKeyboard, ()> for RegistryTestState {
             client_wl_keyboard::Event::Enter { surface, .. } => {
                 state.keyboard_enter_surface_id = Some(surface.id().protocol_id());
                 state.keyboard_enter_count += 1;
+                state.keyboard_event_log.push("keyboard_enter");
             }
             client_wl_keyboard::Event::Leave { .. } => {
                 state.keyboard_leave_count += 1;
+                state.keyboard_event_log.push("keyboard_leave");
             }
-            client_wl_keyboard::Event::Keymap { .. } => state.keyboard_keymap = true,
+            client_wl_keyboard::Event::Keymap { fd, size, .. } => {
+                state.keyboard_keymap = true;
+                state.keyboard_keymap_size = size;
+                let mut bytes = vec![0; size as usize];
+                let mut file = File::from(fd);
+                let _ = file.read_exact(&mut bytes);
+                state.keyboard_keymap_bytes = bytes;
+            }
             client_wl_keyboard::Event::Key { serial, key, .. } => {
                 state.keyboard_key = true;
                 state.keyboard_key_serial = Some(serial);
                 state.keyboard_keys.push(key);
+                state.keyboard_event_log.push("keyboard_key");
             }
             client_wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
                 state.keyboard_mods_depressed.push(mods_depressed);
+                state.keyboard_event_log.push("keyboard_modifiers");
             }
             client_wl_keyboard::Event::RepeatInfo { .. } => {
                 state.keyboard_repeat_info = true;
@@ -443,11 +493,16 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                 state.pointer_enter = true;
                 state.pointer_enter_count += 1;
                 state.pointer_enter_serial = Some(serial);
+                state
+                    .pointer_enter_serials
+                    .push((_proxy.id().protocol_id(), serial));
                 state.pointer_enter_surface_id = Some(surface.id().protocol_id());
+                state.pointer_event_log.push("enter");
             }
             client_wl_pointer::Event::Leave { .. } => {
                 state.pointer_leave_count += 1;
                 state.pointer_enter_surface_id = None;
+                state.pointer_event_log.push("leave");
             }
             client_wl_pointer::Event::Motion {
                 surface_x,
@@ -457,13 +512,23 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                 state.pointer_motion = true;
                 state.pointer_surface_x = Some(surface_x);
                 state.pointer_surface_y = Some(surface_y);
+                state.pointer_event_log.push("motion");
             }
-            client_wl_pointer::Event::Button { serial, .. } => {
+            client_wl_pointer::Event::Button { serial, state: button_state, .. } => {
                 state.pointer_button = true;
                 state.pointer_button_serial = Some(serial);
                 state.pointer_button_surface_id = state.pointer_enter_surface_id;
                 if let Some(surface_id) = state.pointer_enter_surface_id {
                     state.pointer_button_surface_ids.push(surface_id);
+                }
+                match button_state {
+                    WEnum::Value(client_wl_pointer::ButtonState::Pressed) => {
+                        state.pointer_event_log.push("button_pressed");
+                    }
+                    WEnum::Value(client_wl_pointer::ButtonState::Released) => {
+                        state.pointer_event_log.push("button_released");
+                    }
+                    _ => state.pointer_event_log.push("button"),
                 }
             }
             client_wl_pointer::Event::Axis {
@@ -481,9 +546,22 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                     }
                     _ => {}
                 }
+                state.pointer_event_log.push("axis");
             }
             client_wl_pointer::Event::Frame => {
                 state.pointer_frame_count += 1;
+                if state.pointer_event_log.last() == Some(&"enter") {
+                    state.pointer_enter_frame_count += 1;
+                }
+                state.pointer_event_log.push("frame");
+                if state.pointer_event_log.contains(&"enter")
+                    && !state
+                        .pointer_event_log
+                        .windows(2)
+                        .any(|events| events == ["enter", "frame"])
+                {
+                    state.pointer_enter_without_frame_count += 1;
+                }
             }
             _ => {}
         }
@@ -523,12 +601,68 @@ impl Dispatch<client_zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for Regi
         } = event
         {
             state.relative_motion_count += 1;
+            state.relative_motion_resource_ids.push(_proxy.id().protocol_id());
             state.relative_motion_utime =
                 Some((u64::from(utime_hi) << 32) | u64::from(utime_lo));
             state.relative_motion_dx = Some(dx);
             state.relative_motion_dy = Some(dy);
             state.relative_motion_dx_unaccel = Some(dx_unaccel);
             state.relative_motion_dy_unaccel = Some(dy_unaccel);
+            state.pointer_event_log.push("relative");
+        }
+    }
+}
+
+impl Dispatch<client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1,
+        _event: client_zwp_pointer_constraints_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_zwp_locked_pointer_v1::ZwpLockedPointerV1, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_zwp_locked_pointer_v1::ZwpLockedPointerV1,
+        event: client_zwp_locked_pointer_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_zwp_locked_pointer_v1::Event::Locked => {
+                state.locked_count += 1;
+                state.pointer_event_log.push("locked");
+            }
+            client_zwp_locked_pointer_v1::Event::Unlocked => {
+                state.unlocked_count += 1;
+                state.pointer_event_log.push("unlocked");
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<client_zwp_confined_pointer_v1::ZwpConfinedPointerV1, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_zwp_confined_pointer_v1::ZwpConfinedPointerV1,
+        event: client_zwp_confined_pointer_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_zwp_confined_pointer_v1::Event::Confined => state.confined_count += 1,
+            client_zwp_confined_pointer_v1::Event::Unconfined => state.unconfined_count += 1,
+            _ => {}
         }
     }
 }
@@ -867,6 +1001,8 @@ impl Dispatch<client_xdg_surface::XdgSurface, ()> for RegistryTestState {
     ) {
         if let client_xdg_surface::Event::Configure { serial } = event {
             state.surface_configured = true;
+            state.surface_configure_count += 1;
+            state.surface_configure_serials.push(serial);
             proxy.ack_configure(serial);
         }
     }
@@ -1091,6 +1227,55 @@ fn create_toplevel_and_check_initial_commit_configure_order(
     queue.roundtrip(&mut state)?;
     state.configured_after_initial_commit = state.surface_configured && state.toplevel_configured;
     Ok(state)
+}
+
+fn recreate_toplevel_role_on_same_surface(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<(RegistryTestState, u32, XdgRoleSnapshot), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let surface = compositor.create_surface(&qh, ());
+    let surface_id = surface.id().protocol_id();
+
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    xdg_surface.set_window_geometry(5, 6, 111, 77);
+    let toplevel = xdg_surface.get_toplevel(&qh, ());
+    toplevel.set_app_id("oblivion.recreate-a".to_string());
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.surface_configure_count, 1);
+    assert_eq!(state.toplevel_configure_count, 1);
+
+    toplevel.destroy();
+    xdg_surface.destroy();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+
+    state.surface_configured = false;
+    state.toplevel_configured = false;
+    state.toplevel_configure_count = 0;
+
+    let recreated_xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let recreated_toplevel = recreated_xdg_surface.get_toplevel(&qh, ());
+    recreated_toplevel.set_app_id("oblivion.recreate-b".to_string());
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+
+    Ok((
+        state,
+        surface_id,
+        capture_xdg_role_snapshot(commands, surface_id),
+    ))
 }
 
 fn create_popup_and_check_initial_commit_configure_order(
@@ -2892,6 +3077,95 @@ fn forward_clipboard_between_two_clients(
     Ok((source_state, target_state, received))
 }
 
+fn disconnect_clipboard_source_after_target_offer(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let source_stream = UnixStream::connect(socket_path)?;
+    let source_connection = Connection::from_socket(source_stream)?;
+    let (source_globals, mut source_queue) =
+        registry_queue_init::<RegistryTestState>(&source_connection)?;
+    let source_qh = source_queue.handle();
+
+    let source_compositor: client_wl_compositor::WlCompositor =
+        source_globals.bind(&source_qh, 1..=6, ())?;
+    let source_wm_base: client_xdg_wm_base::XdgWmBase =
+        source_globals.bind(&source_qh, 1..=6, ())?;
+    let source_seat: client_wl_seat::WlSeat = source_globals.bind(&source_qh, 1..=7, ())?;
+    let source_manager: client_wl_data_device_manager::WlDataDeviceManager =
+        source_globals.bind(&source_qh, 1..=3, ())?;
+    let source_keyboard = source_seat.get_keyboard(&source_qh, ());
+    let source_data_source = source_manager.create_data_source(&source_qh, ());
+    source_data_source.offer("text/plain".to_string());
+    let source_data_device = source_manager.get_data_device(&source_seat, &source_qh, ());
+    let source_surface = source_compositor.create_surface(&source_qh, ());
+    let source_xdg_surface = source_wm_base.get_xdg_surface(&source_surface, &source_qh, ());
+    let source_toplevel = source_xdg_surface.get_toplevel(&source_qh, ());
+    source_surface.commit();
+    source_connection.flush()?;
+
+    let mut source_state = RegistryTestState::default();
+    source_queue.roundtrip(&mut source_state)?;
+    commands.send(ServerCommand::KeyboardKey {
+        key: 30,
+        pressed: true,
+    })?;
+    wait_for_server_commands(commands);
+    source_queue.roundtrip(&mut source_state)?;
+    let serial = source_state
+        .keyboard_key_serial
+        .ok_or_else(|| io::Error::other("keyboard serial was not delivered"))?;
+    source_data_device.set_selection(Some(&source_data_source), serial);
+    source_connection.flush()?;
+    source_connection.roundtrip()?;
+
+    let target_stream = UnixStream::connect(socket_path)?;
+    let target_connection = Connection::from_socket(target_stream)?;
+    let (target_globals, mut target_queue) =
+        registry_queue_init::<RegistryTestState>(&target_connection)?;
+    let target_qh = target_queue.handle();
+
+    let target_compositor: client_wl_compositor::WlCompositor =
+        target_globals.bind(&target_qh, 1..=6, ())?;
+    let target_wm_base: client_xdg_wm_base::XdgWmBase =
+        target_globals.bind(&target_qh, 1..=6, ())?;
+    let target_seat: client_wl_seat::WlSeat = target_globals.bind(&target_qh, 1..=7, ())?;
+    let target_manager: client_wl_data_device_manager::WlDataDeviceManager =
+        target_globals.bind(&target_qh, 1..=3, ())?;
+    let _target_keyboard = target_seat.get_keyboard(&target_qh, ());
+    let target_surface = target_compositor.create_surface(&target_qh, ());
+    let target_xdg_surface = target_wm_base.get_xdg_surface(&target_surface, &target_qh, ());
+    let _target_toplevel = target_xdg_surface.get_toplevel(&target_qh, ());
+    target_surface.commit();
+    target_connection.flush()?;
+
+    let mut target_state = RegistryTestState::default();
+    target_queue.roundtrip(&mut target_state)?;
+    let _target_data_device = target_manager.get_data_device(&target_seat, &target_qh, ());
+    target_connection.flush()?;
+    target_queue.roundtrip(&mut target_state)?;
+    assert!(target_state.data_device_selection_offer.is_some());
+
+    drop(source_toplevel);
+    drop(source_xdg_surface);
+    drop(source_surface);
+    drop(source_data_device);
+    drop(source_data_source);
+    drop(source_keyboard);
+    drop(source_manager);
+    drop(source_seat);
+    drop(source_wm_base);
+    drop(source_compositor);
+    drop(source_globals);
+    drop(source_qh);
+    drop(source_queue);
+    drop(source_connection);
+    wait_for_server_commands(commands);
+    wait_for_server_commands(commands);
+    target_queue.roundtrip(&mut target_state)?;
+    Ok(target_state)
+}
+
 fn receive_host_clipboard_from_bridge(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
@@ -3148,6 +3422,64 @@ fn create_focused_toplevel_and_receive_key(
     Ok(state)
 }
 
+fn create_focused_toplevel_without_keypress(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let _keyboard = seat.get_keyboard(&qh, ());
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    Ok(state)
+}
+
+fn create_focused_toplevel_then_press_tab(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let _keyboard = seat.get_keyboard(&qh, ());
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::KeyboardKey {
+        key: 15,
+        pressed: true,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    Ok(state)
+}
+
 fn create_focused_toplevel_and_receive_two_keys(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
@@ -3335,6 +3667,317 @@ fn create_locked_focused_toplevel_and_receive_pointer_motion_sample(
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     Ok(state)
+}
+
+fn capture_pointer_constraint_backend_requests(
+    commands: &Sender<ServerCommand>,
+) -> Vec<PointerConstraintBackendRequest> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePointerConstraintBackendRequests(reply))
+        .unwrap();
+    receiver.recv().unwrap()
+}
+
+fn request_lock_activate_and_receive_pointer_motion_sample(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    sample: PointerMotionSample,
+) -> Result<(RegistryTestState, Vec<PointerConstraintBackendRequest>), Box<dyn std::error::Error>>
+{
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let pointer = seat.get_pointer(&qh, ());
+    let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+    let _relative_pointer = relative_manager.get_relative_pointer(&pointer, &qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ())?;
+
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let requests = capture_pointer_constraint_backend_requests(commands);
+    assert_eq!(state.locked_count, 0);
+    let backend_id = requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateLocked(id) => Some(*id),
+            _ => None,
+        })
+        .ok_or("expected locked backend activation request")?;
+    commands.send(ServerCommand::PointerConstraintBackendActivated(backend_id))?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.locked_count, 1);
+
+    state.pointer_motion = false;
+    state.pointer_surface_x = None;
+    state.pointer_surface_y = None;
+    commands.send(ServerCommand::PointerMotionSample(sample))?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    Ok((state, requests))
+}
+
+fn create_late_pointer_after_focus(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ())?;
+    let _pointer_a = seat.get_pointer(&qh, ());
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.pointer_enter_count, 1);
+
+    let _pointer_b = seat.get_pointer(&qh, ());
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    Ok(state)
+}
+
+fn late_pointer_lock_activate_and_receive_relative_motion(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    sample: PointerMotionSample,
+) -> Result<(RegistryTestState, Vec<PointerConstraintBackendRequest>), Box<dyn std::error::Error>>
+{
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ())?;
+    let _pointer_a = seat.get_pointer(&qh, ());
+    let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ())?;
+
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.pointer_enter_count, 1);
+
+    let pointer_b = seat.get_pointer(&qh, ());
+    let _relative_pointer = relative_manager.get_relative_pointer(&pointer_b, &qh, ());
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &pointer_b,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let requests = capture_pointer_constraint_backend_requests(commands);
+    assert_eq!(state.locked_count, 0);
+    let backend_id = requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateLocked(id) => Some(*id),
+            _ => None,
+        })
+        .ok_or("expected locked backend activation request")?;
+    commands.send(ServerCommand::PointerConstraintBackendActivated(backend_id))?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    state.pointer_motion = false;
+    state.pointer_surface_x = None;
+    state.pointer_surface_y = None;
+    commands.send(ServerCommand::PointerMotionSample(sample))?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    Ok((state, requests))
+}
+
+fn lock_activation_repairs_missing_source_pointer_enter_state(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    sample: PointerMotionSample,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ())?;
+    let _pointer_a = seat.get_pointer(&qh, ());
+    let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ())?;
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let pointer_b = seat.get_pointer(&qh, ());
+    let _relative_pointer = relative_manager.get_relative_pointer(&pointer_b, &qh, ());
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.pointer_enter_count, 2);
+
+    commands.send(ServerCommand::ClearPointerEnterTracking)?;
+    wait_for_server_commands(commands);
+
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &pointer_b,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let requests = capture_pointer_constraint_backend_requests(commands);
+    let backend_id = requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateLocked(id) => Some(*id),
+            _ => None,
+        })
+        .ok_or("expected locked backend activation request")?;
+    commands.send(ServerCommand::PointerConstraintBackendActivated(backend_id))?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    commands.send(ServerCommand::PointerMotionSample(sample))?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    Ok(state)
+}
+
+fn relative_motion_for_focused_client_is_not_broadcast_to_other_client(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let focused_stream = UnixStream::connect(socket_path)?;
+    let focused_connection = Connection::from_socket(focused_stream)?;
+    let (focused_globals, mut focused_queue) =
+        registry_queue_init::<RegistryTestState>(&focused_connection)?;
+    let focused_qh = focused_queue.handle();
+    let focused_compositor: client_wl_compositor::WlCompositor =
+        focused_globals.bind(&focused_qh, 1..=6, ())?;
+    let focused_wm_base: client_xdg_wm_base::XdgWmBase =
+        focused_globals.bind(&focused_qh, 1..=6, ())?;
+    let focused_seat: client_wl_seat::WlSeat = focused_globals.bind(&focused_qh, 5..=5, ())?;
+    let _focused_pointer = focused_seat.get_pointer(&focused_qh, ());
+    let focused_surface = focused_compositor.create_surface(&focused_qh, ());
+    let focused_xdg_surface = focused_wm_base.get_xdg_surface(&focused_surface, &focused_qh, ());
+    let _focused_toplevel = focused_xdg_surface.get_toplevel(&focused_qh, ());
+    focused_surface.commit();
+    focused_connection.flush()?;
+
+    let mut focused_state = RegistryTestState::default();
+    focused_queue.roundtrip(&mut focused_state)?;
+    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    wait_for_server_commands(commands);
+    focused_queue.roundtrip(&mut focused_state)?;
+    assert_eq!(focused_state.pointer_enter_count, 1);
+
+    let other_stream = UnixStream::connect(socket_path)?;
+    let other_connection = Connection::from_socket(other_stream)?;
+    let (other_globals, mut other_queue) =
+        registry_queue_init::<RegistryTestState>(&other_connection)?;
+    let other_qh = other_queue.handle();
+    let other_seat: client_wl_seat::WlSeat = other_globals.bind(&other_qh, 5..=5, ())?;
+    let other_pointer = other_seat.get_pointer(&other_qh, ());
+    let other_relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
+        other_globals.bind(&other_qh, 1..=1, ())?;
+    let _other_relative_pointer =
+        other_relative_manager.get_relative_pointer(&other_pointer, &other_qh, ());
+    other_connection.flush()?;
+    wait_for_server_commands(commands);
+
+    commands.send(ServerCommand::PointerMotionSample(PointerMotionSample {
+        timestamp_usec: 44,
+        absolute: None,
+        relative: Some(RelativePointerMotion {
+            dx: 1.0,
+            dy: 1.0,
+            dx_unaccelerated: 1.0,
+            dy_unaccelerated: 1.0,
+        }),
+    }))?;
+    wait_for_server_commands(commands);
+    let mut other_state = RegistryTestState::default();
+    other_queue.roundtrip(&mut other_state)?;
+
+    Ok(other_state)
 }
 
 fn create_focused_toplevel_and_receive_pointer_axis(
@@ -3733,6 +4376,247 @@ fn create_toplevel_then_map_subsurface_before_button_release(
     commands.send(ServerCommand::PointerButton {
         button: 0x110,
         pressed: false,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    Ok(state)
+}
+
+fn create_overlapping_subsurfaces_then_place_above_after_parent_commit(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let _pointer = seat.get_pointer(&qh, ());
+
+    let (parent, _xdg_surface, toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120)?;
+    toplevel.set_app_id("oblivion.subsurface-place-above".to_string());
+    parent.commit();
+
+    let lower = compositor.create_surface(&qh, ());
+    let lower_id = lower.id().protocol_id();
+    let lower_subsurface = subcompositor.get_subsurface(&lower, &parent, &qh, ());
+    lower_subsurface.set_position(0, 0);
+    commit_test_buffered_surface(&lower, &shm, &qh, 80, 80)?;
+
+    let upper = compositor.create_surface(&qh, ());
+    let upper_id = upper.id().protocol_id();
+    let upper_subsurface = subcompositor.get_subsurface(&upper, &parent, &qh, ());
+    upper_subsurface.set_position(0, 0);
+    commit_test_buffered_surface(&upper, &shm, &qh, 81, 81)?;
+    connection.flush()?;
+
+    let mut state = RegistryTestState {
+        child_surface_id: Some(lower_id),
+        second_child_surface_id: Some(upper_id),
+        ..RegistryTestState::default()
+    };
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 20.0,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerButton {
+        button: 0x110,
+        pressed: true,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.pointer_button_surface_id, Some(upper_id));
+
+    lower_subsurface.place_above(&upper);
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    state.pointer_button_surface_id = None;
+    commands.send(ServerCommand::PointerButton {
+        button: 0x110,
+        pressed: false,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.pointer_button_surface_id, Some(upper_id));
+
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    state.pointer_button_surface_id = None;
+    commands.send(ServerCommand::PointerButton {
+        button: 0x110,
+        pressed: true,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    Ok(state)
+}
+
+fn create_subsurface_below_parent_and_click_overlap(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let _pointer = seat.get_pointer(&qh, ());
+
+    let (parent, _xdg_surface, toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120)?;
+    let parent_id = parent.id().protocol_id();
+    toplevel.set_app_id("oblivion.subsurface-place-below-parent".to_string());
+    parent.commit();
+
+    let child = compositor.create_surface(&qh, ());
+    let child_id = child.id().protocol_id();
+    let subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    subsurface.set_position(0, 0);
+    commit_test_buffered_surface(&child, &shm, &qh, 160, 120)?;
+    subsurface.place_below(&parent);
+    parent.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState {
+        parent_surface_id: Some(parent_id),
+        child_surface_id: Some(child_id),
+        ..RegistryTestState::default()
+    };
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 20.0,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerButton {
+        button: 0x110,
+        pressed: true,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    Ok(state)
+}
+
+fn create_subsurface_with_invalid_restack_reference(
+    socket_path: &PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let parent = compositor.create_surface(&qh, ());
+    let child = compositor.create_surface(&qh, ());
+    let unrelated = compositor.create_surface(&qh, ());
+    let subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    subsurface.place_above(&unrelated);
+    connection.flush()?;
+    connection.roundtrip()?;
+    Ok(())
+}
+
+fn create_repeated_restack_then_destroy_subsurface(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<
+    (Vec<RenderableSurfaceSnapshot>, Vec<RenderableSurfaceSnapshot>),
+    Box<dyn std::error::Error>,
+> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let (parent, _xdg_surface, toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120)?;
+    toplevel.set_app_id("oblivion.subsurface-repeated-reorder".to_string());
+    parent.commit();
+
+    let subtree = compositor.create_surface(&qh, ());
+    let subtree_subsurface = subcompositor.get_subsurface(&subtree, &parent, &qh, ());
+    subtree_subsurface.set_position(0, 0);
+    commit_test_buffered_surface(&subtree, &shm, &qh, 80, 80)?;
+
+    let grandchild = compositor.create_surface(&qh, ());
+    let grandchild_subsurface = subcompositor.get_subsurface(&grandchild, &subtree, &qh, ());
+    grandchild_subsurface.set_position(1, 1);
+    commit_test_buffered_surface(&grandchild, &shm, &qh, 40, 40)?;
+
+    let sibling = compositor.create_surface(&qh, ());
+    let sibling_subsurface = subcompositor.get_subsurface(&sibling, &parent, &qh, ());
+    sibling_subsurface.set_position(0, 0);
+    commit_test_buffered_surface(&sibling, &shm, &qh, 81, 81)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    for _ in 0..3 {
+        subtree_subsurface.place_above(&sibling);
+    }
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    wait_for_server_commands(commands);
+    let reordered = capture_renderable_surface_snapshot(commands);
+
+    subtree_subsurface.destroy();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    wait_for_server_commands(commands);
+    let after_destroy = capture_renderable_surface_snapshot(commands);
+
+    Ok((reordered, after_destroy))
+}
+
+fn create_pointer_enter_with_v5_pointer(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let _pointer = seat.get_pointer(&qh, ());
+
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120)?;
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 20.0,
     })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
@@ -4611,10 +5495,23 @@ enum ServerCommand {
     CaptureRenderGeneration(Sender<u64>),
     CaptureRenderGenerationCause(Sender<RenderGenerationCause>),
     CaptureRenderableSurfaceCount(Sender<usize>),
+    CaptureRenderableSurfaceSnapshot(Sender<Vec<RenderableSurfaceSnapshot>>),
+    CaptureXdgRoleSnapshot {
+        surface_id: u32,
+        reply: Sender<XdgRoleSnapshot>,
+    },
     CapturePendingFrameCallbacks(Sender<bool>),
     CaptureOnlyPendingSurfaceFrameCallbacks(Sender<bool>),
     CapturePendingFrameWork(Sender<bool>),
     CaptureIdleInhibited(Sender<bool>),
+    CapturePointerConstraintBackendRequests(Sender<Vec<PointerConstraintBackendRequest>>),
+    CapturePointerConstraintIds(Sender<Vec<u64>>),
+    CaptureLastPointerPosition(Sender<(f64, f64)>),
+    PointerConstraintBackendActivated(PointerConstraintBackendId),
+    PointerConstraintBackendFailed(PointerConstraintBackendId),
+    #[allow(dead_code)]
+    PointerConstraintBackendDeactivated(PointerConstraintBackendId),
+    ClearPointerEnterTracking,
     Barrier(Sender<()>),
     PrepareFrame,
     FinishFrame,
@@ -4703,6 +5600,57 @@ fn spawn_controllable_test_server(
                     ServerCommand::CaptureRenderableSurfaceCount(reply) => {
                         let _ = reply.send(server.renderable_surfaces().len());
                     }
+                    ServerCommand::CaptureRenderableSurfaceSnapshot(reply) => {
+                        let _ = reply.send(
+                            server
+                                .renderable_surfaces()
+                                .iter()
+                                .map(|surface| RenderableSurfaceSnapshot {
+                                    surface_id: surface.surface_id,
+                                    width: surface.width,
+                                    height: surface.height,
+                                    parent_surface_id: surface.placement.parent_surface_id,
+                                })
+                                .collect(),
+                        );
+                    }
+                    ServerCommand::CaptureXdgRoleSnapshot { surface_id, reply } => {
+                        let tracked_surface_id =
+                            if server.state.toplevel_surfaces.len() == 1 {
+                                *server.state.toplevel_surfaces.keys().next().unwrap()
+                            } else if server.state.surface_resources.contains_key(&surface_id) {
+                                surface_id
+                            } else if server.state.surface_resources.len() == 1 {
+                                *server.state.surface_resources.keys().next().unwrap()
+                            } else {
+                                surface_id
+                            };
+                        let _ = reply.send(XdgRoleSnapshot {
+                            surface_registered: server
+                                .state
+                                .surface_resources
+                                .contains_key(&tracked_surface_id),
+                            configured: server
+                                .state
+                                .configured_xdg_surfaces
+                                .contains(&tracked_surface_id),
+                            toplevel_count: server.state.toplevel_surfaces.len(),
+                            toplevel_registered: server
+                                .state
+                                .toplevel_surfaces
+                                .contains_key(&tracked_surface_id),
+                            popup_count: server.state.popup_surfaces.len(),
+                            window_geometry_present: server
+                                .state
+                                .surface_window_geometries
+                                .contains_key(&tracked_surface_id),
+                            placement: server
+                                .state
+                                .surface_placements
+                                .get(&tracked_surface_id)
+                                .copied(),
+                        });
+                    }
                     ServerCommand::CapturePendingFrameCallbacks(reply) => {
                         let _ = reply.send(server.has_pending_frame_callbacks());
                     }
@@ -4714,6 +5662,34 @@ fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureIdleInhibited(reply) => {
                         let _ = reply.send(server.state.idle_inhibited());
+                    }
+                    ServerCommand::CapturePointerConstraintBackendRequests(reply) => {
+                        let _ = reply.send(server.take_pointer_constraint_backend_requests());
+                    }
+                    ServerCommand::CapturePointerConstraintIds(reply) => {
+                        let ids = server
+                            .state
+                            .pointer_constraints
+                            .keys()
+                            .copied()
+                            .collect();
+                        let _ = reply.send(ids);
+                    }
+                    ServerCommand::CaptureLastPointerPosition(reply) => {
+                        let _ =
+                            reply.send((server.state.last_pointer_x, server.state.last_pointer_y));
+                    }
+                    ServerCommand::PointerConstraintBackendActivated(id) => {
+                        server.pointer_constraint_backend_activated(id);
+                    }
+                    ServerCommand::PointerConstraintBackendFailed(id) => {
+                        server.pointer_constraint_backend_failed(id, "test failure");
+                    }
+                    ServerCommand::PointerConstraintBackendDeactivated(id) => {
+                        server.pointer_constraint_backend_deactivated(id);
+                    }
+                    ServerCommand::ClearPointerEnterTracking => {
+                        server.state.pointer_entered_surfaces.clear();
                     }
                     ServerCommand::Barrier(reply) => {
                         let _ = reply.send(());
@@ -4785,6 +5761,28 @@ fn capture_renderable_surface_count(commands: &Sender<ServerCommand>) -> usize {
         .expect("server should report renderable surface count")
 }
 
+fn capture_renderable_surface_snapshot(
+    commands: &Sender<ServerCommand>,
+) -> Vec<RenderableSurfaceSnapshot> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureRenderableSurfaceSnapshot(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report renderable surface snapshot")
+}
+
+fn capture_xdg_role_snapshot(commands: &Sender<ServerCommand>, surface_id: u32) -> XdgRoleSnapshot {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureXdgRoleSnapshot { surface_id, reply })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report XDG role snapshot")
+}
+
 fn capture_pending_frame_callbacks(commands: &Sender<ServerCommand>) -> bool {
     let (reply, receiver) = mpsc::channel();
     commands
@@ -4827,6 +5825,557 @@ fn update_interaction_and_report(commands: &Sender<ServerCommand>, x: f64, y: f6
 
 fn runtime_socket_path(socket_name: &str) -> PathBuf {
     PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(socket_name)
+}
+
+fn activate_backend_locked_pointer(
+    commands: &Sender<ServerCommand>,
+    state: &mut RegistryTestState,
+    queue: &mut EventQueue<RegistryTestState>,
+) -> Result<PointerConstraintBackendId, Box<dyn std::error::Error>> {
+    let requests = capture_pointer_constraint_backend_requests(commands);
+    let backend_id = requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateLocked(id) => Some(*id),
+            _ => None,
+        })
+        .ok_or("expected locked backend activation request")?;
+    commands.send(ServerCommand::PointerConstraintBackendActivated(backend_id))?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(state)?;
+    assert_eq!(state.locked_count, 1);
+    Ok(backend_id)
+}
+
+fn locked_relative_motion_survives_stale_hit_test(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    sample: PointerMotionSample,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let pointer = seat.get_pointer(&qh, ());
+    let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+    let _relative_pointer = relative_manager.get_relative_pointer(&pointer, &qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ())?;
+
+    let (parent, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120)?;
+    let parent_surface_id = parent.id().protocol_id();
+    parent.commit();
+
+    let mut state = RegistryTestState {
+        parent_surface_id: Some(parent_surface_id),
+        ..RegistryTestState::default()
+    };
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let _lock = constraints.lock_pointer(
+        &parent,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    activate_backend_locked_pointer(commands, &mut state, &mut queue)?;
+
+    let child = compositor.create_surface(&qh, ());
+    let subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    subsurface.set_position(0, 0);
+    let region = compositor.create_region(&qh, ());
+    region.add(0, 0, 160, 120);
+    child.set_input_region(Some(&region));
+    commit_test_buffered_surface(&child, &shm, &qh, 160, 120)?;
+    parent.commit();
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let enter_before_motion = state.pointer_enter_count;
+    let leave_before_motion = state.pointer_leave_count;
+    state.pointer_motion = false;
+    state.pointer_surface_x = None;
+    state.pointer_surface_y = None;
+    commands.send(ServerCommand::PointerMotionSample(sample))?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    assert_eq!(state.pointer_enter_count, enter_before_motion);
+    assert_eq!(state.pointer_leave_count, leave_before_motion);
+    Ok(state)
+}
+
+fn run_locked_relative_motion_targets_exact_source_pointer(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    sample: PointerMotionSample,
+) -> Result<(RegistryTestState, u32, u32), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ())?;
+    let pointer_a = seat.get_pointer(&qh, ());
+    let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ())?;
+
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let pointer_b = seat.get_pointer(&qh, ());
+    let relative_a = relative_manager.get_relative_pointer(&pointer_a, &qh, ());
+    let relative_b = relative_manager.get_relative_pointer(&pointer_b, &qh, ());
+    let relative_a_id = relative_a.id().protocol_id();
+    let relative_b_id = relative_b.id().protocol_id();
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &pointer_b,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    activate_backend_locked_pointer(commands, &mut state, &mut queue)?;
+
+    commands.send(ServerCommand::PointerMotionSample(sample))?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    Ok((state, relative_a_id, relative_b_id))
+}
+
+fn run_locked_relative_motion_falls_back_to_same_client_pointer_resource(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    sample: PointerMotionSample,
+) -> Result<(RegistryTestState, u32), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ())?;
+    let pointer_a = seat.get_pointer(&qh, ());
+    let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ())?;
+
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let pointer_b = seat.get_pointer(&qh, ());
+    let relative_a = relative_manager.get_relative_pointer(&pointer_a, &qh, ());
+    let relative_a_id = relative_a.id().protocol_id();
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &pointer_b,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    activate_backend_locked_pointer(commands, &mut state, &mut queue)?;
+
+    state.pointer_motion = false;
+    state.pointer_surface_x = None;
+    state.pointer_surface_y = None;
+    commands.send(ServerCommand::PointerMotionSample(sample))?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    Ok((state, relative_a_id))
+}
+
+fn run_locked_relative_motion_fallback_does_not_cross_clients(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<(RegistryTestState, RegistryTestState), Box<dyn std::error::Error>> {
+    let locked_stream = UnixStream::connect(socket_path)?;
+    let locked_connection = Connection::from_socket(locked_stream)?;
+    let (locked_globals, mut locked_queue) =
+        registry_queue_init::<RegistryTestState>(&locked_connection)?;
+    let locked_qh = locked_queue.handle();
+    let locked_compositor: client_wl_compositor::WlCompositor =
+        locked_globals.bind(&locked_qh, 1..=6, ())?;
+    let locked_wm_base: client_xdg_wm_base::XdgWmBase =
+        locked_globals.bind(&locked_qh, 1..=6, ())?;
+    let locked_seat: client_wl_seat::WlSeat = locked_globals.bind(&locked_qh, 5..=5, ())?;
+    let locked_pointer = locked_seat.get_pointer(&locked_qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        locked_globals.bind(&locked_qh, 1..=1, ())?;
+
+    let locked_surface = locked_compositor.create_surface(&locked_qh, ());
+    let locked_xdg_surface = locked_wm_base.get_xdg_surface(&locked_surface, &locked_qh, ());
+    let _locked_toplevel = locked_xdg_surface.get_toplevel(&locked_qh, ());
+    locked_surface.commit();
+    locked_connection.flush()?;
+
+    let mut locked_state = RegistryTestState::default();
+    locked_queue.roundtrip(&mut locked_state)?;
+    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    wait_for_server_commands(commands);
+    locked_queue.roundtrip(&mut locked_state)?;
+
+    let _lock = constraints.lock_pointer(
+        &locked_surface,
+        &locked_pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &locked_qh,
+        (),
+    );
+    locked_connection.flush()?;
+    wait_for_server_commands(commands);
+    locked_queue.roundtrip(&mut locked_state)?;
+    activate_backend_locked_pointer(commands, &mut locked_state, &mut locked_queue)?;
+
+    let other_stream = UnixStream::connect(socket_path)?;
+    let other_connection = Connection::from_socket(other_stream)?;
+    let (other_globals, mut other_queue) =
+        registry_queue_init::<RegistryTestState>(&other_connection)?;
+    let other_qh = other_queue.handle();
+    let other_seat: client_wl_seat::WlSeat = other_globals.bind(&other_qh, 5..=5, ())?;
+    let other_pointer = other_seat.get_pointer(&other_qh, ());
+    let other_relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
+        other_globals.bind(&other_qh, 1..=1, ())?;
+    let _other_relative_pointer =
+        other_relative_manager.get_relative_pointer(&other_pointer, &other_qh, ());
+    other_connection.flush()?;
+    wait_for_server_commands(commands);
+
+    commands
+        .send(ServerCommand::PointerMotionSample(PointerMotionSample {
+            timestamp_usec: 505,
+            absolute: None,
+            relative: Some(RelativePointerMotion {
+                dx: 3.0,
+                dy: -2.0,
+                dx_unaccelerated: 3.0,
+                dy_unaccelerated: -2.0,
+            }),
+        }))?;
+    wait_for_server_commands(commands);
+    let mut other_state = RegistryTestState::default();
+    other_queue.roundtrip(&mut other_state)?;
+
+    Ok((locked_state, other_state))
+}
+
+fn run_locked_relative_motion_dispatches_to_all_same_client_resources(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    sample: PointerMotionSample,
+) -> Result<(RegistryTestState, Vec<u32>), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ())?;
+    let pointer_a = seat.get_pointer(&qh, ());
+    let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ())?;
+
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let pointer_b = seat.get_pointer(&qh, ());
+    let relative_a = relative_manager.get_relative_pointer(&pointer_a, &qh, ());
+    let relative_b = relative_manager.get_relative_pointer(&pointer_b, &qh, ());
+    let expected_ids = vec![relative_a.id().protocol_id(), relative_b.id().protocol_id()];
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &pointer_b,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    activate_backend_locked_pointer(commands, &mut state, &mut queue)?;
+
+    commands.send(ServerCommand::PointerMotionSample(sample))?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    Ok((state, expected_ids))
+}
+
+fn capture_pointer_constraint_ids(commands: &Sender<ServerCommand>) -> Vec<u64> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePointerConstraintIds(reply))
+        .unwrap();
+    receiver.recv().unwrap()
+}
+
+fn run_multi_client_pointer_constraints_remain_independent(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<(PointerConstraintBackendId, PointerConstraintBackendId), Box<dyn std::error::Error>> {
+    #[allow(clippy::type_complexity)]
+    fn setup_client(
+        socket_path: &PathBuf,
+    ) -> Result<
+        (
+            Connection,
+            EventQueue<RegistryTestState>,
+            client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1,
+            client_wl_surface::WlSurface,
+            client_wl_pointer::WlPointer,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let stream = UnixStream::connect(socket_path)?;
+        let connection = Connection::from_socket(stream)?;
+        let (globals, queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+        let qh = queue.handle();
+        let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+        let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+        let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+        let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+        let pointer = seat.get_pointer(&qh, ());
+        let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+            globals.bind(&qh, 1..=1, ())?;
+        let (surface, _xdg_surface, _toplevel) =
+            create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 120, 90)?;
+        surface.commit();
+        connection.flush()?;
+        Ok((connection, queue, constraints, surface, pointer))
+    }
+
+    let (connection_a, mut queue_a, constraints_a, surface_a, pointer_a) =
+        setup_client(socket_path)?;
+    let mut state_a = RegistryTestState::default();
+    queue_a.roundtrip(&mut state_a)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
+    wait_for_server_commands(commands);
+    queue_a.roundtrip(&mut state_a)?;
+
+    let _lock_a = constraints_a.lock_pointer(
+        &surface_a,
+        &pointer_a,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &queue_a.handle(),
+        (),
+    );
+    connection_a.flush()?;
+    wait_for_server_commands(commands);
+    queue_a.roundtrip(&mut state_a)?;
+    let requests_a = capture_pointer_constraint_backend_requests(commands);
+    let id_a = requests_a
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateLocked(id) => Some(*id),
+            _ => None,
+        })
+        .ok_or("expected client A locked backend activation request")?;
+
+    let (connection_b, mut queue_b, constraints_b, surface_b, pointer_b) =
+        setup_client(socket_path)?;
+    let mut state_b = RegistryTestState::default();
+    queue_b.roundtrip(&mut state_b)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
+    wait_for_server_commands(commands);
+    queue_b.roundtrip(&mut state_b)?;
+
+    let _lock_b = constraints_b.lock_pointer(
+        &surface_b,
+        &pointer_b,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &queue_b.handle(),
+        (),
+    );
+    connection_b.flush()?;
+    wait_for_server_commands(commands);
+    queue_b.roundtrip(&mut state_b)?;
+    let ids = capture_pointer_constraint_ids(commands);
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+    assert!(ids.contains(&id_a.constraint_id));
+
+    commands.send(ServerCommand::PointerConstraintBackendActivated(id_a))?;
+    wait_for_server_commands(commands);
+    queue_a.roundtrip(&mut state_a)?;
+    assert_eq!(state_a.locked_count, 1);
+    assert_eq!(state_b.locked_count, 0);
+
+    let wrong_client_activation = PointerConstraintBackendId {
+        constraint_id: id_a.constraint_id,
+        generation: id_a.generation.wrapping_add(999),
+    };
+    commands.send(ServerCommand::PointerConstraintBackendActivated(
+        wrong_client_activation,
+    ))?;
+    wait_for_server_commands(commands);
+    queue_b.roundtrip(&mut state_b)?;
+    assert_eq!(state_b.locked_count, 0);
+
+    commands
+        .send(ServerCommand::PointerMotionSample(PointerMotionSample {
+            timestamp_usec: 1,
+            absolute: None,
+            relative: Some(RelativePointerMotion {
+                dx: 3.0,
+                dy: 1.0,
+                dx_unaccelerated: 3.0,
+                dy_unaccelerated: 1.0,
+            }),
+        }))?;
+    wait_for_server_commands(commands);
+    queue_b.roundtrip(&mut state_b)?;
+    assert_eq!(state_b.relative_motion_count, 0);
+
+    Ok((id_a, PointerConstraintBackendId {
+        constraint_id: ids.iter().copied().find(|id| *id != id_a.constraint_id).unwrap(),
+        generation: id_a.generation,
+    }))
+}
+
+fn run_locked_relative_motion_survives_surface_tree_churn(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    sample: PointerMotionSample,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let pointer = seat.get_pointer(&qh, ());
+    let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+    let _relative_pointer = relative_manager.get_relative_pointer(&pointer, &qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ())?;
+
+    let (parent, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120)?;
+    parent.commit();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 20.0,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let _lock = constraints.lock_pointer(
+        &parent,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    activate_backend_locked_pointer(commands, &mut state, &mut queue)?;
+
+    let lower = compositor.create_surface(&qh, ());
+    let lower_subsurface = subcompositor.get_subsurface(&lower, &parent, &qh, ());
+    lower_subsurface.set_position(0, 0);
+    commit_test_buffered_surface(&lower, &shm, &qh, 80, 80)?;
+
+    let upper = compositor.create_surface(&qh, ());
+    let upper_subsurface = subcompositor.get_subsurface(&upper, &parent, &qh, ());
+    upper_subsurface.set_position(0, 0);
+    let region = compositor.create_region(&qh, ());
+    region.add(0, 0, 80, 80);
+    upper.set_input_region(Some(&region));
+    commit_test_buffered_surface(&upper, &shm, &qh, 80, 80)?;
+    lower_subsurface.place_above(&upper);
+    parent.commit();
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    commands.send(ServerCommand::PointerMotionSample(sample))?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    Ok(state)
 }
 
 fn unique_socket_name() -> String {

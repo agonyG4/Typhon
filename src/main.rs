@@ -14,7 +14,10 @@ mod prototype;
 use oblivion_one::{
     CompositorAppGpuPreference, DEFAULT_APP, DesktopOptions, HyprlandLaunchPlan, NestedBackend,
     NestedLaunchPlan, NestedOptions,
-    compositor::{CompositorPlan, OwnCompositorServer},
+    compositor::{
+        CompositorPlan, InputProtocolCapabilities, OwnCompositorServer,
+        SelectionProtocolCapabilities, client_protocols_for_capabilities,
+    },
     default_state_dir, discover_tools, export_lines, parse_session_env,
     portal::PortalRuntime,
     session::NativeSessionProbe,
@@ -538,10 +541,20 @@ fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
     println!("command: {}", plan.command_preview());
 
     let server = match output_backend {
-        ResolvedCompositorOutputBackend::Nested => OwnCompositorServer::bind(&options.socket_name)?,
+        ResolvedCompositorOutputBackend::Nested => OwnCompositorServer::bind_with_capabilities(
+            &options.socket_name,
+            true,
+            InputProtocolCapabilities::nested_winit(),
+            SelectionProtocolCapabilities::core_clipboard(),
+        )?,
         ResolvedCompositorOutputBackend::Native => {
             println!("gpu buffer protocols: deferred until the native scanout backend is known");
-            OwnCompositorServer::bind_native_base(&options.socket_name)?
+            OwnCompositorServer::bind_with_capabilities(
+                &options.socket_name,
+                false,
+                InputProtocolCapabilities::native_base(),
+                SelectionProtocolCapabilities::core_clipboard(),
+            )?
         }
     };
     println!("Wayland socket bound: {}", server.socket_name());
@@ -569,6 +582,15 @@ fn compositor_protocol_names_for_output_backend(
     output_backend: ResolvedCompositorOutputBackend,
 ) -> Vec<&'static str> {
     let mut protocols = plan.protocol_names().to_vec();
+    if output_backend == ResolvedCompositorOutputBackend::Nested {
+        protocols = client_protocols_for_capabilities(
+            InputProtocolCapabilities::nested_winit(),
+            SelectionProtocolCapabilities::core_clipboard(),
+        )
+        .into_iter()
+        .map(|protocol| protocol.name())
+        .collect();
+    }
     if output_backend == ResolvedCompositorOutputBackend::Native {
         protocols.retain(|protocol| {
             !matches!(

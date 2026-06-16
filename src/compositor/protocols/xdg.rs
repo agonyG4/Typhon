@@ -240,7 +240,9 @@ impl Dispatch<xdg_surface::XdgSurface, XdgSurfaceData> for CompositorState {
             xdg_surface::Request::AckConfigure { serial } => {
                 state.ack_xdg_surface_configure(compositor_surface_id(&data.surface), serial);
             }
-            xdg_surface::Request::Destroy => {}
+            xdg_surface::Request::Destroy => {
+                state.unregister_xdg_surface_role(compositor_surface_id(&data.surface));
+            }
             _ => {}
         }
     }
@@ -265,9 +267,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, XdgToplevelData> for CompositorState {
                 state.last_app_id = Some(app_id);
             }
             xdg_toplevel::Request::Destroy => {
-                state
-                    .toplevel_surfaces
-                    .remove(&compositor_surface_id(&data.surface));
+                state.unregister_toplevel_surface(compositor_surface_id(&data.surface));
             }
             xdg_toplevel::Request::Move { seat, serial } => {
                 if resource_belongs_to_surface_client(&seat, &data.surface) {

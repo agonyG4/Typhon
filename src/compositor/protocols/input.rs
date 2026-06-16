@@ -53,8 +53,13 @@ impl Dispatch<wl_pointer::WlPointer, ()> for CompositorState {
         _data_init: &mut DataInit<'_, Self>,
     ) {
         match request {
-            wl_pointer::Request::SetCursor { surface, .. } => {
-                state.set_pointer_cursor(surface);
+            wl_pointer::Request::SetCursor {
+                serial,
+                surface,
+                hotspot_x,
+                hotspot_y,
+            } => {
+                state.set_pointer_cursor(resource, serial, surface, hotspot_x, hotspot_y);
             }
             wl_pointer::Request::Release => {
                 state.unregister_pointer(resource);

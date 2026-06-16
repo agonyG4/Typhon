@@ -10,19 +10,21 @@ use crate::nested_renderer::{
 };
 use oblivion_one::{
     compositor::{
-        DesktopSceneRenderer, DesktopVisualState, OwnCompositorServer, ShellOverlayRenderer,
-        ShellOverlayState, ShellTopbarModel, SpotlightModel, dock_item_at,
+        DesktopSceneRenderer, DesktopVisualState, OutputPosition, OwnCompositorServer,
+        PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample,
+        RelativePointerMotion, ShellOverlayRenderer, ShellOverlayState, ShellTopbarModel,
+        SpotlightModel, dock_item_at,
     },
     spawn_compositor_app,
 };
 use winit::{
     application::ApplicationHandler,
-    dpi::LogicalSize,
-    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+    dpi::{LogicalPosition, LogicalSize},
+    event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, KeyCode, PhysicalKey},
     monitor::MonitorHandle,
-    window::{Window, WindowAttributes, WindowId},
+    window::{CursorGrabMode, Window, WindowAttributes, WindowId},
 };
 
 type OutputResult<T> = Result<T, Box<dyn Error>>;
@@ -101,8 +103,24 @@ struct NestedOutputApp {
     input_response_until: Option<Instant>,
     perf: NestedPerfCounters,
     host_monitor_refresh_millihz: Option<u32>,
+    active_pointer_constraint: Option<NestedPointerConstraint>,
+    host_cursor_client_visible: bool,
+    host_window_focused: bool,
+    input_clock_start: Instant,
     fatal_error: Option<String>,
     shutdown_reason: ShutdownReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NestedPointerConstraint {
+    id: PointerConstraintBackendId,
+    mode: NestedPointerConstraintMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NestedPointerConstraintMode {
+    Locked,
+    Confined,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +173,10 @@ impl NestedOutputApp {
             input_response_until: None,
             perf: NestedPerfCounters::default(),
             host_monitor_refresh_millihz: None,
+            active_pointer_constraint: None,
+            host_cursor_client_visible: true,
+            host_window_focused: true,
+            input_clock_start: Instant::now(),
             fatal_error: None,
             shutdown_reason: ShutdownReason::EventLoopExited,
         }
@@ -174,6 +196,11 @@ impl NestedOutputApp {
     }
 
     fn shutdown_output(&mut self) {
+        if let Some(constraint) = self.active_pointer_constraint {
+            self.release_host_pointer_constraint(None);
+            self.server
+                .pointer_constraint_backend_deactivated(constraint.id);
+        }
         // EGL's wl_egl_window must be destroyed before winit drops the underlying wl_surface.
         drop_renderer_before_window(&mut self.output_renderer, &mut self.window);
     }
@@ -222,6 +249,7 @@ impl NestedOutputApp {
                 );
             }
         }
+        self.process_pointer_constraint_backend_requests();
 
         let toplevel_count = self.server.xdg_toplevels();
         if toplevel_count != self.last_toplevel_count {
@@ -240,6 +268,164 @@ impl NestedOutputApp {
             self.last_surface_count = surface_count;
             println!("renderable surfaces: {surface_count}");
         }
+    }
+
+    fn process_pointer_constraint_backend_requests(&mut self) {
+        for request in self.server.take_pointer_constraint_backend_requests() {
+            match request {
+                PointerConstraintBackendRequest::ActivateLocked(id) => {
+                    self.activate_host_pointer_constraint(id, NestedPointerConstraintMode::Locked);
+                }
+                PointerConstraintBackendRequest::ActivateConfined(id) => {
+                    self.activate_host_pointer_constraint(
+                        id,
+                        NestedPointerConstraintMode::Confined,
+                    );
+                }
+                PointerConstraintBackendRequest::Deactivate {
+                    id,
+                    restore_position,
+                } => {
+                    if self
+                        .active_pointer_constraint
+                        .is_some_and(|constraint| constraint.id == id)
+                    {
+                        self.release_host_pointer_constraint(restore_position);
+                        self.server.pointer_constraint_backend_deactivated(id);
+                    }
+                }
+                PointerConstraintBackendRequest::ApplyCursorVisibility { visible } => {
+                    self.host_cursor_client_visible = visible;
+                    self.apply_host_cursor_visibility();
+                }
+            }
+        }
+    }
+
+    fn activate_host_pointer_constraint(
+        &mut self,
+        id: PointerConstraintBackendId,
+        mode: NestedPointerConstraintMode,
+    ) {
+        if let Some(active) = self.active_pointer_constraint {
+            if active.id == id {
+                pointer_debug_log(format!(
+                    "backend activate requested id={:?} already_active=true",
+                    id
+                ));
+                self.server.pointer_constraint_backend_activated(id);
+                return;
+            }
+            pointer_debug_log(format!(
+                "backend activation rejected/replaced old={:?} new={:?}",
+                active.id, id
+            ));
+            self.server
+                .pointer_constraint_backend_failed(id, "nested pointer constraint already active");
+            return;
+        }
+        let Some(window) = self.window.as_deref() else {
+            self.server
+                .pointer_constraint_backend_failed(id, "nested window is not available");
+            return;
+        };
+        if !self.host_window_focused {
+            self.server
+                .pointer_constraint_backend_failed(id, "nested window is not focused");
+            return;
+        }
+        let grab_mode = match mode {
+            NestedPointerConstraintMode::Locked => CursorGrabMode::Locked,
+            NestedPointerConstraintMode::Confined => CursorGrabMode::Confined,
+        };
+        if let Err(error) = window.set_cursor_grab(grab_mode) {
+            eprintln!(
+                "oblivion-one compositor: pointer constraint {:?} grab failed for {:?}: {error}",
+                id, mode
+            );
+            self.server
+                .pointer_constraint_backend_failed(id, error.to_string());
+            return;
+        }
+        self.active_pointer_constraint = Some(NestedPointerConstraint { id, mode });
+        self.apply_host_cursor_visibility();
+        pointer_debug_log(format!("backend activate requested id={:?}", id));
+        self.server.pointer_constraint_backend_activated(id);
+    }
+
+    fn release_host_pointer_constraint(&mut self, restore_position: Option<OutputPosition>) {
+        let Some(constraint) = self.active_pointer_constraint.take() else {
+            return;
+        };
+        if let Some(window) = self.window.as_deref() {
+            if let Some(position) = restore_position {
+                match window.set_cursor_position(LogicalPosition::new(position.x, position.y)) {
+                    Ok(()) => {
+                        let scale_factor = output_scale_for_window(window);
+                        self.cursor_x = position.x.round() as i32;
+                        self.cursor_y = position.y.round() as i32;
+                        self.cursor_physical_x =
+                            logical_coordinate_to_physical(self.cursor_x, scale_factor);
+                        self.cursor_physical_y =
+                            logical_coordinate_to_physical(self.cursor_y, scale_factor);
+                        pointer_debug_log(format!(
+                            "host cursor positioned while locked x={} y={}",
+                            position.x, position.y
+                        ));
+                    }
+                    Err(error) => {
+                        pointer_debug_log(format!(
+                            "host cursor position while locked failed x={} y={} error={error}",
+                            position.x, position.y
+                        ));
+                    }
+                }
+            }
+            if let Err(error) = window.set_cursor_grab(CursorGrabMode::None) {
+                eprintln!("oblivion-one compositor: failed to release pointer grab: {error}");
+            }
+        }
+        pointer_debug_log(format!("host grab released id={:?}", constraint.id));
+        self.apply_host_cursor_visibility();
+    }
+
+    fn apply_host_cursor_visibility(&self) {
+        let Some(window) = self.window.as_deref() else {
+            return;
+        };
+        let lock_hides_cursor = self
+            .active_pointer_constraint
+            .is_some_and(|constraint| constraint.mode == NestedPointerConstraintMode::Locked);
+        window.set_cursor_visible(
+            nested_output_uses_host_cursor()
+                && self.host_cursor_client_visible
+                && !lock_hides_cursor,
+        );
+    }
+
+    fn locked_pointer_constraint_active(&self) -> bool {
+        self.active_pointer_constraint
+            .is_some_and(|constraint| constraint.mode == NestedPointerConstraintMode::Locked)
+    }
+
+    fn forward_host_relative_mouse_delta(&mut self, dx: f64, dy: f64) -> bool {
+        if !self.host_window_focused {
+            return false;
+        }
+        let Some(sample) = host_relative_delta_sample(
+            self.locked_pointer_constraint_active(),
+            self.monotonic_input_timestamp_usec(),
+            dx,
+            dy,
+        ) else {
+            return false;
+        };
+        self.server.send_pointer_motion_sample(sample);
+        true
+    }
+
+    fn monotonic_input_timestamp_usec(&self) -> u64 {
+        self.input_clock_start.elapsed().as_micros() as u64
     }
 
     fn draw(&mut self) -> OutputResult<()> {
@@ -346,21 +532,33 @@ impl NestedOutputApp {
     }
 
     fn send_client_keyboard_key(&mut self, key: u32, pressed: bool) {
+        if !self.host_window_focused {
+            return;
+        }
         self.server.send_keyboard_key(key, pressed);
         self.mark_client_input_forwarded();
     }
 
     fn send_client_pointer_motion(&mut self, x: f64, y: f64) {
+        if !self.host_window_focused {
+            return;
+        }
         self.server.send_pointer_motion(x, y);
         self.mark_client_input_forwarded();
     }
 
     fn send_client_pointer_button(&mut self, button: u32, pressed: bool) {
+        if !self.host_window_focused {
+            return;
+        }
         self.server.send_pointer_button(button, pressed);
         self.mark_client_input_forwarded();
     }
 
     fn send_client_pointer_axis(&mut self, horizontal: f64, vertical: f64) {
+        if !self.host_window_focused {
+            return;
+        }
         self.server.send_pointer_axis(horizontal, vertical);
         self.mark_client_input_forwarded();
     }
@@ -671,6 +869,9 @@ impl ApplicationHandler for NestedOutputApp {
                 self.redraw_requested_at = None;
             }
             WindowEvent::CursorMoved { position, .. } => {
+                if self.locked_pointer_constraint_active() {
+                    return;
+                }
                 self.cursor_physical_x = position.x.round() as i32;
                 self.cursor_physical_y = position.y.round() as i32;
                 let output_scale = self
@@ -901,9 +1102,66 @@ impl ApplicationHandler for NestedOutputApp {
                 self.server.set_output_size(width, height);
                 self.request_redraw();
             }
+            WindowEvent::Focused(focused) => {
+                self.host_window_focused = focused;
+                if std::env::var_os("TYPHON_POINTER_DEBUG").is_some() {
+                    eprintln!("typhon pointer: host_window_focused={focused}");
+                }
+                if focused {
+                    self.apply_host_cursor_visibility();
+                    self.request_redraw();
+                    return;
+                }
+                if let Some(constraint) = self.active_pointer_constraint {
+                    self.release_host_pointer_constraint(None);
+                    self.server
+                        .pointer_constraint_backend_deactivated(constraint.id);
+                }
+            }
             _ => {}
         }
     }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
+        let DeviceEvent::MouseMotion { delta: (dx, dy) } = event else {
+            return;
+        };
+        if self.forward_host_relative_mouse_delta(dx, dy)
+            && forwarded_client_input_requests_redraw(true)
+        {
+            self.request_redraw();
+        }
+    }
+}
+
+fn host_relative_delta_sample(
+    locked: bool,
+    timestamp_usec: u64,
+    dx: f64,
+    dy: f64,
+) -> Option<PointerMotionSample> {
+    let relative = RelativePointerMotion {
+        dx,
+        dy,
+        dx_unaccelerated: dx,
+        dy_unaccelerated: dy,
+    };
+    if relative.is_zero() {
+        return None;
+    }
+    if std::env::var_os("TYPHON_POINTER_DEBUG").is_some() {
+        eprintln!("typhon pointer: host relative delta locked={locked} dx={dx} dy={dy}");
+    }
+    Some(PointerMotionSample {
+        timestamp_usec,
+        absolute: None,
+        relative: Some(relative),
+    })
 }
 
 impl Drop for NestedOutputApp {
@@ -1059,6 +1317,17 @@ fn report_host_monitor_refresh(
 fn debug_surface_logging_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("OBLIVION_ONE_DEBUG_SURFACES").is_some())
+}
+
+fn pointer_debug_logging_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TYPHON_POINTER_DEBUG").is_some())
+}
+
+fn pointer_debug_log(message: impl AsRef<str>) {
+    if pointer_debug_logging_enabled() {
+        eprintln!("typhon pointer: {}", message.as_ref());
+    }
 }
 
 fn debug_frame_logging_enabled() -> bool {
@@ -1655,6 +1924,36 @@ mod tests {
             nested_output_wakeup_interval(active_interval, false, false, true, false, false),
             active_interval
         );
+    }
+
+    #[test]
+    fn locked_host_delta_bridge_forwards_relative_sample() {
+        let sample = host_relative_delta_sample(true, 55, 3.5, -2.0).unwrap();
+        let relative = sample.relative.unwrap();
+
+        assert_eq!(sample.timestamp_usec, 55);
+        assert_eq!(sample.absolute, None);
+        assert_eq!(relative.dx, 3.5);
+        assert_eq!(relative.dy, -2.0);
+        assert_eq!(relative.dx_unaccelerated, 3.5);
+        assert_eq!(relative.dy_unaccelerated, -2.0);
+    }
+
+    #[test]
+    fn host_delta_bridge_forwards_relative_sample_before_lock() {
+        let sample = host_relative_delta_sample(false, 55, 3.5, -2.0)
+            .expect("raw host deltas should produce relative samples before lock");
+        let relative = sample.relative.unwrap();
+
+        assert_eq!(sample.timestamp_usec, 55);
+        assert_eq!(sample.absolute, None);
+        assert_eq!(relative.dx, 3.5);
+        assert_eq!(relative.dy, -2.0);
+    }
+
+    #[test]
+    fn zero_locked_host_delta_is_ignored() {
+        assert!(host_relative_delta_sample(true, 55, 0.0, 0.0).is_none());
     }
 
     #[test]

@@ -63,6 +63,35 @@ fn xdg_toplevel_configure_waits_for_initial_empty_commit() {
 }
 
 #[test]
+fn recreated_xdg_role_on_same_wl_surface_receives_initial_configure() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (state, _surface_id, snapshot) =
+        recreate_toplevel_role_on_same_surface(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(state.toplevel_configured);
+    assert!(state.surface_configured);
+    assert_eq!(state.toplevel_configure_count, 1);
+    assert_eq!(state.surface_configure_count, 2);
+    assert_eq!(state.surface_configure_serials.len(), 2);
+    assert_ne!(
+        state.surface_configure_serials[0],
+        state.surface_configure_serials[1]
+    );
+    assert!(snapshot.surface_registered);
+    assert!(snapshot.configured);
+    assert_eq!(snapshot.toplevel_count, 1);
+    assert!(snapshot.toplevel_registered);
+    assert_eq!(snapshot.popup_count, 0);
+    assert!(!snapshot.window_geometry_present);
+    assert_eq!(snapshot.placement, None);
+}
+
+#[test]
 fn wayland_client_xdg_popup_is_configured_and_rendered_as_child_surface() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

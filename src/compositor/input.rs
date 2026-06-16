@@ -78,6 +78,42 @@ pub enum PointerConstraintMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerConstraintLifetime {
+    Oneshot,
+    Persistent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PointerConstraintBackendId {
+    pub constraint_id: u64,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PointerConstraintBackendRequest {
+    ActivateLocked(PointerConstraintBackendId),
+    ActivateConfined(PointerConstraintBackendId),
+    Deactivate {
+        id: PointerConstraintBackendId,
+        restore_position: Option<OutputPosition>,
+    },
+    ApplyCursorVisibility {
+        visible: bool,
+    },
+}
+
+impl PointerConstraintBackendRequest {
+    pub const fn id(self) -> Option<PointerConstraintBackendId> {
+        match self {
+            Self::ActivateLocked(id) | Self::ActivateConfined(id) | Self::Deactivate { id, .. } => {
+                Some(id)
+            }
+            Self::ApplyCursorVisibility { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct PointerConstraintState {
     mode: PointerConstraintMode,
@@ -324,9 +360,15 @@ fn keymap_file() -> io::Result<(File, u32)> {
         .open(&path)?;
     let _ = fs::remove_file(&path);
     file.write_all(keymap.as_bytes())?;
+    file.write_all(&[0])?;
     file.flush()?;
     file.rewind()?;
-    Ok((file, keymap.len() as u32))
+    let size = keymap
+        .len()
+        .checked_add(1)
+        .and_then(|size| u32::try_from(size).ok())
+        .ok_or_else(|| io::Error::other("keyboard keymap is too large"))?;
+    Ok((file, size))
 }
 
 pub(super) fn wayland_event_time() -> u32 {

@@ -100,6 +100,30 @@ fn unsupported_gaming_protocol_stubs_are_hidden_from_public_plan() {
 }
 
 #[test]
+fn nested_winit_profile_advertises_serviced_pointer_lock_protocols() {
+    let protocols = client_protocols_for_capabilities(
+        InputProtocolCapabilities::nested_winit(),
+        SelectionProtocolCapabilities::core_clipboard(),
+    );
+    let names: Vec<_> = protocols.into_iter().map(ProtocolGlobal::name).collect();
+
+    assert!(names.contains(&"zwp_relative_pointer_manager_v1"));
+    assert!(names.contains(&"zwp_pointer_constraints_v1"));
+
+    let native_protocols = client_protocols_for_capabilities(
+        InputProtocolCapabilities::native_base(),
+        SelectionProtocolCapabilities::core_clipboard(),
+    );
+    let native_names: Vec<_> = native_protocols
+        .into_iter()
+        .map(ProtocolGlobal::name)
+        .collect();
+
+    assert!(!native_names.contains(&"zwp_relative_pointer_manager_v1"));
+    assert!(!native_names.contains(&"zwp_pointer_constraints_v1"));
+}
+
+#[test]
 fn staging_frame_pacing_protocols_are_hidden_until_barriers_are_implemented() {
     let plan = CompositorPlan::new("oblivion-one-test");
     let protocols = plan.protocol_names();

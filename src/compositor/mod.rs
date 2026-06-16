@@ -95,12 +95,12 @@ use explicit_sync::{
 };
 pub use idle::{IdleManager, IdleState};
 use input::{
-    InputSerial, KeyboardModifierState, send_keyboard_initial_state,
+    InputSerial, KeyboardModifierState, PointerConstraintLifetime, send_keyboard_initial_state,
     send_pointer_frame_if_supported, wayland_event_time,
 };
 pub use input::{
-    OutputPosition, PointerConstraintMode, PointerConstraintState, PointerMotionSample,
-    RelativePointerMotion,
+    OutputPosition, PointerConstraintBackendId, PointerConstraintBackendRequest,
+    PointerConstraintMode, PointerConstraintState, PointerMotionSample, RelativePointerMotion,
 };
 use interaction::{
     PendingResizeCommit, PendingResizeConfigure, PointerPress, PointerTarget, ResizeEdges,
@@ -214,7 +214,7 @@ pub struct CompositorState {
     fractional_scale_resources: HashMap<u32, Vec<wp_fractional_scale_v1::WpFractionalScaleV1>>,
     keyboard_resources: Vec<wl_keyboard::WlKeyboard>,
     pointer_resources: Vec<wl_pointer::WlPointer>,
-    relative_pointer_resources: Vec<zwp_relative_pointer_v1::ZwpRelativePointerV1>,
+    relative_pointer_resources: Vec<RelativePointerResource>,
     idle_inhibitor_resources: Vec<zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1>,
     idle_manager: IdleManager,
     output_size: OutputSize,
@@ -225,9 +225,21 @@ pub struct CompositorState {
     keyboard_modifiers: KeyboardModifierState,
     pointer_surface: Option<wl_surface::WlSurface>,
     pointer_constraint: PointerConstraintState,
+    pointer_constraints: HashMap<u64, PointerConstraint>,
+    next_internal_pointer_constraint_id: u64,
+    next_pointer_constraint_generation: u64,
+    active_locked_pointer_routing: Option<ActiveLockedPointerRouting>,
+    relative_motion_debug: RelativeMotionDebugState,
+    active_backend_constraint: Option<PointerConstraintBackendId>,
+    pending_backend_constraint: Option<PointerConstraintBackendId>,
+    pending_pointer_constraint_backend_requests: Vec<PointerConstraintBackendRequest>,
+    cursor_visibility: CursorVisibilityState,
     pointer_entered_surfaces: Vec<(wl_pointer::WlPointer, wl_surface::WlSurface)>,
+    pointer_enter_serials: Vec<PointerEnterSerial>,
     cursor_surface_ids: HashSet<u32>,
     surface_placements: HashMap<u32, SurfacePlacement>,
+    committed_subsurface_stacks: HashMap<u32, Vec<u32>>,
+    pending_subsurface_stacks: HashMap<u32, Vec<u32>>,
     current_surface_buffers: HashMap<u32, PendingSurfaceBuffer>,
     surface_window_geometries: HashMap<u32, XdgWindowGeometry>,
     surface_entered_outputs: HashSet<(u32, u32)>,
@@ -242,6 +254,7 @@ pub struct CompositorState {
     last_pointer_motion_usec: Option<u64>,
     last_relative_pointer_motion: Option<RelativePointerMotion>,
     last_pointer_press: Option<PointerPress>,
+    held_pointer_buttons: Vec<PointerPress>,
     recent_input_serials: Vec<InputSerial>,
     active_dmabuf_buffers: HashMap<u32, SurfaceBufferRelease>,
     pending_buffer_releases: Vec<wl_buffer::WlBuffer>,
@@ -270,6 +283,179 @@ pub struct CompositorState {
     popup_surfaces: HashMap<u32, PopupSurface>,
     popup_grab_stack: Vec<u32>,
     pending_color_info: Vec<color::PendingColorInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveLockedPointerRouting {
+    constraint_id: u64,
+    generation: u64,
+    pointer: wl_pointer::WlPointer,
+    surface: wl_surface::WlSurface,
+    surface_x: f64,
+    surface_y: f64,
+}
+
+#[derive(Debug, Default)]
+struct RelativeMotionDebugState {
+    pending_drop_reason: Option<String>,
+    pending_drop_count: u32,
+    last_drop_log: Option<Instant>,
+    last_route_snapshot_log: Option<Instant>,
+    dispatch_total: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RelativePointerResource {
+    resource: zwp_relative_pointer_v1::ZwpRelativePointerV1,
+    source_pointer: wl_pointer::WlPointer,
+}
+
+#[derive(Debug, Clone)]
+struct PointerConstraint {
+    id: u64,
+    generation: u64,
+    mode: PointerConstraintMode,
+    lifetime: PointerConstraintLifetime,
+    surface: wl_surface::WlSurface,
+    pointer: wl_pointer::WlPointer,
+    locked_resource: Option<zwp_locked_pointer_v1::ZwpLockedPointerV1>,
+    confined_resource: Option<zwp_confined_pointer_v1::ZwpConfinedPointerV1>,
+    active: bool,
+    backend_pending: bool,
+    defunct: bool,
+    pending_region: SurfaceInputRegion,
+    committed_region: SurfaceInputRegion,
+    pending_cursor_position_hint: Option<(f64, f64)>,
+    committed_cursor_position_hint: Option<(f64, f64)>,
+}
+
+#[derive(Debug, Clone)]
+struct PointerConstraintRegistration {
+    id: u64,
+    mode: PointerConstraintMode,
+    lifetime: PointerConstraintLifetime,
+    surface: wl_surface::WlSurface,
+    pointer: wl_pointer::WlPointer,
+    locked_resource: Option<zwp_locked_pointer_v1::ZwpLockedPointerV1>,
+    confined_resource: Option<zwp_confined_pointer_v1::ZwpConfinedPointerV1>,
+    region: SurfaceInputRegion,
+}
+
+impl PointerConstraint {
+    fn backend_id(&self) -> PointerConstraintBackendId {
+        PointerConstraintBackendId {
+            constraint_id: self.id,
+            generation: self.generation,
+        }
+    }
+
+    fn activation_request(&self) -> PointerConstraintBackendRequest {
+        let id = self.backend_id();
+        match self.mode {
+            PointerConstraintMode::Locked => PointerConstraintBackendRequest::ActivateLocked(id),
+            PointerConstraintMode::Confined => {
+                PointerConstraintBackendRequest::ActivateConfined(id)
+            }
+            PointerConstraintMode::None => PointerConstraintBackendRequest::Deactivate {
+                id,
+                restore_position: None,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CursorVisibilityState {
+    client_hidden_pointer: Option<wl_pointer::WlPointer>,
+    lock_hidden_constraint_id: Option<u64>,
+    visible: bool,
+}
+
+impl Default for CursorVisibilityState {
+    fn default() -> Self {
+        Self {
+            client_hidden_pointer: None,
+            lock_hidden_constraint_id: None,
+            visible: true,
+        }
+    }
+}
+
+impl CursorVisibilityState {
+    fn desired_visible(&self) -> bool {
+        self.client_hidden_pointer.is_none() && self.lock_hidden_constraint_id.is_none()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PointerEnterSerial {
+    pointer: wl_pointer::WlPointer,
+    surface: wl_surface::WlSurface,
+    serial: u32,
+}
+
+fn pointer_debug_log(message: impl AsRef<str>) {
+    if std::env::var_os("TYPHON_POINTER_DEBUG").is_some() {
+        eprintln!("typhon pointer: {}", message.as_ref());
+    }
+}
+
+impl RelativeMotionDebugState {
+    fn note_dispatch(&mut self, message: String) {
+        self.dispatch_total = self.dispatch_total.saturating_add(1);
+        pointer_debug_log(message);
+    }
+
+    fn note_drop(&mut self, reason: impl Into<String>) {
+        self.pending_drop_count = self.pending_drop_count.saturating_add(1);
+        self.pending_drop_reason = Some(reason.into());
+        self.flush_drops(false);
+    }
+
+    fn should_log_route_snapshot(&mut self) -> bool {
+        if std::env::var_os("TYPHON_POINTER_DEBUG").is_none() {
+            return false;
+        }
+        let now = Instant::now();
+        let should_log = self
+            .last_route_snapshot_log
+            .is_none_or(|last| now.duration_since(last) >= std::time::Duration::from_millis(500));
+        if should_log {
+            self.last_route_snapshot_log = Some(now);
+        }
+        should_log
+    }
+
+    fn flush_drops(&mut self, force: bool) {
+        let Some(reason) = self.pending_drop_reason.take() else {
+            return;
+        };
+        let count = self.pending_drop_count;
+        self.pending_drop_count = 0;
+        let now = Instant::now();
+        let should_log = force
+            || self.last_drop_log.is_none_or(|last| {
+                now.duration_since(last) >= std::time::Duration::from_millis(500)
+            });
+        if !should_log {
+            self.pending_drop_reason = Some(reason);
+            self.pending_drop_count = count;
+            return;
+        }
+        self.last_drop_log = Some(now);
+        if count > 1 {
+            pointer_debug_log(format!("relative motion drop reason ({count}x): {reason}"));
+        } else {
+            pointer_debug_log(format!("relative motion drop reason: {reason}"));
+        }
+    }
+}
+
+fn wayland_resource_client_label(resource: &impl Resource) -> String {
+    resource
+        .client()
+        .map(|client| format!("{:?}", client.id()))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -437,7 +623,28 @@ impl CompositorState {
     }
 
     fn focus_surface(&mut self, surface: wl_surface::WlSurface) {
-        self.focused_surface = Some(surface);
+        self.set_desktop_focus(surface, "focus");
+    }
+
+    fn set_desktop_focus(&mut self, surface: wl_surface::WlSurface, reason: &'static str) {
+        let old_surface_id = self.focused_surface.as_ref().map(compositor_surface_id);
+        let new_surface_id = compositor_surface_id(&surface);
+        let changed = !self
+            .focused_surface
+            .as_ref()
+            .is_some_and(|current| same_surface_resource(current, &surface));
+        if changed {
+            pointer_debug_log(format!(
+                "focus change reason={} old={:?} new={}",
+                reason, old_surface_id, new_surface_id
+            ));
+            if let Some(old_surface_id) = old_surface_id {
+                self.deactivate_pointer_constraints_for_surface_focus_loss(old_surface_id, true);
+            }
+        }
+        self.focused_surface = Some(surface.clone());
+        self.ensure_keyboard_focus(&surface);
+        self.apply_pending_pointer_constraint_state_for_surface(new_surface_id);
     }
 
     fn focused_client_id(&self) -> Option<ClientId> {
@@ -605,16 +812,15 @@ impl CompositorState {
             return false;
         }
 
-        if let Some(previous) = self.active_clipboard.as_ref() {
-            if let ClipboardSourceBackend::InternalWayland {
+        if let Some(previous) = self.active_clipboard.as_ref()
+            && let ClipboardSourceBackend::InternalWayland {
                 source: previous_source,
                 ..
             } = &previous.source
-                && !same_wayland_resource(previous_source, &source)
-                && previous_source.is_alive()
-            {
-                previous_source.cancelled();
-            }
+            && !same_wayland_resource(previous_source, &source)
+            && previous_source.is_alive()
+        {
+            previous_source.cancelled();
         }
 
         self.next_clipboard_generation = self.next_clipboard_generation.saturating_add(1);
@@ -912,6 +1118,8 @@ impl CompositorState {
 
     fn unregister_surface_resource(&mut self, surface_id: u32) {
         self.discard_pending_presentation_feedbacks_for_surface(surface_id);
+        self.deactivate_pointer_constraints_for_surface(surface_id, false);
+        self.cleanup_subsurface_stack_state_for_surface(surface_id);
         self.surface_resources.remove(&surface_id);
         self.cursor_surface_ids.remove(&surface_id);
         self.unregister_fractional_scale_resources_for_surface(surface_id);
@@ -977,9 +1185,13 @@ impl CompositorState {
         {
             self.pointer_surface = None;
             self.clear_pointer_constraint();
+            self.cursor_visibility.client_hidden_pointer = None;
+            self.sync_cursor_visibility_request();
         }
         self.pointer_entered_surfaces
             .retain(|(_, surface)| compositor_surface_id(surface) != surface_id);
+        self.pointer_enter_serials
+            .retain(|entry| compositor_surface_id(&entry.surface) != surface_id);
     }
 
     fn register_keyboard(&mut self, keyboard: wl_keyboard::WlKeyboard) {
@@ -991,6 +1203,9 @@ impl CompositorState {
             return;
         }
         self.keyboard_resources.push(keyboard);
+        if let Some(surface) = self.focused_surface.clone() {
+            self.ensure_keyboard_focus(&surface);
+        }
     }
 
     fn register_pointer(&mut self, pointer: wl_pointer::WlPointer) {
@@ -1001,7 +1216,8 @@ impl CompositorState {
         {
             return;
         }
-        self.pointer_resources.push(pointer);
+        self.pointer_resources.push(pointer.clone());
+        self.synchronize_pointer_resource_focus(&pointer);
     }
 
     fn unregister_keyboard(&mut self, keyboard: &wl_keyboard::WlKeyboard) {
@@ -1014,15 +1230,61 @@ impl CompositorState {
             .retain(|resource| !same_wayland_resource(resource, pointer));
         self.pointer_entered_surfaces
             .retain(|(resource, _)| !same_wayland_resource(resource, pointer));
+        self.pointer_enter_serials
+            .retain(|entry| !same_wayland_resource(&entry.pointer, pointer));
+        self.relative_pointer_resources
+            .retain(|resource| !same_wayland_resource(&resource.source_pointer, pointer));
+        self.deactivate_pointer_constraints_for_pointer(pointer, false);
+        if self
+            .cursor_visibility
+            .client_hidden_pointer
+            .as_ref()
+            .is_some_and(|hidden_pointer| same_wayland_resource(hidden_pointer, pointer))
+        {
+            self.cursor_visibility.client_hidden_pointer = None;
+            self.sync_cursor_visibility_request();
+        }
     }
 
-    fn set_pointer_cursor(&mut self, surface: Option<wl_surface::WlSurface>) {
+    fn set_pointer_cursor(
+        &mut self,
+        pointer: &wl_pointer::WlPointer,
+        serial: u32,
+        surface: Option<wl_surface::WlSurface>,
+        _hotspot_x: i32,
+        _hotspot_y: i32,
+    ) {
+        let Some(pointer_surface) = self.pointer_surface.as_ref() else {
+            return;
+        };
+        let focused_client = resource_belongs_to_surface_client(pointer, pointer_surface);
+        let exact_serial = self.pointer_has_current_enter_serial(pointer, serial, pointer_surface);
+        let valid = focused_client;
+        pointer_debug_log(format!(
+            "cursor request pointer={} client={} serial={} valid={} exact_serial={} focused_client={} null={}",
+            pointer.id().protocol_id(),
+            wayland_resource_client_label(pointer),
+            serial,
+            valid,
+            exact_serial,
+            focused_client,
+            surface.is_none()
+        ));
+        if !valid {
+            return;
+        }
         let Some(surface) = surface else {
+            self.cursor_visibility.client_hidden_pointer = Some(pointer.clone());
+            self.sync_cursor_visibility_request();
             return;
         };
         let surface_id = compositor_surface_id(&surface);
         self.cursor_surface_ids.insert(surface_id);
         self.unmap_surface_content(surface_id);
+        if self.cursor_visibility.client_hidden_pointer.is_some() {
+            self.cursor_visibility.client_hidden_pointer = None;
+            self.sync_cursor_visibility_request();
+        }
     }
 
     fn is_cursor_surface(&self, surface_id: u32) -> bool {
@@ -1098,6 +1360,11 @@ impl CompositorState {
                 group: 0,
             });
         }
+        pointer_debug_log(format!(
+            "keyboard enter surface={} client={}",
+            compositor_surface_id(surface),
+            wayland_resource_client_label(surface)
+        ));
         self.keyboard_surface = Some(surface.clone());
         self.publish_clipboard_to_focused_client();
     }
@@ -1141,6 +1408,11 @@ impl CompositorState {
                 surface: surface.clone(),
             });
         }
+        pointer_debug_log(format!(
+            "keyboard leave surface={} client={}",
+            compositor_surface_id(&surface),
+            wayland_resource_client_label(&surface)
+        ));
     }
 
     fn send_pointer_motion(&mut self, x: f64, y: f64) {
@@ -1207,6 +1479,506 @@ impl CompositorState {
         self.pointer_constraint.clear();
     }
 
+    fn sync_cursor_visibility_request(&mut self) {
+        let desired_visible = self.cursor_visibility.desired_visible();
+        if self.cursor_visibility.visible == desired_visible {
+            return;
+        }
+        self.cursor_visibility.visible = desired_visible;
+        pointer_debug_log(format!(
+            "cursor visibility effective visible={} client_hidden={} lock_hidden={:?}",
+            desired_visible,
+            self.cursor_visibility
+                .client_hidden_pointer
+                .as_ref()
+                .map(|pointer| pointer.id().protocol_id())
+                .map_or_else(|| "none".to_string(), |id| id.to_string()),
+            self.cursor_visibility.lock_hidden_constraint_id
+        ));
+        self.pending_pointer_constraint_backend_requests.push(
+            PointerConstraintBackendRequest::ApplyCursorVisibility {
+                visible: desired_visible,
+            },
+        );
+    }
+
+    fn allocate_internal_pointer_constraint_id(&mut self) -> u64 {
+        self.next_internal_pointer_constraint_id = self
+            .next_internal_pointer_constraint_id
+            .saturating_add(1)
+            .max(1);
+        self.next_internal_pointer_constraint_id
+    }
+
+    fn active_locked_pointer_binding(&self) -> Option<ActiveLockedPointerRouting> {
+        let active = self.active_locked_pointer_routing.as_ref()?;
+        let constraint = self.pointer_constraints.get(&active.constraint_id)?;
+        if constraint.generation != active.generation
+            || !constraint.active
+            || constraint.defunct
+            || constraint.mode != PointerConstraintMode::Locked
+        {
+            return None;
+        }
+        if !active.pointer.is_alive() || !active.surface.is_alive() {
+            return None;
+        }
+        Some(active.clone())
+    }
+
+    fn clear_active_locked_pointer_routing(&mut self) {
+        self.active_locked_pointer_routing = None;
+    }
+
+    fn pin_locked_pointer_focus(&mut self, active: &ActiveLockedPointerRouting) {
+        self.ensure_pointer_focus(&active.surface);
+        if !self.pointer_resource_entered_surface(&active.pointer, &active.surface) {
+            let target = PointerTarget {
+                surface: active.surface.clone(),
+                surface_x: active.surface_x,
+                surface_y: active.surface_y,
+            };
+            self.send_pointer_enter_to_resource(&active.pointer, &target);
+        }
+    }
+
+    fn locked_pointer_input_surface(&self) -> Option<wl_surface::WlSurface> {
+        self.active_locked_pointer_binding()
+            .map(|active| active.surface)
+    }
+
+    fn register_pointer_constraint(&mut self, registration: PointerConstraintRegistration) -> bool {
+        if let Some(existing) = self.pointer_constraints.values().find(|constraint| {
+            !constraint.defunct && same_surface_resource(&constraint.surface, &registration.surface)
+        }) {
+            pointer_debug_log(format!(
+                "constraint reject already_constrained existing={} requested={} surface={} pointer={}",
+                existing.id,
+                registration.id,
+                compositor_surface_id(&registration.surface),
+                registration.pointer.id().protocol_id()
+            ));
+            return false;
+        }
+
+        self.next_pointer_constraint_generation = self
+            .next_pointer_constraint_generation
+            .wrapping_add(1)
+            .max(1);
+        let generation = self.next_pointer_constraint_generation;
+        pointer_debug_log(format!(
+            "constraint create id={} generation={} mode={:?} surface={} pointer={} client={}",
+            registration.id,
+            generation,
+            registration.mode,
+            compositor_surface_id(&registration.surface),
+            registration.pointer.id().protocol_id(),
+            wayland_resource_client_label(&registration.pointer)
+        ));
+        self.pointer_constraints.insert(
+            registration.id,
+            PointerConstraint {
+                id: registration.id,
+                generation,
+                mode: registration.mode,
+                lifetime: registration.lifetime,
+                surface: registration.surface,
+                pointer: registration.pointer,
+                locked_resource: registration.locked_resource,
+                confined_resource: registration.confined_resource,
+                active: false,
+                backend_pending: false,
+                defunct: false,
+                pending_region: registration.region.clone(),
+                committed_region: registration.region,
+                pending_cursor_position_hint: None,
+                committed_cursor_position_hint: None,
+            },
+        );
+        self.maybe_request_pointer_constraint_activation(registration.id);
+        true
+    }
+
+    fn maybe_request_pointer_constraint_activation(&mut self, constraint_id: u64) {
+        let Some((pointer, surface)) =
+            self.pointer_constraints
+                .get(&constraint_id)
+                .and_then(|constraint| {
+                    if constraint.active || constraint.backend_pending || constraint.defunct {
+                        return None;
+                    }
+                    Some((constraint.pointer.clone(), constraint.surface.clone()))
+                })
+        else {
+            return;
+        };
+        if !pointer.is_alive()
+            || !surface.is_alive()
+            || !self.pointer_surface.as_ref().is_some_and(|focused| {
+                same_surface_resource(focused, &surface)
+                    && resource_belongs_to_surface_client(&pointer, focused)
+            })
+            || !self.synchronize_pointer_resource_focus(&pointer)
+        {
+            return;
+        }
+        if self.active_backend_constraint.is_some() || self.pending_backend_constraint.is_some() {
+            pointer_debug_log(format!(
+                "backend activate requested id={} skipped current_active={:?} current_pending={:?}",
+                constraint_id, self.active_backend_constraint, self.pending_backend_constraint
+            ));
+            return;
+        }
+        let Some(constraint) = self.pointer_constraints.get_mut(&constraint_id) else {
+            return;
+        };
+        if constraint.active || constraint.backend_pending || constraint.defunct {
+            return;
+        }
+        let backend_id = constraint.backend_id();
+        self.pending_backend_constraint = Some(backend_id);
+        constraint.backend_pending = true;
+        pointer_debug_log(format!(
+            "constraint activation queued id={} generation={}",
+            backend_id.constraint_id, backend_id.generation
+        ));
+        self.pending_pointer_constraint_backend_requests
+            .push(constraint.activation_request());
+    }
+
+    fn pointer_constraint_backend_activated(&mut self, id: PointerConstraintBackendId) {
+        if self.pending_backend_constraint != Some(id) {
+            pointer_debug_log(format!(
+                "backend activated stale id={:?} current_active={:?} current_pending={:?}",
+                id, self.active_backend_constraint, self.pending_backend_constraint
+            ));
+            return;
+        }
+        let activation = {
+            let Some(constraint) = self.pointer_constraints.get_mut(&id.constraint_id) else {
+                return;
+            };
+            if constraint.generation != id.generation || constraint.defunct {
+                return;
+            }
+            constraint.backend_pending = false;
+            if constraint.active {
+                return;
+            }
+            constraint.active = true;
+            self.pending_backend_constraint = None;
+            self.active_backend_constraint = Some(id);
+            Some((
+                constraint.id,
+                constraint.generation,
+                constraint.mode,
+                compositor_surface_id(&constraint.surface),
+                constraint.surface.clone(),
+                constraint.pointer.clone(),
+                constraint.locked_resource.clone(),
+                constraint.confined_resource.clone(),
+            ))
+        };
+        let Some((
+            constraint_id,
+            generation,
+            mode,
+            surface_id,
+            surface,
+            pointer,
+            locked_resource,
+            confined_resource,
+        )) = activation
+        else {
+            return;
+        };
+        pointer_debug_log(format!(
+            "backend activated id={} generation={}",
+            id.constraint_id, id.generation
+        ));
+        self.pointer_constraint.activate(mode, surface_id);
+        if mode == PointerConstraintMode::Locked {
+            self.cursor_visibility.lock_hidden_constraint_id = Some(constraint_id);
+            self.sync_cursor_visibility_request();
+            let (surface_x, surface_y) = self
+                .pointer_target_at(self.last_pointer_x, self.last_pointer_y)
+                .filter(|target| same_surface_resource(&target.surface, &surface))
+                .map(|target| (target.surface_x, target.surface_y))
+                .unwrap_or((0.0, 0.0));
+            self.ensure_pointer_focus(&surface);
+            if !self.pointer_resource_entered_surface(&pointer, &surface) {
+                let target = PointerTarget {
+                    surface: surface.clone(),
+                    surface_x,
+                    surface_y,
+                };
+                self.send_pointer_enter_to_resource(&pointer, &target);
+            }
+            self.active_locked_pointer_routing = Some(ActiveLockedPointerRouting {
+                constraint_id,
+                generation,
+                pointer,
+                surface,
+                surface_x,
+                surface_y,
+            });
+        }
+        match mode {
+            PointerConstraintMode::Locked => {
+                if let Some(resource) = &locked_resource {
+                    resource.locked();
+                }
+            }
+            PointerConstraintMode::Confined => {
+                if let Some(resource) = &confined_resource {
+                    resource.confined();
+                }
+            }
+            PointerConstraintMode::None => {}
+        }
+    }
+
+    fn pointer_constraint_backend_failed(&mut self, id: PointerConstraintBackendId, _reason: &str) {
+        if self.pending_backend_constraint == Some(id) {
+            self.pending_backend_constraint = None;
+        }
+        let Some(constraint) = self.pointer_constraints.get_mut(&id.constraint_id) else {
+            return;
+        };
+        if constraint.generation != id.generation {
+            return;
+        }
+        constraint.backend_pending = false;
+        if constraint.lifetime == PointerConstraintLifetime::Oneshot {
+            constraint.defunct = true;
+        }
+    }
+
+    fn pointer_constraint_backend_deactivated(&mut self, id: PointerConstraintBackendId) {
+        if self.active_backend_constraint == Some(id) {
+            self.active_backend_constraint = None;
+        }
+        self.deactivate_pointer_constraint_by_id(id.constraint_id, true, true, false);
+    }
+
+    fn deactivate_pointer_constraint_by_id(
+        &mut self,
+        constraint_id: u64,
+        compositor_driven: bool,
+        emit_event: bool,
+        queue_backend_deactivate: bool,
+    ) {
+        let Some((
+            was_active,
+            was_pending,
+            backend_id,
+            mode,
+            surface,
+            locked_resource,
+            confined_resource,
+            cursor_position_hint,
+        )) = ({
+            let Some(constraint) = self.pointer_constraints.get_mut(&constraint_id) else {
+                return;
+            };
+            let was_active = constraint.active;
+            let was_pending = constraint.backend_pending;
+            let backend_id = constraint.backend_id();
+            let mode = constraint.mode;
+            let surface = constraint.surface.clone();
+            let locked_resource = constraint.locked_resource.clone();
+            let confined_resource = constraint.confined_resource.clone();
+            let cursor_position_hint = constraint.committed_cursor_position_hint;
+            pointer_debug_log(format!(
+                "constraint destroy id={} active={} pending={}",
+                constraint.id, was_active, was_pending
+            ));
+            constraint.active = false;
+            constraint.backend_pending = false;
+            if compositor_driven && constraint.lifetime == PointerConstraintLifetime::Oneshot {
+                constraint.defunct = true;
+            }
+            Some((
+                was_active,
+                was_pending,
+                backend_id,
+                mode,
+                surface,
+                locked_resource,
+                confined_resource,
+                cursor_position_hint,
+            ))
+        })
+        else {
+            return;
+        };
+        if self.pending_backend_constraint == Some(backend_id) {
+            self.pending_backend_constraint = None;
+        }
+        if self.active_backend_constraint == Some(backend_id) {
+            self.active_backend_constraint = None;
+        }
+        let restore_position = if self
+            .active_locked_pointer_routing
+            .as_ref()
+            .is_some_and(|active| active.constraint_id == constraint_id)
+        {
+            let restore_position = if mode == PointerConstraintMode::Locked {
+                self.restore_locked_pointer_position(&surface, cursor_position_hint)
+            } else {
+                None
+            };
+            if mode == PointerConstraintMode::Locked {
+                self.clear_active_locked_pointer_routing();
+                self.refresh_pointer_focus_at_last_position();
+            }
+            restore_position
+        } else {
+            None
+        };
+        if self.cursor_visibility.lock_hidden_constraint_id == Some(constraint_id) {
+            self.cursor_visibility.lock_hidden_constraint_id = None;
+            self.sync_cursor_visibility_request();
+        }
+        if was_active {
+            self.clear_pointer_constraint();
+            if queue_backend_deactivate {
+                pointer_debug_log(format!(
+                    "backend deactivate queued id={} generation={} reason=constraint_deactivate",
+                    backend_id.constraint_id, backend_id.generation
+                ));
+                self.pending_pointer_constraint_backend_requests.push(
+                    PointerConstraintBackendRequest::Deactivate {
+                        id: backend_id,
+                        restore_position,
+                    },
+                );
+            }
+            if emit_event {
+                match mode {
+                    PointerConstraintMode::Locked => {
+                        if let Some(resource) = &locked_resource {
+                            resource.unlocked();
+                        }
+                    }
+                    PointerConstraintMode::Confined => {
+                        if let Some(resource) = &confined_resource {
+                            resource.unconfined();
+                        }
+                    }
+                    PointerConstraintMode::None => {}
+                }
+            }
+        } else if was_pending {
+            pointer_debug_log(format!(
+                "constraint pending activation canceled id={} generation={}",
+                backend_id.constraint_id, backend_id.generation
+            ));
+        }
+    }
+
+    fn remove_pointer_constraint(&mut self, constraint_id: u64) {
+        let was_active = self
+            .pointer_constraints
+            .get(&constraint_id)
+            .is_some_and(|constraint| constraint.active || constraint.backend_pending);
+        if was_active {
+            self.deactivate_pointer_constraint_by_id(constraint_id, false, false, true);
+        }
+        self.pointer_constraints.remove(&constraint_id);
+        if self.cursor_visibility.lock_hidden_constraint_id == Some(constraint_id) {
+            self.cursor_visibility.lock_hidden_constraint_id = None;
+            self.sync_cursor_visibility_request();
+        }
+    }
+
+    fn deactivate_pointer_constraints_for_pointer(
+        &mut self,
+        pointer: &wl_pointer::WlPointer,
+        emit_event: bool,
+    ) {
+        let ids = self
+            .pointer_constraints
+            .values()
+            .filter(|constraint| same_wayland_resource(&constraint.pointer, pointer))
+            .map(|constraint| constraint.id)
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.deactivate_pointer_constraint_by_id(id, true, emit_event, true);
+            self.pointer_constraints.remove(&id);
+        }
+    }
+
+    fn deactivate_pointer_constraints_for_surface(&mut self, surface_id: u32, emit_event: bool) {
+        let ids = self
+            .pointer_constraints
+            .values()
+            .filter(|constraint| compositor_surface_id(&constraint.surface) == surface_id)
+            .map(|constraint| constraint.id)
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.deactivate_pointer_constraint_by_id(id, true, emit_event, true);
+            self.pointer_constraints.remove(&id);
+        }
+    }
+
+    fn deactivate_pointer_constraints_for_surface_focus_loss(
+        &mut self,
+        surface_id: u32,
+        emit_event: bool,
+    ) {
+        let ids = self
+            .pointer_constraints
+            .values()
+            .filter(|constraint| compositor_surface_id(&constraint.surface) == surface_id)
+            .map(|constraint| constraint.id)
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.deactivate_pointer_constraint_by_id(id, true, emit_event, true);
+        }
+    }
+
+    fn set_pointer_constraint_pending_region(
+        &mut self,
+        constraint_id: u64,
+        region: SurfaceInputRegion,
+    ) {
+        if let Some(constraint) = self.pointer_constraints.get_mut(&constraint_id) {
+            constraint.pending_region = region;
+        }
+    }
+
+    fn set_pointer_constraint_pending_cursor_position_hint(
+        &mut self,
+        constraint_id: u64,
+        surface_x: f64,
+        surface_y: f64,
+    ) {
+        if let Some(constraint) = self.pointer_constraints.get_mut(&constraint_id) {
+            constraint.pending_cursor_position_hint = Some((surface_x, surface_y));
+        }
+    }
+
+    fn apply_pending_pointer_constraint_state_for_surface(&mut self, surface_id: u32) {
+        let ids = self
+            .pointer_constraints
+            .values()
+            .filter(|constraint| compositor_surface_id(&constraint.surface) == surface_id)
+            .map(|constraint| constraint.id)
+            .collect::<Vec<_>>();
+        for id in ids {
+            if let Some(constraint) = self.pointer_constraints.get_mut(&id) {
+                constraint.committed_region = constraint.pending_region.clone();
+                constraint.committed_cursor_position_hint = constraint.pending_cursor_position_hint;
+            }
+            self.maybe_request_pointer_constraint_activation(id);
+        }
+    }
+
+    fn take_pointer_constraint_backend_requests(&mut self) -> Vec<PointerConstraintBackendRequest> {
+        std::mem::take(&mut self.pending_pointer_constraint_backend_requests)
+    }
+
     fn add_idle_inhibitor(&mut self, inhibitor: zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1) {
         self.idle_inhibitor_resources.push(inhibitor);
         self.idle_manager.inhibit();
@@ -1234,8 +2006,18 @@ impl CompositorState {
     fn add_relative_pointer_resource(
         &mut self,
         pointer: zwp_relative_pointer_v1::ZwpRelativePointerV1,
+        source_pointer: wl_pointer::WlPointer,
     ) {
-        self.relative_pointer_resources.push(pointer);
+        pointer_debug_log(format!(
+            "relative pointer {} created for wl_pointer {}",
+            pointer.id().protocol_id(),
+            source_pointer.id().protocol_id()
+        ));
+        self.relative_pointer_resources
+            .push(RelativePointerResource {
+                resource: pointer,
+                source_pointer,
+            });
     }
 
     fn remove_relative_pointer_resource(
@@ -1243,25 +2025,141 @@ impl CompositorState {
         pointer: &zwp_relative_pointer_v1::ZwpRelativePointerV1,
     ) {
         self.relative_pointer_resources
-            .retain(|resource| !same_wayland_resource(resource, pointer));
+            .retain(|resource| !same_wayland_resource(&resource.resource, pointer));
     }
 
     fn send_relative_pointer_motion(&mut self, timestamp_usec: u64, motion: RelativePointerMotion) {
         if motion.is_zero() {
             return;
         }
+        self.relative_pointer_resources
+            .retain(|resource| resource.resource.is_alive() && resource.source_pointer.is_alive());
+        let live_relative_count = self.relative_pointer_resources.len();
+        if let Some(active) = self.active_locked_pointer_binding() {
+            self.pin_locked_pointer_focus(&active);
+            self.dispatch_locked_relative_pointer_motion(
+                timestamp_usec,
+                motion,
+                &active,
+                live_relative_count,
+            );
+            return;
+        }
+
         let Some(surface) = self.pointer_surface.clone() else {
+            self.relative_motion_debug.note_drop(format!(
+                "no pointer focus; active_lock=absent relative_resources={live_relative_count}"
+            ));
             return;
         };
-        self.relative_pointer_resources.retain(Resource::is_alive);
+        let dispatch_count = self.dispatch_relative_pointer_motion_to_surface_client(
+            timestamp_usec,
+            motion,
+            &surface,
+        );
+        if dispatch_count == 0 {
+            self.relative_motion_debug.note_drop(format!(
+                "unlocked route found no recipient; pointer_surface={} client={} relative_resources={live_relative_count}",
+                compositor_surface_id(&surface),
+                wayland_resource_client_label(&surface)
+            ));
+        }
+    }
+
+    fn dispatch_locked_relative_pointer_motion(
+        &mut self,
+        timestamp_usec: u64,
+        motion: RelativePointerMotion,
+        active: &ActiveLockedPointerRouting,
+        live_relative_count: usize,
+    ) {
         let utime_hi = (timestamp_usec >> 32) as u32;
         let utime_lo = (timestamp_usec & 0xffff_ffff) as u32;
-        for pointer in self
-            .relative_pointer_resources
+        let pointer_entered =
+            self.pointer_resource_entered_surface(&active.pointer, &active.surface);
+        let relative_pointers = self.relative_pointer_resources.clone();
+        let mut recipients: Vec<RelativePointerResource> = Vec::new();
+        let mut exact_match_count = 0usize;
+        let mut stale_count = 0usize;
+        let mut cross_client_count = 0usize;
+
+        for relative_pointer in relative_pointers {
+            if !relative_pointer.resource.is_alive() || !relative_pointer.source_pointer.is_alive()
+            {
+                stale_count += 1;
+                continue;
+            }
+            if !resource_belongs_to_surface_client(&relative_pointer.resource, &active.surface)
+                || !resource_belongs_to_surface_client(
+                    &relative_pointer.source_pointer,
+                    &active.surface,
+                )
+            {
+                cross_client_count += 1;
+                continue;
+            }
+            if same_wayland_resource(&relative_pointer.source_pointer, &active.pointer) {
+                exact_match_count += 1;
+            }
+            if !recipients.iter().any(|recipient| {
+                same_wayland_resource(&recipient.resource, &relative_pointer.resource)
+            }) {
+                recipients.push(relative_pointer);
+            }
+        }
+
+        let same_client_relative_count = recipients.len();
+
+        if self.relative_motion_debug.should_log_route_snapshot() {
+            let relative_sources = self
+                .relative_pointer_resources
+                .iter()
+                .map(|relative_pointer| {
+                    format!(
+                        "relative={} source_pointer={} source_client={} source_seat=untracked",
+                        relative_pointer.resource.id().protocol_id(),
+                        relative_pointer.source_pointer.id().protocol_id(),
+                        wayland_resource_client_label(&relative_pointer.source_pointer)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            pointer_debug_log(format!(
+                "relative route snapshot constraint={} generation={} surface={} surface_client={} lock_pointer={} lock_client={} lock_seat=untracked exact_match_count={} same_client_relative_count={} dispatch_count={} pointer_entered={} live_relative_count={} stale_count={} cross_client_count={} [{}]",
+                active.constraint_id,
+                active.generation,
+                compositor_surface_id(&active.surface),
+                wayland_resource_client_label(&active.surface),
+                active.pointer.id().protocol_id(),
+                wayland_resource_client_label(&active.pointer),
+                exact_match_count,
+                same_client_relative_count,
+                recipients.len(),
+                pointer_entered,
+                live_relative_count,
+                stale_count,
+                cross_client_count,
+                relative_sources
+            ));
+        }
+
+        let dispatched_ids = recipients
             .iter()
-            .filter(|pointer| resource_belongs_to_surface_client(*pointer, &surface))
-        {
-            pointer.relative_motion(
+            .map(|relative_pointer| relative_pointer.resource.id().protocol_id())
+            .collect::<Vec<_>>();
+        pointer_debug_log(format!(
+            "relative route exact={} same_client={} dispatched={:?} client={} seat=untracked constraint={} generation={}",
+            exact_match_count,
+            same_client_relative_count,
+            dispatched_ids,
+            wayland_resource_client_label(&active.surface),
+            active.constraint_id,
+            active.generation
+        ));
+
+        let mut dispatched = false;
+        for relative_pointer in recipients {
+            relative_pointer.resource.relative_motion(
                 utime_hi,
                 utime_lo,
                 motion.dx,
@@ -1269,10 +2167,233 @@ impl CompositorState {
                 motion.dx_unaccelerated,
                 motion.dy_unaccelerated,
             );
+            self.relative_motion_debug.note_dispatch(format!(
+                "relative motion dispatched constraint={} generation={} pointer={} relative={} dx={} dy={}",
+                active.constraint_id,
+                active.generation,
+                active.pointer.id().protocol_id(),
+                relative_pointer.resource.id().protocol_id(),
+                motion.dx,
+                motion.dy
+            ));
+            dispatched = true;
+        }
+        if !dispatched {
+            let reason = if exact_match_count > 0 {
+                format!(
+                    "locked route rejected all exact relative pointers; constraint={} generation={} pointer={} client={} surface={} client={} exact_match_count={} same_client_same_seat_count={} stale_count={} cross_client_count={} pointer_entered={pointer_entered} relative_resources={live_relative_count}",
+                    active.constraint_id,
+                    active.generation,
+                    active.pointer.id().protocol_id(),
+                    wayland_resource_client_label(&active.pointer),
+                    compositor_surface_id(&active.surface),
+                    wayland_resource_client_label(&active.surface),
+                    exact_match_count,
+                    same_client_relative_count,
+                    stale_count,
+                    cross_client_count,
+                )
+            } else {
+                format!(
+                    "locked route has no same-client relative pointer; constraint={} generation={} pointer={} client={} surface={} client={} exact_match_count=0 same_client_relative_count=0 stale_count={} cross_client_count={} pointer_entered={pointer_entered} relative_resources={live_relative_count}",
+                    active.constraint_id,
+                    active.generation,
+                    active.pointer.id().protocol_id(),
+                    wayland_resource_client_label(&active.pointer),
+                    compositor_surface_id(&active.surface),
+                    wayland_resource_client_label(&active.surface),
+                    stale_count,
+                    cross_client_count,
+                )
+            };
+            self.relative_motion_debug.note_drop(reason);
+        }
+    }
+
+    fn dispatch_relative_pointer_motion_to_surface_client(
+        &mut self,
+        timestamp_usec: u64,
+        motion: RelativePointerMotion,
+        surface: &wl_surface::WlSurface,
+    ) -> usize {
+        let utime_hi = (timestamp_usec >> 32) as u32;
+        let utime_lo = (timestamp_usec & 0xffff_ffff) as u32;
+        let relative_pointers = self.relative_pointer_resources.clone();
+        let mut dispatched_resource_ids = HashSet::new();
+        for relative_pointer in relative_pointers {
+            if !relative_pointer.resource.is_alive() || !relative_pointer.source_pointer.is_alive()
+            {
+                continue;
+            }
+            if !resource_belongs_to_surface_client(&relative_pointer.resource, surface) {
+                continue;
+            }
+            let resource_id = relative_pointer.resource.id().protocol_id();
+            if !dispatched_resource_ids.insert(resource_id) {
+                continue;
+            }
+            relative_pointer.resource.relative_motion(
+                utime_hi,
+                utime_lo,
+                motion.dx,
+                motion.dy,
+                motion.dx_unaccelerated,
+                motion.dy_unaccelerated,
+            );
+            self.relative_motion_debug.note_dispatch(format!(
+                "relative motion dispatched client={} relative={} dx={} dy={}",
+                wayland_resource_client_label(surface),
+                resource_id,
+                motion.dx,
+                motion.dy
+            ));
+        }
+        dispatched_resource_ids.len()
+    }
+
+    fn remember_held_pointer_button(&mut self, press: PointerPress) {
+        if self
+            .held_pointer_buttons
+            .iter()
+            .any(|held| held.button == press.button)
+        {
+            pointer_debug_log(format!(
+                "duplicate button press ignored button={}",
+                press.button
+            ));
+            return;
+        }
+        pointer_debug_log(format!(
+            "button press button={} surface={} held_count={}",
+            press.button,
+            compositor_surface_id(&press.surface),
+            self.held_pointer_buttons.len() + 1
+        ));
+        self.held_pointer_buttons.push(press);
+    }
+
+    fn forget_held_pointer_button(&mut self, button: u32) {
+        let before = self.held_pointer_buttons.len();
+        self.held_pointer_buttons
+            .retain(|held| held.button != button);
+        if before == self.held_pointer_buttons.len() {
+            pointer_debug_log(format!("unmatched button release ignored button={button}"));
+        } else {
+            pointer_debug_log(format!(
+                "button release button={} held_count={}",
+                button,
+                self.held_pointer_buttons.len()
+            ));
+        }
+    }
+
+    fn synthesize_held_button_releases_for_surface(&mut self, surface: &wl_surface::WlSurface) {
+        let releases = self
+            .held_pointer_buttons
+            .iter()
+            .filter(|held| same_surface_resource(&held.surface, surface))
+            .cloned()
+            .collect::<Vec<_>>();
+        if releases.is_empty() {
+            return;
+        }
+        let pointers = self
+            .pointer_resources
+            .iter()
+            .filter(|pointer| resource_belongs_to_surface_client(*pointer, surface))
+            .cloned()
+            .collect::<Vec<_>>();
+        let time = wayland_event_time();
+        for press in releases {
+            let serial = self.next_configure_serial();
+            self.remember_input_serial(serial, press.surface.clone());
+            pointer_debug_log(format!(
+                "synthetic button release before leave button={} surface={}",
+                press.button,
+                compositor_surface_id(&press.surface)
+            ));
+            for pointer in &pointers {
+                let _ = pointer.send_event(wl_pointer::Event::Button {
+                    serial,
+                    time,
+                    button: press.button,
+                    state: WEnum::Value(wl_pointer::ButtonState::Released),
+                });
+                send_pointer_frame_if_supported(pointer);
+            }
+            self.forget_held_pointer_button(press.button);
+            if self
+                .last_pointer_press
+                .as_ref()
+                .is_some_and(|last| last.button == press.button)
+            {
+                self.last_pointer_press = None;
+            }
         }
     }
 
     fn send_pointer_button(&mut self, button: u32, pressed: bool) {
+        if let Some(locked_surface) = self.locked_pointer_input_surface() {
+            self.ensure_pointer_focus(&locked_surface);
+            if let Some(active) = self.active_locked_pointer_binding() {
+                self.pin_locked_pointer_focus(&active);
+            }
+            let surface = locked_surface;
+            let state = if pressed {
+                wl_pointer::ButtonState::Pressed
+            } else {
+                wl_pointer::ButtonState::Released
+            };
+            let serial = self.next_configure_serial();
+            let time = wayland_event_time();
+            self.remember_input_serial(serial, surface.clone());
+            if pressed {
+                let surface_id = compositor_surface_id(&surface);
+                let root_surface_id = self.root_surface_id_for_surface(surface_id);
+                if self
+                    .topmost_popup_grab_surface_id()
+                    .is_some_and(|popup_id| self.surface_is_descendant_of(surface_id, popup_id))
+                {
+                    self.focus_surface(surface.clone());
+                } else if let Some(root_surface) = self.surface_resource_by_id(root_surface_id) {
+                    self.focus_surface(root_surface);
+                }
+                let press = PointerPress {
+                    serial,
+                    button,
+                    surface: surface.clone(),
+                    root_surface_id,
+                    output_x: self.last_pointer_x,
+                    output_y: self.last_pointer_y,
+                };
+                self.remember_held_pointer_button(press.clone());
+                self.last_pointer_press = Some(press);
+            } else if self
+                .last_pointer_press
+                .as_ref()
+                .is_some_and(|press| press.button == button)
+            {
+                self.forget_held_pointer_button(button);
+                self.last_pointer_press = None;
+            } else {
+                self.forget_held_pointer_button(button);
+            }
+            for pointer in self
+                .pointer_resources
+                .iter()
+                .filter(|pointer| resource_belongs_to_surface_client(*pointer, &surface))
+            {
+                let _ = pointer.send_event(wl_pointer::Event::Button {
+                    serial,
+                    time,
+                    button,
+                    state: WEnum::Value(state),
+                });
+                send_pointer_frame_if_supported(pointer);
+            }
+            return;
+        }
+
         let target = self.pointer_target_at(self.last_pointer_x, self.last_pointer_y);
         if pressed
             && let Some(popup_surface_id) =
@@ -1326,20 +2447,25 @@ impl CompositorState {
             } else if let Some(root_surface) = self.surface_resource_by_id(root_surface_id) {
                 self.focus_surface(root_surface);
             }
-            self.last_pointer_press = Some(PointerPress {
+            let press = PointerPress {
                 serial,
                 button,
                 surface: surface.clone(),
                 root_surface_id,
                 output_x: self.last_pointer_x,
                 output_y: self.last_pointer_y,
-            });
+            };
+            self.remember_held_pointer_button(press.clone());
+            self.last_pointer_press = Some(press);
         } else if self
             .last_pointer_press
             .as_ref()
             .is_some_and(|press| press.button == button)
         {
+            self.forget_held_pointer_button(button);
             self.last_pointer_press = None;
+        } else {
+            self.forget_held_pointer_button(button);
         }
 
         for pointer in self
@@ -1359,6 +2485,36 @@ impl CompositorState {
 
     fn send_pointer_axis(&mut self, horizontal: f64, vertical: f64) {
         if horizontal == 0.0 && vertical == 0.0 {
+            return;
+        }
+
+        if let Some(surface) = self.locked_pointer_input_surface() {
+            if let Some(active) = self.active_locked_pointer_binding() {
+                self.pin_locked_pointer_focus(&active);
+            }
+            self.ensure_pointer_focus(&surface);
+            let time = wayland_event_time();
+            for pointer in self
+                .pointer_resources
+                .iter()
+                .filter(|pointer| resource_belongs_to_surface_client(*pointer, &surface))
+            {
+                if horizontal != 0.0 {
+                    let _ = pointer.send_event(wl_pointer::Event::Axis {
+                        time,
+                        axis: WEnum::Value(wl_pointer::Axis::HorizontalScroll),
+                        value: horizontal,
+                    });
+                }
+                if vertical != 0.0 {
+                    let _ = pointer.send_event(wl_pointer::Event::Axis {
+                        time,
+                        axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
+                        value: vertical,
+                    });
+                }
+                send_pointer_frame_if_supported(pointer);
+            }
             return;
         }
 
@@ -1499,7 +2655,7 @@ impl CompositorState {
                 };
             self.renderable_surfaces.push(surface);
         }
-        self.stack_renderable_descendants_above_parent(surface_id);
+        self.reorder_renderable_surfaces_by_committed_stack();
 
         let committed_popup = self.popup_surfaces.contains_key(&surface_id);
         if committed_popup {
@@ -1808,6 +2964,58 @@ impl CompositorState {
         true
     }
 
+    fn unmap_xdg_role_surfaces(&mut self, surface_id: u32) -> bool {
+        let renderable_ids = self
+            .renderable_surfaces
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>();
+        let mut removed_surface_ids = renderable_ids
+            .into_iter()
+            .filter(|candidate_id| self.surface_is_descendant_of(*candidate_id, surface_id))
+            .collect::<Vec<_>>();
+        removed_surface_ids.push(surface_id);
+        removed_surface_ids.sort_unstable();
+        removed_surface_ids.dedup();
+
+        let previous_renderable_count = self.renderable_surfaces.len();
+        self.renderable_surfaces
+            .retain(|surface| !removed_surface_ids.contains(&surface.surface_id));
+        self.popup_grab_stack
+            .retain(|surface_id| !removed_surface_ids.contains(surface_id));
+        self.recent_input_serials
+            .retain(|input| !removed_surface_ids.contains(&compositor_surface_id(&input.surface)));
+        self.clear_resize_state_for_surfaces(&removed_surface_ids);
+        if self
+            .pointer_surface
+            .as_ref()
+            .is_some_and(|surface| removed_surface_ids.contains(&compositor_surface_id(surface)))
+        {
+            self.clear_pointer_focus();
+        }
+        if self
+            .focused_surface
+            .as_ref()
+            .is_some_and(|surface| removed_surface_ids.contains(&compositor_surface_id(surface)))
+        {
+            self.focused_surface = None;
+            if self.keyboard_surface.as_ref().is_some_and(|surface| {
+                removed_surface_ids.contains(&compositor_surface_id(surface))
+            }) {
+                self.clear_keyboard_focus();
+            }
+            let _ = self.focus_topmost_renderable_toplevel();
+        }
+
+        if self.renderable_surfaces.len() == previous_renderable_count {
+            return false;
+        }
+
+        self.invalidate_surface_origin_cache();
+        self.advance_render_generation(RenderGenerationCause::SurfaceUnmap);
+        true
+    }
+
     fn clear_resize_state_for_surfaces(&mut self, surface_ids: &[u32]) {
         if self
             .pending_resize_configure
@@ -1882,6 +3090,202 @@ impl CompositorState {
         }
     }
 
+    fn register_subsurface_relationship(&mut self, surface_id: u32, parent_id: u32) {
+        self.committed_subsurface_stacks
+            .entry(parent_id)
+            .or_insert_with(|| vec![parent_id])
+            .retain(|id| *id == parent_id || *id != surface_id);
+        self.committed_subsurface_stacks
+            .entry(parent_id)
+            .or_insert_with(|| vec![parent_id])
+            .push(surface_id);
+        self.pending_subsurface_stacks.remove(&parent_id);
+        self.reorder_renderable_surfaces_by_committed_stack();
+    }
+
+    fn pending_stack_for_parent(&mut self, parent_id: u32) -> &mut Vec<u32> {
+        self.pending_subsurface_stacks
+            .entry(parent_id)
+            .or_insert_with(|| {
+                self.committed_subsurface_stacks
+                    .get(&parent_id)
+                    .cloned()
+                    .unwrap_or_else(|| vec![parent_id])
+            })
+    }
+
+    fn restack_subsurface(
+        &mut self,
+        surface_id: u32,
+        parent_id: u32,
+        reference_id: u32,
+        above: bool,
+    ) -> bool {
+        if reference_id == surface_id {
+            return false;
+        }
+        let valid_reference = reference_id == parent_id
+            || self
+                .surface_placements
+                .get(&reference_id)
+                .is_some_and(|placement| placement.parent_surface_id == Some(parent_id));
+        if !valid_reference {
+            return false;
+        }
+
+        let stack = self.pending_stack_for_parent(parent_id);
+        stack.retain(|id| *id == parent_id || *id != surface_id);
+        if !stack.contains(&parent_id) {
+            stack.insert(0, parent_id);
+        }
+        let Some(reference_index) = stack.iter().position(|id| *id == reference_id) else {
+            return false;
+        };
+        let insert_index = if above {
+            reference_index + 1
+        } else {
+            reference_index
+        };
+        stack.insert(insert_index.min(stack.len()), surface_id);
+        true
+    }
+
+    fn apply_pending_subsurface_stack_for_parent(&mut self, parent_id: u32) -> bool {
+        let Some(mut stack) = self.pending_subsurface_stacks.remove(&parent_id) else {
+            return false;
+        };
+        stack.retain(|id| {
+            *id == parent_id
+                || self
+                    .surface_placements
+                    .get(id)
+                    .is_some_and(|placement| placement.parent_surface_id == Some(parent_id))
+        });
+        if !stack.contains(&parent_id) {
+            stack.insert(0, parent_id);
+        }
+        stack.dedup();
+        let changed = self
+            .committed_subsurface_stacks
+            .get(&parent_id)
+            .is_none_or(|current| *current != stack);
+        self.committed_subsurface_stacks.insert(parent_id, stack);
+        if changed {
+            self.reorder_renderable_surfaces_by_committed_stack();
+            self.refresh_pointer_focus_at_last_position();
+        }
+        changed
+    }
+
+    fn cleanup_subsurface_stack_state_for_surface(&mut self, surface_id: u32) {
+        self.committed_subsurface_stacks.remove(&surface_id);
+        self.pending_subsurface_stacks.remove(&surface_id);
+        for stack in self.committed_subsurface_stacks.values_mut() {
+            stack.retain(|id| *id != surface_id);
+            stack.dedup();
+        }
+        for stack in self.pending_subsurface_stacks.values_mut() {
+            stack.retain(|id| *id != surface_id);
+            stack.dedup();
+        }
+        self.committed_subsurface_stacks.retain(|parent_id, stack| {
+            self.surface_resources.contains_key(parent_id) && stack.iter().any(|id| id != parent_id)
+        });
+        self.pending_subsurface_stacks.retain(|parent_id, stack| {
+            self.surface_resources.contains_key(parent_id) && stack.iter().any(|id| id != parent_id)
+        });
+        self.reorder_renderable_surfaces_by_committed_stack();
+    }
+
+    fn reorder_renderable_surfaces_by_committed_stack(&mut self) -> bool {
+        if self.renderable_surfaces.len() <= 1 {
+            return false;
+        }
+
+        let original_order = self
+            .renderable_surfaces
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>();
+        let mut by_id = self
+            .renderable_surfaces
+            .drain(..)
+            .map(|surface| (surface.surface_id, surface))
+            .collect::<HashMap<_, _>>();
+        let visible_ids = by_id.keys().copied().collect::<HashSet<_>>();
+        let mut ordered_ids = Vec::new();
+        let root_ids = original_order
+            .iter()
+            .copied()
+            .filter(|surface_id| {
+                self.surface_placements
+                    .get(surface_id)
+                    .and_then(|placement| placement.parent_surface_id)
+                    .is_none_or(|parent_id| !visible_ids.contains(&parent_id))
+            })
+            .collect::<Vec<_>>();
+
+        for root_id in root_ids {
+            self.append_surface_tree_order(root_id, &visible_ids, &mut ordered_ids);
+        }
+        for surface_id in &original_order {
+            if visible_ids.contains(surface_id) && !ordered_ids.contains(surface_id) {
+                self.append_surface_tree_order(*surface_id, &visible_ids, &mut ordered_ids);
+            }
+        }
+
+        self.renderable_surfaces = ordered_ids
+            .into_iter()
+            .filter_map(|surface_id| by_id.remove(&surface_id))
+            .collect();
+        let changed = self
+            .renderable_surfaces
+            .iter()
+            .map(|surface| surface.surface_id)
+            .ne(original_order);
+        if changed {
+            self.invalidate_surface_origin_cache();
+        }
+        changed
+    }
+
+    fn append_surface_tree_order(
+        &self,
+        surface_id: u32,
+        visible_ids: &HashSet<u32>,
+        ordered_ids: &mut Vec<u32>,
+    ) {
+        if !visible_ids.contains(&surface_id) || ordered_ids.contains(&surface_id) {
+            return;
+        }
+
+        if let Some(stack) = self.committed_subsurface_stacks.get(&surface_id) {
+            for stacked_id in stack {
+                if *stacked_id == surface_id {
+                    ordered_ids.push(surface_id);
+                } else {
+                    self.append_surface_tree_order(*stacked_id, visible_ids, ordered_ids);
+                }
+            }
+        } else {
+            ordered_ids.push(surface_id);
+        }
+
+        let children = self
+            .surface_placements
+            .iter()
+            .filter_map(|(child_id, placement)| {
+                (placement.parent_surface_id == Some(surface_id)
+                    && visible_ids.contains(child_id)
+                    && !ordered_ids.contains(child_id))
+                .then_some(*child_id)
+            })
+            .collect::<Vec<_>>();
+        for child_id in children {
+            self.append_surface_tree_order(child_id, visible_ids, ordered_ids);
+        }
+    }
+
     fn set_surface_placement(&mut self, surface_id: u32, placement: SurfacePlacement) -> bool {
         self.set_surface_placement_with_cause(
             surface_id,
@@ -1928,64 +3332,6 @@ impl CompositorState {
         self.surface_origin_cache_generation = None;
     }
 
-    fn stack_renderable_descendants_above_parent(&mut self, surface_id: u32) -> bool {
-        if !self
-            .renderable_surfaces
-            .iter()
-            .any(|surface| surface.surface_id == surface_id)
-        {
-            return false;
-        }
-        let descendant_ids = self
-            .renderable_surfaces
-            .iter()
-            .map(|surface| surface.surface_id)
-            .filter(|candidate_id| {
-                *candidate_id != surface_id
-                    && self.surface_is_descendant_of(*candidate_id, surface_id)
-            })
-            .collect::<HashSet<_>>();
-        if descendant_ids.is_empty() {
-            return false;
-        }
-
-        let original_order = self
-            .renderable_surfaces
-            .iter()
-            .map(|surface| surface.surface_id)
-            .collect::<Vec<_>>();
-        let mut descendants = Vec::new();
-        let mut others = Vec::with_capacity(self.renderable_surfaces.len());
-        for surface in self.renderable_surfaces.drain(..) {
-            if descendant_ids.contains(&surface.surface_id) {
-                descendants.push(surface);
-            } else {
-                others.push(surface);
-            }
-        }
-
-        let Some(parent_index) = others
-            .iter()
-            .position(|surface| surface.surface_id == surface_id)
-        else {
-            self.renderable_surfaces = others;
-            self.renderable_surfaces.extend(descendants);
-            self.invalidate_surface_origin_cache();
-            return true;
-        };
-        let insert_index = parent_index + 1;
-        others.splice(insert_index..insert_index, descendants);
-        let changed = others
-            .iter()
-            .map(|surface| surface.surface_id)
-            .ne(original_order);
-        self.renderable_surfaces = others;
-        if changed {
-            self.invalidate_surface_origin_cache();
-        }
-        changed
-    }
-
     fn raise_renderable_surface_tree(&mut self, surface_id: u32) -> bool {
         let tree_ids = self
             .renderable_surfaces
@@ -2030,6 +3376,8 @@ impl CompositorState {
         toplevel: xdg_toplevel::XdgToplevel,
     ) {
         let surface_id = compositor_surface_id(&surface);
+        self.configured_xdg_surfaces.remove(&surface_id);
+        self.clear_resize_state_for_surfaces(&[surface_id]);
         self.toplevel_surfaces.insert(
             surface_id,
             ToplevelSurface {
@@ -2053,6 +3401,8 @@ impl CompositorState {
         positioner: XdgPositionerState,
     ) {
         let surface_id = compositor_surface_id(&surface);
+        self.configured_xdg_surfaces.remove(&surface_id);
+        self.clear_resize_state_for_surfaces(&[surface_id]);
         self.popup_surfaces.insert(
             surface_id,
             PopupSurface {
@@ -2063,6 +3413,37 @@ impl CompositorState {
             },
         );
         self.note_xdg_popup_created();
+    }
+
+    fn unregister_toplevel_surface(&mut self, surface_id: u32) {
+        self.unmap_xdg_role_surfaces(surface_id);
+        self.toplevel_surfaces.remove(&surface_id);
+        self.surface_placements.remove(&surface_id);
+        self.configured_xdg_surfaces.remove(&surface_id);
+        self.clear_resize_state_for_surfaces(&[surface_id]);
+    }
+
+    fn unregister_xdg_surface_role(&mut self, surface_id: u32) {
+        let child_popup_ids = self
+            .popup_surfaces
+            .iter()
+            .filter_map(|(child_surface_id, popup)| {
+                (popup.parent_surface_id == Some(surface_id)).then_some(*child_surface_id)
+            })
+            .collect::<Vec<_>>();
+        for child_surface_id in child_popup_ids {
+            self.unregister_popup_surface(child_surface_id);
+        }
+
+        self.unregister_toplevel_surface(surface_id);
+        self.unregister_popup_surface(surface_id);
+        self.surface_window_geometries.remove(&surface_id);
+        self.configured_xdg_surfaces.remove(&surface_id);
+        self.surface_placements.remove(&surface_id);
+        self.popup_grab_stack.retain(|id| *id != surface_id);
+        self.recent_input_serials
+            .retain(|input| compositor_surface_id(&input.surface) != surface_id);
+        self.clear_resize_state_for_surfaces(&[surface_id]);
     }
 
     fn grab_popup_surface(
@@ -2091,6 +3472,7 @@ impl CompositorState {
             .popup_surfaces
             .get(&surface_id)
             .and_then(|popup| popup.parent_surface_id);
+        self.unmap_xdg_role_surfaces(surface_id);
         if self
             .pointer_surface
             .as_ref()
@@ -2105,15 +3487,7 @@ impl CompositorState {
         self.surface_placements.remove(&surface_id);
         self.configured_xdg_surfaces.remove(&surface_id);
         self.surface_window_geometries.remove(&surface_id);
-        if let Some(buffer) = self.active_dmabuf_buffers.remove(&surface_id) {
-            self.queue_dmabuf_buffer_release(buffer);
-        }
-        let previous_renderable_count = self.renderable_surfaces.len();
-        self.renderable_surfaces
-            .retain(|surface| surface.surface_id != surface_id);
-        if self.renderable_surfaces.len() != previous_renderable_count {
-            self.advance_render_generation(RenderGenerationCause::SurfaceUnmap);
-        }
+        self.clear_resize_state_for_surfaces(&[surface_id]);
         if self
             .focused_surface
             .as_ref()
@@ -2260,16 +3634,25 @@ impl CompositorState {
                 .popup
                 .send_event(xdg_popup::Event::Repositioned { token });
         }
-        let _ = popup_surface.popup.send_event(xdg_popup::Event::Configure {
+        if let Err(error) = popup_surface.popup.send_event(xdg_popup::Event::Configure {
             x: geometry.x,
             y: geometry.y,
             width: geometry.width,
             height: geometry.height,
-        });
+        }) && compositor_debug_surface_logging_enabled()
+        {
+            eprintln!("oblivion-one compositor: failed to send popup configure: {error:?}");
+        }
         let serial = self.next_configure_serial();
-        let _ = popup_surface
+        if let Err(error) = popup_surface
             .xdg_surface
-            .send_event(xdg_surface::Event::Configure { serial });
+            .send_event(xdg_surface::Event::Configure { serial })
+            && compositor_debug_surface_logging_enabled()
+        {
+            eprintln!(
+                "oblivion-one compositor: failed to send popup xdg_surface configure serial={serial}: {error:?}"
+            );
+        }
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
                 "oblivion-one compositor: popup surface {surface_id} configured xdg={}x{}+{},{} placement={},{} parent={:?}",
@@ -2291,17 +3674,27 @@ impl CompositorState {
         }
 
         if let Some(toplevel) = self.toplevel_surfaces.get(&surface_id).cloned() {
-            let _ = toplevel
+            if let Err(error) = toplevel
                 .toplevel
                 .send_event(xdg_toplevel::Event::Configure {
                     width: 0,
                     height: 0,
                     states: Vec::new(),
-                });
+                })
+                && compositor_debug_surface_logging_enabled()
+            {
+                eprintln!("oblivion-one compositor: failed to send toplevel configure: {error:?}");
+            }
             let serial = self.next_configure_serial();
-            let _ = toplevel
+            if let Err(error) = toplevel
                 .xdg_surface
-                .send_event(xdg_surface::Event::Configure { serial });
+                .send_event(xdg_surface::Event::Configure { serial })
+                && compositor_debug_surface_logging_enabled()
+            {
+                eprintln!(
+                    "oblivion-one compositor: failed to send toplevel xdg_surface configure serial={serial}: {error:?}"
+                );
+            }
             self.configured_xdg_surfaces.insert(surface_id);
             return true;
         }
@@ -3403,13 +4796,79 @@ impl CompositorState {
     }
 
     fn refresh_pointer_focus_at_last_position(&mut self) {
+        if self.active_locked_pointer_binding().is_some() {
+            if let Some(active) = self.active_locked_pointer_binding() {
+                self.pin_locked_pointer_focus(&active);
+            }
+            return;
+        }
+
         let Some(target) = self.pointer_target_at(self.last_pointer_x, self.last_pointer_y) else {
             self.clear_pointer_focus();
+            pointer_debug_log("post-unlock focus target=none");
             return;
         };
 
+        pointer_debug_log(format!(
+            "post-unlock focus target={} x={} y={}",
+            compositor_surface_id(&target.surface),
+            target.surface_x,
+            target.surface_y
+        ));
         self.ensure_pointer_focus(&target.surface);
         self.send_pointer_enter_if_needed(&target);
+    }
+
+    fn restore_locked_pointer_position(
+        &mut self,
+        surface: &wl_surface::WlSurface,
+        cursor_position_hint: Option<(f64, f64)>,
+    ) -> Option<OutputPosition> {
+        let fallback_position = self
+            .active_locked_pointer_routing
+            .as_ref()
+            .filter(|active| same_surface_resource(&active.surface, surface))
+            .map(|active| (active.surface_x, active.surface_y));
+        let Some((surface_x, surface_y)) = cursor_position_hint.or(fallback_position) else {
+            pointer_debug_log("unlock restore hint=none output_position=unchanged");
+            return None;
+        };
+        let Some((output_x, output_y)) =
+            self.output_position_for_surface_local(surface, surface_x, surface_y)
+        else {
+            pointer_debug_log(format!(
+                "unlock restore hint=({surface_x},{surface_y}) output_position=unresolved"
+            ));
+            return None;
+        };
+        self.last_pointer_x = output_x;
+        self.last_pointer_y = output_y;
+        pointer_debug_log(format!(
+            "unlock restore hint=({surface_x},{surface_y}) output_position=({output_x},{output_y})"
+        ));
+        Some(OutputPosition {
+            x: output_x,
+            y: output_y,
+        })
+    }
+
+    fn output_position_for_surface_local(
+        &mut self,
+        surface: &wl_surface::WlSurface,
+        surface_x: f64,
+        surface_y: f64,
+    ) -> Option<(f64, f64)> {
+        let surface_id = compositor_surface_id(surface);
+        self.refresh_surface_origin_cache();
+        let index = self
+            .renderable_surfaces
+            .iter()
+            .position(|renderable| renderable.surface_id == surface_id)?;
+        let origin = self.surface_origin_cache.get(index).copied()?;
+        Some((
+            f64::from(origin.0) + surface_x,
+            f64::from(origin.1) + surface_y,
+        ))
     }
 
     fn surface_resource_by_id(&self, surface_id: u32) -> Option<wl_surface::WlSurface> {
@@ -3429,6 +4888,118 @@ impl CompositorState {
         self.pointer_surface = Some(surface.clone());
     }
 
+    fn pointer_resource_entered_surface(
+        &self,
+        pointer: &wl_pointer::WlPointer,
+        surface: &wl_surface::WlSurface,
+    ) -> bool {
+        self.pointer_entered_surfaces
+            .iter()
+            .any(|(resource, entered_surface)| {
+                same_wayland_resource(resource, pointer)
+                    && same_surface_resource(entered_surface, surface)
+            })
+    }
+
+    fn pointer_has_current_enter_serial(
+        &self,
+        pointer: &wl_pointer::WlPointer,
+        serial: u32,
+        surface: &wl_surface::WlSurface,
+    ) -> bool {
+        self.pointer_enter_serials.iter().any(|entry| {
+            same_wayland_resource(&entry.pointer, pointer)
+                && same_surface_resource(&entry.surface, surface)
+                && entry.serial == serial
+        })
+    }
+
+    fn remember_pointer_enter_serial(
+        &mut self,
+        pointer: &wl_pointer::WlPointer,
+        surface: &wl_surface::WlSurface,
+        serial: u32,
+    ) {
+        self.pointer_enter_serials
+            .retain(|entry| !same_wayland_resource(&entry.pointer, pointer));
+        self.pointer_enter_serials.push(PointerEnterSerial {
+            pointer: pointer.clone(),
+            surface: surface.clone(),
+            serial,
+        });
+    }
+
+    fn forget_pointer_enter_serial(&mut self, pointer: &wl_pointer::WlPointer) {
+        self.pointer_enter_serials
+            .retain(|entry| !same_wayland_resource(&entry.pointer, pointer));
+    }
+
+    fn synchronize_pointer_resource_focus(&mut self, pointer: &wl_pointer::WlPointer) -> bool {
+        let Some(focused_surface) = self.pointer_surface.clone() else {
+            return false;
+        };
+        if !pointer.is_alive() || !resource_belongs_to_surface_client(pointer, &focused_surface) {
+            return false;
+        }
+        if self.pointer_resource_entered_surface(pointer, &focused_surface) {
+            return true;
+        }
+        let Some(target) = self.pointer_target_at(self.last_pointer_x, self.last_pointer_y) else {
+            return false;
+        };
+        if !same_surface_resource(&target.surface, &focused_surface) {
+            return false;
+        }
+        self.send_pointer_enter_to_resource(pointer, &target);
+        true
+    }
+
+    fn send_pointer_enter_to_resource(
+        &mut self,
+        pointer: &wl_pointer::WlPointer,
+        target: &PointerTarget,
+    ) {
+        if let Some(index) = self
+            .pointer_entered_surfaces
+            .iter()
+            .position(|(resource, _)| same_wayland_resource(resource, pointer))
+        {
+            if same_surface_resource(&self.pointer_entered_surfaces[index].1, &target.surface) {
+                return;
+            }
+
+            let (_, previous_surface) = self.pointer_entered_surfaces.remove(index);
+            self.forget_pointer_enter_serial(pointer);
+            if resource_belongs_to_surface_client(pointer, &previous_surface) {
+                self.synthesize_held_button_releases_for_surface(&previous_surface);
+                let serial = self.next_configure_serial();
+                let _ = pointer.send_event(wl_pointer::Event::Leave {
+                    serial,
+                    surface: previous_surface,
+                });
+                send_pointer_frame_if_supported(pointer);
+            }
+        }
+
+        let serial = self.next_configure_serial();
+        let _ = pointer.send_event(wl_pointer::Event::Enter {
+            serial,
+            surface: target.surface.clone(),
+            surface_x: target.surface_x,
+            surface_y: target.surface_y,
+        });
+        pointer_debug_log(format!(
+            "wl_pointer {} synchronized enter for surface {}",
+            pointer.id().protocol_id(),
+            compositor_surface_id(&target.surface)
+        ));
+        self.remember_input_serial(serial, target.surface.clone());
+        self.remember_pointer_enter_serial(pointer, &target.surface, serial);
+        send_pointer_frame_if_supported(pointer);
+        self.pointer_entered_surfaces
+            .push((pointer.clone(), target.surface.clone()));
+    }
+
     fn send_pointer_enter_if_needed(&mut self, target: &PointerTarget) {
         self.pointer_resources.retain(Resource::is_alive);
         let pointers = self
@@ -3439,39 +5010,26 @@ impl CompositorState {
             .collect::<Vec<_>>();
 
         for pointer in pointers {
-            if let Some(index) = self
-                .pointer_entered_surfaces
-                .iter()
-                .position(|(resource, _)| same_wayland_resource(resource, &pointer))
-            {
-                if same_surface_resource(&self.pointer_entered_surfaces[index].1, &target.surface) {
-                    continue;
-                }
-
-                let (_, previous_surface) = self.pointer_entered_surfaces.remove(index);
-                if resource_belongs_to_surface_client(&pointer, &previous_surface) {
-                    let serial = self.next_configure_serial();
-                    let _ = pointer.send_event(wl_pointer::Event::Leave {
-                        serial,
-                        surface: previous_surface,
-                    });
-                    send_pointer_frame_if_supported(&pointer);
-                }
-            }
-
-            let serial = self.next_configure_serial();
-            let _ = pointer.send_event(wl_pointer::Event::Enter {
-                serial,
-                surface: target.surface.clone(),
-                surface_x: target.surface_x,
-                surface_y: target.surface_y,
-            });
-            self.pointer_entered_surfaces
-                .push((pointer, target.surface.clone()));
+            self.send_pointer_enter_to_resource(&pointer, target);
+        }
+        let surface_id = compositor_surface_id(&target.surface);
+        let constraint_ids = self
+            .pointer_constraints
+            .values()
+            .filter(|constraint| compositor_surface_id(&constraint.surface) == surface_id)
+            .map(|constraint| constraint.id)
+            .collect::<Vec<_>>();
+        for constraint_id in constraint_ids {
+            self.maybe_request_pointer_constraint_activation(constraint_id);
         }
     }
 
     fn clear_pointer_focus(&mut self) {
+        if let Some(surface_id) = self.pointer_surface.as_ref().map(compositor_surface_id) {
+            self.deactivate_pointer_constraints_for_surface_focus_loss(surface_id, true);
+        }
+        self.cursor_visibility.client_hidden_pointer = None;
+        self.sync_cursor_visibility_request();
         self.pointer_surface = None;
         self.pointer_resources.retain(Resource::is_alive);
         let pointers = self.pointer_resources.clone();
@@ -3484,9 +5042,11 @@ impl CompositorState {
                 continue;
             };
             let (_, surface) = self.pointer_entered_surfaces.remove(index);
+            self.forget_pointer_enter_serial(&pointer);
             if !resource_belongs_to_surface_client(&pointer, &surface) {
                 continue;
             }
+            self.synthesize_held_button_releases_for_surface(&surface);
             let serial = self.next_configure_serial();
             let _ = pointer.send_event(wl_pointer::Event::Leave { serial, surface });
             send_pointer_frame_if_supported(&pointer);

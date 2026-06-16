@@ -28,7 +28,8 @@ use crate::wayland_drm::server::wl_drm;
 
 use super::{
     CompositorState, InputProtocolCapabilities, RenderGenerationCause, RenderableSurface,
-    SelectionProtocolCapabilities, ShellDockItem, color, input::PointerMotionSample,
+    SelectionProtocolCapabilities, ShellDockItem, color,
+    input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 
 #[derive(Debug)]
@@ -51,6 +52,20 @@ impl OwnCompositorServer {
 
     pub fn bind_native_base(socket_name: impl Into<String>) -> Result<Self, CompositorError> {
         Self::bind_with_gpu_buffers(socket_name, false)
+    }
+
+    pub fn bind_with_capabilities(
+        socket_name: impl Into<String>,
+        gpu_buffers_enabled: bool,
+        input_capabilities: InputProtocolCapabilities,
+        selection_capabilities: SelectionProtocolCapabilities,
+    ) -> Result<Self, CompositorError> {
+        Self::bind_with_gpu_buffers_and_capabilities(
+            socket_name,
+            gpu_buffers_enabled,
+            input_capabilities,
+            selection_capabilities,
+        )
     }
 
     #[cfg(test)]
@@ -250,6 +265,32 @@ impl OwnCompositorServer {
 
     pub fn send_pointer_axis(&mut self, horizontal: f64, vertical: f64) {
         self.state.send_pointer_axis(horizontal, vertical);
+        let _ = self.display.flush_clients();
+    }
+
+    pub fn take_pointer_constraint_backend_requests(
+        &mut self,
+    ) -> Vec<PointerConstraintBackendRequest> {
+        self.state.take_pointer_constraint_backend_requests()
+    }
+
+    pub fn pointer_constraint_backend_activated(&mut self, id: PointerConstraintBackendId) {
+        self.state.pointer_constraint_backend_activated(id);
+        let _ = self.display.flush_clients();
+    }
+
+    pub fn pointer_constraint_backend_deactivated(&mut self, id: PointerConstraintBackendId) {
+        self.state.pointer_constraint_backend_deactivated(id);
+        let _ = self.display.flush_clients();
+    }
+
+    pub fn pointer_constraint_backend_failed(
+        &mut self,
+        id: PointerConstraintBackendId,
+        reason: impl AsRef<str>,
+    ) {
+        self.state
+            .pointer_constraint_backend_failed(id, reason.as_ref());
         let _ = self.display.flush_clients();
     }
 
