@@ -205,6 +205,80 @@ fn wayland_client_receives_wl_drm_compatibility_events() {
 }
 
 #[test]
+fn wl_shm_pool_resize_growth_enables_buffer_above_initial_size() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let result = create_toplevel_with_resized_shm_pool_buffer(&socket_path, 32, 16);
+    let server = stop_test_server(running, server_thread);
+
+    result.unwrap();
+    assert_eq!(server.renderable_surfaces().len(), 1);
+    let surface = &server.renderable_surfaces()[0];
+    assert_eq!(surface.width, 2);
+    assert_eq!(surface.height, 2);
+    assert_eq!(
+        surface.cpu_pixels(),
+        Some(vec![0xff55_0000, 0xff00_5500, 0xff00_0055, 0xff55_5555].as_slice())
+    );
+}
+
+#[test]
+fn wl_shm_pool_resize_to_same_size_remains_usable() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let result = create_toplevel_with_resized_shm_pool_buffer(&socket_path, 16, 0);
+    let server = stop_test_server(running, server_thread);
+
+    result.unwrap();
+    assert_eq!(server.renderable_surfaces().len(), 1);
+}
+
+#[test]
+fn wl_shm_pool_resize_shrink_is_rejected() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let result = resize_shm_pool_to_invalid_size(&socket_path, 8);
+    stop_test_server(running, server_thread);
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn wl_shm_create_pool_zero_size_is_rejected() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let result = create_shm_pool_with_invalid_size(&socket_path, 0);
+    stop_test_server(running, server_thread);
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn wl_shm_create_pool_negative_size_is_rejected() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let result = create_shm_pool_with_invalid_size(&socket_path, -1);
+    stop_test_server(running, server_thread);
+
+    assert!(result.is_err());
+}
+
+#[test]
 fn wl_drm_v1_bind_does_not_receive_capabilities() {
     let socket_name = unique_socket_name();
     let mut server = OwnCompositorServer::bind(&socket_name).unwrap();

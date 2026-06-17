@@ -5078,6 +5078,88 @@ fn create_client_toplevel_with_dmabuf_buffer(
     Ok(())
 }
 
+fn create_toplevel_with_resized_shm_pool_buffer(
+    socket_path: &PathBuf,
+    resized_pool_size: i32,
+    buffer_offset: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let file = create_test_shm_file(&[
+        0xffff_0000,
+        0xff00_ff00,
+        0xff00_00ff,
+        0xffff_ffff,
+        0xff55_0000,
+        0xff00_5500,
+        0xff00_0055,
+        0xff55_5555,
+    ])?;
+    let pool = shm.create_pool(file.as_fd(), 16, &qh, ());
+    pool.resize(resized_pool_size);
+    let buffer = pool.create_buffer(
+        buffer_offset,
+        2,
+        2,
+        8,
+        client_wl_shm::Format::Argb8888,
+        &qh,
+        (),
+    );
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let toplevel = xdg_surface.get_toplevel(&qh, ());
+
+    toplevel.set_app_id("oblivion.shm-resize-test".to_string());
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage_buffer(0, 0, 2, 2);
+    surface.commit();
+    connection.flush()?;
+    connection.roundtrip()?;
+    Ok(())
+}
+
+fn resize_shm_pool_to_invalid_size(
+    socket_path: &PathBuf,
+    resized_pool_size: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let file = create_test_shm_file(&[0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff])?;
+    let pool = shm.create_pool(file.as_fd(), 16, &qh, ());
+    pool.resize(resized_pool_size);
+    connection.flush()?;
+    connection.roundtrip()?;
+    Ok(())
+}
+
+fn create_shm_pool_with_invalid_size(
+    socket_path: &PathBuf,
+    pool_size: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let file = create_test_shm_file(&[0xffff_0000])?;
+    let _pool = shm.create_pool(file.as_fd(), pool_size, &qh, ());
+    connection.flush()?;
+    connection.roundtrip()?;
+    Ok(())
+}
+
 fn create_client_toplevel_with_shm_then_dmabuf_buffer(
     socket_path: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {

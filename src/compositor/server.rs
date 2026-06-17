@@ -51,7 +51,12 @@ impl OwnCompositorServer {
     }
 
     pub fn bind_native_base(socket_name: impl Into<String>) -> Result<Self, CompositorError> {
-        Self::bind_with_gpu_buffers(socket_name, false)
+        Self::bind_with_gpu_buffers_and_capabilities(
+            socket_name,
+            false,
+            InputProtocolCapabilities::native_libinput(),
+            SelectionProtocolCapabilities::core_clipboard(),
+        )
     }
 
     pub fn bind_with_capabilities(

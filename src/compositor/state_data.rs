@@ -300,7 +300,7 @@ pub(super) enum SurfaceInputRegion {
 }
 
 impl SurfaceInputRegion {
-    fn contains(
+    pub(super) fn contains(
         &self,
         surface_x: f64,
         surface_y: f64,

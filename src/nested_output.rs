@@ -104,6 +104,7 @@ struct NestedOutputApp {
     perf: NestedPerfCounters,
     host_monitor_refresh_millihz: Option<u32>,
     active_pointer_constraint: Option<NestedPointerConstraint>,
+    pending_host_cursor_warp: Option<NestedPendingCursorWarp>,
     host_cursor_client_visible: bool,
     host_window_focused: bool,
     input_clock_start: Instant,
@@ -115,6 +116,12 @@ struct NestedOutputApp {
 struct NestedPointerConstraint {
     id: PointerConstraintBackendId,
     mode: NestedPointerConstraintMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NestedPendingCursorWarp {
+    physical_x: i32,
+    physical_y: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +181,7 @@ impl NestedOutputApp {
             perf: NestedPerfCounters::default(),
             host_monitor_refresh_millihz: None,
             active_pointer_constraint: None,
+            pending_host_cursor_warp: None,
             host_cursor_client_visible: true,
             host_window_focused: true,
             input_clock_start: Instant::now(),
@@ -276,12 +284,13 @@ impl NestedOutputApp {
                 PointerConstraintBackendRequest::ActivateLocked(id) => {
                     self.activate_host_pointer_constraint(id, NestedPointerConstraintMode::Locked);
                 }
-                PointerConstraintBackendRequest::ActivateConfined(id) => {
+                PointerConstraintBackendRequest::ActivateConfined { id, .. } => {
                     self.activate_host_pointer_constraint(
                         id,
                         NestedPointerConstraintMode::Confined,
                     );
                 }
+                PointerConstraintBackendRequest::UpdateConfinedRegion { .. } => {}
                 PointerConstraintBackendRequest::Deactivate {
                     id,
                     restore_position,
@@ -368,6 +377,10 @@ impl NestedOutputApp {
                             logical_coordinate_to_physical(self.cursor_x, scale_factor);
                         self.cursor_physical_y =
                             logical_coordinate_to_physical(self.cursor_y, scale_factor);
+                        self.pending_host_cursor_warp = Some(NestedPendingCursorWarp {
+                            physical_x: self.cursor_physical_x,
+                            physical_y: self.cursor_physical_y,
+                        });
                         pointer_debug_log(format!(
                             "host cursor positioned while locked x={} y={}",
                             position.x, position.y
@@ -406,6 +419,18 @@ impl NestedOutputApp {
     fn locked_pointer_constraint_active(&self) -> bool {
         self.active_pointer_constraint
             .is_some_and(|constraint| constraint.mode == NestedPointerConstraintMode::Locked)
+    }
+
+    fn consume_pending_host_cursor_warp(&mut self, physical_x: i32, physical_y: i32) -> bool {
+        let Some(pending) = self.pending_host_cursor_warp else {
+            return false;
+        };
+        if host_cursor_warp_matches(pending, physical_x, physical_y) {
+            self.pending_host_cursor_warp = None;
+            true
+        } else {
+            false
+        }
     }
 
     fn forward_host_relative_mouse_delta(&mut self, dx: f64, dy: f64) -> bool {
@@ -869,11 +894,27 @@ impl ApplicationHandler for NestedOutputApp {
                 self.redraw_requested_at = None;
             }
             WindowEvent::CursorMoved { position, .. } => {
+                let physical_x = position.x.round() as i32;
+                let physical_y = position.y.round() as i32;
+                if self.consume_pending_host_cursor_warp(physical_x, physical_y) {
+                    self.cursor_physical_x = physical_x;
+                    self.cursor_physical_y = physical_y;
+                    let output_scale = self
+                        .window
+                        .as_deref()
+                        .map(output_scale_for_window)
+                        .unwrap_or(1.0);
+                    let x = logical_coordinate_from_physical(position.x, output_scale).max(0.0);
+                    let y = logical_coordinate_from_physical(position.y, output_scale).max(0.0);
+                    self.cursor_x = x.round() as i32;
+                    self.cursor_y = y.round() as i32;
+                    return;
+                }
                 if self.locked_pointer_constraint_active() {
                     return;
                 }
-                self.cursor_physical_x = position.x.round() as i32;
-                self.cursor_physical_y = position.y.round() as i32;
+                self.cursor_physical_x = physical_x;
+                self.cursor_physical_y = physical_y;
                 let output_scale = self
                     .window
                     .as_deref()
@@ -1289,6 +1330,16 @@ fn nested_output_initial_cursor_physical(
 
 fn logical_coordinate_to_physical(logical: i32, scale_factor: f64) -> i32 {
     (f64::from(logical.max(0)) * sanitize_output_scale(scale_factor)).round() as i32
+}
+
+fn host_cursor_warp_matches(
+    pending: NestedPendingCursorWarp,
+    physical_x: i32,
+    physical_y: i32,
+) -> bool {
+    const TOLERANCE: i32 = 2;
+    (pending.physical_x - physical_x).abs() <= TOLERANCE
+        && (pending.physical_y - physical_y).abs() <= TOLERANCE
 }
 
 fn report_host_monitor_refresh(
@@ -1891,6 +1942,18 @@ mod tests {
             nested_visual_state(120, 80),
             DesktopVisualState::wallpaper_only()
         );
+    }
+
+    #[test]
+    fn pending_host_cursor_warp_matches_with_rounding_tolerance() {
+        let pending = NestedPendingCursorWarp {
+            physical_x: 120,
+            physical_y: 80,
+        };
+
+        assert!(host_cursor_warp_matches(pending, 122, 78));
+        assert!(!host_cursor_warp_matches(pending, 123, 80));
+        assert!(!host_cursor_warp_matches(pending, 120, 77));
     }
 
     #[test]

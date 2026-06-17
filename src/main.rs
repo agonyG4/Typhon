@@ -552,7 +552,7 @@ fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
             OwnCompositorServer::bind_with_capabilities(
                 &options.socket_name,
                 false,
-                InputProtocolCapabilities::native_base(),
+                InputProtocolCapabilities::native_libinput(),
                 SelectionProtocolCapabilities::core_clipboard(),
             )?
         }
@@ -592,12 +592,19 @@ fn compositor_protocol_names_for_output_backend(
         .collect();
     }
     if output_backend == ResolvedCompositorOutputBackend::Native {
-        protocols.retain(|protocol| {
+        protocols = client_protocols_for_capabilities(
+            InputProtocolCapabilities::native_libinput(),
+            SelectionProtocolCapabilities::core_clipboard(),
+        )
+        .into_iter()
+        .map(|protocol| protocol.name())
+        .filter(|protocol| {
             !matches!(
                 *protocol,
                 "zwp_linux_dmabuf_v1" | "wp_linux_drm_syncobj_manager_v1" | "wl_drm"
             )
-        });
+        })
+        .collect();
     }
     protocols
 }

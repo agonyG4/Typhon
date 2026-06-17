@@ -33,6 +33,77 @@ pub struct OutputPosition {
     pub y: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OutputRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl OutputRect {
+    pub fn new(x: f64, y: f64, width: f64, height: f64) -> Option<Self> {
+        if !x.is_finite()
+            || !y.is_finite()
+            || !width.is_finite()
+            || !height.is_finite()
+            || width <= 0.0
+            || height <= 0.0
+        {
+            return None;
+        }
+        Some(Self {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    pub fn closest_point(self, position: OutputPosition) -> OutputPosition {
+        let max_x = self.x + self.width - 1.0;
+        let max_y = self.y + self.height - 1.0;
+        OutputPosition {
+            x: position.x.clamp(self.x, max_x),
+            y: position.y.clamp(self.y, max_y),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputRegion {
+    pub rects: Vec<OutputRect>,
+}
+
+impl OutputRegion {
+    pub fn from_rect(rect: OutputRect) -> Self {
+        Self { rects: vec![rect] }
+    }
+
+    pub fn closest_point(&self, position: OutputPosition) -> OutputPosition {
+        let Some(first) = self.rects.first().copied() else {
+            return position;
+        };
+        let mut closest = first.closest_point(position);
+        let mut closest_distance = output_distance_squared(position, closest);
+        for rect in self.rects.iter().copied().skip(1) {
+            let candidate = rect.closest_point(position);
+            let distance = output_distance_squared(position, candidate);
+            if distance < closest_distance {
+                closest = candidate;
+                closest_distance = distance;
+            }
+        }
+        closest
+    }
+}
+
+fn output_distance_squared(left: OutputPosition, right: OutputPosition) -> f64 {
+    let dx = left.x - right.x;
+    let dy = left.y - right.y;
+    dx.mul_add(dx, dy * dy)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct RelativePointerMotion {
     pub dx: f64,
@@ -89,10 +160,17 @@ pub struct PointerConstraintBackendId {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PointerConstraintBackendRequest {
     ActivateLocked(PointerConstraintBackendId),
-    ActivateConfined(PointerConstraintBackendId),
+    ActivateConfined {
+        id: PointerConstraintBackendId,
+        region: OutputRegion,
+    },
+    UpdateConfinedRegion {
+        id: PointerConstraintBackendId,
+        region: OutputRegion,
+    },
     Deactivate {
         id: PointerConstraintBackendId,
         restore_position: Option<OutputPosition>,
@@ -103,11 +181,12 @@ pub enum PointerConstraintBackendRequest {
 }
 
 impl PointerConstraintBackendRequest {
-    pub const fn id(self) -> Option<PointerConstraintBackendId> {
+    pub const fn id(&self) -> Option<PointerConstraintBackendId> {
         match self {
-            Self::ActivateLocked(id) | Self::ActivateConfined(id) | Self::Deactivate { id, .. } => {
-                Some(id)
-            }
+            Self::ActivateLocked(id)
+            | Self::ActivateConfined { id, .. }
+            | Self::UpdateConfinedRegion { id, .. } => Some(*id),
+            Self::Deactivate { id, .. } => Some(*id),
             Self::ApplyCursorVisibility { .. } => None,
         }
     }

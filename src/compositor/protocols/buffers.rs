@@ -4,20 +4,22 @@ impl Dispatch<wl_shm::WlShm, ()> for CompositorState {
     fn request(
         _state: &mut Self,
         _client: &Client,
-        _resource: &wl_shm::WlShm,
+        resource: &wl_shm::WlShm,
         request: wl_shm::Request,
         _data: &(),
         _dhandle: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
         if let wl_shm::Request::CreatePool { id, fd, size } = request {
-            data_init.init(
-                id,
-                ShmPoolData {
-                    file: Arc::new(File::from(fd)),
-                    size,
-                },
-            );
+            if size <= 0 {
+                resource.post_error(
+                    wl_shm::Error::InvalidStride,
+                    "wl_shm_pool size must be positive".to_string(),
+                );
+                return;
+            }
+
+            data_init.init(id, ShmPoolData::new(Arc::new(File::from(fd)), size));
         }
     }
 }
@@ -26,7 +28,7 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for CompositorState {
     fn request(
         _state: &mut Self,
         _client: &Client,
-        _resource: &wl_shm_pool::WlShmPool,
+        resource: &wl_shm_pool::WlShmPool,
         request: wl_shm_pool::Request,
         data: &ShmPoolData,
         _dhandle: &DisplayHandle,
@@ -44,7 +46,7 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for CompositorState {
                 data_init.init(
                     id,
                     ShmBufferData {
-                        pool_size: data.size,
+                        pool_size: data.size(),
                         file: Arc::clone(&data.file),
                         offset,
                         width,
@@ -54,7 +56,15 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for CompositorState {
                     },
                 );
             }
-            wl_shm_pool::Request::Destroy | wl_shm_pool::Request::Resize { .. } => {}
+            wl_shm_pool::Request::Resize { size } => {
+                if data.grow_to(size).is_err() {
+                    resource.post_error(
+                        wl_shm::Error::InvalidFd,
+                        "shrinking wl_shm_pool is invalid".to_string(),
+                    );
+                }
+            }
+            wl_shm_pool::Request::Destroy => {}
             _ => {}
         }
     }

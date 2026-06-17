@@ -50,6 +50,18 @@ pub(crate) type EglSwapBuffersWithDamage = unsafe extern "system" fn(
 ) -> egl::Boolean;
 const MAX_CACHED_DMABUF_RESOURCES_PER_SURFACE: usize = 4;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeEglConfigCandidate {
+    pub config_id: egl::Int,
+    pub native_visual_id: u32,
+    pub surface_type: egl::Int,
+    pub renderable_type: egl::Int,
+    pub red_size: egl::Int,
+    pub green_size: egl::Int,
+    pub blue_size: egl::Int,
+    pub alpha_size: egl::Int,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GlesSceneFrameStats {
     pub scene_rebuilt: bool,
@@ -1673,23 +1685,130 @@ pub(crate) fn choose_native_egl_config(
     display: egl::Display,
     native_visual_id: u32,
 ) -> RendererResult<egl::Config> {
-    let attributes = [
-        egl::SURFACE_TYPE,
-        egl::WINDOW_BIT,
-        egl::RENDERABLE_TYPE,
-        egl::OPENGL_ES2_BIT | egl::OPENGL_ES3_BIT,
-        egl::RED_SIZE,
-        8,
-        egl::GREEN_SIZE,
-        8,
-        egl::BLUE_SIZE,
-        8,
-        egl::NATIVE_VISUAL_ID,
-        native_visual_id as egl::Int,
-        egl::NONE,
-    ];
-    egl.choose_first_config(display, &attributes)?
-        .ok_or_else(|| io::Error::other("EGL has no GLES GBM window config").into())
+    let mut configs = Vec::with_capacity(egl.get_config_count(display)?);
+    egl.get_configs(display, &mut configs)?;
+    let candidates = configs
+        .iter()
+        .copied()
+        .map(|config| native_egl_config_candidate(egl, display, config))
+        .collect::<Result<Vec<_>, _>>()?;
+    if native_egl_debug_enabled() {
+        for candidate in &candidates {
+            eprintln!("{}", native_egl_config_candidate_diagnostic(candidate));
+        }
+    }
+    let selected = select_native_egl_config_candidate(&candidates, native_visual_id)?;
+    configs
+        .get(selected)
+        .copied()
+        .ok_or_else(|| io::Error::other("selected EGL config index out of range").into())
+}
+
+#[cfg(test)]
+pub(crate) fn select_native_egl_visual_format(
+    formats: &[u32],
+    candidates: &[NativeEglConfigCandidate],
+) -> RendererResult<u32> {
+    formats
+        .iter()
+        .copied()
+        .find(|format| select_native_egl_config_candidate(candidates, *format).is_ok())
+        .ok_or_else(|| {
+            let requested = formats
+                .iter()
+                .map(|format| native_visual_label(*format))
+                .collect::<Vec<_>>()
+                .join(", ");
+            io::Error::other(format!(
+                "EGL has no GLES GBM window config for requested native visuals: {requested}"
+            ))
+            .into()
+        })
+}
+
+pub(crate) fn select_native_egl_config_candidate(
+    candidates: &[NativeEglConfigCandidate],
+    native_visual_id: u32,
+) -> RendererResult<usize> {
+    candidates
+        .iter()
+        .position(|candidate| native_egl_config_candidate_matches(candidate, native_visual_id))
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "EGL has no GLES GBM window config for native visual {}",
+                native_visual_label(native_visual_id)
+            ))
+            .into()
+        })
+}
+
+fn native_egl_config_candidate_matches(
+    candidate: &NativeEglConfigCandidate,
+    native_visual_id: u32,
+) -> bool {
+    candidate.native_visual_id == native_visual_id
+        && (candidate.surface_type & egl::WINDOW_BIT) != 0
+        && (candidate.renderable_type & (egl::OPENGL_ES2_BIT | egl::OPENGL_ES3_BIT)) != 0
+        && candidate.red_size >= 8
+        && candidate.green_size >= 8
+        && candidate.blue_size >= 8
+}
+
+fn native_egl_config_candidate(
+    egl: &EglInstance,
+    display: egl::Display,
+    config: egl::Config,
+) -> RendererResult<NativeEglConfigCandidate> {
+    Ok(NativeEglConfigCandidate {
+        config_id: egl.get_config_attrib(display, config, egl::CONFIG_ID)?,
+        native_visual_id: egl.get_config_attrib(display, config, egl::NATIVE_VISUAL_ID)? as u32,
+        surface_type: egl.get_config_attrib(display, config, egl::SURFACE_TYPE)?,
+        renderable_type: egl.get_config_attrib(display, config, egl::RENDERABLE_TYPE)?,
+        red_size: egl.get_config_attrib(display, config, egl::RED_SIZE)?,
+        green_size: egl.get_config_attrib(display, config, egl::GREEN_SIZE)?,
+        blue_size: egl.get_config_attrib(display, config, egl::BLUE_SIZE)?,
+        alpha_size: egl.get_config_attrib(display, config, egl::ALPHA_SIZE)?,
+    })
+}
+
+fn native_egl_debug_enabled() -> bool {
+    std::env::var_os("OBLIVION_ONE_DEBUG_EGL").is_some()
+}
+
+fn native_egl_config_candidate_diagnostic(candidate: &NativeEglConfigCandidate) -> String {
+    format!(
+        "native EGL config config_id={} visual={} window={} gles2={} gles3={} rgba={}/{}/{}/{} surface_type=0x{:x} renderable_type=0x{:x}",
+        candidate.config_id,
+        native_visual_label(candidate.native_visual_id),
+        (candidate.surface_type & egl::WINDOW_BIT) != 0,
+        (candidate.renderable_type & egl::OPENGL_ES2_BIT) != 0,
+        (candidate.renderable_type & egl::OPENGL_ES3_BIT) != 0,
+        candidate.red_size,
+        candidate.green_size,
+        candidate.blue_size,
+        candidate.alpha_size,
+        candidate.surface_type,
+        candidate.renderable_type,
+    )
+}
+
+pub(crate) fn native_visual_label(native_visual_id: u32) -> String {
+    format!(
+        "{}/0x{native_visual_id:08x}",
+        native_visual_fourcc(native_visual_id)
+    )
+}
+
+fn native_visual_fourcc(native_visual_id: u32) -> String {
+    let bytes = native_visual_id.to_le_bytes();
+    if bytes
+        .iter()
+        .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+    {
+        String::from_utf8_lossy(&bytes).into_owned()
+    } else {
+        "????".to_string()
+    }
 }
 
 pub(crate) fn create_gles_context(
@@ -1782,6 +1901,86 @@ mod tests {
     use oblivion_one::render_backend::buffer::{
         BufferSize, DmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
     };
+
+    const XR24: u32 = u32::from_le_bytes(*b"XR24");
+    const AR24: u32 = u32::from_le_bytes(*b"AR24");
+
+    fn native_candidate(config_id: egl::Int, native_visual_id: u32) -> NativeEglConfigCandidate {
+        NativeEglConfigCandidate {
+            config_id,
+            native_visual_id,
+            surface_type: egl::WINDOW_BIT,
+            renderable_type: egl::OPENGL_ES2_BIT,
+            red_size: 8,
+            green_size: 8,
+            blue_size: 8,
+            alpha_size: 0,
+        }
+    }
+
+    #[test]
+    fn native_egl_config_selection_prefers_requested_xrgb8888() {
+        let candidates = [
+            native_candidate(1, AR24),
+            native_candidate(2, XR24),
+            native_candidate(3, XR24),
+        ];
+
+        let selected = select_native_egl_config_candidate(&candidates, XR24).unwrap();
+
+        assert_eq!(selected, 1);
+    }
+
+    #[test]
+    fn native_egl_config_selection_ignores_wrong_visual() {
+        let candidates = [native_candidate(1, AR24)];
+
+        assert!(select_native_egl_config_candidate(&candidates, XR24).is_err());
+    }
+
+    #[test]
+    fn native_egl_config_selection_accepts_zero_alpha_for_xrgb8888() {
+        let candidates = [native_candidate(7, XR24)];
+
+        let selected = select_native_egl_config_candidate(&candidates, XR24).unwrap();
+
+        assert_eq!(selected, 0);
+    }
+
+    #[test]
+    fn native_egl_format_selection_falls_back_to_argb8888_when_xrgb8888_absent() {
+        let available_formats = [XR24, AR24];
+        let candidates = [native_candidate(9, AR24)];
+
+        let selected = select_native_egl_visual_format(&available_formats, &candidates).unwrap();
+
+        assert_eq!(selected, AR24);
+    }
+
+    #[test]
+    fn native_egl_config_selection_rejects_missing_window_bit() {
+        let mut candidate = native_candidate(1, XR24);
+        candidate.surface_type = 0;
+
+        assert!(select_native_egl_config_candidate(&[candidate], XR24).is_err());
+    }
+
+    #[test]
+    fn native_egl_config_selection_rejects_missing_gles_renderable_bit() {
+        let mut candidate = native_candidate(1, XR24);
+        candidate.renderable_type = 0;
+
+        assert!(select_native_egl_config_candidate(&[candidate], XR24).is_err());
+    }
+
+    #[test]
+    fn native_egl_config_selection_diagnostic_names_requested_fourcc_and_hex() {
+        let error = select_native_egl_config_candidate(&[], XR24).unwrap_err();
+        let diagnostic = error.to_string();
+
+        assert!(diagnostic.contains("XR24"));
+        assert!(diagnostic.contains("0x34325258"));
+    }
 
     #[test]
     fn output_damage_tracker_uses_full_damage_for_first_or_scene_frame() {

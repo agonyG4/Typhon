@@ -968,6 +968,335 @@ fn backend_reported_deactivation_does_not_queue_duplicate_release() {
 }
 
 #[test]
+fn confined_pointer_activation_queues_backend_region_for_mapped_surface() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        pointer_constraints: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 40, 30).unwrap();
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 10.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 10.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let _confine = constraints.confine_pointer(
+        &surface,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let requests = capture_pointer_constraint_backend_requests(&commands);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    let region = requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateConfined { region, .. } => Some(region),
+            _ => None,
+        })
+        .expect("expected confined backend activation request with region");
+    assert_eq!(region.rects.len(), 1);
+    let rect = region.rects[0];
+    assert_eq!(rect.x, f64::from(render::FIRST_SURFACE_OFFSET.0));
+    assert_eq!(rect.y, f64::from(render::FIRST_SURFACE_OFFSET.1));
+    assert_eq!(rect.width, 40.0);
+    assert_eq!(rect.height, 30.0);
+}
+
+#[test]
+fn confined_pointer_motion_beyond_window_border_clamps_without_leave_or_unconfined() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        pointer_constraints: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 80, 60).unwrap();
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 20.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let _confine = constraints.confine_pointer(
+        &surface,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let requests = capture_pointer_constraint_backend_requests(&commands);
+    let backend_id = requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateConfined { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("expected confined backend activation request");
+    commands
+        .send(ServerCommand::PointerConstraintBackendActivated(backend_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.confined_count, 1);
+
+    let leave_before = state.pointer_leave_count;
+    let unconfined_before = state.unconfined_count;
+    state.pointer_motion = false;
+    state.pointer_surface_x = None;
+    state.pointer_surface_y = None;
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 500.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 500.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    assert_eq!(state.pointer_leave_count, leave_before);
+    assert_eq!(state.unconfined_count, unconfined_before);
+    assert!(state.pointer_motion);
+    assert_eq!(state.pointer_surface_x, Some(79.0));
+    assert_eq!(state.pointer_surface_y, Some(59.0));
+}
+
+#[test]
+fn confined_pointer_activation_region_intersects_constraint_and_input_regions() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        pointer_constraints: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 100, 80).unwrap();
+    let input_region = compositor.create_region(&qh, ());
+    input_region.add(20, 10, 30, 20);
+    surface.set_input_region(Some(&input_region));
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 25.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 15.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let constraint_region = compositor.create_region(&qh, ());
+    constraint_region.add(10, 5, 40, 30);
+    let _confine = constraints.confine_pointer(
+        &surface,
+        &pointer,
+        Some(&constraint_region),
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let requests = capture_pointer_constraint_backend_requests(&commands);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    let region = requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateConfined { region, .. } => Some(region),
+            _ => None,
+        })
+        .expect("expected confined backend activation request with region");
+    assert_eq!(region.rects.len(), 1);
+    let rect = region.rects[0];
+    assert_eq!(rect.x, f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0);
+    assert_eq!(rect.y, f64::from(render::FIRST_SURFACE_OFFSET.1) + 10.0);
+    assert_eq!(rect.width, 30.0);
+    assert_eq!(rect.height, 20.0);
+}
+
+#[test]
+fn confined_pointer_set_region_updates_backend_only_after_surface_commit() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        pointer_constraints: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 100, 80).unwrap();
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 25.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 15.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let confine = constraints.confine_pointer(
+        &surface,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let requests = capture_pointer_constraint_backend_requests(&commands);
+    let backend_id = requests
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::ActivateConfined { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("expected confined backend activation request");
+    commands
+        .send(ServerCommand::PointerConstraintBackendActivated(backend_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let _ = capture_pointer_constraint_backend_requests(&commands);
+
+    let update_region = compositor.create_region(&qh, ());
+    update_region.add(30, 20, 10, 10);
+    confine.set_region(Some(&update_region));
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let before_commit = capture_pointer_constraint_backend_requests(&commands);
+    assert!(before_commit.is_empty(), "requests: {before_commit:?}");
+
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let after_commit = capture_pointer_constraint_backend_requests(&commands);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    let region = after_commit
+        .iter()
+        .find_map(|request| match request {
+            PointerConstraintBackendRequest::UpdateConfinedRegion { region, .. } => Some(region),
+            _ => None,
+        })
+        .expect("expected committed confined region update");
+    assert_eq!(region.rects.len(), 1);
+    let rect = region.rects[0];
+    assert_eq!(rect.x, f64::from(render::FIRST_SURFACE_OFFSET.0) + 30.0);
+    assert_eq!(rect.y, f64::from(render::FIRST_SURFACE_OFFSET.1) + 20.0);
+    assert_eq!(rect.width, 10.0);
+    assert_eq!(rect.height, 10.0);
+}
+
+#[test]
 fn locked_pointer_destroy_restores_committed_cursor_position_hint() {
     let socket_name = unique_socket_name();
     let capabilities = InputProtocolCapabilities {

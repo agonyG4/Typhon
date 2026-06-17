@@ -110,17 +110,30 @@ fn nested_winit_profile_advertises_serviced_pointer_lock_protocols() {
     assert!(names.contains(&"zwp_relative_pointer_manager_v1"));
     assert!(names.contains(&"zwp_pointer_constraints_v1"));
 
-    let native_protocols = client_protocols_for_capabilities(
-        InputProtocolCapabilities::native_base(),
+    let baseline_protocols = client_protocols_for_capabilities(
+        InputProtocolCapabilities::desktop_baseline(),
         SelectionProtocolCapabilities::core_clipboard(),
     );
-    let native_names: Vec<_> = native_protocols
+    let baseline_names: Vec<_> = baseline_protocols
         .into_iter()
         .map(ProtocolGlobal::name)
         .collect();
 
-    assert!(!native_names.contains(&"zwp_relative_pointer_manager_v1"));
-    assert!(!native_names.contains(&"zwp_pointer_constraints_v1"));
+    assert!(!baseline_names.contains(&"zwp_relative_pointer_manager_v1"));
+    assert!(!baseline_names.contains(&"zwp_pointer_constraints_v1"));
+}
+
+#[test]
+fn native_libinput_profile_advertises_serviced_pointer_lock_protocols_only() {
+    let protocols = client_protocols_for_capabilities(
+        InputProtocolCapabilities::native_libinput(),
+        SelectionProtocolCapabilities::core_clipboard(),
+    );
+    let names: Vec<_> = protocols.into_iter().map(ProtocolGlobal::name).collect();
+
+    assert!(names.contains(&"zwp_relative_pointer_manager_v1"));
+    assert!(names.contains(&"zwp_pointer_constraints_v1"));
+    assert!(!names.contains(&"zwp_idle_inhibit_manager_v1"));
 }
 
 #[test]

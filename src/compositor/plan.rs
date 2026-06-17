@@ -76,8 +76,13 @@ impl InputProtocolCapabilities {
         }
     }
 
-    pub const fn native_base() -> Self {
-        Self::desktop_baseline()
+    pub const fn native_libinput() -> Self {
+        Self {
+            relative_pointer: true,
+            pointer_constraints: true,
+            keyboard_shortcuts_inhibit: false,
+            idle_inhibit: false,
+        }
     }
 }
 

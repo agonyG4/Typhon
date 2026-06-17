@@ -99,8 +99,9 @@ use input::{
     send_pointer_frame_if_supported, wayland_event_time,
 };
 pub use input::{
-    OutputPosition, PointerConstraintBackendId, PointerConstraintBackendRequest,
-    PointerConstraintMode, PointerConstraintState, PointerMotionSample, RelativePointerMotion,
+    OutputPosition, OutputRect, OutputRegion, PointerConstraintBackendId,
+    PointerConstraintBackendRequest, PointerConstraintMode, PointerConstraintState,
+    PointerMotionSample, RelativePointerMotion,
 };
 use interaction::{
     PendingResizeCommit, PendingResizeConfigure, PointerPress, PointerTarget, ResizeEdges,
@@ -229,6 +230,7 @@ pub struct CompositorState {
     next_internal_pointer_constraint_id: u64,
     next_pointer_constraint_generation: u64,
     active_locked_pointer_routing: Option<ActiveLockedPointerRouting>,
+    active_confined_pointer_routing: Option<ActiveConfinedPointerRouting>,
     relative_motion_debug: RelativeMotionDebugState,
     active_backend_constraint: Option<PointerConstraintBackendId>,
     pending_backend_constraint: Option<PointerConstraintBackendId>,
@@ -295,6 +297,15 @@ struct ActiveLockedPointerRouting {
     surface_y: f64,
 }
 
+#[derive(Debug, Clone)]
+struct ActiveConfinedPointerRouting {
+    constraint_id: u64,
+    generation: u64,
+    pointer: wl_pointer::WlPointer,
+    surface: wl_surface::WlSurface,
+    region: OutputRegion,
+}
+
 #[derive(Debug, Default)]
 struct RelativeMotionDebugState {
     pending_drop_reason: Option<String>,
@@ -349,19 +360,39 @@ impl PointerConstraint {
         }
     }
 
-    fn activation_request(&self) -> PointerConstraintBackendRequest {
+    fn activation_request(
+        &self,
+        confinement_region: Option<OutputRegion>,
+    ) -> Option<PointerConstraintBackendRequest> {
         let id = self.backend_id();
-        match self.mode {
+        Some(match self.mode {
             PointerConstraintMode::Locked => PointerConstraintBackendRequest::ActivateLocked(id),
-            PointerConstraintMode::Confined => {
-                PointerConstraintBackendRequest::ActivateConfined(id)
-            }
+            PointerConstraintMode::Confined => PointerConstraintBackendRequest::ActivateConfined {
+                id,
+                region: confinement_region?,
+            },
             PointerConstraintMode::None => PointerConstraintBackendRequest::Deactivate {
                 id,
                 restore_position: None,
             },
-        }
+        })
     }
+}
+
+fn coalesce_output_row_rects(rects: Vec<OutputRect>) -> Vec<OutputRect> {
+    let mut coalesced: Vec<OutputRect> = Vec::new();
+    for rect in rects {
+        if let Some(last) = coalesced.last_mut()
+            && last.x == rect.x
+            && last.width == rect.width
+            && (last.y + last.height) == rect.y
+        {
+            last.height += rect.height;
+            continue;
+        }
+        coalesced.push(rect);
+    }
+    coalesced
 }
 
 #[derive(Debug, Clone)]
@@ -544,6 +575,7 @@ impl CompositorState {
     fn advance_render_generation(&mut self, cause: RenderGenerationCause) -> u64 {
         let generation = self.next_render_generation_value();
         self.set_render_generation(generation, cause);
+        self.update_all_active_confined_pointer_regions(cause.as_str());
         generation
     }
 
@@ -1416,6 +1448,10 @@ impl CompositorState {
     }
 
     fn send_pointer_motion(&mut self, x: f64, y: f64) {
+        if self.active_confined_pointer_binding().is_some() {
+            self.send_confined_pointer_motion(x, y);
+            return;
+        }
         self.last_pointer_x = x;
         self.last_pointer_y = y;
         let Some(target) = self.pointer_target_at(x, y) else {
@@ -1547,6 +1583,87 @@ impl CompositorState {
             .map(|active| active.surface)
     }
 
+    fn active_confined_pointer_binding(&self) -> Option<ActiveConfinedPointerRouting> {
+        let active = self.active_confined_pointer_routing.as_ref()?;
+        let constraint = self.pointer_constraints.get(&active.constraint_id)?;
+        if constraint.generation != active.generation
+            || !constraint.active
+            || constraint.defunct
+            || constraint.mode != PointerConstraintMode::Confined
+        {
+            return None;
+        }
+        if !active.pointer.is_alive() || !active.surface.is_alive() {
+            return None;
+        }
+        Some(active.clone())
+    }
+
+    fn clear_active_confined_pointer_routing(&mut self) {
+        self.active_confined_pointer_routing = None;
+    }
+
+    fn pin_confined_pointer_focus(&mut self, active: &ActiveConfinedPointerRouting) {
+        if !self
+            .pointer_surface
+            .as_ref()
+            .is_some_and(|current| same_surface_resource(current, &active.surface))
+        {
+            self.pointer_surface = Some(active.surface.clone());
+        }
+        if !self.pointer_resource_entered_surface(&active.pointer, &active.surface) {
+            let target = self
+                .pointer_target_for_surface_at_output(
+                    &active.surface,
+                    self.last_pointer_x,
+                    self.last_pointer_y,
+                )
+                .unwrap_or(PointerTarget {
+                    surface: active.surface.clone(),
+                    surface_x: 0.0,
+                    surface_y: 0.0,
+                });
+            self.send_pointer_enter_to_resource(&active.pointer, &target);
+        }
+    }
+
+    fn send_confined_pointer_motion(&mut self, x: f64, y: f64) {
+        let Some(active) = self.active_confined_pointer_binding() else {
+            return;
+        };
+        let proposed = OutputPosition { x, y };
+        let clamped = active.region.closest_point(proposed);
+        self.last_pointer_x = clamped.x;
+        self.last_pointer_y = clamped.y;
+        self.pin_confined_pointer_focus(&active);
+        let Some(target) =
+            self.pointer_target_for_surface_at_output(&active.surface, clamped.x, clamped.y)
+        else {
+            pointer_debug_log(format!(
+                "confined motion dropped id={} reason=local_unresolved proposed=({},{}) clamped=({},{})",
+                active.constraint_id, x, y, clamped.x, clamped.y
+            ));
+            return;
+        };
+        pointer_debug_log(format!(
+            "confined motion proposed=({},{}) clamped=({},{}) surface_local=({},{})",
+            x, y, clamped.x, clamped.y, target.surface_x, target.surface_y
+        ));
+        let time = wayland_event_time();
+        for pointer in self
+            .pointer_resources
+            .iter()
+            .filter(|pointer| resource_belongs_to_surface_client(*pointer, &active.surface))
+        {
+            let _ = pointer.send_event(wl_pointer::Event::Motion {
+                time,
+                surface_x: target.surface_x,
+                surface_y: target.surface_y,
+            });
+            send_pointer_frame_if_supported(pointer);
+        }
+    }
+
     fn register_pointer_constraint(&mut self, registration: PointerConstraintRegistration) -> bool {
         if let Some(existing) = self.pointer_constraints.values().find(|constraint| {
             !constraint.defunct && same_surface_resource(&constraint.surface, &registration.surface)
@@ -1629,12 +1746,20 @@ impl CompositorState {
             ));
             return;
         }
+        let confinement_region = self.pointer_constraint_output_region(constraint_id);
         let Some(constraint) = self.pointer_constraints.get_mut(&constraint_id) else {
             return;
         };
         if constraint.active || constraint.backend_pending || constraint.defunct {
             return;
         }
+        let Some(request) = constraint.activation_request(confinement_region) else {
+            pointer_debug_log(format!(
+                "constraint activation skipped id={} reason=region_unresolved mode={:?}",
+                constraint.id, constraint.mode
+            ));
+            return;
+        };
         let backend_id = constraint.backend_id();
         self.pending_backend_constraint = Some(backend_id);
         constraint.backend_pending = true;
@@ -1643,7 +1768,84 @@ impl CompositorState {
             backend_id.constraint_id, backend_id.generation
         ));
         self.pending_pointer_constraint_backend_requests
-            .push(constraint.activation_request());
+            .push(request);
+    }
+
+    fn pointer_constraint_output_region(&mut self, constraint_id: u64) -> Option<OutputRegion> {
+        let (surface_id, constraint_region, surface_resource) = self
+            .pointer_constraints
+            .get(&constraint_id)
+            .map(|constraint| {
+                (
+                    compositor_surface_id(&constraint.surface),
+                    constraint.committed_region.clone(),
+                    constraint.surface.clone(),
+                )
+            })?;
+        self.refresh_surface_origin_cache();
+        let index = self
+            .renderable_surfaces
+            .iter()
+            .position(|renderable| renderable.surface_id == surface_id)?;
+        let renderable = &self.renderable_surfaces[index];
+        let origin = self.surface_origin_cache.get(index).copied()?;
+        let input_region = surface_resource
+            .data::<SurfaceData>()
+            .map(|data| {
+                let mut rows = Vec::new();
+                for y in 0..renderable.height {
+                    let mut run_start = None;
+                    for x in 0..renderable.width {
+                        let surface_x = f64::from(x);
+                        let surface_y = f64::from(y);
+                        let contained = constraint_region.contains(
+                            surface_x,
+                            surface_y,
+                            renderable.width,
+                            renderable.height,
+                        ) && data.input_region_contains(
+                            surface_x,
+                            surface_y,
+                            renderable.width,
+                            renderable.height,
+                        );
+                        match (run_start, contained) {
+                            (None, true) => run_start = Some(x),
+                            (Some(start), false) => {
+                                if let Some(rect) = OutputRect::new(
+                                    f64::from(origin.0 + start as i32),
+                                    f64::from(origin.1 + y as i32),
+                                    f64::from(x - start),
+                                    1.0,
+                                ) {
+                                    rows.push(rect);
+                                }
+                                run_start = None;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(start) = run_start
+                        && let Some(rect) = OutputRect::new(
+                            f64::from(origin.0 + start as i32),
+                            f64::from(origin.1 + y as i32),
+                            f64::from(renderable.width - start),
+                            1.0,
+                        )
+                    {
+                        rows.push(rect);
+                    }
+                }
+                rows
+            })
+            .unwrap_or_default();
+        if input_region.is_empty() {
+            None
+        } else {
+            Some(OutputRegion {
+                rects: coalesce_output_row_rects(input_region),
+            })
+        }
     }
 
     fn pointer_constraint_backend_activated(&mut self, id: PointerConstraintBackendId) {
@@ -1721,6 +1923,39 @@ impl CompositorState {
                 surface,
                 surface_x,
                 surface_y,
+            });
+        } else if mode == PointerConstraintMode::Confined
+            && let Some(region) = self.pointer_constraint_output_region(constraint_id)
+        {
+            let clamped = region.closest_point(OutputPosition {
+                x: self.last_pointer_x,
+                y: self.last_pointer_y,
+            });
+            self.last_pointer_x = clamped.x;
+            self.last_pointer_y = clamped.y;
+            let target = self
+                .pointer_target_for_surface_at_output(&surface, clamped.x, clamped.y)
+                .unwrap_or(PointerTarget {
+                    surface: surface.clone(),
+                    surface_x: 0.0,
+                    surface_y: 0.0,
+                });
+            self.ensure_pointer_focus(&surface);
+            if !self.pointer_resource_entered_surface(&pointer, &surface) {
+                self.send_pointer_enter_to_resource(&pointer, &target);
+            }
+            pointer_debug_log(format!(
+                "confined route activate id={} surface={} region={:?}",
+                constraint_id,
+                compositor_surface_id(&surface),
+                region.rects
+            ));
+            self.active_confined_pointer_routing = Some(ActiveConfinedPointerRouting {
+                constraint_id,
+                generation,
+                pointer,
+                surface,
+                region,
             });
         }
         match mode {
@@ -1833,13 +2068,21 @@ impl CompositorState {
                 self.refresh_pointer_focus_at_last_position();
             }
             restore_position
+        } else if self
+            .active_confined_pointer_routing
+            .as_ref()
+            .is_some_and(|active| active.constraint_id == constraint_id)
+        {
+            pointer_debug_log(format!(
+                "confined route deactivate id={} reason=constraint_deactivate",
+                constraint_id
+            ));
+            self.clear_active_confined_pointer_routing();
+            self.refresh_pointer_focus_at_last_position();
+            None
         } else {
             None
         };
-        if self.cursor_visibility.lock_hidden_constraint_id == Some(constraint_id) {
-            self.cursor_visibility.lock_hidden_constraint_id = None;
-            self.sync_cursor_visibility_request();
-        }
         if was_active {
             self.clear_pointer_constraint();
             if queue_backend_deactivate {
@@ -1874,6 +2117,10 @@ impl CompositorState {
                 "constraint pending activation canceled id={} generation={}",
                 backend_id.constraint_id, backend_id.generation
             ));
+        }
+        if self.cursor_visibility.lock_hidden_constraint_id == Some(constraint_id) {
+            self.cursor_visibility.lock_hidden_constraint_id = None;
+            self.sync_cursor_visibility_request();
         }
     }
 
@@ -1971,8 +2218,56 @@ impl CompositorState {
                 constraint.committed_region = constraint.pending_region.clone();
                 constraint.committed_cursor_position_hint = constraint.pending_cursor_position_hint;
             }
+            self.update_active_confined_pointer_region(id, "commit");
             self.maybe_request_pointer_constraint_activation(id);
         }
+    }
+
+    fn update_active_confined_pointer_region(&mut self, constraint_id: u64, reason: &'static str) {
+        let Some(active) = self.active_confined_pointer_binding() else {
+            return;
+        };
+        if active.constraint_id != constraint_id {
+            return;
+        }
+        let Some(region) = self.pointer_constraint_output_region(constraint_id) else {
+            return;
+        };
+        if region == active.region {
+            return;
+        }
+        pointer_debug_log(format!(
+            "confined route update id={} old={:?} new={:?} reason={}",
+            constraint_id, active.region.rects, region.rects, reason
+        ));
+        let id = PointerConstraintBackendId {
+            constraint_id,
+            generation: active.generation,
+        };
+        self.pending_pointer_constraint_backend_requests.push(
+            PointerConstraintBackendRequest::UpdateConfinedRegion {
+                id,
+                region: region.clone(),
+            },
+        );
+        self.active_confined_pointer_routing = Some(ActiveConfinedPointerRouting {
+            region: region.clone(),
+            ..active
+        });
+        let position = OutputPosition {
+            x: self.last_pointer_x,
+            y: self.last_pointer_y,
+        };
+        if region.closest_point(position) != position {
+            self.send_confined_pointer_motion(position.x, position.y);
+        }
+    }
+
+    fn update_all_active_confined_pointer_regions(&mut self, reason: &'static str) {
+        let Some(active) = self.active_confined_pointer_binding() else {
+            return;
+        };
+        self.update_active_confined_pointer_region(active.constraint_id, reason);
     }
 
     fn take_pointer_constraint_backend_requests(&mut self) -> Vec<PointerConstraintBackendRequest> {
@@ -4780,6 +5075,29 @@ impl CompositorState {
         }
     }
 
+    fn pointer_target_for_surface_at_output(
+        &mut self,
+        surface: &wl_surface::WlSurface,
+        x: f64,
+        y: f64,
+    ) -> Option<PointerTarget> {
+        let surface_id = compositor_surface_id(surface);
+        self.refresh_surface_origin_cache();
+        let index = self
+            .renderable_surfaces
+            .iter()
+            .position(|renderable| renderable.surface_id == surface_id)?;
+        let renderable = &self.renderable_surfaces[index];
+        let origin = self.surface_origin_cache.get(index).copied()?;
+        let (surface_x, surface_y) =
+            render::surface_local_point_at_origin(renderable, origin, x, y)?;
+        Some(PointerTarget {
+            surface: surface.clone(),
+            surface_x,
+            surface_y,
+        })
+    }
+
     fn surface_accepts_input_at(
         &self,
         surface: &RenderableSurface,
@@ -4876,6 +5194,12 @@ impl CompositorState {
     }
 
     fn ensure_pointer_focus(&mut self, surface: &wl_surface::WlSurface) {
+        if let Some(active) = self.active_confined_pointer_binding()
+            && !same_surface_resource(&active.surface, surface)
+        {
+            self.pin_confined_pointer_focus(&active);
+            return;
+        }
         if self
             .pointer_surface
             .as_ref()
@@ -5025,7 +5349,20 @@ impl CompositorState {
     }
 
     fn clear_pointer_focus(&mut self) {
+        if let Some(active) = self.active_confined_pointer_binding() {
+            pointer_debug_log(format!(
+                "pointer focus clear suppressed by confined route id={} surface={}",
+                active.constraint_id,
+                compositor_surface_id(&active.surface)
+            ));
+            self.pin_confined_pointer_focus(&active);
+            return;
+        }
         if let Some(surface_id) = self.pointer_surface.as_ref().map(compositor_surface_id) {
+            pointer_debug_log(format!(
+                "pointer focus loss deactivating constraints surface={}",
+                surface_id
+            ));
             self.deactivate_pointer_constraints_for_surface_focus_loss(surface_id, true);
         }
         self.cursor_visibility.client_hidden_pointer = None;

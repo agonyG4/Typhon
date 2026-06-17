@@ -21,14 +21,17 @@ use crate::egl_renderer::{EglInstance, EglSwapBuffersWithDamage};
 use crate::egl_renderer::{
     EglSceneDrawRequest, GlEglImageTargetTexture2DOes, GlesSceneFrameStats, GlesSceneRenderer,
     choose_egl_config, choose_native_egl_config, create_gles_context, egl_swap_buffers_with_damage,
-    load_egl_image_target_texture_2d, load_swap_buffers_with_damage,
+    load_egl_image_target_texture_2d, load_swap_buffers_with_damage, native_visual_label,
 };
 use gbm::AsRaw as GbmAsRaw;
 use khronos_egl as egl;
+#[cfg(test)]
+use oblivion_one::compositor::OutputRect;
 use oblivion_one::compositor::{
     DesktopComposeRequest, DesktopFrameCopyKind, DesktopSceneRebuildKind, DesktopSceneRenderer,
-    DesktopVisualState, OutputPosition as CompositorOutputPosition, OwnCompositorServer,
-    PointerMotionSample as CompositorPointerMotionSample,
+    DesktopVisualState, OutputPosition as CompositorOutputPosition, OutputRegion,
+    OwnCompositorServer, PointerConstraintBackendId, PointerConstraintBackendRequest,
+    PointerConstraintMode, PointerMotionSample as CompositorPointerMotionSample,
     RelativePointerMotion as CompositorRelativePointerMotion, RenderGenerationCause,
     RenderSceneElement, RenderSceneElementId, RenderableSurface, ShellDockItem,
     ShellOverlayRenderer, ShellOverlayState, ShellTopbarModel, SpotlightModel,
@@ -754,8 +757,9 @@ pub fn run(
     server.set_output_size(target.width, target.height);
     server.set_output_refresh_hz(frame_pacing.refresh_hz);
     let original_crtc = drm_ffi::mode::get_crtc(kms.file().as_fd(), target.crtc_id).ok();
+    let scanout_preference = NativeScanoutPreference::from_env();
     let scanout_plan = NativeScanoutPlan::choose(NativeScanoutChoice {
-        preference: NativeScanoutPreference::from_env(),
+        preference: scanout_preference,
         gbm_available: session_probe.plan.dependencies.gbm_available,
         egl_available: session_probe.plan.dependencies.egl_available,
         page_flip_available: true,
@@ -846,7 +850,11 @@ pub fn run(
         &initial_damage,
     ) {
         Ok(paint) => paint,
-        Err(error) if scanout.kind() == NativeScanoutKind::NativeEglGbm => {
+        Err(error)
+            if scanout.kind() == NativeScanoutKind::NativeEglGbm
+                && scanout_preference != NativeScanoutPreference::NativeEglGbm
+                && app_gpu_preference != CompositorAppGpuPreference::Accelerated =>
+        {
             let fallback_plan = scanout_plan.after_failed(scanout.kind());
             if fallback_plan.primary == NativeScanoutKind::Unavailable {
                 return Err(error.into());
@@ -1015,6 +1023,7 @@ pub fn run(
     let mut known_toplevels = server.xdg_toplevels();
     let mut pending_launches = VecDeque::<NativeAppLaunchPerf>::new();
     let mut resize_perf = NativeResizePerfState::default();
+    let mut pointer_constraint_backend = NativePointerConstraintBackend::new();
     if let Some(command) = startup_app
         && let Some(launch) = launch_native_shell_command(
             &server,
@@ -1080,6 +1089,13 @@ pub fn run(
         } else {
             elapsed_micros(tick_start)
         };
+        let mut redraw_requested = process_native_pointer_constraint_backend_requests(
+            &mut server,
+            &mut pointer_constraint_backend,
+            &mut input_state,
+            &mut hardware_cursor,
+            cursor_render_mode,
+        )?;
         let current_toplevels = server.xdg_toplevels();
         if current_toplevels > known_toplevels {
             for _ in known_toplevels..current_toplevels {
@@ -1115,7 +1131,6 @@ pub fn run(
                 server.accepted_clients()
             );
         }
-        let mut redraw_requested = false;
         let mut input_events = false;
         let mut skipped_input_repaints = 0usize;
         let input_drain_start = Instant::now();
@@ -1168,6 +1183,13 @@ pub fn run(
             }
             redraw_requested |= application.redraw_requested;
         }
+        redraw_requested |= process_native_pointer_constraint_backend_requests(
+            &mut server,
+            &mut pointer_constraint_backend,
+            &mut input_state,
+            &mut hardware_cursor,
+            cursor_render_mode,
+        )?;
         if !scanout.page_flip_pending() && server.has_pending_frame_prepare_work() {
             let prepare_frame_start = Instant::now();
             let before_generation = server.render_generation();
@@ -1551,6 +1573,199 @@ impl NativeCursorPreference {
             Self::Hardware => "hardware",
             Self::Software => "software",
         }
+    }
+}
+
+#[derive(Debug)]
+struct NativePointerConstraintBackend {
+    active: Option<NativePointerConstraint>,
+    cursor_visible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct NativePointerConstraint {
+    id: PointerConstraintBackendId,
+    mode: PointerConstraintMode,
+    anchor: CompositorOutputPosition,
+    region: Option<OutputRegion>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct NativePointerConstraintBackendAction {
+    activated: Option<NativePointerConstraint>,
+    deactivated: Option<PointerConstraintBackendId>,
+    failed: Option<(PointerConstraintBackendId, &'static str)>,
+    restore_position: Option<CompositorOutputPosition>,
+    cursor_position: Option<CompositorOutputPosition>,
+    cursor_visibility_changed: Option<bool>,
+}
+
+impl NativePointerConstraintBackend {
+    fn new() -> Self {
+        Self {
+            active: None,
+            cursor_visible: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn active_locked(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|constraint| constraint.mode == PointerConstraintMode::Locked)
+    }
+
+    fn active_constraint_state(&self) -> NativePointerConstraintState {
+        match self.active.as_ref() {
+            Some(NativePointerConstraint {
+                mode: PointerConstraintMode::Locked,
+                anchor,
+                ..
+            }) => NativePointerConstraintState::Locked { anchor: *anchor },
+            Some(NativePointerConstraint {
+                mode: PointerConstraintMode::Confined,
+                region: Some(region),
+                ..
+            }) => NativePointerConstraintState::Confined {
+                region: region.clone(),
+            },
+            _ => NativePointerConstraintState::None,
+        }
+    }
+
+    fn handle_request(
+        &mut self,
+        request: PointerConstraintBackendRequest,
+        cursor_position: CompositorOutputPosition,
+    ) -> NativePointerConstraintBackendAction {
+        match request {
+            PointerConstraintBackendRequest::ActivateLocked(id) => {
+                self.activate_locked(id, cursor_position)
+            }
+            PointerConstraintBackendRequest::ActivateConfined { id, region } => {
+                self.activate_confined(id, cursor_position, region)
+            }
+            PointerConstraintBackendRequest::UpdateConfinedRegion { id, region } => {
+                self.update_confined_region(id, cursor_position, region)
+            }
+            PointerConstraintBackendRequest::Deactivate {
+                id,
+                restore_position,
+            } => self.deactivate(id, restore_position),
+            PointerConstraintBackendRequest::ApplyCursorVisibility { visible } => {
+                if self.cursor_visible == visible {
+                    NativePointerConstraintBackendAction::default()
+                } else {
+                    self.cursor_visible = visible;
+                    NativePointerConstraintBackendAction {
+                        cursor_visibility_changed: Some(visible),
+                        ..NativePointerConstraintBackendAction::default()
+                    }
+                }
+            }
+        }
+    }
+
+    fn activate_locked(
+        &mut self,
+        id: PointerConstraintBackendId,
+        anchor: CompositorOutputPosition,
+    ) -> NativePointerConstraintBackendAction {
+        if let Some(active) = self.active.as_ref() {
+            if active.id == id {
+                return NativePointerConstraintBackendAction::default();
+            }
+            return NativePointerConstraintBackendAction {
+                failed: Some((id, "native pointer constraint already active")),
+                ..NativePointerConstraintBackendAction::default()
+            };
+        }
+        let constraint = NativePointerConstraint {
+            id,
+            mode: PointerConstraintMode::Locked,
+            anchor,
+            region: None,
+        };
+        self.active = Some(constraint.clone());
+        NativePointerConstraintBackendAction {
+            activated: Some(constraint),
+            ..NativePointerConstraintBackendAction::default()
+        }
+    }
+
+    fn activate_confined(
+        &mut self,
+        id: PointerConstraintBackendId,
+        anchor: CompositorOutputPosition,
+        region: OutputRegion,
+    ) -> NativePointerConstraintBackendAction {
+        if let Some(active) = self.active.as_ref() {
+            if active.id == id {
+                return NativePointerConstraintBackendAction::default();
+            }
+            return NativePointerConstraintBackendAction {
+                failed: Some((id, "native pointer constraint already active")),
+                ..NativePointerConstraintBackendAction::default()
+            };
+        }
+        let constraint = NativePointerConstraint {
+            id,
+            mode: PointerConstraintMode::Confined,
+            anchor,
+            region: Some(region),
+        };
+        self.active = Some(constraint.clone());
+        NativePointerConstraintBackendAction {
+            activated: Some(constraint),
+            ..NativePointerConstraintBackendAction::default()
+        }
+    }
+
+    fn deactivate(
+        &mut self,
+        id: PointerConstraintBackendId,
+        restore_position: Option<CompositorOutputPosition>,
+    ) -> NativePointerConstraintBackendAction {
+        let Some(active) = self.active.as_ref().cloned() else {
+            return NativePointerConstraintBackendAction::default();
+        };
+        if active.id != id {
+            return NativePointerConstraintBackendAction::default();
+        }
+        self.active = None;
+        let restore_position = (active.mode == PointerConstraintMode::Locked)
+            .then(|| restore_position.unwrap_or(active.anchor));
+        NativePointerConstraintBackendAction {
+            deactivated: Some(id),
+            restore_position,
+            ..NativePointerConstraintBackendAction::default()
+        }
+    }
+
+    fn update_confined_region(
+        &mut self,
+        id: PointerConstraintBackendId,
+        cursor_position: CompositorOutputPosition,
+        region: OutputRegion,
+    ) -> NativePointerConstraintBackendAction {
+        let Some(active) = self.active.as_mut() else {
+            return NativePointerConstraintBackendAction::default();
+        };
+        if active.id != id || active.mode != PointerConstraintMode::Confined {
+            return NativePointerConstraintBackendAction::default();
+        }
+        active.region = Some(region.clone());
+        let constrained = region.closest_point(cursor_position);
+        NativePointerConstraintBackendAction {
+            cursor_position: (constrained != cursor_position).then_some(constrained),
+            ..NativePointerConstraintBackendAction::default()
+        }
+    }
+}
+
+impl Default for NativePointerConstraintBackend {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1946,6 +2161,31 @@ struct NativeInputEffect {
     launch_command: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
+enum NativePointerConstraintState {
+    #[default]
+    None,
+    Locked {
+        anchor: CompositorOutputPosition,
+    },
+    Confined {
+        region: OutputRegion,
+    },
+}
+
+impl NativePointerConstraintState {
+    const fn locked(&self) -> bool {
+        matches!(self, Self::Locked { .. })
+    }
+
+    fn constrain_position(&self, position: CompositorOutputPosition) -> CompositorOutputPosition {
+        match self {
+            Self::None | Self::Locked { .. } => position,
+            Self::Confined { region } => region.closest_point(position),
+        }
+    }
+}
+
 impl NativeInputEffect {
     fn request_redraw(&mut self) {
         self.redraw_requested = true;
@@ -1983,6 +2223,8 @@ struct NativeInputState {
     shift_pressed: bool,
     window_interaction_active: bool,
     keyboard_shortcuts_inhibited: bool,
+    pointer_constraint: NativePointerConstraintState,
+    cursor_visible: bool,
     forwarded_control_keys: Vec<u16>,
     suppressed_window_shortcut_keys: Vec<u16>,
     spotlight: SpotlightModel,
@@ -2002,6 +2244,8 @@ impl NativeInputState {
             shift_pressed: false,
             window_interaction_active: false,
             keyboard_shortcuts_inhibited: false,
+            pointer_constraint: NativePointerConstraintState::None,
+            cursor_visible: true,
             forwarded_control_keys: Vec::new(),
             suppressed_window_shortcut_keys: Vec::new(),
             spotlight: SpotlightModel::default(),
@@ -2035,13 +2279,60 @@ impl NativeInputState {
         (self.cursor_x.round() as i32, self.cursor_y.round() as i32)
     }
 
+    fn set_pointer_locked(&mut self, locked: bool) {
+        self.pointer_constraint = if locked {
+            NativePointerConstraintState::Locked {
+                anchor: CompositorOutputPosition {
+                    x: self.cursor_x,
+                    y: self.cursor_y,
+                },
+            }
+        } else {
+            NativePointerConstraintState::None
+        };
+    }
+
+    fn set_pointer_confined(&mut self, region: OutputRegion) {
+        self.pointer_constraint = NativePointerConstraintState::Confined { region };
+        let position = self
+            .pointer_constraint
+            .constrain_position(CompositorOutputPosition {
+                x: self.cursor_x,
+                y: self.cursor_y,
+            });
+        self.cursor_x = position.x;
+        self.cursor_y = position.y;
+    }
+
+    fn clear_pointer_constraint(&mut self) {
+        self.pointer_constraint = NativePointerConstraintState::None;
+    }
+
+    fn set_cursor_visible(&mut self, visible: bool) -> bool {
+        if self.cursor_visible == visible {
+            return false;
+        }
+        self.cursor_visible = visible;
+        true
+    }
+
+    fn restore_cursor_position(&mut self, position: CompositorOutputPosition) -> NativeInputEffect {
+        self.cursor_x = position.x.clamp(0.0, f64::from(self.output_width - 1));
+        self.cursor_y = position.y.clamp(0.0, f64::from(self.output_height - 1));
+        let mut effect = NativeInputEffect::default();
+        effect.mark_cursor_moved(self.cursor_x, self.cursor_y);
+        effect
+    }
+
     fn desktop_visual_state(&self, cursor_mode: NativeCursorRenderMode) -> DesktopVisualState {
         match cursor_mode {
-            NativeCursorRenderMode::Software => {
+            NativeCursorRenderMode::Software if self.cursor_visible => {
                 let (x, y) = self.cursor_position();
                 DesktopVisualState::with_cursor(x, y)
             }
-            NativeCursorRenderMode::Hardware => DesktopVisualState::wallpaper_only(),
+            NativeCursorRenderMode::Software | NativeCursorRenderMode::Hardware => {
+                DesktopVisualState::wallpaper_only()
+            }
         }
     }
 
@@ -2272,16 +2563,28 @@ impl NativeInputState {
         };
         if let Some(relative) = sample.relative {
             effect.relative_motion = (!relative.is_zero()).then_some(relative);
-            self.cursor_x =
-                (self.cursor_x + relative.dx).clamp(0.0, f64::from(self.output_width - 1));
-            self.cursor_y =
-                (self.cursor_y + relative.dy).clamp(0.0, f64::from(self.output_height - 1));
+            if !self.pointer_constraint.locked() {
+                let proposed = CompositorOutputPosition {
+                    x: (self.cursor_x + relative.dx).clamp(0.0, f64::from(self.output_width - 1)),
+                    y: (self.cursor_y + relative.dy).clamp(0.0, f64::from(self.output_height - 1)),
+                };
+                let constrained = self.pointer_constraint.constrain_position(proposed);
+                self.cursor_x = constrained.x;
+                self.cursor_y = constrained.y;
+            }
         }
-        if let Some((x, y)) = sample.absolute {
-            self.cursor_x = x.clamp(0.0, f64::from(self.output_width - 1));
-            self.cursor_y = y.clamp(0.0, f64::from(self.output_height - 1));
+        if let Some((x, y)) = sample.absolute
+            && !self.pointer_constraint.locked()
+        {
+            let proposed = CompositorOutputPosition {
+                x: x.clamp(0.0, f64::from(self.output_width - 1)),
+                y: y.clamp(0.0, f64::from(self.output_height - 1)),
+            };
+            let constrained = self.pointer_constraint.constrain_position(proposed);
+            self.cursor_x = constrained.x;
+            self.cursor_y = constrained.y;
         }
-        if !self.spotlight_visible() {
+        if !self.pointer_constraint.locked() && !self.spotlight_visible() {
             if self.window_interaction_active {
                 effect
                     .window_actions
@@ -2294,7 +2597,9 @@ impl NativeInputState {
                 effect.pointer_motion = Some((self.cursor_x, self.cursor_y));
             }
         }
-        effect.mark_cursor_moved(self.cursor_x, self.cursor_y);
+        if !self.pointer_constraint.locked() {
+            effect.mark_cursor_moved(self.cursor_x, self.cursor_y);
+        }
         effect
     }
 
@@ -3651,6 +3956,87 @@ fn apply_native_input_effect(
     Ok(application)
 }
 
+fn process_native_pointer_constraint_backend_requests(
+    server: &mut OwnCompositorServer,
+    backend: &mut NativePointerConstraintBackend,
+    input_state: &mut NativeInputState,
+    hardware_cursor: &mut Option<NativeHardwareCursor>,
+    cursor_mode: NativeCursorRenderMode,
+) -> NativeResult<bool> {
+    let mut redraw_requested = false;
+    loop {
+        let requests = server.take_pointer_constraint_backend_requests();
+        if requests.is_empty() {
+            break;
+        }
+        for request in requests {
+            let (cursor_x, cursor_y) = input_state.cursor_position();
+            let action = backend.handle_request(
+                request,
+                CompositorOutputPosition {
+                    x: f64::from(cursor_x),
+                    y: f64::from(cursor_y),
+                },
+            );
+            if let Some((id, reason)) = action.failed {
+                server.pointer_constraint_backend_failed(id, reason);
+            }
+            if let Some(constraint) = action.activated {
+                match constraint.mode {
+                    PointerConstraintMode::Locked => input_state.set_pointer_locked(true),
+                    PointerConstraintMode::Confined => {
+                        if let Some(region) = constraint.region {
+                            input_state.set_pointer_confined(region);
+                        }
+                    }
+                    PointerConstraintMode::None => input_state.clear_pointer_constraint(),
+                }
+                server.pointer_constraint_backend_activated(constraint.id);
+            }
+            if let Some(restore_position) = action.restore_position {
+                input_state.clear_pointer_constraint();
+                let effect = input_state.restore_cursor_position(restore_position);
+                redraw_requested |= effect.requires_frame_repaint(cursor_mode);
+                if let Some((cursor_x, cursor_y)) = effect.cursor_position
+                    && let Some(cursor) = hardware_cursor.as_mut()
+                {
+                    cursor.move_to(cursor_x, cursor_y)?;
+                }
+            }
+            if let Some(cursor_position) = action.cursor_position {
+                let effect = input_state.restore_cursor_position(cursor_position);
+                redraw_requested |= effect.requires_frame_repaint(cursor_mode);
+                if let Some((cursor_x, cursor_y)) = effect.cursor_position
+                    && let Some(cursor) = hardware_cursor.as_mut()
+                {
+                    cursor.move_to(cursor_x, cursor_y)?;
+                }
+            }
+            if let Some(id) = action.deactivated {
+                server.pointer_constraint_backend_deactivated(id);
+            }
+            if let Some(visible) = action.cursor_visibility_changed {
+                let changed = input_state.set_cursor_visible(visible);
+                if cursor_mode == NativeCursorRenderMode::Software && changed {
+                    redraw_requested = true;
+                }
+                if let Some(cursor) = hardware_cursor.as_mut() {
+                    if visible {
+                        let (cursor_x, cursor_y) = input_state.cursor_position();
+                        cursor
+                            .enable()
+                            .and_then(|()| cursor.move_to(cursor_x, cursor_y))?;
+                    } else {
+                        cursor.disable()?;
+                    }
+                }
+            }
+        }
+    }
+    input_state.pointer_constraint = backend.active_constraint_state();
+    Ok(redraw_requested)
+}
+
 #[derive(Debug)]
 struct NativeInputApplication {
     redraw_requested: bool,
@@ -3986,6 +4372,7 @@ impl NativeScanoutKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NativePaintStats {
     backend: NativeScanoutKind,
+    scanout_format: Option<u32>,
     width: u32,
     height: u32,
     bytes: usize,
@@ -4007,7 +4394,7 @@ struct NativePaintStats {
 
 impl NativePaintStats {
     fn fields(self) -> Vec<NativePerfField> {
-        vec![
+        let mut fields = vec![
             NativePerfField::str("backend", self.backend.metric_name()),
             NativePerfField::str("scanout", self.backend.as_str()),
             NativePerfField::u64("width", u64::from(self.width)),
@@ -4028,7 +4415,14 @@ impl NativePaintStats {
             NativePerfField::u64("render_us", self.render_us),
             NativePerfField::u64("copy_us", self.copy_us),
             NativePerfField::u64("write_us", self.write_us),
-        ]
+        ];
+        if let Some(scanout_format) = self.scanout_format {
+            fields.push(NativePerfField::str(
+                "scanout_format",
+                native_visual_label(scanout_format),
+            ));
+        }
+        fields
     }
 }
 
@@ -5132,6 +5526,7 @@ impl<T> NativePageFlipBuffers<T> {
 struct NativeEglGbmScanout {
     _device: gbm::Device<OwnedFd>,
     surface: gbm::Surface<()>,
+    format: gbm::Format,
     fd: RawFd,
     width: u32,
     height: u32,
@@ -5156,6 +5551,49 @@ struct NativeEglGbmScanout {
 struct NativePresentedGbmBuffer {
     _bo: gbm::BufferObject<()>,
     fb_id: u32,
+}
+
+struct NativeEglGbmFormatConfig {
+    format: gbm::Format,
+    config: egl::Config,
+}
+
+fn native_egl_gbm_format_candidates() -> [gbm::Format; 2] {
+    [gbm::Format::Xrgb8888, gbm::Format::Argb8888]
+}
+
+fn choose_native_egl_gbm_format_config<T: AsFd>(
+    egl: &EglInstance,
+    egl_display: egl::Display,
+    device: &gbm::Device<T>,
+    usage: gbm::BufferObjectFlags,
+) -> io::Result<NativeEglGbmFormatConfig> {
+    let mut unsupported = Vec::new();
+    let mut egl_errors = Vec::new();
+    for format in native_egl_gbm_format_candidates() {
+        let format_label = native_visual_label(format as u32);
+        if !device.is_format_supported(format, usage) {
+            unsupported.push(format_label);
+            continue;
+        }
+        match choose_native_egl_config(egl, egl_display, format as u32) {
+            Ok(config) => return Ok(NativeEglGbmFormatConfig { format, config }),
+            Err(error) => egl_errors.push(format!("{format_label}: {error}")),
+        }
+    }
+    let unsupported = if unsupported.is_empty() {
+        "none".to_string()
+    } else {
+        unsupported.join(", ")
+    };
+    let egl_errors = if egl_errors.is_empty() {
+        "none".to_string()
+    } else {
+        egl_errors.join("; ")
+    };
+    Err(io::Error::other(format!(
+        "GBM/EGL has no compatible native scanout format; unsupported_by_gbm={unsupported}; egl_errors={egl_errors}"
+    )))
 }
 
 #[derive(Debug, Default)]
@@ -5186,12 +5624,6 @@ impl NativeEglGbmScanout {
         let gbm_fd = duplicate_fd_cloexec(kms.as_raw_fd()).map_err(io::Error::from_raw_os_error)?;
         let device = gbm::Device::new(gbm_fd)?;
         let usage = gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING;
-        if !device.is_format_supported(gbm::Format::Xrgb8888, usage) {
-            return Err(io::Error::other(
-                "GBM device does not support renderable XRGB8888 scanout surfaces",
-            ));
-        }
-        let surface = device.create_surface(width, height, gbm::Format::Xrgb8888, usage)?;
 
         let egl = unsafe { EglInstance::load_required() }.map_err(native_egl_io_error)?;
         const EGL_PLATFORM_GBM_KHR: egl::Enum = 0x31d7;
@@ -5215,14 +5647,22 @@ impl NativeEglGbmScanout {
             let _ = egl.terminate(egl_display);
             return Err(native_egl_io_error(error));
         }
-        let egl_config =
-            match choose_native_egl_config(&egl, egl_display, gbm::Format::Xrgb8888 as u32) {
-                Ok(config) => config,
+        let format_config =
+            match choose_native_egl_gbm_format_config(&egl, egl_display, &device, usage) {
+                Ok(format_config) => format_config,
                 Err(error) => {
                     let _ = egl.terminate(egl_display);
-                    return Err(native_egl_io_error(error));
+                    return Err(error);
                 }
             };
+        let surface = match device.create_surface(width, height, format_config.format, usage) {
+            Ok(surface) => surface,
+            Err(error) => {
+                let _ = egl.terminate(egl_display);
+                return Err(error);
+            }
+        };
+        let egl_config = format_config.config;
         let egl_context = match create_gles_context(&egl, egl_display, egl_config) {
             Ok(context) => context,
             Err(error) => {
@@ -5299,16 +5739,18 @@ impl NativeEglGbmScanout {
             .unwrap_or_else(|_| "unknown".to_string());
         let gl_info = scene.renderer_info();
         println!(
-            "native EGL/GBM renderer active: EGL {vendor} {version}; GL {} {} ({}) on {}",
+            "native EGL/GBM renderer active: EGL {vendor} {version}; GL {} {} ({}) on {} format {}",
             gl_info.vendor,
             gl_info.renderer,
             gl_info.version,
-            device.backend_name()
+            device.backend_name(),
+            native_visual_label(format_config.format as u32)
         );
 
         Ok(Self {
             _device: device,
             surface,
+            format: format_config.format,
             fd: kms.as_raw_fd(),
             width,
             height,
@@ -5381,6 +5823,7 @@ impl NativeEglGbmScanout {
         self.buffers
             .set_ready(NativePresentedGbmBuffer { _bo: bo, fb_id });
         Ok(native_egl_gbm_paint_stats(
+            self.format as u32,
             self.width,
             self.height,
             draw_us,
@@ -5465,6 +5908,7 @@ impl Drop for NativeEglGbmScanout {
 }
 
 fn native_egl_gbm_paint_stats(
+    scanout_format: u32,
     width: u32,
     height: u32,
     draw_us: u64,
@@ -5474,6 +5918,7 @@ fn native_egl_gbm_paint_stats(
 ) -> NativePaintStats {
     NativePaintStats {
         backend: NativeScanoutKind::NativeEglGbm,
+        scanout_format: Some(scanout_format),
         width,
         height,
         bytes: 0,
@@ -5599,6 +6044,7 @@ impl NativeGbmScanout {
         self.ready_index = Some(index);
         Ok(NativePaintStats {
             backend: NativeScanoutKind::GbmCpuWritePageFlip,
+            scanout_format: None,
             width: self.width,
             height: self.height,
             bytes: byte_len,
@@ -5905,6 +6351,7 @@ impl DumbFramebuffer {
         let copy_us = elapsed_micros(copy_start);
         Ok(NativePaintStats {
             backend: NativeScanoutKind::DumbFramebuffer,
+            scanout_format: None,
             width: self.width,
             height: self.height,
             bytes: self.size,
@@ -6099,6 +6546,13 @@ fn probe_native_egl_gbm_device(bootstrap: &NativeOutputBootstrap, perf: &NativeP
     let has_config = choose_egl_config(&egl, display).is_ok();
     let has_native_xrgb_config =
         choose_native_egl_config(&egl, display, gbm::Format::Xrgb8888 as u32).is_ok();
+    let has_native_argb_config =
+        choose_native_egl_config(&egl, display, gbm::Format::Argb8888 as u32).is_ok();
+    let usage = gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING;
+    let selected_native_format =
+        choose_native_egl_gbm_format_config(&egl, display, &gbm_device, usage)
+            .ok()
+            .map(|format_config| format_config.format as u32);
 
     let feedback = query_egl_dmabuf_feedback(&egl, display);
     let (main_device_path, main_device) = query_egl_main_device(&egl, display)
@@ -6123,6 +6577,13 @@ fn probe_native_egl_gbm_device(bootstrap: &NativeOutputBootstrap, perf: &NativeP
             NativePerfField::u64("minor", minor as u64),
             NativePerfField::bool("has_config", has_config),
             NativePerfField::bool("has_native_xrgb_config", has_native_xrgb_config),
+            NativePerfField::bool("has_native_argb_config", has_native_argb_config),
+            NativePerfField::str(
+                "selected_native_format",
+                selected_native_format
+                    .map(native_visual_label)
+                    .unwrap_or_else(|| "none".to_string()),
+            ),
             NativePerfField::u64("config_count", config_count as u64),
             NativePerfField::bool("dmabuf_import", has_dmabuf_import),
             NativePerfField::bool("dmabuf_import_modifiers", has_dmabuf_import_modifiers),
@@ -7452,6 +7913,348 @@ mod tests {
             move_end.window_actions,
             vec![NativeWindowAction::EndInteraction]
         );
+    }
+
+    #[test]
+    fn native_input_unlocked_relative_motion_moves_cursor_and_preserves_relative_delta() {
+        let mut input = NativeInputState::new(320, 200);
+
+        let effect = input.handle_pointer_motion_delta(24.0, 12.0);
+
+        assert_eq!(input.cursor_position(), (184, 112));
+        assert_eq!(
+            effect.relative_motion,
+            Some(RelativeMotion::accelerated_only(24.0, 12.0))
+        );
+        assert_eq!(effect.pointer_motion, Some((184.0, 112.0)));
+        assert_eq!(effect.cursor_position, Some((184, 112)));
+    }
+
+    #[test]
+    fn native_input_locked_relative_motion_preserves_delta_without_moving_cursor() {
+        let mut input = NativeInputState::new(320, 200);
+        input.set_pointer_locked(true);
+
+        let effect = input.handle_pointer_motion_delta(24.0, 12.0);
+
+        assert_eq!(input.cursor_position(), (160, 100));
+        assert_eq!(
+            effect.relative_motion,
+            Some(RelativeMotion::accelerated_only(24.0, 12.0))
+        );
+        assert_eq!(effect.pointer_motion, None);
+        assert_eq!(effect.cursor_position, None);
+        assert!(!effect.requires_frame_repaint(NativeCursorRenderMode::Software));
+        assert!(!effect.requires_frame_repaint(NativeCursorRenderMode::Hardware));
+    }
+
+    #[test]
+    fn native_input_locked_absolute_motion_does_not_move_cursor() {
+        let mut input = NativeInputState::new(320, 200);
+        input.set_pointer_locked(true);
+
+        let effect = input.handle_pointer_motion(PointerMotionSample::absolute(7, 25.0, 26.0));
+
+        assert_eq!(input.cursor_position(), (160, 100));
+        assert_eq!(effect.pointer_motion, None);
+        assert_eq!(effect.cursor_position, None);
+    }
+
+    #[test]
+    fn native_input_unlock_restore_sets_logical_cursor_position() {
+        let mut input = NativeInputState::new(320, 200);
+        input.set_pointer_locked(true);
+        input.handle_pointer_motion_delta(200.0, 200.0);
+
+        input.set_pointer_locked(false);
+        let effect = input.restore_cursor_position(CompositorOutputPosition { x: 35.0, y: 45.0 });
+
+        assert_eq!(input.cursor_position(), (35, 45));
+        assert_eq!(effect.cursor_position, Some((35, 45)));
+        assert!(effect.requires_frame_repaint(NativeCursorRenderMode::Software));
+        assert!(!effect.requires_frame_repaint(NativeCursorRenderMode::Hardware));
+    }
+
+    #[test]
+    fn native_input_first_real_move_after_unlock_starts_from_restored_position() {
+        let mut input = NativeInputState::new(320, 200);
+        input.set_pointer_locked(true);
+        input.handle_pointer_motion_delta(200.0, 200.0);
+        input.set_pointer_locked(false);
+        input.restore_cursor_position(CompositorOutputPosition { x: 35.0, y: 45.0 });
+
+        let effect = input.handle_pointer_motion_delta(5.0, -10.0);
+
+        assert_eq!(input.cursor_position(), (40, 35));
+        assert_eq!(effect.pointer_motion, Some((40.0, 35.0)));
+    }
+
+    #[test]
+    fn native_input_confined_relative_motion_clamps_to_region_and_keeps_absolute_motion() {
+        let mut input = NativeInputState::new(320, 200);
+        input.restore_cursor_position(CompositorOutputPosition { x: 50.0, y: 50.0 });
+        input.set_pointer_confined(OutputRegion::from_rect(
+            OutputRect::new(40.0, 30.0, 60.0, 40.0).unwrap(),
+        ));
+
+        let right = input.handle_pointer_motion_delta(100.0, 0.0);
+        assert_eq!(input.cursor_position(), (99, 50));
+        assert_eq!(right.pointer_motion, Some((99.0, 50.0)));
+        assert_eq!(
+            right.relative_motion,
+            Some(RelativeMotion::accelerated_only(100.0, 0.0))
+        );
+
+        let bottom = input.handle_pointer_motion_delta(0.0, 100.0);
+        assert_eq!(input.cursor_position(), (99, 69));
+        assert_eq!(bottom.pointer_motion, Some((99.0, 69.0)));
+
+        let left = input.handle_pointer_motion_delta(-100.0, 0.0);
+        assert_eq!(input.cursor_position(), (40, 69));
+        assert_eq!(left.pointer_motion, Some((40.0, 69.0)));
+
+        let top = input.handle_pointer_motion_delta(0.0, -100.0);
+        assert_eq!(input.cursor_position(), (40, 30));
+        assert_eq!(top.pointer_motion, Some((40.0, 30.0)));
+    }
+
+    #[test]
+    fn native_input_confined_absolute_motion_clamps_and_requests_cursor_repaint() {
+        let mut input = NativeInputState::new(320, 200);
+        input.set_pointer_confined(OutputRegion::from_rect(
+            OutputRect::new(40.0, 30.0, 60.0, 40.0).unwrap(),
+        ));
+
+        let effect = input.handle_pointer_motion(PointerMotionSample::absolute(7, 500.0, 1.0));
+
+        assert_eq!(input.cursor_position(), (99, 30));
+        assert_eq!(effect.pointer_motion, Some((99.0, 30.0)));
+        assert_eq!(effect.cursor_position, Some((99, 30)));
+        assert!(effect.requires_frame_repaint(NativeCursorRenderMode::Software));
+        assert!(!effect.requires_frame_repaint(NativeCursorRenderMode::Hardware));
+    }
+
+    #[test]
+    fn native_pointer_constraint_backend_activates_locked_once() {
+        let mut backend = NativePointerConstraintBackend::new();
+        let id = PointerConstraintBackendId {
+            constraint_id: 7,
+            generation: 1,
+        };
+
+        let first = backend.handle_request(
+            PointerConstraintBackendRequest::ActivateLocked(id),
+            CompositorOutputPosition { x: 10.0, y: 20.0 },
+        );
+        let duplicate = backend.handle_request(
+            PointerConstraintBackendRequest::ActivateLocked(id),
+            CompositorOutputPosition { x: 30.0, y: 40.0 },
+        );
+
+        assert_eq!(
+            first.activated,
+            Some(NativePointerConstraint {
+                id,
+                mode: PointerConstraintMode::Locked,
+                anchor: CompositorOutputPosition { x: 10.0, y: 20.0 },
+                region: None,
+            })
+        );
+        assert_eq!(duplicate, NativePointerConstraintBackendAction::default());
+        assert!(backend.active_locked());
+    }
+
+    #[test]
+    fn native_pointer_constraint_backend_activates_confined_with_region() {
+        let mut backend = NativePointerConstraintBackend::new();
+        let id = PointerConstraintBackendId {
+            constraint_id: 8,
+            generation: 1,
+        };
+        let region = OutputRegion::from_rect(OutputRect::new(10.0, 20.0, 100.0, 50.0).unwrap());
+
+        let action = backend.handle_request(
+            PointerConstraintBackendRequest::ActivateConfined {
+                id,
+                region: region.clone(),
+            },
+            CompositorOutputPosition { x: 10.0, y: 20.0 },
+        );
+
+        assert_eq!(
+            action.activated,
+            Some(NativePointerConstraint {
+                id,
+                mode: PointerConstraintMode::Confined,
+                anchor: CompositorOutputPosition { x: 10.0, y: 20.0 },
+                region: Some(region),
+            })
+        );
+        assert!(action.failed.is_none());
+    }
+
+    #[test]
+    fn native_pointer_constraint_backend_mismatched_deactivation_cannot_unlock_newer_lock() {
+        let mut backend = NativePointerConstraintBackend::new();
+        let active = PointerConstraintBackendId {
+            constraint_id: 9,
+            generation: 2,
+        };
+        let stale = PointerConstraintBackendId {
+            constraint_id: 9,
+            generation: 1,
+        };
+        backend.handle_request(
+            PointerConstraintBackendRequest::ActivateLocked(active),
+            CompositorOutputPosition { x: 10.0, y: 20.0 },
+        );
+
+        let action = backend.handle_request(
+            PointerConstraintBackendRequest::Deactivate {
+                id: stale,
+                restore_position: Some(CompositorOutputPosition { x: 40.0, y: 50.0 }),
+            },
+            CompositorOutputPosition { x: 99.0, y: 99.0 },
+        );
+
+        assert_eq!(action, NativePointerConstraintBackendAction::default());
+        assert!(backend.active_locked());
+    }
+
+    #[test]
+    fn native_pointer_constraint_backend_deactivation_restores_hint_or_anchor() {
+        let mut backend = NativePointerConstraintBackend::new();
+        let id = PointerConstraintBackendId {
+            constraint_id: 10,
+            generation: 1,
+        };
+        backend.handle_request(
+            PointerConstraintBackendRequest::ActivateLocked(id),
+            CompositorOutputPosition { x: 10.0, y: 20.0 },
+        );
+
+        let action = backend.handle_request(
+            PointerConstraintBackendRequest::Deactivate {
+                id,
+                restore_position: Some(CompositorOutputPosition { x: 30.0, y: 40.0 }),
+            },
+            CompositorOutputPosition { x: 99.0, y: 99.0 },
+        );
+
+        assert_eq!(action.deactivated, Some(id));
+        assert_eq!(
+            action.restore_position,
+            Some(CompositorOutputPosition { x: 30.0, y: 40.0 })
+        );
+        assert!(!backend.active_locked());
+
+        backend.handle_request(
+            PointerConstraintBackendRequest::ActivateLocked(id),
+            CompositorOutputPosition { x: 10.0, y: 20.0 },
+        );
+        let action = backend.handle_request(
+            PointerConstraintBackendRequest::Deactivate {
+                id,
+                restore_position: None,
+            },
+            CompositorOutputPosition { x: 99.0, y: 99.0 },
+        );
+
+        assert_eq!(
+            action.restore_position,
+            Some(CompositorOutputPosition { x: 10.0, y: 20.0 })
+        );
+    }
+
+    #[test]
+    fn native_pointer_constraint_backend_confined_deactivation_does_not_restore_anchor() {
+        let mut backend = NativePointerConstraintBackend::new();
+        let id = PointerConstraintBackendId {
+            constraint_id: 11,
+            generation: 1,
+        };
+        backend.handle_request(
+            PointerConstraintBackendRequest::ActivateConfined {
+                id,
+                region: OutputRegion::from_rect(OutputRect::new(10.0, 20.0, 100.0, 50.0).unwrap()),
+            },
+            CompositorOutputPosition { x: 30.0, y: 40.0 },
+        );
+
+        let action = backend.handle_request(
+            PointerConstraintBackendRequest::Deactivate {
+                id,
+                restore_position: None,
+            },
+            CompositorOutputPosition { x: 99.0, y: 99.0 },
+        );
+
+        assert_eq!(action.deactivated, Some(id));
+        assert_eq!(action.restore_position, None);
+        assert!(!backend.active_locked());
+    }
+
+    #[test]
+    fn native_pointer_constraint_backend_updates_confined_region_in_place() {
+        let mut backend = NativePointerConstraintBackend::new();
+        let id = PointerConstraintBackendId {
+            constraint_id: 12,
+            generation: 1,
+        };
+        backend.handle_request(
+            PointerConstraintBackendRequest::ActivateConfined {
+                id,
+                region: OutputRegion::from_rect(OutputRect::new(10.0, 20.0, 100.0, 50.0).unwrap()),
+            },
+            CompositorOutputPosition { x: 30.0, y: 40.0 },
+        );
+
+        let action = backend.handle_request(
+            PointerConstraintBackendRequest::UpdateConfinedRegion {
+                id,
+                region: OutputRegion::from_rect(OutputRect::new(40.0, 50.0, 20.0, 10.0).unwrap()),
+            },
+            CompositorOutputPosition { x: 30.0, y: 40.0 },
+        );
+
+        assert_eq!(action.deactivated, None);
+        assert_eq!(action.activated, None);
+        assert_eq!(
+            action.cursor_position,
+            Some(CompositorOutputPosition { x: 40.0, y: 50.0 })
+        );
+        assert_eq!(action.restore_position, None);
+        assert_eq!(
+            backend.active_constraint_state(),
+            NativePointerConstraintState::Confined {
+                region: OutputRegion::from_rect(OutputRect::new(40.0, 50.0, 20.0, 10.0).unwrap())
+            }
+        );
+    }
+
+    #[test]
+    fn native_pointer_constraint_backend_tracks_cursor_visibility_changes() {
+        let mut backend = NativePointerConstraintBackend::new();
+
+        let hide = backend.handle_request(
+            PointerConstraintBackendRequest::ApplyCursorVisibility { visible: false },
+            CompositorOutputPosition::default(),
+        );
+        let duplicate_hide = backend.handle_request(
+            PointerConstraintBackendRequest::ApplyCursorVisibility { visible: false },
+            CompositorOutputPosition::default(),
+        );
+        let show = backend.handle_request(
+            PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true },
+            CompositorOutputPosition::default(),
+        );
+
+        assert_eq!(hide.cursor_visibility_changed, Some(false));
+        assert_eq!(
+            duplicate_hide,
+            NativePointerConstraintBackendAction::default()
+        );
+        assert_eq!(show.cursor_visibility_changed, Some(true));
     }
 
     #[test]

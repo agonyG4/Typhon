@@ -1,4 +1,13 @@
-use std::{fs::File, io, os::unix::fs::FileExt, sync::Arc};
+use std::{
+    cmp::Ordering as CmpOrdering,
+    fs::File,
+    io,
+    os::unix::fs::FileExt,
+    sync::{
+        Arc,
+        atomic::{AtomicI32, Ordering},
+    },
+};
 
 use wayland_server::{WEnum, protocol::wl_shm};
 
@@ -14,7 +23,49 @@ pub(super) const WL_SHM_FORMAT_XBGR2101010: u32 = 0x3033_4258;
 #[derive(Debug)]
 pub(super) struct ShmPoolData {
     pub(super) file: Arc<File>,
-    pub(super) size: i32,
+    size: AtomicI32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ShmPoolResizeError {
+    Shrinking,
+}
+
+impl ShmPoolData {
+    pub(super) fn new(file: Arc<File>, size: i32) -> Self {
+        Self {
+            file,
+            size: AtomicI32::new(size),
+        }
+    }
+
+    pub(super) fn size(&self) -> i32 {
+        self.size.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn grow_to(&self, new_size: i32) -> Result<(), ShmPoolResizeError> {
+        loop {
+            let current_size = self.size();
+            match new_size.cmp(&current_size) {
+                CmpOrdering::Less => return Err(ShmPoolResizeError::Shrinking),
+                CmpOrdering::Equal => return Ok(()),
+                CmpOrdering::Greater => {
+                    if self
+                        .size
+                        .compare_exchange(
+                            current_size,
+                            new_size,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
