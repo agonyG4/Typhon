@@ -16,7 +16,8 @@ use oblivion_one::{
     NestedLaunchPlan, NestedOptions,
     compositor::{
         CompositorPlan, InputProtocolCapabilities, OwnCompositorServer,
-        SelectionProtocolCapabilities, client_protocols_for_capabilities,
+        RendererProtocolCapabilities, SelectionProtocolCapabilities,
+        client_protocols_for_capabilities,
     },
     default_state_dir, discover_tools, export_lines, parse_session_env,
     portal::PortalRuntime,
@@ -546,6 +547,7 @@ fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
             true,
             InputProtocolCapabilities::nested_winit(),
             SelectionProtocolCapabilities::core_clipboard(),
+            renderer_protocol_capabilities_for_output_backend(output_backend),
         )?,
         ResolvedCompositorOutputBackend::Native => {
             println!("gpu buffer protocols: deferred until the native scanout backend is known");
@@ -554,6 +556,7 @@ fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
                 false,
                 InputProtocolCapabilities::native_libinput(),
                 SelectionProtocolCapabilities::core_clipboard(),
+                renderer_protocol_capabilities_for_output_backend(output_backend),
             )?
         }
     };
@@ -586,6 +589,7 @@ fn compositor_protocol_names_for_output_backend(
         protocols = client_protocols_for_capabilities(
             InputProtocolCapabilities::nested_winit(),
             SelectionProtocolCapabilities::core_clipboard(),
+            renderer_protocol_capabilities_for_output_backend(output_backend),
         )
         .into_iter()
         .map(|protocol| protocol.name())
@@ -595,6 +599,7 @@ fn compositor_protocol_names_for_output_backend(
         protocols = client_protocols_for_capabilities(
             InputProtocolCapabilities::native_libinput(),
             SelectionProtocolCapabilities::core_clipboard(),
+            renderer_protocol_capabilities_for_output_backend(output_backend),
         )
         .into_iter()
         .map(|protocol| protocol.name())
@@ -607,6 +612,12 @@ fn compositor_protocol_names_for_output_backend(
         .collect();
     }
     protocols
+}
+
+const fn renderer_protocol_capabilities_for_output_backend(
+    _output_backend: ResolvedCompositorOutputBackend,
+) -> RendererProtocolCapabilities {
+    RendererProtocolCapabilities::unsupported()
 }
 
 fn desktop(options: DesktopOptions) -> AppResult<()> {
@@ -1208,6 +1219,21 @@ mod tests {
         assert!(!protocols.contains(&"zwp_linux_dmabuf_v1"));
         assert!(!protocols.contains(&"wp_linux_drm_syncobj_manager_v1"));
         assert!(!protocols.contains(&"wl_drm"));
+    }
+
+    #[test]
+    fn current_output_backends_do_not_claim_color_management() {
+        for backend in [
+            ResolvedCompositorOutputBackend::Nested,
+            ResolvedCompositorOutputBackend::Native,
+        ] {
+            let protocols = compositor_protocol_names_for_output_backend(
+                &CompositorPlan::new("oblivion-one-test"),
+                backend,
+            );
+
+            assert!(!protocols.contains(&"wp_color_manager_v1"));
+        }
     }
 
     #[test]

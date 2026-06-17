@@ -111,14 +111,26 @@ impl SelectionProtocolCapabilities {
     }
 }
 
-pub const BASE_CLIENT_PROTOCOLS: [ProtocolGlobal; 14] = [
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RendererProtocolCapabilities {
+    pub color_management: bool,
+}
+
+impl RendererProtocolCapabilities {
+    pub const fn unsupported() -> Self {
+        Self {
+            color_management: false,
+        }
+    }
+}
+
+pub const BASE_CLIENT_PROTOCOLS: [ProtocolGlobal; 13] = [
     ProtocolGlobal::WlCompositor,
     ProtocolGlobal::WlSubcompositor,
     ProtocolGlobal::WlShm,
     ProtocolGlobal::WpViewporter,
     ProtocolGlobal::WpFractionalScale,
     ProtocolGlobal::WpPresentation,
-    ProtocolGlobal::WpColorManagement,
     ProtocolGlobal::XdgDecoration,
     ProtocolGlobal::LinuxDmabuf,
     ProtocolGlobal::LinuxDrmSyncobj,
@@ -131,6 +143,7 @@ pub const BASE_CLIENT_PROTOCOLS: [ProtocolGlobal; 14] = [
 pub fn client_protocols_for_capabilities(
     input_capabilities: InputProtocolCapabilities,
     selection_capabilities: SelectionProtocolCapabilities,
+    renderer_capabilities: RendererProtocolCapabilities,
 ) -> Vec<ProtocolGlobal> {
     let mut protocols = BASE_CLIENT_PROTOCOLS.to_vec();
     let selection_insert_at = protocols
@@ -145,6 +158,14 @@ pub fn client_protocols_for_capabilities(
     }
     if selection_capabilities.clipboard {
         protocols.insert(selection_insert_at, ProtocolGlobal::WlDataDeviceManager);
+    }
+
+    if renderer_capabilities.color_management {
+        let insert_at = protocols
+            .iter()
+            .position(|protocol| *protocol == ProtocolGlobal::XdgDecoration)
+            .unwrap_or(protocols.len());
+        protocols.insert(insert_at, ProtocolGlobal::WpColorManagement);
     }
 
     let insert_at = protocols
@@ -249,6 +270,7 @@ impl CompositorPlan {
         client_protocols_for_capabilities(
             InputProtocolCapabilities::desktop_baseline(),
             SelectionProtocolCapabilities::core_clipboard(),
+            RendererProtocolCapabilities::unsupported(),
         )
         .into_iter()
         .map(ProtocolGlobal::name)

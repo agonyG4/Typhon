@@ -53,6 +53,20 @@ fn default_registry_omits_unsupported_gaming_protocol_stubs() {
 }
 
 #[test]
+fn default_registry_hides_color_management_until_renderer_supports_transforms() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let result = read_registry_globals(&socket_path);
+    stop_test_server(running, server_thread);
+
+    let globals = result.unwrap();
+    assert!(!globals.contains(&"wp_color_manager_v1".to_string()));
+}
+
+#[test]
 fn default_registry_advertises_core_clipboard_only() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

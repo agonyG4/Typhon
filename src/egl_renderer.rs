@@ -1918,6 +1918,42 @@ mod tests {
         }
     }
 
+    fn config_attribute_value(attributes: &[egl::Int], key: egl::Int) -> Option<egl::Int> {
+        attributes
+            .chunks_exact(2)
+            .take_while(|pair| pair[0] != egl::NONE)
+            .find(|pair| pair[0] == key)
+            .map(|pair| pair[1])
+    }
+
+    #[test]
+    fn egl_window_config_attributes_request_gles3_only() {
+        let renderable_type =
+            config_attribute_value(egl_window_config_attributes(), egl::RENDERABLE_TYPE).unwrap();
+
+        assert_eq!(renderable_type, egl::OPENGL_ES3_BIT);
+        assert_eq!(renderable_type & egl::OPENGL_ES2_BIT, 0);
+    }
+
+    #[test]
+    fn gles_context_attributes_request_client_version_3_only() {
+        let client_version =
+            config_attribute_value(gles_context_attributes(), egl::CONTEXT_CLIENT_VERSION)
+                .unwrap();
+
+        assert_eq!(client_version, 3);
+        assert!(!gles_context_attributes().contains(&2));
+    }
+
+    #[test]
+    fn native_egl_config_selection_rejects_gles2_only_candidates() {
+        let candidates = [native_candidate(1, XR24)];
+
+        let error = select_native_egl_config_candidate(&candidates, XR24).unwrap_err();
+
+        assert!(error.to_string().contains("GLES3"));
+    }
+
     #[test]
     fn native_egl_config_selection_prefers_requested_xrgb8888() {
         let candidates = [

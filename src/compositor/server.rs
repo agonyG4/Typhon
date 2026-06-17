@@ -28,7 +28,7 @@ use crate::wayland_drm::server::wl_drm;
 
 use super::{
     CompositorState, InputProtocolCapabilities, RenderGenerationCause, RenderableSurface,
-    SelectionProtocolCapabilities, ShellDockItem, color,
+    RendererProtocolCapabilities, SelectionProtocolCapabilities, ShellDockItem, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 
@@ -56,6 +56,7 @@ impl OwnCompositorServer {
             false,
             InputProtocolCapabilities::native_libinput(),
             SelectionProtocolCapabilities::core_clipboard(),
+            RendererProtocolCapabilities::unsupported(),
         )
     }
 
@@ -64,12 +65,14 @@ impl OwnCompositorServer {
         gpu_buffers_enabled: bool,
         input_capabilities: InputProtocolCapabilities,
         selection_capabilities: SelectionProtocolCapabilities,
+        renderer_capabilities: RendererProtocolCapabilities,
     ) -> Result<Self, CompositorError> {
         Self::bind_with_gpu_buffers_and_capabilities(
             socket_name,
             gpu_buffers_enabled,
             input_capabilities,
             selection_capabilities,
+            renderer_capabilities,
         )
     }
 
@@ -83,6 +86,7 @@ impl OwnCompositorServer {
             false,
             input_capabilities,
             SelectionProtocolCapabilities::core_clipboard(),
+            RendererProtocolCapabilities::unsupported(),
         )
     }
 
@@ -96,6 +100,7 @@ impl OwnCompositorServer {
             false,
             InputProtocolCapabilities::desktop_baseline(),
             selection_capabilities,
+            RendererProtocolCapabilities::unsupported(),
         )
     }
 
@@ -109,6 +114,7 @@ impl OwnCompositorServer {
             false,
             InputProtocolCapabilities::desktop_baseline(),
             SelectionProtocolCapabilities::core_clipboard(),
+            RendererProtocolCapabilities::unsupported(),
         )?;
         server.state.clipboard_bridge = Some(clipboard_bridge);
         Ok(server)
@@ -123,6 +129,7 @@ impl OwnCompositorServer {
             gpu_buffers_enabled,
             InputProtocolCapabilities::desktop_baseline(),
             SelectionProtocolCapabilities::core_clipboard(),
+            RendererProtocolCapabilities::unsupported(),
         )
     }
 
@@ -131,6 +138,7 @@ impl OwnCompositorServer {
         gpu_buffers_enabled: bool,
         input_capabilities: InputProtocolCapabilities,
         selection_capabilities: SelectionProtocolCapabilities,
+        renderer_capabilities: RendererProtocolCapabilities,
     ) -> Result<Self, CompositorError> {
         let socket_name = socket_name.into();
         let display =
@@ -142,6 +150,7 @@ impl OwnCompositorServer {
             gpu_buffers_enabled,
             input_capabilities,
             selection_capabilities,
+            renderer_capabilities,
         );
         let socket = ListeningSocket::bind(&socket_name)
             .map_err(|error| CompositorError::Bind(error.to_string()))?;
@@ -410,6 +419,7 @@ fn register_minimum_globals(
     gpu_buffers_enabled: bool,
     input_capabilities: InputProtocolCapabilities,
     selection_capabilities: SelectionProtocolCapabilities,
+    renderer_capabilities: RendererProtocolCapabilities,
 ) {
     display.create_global::<CompositorState, wl_compositor::WlCompositor, _>(6, ());
     display.create_global::<CompositorState, wl_subcompositor::WlSubcompositor, _>(1, ());
@@ -427,7 +437,9 @@ fn register_minimum_globals(
         _,
     >(1, ());
     display.create_global::<CompositorState, wp_presentation::WpPresentation, _>(2, ());
-    color::register_color_management_global(display);
+    if renderer_capabilities.color_management {
+        color::register_color_management_global(display);
+    }
     if input_capabilities.relative_pointer {
         display.create_global::<
             CompositorState,

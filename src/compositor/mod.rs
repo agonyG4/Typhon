@@ -115,7 +115,8 @@ use output::{
 };
 pub use plan::{
     ArchitectureLayer, CompositorArchitecture, CompositorPlan, InputProtocolCapabilities,
-    ProtocolGlobal, SelectionProtocolCapabilities, client_protocols_for_capabilities,
+    ProtocolGlobal, RendererProtocolCapabilities, SelectionProtocolCapabilities,
+    client_protocols_for_capabilities,
 };
 use popup::{
     PopupAnchorRect, PopupConstraintAdjustment, PopupEdges, PopupRect, XdgPositionerState,

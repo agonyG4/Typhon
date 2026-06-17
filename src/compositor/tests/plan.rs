@@ -11,7 +11,6 @@ fn compositor_plan_advertises_minimum_real_client_protocols() {
         "wp_viewporter",
         "wp_fractional_scale_manager_v1",
         "wp_presentation",
-        "wp_color_manager_v1",
         "zxdg_decoration_manager_v1",
         "zwp_linux_dmabuf_v1",
         "wp_linux_drm_syncobj_manager_v1",
@@ -25,10 +24,39 @@ fn compositor_plan_advertises_minimum_real_client_protocols() {
 }
 
 #[test]
+fn default_plan_hides_color_management_until_renderer_supports_transforms() {
+    let protocols = CompositorPlan::new("oblivion-one-test").protocol_names();
+
+    assert!(!protocols.contains(&"wp_color_manager_v1"));
+}
+
+#[test]
+fn renderer_color_capability_adds_color_management_once() {
+    let protocols = client_protocols_for_capabilities(
+        InputProtocolCapabilities::desktop_baseline(),
+        SelectionProtocolCapabilities::core_clipboard(),
+        RendererProtocolCapabilities {
+            color_management: true,
+        },
+    );
+    let names: Vec<_> = protocols.into_iter().map(ProtocolGlobal::name).collect();
+
+    assert!(names.contains(&"wp_color_manager_v1"));
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| **name == "wp_color_manager_v1")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn safe_selection_profile_hides_unimplemented_selection_protocols() {
     let protocols = client_protocols_for_capabilities(
         InputProtocolCapabilities::desktop_baseline(),
         SelectionProtocolCapabilities::safe_baseline(),
+        RendererProtocolCapabilities::unsupported(),
     );
     let names: Vec<_> = protocols.into_iter().map(ProtocolGlobal::name).collect();
 
@@ -46,6 +74,7 @@ fn clipboard_ready_profile_advertises_only_core_clipboard_selection() {
             primary_selection: false,
             data_control: false,
         },
+        RendererProtocolCapabilities::unsupported(),
     );
     let names: Vec<_> = protocols.into_iter().map(ProtocolGlobal::name).collect();
 
@@ -77,6 +106,9 @@ fn protocol_capability_policy_does_not_duplicate_globals() {
             primary_selection: true,
             data_control: true,
         },
+        RendererProtocolCapabilities {
+            color_management: true,
+        },
     );
     let names: Vec<_> = protocols.into_iter().map(ProtocolGlobal::name).collect();
 
@@ -104,6 +136,7 @@ fn nested_winit_profile_advertises_serviced_pointer_lock_protocols() {
     let protocols = client_protocols_for_capabilities(
         InputProtocolCapabilities::nested_winit(),
         SelectionProtocolCapabilities::core_clipboard(),
+        RendererProtocolCapabilities::unsupported(),
     );
     let names: Vec<_> = protocols.into_iter().map(ProtocolGlobal::name).collect();
 
@@ -113,6 +146,7 @@ fn nested_winit_profile_advertises_serviced_pointer_lock_protocols() {
     let baseline_protocols = client_protocols_for_capabilities(
         InputProtocolCapabilities::desktop_baseline(),
         SelectionProtocolCapabilities::core_clipboard(),
+        RendererProtocolCapabilities::unsupported(),
     );
     let baseline_names: Vec<_> = baseline_protocols
         .into_iter()
@@ -128,6 +162,7 @@ fn native_libinput_profile_advertises_serviced_pointer_lock_protocols_only() {
     let protocols = client_protocols_for_capabilities(
         InputProtocolCapabilities::native_libinput(),
         SelectionProtocolCapabilities::core_clipboard(),
+        RendererProtocolCapabilities::unsupported(),
     );
     let names: Vec<_> = protocols.into_iter().map(ProtocolGlobal::name).collect();
 
