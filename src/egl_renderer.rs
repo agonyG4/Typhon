@@ -183,7 +183,7 @@ impl EglGlesFrameRenderer {
         let renderer = unsafe { scene.gl.get_parameter_string(glow::RENDERER) };
         let version = unsafe { scene.gl.get_parameter_string(glow::VERSION) };
         eprintln!(
-            "oblivion-one compositor: EGL/GLES renderer active: {vendor} {renderer} ({version}, profile {})",
+            "oblivion-one compositor: EGL/GLES3 renderer active: {vendor} {renderer} ({version}, profile {})",
             RenderBackendProfile::egl_gles().kind.as_str()
         );
 
@@ -1661,11 +1661,16 @@ pub(crate) fn choose_egl_config(
     egl: &EglInstance,
     display: egl::Display,
 ) -> RendererResult<egl::Config> {
-    let attributes = [
+    egl.choose_first_config(display, egl_window_config_attributes())?
+        .ok_or_else(|| io::Error::other("EGL has no GLES3-capable window config").into())
+}
+
+fn egl_window_config_attributes() -> &'static [egl::Int] {
+    &[
         egl::SURFACE_TYPE,
         egl::WINDOW_BIT,
         egl::RENDERABLE_TYPE,
-        egl::OPENGL_ES2_BIT | egl::OPENGL_ES3_BIT,
+        egl::OPENGL_ES3_BIT,
         egl::RED_SIZE,
         8,
         egl::GREEN_SIZE,
@@ -1675,9 +1680,7 @@ pub(crate) fn choose_egl_config(
         egl::ALPHA_SIZE,
         8,
         egl::NONE,
-    ];
-    egl.choose_first_config(display, &attributes)?
-        .ok_or_else(|| io::Error::other("EGL has no GLES window config").into())
+    ]
 }
 
 pub(crate) fn choose_native_egl_config(
@@ -1720,7 +1723,7 @@ pub(crate) fn select_native_egl_visual_format(
                 .collect::<Vec<_>>()
                 .join(", ");
             io::Error::other(format!(
-                "EGL has no GLES GBM window config for requested native visuals: {requested}"
+                "EGL has no GLES3-capable GBM window config for requested native visuals: {requested}"
             ))
             .into()
         })
@@ -1735,7 +1738,7 @@ pub(crate) fn select_native_egl_config_candidate(
         .position(|candidate| native_egl_config_candidate_matches(candidate, native_visual_id))
         .ok_or_else(|| {
             io::Error::other(format!(
-                "EGL has no GLES GBM window config for native visual {}",
+                "EGL has no GLES3-capable GBM window config for native visual {}",
                 native_visual_label(native_visual_id)
             ))
             .into()
@@ -1748,7 +1751,7 @@ fn native_egl_config_candidate_matches(
 ) -> bool {
     candidate.native_visual_id == native_visual_id
         && (candidate.surface_type & egl::WINDOW_BIT) != 0
-        && (candidate.renderable_type & (egl::OPENGL_ES2_BIT | egl::OPENGL_ES3_BIT)) != 0
+        && (candidate.renderable_type & egl::OPENGL_ES3_BIT) != 0
         && candidate.red_size >= 8
         && candidate.green_size >= 8
         && candidate.blue_size >= 8
@@ -1777,11 +1780,10 @@ fn native_egl_debug_enabled() -> bool {
 
 fn native_egl_config_candidate_diagnostic(candidate: &NativeEglConfigCandidate) -> String {
     format!(
-        "native EGL config config_id={} visual={} window={} gles2={} gles3={} rgba={}/{}/{}/{} surface_type=0x{:x} renderable_type=0x{:x}",
+        "native EGL config config_id={} visual={} window={} gles3={} rgba={}/{}/{}/{} surface_type=0x{:x} renderable_type=0x{:x}",
         candidate.config_id,
         native_visual_label(candidate.native_visual_id),
         (candidate.surface_type & egl::WINDOW_BIT) != 0,
-        (candidate.renderable_type & egl::OPENGL_ES2_BIT) != 0,
         (candidate.renderable_type & egl::OPENGL_ES3_BIT) != 0,
         candidate.red_size,
         candidate.green_size,
@@ -1816,20 +1818,16 @@ pub(crate) fn create_gles_context(
     display: egl::Display,
     config: egl::Config,
 ) -> RendererResult<egl::Context> {
-    let gles3 = [egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE];
-    match egl.create_context(display, config, None, &gles3) {
-        Ok(context) => Ok(context),
-        Err(gles3_error) => {
-            let gles2 = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
-            egl.create_context(display, config, None, &gles2)
-                .map_err(|gles2_error| {
-                    io::Error::other(format!(
-                        "failed to create GLES context: GLES3={gles3_error}; GLES2={gles2_error}"
-                    ))
-                    .into()
-                })
-        }
-    }
+    egl.create_context(display, config, None, gles_context_attributes())
+        .map_err(|error| io::Error::other(format_gles3_context_error(&error)).into())
+}
+
+fn gles_context_attributes() -> &'static [egl::Int] {
+    &[egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE]
+}
+
+fn format_gles3_context_error(error: &dyn Error) -> String {
+    format!("failed to create required GLES3 context: {error}")
 }
 
 pub(crate) fn load_egl_image_target_texture_2d(
@@ -1910,7 +1908,7 @@ mod tests {
             config_id,
             native_visual_id,
             surface_type: egl::WINDOW_BIT,
-            renderable_type: egl::OPENGL_ES2_BIT,
+            renderable_type: egl::OPENGL_ES3_BIT,
             red_size: 8,
             green_size: 8,
             blue_size: 8,
@@ -1938,16 +1936,27 @@ mod tests {
     #[test]
     fn gles_context_attributes_request_client_version_3_only() {
         let client_version =
-            config_attribute_value(gles_context_attributes(), egl::CONTEXT_CLIENT_VERSION)
-                .unwrap();
+            config_attribute_value(gles_context_attributes(), egl::CONTEXT_CLIENT_VERSION).unwrap();
 
         assert_eq!(client_version, 3);
         assert!(!gles_context_attributes().contains(&2));
     }
 
     #[test]
+    fn gles_context_creation_error_mentions_required_gles3() {
+        let error = io::Error::other("driver rejected context");
+
+        let message = format_gles3_context_error(&error);
+
+        assert!(message.contains("required GLES3 context"));
+        assert!(message.contains("driver rejected context"));
+    }
+
+    #[test]
     fn native_egl_config_selection_rejects_gles2_only_candidates() {
-        let candidates = [native_candidate(1, XR24)];
+        let mut candidate = native_candidate(1, XR24);
+        candidate.renderable_type = egl::OPENGL_ES2_BIT;
+        let candidates = [candidate];
 
         let error = select_native_egl_config_candidate(&candidates, XR24).unwrap_err();
 

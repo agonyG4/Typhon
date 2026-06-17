@@ -5739,7 +5739,7 @@ impl NativeEglGbmScanout {
             .unwrap_or_else(|_| "unknown".to_string());
         let gl_info = scene.renderer_info();
         println!(
-            "native EGL/GBM renderer active: EGL {vendor} {version}; GL {} {} ({}) on {} format {}",
+            "native EGL/GBM GLES3 renderer active: EGL {vendor} {version}; GL {} {} ({}) on {} format {}",
             gl_info.vendor,
             gl_info.renderer,
             gl_info.version,
