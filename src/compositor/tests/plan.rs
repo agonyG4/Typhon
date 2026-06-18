@@ -98,6 +98,7 @@ fn protocol_capability_policy_does_not_duplicate_globals() {
         InputProtocolCapabilities {
             relative_pointer: true,
             pointer_constraints: true,
+            pointer_warp: true,
             keyboard_shortcuts_inhibit: false,
             idle_inhibit: true,
         },
@@ -128,6 +129,7 @@ fn unsupported_gaming_protocol_stubs_are_hidden_from_public_plan() {
 
     assert!(!protocols.contains(&"zwp_relative_pointer_manager_v1"));
     assert!(!protocols.contains(&"zwp_pointer_constraints_v1"));
+    assert!(!protocols.contains(&"wp_pointer_warp_v1"));
     assert!(!protocols.contains(&"zwp_idle_inhibit_manager_v1"));
 }
 
@@ -142,6 +144,7 @@ fn nested_winit_profile_advertises_serviced_pointer_lock_protocols() {
 
     assert!(names.contains(&"zwp_relative_pointer_manager_v1"));
     assert!(names.contains(&"zwp_pointer_constraints_v1"));
+    assert!(names.contains(&"wp_pointer_warp_v1"));
 
     let baseline_protocols = client_protocols_for_capabilities(
         InputProtocolCapabilities::desktop_baseline(),
@@ -155,6 +158,7 @@ fn nested_winit_profile_advertises_serviced_pointer_lock_protocols() {
 
     assert!(!baseline_names.contains(&"zwp_relative_pointer_manager_v1"));
     assert!(!baseline_names.contains(&"zwp_pointer_constraints_v1"));
+    assert!(!baseline_names.contains(&"wp_pointer_warp_v1"));
 }
 
 #[test]
@@ -168,6 +172,7 @@ fn native_libinput_profile_advertises_serviced_pointer_lock_protocols_only() {
 
     assert!(names.contains(&"zwp_relative_pointer_manager_v1"));
     assert!(names.contains(&"zwp_pointer_constraints_v1"));
+    assert!(names.contains(&"wp_pointer_warp_v1"));
     assert!(!names.contains(&"zwp_idle_inhibit_manager_v1"));
 }
 

@@ -109,6 +109,12 @@ impl Dispatch<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1, ()> for Compo
                 region,
                 lifetime,
             } => {
+                pointer_debug_log(format!(
+                    "pointer.lock request surface={} pointer={} client={}",
+                    compositor_surface_id(&surface),
+                    pointer.id().protocol_id(),
+                    wayland_resource_client_label(&pointer)
+                ));
                 let lifetime = pointer_constraint_lifetime(lifetime);
                 let region = region
                     .as_ref()
@@ -140,6 +146,12 @@ impl Dispatch<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1, ()> for Compo
                 region,
                 lifetime,
             } => {
+                pointer_debug_log(format!(
+                    "pointer.confine request surface={} pointer={} client={}",
+                    compositor_surface_id(&surface),
+                    pointer.id().protocol_id(),
+                    wayland_resource_client_label(&pointer)
+                ));
                 let lifetime = pointer_constraint_lifetime(lifetime);
                 let region = region
                     .as_ref()
@@ -195,6 +207,10 @@ impl Dispatch<zwp_locked_pointer_v1::ZwpLockedPointerV1, LockedPointerData> for 
                 surface_x,
                 surface_y,
             } => {
+                pointer_debug_log(format!(
+                    "pointer.lock cursor_hint pending id={} hint=({},{})",
+                    data.constraint_id, surface_x, surface_y
+                ));
                 state.set_pointer_constraint_pending_cursor_position_hint(
                     data.constraint_id,
                     surface_x,
@@ -229,6 +245,45 @@ impl Dispatch<zwp_confined_pointer_v1::ZwpConfinedPointerV1, ConfinedPointerData
                     .map(RegionData::snapshot)
                     .unwrap_or_default();
                 state.set_pointer_constraint_pending_region(data.constraint_id, region);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl GlobalDispatch<wp_pointer_warp_v1::WpPointerWarpV1, ()> for CompositorState {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<wp_pointer_warp_v1::WpPointerWarpV1>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<wp_pointer_warp_v1::WpPointerWarpV1, ()> for CompositorState {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        _resource: &wp_pointer_warp_v1::WpPointerWarpV1,
+        request: wp_pointer_warp_v1::Request,
+        _data: &(),
+        _dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            wp_pointer_warp_v1::Request::Destroy => {}
+            wp_pointer_warp_v1::Request::WarpPointer {
+                surface,
+                pointer,
+                x,
+                y,
+                serial,
+            } => {
+                state.warp_pointer_protocol_request(surface, pointer, x, y, serial);
             }
             _ => {}
         }

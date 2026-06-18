@@ -162,7 +162,10 @@ pub struct PointerConstraintBackendId {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PointerConstraintBackendRequest {
-    ActivateLocked(PointerConstraintBackendId),
+    ActivateLocked {
+        id: PointerConstraintBackendId,
+        anchor: OutputPosition,
+    },
     ActivateConfined {
         id: PointerConstraintBackendId,
         region: OutputRegion,
@@ -175,6 +178,9 @@ pub enum PointerConstraintBackendRequest {
         id: PointerConstraintBackendId,
         restore_position: Option<OutputPosition>,
     },
+    WarpPointer {
+        position: OutputPosition,
+    },
     ApplyCursorVisibility {
         visible: bool,
     },
@@ -183,11 +189,11 @@ pub enum PointerConstraintBackendRequest {
 impl PointerConstraintBackendRequest {
     pub const fn id(&self) -> Option<PointerConstraintBackendId> {
         match self {
-            Self::ActivateLocked(id)
+            Self::ActivateLocked { id, .. }
             | Self::ActivateConfined { id, .. }
             | Self::UpdateConfinedRegion { id, .. } => Some(*id),
             Self::Deactivate { id, .. } => Some(*id),
-            Self::ApplyCursorVisibility { .. } => None,
+            Self::WarpPointer { .. } | Self::ApplyCursorVisibility { .. } => None,
         }
     }
 }

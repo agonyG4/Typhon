@@ -281,14 +281,37 @@ impl NestedOutputApp {
     fn process_pointer_constraint_backend_requests(&mut self) {
         for request in self.server.take_pointer_constraint_backend_requests() {
             match request {
-                PointerConstraintBackendRequest::ActivateLocked(id) => {
-                    self.activate_host_pointer_constraint(id, NestedPointerConstraintMode::Locked);
+                PointerConstraintBackendRequest::ActivateLocked { id, .. } => {
+                    if self
+                        .server
+                        .pointer_constraint_backend_activation_current(id)
+                    {
+                        self.activate_host_pointer_constraint(
+                            id,
+                            NestedPointerConstraintMode::Locked,
+                        );
+                    } else {
+                        pointer_debug_log(format!(
+                            "backend activation dropped stale id={:?} rollback=not_needed",
+                            id
+                        ));
+                    }
                 }
                 PointerConstraintBackendRequest::ActivateConfined { id, .. } => {
-                    self.activate_host_pointer_constraint(
-                        id,
-                        NestedPointerConstraintMode::Confined,
-                    );
+                    if self
+                        .server
+                        .pointer_constraint_backend_activation_current(id)
+                    {
+                        self.activate_host_pointer_constraint(
+                            id,
+                            NestedPointerConstraintMode::Confined,
+                        );
+                    } else {
+                        pointer_debug_log(format!(
+                            "backend activation dropped stale id={:?} rollback=not_needed",
+                            id
+                        ));
+                    }
                 }
                 PointerConstraintBackendRequest::UpdateConfinedRegion { .. } => {}
                 PointerConstraintBackendRequest::Deactivate {
@@ -306,6 +329,9 @@ impl NestedOutputApp {
                 PointerConstraintBackendRequest::ApplyCursorVisibility { visible } => {
                     self.host_cursor_client_visible = visible;
                     self.apply_host_cursor_visibility();
+                }
+                PointerConstraintBackendRequest::WarpPointer { position } => {
+                    self.warp_host_pointer(position);
                 }
             }
         }
@@ -400,6 +426,41 @@ impl NestedOutputApp {
         }
         pointer_debug_log(format!("host grab released id={:?}", constraint.id));
         self.apply_host_cursor_visibility();
+    }
+
+    fn warp_host_pointer(&mut self, position: OutputPosition) {
+        let Some(window) = self.window.as_deref() else {
+            pointer_debug_log(format!(
+                "backend warp skipped reason=no_window position=({},{})",
+                position.x, position.y
+            ));
+            return;
+        };
+        match window.set_cursor_position(LogicalPosition::new(position.x, position.y)) {
+            Ok(()) => {
+                let scale_factor = output_scale_for_window(window);
+                self.cursor_x = position.x.round() as i32;
+                self.cursor_y = position.y.round() as i32;
+                self.cursor_physical_x =
+                    logical_coordinate_to_physical(self.cursor_x, scale_factor);
+                self.cursor_physical_y =
+                    logical_coordinate_to_physical(self.cursor_y, scale_factor);
+                self.pending_host_cursor_warp = Some(NestedPendingCursorWarp {
+                    physical_x: self.cursor_physical_x,
+                    physical_y: self.cursor_physical_y,
+                });
+                pointer_debug_log(format!(
+                    "backend warp applied position=({},{}) physical=({},{})",
+                    position.x, position.y, self.cursor_physical_x, self.cursor_physical_y
+                ));
+            }
+            Err(error) => {
+                pointer_debug_log(format!(
+                    "backend warp failed position=({},{}) error={error}",
+                    position.x, position.y
+                ));
+            }
+        }
     }
 
     fn apply_host_cursor_visibility(&self) {

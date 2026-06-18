@@ -1141,6 +1141,7 @@ pub fn run(
         let coalesced_input_events = coalesced_events.len();
         for event in coalesced_events {
             input_events = true;
+            let may_change_pointer_constraints = event.may_change_pointer_constraints();
             let effect = input_state.handle_hardware_input_event(event);
             let effect_requested_redraw = effect.redraw_requested;
             if let Some((cursor_x, cursor_y)) = effect.cursor_position
@@ -1182,6 +1183,16 @@ pub fn run(
                 skipped_input_repaints = skipped_input_repaints.saturating_add(1);
             }
             redraw_requested |= application.redraw_requested;
+            if may_change_pointer_constraints && !tick_blocked_by_pageflip {
+                let _ = server.tick()?;
+                redraw_requested |= process_native_pointer_constraint_backend_requests(
+                    &mut server,
+                    &mut pointer_constraint_backend,
+                    &mut input_state,
+                    &mut hardware_cursor,
+                    cursor_render_mode,
+                )?;
+            }
         }
         redraw_requested |= process_native_pointer_constraint_backend_requests(
             &mut server,
@@ -1582,6 +1593,12 @@ struct NativePointerConstraintBackend {
     cursor_visible: bool,
 }
 
+fn native_pointer_debug_log(message: impl AsRef<str>) {
+    if std::env::var_os("TYPHON_POINTER_DEBUG").is_some() {
+        eprintln!("typhon pointer: {}", message.as_ref());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct NativePointerConstraint {
     id: PointerConstraintBackendId,
@@ -1639,8 +1656,8 @@ impl NativePointerConstraintBackend {
         cursor_position: CompositorOutputPosition,
     ) -> NativePointerConstraintBackendAction {
         match request {
-            PointerConstraintBackendRequest::ActivateLocked(id) => {
-                self.activate_locked(id, cursor_position)
+            PointerConstraintBackendRequest::ActivateLocked { id, anchor } => {
+                self.activate_locked(id, anchor)
             }
             PointerConstraintBackendRequest::ActivateConfined { id, region } => {
                 self.activate_confined(id, cursor_position, region)
@@ -1652,6 +1669,16 @@ impl NativePointerConstraintBackend {
                 id,
                 restore_position,
             } => self.deactivate(id, restore_position),
+            PointerConstraintBackendRequest::WarpPointer { position } => {
+                native_pointer_debug_log(format!(
+                    "backend warp requested position=({},{})",
+                    position.x, position.y
+                ));
+                NativePointerConstraintBackendAction {
+                    cursor_position: Some(position),
+                    ..NativePointerConstraintBackendAction::default()
+                }
+            }
             PointerConstraintBackendRequest::ApplyCursorVisibility { visible } => {
                 if self.cursor_visible == visible {
                     NativePointerConstraintBackendAction::default()
@@ -2108,6 +2135,10 @@ enum NativeWindowAction {
 }
 
 impl NativeHardwareInputEvent {
+    const fn may_change_pointer_constraints(self) -> bool {
+        matches!(self, Self::Key { .. } | Self::PointerButton { .. })
+    }
+
     fn from_linux_event(event: LinuxInputEvent) -> Option<Self> {
         match event.type_ {
             EV_KEY if is_pointer_button(event.code) && event.value != 2 => {
@@ -2279,17 +2310,15 @@ impl NativeInputState {
         (self.cursor_x.round() as i32, self.cursor_y.round() as i32)
     }
 
-    fn set_pointer_locked(&mut self, locked: bool) {
-        self.pointer_constraint = if locked {
-            NativePointerConstraintState::Locked {
-                anchor: CompositorOutputPosition {
-                    x: self.cursor_x,
-                    y: self.cursor_y,
-                },
-            }
-        } else {
-            NativePointerConstraintState::None
-        };
+    fn cursor_position_f64(&self) -> CompositorOutputPosition {
+        CompositorOutputPosition {
+            x: self.cursor_x,
+            y: self.cursor_y,
+        }
+    }
+
+    fn set_pointer_locked_at(&mut self, anchor: CompositorOutputPosition) {
+        self.pointer_constraint = NativePointerConstraintState::Locked { anchor };
     }
 
     fn set_pointer_confined(&mut self, region: OutputRegion) {
@@ -2561,6 +2590,7 @@ impl NativeInputState {
             pointer_motion_usec: Some(sample.timestamp_usec),
             ..NativeInputEffect::default()
         };
+        let locked_at_start = self.pointer_constraint.locked();
         if let Some(relative) = sample.relative {
             effect.relative_motion = (!relative.is_zero()).then_some(relative);
             if !self.pointer_constraint.locked() {
@@ -2600,6 +2630,15 @@ impl NativeInputState {
         if !self.pointer_constraint.locked() {
             effect.mark_cursor_moved(self.cursor_x, self.cursor_y);
         }
+        native_pointer_debug_log(format!(
+            "pointer.motion native locked={} absolute_updated={} relative=({},{}) cursor=({},{})",
+            locked_at_start,
+            effect.pointer_motion.is_some(),
+            sample.relative.map(|relative| relative.dx).unwrap_or(0.0),
+            sample.relative.map(|relative| relative.dy).unwrap_or(0.0),
+            self.cursor_x,
+            self.cursor_y
+        ));
         effect
     }
 
@@ -3970,20 +4009,41 @@ fn process_native_pointer_constraint_backend_requests(
             break;
         }
         for request in requests {
-            let (cursor_x, cursor_y) = input_state.cursor_position();
-            let action = backend.handle_request(
-                request,
-                CompositorOutputPosition {
-                    x: f64::from(cursor_x),
-                    y: f64::from(cursor_y),
-                },
-            );
+            let cursor_position = input_state.cursor_position_f64();
+            native_pointer_debug_log(format!(
+                "pointer.constraint native_request {:?} cursor=({},{})",
+                request, cursor_position.x, cursor_position.y
+            ));
+            if let Some(id) = pointer_constraint_activation_request_id(&request)
+                && !server.pointer_constraint_backend_activation_current(id)
+            {
+                native_pointer_debug_log(format!(
+                    "pointer.constraint native_request dropped stale id={} generation={} rollback=not_needed",
+                    id.constraint_id, id.generation
+                ));
+                continue;
+            }
+            let action = backend.handle_request(request, cursor_position);
             if let Some((id, reason)) = action.failed {
+                native_pointer_debug_log(format!(
+                    "pointer.constraint native_failed id={} generation={} reason={}",
+                    id.constraint_id, id.generation, reason
+                ));
                 server.pointer_constraint_backend_failed(id, reason);
             }
             if let Some(constraint) = action.activated {
+                native_pointer_debug_log(format!(
+                    "pointer.constraint native_activated id={} generation={} mode={:?} anchor=({},{})",
+                    constraint.id.constraint_id,
+                    constraint.id.generation,
+                    constraint.mode,
+                    constraint.anchor.x,
+                    constraint.anchor.y
+                ));
                 match constraint.mode {
-                    PointerConstraintMode::Locked => input_state.set_pointer_locked(true),
+                    PointerConstraintMode::Locked => {
+                        input_state.set_pointer_locked_at(constraint.anchor)
+                    }
                     PointerConstraintMode::Confined => {
                         if let Some(region) = constraint.region {
                             input_state.set_pointer_confined(region);
@@ -3994,6 +4054,10 @@ fn process_native_pointer_constraint_backend_requests(
                 server.pointer_constraint_backend_activated(constraint.id);
             }
             if let Some(restore_position) = action.restore_position {
+                native_pointer_debug_log(format!(
+                    "pointer.unlock native_restore output=({},{})",
+                    restore_position.x, restore_position.y
+                ));
                 input_state.clear_pointer_constraint();
                 let effect = input_state.restore_cursor_position(restore_position);
                 redraw_requested |= effect.requires_frame_repaint(cursor_mode);
@@ -4013,9 +4077,14 @@ fn process_native_pointer_constraint_backend_requests(
                 }
             }
             if let Some(id) = action.deactivated {
+                native_pointer_debug_log(format!(
+                    "pointer.constraint native_deactivated id={} generation={}",
+                    id.constraint_id, id.generation
+                ));
                 server.pointer_constraint_backend_deactivated(id);
             }
             if let Some(visible) = action.cursor_visibility_changed {
+                native_pointer_debug_log(format!("cursor visibility native visible={}", visible));
                 let changed = input_state.set_cursor_visible(visible);
                 if cursor_mode == NativeCursorRenderMode::Software && changed {
                     redraw_requested = true;
@@ -4035,6 +4104,16 @@ fn process_native_pointer_constraint_backend_requests(
     }
     input_state.pointer_constraint = backend.active_constraint_state();
     Ok(redraw_requested)
+}
+
+fn pointer_constraint_activation_request_id(
+    request: &PointerConstraintBackendRequest,
+) -> Option<PointerConstraintBackendId> {
+    match request {
+        PointerConstraintBackendRequest::ActivateLocked { id, .. }
+        | PointerConstraintBackendRequest::ActivateConfined { id, .. } => Some(*id),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -7933,7 +8012,7 @@ mod tests {
     #[test]
     fn native_input_locked_relative_motion_preserves_delta_without_moving_cursor() {
         let mut input = NativeInputState::new(320, 200);
-        input.set_pointer_locked(true);
+        input.set_pointer_locked_at(input.cursor_position_f64());
 
         let effect = input.handle_pointer_motion_delta(24.0, 12.0);
 
@@ -7951,7 +8030,7 @@ mod tests {
     #[test]
     fn native_input_locked_absolute_motion_does_not_move_cursor() {
         let mut input = NativeInputState::new(320, 200);
-        input.set_pointer_locked(true);
+        input.set_pointer_locked_at(input.cursor_position_f64());
 
         let effect = input.handle_pointer_motion(PointerMotionSample::absolute(7, 25.0, 26.0));
 
@@ -7961,12 +8040,40 @@ mod tests {
     }
 
     #[test]
+    fn locked_pointer_motion_never_accumulates_absolute_cursor_position() {
+        let mut input = NativeInputState::new(800, 600);
+        let anchor = CompositorOutputPosition {
+            x: 400.25,
+            y: 300.75,
+        };
+        input.restore_cursor_position(anchor);
+        input.set_pointer_locked_at(anchor);
+
+        let mut total_dx = 0.0;
+        let mut total_dy = 0.0;
+        for _ in 0..100 {
+            let effect = input.handle_pointer_motion(PointerMotionSample::relative(
+                10,
+                RelativeMotion::accelerated_only(20.0, -15.0),
+            ));
+            total_dx += effect.relative_motion.unwrap().dx;
+            total_dy += effect.relative_motion.unwrap().dy;
+            assert_eq!(effect.pointer_motion, None);
+            assert_eq!(effect.cursor_position, None);
+        }
+
+        assert_eq!(total_dx, 2000.0);
+        assert_eq!(total_dy, -1500.0);
+        assert_eq!(input.cursor_position_f64(), anchor);
+    }
+
+    #[test]
     fn native_input_unlock_restore_sets_logical_cursor_position() {
         let mut input = NativeInputState::new(320, 200);
-        input.set_pointer_locked(true);
+        input.set_pointer_locked_at(input.cursor_position_f64());
         input.handle_pointer_motion_delta(200.0, 200.0);
 
-        input.set_pointer_locked(false);
+        input.clear_pointer_constraint();
         let effect = input.restore_cursor_position(CompositorOutputPosition { x: 35.0, y: 45.0 });
 
         assert_eq!(input.cursor_position(), (35, 45));
@@ -7978,9 +8085,9 @@ mod tests {
     #[test]
     fn native_input_first_real_move_after_unlock_starts_from_restored_position() {
         let mut input = NativeInputState::new(320, 200);
-        input.set_pointer_locked(true);
+        input.set_pointer_locked_at(input.cursor_position_f64());
         input.handle_pointer_motion_delta(200.0, 200.0);
-        input.set_pointer_locked(false);
+        input.clear_pointer_constraint();
         input.restore_cursor_position(CompositorOutputPosition { x: 35.0, y: 45.0 });
 
         let effect = input.handle_pointer_motion_delta(5.0, -10.0);
@@ -8043,11 +8150,17 @@ mod tests {
         };
 
         let first = backend.handle_request(
-            PointerConstraintBackendRequest::ActivateLocked(id),
+            PointerConstraintBackendRequest::ActivateLocked {
+                id,
+                anchor: CompositorOutputPosition { x: 10.0, y: 20.0 },
+            },
             CompositorOutputPosition { x: 10.0, y: 20.0 },
         );
         let duplicate = backend.handle_request(
-            PointerConstraintBackendRequest::ActivateLocked(id),
+            PointerConstraintBackendRequest::ActivateLocked {
+                id,
+                anchor: CompositorOutputPosition { x: 30.0, y: 40.0 },
+            },
             CompositorOutputPosition { x: 30.0, y: 40.0 },
         );
 
@@ -8105,7 +8218,10 @@ mod tests {
             generation: 1,
         };
         backend.handle_request(
-            PointerConstraintBackendRequest::ActivateLocked(active),
+            PointerConstraintBackendRequest::ActivateLocked {
+                id: active,
+                anchor: CompositorOutputPosition { x: 10.0, y: 20.0 },
+            },
             CompositorOutputPosition { x: 10.0, y: 20.0 },
         );
 
@@ -8129,7 +8245,10 @@ mod tests {
             generation: 1,
         };
         backend.handle_request(
-            PointerConstraintBackendRequest::ActivateLocked(id),
+            PointerConstraintBackendRequest::ActivateLocked {
+                id,
+                anchor: CompositorOutputPosition { x: 10.0, y: 20.0 },
+            },
             CompositorOutputPosition { x: 10.0, y: 20.0 },
         );
 
@@ -8149,7 +8268,10 @@ mod tests {
         assert!(!backend.active_locked());
 
         backend.handle_request(
-            PointerConstraintBackendRequest::ActivateLocked(id),
+            PointerConstraintBackendRequest::ActivateLocked {
+                id,
+                anchor: CompositorOutputPosition { x: 10.0, y: 20.0 },
+            },
             CompositorOutputPosition { x: 10.0, y: 20.0 },
         );
         let action = backend.handle_request(
@@ -8164,6 +8286,33 @@ mod tests {
             action.restore_position,
             Some(CompositorOutputPosition { x: 10.0, y: 20.0 })
         );
+    }
+
+    #[test]
+    fn native_pointer_constraint_backend_preserves_fractional_activation_anchor() {
+        let mut backend = NativePointerConstraintBackend::new();
+        let id = PointerConstraintBackendId {
+            constraint_id: 12,
+            generation: 3,
+        };
+        let anchor = CompositorOutputPosition {
+            x: 400.25,
+            y: 300.75,
+        };
+
+        backend.handle_request(
+            PointerConstraintBackendRequest::ActivateLocked { id, anchor },
+            anchor,
+        );
+        let action = backend.handle_request(
+            PointerConstraintBackendRequest::Deactivate {
+                id,
+                restore_position: None,
+            },
+            CompositorOutputPosition { x: 0.0, y: 0.0 },
+        );
+
+        assert_eq!(action.restore_position, Some(anchor));
     }
 
     #[test]

@@ -59,6 +59,9 @@ use wayland_protocols::wp::pointer_constraints::zv1::client::{
     zwp_locked_pointer_v1 as client_zwp_locked_pointer_v1,
     zwp_pointer_constraints_v1 as client_zwp_pointer_constraints_v1,
 };
+use wayland_protocols::wp::pointer_warp::v1::client::{
+    wp_pointer_warp_v1 as client_wp_pointer_warp_v1,
+};
 use wayland_protocols::wp::presentation_time::client::{
     wp_presentation as client_wp_presentation,
     wp_presentation_feedback as client_wp_presentation_feedback,
@@ -103,6 +106,7 @@ struct RegistryTestState {
     pointer_vertical_axis: Option<f64>,
     pointer_horizontal_axis: Option<f64>,
     pointer_frame_count: usize,
+    pointer_frame_resource_ids: Vec<u32>,
     pointer_enter_frame_count: usize,
     pointer_enter_without_frame_count: usize,
     pointer_event_log: Vec<&'static str>,
@@ -115,6 +119,8 @@ struct RegistryTestState {
     relative_motion_dx_unaccel: Option<f64>,
     relative_motion_dy_unaccel: Option<f64>,
     relative_motion_resource_ids: Vec<u32>,
+    sdl_pending_relative_motion_count: usize,
+    sdl_camera_motion_count: usize,
     locked_count: usize,
     unlocked_count: usize,
     confined_count: usize,
@@ -550,8 +556,15 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
             }
             client_wl_pointer::Event::Frame => {
                 state.pointer_frame_count += 1;
+                state
+                    .pointer_frame_resource_ids
+                    .push(_proxy.id().protocol_id());
                 if state.pointer_event_log.last() == Some(&"enter") {
                     state.pointer_enter_frame_count += 1;
+                }
+                if state.sdl_pending_relative_motion_count > 0 {
+                    state.sdl_camera_motion_count += state.sdl_pending_relative_motion_count;
+                    state.sdl_pending_relative_motion_count = 0;
                 }
                 state.pointer_event_log.push("frame");
                 if state.pointer_event_log.contains(&"enter")
@@ -608,6 +621,7 @@ impl Dispatch<client_zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for Regi
             state.relative_motion_dy = Some(dy);
             state.relative_motion_dx_unaccel = Some(dx_unaccel);
             state.relative_motion_dy_unaccel = Some(dy_unaccel);
+            state.sdl_pending_relative_motion_count += 1;
             state.pointer_event_log.push("relative");
         }
     }
@@ -664,6 +678,18 @@ impl Dispatch<client_zwp_confined_pointer_v1::ZwpConfinedPointerV1, ()> for Regi
             client_zwp_confined_pointer_v1::Event::Unconfined => state.unconfined_count += 1,
             _ => {}
         }
+    }
+}
+
+impl Dispatch<client_wp_pointer_warp_v1::WpPointerWarpV1, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wp_pointer_warp_v1::WpPointerWarpV1,
+        _event: client_wp_pointer_warp_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
     }
 }
 
@@ -3728,7 +3754,7 @@ fn request_lock_activate_and_receive_pointer_motion_sample(
     let backend_id = requests
         .iter()
         .find_map(|request| match request {
-            PointerConstraintBackendRequest::ActivateLocked(id) => Some(*id),
+            PointerConstraintBackendRequest::ActivateLocked { id, .. } => Some(*id),
             _ => None,
         })
         .ok_or("expected locked backend activation request")?;
@@ -3833,7 +3859,7 @@ fn late_pointer_lock_activate_and_receive_relative_motion(
     let backend_id = requests
         .iter()
         .find_map(|request| match request {
-            PointerConstraintBackendRequest::ActivateLocked(id) => Some(*id),
+            PointerConstraintBackendRequest::ActivateLocked { id, .. } => Some(*id),
             _ => None,
         })
         .ok_or("expected locked backend activation request")?;
@@ -3906,7 +3932,7 @@ fn lock_activation_repairs_missing_source_pointer_enter_state(
     let backend_id = requests
         .iter()
         .find_map(|request| match request {
-            PointerConstraintBackendRequest::ActivateLocked(id) => Some(*id),
+            PointerConstraintBackendRequest::ActivateLocked { id, .. } => Some(*id),
             _ => None,
         })
         .ok_or("expected locked backend activation request")?;
@@ -5918,7 +5944,7 @@ fn activate_backend_locked_pointer(
     let backend_id = requests
         .iter()
         .find_map(|request| match request {
-            PointerConstraintBackendRequest::ActivateLocked(id) => Some(*id),
+            PointerConstraintBackendRequest::ActivateLocked { id, .. } => Some(*id),
             _ => None,
         })
         .ok_or("expected locked backend activation request")?;
@@ -6249,6 +6275,165 @@ fn run_locked_relative_motion_dispatches_to_all_same_client_resources(
     Ok((state, expected_ids))
 }
 
+fn clear_locked_relative_motion_observations(state: &mut RegistryTestState) {
+    state.pointer_frame_count = 0;
+    state.pointer_frame_resource_ids.clear();
+    state.pointer_event_log.clear();
+    state.relative_motion_count = 0;
+    state.relative_motion_resource_ids.clear();
+    state.relative_motion_utime = None;
+    state.relative_motion_dx = None;
+    state.relative_motion_dy = None;
+    state.relative_motion_dx_unaccel = None;
+    state.relative_motion_dy_unaccel = None;
+    state.sdl_pending_relative_motion_count = 0;
+    state.sdl_camera_motion_count = 0;
+    state.pointer_button = false;
+}
+
+struct LockedRelativeFrameResult {
+    state: RegistryTestState,
+    relative_ids: Vec<u32>,
+    pointer_ids: Vec<u32>,
+}
+
+fn run_locked_relative_motion_shared_source_pointer_frames(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<LockedRelativeFrameResult, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ())?;
+    let pointer = seat.get_pointer(&qh, ());
+    let pointer_id = pointer.id().protocol_id();
+    let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ())?;
+
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let relative_a = relative_manager.get_relative_pointer(&pointer, &qh, ());
+    let relative_b = relative_manager.get_relative_pointer(&pointer, &qh, ());
+    let relative_ids = vec![relative_a.id().protocol_id(), relative_b.id().protocol_id()];
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    activate_backend_locked_pointer(commands, &mut state, &mut queue)?;
+
+    clear_locked_relative_motion_observations(&mut state);
+    commands.send(ServerCommand::PointerMotionSample(PointerMotionSample {
+        timestamp_usec: 808,
+        absolute: None,
+        relative: Some(RelativePointerMotion {
+            dx: 4.0,
+            dy: -1.0,
+            dx_unaccelerated: 4.0,
+            dy_unaccelerated: -1.0,
+        }),
+    }))?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    Ok(LockedRelativeFrameResult {
+        state,
+        relative_ids,
+        pointer_ids: vec![pointer_id],
+    })
+}
+
+fn run_locked_relative_motion_different_source_pointer_frames(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<LockedRelativeFrameResult, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ())?;
+    let pointer_a = seat.get_pointer(&qh, ());
+    let pointer_b = seat.get_pointer(&qh, ());
+    let pointer_ids = vec![pointer_a.id().protocol_id(), pointer_b.id().protocol_id()];
+    let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ())?;
+
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let relative_a = relative_manager.get_relative_pointer(&pointer_a, &qh, ());
+    let relative_b = relative_manager.get_relative_pointer(&pointer_b, &qh, ());
+    let relative_ids = vec![relative_a.id().protocol_id(), relative_b.id().protocol_id()];
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &pointer_b,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    activate_backend_locked_pointer(commands, &mut state, &mut queue)?;
+
+    clear_locked_relative_motion_observations(&mut state);
+    commands.send(ServerCommand::PointerMotionSample(PointerMotionSample {
+        timestamp_usec: 809,
+        absolute: None,
+        relative: Some(RelativePointerMotion {
+            dx: -2.0,
+            dy: 5.0,
+            dx_unaccelerated: -2.0,
+            dy_unaccelerated: 5.0,
+        }),
+    }))?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    Ok(LockedRelativeFrameResult {
+        state,
+        relative_ids,
+        pointer_ids,
+    })
+}
+
 fn capture_pointer_constraint_ids(commands: &Sender<ServerCommand>) -> Vec<u64> {
     let (reply, receiver) = mpsc::channel();
     commands
@@ -6318,7 +6503,7 @@ fn run_multi_client_pointer_constraints_remain_independent(
     let id_a = requests_a
         .iter()
         .find_map(|request| match request {
-            PointerConstraintBackendRequest::ActivateLocked(id) => Some(*id),
+            PointerConstraintBackendRequest::ActivateLocked { id, .. } => Some(*id),
             _ => None,
         })
         .ok_or("expected client A locked backend activation request")?;

@@ -8,6 +8,7 @@ pub enum ProtocolGlobal {
     WpFractionalScale,
     WpPresentation,
     WpColorManagement,
+    WpPointerWarp,
     WpRelativePointer,
     WpPointerConstraints,
     WpIdleInhibit,
@@ -33,6 +34,7 @@ impl ProtocolGlobal {
             Self::WpFractionalScale => "wp_fractional_scale_manager_v1",
             Self::WpPresentation => "wp_presentation",
             Self::WpColorManagement => "wp_color_manager_v1",
+            Self::WpPointerWarp => "wp_pointer_warp_v1",
             Self::WpRelativePointer => "zwp_relative_pointer_manager_v1",
             Self::WpPointerConstraints => "zwp_pointer_constraints_v1",
             Self::WpIdleInhibit => "zwp_idle_inhibit_manager_v1",
@@ -53,6 +55,7 @@ impl ProtocolGlobal {
 pub struct InputProtocolCapabilities {
     pub relative_pointer: bool,
     pub pointer_constraints: bool,
+    pub pointer_warp: bool,
     pub keyboard_shortcuts_inhibit: bool,
     pub idle_inhibit: bool,
 }
@@ -62,6 +65,7 @@ impl InputProtocolCapabilities {
         Self {
             relative_pointer: false,
             pointer_constraints: false,
+            pointer_warp: false,
             keyboard_shortcuts_inhibit: false,
             idle_inhibit: false,
         }
@@ -71,6 +75,7 @@ impl InputProtocolCapabilities {
         Self {
             relative_pointer: true,
             pointer_constraints: true,
+            pointer_warp: true,
             keyboard_shortcuts_inhibit: false,
             idle_inhibit: false,
         }
@@ -80,6 +85,7 @@ impl InputProtocolCapabilities {
         Self {
             relative_pointer: true,
             pointer_constraints: true,
+            pointer_warp: true,
             keyboard_shortcuts_inhibit: false,
             idle_inhibit: false,
         }
@@ -174,6 +180,9 @@ pub fn client_protocols_for_capabilities(
         .unwrap_or(protocols.len());
     if input_capabilities.pointer_constraints {
         protocols.insert(insert_at, ProtocolGlobal::WpPointerConstraints);
+    }
+    if input_capabilities.pointer_warp {
+        protocols.insert(insert_at, ProtocolGlobal::WpPointerWarp);
     }
     if input_capabilities.relative_pointer {
         protocols.insert(insert_at, ProtocolGlobal::WpRelativePointer);

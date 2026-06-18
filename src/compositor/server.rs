@@ -7,7 +7,7 @@ use wayland_protocols::wp::{
     fractional_scale::v1::server::wp_fractional_scale_manager_v1,
     idle_inhibit::zv1::server::zwp_idle_inhibit_manager_v1,
     pointer_constraints::zv1::server::zwp_pointer_constraints_v1,
-    presentation_time::server::wp_presentation,
+    pointer_warp::v1::server::wp_pointer_warp_v1, presentation_time::server::wp_presentation,
     primary_selection::zv1::server::zwp_primary_selection_device_manager_v1,
     relative_pointer::zv1::server::zwp_relative_pointer_manager_v1,
     viewporter::server::wp_viewporter,
@@ -293,6 +293,13 @@ impl OwnCompositorServer {
         let _ = self.display.flush_clients();
     }
 
+    pub fn pointer_constraint_backend_activation_current(
+        &self,
+        id: PointerConstraintBackendId,
+    ) -> bool {
+        self.state.pointer_constraint_backend_activation_current(id)
+    }
+
     pub fn pointer_constraint_backend_deactivated(&mut self, id: PointerConstraintBackendId) {
         self.state.pointer_constraint_backend_deactivated(id);
         let _ = self.display.flush_clients();
@@ -406,7 +413,9 @@ impl OwnCompositorServer {
 
         self.state.accepted_clients += accepted;
         self.state.poll_clipboard_bridge();
+        self.state.begin_client_dispatch_cycle();
         self.display.dispatch_clients(&mut self.state)?;
+        self.state.finish_client_dispatch_cycle();
         self.state.poll_clipboard_bridge();
         self.display.flush_clients()?;
         Ok(accepted)
@@ -453,6 +462,9 @@ fn register_minimum_globals(
             zwp_pointer_constraints_v1::ZwpPointerConstraintsV1,
             _,
         >(1, ());
+    }
+    if input_capabilities.pointer_warp {
+        display.create_global::<CompositorState, wp_pointer_warp_v1::WpPointerWarpV1, _>(1, ());
     }
     if input_capabilities.idle_inhibit {
         display.create_global::<
