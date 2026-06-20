@@ -14,6 +14,18 @@ Remaining work from this note still applies to DRM-fd/libinput-driven wakeups,
 precise pageflip timestamp/sequence propagation, and the future EGL/GLES render
 path.
 
+Update 2026-06-19: DRM, Wayland, and input fds now drive an epoll reactor and a
+monotonic absolute timerfd supplies protocol-only deadlines plus a bounded
+pageflip watchdog. The scheduler never completes an asynchronous frame from a
+timer.
+
+Update 2026-06-19 (presentation metadata): legacy pageflip events are now
+length-validated and matched through unique user-data tokens. Kernel seconds,
+microseconds, and `u32` sequence values reach `wp_presentation` unchanged apart
+from exact microsecond-to-nanosecond conversion. The advertised clock follows
+`DRM_CAP_TIMESTAMP_MONOTONIC`, and feedback conservatively reports `VSYNC`
+without `HW_CLOCK`, `HW_COMPLETION`, or `ZERO_COPY`.
+
 Non-goals:
 
 - Do not patch production compositor code in this document.

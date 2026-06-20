@@ -12,8 +12,9 @@ use std::{
     path::{Path, PathBuf},
     ptr,
     rc::Rc,
-    slice, thread,
-    time::{Duration, Instant},
+    slice,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
 };
 
 use crate::egl_renderer::dmabuf::{query_egl_dmabuf_feedback, query_egl_main_device};
@@ -29,13 +30,21 @@ use khronos_egl as egl;
 use oblivion_one::compositor::OutputRect;
 use oblivion_one::compositor::{
     DesktopComposeRequest, DesktopFrameCopyKind, DesktopSceneRebuildKind, DesktopSceneRenderer,
-    DesktopVisualState, OutputPosition as CompositorOutputPosition, OutputRegion,
-    OwnCompositorServer, PointerConstraintBackendId, PointerConstraintBackendRequest,
-    PointerConstraintMode, PointerMotionSample as CompositorPointerMotionSample,
+    DesktopVisualState, FramePresentation, OutputPosition as CompositorOutputPosition,
+    OutputRegion, OwnCompositorServer, PointerConstraintBackendId, PointerConstraintBackendRequest,
+    PointerConstraintMode, PointerMotionSample as CompositorPointerMotionSample, PresentationClock,
     RelativePointerMotion as CompositorRelativePointerMotion, RenderGenerationCause,
     RenderSceneElement, RenderSceneElementId, RenderableSurface, ShellDockItem,
     ShellOverlayRenderer, ShellOverlayState, ShellTopbarModel, SpotlightModel,
     cursor_texture_pixels, cursor_texture_size, dock_item_at, render_scene_elements_for_surfaces,
+};
+use oblivion_one::native::{
+    drm::{
+        DrmPresentationEvent, DrmTimestampClock, drain_drm_page_flip_events,
+        query_drm_timestamp_clock, sample_clock_microseconds, submit_legacy_page_flip,
+    },
+    event_loop::{NativeEventLoop, NativeEventSource, monotonic_now_ns},
+    scheduler::{NativeFrameScheduler, PageFlipCompletionResult, SchedulerDecision},
 };
 use oblivion_one::render_backend::egl_gles::EglGlesDmabufFeedback;
 use oblivion_one::session::NativeSessionProbe;
@@ -724,6 +733,12 @@ pub fn run(
     println!("native DRM backend target: {}", drm_plan.primary.as_str());
     let kms = NativeDrmDevice::open(drm_plan, kms_device, seat_session.clone())?;
     println!("native DRM backend active: {}", kms.kind().as_str());
+    let drm_timestamp_clock = query_drm_timestamp_clock(kms.file().as_fd())?;
+    let presentation_clock = match drm_timestamp_clock {
+        DrmTimestampClock::Monotonic => PresentationClock::Monotonic,
+        DrmTimestampClock::Realtime => PresentationClock::Realtime,
+    };
+    server.set_presentation_clock(presentation_clock);
     let mode_preference = NativeModePreference::from_env();
     let target = select_kms_target(kms.file(), mode_preference)?;
     let mode_label = format!(
@@ -745,17 +760,19 @@ pub fn run(
             NativePerfField::u64("crtc", u64::from(target.crtc_id)),
             NativePerfField::str("mode", mode_label.clone()),
             NativePerfField::str("policy", mode_preference.as_str()),
+            NativePerfField::str("presentation_clock", drm_timestamp_clock.as_str()),
         ]
     });
-    let frame_pacing = NativeFramePacing::from_mode(&target.mode);
+    let refresh_hz = normalize_refresh_hz(target.mode.vrefresh);
+    let refresh_interval_ns = 1_000_000_000 / u64::from(refresh_hz);
     println!(
-        "native frame pacing: {} Hz target, active wake {} us",
-        frame_pacing.refresh_hz,
-        frame_pacing.active_interval.as_micros()
+        "native frame scheduler: {} Hz target, {} us absolute interval",
+        refresh_hz,
+        refresh_interval_ns / 1_000
     );
 
     server.set_output_size(target.width, target.height);
-    server.set_output_refresh_hz(frame_pacing.refresh_hz);
+    server.set_output_refresh_hz(refresh_hz);
     let original_crtc = drm_ffi::mode::get_crtc(kms.file().as_fd(), target.crtc_id).ok();
     let scanout_preference = NativeScanoutPreference::from_env();
     let scanout_plan = NativeScanoutPlan::choose(NativeScanoutChoice {
@@ -781,11 +798,8 @@ pub fn run(
             NativePerfField::str("scanout", scanout.kind().as_str()),
             NativePerfField::str("scanout_target", scanout_target),
             NativePerfField::str("mode", mode_label.clone()),
-            NativePerfField::u64("refresh_hz", u64::from(frame_pacing.refresh_hz)),
-            NativePerfField::u64(
-                "active_wake_us",
-                frame_pacing.active_interval.as_micros() as u64,
-            ),
+            NativePerfField::u64("refresh_hz", u64::from(refresh_hz)),
+            NativePerfField::u64("refresh_interval_ns", refresh_interval_ns),
         ]
     });
     let mut frame_renderer = NativeFrameRenderer::default();
@@ -1017,11 +1031,38 @@ pub fn run(
             NativePerfField::u64("height", u64::from(target.height)),
         ]
     });
+    set_fd_nonblocking(kms.file().as_raw_fd())?;
+    let mut event_loop = NativeEventLoop::new()?;
+    event_loop.register(kms.file().as_raw_fd(), NativeEventSource::Drm)?;
+    event_loop.register(
+        server.listener_fd().as_raw_fd(),
+        NativeEventSource::WaylandListener,
+    )?;
+    event_loop.register(
+        server.client_dispatch_fd().as_raw_fd(),
+        NativeEventSource::WaylandClients,
+    )?;
+    for (index, fd) in input_devices.event_fds().enumerate() {
+        let index = u16::try_from(index)
+            .map_err(|_| io::Error::other("too many native input event sources"))?;
+        event_loop.register(fd, NativeEventSource::Input(index))?;
+    }
+    let scheduler_anchor_ns = monotonic_now_ns()?;
+    let mut frame_scheduler = NativeFrameScheduler::new(refresh_hz, scheduler_anchor_ns);
+    if let Some(token) = scanout.pending_page_flip_token() {
+        frame_scheduler
+            .note_async_submission(token, scheduler_anchor_ns)
+            .map_err(io::Error::other)?;
+    }
+    event_loop.arm_deadline(frame_scheduler.next_deadline_ns())?;
     let mut last_render_generation = server.render_generation();
     let mut last_renderable_surfaces = server.renderable_surfaces().to_vec();
+    let mut queued_redraw_requested = false;
     let mut frame_index = 0u64;
     let mut known_toplevels = server.xdg_toplevels();
     let mut pending_launches = VecDeque::<NativeAppLaunchPerf>::new();
+    let mut mismatched_pageflip_events = 0u64;
+    let mut stale_pageflip_events = 0u64;
     let mut resize_perf = NativeResizePerfState::default();
     let mut pointer_constraint_backend = NativePointerConstraintBackend::new();
     if let Some(command) = startup_app
@@ -1036,59 +1077,134 @@ pub fn run(
         pending_launches.push_back(launch);
     }
     loop {
-        let pageflip_drain_start = Instant::now();
-        let pageflip_completed = scanout
-            .drain_page_flip_events(kms.file().as_raw_fd())
-            .map_err(|error| {
-                native_runtime_error(
-                    NativeRuntimeStage::DrainPageFlipEvents,
-                    scanout.kind(),
-                    target.crtc_id,
-                    frame_index,
-                    error,
-                )
-            })?;
-        let pageflip_drain_us = elapsed_micros(pageflip_drain_start);
-        if pageflip_completed {
-            let finish_frame_start = Instant::now();
-            server.finish_frame();
-            perf.log("native.finish_frame", || {
+        let wakeup = event_loop.wait()?;
+        let scheduler_state_before = frame_scheduler.state();
+        perf.log("native.wakeup", || {
+            vec![
+                NativePerfField::u64("ready_mask", u64::from(wakeup.reasons.bits())),
+                NativePerfField::usize("ready_sources", wakeup.ready_sources),
+                NativePerfField::u64("blocked_us", wakeup.blocked_ns / 1_000),
+                NativePerfField::u64(
+                    "deadline_late_us",
+                    wakeup.timer_lateness_ns.unwrap_or(0) / 1_000,
+                ),
+                NativePerfField::str("scheduler_before", format!("{scheduler_state_before:?}")),
+                NativePerfField::bool("pageflip_pending", scanout.page_flip_pending()),
+            ]
+        });
+        if wakeup.reasons.timer() {
+            perf.log("native.deadline", || {
                 vec![
-                    NativePerfField::str("reason", "pageflip_complete"),
-                    NativePerfField::u64("elapsed_us", elapsed_micros(finish_frame_start)),
-                    NativePerfField::usize("surfaces", server.renderable_surfaces().len()),
-                    NativePerfField::u64("render_generation", server.render_generation()),
+                    NativePerfField::u64(
+                        "lateness_us",
+                        wakeup.timer_lateness_ns.unwrap_or(0) / 1_000,
+                    ),
+                    NativePerfField::str("scheduler_state", format!("{scheduler_state_before:?}")),
+                    NativePerfField::bool("pageflip_watchdog", frame_scheduler.page_flip_pending()),
                 ]
             });
         }
 
-        let present_start = Instant::now();
-        scanout
-            .present(kms.file().as_fd(), target.crtc_id)
-            .map_err(|error| {
-                native_runtime_error(
-                    NativeRuntimeStage::Present,
-                    scanout.kind(),
-                    target.crtc_id,
-                    frame_index,
-                    error,
-                )
-            })?;
-        let present_us = elapsed_micros(present_start);
+        input_devices.dispatch_session_events();
+        let pageflip_drain_start = Instant::now();
+        let should_drain_pageflips =
+            wakeup.reasons.drm() || (wakeup.reasons.timer() && frame_scheduler.page_flip_pending());
+        let pageflip_drain = if should_drain_pageflips {
+            scanout
+                .drain_page_flip_events(kms.file().as_raw_fd())
+                .map_err(|error| {
+                    native_runtime_error(
+                        NativeRuntimeStage::DrainPageFlipEvents,
+                        scanout.kind(),
+                        target.crtc_id,
+                        frame_index,
+                        error,
+                    )
+                })?
+        } else {
+            NativePageFlipDrain::default()
+        };
+        let pageflip_drain_us = elapsed_micros(pageflip_drain_start);
+        mismatched_pageflip_events =
+            mismatched_pageflip_events.saturating_add(pageflip_drain.mismatched_events);
+        stale_pageflip_events = stale_pageflip_events.saturating_add(pageflip_drain.stale_events);
+        if pageflip_drain.mismatched_events > 0 || pageflip_drain.stale_events > 0 {
+            perf.log("native.pageflip_event_error", || {
+                vec![
+                    NativePerfField::u64("mismatched", pageflip_drain.mismatched_events),
+                    NativePerfField::u64("stale", pageflip_drain.stale_events),
+                    NativePerfField::u64(
+                        "expected_token",
+                        pageflip_drain.last_mismatch.map_or(0, |value| value.0),
+                    ),
+                    NativePerfField::u64(
+                        "received_token",
+                        pageflip_drain.last_mismatch.map_or(0, |value| value.1),
+                    ),
+                    NativePerfField::u64(
+                        "stale_token",
+                        pageflip_drain.last_stale_token.unwrap_or(0),
+                    ),
+                ]
+            });
+        }
+        let pageflip_completed = pageflip_drain.completion.is_some();
+        let mut frame_completed = false;
+        let mut frame_rendered = false;
+        let mut frame_submitted = false;
+        if let Some(pageflip) = pageflip_drain.completion {
+            let compositor_receive_ns = monotonic_now_ns()?;
+            let scheduler_state_at_completion = frame_scheduler.state();
+            let completion = frame_scheduler
+                .note_page_flip_completion(pageflip.user_data, compositor_receive_ns);
+            if let PageFlipCompletionResult::Completed { submitted_at_ns } = completion {
+                let presentation = FramePresentation::synchronized(
+                    presentation_clock,
+                    pageflip.timestamp.seconds,
+                    pageflip.timestamp.microseconds,
+                    pageflip.sequence,
+                )?;
+                let compositor_receive_us = sample_clock_microseconds(drm_timestamp_clock)?;
+                let kernel_timestamp_us = u64::from(pageflip.timestamp.seconds)
+                    .saturating_mul(1_000_000)
+                    .saturating_add(u64::from(pageflip.timestamp.microseconds));
+                let finish_frame_start = Instant::now();
+                server.finish_frame_with_presentation(presentation);
+                if !server.has_pending_frame_work() {
+                    frame_scheduler.complete_protocol_only();
+                }
+                frame_completed = true;
+                perf.log("native.finish_frame", || {
+                    vec![
+                        NativePerfField::str("reason", "pageflip_complete"),
+                        NativePerfField::u64("elapsed_us", elapsed_micros(finish_frame_start)),
+                        NativePerfField::usize("surfaces", server.renderable_surfaces().len()),
+                        NativePerfField::u64("render_generation", server.render_generation()),
+                        NativePerfField::u64("pageflip_token", pageflip.user_data),
+                        NativePerfField::u64("kernel_sequence", u64::from(pageflip.sequence)),
+                        NativePerfField::u64("kernel_timestamp_us", kernel_timestamp_us),
+                        NativePerfField::u64("compositor_receive_us", compositor_receive_us),
+                        NativePerfField::u64(
+                            "receive_delay_us",
+                            compositor_receive_us.saturating_sub(kernel_timestamp_us),
+                        ),
+                        NativePerfField::u64(
+                            "submit_to_completion_us",
+                            compositor_receive_ns.saturating_sub(submitted_at_ns) / 1_000,
+                        ),
+                        NativePerfField::str(
+                            "scheduler_state",
+                            format!("{scheduler_state_at_completion:?}"),
+                        ),
+                    ]
+                });
+            }
+        }
+        let present_us = 0;
         let pageflip_pending_at_tick = scanout.page_flip_pending();
-        let tick_blocked_by_pageflip =
-            !native_dispatch_clients_while_pageflip_pending(pageflip_pending_at_tick);
         let tick_start = Instant::now();
-        let accepted = if tick_blocked_by_pageflip {
-            0
-        } else {
-            server.tick()?
-        };
-        let tick_us = if tick_blocked_by_pageflip {
-            0
-        } else {
-            elapsed_micros(tick_start)
-        };
+        let accepted = server.tick()?;
+        let tick_us = elapsed_micros(tick_start);
         let mut redraw_requested = process_native_pointer_constraint_backend_requests(
             &mut server,
             &mut pointer_constraint_backend,
@@ -1131,16 +1247,26 @@ pub fn run(
                 server.accepted_clients()
             );
         }
-        let mut input_events = false;
         let mut skipped_input_repaints = 0usize;
         let input_drain_start = Instant::now();
         let raw_events = input_devices.drain_events();
         let input_drain_us = elapsed_micros(input_drain_start);
         let raw_input_events = raw_events.len();
+        let input_event_timestamp_usec = matches!(
+            input_devices.kind(),
+            NativeInputBackendKind::LibseatLibinputUdev
+                | NativeInputBackendKind::DirectLibinputUdev
+        )
+        .then(|| {
+            raw_events
+                .iter()
+                .filter_map(|event| event.timestamp_usec())
+                .max()
+        })
+        .flatten();
         let coalesced_events = coalesce_pointer_motion_events(raw_events);
         let coalesced_input_events = coalesced_events.len();
         for event in coalesced_events {
-            input_events = true;
             let may_change_pointer_constraints = event.may_change_pointer_constraints();
             let effect = input_state.handle_hardware_input_event(event);
             let effect_requested_redraw = effect.redraw_requested;
@@ -1183,7 +1309,7 @@ pub fn run(
                 skipped_input_repaints = skipped_input_repaints.saturating_add(1);
             }
             redraw_requested |= application.redraw_requested;
-            if may_change_pointer_constraints && !tick_blocked_by_pageflip {
+            if may_change_pointer_constraints {
                 let _ = server.tick()?;
                 redraw_requested |= process_native_pointer_constraint_backend_requests(
                     &mut server,
@@ -1201,6 +1327,18 @@ pub fn run(
             &mut hardware_cursor,
             cursor_render_mode,
         )?;
+        if let Some(event_timestamp_us) = input_event_timestamp_usec {
+            let dispatch_latency_us = monotonic_now_ns()?
+                .saturating_div(1_000)
+                .saturating_sub(event_timestamp_us);
+            perf.log("native.input_dispatch", || {
+                vec![
+                    NativePerfField::usize("events", coalesced_input_events),
+                    NativePerfField::u64("event_timestamp_us", event_timestamp_us),
+                    NativePerfField::u64("dispatch_latency_us", dispatch_latency_us),
+                ]
+            });
+        }
         if !scanout.page_flip_pending() && server.has_pending_frame_prepare_work() {
             let prepare_frame_start = Instant::now();
             let before_generation = server.render_generation();
@@ -1219,21 +1357,53 @@ pub fn run(
         let render_generation_changed = render_generation != last_render_generation;
         let render_generation_cause = server.render_generation_cause();
         let pending_frame_work = server.has_pending_frame_work();
+        let pending_explicit_sync_work = server.has_pending_explicit_sync_work();
         let repaint_decision = native_repaint_decision(NativeRepaintInputs {
             accepted_clients: accepted > 0,
             render_generation_changed,
             pending_frame_work,
             only_pending_surface_frame_callbacks: server.has_only_pending_surface_frame_callbacks(),
             redraw_requested,
-            page_flip_pending: scanout.page_flip_pending(),
+            page_flip_pending: false,
         });
-        if repaint_decision.repaint {
+        let explicit_sync_wait_only = pending_explicit_sync_work
+            && !render_generation_changed
+            && accepted == 0
+            && !redraw_requested;
+        if repaint_decision.repaint && !explicit_sync_wait_only {
+            frame_scheduler.queue_visual_work();
+            queued_redraw_requested |= redraw_requested;
+        } else if repaint_decision.protocol_only_present || explicit_sync_wait_only {
+            frame_scheduler.queue_protocol_work(monotonic_now_ns()?);
+        }
+        let scheduler_decision = frame_scheduler.decision(monotonic_now_ns()?);
+        if scheduler_decision == SchedulerDecision::PageFlipWatchdogExpired {
+            perf.log("native.pageflip_watchdog", || {
+                vec![
+                    NativePerfField::u64("frame", frame_index),
+                    NativePerfField::u64("crtc", u64::from(target.crtc_id)),
+                    NativePerfField::str("scanout", scanout.kind().metric_name()),
+                    NativePerfField::u64("timeout_count", frame_scheduler.watchdog_timeout_count()),
+                    NativePerfField::bool("drm_ready", wakeup.reasons.drm()),
+                    NativePerfField::bool("final_drain_completed", pageflip_completed),
+                ]
+            });
+            return Err(io::Error::other(format!(
+                "native page flip watchdog expired: backend={} crtc={} frame={} pending=true; final DRM drain found no completion",
+                scanout.kind().metric_name(),
+                target.crtc_id,
+                frame_index
+            ))
+            .into());
+        }
+        if scheduler_decision == SchedulerDecision::Render {
+            let effective_redraw_requested = redraw_requested || queued_redraw_requested;
             let render_cause = native_repaint_cause_label(
                 render_generation_cause,
                 render_generation_changed,
                 accepted,
                 pending_frame_work,
-                redraw_requested,
+                effective_redraw_requested,
             );
             let output_damage = native_output_damage_for_repaint(
                 target.width,
@@ -1246,7 +1416,7 @@ pub fn run(
             let skip_empty_visible_damage = output_damage.is_empty()
                 && render_generation_changed
                 && accepted == 0
-                && !redraw_requested;
+                && !effective_redraw_requested;
             if skip_empty_visible_damage {
                 perf.log("native.frame_skip", || {
                     let mut fields = output_damage.fields().to_vec();
@@ -1254,7 +1424,6 @@ pub fn run(
                         NativePerfField::str("reason", "empty_visible_damage"),
                         NativePerfField::usize("skipped_input_repaints", skipped_input_repaints),
                         NativePerfField::u64("tick_us", tick_us),
-                        NativePerfField::bool("tick_blocked_by_pageflip", tick_blocked_by_pageflip),
                         NativePerfField::bool("pageflip_pending_at_tick", pageflip_pending_at_tick),
                         NativePerfField::u64("input_drain_us", input_drain_us),
                         NativePerfField::usize("raw_input_events", raw_input_events),
@@ -1280,6 +1449,8 @@ pub fn run(
                         ]
                     });
                 }
+                frame_scheduler.note_immediate_completion();
+                queued_redraw_requested = false;
                 last_render_generation = render_generation;
                 last_renderable_surfaces = server.renderable_surfaces().to_vec();
             } else {
@@ -1294,6 +1465,7 @@ pub fn run(
                     cursor_render_mode,
                     &output_damage,
                 )?;
+                frame_rendered = true;
                 let cpu_after = perf
                     .enabled()
                     .then(NativeProcessCpuSample::read_current)
@@ -1303,8 +1475,57 @@ pub fn run(
                     .map(|(before, after)| after.delta_us_since(before))
                     .unwrap_or((0, 0));
                 let repaint_present_start = Instant::now();
-                scanout.present(kms.file().as_fd(), target.crtc_id)?;
+                let present_result = scanout
+                    .present(kms.file().as_fd(), target.crtc_id)
+                    .map_err(|error| {
+                        native_runtime_error(
+                            NativeRuntimeStage::Present,
+                            scanout.kind(),
+                            target.crtc_id,
+                            frame_index,
+                            error,
+                        )
+                    })?;
                 let repaint_present_us = elapsed_micros(repaint_present_start);
+                match present_result {
+                    NativePresentResult::AsyncSubmitted { token } => {
+                        frame_scheduler
+                            .note_async_submission(token, monotonic_now_ns()?)
+                            .map_err(io::Error::other)?;
+                        frame_submitted = true;
+                    }
+                    NativePresentResult::Immediate => {
+                        frame_scheduler.note_immediate_completion();
+                        if server.has_pending_frame_work() {
+                            let finish_frame_start = Instant::now();
+                            server.finish_frame();
+                            frame_completed = true;
+                            perf.log("native.finish_frame", || {
+                                vec![
+                                    NativePerfField::str("reason", "immediate_scanout"),
+                                    NativePerfField::u64(
+                                        "elapsed_us",
+                                        elapsed_micros(finish_frame_start),
+                                    ),
+                                    NativePerfField::usize(
+                                        "surfaces",
+                                        server.renderable_surfaces().len(),
+                                    ),
+                                    NativePerfField::u64(
+                                        "render_generation",
+                                        server.render_generation(),
+                                    ),
+                                ]
+                            });
+                        }
+                    }
+                    NativePresentResult::Noop => {
+                        return Err(io::Error::other(
+                            "native scanout rendered a frame but did not submit or complete it",
+                        )
+                        .into());
+                    }
+                }
                 frame_index = frame_index.saturating_add(1);
                 perf.log("native.frame", || {
                     let mut fields = paint_stats.fields();
@@ -1314,13 +1535,12 @@ pub fn run(
                         NativePerfField::str("phase", "repaint"),
                         NativePerfField::str("mode", mode_label.clone()),
                         NativePerfField::str("cursor", cursor_render_mode.as_str()),
-                        NativePerfField::u64("refresh_hz", u64::from(frame_pacing.refresh_hz)),
+                        NativePerfField::u64("refresh_hz", u64::from(refresh_hz)),
                         NativePerfField::usize("surfaces", server.renderable_surfaces().len()),
                         NativePerfField::u64("render_generation", render_generation),
                         NativePerfField::bool("render_changed", render_generation_changed),
                         NativePerfField::str("render_cause", render_cause),
                         NativePerfField::u64("tick_us", tick_us),
-                        NativePerfField::bool("tick_blocked_by_pageflip", tick_blocked_by_pageflip),
                         NativePerfField::bool("pageflip_pending_at_tick", pageflip_pending_at_tick),
                         NativePerfField::u64("input_drain_us", input_drain_us),
                         NativePerfField::usize("raw_input_events", raw_input_events),
@@ -1338,16 +1558,32 @@ pub fn run(
                     ]);
                     fields
                 });
+                queued_redraw_requested = false;
                 last_render_generation = render_generation;
                 last_renderable_surfaces = server.renderable_surfaces().to_vec();
             }
-        } else if repaint_decision.protocol_only_present {
+        } else if scheduler_decision == SchedulerDecision::CompleteProtocolOnly {
+            if pending_explicit_sync_work {
+                frame_scheduler.complete_protocol_only();
+                frame_scheduler.queue_protocol_work(monotonic_now_ns()?);
+                perf.log("native.deadline", || {
+                    vec![
+                        NativePerfField::str("reason", "explicit_sync_acquire_wait"),
+                        NativePerfField::bool("acquire_ready", false),
+                        NativePerfField::u64(
+                            "next_deadline_ns",
+                            frame_scheduler.next_deadline_ns().unwrap_or(0),
+                        ),
+                    ]
+                });
+                event_loop.arm_deadline(frame_scheduler.next_deadline_ns())?;
+                continue;
+            }
             perf.log("native.frame_skip", || {
                 vec![
                     NativePerfField::str("reason", "frame_callback_no_damage"),
                     NativePerfField::usize("skipped_input_repaints", skipped_input_repaints),
                     NativePerfField::u64("tick_us", tick_us),
-                    NativePerfField::bool("tick_blocked_by_pageflip", tick_blocked_by_pageflip),
                     NativePerfField::bool("pageflip_pending_at_tick", pageflip_pending_at_tick),
                     NativePerfField::u64("input_drain_us", input_drain_us),
                     NativePerfField::usize("raw_input_events", raw_input_events),
@@ -1360,6 +1596,8 @@ pub fn run(
             });
             let finish_frame_start = Instant::now();
             server.finish_frame();
+            frame_scheduler.complete_protocol_only();
+            frame_completed = true;
             perf.log("native.finish_frame", || {
                 vec![
                     NativePerfField::str("reason", "frame_callback_no_damage"),
@@ -1368,13 +1606,12 @@ pub fn run(
                     NativePerfField::u64("render_generation", server.render_generation()),
                 ]
             });
-        } else if scanout.page_flip_pending() {
+        } else if scheduler_decision == SchedulerDecision::WaitForPageFlip {
             perf.log("native.frame_skip", || {
                 vec![
                     NativePerfField::str("reason", "pageflip_pending"),
                     NativePerfField::usize("skipped_input_repaints", skipped_input_repaints),
                     NativePerfField::u64("tick_us", tick_us),
-                    NativePerfField::bool("tick_blocked_by_pageflip", tick_blocked_by_pageflip),
                     NativePerfField::bool("pageflip_pending_at_tick", pageflip_pending_at_tick),
                     NativePerfField::u64("input_drain_us", input_drain_us),
                     NativePerfField::usize("raw_input_events", raw_input_events),
@@ -1394,7 +1631,6 @@ pub fn run(
                     NativePerfField::str("reason", "input_forwarded_no_visual"),
                     NativePerfField::usize("skipped_input_repaints", skipped_input_repaints),
                     NativePerfField::u64("tick_us", tick_us),
-                    NativePerfField::bool("tick_blocked_by_pageflip", tick_blocked_by_pageflip),
                     NativePerfField::bool("pageflip_pending_at_tick", pageflip_pending_at_tick),
                     NativePerfField::u64("input_drain_us", input_drain_us),
                     NativePerfField::usize("raw_input_events", raw_input_events),
@@ -1406,38 +1642,29 @@ pub fn run(
                 ]
             });
         }
-        if server.has_pending_frame_work() && scanout.frames_complete_immediately() {
-            let finish_frame_start = Instant::now();
-            server.finish_frame();
-            perf.log("native.finish_frame", || {
-                vec![
-                    NativePerfField::str("reason", "immediate_scanout"),
-                    NativePerfField::u64("elapsed_us", elapsed_micros(finish_frame_start)),
-                    NativePerfField::usize("surfaces", server.renderable_surfaces().len()),
-                    NativePerfField::u64("render_generation", server.render_generation()),
-                ]
-            });
-        }
-        thread::sleep(native_wakeup_interval(
-            NativeLoopActivity {
-                accepted_clients: accepted > 0,
-                input_events,
-                redraw_requested,
-                pending_frame_work: server.has_pending_frame_work(),
-                has_surfaces: !server.renderable_surfaces().is_empty(),
-            },
-            frame_pacing,
-        ));
+        perf.log("native.scheduler", || {
+            vec![
+                NativePerfField::str("decision", format!("{scheduler_decision:?}")),
+                NativePerfField::str("state_after", format!("{:?}", frame_scheduler.state())),
+                NativePerfField::bool("pageflip_pending", frame_scheduler.page_flip_pending()),
+                NativePerfField::bool("visual_work_queued", frame_scheduler.visual_work_queued()),
+                NativePerfField::bool(
+                    "protocol_work_queued",
+                    frame_scheduler.protocol_work_queued(),
+                ),
+                NativePerfField::bool("frame_rendered", frame_rendered),
+                NativePerfField::bool("frame_submitted", frame_submitted),
+                NativePerfField::bool("frame_completed", frame_completed),
+                NativePerfField::u64(
+                    "watchdog_timeout_count",
+                    frame_scheduler.watchdog_timeout_count(),
+                ),
+                NativePerfField::u64("mismatched_pageflip_events", mismatched_pageflip_events),
+                NativePerfField::u64("stale_pageflip_events", stale_pageflip_events),
+            ]
+        });
+        event_loop.arm_deadline(frame_scheduler.next_deadline_ns())?;
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NativeLoopActivity {
-    accepted_clients: bool,
-    input_events: bool,
-    redraw_requested: bool,
-    pending_frame_work: bool,
-    has_surfaces: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1454,11 +1681,6 @@ struct NativeRepaintInputs {
 struct NativeRepaintDecision {
     repaint: bool,
     protocol_only_present: bool,
-}
-
-fn native_dispatch_clients_while_pageflip_pending(page_flip_pending: bool) -> bool {
-    let _ = page_flip_pending;
-    true
 }
 
 fn native_repaint_decision(inputs: NativeRepaintInputs) -> NativeRepaintDecision {
@@ -1480,50 +1702,6 @@ fn native_repaint_decision(inputs: NativeRepaintInputs) -> NativeRepaintDecision
             || inputs.redraw_requested
             || (inputs.pending_frame_work && !protocol_only_present),
         protocol_only_present,
-    }
-}
-
-fn native_wakeup_interval(activity: NativeLoopActivity, pacing: NativeFramePacing) -> Duration {
-    native_wakeup_interval_with_pacing(activity, pacing)
-}
-
-fn native_wakeup_interval_with_pacing(
-    activity: NativeLoopActivity,
-    pacing: NativeFramePacing,
-) -> Duration {
-    if activity.input_events {
-        pacing.input_interval
-    } else if activity.accepted_clients || activity.redraw_requested || activity.pending_frame_work
-    {
-        pacing.active_interval
-    } else if activity.has_surfaces {
-        pacing.active_interval.min(NATIVE_SURFACE_WAKEUP_INTERVAL)
-    } else {
-        pacing.idle_interval
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NativeFramePacing {
-    refresh_hz: u32,
-    input_interval: Duration,
-    active_interval: Duration,
-    idle_interval: Duration,
-}
-
-impl NativeFramePacing {
-    fn from_mode(mode: &drm_sys::drm_mode_modeinfo) -> Self {
-        Self::for_refresh_hz(mode.vrefresh)
-    }
-
-    fn for_refresh_hz(refresh_hz: u32) -> Self {
-        let refresh_hz = normalize_refresh_hz(refresh_hz);
-        Self {
-            refresh_hz,
-            input_interval: NATIVE_INPUT_WAKEUP_INTERVAL,
-            active_interval: Duration::from_micros(1_000_000 / u64::from(refresh_hz)),
-            idle_interval: NATIVE_IDLE_WAKEUP_INTERVAL,
-        }
     }
 }
 
@@ -1919,9 +2097,6 @@ const fn native_scene_content_generation(
 }
 
 const WAYLAND_SCROLL_LINE_DISTANCE: f64 = 15.0;
-const NATIVE_INPUT_WAKEUP_INTERVAL: Duration = Duration::from_millis(1);
-const NATIVE_SURFACE_WAKEUP_INTERVAL: Duration = Duration::from_millis(4);
-const NATIVE_IDLE_WAKEUP_INTERVAL: Duration = Duration::from_millis(4);
 const EV_KEY: u16 = 0x01;
 const EV_REL: u16 = 0x02;
 const KEY_ESC: u16 = 1;
@@ -2137,6 +2312,13 @@ enum NativeWindowAction {
 impl NativeHardwareInputEvent {
     const fn may_change_pointer_constraints(self) -> bool {
         matches!(self, Self::Key { .. } | Self::PointerButton { .. })
+    }
+
+    const fn timestamp_usec(self) -> Option<u64> {
+        match self {
+            Self::PointerMotion(sample) => Some(sample.timestamp_usec),
+            Self::Key { .. } | Self::PointerButton { .. } | Self::PointerAxis { .. } => None,
+        }
     }
 
     fn from_linux_event(event: LinuxInputEvent) -> Option<Self> {
@@ -3200,6 +3382,22 @@ enum NativeInputBackend {
     RawEvdev(NativeInputDevices),
 }
 
+enum NativeInputEventFds<'a> {
+    Libinput(Option<RawFd>),
+    Raw(std::slice::Iter<'a, NativeInputDevice>),
+}
+
+impl Iterator for NativeInputEventFds<'_> {
+    type Item = RawFd;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Libinput(fd) => fd.take(),
+            Self::Raw(devices) => devices.next().map(|device| device.file.as_raw_fd()),
+        }
+    }
+}
+
 impl NativeInputBackend {
     fn open(
         plan: NativeInputBackendPlan,
@@ -3267,6 +3465,21 @@ impl NativeInputBackend {
             Self::LibseatLibinput(_) => NativeInputBackendKind::LibseatLibinputUdev,
             Self::DirectLibinput(_) => NativeInputBackendKind::DirectLibinputUdev,
             Self::RawEvdev(_) => NativeInputBackendKind::RawEvdev,
+        }
+    }
+
+    fn event_fds(&self) -> NativeInputEventFds<'_> {
+        match self {
+            Self::LibseatLibinput(backend) | Self::DirectLibinput(backend) => {
+                NativeInputEventFds::Libinput(Some(backend.input.as_fd().as_raw_fd()))
+            }
+            Self::RawEvdev(backend) => NativeInputEventFds::Raw(backend.devices.iter()),
+        }
+    }
+
+    fn dispatch_session_events(&mut self) {
+        if let Self::LibseatLibinput(backend) = self {
+            backend.sync_seat_lifecycle();
         }
     }
 
@@ -5363,6 +5576,22 @@ enum NativeScanoutBackend {
     Dumb(DumbFramebuffer),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativePresentResult {
+    Noop,
+    AsyncSubmitted { token: u64 },
+    Immediate,
+}
+
+#[derive(Debug, Default)]
+struct NativePageFlipDrain {
+    completion: Option<DrmPresentationEvent>,
+    mismatched_events: u64,
+    stale_events: u64,
+    last_mismatch: Option<(u64, u64)>,
+    last_stale_token: Option<u64>,
+}
+
 impl NativeScanoutBackend {
     fn open(plan: NativeScanoutPlan, kms: &fs::File, width: u32, height: u32) -> io::Result<Self> {
         let mut last_error = None;
@@ -5459,20 +5688,23 @@ impl NativeScanoutBackend {
         }
     }
 
-    fn present(&mut self, fd: BorrowedFd<'_>, crtc_id: u32) -> io::Result<()> {
-        match self {
+    fn present(&mut self, fd: BorrowedFd<'_>, crtc_id: u32) -> io::Result<NativePresentResult> {
+        let submitted_token = match self {
             Self::NativeEglGbm(scanout) => scanout.present(fd, crtc_id)?,
             Self::Gbm(scanout) => scanout.present(fd, crtc_id)?,
-            Self::Dumb(_) => {}
+            Self::Dumb(_) => return Ok(NativePresentResult::Immediate),
+        };
+        match submitted_token {
+            Some(token) => Ok(NativePresentResult::AsyncSubmitted { token }),
+            None => Ok(NativePresentResult::Noop),
         }
-        Ok(())
     }
 
-    fn drain_page_flip_events(&mut self, fd: RawFd) -> io::Result<bool> {
+    fn drain_page_flip_events(&mut self, fd: RawFd) -> io::Result<NativePageFlipDrain> {
         match self {
             Self::NativeEglGbm(scanout) => scanout.drain_page_flip_events(fd),
             Self::Gbm(scanout) => scanout.drain_page_flip_events(fd),
-            Self::Dumb(_) => Ok(false),
+            Self::Dumb(_) => Ok(NativePageFlipDrain::default()),
         }
     }
 
@@ -5484,8 +5716,12 @@ impl NativeScanoutBackend {
         }
     }
 
-    fn frames_complete_immediately(&self) -> bool {
-        matches!(self, Self::Dumb(_))
+    fn pending_page_flip_token(&self) -> Option<u64> {
+        match self {
+            Self::NativeEglGbm(scanout) => scanout.page_flip.pending_token(),
+            Self::Gbm(scanout) => scanout.page_flip.pending_token(),
+            Self::Dumb(_) => None,
+        }
     }
 
     fn dmabuf_feedback(&self) -> EglGlesDmabufFeedback {
@@ -5523,30 +5759,79 @@ enum NativePageFlipError {
     AlreadyPending,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativePageFlipCompletion {
+    Completed { token: u64 },
+    Mismatched { expected: u64, received: u64 },
+    Stale { token: u64 },
+}
+
+static NEXT_NATIVE_PAGE_FLIP_TOKEN: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct NativePageFlipState {
-    pending: bool,
+    pending_token: Option<u64>,
 }
 
 impl NativePageFlipState {
     const fn can_schedule(self) -> bool {
-        !self.pending
+        self.pending_token.is_none()
     }
 
-    fn mark_scheduled(&mut self) -> Result<(), NativePageFlipError> {
-        if self.pending {
-            Err(NativePageFlipError::AlreadyPending)
+    fn reserve_submission(&mut self) -> Result<u64, NativePageFlipError> {
+        if self.pending_token.is_some() {
+            return Err(NativePageFlipError::AlreadyPending);
+        }
+        let token = allocate_native_page_flip_token();
+        self.pending_token = Some(token);
+        Ok(token)
+    }
+
+    fn cancel_submission(&mut self, token: u64) -> bool {
+        if self.pending_token == Some(token) {
+            self.pending_token = None;
+            true
         } else {
-            self.pending = true;
-            Ok(())
+            false
         }
     }
 
-    fn mark_presented(&mut self) -> bool {
-        let was_pending = self.pending;
-        self.pending = false;
-        was_pending
+    const fn pending_token(self) -> Option<u64> {
+        self.pending_token
     }
+
+    fn complete(&mut self, token: u64) -> NativePageFlipCompletion {
+        let Some(expected) = self.pending_token else {
+            return NativePageFlipCompletion::Stale { token };
+        };
+        if expected != token {
+            return NativePageFlipCompletion::Mismatched {
+                expected,
+                received: token,
+            };
+        }
+        self.pending_token = None;
+        NativePageFlipCompletion::Completed { token }
+    }
+}
+
+fn allocate_native_page_flip_token() -> u64 {
+    loop {
+        let current = NEXT_NATIVE_PAGE_FLIP_TOKEN.load(Ordering::Relaxed);
+        let token = current.max(1);
+        let next = next_nonzero_page_flip_token(token);
+        if NEXT_NATIVE_PAGE_FLIP_TOKEN
+            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return token;
+        }
+    }
+}
+
+const fn next_nonzero_page_flip_token(token: u64) -> u64 {
+    let next = token.wrapping_add(1);
+    if next == 0 { 1 } else { next }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5923,42 +6208,53 @@ impl NativeEglGbmScanout {
         self.buffers.finish_initial_scanout();
     }
 
-    fn present(&mut self, fd: BorrowedFd<'_>, crtc_id: u32) -> io::Result<()> {
+    fn present(&mut self, fd: BorrowedFd<'_>, crtc_id: u32) -> io::Result<Option<u64>> {
         if !self.page_flip.can_schedule() {
-            return Ok(());
+            return Ok(None);
         }
         let Some(buffer) = self.buffers.take_ready() else {
-            return Ok(());
+            return Ok(None);
         };
-        self.page_flip
-            .mark_scheduled()
+        let token = self
+            .page_flip
+            .reserve_submission()
             .map_err(|_| io::Error::other("native page flip is already pending"))?;
-        match drm_ffi::mode::page_flip(
-            fd,
-            crtc_id,
-            buffer.fb_id,
-            drm_sys::DRM_MODE_PAGE_FLIP_EVENT,
-            0,
-        ) {
+        match submit_legacy_page_flip(fd, crtc_id, buffer.fb_id, token) {
             Ok(()) => {
                 self.buffers.set_pending(buffer);
-                Ok(())
+                Ok(Some(token))
             }
             Err(error) => {
-                self.page_flip.mark_presented();
+                self.page_flip.cancel_submission(token);
                 self.buffers.restore_ready(buffer);
                 Err(error)
             }
         }
     }
 
-    fn drain_page_flip_events(&mut self, fd: RawFd) -> io::Result<bool> {
-        let completed = drain_drm_page_flip_events(fd)?;
-        if completed == 0 {
-            return Ok(false);
+    fn drain_page_flip_events(&mut self, fd: RawFd) -> io::Result<NativePageFlipDrain> {
+        let mut drain = NativePageFlipDrain::default();
+        for event in drain_drm_page_flip_events(fd)? {
+            match self.page_flip.complete(event.user_data) {
+                NativePageFlipCompletion::Completed { .. } => {
+                    if drain.completion.is_none() {
+                        self.buffers.complete_page_flip();
+                        drain.completion = Some(event);
+                    } else {
+                        drain.stale_events = drain.stale_events.saturating_add(1);
+                    }
+                }
+                NativePageFlipCompletion::Mismatched { expected, received } => {
+                    drain.mismatched_events = drain.mismatched_events.saturating_add(1);
+                    drain.last_mismatch = Some((expected, received));
+                }
+                NativePageFlipCompletion::Stale { token } => {
+                    drain.stale_events = drain.stale_events.saturating_add(1);
+                    drain.last_stale_token = Some(token);
+                }
+            }
         }
-        let had_pending = self.buffers.complete_page_flip();
-        Ok(self.page_flip.mark_presented() || had_pending)
+        Ok(drain)
     }
 
     fn page_flip_pending(&self) -> bool {
@@ -6156,47 +6452,58 @@ impl NativeGbmScanout {
         }
     }
 
-    fn present(&mut self, fd: BorrowedFd<'_>, crtc_id: u32) -> io::Result<()> {
+    fn present(&mut self, fd: BorrowedFd<'_>, crtc_id: u32) -> io::Result<Option<u64>> {
         if !self.page_flip.can_schedule() {
-            return Ok(());
+            return Ok(None);
         }
         let Some(index) = self.ready_index.take() else {
-            return Ok(());
+            return Ok(None);
         };
         if index == self.current_index {
-            return Ok(());
+            return Ok(None);
         }
-        self.page_flip
-            .mark_scheduled()
+        let token = self
+            .page_flip
+            .reserve_submission()
             .map_err(|_| io::Error::other("native page flip is already pending"))?;
-        match drm_ffi::mode::page_flip(
-            fd,
-            crtc_id,
-            self.buffers[index].fb_id,
-            drm_sys::DRM_MODE_PAGE_FLIP_EVENT,
-            0,
-        ) {
+        match submit_legacy_page_flip(fd, crtc_id, self.buffers[index].fb_id, token) {
             Ok(()) => {
                 self.pending_index = Some(index);
-                Ok(())
+                Ok(Some(token))
             }
             Err(error) => {
-                self.page_flip.mark_presented();
+                self.page_flip.cancel_submission(token);
                 self.ready_index = Some(index);
                 Err(error)
             }
         }
     }
 
-    fn drain_page_flip_events(&mut self, fd: RawFd) -> io::Result<bool> {
-        let completed = drain_drm_page_flip_events(fd)?;
-        if completed == 0 {
-            return Ok(false);
+    fn drain_page_flip_events(&mut self, fd: RawFd) -> io::Result<NativePageFlipDrain> {
+        let mut drain = NativePageFlipDrain::default();
+        for event in drain_drm_page_flip_events(fd)? {
+            match self.page_flip.complete(event.user_data) {
+                NativePageFlipCompletion::Completed { .. } => {
+                    if drain.completion.is_none() {
+                        if let Some(index) = self.pending_index.take() {
+                            self.current_index = index;
+                        }
+                        drain.completion = Some(event);
+                    } else {
+                        drain.stale_events = drain.stale_events.saturating_add(1);
+                    }
+                }
+                NativePageFlipCompletion::Mismatched { expected, received } => {
+                    drain.mismatched_events = drain.mismatched_events.saturating_add(1);
+                    drain.last_mismatch = Some((expected, received));
+                }
+                NativePageFlipCompletion::Stale { token } => {
+                    drain.stale_events = drain.stale_events.saturating_add(1);
+                    drain.last_stale_token = Some(token);
+                }
+            }
         }
-        if let Some(index) = self.pending_index.take() {
-            self.current_index = index;
-        }
-        Ok(self.page_flip.mark_presented())
+        Ok(drain)
     }
 
     fn page_flip_pending(&self) -> bool {
@@ -6296,46 +6603,15 @@ fn add_gbm_framebuffer(fd: BorrowedFd<'_>, bo: &gbm::BufferObject<()>) -> io::Re
     .map(|framebuffer| framebuffer.fb_id)
 }
 
-fn drain_drm_page_flip_events(fd: RawFd) -> io::Result<usize> {
-    let mut pollfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
-    if ready < 0 {
+fn set_fd_nonblocking(fd: RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
         return Err(io::Error::last_os_error());
     }
-    if ready == 0 || pollfd.revents & libc::POLLIN == 0 {
-        return Ok(0);
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
     }
-
-    let mut buffer = [0u8; 1024];
-    let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast::<c_void>(), buffer.len()) };
-    if read < 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::WouldBlock {
-            return Ok(0);
-        }
-        return Err(error);
-    }
-    let mut offset = 0usize;
-    let read = read as usize;
-    let mut completed = 0usize;
-    while offset + mem::size_of::<drm_sys::drm_event>() <= read {
-        let event = unsafe {
-            ptr::read_unaligned(buffer.as_ptr().add(offset).cast::<drm_sys::drm_event>())
-        };
-        let length = event.length as usize;
-        if length == 0 || offset + length > read {
-            break;
-        }
-        if event.type_ == drm_sys::DRM_EVENT_FLIP_COMPLETE {
-            completed += 1;
-        }
-        offset += length;
-    }
-    Ok(completed)
+    Ok(())
 }
 
 struct DumbFramebuffer {
@@ -7813,15 +8089,76 @@ mod tests {
         let mut state = NativePageFlipState::default();
 
         assert!(state.can_schedule());
-        assert_eq!(state.mark_scheduled(), Ok(()));
+        let token = state.reserve_submission().unwrap();
+        assert_ne!(token, 0);
         assert!(!state.can_schedule());
         assert_eq!(
-            state.mark_scheduled(),
+            state.reserve_submission(),
             Err(NativePageFlipError::AlreadyPending)
         );
-        assert!(state.mark_presented());
+        assert_eq!(
+            state.complete(token),
+            NativePageFlipCompletion::Completed { token }
+        );
         assert!(state.can_schedule());
-        assert!(!state.mark_presented());
+        assert_eq!(
+            state.complete(token),
+            NativePageFlipCompletion::Stale { token }
+        );
+    }
+
+    #[test]
+    fn native_pageflip_state_rejects_mismatch_without_clearing_pending() {
+        let mut state = NativePageFlipState::default();
+        let expected = state.reserve_submission().unwrap();
+        let received = next_nonzero_page_flip_token(expected);
+
+        assert_eq!(
+            state.complete(received),
+            NativePageFlipCompletion::Mismatched { expected, received }
+        );
+        assert_eq!(state.pending_token(), Some(expected));
+    }
+
+    #[test]
+    fn native_pageflip_state_stale_event_cannot_complete_new_submission() {
+        let mut state = NativePageFlipState::default();
+        let first = state.reserve_submission().unwrap();
+        assert_eq!(
+            state.complete(first),
+            NativePageFlipCompletion::Completed { token: first }
+        );
+        let second = state.reserve_submission().unwrap();
+
+        assert_eq!(
+            state.complete(first),
+            NativePageFlipCompletion::Mismatched {
+                expected: second,
+                received: first,
+            }
+        );
+        assert_eq!(state.pending_token(), Some(second));
+    }
+
+    #[test]
+    fn native_pageflip_token_wrap_skips_zero() {
+        assert_eq!(next_nonzero_page_flip_token(u64::MAX), 1);
+        assert_eq!(next_nonzero_page_flip_token(1), 2);
+    }
+
+    #[test]
+    fn native_pageflip_token_does_not_restart_after_backend_recreation() {
+        let mut first = NativePageFlipState::default();
+        let old_token = first.reserve_submission().unwrap();
+        assert_eq!(
+            first.complete(old_token),
+            NativePageFlipCompletion::Completed { token: old_token }
+        );
+        let mut replacement = NativePageFlipState::default();
+
+        let replacement_token = replacement.reserve_submission().unwrap();
+
+        assert_ne!(replacement_token, old_token);
     }
 
     #[test]
@@ -8985,40 +9322,6 @@ mod tests {
     }
 
     #[test]
-    fn native_wakeup_uses_idle_interval_when_no_work_is_pending() {
-        assert_eq!(
-            native_wakeup_interval(
-                NativeLoopActivity {
-                    accepted_clients: false,
-                    input_events: false,
-                    redraw_requested: false,
-                    pending_frame_work: false,
-                    has_surfaces: false,
-                },
-                NativeFramePacing::for_refresh_hz(60),
-            ),
-            NATIVE_IDLE_WAKEUP_INTERVAL
-        );
-    }
-
-    #[test]
-    fn native_wakeup_uses_fast_interval_after_input() {
-        assert_eq!(
-            native_wakeup_interval(
-                NativeLoopActivity {
-                    accepted_clients: false,
-                    input_events: true,
-                    redraw_requested: false,
-                    pending_frame_work: false,
-                    has_surfaces: true,
-                },
-                NativeFramePacing::for_refresh_hz(60),
-            ),
-            NATIVE_INPUT_WAKEUP_INTERVAL
-        );
-    }
-
-    #[test]
     fn native_repaint_decision_skips_visible_frame_callback_without_damage() {
         assert_eq!(
             native_repaint_decision(NativeRepaintInputs {
@@ -9087,45 +9390,6 @@ mod tests {
                 repaint: false,
                 protocol_only_present: false,
             }
-        );
-    }
-
-    #[test]
-    fn native_dispatch_policy_keeps_wayland_clients_live_while_pageflip_is_pending() {
-        assert!(native_dispatch_clients_while_pageflip_pending(false));
-        assert!(native_dispatch_clients_while_pageflip_pending(true));
-    }
-
-    #[test]
-    fn native_frame_pacing_uses_kms_refresh_rate() {
-        let pacing = NativeFramePacing::for_refresh_hz(165);
-
-        assert_eq!(pacing.active_interval, Duration::from_micros(6060));
-    }
-
-    #[test]
-    fn native_frame_pacing_falls_back_to_sixty_hz_when_refresh_is_missing() {
-        let pacing = NativeFramePacing::for_refresh_hz(0);
-
-        assert_eq!(pacing.active_interval, Duration::from_micros(16_666));
-    }
-
-    #[test]
-    fn native_wakeup_uses_poll_interval_while_surfaces_are_active() {
-        let pacing = NativeFramePacing::for_refresh_hz(165);
-
-        assert_eq!(
-            native_wakeup_interval_with_pacing(
-                NativeLoopActivity {
-                    accepted_clients: false,
-                    input_events: false,
-                    redraw_requested: false,
-                    pending_frame_work: false,
-                    has_surfaces: true,
-                },
-                pacing,
-            ),
-            NATIVE_SURFACE_WAKEUP_INTERVAL
         );
     }
 }

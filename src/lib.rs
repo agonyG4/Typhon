@@ -3,6 +3,7 @@ pub mod core;
 mod defaults;
 mod launch_env;
 mod launch_plan;
+pub mod native;
 mod options;
 mod paths;
 pub mod portal;

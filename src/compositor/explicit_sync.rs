@@ -1,7 +1,4 @@
-use std::{
-    sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::sync::Mutex;
 
 use wayland_protocols::wp::{
     linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1,
@@ -70,38 +67,6 @@ pub(super) struct PendingPresentationFeedback {
     pub(super) surface_id: u32,
     pub(super) surface: wl_surface::WlSurface,
     pub(super) feedback: wp_presentation_feedback::WpPresentationFeedback,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct PresentationTimestamp {
-    pub(super) tv_sec_hi: u32,
-    pub(super) tv_sec_lo: u32,
-    pub(super) tv_nsec: u32,
-}
-
-pub(super) fn presentation_timestamp() -> PresentationTimestamp {
-    let mut timespec = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timespec) };
-    if result == 0 {
-        let seconds = timespec.tv_sec.max(0) as u64;
-        return PresentationTimestamp {
-            tv_sec_hi: (seconds >> 32) as u32,
-            tv_sec_lo: seconds as u32,
-            tv_nsec: timespec.tv_nsec.clamp(0, 999_999_999) as u32,
-        };
-    }
-
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    PresentationTimestamp {
-        tv_sec_hi: (duration.as_secs() >> 32) as u32,
-        tv_sec_lo: duration.as_secs() as u32,
-        tv_nsec: duration.subsec_nanos(),
-    }
 }
 
 #[derive(Debug)]

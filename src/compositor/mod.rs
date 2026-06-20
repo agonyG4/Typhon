@@ -70,6 +70,7 @@ mod interaction;
 mod output;
 mod plan;
 mod popup;
+mod presentation;
 mod protocols;
 mod render;
 mod runtime_files;
@@ -92,7 +93,7 @@ use explicit_sync::{
     SYNCOBJ_SURFACE_ERROR_CONFLICTING_POINTS, SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
     SYNCOBJ_SURFACE_ERROR_NO_BUFFER, SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT,
     SYNCOBJ_SURFACE_ERROR_NO_SURFACE, SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER,
-    SyncobjSurfaceState, SyncobjTimelineData, presentation_timestamp,
+    SyncobjSurfaceState, SyncobjTimelineData,
 };
 pub use idle::{IdleManager, IdleState};
 use input::{
@@ -122,6 +123,9 @@ pub use plan::{
 use popup::{
     PopupAnchorRect, PopupConstraintAdjustment, PopupEdges, PopupRect, XdgPositionerState,
     XdgWindowGeometry,
+};
+pub use presentation::{
+    FramePresentation, PresentationClock, PresentationKind, PresentationTimestamp,
 };
 pub use render::{
     BufferAge, DesktopComposeRequest, DesktopFrameCopyKind, DesktopSceneRebuildKind,
@@ -223,6 +227,7 @@ pub struct CompositorState {
     output_size: OutputSize,
     output_scale: OutputScale,
     output_refresh: OutputRefreshRate,
+    presentation_clock: PresentationClock,
     focused_surface: Option<wl_surface::WlSurface>,
     keyboard_surface: Option<wl_surface::WlSurface>,
     keyboard_modifiers: KeyboardModifierState,
@@ -6313,22 +6318,31 @@ impl CompositorState {
             || !self.pending_color_info.is_empty()
     }
 
+    fn has_pending_explicit_sync_work(&self) -> bool {
+        !self.pending_explicit_sync_commits.is_empty()
+    }
+
     fn has_pending_frame_work(&self) -> bool {
         self.pending_resize_configure_is_flushable()
             || self.has_pending_frame_callbacks()
             || !self.pending_presentation_feedbacks.is_empty()
     }
 
-    fn complete_pending_presentation_feedbacks(&mut self) {
+    fn complete_pending_presentation_feedbacks(&mut self, presentation: FramePresentation) {
         let feedbacks = std::mem::take(&mut self.pending_presentation_feedbacks);
         if feedbacks.is_empty() {
             return;
         }
 
-        let timestamp = presentation_timestamp();
-        let sequence = self.render_generation;
+        let timestamp = presentation.timestamp;
+        let (tv_sec_hi, tv_sec_lo) = timestamp.protocol_seconds();
+        let sequence = presentation.sequence;
+        let flags = match presentation.kind {
+            PresentationKind::Synchronized => wp_presentation_feedback::Kind::Vsync,
+            PresentationKind::Software => wp_presentation_feedback::Kind::empty(),
+        };
         for pending in feedbacks {
-            if !pending.surface.is_alive() {
+            if !pending.surface.is_alive() || presentation.clock != self.presentation_clock {
                 pending.feedback.discarded();
                 continue;
             }
@@ -6340,13 +6354,13 @@ impl CompositorState {
                 pending.feedback.sync_output(output);
             }
             pending.feedback.presented(
-                timestamp.tv_sec_hi,
-                timestamp.tv_sec_lo,
-                timestamp.tv_nsec,
+                tv_sec_hi,
+                tv_sec_lo,
+                timestamp.nanoseconds(),
                 self.output_refresh.presentation_refresh_nsec(),
                 (sequence >> 32) as u32,
                 sequence as u32,
-                wp_presentation_feedback::Kind::Vsync | wp_presentation_feedback::Kind::HwClock,
+                flags,
             );
         }
     }
@@ -6361,6 +6375,12 @@ impl CompositorState {
             }
         }
         self.pending_presentation_feedbacks = pending_feedbacks;
+    }
+
+    fn discard_all_pending_presentation_feedbacks(&mut self) {
+        for pending in std::mem::take(&mut self.pending_presentation_feedbacks) {
+            pending.feedback.discarded();
+        }
     }
 
     fn release_pending_buffers(&mut self) {

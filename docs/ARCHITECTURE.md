@@ -160,6 +160,24 @@ scene rectangles into a staging buffer but still submits the full staging BO via
 Legacy environment aliases such as `gbm` and `gbm-egl` continue to select the
 CPU-write fallback for compatibility.
 
+Native runtime scheduling is split between `src/native/event_loop.rs` and
+`src/native/scheduler.rs`. The reactor registers the DRM fd, Wayland listening
+socket, Wayland backend dispatch fd, libinput or raw evdev fds, and one
+`CLOCK_MONOTONIC` timerfd. The scheduler owns visual/protocol work, pageflip
+pending state, absolute refresh deadlines, and the pageflip watchdog. A timer
+can advance protocol-only work or report a watchdog failure, but it cannot
+invent presentation completion; asynchronous frame completion is accepted only
+after the scanout backend drains a DRM flip-complete event.
+
+Legacy pageflip submissions carry a unique nonzero `u64` user-data token. The
+DRM event parser validates each event length, matches that token, and preserves
+the kernel seconds, microseconds, and finite-width sequence through compositor
+frame completion. Native setup queries `DRM_CAP_TIMESTAMP_MONOTONIC` and
+advertises the matching `CLOCK_MONOTONIC` or `CLOCK_REALTIME` ID through
+`wp_presentation`. Legacy synchronized flips report `VSYNC`; `HW_CLOCK`,
+`HW_COMPLETION`, and `ZERO_COPY` remain unset because the current path does not
+establish those semantics conservatively.
+
 For native output, optional GPU buffer protocols are bound after the active
 scanout backend is known. The base Wayland socket starts without
 `zwp_linux_dmabuf_v1`, explicit sync, or `wl_drm`; those globals are published

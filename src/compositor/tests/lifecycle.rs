@@ -193,18 +193,82 @@ fn presentation_feedback_for_committed_buffer_is_presented_on_present_frame() {
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
-    let state =
-        create_surface_with_presentation_feedback_and_present(&socket_path, &commands).unwrap();
+    let state = create_surface_with_presentation_feedback_and_present(
+        &socket_path,
+        &commands,
+        ServerCommand::PresentFrame,
+    )
+    .unwrap();
     stop_controllable_test_server(commands, server_thread);
 
     assert_eq!(state.presentation_discarded_count, 0);
     assert_eq!(state.presentation_presented_count, 1);
     assert_eq!(
         state.presentation_kind,
-        Some(
-            client_wp_presentation_feedback::Kind::Vsync
-                | client_wp_presentation_feedback::Kind::HwClock
-        )
+        Some(client_wp_presentation_feedback::Kind::empty())
+    );
+}
+
+#[test]
+fn presentation_feedback_uses_injected_kernel_metadata_once() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    server.set_presentation_clock(PresentationClock::Monotonic);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let presentation = FramePresentation::synchronized(
+        PresentationClock::Monotonic,
+        0xfedc_ba98,
+        999_999,
+        u32::MAX,
+    )
+    .unwrap();
+
+    let state = create_surface_with_presentation_feedback_and_present(
+        &socket_path,
+        &commands,
+        ServerCommand::FinishFrameWithPresentation(presentation),
+    )
+    .unwrap();
+    stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(
+        state.presentation_clock_id,
+        Some(libc::CLOCK_MONOTONIC as u32)
+    );
+    assert_eq!(
+        state.presentation_timestamp,
+        Some((0, 0xfedc_ba98, 999_999_000))
+    );
+    assert_eq!(state.presentation_sequence, Some((0, u32::MAX)));
+    assert_eq!(state.presentation_presented_count, 1);
+    assert_eq!(
+        state.presentation_kind,
+        Some(client_wp_presentation_feedback::Kind::Vsync)
+    );
+}
+
+#[test]
+fn presentation_global_advertises_configured_realtime_clock() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    server.set_presentation_clock(PresentationClock::Realtime);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let presentation =
+        FramePresentation::synchronized(PresentationClock::Realtime, 1, 0, 1).unwrap();
+
+    let state = create_surface_with_presentation_feedback_and_present(
+        &socket_path,
+        &commands,
+        ServerCommand::FinishFrameWithPresentation(presentation),
+    )
+    .unwrap();
+    stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(
+        state.presentation_clock_id,
+        Some(libc::CLOCK_REALTIME as u32)
     );
 }
 

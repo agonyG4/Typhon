@@ -8,6 +8,12 @@ Goal: make the native backend reliably select `1920x1080@165`, pace frames from
 the chosen mode, advertise the correct refresh to clients, and reduce mouse
 latency toward Hyprland/KWin-class behavior.
 
+Update 2026-06-19: the native runtime now registers DRM, Wayland, libinput/raw
+evdev, and timerfd sources in `epoll`. Refresh timing uses monotonic absolute
+deadlines, DRM completion wakes the compositor directly, and idle operation has
+no periodic wake. Historical "current behavior" sections below describe the
+pre-reactor implementation.
+
 ## Summary
 
 The native backend already derives frame pacing from the selected KMS mode, so a

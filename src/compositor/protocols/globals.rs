@@ -131,7 +131,7 @@ impl GlobalDispatch<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, 
 
 impl GlobalDispatch<wp_presentation::WpPresentation, ()> for CompositorState {
     fn bind(
-        _state: &mut Self,
+        state: &mut Self,
         _handle: &DisplayHandle,
         _client: &Client,
         resource: New<wp_presentation::WpPresentation>,
@@ -139,7 +139,7 @@ impl GlobalDispatch<wp_presentation::WpPresentation, ()> for CompositorState {
         data_init: &mut DataInit<'_, Self>,
     ) {
         let presentation = data_init.init(resource, ());
-        presentation.clock_id(1);
+        presentation.clock_id(state.presentation_clock.clock_id() as u32);
     }
 }
 

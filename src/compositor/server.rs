@@ -1,4 +1,8 @@
-use std::{fmt, io, sync::Arc};
+use std::{
+    fmt, io,
+    os::fd::{AsFd, BorrowedFd},
+    sync::Arc,
+};
 
 use wayland_protocols::ext::data_control::v1::server::ext_data_control_manager_v1;
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1;
@@ -27,8 +31,9 @@ use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
 
 use super::{
-    CompositorState, InputProtocolCapabilities, RenderGenerationCause, RenderableSurface,
-    RendererProtocolCapabilities, SelectionProtocolCapabilities, ShellDockItem, color,
+    CompositorState, FramePresentation, InputProtocolCapabilities, PresentationClock,
+    RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
+    SelectionProtocolCapabilities, ShellDockItem, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 
@@ -180,6 +185,14 @@ impl OwnCompositorServer {
         &self.socket_name
     }
 
+    pub fn listener_fd(&self) -> BorrowedFd<'_> {
+        self.socket.as_fd()
+    }
+
+    pub fn client_dispatch_fd(&self) -> BorrowedFd<'_> {
+        self.display.as_fd()
+    }
+
     pub fn accepted_clients(&self) -> usize {
         self.state.accepted_clients
     }
@@ -220,6 +233,10 @@ impl OwnCompositorServer {
         self.state.has_pending_frame_prepare_work()
     }
 
+    pub fn has_pending_explicit_sync_work(&self) -> bool {
+        self.state.has_pending_explicit_sync_work()
+    }
+
     pub fn has_pending_frame_work(&self) -> bool {
         self.state.has_pending_frame_work()
     }
@@ -255,6 +272,14 @@ impl OwnCompositorServer {
         let changed = self.state.set_output_refresh_hz(refresh_hz);
         let _ = self.display.flush_clients();
         changed
+    }
+
+    pub fn set_presentation_clock(&mut self, clock: PresentationClock) {
+        self.state.presentation_clock = clock;
+    }
+
+    pub fn presentation_clock(&self) -> PresentationClock {
+        self.state.presentation_clock
     }
 
     pub fn send_keyboard_key(&mut self, key: u32, pressed: bool) {
@@ -392,9 +417,22 @@ impl OwnCompositorServer {
     }
 
     pub fn finish_frame(&mut self) {
+        let Ok(presentation) = FramePresentation::software_now(self.state.presentation_clock)
+        else {
+            self.state.discard_all_pending_presentation_feedbacks();
+            self.state.release_pending_buffers();
+            self.state.complete_pending_frame_callbacks();
+            let _ = self.display.flush_clients();
+            return;
+        };
+        self.finish_frame_with_presentation(presentation);
+    }
+
+    pub fn finish_frame_with_presentation(&mut self, presentation: FramePresentation) {
         self.state.release_pending_buffers();
         self.state.complete_pending_frame_callbacks();
-        self.state.complete_pending_presentation_feedbacks();
+        self.state
+            .complete_pending_presentation_feedbacks(presentation);
         let _ = self.display.flush_clients();
     }
 

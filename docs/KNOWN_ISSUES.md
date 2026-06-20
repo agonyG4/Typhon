@@ -44,12 +44,17 @@ Current limits:
   fallback sessions do not publish GPU buffer globals and default apps to the
   software profile; `OBLIVION_ONE_NATIVE_APP_GPU=gpu` requires
   `native-egl-gbm`;
-- active wakeups, `wl_output.mode`, and presentation feedback follow the
-  selected KMS refresh rate. On GBM/KMS, frame callbacks, buffer releases, and
-  presentation feedback are now completed after DRM pageflip completion, but
-  the native loop still polls DRM with a zero-timeout check and then sleeps from
-  a refresh-derived timer instead of using DRM/libinput readiness as the wake
-  source;
+- `wl_output.mode` and presentation feedback follow the selected KMS refresh
+  rate. The native loop now blocks on DRM, Wayland, input, and absolute timerfd
+  readiness; GBM/KMS frame callbacks, buffer releases, and presentation
+  feedback complete only after a token-matched DRM pageflip completion and use
+  its kernel timestamp and sequence. Accurate real-hardware validation across
+  drivers remains outstanding;
+- `libseat` 0.2.4 does not expose a seat event fd through its safe API. Seat
+  lifecycle dispatch therefore runs on other reactor wakeups rather than as an
+  independently registered source. Explicit-sync acquire points are similarly
+  rechecked at client activity or refresh-aligned deadlines until eventfd-backed
+  fence integration lands;
 - VRR is not implemented yet: the compositor does not query `vrr_capable`, set
   the DRM `VRR_ENABLED` property, or expose an `off/on/fullscreen` policy;
 - interactive resize now moves compositor visual geometry immediately, allows
@@ -68,7 +73,7 @@ Current limits:
 Expected direction:
 
 Validate native EGL/GLES over GBM/KMS on real TTY sessions, then wire output
-revoke/resume, fd-driven scheduling, and direct scanout before treating SDDM
+revoke/resume and direct scanout before treating SDDM
 performance as comparable to KWin, Hyprland, or other mature compositors.
 
 ## Brave/Chromium Vulkan warning on Wayland

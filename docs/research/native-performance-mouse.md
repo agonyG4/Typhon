@@ -4,6 +4,12 @@ Date: 2026-06-11
 
 Scope: native session input, render, pageflip, and frame pacing behavior for high-refresh displays, especially 165 Hz. This document focuses on low-risk and medium-risk improvements that do not require rewriting the native loop around epoll.
 
+Update 2026-06-19: the epoll rewrite described as future work below is now
+implemented. Input and DRM readiness wake the compositor directly, frame
+deadlines are absolute timerfd deadlines, and mapped unchanged surfaces do not
+cause periodic wakeups. The bottleneck analysis remains useful historical
+context for renderer and cursor work.
+
 ## Summary
 
 The native session currently has a working transitional scanout path, but mouse latency and high-refresh pacing are limited by three confirmed design costs:

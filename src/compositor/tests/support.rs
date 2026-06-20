@@ -178,6 +178,9 @@ struct RegistryTestState {
     presentation_presented_count: usize,
     presentation_discarded_count: usize,
     presentation_kind: Option<client_wp_presentation_feedback::Kind>,
+    presentation_clock_id: Option<u32>,
+    presentation_timestamp: Option<(u32, u32, u32)>,
+    presentation_sequence: Option<(u32, u32)>,
     fractional_preferred_scales: Vec<u32>,
     data_device_selection_offer: Option<client_wl_data_offer::WlDataOffer>,
     data_offer_mime_types: Vec<String>,
@@ -914,13 +917,16 @@ impl Dispatch<client_wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1
 
 impl Dispatch<client_wp_presentation::WpPresentation, ()> for RegistryTestState {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _proxy: &client_wp_presentation::WpPresentation,
-        _event: client_wp_presentation::Event,
+        event: client_wp_presentation::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
+        if let client_wp_presentation::Event::ClockId { clk_id } = event {
+            state.presentation_clock_id = Some(clk_id);
+        }
     }
 }
 
@@ -934,8 +940,18 @@ impl Dispatch<client_wp_presentation_feedback::WpPresentationFeedback, ()> for R
         _qhandle: &QueueHandle<Self>,
     ) {
         match event {
-            client_wp_presentation_feedback::Event::Presented { flags, .. } => {
+            client_wp_presentation_feedback::Event::Presented {
+                tv_sec_hi,
+                tv_sec_lo,
+                tv_nsec,
+                seq_hi,
+                seq_lo,
+                flags,
+                ..
+            } => {
                 state.presentation_presented_count += 1;
+                state.presentation_timestamp = Some((tv_sec_hi, tv_sec_lo, tv_nsec));
+                state.presentation_sequence = Some((seq_hi, seq_lo));
                 if let WEnum::Value(flags) = flags {
                     state.presentation_kind = Some(flags);
                 }
@@ -1136,6 +1152,7 @@ fn request_presentation_feedback(
 fn create_surface_with_presentation_feedback_and_present(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
+    completion: ServerCommand,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
@@ -1157,7 +1174,7 @@ fn create_surface_with_presentation_feedback_and_present(
 
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
-    commands.send(ServerCommand::PresentFrame)?;
+    commands.send(completion)?;
     queue.roundtrip(&mut state)?;
     Ok(state)
 }
@@ -5623,6 +5640,7 @@ enum ServerCommand {
     Barrier(Sender<()>),
     PrepareFrame,
     FinishFrame,
+    FinishFrameWithPresentation(FramePresentation),
     PresentFrame,
     Stop,
 }
@@ -5807,6 +5825,9 @@ fn spawn_controllable_test_server(
                     }
                     ServerCommand::FinishFrame => {
                         server.finish_frame();
+                    }
+                    ServerCommand::FinishFrameWithPresentation(presentation) => {
+                        server.finish_frame_with_presentation(presentation);
                     }
                     ServerCommand::PresentFrame => {
                         server.present_frame();

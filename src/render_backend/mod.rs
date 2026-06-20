@@ -108,74 +108,6 @@ pub struct HardwareCursorPlan {
     pub mode: CursorCompositionMode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameAction {
-    Idle,
-    Render,
-    WaitForPageFlip,
-    FinishFrame,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrameScheduler {
-    refresh_interval_nsec: u64,
-    has_work: bool,
-    render_submitted_at_nsec: Option<u64>,
-    page_flip_at_nsec: Option<u64>,
-    finish_ready: bool,
-}
-
-impl FrameScheduler {
-    pub fn new(refresh_interval_nsec: u64) -> Self {
-        Self {
-            refresh_interval_nsec: refresh_interval_nsec.max(1),
-            has_work: false,
-            render_submitted_at_nsec: None,
-            page_flip_at_nsec: None,
-            finish_ready: false,
-        }
-    }
-
-    pub fn note_frame_work(&mut self, _now_nsec: u64) {
-        self.has_work = true;
-    }
-
-    pub fn note_render_submitted(&mut self, now_nsec: u64) {
-        self.render_submitted_at_nsec = Some(now_nsec);
-    }
-
-    pub fn note_page_flip(&mut self, now_nsec: u64) {
-        self.page_flip_at_nsec = Some(now_nsec);
-        self.finish_ready = true;
-    }
-
-    pub fn next_action(&mut self, now_nsec: u64) -> FrameAction {
-        if self.finish_ready {
-            self.has_work = false;
-            self.render_submitted_at_nsec = None;
-            self.page_flip_at_nsec = None;
-            self.finish_ready = false;
-            return FrameAction::FinishFrame;
-        }
-
-        if let Some(submitted_at) = self.render_submitted_at_nsec {
-            if self.page_flip_at_nsec.is_some()
-                || now_nsec.saturating_sub(submitted_at) >= self.refresh_interval_nsec
-            {
-                self.finish_ready = true;
-                return self.next_action(now_nsec);
-            }
-            return FrameAction::WaitForPageFlip;
-        }
-
-        if self.has_work {
-            FrameAction::Render
-        } else {
-            FrameAction::Idle
-        }
-    }
-}
-
 impl HardwareCursorPlan {
     pub fn choose(
         policy: FrameRenderPolicy,
@@ -463,46 +395,5 @@ mod tests {
         let plan = HardwareCursorPlan::choose(policy, 32, 32, 64, 64);
 
         assert_eq!(plan.mode, CursorCompositionMode::Composited);
-    }
-
-    #[test]
-    fn frame_scheduler_waits_for_work_before_rendering() {
-        let mut scheduler = FrameScheduler::new(16_666_667);
-
-        assert_eq!(scheduler.next_action(0), FrameAction::Idle);
-        scheduler.note_frame_work(1);
-        assert_eq!(scheduler.next_action(1), FrameAction::Render);
-    }
-
-    #[test]
-    fn frame_scheduler_reports_presented_only_after_pageflip() {
-        let mut scheduler = FrameScheduler::new(16_666_667);
-
-        scheduler.note_frame_work(0);
-        assert_eq!(scheduler.next_action(0), FrameAction::Render);
-        scheduler.note_render_submitted(1_000_000);
-
-        assert_eq!(
-            scheduler.next_action(2_000_000),
-            FrameAction::WaitForPageFlip
-        );
-        scheduler.note_page_flip(16_666_667);
-        assert_eq!(scheduler.next_action(16_666_668), FrameAction::FinishFrame);
-        assert_eq!(scheduler.next_action(16_666_669), FrameAction::Idle);
-    }
-
-    #[test]
-    fn frame_scheduler_uses_refresh_deadline_when_pageflip_is_missing() {
-        let mut scheduler = FrameScheduler::new(16_666_667);
-
-        scheduler.note_frame_work(0);
-        assert_eq!(scheduler.next_action(0), FrameAction::Render);
-        scheduler.note_render_submitted(1_000_000);
-
-        assert_eq!(
-            scheduler.next_action(17_666_666),
-            FrameAction::WaitForPageFlip
-        );
-        assert_eq!(scheduler.next_action(17_666_667), FrameAction::FinishFrame);
     }
 }

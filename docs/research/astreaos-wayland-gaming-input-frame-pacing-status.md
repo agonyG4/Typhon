@@ -2,6 +2,11 @@
 
 Date: 2026-06-15
 
+Update 2026-06-19: native frame pacing is now event driven. DRM, Wayland,
+libinput/raw evdev, and timerfd readiness feed the runtime scheduler; pageflip
+completion remains the only asynchronous finish boundary, and no-damage frame
+callbacks use refresh-aligned absolute deadlines.
+
 This note records the implemented subset of Plan 02 and the remaining runtime
 validation boundary.
 
@@ -43,9 +48,12 @@ validation boundary.
   needs to be connected end to end.
 - Nested mode still needs an explicit raw-motion capability decision. It must
   not advertise raw relative motion if host raw device motion is unavailable.
-- The native loop still uses the existing sleep/refresh approximation. It now
-  keeps Wayland dispatch alive during pageflip pending state, but DRM/libinput
-  readiness-driven wakeups remain a later step.
+- The safe `libseat` crate API still exposes no independently registerable seat
+  event fd. Seat lifecycle work is dispatched on other reactor wakeups without
+  restoring an idle polling timer.
+- Explicit-sync acquire points are still nonblocking readiness checks scheduled
+  after client activity or at refresh-aligned deadlines. Eventfd-backed fence
+  readiness remains future work.
 - Gaming readiness still requires real hardware validation with native
   libinput devices, fullscreen focus transitions, KMS pageflip logs, and at
   least one native Wayland game or relative-pointer test client.

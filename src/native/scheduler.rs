@@ -1,0 +1,447 @@
+//! Absolute-deadline frame scheduling for the native compositor runtime.
+
+const DEFAULT_PAGE_FLIP_WATCHDOG_NS: u64 = 1_000_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerDecision {
+    Idle,
+    Render,
+    CompleteProtocolOnly,
+    WaitForRefresh,
+    WaitForPageFlip,
+    PageFlipWatchdogExpired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerState {
+    Idle,
+    VisualWorkQueued,
+    ProtocolWorkQueued,
+    RefreshDeadlineArmed,
+    PageFlipPending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageFlipCompletionResult {
+    Completed { submitted_at_ns: u64 },
+    Mismatched { expected: u64 },
+    Stale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeFrameScheduler {
+    refresh_interval_ns: u64,
+    anchor_ns: u64,
+    visual_work_queued: bool,
+    protocol_work_queued: bool,
+    pending_page_flip_token: Option<u64>,
+    pending_page_flip_submitted_at_ns: Option<u64>,
+    refresh_deadline_ns: Option<u64>,
+    watchdog_deadline_ns: Option<u64>,
+    watchdog_interval_ns: u64,
+    watchdog_timeout_count: u64,
+    watchdog_reported: bool,
+}
+
+impl NativeFrameScheduler {
+    pub fn new(refresh_hz: u32, anchor_ns: u64) -> Self {
+        Self::with_watchdog(refresh_hz, anchor_ns, DEFAULT_PAGE_FLIP_WATCHDOG_NS)
+    }
+
+    fn with_watchdog(refresh_hz: u32, anchor_ns: u64, watchdog_interval_ns: u64) -> Self {
+        let refresh_hz = if refresh_hz == 0 {
+            60
+        } else {
+            refresh_hz.clamp(30, 360)
+        };
+        Self {
+            refresh_interval_ns: 1_000_000_000 / u64::from(refresh_hz),
+            anchor_ns,
+            visual_work_queued: false,
+            protocol_work_queued: false,
+            pending_page_flip_token: None,
+            pending_page_flip_submitted_at_ns: None,
+            refresh_deadline_ns: None,
+            watchdog_deadline_ns: None,
+            watchdog_interval_ns: watchdog_interval_ns.max(1),
+            watchdog_timeout_count: 0,
+            watchdog_reported: false,
+        }
+    }
+
+    pub fn refresh_interval_ns(&self) -> u64 {
+        self.refresh_interval_ns
+    }
+
+    pub fn queue_visual_work(&mut self) {
+        self.visual_work_queued = true;
+        self.protocol_work_queued = false;
+        self.refresh_deadline_ns = None;
+    }
+
+    pub fn queue_protocol_work(&mut self, now_ns: u64) {
+        if self.visual_work_queued {
+            return;
+        }
+        self.protocol_work_queued = true;
+        if self.pending_page_flip_token.is_none() && self.refresh_deadline_ns.is_none() {
+            self.refresh_deadline_ns = Some(self.first_boundary_after(now_ns));
+        }
+    }
+
+    pub fn decision(&mut self, now_ns: u64) -> SchedulerDecision {
+        if self.pending_page_flip_token.is_some() {
+            if self
+                .watchdog_deadline_ns
+                .is_some_and(|deadline| now_ns >= deadline)
+            {
+                if !self.watchdog_reported {
+                    self.watchdog_timeout_count = self.watchdog_timeout_count.saturating_add(1);
+                    self.watchdog_reported = true;
+                }
+                return SchedulerDecision::PageFlipWatchdogExpired;
+            }
+            return SchedulerDecision::WaitForPageFlip;
+        }
+        if self.visual_work_queued {
+            return SchedulerDecision::Render;
+        }
+        if self.protocol_work_queued {
+            let deadline = match self.refresh_deadline_ns {
+                Some(deadline) => deadline,
+                None => {
+                    let deadline = self.first_boundary_after(now_ns);
+                    self.refresh_deadline_ns = Some(deadline);
+                    deadline
+                }
+            };
+            if now_ns >= deadline {
+                SchedulerDecision::CompleteProtocolOnly
+            } else {
+                SchedulerDecision::WaitForRefresh
+            }
+        } else {
+            SchedulerDecision::Idle
+        }
+    }
+
+    pub fn note_async_submission(&mut self, token: u64, now_ns: u64) -> Result<(), &'static str> {
+        if token == 0 {
+            return Err("page flip token must be nonzero");
+        }
+        if self.pending_page_flip_token.is_some() {
+            return Err("page flip already pending");
+        }
+        self.visual_work_queued = false;
+        self.protocol_work_queued = false;
+        self.refresh_deadline_ns = None;
+        self.pending_page_flip_token = Some(token);
+        self.pending_page_flip_submitted_at_ns = Some(now_ns);
+        self.watchdog_deadline_ns = Some(now_ns.saturating_add(self.watchdog_interval_ns));
+        self.watchdog_reported = false;
+        Ok(())
+    }
+
+    pub fn note_page_flip_completion(
+        &mut self,
+        token: u64,
+        observed_ns: u64,
+    ) -> PageFlipCompletionResult {
+        let Some(expected) = self.pending_page_flip_token else {
+            return PageFlipCompletionResult::Stale;
+        };
+        if token != expected {
+            return PageFlipCompletionResult::Mismatched { expected };
+        }
+        self.pending_page_flip_token = None;
+        let submitted_at_ns = self
+            .pending_page_flip_submitted_at_ns
+            .take()
+            .unwrap_or(observed_ns);
+        self.watchdog_deadline_ns = None;
+        self.watchdog_reported = false;
+        self.anchor_ns = observed_ns;
+        if self.protocol_work_queued && !self.visual_work_queued {
+            self.refresh_deadline_ns = Some(self.first_boundary_after(observed_ns));
+        }
+        PageFlipCompletionResult::Completed { submitted_at_ns }
+    }
+
+    pub fn complete_protocol_only(&mut self) {
+        self.protocol_work_queued = false;
+        self.refresh_deadline_ns = None;
+    }
+
+    pub fn note_immediate_completion(&mut self) {
+        self.visual_work_queued = false;
+        self.protocol_work_queued = false;
+        self.refresh_deadline_ns = None;
+    }
+
+    pub fn next_deadline_ns(&self) -> Option<u64> {
+        if self.pending_page_flip_token.is_some() {
+            self.watchdog_deadline_ns
+        } else {
+            self.refresh_deadline_ns
+        }
+    }
+
+    pub fn visual_work_queued(&self) -> bool {
+        self.visual_work_queued
+    }
+
+    pub fn protocol_work_queued(&self) -> bool {
+        self.protocol_work_queued
+    }
+
+    pub fn page_flip_pending(&self) -> bool {
+        self.pending_page_flip_token.is_some()
+    }
+
+    pub fn pending_page_flip_token(&self) -> Option<u64> {
+        self.pending_page_flip_token
+    }
+
+    pub fn watchdog_timeout_count(&self) -> u64 {
+        self.watchdog_timeout_count
+    }
+
+    pub fn state(&self) -> SchedulerState {
+        if self.pending_page_flip_token.is_some() {
+            SchedulerState::PageFlipPending
+        } else if self.visual_work_queued {
+            SchedulerState::VisualWorkQueued
+        } else if self.refresh_deadline_ns.is_some() {
+            SchedulerState::RefreshDeadlineArmed
+        } else if self.protocol_work_queued {
+            SchedulerState::ProtocolWorkQueued
+        } else {
+            SchedulerState::Idle
+        }
+    }
+
+    fn first_boundary_after(&self, now_ns: u64) -> u64 {
+        let elapsed = now_ns.saturating_sub(self.anchor_ns);
+        let intervals = elapsed / self.refresh_interval_ns + 1;
+        self.anchor_ns
+            .saturating_add(intervals.saturating_mul(self.refresh_interval_ns))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_deadlines_do_not_drift(refresh_hz: u32) {
+        let mut scheduler = NativeFrameScheduler::new(refresh_hz, 1_000);
+        let interval = scheduler.refresh_interval_ns();
+
+        for boundary in 1..=10 {
+            let queued_at = 1_000 + (boundary - 1) * interval + interval / 3;
+            scheduler.queue_protocol_work(queued_at);
+            assert_eq!(
+                scheduler.next_deadline_ns(),
+                Some(1_000 + boundary * interval)
+            );
+            assert_eq!(
+                scheduler.decision(1_000 + boundary * interval),
+                SchedulerDecision::CompleteProtocolOnly
+            );
+            scheduler.complete_protocol_only();
+        }
+    }
+
+    #[test]
+    fn sixty_hz_deadlines_do_not_accumulate_execution_time_drift() {
+        assert_deadlines_do_not_drift(60);
+    }
+
+    #[test]
+    fn one_sixty_five_hz_deadlines_do_not_accumulate_execution_time_drift() {
+        assert_deadlines_do_not_drift(165);
+    }
+
+    #[test]
+    fn two_forty_hz_deadlines_do_not_accumulate_execution_time_drift() {
+        assert_deadlines_do_not_drift(240);
+    }
+
+    #[test]
+    fn missed_deadline_advances_to_first_future_boundary() {
+        let mut scheduler = NativeFrameScheduler::new(60, 0);
+        let interval = scheduler.refresh_interval_ns();
+
+        scheduler.queue_protocol_work(interval * 4 + 7);
+
+        assert_eq!(scheduler.next_deadline_ns(), Some(interval * 5));
+    }
+
+    #[test]
+    fn idle_has_no_refresh_deadline() {
+        let scheduler = NativeFrameScheduler::new(60, 0);
+
+        assert_eq!(scheduler.next_deadline_ns(), None);
+    }
+
+    #[test]
+    fn protocol_work_arms_one_deadline_and_does_not_duplicate_completion() {
+        let mut scheduler = NativeFrameScheduler::new(60, 0);
+        scheduler.queue_protocol_work(1);
+        let deadline = scheduler.next_deadline_ns().unwrap();
+
+        scheduler.queue_protocol_work(deadline - 1);
+        assert_eq!(scheduler.next_deadline_ns(), Some(deadline));
+        assert_eq!(
+            scheduler.decision(deadline - 1),
+            SchedulerDecision::WaitForRefresh
+        );
+        assert_eq!(
+            scheduler.decision(deadline),
+            SchedulerDecision::CompleteProtocolOnly
+        );
+        scheduler.complete_protocol_only();
+        assert_eq!(scheduler.decision(deadline), SchedulerDecision::Idle);
+        assert_eq!(scheduler.next_deadline_ns(), None);
+    }
+
+    #[test]
+    fn visual_work_without_pending_flip_renders() {
+        let mut scheduler = NativeFrameScheduler::new(60, 0);
+        scheduler.queue_visual_work();
+
+        assert_eq!(scheduler.decision(0), SchedulerDecision::Render);
+    }
+
+    #[test]
+    fn visual_work_during_pending_flip_is_queued() {
+        let mut scheduler = NativeFrameScheduler::new(60, 0);
+        scheduler.queue_visual_work();
+        scheduler.note_async_submission(41, 10).unwrap();
+        scheduler.queue_visual_work();
+
+        assert_eq!(scheduler.decision(20), SchedulerDecision::WaitForPageFlip);
+        assert!(scheduler.visual_work_queued());
+    }
+
+    #[test]
+    fn page_flip_completion_finishes_exactly_once() {
+        let mut scheduler = NativeFrameScheduler::new(60, 0);
+        scheduler.queue_visual_work();
+        scheduler.note_async_submission(41, 10).unwrap();
+
+        assert_eq!(
+            scheduler.note_page_flip_completion(41, 20),
+            PageFlipCompletionResult::Completed {
+                submitted_at_ns: 10
+            }
+        );
+        assert_eq!(
+            scheduler.note_page_flip_completion(41, 21),
+            PageFlipCompletionResult::Stale
+        );
+        assert!(!scheduler.page_flip_pending());
+    }
+
+    #[test]
+    fn spurious_drm_readiness_does_not_finish_frame() {
+        let mut scheduler = NativeFrameScheduler::new(60, 0);
+
+        assert_eq!(
+            scheduler.note_page_flip_completion(41, 20),
+            PageFlipCompletionResult::Stale
+        );
+    }
+
+    #[test]
+    fn queued_work_after_page_flip_is_renderable_immediately() {
+        let mut scheduler = NativeFrameScheduler::new(60, 0);
+        scheduler.queue_visual_work();
+        scheduler.note_async_submission(41, 10).unwrap();
+        scheduler.queue_visual_work();
+        assert_eq!(
+            scheduler.note_page_flip_completion(41, 20),
+            PageFlipCompletionResult::Completed {
+                submitted_at_ns: 10
+            }
+        );
+
+        assert_eq!(scheduler.decision(20), SchedulerDecision::Render);
+    }
+
+    #[test]
+    fn watchdog_never_fabricates_completion() {
+        let mut scheduler = NativeFrameScheduler::with_watchdog(60, 0, 100);
+        scheduler.queue_visual_work();
+        scheduler.note_async_submission(41, 10).unwrap();
+
+        assert_eq!(scheduler.decision(109), SchedulerDecision::WaitForPageFlip);
+        assert_eq!(
+            scheduler.decision(110),
+            SchedulerDecision::PageFlipWatchdogExpired
+        );
+        assert!(scheduler.page_flip_pending());
+        assert_eq!(scheduler.watchdog_timeout_count(), 1);
+        assert_eq!(
+            scheduler.note_page_flip_completion(41, 111),
+            PageFlipCompletionResult::Completed {
+                submitted_at_ns: 10
+            }
+        );
+    }
+
+    #[test]
+    fn immediate_scanout_completes_without_page_flip_state() {
+        let mut scheduler = NativeFrameScheduler::new(60, 0);
+        scheduler.queue_visual_work();
+        scheduler.note_immediate_completion();
+
+        assert_eq!(scheduler.decision(0), SchedulerDecision::Idle);
+        assert!(!scheduler.page_flip_pending());
+        assert!(!scheduler.visual_work_queued());
+    }
+
+    #[test]
+    fn second_async_submission_is_rejected() {
+        let mut scheduler = NativeFrameScheduler::new(60, 0);
+        scheduler.queue_visual_work();
+        scheduler.note_async_submission(41, 1).unwrap();
+
+        assert_eq!(
+            scheduler.note_async_submission(42, 2),
+            Err("page flip already pending")
+        );
+    }
+
+    #[test]
+    fn mismatched_page_flip_token_keeps_pending_frame() {
+        let mut scheduler = NativeFrameScheduler::new(60, 0);
+        scheduler.queue_visual_work();
+        scheduler.note_async_submission(41, 1).unwrap();
+
+        assert_eq!(
+            scheduler.note_page_flip_completion(42, 2),
+            PageFlipCompletionResult::Mismatched { expected: 41 }
+        );
+        assert!(scheduler.page_flip_pending());
+        assert_eq!(scheduler.pending_page_flip_token(), Some(41));
+    }
+
+    #[test]
+    fn stale_completion_cannot_finish_next_submission() {
+        let mut scheduler = NativeFrameScheduler::new(60, 0);
+        scheduler.queue_visual_work();
+        scheduler.note_async_submission(41, 1).unwrap();
+        assert_eq!(
+            scheduler.note_page_flip_completion(41, 2),
+            PageFlipCompletionResult::Completed { submitted_at_ns: 1 }
+        );
+        scheduler.queue_visual_work();
+        scheduler.note_async_submission(42, 3).unwrap();
+
+        assert_eq!(
+            scheduler.note_page_flip_completion(41, 4),
+            PageFlipCompletionResult::Mismatched { expected: 42 }
+        );
+        assert_eq!(scheduler.pending_page_flip_token(), Some(42));
+    }
+}

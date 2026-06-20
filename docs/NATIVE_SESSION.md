@@ -104,9 +104,13 @@ The native backend currently:
 - forwards the normalized keyboard and pointer events into `OwnCompositorServer`;
 - coalesces consecutive pointer motion events before applying input effects, so
   high-rate mice do less duplicate compositor work per native loop tick;
-- uses a small activity-based wakeup policy and derives the active-frame wakeup
-  interval from the selected KMS mode refresh rate instead of sleeping at a
-  fixed 16 ms in all states;
+- registers DRM, Wayland listener/client, libinput or raw evdev, and monotonic
+  timer fds in a level-triggered `epoll` reactor. With no work or deadline the
+  native thread blocks indefinitely in `epoll_wait`;
+- schedules no-damage frame callbacks and explicit-sync acquire rechecks on
+  absolute refresh-aligned `timerfd` deadlines. Visual work renders immediately
+  when no pageflip is pending, while queued visual work waits for the current
+  pageflip completion;
 - advertises the selected KMS refresh rate through `wl_output.mode` and
   presentation feedback instead of hardcoding 60 Hz for native clients.
 - can emit structured native performance logs when `OBLIVION_ONE_PERF_LOG=1`
@@ -134,7 +138,17 @@ The native backend currently:
   reason=pageflip_pending` when repaint is held behind an outstanding
   pageflip. Wayland client dispatch is still serviced while a pageflip is
   pending, and native frame logs include `pageflip_pending_at_tick` for that
-  state.
+  state. `perf native.wakeup`, `perf native.scheduler`, `perf native.deadline`,
+  and `perf native.pageflip_watchdog` report readiness masks, kernel wait time,
+  deadline lateness, scheduler state, submission/completion decisions, and
+  watchdog failures. Reliable libinput motion timestamps also produce
+  `perf native.input_dispatch` latency fields.
+- parses complete legacy DRM pageflip events and uses their kernel timestamp,
+  sequence, CRTC ID, and unique submission token as native presentation
+  metadata. `wp_presentation.clock_id` follows
+  `DRM_CAP_TIMESTAMP_MONOTONIC`; feedback carries only the conservative
+  `VSYNC` flag for synchronized legacy flips. Compositor receive time and
+  submission duration are logged separately and never replace kernel metadata;
 - repairs the cached CPU scene from explicit same-layout surface damage instead
   of rebuilding every client surface on every small `wl_surface` commit. Bounds
   changes for the same surface, such as interactive move/resize, now repair the
@@ -217,17 +231,20 @@ architecture milestones are:
 - remove direct DRM/input fallbacks after the libseat path is stable under real
   SDDM/VT switching;
 - harden EGL/GBM rendering under real SDDM/TTY hardware runs across drivers;
-- make the loop wake from DRM/libinput readiness instead of polling DRM and
-  sleeping from the current refresh-derived timer approximation;
 - complete protocol-owned pointer constraints and keyboard-shortcuts-inhibit
   activation before advertising them in normal sessions;
-- parse DRM pageflip timestamps/sequences for precise presentation feedback;
 - add VRR capability detection and a conservative `off/on/fullscreen` policy;
 - centralize output suspend/resume and device revoke handling in the session
   abstraction;
-- add a tight-damage software cursor fallback, fd-driven scheduling, suspend
-  recovery, direct scanout, and driver-specific validation for GBM/EGL-native
-  presentation.
+- add a tight-damage software cursor fallback, suspend recovery, direct scanout,
+  and driver-specific validation for GBM/EGL-native presentation.
+
+The current `libseat` crate API does not expose the seat event fd, so libseat
+lifecycle dispatch runs before other work whenever another registered source
+wakes the reactor. No periodic idle timer is used as a workaround. Explicit
+sync acquire points also remain nonblocking checks at client activity or an
+intentional refresh deadline; eventfd-backed acquire-fence readiness is a later
+milestone.
 
 Research notes for the current native push live in:
 
