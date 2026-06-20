@@ -130,6 +130,12 @@ enum NestedPointerConstraintMode {
     Confined,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NestedPointerMotionDisposition {
+    Captured,
+    Forwarded,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct NestedPerfCounters {
     redraw_requests: u64,
@@ -495,7 +501,9 @@ impl NestedOutputApp {
     }
 
     fn forward_host_relative_mouse_delta(&mut self, dx: f64, dy: f64) -> bool {
-        if !self.host_window_focused {
+        if !self.host_window_focused
+            || shell_overlay_captures_client_input(self.spotlight.is_visible())
+        {
             return false;
         }
         let Some(sample) = host_relative_delta_sample(
@@ -638,6 +646,26 @@ impl NestedOutputApp {
         }
         self.server.send_pointer_motion(x, y);
         self.mark_client_input_forwarded();
+    }
+
+    fn route_logical_pointer_motion(&mut self, x: f64, y: f64) -> NestedPointerMotionDisposition {
+        self.cursor_x = x.round() as i32;
+        self.cursor_y = y.round() as i32;
+        if shell_overlay_captures_client_input(self.spotlight.is_visible()) {
+            let client_cursor_moved = self
+                .server
+                .update_pointer_position_without_client_dispatch(x, y);
+            if client_cursor_moved || !nested_output_uses_host_cursor() {
+                self.request_redraw();
+            }
+            return NestedPointerMotionDisposition::Captured;
+        }
+
+        self.send_client_pointer_motion(x, y);
+        if !nested_output_uses_host_cursor() {
+            self.request_redraw();
+        }
+        NestedPointerMotionDisposition::Forwarded
     }
 
     fn send_client_pointer_button(&mut self, button: u32, pressed: bool) {
@@ -1002,17 +1030,7 @@ impl ApplicationHandler for NestedOutputApp {
                     return;
                 }
 
-                if shell_overlay_captures_client_input(self.spotlight.is_visible()) {
-                    if !nested_output_uses_host_cursor() {
-                        self.request_redraw();
-                    }
-                    return;
-                }
-
-                self.send_client_pointer_motion(x, y);
-                if !nested_output_uses_host_cursor() {
-                    self.request_redraw();
-                }
+                let _ = self.route_logical_pointer_motion(x, y);
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if shell_overlay_captures_client_input(self.spotlight.is_visible()) {
@@ -1697,8 +1715,29 @@ fn keycode_to_evdev_key(code: KeyCode) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use winit::dpi::PhysicalPosition;
     use winit::keyboard::NamedKey;
+
+    fn nested_test_app() -> NestedOutputApp {
+        static NEXT_SOCKET: AtomicU64 = AtomicU64::new(1);
+        let socket_name = format!(
+            "typhon-nested-spotlight-test-{}-{}",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        );
+        let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+        NestedOutputApp::new(
+            server,
+            OutputRendererPreference::Cpu,
+            NestedOutputConfig {
+                width: 320,
+                height: 200,
+                refresh_hz: 60,
+            },
+            Vec::new(),
+        )
+    }
 
     #[test]
     fn keycode_mapping_uses_linux_evdev_codes_for_typing_keys() {
@@ -1970,6 +2009,47 @@ mod tests {
     fn visible_spotlight_captures_client_pointer_input() {
         assert!(shell_overlay_captures_client_input(true));
         assert!(!shell_overlay_captures_client_input(false));
+    }
+
+    #[test]
+    fn nested_spotlight_cursor_moved_updates_visual_position_without_dispatch() {
+        let mut app = nested_test_app();
+        app.toggle_spotlight();
+
+        let disposition = app.route_logical_pointer_motion(210.0, 145.0);
+
+        assert_eq!(app.cursor_x, 210);
+        assert_eq!(app.cursor_y, 145);
+        assert!(matches!(
+            disposition,
+            NestedPointerMotionDisposition::Captured
+        ));
+    }
+
+    #[test]
+    fn nested_spotlight_suppresses_device_relative_motion() {
+        let mut app = nested_test_app();
+        app.toggle_spotlight();
+
+        assert!(!app.forward_host_relative_mouse_delta(12.0, -4.0));
+    }
+
+    #[test]
+    fn nested_normal_motion_resumes_after_spotlight_closes() {
+        let mut app = nested_test_app();
+        app.toggle_spotlight();
+        assert!(matches!(
+            app.route_logical_pointer_motion(200.0, 140.0),
+            NestedPointerMotionDisposition::Captured
+        ));
+
+        app.toggle_spotlight();
+
+        assert_eq!(
+            app.route_logical_pointer_motion(220.0, 150.0),
+            NestedPointerMotionDisposition::Forwarded
+        );
+        assert!(app.forward_host_relative_mouse_delta(2.0, 1.0));
     }
 
     #[test]

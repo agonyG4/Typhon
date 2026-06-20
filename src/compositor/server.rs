@@ -300,6 +300,11 @@ impl OwnCompositorServer {
         let _ = self.display.flush_clients();
     }
 
+    pub fn update_pointer_position_without_client_dispatch(&mut self, x: f64, y: f64) -> bool {
+        self.state
+            .update_pointer_position_without_client_dispatch(x, y)
+    }
+
     pub fn send_pointer_motion_sample(&mut self, sample: PointerMotionSample) {
         self.state.send_pointer_motion_sample(sample);
         let _ = self.display.flush_clients();

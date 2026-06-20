@@ -1665,6 +1665,12 @@ impl CompositorState {
         }
     }
 
+    fn update_pointer_position_without_client_dispatch(&mut self, x: f64, y: f64) -> bool {
+        let before = self.render_generation;
+        self.update_pointer_position(x, y);
+        self.render_generation != before
+    }
+
     fn send_pointer_motion_sample(&mut self, sample: PointerMotionSample) {
         self.last_pointer_motion_usec = Some(sample.timestamp_usec);
         if let Some(relative) = sample.relative {

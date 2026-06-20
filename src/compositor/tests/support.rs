@@ -233,6 +233,23 @@ struct CursorTransitionSnapshots {
     destroyed: Option<ClientCursorSnapshot>,
 }
 
+#[derive(Debug)]
+struct CompositorOnlyCursorMotionSnapshot {
+    cursor: Option<ClientCursorSnapshot>,
+    visual_changed: bool,
+    render_generation_before: u64,
+    render_generation_after: u64,
+    scene_generation_before: u64,
+    scene_generation_after: u64,
+    cause: RenderGenerationCause,
+    pointer_event_log_before: Vec<&'static str>,
+    pointer_event_log_after: Vec<&'static str>,
+    relative_motion_count_before: usize,
+    relative_motion_count_after: usize,
+    pointer_focus_surface_before: Option<u32>,
+    pointer_focus_surface_after: Option<u32>,
+}
+
 impl RegistryTestState {
     fn toplevel_has_state(&self, expected: client_xdg_toplevel::State) -> bool {
         let expected = (expected as u32).to_ne_bytes();
@@ -4265,6 +4282,75 @@ fn exercise_client_cursor_state_transitions(
     })
 }
 
+fn create_client_cursor_then_update_position_without_dispatch(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    x: f64,
+    y: f64,
+) -> Result<CompositorOnlyCursorMotionSnapshot, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let pointer = seat.get_pointer(&qh, ());
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120)?;
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let serial = state.pointer_enter_serial.ok_or("missing pointer enter serial")?;
+
+    let cursor_surface = compositor.create_surface(&qh, ());
+    pointer.set_cursor(serial, Some(&cursor_surface), 3, 4);
+    commit_test_buffered_surface(&cursor_surface, &shm, &qh, 24, 24)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let render_generation_before = capture_render_generation(commands);
+    let scene_generation_before = capture_scene_render_generation(commands);
+    let pointer_event_log_before = state.pointer_event_log.clone();
+    let relative_motion_count_before = state.relative_motion_count;
+    let pointer_focus_surface_before = capture_pointer_focus_surface_id(commands);
+    let (reply, receiver) = mpsc::channel();
+    commands.send(ServerCommand::UpdatePointerPositionWithoutClientDispatch {
+        x,
+        y,
+        reply,
+    })?;
+    let visual_changed = receiver.recv_timeout(Duration::from_secs(1))?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    Ok(CompositorOnlyCursorMotionSnapshot {
+        cursor: capture_client_cursor_snapshot(commands),
+        visual_changed,
+        render_generation_before,
+        render_generation_after: capture_render_generation(commands),
+        scene_generation_before,
+        scene_generation_after: capture_scene_render_generation(commands),
+        cause: capture_render_generation_cause(commands),
+        pointer_event_log_before,
+        pointer_event_log_after: state.pointer_event_log,
+        relative_motion_count_before,
+        relative_motion_count_after: state.relative_motion_count,
+        pointer_focus_surface_before,
+        pointer_focus_surface_after: capture_pointer_focus_surface_id(commands),
+    })
+}
+
 fn create_buffered_toplevel_and_receive_surface_local_pointer_motion(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
@@ -5744,6 +5830,7 @@ enum ServerCommand {
     ToggleMaximizeFocused,
     ToggleFullscreenFocused,
     CaptureRenderGeneration(Sender<u64>),
+    CaptureSceneRenderGeneration(Sender<u64>),
     CaptureRenderGenerationCause(Sender<RenderGenerationCause>),
     CaptureRenderableSurfaceCount(Sender<usize>),
     CaptureRenderableSurfaceSnapshot(Sender<Vec<RenderableSurfaceSnapshot>>),
@@ -5759,6 +5846,12 @@ enum ServerCommand {
     CapturePointerConstraintBackendRequests(Sender<Vec<PointerConstraintBackendRequest>>),
     CapturePointerConstraintIds(Sender<Vec<u64>>),
     CaptureLastPointerPosition(Sender<(f64, f64)>),
+    CapturePointerFocusSurfaceId(Sender<Option<u32>>),
+    UpdatePointerPositionWithoutClientDispatch {
+        x: f64,
+        y: f64,
+        reply: Sender<bool>,
+    },
     PointerConstraintBackendActivated(PointerConstraintBackendId),
     PointerConstraintBackendFailed(PointerConstraintBackendId),
     #[allow(dead_code)]
@@ -5846,6 +5939,9 @@ fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureRenderGeneration(reply) => {
                         let _ = reply.send(server.render_generation());
+                    }
+                    ServerCommand::CaptureSceneRenderGeneration(reply) => {
+                        let _ = reply.send(server.scene_render_generation());
                     }
                     ServerCommand::CaptureRenderGenerationCause(reply) => {
                         let _ = reply.send(server.render_generation_cause());
@@ -5944,6 +6040,20 @@ fn spawn_controllable_test_server(
                         let _ =
                             reply.send((server.state.last_pointer_x, server.state.last_pointer_y));
                     }
+                    ServerCommand::CapturePointerFocusSurfaceId(reply) => {
+                        let _ = reply.send(
+                            server
+                                .state
+                                .pointer_surface
+                                .as_ref()
+                                .map(compositor_surface_id),
+                        );
+                    }
+                    ServerCommand::UpdatePointerPositionWithoutClientDispatch { x, y, reply } => {
+                        let _ = reply.send(
+                            server.update_pointer_position_without_client_dispatch(x, y),
+                        );
+                    }
                     ServerCommand::PointerConstraintBackendActivated(id) => {
                         server.pointer_constraint_backend_activated(id);
                     }
@@ -6007,6 +6117,26 @@ fn capture_render_generation(commands: &Sender<ServerCommand>) -> u64 {
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report render generation")
+}
+
+fn capture_scene_render_generation(commands: &Sender<ServerCommand>) -> u64 {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureSceneRenderGeneration(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report scene render generation")
+}
+
+fn capture_pointer_focus_surface_id(commands: &Sender<ServerCommand>) -> Option<u32> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePointerFocusSurfaceId(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report pointer focus surface")
 }
 
 fn capture_render_generation_cause(commands: &Sender<ServerCommand>) -> RenderGenerationCause {

@@ -2778,8 +2778,10 @@ impl NativeInputState {
             ..NativeInputEffect::default()
         };
         let locked_at_start = self.pointer_constraint.locked();
+        let shell_captures_pointer = self.spotlight_visible();
         if let Some(relative) = sample.relative {
-            effect.relative_motion = (!relative.is_zero()).then_some(relative);
+            effect.relative_motion =
+                (!shell_captures_pointer && !relative.is_zero()).then_some(relative);
             if !self.pointer_constraint.locked() {
                 let proposed = CompositorOutputPosition {
                     x: (self.cursor_x + relative.dx).clamp(0.0, f64::from(self.output_width - 1)),
@@ -4167,6 +4169,9 @@ fn apply_native_input_effect(
         exit_requested: effect.exit_requested,
         launch: None,
     };
+    application.redraw_requested |= apply_compositor_only_pointer_position(&effect, |x, y| {
+        server.update_pointer_position_without_client_dispatch(x, y)
+    });
     for event in effect.keyboard_events {
         server.send_keyboard_key(event.key, event.pressed);
     }
@@ -4211,6 +4216,19 @@ fn apply_native_input_effect(
         )?;
     }
     Ok(application)
+}
+
+fn apply_compositor_only_pointer_position(
+    effect: &NativeInputEffect,
+    update: impl FnOnce(f64, f64) -> bool,
+) -> bool {
+    if effect.pointer_motion.is_some() {
+        return false;
+    }
+    let Some((x, y)) = effect.cursor_position else {
+        return false;
+    };
+    update(f64::from(x), f64::from(y))
 }
 
 fn process_native_pointer_constraint_backend_requests(
@@ -8282,6 +8300,68 @@ mod tests {
         assert!(effect.redraw_requested);
         assert!(effect.keyboard_events.is_empty());
         assert_eq!(input.spotlight_query(), "z");
+    }
+
+    #[test]
+    fn spotlight_motion_updates_visual_cursor_without_forwarding_client_motion() {
+        let mut input = NativeInputState::new(320, 200);
+        input.handle_key_event(KEY_LEFTCTRL, 1);
+        input.handle_key_event(KEY_SPACE, 1);
+
+        let effect = input.handle_pointer_motion_delta(24.0, 12.0);
+
+        assert_eq!(input.cursor_position(), (184, 112));
+        assert_eq!(effect.cursor_position, Some((184, 112)));
+        assert_eq!(effect.pointer_motion, None);
+        assert_eq!(effect.relative_motion, None);
+    }
+
+    #[test]
+    fn spotlight_locked_motion_does_not_leak_relative_or_absolute_motion() {
+        let mut input = NativeInputState::new(320, 200);
+        let anchor = input.cursor_position_f64();
+        input.set_pointer_locked_at(anchor);
+        input.handle_key_event(KEY_LEFTCTRL, 1);
+        input.handle_key_event(KEY_SPACE, 1);
+
+        let effect = input.handle_pointer_motion_delta(24.0, 12.0);
+
+        assert_eq!(input.cursor_position_f64(), anchor);
+        assert_eq!(effect.cursor_position, None);
+        assert_eq!(effect.pointer_motion, None);
+        assert_eq!(effect.relative_motion, None);
+    }
+
+    #[test]
+    fn spotlight_client_cursor_repaints_even_with_hardware_cursor_mode() {
+        let mut input = NativeInputState::new(320, 200);
+        input.handle_key_event(KEY_LEFTCTRL, 1);
+        input.handle_key_event(KEY_SPACE, 1);
+        let effect = input.handle_pointer_motion_delta(24.0, 12.0);
+        let mut updated_position = None;
+
+        let compositor_visual_changed = apply_compositor_only_pointer_position(&effect, |x, y| {
+            updated_position = Some((x, y));
+            true
+        });
+        let redraw_requested = effect.requires_frame_repaint(NativeCursorRenderMode::Hardware)
+            || compositor_visual_changed;
+
+        assert_eq!(updated_position, Some((184.0, 112.0)));
+        assert!(redraw_requested);
+    }
+
+    #[test]
+    fn ordinary_motion_does_not_apply_compositor_only_position_update() {
+        let mut input = NativeInputState::new(320, 200);
+        let effect = input.handle_pointer_motion_delta(24.0, 12.0);
+
+        let compositor_visual_changed = apply_compositor_only_pointer_position(&effect, |_, _| {
+            panic!("ordinary forwarded motion must not update position twice")
+        });
+
+        assert_eq!(effect.pointer_motion, Some((184.0, 112.0)));
+        assert!(!compositor_visual_changed);
     }
 
     #[test]
