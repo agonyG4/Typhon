@@ -534,9 +534,15 @@ impl NestedOutputApp {
             .shell_overlay_renderer
             .render(width, height, &shell_state);
         let content_generation = nested_scene_content_generation(
-            self.server.render_generation(),
+            self.server.scene_render_generation(),
             shell_overlay.generation,
         );
+        let client_cursor = self.server.client_cursor_render_state();
+        let visual_state = if self.host_cursor_client_visible {
+            nested_visual_state(self.cursor_x, self.cursor_y)
+        } else {
+            DesktopVisualState::wallpaper_only()
+        };
         let Some(output_renderer) = &mut self.output_renderer else {
             return Ok(());
         };
@@ -546,8 +552,9 @@ impl NestedOutputApp {
             output_scale,
             surfaces: self.server.renderable_surfaces(),
             content_generation,
-            visual_state: nested_visual_state(self.cursor_x, self.cursor_y),
+            visual_state,
             shell_overlay: Some(shell_overlay),
+            client_cursor,
             cpu_scene_renderer: &mut self.renderer,
         })?;
         if debug_frame_logging_enabled() {

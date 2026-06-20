@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use super::shell::{ShellOverlayImage, blend_shell_overlay_argb};
-use super::{RenderableSurface, RenderableSurfaceDamage, SurfaceDamageRect};
+use super::{
+    ClientCursorRenderState, RenderableSurface, RenderableSurfaceDamage, SurfaceDamageRect,
+};
 use crate::render_backend::buffer::{BufferSize, SurfaceBufferSource};
 
 pub const NESTED_OUTPUT_BACKGROUND: u32 = 0xff08_0a0e;
@@ -55,6 +57,7 @@ pub struct DesktopComposeRequest<'a> {
     pub content_generation: u64,
     pub visual_state: DesktopVisualState,
     pub shell_overlay: Option<&'a ShellOverlayImage>,
+    pub client_cursor: Option<ClientCursorRenderState<'a>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -283,6 +286,7 @@ pub struct DesktopSceneRenderer {
     last_frame_copy_kind: DesktopFrameCopyKind,
     last_damage_debug_stats: DamageDebugStats,
     reusable_frame_key: Option<ReusableFrameKey>,
+    reusable_frame_had_client_cursor: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,6 +375,7 @@ impl DesktopSceneRenderer {
             content_generation,
             visual_state,
             shell_overlay,
+            client_cursor,
         } = request;
 
         self.rebuild_scene(
@@ -394,12 +399,16 @@ impl DesktopSceneRenderer {
         let partial_frame_copy = reuse_frame
             && self.reusable_frame_key == Some(frame_key)
             && scaled_visual_state.cursor.is_none()
+            && client_cursor.is_none()
+            && !self.reusable_frame_had_client_cursor
             && self.last_rebuild_kind == DesktopSceneRebuildKind::Partial
             && !self.last_rebuild_damage_rects.is_empty()
             && frame.len() == self.scene.len();
         let no_frame_copy = reuse_frame
             && self.reusable_frame_key == Some(frame_key)
             && scaled_visual_state.cursor.is_none()
+            && client_cursor.is_none()
+            && !self.reusable_frame_had_client_cursor
             && self.last_rebuild_kind == DesktopSceneRebuildKind::None
             && frame.len() == self.scene.len();
         if partial_frame_copy {
@@ -422,10 +431,16 @@ impl DesktopSceneRenderer {
                 blend_shell_overlay(frame, frame_width, frame_height, shell_overlay);
             }
         }
-        if let Some((cursor_x, cursor_y)) = scaled_visual_state.cursor {
+        if client_cursor.is_none()
+            && let Some((cursor_x, cursor_y)) = scaled_visual_state.cursor
+        {
             draw_cursor(frame, frame_width, frame_height, cursor_x, cursor_y);
         }
+        if let Some(cursor) = client_cursor {
+            draw_client_cursor(frame, frame_width, frame_height, cursor, output_scale);
+        }
         self.reusable_frame_key = reuse_frame.then_some(frame_key);
+        self.reusable_frame_had_client_cursor = reuse_frame && client_cursor.is_some();
     }
 
     pub fn scene_generation(&self) -> u64 {
@@ -669,6 +684,35 @@ impl DesktopSceneRenderer {
         draw_wallpaper(&mut self.wallpaper, frame_width, frame_height);
         self.wallpaper_generation = self.wallpaper_generation.saturating_add(1);
     }
+}
+
+fn draw_client_cursor(
+    frame: &mut [u32],
+    frame_width: u32,
+    frame_height: u32,
+    cursor: ClientCursorRenderState<'_>,
+    output_scale: f64,
+) {
+    let target = SurfaceTargetRect {
+        x: scale_logical_coordinate(
+            cursor.logical_x.saturating_add(cursor.surface.x),
+            output_scale,
+        ),
+        y: scale_logical_coordinate(
+            cursor.logical_y.saturating_add(cursor.surface.y),
+            output_scale,
+        ),
+        width: scale_logical_extent(cursor.surface.width, output_scale),
+        height: scale_logical_extent(cursor.surface.height, output_scale),
+    };
+    blit_surface_to_rect_clipped(
+        frame,
+        frame_width,
+        frame_height,
+        cursor.surface,
+        target,
+        None,
+    );
 }
 
 fn copy_scene_rect_to_frame(scene: &[u32], frame: &mut [u32], frame_width: u32, rect: OutputRect) {
@@ -2309,6 +2353,7 @@ mod tests {
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             shell_overlay: None,
+            client_cursor: None,
         });
 
         let resized_surface = RenderableSurface {
@@ -2332,6 +2377,7 @@ mod tests {
             content_generation: 2,
             visual_state: DesktopVisualState::wallpaper_only(),
             shell_overlay: None,
+            client_cursor: None,
         });
 
         assert_eq!(
@@ -2446,6 +2492,7 @@ mod tests {
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             shell_overlay: None,
+            client_cursor: None,
         });
         assert_eq!(renderer.last_frame_copy_kind(), DesktopFrameCopyKind::Full);
 
@@ -2480,6 +2527,7 @@ mod tests {
             content_generation: 2,
             visual_state: DesktopVisualState::wallpaper_only(),
             shell_overlay: None,
+            client_cursor: None,
         });
 
         assert_eq!(
@@ -2608,6 +2656,7 @@ mod tests {
                 content_generation: 1,
                 visual_state: DesktopVisualState::wallpaper_only(),
                 shell_overlay: None,
+                client_cursor: None,
             },
             BufferAge::Reset,
         );
@@ -2634,6 +2683,7 @@ mod tests {
                 content_generation: 2,
                 visual_state: DesktopVisualState::wallpaper_only(),
                 shell_overlay: None,
+                client_cursor: None,
             },
             BufferAge::Reset,
         );
@@ -2809,6 +2859,7 @@ mod tests {
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             shell_overlay: None,
+            client_cursor: None,
         });
         renderer.compose_request(DesktopComposeRequest {
             frame: &mut overlay_frame,
@@ -2819,6 +2870,7 @@ mod tests {
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             shell_overlay: Some(&overlay),
+            client_cursor: None,
         });
 
         assert_ne!(overlay_frame[sample_index], base_frame[sample_index]);
@@ -3006,6 +3058,75 @@ mod tests {
 
         let origin = (72 * 96 + 72) as usize;
         assert_eq!(frame[origin], 0xff80_007f);
+    }
+
+    #[test]
+    fn desktop_scene_renderer_draws_client_cursor_last_without_motion_trails() {
+        let cursor_surface = RenderableSurface {
+            surface_id: 99,
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+            placement: SurfacePlacement::root(),
+            resize_preview: None,
+            generation: 1,
+            buffer: shm_buffer(2, 2, vec![0xff00_ff00; 4]),
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+        let mut renderer = DesktopSceneRenderer::default();
+        let mut frame = vec![0; 16 * 16];
+
+        renderer.compose_reusing_frame(DesktopComposeRequest {
+            frame: &mut frame,
+            frame_width: 16,
+            frame_height: 16,
+            output_scale: 1.0,
+            surfaces: &[],
+            content_generation: 1,
+            visual_state: DesktopVisualState::with_cursor(0, 0),
+            shell_overlay: None,
+            client_cursor: Some(crate::compositor::ClientCursorRenderState {
+                surface: &cursor_surface,
+                logical_x: 2,
+                logical_y: 3,
+            }),
+        });
+        assert_ne!(frame[0], CURSOR_OUTLINE);
+        assert_eq!(frame[3 * 16 + 2], 0xff00_ff00);
+
+        renderer.compose_reusing_frame(DesktopComposeRequest {
+            frame: &mut frame,
+            frame_width: 16,
+            frame_height: 16,
+            output_scale: 1.0,
+            surfaces: &[],
+            content_generation: 1,
+            visual_state: DesktopVisualState::wallpaper_only(),
+            shell_overlay: None,
+            client_cursor: Some(crate::compositor::ClientCursorRenderState {
+                surface: &cursor_surface,
+                logical_x: 8,
+                logical_y: 9,
+            }),
+        });
+
+        assert_ne!(frame[3 * 16 + 2], 0xff00_ff00);
+        assert_eq!(frame[9 * 16 + 8], 0xff00_ff00);
+        assert_eq!(renderer.last_rebuild_kind(), DesktopSceneRebuildKind::None);
+
+        renderer.compose_reusing_frame(DesktopComposeRequest {
+            frame: &mut frame,
+            frame_width: 16,
+            frame_height: 16,
+            output_scale: 1.0,
+            surfaces: &[],
+            content_generation: 1,
+            visual_state: DesktopVisualState::wallpaper_only(),
+            shell_overlay: None,
+            client_cursor: None,
+        });
+        assert_ne!(frame[9 * 16 + 8], 0xff00_ff00);
     }
 
     #[test]

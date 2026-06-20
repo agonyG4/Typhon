@@ -31,8 +31,8 @@ use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
 
 use super::{
-    CompositorState, FramePresentation, InputProtocolCapabilities, PresentationClock,
-    RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
+    ClientCursorRenderState, CompositorState, FramePresentation, InputProtocolCapabilities,
+    PresentationClock, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
     SelectionProtocolCapabilities, ShellDockItem, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
@@ -213,8 +213,16 @@ impl OwnCompositorServer {
         &self.state.renderable_surfaces
     }
 
+    pub fn client_cursor_render_state(&self) -> Option<ClientCursorRenderState<'_>> {
+        self.state.client_cursor_render_state()
+    }
+
     pub fn render_generation(&self) -> u64 {
         self.state.render_generation
+    }
+
+    pub fn scene_render_generation(&self) -> u64 {
+        self.state.scene_render_generation
     }
 
     pub fn render_generation_cause(&self) -> RenderGenerationCause {

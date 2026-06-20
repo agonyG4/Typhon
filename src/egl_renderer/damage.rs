@@ -114,6 +114,30 @@ pub(super) struct EglOutputDamageTracker {
     output_size: (u32, u32),
     last_cursor_rect: Option<SurfaceDamageRect>,
     last_shell_overlay: Option<ShellOverlayDamageState>,
+    last_client_cursor: Option<ClientCursorDamageState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ClientCursorDamageState {
+    pub(super) rect: Option<SurfaceDamageRect>,
+    generation: u64,
+}
+
+impl ClientCursorDamageState {
+    pub(super) fn new(
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        generation: u64,
+        output_width: u32,
+        output_height: u32,
+    ) -> Self {
+        Self {
+            rect: arbitrary_cursor_damage_rect(x, y, width, height, output_width, output_height),
+            generation,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +201,7 @@ impl EglOutputDamageTracker {
         scene_changed: bool,
         visual_state: DesktopVisualState,
         shell_overlay: Option<ShellOverlayDamageState>,
+        client_cursor: Option<ClientCursorDamageState>,
     ) -> EglOutputDamage {
         let cursor_rect = visual_state
             .cursor
@@ -187,6 +212,7 @@ impl EglOutputDamageTracker {
         if size_changed || scene_changed {
             self.last_cursor_rect = cursor_rect;
             self.last_shell_overlay = shell_overlay;
+            self.last_client_cursor = client_cursor;
             return EglOutputDamage::full(width, height);
         }
 
@@ -213,8 +239,18 @@ impl EglOutputDamageTracker {
             }
         }
 
+        if self.last_client_cursor != client_cursor {
+            if let Some(previous) = self.last_client_cursor.and_then(|cursor| cursor.rect) {
+                damage.push(previous);
+            }
+            if let Some(current) = client_cursor.and_then(|cursor| cursor.rect) {
+                damage.push(current);
+            }
+        }
+
         self.last_cursor_rect = cursor_rect;
         self.last_shell_overlay = shell_overlay;
+        self.last_client_cursor = client_cursor;
         if damage.is_empty() {
             EglOutputDamage::full(width, height)
         } else {
@@ -230,22 +266,39 @@ pub(super) fn cursor_damage_rect(
     output_height: u32,
 ) -> Option<SurfaceDamageRect> {
     let (cursor_width, cursor_height) = cursor_texture_size();
-    let left = cursor_x.max(0) as u32;
-    let top = cursor_y.max(0) as u32;
-    if left >= output_width || top >= output_height {
-        return None;
-    }
-    let right = (cursor_x + cursor_width as i32)
+    arbitrary_cursor_damage_rect(
+        cursor_x,
+        cursor_y,
+        cursor_width,
+        cursor_height,
+        output_width,
+        output_height,
+    )
+}
+
+fn arbitrary_cursor_damage_rect(
+    cursor_x: i32,
+    cursor_y: i32,
+    cursor_width: u32,
+    cursor_height: u32,
+    output_width: u32,
+    output_height: u32,
+) -> Option<SurfaceDamageRect> {
+    let left = i64::from(cursor_x).max(0).min(i64::from(output_width));
+    let top = i64::from(cursor_y).max(0).min(i64::from(output_height));
+    let right = i64::from(cursor_x)
+        .saturating_add(i64::from(cursor_width))
         .max(0)
-        .min(output_width as i32) as u32;
-    let bottom = (cursor_y + cursor_height as i32)
+        .min(i64::from(output_width));
+    let bottom = i64::from(cursor_y)
+        .saturating_add(i64::from(cursor_height))
         .max(0)
-        .min(output_height as i32) as u32;
-    let width = right.saturating_sub(left);
-    let height = bottom.saturating_sub(top);
+        .min(i64::from(output_height));
+    let width = right.saturating_sub(left) as u32;
+    let height = bottom.saturating_sub(top) as u32;
     (width > 0 && height > 0).then_some(SurfaceDamageRect {
-        x: left,
-        y: top,
+        x: left as u32,
+        y: top as u32,
         width,
         height,
     })

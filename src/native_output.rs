@@ -1991,7 +1991,8 @@ impl NativeFrameRenderer {
             spotlight: input_state.spotlight(),
             shell_generation: input_state.shell_generation(),
             visual_state: input_state.desktop_visual_state(cursor_mode),
-            render_generation: server.render_generation(),
+            render_generation: server.scene_render_generation(),
+            client_cursor: server.client_cursor_render_state(),
         })
     }
 
@@ -2005,6 +2006,7 @@ impl NativeFrameRenderer {
             shell_generation,
             visual_state,
             render_generation,
+            client_cursor,
         } = request;
         let pixel_count = width.saturating_mul(height) as usize;
         self.frame.resize(pixel_count, 0);
@@ -2030,6 +2032,7 @@ impl NativeFrameRenderer {
                 ),
                 visual_state,
                 shell_overlay: Some(shell_overlay),
+                client_cursor,
             });
         NativeRenderedFrame {
             pixels: &self.frame,
@@ -2060,12 +2063,13 @@ impl NativeFrameRenderer {
             height,
             surfaces: server.renderable_surfaces(),
             content_generation: native_scene_content_generation(
-                server.render_generation(),
+                server.scene_render_generation(),
                 shell_overlay.generation,
             ),
             visual_state: input_state.desktop_visual_state(cursor_mode),
             output_scale: 1.0,
             shell_overlay: Some(shell_overlay),
+            client_cursor: server.client_cursor_render_state(),
         }
     }
 }
@@ -2085,6 +2089,7 @@ struct NativeFrameRequest<'a> {
     shell_generation: u64,
     visual_state: DesktopVisualState,
     render_generation: u64,
+    client_cursor: Option<oblivion_one::compositor::ClientCursorRenderState<'a>>,
 }
 
 const fn native_scene_content_generation(
@@ -8200,6 +8205,7 @@ mod tests {
                 shell_generation: 0,
                 visual_state: DesktopVisualState::wallpaper_only(),
                 render_generation: 0,
+                client_cursor: None,
             })
             .pixels
             .to_vec();
@@ -8229,6 +8235,7 @@ mod tests {
                 shell_generation: 0,
                 visual_state: DesktopVisualState::wallpaper_only(),
                 render_generation: 0,
+                client_cursor: None,
             })
             .pixels
             .to_vec();
@@ -9079,6 +9086,7 @@ mod tests {
             shell_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             render_generation: 1,
+            client_cursor: None,
         });
         assert_eq!(initial.scene_rebuild_kind, DesktopSceneRebuildKind::Full);
 
@@ -9105,6 +9113,7 @@ mod tests {
             shell_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             render_generation: 2,
+            client_cursor: None,
         });
 
         assert_eq!(moved.scene_rebuild_kind, DesktopSceneRebuildKind::Partial);
@@ -9126,6 +9135,7 @@ mod tests {
             shell_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             render_generation: 1,
+            client_cursor: None,
         });
         assert_eq!(initial.scene_rebuild_kind, DesktopSceneRebuildKind::Full);
 
@@ -9152,6 +9162,7 @@ mod tests {
             shell_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             render_generation: 2,
+            client_cursor: None,
         });
 
         assert_eq!(

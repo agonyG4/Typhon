@@ -45,6 +45,7 @@ pub struct NestedSceneDrawRequest<'a> {
     pub content_generation: u64,
     pub visual_state: DesktopVisualState,
     pub shell_overlay: Option<&'a ShellOverlayImage>,
+    pub client_cursor: Option<oblivion_one::compositor::ClientCursorRenderState<'a>>,
     pub cpu_scene_renderer: &'a mut DesktopSceneRenderer,
 }
 
@@ -149,6 +150,7 @@ impl NestedOutputRenderer {
             content_generation,
             visual_state,
             shell_overlay,
+            client_cursor,
             cpu_scene_renderer,
         } = request;
 
@@ -161,6 +163,7 @@ impl NestedOutputRenderer {
                 visual_state,
                 output_scale,
                 shell_overlay,
+                client_cursor,
             }),
             OutputRendererInner::Cpu(renderer) => renderer.draw(width, height, |frame| {
                 cpu_scene_renderer.compose_request(DesktopComposeRequest {
@@ -172,6 +175,7 @@ impl NestedOutputRenderer {
                     content_generation,
                     visual_state,
                     shell_overlay,
+                    client_cursor,
                 });
             }),
         }

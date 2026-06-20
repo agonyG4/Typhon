@@ -4186,11 +4186,126 @@ fn pointer_cursor_surface_commit_is_not_rendered_as_client_content() {
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
-    let renderable_count =
-        create_toplevel_then_set_and_commit_cursor_surface(&socket_path, &commands);
+    let result = create_toplevel_then_set_and_commit_cursor_surface(
+        &socket_path,
+        &commands,
+        false,
+        false,
+        None,
+    )
+    .unwrap();
     let _server = stop_controllable_test_server(commands, server_thread);
 
-    assert_eq!(renderable_count.unwrap(), 1);
+    assert_eq!(result.renderable_count, 1);
+}
+
+#[test]
+fn valid_cursor_surface_commit_exposes_hotspot_adjusted_overlay_snapshot() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let result = create_toplevel_then_set_and_commit_cursor_surface(
+        &socket_path,
+        &commands,
+        false,
+        false,
+        None,
+    );
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let cursor = result
+        .unwrap()
+        .cursor
+        .expect("valid committed cursor should have an overlay snapshot");
+    assert_eq!(cursor.logical_x, render::FIRST_SURFACE_OFFSET.0 + 19);
+    assert_eq!(cursor.logical_y, render::FIRST_SURFACE_OFFSET.1 + 13);
+    assert_eq!((cursor.width, cursor.height), (24, 24));
+}
+
+#[test]
+fn cursor_surface_null_attachment_removes_overlay_without_mapping_client_content() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let result = create_toplevel_then_set_and_commit_cursor_surface(
+        &socket_path,
+        &commands,
+        true,
+        false,
+        None,
+    );
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let result = result.unwrap();
+    assert_eq!(result.renderable_count, 1);
+    assert_eq!(result.cursor, None);
+}
+
+#[test]
+fn visible_cursor_surface_frame_callback_waits_for_frame_completion() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let result = create_toplevel_then_set_and_commit_cursor_surface(
+        &socket_path,
+        &commands,
+        false,
+        true,
+        None,
+    );
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(result.unwrap().callback_state, Some((true, false)));
+}
+
+#[test]
+fn active_client_cursor_motion_advances_overlay_generation_without_mapping_surface() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let x = f64::from(render::FIRST_SURFACE_OFFSET.0) + 40.0;
+    let y = f64::from(render::FIRST_SURFACE_OFFSET.1) + 30.0;
+
+    let result = create_toplevel_then_set_and_commit_cursor_surface(
+        &socket_path,
+        &commands,
+        false,
+        false,
+        Some((x, y)),
+    );
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let result = result.unwrap();
+    assert_eq!(result.renderable_count, 1);
+    assert_eq!(result.cause, RenderGenerationCause::CursorMotion);
+    assert_eq!(result.cursor.unwrap().logical_x, x.round() as i32 - 1);
+}
+
+#[test]
+fn client_cursor_hotspot_hide_reselect_and_destroy_transitions_are_isolated() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots = exercise_client_cursor_state_transitions(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let initial = snapshots.initial.unwrap();
+    let hotspot_changed = snapshots.hotspot_changed.unwrap();
+    assert_eq!(hotspot_changed.surface_id, initial.surface_id);
+    assert_eq!(hotspot_changed.logical_x, initial.logical_x - 4);
+    assert_eq!(hotspot_changed.logical_y, initial.logical_y - 6);
+    assert_eq!(snapshots.hidden, None);
+    assert_eq!(snapshots.reselected.unwrap().surface_id, initial.surface_id);
+    assert_eq!(snapshots.destroyed, None);
 }
 
 #[test]

@@ -207,6 +207,32 @@ struct RenderableSurfaceSnapshot {
     parent_surface_id: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClientCursorSnapshot {
+    surface_id: u32,
+    logical_x: i32,
+    logical_y: i32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug)]
+struct CursorSurfaceCommitSnapshot {
+    renderable_count: usize,
+    cursor: Option<ClientCursorSnapshot>,
+    callback_state: Option<(bool, bool)>,
+    cause: RenderGenerationCause,
+}
+
+#[derive(Debug)]
+struct CursorTransitionSnapshots {
+    initial: Option<ClientCursorSnapshot>,
+    hotspot_changed: Option<ClientCursorSnapshot>,
+    hidden: Option<ClientCursorSnapshot>,
+    reselected: Option<ClientCursorSnapshot>,
+    destroyed: Option<ClientCursorSnapshot>,
+}
+
 impl RegistryTestState {
     fn toplevel_has_state(&self, expected: client_xdg_toplevel::State) -> bool {
         let expected = (expected as u32).to_ne_bytes();
@@ -4101,7 +4127,10 @@ fn create_toplevel_then_click_and_move_pointer_on_same_surface(
 fn create_toplevel_then_set_and_commit_cursor_surface(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
-) -> Result<usize, Box<dyn std::error::Error>> {
+    remove_content: bool,
+    request_frame_callback: bool,
+    motion_after_commit: Option<(f64, f64)>,
+) -> Result<CursorSurfaceCommitSnapshot, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
@@ -4131,12 +4160,109 @@ fn create_toplevel_then_set_and_commit_cursor_surface(
     };
     let cursor_surface = compositor.create_surface(&qh, ());
     pointer.set_cursor(serial, Some(&cursor_surface), 1, 1);
+    if request_frame_callback {
+        cursor_surface.frame(&qh, ());
+    }
     commit_test_buffered_surface(&cursor_surface, &shm, &qh, 24, 24)?;
     connection.flush()?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
 
-    Ok(capture_renderable_surface_count(commands))
+    let callback_state = if request_frame_callback {
+        let before = capture_pending_frame_callbacks(commands);
+        commands.send(ServerCommand::FinishFrame)?;
+        wait_for_server_commands(commands);
+        let after = capture_pending_frame_callbacks(commands);
+        Some((before, after))
+    } else {
+        None
+    };
+
+    if let Some((x, y)) = motion_after_commit {
+        commands.send(ServerCommand::PointerMotion { x, y })?;
+        wait_for_server_commands(commands);
+        queue.roundtrip(&mut state)?;
+    }
+
+    if remove_content {
+        cursor_surface.attach(None, 0, 0);
+        cursor_surface.commit();
+        connection.flush()?;
+        wait_for_server_commands(commands);
+        queue.roundtrip(&mut state)?;
+    }
+
+    Ok(CursorSurfaceCommitSnapshot {
+        renderable_count: capture_renderable_surface_count(commands),
+        cursor: capture_client_cursor_snapshot(commands),
+        callback_state,
+        cause: capture_render_generation_cause(commands),
+    })
+}
+
+fn exercise_client_cursor_state_transitions(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<CursorTransitionSnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let pointer = seat.get_pointer(&qh, ());
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120)?;
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let serial = state.pointer_enter_serial.ok_or("missing pointer enter serial")?;
+
+    let cursor_surface = compositor.create_surface(&qh, ());
+    pointer.set_cursor(serial, Some(&cursor_surface), 1, 1);
+    commit_test_buffered_surface(&cursor_surface, &shm, &qh, 24, 24)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let initial = capture_client_cursor_snapshot(commands);
+
+    pointer.set_cursor(serial, Some(&cursor_surface), 5, 7);
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    let hotspot_changed = capture_client_cursor_snapshot(commands);
+
+    pointer.set_cursor(serial, None, 0, 0);
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    let hidden = capture_client_cursor_snapshot(commands);
+
+    pointer.set_cursor(serial, Some(&cursor_surface), 2, 3);
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    let reselected = capture_client_cursor_snapshot(commands);
+
+    cursor_surface.destroy();
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    let destroyed = capture_client_cursor_snapshot(commands);
+
+    Ok(CursorTransitionSnapshots {
+        initial,
+        hotspot_changed,
+        hidden,
+        reselected,
+        destroyed,
+    })
 }
 
 fn create_buffered_toplevel_and_receive_surface_local_pointer_motion(
@@ -5621,6 +5747,7 @@ enum ServerCommand {
     CaptureRenderGenerationCause(Sender<RenderGenerationCause>),
     CaptureRenderableSurfaceCount(Sender<usize>),
     CaptureRenderableSurfaceSnapshot(Sender<Vec<RenderableSurfaceSnapshot>>),
+    CaptureClientCursorSnapshot(Sender<Option<ClientCursorSnapshot>>),
     CaptureXdgRoleSnapshot {
         surface_id: u32,
         reply: Sender<XdgRoleSnapshot>,
@@ -5739,6 +5866,18 @@ fn spawn_controllable_test_server(
                                 })
                                 .collect(),
                         );
+                    }
+                    ServerCommand::CaptureClientCursorSnapshot(reply) => {
+                        let snapshot = server.client_cursor_render_state().map(|cursor| {
+                            ClientCursorSnapshot {
+                                surface_id: cursor.surface.surface_id,
+                                logical_x: cursor.logical_x,
+                                logical_y: cursor.logical_y,
+                                width: cursor.surface.width,
+                                height: cursor.surface.height,
+                            }
+                        });
+                        let _ = reply.send(snapshot);
                     }
                     ServerCommand::CaptureXdgRoleSnapshot { surface_id, reply } => {
                         let tracked_surface_id =
@@ -5900,6 +6039,18 @@ fn capture_renderable_surface_snapshot(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report renderable surface snapshot")
+}
+
+fn capture_client_cursor_snapshot(
+    commands: &Sender<ServerCommand>,
+) -> Option<ClientCursorSnapshot> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureClientCursorSnapshot(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report client cursor snapshot")
 }
 
 fn capture_xdg_role_snapshot(commands: &Sender<ServerCommand>, surface_id: u32) -> XdgRoleSnapshot {

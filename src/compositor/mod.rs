@@ -183,6 +183,9 @@ pub enum RenderGenerationCause {
     WindowRestore,
     WindowStack,
     OutputChange,
+    CursorCommit,
+    CursorMotion,
+    CursorState,
 }
 
 impl RenderGenerationCause {
@@ -200,12 +203,22 @@ impl RenderGenerationCause {
             Self::WindowRestore => "window_restore",
             Self::WindowStack => "window_stack",
             Self::OutputChange => "output_change",
+            Self::CursorCommit => "cursor_commit",
+            Self::CursorMotion => "cursor_motion",
+            Self::CursorState => "cursor_state",
         }
     }
 
     pub const fn uses_surface_damage(self) -> bool {
         matches!(self, Self::SurfaceCommit | Self::SurfaceDamage)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ClientCursorRenderState<'a> {
+    pub surface: &'a RenderableSurface,
+    pub logical_x: i32,
+    pub logical_y: i32,
 }
 
 #[derive(Debug, Default)]
@@ -249,6 +262,8 @@ pub struct CompositorState {
     pointer_entered_surfaces: Vec<(wl_pointer::WlPointer, wl_surface::WlSurface)>,
     pointer_enter_serials: Vec<PointerEnterSerial>,
     cursor_surface_ids: HashSet<u32>,
+    active_client_cursor: Option<ActiveClientCursor>,
+    client_cursor_surfaces: HashMap<u32, RenderableSurface>,
     surface_placements: HashMap<u32, SurfacePlacement>,
     committed_subsurface_stacks: HashMap<u32, Vec<u32>>,
     pending_subsurface_stacks: HashMap<u32, Vec<u32>>,
@@ -279,6 +294,7 @@ pub struct CompositorState {
     frame_clock_start: Option<Instant>,
     next_configure_serial: u32,
     render_generation: u64,
+    scene_render_generation: u64,
     render_generation_cause: RenderGenerationCause,
     surface_origin_cache_generation: Option<u64>,
     surface_origin_cache: Vec<(i32, i32)>,
@@ -438,6 +454,14 @@ struct PointerEnterSerial {
     serial: u32,
 }
 
+#[derive(Debug, Clone)]
+struct ActiveClientCursor {
+    pointer: wl_pointer::WlPointer,
+    surface_id: u32,
+    hotspot_x: i32,
+    hotspot_y: i32,
+}
+
 fn pointer_debug_log(message: impl AsRef<str>) {
     if std::env::var_os("TYPHON_POINTER_DEBUG").is_some() {
         eprintln!("typhon pointer: {}", message.as_ref());
@@ -583,6 +607,14 @@ impl CompositorState {
     fn set_render_generation(&mut self, generation: u64, cause: RenderGenerationCause) {
         self.render_generation = generation;
         self.render_generation_cause = cause;
+        if !matches!(
+            cause,
+            RenderGenerationCause::CursorCommit
+                | RenderGenerationCause::CursorMotion
+                | RenderGenerationCause::CursorState
+        ) {
+            self.scene_render_generation = generation;
+        }
     }
 
     fn advance_render_generation(&mut self, cause: RenderGenerationCause) -> u64 {
@@ -1164,6 +1196,28 @@ impl CompositorState {
         self.cleanup_subsurface_stack_state_for_surface(surface_id);
         self.surface_resources.remove(&surface_id);
         self.cursor_surface_ids.remove(&surface_id);
+        let removed_cursor_content = self.client_cursor_surfaces.remove(&surface_id).is_some();
+        let active_cursor_pointer = self
+            .active_client_cursor
+            .as_ref()
+            .filter(|active| active.surface_id == surface_id)
+            .map(|active| active.pointer.clone());
+        if let Some(pointer) = active_cursor_pointer {
+            self.active_client_cursor = None;
+            self.cursor_visibility.client_cursor_pointer = None;
+            self.cursor_visibility.client_hidden_pointer = Some(pointer);
+            pointer_debug_log(format!(
+                "cursor cleanup surface={} reason=active-surface-destroyed",
+                surface_id
+            ));
+            self.advance_render_generation(RenderGenerationCause::CursorState);
+            self.sync_cursor_visibility_request();
+        } else if removed_cursor_content {
+            pointer_debug_log(format!(
+                "cursor cleanup surface={} reason=inactive-surface-destroyed",
+                surface_id
+            ));
+        }
         self.unregister_fractional_scale_resources_for_surface(surface_id);
         self.surface_placements.remove(&surface_id);
         self.current_surface_buffers.remove(&surface_id);
@@ -1302,6 +1356,18 @@ impl CompositorState {
             .retain(|resource| !same_wayland_resource(&resource.source_pointer, pointer));
         self.deactivate_pointer_constraints_for_pointer(pointer, false);
         if self
+            .active_client_cursor
+            .as_ref()
+            .is_some_and(|active| same_wayland_resource(&active.pointer, pointer))
+        {
+            self.active_client_cursor = None;
+            self.advance_render_generation(RenderGenerationCause::CursorState);
+            pointer_debug_log(format!(
+                "cursor cleanup pointer={} reason=owning-pointer-destroyed",
+                pointer.id().protocol_id()
+            ));
+        }
+        if self
             .cursor_visibility
             .client_hidden_pointer
             .as_ref()
@@ -1326,8 +1392,8 @@ impl CompositorState {
         pointer: &wl_pointer::WlPointer,
         serial: u32,
         surface: Option<wl_surface::WlSurface>,
-        _hotspot_x: i32,
-        _hotspot_y: i32,
+        hotspot_x: i32,
+        hotspot_y: i32,
     ) {
         let Some(pointer_surface) = self.pointer_surface.as_ref() else {
             return;
@@ -1346,6 +1412,7 @@ impl CompositorState {
             surface.is_none()
         ));
         if !valid {
+            pointer_debug_log("cursor request ignored reason=invalid-focus-or-enter-serial");
             return;
         }
         let resolves_pending_unlock = self
@@ -1353,8 +1420,12 @@ impl CompositorState {
             .as_ref()
             .is_some_and(|pending| same_wayland_resource(&pending.pointer, pointer));
         let Some(surface) = surface else {
+            let changed = self.active_client_cursor.take().is_some();
             self.cursor_visibility.client_hidden_pointer = Some(pointer.clone());
             self.cursor_visibility.client_cursor_pointer = None;
+            if changed {
+                self.advance_render_generation(RenderGenerationCause::CursorState);
+            }
             self.sync_cursor_visibility_request();
             if resolves_pending_unlock {
                 self.finalize_pending_locked_pointer_reveal("client_hidden_cursor");
@@ -1364,13 +1435,30 @@ impl CompositorState {
         let surface_id = compositor_surface_id(&surface);
         self.cursor_surface_ids.insert(surface_id);
         self.unmap_surface_content(surface_id);
+        let changed = self.active_client_cursor.as_ref().is_none_or(|active| {
+            !same_wayland_resource(&active.pointer, pointer)
+                || active.surface_id != surface_id
+                || active.hotspot_x != hotspot_x
+                || active.hotspot_y != hotspot_y
+        });
+        self.active_client_cursor = Some(ActiveClientCursor {
+            pointer: pointer.clone(),
+            surface_id,
+            hotspot_x,
+            hotspot_y,
+        });
         self.cursor_visibility.client_hidden_pointer = None;
         self.cursor_visibility.client_cursor_pointer = Some(pointer.clone());
         pointer_debug_log(format!(
-            "cursor request client_surface pointer={} surface={} hotspot=stored_by_protocol_path",
+            "cursor request client_surface pointer={} surface={} hotspot=({}, {})",
             pointer.id().protocol_id(),
-            surface_id
+            surface_id,
+            hotspot_x,
+            hotspot_y
         ));
+        if changed {
+            self.advance_render_generation(RenderGenerationCause::CursorState);
+        }
         self.sync_cursor_visibility_request();
         if resolves_pending_unlock {
             self.finalize_pending_locked_pointer_reveal("client_cursor_surface");
@@ -1379,6 +1467,25 @@ impl CompositorState {
 
     fn is_cursor_surface(&self, surface_id: u32) -> bool {
         self.cursor_surface_ids.contains(&surface_id)
+    }
+
+    fn client_cursor_render_state(&self) -> Option<ClientCursorRenderState<'_>> {
+        if self.cursor_visibility.lock_hidden_constraint_id.is_some() {
+            return None;
+        }
+        let active = self.active_client_cursor.as_ref()?;
+        let surface = self.client_cursor_surfaces.get(&active.surface_id)?;
+        Some(ClientCursorRenderState {
+            surface,
+            logical_x: (self.last_pointer_x.round() as i32).saturating_sub(active.hotspot_x),
+            logical_y: (self.last_pointer_y.round() as i32).saturating_sub(active.hotspot_y),
+        })
+    }
+
+    fn active_client_cursor_has_content(&self) -> bool {
+        self.active_client_cursor
+            .as_ref()
+            .is_some_and(|active| self.client_cursor_surfaces.contains_key(&active.surface_id))
     }
 
     fn send_keyboard_key(&mut self, key: u32, pressed: bool) {
@@ -1518,8 +1625,7 @@ impl CompositorState {
             self.send_confined_pointer_motion(x, y);
             return;
         }
-        self.last_pointer_x = x;
-        self.last_pointer_y = y;
+        self.update_pointer_position(x, y);
         if self.send_implicit_pointer_grab_motion(x, y) {
             return;
         }
@@ -1546,6 +1652,16 @@ impl CompositorState {
                 surface_y: target.surface_y,
             });
             send_pointer_frame_if_supported(pointer);
+        }
+    }
+
+    fn update_pointer_position(&mut self, x: f64, y: f64) {
+        let changed = self.last_pointer_x != x || self.last_pointer_y != y;
+        let moves_client_cursor = changed && self.client_cursor_render_state().is_some();
+        self.last_pointer_x = x;
+        self.last_pointer_y = y;
+        if moves_client_cursor {
+            self.advance_render_generation(RenderGenerationCause::CursorMotion);
         }
     }
 
@@ -1702,6 +1818,9 @@ impl CompositorState {
             == Some(pending.backend_id.constraint_id)
         {
             self.cursor_visibility.lock_hidden_constraint_id = None;
+            if self.active_client_cursor_has_content() {
+                self.advance_render_generation(RenderGenerationCause::CursorState);
+            }
         }
         pointer_debug_log(format!(
             "pointer.unlock transition_finalize reason={} id={} generation={} final=({}) visibility_request={} epoch={}",
@@ -1825,8 +1944,7 @@ impl CompositorState {
         };
         let proposed = OutputPosition { x, y };
         let clamped = active.region.closest_point(proposed);
-        self.last_pointer_x = clamped.x;
-        self.last_pointer_y = clamped.y;
+        self.update_pointer_position(clamped.x, clamped.y);
         self.pin_confined_pointer_focus(&active);
         let Some(target) =
             self.pointer_target_for_surface_at_output(&active.surface, clamped.x, clamped.y)
@@ -2203,6 +2321,9 @@ impl CompositorState {
                 activation_anchor.y
             ));
             self.cursor_visibility.lock_hidden_constraint_id = Some(constraint_id);
+            if self.active_client_cursor_has_content() {
+                self.advance_render_generation(RenderGenerationCause::CursorState);
+            }
             self.sync_cursor_visibility_request();
             let (surface_x, surface_y) = self
                 .pointer_target_at(activation_anchor.x, activation_anchor.y)
@@ -2257,8 +2378,7 @@ impl CompositorState {
                     x: self.last_pointer_x,
                     y: self.last_pointer_y,
                 });
-                self.last_pointer_x = clamped.x;
-                self.last_pointer_y = clamped.y;
+                self.update_pointer_position(clamped.x, clamped.y);
                 let target = self
                     .pointer_target_for_surface_at_output(&surface, clamped.x, clamped.y)
                     .unwrap_or(PointerTarget {
@@ -2540,6 +2660,9 @@ impl CompositorState {
                 .is_none_or(|pending| pending.backend_id.constraint_id != constraint_id)
         {
             self.cursor_visibility.lock_hidden_constraint_id = None;
+            if self.active_client_cursor_has_content() {
+                self.advance_render_generation(RenderGenerationCause::CursorState);
+            }
             self.sync_cursor_visibility_request();
         }
     }
@@ -2566,8 +2689,7 @@ impl CompositorState {
             x: self.last_pointer_x,
             y: self.last_pointer_y,
         };
-        self.last_pointer_x = position.x;
-        self.last_pointer_y = position.y;
+        self.update_pointer_position(position.x, position.y);
         pointer_debug_log(format!(
             "pointer warp compositor before=({},{}) after=({},{}) send_motion={}",
             before.x, before.y, position.x, position.y, send_motion
@@ -2634,6 +2756,9 @@ impl CompositorState {
                 .is_none_or(|pending| pending.backend_id.constraint_id != constraint_id)
         {
             self.cursor_visibility.lock_hidden_constraint_id = None;
+            if self.active_client_cursor_has_content() {
+                self.advance_render_generation(RenderGenerationCause::CursorState);
+            }
             self.sync_cursor_visibility_request();
         }
     }
@@ -3814,15 +3939,11 @@ impl CompositorState {
         frame_callbacks: Vec<wl_callback::WlCallback>,
         explicit_sync: Option<Arc<SyncobjSurfaceState>>,
     ) {
-        if self.is_cursor_surface(surface_id) {
-            self.commit_cursor_surface_buffer(surface_id, pending, frame_callbacks);
-            return;
+        if !self.is_cursor_surface(surface_id) {
+            self.configure_xdg_surface_if_needed(surface_id);
         }
-
-        self.configure_xdg_surface_if_needed(surface_id);
         let Some(sync_state) = explicit_sync else {
-            self.commit_surface_buffer(surface_id, pending, damage);
-            self.pending_frame_callbacks.extend(frame_callbacks);
+            self.commit_surface_buffer_by_role(surface_id, pending, damage, frame_callbacks);
             return;
         };
 
@@ -3860,8 +3981,7 @@ impl CompositorState {
 
         pending.explicit_release = Some(release);
         if acquire.is_signaled() {
-            self.commit_surface_buffer(surface_id, pending, damage);
-            self.pending_frame_callbacks.extend(frame_callbacks);
+            self.commit_surface_buffer_by_role(surface_id, pending, damage, frame_callbacks);
         } else {
             self.pending_explicit_sync_commits
                 .push(PendingExplicitSyncCommit {
@@ -3881,13 +4001,6 @@ impl CompositorState {
         damage: Option<RenderableSurfaceDamage>,
         explicit_sync: Option<Arc<SyncobjSurfaceState>>,
     ) {
-        if self.is_cursor_surface(surface_id) {
-            let _ = data.commit_pending_viewport();
-            let _ = data.commit_pending_buffer_scale();
-            self.complete_frame_callbacks_now(data);
-            return;
-        }
-
         if let Some(sync_state) = explicit_sync {
             let (acquire, release) = sync_state.take_points();
             if acquire.is_some() || release.is_some() {
@@ -3897,6 +4010,29 @@ impl CompositorState {
                 );
                 return;
             }
+        }
+
+        if self.is_cursor_surface(surface_id) {
+            let surface_size = data.commit_pending_viewport();
+            let buffer_scale = data.commit_pending_buffer_scale();
+            if let Some(damage) = damage {
+                self.commit_cursor_surface_damage_only(
+                    surface_id,
+                    damage,
+                    surface_size,
+                    buffer_scale,
+                );
+            }
+            let callbacks = data.take_frame_callbacks();
+            if self
+                .client_cursor_render_state()
+                .is_some_and(|cursor| cursor.surface.surface_id == surface_id)
+            {
+                self.pending_frame_callbacks.extend(callbacks);
+            } else {
+                self.complete_frame_callbacks(callbacks);
+            }
+            return;
         }
 
         self.configure_xdg_surface_if_needed(surface_id);
@@ -4073,12 +4209,141 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
         pending: PendingSurfaceBuffer,
+        damage: RenderableSurfaceDamage,
         frame_callbacks: Vec<wl_callback::WlCallback>,
     ) {
         self.unmap_surface_content(surface_id);
+        let generation = self.next_render_generation_value();
+        let Ok(buffer_width) = pending.data.width() else {
+            return;
+        };
+        let Ok(buffer_height) = pending.data.height() else {
+            return;
+        };
+        let damage = damage.normalized_for_surface(buffer_width, buffer_height);
+        let Ok(surface) =
+            pending.to_renderable_surface(surface_id, SurfacePlacement::root(), generation, damage)
+        else {
+            return;
+        };
         self.track_committed_buffer_lifetime(surface_id, &pending);
         self.current_surface_buffers.insert(surface_id, pending);
-        self.complete_frame_callbacks(frame_callbacks);
+        self.client_cursor_surfaces.insert(surface_id, surface);
+        self.set_render_generation(generation, RenderGenerationCause::CursorCommit);
+        if self
+            .active_client_cursor
+            .as_ref()
+            .is_some_and(|active| active.surface_id == surface_id)
+            && self.cursor_visibility.lock_hidden_constraint_id.is_none()
+        {
+            self.pending_frame_callbacks.extend(frame_callbacks);
+        } else {
+            self.complete_frame_callbacks(frame_callbacks);
+        }
+    }
+
+    fn commit_surface_buffer_by_role(
+        &mut self,
+        surface_id: u32,
+        pending: PendingSurfaceBuffer,
+        damage: RenderableSurfaceDamage,
+        frame_callbacks: Vec<wl_callback::WlCallback>,
+    ) {
+        if self.is_cursor_surface(surface_id) {
+            self.commit_cursor_surface_buffer(surface_id, pending, damage, frame_callbacks);
+        } else {
+            self.commit_surface_buffer(surface_id, pending, damage);
+            self.pending_frame_callbacks.extend(frame_callbacks);
+        }
+    }
+
+    fn commit_cursor_surface_damage_only(
+        &mut self,
+        surface_id: u32,
+        damage: RenderableSurfaceDamage,
+        surface_size: Option<BufferSize>,
+        buffer_scale: u32,
+    ) -> bool {
+        let Some(current) = self.current_surface_buffers.get(&surface_id).cloned() else {
+            return false;
+        };
+        let Ok(buffer_width) = current.data.width() else {
+            return false;
+        };
+        let Ok(buffer_height) = current.data.height() else {
+            return false;
+        };
+        let Some(buffer_size) = BufferSize::new(buffer_width, buffer_height) else {
+            return false;
+        };
+        let generation = self.next_render_generation_value();
+        let Some(existing) = self.client_cursor_surfaces.get_mut(&surface_id) else {
+            return false;
+        };
+        let damage = if existing.buffer_size() == buffer_size {
+            damage.normalized_for_surface(buffer_width, buffer_height)
+        } else {
+            RenderableSurfaceDamage::Full
+        };
+        if current.data.is_shm()
+            && existing.buffer_size() == buffer_size
+            && let Some(pixels) = existing.shm_pixels_mut()
+            && current
+                .data
+                .read_pixels_into_with_damage(pixels, &damage)
+                .is_err()
+        {
+            return false;
+        }
+        if let Ok(size) = current.surface_size_for_state(surface_size, buffer_scale) {
+            existing.width = size.width;
+            existing.height = size.height;
+        }
+        existing.x = current.x;
+        existing.y = current.y;
+        existing.generation = generation;
+        existing.damage = damage;
+        self.set_render_generation(generation, RenderGenerationCause::CursorCommit);
+        true
+    }
+
+    fn commit_cursor_surface_removal_request(
+        &mut self,
+        surface_id: u32,
+        data: &SurfaceData,
+        explicit_sync: Option<Arc<SyncobjSurfaceState>>,
+    ) {
+        if let Some(sync_state) = explicit_sync {
+            let (acquire, release) = sync_state.take_points();
+            if acquire.is_some() || release.is_some() {
+                sync_state.post_error(
+                    SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
+                    "explicit sync points were set without an attached buffer",
+                );
+                return;
+            }
+        }
+        let was_visible = self
+            .client_cursor_render_state()
+            .is_some_and(|cursor| cursor.surface.surface_id == surface_id);
+        let removed = self.client_cursor_surfaces.remove(&surface_id).is_some();
+        self.current_surface_buffers.remove(&surface_id);
+        if let Some(release) = self.active_dmabuf_buffers.remove(&surface_id) {
+            self.queue_dmabuf_buffer_release(release);
+        }
+        if removed {
+            self.advance_render_generation(RenderGenerationCause::CursorCommit);
+            pointer_debug_log(format!(
+                "cursor surface buffer removed surface={}",
+                surface_id
+            ));
+        }
+        let callbacks = data.take_frame_callbacks();
+        if was_visible && removed {
+            self.pending_frame_callbacks.extend(callbacks);
+        } else {
+            self.complete_frame_callbacks(callbacks);
+        }
     }
 
     fn surface_placement(&self, surface_id: u32) -> SurfacePlacement {
@@ -4383,6 +4648,13 @@ impl CompositorState {
         toplevel: xdg_toplevel::XdgToplevel,
     ) {
         let surface_id = compositor_surface_id(&surface);
+        if self.is_cursor_surface(surface_id) {
+            pointer_debug_log(format!(
+                "cursor surface role isolation surface={} rejected=xdg-toplevel",
+                surface_id
+            ));
+            return;
+        }
         self.configured_xdg_surfaces.remove(&surface_id);
         self.clear_resize_state_for_surfaces(&[surface_id]);
         self.toplevel_surfaces.insert(
@@ -4408,6 +4680,13 @@ impl CompositorState {
         positioner: XdgPositionerState,
     ) {
         let surface_id = compositor_surface_id(&surface);
+        if self.is_cursor_surface(surface_id) {
+            pointer_debug_log(format!(
+                "cursor surface role isolation surface={} rejected=xdg-popup",
+                surface_id
+            ));
+            return;
+        }
         self.configured_xdg_surfaces.remove(&surface_id);
         self.clear_resize_state_for_surfaces(&[surface_id]);
         self.popup_surfaces.insert(
@@ -6247,8 +6526,13 @@ impl CompositorState {
             ));
             self.deactivate_pointer_constraints_for_surface_focus_loss(surface_id, true);
         }
+        let cleared_client_cursor = self.active_client_cursor.take().is_some();
         self.cursor_visibility.client_hidden_pointer = None;
         self.cursor_visibility.client_cursor_pointer = None;
+        if cleared_client_cursor {
+            self.advance_render_generation(RenderGenerationCause::CursorState);
+            pointer_debug_log("cursor cleanup reason=pointer-focus-loss");
+        }
         self.sync_cursor_visibility_request();
         self.pointer_surface = None;
         self.pointer_resources.retain(Resource::is_alive);
@@ -6411,8 +6695,12 @@ impl CompositorState {
         let mut waiting = Vec::new();
         for commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
             if commit.acquire.is_signaled() {
-                self.commit_surface_buffer(commit.surface_id, commit.pending, commit.damage);
-                self.pending_frame_callbacks.extend(commit.frame_callbacks);
+                self.commit_surface_buffer_by_role(
+                    commit.surface_id,
+                    commit.pending,
+                    commit.damage,
+                    commit.frame_callbacks,
+                );
             } else {
                 waiting.push(commit);
             }

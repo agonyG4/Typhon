@@ -75,7 +75,13 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                         let _ = data.take_pending_offset();
                         data.commit_pending_viewport();
                         data.commit_pending_buffer_scale();
-                        if explicit_sync.is_some() {
+                        if state.is_cursor_surface(surface_id) {
+                            state.commit_cursor_surface_removal_request(
+                                surface_id,
+                                data,
+                                explicit_sync,
+                            );
+                        } else if explicit_sync.is_some() {
                             state.commit_surface_without_buffer(
                                 surface_id,
                                 data,
@@ -215,11 +221,13 @@ impl Dispatch<wl_subcompositor::WlSubcompositor, ()> for CompositorState {
             } => {
                 let surface_id = compositor_surface_id(&surface);
                 let parent_id = compositor_surface_id(&parent);
-                state.set_surface_placement(
-                    surface_id,
-                    SurfacePlacement::subsurface(parent_id, 0, 0),
-                );
-                state.register_subsurface_relationship(surface_id, parent_id);
+                if !state.is_cursor_surface(surface_id) {
+                    state.set_surface_placement(
+                        surface_id,
+                        SurfacePlacement::subsurface(parent_id, 0, 0),
+                    );
+                    state.register_subsurface_relationship(surface_id, parent_id);
+                }
                 data_init.init(id, SubsurfaceData { surface, parent });
             }
             wl_subcompositor::Request::Destroy => {}

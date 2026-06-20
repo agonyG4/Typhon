@@ -27,7 +27,9 @@ mod program;
 
 #[cfg(test)]
 use damage::cursor_damage_rect;
-use damage::{EglOutputDamage, EglOutputDamageTracker, ShellOverlayDamageState};
+use damage::{
+    ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker, ShellOverlayDamageState,
+};
 use dmabuf::{query_egl_dmabuf_feedback, query_egl_main_device};
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglRect, EglTexturedVertex, EglUvRect, MIN_VERTEX_BUFFER_BYTES,
@@ -79,6 +81,7 @@ pub struct EglSceneDrawRequest<'a> {
     pub visual_state: DesktopVisualState,
     pub output_scale: f64,
     pub shell_overlay: Option<&'a ShellOverlayImage>,
+    pub client_cursor: Option<compositor::ClientCursorRenderState<'a>>,
 }
 
 pub struct EglGlesFrameRenderer {
@@ -340,12 +343,16 @@ impl GlesSceneRenderer {
             visual_state,
             output_scale,
             shell_overlay,
+            client_cursor,
         } = request;
         let width = width.max(1);
         let height = height.max(1);
         let output_scale_key = compositor::output_scale_key(output_scale);
-        let scaled_visual_state =
+        let mut scaled_visual_state =
             compositor::scale_desktop_visual_state(visual_state, output_scale);
+        if client_cursor.is_some() {
+            scaled_visual_state.cursor = None;
+        }
         self.frame_stats = GlesSceneFrameStats::default();
         self.ensure_output_size(egl, egl_display, width, height)?;
         self.ensure_wallpaper_resource(egl, egl_display, width, height)?;
@@ -354,7 +361,12 @@ impl GlesSceneRenderer {
             self.ensure_cursor_resource(egl, egl_display)?;
         }
         self.ensure_shell_overlay_resource(egl, egl_display, shell_overlay)?;
-        self.sync_surface_resources(egl, egl_display, surfaces)?;
+        self.sync_surface_resources(
+            egl,
+            egl_display,
+            surfaces,
+            client_cursor.map(|cursor| cursor.surface),
+        )?;
 
         let surface_signatures = egl_scene_surface_signatures(surfaces);
         let scene_changed = !self.scene_cache_is_current(
@@ -365,12 +377,30 @@ impl GlesSceneRenderer {
             &surface_signatures,
         );
         let shell_overlay_damage = shell_overlay.and_then(shell_overlay_damage_state);
+        let client_cursor_damage = client_cursor.map(|cursor| {
+            ClientCursorDamageState::new(
+                compositor::scale_logical_coordinate(
+                    cursor.logical_x.saturating_add(cursor.surface.x),
+                    output_scale,
+                ),
+                compositor::scale_logical_coordinate(
+                    cursor.logical_y.saturating_add(cursor.surface.y),
+                    output_scale,
+                ),
+                compositor::scale_logical_extent(cursor.surface.width, output_scale),
+                compositor::scale_logical_extent(cursor.surface.height, output_scale),
+                cursor.surface.generation,
+                width,
+                height,
+            )
+        });
         let output_damage = self.damage_tracker.damage_for_frame(
             width,
             height,
             scene_changed,
             scaled_visual_state,
             shell_overlay_damage,
+            client_cursor_damage,
         );
 
         if scene_changed {
@@ -385,7 +415,14 @@ impl GlesSceneRenderer {
                 &surface_signatures,
             );
         }
-        self.rebuild_overlay_commands(width, height, scaled_visual_state, shell_overlay);
+        self.rebuild_overlay_commands(
+            width,
+            height,
+            scaled_visual_state,
+            shell_overlay,
+            client_cursor,
+            output_scale,
+        );
         self.draw_textured_layers()?;
         Ok(output_damage)
     }
@@ -560,10 +597,13 @@ impl GlesSceneRenderer {
         egl: &EglInstance,
         egl_display: egl::Display,
         surfaces: &[RenderableSurface],
+        client_cursor: Option<&RenderableSurface>,
     ) -> RendererResult<()> {
         self.active_surface_ids.clear();
         self.active_surface_ids
             .extend(surfaces.iter().map(|surface| surface.surface_id));
+        self.active_surface_ids
+            .extend(client_cursor.map(|surface| surface.surface_id));
         self.active_surface_ids.sort_unstable();
         self.active_surface_ids.dedup();
 
@@ -581,7 +621,7 @@ impl GlesSceneRenderer {
             self.failed_surface_generations.remove(&surface_id);
         }
 
-        for surface in surfaces {
+        for surface in surfaces.iter().chain(client_cursor) {
             let update = self
                 .surface_resources
                 .get(&surface.surface_id)
@@ -905,6 +945,8 @@ impl GlesSceneRenderer {
         height: u32,
         visual_state: DesktopVisualState,
         shell_overlay: Option<&ShellOverlayImage>,
+        client_cursor: Option<compositor::ClientCursorRenderState<'_>>,
+        output_scale: f64,
     ) {
         self.cursor_vertices.clear();
         self.cursor_commands.clear();
@@ -940,26 +982,62 @@ impl GlesSceneRenderer {
             }
         }
 
-        let Some((cursor_x, cursor_y)) = visual_state.cursor else {
-            return;
-        };
-        let Some(cursor) = self.cursor_resource.as_ref() else {
-            return;
-        };
+        if let Some((cursor_x, cursor_y)) = visual_state.cursor
+            && let Some(cursor) = self.cursor_resource.as_ref()
+        {
+            push_draw_command(
+                &mut self.cursor_vertices,
+                &mut self.cursor_commands,
+                EglDrawLayer::Cursor,
+                EglRect::new(
+                    cursor_x as f32,
+                    cursor_y as f32,
+                    cursor.size.0 as f32,
+                    cursor.size.1 as f32,
+                ),
+                width,
+                height,
+            );
+        }
 
-        push_draw_command(
-            &mut self.cursor_vertices,
-            &mut self.cursor_commands,
-            EglDrawLayer::Cursor,
-            EglRect::new(
-                cursor_x as f32,
-                cursor_y as f32,
-                cursor.size.0 as f32,
-                cursor.size.1 as f32,
-            ),
-            width,
-            height,
-        );
+        if let Some(cursor) = client_cursor
+            && self
+                .surface_resources
+                .contains_key(&cursor.surface.surface_id)
+        {
+            let visual_target = compositor::SurfaceTargetRect::new(
+                compositor::scale_logical_coordinate(
+                    cursor.logical_x.saturating_add(cursor.surface.x),
+                    output_scale,
+                ),
+                compositor::scale_logical_coordinate(
+                    cursor.logical_y.saturating_add(cursor.surface.y),
+                    output_scale,
+                ),
+                compositor::scale_logical_extent(cursor.surface.width, output_scale),
+                compositor::scale_logical_extent(cursor.surface.height, output_scale),
+            );
+            let render_plan = compositor::surface_render_plan(cursor.surface, visual_target);
+            push_draw_command_with_uv(
+                &mut self.cursor_vertices,
+                &mut self.cursor_commands,
+                EglDrawLayer::Surface(cursor.surface.surface_id),
+                EglRect::new(
+                    render_plan.content_target.x() as f32,
+                    render_plan.content_target.y() as f32,
+                    render_plan.content_target.width() as f32,
+                    render_plan.content_target.height() as f32,
+                ),
+                EglUvRect::new(
+                    render_plan.content_uv.left,
+                    render_plan.content_uv.top,
+                    render_plan.content_uv.right,
+                    render_plan.content_uv.bottom,
+                ),
+                width,
+                height,
+            );
+        }
     }
 
     fn draw_textured_layers(&mut self) -> RendererResult<()> {
@@ -2032,11 +2110,25 @@ mod tests {
         let mut tracker = EglOutputDamageTracker::default();
 
         assert_eq!(
-            tracker.damage_for_frame(1280, 800, true, DesktopVisualState::wallpaper_only(), None),
+            tracker.damage_for_frame(
+                1280,
+                800,
+                true,
+                DesktopVisualState::wallpaper_only(),
+                None,
+                None,
+            ),
             EglOutputDamage::full(1280, 800)
         );
         assert_eq!(
-            tracker.damage_for_frame(1280, 800, true, DesktopVisualState::wallpaper_only(), None),
+            tracker.damage_for_frame(
+                1280,
+                800,
+                true,
+                DesktopVisualState::wallpaper_only(),
+                None,
+                None,
+            ),
             EglOutputDamage::full(1280, 800)
         );
     }
@@ -2050,6 +2142,7 @@ mod tests {
             true,
             DesktopVisualState::with_cursor(10, 10),
             None,
+            None,
         );
 
         let damage = tracker.damage_for_frame(
@@ -2057,6 +2150,7 @@ mod tests {
             800,
             false,
             DesktopVisualState::with_cursor(20, 22),
+            None,
             None,
         );
 
@@ -2066,6 +2160,35 @@ mod tests {
                 cursor_damage_rect(10, 10, 1280, 800).unwrap(),
                 cursor_damage_rect(20, 22, 1280, 800).unwrap()
             )
+        );
+    }
+
+    #[test]
+    fn output_damage_tracker_limits_client_cursor_motion_to_actual_old_and_new_bounds() {
+        let mut tracker = EglOutputDamageTracker::default();
+        let old = ClientCursorDamageState::new(-3, 4, 12, 18, 1, 1280, 800);
+        let new = ClientCursorDamageState::new(20, 22, 12, 18, 1, 1280, 800);
+        tracker.damage_for_frame(
+            1280,
+            800,
+            true,
+            DesktopVisualState::wallpaper_only(),
+            None,
+            Some(old),
+        );
+
+        let damage = tracker.damage_for_frame(
+            1280,
+            800,
+            false,
+            DesktopVisualState::wallpaper_only(),
+            None,
+            Some(new),
+        );
+
+        assert_eq!(
+            damage,
+            EglOutputDamage::two_rects(old.rect.unwrap(), new.rect.unwrap())
         );
     }
 
@@ -2090,6 +2213,7 @@ mod tests {
             true,
             DesktopVisualState::wallpaper_only(),
             Some(ShellOverlayDamageState::new(1, [old_overlay])),
+            None,
         );
 
         let damage = tracker.damage_for_frame(
@@ -2098,6 +2222,7 @@ mod tests {
             false,
             DesktopVisualState::wallpaper_only(),
             Some(ShellOverlayDamageState::new(2, [new_overlay])),
+            None,
         );
 
         assert_eq!(
