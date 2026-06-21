@@ -2,7 +2,7 @@ use std::{
     fmt,
     fs::{File, OpenOptions},
     io,
-    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
     sync::Arc,
 };
 
@@ -124,6 +124,22 @@ impl DrmSyncobjTimeline {
         self.inner.device.point_signaled(self.inner.handle, point)
     }
 
+    pub(crate) fn register_eventfd(
+        &self,
+        point: u64,
+        event_fd: BorrowedFd<'_>,
+    ) -> Result<(), SyncobjEventfdError> {
+        drm_ffi::syncobj::eventfd(
+            self.inner.device.as_file().as_fd(),
+            self.handle(),
+            point,
+            event_fd,
+            false,
+        )
+        .map(|_| ())
+        .map_err(classify_syncobj_eventfd_error)
+    }
+
     pub fn export_timeline_fd(&self) -> io::Result<File> {
         let mut args = drm_sys::drm_syncobj_handle {
             handle: self.handle(),
@@ -141,6 +157,80 @@ impl DrmSyncobjTimeline {
         // descriptor on success, and this File takes over that ownership.
         Ok(unsafe { File::from_raw_fd(args.fd) })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncobjEventfdErrnoClass {
+    Unsupported,
+    Failure(i32),
+}
+
+#[derive(Debug)]
+pub(crate) struct SyncobjEventfdError {
+    source: io::Error,
+    class: SyncobjEventfdErrnoClass,
+}
+
+impl SyncobjEventfdError {
+    pub(crate) const fn class(&self) -> SyncobjEventfdErrnoClass {
+        self.class
+    }
+
+    pub(crate) fn raw_os_error(&self) -> Option<i32> {
+        self.source.raw_os_error()
+    }
+}
+
+impl fmt::Display for SyncobjEventfdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for SyncobjEventfdError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn classify_syncobj_eventfd_error(error: io::Error) -> SyncobjEventfdError {
+    let class = error
+        .raw_os_error()
+        .map(classify_syncobj_eventfd_errno)
+        .unwrap_or(SyncobjEventfdErrnoClass::Failure(0));
+    SyncobjEventfdError {
+        source: error,
+        class,
+    }
+}
+
+const fn classify_syncobj_eventfd_errno(errno: i32) -> SyncobjEventfdErrnoClass {
+    if errno == libc::ENOTTY || errno == libc::EOPNOTSUPP || errno == libc::ENOSYS {
+        SyncobjEventfdErrnoClass::Unsupported
+    } else {
+        SyncobjEventfdErrnoClass::Failure(errno)
+    }
+}
+
+#[cfg(test)]
+fn build_syncobj_eventfd_request(
+    handle: u32,
+    point: u64,
+    event_fd: libc::c_int,
+) -> io::Result<drm_sys::drm_syncobj_eventfd> {
+    if event_fd < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "syncobj eventfd must be nonnegative",
+        ));
+    }
+    Ok(drm_sys::drm_syncobj_eventfd {
+        handle,
+        flags: 0,
+        point,
+        fd: event_fd,
+        pad: 0,
+    })
 }
 
 struct DrmSyncobjTimelineInner {
@@ -214,6 +304,65 @@ fn drm_iowr<T>(nr: u8) -> libc::c_ulong {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn syncobj_eventfd_request_matches_kernel_layout() {
+        assert_eq!(std::mem::size_of::<drm_sys::drm_syncobj_eventfd>(), 24);
+        assert_eq!(std::mem::align_of::<drm_sys::drm_syncobj_eventfd>(), 8);
+        assert_eq!(std::mem::offset_of!(drm_sys::drm_syncobj_eventfd, handle), 0);
+        assert_eq!(std::mem::offset_of!(drm_sys::drm_syncobj_eventfd, flags), 4);
+        assert_eq!(std::mem::offset_of!(drm_sys::drm_syncobj_eventfd, point), 8);
+        assert_eq!(std::mem::offset_of!(drm_sys::drm_syncobj_eventfd, fd), 16);
+        assert_eq!(std::mem::offset_of!(drm_sys::drm_syncobj_eventfd, pad), 20);
+    }
+
+    #[test]
+    fn syncobj_eventfd_request_waits_for_signal_and_preserves_fields() {
+        let point = 0xfedc_ba98_7654_3210;
+        let request = build_syncobj_eventfd_request(0x89ab_cdef, point, 17).unwrap();
+
+        assert_eq!(request.handle, 0x89ab_cdef);
+        assert_eq!(request.point, point);
+        assert_eq!(request.fd, 17);
+        assert_eq!(request.flags, 0);
+        assert_ne!(
+            request.flags,
+            drm_sys::DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE
+        );
+        assert_eq!(request.pad, 0);
+    }
+
+    #[test]
+    fn syncobj_eventfd_request_rejects_negative_fd() {
+        let error = build_syncobj_eventfd_request(1, 2, -1).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn syncobj_eventfd_unsupported_errno_classification_is_narrow() {
+        for errno in [libc::ENOTTY, libc::EOPNOTSUPP, libc::ENOSYS] {
+            assert_eq!(
+                classify_syncobj_eventfd_errno(errno),
+                SyncobjEventfdErrnoClass::Unsupported
+            );
+        }
+        for errno in [libc::EINVAL, libc::EBADF, libc::EMFILE, libc::ENOMEM] {
+            assert_eq!(
+                classify_syncobj_eventfd_errno(errno),
+                SyncobjEventfdErrnoClass::Failure(errno)
+            );
+        }
+    }
+
+    #[test]
+    fn syncobj_eventfd_error_preserves_errno() {
+        let error = io::Error::from_raw_os_error(libc::ENOMEM);
+        let classified = classify_syncobj_eventfd_error(error);
+
+        assert_eq!(classified.raw_os_error(), Some(libc::ENOMEM));
+        assert_eq!(classified.class(), SyncobjEventfdErrnoClass::Failure(libc::ENOMEM));
+    }
 
     #[test]
     fn syncobj_device_opens_when_kernel_reports_timeline_support() {
