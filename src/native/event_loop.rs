@@ -14,6 +14,42 @@ pub enum NativeEventSource {
     WaylandClients,
     Input(u16),
     Timer,
+    ExplicitSyncAcquire,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReactorToken(u64);
+
+impl ReactorToken {
+    fn new(slot_index: usize, generation: u32) -> io::Result<Self> {
+        let slot = u32::try_from(slot_index)
+            .ok()
+            .and_then(|slot| slot.checked_add(1))
+            .ok_or_else(|| io::Error::other("native reactor token slots exhausted"))?;
+        if generation == 0 {
+            return Err(io::Error::other(
+                "native reactor token generation must be nonzero",
+            ));
+        }
+        Ok(Self((u64::from(generation) << 32) | u64::from(slot)))
+    }
+
+    fn decode(self) -> Option<(usize, u32)> {
+        let slot = self.0 as u32;
+        let generation = (self.0 >> 32) as u32;
+        if slot == 0 || generation == 0 {
+            return None;
+        }
+        Some(((slot - 1) as usize, generation))
+    }
+
+    const fn raw(self) -> u64 {
+        self.0
+    }
+
+    const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -25,6 +61,7 @@ impl WakeReasons {
     const WAYLAND_CLIENTS: u32 = 1 << 2;
     const INPUT: u32 = 1 << 3;
     const TIMER: u32 = 1 << 4;
+    const EXPLICIT_SYNC_ACQUIRE: u32 = 1 << 5;
 
     pub const fn drm(self) -> bool {
         self.0 & Self::DRM != 0
@@ -46,6 +83,10 @@ impl WakeReasons {
         self.0 & Self::TIMER != 0
     }
 
+    pub const fn explicit_sync_acquire(self) -> bool {
+        self.0 & Self::EXPLICIT_SYNC_ACQUIRE != 0
+    }
+
     pub const fn bits(self) -> u32 {
         self.0
     }
@@ -57,30 +98,38 @@ impl WakeReasons {
             NativeEventSource::WaylandClients => Self::WAYLAND_CLIENTS,
             NativeEventSource::Input(_) => Self::INPUT,
             NativeEventSource::Timer => Self::TIMER,
+            NativeEventSource::ExplicitSyncAcquire => Self::EXPLICIT_SYNC_ACQUIRE,
         };
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeWakeup {
     pub reasons: WakeReasons,
     pub ready_sources: usize,
     pub blocked_ns: u64,
     pub timer_lateness_ns: Option<u64>,
+    pub explicit_sync_acquire_tokens: Vec<ReactorToken>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Registration {
     fd: RawFd,
     source: NativeEventSource,
-    active: bool,
+}
+
+#[derive(Debug)]
+struct RegistrationSlot {
+    generation: u32,
+    registration: Option<Registration>,
 }
 
 #[derive(Debug)]
 pub struct NativeEventLoop {
     epoll: OwnedFd,
     timer: OwnedFd,
-    registrations: Vec<Registration>,
+    registrations: Vec<RegistrationSlot>,
+    free_registration_slots: Vec<usize>,
     events: Vec<libc::epoll_event>,
     armed_deadline_ns: Option<u64>,
 }
@@ -107,6 +156,7 @@ impl NativeEventLoop {
             epoll: unsafe { OwnedFd::from_raw_fd(epoll_fd) },
             timer: unsafe { OwnedFd::from_raw_fd(timer_fd) },
             registrations: Vec::new(),
+            free_registration_slots: Vec::new(),
             events: vec![libc::epoll_event { events: 0, u64: 0 }; MAX_READY_EVENTS],
             armed_deadline_ns: None,
         };
@@ -114,7 +164,11 @@ impl NativeEventLoop {
         Ok(event_loop)
     }
 
-    pub fn register(&mut self, fd: RawFd, source: NativeEventSource) -> io::Result<()> {
+    pub fn register(
+        &mut self,
+        fd: RawFd,
+        source: NativeEventSource,
+    ) -> io::Result<ReactorToken> {
         if source == NativeEventSource::Timer {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -122,6 +176,47 @@ impl NativeEventLoop {
             ));
         }
         self.register_raw(fd, source)
+    }
+
+    pub fn unregister(&mut self, token: ReactorToken) -> io::Result<bool> {
+        let Some((slot_index, generation)) = token.decode() else {
+            return Ok(false);
+        };
+        let Some(slot) = self.registrations.get(slot_index) else {
+            return Ok(false);
+        };
+        if slot.generation != generation {
+            return Ok(false);
+        }
+        let Some(registration) = slot.registration else {
+            return Ok(false);
+        };
+        let result = unsafe {
+            libc::epoll_ctl(
+                self.epoll.as_raw_fd(),
+                libc::EPOLL_CTL_DEL,
+                registration.fd,
+                std::ptr::null_mut(),
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let slot = &mut self.registrations[slot_index];
+        slot.registration = None;
+        if slot.generation != u32::MAX {
+            slot.generation += 1;
+            self.free_registration_slots.push(slot_index);
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn source_for_token(&self, token: ReactorToken) -> Option<NativeEventSource> {
+        let (slot_index, generation) = token.decode()?;
+        let slot = self.registrations.get(slot_index)?;
+        (slot.generation == generation)
+            .then_some(slot.registration?)
+            .map(|registration| registration.source)
     }
 
     pub fn arm_deadline(&mut self, deadline_ns: Option<u64>) -> io::Result<()> {
@@ -170,25 +265,28 @@ impl NativeEventLoop {
         })?;
         let observed_ns = monotonic_now_ns()?;
         let mut reasons = WakeReasons::default();
+        let mut explicit_sync_acquire_tokens = Vec::new();
 
         for index in 0..ready {
             let event = self.events[index];
             let event_flags = event.events;
-            let registration_index = usize::try_from(event.u64)
-                .ok()
-                .and_then(|token| token.checked_sub(1))
-                .ok_or_else(|| io::Error::other("epoll returned an invalid source token"))?;
-            let registration = *self
-                .registrations
-                .get(registration_index)
-                .ok_or_else(|| io::Error::other("epoll returned an unknown source token"))?;
-            if !registration.active {
+            let token = ReactorToken::from_raw(event.u64);
+            let Some((registration_index, generation)) = token.decode() else {
+                continue;
+            };
+            let Some(slot) = self.registrations.get(registration_index) else {
+                continue;
+            };
+            if slot.generation != generation {
                 continue;
             }
+            let Some(registration) = slot.registration else {
+                continue;
+            };
             let error_events =
                 libc::EPOLLERR as u32 | libc::EPOLLHUP as u32 | libc::EPOLLRDHUP as u32;
             if event_flags & error_events != 0 {
-                self.disable_registration(registration_index);
+                let _ = self.unregister(token);
                 return Err(io::Error::other(format!(
                     "native event source {:?} fd {} reported readiness error 0x{:x}",
                     registration.source, registration.fd, event_flags
@@ -196,6 +294,9 @@ impl NativeEventLoop {
             }
             if event_flags & libc::EPOLLIN as u32 != 0 {
                 reasons.insert(registration.source);
+                if registration.source == NativeEventSource::ExplicitSyncAcquire {
+                    explicit_sync_acquire_tokens.push(token);
+                }
             }
         }
 
@@ -214,49 +315,52 @@ impl NativeEventLoop {
             ready_sources: ready,
             blocked_ns: observed_ns.saturating_sub(wait_started_ns),
             timer_lateness_ns,
+            explicit_sync_acquire_tokens,
         })
     }
 
-    fn register_raw(&mut self, fd: RawFd, source: NativeEventSource) -> io::Result<()> {
+    fn register_raw(
+        &mut self,
+        fd: RawFd,
+        source: NativeEventSource,
+    ) -> io::Result<ReactorToken> {
         if fd < 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("cannot register invalid fd {fd}"),
             ));
         }
-        let token = self.registrations.len() + 1;
+        let (slot_index, generation, reusing_slot) =
+            if let Some(slot_index) = self.free_registration_slots.last().copied() {
+                (
+                    slot_index,
+                    self.registrations[slot_index].generation,
+                    true,
+                )
+            } else {
+                (self.registrations.len(), 1, false)
+            };
+        let token = ReactorToken::new(slot_index, generation)?;
         let mut event = libc::epoll_event {
             events: (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32,
-            u64: token as u64,
+            u64: token.raw(),
         };
         let result =
             unsafe { libc::epoll_ctl(self.epoll.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut event) };
         if result < 0 {
             return Err(io::Error::last_os_error());
         }
-        self.registrations.push(Registration {
-            fd,
-            source,
-            active: true,
-        });
-        Ok(())
-    }
-
-    fn disable_registration(&mut self, index: usize) {
-        let Some(registration) = self.registrations.get_mut(index) else {
-            return;
-        };
-        if registration.active {
-            unsafe {
-                libc::epoll_ctl(
-                    self.epoll.as_raw_fd(),
-                    libc::EPOLL_CTL_DEL,
-                    registration.fd,
-                    std::ptr::null_mut(),
-                );
-            }
-            registration.active = false;
+        let registration = Registration { fd, source };
+        if reusing_slot {
+            self.free_registration_slots.pop();
+            self.registrations[slot_index].registration = Some(registration);
+        } else {
+            self.registrations.push(RegistrationSlot {
+                generation,
+                registration: Some(registration),
+            });
         }
+        Ok(token)
     }
 
     fn drain_timer(&self) -> io::Result<()> {
@@ -484,5 +588,79 @@ mod tests {
 
         assert!(wakeup.reasons.timer());
         assert!(wakeup.timer_lateness_ns.is_some());
+    }
+
+    #[test]
+    fn explicit_sync_readiness_returns_its_registration_token() {
+        let acquire = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let token = event_loop
+            .register(acquire.as_raw_fd(), NativeEventSource::ExplicitSyncAcquire)
+            .unwrap();
+
+        signal(acquire.as_raw_fd());
+        let wakeup = event_loop.wait().unwrap();
+
+        assert!(wakeup.reasons.explicit_sync_acquire());
+        assert_eq!(wakeup.explicit_sync_acquire_tokens, vec![token]);
+    }
+
+    #[test]
+    fn removed_registration_token_is_stale() {
+        let acquire = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let token = event_loop
+            .register(acquire.as_raw_fd(), NativeEventSource::ExplicitSyncAcquire)
+            .unwrap();
+
+        assert!(event_loop.unregister(token).unwrap());
+        assert!(!event_loop.unregister(token).unwrap());
+        assert_eq!(event_loop.source_for_token(token), None);
+    }
+
+    #[test]
+    fn reused_registration_slot_changes_generation() {
+        let first = event_fd();
+        let second = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let first_token = event_loop
+            .register(first.as_raw_fd(), NativeEventSource::ExplicitSyncAcquire)
+            .unwrap();
+        event_loop.unregister(first_token).unwrap();
+
+        let second_token = event_loop
+            .register(second.as_raw_fd(), NativeEventSource::ExplicitSyncAcquire)
+            .unwrap();
+
+        assert_ne!(first_token, second_token);
+        assert_eq!(event_loop.source_for_token(first_token), None);
+        assert_eq!(
+            event_loop.source_for_token(second_token),
+            Some(NativeEventSource::ExplicitSyncAcquire)
+        );
+    }
+
+    #[test]
+    fn numeric_fd_reuse_does_not_reuse_registration_identity() {
+        let first = event_fd();
+        let reused_fd_number = first.as_raw_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let first_token = event_loop
+            .register(reused_fd_number, NativeEventSource::ExplicitSyncAcquire)
+            .unwrap();
+        event_loop.unregister(first_token).unwrap();
+        drop(first);
+
+        let replacement = event_fd();
+        assert_eq!(replacement.as_raw_fd(), reused_fd_number);
+        let replacement_token = event_loop
+            .register(
+                replacement.as_raw_fd(),
+                NativeEventSource::ExplicitSyncAcquire,
+            )
+            .unwrap();
+
+        assert_ne!(first_token, replacement_token);
+        assert_eq!(event_loop.source_for_token(first_token), None);
     }
 }
