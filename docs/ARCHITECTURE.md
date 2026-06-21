@@ -161,13 +161,29 @@ Legacy environment aliases such as `gbm` and `gbm-egl` continue to select the
 CPU-write fallback for compatibility.
 
 Native runtime scheduling is split between `src/native/event_loop.rs` and
-`src/native/scheduler.rs`. The reactor registers the DRM fd, Wayland listening
-socket, Wayland backend dispatch fd, libinput or raw evdev fds, and one
-`CLOCK_MONOTONIC` timerfd. The scheduler owns visual/protocol work, pageflip
-pending state, absolute refresh deadlines, and the pageflip watchdog. A timer
-can advance protocol-only work or report a watchdog failure, but it cannot
-invent presentation completion; asynchronous frame completion is accepted only
-after the scanout backend drains a DRM flip-complete event.
+`src/native/scheduler.rs`, with explicit-sync watches in
+`src/native/explicit_sync.rs`. The reactor registers the DRM fd, Wayland
+listening socket, Wayland backend dispatch fd, input fds, dynamic acquire
+eventfds, and one `CLOCK_MONOTONIC` timerfd. Dynamic sources use
+slot-plus-generation tokens rather than numeric fds, so queued stale events
+cannot resolve to a reused slot or fd.
+
+Native explicit-sync imports use a close-on-exec duplicate of the active DRM
+file description. An unsignaled acquire point receives an exact compositor
+commit ID and registers `DRM_IOCTL_SYNCOBJ_EVENTFD` for signal completion.
+Readiness is defensively verified against the exact timeline and point before
+that commit becomes renderable. Unsupported ioctl implementations use one
+absolute retry deadline only while fallback points remain blocked;
+eventfd-backed watches are never included in fallback scans.
+
+Each native cycle drains pageflip metadata, dispatches Wayland, routes input,
+applies acquire-watch changes, prepares eligible state, and reevaluates
+scheduling. An acquire ready while a pageflip is pending is not promoted into
+the outstanding frame's callback or release batch. The scheduler owns
+visual/protocol work, pageflip state, absolute refresh deadlines, and the
+pageflip watchdog. A timer cannot invent acquire readiness or presentation
+completion; asynchronous completion requires a matching DRM flip-complete
+event.
 
 Legacy pageflip submissions carry a unique nonzero `u64` user-data token. The
 DRM event parser validates each event length, matches that token, and preserves

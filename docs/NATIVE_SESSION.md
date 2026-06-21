@@ -107,10 +107,12 @@ The native backend currently:
 - registers DRM, Wayland listener/client, libinput or raw evdev, and monotonic
   timer fds in a level-triggered `epoll` reactor. With no work or deadline the
   native thread blocks indefinitely in `epoll_wait`;
-- schedules no-damage frame callbacks and explicit-sync acquire rechecks on
-  absolute refresh-aligned `timerfd` deadlines. Visual work renders immediately
-  when no pageflip is pending, while queued visual work waits for the current
-  pageflip completion;
+- registers pending explicit-sync acquire points with
+  `DRM_IOCTL_SYNCOBJ_EVENTFD` on the active DRM file and adds each nonblocking,
+  close-on-exec eventfd to epoll. Supported watches do not arm a refresh polling
+  deadline. Unsupported implementations use one absolute refresh-derived retry
+  deadline only while fallback points exist. Visual work renders immediately
+  when no pageflip is pending, while queued work waits for the current pageflip;
 - advertises the selected KMS refresh rate through `wl_output.mode` and
   presentation feedback instead of hardcoding 60 Hz for native clients.
 - can emit structured native performance logs when `OBLIVION_ONE_PERF_LOG=1`
@@ -139,9 +141,10 @@ The native backend currently:
   pageflip. Wayland client dispatch is still serviced while a pageflip is
   pending, and native frame logs include `pageflip_pending_at_tick` for that
   state. `perf native.wakeup`, `perf native.scheduler`, `perf native.deadline`,
-  and `perf native.pageflip_watchdog` report readiness masks, kernel wait time,
-  deadline lateness, scheduler state, submission/completion decisions, and
-  watchdog failures. Reliable libinput motion timestamps also produce
+  `perf native.pageflip_watchdog`, and `perf native.explicit_sync` report
+  readiness masks, kernel wait time, deadlines, scheduling, watch counts,
+  registrations, wakeups, cancellations, fallback activation, stale/duplicate
+  tokens, and acquire latency. Reliable libinput motion timestamps also produce
   `perf native.input_dispatch` latency fields.
 - parses complete legacy DRM pageflip events and uses their kernel timestamp,
   sequence, CRTC ID, and unique submission token as native presentation
@@ -242,15 +245,16 @@ architecture milestones are:
 The current `libseat` crate API does not expose the seat event fd, so libseat
 lifecycle dispatch runs before other work whenever another registered source
 wakes the reactor. No periodic idle timer is used as a workaround. Explicit
-sync acquire points also remain nonblocking checks at client activity or an
-intentional refresh deadline; eventfd-backed acquire-fence readiness is a later
-milestone.
+sync acquire points are independent epoll sources where syncobj eventfd is
+supported; the bounded retry timer is armed only for blocked points on kernels
+or drivers that reject that ioctl.
 
 Research notes for the current native push live in:
 
 - `docs/research/kms-mode-refresh.md`
 - `docs/research/gecko-resize-rendering.md`
 - `docs/research/native-performance-mouse.md`
+- `docs/research/native-explicit-sync-eventfd.md`
 - `docs/research/hyprland-resize-refresh-mouse.md`
 - `docs/research/agent-raman-hyprland-resize-scale-followup.md`
 - `docs/research/agent-gauge-resize-followup-perf.md`

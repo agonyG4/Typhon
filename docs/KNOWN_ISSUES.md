@@ -52,9 +52,11 @@ Current limits:
   drivers remains outstanding;
 - `libseat` 0.2.4 does not expose a seat event fd through its safe API. Seat
   lifecycle dispatch therefore runs on other reactor wakeups rather than as an
-  independently registered source. Explicit-sync acquire points are similarly
-  rechecked at client activity or refresh-aligned deadlines until eventfd-backed
-  fence integration lands;
+  independently registered source. Explicit-sync acquire points use syncobj
+  eventfds on supported native DRM devices. Drivers returning `ENOTTY`,
+  `EOPNOTSUPP`, or `ENOSYS` use a bounded absolute retry deadline only while a
+  fallback point remains blocked. Cross-driver real-hardware coverage remains
+  outstanding;
 - VRR is not implemented yet: the compositor does not query `vrr_capable`, set
   the DRM `VRR_ENABLED` property, or expose an `off/on/fullscreen` policy;
 - interactive resize now moves compositor visual geometry immediately, allows
