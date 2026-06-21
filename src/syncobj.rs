@@ -30,6 +30,19 @@ impl DrmSyncobjDevice {
             })
     }
 
+    pub fn from_active_drm_file(file: &File) -> io::Result<Self> {
+        let file = duplicate_file_cloexec(file.as_fd())?;
+        if !device_supports_timeline_syncobj(&file) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "active DRM device does not support timeline syncobj",
+            ));
+        }
+        Ok(Self {
+            file: Arc::new(file),
+        })
+    }
+
     pub fn import_timeline_fd(&self, fd: OwnedFd) -> io::Result<DrmSyncobjTimeline> {
         let mut args = drm_sys::drm_syncobj_handle {
             handle: 0,
@@ -87,6 +100,15 @@ impl DrmSyncobjDevice {
     }
 }
 
+fn duplicate_file_cloexec(file: BorrowedFd<'_>) -> io::Result<File> {
+    let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
 #[derive(Clone)]
 pub struct DrmSyncobjTimeline {
     inner: Arc<DrmSyncobjTimelineInner>,
@@ -113,7 +135,7 @@ impl DrmSyncobjTimeline {
     }
 
     pub fn same_timeline(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner) || self.handle() == other.handle()
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     pub fn signal_point(&self, point: u64) -> io::Result<()> {
@@ -124,7 +146,23 @@ impl DrmSyncobjTimeline {
         self.inner.device.point_signaled(self.inner.handle, point)
     }
 
-    pub(crate) fn register_eventfd(
+    #[cfg(test)]
+    pub(crate) fn invalid_for_tests(handle: u32) -> Self {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .expect("open /dev/null for fake syncobj timeline");
+        Self::from_imported_handle(
+            DrmSyncobjDevice {
+                file: Arc::new(file),
+            },
+            handle,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn register_eventfd(
         &self,
         point: u64,
         event_fd: BorrowedFd<'_>,
@@ -160,24 +198,33 @@ impl DrmSyncobjTimeline {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SyncobjEventfdErrnoClass {
+pub enum SyncobjEventfdErrnoClass {
     Unsupported,
     Failure(i32),
 }
 
 #[derive(Debug)]
-pub(crate) struct SyncobjEventfdError {
+pub struct SyncobjEventfdError {
     source: io::Error,
     class: SyncobjEventfdErrnoClass,
 }
 
 impl SyncobjEventfdError {
-    pub(crate) const fn class(&self) -> SyncobjEventfdErrnoClass {
+    pub const fn class(&self) -> SyncobjEventfdErrnoClass {
         self.class
     }
 
-    pub(crate) fn raw_os_error(&self) -> Option<i32> {
+    pub fn raw_os_error(&self) -> Option<i32> {
         self.source.raw_os_error()
+    }
+
+    pub fn into_io_error(self) -> io::Error {
+        self.source
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_errno(errno: i32) -> Self {
+        classify_syncobj_eventfd_error(io::Error::from_raw_os_error(errno))
     }
 }
 
@@ -309,7 +356,10 @@ mod tests {
     fn syncobj_eventfd_request_matches_kernel_layout() {
         assert_eq!(std::mem::size_of::<drm_sys::drm_syncobj_eventfd>(), 24);
         assert_eq!(std::mem::align_of::<drm_sys::drm_syncobj_eventfd>(), 8);
-        assert_eq!(std::mem::offset_of!(drm_sys::drm_syncobj_eventfd, handle), 0);
+        assert_eq!(
+            std::mem::offset_of!(drm_sys::drm_syncobj_eventfd, handle),
+            0
+        );
         assert_eq!(std::mem::offset_of!(drm_sys::drm_syncobj_eventfd, flags), 4);
         assert_eq!(std::mem::offset_of!(drm_sys::drm_syncobj_eventfd, point), 8);
         assert_eq!(std::mem::offset_of!(drm_sys::drm_syncobj_eventfd, fd), 16);
@@ -361,7 +411,33 @@ mod tests {
         let classified = classify_syncobj_eventfd_error(error);
 
         assert_eq!(classified.raw_os_error(), Some(libc::ENOMEM));
-        assert_eq!(classified.class(), SyncobjEventfdErrnoClass::Failure(libc::ENOMEM));
+        assert_eq!(
+            classified.class(),
+            SyncobjEventfdErrnoClass::Failure(libc::ENOMEM)
+        );
+    }
+
+    #[test]
+    fn active_drm_file_duplicate_is_owned_and_close_on_exec() {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(fd >= 0);
+        let source = unsafe { File::from_raw_fd(fd) };
+
+        let duplicate = duplicate_file_cloexec(source.as_fd()).unwrap();
+        drop(source);
+
+        let flags = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn equal_numeric_handles_from_distinct_imports_are_not_the_same_timeline() {
+        let first = DrmSyncobjTimeline::invalid_for_tests(7);
+        let second = DrmSyncobjTimeline::invalid_for_tests(7);
+
+        assert!(!first.same_timeline(&second));
+        assert!(first.same_timeline(&first.clone()));
     }
 
     #[test]

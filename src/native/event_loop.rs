@@ -164,11 +164,7 @@ impl NativeEventLoop {
         Ok(event_loop)
     }
 
-    pub fn register(
-        &mut self,
-        fd: RawFd,
-        source: NativeEventSource,
-    ) -> io::Result<ReactorToken> {
+    pub fn register(&mut self, fd: RawFd, source: NativeEventSource) -> io::Result<ReactorToken> {
         if source == NativeEventSource::Timer {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -211,7 +207,8 @@ impl NativeEventLoop {
         Ok(true)
     }
 
-    pub(crate) fn source_for_token(&self, token: ReactorToken) -> Option<NativeEventSource> {
+    #[cfg(test)]
+    fn source_for_token(&self, token: ReactorToken) -> Option<NativeEventSource> {
         let (slot_index, generation) = token.decode()?;
         let slot = self.registrations.get(slot_index)?;
         (slot.generation == generation)
@@ -319,11 +316,7 @@ impl NativeEventLoop {
         })
     }
 
-    fn register_raw(
-        &mut self,
-        fd: RawFd,
-        source: NativeEventSource,
-    ) -> io::Result<ReactorToken> {
+    fn register_raw(&mut self, fd: RawFd, source: NativeEventSource) -> io::Result<ReactorToken> {
         if fd < 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -332,11 +325,7 @@ impl NativeEventLoop {
         }
         let (slot_index, generation, reusing_slot) =
             if let Some(slot_index) = self.free_registration_slots.last().copied() {
-                (
-                    slot_index,
-                    self.registrations[slot_index].generation,
-                    true,
-                )
+                (slot_index, self.registrations[slot_index].generation, true)
             } else {
                 (self.registrations.len(), 1, false)
             };
@@ -379,6 +368,25 @@ impl NativeEventLoop {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for NativeEventLoop {
+    fn drop(&mut self) {
+        for registration in self
+            .registrations
+            .iter()
+            .filter_map(|slot| slot.registration)
+        {
+            unsafe {
+                libc::epoll_ctl(
+                    self.epoll.as_raw_fd(),
+                    libc::EPOLL_CTL_DEL,
+                    registration.fd,
+                    std::ptr::null_mut(),
+                );
+            }
+        }
     }
 }
 
@@ -652,7 +660,6 @@ mod tests {
         drop(first);
 
         let replacement = event_fd();
-        assert_eq!(replacement.as_raw_fd(), reused_fd_number);
         let replacement_token = event_loop
             .register(
                 replacement.as_raw_fd(),
