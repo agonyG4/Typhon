@@ -146,6 +146,13 @@ The native backend currently:
   registrations, wakeups, cancellations, fallback activation, stale/duplicate
   tokens, and acquire latency. Reliable libinput motion timestamps also produce
   `perf native.input_dispatch` latency fields.
+- reports logical and repair damage, EGL buffer age, retained history depth,
+  scissor passes, command replays, avoided pixels, swap-with-damage use, and
+  conservative full-repaint reasons for native EGL frames;
+- supports `OBLIVION_ONE_FORCE_FULL_REPAINT=1` to force a full GLES clear and
+  replay for A/B validation. `OBLIVION_ONE_DISABLE_BUFFER_AGE=1` leaves damage
+  calculation active but disables buffer-age partial repaint, conservatively
+  falling back to full repaint;
 - parses complete legacy DRM pageflip events and uses their kernel timestamp,
   sequence, CRTC ID, and unique submission token as native presentation
   metadata. `wp_presentation.clock_id` follows

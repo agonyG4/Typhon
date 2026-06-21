@@ -25,11 +25,12 @@ pub(crate) mod dmabuf;
 mod geometry;
 mod program;
 
-#[cfg(test)]
-use damage::cursor_damage_rect;
 use damage::{
-    ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker, ShellOverlayDamageState,
+    BufferAge, ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker,
+    EglPartialRepaintCapabilities, FullRepaintReason, PartialRepaintPlanner, RenderExecution,
+    RepaintMode, RepaintPlan, ShellOverlayDamageState,
 };
+pub(crate) use damage::{OutputDamage, OutputRect};
 use dmabuf::{query_egl_dmabuf_feedback, query_egl_main_device};
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglRect, EglTexturedVertex, EglUvRect, MIN_VERTEX_BUFFER_BYTES,
@@ -51,6 +52,7 @@ pub(crate) type EglSwapBuffersWithDamage = unsafe extern "system" fn(
     egl::Int,
 ) -> egl::Boolean;
 const MAX_CACHED_DMABUF_RESOURCES_PER_SURFACE: usize = 4;
+const EGL_BUFFER_AGE_EXT: egl::Int = 0x313d;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeEglConfigCandidate {
@@ -71,6 +73,16 @@ pub(crate) struct GlesSceneFrameStats {
     pub dmabuf_imports: usize,
     pub dmabuf_reuses: usize,
     pub dmabuf_import_failures: usize,
+    pub repaint_mode: RepaintMode,
+    pub buffer_age: Option<u32>,
+    pub current_damage_rects: usize,
+    pub current_damage_pixels: u64,
+    pub repair_damage_rects: usize,
+    pub repair_damage_pixels: u64,
+    pub scissor_passes: usize,
+    pub draw_command_replays: usize,
+    pub history_depth: usize,
+    pub fallback_reason: Option<FullRepaintReason>,
 }
 
 pub struct EglSceneDrawRequest<'a> {
@@ -82,6 +94,7 @@ pub struct EglSceneDrawRequest<'a> {
     pub output_scale: f64,
     pub shell_overlay: Option<&'a ShellOverlayImage>,
     pub client_cursor: Option<compositor::ClientCursorRenderState<'a>>,
+    pub(crate) current_damage: Option<OutputDamage>,
 }
 
 pub struct EglGlesFrameRenderer {
@@ -120,6 +133,7 @@ pub(crate) struct GlesSceneRenderer {
     frame_resources: HashMap<compositor::ServerFrameColor, EglImageResource>,
     egl_image_target_texture_2d: Option<GlEglImageTargetTexture2DOes>,
     damage_tracker: EglOutputDamageTracker,
+    repaint_planner: PartialRepaintPlanner,
     frame_stats: GlesSceneFrameStats,
 }
 
@@ -172,9 +186,19 @@ impl EglGlesFrameRenderer {
                 );
                 None
         });
-        let scene =
-            GlesSceneRenderer::new_current(&egl, width, height, egl_image_target_texture_2d)?;
         let swap_buffers_with_damage = load_swap_buffers_with_damage(&egl, egl_display);
+        let partial_repaint_capabilities = detect_partial_repaint_capabilities(
+            &egl,
+            egl_display,
+            swap_buffers_with_damage.is_some(),
+        );
+        let scene = GlesSceneRenderer::new_current(
+            &egl,
+            width,
+            height,
+            egl_image_target_texture_2d,
+            partial_repaint_capabilities,
+        )?;
         let dmabuf_feedback = query_egl_dmabuf_feedback(&egl, egl_display);
         let (dmabuf_main_device_path, dmabuf_main_device) =
             match query_egl_main_device(&egl, egl_display) {
@@ -223,20 +247,31 @@ impl EglGlesFrameRenderer {
             self.wl_egl_surface
                 .resize(width as i32, height as i32, 0, 0);
         }
-        let damage = self
+        let plan = self
             .scene
-            .draw_scene(&self.egl, self.egl_display, request)?;
-        self.swap_buffers(damage)
+            .draw_scene(&self.egl, self.egl_display, self.egl_surface, request)?;
+        self.swap_buffers(&plan)
     }
 
-    fn swap_buffers(&self, damage: EglOutputDamage) -> RendererResult<()> {
-        egl_swap_buffers_with_damage(
+    fn swap_buffers(&mut self, plan: &RepaintPlan) -> RendererResult<()> {
+        let result = egl_swap_buffers_with_damage(
             &self.egl,
             self.egl_display,
             self.egl_surface,
             self.swap_buffers_with_damage,
-            damage,
-        )
+            plan.swap_damage(),
+            self.scene.current_size(),
+        );
+        match result {
+            Ok(()) => {
+                self.scene.frame_presented(plan);
+                Ok(())
+            }
+            Err(error) => {
+                self.scene.frame_swap_failed();
+                Err(error)
+            }
+        }
     }
 }
 
@@ -246,6 +281,7 @@ impl GlesSceneRenderer {
         width: u32,
         height: u32,
         egl_image_target_texture_2d: Option<GlEglImageTargetTexture2DOes>,
+        partial_repaint_capabilities: EglPartialRepaintCapabilities,
     ) -> RendererResult<Self> {
         let gl = unsafe {
             glow::Context::from_loader_function(|name| {
@@ -309,6 +345,10 @@ impl GlesSceneRenderer {
             frame_resources: HashMap::new(),
             egl_image_target_texture_2d,
             damage_tracker: EglOutputDamageTracker::default(),
+            repaint_planner: PartialRepaintPlanner::new(
+                (width, height),
+                partial_repaint_capabilities,
+            ),
             frame_stats: GlesSceneFrameStats::default(),
         })
     }
@@ -333,8 +373,9 @@ impl GlesSceneRenderer {
         &mut self,
         egl: &EglInstance,
         egl_display: egl::Display,
+        egl_surface: egl::Surface,
         request: EglSceneDrawRequest<'_>,
-    ) -> RendererResult<EglOutputDamage> {
+    ) -> RendererResult<RepaintPlan> {
         let EglSceneDrawRequest {
             width,
             height,
@@ -344,6 +385,7 @@ impl GlesSceneRenderer {
             output_scale,
             shell_overlay,
             client_cursor,
+            current_damage,
         } = request;
         let width = width.max(1);
         let height = height.max(1);
@@ -398,6 +440,7 @@ impl GlesSceneRenderer {
             width,
             height,
             scene_changed,
+            current_damage,
             scaled_visual_state,
             shell_overlay_damage,
             client_cursor_damage,
@@ -423,8 +466,45 @@ impl GlesSceneRenderer {
             client_cursor,
             output_scale,
         );
-        self.draw_textured_layers()?;
-        Ok(output_damage)
+        let buffer_age = query_egl_buffer_age(
+            egl,
+            egl_display,
+            egl_surface,
+            self.repaint_planner.capabilities().buffer_age,
+        );
+        let plan = self.repaint_planner.plan(output_damage, buffer_age);
+        if let Err(error) = self.draw_textured_layers(&plan) {
+            self.repaint_planner.invalidate();
+            return Err(error);
+        }
+        self.record_repaint_stats(&plan);
+        Ok(plan)
+    }
+
+    pub(crate) fn frame_presented(&mut self, plan: &RepaintPlan) {
+        self.repaint_planner.commit_presented(plan);
+        self.frame_stats.history_depth = self.repaint_planner.history_depth();
+    }
+
+    pub(crate) fn frame_swap_failed(&mut self) {
+        self.repaint_planner.swap_failed();
+        self.frame_stats.history_depth = 0;
+    }
+
+    fn record_repaint_stats(&mut self, plan: &RepaintPlan) {
+        let (width, height) = self.current_size;
+        self.frame_stats.repaint_mode = plan.mode;
+        self.frame_stats.buffer_age = plan.buffer_age;
+        self.frame_stats.current_damage_rects = plan.current_damage.rect_count();
+        self.frame_stats.current_damage_pixels = plan
+            .current_damage
+            .pixels(width, height)
+            .unwrap_or(u64::MAX);
+        self.frame_stats.repair_damage_rects = plan.repair_damage.rect_count();
+        self.frame_stats.repair_damage_pixels =
+            plan.repair_damage.pixels(width, height).unwrap_or(u64::MAX);
+        self.frame_stats.fallback_reason = plan.fallback_reason;
+        self.frame_stats.history_depth = self.repaint_planner.history_depth();
     }
 
     fn ensure_output_size(
@@ -439,6 +519,7 @@ impl GlesSceneRenderer {
         }
 
         self.current_size = (width, height);
+        self.repaint_planner.resize((width, height));
         if let Some(resource) = self.wallpaper_resource.take() {
             destroy_image_resource(&self.gl, egl, egl_display, resource);
         }
@@ -1040,19 +1121,66 @@ impl GlesSceneRenderer {
         }
     }
 
-    fn draw_textured_layers(&mut self) -> RendererResult<()> {
+    fn draw_textured_layers(&mut self, plan: &RepaintPlan) -> RendererResult<()> {
+        let command_count = self
+            .commands
+            .len()
+            .saturating_add(self.cursor_commands.len());
         unsafe {
             self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            self.gl.clear(glow::COLOR_BUFFER_BIT);
             self.gl.use_program(Some(self.program));
             self.gl.active_texture(glow::TEXTURE0);
             self.gl.bind_vertex_array(Some(self.vertex_array));
         }
 
-        self.draw_command_batch(true)?;
-        self.draw_command_batch(false)?;
+        let execution = plan
+            .render_execution(self.current_size.0, self.current_size.1)
+            .ok_or_else(|| io::Error::other("repaint execution conversion failed"))?;
+        match execution {
+            RenderExecution::Skip => {}
+            RenderExecution::Full => {
+                unsafe {
+                    self.gl.disable(glow::SCISSOR_TEST);
+                    self.gl.clear(glow::COLOR_BUFFER_BIT);
+                }
+                self.draw_command_batch(true)?;
+                self.draw_command_batch(false)?;
+                self.frame_stats.draw_command_replays = command_count;
+            }
+            RenderExecution::Scissored {
+                scissors,
+                disable_scissor_after,
+            } => {
+                unsafe {
+                    self.gl.enable(glow::SCISSOR_TEST);
+                }
+                let mut draw_result = Ok(());
+                for [x, y, width, height] in &scissors {
+                    unsafe {
+                        self.gl.scissor(*x, *y, *width, *height);
+                        self.gl.clear(glow::COLOR_BUFFER_BIT);
+                    }
+                    draw_result = self
+                        .draw_command_batch(true)
+                        .and_then(|()| self.draw_command_batch(false));
+                    if draw_result.is_err() {
+                        break;
+                    }
+                }
+                if disable_scissor_after {
+                    unsafe {
+                        self.gl.disable(glow::SCISSOR_TEST);
+                    }
+                }
+                draw_result?;
+                self.frame_stats.scissor_passes = scissors.len();
+                self.frame_stats.draw_command_replays =
+                    command_count.saturating_mul(scissors.len());
+            }
+        }
 
         unsafe {
+            self.gl.disable(glow::SCISSOR_TEST);
             self.gl.bind_vertex_array(None);
             self.gl.bind_texture(glow::TEXTURE_2D, None);
         }
@@ -1925,9 +2053,14 @@ pub(crate) fn load_swap_buffers_with_damage(
         .query_string(Some(display), egl::EXTENSIONS)
         .ok()?
         .to_string_lossy();
-    let symbol_name = if extensions.contains("EGL_KHR_swap_buffers_with_damage") {
+    let mut extensions = extensions.split_ascii_whitespace();
+    let has_khr = extensions
+        .clone()
+        .any(|extension| extension == "EGL_KHR_swap_buffers_with_damage");
+    let has_ext = extensions.any(|extension| extension == "EGL_EXT_swap_buffers_with_damage");
+    let symbol_name = if has_khr {
         "eglSwapBuffersWithDamageKHR"
-    } else if extensions.contains("EGL_EXT_swap_buffers_with_damage") {
+    } else if has_ext {
         "eglSwapBuffersWithDamageEXT"
     } else {
         return None;
@@ -1936,18 +2069,61 @@ pub(crate) fn load_swap_buffers_with_damage(
     Some(unsafe { std::mem::transmute::<extern "system" fn(), EglSwapBuffersWithDamage>(symbol) })
 }
 
+pub(crate) fn detect_partial_repaint_capabilities(
+    egl: &EglInstance,
+    display: egl::Display,
+    swap_buffers_with_damage: bool,
+) -> EglPartialRepaintCapabilities {
+    let extensions = egl
+        .query_string(Some(display), egl::EXTENSIONS)
+        .map(|extensions| extensions.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    EglPartialRepaintCapabilities {
+        buffer_age: extensions
+            .split_ascii_whitespace()
+            .any(|extension| extension == "EGL_EXT_buffer_age")
+            && !buffer_age_disabled(),
+        swap_buffers_with_damage,
+    }
+}
+
+fn query_egl_buffer_age(
+    egl: &EglInstance,
+    display: egl::Display,
+    surface: egl::Surface,
+    supported: bool,
+) -> BufferAge {
+    if !supported {
+        return BufferAge::Unsupported;
+    }
+    match egl.query_surface(display, surface, EGL_BUFFER_AGE_EXT) {
+        Ok(age) => BufferAge::Value(age),
+        Err(error) => {
+            if native_egl_debug_enabled() {
+                eprintln!("EGL buffer-age query failed: {error}");
+            }
+            BufferAge::QueryFailed
+        }
+    }
+}
+
+fn buffer_age_disabled() -> bool {
+    std::env::var_os("OBLIVION_ONE_DISABLE_BUFFER_AGE").is_some_and(|value| value == "1")
+}
+
 pub(crate) fn egl_swap_buffers_with_damage(
     egl: &EglInstance,
     display: egl::Display,
     surface: egl::Surface,
     swap_buffers_with_damage: Option<EglSwapBuffersWithDamage>,
-    damage: EglOutputDamage,
+    damage: &EglOutputDamage,
+    output_size: (u32, u32),
 ) -> RendererResult<()> {
     let Some(swap_buffers_with_damage) = swap_buffers_with_damage else {
         egl.swap_buffers(display, surface)?;
         return Ok(());
     };
-    let Some(rects) = damage.to_egl_rects() else {
+    let Some(rects) = damage.to_egl_rects(output_size.0, output_size.1) else {
         egl.swap_buffers(display, surface)?;
         return Ok(());
     };
@@ -2106,104 +2282,75 @@ mod tests {
     }
 
     #[test]
-    fn output_damage_tracker_uses_full_damage_for_first_or_scene_frame() {
-        let mut tracker = EglOutputDamageTracker::default();
-
-        assert_eq!(
-            tracker.damage_for_frame(
-                1280,
-                800,
-                true,
-                DesktopVisualState::wallpaper_only(),
-                None,
-                None,
-            ),
-            EglOutputDamage::full(1280, 800)
-        );
-        assert_eq!(
-            tracker.damage_for_frame(
-                1280,
-                800,
-                true,
-                DesktopVisualState::wallpaper_only(),
-                None,
-                None,
-            ),
-            EglOutputDamage::full(1280, 800)
-        );
-    }
-
-    #[test]
-    fn output_damage_tracker_limits_damage_to_old_and_new_cursor_rects() {
+    fn output_damage_tracker_separates_scene_rebuild_from_authoritative_damage() {
         let mut tracker = EglOutputDamageTracker::default();
         tracker.damage_for_frame(
             1280,
             800,
             true,
+            None,
+            DesktopVisualState::wallpaper_only(),
+            None,
+            None,
+        );
+        let precise = OutputDamage::rects(1280, 800, [OutputRect::new(10, 20, 30, 40)]);
+
+        assert_eq!(
+            tracker.damage_for_frame(
+                1280,
+                800,
+                true,
+                Some(precise.clone()),
+                DesktopVisualState::wallpaper_only(),
+                None,
+                None,
+            ),
+            precise
+        );
+    }
+
+    #[test]
+    fn output_damage_tracker_limits_cursor_motion_to_old_and_new_bounds() {
+        let mut tracker = EglOutputDamageTracker::default();
+        tracker.damage_for_frame(
+            1280,
+            800,
+            true,
+            None,
             DesktopVisualState::with_cursor(10, 10),
             None,
             None,
         );
-
         let damage = tracker.damage_for_frame(
             1280,
             800,
             false,
+            Some(OutputDamage::Empty),
             DesktopVisualState::with_cursor(20, 22),
             None,
             None,
         );
 
+        assert_eq!(damage.rect_count(), 2);
+        let (cursor_width, cursor_height) = compositor::cursor_texture_size();
         assert_eq!(
-            damage,
-            EglOutputDamage::two_rects(
-                cursor_damage_rect(10, 10, 1280, 800).unwrap(),
-                cursor_damage_rect(20, 22, 1280, 800).unwrap()
-            )
+            damage.pixels(1280, 800),
+            Some(u64::from(cursor_width) * u64::from(cursor_height) * 2)
         );
     }
 
     #[test]
-    fn output_damage_tracker_limits_client_cursor_motion_to_actual_old_and_new_bounds() {
+    fn output_damage_tracker_limits_shell_overlay_change_to_overlay_bounds() {
         let mut tracker = EglOutputDamageTracker::default();
-        let old = ClientCursorDamageState::new(-3, 4, 12, 18, 1, 1280, 800);
-        let new = ClientCursorDamageState::new(20, 22, 12, 18, 1, 1280, 800);
-        tracker.damage_for_frame(
-            1280,
-            800,
-            true,
-            DesktopVisualState::wallpaper_only(),
-            None,
-            Some(old),
-        );
-
-        let damage = tracker.damage_for_frame(
-            1280,
-            800,
-            false,
-            DesktopVisualState::wallpaper_only(),
-            None,
-            Some(new),
-        );
-
-        assert_eq!(
-            damage,
-            EglOutputDamage::two_rects(old.rect.unwrap(), new.rect.unwrap())
-        );
-    }
-
-    #[test]
-    fn output_damage_tracker_limits_shell_overlay_change_to_overlay_rects() {
-        let mut tracker = EglOutputDamageTracker::default();
-        let old_overlay = SurfaceDamageRect {
+        let old = SurfaceDamageRect {
             x: 16,
             y: 10,
             width: 420,
             height: 32,
         };
-        let new_overlay = SurfaceDamageRect {
+        let new = SurfaceDamageRect {
             x: 16,
-            y: 10,
+            y: 50,
             width: 520,
             height: 32,
         };
@@ -2211,47 +2358,22 @@ mod tests {
             1280,
             800,
             true,
+            None,
             DesktopVisualState::wallpaper_only(),
-            Some(ShellOverlayDamageState::new(1, [old_overlay])),
+            Some(ShellOverlayDamageState::new(1, [old])),
             None,
         );
-
         let damage = tracker.damage_for_frame(
             1280,
             800,
             false,
+            Some(OutputDamage::Empty),
             DesktopVisualState::wallpaper_only(),
-            Some(ShellOverlayDamageState::new(2, [new_overlay])),
+            Some(ShellOverlayDamageState::new(2, [new])),
             None,
         );
 
-        assert_eq!(
-            damage.to_egl_rects().unwrap().as_slice(),
-            &[16, 10, 420, 32, 16, 10, 520, 32]
-        );
-    }
-
-    #[test]
-    fn output_damage_converts_to_egl_rect_list() {
-        let damage = EglOutputDamage::two_rects(
-            SurfaceDamageRect {
-                x: 4,
-                y: 8,
-                width: 16,
-                height: 24,
-            },
-            SurfaceDamageRect {
-                x: 40,
-                y: 48,
-                width: 8,
-                height: 12,
-            },
-        );
-
-        assert_eq!(
-            damage.to_egl_rects().unwrap().as_slice(),
-            &[4, 8, 16, 24, 40, 48, 8, 12]
-        );
+        assert_eq!(damage.rect_count(), 2);
     }
 
     #[test]

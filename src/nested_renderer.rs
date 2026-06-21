@@ -164,6 +164,7 @@ impl NestedOutputRenderer {
                 output_scale,
                 shell_overlay,
                 client_cursor,
+                current_damage: None,
             }),
             OutputRendererInner::Cpu(renderer) => renderer.draw(width, height, |frame| {
                 cpu_scene_renderer.compose_request(DesktopComposeRequest {

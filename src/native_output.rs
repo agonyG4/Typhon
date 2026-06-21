@@ -21,7 +21,8 @@ use crate::egl_renderer::dmabuf::{query_egl_dmabuf_feedback, query_egl_main_devi
 use crate::egl_renderer::{EglInstance, EglSwapBuffersWithDamage};
 use crate::egl_renderer::{
     EglSceneDrawRequest, GlEglImageTargetTexture2DOes, GlesSceneFrameStats, GlesSceneRenderer,
-    choose_egl_config, choose_native_egl_config, create_gles_context, egl_swap_buffers_with_damage,
+    OutputDamage, OutputRect as RendererOutputRect, choose_egl_config, choose_native_egl_config,
+    create_gles_context, detect_partial_repaint_capabilities, egl_swap_buffers_with_damage,
     load_egl_image_target_texture_2d, load_swap_buffers_with_damage, native_visual_label,
 };
 use gbm::AsRaw as GbmAsRaw;
@@ -2206,6 +2207,7 @@ impl NativeFrameRenderer {
         server: &'a OwnCompositorServer,
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
+        current_damage: Option<OutputDamage>,
     ) -> EglSceneDrawRequest<'a> {
         let shell_state = ShellOverlayState {
             topbar: ShellTopbarModel::visible("Oblivion One").with_trailing_text("Super+Space"),
@@ -2228,6 +2230,7 @@ impl NativeFrameRenderer {
             output_scale: 1.0,
             shell_overlay: Some(shell_overlay),
             client_cursor: server.client_cursor_render_state(),
+            current_damage,
         }
     }
 }
@@ -4863,6 +4866,8 @@ struct NativePaintStats {
     render_us: u64,
     copy_us: u64,
     write_us: u64,
+    gles_repaint: Option<GlesSceneFrameStats>,
+    swap_with_damage_used: bool,
 }
 
 impl NativePaintStats {
@@ -4894,6 +4899,30 @@ impl NativePaintStats {
                 "scanout_format",
                 native_visual_label(scanout_format),
             ));
+        }
+        if let Some(repaint) = self.gles_repaint {
+            let output_pixels = u64::from(self.width).saturating_mul(u64::from(self.height));
+            fields.extend([
+                NativePerfField::str("repaint_mode", repaint.repaint_mode.as_str()),
+                NativePerfField::usize("current_damage_rects", repaint.current_damage_rects),
+                NativePerfField::u64("current_damage_pixels", repaint.current_damage_pixels),
+                NativePerfField::usize("repair_damage_rects", repaint.repair_damage_rects),
+                NativePerfField::u64("repair_damage_pixels", repaint.repair_damage_pixels),
+                NativePerfField::usize("scissor_passes", repaint.scissor_passes),
+                NativePerfField::usize("draw_command_replays", repaint.draw_command_replays),
+                NativePerfField::usize("damage_history_depth", repaint.history_depth),
+                NativePerfField::u64(
+                    "output_pixels_avoided",
+                    output_pixels.saturating_sub(repaint.repair_damage_pixels),
+                ),
+                NativePerfField::bool("swap_with_damage", self.swap_with_damage_used),
+            ]);
+            if let Some(age) = repaint.buffer_age {
+                fields.push(NativePerfField::u64("egl_buffer_age", u64::from(age)));
+            }
+            if let Some(reason) = repaint.fallback_reason {
+                fields.push(NativePerfField::str("full_repaint_reason", reason.as_str()));
+            }
         }
         fields
     }
@@ -4979,6 +5008,20 @@ impl NativeOutputDamage {
 
     fn fields(&self) -> [NativePerfField; 3] {
         self.summary().fields()
+    }
+
+    fn as_renderer_damage(&self, width: u32, height: u32) -> OutputDamage {
+        match self.kind {
+            NativeDamageKind::Empty => OutputDamage::Empty,
+            NativeDamageKind::FullOutput => OutputDamage::Full,
+            NativeDamageKind::SurfaceDamage => OutputDamage::rects(
+                width,
+                height,
+                self.rects
+                    .iter()
+                    .map(|rect| RendererOutputRect::new(rect.x, rect.y, rect.width, rect.height)),
+            ),
+        }
     }
 
     fn frame_copy_damage(&self) -> NativeFrameCopyDamage<'_> {
@@ -5842,7 +5885,7 @@ impl NativeScanoutBackend {
     ) -> io::Result<NativePaintStats> {
         match self {
             Self::NativeEglGbm(scanout) => {
-                scanout.paint_server_frame(renderer, server, input_state, cursor_mode)
+                scanout.paint_server_frame(renderer, server, input_state, cursor_mode, damage)
             }
             Self::Gbm(scanout) => {
                 scanout.paint_server_frame(renderer, server, input_state, cursor_mode, damage)
@@ -6267,11 +6310,17 @@ impl NativeEglGbmScanout {
                 );
                 None
             });
+        let swap_buffers_with_damage = load_swap_buffers_with_damage(&egl, egl_display);
         let scene = match GlesSceneRenderer::new_current(
             &egl,
             width,
             height,
             egl_image_target_texture_2d,
+            detect_partial_repaint_capabilities(
+                &egl,
+                egl_display,
+                swap_buffers_with_damage.is_some(),
+            ),
         ) {
             Ok(scene) => scene,
             Err(error) => {
@@ -6282,7 +6331,6 @@ impl NativeEglGbmScanout {
                 return Err(native_egl_io_error(error));
             }
         };
-        let swap_buffers_with_damage = load_swap_buffers_with_damage(&egl, egl_display);
         let dmabuf_feedback = query_egl_dmabuf_feedback(&egl, egl_display);
         let (dmabuf_main_device_path, dmabuf_main_device) =
             match query_egl_main_device(&egl, egl_display) {
@@ -6335,6 +6383,7 @@ impl NativeEglGbmScanout {
         server: &OwnCompositorServer,
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
+        damage: &NativeOutputDamage,
     ) -> io::Result<NativePaintStats> {
         if !self.surface.has_free_buffers() {
             return Err(io::Error::other(
@@ -6357,23 +6406,34 @@ impl NativeEglGbmScanout {
             server,
             input_state,
             cursor_mode,
+            Some(damage.as_renderer_damage(self.width, self.height)),
         );
         let draw_start = Instant::now();
         let output_damage = self
             .scene
-            .draw_scene(&self.egl, self.egl_display, request)
+            .draw_scene(&self.egl, self.egl_display, self.egl_surface, request)
             .map_err(native_egl_io_error)?;
         let draw_us = elapsed_micros(draw_start);
-        let scene_stats = self.scene.last_frame_stats();
+        let swap_with_damage_used = self.swap_buffers_with_damage.is_some()
+            && output_damage
+                .swap_damage()
+                .to_egl_rects(self.width, self.height)
+                .is_some();
         let swap_start = Instant::now();
         egl_swap_buffers_with_damage(
             &self.egl,
             self.egl_display,
             self.egl_surface,
             self.swap_buffers_with_damage,
-            output_damage,
+            output_damage.swap_damage(),
+            (self.width, self.height),
         )
-        .map_err(native_egl_io_error)?;
+        .map_err(|error| {
+            self.scene.frame_swap_failed();
+            native_egl_io_error(error)
+        })?;
+        self.scene.frame_presented(&output_damage);
+        let scene_stats = self.scene.last_frame_stats();
         let swap_us = elapsed_micros(swap_start);
         let bo = unsafe { self.surface.lock_front_buffer() }.map_err(|error| {
             io::Error::other(format!("failed to lock GBM front buffer: {error}"))
@@ -6390,6 +6450,7 @@ impl NativeEglGbmScanout {
             swap_us,
             elapsed_micros(total_start),
             scene_stats,
+            swap_with_damage_used,
         ))
     }
 
@@ -6478,6 +6539,7 @@ impl Drop for NativeEglGbmScanout {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn native_egl_gbm_paint_stats(
     scanout_format: u32,
     width: u32,
@@ -6486,6 +6548,7 @@ fn native_egl_gbm_paint_stats(
     swap_us: u64,
     total_us: u64,
     scene_stats: GlesSceneFrameStats,
+    swap_with_damage_used: bool,
 ) -> NativePaintStats {
     NativePaintStats {
         backend: NativeScanoutKind::NativeEglGbm,
@@ -6511,6 +6574,8 @@ fn native_egl_gbm_paint_stats(
         render_us: draw_us,
         copy_us: 0,
         write_us: 0,
+        gles_repaint: Some(scene_stats),
+        swap_with_damage_used,
     }
 }
 
@@ -6633,6 +6698,8 @@ impl NativeGbmScanout {
             render_us,
             copy_us,
             write_us,
+            gles_repaint: None,
+            swap_with_damage_used: false,
         })
     }
 
@@ -6920,6 +6987,8 @@ impl DumbFramebuffer {
             render_us,
             copy_us,
             write_us: 0,
+            gles_repaint: None,
+            swap_with_damage_used: false,
         })
     }
 }
