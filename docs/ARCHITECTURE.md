@@ -185,14 +185,37 @@ pageflip watchdog. A timer cannot invent acquire readiness or presentation
 completion; asynchronous completion requires a matching DRM flip-complete
 event.
 
-Legacy pageflip submissions carry a unique nonzero `u64` user-data token. The
-DRM event parser validates each event length, matches that token, and preserves
+Native display programming has explicit atomic and legacy backends under
+`src/native/kms/`. `OBLIVION_ONE_KMS_MODE=auto` probes
+`DRM_CLIENT_CAP_ATOMIC`, discovers connector/CRTC/primary-plane properties,
+selects a compatible primary plane, creates an owned mode blob, and validates
+the initial state with `TEST_ONLY | ALLOW_MODESET` before a blocking takeover.
+Capability, discovery, or test-only failure may select legacy only before
+takeover. Forced `atomic` fails startup; forced `legacy` skips atomic probing.
+Once an atomic takeover succeeds, runtime errors never downgrade the live
+device.
+
+Normal atomic frames change only primary-plane `FB_ID` and use
+`NONBLOCK | PAGE_FLIP_EVENT`; legacy frames retain `page_flip`. Both paths carry
+a unique nonzero process-wide `u64` user-data token. One typed pending commit is
+allowed per backend generation, and framebuffer ownership moves from ready to
+pending to current only after the matching event. The existing legacy cursor
+IOCTL path remains separate: primary-plane atomic requests never include cursor
+plane properties.
+
+The DRM event parser validates each event length, matches that token, and preserves
 the kernel seconds, microseconds, and finite-width sequence through compositor
 frame completion. Native setup queries `DRM_CAP_TIMESTAMP_MONOTONIC` and
 advertises the matching `CLOCK_MONOTONIC` or `CLOCK_REALTIME` ID through
 `wp_presentation`. Legacy synchronized flips report `VSYNC`; `HW_CLOCK`,
 `HW_COMPLETION`, and `ZERO_COPY` remain unset because the current path does not
 establish those semantics conservatively.
+
+Before takeover, atomic KMS snapshots connector, CRTC, and selected primary
+plane values. Orderly shutdown first attempts a test-only and real exact atomic
+restore. If a saved external framebuffer or mode blob is no longer usable, it
+test-validates and commits one safe-disable transaction before compositor
+framebuffers and the compositor-owned mode blob are released.
 
 For native output, optional GPU buffer protocols are bound after the active
 scanout backend is known. The base Wayland socket starts without

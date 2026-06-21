@@ -24,6 +24,11 @@ Current limits:
   diagnostics;
 - DRM/KMS is opened through the shared libseat session when possible, but direct
   DRM fallback remains for diagnostics;
+- Atomic KMS is selected by default when capability discovery and the initial
+  test-only transaction succeed. `OBLIVION_ONE_KMS_MODE=atomic` requires it and
+  `OBLIVION_ONE_KMS_MODE=legacy` retains the old path. Real atomic takeover,
+  mixed legacy-cursor/atomic-primary operation, VT cycling, and exact restore
+  still require physical TTY validation on the target RTX 3060 Ti;
 - KMS mode selection now supports `OBLIVION_ONE_MODE` and the installed
   SDDM/TTY paths default to `1920x1080@165` for this test cycle;
 - native scanout now tries `native-egl-gbm` first in `auto`. That path renders
@@ -59,6 +64,10 @@ Current limits:
   outstanding;
 - VRR is not implemented yet: the compositor does not query `vrr_capable`, set
   the DRM `VRR_ENABLED` property, or expose an `off/on/fullscreen` policy;
+- Atomic property discovery does not imply later display features: direct
+  scanout, cursor-plane migration, overlay planes, KMS in/out fences,
+  `FB_DAMAGE_CLIPS`, hotplug policy, and multi-output commits are not
+  implemented;
 - interactive resize now moves compositor visual geometry immediately, allows
   multiple bounded resize configures in flight, crops stale content rather than
   stretching it, and damages old/new bounds even when a browser commit changes

@@ -79,6 +79,12 @@ The native backend currently:
   `--refresh` flags;
 - opens DRM through the shared libseat session when available, with a direct DRM
   fallback kept for development sessions;
+- selects KMS through `OBLIVION_ONE_KMS_MODE=auto|atomic|legacy`. `auto`
+  enables the atomic client capability, discovers connector/CRTC/primary-plane
+  properties, validates the complete initial state with a test-only commit, and
+  uses atomic takeover when that succeeds. It falls back to legacy only for
+  capability, discovery, or test-only failure before takeover. `atomic`
+  requires this path; `legacy` skips it;
 - prefers `native-egl-gbm` scanout in `auto`: a GBM surface with
   `SCANOUT|RENDERING`, an EGLDisplay created from the `gbm_device`, the shared
   GLES scene renderer, `eglSwapBuffers`, `gbm_surface_lock_front_buffer`, a DRM
@@ -153,7 +159,7 @@ The native backend currently:
   replay for A/B validation. `OBLIVION_ONE_DISABLE_BUFFER_AGE=1` leaves damage
   calculation active but disables buffer-age partial repaint, conservatively
   falling back to full repaint;
-- parses complete legacy DRM pageflip events and uses their kernel timestamp,
+- parses complete legacy or atomic DRM pageflip events and uses their kernel timestamp,
   sequence, CRTC ID, and unique submission token as native presentation
   metadata. `wp_presentation.clock_id` follows
   `DRM_CAP_TIMESTAMP_MONOTONIC`; feedback carries only the conservative
@@ -196,6 +202,22 @@ again, so terminals and shells inside the session can use it normally.
 
 ## Backend Selection
 
+- `OBLIVION_ONE_KMS_MODE=auto` (default): attempt atomic discovery and initial
+  `TEST_ONLY | ALLOW_MODESET`; use legacy only if capability, discovery, or
+  test-only validation fails before takeover.
+- `OBLIVION_ONE_KMS_MODE=atomic`: require atomic capability, required
+  properties, compatible primary plane, successful test-only validation, and a
+  successful real initial commit.
+- `OBLIVION_ONE_KMS_MODE=legacy`: retain legacy `set_crtc` and `page_flip` for
+  recovery and regression comparison.
+
+For direct comparison:
+
+```sh
+OBLIVION_ONE_KMS_MODE=atomic cargo run --release
+OBLIVION_ONE_KMS_MODE=legacy cargo run --release
+```
+
 - `OBLIVION_ONE_SCANOUT_BACKEND=auto` (default): try `native-egl-gbm`, then
   `gbm-cpu-write`, then `dumb`.
 - `OBLIVION_ONE_SCANOUT_BACKEND=gpu` or `native-egl-gbm`: require native
@@ -233,6 +255,20 @@ structured diagnostics and an explicit CPU restart recommendation. The
 compositor does not remove already-published Wayland globals or hot-swap to a
 CPU backend mid-pageflip.
 
+Atomic KMS follows the same rule. `auto` may choose legacy only before a real
+atomic takeover. A failed real initial atomic commit is rolled back and fails
+startup; a runtime atomic flip error is fatal and never silently changes the
+owned device to legacy. Normal atomic flips submit only primary-plane `FB_ID`
+with `NONBLOCK | PAGE_FLIP_EVENT`; the existing token-matched DRM completion,
+watchdog, protocol callback, buffer release, and presentation metadata path is
+shared with legacy flips.
+
+On orderly shutdown, atomic mode first test-validates and commits the captured
+connector/CRTC/primary-plane state. If an external saved framebuffer or mode
+blob can no longer be restored, it commits an atomic safe-disable state. The
+hardware cursor remains on the legacy cursor IOCTL path; atomic primary-plane
+requests do not touch cursor-plane properties.
+
 ## Production Gaps
 
 This is not yet a Hyprland/KWin-class native compositor backend. The next
@@ -248,6 +284,10 @@ architecture milestones are:
   abstraction;
 - add a tight-damage software cursor fallback, suspend recovery, direct scanout,
   and driver-specific validation for GBM/EGL-native presentation.
+
+Atomic KMS is only a foundation here. VRR policy, direct scanout, atomic cursor
+planes, overlay promotion, KMS in/out fences, framebuffer damage clips,
+hotplug, and multi-output commits remain unimplemented.
 
 The current `libseat` crate API does not expose the seat event fd, so libseat
 lifecycle dispatch runs before other work whenever another registered source

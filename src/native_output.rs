@@ -40,10 +40,14 @@ use oblivion_one::compositor::{
     ShellOverlayRenderer, ShellOverlayState, ShellTopbarModel, SpotlightModel,
     cursor_texture_pixels, cursor_texture_size, dock_item_at, render_scene_elements_for_surfaces,
 };
+use oblivion_one::native::kms::{
+    AtomicCommitState, AtomicCompletion, ConnectorId, CrtcId, FramebufferId, KmsBackendSelection,
+    KmsPolicy, PageFlipToken,
+};
 use oblivion_one::native::{
     drm::{
         DrmPresentationEvent, DrmTimestampClock, drain_drm_page_flip_events,
-        query_drm_timestamp_clock, sample_clock_microseconds, submit_legacy_page_flip,
+        query_drm_timestamp_clock, sample_clock_microseconds,
     },
     event_loop::{NativeEventLoop, NativeEventSource, monotonic_now_ns},
     explicit_sync::{
@@ -740,6 +744,9 @@ pub fn run(
     println!("native DRM backend target: {}", drm_plan.primary.as_str());
     let kms = NativeDrmDevice::open(drm_plan, kms_device, seat_session.clone())?;
     println!("native DRM backend active: {}", kms.kind().as_str());
+    let drm_file_generation = allocate_native_drm_file_generation();
+    let kms_policy = KmsPolicy::parse(std::env::var("OBLIVION_ONE_KMS_MODE").ok().as_deref())?;
+    println!("native KMS policy requested: {}", kms_policy.as_str());
     let native_syncobj_device = match DrmSyncobjDevice::from_active_drm_file(kms.file()) {
         Ok(device) => Some(device),
         Err(error) if error.kind() == io::ErrorKind::Unsupported => {
@@ -789,7 +796,6 @@ pub fn run(
 
     server.set_output_size(target.width, target.height);
     server.set_output_refresh_hz(refresh_hz);
-    let original_crtc = drm_ffi::mode::get_crtc(kms.file().as_fd(), target.crtc_id).ok();
     let scanout_preference = NativeScanoutPreference::from_env();
     let scanout_plan = NativeScanoutPlan::choose(NativeScanoutChoice {
         preference: scanout_preference,
@@ -807,6 +813,7 @@ pub fn run(
         kms.file(),
         target.width,
         target.height,
+        drm_file_generation,
     )?;
     perf.log("native.backend", || {
         vec![
@@ -825,7 +832,7 @@ pub fn run(
         "native cursor backend target: {}",
         cursor_preference.as_str()
     );
-    let mut hardware_cursor = match cursor_preference {
+    let pre_kms_hardware_cursor = match cursor_preference {
         NativeCursorPreference::Software => None,
         NativeCursorPreference::Auto | NativeCursorPreference::Hardware => {
             match NativeHardwareCursor::create(kms.file(), target.crtc_id) {
@@ -850,7 +857,7 @@ pub fn run(
             }
         }
     };
-    let mut cursor_render_mode = if hardware_cursor.is_some() {
+    let mut cursor_render_mode = if pre_kms_hardware_cursor.is_some() {
         NativeCursorRenderMode::Hardware
     } else {
         NativeCursorRenderMode::Software
@@ -864,12 +871,6 @@ pub fn run(
     println!(
         "native input backend target: {}",
         input_plan.primary.as_str()
-    );
-    let _restore = CrtcRestore::new(
-        kms.file().as_raw_fd(),
-        target.crtc_id,
-        target.connector_id,
-        original_crtc,
     );
     let initial_damage = NativeOutputDamage::full_output(target.width, target.height);
     let initial_paint = match scanout.paint_server_frame(
@@ -901,8 +902,13 @@ pub fn run(
                 ]
             });
             drop(scanout);
-            scanout =
-                NativeScanoutBackend::open(fallback_plan, kms.file(), target.width, target.height)?;
+            scanout = NativeScanoutBackend::open(
+                fallback_plan,
+                kms.file(),
+                target.width,
+                target.height,
+                drm_file_generation,
+            )?;
             scanout.paint_server_frame(
                 &mut frame_renderer,
                 &server,
@@ -953,15 +959,78 @@ pub fn run(
         ]);
         fields
     });
-    drm_ffi::mode::set_crtc(
+    let connector_id = ConnectorId::new(target.connector_id)
+        .ok_or_else(|| io::Error::other("selected connector ID is zero"))?;
+    let crtc_id =
+        CrtcId::new(target.crtc_id).ok_or_else(|| io::Error::other("selected CRTC ID is zero"))?;
+    let initial_framebuffer = FramebufferId::new(scanout.fb_id())
+        .ok_or_else(|| io::Error::other("initial scanout framebuffer ID is zero"))?;
+    let mut kms_backend = KmsBackendSelection::initialize(
         kms.file().as_fd(),
-        target.crtc_id,
-        scanout.fb_id(),
-        0,
-        0,
-        &[target.connector_id],
-        Some(target.mode),
+        kms_policy,
+        connector_id,
+        crtc_id,
+        target.mode,
+        target.width,
+        target.height,
+        scanout.scanout_format(),
+        initial_framebuffer,
     )?;
+    println!(
+        "native KMS backend active: {}",
+        kms_backend.effective_kind().as_str()
+    );
+    if let Some(reason) = &kms_backend.fallback_reason {
+        eprintln!("native KMS: atomic startup unavailable, using legacy: {reason}");
+    }
+    perf.log("native.kms_backend", || {
+        let mut fields = vec![
+            NativePerfField::str("requested", kms_policy.as_str()),
+            NativePerfField::str("effective", kms_backend.effective_kind().as_str()),
+            NativePerfField::u64("connector", u64::from(target.connector_id)),
+            NativePerfField::u64("crtc", u64::from(target.crtc_id)),
+            NativePerfField::str("mode", mode_label.clone()),
+            NativePerfField::str(
+                "scanout_format",
+                native_visual_label(scanout.scanout_format()),
+            ),
+        ];
+        if let Some(reason) = &kms_backend.fallback_reason {
+            fields.push(NativePerfField::str("fallback_reason", reason.to_string()));
+        }
+        if let Some(atomic) = kms_backend.atomic() {
+            fields.extend([
+                NativePerfField::u64(
+                    "primary_plane",
+                    u64::from(atomic.discovery().pipeline.plane.get()),
+                ),
+                NativePerfField::u64("mode_blob", u64::from(atomic.mode_blob_id().get())),
+                NativePerfField::usize("initial_property_count", atomic.initial_property_count()),
+                NativePerfField::u64("test_only_us", atomic.test_only_us()),
+                NativePerfField::u64("initial_commit_us", atomic.initial_commit_us()),
+                NativePerfField::u64(
+                    "plane_possible_crtcs",
+                    u64::from(atomic.discovery().plane_possible_crtcs),
+                ),
+                NativePerfField::usize(
+                    "plane_format_count",
+                    atomic.discovery().plane_formats.len(),
+                ),
+                NativePerfField::bool("vrr_property", atomic.discovery().optional.vrr_enabled),
+                NativePerfField::bool("in_fence_fd", atomic.discovery().optional.in_fence_fd),
+                NativePerfField::bool("out_fence_ptr", atomic.discovery().optional.out_fence_ptr),
+                NativePerfField::bool(
+                    "fb_damage_clips",
+                    atomic.discovery().optional.framebuffer_damage_clips,
+                ),
+            ]);
+        }
+        fields
+    });
+    // Keep cursor teardown ahead of KMS restoration on every return path. The
+    // cursor is created before the initial paint, but ownership moves here so
+    // reverse declaration-order drop disables it before `kms_backend` restores.
+    let mut hardware_cursor = pre_kms_hardware_cursor;
     scanout.finish_initial_scanout();
     if let Some(cursor) = hardware_cursor.as_mut() {
         let (cursor_x, cursor_y) = input_state.cursor_position();
@@ -996,7 +1065,7 @@ pub fn run(
                 ]);
                 fields
             });
-            scanout.present(kms.file().as_fd(), target.crtc_id)?;
+            scanout.present(&kms_backend)?;
             perf.log("native.cursor", || {
                 vec![
                     NativePerfField::str("backend", cursor_render_mode.as_str()),
@@ -1048,7 +1117,6 @@ pub fn run(
         ]
     });
     set_fd_nonblocking(kms.file().as_raw_fd())?;
-    let drm_file_generation = allocate_native_drm_file_generation();
     let acquire_notifier = DrmAcquirePointNotifier;
     let mut acquire_watches =
         ExplicitSyncWatchRegistry::new(refresh_interval_ns, drm_file_generation);
@@ -1170,6 +1238,8 @@ pub fn run(
                         "stale_token",
                         pageflip_drain.last_stale_token.unwrap_or(0),
                     ),
+                    NativePerfField::str("kms_backend", kms_backend.effective_kind().as_str()),
+                    NativePerfField::u64("backend_generation", drm_file_generation),
                 ]
             });
         }
@@ -1206,6 +1276,8 @@ pub fn run(
                         NativePerfField::usize("surfaces", server.renderable_surfaces().len()),
                         NativePerfField::u64("render_generation", server.render_generation()),
                         NativePerfField::u64("pageflip_token", pageflip.user_data),
+                        NativePerfField::str("kms_backend", kms_backend.effective_kind().as_str()),
+                        NativePerfField::u64("backend_generation", drm_file_generation),
                         NativePerfField::u64("kernel_sequence", u64::from(pageflip.sequence)),
                         NativePerfField::u64("kernel_timestamp_us", kernel_timestamp_us),
                         NativePerfField::u64("compositor_receive_us", compositor_receive_us),
@@ -1326,6 +1398,17 @@ pub fn run(
             if application.exit_requested {
                 println!("native input exit requested; shutting down cleanly");
                 acquire_watches.shutdown(&mut event_loop)?;
+                if let Some(cursor) = hardware_cursor.as_mut() {
+                    let _ = cursor.disable();
+                }
+                let restoration = kms_backend.restore()?;
+                perf.log("native.kms_restore", || {
+                    vec![
+                        NativePerfField::str("backend", kms_backend.effective_kind().as_str()),
+                        NativePerfField::str("outcome", restoration.as_str()),
+                        NativePerfField::bool("pageflip_pending", scanout.page_flip_pending()),
+                    ]
+                });
                 return Ok(());
             }
             if let Some(launch) = application.launch {
@@ -1535,6 +1618,12 @@ pub fn run(
                     NativePerfField::u64("frame", frame_index),
                     NativePerfField::u64("crtc", u64::from(target.crtc_id)),
                     NativePerfField::str("scanout", scanout.kind().metric_name()),
+                    NativePerfField::str("kms_backend", kms_backend.effective_kind().as_str()),
+                    NativePerfField::u64(
+                        "pending_token",
+                        scanout.pending_page_flip_token().unwrap_or(0),
+                    ),
+                    NativePerfField::u64("backend_generation", drm_file_generation),
                     NativePerfField::u64("timeout_count", frame_scheduler.watchdog_timeout_count()),
                     NativePerfField::bool("drm_ready", wakeup.reasons.drm()),
                     NativePerfField::bool("final_drain_completed", pageflip_completed),
@@ -1584,6 +1673,12 @@ pub fn run(
                         NativePerfField::u64("pageflip_drain_us", pageflip_drain_us),
                         NativePerfField::bool("pageflip_completed", pageflip_completed),
                         NativePerfField::u64("present_us", present_us),
+                        NativePerfField::str("kms_backend", kms_backend.effective_kind().as_str()),
+                        NativePerfField::u64(
+                            "pageflip_token",
+                            scanout.pending_page_flip_token().unwrap_or(0),
+                        ),
+                        NativePerfField::u64("backend_generation", drm_file_generation),
                         NativePerfField::u64("render_generation", render_generation),
                         NativePerfField::str("render_cause", render_cause),
                         NativePerfField::bool("pending_frame_work", pending_frame_work),
@@ -1628,17 +1723,15 @@ pub fn run(
                     .map(|(before, after)| after.delta_us_since(before))
                     .unwrap_or((0, 0));
                 let repaint_present_start = Instant::now();
-                let present_result = scanout
-                    .present(kms.file().as_fd(), target.crtc_id)
-                    .map_err(|error| {
-                        native_runtime_error(
-                            NativeRuntimeStage::Present,
-                            scanout.kind(),
-                            target.crtc_id,
-                            frame_index,
-                            error,
-                        )
-                    })?;
+                let present_result = scanout.present(&kms_backend).map_err(|error| {
+                    native_runtime_error(
+                        NativeRuntimeStage::Present,
+                        scanout.kind(),
+                        target.crtc_id,
+                        frame_index,
+                        error,
+                    )
+                })?;
                 let repaint_present_us = elapsed_micros(repaint_present_start);
                 let acquire_ready_to_render_submit_us = last_acquire_ready_at_ns
                     .map(|ready_at| {
@@ -5817,10 +5910,16 @@ struct NativePageFlipDrain {
 }
 
 impl NativeScanoutBackend {
-    fn open(plan: NativeScanoutPlan, kms: &fs::File, width: u32, height: u32) -> io::Result<Self> {
+    fn open(
+        plan: NativeScanoutPlan,
+        kms: &fs::File,
+        width: u32,
+        height: u32,
+        backend_generation: u64,
+    ) -> io::Result<Self> {
         let mut last_error = None;
         for candidate in plan.candidates() {
-            match Self::open_kind(candidate, kms, width, height) {
+            match Self::open_kind(candidate, kms, width, height, backend_generation) {
                 Ok(backend) => return Ok(backend),
                 Err(error) => {
                     eprintln!(
@@ -5839,6 +5938,7 @@ impl NativeScanoutBackend {
         kms: &fs::File,
         width: u32,
         height: u32,
+        backend_generation: u64,
     ) -> io::Result<Self> {
         match kind {
             NativeScanoutKind::NativeEglGbm => {
@@ -5848,12 +5948,18 @@ impl NativeScanoutBackend {
                     ));
                 }
                 Ok(Self::NativeEglGbm(Box::new(NativeEglGbmScanout::create(
-                    kms, width, height,
+                    kms,
+                    width,
+                    height,
+                    backend_generation,
                 )?)))
             }
-            NativeScanoutKind::GbmCpuWritePageFlip => {
-                Ok(Self::Gbm(NativeGbmScanout::create(kms, width, height)?))
-            }
+            NativeScanoutKind::GbmCpuWritePageFlip => Ok(Self::Gbm(NativeGbmScanout::create(
+                kms,
+                width,
+                height,
+                backend_generation,
+            )?)),
             NativeScanoutKind::DumbFramebuffer => {
                 Ok(Self::Dumb(DumbFramebuffer::create(kms, width, height)?))
             }
@@ -5904,6 +6010,13 @@ impl NativeScanoutBackend {
         }
     }
 
+    fn scanout_format(&self) -> u32 {
+        match self {
+            Self::NativeEglGbm(scanout) => scanout.format as u32,
+            Self::Gbm(_) | Self::Dumb(_) => u32::from_le_bytes(*b"XR24"),
+        }
+    }
+
     fn finish_initial_scanout(&mut self) {
         match self {
             Self::NativeEglGbm(scanout) => scanout.finish_initial_scanout(),
@@ -5912,10 +6025,10 @@ impl NativeScanoutBackend {
         }
     }
 
-    fn present(&mut self, fd: BorrowedFd<'_>, crtc_id: u32) -> io::Result<NativePresentResult> {
+    fn present(&mut self, kms: &KmsBackendSelection) -> io::Result<NativePresentResult> {
         let submitted_token = match self {
-            Self::NativeEglGbm(scanout) => scanout.present(fd, crtc_id)?,
-            Self::Gbm(scanout) => scanout.present(fd, crtc_id)?,
+            Self::NativeEglGbm(scanout) => scanout.present(kms)?,
+            Self::Gbm(scanout) => scanout.present(kms)?,
             Self::Dumb(_) => return Ok(NativePresentResult::Immediate),
         };
         match submitted_token {
@@ -5942,8 +6055,10 @@ impl NativeScanoutBackend {
 
     fn pending_page_flip_token(&self) -> Option<u64> {
         match self {
-            Self::NativeEglGbm(scanout) => scanout.page_flip.pending_token(),
-            Self::Gbm(scanout) => scanout.page_flip.pending_token(),
+            Self::NativeEglGbm(scanout) => {
+                scanout.page_flip.pending_token().map(PageFlipToken::get)
+            }
+            Self::Gbm(scanout) => scanout.page_flip.pending_token().map(PageFlipToken::get),
             Self::Dumb(_) => None,
         }
     }
@@ -5978,67 +6093,8 @@ fn apply_native_scanout_feedback(server: &mut OwnCompositorServer, scanout: &Nat
     );
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativePageFlipError {
-    AlreadyPending,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativePageFlipCompletion {
-    Completed { token: u64 },
-    Mismatched { expected: u64, received: u64 },
-    Stale { token: u64 },
-}
-
 static NEXT_NATIVE_PAGE_FLIP_TOKEN: AtomicU64 = AtomicU64::new(1);
 static NEXT_NATIVE_DRM_FILE_GENERATION: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct NativePageFlipState {
-    pending_token: Option<u64>,
-}
-
-impl NativePageFlipState {
-    const fn can_schedule(self) -> bool {
-        self.pending_token.is_none()
-    }
-
-    fn reserve_submission(&mut self) -> Result<u64, NativePageFlipError> {
-        if self.pending_token.is_some() {
-            return Err(NativePageFlipError::AlreadyPending);
-        }
-        let token = allocate_native_page_flip_token();
-        self.pending_token = Some(token);
-        Ok(token)
-    }
-
-    fn cancel_submission(&mut self, token: u64) -> bool {
-        if self.pending_token == Some(token) {
-            self.pending_token = None;
-            true
-        } else {
-            false
-        }
-    }
-
-    const fn pending_token(self) -> Option<u64> {
-        self.pending_token
-    }
-
-    fn complete(&mut self, token: u64) -> NativePageFlipCompletion {
-        let Some(expected) = self.pending_token else {
-            return NativePageFlipCompletion::Stale { token };
-        };
-        if expected != token {
-            return NativePageFlipCompletion::Mismatched {
-                expected,
-                received: token,
-            };
-        }
-        self.pending_token = None;
-        NativePageFlipCompletion::Completed { token }
-    }
-}
 
 fn allocate_native_page_flip_token() -> u64 {
     loop {
@@ -6144,7 +6200,8 @@ struct NativeEglGbmScanout {
     dmabuf_main_device_path: Option<String>,
     framebuffer_cache: NativeGbmFramebufferCache,
     buffers: NativePageFlipBuffers<NativePresentedGbmBuffer>,
-    page_flip: NativePageFlipState,
+    page_flip: AtomicCommitState,
+    backend_generation: u64,
 }
 
 // A locked GBM front buffer must stay alive while KMS may scan it out. Ready is
@@ -6223,7 +6280,12 @@ impl NativeGbmFramebufferCache {
 }
 
 impl NativeEglGbmScanout {
-    fn create(kms: &fs::File, width: u32, height: u32) -> io::Result<Self> {
+    fn create(
+        kms: &fs::File,
+        width: u32,
+        height: u32,
+        backend_generation: u64,
+    ) -> io::Result<Self> {
         let gbm_fd = duplicate_fd_cloexec(kms.as_raw_fd()).map_err(io::Error::from_raw_os_error)?;
         let device = gbm::Device::new(gbm_fd)?;
         let usage = gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING;
@@ -6373,7 +6435,8 @@ impl NativeEglGbmScanout {
             dmabuf_main_device_path,
             framebuffer_cache: NativeGbmFramebufferCache::default(),
             buffers: NativePageFlipBuffers::default(),
-            page_flip: NativePageFlipState::default(),
+            page_flip: AtomicCommitState::default(),
+            backend_generation,
         })
     }
 
@@ -6465,26 +6528,29 @@ impl NativeEglGbmScanout {
         self.buffers.finish_initial_scanout();
     }
 
-    fn present(&mut self, fd: BorrowedFd<'_>, crtc_id: u32) -> io::Result<Option<u64>> {
-        if !self.page_flip.can_schedule() {
+    fn present(&mut self, kms: &KmsBackendSelection) -> io::Result<Option<u64>> {
+        if self.page_flip.is_pending() {
             return Ok(None);
         }
         let Some(buffer) = self.buffers.take_ready() else {
             return Ok(None);
         };
-        let token = self
-            .page_flip
-            .reserve_submission()
-            .map_err(|_| io::Error::other("native page flip is already pending"))?;
-        match submit_legacy_page_flip(fd, crtc_id, buffer.fb_id, token) {
+        let framebuffer = FramebufferId::new(buffer.fb_id)
+            .ok_or_else(|| io::Error::other("ready EGL/GBM framebuffer ID is zero"))?;
+        let token = PageFlipToken::new(allocate_native_page_flip_token())
+            .expect("native pageflip allocator never returns zero");
+        self.page_flip
+            .begin(token, framebuffer, self.backend_generation, Instant::now())
+            .map_err(io::Error::other)?;
+        match kms.submit_flip(framebuffer, token) {
             Ok(()) => {
                 self.buffers.set_pending(buffer);
-                Ok(Some(token))
+                Ok(Some(token.get()))
             }
             Err(error) => {
-                self.page_flip.cancel_submission(token);
+                self.page_flip.submission_failed(token);
                 self.buffers.restore_ready(buffer);
-                Err(error)
+                Err(io::Error::other(error))
             }
         }
     }
@@ -6492,8 +6558,14 @@ impl NativeEglGbmScanout {
     fn drain_page_flip_events(&mut self, fd: RawFd) -> io::Result<NativePageFlipDrain> {
         let mut drain = NativePageFlipDrain::default();
         for event in drain_drm_page_flip_events(fd)? {
-            match self.page_flip.complete(event.user_data) {
-                NativePageFlipCompletion::Completed { .. } => {
+            let expected = self.page_flip.pending_token().map(PageFlipToken::get);
+            let Some(token) = PageFlipToken::new(event.user_data) else {
+                drain.stale_events = drain.stale_events.saturating_add(1);
+                drain.last_stale_token = Some(event.user_data);
+                continue;
+            };
+            match self.page_flip.complete(token, self.backend_generation) {
+                AtomicCompletion::Completed { .. } => {
                     if drain.completion.is_none() {
                         self.buffers.complete_page_flip();
                         drain.completion = Some(event);
@@ -6501,13 +6573,13 @@ impl NativeEglGbmScanout {
                         drain.stale_events = drain.stale_events.saturating_add(1);
                     }
                 }
-                NativePageFlipCompletion::Mismatched { expected, received } => {
+                AtomicCompletion::Mismatched => {
                     drain.mismatched_events = drain.mismatched_events.saturating_add(1);
-                    drain.last_mismatch = Some((expected, received));
+                    drain.last_mismatch = expected.map(|expected| (expected, event.user_data));
                 }
-                NativePageFlipCompletion::Stale { token } => {
+                AtomicCompletion::Stale | AtomicCompletion::StaleGeneration => {
                     drain.stale_events = drain.stale_events.saturating_add(1);
-                    drain.last_stale_token = Some(token);
+                    drain.last_stale_token = Some(event.user_data);
                 }
             }
         }
@@ -6515,7 +6587,7 @@ impl NativeEglGbmScanout {
     }
 
     fn page_flip_pending(&self) -> bool {
-        !self.page_flip.can_schedule()
+        self.page_flip.is_pending()
     }
 }
 
@@ -6592,7 +6664,8 @@ struct NativeGbmScanout {
     current_index: usize,
     ready_index: Option<usize>,
     pending_index: Option<usize>,
-    page_flip: NativePageFlipState,
+    page_flip: AtomicCommitState,
+    backend_generation: u64,
     staging: Vec<u8>,
 }
 
@@ -6603,7 +6676,12 @@ struct NativeGbmScanoutBuffer {
 }
 
 impl NativeGbmScanout {
-    fn create(kms: &fs::File, width: u32, height: u32) -> io::Result<Self> {
+    fn create(
+        kms: &fs::File,
+        width: u32,
+        height: u32,
+        backend_generation: u64,
+    ) -> io::Result<Self> {
         let gbm_fd = duplicate_fd_cloexec(kms.as_raw_fd()).map_err(io::Error::from_raw_os_error)?;
         let device = gbm::Device::new(gbm_fd)?;
         let usage = gbm::BufferObjectFlags::SCANOUT
@@ -6638,7 +6716,8 @@ impl NativeGbmScanout {
             current_index: 0,
             ready_index: None,
             pending_index: None,
-            page_flip: NativePageFlipState::default(),
+            page_flip: AtomicCommitState::default(),
+            backend_generation,
             staging: Vec::new(),
         })
     }
@@ -6715,8 +6794,8 @@ impl NativeGbmScanout {
         }
     }
 
-    fn present(&mut self, fd: BorrowedFd<'_>, crtc_id: u32) -> io::Result<Option<u64>> {
-        if !self.page_flip.can_schedule() {
+    fn present(&mut self, kms: &KmsBackendSelection) -> io::Result<Option<u64>> {
+        if self.page_flip.is_pending() {
             return Ok(None);
         }
         let Some(index) = self.ready_index.take() else {
@@ -6725,19 +6804,22 @@ impl NativeGbmScanout {
         if index == self.current_index {
             return Ok(None);
         }
-        let token = self
-            .page_flip
-            .reserve_submission()
-            .map_err(|_| io::Error::other("native page flip is already pending"))?;
-        match submit_legacy_page_flip(fd, crtc_id, self.buffers[index].fb_id, token) {
+        let framebuffer = FramebufferId::new(self.buffers[index].fb_id)
+            .ok_or_else(|| io::Error::other("ready CPU GBM framebuffer ID is zero"))?;
+        let token = PageFlipToken::new(allocate_native_page_flip_token())
+            .expect("native pageflip allocator never returns zero");
+        self.page_flip
+            .begin(token, framebuffer, self.backend_generation, Instant::now())
+            .map_err(io::Error::other)?;
+        match kms.submit_flip(framebuffer, token) {
             Ok(()) => {
                 self.pending_index = Some(index);
-                Ok(Some(token))
+                Ok(Some(token.get()))
             }
             Err(error) => {
-                self.page_flip.cancel_submission(token);
+                self.page_flip.submission_failed(token);
                 self.ready_index = Some(index);
-                Err(error)
+                Err(io::Error::other(error))
             }
         }
     }
@@ -6745,8 +6827,14 @@ impl NativeGbmScanout {
     fn drain_page_flip_events(&mut self, fd: RawFd) -> io::Result<NativePageFlipDrain> {
         let mut drain = NativePageFlipDrain::default();
         for event in drain_drm_page_flip_events(fd)? {
-            match self.page_flip.complete(event.user_data) {
-                NativePageFlipCompletion::Completed { .. } => {
+            let expected = self.page_flip.pending_token().map(PageFlipToken::get);
+            let Some(token) = PageFlipToken::new(event.user_data) else {
+                drain.stale_events = drain.stale_events.saturating_add(1);
+                drain.last_stale_token = Some(event.user_data);
+                continue;
+            };
+            match self.page_flip.complete(token, self.backend_generation) {
+                AtomicCompletion::Completed { .. } => {
                     if drain.completion.is_none() {
                         if let Some(index) = self.pending_index.take() {
                             self.current_index = index;
@@ -6756,13 +6844,13 @@ impl NativeGbmScanout {
                         drain.stale_events = drain.stale_events.saturating_add(1);
                     }
                 }
-                NativePageFlipCompletion::Mismatched { expected, received } => {
+                AtomicCompletion::Mismatched => {
                     drain.mismatched_events = drain.mismatched_events.saturating_add(1);
-                    drain.last_mismatch = Some((expected, received));
+                    drain.last_mismatch = expected.map(|expected| (expected, event.user_data));
                 }
-                NativePageFlipCompletion::Stale { token } => {
+                AtomicCompletion::Stale | AtomicCompletion::StaleGeneration => {
                     drain.stale_events = drain.stale_events.saturating_add(1);
-                    drain.last_stale_token = Some(token);
+                    drain.last_stale_token = Some(event.user_data);
                 }
             }
         }
@@ -6770,7 +6858,7 @@ impl NativeGbmScanout {
     }
 
     fn page_flip_pending(&self) -> bool {
-        !self.page_flip.can_schedule()
+        self.page_flip.is_pending()
     }
 
     fn next_render_index(&self) -> io::Result<usize> {
@@ -6999,52 +7087,6 @@ impl Drop for DumbFramebuffer {
         let _ = unsafe { libc::munmap(self.mapping, self.size) };
         let _ = drm_ffi::mode::rm_fb(fd, self.fb_id);
         let _ = drm_ffi::mode::dumbbuffer::destroy(fd, self.handle);
-    }
-}
-
-struct CrtcRestore {
-    fd: RawFd,
-    crtc_id: u32,
-    connector_id: u32,
-    original: Option<drm_sys::drm_mode_crtc>,
-}
-
-impl CrtcRestore {
-    fn new(
-        fd: RawFd,
-        crtc_id: u32,
-        connector_id: u32,
-        original: Option<drm_sys::drm_mode_crtc>,
-    ) -> Self {
-        Self {
-            fd,
-            crtc_id,
-            connector_id,
-            original,
-        }
-    }
-}
-
-impl Drop for CrtcRestore {
-    fn drop(&mut self) {
-        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        if let Some(original) = self.original {
-            let mode = (original.mode_valid != 0).then_some(original.mode);
-            let connectors = if mode.is_some() {
-                vec![self.connector_id]
-            } else {
-                Vec::new()
-            };
-            let _ = drm_ffi::mode::set_crtc(
-                fd,
-                self.crtc_id,
-                original.fb_id,
-                original.x,
-                original.y,
-                &connectors,
-                mode,
-            );
-        }
     }
 }
 
@@ -8268,11 +8310,16 @@ mod tests {
         }
         let file = fs::File::open("Cargo.toml").unwrap();
 
-        let error =
-            match NativeScanoutBackend::open_kind(NativeScanoutKind::NativeEglGbm, &file, 1, 1) {
-                Ok(_) => panic!("injected native EGL/GBM failure should fail before KMS use"),
-                Err(error) => error,
-            };
+        let error = match NativeScanoutBackend::open_kind(
+            NativeScanoutKind::NativeEglGbm,
+            &file,
+            1,
+            1,
+            1,
+        ) {
+            Ok(_) => panic!("injected native EGL/GBM failure should fail before KMS use"),
+            Err(error) => error,
+        };
 
         match previous {
             Some(value) => unsafe {
@@ -8351,57 +8398,64 @@ mod tests {
 
     #[test]
     fn native_pageflip_state_blocks_overlapping_flips() {
-        let mut state = NativePageFlipState::default();
+        let mut state = AtomicCommitState::default();
+        let token = PageFlipToken::new(allocate_native_page_flip_token()).unwrap();
+        let framebuffer = FramebufferId::new(17).unwrap();
 
-        assert!(state.can_schedule());
-        let token = state.reserve_submission().unwrap();
-        assert_ne!(token, 0);
-        assert!(!state.can_schedule());
-        assert_eq!(
-            state.reserve_submission(),
-            Err(NativePageFlipError::AlreadyPending)
+        assert!(!state.is_pending());
+        state.begin(token, framebuffer, 3, Instant::now()).unwrap();
+        assert!(state.is_pending());
+        assert!(
+            state
+                .begin(
+                    PageFlipToken::new(allocate_native_page_flip_token()).unwrap(),
+                    FramebufferId::new(18).unwrap(),
+                    3,
+                    Instant::now(),
+                )
+                .is_err()
         );
         assert_eq!(
-            state.complete(token),
-            NativePageFlipCompletion::Completed { token }
+            state.complete(token, 3),
+            AtomicCompletion::Completed { framebuffer }
         );
-        assert!(state.can_schedule());
-        assert_eq!(
-            state.complete(token),
-            NativePageFlipCompletion::Stale { token }
-        );
+        assert!(!state.is_pending());
+        assert_eq!(state.complete(token, 3), AtomicCompletion::Stale);
     }
 
     #[test]
     fn native_pageflip_state_rejects_mismatch_without_clearing_pending() {
-        let mut state = NativePageFlipState::default();
-        let expected = state.reserve_submission().unwrap();
-        let received = next_nonzero_page_flip_token(expected);
+        let mut state = AtomicCommitState::default();
+        let expected = PageFlipToken::new(allocate_native_page_flip_token()).unwrap();
+        let received = PageFlipToken::new(next_nonzero_page_flip_token(expected.get())).unwrap();
+        state
+            .begin(expected, FramebufferId::new(21).unwrap(), 5, Instant::now())
+            .unwrap();
 
-        assert_eq!(
-            state.complete(received),
-            NativePageFlipCompletion::Mismatched { expected, received }
-        );
+        assert_eq!(state.complete(received, 5), AtomicCompletion::Mismatched);
         assert_eq!(state.pending_token(), Some(expected));
     }
 
     #[test]
     fn native_pageflip_state_stale_event_cannot_complete_new_submission() {
-        let mut state = NativePageFlipState::default();
-        let first = state.reserve_submission().unwrap();
+        let mut state = AtomicCommitState::default();
+        let first = PageFlipToken::new(allocate_native_page_flip_token()).unwrap();
+        let first_framebuffer = FramebufferId::new(31).unwrap();
+        state
+            .begin(first, first_framebuffer, 7, Instant::now())
+            .unwrap();
         assert_eq!(
-            state.complete(first),
-            NativePageFlipCompletion::Completed { token: first }
-        );
-        let second = state.reserve_submission().unwrap();
-
-        assert_eq!(
-            state.complete(first),
-            NativePageFlipCompletion::Mismatched {
-                expected: second,
-                received: first,
+            state.complete(first, 7),
+            AtomicCompletion::Completed {
+                framebuffer: first_framebuffer
             }
         );
+        let second = PageFlipToken::new(allocate_native_page_flip_token()).unwrap();
+        state
+            .begin(second, FramebufferId::new(32).unwrap(), 7, Instant::now())
+            .unwrap();
+
+        assert_eq!(state.complete(first, 7), AtomicCompletion::Mismatched);
         assert_eq!(state.pending_token(), Some(second));
     }
 
@@ -8413,17 +8467,33 @@ mod tests {
 
     #[test]
     fn native_pageflip_token_does_not_restart_after_backend_recreation() {
-        let mut first = NativePageFlipState::default();
-        let old_token = first.reserve_submission().unwrap();
+        let mut first = AtomicCommitState::default();
+        let old_token = PageFlipToken::new(allocate_native_page_flip_token()).unwrap();
+        let framebuffer = FramebufferId::new(41).unwrap();
+        first
+            .begin(old_token, framebuffer, 11, Instant::now())
+            .unwrap();
         assert_eq!(
-            first.complete(old_token),
-            NativePageFlipCompletion::Completed { token: old_token }
+            first.complete(old_token, 11),
+            AtomicCompletion::Completed { framebuffer }
         );
-        let mut replacement = NativePageFlipState::default();
-
-        let replacement_token = replacement.reserve_submission().unwrap();
+        let mut replacement = AtomicCommitState::default();
+        let replacement_token = PageFlipToken::new(allocate_native_page_flip_token()).unwrap();
+        replacement
+            .begin(
+                replacement_token,
+                FramebufferId::new(42).unwrap(),
+                12,
+                Instant::now(),
+            )
+            .unwrap();
 
         assert_ne!(replacement_token, old_token);
+        assert_eq!(
+            replacement.complete(old_token, 11),
+            AtomicCompletion::StaleGeneration
+        );
+        assert_eq!(replacement.pending_token(), Some(replacement_token));
     }
 
     #[test]
