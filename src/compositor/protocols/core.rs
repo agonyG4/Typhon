@@ -72,6 +72,10 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                         );
                     }
                     Some(PendingSurfaceAttachment::RemoveContent) => {
+                        state.cancel_pending_acquire_commits_for_surface(
+                            surface_id,
+                            AcquireWatchCancelReason::Superseded,
+                        );
                         let _ = data.take_pending_offset();
                         data.commit_pending_viewport();
                         data.commit_pending_buffer_scale();
@@ -150,6 +154,18 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
             }
             _ => {}
         }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _client: ClientId,
+        _resource: &wl_surface::WlSurface,
+        data: &SurfaceData,
+    ) {
+        let _ = state.cancel_pending_acquire_commits_for_surface(
+            data.surface_id(),
+            AcquireWatchCancelReason::ClientDisconnected,
+        );
     }
 }
 

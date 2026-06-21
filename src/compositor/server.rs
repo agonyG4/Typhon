@@ -31,8 +31,9 @@ use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
 
 use super::{
-    ClientCursorRenderState, CompositorState, FramePresentation, InputProtocolCapabilities,
-    PresentationClock, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
+    AcquireCommitId, AcquireWatchChange, ClientCursorRenderState, CompositorState,
+    ExplicitSyncPoint, FramePresentation, InputProtocolCapabilities, PresentationClock,
+    RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
     SelectionProtocolCapabilities, ShellDockItem, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
@@ -175,6 +176,46 @@ impl OwnCompositorServer {
         }
         register_gpu_buffer_globals(&self.display.handle(), self.state.syncobj_device.is_some());
         self.gpu_buffer_protocols_enabled = true;
+    }
+
+    #[doc(hidden)]
+    pub fn set_native_syncobj_device(&mut self, device: Option<DrmSyncobjDevice>) {
+        assert!(
+            !self.gpu_buffer_protocols_enabled,
+            "native syncobj device must be selected before GPU globals are enabled"
+        );
+        self.state.syncobj_device = device;
+    }
+
+    #[doc(hidden)]
+    pub fn enable_external_acquire_readiness(&mut self) {
+        self.state.enable_external_acquire_readiness();
+    }
+
+    #[doc(hidden)]
+    pub fn take_acquire_watch_changes(&mut self) -> Vec<AcquireWatchChange> {
+        self.state.take_acquire_watch_changes()
+    }
+
+    #[doc(hidden)]
+    pub fn mark_acquire_commit_eventfd_backed(&mut self, commit_id: AcquireCommitId) -> bool {
+        self.state.mark_acquire_commit_eventfd_backed(commit_id)
+    }
+
+    #[doc(hidden)]
+    pub fn mark_acquire_commit_fallback_backed(&mut self, commit_id: AcquireCommitId) -> bool {
+        self.state.mark_acquire_commit_fallback_backed(commit_id)
+    }
+
+    #[doc(hidden)]
+    pub fn mark_acquire_commit_ready(
+        &mut self,
+        commit_id: AcquireCommitId,
+        surface_id: u32,
+        acquire: &ExplicitSyncPoint,
+    ) -> bool {
+        self.state
+            .mark_acquire_commit_ready(commit_id, surface_id, acquire)
     }
 
     pub const fn gpu_buffer_protocols_enabled(&self) -> bool {

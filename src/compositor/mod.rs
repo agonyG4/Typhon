@@ -87,13 +87,18 @@ use dmabuf::{
     default_dmabuf_main_device, send_dmabuf_feedback, send_dmabuf_format_modifiers,
     send_wl_drm_capabilities,
 };
+#[doc(hidden)]
+pub use explicit_sync::{
+    AcquireCommitId, AcquireWatchCancelReason, AcquireWatchChange, AcquireWatchRequest,
+    ExplicitSyncPoint,
+};
 use explicit_sync::{
-    ExplicitSyncPoint, PendingExplicitSyncCommit, PendingPresentationFeedback,
-    SYNCOBJ_MANAGER_ERROR_INVALID_TIMELINE, SYNCOBJ_MANAGER_ERROR_SURFACE_EXISTS,
-    SYNCOBJ_SURFACE_ERROR_CONFLICTING_POINTS, SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
-    SYNCOBJ_SURFACE_ERROR_NO_BUFFER, SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT,
-    SYNCOBJ_SURFACE_ERROR_NO_SURFACE, SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER,
-    SyncobjSurfaceState, SyncobjTimelineData,
+    AcquireCommitIdAllocator, PendingAcquireState, PendingExplicitSyncCommit,
+    PendingPresentationFeedback, SYNCOBJ_MANAGER_ERROR_INVALID_TIMELINE,
+    SYNCOBJ_MANAGER_ERROR_SURFACE_EXISTS, SYNCOBJ_SURFACE_ERROR_CONFLICTING_POINTS,
+    SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT, SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
+    SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT, SYNCOBJ_SURFACE_ERROR_NO_SURFACE,
+    SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER, SyncobjSurfaceState, SyncobjTimelineData,
 };
 pub use idle::{IdleManager, IdleState};
 use input::{
@@ -289,6 +294,9 @@ pub struct CompositorState {
     pending_dmabuf_buffer_releases: Vec<SurfaceBufferRelease>,
     deferred_dmabuf_buffer_releases: Vec<SurfaceBufferRelease>,
     pending_explicit_sync_commits: Vec<PendingExplicitSyncCommit>,
+    acquire_commit_ids: AcquireCommitIdAllocator,
+    pending_acquire_watch_changes: Vec<AcquireWatchChange>,
+    external_acquire_readiness: bool,
     pending_frame_callbacks: Vec<wl_callback::WlCallback>,
     pending_presentation_feedbacks: Vec<PendingPresentationFeedback>,
     frame_clock_start: Option<Instant>,
@@ -1191,6 +1199,10 @@ impl CompositorState {
     }
 
     fn unregister_surface_resource(&mut self, surface_id: u32) {
+        self.cancel_pending_acquire_commits_for_surface(
+            surface_id,
+            AcquireWatchCancelReason::SurfaceDestroyed,
+        );
         self.discard_pending_presentation_feedbacks_for_surface(surface_id);
         self.deactivate_pointer_constraints_for_surface(surface_id, false);
         self.cleanup_subsurface_stack_state_for_surface(surface_id);
@@ -3945,6 +3957,12 @@ impl CompositorState {
         frame_callbacks: Vec<wl_callback::WlCallback>,
         explicit_sync: Option<Arc<SyncobjSurfaceState>>,
     ) {
+        let mut superseded_callbacks = self.cancel_pending_acquire_commits_for_surface(
+            surface_id,
+            AcquireWatchCancelReason::Superseded,
+        );
+        superseded_callbacks.extend(frame_callbacks);
+        let frame_callbacks = superseded_callbacks;
         if !self.is_cursor_surface(surface_id) {
             self.configure_xdg_surface_if_needed(surface_id);
         }
@@ -3986,17 +4004,38 @@ impl CompositorState {
         }
 
         pending.explicit_release = Some(release);
-        if acquire.is_signaled() {
+        if !self.external_acquire_readiness && acquire.is_signaled() {
             self.commit_surface_buffer_by_role(surface_id, pending, damage, frame_callbacks);
         } else {
+            let Some(commit_id) = self.acquire_commit_ids.allocate() else {
+                sync_state.post_error(
+                    SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
+                    "explicit sync commit identity space exhausted",
+                );
+                return;
+            };
+            let buffer_id = pending.resource.id().protocol_id();
+            let received_at = Instant::now();
             self.pending_explicit_sync_commits
                 .push(PendingExplicitSyncCommit {
+                    commit_id,
                     surface_id,
                     pending,
                     damage,
                     frame_callbacks,
-                    acquire,
+                    acquire: acquire.clone(),
+                    acquire_state: PendingAcquireState::RegistrationPending,
                 });
+            if self.external_acquire_readiness {
+                self.pending_acquire_watch_changes
+                    .push(AcquireWatchChange::Register(AcquireWatchRequest {
+                        commit_id,
+                        surface_id,
+                        buffer_id,
+                        acquire,
+                        received_at,
+                    }));
+            }
         }
     }
 
@@ -6579,10 +6618,9 @@ impl CompositorState {
 
     fn has_pending_frame_callbacks(&self) -> bool {
         !self.pending_frame_callbacks.is_empty()
-            || self
-                .pending_explicit_sync_commits
-                .iter()
-                .any(|commit| !commit.frame_callbacks.is_empty())
+            || self.pending_explicit_sync_commits.iter().any(|commit| {
+                !self.external_acquire_readiness && !commit.frame_callbacks.is_empty()
+            })
             || self
                 .surface_resources
                 .values()
@@ -6604,7 +6642,10 @@ impl CompositorState {
 
     fn has_pending_frame_prepare_work(&self) -> bool {
         self.pending_resize_configure_is_flushable()
-            || !self.pending_explicit_sync_commits.is_empty()
+            || self.pending_explicit_sync_commits.iter().any(|commit| {
+                !self.external_acquire_readiness
+                    || commit.acquire_state == PendingAcquireState::Ready
+            })
             || !self.pending_color_info.is_empty()
     }
 
@@ -6697,10 +6738,133 @@ impl CompositorState {
         }
     }
 
+    fn cancel_pending_acquire_commits_for_surface(
+        &mut self,
+        surface_id: u32,
+        reason: AcquireWatchCancelReason,
+    ) -> Vec<wl_callback::WlCallback> {
+        let mut retained = Vec::with_capacity(self.pending_explicit_sync_commits.len());
+        let mut canceled_callbacks = Vec::new();
+        for commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
+            if commit.surface_id == surface_id {
+                canceled_callbacks.extend(commit.frame_callbacks);
+                if self.external_acquire_readiness {
+                    self.pending_acquire_watch_changes
+                        .push(AcquireWatchChange::Cancel {
+                            commit_id: commit.commit_id,
+                            reason,
+                        });
+                }
+            } else {
+                retained.push(commit);
+            }
+        }
+        self.pending_explicit_sync_commits = retained;
+        canceled_callbacks
+    }
+
+    fn cancel_pending_acquire_commits_for_buffer(
+        &mut self,
+        buffer: &wl_buffer::WlBuffer,
+        reason: AcquireWatchCancelReason,
+    ) {
+        let ids = self
+            .pending_explicit_sync_commits
+            .iter()
+            .filter(|commit| same_wayland_resource(&commit.pending.resource, buffer))
+            .map(|commit| commit.surface_id)
+            .collect::<Vec<_>>();
+        for surface_id in ids {
+            self.cancel_pending_acquire_commits_for_surface(surface_id, reason);
+        }
+    }
+
+    fn cancel_pending_acquire_commits_for_timeline(
+        &mut self,
+        timeline: &crate::syncobj::DrmSyncobjTimeline,
+        reason: AcquireWatchCancelReason,
+    ) {
+        let mut retained = Vec::with_capacity(self.pending_explicit_sync_commits.len());
+        for commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
+            let uses_timeline = commit.acquire.timeline.same_timeline(timeline)
+                || commit
+                    .pending
+                    .explicit_release
+                    .as_ref()
+                    .is_some_and(|release| release.timeline.same_timeline(timeline));
+            if uses_timeline {
+                if self.external_acquire_readiness {
+                    self.pending_acquire_watch_changes
+                        .push(AcquireWatchChange::Cancel {
+                            commit_id: commit.commit_id,
+                            reason,
+                        });
+                }
+            } else {
+                retained.push(commit);
+            }
+        }
+        self.pending_explicit_sync_commits = retained;
+    }
+
+    fn enable_external_acquire_readiness(&mut self) {
+        if self.external_acquire_readiness {
+            return;
+        }
+        self.external_acquire_readiness = true;
+        for commit in &self.pending_explicit_sync_commits {
+            self.pending_acquire_watch_changes
+                .push(AcquireWatchChange::Register(AcquireWatchRequest {
+                    commit_id: commit.commit_id,
+                    surface_id: commit.surface_id,
+                    buffer_id: commit.pending.resource.id().protocol_id(),
+                    acquire: commit.acquire.clone(),
+                    received_at: Instant::now(),
+                }));
+        }
+    }
+
+    fn take_acquire_watch_changes(&mut self) -> Vec<AcquireWatchChange> {
+        std::mem::take(&mut self.pending_acquire_watch_changes)
+    }
+
+    fn mark_acquire_commit_eventfd_backed(&mut self, commit_id: AcquireCommitId) -> bool {
+        self.pending_explicit_sync_commits
+            .iter_mut()
+            .find(|commit| commit.commit_id == commit_id)
+            .is_some_and(|commit| commit.acquire_state.mark_eventfd_backed())
+    }
+
+    fn mark_acquire_commit_fallback_backed(&mut self, commit_id: AcquireCommitId) -> bool {
+        self.pending_explicit_sync_commits
+            .iter_mut()
+            .find(|commit| commit.commit_id == commit_id)
+            .is_some_and(|commit| commit.acquire_state.mark_fallback_backed())
+    }
+
+    fn mark_acquire_commit_ready(
+        &mut self,
+        commit_id: AcquireCommitId,
+        surface_id: u32,
+        acquire: &ExplicitSyncPoint,
+    ) -> bool {
+        self.pending_explicit_sync_commits
+            .iter_mut()
+            .find(|commit| {
+                commit.commit_id == commit_id
+                    && commit.surface_id == surface_id
+                    && commit.acquire == *acquire
+            })
+            .is_some_and(|commit| commit.acquire_state.mark_ready())
+    }
+
     fn commit_ready_explicit_sync_buffers(&mut self) {
         let mut waiting = Vec::new();
-        for commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
-            if commit.acquire.is_signaled() {
+        for mut commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
+            if !self.external_acquire_readiness && commit.acquire.is_signaled() {
+                commit.acquire_state.mark_ready();
+            }
+            if commit.acquire_state == PendingAcquireState::Ready {
                 self.commit_surface_buffer_by_role(
                     commit.surface_id,
                     commit.pending,

@@ -57,14 +57,32 @@ impl Dispatch<wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1, Syn
     for CompositorState
 {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         _resource: &wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1,
-        _request: wp_linux_drm_syncobj_timeline_v1::Request,
-        _data: &SyncobjTimelineData,
+        request: wp_linux_drm_syncobj_timeline_v1::Request,
+        data: &SyncobjTimelineData,
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
+        if matches!(request, wp_linux_drm_syncobj_timeline_v1::Request::Destroy) {
+            state.cancel_pending_acquire_commits_for_timeline(
+                &data.timeline,
+                AcquireWatchCancelReason::TimelineDestroyed,
+            );
+        }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _client: ClientId,
+        _resource: &wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1,
+        data: &SyncobjTimelineData,
+    ) {
+        state.cancel_pending_acquire_commits_for_timeline(
+            &data.timeline,
+            AcquireWatchCancelReason::TimelineDestroyed,
+        );
     }
 }
 
@@ -72,7 +90,7 @@ impl Dispatch<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1, Arc<S
     for CompositorState
 {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         _resource: &wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1,
         request: wp_linux_drm_syncobj_surface_v1::Request,
@@ -83,6 +101,12 @@ impl Dispatch<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1, Arc<S
         match request {
             wp_linux_drm_syncobj_surface_v1::Request::Destroy => {
                 data.clear_resource();
+                if let Some(surface_id) = data.surface_id() {
+                    state.cancel_pending_acquire_commits_for_surface(
+                        surface_id,
+                        AcquireWatchCancelReason::SyncSurfaceDestroyed,
+                    );
+                }
             }
             wp_linux_drm_syncobj_surface_v1::Request::SetAcquirePoint {
                 timeline,
@@ -125,6 +149,21 @@ impl Dispatch<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1, Arc<S
                 }
             }
             _ => {}
+        }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _client: ClientId,
+        _resource: &wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1,
+        data: &Arc<SyncobjSurfaceState>,
+    ) {
+        data.clear_resource();
+        if let Some(surface_id) = data.surface_id() {
+            state.cancel_pending_acquire_commits_for_surface(
+                surface_id,
+                AcquireWatchCancelReason::SyncSurfaceDestroyed,
+            );
         }
     }
 }

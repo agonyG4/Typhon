@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use std::{num::NonZeroU64, time::Instant};
 
 use wayland_protocols::wp::{
     linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1,
@@ -23,9 +24,9 @@ pub(super) const SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT: u32 = 5;
 pub(super) const SYNCOBJ_SURFACE_ERROR_CONFLICTING_POINTS: u32 = 6;
 
 #[derive(Debug, Clone)]
-pub(super) struct ExplicitSyncPoint {
-    pub(super) timeline: DrmSyncobjTimeline,
-    pub(super) point: u64,
+pub struct ExplicitSyncPoint {
+    pub timeline: DrmSyncobjTimeline,
+    pub point: u64,
 }
 
 impl ExplicitSyncPoint {
@@ -36,13 +37,115 @@ impl ExplicitSyncPoint {
         }
     }
 
-    pub(super) fn is_signaled(&self) -> bool {
+    pub(crate) fn is_signaled(&self) -> bool {
         self.timeline.point_signaled(self.point).unwrap_or(false)
+    }
+
+    pub fn signaled_result(&self) -> std::io::Result<bool> {
+        self.timeline.point_signaled(self.point)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(handle: u32, point: u64) -> Self {
+        Self {
+            timeline: DrmSyncobjTimeline::invalid_for_tests(handle),
+            point,
+        }
     }
 
     pub(super) fn signal(&self) {
         let _ = self.timeline.signal_point(self.point);
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AcquireCommitId(NonZeroU64);
+
+impl AcquireCommitId {
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(value: u64) -> Self {
+        Self(NonZeroU64::new(value).expect("test acquire commit ID must be nonzero"))
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct AcquireCommitIdAllocator {
+    last: u64,
+}
+
+impl AcquireCommitIdAllocator {
+    pub(super) fn allocate(&mut self) -> Option<AcquireCommitId> {
+        self.last = self.last.checked_add(1)?;
+        NonZeroU64::new(self.last).map(AcquireCommitId)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PendingAcquireState {
+    RegistrationPending,
+    EventfdBacked,
+    FallbackBacked,
+    Ready,
+}
+
+impl PendingAcquireState {
+    pub(super) fn mark_eventfd_backed(&mut self) -> bool {
+        if *self != Self::RegistrationPending {
+            return false;
+        }
+        *self = Self::EventfdBacked;
+        true
+    }
+
+    pub(super) fn mark_fallback_backed(&mut self) -> bool {
+        if *self != Self::RegistrationPending {
+            return false;
+        }
+        *self = Self::FallbackBacked;
+        true
+    }
+
+    pub(super) fn mark_ready(&mut self) -> bool {
+        if *self == Self::Ready {
+            return false;
+        }
+        *self = Self::Ready;
+        true
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AcquireWatchRequest {
+    pub commit_id: AcquireCommitId,
+    pub surface_id: u32,
+    pub buffer_id: u32,
+    pub acquire: ExplicitSyncPoint,
+    pub received_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquireWatchCancelReason {
+    Superseded,
+    SurfaceDestroyed,
+    BufferDestroyed,
+    SyncSurfaceDestroyed,
+    TimelineDestroyed,
+    ClientDisconnected,
+    BackendShutdown,
+    Rejected,
+}
+
+#[derive(Debug, Clone)]
+pub enum AcquireWatchChange {
+    Register(AcquireWatchRequest),
+    Cancel {
+        commit_id: AcquireCommitId,
+        reason: AcquireWatchCancelReason,
+    },
 }
 
 impl PartialEq for ExplicitSyncPoint {
@@ -55,11 +158,13 @@ impl Eq for ExplicitSyncPoint {}
 
 #[derive(Debug)]
 pub(super) struct PendingExplicitSyncCommit {
+    pub(super) commit_id: AcquireCommitId,
     pub(super) surface_id: u32,
     pub(super) pending: PendingSurfaceBuffer,
     pub(super) damage: RenderableSurfaceDamage,
     pub(super) frame_callbacks: Vec<wl_callback::WlCallback>,
     pub(super) acquire: ExplicitSyncPoint,
+    pub(super) acquire_state: PendingAcquireState,
 }
 
 #[derive(Debug)]
@@ -113,6 +218,14 @@ impl SyncobjSurfaceState {
         self.surface.is_alive()
     }
 
+    pub(super) fn surface_id(&self) -> Option<u32> {
+        self.surface.upgrade().ok().and_then(|surface| {
+            surface
+                .data::<super::SurfaceData>()
+                .map(|data| data.surface_id())
+        })
+    }
+
     pub(super) fn clear_resource(&self) {
         if let Ok(mut guard) = self.resource.lock() {
             *guard = None;
@@ -151,5 +264,37 @@ impl SyncobjSurfaceState {
             .ok()
             .and_then(|mut guard| guard.take());
         (acquire, release)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acquire_commit_identity_is_nonzero_and_monotonic() {
+        let mut allocator = AcquireCommitIdAllocator::default();
+
+        assert_eq!(allocator.allocate().unwrap().get(), 1);
+        assert_eq!(allocator.allocate().unwrap().get(), 2);
+    }
+
+    #[test]
+    fn acquire_readiness_transitions_at_most_once() {
+        let mut state = PendingAcquireState::RegistrationPending;
+
+        assert!(state.mark_eventfd_backed());
+        assert!(state.mark_ready());
+        assert!(!state.mark_ready());
+        assert_eq!(state, PendingAcquireState::Ready);
+    }
+
+    #[test]
+    fn fallback_state_is_distinct_from_eventfd_state() {
+        let mut state = PendingAcquireState::RegistrationPending;
+
+        assert!(state.mark_fallback_backed());
+        assert_eq!(state, PendingAcquireState::FallbackBacked);
+        assert!(state.mark_ready());
     }
 }

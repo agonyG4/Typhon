@@ -82,6 +82,18 @@ impl Dispatch<wl_buffer::WlBuffer, ShmBufferData> for CompositorState {
     ) {
         let _ = data.fits_in_pool();
     }
+
+    fn destroyed(
+        state: &mut Self,
+        _client: ClientId,
+        resource: &wl_buffer::WlBuffer,
+        _data: &ShmBufferData,
+    ) {
+        state.cancel_pending_acquire_commits_for_buffer(
+            resource,
+            AcquireWatchCancelReason::BufferDestroyed,
+        );
+    }
 }
 
 impl Dispatch<wl_buffer::WlBuffer, DmabufBufferData> for CompositorState {
@@ -94,6 +106,18 @@ impl Dispatch<wl_buffer::WlBuffer, DmabufBufferData> for CompositorState {
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _client: ClientId,
+        resource: &wl_buffer::WlBuffer,
+        _data: &DmabufBufferData,
+    ) {
+        state.cancel_pending_acquire_commits_for_buffer(
+            resource,
+            AcquireWatchCancelReason::BufferDestroyed,
+        );
     }
 }
 
