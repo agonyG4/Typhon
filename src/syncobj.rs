@@ -441,6 +441,40 @@ mod tests {
     }
 
     #[test]
+    fn syncobj_eventfd_notifies_a_signaled_timeline_point_when_supported() {
+        let Some(device) = DrmSyncobjDevice::open_available() else {
+            return;
+        };
+        let timeline = device.create_timeline_for_tests().unwrap();
+        let event_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(event_fd >= 0);
+        let event_fd = unsafe { OwnedFd::from_raw_fd(event_fd) };
+        if let Err(error) = timeline.register_eventfd(9, event_fd.as_fd()) {
+            if error.class() == SyncobjEventfdErrnoClass::Unsupported {
+                assert!(
+                    std::env::var_os("TYPHON_REQUIRE_SYNCOBJ_EVENTFD_TEST").is_none(),
+                    "syncobj eventfd support was required for this hardware smoke test"
+                );
+                return;
+            }
+            panic!("syncobj eventfd registration failed: {error}");
+        }
+
+        timeline.signal_point(9).unwrap();
+        let mut counter = 0u64;
+        let read = unsafe {
+            libc::read(
+                event_fd.as_raw_fd(),
+                (&mut counter as *mut u64).cast(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+
+        assert_eq!(read, std::mem::size_of::<u64>() as isize);
+        assert_eq!(counter, 1);
+    }
+
+    #[test]
     fn syncobj_device_opens_when_kernel_reports_timeline_support() {
         if let Some(device) = DrmSyncobjDevice::open_available() {
             let timeline = device.create_timeline_for_tests().unwrap();
