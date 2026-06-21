@@ -29,10 +29,11 @@ use khronos_egl as egl;
 #[cfg(test)]
 use oblivion_one::compositor::OutputRect;
 use oblivion_one::compositor::{
-    DesktopComposeRequest, DesktopFrameCopyKind, DesktopSceneRebuildKind, DesktopSceneRenderer,
-    DesktopVisualState, FramePresentation, OutputPosition as CompositorOutputPosition,
-    OutputRegion, OwnCompositorServer, PointerConstraintBackendId, PointerConstraintBackendRequest,
-    PointerConstraintMode, PointerMotionSample as CompositorPointerMotionSample, PresentationClock,
+    AcquireWatchChange, DesktopComposeRequest, DesktopFrameCopyKind, DesktopSceneRebuildKind,
+    DesktopSceneRenderer, DesktopVisualState, FramePresentation,
+    OutputPosition as CompositorOutputPosition, OutputRegion, OwnCompositorServer,
+    PointerConstraintBackendId, PointerConstraintBackendRequest, PointerConstraintMode,
+    PointerMotionSample as CompositorPointerMotionSample, PresentationClock,
     RelativePointerMotion as CompositorRelativePointerMotion, RenderGenerationCause,
     RenderSceneElement, RenderSceneElementId, RenderableSurface, ShellDockItem,
     ShellOverlayRenderer, ShellOverlayState, ShellTopbarModel, SpotlightModel,
@@ -44,10 +45,15 @@ use oblivion_one::native::{
         query_drm_timestamp_clock, sample_clock_microseconds, submit_legacy_page_flip,
     },
     event_loop::{NativeEventLoop, NativeEventSource, monotonic_now_ns},
+    explicit_sync::{
+        AcquireReadyResult, AcquireRegistrationResult, DrmAcquirePointNotifier,
+        ExplicitSyncWatchRegistry,
+    },
     scheduler::{NativeFrameScheduler, PageFlipCompletionResult, SchedulerDecision},
 };
 use oblivion_one::render_backend::egl_gles::EglGlesDmabufFeedback;
 use oblivion_one::session::NativeSessionProbe;
+use oblivion_one::syncobj::DrmSyncobjDevice;
 use oblivion_one::{
     CompositorAppGpuPreference, EffectiveCompositorAppGpuPolicy, shell_quote,
     spawn_compositor_app_with_policy,
@@ -733,6 +739,15 @@ pub fn run(
     println!("native DRM backend target: {}", drm_plan.primary.as_str());
     let kms = NativeDrmDevice::open(drm_plan, kms_device, seat_session.clone())?;
     println!("native DRM backend active: {}", kms.kind().as_str());
+    let native_syncobj_device = match DrmSyncobjDevice::from_active_drm_file(kms.file()) {
+        Ok(device) => Some(device),
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+            eprintln!("native explicit sync unavailable on active DRM device: {error}");
+            None
+        }
+        Err(error) => return Err(error.into()),
+    };
+    server.set_native_syncobj_device(native_syncobj_device);
     let drm_timestamp_clock = query_drm_timestamp_clock(kms.file().as_fd())?;
     let presentation_clock = match drm_timestamp_clock {
         DrmTimestampClock::Monotonic => PresentationClock::Monotonic,
@@ -1032,6 +1047,11 @@ pub fn run(
         ]
     });
     set_fd_nonblocking(kms.file().as_raw_fd())?;
+    let drm_file_generation = allocate_native_drm_file_generation();
+    let acquire_notifier = DrmAcquirePointNotifier;
+    let mut acquire_watches =
+        ExplicitSyncWatchRegistry::new(refresh_interval_ns, drm_file_generation);
+    server.enable_external_acquire_readiness();
     let mut event_loop = NativeEventLoop::new()?;
     event_loop.register(kms.file().as_raw_fd(), NativeEventSource::Drm)?;
     event_loop.register(
@@ -1054,7 +1074,10 @@ pub fn run(
             .note_async_submission(token, scheduler_anchor_ns)
             .map_err(io::Error::other)?;
     }
-    event_loop.arm_deadline(frame_scheduler.next_deadline_ns())?;
+    event_loop.arm_deadline(earliest_native_deadline(
+        frame_scheduler.next_deadline_ns(),
+        acquire_watches.next_fallback_deadline_ns(),
+    ))?;
     let mut last_render_generation = server.render_generation();
     let mut last_renderable_surfaces = server.renderable_surfaces().to_vec();
     let mut queued_redraw_requested = false;
@@ -1063,6 +1086,7 @@ pub fn run(
     let mut pending_launches = VecDeque::<NativeAppLaunchPerf>::new();
     let mut mismatched_pageflip_events = 0u64;
     let mut stale_pageflip_events = 0u64;
+    let mut last_acquire_ready_at_ns = None;
     let mut resize_perf = NativeResizePerfState::default();
     let mut pointer_constraint_backend = NativePointerConstraintBackend::new();
     if let Some(command) = startup_app
@@ -1275,6 +1299,7 @@ pub fn run(
                 && let Err(error) = cursor.move_to(cursor_x, cursor_y)
             {
                 if cursor_preference == NativeCursorPreference::Hardware {
+                    acquire_watches.shutdown(&mut event_loop)?;
                     return Err(error.into());
                 }
                 eprintln!("native cursor: hardware cursor move failed: {error}; using software");
@@ -1299,6 +1324,7 @@ pub fn run(
             )?;
             if application.exit_requested {
                 println!("native input exit requested; shutting down cleanly");
+                acquire_watches.shutdown(&mut event_loop)?;
                 return Ok(());
             }
             if let Some(launch) = application.launch {
@@ -1339,6 +1365,110 @@ pub fn run(
                 ]
             });
         }
+        let acquire_changes = server.take_acquire_watch_changes();
+        let acquire_change_count = acquire_changes.len();
+        let acquire_ready_token_count = wakeup.explicit_sync_acquire_tokens.len();
+        let mut acquire_ready_count = 0usize;
+        for change in acquire_changes {
+            match change {
+                AcquireWatchChange::Register(request) => {
+                    match acquire_watches.register(
+                        request,
+                        &mut event_loop,
+                        monotonic_now_ns()?,
+                        &acquire_notifier,
+                    )? {
+                        AcquireRegistrationResult::AlreadyReady(request) => {
+                            if server.mark_acquire_commit_ready(
+                                request.commit_id,
+                                request.surface_id,
+                                &request.acquire,
+                            ) {
+                                acquire_ready_count = acquire_ready_count.saturating_add(1);
+                            }
+                        }
+                        AcquireRegistrationResult::EventfdBacked(commit_id) => {
+                            let _ = server.mark_acquire_commit_eventfd_backed(commit_id);
+                        }
+                        AcquireRegistrationResult::FallbackBacked(commit_id) => {
+                            let _ = server.mark_acquire_commit_fallback_backed(commit_id);
+                        }
+                    }
+                }
+                AcquireWatchChange::Cancel { commit_id, reason } => {
+                    let _ = acquire_watches.cancel_commit(commit_id, reason, &mut event_loop)?;
+                }
+            }
+        }
+        for token in wakeup.explicit_sync_acquire_tokens.iter().copied() {
+            match acquire_watches.handle_ready(
+                token,
+                &mut event_loop,
+                drm_file_generation,
+                &acquire_notifier,
+            )? {
+                AcquireReadyResult::Ready(request) => {
+                    if server.mark_acquire_commit_ready(
+                        request.commit_id,
+                        request.surface_id,
+                        &request.acquire,
+                    ) {
+                        acquire_ready_count = acquire_ready_count.saturating_add(1);
+                    }
+                }
+                AcquireReadyResult::BackendMismatch(_) => {}
+                AcquireReadyResult::Pending | AcquireReadyResult::Stale => {}
+            }
+        }
+        for request in acquire_watches.retry_fallback(monotonic_now_ns()?, &acquire_notifier) {
+            if server.mark_acquire_commit_ready(
+                request.commit_id,
+                request.surface_id,
+                &request.acquire,
+            ) {
+                acquire_ready_count = acquire_ready_count.saturating_add(1);
+            }
+        }
+        if acquire_change_count > 0 || acquire_ready_token_count > 0 || acquire_ready_count > 0 {
+            if acquire_ready_count > 0 {
+                last_acquire_ready_at_ns = Some(monotonic_now_ns()?);
+            }
+            let metrics = acquire_watches.metrics();
+            perf.log("native.explicit_sync", || {
+                vec![
+                    NativePerfField::usize("changes", acquire_change_count),
+                    NativePerfField::usize("ready_tokens", acquire_ready_token_count),
+                    NativePerfField::usize("ready_commits", acquire_ready_count),
+                    NativePerfField::usize(
+                        "active_eventfd_watches",
+                        metrics.active_eventfd_watches,
+                    ),
+                    NativePerfField::usize(
+                        "active_fallback_watches",
+                        metrics.active_fallback_watches,
+                    ),
+                    NativePerfField::u64("registrations", metrics.registrations),
+                    NativePerfField::u64("eventfd_wakeups", metrics.eventfd_wakeups),
+                    NativePerfField::u64("stale_wakeups", metrics.stale_wakeups),
+                    NativePerfField::u64("duplicate_wakeups", metrics.duplicate_wakeups),
+                    NativePerfField::u64("cancellations", metrics.cancellations),
+                    NativePerfField::u64("registration_failures", metrics.registration_failures),
+                    NativePerfField::u64(
+                        "last_registration_errno",
+                        metrics.last_registration_errno.max(0) as u64,
+                    ),
+                    NativePerfField::u64(
+                        "commit_to_acquire_ready_us",
+                        metrics.last_commit_to_ready_ns / 1_000,
+                    ),
+                    NativePerfField::u64("fallback_activations", metrics.fallback_activations),
+                    NativePerfField::usize(
+                        "maximum_simultaneous_watches",
+                        metrics.maximum_simultaneous_watches,
+                    ),
+                ]
+            });
+        }
         if !scanout.page_flip_pending() && server.has_pending_frame_prepare_work() {
             let prepare_frame_start = Instant::now();
             let before_generation = server.render_generation();
@@ -1357,7 +1487,6 @@ pub fn run(
         let render_generation_changed = render_generation != last_render_generation;
         let render_generation_cause = server.render_generation_cause();
         let pending_frame_work = server.has_pending_frame_work();
-        let pending_explicit_sync_work = server.has_pending_explicit_sync_work();
         let repaint_decision = native_repaint_decision(NativeRepaintInputs {
             accepted_clients: accepted > 0,
             render_generation_changed,
@@ -1366,14 +1495,10 @@ pub fn run(
             redraw_requested,
             page_flip_pending: false,
         });
-        let explicit_sync_wait_only = pending_explicit_sync_work
-            && !render_generation_changed
-            && accepted == 0
-            && !redraw_requested;
-        if repaint_decision.repaint && !explicit_sync_wait_only {
+        if repaint_decision.repaint {
             frame_scheduler.queue_visual_work();
             queued_redraw_requested |= redraw_requested;
-        } else if repaint_decision.protocol_only_present || explicit_sync_wait_only {
+        } else if repaint_decision.protocol_only_present {
             frame_scheduler.queue_protocol_work(monotonic_now_ns()?);
         }
         let scheduler_decision = frame_scheduler.decision(monotonic_now_ns()?);
@@ -1388,6 +1513,7 @@ pub fn run(
                     NativePerfField::bool("final_drain_completed", pageflip_completed),
                 ]
             });
+            acquire_watches.shutdown(&mut event_loop)?;
             return Err(io::Error::other(format!(
                 "native page flip watchdog expired: backend={} crtc={} frame={} pending=true; final DRM drain found no completion",
                 scanout.kind().metric_name(),
@@ -1487,6 +1613,12 @@ pub fn run(
                         )
                     })?;
                 let repaint_present_us = elapsed_micros(repaint_present_start);
+                let acquire_ready_to_render_submit_us = last_acquire_ready_at_ns
+                    .map(|ready_at| {
+                        monotonic_now_ns().map(|now| now.saturating_sub(ready_at) / 1_000)
+                    })
+                    .transpose()?
+                    .unwrap_or(0);
                 match present_result {
                     NativePresentResult::AsyncSubmitted { token } => {
                         frame_scheduler
@@ -1526,6 +1658,7 @@ pub fn run(
                         .into());
                     }
                 }
+                last_acquire_ready_at_ns = None;
                 frame_index = frame_index.saturating_add(1);
                 perf.log("native.frame", || {
                     let mut fields = paint_stats.fields();
@@ -1549,6 +1682,10 @@ pub fn run(
                         NativePerfField::bool("pageflip_completed", pageflip_completed),
                         NativePerfField::u64("present_us", present_us),
                         NativePerfField::u64("repaint_present_us", repaint_present_us),
+                        NativePerfField::u64(
+                            "acquire_ready_to_render_submit_us",
+                            acquire_ready_to_render_submit_us,
+                        ),
                         NativePerfField::u64("cpu_user_us", cpu_user_us),
                         NativePerfField::u64("cpu_system_us", cpu_system_us),
                         NativePerfField::bool("pending_frame_work", pending_frame_work),
@@ -1563,22 +1700,6 @@ pub fn run(
                 last_renderable_surfaces = server.renderable_surfaces().to_vec();
             }
         } else if scheduler_decision == SchedulerDecision::CompleteProtocolOnly {
-            if pending_explicit_sync_work {
-                frame_scheduler.complete_protocol_only();
-                frame_scheduler.queue_protocol_work(monotonic_now_ns()?);
-                perf.log("native.deadline", || {
-                    vec![
-                        NativePerfField::str("reason", "explicit_sync_acquire_wait"),
-                        NativePerfField::bool("acquire_ready", false),
-                        NativePerfField::u64(
-                            "next_deadline_ns",
-                            frame_scheduler.next_deadline_ns().unwrap_or(0),
-                        ),
-                    ]
-                });
-                event_loop.arm_deadline(frame_scheduler.next_deadline_ns())?;
-                continue;
-            }
             perf.log("native.frame_skip", || {
                 vec![
                     NativePerfField::str("reason", "frame_callback_no_damage"),
@@ -1663,7 +1784,10 @@ pub fn run(
                 NativePerfField::u64("stale_pageflip_events", stale_pageflip_events),
             ]
         });
-        event_loop.arm_deadline(frame_scheduler.next_deadline_ns())?;
+        event_loop.arm_deadline(earliest_native_deadline(
+            frame_scheduler.next_deadline_ns(),
+            acquire_watches.next_fallback_deadline_ns(),
+        ))?;
     }
 }
 
@@ -1675,6 +1799,14 @@ struct NativeRepaintInputs {
     only_pending_surface_frame_callbacks: bool,
     redraw_requested: bool,
     page_flip_pending: bool,
+}
+
+fn earliest_native_deadline(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5790,6 +5922,7 @@ enum NativePageFlipCompletion {
 }
 
 static NEXT_NATIVE_PAGE_FLIP_TOKEN: AtomicU64 = AtomicU64::new(1);
+static NEXT_NATIVE_DRM_FILE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct NativePageFlipState {
@@ -5848,6 +5981,20 @@ fn allocate_native_page_flip_token() -> u64 {
             .is_ok()
         {
             return token;
+        }
+    }
+}
+
+fn allocate_native_drm_file_generation() -> u64 {
+    loop {
+        let current = NEXT_NATIVE_DRM_FILE_GENERATION.load(Ordering::Relaxed);
+        let generation = current.max(1);
+        let next = generation.checked_add(1).unwrap_or(1);
+        if NEXT_NATIVE_DRM_FILE_GENERATION
+            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return generation;
         }
     }
 }
