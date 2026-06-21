@@ -1448,6 +1448,7 @@ pub fn run(
                         metrics.active_fallback_watches,
                     ),
                     NativePerfField::u64("registrations", metrics.registrations),
+                    NativePerfField::u64("already_signaled", metrics.already_signaled),
                     NativePerfField::u64("eventfd_wakeups", metrics.eventfd_wakeups),
                     NativePerfField::u64("stale_wakeups", metrics.stale_wakeups),
                     NativePerfField::u64("duplicate_wakeups", metrics.duplicate_wakeups),
@@ -1465,6 +1466,31 @@ pub fn run(
                     NativePerfField::usize(
                         "maximum_simultaneous_watches",
                         metrics.maximum_simultaneous_watches,
+                    ),
+                    NativePerfField::u64(
+                        "leaked_watch_assertions",
+                        metrics.leaked_watch_assertions,
+                    ),
+                    NativePerfField::u64("canceled_superseded", metrics.cancellations_by_reason[0]),
+                    NativePerfField::u64(
+                        "canceled_surface_destroyed",
+                        metrics.cancellations_by_reason[1],
+                    ),
+                    NativePerfField::u64(
+                        "canceled_buffer_destroyed",
+                        metrics.cancellations_by_reason[2],
+                    ),
+                    NativePerfField::u64(
+                        "canceled_sync_surface_destroyed",
+                        metrics.cancellations_by_reason[3],
+                    ),
+                    NativePerfField::u64(
+                        "canceled_timeline_destroyed",
+                        metrics.cancellations_by_reason[4],
+                    ),
+                    NativePerfField::u64(
+                        "canceled_client_disconnected",
+                        metrics.cancellations_by_reason[5],
                     ),
                 ]
             });
