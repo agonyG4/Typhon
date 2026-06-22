@@ -168,6 +168,24 @@ pub(super) struct PendingExplicitSyncCommit {
 }
 
 #[derive(Debug)]
+pub(super) struct CapturedExplicitSyncState {
+    pub(super) state: std::sync::Arc<SyncobjSurfaceState>,
+    pub(super) acquire: Option<ExplicitSyncPoint>,
+    pub(super) release: Option<ExplicitSyncPoint>,
+}
+
+impl CapturedExplicitSyncState {
+    pub(super) fn capture(state: std::sync::Arc<SyncobjSurfaceState>) -> Self {
+        let (acquire, release) = state.take_points();
+        Self {
+            state,
+            acquire,
+            release,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct PendingPresentationFeedback {
     pub(super) surface_id: u32,
     pub(super) surface: wl_surface::WlSurface,

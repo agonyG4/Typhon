@@ -1585,6 +1585,7 @@ pub fn run(
             server.prepare_frame();
             let after_generation = server.render_generation();
             let resize = server.resize_flow_metrics();
+            let subsurface = server.subsurface_transaction_metrics();
             perf.log("native.prepare_frame", || {
                 vec![
                     NativePerfField::u64("elapsed_us", elapsed_micros(prepare_frame_start)),
@@ -1609,6 +1610,34 @@ pub fn run(
                     NativePerfField::usize(
                         "resize_max_pending_explicit_sync",
                         resize.max_pending_explicit_sync_commits,
+                    ),
+                    NativePerfField::u64(
+                        "subsurface_commits_cached",
+                        subsurface.synchronized_child_commits_cached,
+                    ),
+                    NativePerfField::u64(
+                        "subsurface_commits_merged",
+                        subsurface.cached_commits_merged,
+                    ),
+                    NativePerfField::u64(
+                        "subsurface_trees_published",
+                        subsurface.tree_transactions_published,
+                    ),
+                    NativePerfField::u64(
+                        "subsurface_trees_waiting_acquire",
+                        subsurface.tree_transactions_waiting_on_acquire,
+                    ),
+                    NativePerfField::usize(
+                        "subsurface_max_cached_nodes",
+                        subsurface.maximum_cached_nodes,
+                    ),
+                    NativePerfField::usize(
+                        "subsurface_max_tree_depth",
+                        subsurface.maximum_tree_depth,
+                    ),
+                    NativePerfField::u64(
+                        "subsurface_max_wait_ms",
+                        subsurface.maximum_transaction_wait_ms,
                     ),
                 ]
             });

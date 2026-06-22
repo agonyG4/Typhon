@@ -79,6 +79,7 @@ mod server;
 mod shell;
 mod shm;
 mod state_data;
+mod subsurface;
 mod surface;
 mod window_state;
 
@@ -93,8 +94,8 @@ pub use explicit_sync::{
     ExplicitSyncPoint,
 };
 use explicit_sync::{
-    AcquireCommitIdAllocator, PendingAcquireState, PendingExplicitSyncCommit,
-    PendingPresentationFeedback, SYNCOBJ_MANAGER_ERROR_INVALID_TIMELINE,
+    AcquireCommitIdAllocator, CapturedExplicitSyncState, PendingAcquireState,
+    PendingExplicitSyncCommit, PendingPresentationFeedback, SYNCOBJ_MANAGER_ERROR_INVALID_TIMELINE,
     SYNCOBJ_MANAGER_ERROR_SURFACE_EXISTS, SYNCOBJ_SURFACE_ERROR_CONFLICTING_POINTS,
     SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT, SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
     SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT, SYNCOBJ_SURFACE_ERROR_NO_SURFACE,
@@ -157,6 +158,7 @@ use shm::{
     WL_SHM_FORMAT_XRGB2101010,
 };
 use state_data::*;
+use subsurface::{CachedSubsurfaceCommit, SubsurfaceSyncMode, SubsurfaceTransactionState};
 pub use surface::{
     RenderableSurface, RenderableSurfaceDamage, ResizePreview, SurfaceDamageRect, SurfacePlacement,
 };
@@ -187,6 +189,20 @@ pub struct ResizeFlowMetrics {
     pub max_pending_explicit_sync_commits: usize,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SubsurfaceTransactionMetrics {
+    pub synchronized_child_commits_cached: u64,
+    pub cached_commits_merged: u64,
+    pub tree_transactions_prepared: u64,
+    pub tree_transactions_published: u64,
+    pub tree_transactions_waiting_on_acquire: u64,
+    pub tree_transactions_superseded: u64,
+    pub maximum_cached_nodes: usize,
+    pub maximum_tree_depth: usize,
+    pub maximum_transaction_wait_ms: u64,
+    pub synchronized_child_immediate_publish_attempts: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ResizePreviewMetadata {
     flow_sequence: u64,
@@ -197,6 +213,45 @@ struct ResizePreviewMetadata {
 struct XdgConfigureSerialState {
     latest_sent: u32,
     latest_acked: u32,
+}
+
+#[derive(Debug)]
+struct SurfaceTreeAcquireDependency {
+    commit_id: AcquireCommitId,
+    surface_id: u32,
+    buffer_id: u32,
+    acquire: ExplicitSyncPoint,
+    state: PendingAcquireState,
+}
+
+#[derive(Debug)]
+struct PendingSurfaceTreeTransaction {
+    root_surface_id: u32,
+    nodes: Vec<(u32, CachedSubsurfaceCommit)>,
+    dependencies: Vec<SurfaceTreeAcquireDependency>,
+    received_at: Instant,
+}
+
+struct ReleasedSurfaceTreeState {
+    callbacks: Vec<wl_callback::WlCallback>,
+    resize_commit: Option<ResizeCommitSnapshot>,
+}
+
+struct BufferlessSurfaceCommitState {
+    damage: Option<RenderableSurfaceDamage>,
+    explicit_sync: Option<Arc<SyncobjSurfaceState>>,
+    surface_size: Option<BufferSize>,
+    buffer_scale: u32,
+    resize_commit: Option<ResizeCommitSnapshot>,
+    resize_capture_finalized: bool,
+}
+
+impl PendingSurfaceTreeTransaction {
+    fn is_ready(&self) -> bool {
+        self.dependencies
+            .iter()
+            .all(|dependency| dependency.state == PendingAcquireState::Ready)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +354,8 @@ pub struct CompositorState {
     surface_placements: HashMap<u32, SurfacePlacement>,
     committed_subsurface_stacks: HashMap<u32, Vec<u32>>,
     pending_subsurface_stacks: HashMap<u32, Vec<u32>>,
+    subsurface_transactions: SubsurfaceTransactionState,
+    subsurface_transaction_metrics: SubsurfaceTransactionMetrics,
     current_surface_buffers: HashMap<u32, PendingSurfaceBuffer>,
     surface_window_geometries: HashMap<u32, XdgWindowGeometry>,
     pending_window_geometry_commits: HashSet<u32>,
@@ -325,14 +382,17 @@ pub struct CompositorState {
     pending_dmabuf_buffer_releases: Vec<SurfaceBufferRelease>,
     deferred_dmabuf_buffer_releases: Vec<SurfaceBufferRelease>,
     pending_explicit_sync_commits: Vec<PendingExplicitSyncCommit>,
+    pending_surface_tree_transactions: Vec<PendingSurfaceTreeTransaction>,
     acquire_commit_ids: AcquireCommitIdAllocator,
     pending_acquire_watch_changes: Vec<AcquireWatchChange>,
     external_acquire_readiness: bool,
     pending_frame_callbacks: Vec<wl_callback::WlCallback>,
     pending_presentation_feedbacks: Vec<PendingPresentationFeedback>,
+    pending_surface_presentation_feedbacks: HashMap<u32, Vec<PendingPresentationFeedback>>,
     frame_clock_start: Option<Instant>,
     next_configure_serial: u32,
     render_generation: u64,
+    surface_tree_generation: Option<u64>,
     scene_render_generation: u64,
     render_generation_cause: RenderGenerationCause,
     surface_origin_cache_generation: Option<u64>,
@@ -644,7 +704,17 @@ impl CompositorState {
     }
 
     fn next_render_generation_value(&self) -> u64 {
-        self.render_generation.saturating_add(1)
+        self.surface_tree_generation
+            .unwrap_or_else(|| self.render_generation.saturating_add(1))
+    }
+
+    fn begin_surface_tree_publication(&mut self) {
+        debug_assert!(self.surface_tree_generation.is_none());
+        self.surface_tree_generation = Some(self.render_generation.saturating_add(1));
+    }
+
+    fn finish_surface_tree_publication(&mut self) {
+        self.surface_tree_generation = None;
     }
 
     fn set_render_generation(&mut self, generation: u64, cause: RenderGenerationCause) {
@@ -1234,12 +1304,26 @@ impl CompositorState {
     }
 
     fn unregister_surface_resource(&mut self, surface_id: u32) {
+        self.cancel_pending_surface_trees_for_surface(
+            surface_id,
+            AcquireWatchCancelReason::SurfaceDestroyed,
+        );
         self.cancel_pending_acquire_commits_for_surface(
             surface_id,
             AcquireWatchCancelReason::SurfaceDestroyed,
         );
         self.discard_pending_presentation_feedbacks_for_surface(surface_id);
+        if let Some(feedbacks) = self
+            .pending_surface_presentation_feedbacks
+            .remove(&surface_id)
+        {
+            for feedback in feedbacks {
+                feedback.feedback.discarded();
+            }
+        }
         self.deactivate_pointer_constraints_for_surface(surface_id, false);
+        let cached = self.subsurface_transactions.remove_subtree(surface_id);
+        self.release_cached_subsurface_commits(cached);
         self.cleanup_subsurface_stack_state_for_surface(surface_id);
         self.surface_resources.remove(&surface_id);
         self.cursor_surface_ids.remove(&surface_id);
@@ -4011,29 +4095,29 @@ impl CompositorState {
         true
     }
 
-    fn commit_surface_request(
+    fn commit_surface_request_with_captured_sync(
         &mut self,
         surface_id: u32,
         mut pending: PendingSurfaceBuffer,
         damage: RenderableSurfaceDamage,
         frame_callbacks: Vec<wl_callback::WlCallback>,
-        explicit_sync: Option<Arc<SyncobjSurfaceState>>,
+        explicit_sync: Option<CapturedExplicitSyncState>,
     ) {
         if !self.is_cursor_surface(surface_id) {
             self.configure_xdg_surface_if_needed(surface_id);
         }
-        let Some(sync_state) = explicit_sync else {
+        let Some(CapturedExplicitSyncState {
+            state: sync_state,
+            acquire,
+            release,
+        }) = explicit_sync
+        else {
             let mut callbacks = self.cancel_pending_acquire_commits_for_surface(
                 surface_id,
                 AcquireWatchCancelReason::Superseded,
             );
             callbacks.extend(frame_callbacks);
-            pending.resize_commit = self
-                .capture_acked_resize_for_surface_commit(surface_id)
-                .map(|snapshot| {
-                    self.snapshot_resize_commit_for_buffer(surface_id, snapshot, &pending)
-                })
-                .map(Box::new);
+            self.finalize_pending_buffer_resize_capture(surface_id, &mut pending);
             self.commit_surface_buffer_by_role(surface_id, pending, damage, callbacks);
             return;
         };
@@ -4046,7 +4130,6 @@ impl CompositorState {
             return;
         }
 
-        let (acquire, release) = sync_state.take_points();
         let Some(acquire) = acquire else {
             sync_state.post_error(
                 SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
@@ -4078,12 +4161,7 @@ impl CompositorState {
                 AcquireWatchCancelReason::Superseded,
             );
             callbacks.extend(frame_callbacks);
-            pending.resize_commit = self
-                .capture_acked_resize_for_surface_commit(surface_id)
-                .map(|snapshot| {
-                    self.snapshot_resize_commit_for_buffer(surface_id, snapshot, &pending)
-                })
-                .map(Box::new);
+            self.finalize_pending_buffer_resize_capture(surface_id, &mut pending);
             self.commit_surface_buffer_by_role(surface_id, pending, damage, callbacks);
             return;
         }
@@ -4097,10 +4175,7 @@ impl CompositorState {
         };
         let mut callbacks = self.retain_oldest_pending_acquire_for_surface(surface_id);
         callbacks.extend(frame_callbacks);
-        pending.resize_commit = self
-            .capture_acked_resize_for_surface_commit(surface_id)
-            .map(|snapshot| self.snapshot_resize_commit_for_buffer(surface_id, snapshot, &pending))
-            .map(Box::new);
+        self.finalize_pending_buffer_resize_capture(surface_id, &mut pending);
         let buffer_id = pending.resource.id().protocol_id();
         let received_at = Instant::now();
         self.pending_explicit_sync_commits
@@ -4157,10 +4232,16 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
         data: &SurfaceData,
-        damage: Option<RenderableSurfaceDamage>,
-        explicit_sync: Option<Arc<SyncobjSurfaceState>>,
-        _window_geometry_changed: bool,
+        state: BufferlessSurfaceCommitState,
     ) {
+        let BufferlessSurfaceCommitState {
+            damage,
+            explicit_sync,
+            surface_size,
+            buffer_scale,
+            resize_commit: captured_resize_commit,
+            resize_capture_finalized,
+        } = state;
         if let Some(sync_state) = explicit_sync {
             let (acquire, release) = sync_state.take_points();
             if acquire.is_some() || release.is_some() {
@@ -4173,8 +4254,6 @@ impl CompositorState {
         }
 
         if self.is_cursor_surface(surface_id) {
-            let surface_size = data.commit_pending_viewport();
-            let buffer_scale = data.commit_pending_buffer_scale();
             if let Some(damage) = damage {
                 self.commit_cursor_surface_damage_only(
                     surface_id,
@@ -4196,9 +4275,11 @@ impl CompositorState {
         }
 
         self.configure_xdg_surface_if_needed(surface_id);
-        let mut resize_commit = self.capture_acked_resize_for_surface_commit(surface_id);
-        let surface_size = data.commit_pending_viewport();
-        let buffer_scale = data.commit_pending_buffer_scale();
+        let mut resize_commit = if resize_capture_finalized {
+            captured_resize_commit
+        } else {
+            self.capture_acked_resize_for_surface_commit(surface_id)
+        };
         if let Some(snapshot) = resize_commit.as_mut() {
             let committed_size = self
                 .xdg_window_geometry_size(surface_id)
@@ -4402,6 +4483,17 @@ impl CompositorState {
         for commit in &mut self.pending_explicit_sync_commits {
             if surface_ids.contains(&commit.surface_id) {
                 commit.pending.resize_commit = None;
+            }
+        }
+        for transaction in &mut self.pending_surface_tree_transactions {
+            for (surface_id, commit) in &mut transaction.nodes {
+                if !surface_ids.contains(surface_id) {
+                    continue;
+                }
+                commit.resize_commit = None;
+                if let Some(PendingSurfaceAttachment::Buffer(buffer)) = commit.attachment.as_mut() {
+                    buffer.resize_commit = None;
+                }
             }
         }
         self.pending_window_geometry_commits
@@ -4630,7 +4722,10 @@ impl CompositorState {
         }
     }
 
-    fn register_subsurface_relationship(&mut self, surface_id: u32, parent_id: u32) {
+    fn register_subsurface_relationship(&mut self, surface_id: u32, parent_id: u32) -> bool {
+        if !self.subsurface_transactions.register(surface_id, parent_id) {
+            return false;
+        }
         self.committed_subsurface_stacks
             .entry(parent_id)
             .or_insert_with(|| vec![parent_id])
@@ -4641,6 +4736,684 @@ impl CompositorState {
             .push(surface_id);
         self.pending_subsurface_stacks.remove(&parent_id);
         self.reorder_renderable_surfaces_by_committed_stack();
+        true
+    }
+
+    fn is_effectively_synchronized_subsurface(&self, surface_id: u32) -> bool {
+        self.subsurface_transactions
+            .is_effectively_synchronized(surface_id)
+    }
+
+    fn set_subsurface_sync_mode(&mut self, surface_id: u32, mode: SubsurfaceSyncMode) {
+        if !self.subsurface_transactions.set_mode(surface_id, mode) {
+            return;
+        }
+        if mode == SubsurfaceSyncMode::Desynchronized {
+            let mut commits = self
+                .subsurface_transactions
+                .take_desynchronized_subtree_commits(surface_id);
+            if !commits.is_empty() {
+                if !commits
+                    .iter()
+                    .any(|(commit_surface_id, _)| *commit_surface_id == surface_id)
+                {
+                    commits.insert(0, (surface_id, empty_cached_subsurface_commit()));
+                }
+                self.submit_surface_tree_nodes(surface_id, commits);
+            }
+        }
+    }
+
+    fn set_pending_subsurface_position(&mut self, surface_id: u32, x: i32, y: i32) {
+        self.subsurface_transactions
+            .set_pending_position(surface_id, x, y);
+    }
+
+    fn commit_surface_tree_request(&mut self, surface_id: u32, mut commit: CachedSubsurfaceCommit) {
+        if self.is_effectively_synchronized_subsurface(surface_id) {
+            self.cache_synchronized_subsurface_commit(surface_id, commit);
+            return;
+        }
+        match commit.attachment.as_mut() {
+            Some(PendingSurfaceAttachment::Buffer(pending)) => {
+                if let Some(surface) = self.surface_resource_by_id(surface_id)
+                    && let Some(data) = surface.data::<SurfaceData>()
+                {
+                    let viewport_destination =
+                        data.viewport_destination_for_change(commit.viewport_destination);
+                    let buffer_scale = data.buffer_scale_for_change(commit.buffer_scale);
+                    if pending
+                        .apply_committed_surface_state(viewport_destination, buffer_scale)
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                self.finalize_pending_buffer_resize_capture(surface_id, pending);
+            }
+            _ => {
+                commit.resize_commit = self.capture_acked_resize_for_surface_commit(surface_id);
+                commit.resize_capture_finalized = true;
+            }
+        }
+        let descendants = self
+            .subsurface_transactions
+            .take_latched_commits(surface_id);
+        let mut nodes = Vec::with_capacity(descendants.len().saturating_add(1));
+        nodes.push((surface_id, commit));
+        nodes.extend(descendants);
+        self.submit_surface_tree_nodes(surface_id, nodes);
+    }
+
+    fn submit_surface_tree_nodes(
+        &mut self,
+        surface_id: u32,
+        mut nodes: Vec<(u32, CachedSubsurfaceCommit)>,
+    ) {
+        if !self.prepare_surface_tree_surface_state(&mut nodes) {
+            self.release_unpublished_surface_tree_nodes(nodes);
+            return;
+        }
+        let Some(dependencies) = self.prepare_surface_tree_acquires(&mut nodes) else {
+            self.release_unpublished_surface_tree_nodes(nodes);
+            return;
+        };
+        self.subsurface_transaction_metrics
+            .tree_transactions_prepared = self
+            .subsurface_transaction_metrics
+            .tree_transactions_prepared
+            .saturating_add(1);
+        if dependencies.is_empty() {
+            let released = self.cancel_pending_surface_trees_for_root(
+                surface_id,
+                AcquireWatchCancelReason::Superseded,
+            );
+            if let Some((_, root)) = nodes.first_mut() {
+                root.frame_callbacks.extend(released.callbacks);
+            }
+            if let Some(resize_commit) = released.resize_commit {
+                self.install_tree_resize_commit(surface_id, &mut nodes, resize_commit);
+            }
+            self.publish_surface_tree_nodes(surface_id, nodes);
+        } else {
+            self.queue_waiting_surface_tree(surface_id, nodes, dependencies);
+        }
+    }
+
+    fn prepare_surface_tree_surface_state(
+        &self,
+        nodes: &mut [(u32, CachedSubsurfaceCommit)],
+    ) -> bool {
+        for (surface_id, commit) in nodes {
+            let Some(PendingSurfaceAttachment::Buffer(pending)) = commit.attachment.as_mut() else {
+                continue;
+            };
+            let Some(surface) = self.surface_resource_by_id(*surface_id) else {
+                return false;
+            };
+            let Some(data) = surface.data::<SurfaceData>() else {
+                return false;
+            };
+            let viewport_destination =
+                data.viewport_destination_for_change(commit.viewport_destination);
+            let buffer_scale = data.buffer_scale_for_change(commit.buffer_scale);
+            if pending
+                .apply_committed_surface_state(viewport_destination, buffer_scale)
+                .is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn prepare_surface_tree_acquires(
+        &mut self,
+        nodes: &mut [(u32, CachedSubsurfaceCommit)],
+    ) -> Option<Vec<SurfaceTreeAcquireDependency>> {
+        let mut dependencies = Vec::new();
+        for (surface_id, commit) in nodes {
+            let Some(explicit_sync) = commit.explicit_sync.take() else {
+                continue;
+            };
+            let CapturedExplicitSyncState {
+                state,
+                acquire,
+                release,
+            } = explicit_sync;
+            let Some(PendingSurfaceAttachment::Buffer(pending)) = commit.attachment.as_mut() else {
+                if acquire.is_some() || release.is_some() {
+                    state.post_error(
+                        SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
+                        "explicit sync points were set without an attached buffer",
+                    );
+                    return None;
+                }
+                continue;
+            };
+            if !pending.data.is_dmabuf() {
+                state.post_error(
+                    SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER,
+                    "explicit sync is only supported for linux-dmabuf buffers",
+                );
+                return None;
+            }
+            let Some(acquire) = acquire else {
+                state.post_error(
+                    SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
+                    "dmabuf commit is missing an acquire timeline point",
+                );
+                return None;
+            };
+            let Some(release) = release else {
+                state.post_error(
+                    SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT,
+                    "dmabuf commit is missing a release timeline point",
+                );
+                return None;
+            };
+            if acquire.timeline.same_timeline(&release.timeline) && acquire.point >= release.point {
+                state.post_error(
+                    SYNCOBJ_SURFACE_ERROR_CONFLICTING_POINTS,
+                    "acquire timeline point must be lower than release point on the same timeline",
+                );
+                return None;
+            }
+            pending.explicit_release = Some(release);
+            if acquire.is_signaled() {
+                continue;
+            }
+            let Some(commit_id) = self.acquire_commit_ids.allocate() else {
+                state.post_error(
+                    SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
+                    "explicit sync commit identity space exhausted",
+                );
+                return None;
+            };
+            dependencies.push(SurfaceTreeAcquireDependency {
+                commit_id,
+                surface_id: *surface_id,
+                buffer_id: pending.resource.id().protocol_id(),
+                acquire,
+                state: PendingAcquireState::RegistrationPending,
+            });
+        }
+        Some(dependencies)
+    }
+
+    fn queue_waiting_surface_tree(
+        &mut self,
+        root_surface_id: u32,
+        mut nodes: Vec<(u32, CachedSubsurfaceCommit)>,
+        dependencies: Vec<SurfaceTreeAcquireDependency>,
+    ) {
+        let matching = self
+            .pending_surface_tree_transactions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, transaction)| {
+                (transaction.root_surface_id == root_surface_id).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if matching.len() >= 2 {
+            let superseded = self.pending_surface_tree_transactions.remove(matching[1]);
+            let released = self.release_pending_surface_tree_transaction(
+                superseded,
+                AcquireWatchCancelReason::Superseded,
+            );
+            if let Some((_, root)) = nodes.first_mut() {
+                root.frame_callbacks.extend(released.callbacks);
+            }
+            if let Some(resize_commit) = released.resize_commit {
+                self.install_tree_resize_commit(root_surface_id, &mut nodes, resize_commit);
+            }
+            self.subsurface_transaction_metrics
+                .tree_transactions_superseded = self
+                .subsurface_transaction_metrics
+                .tree_transactions_superseded
+                .saturating_add(1);
+        }
+        if self.external_acquire_readiness {
+            for dependency in &dependencies {
+                self.pending_acquire_watch_changes
+                    .push(AcquireWatchChange::Register(AcquireWatchRequest {
+                        commit_id: dependency.commit_id,
+                        surface_id: dependency.surface_id,
+                        buffer_id: dependency.buffer_id,
+                        acquire: dependency.acquire.clone(),
+                        received_at: Instant::now(),
+                    }));
+            }
+        }
+        self.subsurface_transaction_metrics
+            .tree_transactions_waiting_on_acquire = self
+            .subsurface_transaction_metrics
+            .tree_transactions_waiting_on_acquire
+            .saturating_add(1);
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: subsurface_tx root={root_surface_id} decision=waiting_acquire cached_nodes={} waiting_acquires={} callbacks={} preview_active={}",
+                nodes.len(),
+                dependencies.len(),
+                nodes
+                    .iter()
+                    .map(|(_, commit)| commit.frame_callbacks.len())
+                    .sum::<usize>(),
+                self.resize_preview_metadata.contains_key(&root_surface_id),
+            );
+        }
+        self.pending_surface_tree_transactions
+            .push(PendingSurfaceTreeTransaction {
+                root_surface_id,
+                nodes,
+                dependencies,
+                received_at: Instant::now(),
+            });
+        let pending_acquires = self.pending_explicit_sync_commits.len().saturating_add(
+            self.pending_surface_tree_transactions
+                .iter()
+                .map(|transaction| transaction.dependencies.len())
+                .sum::<usize>(),
+        );
+        self.resize_flow_metrics.max_pending_explicit_sync_commits = self
+            .resize_flow_metrics
+            .max_pending_explicit_sync_commits
+            .max(pending_acquires);
+    }
+
+    fn publish_surface_tree_nodes(
+        &mut self,
+        root_surface_id: u32,
+        mut nodes: Vec<(u32, CachedSubsurfaceCommit)>,
+    ) {
+        let Some(root_index) = nodes
+            .iter()
+            .position(|(surface_id, _)| *surface_id == root_surface_id)
+        else {
+            self.release_unpublished_surface_tree_nodes(nodes);
+            return;
+        };
+        let (_, root_commit) = nodes.remove(root_index);
+        self.publish_surface_tree(root_surface_id, root_commit, nodes);
+    }
+
+    fn cancel_pending_surface_trees_for_root(
+        &mut self,
+        root_surface_id: u32,
+        reason: AcquireWatchCancelReason,
+    ) -> ReleasedSurfaceTreeState {
+        let mut retained = Vec::new();
+        let mut released = ReleasedSurfaceTreeState {
+            callbacks: Vec::new(),
+            resize_commit: None,
+        };
+        for transaction in std::mem::take(&mut self.pending_surface_tree_transactions) {
+            if transaction.root_surface_id == root_surface_id {
+                let transaction =
+                    self.release_pending_surface_tree_transaction(transaction, reason);
+                released.callbacks.extend(transaction.callbacks);
+                if released.resize_commit.is_none() {
+                    released.resize_commit = transaction.resize_commit;
+                } else if let Some(resize_commit) = transaction.resize_commit {
+                    self.release_detached_resize_capture(root_surface_id, resize_commit);
+                }
+            } else {
+                retained.push(transaction);
+            }
+        }
+        self.pending_surface_tree_transactions = retained;
+        released
+    }
+
+    fn cancel_pending_surface_trees_for_surface(
+        &mut self,
+        surface_id: u32,
+        reason: AcquireWatchCancelReason,
+    ) {
+        let mut retained = Vec::new();
+        let mut callbacks = Vec::new();
+        for transaction in std::mem::take(&mut self.pending_surface_tree_transactions) {
+            if transaction
+                .nodes
+                .iter()
+                .any(|(node_surface_id, _)| *node_surface_id == surface_id)
+            {
+                let root_surface_id = transaction.root_surface_id;
+                let released = self.release_pending_surface_tree_transaction(transaction, reason);
+                callbacks.extend(released.callbacks);
+                if let Some(resize_commit) = released.resize_commit {
+                    self.release_detached_resize_capture(root_surface_id, resize_commit);
+                }
+            } else {
+                retained.push(transaction);
+            }
+        }
+        self.pending_surface_tree_transactions = retained;
+        self.complete_frame_callbacks(callbacks);
+    }
+
+    fn release_pending_surface_tree_transaction(
+        &mut self,
+        mut transaction: PendingSurfaceTreeTransaction,
+        reason: AcquireWatchCancelReason,
+    ) -> ReleasedSurfaceTreeState {
+        if self.external_acquire_readiness {
+            for dependency in &transaction.dependencies {
+                self.pending_acquire_watch_changes
+                    .push(AcquireWatchChange::Cancel {
+                        commit_id: dependency.commit_id,
+                        reason,
+                    });
+            }
+        }
+        let resize_commit =
+            take_tree_resize_commit(transaction.root_surface_id, &mut transaction.nodes);
+        self.release_resize_captures_for_tree_nodes(&transaction.nodes);
+        ReleasedSurfaceTreeState {
+            callbacks: self.take_unpublished_surface_tree_callbacks(transaction.nodes),
+            resize_commit,
+        }
+    }
+
+    fn release_unpublished_surface_tree_nodes(
+        &mut self,
+        nodes: Vec<(u32, CachedSubsurfaceCommit)>,
+    ) {
+        self.release_resize_captures_for_tree_nodes(&nodes);
+        let callbacks = self.take_unpublished_surface_tree_callbacks(nodes);
+        self.complete_frame_callbacks(callbacks);
+    }
+
+    fn release_resize_captures_for_tree_nodes(&mut self, nodes: &[(u32, CachedSubsurfaceCommit)]) {
+        for (surface_id, commit) in nodes {
+            let resize = match commit.attachment.as_ref() {
+                Some(PendingSurfaceAttachment::Buffer(buffer)) => {
+                    buffer.resize_commit.as_deref().copied()
+                }
+                _ => commit.resize_commit,
+            };
+            if let Some(resize) = resize
+                && let Some(flow) = self.resize_configure_flows.get_mut(surface_id)
+            {
+                flow.release_capture(resize.commit_sequence);
+            }
+        }
+    }
+
+    fn install_tree_resize_commit(
+        &self,
+        root_surface_id: u32,
+        nodes: &mut [(u32, CachedSubsurfaceCommit)],
+        resize_commit: ResizeCommitSnapshot,
+    ) {
+        let Some((_, root)) = nodes
+            .iter_mut()
+            .find(|(surface_id, _)| *surface_id == root_surface_id)
+        else {
+            return;
+        };
+        if let Some(PendingSurfaceAttachment::Buffer(buffer)) = root.attachment.as_mut() {
+            let resize_commit =
+                self.snapshot_resize_commit_for_buffer(root_surface_id, resize_commit, buffer);
+            buffer.resize_commit = Some(Box::new(resize_commit));
+            buffer.resize_capture_finalized = true;
+        } else {
+            root.resize_commit = Some(resize_commit);
+            root.resize_capture_finalized = true;
+        }
+    }
+
+    fn release_detached_resize_capture(
+        &mut self,
+        surface_id: u32,
+        resize_commit: ResizeCommitSnapshot,
+    ) {
+        if let Some(flow) = self.resize_configure_flows.get_mut(&surface_id) {
+            flow.release_capture(resize_commit.commit_sequence);
+        }
+    }
+
+    fn take_unpublished_surface_tree_callbacks(
+        &mut self,
+        nodes: Vec<(u32, CachedSubsurfaceCommit)>,
+    ) -> Vec<wl_callback::WlCallback> {
+        let mut callbacks = Vec::new();
+        for (_, commit) in nodes {
+            callbacks.extend(commit.frame_callbacks);
+            for feedback in commit.presentation_feedbacks {
+                feedback.feedback.discarded();
+            }
+            if let Some(PendingSurfaceAttachment::Buffer(buffer)) = commit.attachment {
+                buffer.release_target().release();
+            }
+        }
+        callbacks
+    }
+
+    fn cache_synchronized_subsurface_commit(
+        &mut self,
+        surface_id: u32,
+        mut commit: CachedSubsurfaceCommit,
+    ) {
+        let buffer_id = commit
+            .attachment
+            .as_ref()
+            .and_then(|attachment| match attachment {
+                PendingSurfaceAttachment::Buffer(buffer) => Some(buffer.data.buffer_id().get()),
+                PendingSurfaceAttachment::RemoveContent => None,
+            });
+        if let (
+            Some(PendingSurfaceAttachment::Buffer(buffer)),
+            Some(CapturedExplicitSyncState {
+                release: Some(release),
+                ..
+            }),
+        ) = (commit.attachment.as_mut(), commit.explicit_sync.as_ref())
+        {
+            buffer.explicit_release = Some(release.clone());
+        }
+        let merged = self.subsurface_transactions.has_cached_commit(surface_id);
+        if let Some(release) = self
+            .subsurface_transactions
+            .cache_commit(surface_id, commit)
+        {
+            release.release();
+        }
+        self.subsurface_transaction_metrics
+            .synchronized_child_commits_cached = self
+            .subsurface_transaction_metrics
+            .synchronized_child_commits_cached
+            .saturating_add(1);
+        if merged {
+            self.subsurface_transaction_metrics.cached_commits_merged = self
+                .subsurface_transaction_metrics
+                .cached_commits_merged
+                .saturating_add(1);
+        }
+        self.subsurface_transaction_metrics.maximum_cached_nodes = self
+            .subsurface_transaction_metrics
+            .maximum_cached_nodes
+            .max(self.subsurface_transactions.cached_node_count());
+        self.subsurface_transaction_metrics.maximum_tree_depth = self
+            .subsurface_transaction_metrics
+            .maximum_tree_depth
+            .max(self.subsurface_transactions.maximum_depth());
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: subsurface_tx surface={surface_id} parent={:?} requested_mode={:?} effective_mode=sync decision=cached buffer_id={buffer_id:?}",
+                self.subsurface_transactions.parent(surface_id),
+                self.subsurface_transactions.requested_mode(surface_id),
+            );
+        }
+    }
+
+    fn apply_pending_subsurface_parent_state(&mut self, parent_id: u32) -> bool {
+        let positions = self
+            .subsurface_transactions
+            .take_pending_positions_for_parent(parent_id);
+        let mut changed = false;
+        for (surface_id, x, y) in positions {
+            let placement = SurfacePlacement::subsurface(parent_id, x, y);
+            changed |= self.surface_placement(surface_id) != placement;
+            self.set_surface_placement(surface_id, SurfacePlacement::subsurface(parent_id, x, y));
+        }
+        changed |= self.apply_pending_subsurface_stack_for_parent(parent_id);
+        if changed {
+            self.advance_render_generation(RenderGenerationCause::SurfaceCommit);
+        }
+        changed
+    }
+
+    fn publish_surface_tree(
+        &mut self,
+        root_id: u32,
+        root_commit: CachedSubsurfaceCommit,
+        commits: Vec<(u32, CachedSubsurfaceCommit)>,
+    ) {
+        let changed_nodes = commits.len().saturating_add(1);
+        let maximum_wait_ms = std::iter::once(&root_commit)
+            .chain(commits.iter().map(|(_, commit)| commit))
+            .map(|commit| u64::try_from(commit.cached_at.elapsed().as_millis()).unwrap_or(u64::MAX))
+            .max()
+            .unwrap_or(0);
+        self.subsurface_transaction_metrics
+            .maximum_transaction_wait_ms = self
+            .subsurface_transaction_metrics
+            .maximum_transaction_wait_ms
+            .max(maximum_wait_ms);
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: subsurface_tx root={root_id} decision=prepared changed_nodes={changed_nodes}",
+            );
+        }
+        self.begin_surface_tree_publication();
+        self.apply_cached_subsurface_commit(root_id, root_commit);
+        self.apply_pending_pointer_constraint_state_for_surface(root_id);
+        self.apply_pending_subsurface_parent_state(root_id);
+        for (surface_id, commit) in commits {
+            self.apply_pending_subsurface_parent_state(surface_id);
+            self.apply_cached_subsurface_commit(surface_id, commit);
+        }
+        self.finish_surface_tree_publication();
+        self.debug_assert_surface_tree_invariants();
+        self.subsurface_transaction_metrics
+            .tree_transactions_published = self
+            .subsurface_transaction_metrics
+            .tree_transactions_published
+            .saturating_add(1);
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: subsurface_tx root={root_id} decision=published changed_nodes={} tree_generation={}",
+                changed_nodes, self.render_generation,
+            );
+        }
+    }
+
+    fn apply_cached_subsurface_commit(&mut self, surface_id: u32, commit: CachedSubsurfaceCommit) {
+        let CachedSubsurfaceCommit {
+            attachment,
+            damage,
+            frame_callbacks,
+            explicit_sync,
+            offset,
+            viewport_destination,
+            buffer_scale,
+            input_region,
+            presentation_feedbacks,
+            resize_commit,
+            resize_capture_finalized,
+            window_geometry_changed,
+            cached_at: _,
+        } = commit;
+        let Some(surface) = self.surface_resource_by_id(surface_id) else {
+            return;
+        };
+        let Some(data) = surface.data::<SurfaceData>() else {
+            return;
+        };
+        let surface_size = data.apply_viewport_change(viewport_destination);
+        let committed_buffer_scale = data.apply_buffer_scale_change(buffer_scale);
+        let input_region_changed = data.apply_input_region_change(input_region);
+        let damage = damage.or(window_geometry_changed.then_some(RenderableSurfaceDamage::Full));
+        match attachment {
+            Some(PendingSurfaceAttachment::Buffer(mut pending)) => {
+                if let Some((x, y)) = offset {
+                    pending.x = x;
+                    pending.y = y;
+                }
+                debug_assert!(pending.surface_size.is_some());
+                self.commit_surface_request_with_captured_sync(
+                    surface_id,
+                    pending,
+                    damage.unwrap_or_else(RenderableSurfaceDamage::full),
+                    frame_callbacks,
+                    explicit_sync,
+                );
+            }
+            Some(PendingSurfaceAttachment::RemoveContent) => {
+                if let Some(explicit_sync) = explicit_sync
+                    && (explicit_sync.acquire.is_some() || explicit_sync.release.is_some())
+                {
+                    explicit_sync.state.post_error(
+                        SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
+                        "explicit sync points were set without an attached buffer",
+                    );
+                    return;
+                }
+                if self.is_cursor_surface(surface_id) {
+                    self.commit_cursor_surface_removal_request(surface_id, data, None);
+                    self.complete_frame_callbacks(frame_callbacks);
+                } else {
+                    self.cancel_pending_acquire_commits_for_surface(
+                        surface_id,
+                        AcquireWatchCancelReason::Superseded,
+                    );
+                    self.unmap_surface_content(surface_id);
+                    self.complete_frame_callbacks(frame_callbacks);
+                }
+            }
+            None => {
+                let explicit_sync = match explicit_sync {
+                    Some(explicit_sync)
+                        if explicit_sync.acquire.is_some() || explicit_sync.release.is_some() =>
+                    {
+                        explicit_sync.state.post_error(
+                            SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
+                            "explicit sync points were set without an attached buffer",
+                        );
+                        return;
+                    }
+                    Some(explicit_sync) => Some(explicit_sync.state),
+                    None => None,
+                };
+                self.commit_surface_without_buffer(
+                    surface_id,
+                    data,
+                    BufferlessSurfaceCommitState {
+                        damage,
+                        explicit_sync,
+                        surface_size,
+                        buffer_scale: committed_buffer_scale,
+                        resize_commit,
+                        resize_capture_finalized,
+                    },
+                );
+                if self
+                    .renderable_surfaces
+                    .iter()
+                    .any(|surface| surface.surface_id == surface_id)
+                {
+                    self.pending_frame_callbacks.extend(frame_callbacks);
+                } else {
+                    self.complete_frame_callbacks(frame_callbacks);
+                }
+            }
+        }
+        if input_region_changed {
+            self.refresh_pointer_focus_at_last_position();
+        }
+        self.pending_presentation_feedbacks
+            .extend(presentation_feedbacks);
     }
 
     fn pending_stack_for_parent(&mut self, parent_id: u32) -> &mut Vec<u32> {
@@ -4735,6 +5508,65 @@ impl CompositorState {
             self.surface_resources.contains_key(parent_id) && stack.iter().any(|id| id != parent_id)
         });
         self.reorder_renderable_surfaces_by_committed_stack();
+    }
+
+    fn destroy_subsurface_role(&mut self, surface_id: u32) {
+        let parent_id = self.subsurface_transactions.parent(surface_id);
+        if let Some(commit) = self.subsurface_transactions.remove_role(surface_id) {
+            self.release_cached_subsurface_commits(vec![commit]);
+        }
+        self.unmap_surface_content(surface_id);
+        self.set_surface_placement(surface_id, SurfacePlacement::root());
+        for stack in self.committed_subsurface_stacks.values_mut() {
+            stack.retain(|id| *id != surface_id);
+        }
+        for stack in self.pending_subsurface_stacks.values_mut() {
+            stack.retain(|id| *id != surface_id);
+        }
+        self.reorder_renderable_surfaces_by_committed_stack();
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: subsurface_tx surface={surface_id} parent={parent_id:?} decision=destroyed reason=role_destroyed"
+            );
+        }
+    }
+
+    fn release_cached_subsurface_commits(&mut self, commits: Vec<CachedSubsurfaceCommit>) {
+        for commit in commits {
+            for feedback in commit.presentation_feedbacks {
+                feedback.feedback.discarded();
+            }
+            if let Some(PendingSurfaceAttachment::Buffer(buffer)) = commit.attachment {
+                buffer.release_target().release();
+            }
+        }
+    }
+
+    fn debug_assert_surface_tree_invariants(&self) {
+        #[cfg(debug_assertions)]
+        {
+            let mut renderable_ids = HashSet::new();
+            for surface in &self.renderable_surfaces {
+                debug_assert!(renderable_ids.insert(surface.surface_id));
+                if let Some(parent_id) = surface.placement.parent_surface_id {
+                    debug_assert!(self.surface_resources.contains_key(&parent_id));
+                }
+            }
+            for (parent_id, stack) in &self.committed_subsurface_stacks {
+                let mut stack_ids = HashSet::new();
+                debug_assert!(stack.iter().all(|surface_id| stack_ids.insert(*surface_id)));
+                debug_assert!(stack.contains(parent_id));
+            }
+        }
+    }
+
+    fn take_surface_presentation_feedbacks(
+        &mut self,
+        surface_id: u32,
+    ) -> Vec<PendingPresentationFeedback> {
+        self.pending_surface_presentation_feedbacks
+            .remove(&surface_id)
+            .unwrap_or_default()
     }
 
     fn reorder_renderable_surfaces_by_committed_stack(&mut self) -> bool {
@@ -6266,6 +7098,21 @@ impl CompositorState {
         })
     }
 
+    fn finalize_pending_buffer_resize_capture(
+        &mut self,
+        surface_id: u32,
+        pending: &mut PendingSurfaceBuffer,
+    ) {
+        if pending.resize_capture_finalized {
+            return;
+        }
+        pending.resize_commit = self
+            .capture_acked_resize_for_surface_commit(surface_id)
+            .map(|snapshot| self.snapshot_resize_commit_for_buffer(surface_id, snapshot, pending))
+            .map(Box::new);
+        pending.resize_capture_finalized = true;
+    }
+
     fn complete_applied_resize_transaction(
         &mut self,
         surface_id: u32,
@@ -7002,6 +7849,11 @@ impl CompositorState {
                 !self.external_acquire_readiness && !commit.frame_callbacks.is_empty()
             })
             || self
+                .pending_surface_tree_transactions
+                .iter()
+                .flat_map(|transaction| &transaction.nodes)
+                .any(|(_, commit)| !commit.frame_callbacks.is_empty())
+            || self
                 .surface_resources
                 .values()
                 .filter_map(Resource::data::<SurfaceData>)
@@ -7012,6 +7864,7 @@ impl CompositorState {
         !self.pending_resize_configure_is_flushable()
             && self.pending_frame_callbacks.is_empty()
             && self.pending_explicit_sync_commits.is_empty()
+            && self.pending_surface_tree_transactions.is_empty()
             && self.pending_presentation_feedbacks.is_empty()
             && self
                 .surface_resources
@@ -7026,11 +7879,16 @@ impl CompositorState {
                 !self.external_acquire_readiness
                     || commit.acquire_state == PendingAcquireState::Ready
             })
+            || self
+                .pending_surface_tree_transactions
+                .iter()
+                .any(|transaction| !self.external_acquire_readiness || transaction.is_ready())
             || !self.pending_color_info.is_empty()
     }
 
     fn has_pending_explicit_sync_work(&self) -> bool {
         !self.pending_explicit_sync_commits.is_empty()
+            || !self.pending_surface_tree_transactions.is_empty()
     }
 
     fn has_pending_frame_work(&self) -> bool {
@@ -7091,6 +7949,13 @@ impl CompositorState {
     fn discard_all_pending_presentation_feedbacks(&mut self) {
         for pending in std::mem::take(&mut self.pending_presentation_feedbacks) {
             pending.feedback.discarded();
+        }
+        for feedbacks in
+            std::mem::take(&mut self.pending_surface_presentation_feedbacks).into_values()
+        {
+            for pending in feedbacks {
+                pending.feedback.discarded();
+            }
         }
     }
 
@@ -7201,6 +8066,25 @@ impl CompositorState {
         for surface_id in ids {
             self.cancel_pending_acquire_commits_for_surface(surface_id, reason);
         }
+        let tree_roots = self
+            .pending_surface_tree_transactions
+            .iter()
+            .filter(|transaction| {
+                transaction.nodes.iter().any(|(_, commit)| {
+                    commit.attachment.as_ref().is_some_and(|attachment| {
+                        matches!(attachment, PendingSurfaceAttachment::Buffer(pending) if same_wayland_resource(&pending.resource, buffer))
+                    })
+                })
+            })
+            .map(|transaction| transaction.root_surface_id)
+            .collect::<Vec<_>>();
+        for root_surface_id in tree_roots {
+            let released = self.cancel_pending_surface_trees_for_root(root_surface_id, reason);
+            if let Some(resize_commit) = released.resize_commit {
+                self.release_detached_resize_capture(root_surface_id, resize_commit);
+            }
+            self.complete_frame_callbacks(released.callbacks);
+        }
     }
 
     fn cancel_pending_acquire_commits_for_timeline(
@@ -7238,6 +8122,27 @@ impl CompositorState {
                 flow.release_capture(commit_sequence);
             }
         }
+        let tree_roots = self
+            .pending_surface_tree_transactions
+            .iter()
+            .filter(|transaction| {
+                transaction.dependencies.iter().any(|dependency| {
+                    dependency.acquire.timeline.same_timeline(timeline)
+                }) || transaction.nodes.iter().any(|(_, commit)| {
+                    commit.attachment.as_ref().is_some_and(|attachment| {
+                        matches!(attachment, PendingSurfaceAttachment::Buffer(pending) if pending.explicit_release.as_ref().is_some_and(|release| release.timeline.same_timeline(timeline)))
+                    })
+                })
+            })
+            .map(|transaction| transaction.root_surface_id)
+            .collect::<Vec<_>>();
+        for root_surface_id in tree_roots {
+            let released = self.cancel_pending_surface_trees_for_root(root_surface_id, reason);
+            if let Some(resize_commit) = released.resize_commit {
+                self.release_detached_resize_capture(root_surface_id, resize_commit);
+            }
+            self.complete_frame_callbacks(released.callbacks);
+        }
     }
 
     fn enable_external_acquire_readiness(&mut self) {
@@ -7258,6 +8163,21 @@ impl CompositorState {
                     received_at: Instant::now(),
                 }));
         }
+        for transaction in &self.pending_surface_tree_transactions {
+            for dependency in &transaction.dependencies {
+                if dependency.state == PendingAcquireState::Ready {
+                    continue;
+                }
+                self.pending_acquire_watch_changes
+                    .push(AcquireWatchChange::Register(AcquireWatchRequest {
+                        commit_id: dependency.commit_id,
+                        surface_id: dependency.surface_id,
+                        buffer_id: dependency.buffer_id,
+                        acquire: dependency.acquire.clone(),
+                        received_at: transaction.received_at,
+                    }));
+            }
+        }
     }
 
     fn take_acquire_watch_changes(&mut self) -> Vec<AcquireWatchChange> {
@@ -7265,17 +8185,35 @@ impl CompositorState {
     }
 
     fn mark_acquire_commit_eventfd_backed(&mut self, commit_id: AcquireCommitId) -> bool {
-        self.pending_explicit_sync_commits
+        if self
+            .pending_explicit_sync_commits
             .iter_mut()
             .find(|commit| commit.commit_id == commit_id)
             .is_some_and(|commit| commit.acquire_state.mark_eventfd_backed())
+        {
+            return true;
+        }
+        self.pending_surface_tree_transactions
+            .iter_mut()
+            .flat_map(|transaction| &mut transaction.dependencies)
+            .find(|dependency| dependency.commit_id == commit_id)
+            .is_some_and(|dependency| dependency.state.mark_eventfd_backed())
     }
 
     fn mark_acquire_commit_fallback_backed(&mut self, commit_id: AcquireCommitId) -> bool {
-        self.pending_explicit_sync_commits
+        if self
+            .pending_explicit_sync_commits
             .iter_mut()
             .find(|commit| commit.commit_id == commit_id)
             .is_some_and(|commit| commit.acquire_state.mark_fallback_backed())
+        {
+            return true;
+        }
+        self.pending_surface_tree_transactions
+            .iter_mut()
+            .flat_map(|transaction| &mut transaction.dependencies)
+            .find(|dependency| dependency.commit_id == commit_id)
+            .is_some_and(|dependency| dependency.state.mark_fallback_backed())
     }
 
     fn mark_acquire_commit_ready(
@@ -7284,7 +8222,8 @@ impl CompositorState {
         surface_id: u32,
         acquire: &ExplicitSyncPoint,
     ) -> bool {
-        self.pending_explicit_sync_commits
+        if self
+            .pending_explicit_sync_commits
             .iter_mut()
             .find(|commit| {
                 commit.commit_id == commit_id
@@ -7292,6 +8231,18 @@ impl CompositorState {
                     && commit.acquire == *acquire
             })
             .is_some_and(|commit| commit.acquire_state.mark_ready())
+        {
+            return true;
+        }
+        self.pending_surface_tree_transactions
+            .iter_mut()
+            .flat_map(|transaction| &mut transaction.dependencies)
+            .find(|dependency| {
+                dependency.commit_id == commit_id
+                    && dependency.surface_id == surface_id
+                    && dependency.acquire == *acquire
+            })
+            .is_some_and(|dependency| dependency.state.mark_ready())
     }
 
     fn commit_ready_explicit_sync_buffers(&mut self) {
@@ -7371,6 +8322,142 @@ impl CompositorState {
                 callbacks,
             );
         }
+        self.commit_ready_surface_tree_transactions();
+    }
+
+    fn commit_ready_surface_tree_transactions(&mut self) {
+        let mut transactions = std::mem::take(&mut self.pending_surface_tree_transactions);
+        if !self.external_acquire_readiness {
+            for transaction in &mut transactions {
+                for dependency in &mut transaction.dependencies {
+                    if dependency.acquire.is_signaled() {
+                        dependency.state.mark_ready();
+                    }
+                }
+            }
+        }
+        let newest_ready =
+            newest_ready_explicit_sync_commit_indices(transactions.iter().enumerate().map(
+                |(index, transaction)| (index, transaction.root_surface_id, transaction.is_ready()),
+            ));
+        let mut waiting = Vec::new();
+        let mut ready = Vec::new();
+        let mut superseded_callbacks: HashMap<u32, Vec<wl_callback::WlCallback>> = HashMap::new();
+        let mut superseded_resize_commits: HashMap<u32, ResizeCommitSnapshot> = HashMap::new();
+        for (index, transaction) in transactions.into_iter().enumerate() {
+            let Some(&ready_index) = newest_ready.get(&transaction.root_surface_id) else {
+                waiting.push(transaction);
+                continue;
+            };
+            if index < ready_index {
+                let root_id = transaction.root_surface_id;
+                let released = self.release_pending_surface_tree_transaction(
+                    transaction,
+                    AcquireWatchCancelReason::Superseded,
+                );
+                superseded_callbacks
+                    .entry(root_id)
+                    .or_default()
+                    .extend(released.callbacks);
+                if let Some(resize_commit) = released.resize_commit
+                    && let Some(previous) = superseded_resize_commits.insert(root_id, resize_commit)
+                {
+                    self.release_detached_resize_capture(root_id, previous);
+                }
+                self.subsurface_transaction_metrics
+                    .tree_transactions_superseded = self
+                    .subsurface_transaction_metrics
+                    .tree_transactions_superseded
+                    .saturating_add(1);
+            } else if index == ready_index {
+                ready.push(transaction);
+            } else {
+                waiting.push(transaction);
+            }
+        }
+        self.pending_surface_tree_transactions = waiting;
+        for mut transaction in ready {
+            if let Some((_, root)) = transaction.nodes.first_mut() {
+                root.frame_callbacks.extend(
+                    superseded_callbacks
+                        .remove(&transaction.root_surface_id)
+                        .unwrap_or_default(),
+                );
+            }
+            if let Some(resize_commit) =
+                superseded_resize_commits.remove(&transaction.root_surface_id)
+            {
+                self.install_tree_resize_commit(
+                    transaction.root_surface_id,
+                    &mut transaction.nodes,
+                    resize_commit,
+                );
+            }
+            let wait_ms =
+                u64::try_from(transaction.received_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            self.subsurface_transaction_metrics
+                .maximum_transaction_wait_ms = self
+                .subsurface_transaction_metrics
+                .maximum_transaction_wait_ms
+                .max(wait_ms);
+            self.publish_surface_tree_nodes(transaction.root_surface_id, transaction.nodes);
+        }
+        for (root_surface_id, resize_commit) in superseded_resize_commits {
+            self.release_detached_resize_capture(root_surface_id, resize_commit);
+        }
+    }
+}
+
+impl CompositorState {
+    fn release_cached_resources_for_shutdown(&mut self) {
+        let mut cached = self.subsurface_transactions.drain_cached_commits();
+        for transaction in self.pending_surface_tree_transactions.drain(..) {
+            cached.extend(transaction.nodes.into_iter().map(|(_, commit)| commit));
+        }
+        for commit in cached {
+            for feedback in commit.presentation_feedbacks {
+                feedback.feedback.discarded();
+            }
+            if let Some(PendingSurfaceAttachment::Buffer(buffer)) = commit.attachment {
+                buffer.release_target().release();
+            }
+        }
+        for commit in self.pending_explicit_sync_commits.drain(..) {
+            commit.pending.release_target().release();
+        }
+    }
+}
+
+fn empty_cached_subsurface_commit() -> CachedSubsurfaceCommit {
+    CachedSubsurfaceCommit {
+        attachment: None,
+        damage: None,
+        frame_callbacks: Vec::new(),
+        explicit_sync: None,
+        offset: None,
+        viewport_destination: None,
+        buffer_scale: None,
+        input_region: None,
+        presentation_feedbacks: Vec::new(),
+        resize_commit: None,
+        resize_capture_finalized: true,
+        window_geometry_changed: false,
+        cached_at: Instant::now(),
+    }
+}
+
+fn take_tree_resize_commit(
+    root_surface_id: u32,
+    nodes: &mut [(u32, CachedSubsurfaceCommit)],
+) -> Option<ResizeCommitSnapshot> {
+    let (_, root) = nodes
+        .iter_mut()
+        .find(|(surface_id, _)| *surface_id == root_surface_id)?;
+    match root.attachment.as_mut() {
+        Some(PendingSurfaceAttachment::Buffer(buffer)) => {
+            buffer.resize_commit.take().map(|resize| *resize)
+        }
+        _ => root.resize_commit.take(),
     }
 }
 

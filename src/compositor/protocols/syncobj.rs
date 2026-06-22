@@ -102,6 +102,10 @@ impl Dispatch<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1, Arc<S
             wp_linux_drm_syncobj_surface_v1::Request::Destroy => {
                 data.clear_resource();
                 if let Some(surface_id) = data.surface_id() {
+                    state.cancel_pending_surface_trees_for_surface(
+                        surface_id,
+                        AcquireWatchCancelReason::SyncSurfaceDestroyed,
+                    );
                     state.cancel_pending_acquire_commits_for_surface(
                         surface_id,
                         AcquireWatchCancelReason::SyncSurfaceDestroyed,
@@ -160,6 +164,10 @@ impl Dispatch<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1, Arc<S
     ) {
         data.clear_resource();
         if let Some(surface_id) = data.surface_id() {
+            state.cancel_pending_surface_trees_for_surface(
+                surface_id,
+                AcquireWatchCancelReason::SyncSurfaceDestroyed,
+            );
             state.cancel_pending_acquire_commits_for_surface(
                 surface_id,
                 AcquireWatchCancelReason::SyncSurfaceDestroyed,

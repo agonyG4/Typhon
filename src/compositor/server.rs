@@ -34,7 +34,7 @@ use super::{
     AcquireCommitId, AcquireWatchChange, ClientCursorRenderState, CompositorState,
     ExplicitSyncPoint, FramePresentation, InputProtocolCapabilities, PresentationClock,
     RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
-    SelectionProtocolCapabilities, ShellDockItem, color,
+    SelectionProtocolCapabilities, ShellDockItem, SubsurfaceTransactionMetrics, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 
@@ -45,6 +45,12 @@ pub struct OwnCompositorServer {
     pub(super) socket_name: String,
     pub(super) state: CompositorState,
     gpu_buffer_protocols_enabled: bool,
+}
+
+impl Drop for OwnCompositorServer {
+    fn drop(&mut self) {
+        self.state.release_cached_resources_for_shutdown();
+    }
 }
 
 impl OwnCompositorServer {
@@ -272,6 +278,10 @@ impl OwnCompositorServer {
 
     pub const fn resize_flow_metrics(&self) -> ResizeFlowMetrics {
         self.state.resize_flow_metrics
+    }
+
+    pub const fn subsurface_transaction_metrics(&self) -> SubsurfaceTransactionMetrics {
+        self.state.subsurface_transaction_metrics
     }
 
     pub fn has_pending_frame_callbacks(&self) -> bool {

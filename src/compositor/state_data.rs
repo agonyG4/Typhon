@@ -98,6 +98,7 @@ impl SurfaceData {
                         explicit_release: None,
                         surface_size: None,
                         resize_commit: None,
+                        resize_capture_finalized: false,
                     }))
                 } else {
                     resource.data::<DmabufBufferData>().cloned().map(|data| {
@@ -109,6 +110,7 @@ impl SurfaceData {
                             explicit_release: None,
                             surface_size: None,
                             resize_commit: None,
+                            resize_capture_finalized: false,
                         })
                     })
                 }
@@ -204,16 +206,38 @@ impl SurfaceData {
         }
     }
 
-    pub(super) fn commit_pending_viewport(&self) -> Option<BufferSize> {
+    pub(super) fn take_pending_viewport(&self) -> Option<Option<BufferSize>> {
+        self.viewport
+            .lock()
+            .ok()
+            .and_then(|mut viewport| viewport.pending_destination.take())
+    }
+
+    pub(super) fn apply_viewport_change(
+        &self,
+        destination: Option<Option<BufferSize>>,
+    ) -> Option<BufferSize> {
         self.viewport
             .lock()
             .map(|mut viewport| {
-                if let Some(destination) = viewport.pending_destination.take() {
+                if let Some(destination) = destination {
                     viewport.destination = destination;
                 }
                 viewport.destination
             })
             .unwrap_or_default()
+    }
+
+    pub(super) fn viewport_destination_for_change(
+        &self,
+        destination: Option<Option<BufferSize>>,
+    ) -> Option<BufferSize> {
+        destination.unwrap_or_else(|| {
+            self.viewport
+                .lock()
+                .map(|viewport| viewport.destination)
+                .unwrap_or_default()
+        })
     }
 
     pub(super) fn set_pending_buffer_scale(&self, scale: u32) {
@@ -222,16 +246,32 @@ impl SurfaceData {
         }
     }
 
-    pub(super) fn commit_pending_buffer_scale(&self) -> u32 {
+    pub(super) fn take_pending_buffer_scale(&self) -> Option<u32> {
+        self.buffer_scale
+            .lock()
+            .ok()
+            .and_then(|mut buffer_scale| buffer_scale.pending.take())
+    }
+
+    pub(super) fn apply_buffer_scale_change(&self, scale: Option<u32>) -> u32 {
         self.buffer_scale
             .lock()
             .map(|mut buffer_scale| {
-                if let Some(scale) = buffer_scale.pending.take() {
+                if let Some(scale) = scale {
                     buffer_scale.committed = scale.max(1);
                 }
                 buffer_scale.committed
             })
             .unwrap_or(1)
+    }
+
+    pub(super) fn buffer_scale_for_change(&self, scale: Option<u32>) -> u32 {
+        scale.unwrap_or_else(|| {
+            self.buffer_scale
+                .lock()
+                .map(|buffer_scale| buffer_scale.committed)
+                .unwrap_or(1)
+        })
     }
 
     pub(super) fn set_pending_input_region(&self, region: SurfaceInputRegion) {
@@ -240,11 +280,18 @@ impl SurfaceData {
         }
     }
 
-    pub(super) fn commit_pending_input_region(&self) -> bool {
+    pub(super) fn take_pending_input_region(&self) -> Option<SurfaceInputRegion> {
+        self.input_region
+            .lock()
+            .ok()
+            .and_then(|mut state| state.pending.take())
+    }
+
+    pub(super) fn apply_input_region_change(&self, pending: Option<SurfaceInputRegion>) -> bool {
         let Ok(mut state) = self.input_region.lock() else {
             return false;
         };
-        let Some(pending) = state.pending.take() else {
+        let Some(pending) = pending else {
             return false;
         };
         let changed = state.committed != pending;
@@ -413,6 +460,7 @@ pub(super) struct PendingSurfaceBuffer {
     pub(super) explicit_release: Option<ExplicitSyncPoint>,
     pub(super) surface_size: Option<BufferSize>,
     pub(super) resize_commit: Option<Box<ResizeCommitSnapshot>>,
+    pub(super) resize_capture_finalized: bool,
 }
 
 impl PendingSurfaceBuffer {

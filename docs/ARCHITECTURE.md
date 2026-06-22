@@ -281,6 +281,31 @@ both perpetual replacement and head-of-line starvation. Applying the captured
 transaction clears preview once, records its age, invalidates geometry/resource
 damage as needed, and releases the flow to send the newest target.
 
+Wayland subsurfaces use a separate transactional role model. Every role records
+its immutable parent, requested synchronization mode, cached commit, and
+parent-latched position. Roles default to synchronized. Effective
+synchronization walks ancestors, so a requested-desynchronized descendant still
+caches while any ancestor remains synchronized. `set_desync` publishes eligible
+cached state only when that ancestry constraint disappears.
+
+`wl_surface.commit` first captures attachment/removal, damage, offset, viewport,
+scale, input region, callbacks, presentation feedback, and explicit-sync points
+without changing renderer-visible state. Effectively synchronized commits merge
+in the role cache; replacement buffers are released once and callbacks
+accumulate. A parent commit collects cached descendants recursively and applies
+the root, child state, position, and stacking under one reserved render
+generation. Renderer scene collection, hit testing, damage history, and resize
+preview therefore observe only the complete old or complete new tree.
+
+A tree containing unsignaled explicit-sync acquires remains prepared while the
+old tree stays current. Watches are owned by the tree transaction, and all
+dependencies must become ready before any node publishes. Per root the
+compositor retains an oldest waiting candidate and one newest successor; a
+ready successor explicitly supersedes older waits, while a newer unready tree
+cannot discard a ready candidate. Supersession cancels watches, releases
+never-current buffers, transfers frame callbacks, discards presentation
+feedback, and rejects stale readiness by acquire identity.
+
 The remaining gap before using normal desktop apps comfortably is protocol and
 WM breadth: real floating placement/move/resize, richer focus policy, and then
 decoration/activation details for bigger toolkits.

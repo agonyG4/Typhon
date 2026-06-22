@@ -77,10 +77,15 @@ Current limits:
   accumulator. This is conservative and correct for the compositor's current
   scale/transform paths only when their coordinate spaces coincide; separating
   and transforming the two coordinate spaces remains isolated follow-up work;
+- synchronized subsurface buffers, placement, stacking, callbacks, feedback,
+  and acquire dependencies now publish as one parent-latched tree generation.
+  Real-driver explicit-sync subtree waits and deeply nested libdecor trees still
+  require live TTY validation on supported DRM hardware;
 - `clipboard_source_disconnect_clears_focused_target_selection` is a known
   baseline failure: the focused target does not receive `selection(None)` when
   the source client disconnects. TASK 05.2 reproduces this unchanged on its
-  starting commit `4791f55` and does not alter clipboard behavior;
+  starting commit `4791f55`; TASK 05.3 also reproduces it on starting commit
+  `d67fc35`. Neither task alters clipboard behavior;
 - nested output size and refresh are configurable through
   `start-oblivion-one --width W --height H --refresh R -- app`, but the selected
   nested refresh is a target advertised to clients and used for scheduling.

@@ -49,72 +49,32 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     state.pending_window_geometry_commits.remove(&surface_id);
                 let damage = data.take_damage();
                 let explicit_sync = data.explicit_sync();
-                let input_region_changed = data.commit_pending_input_region();
-                match data.take_pending() {
-                    Some(PendingSurfaceAttachment::Buffer(mut pending)) => {
-                        if let Some((x, y)) = data.take_pending_offset() {
-                            pending.x = x;
-                            pending.y = y;
-                        }
-                        let viewport_destination = data.commit_pending_viewport();
-                        let buffer_scale = data.commit_pending_buffer_scale();
-                        if pending
-                            .apply_committed_surface_state(viewport_destination, buffer_scale)
-                            .is_err()
-                        {
-                            return;
-                        }
-                        let frame_callbacks = data.take_frame_callbacks();
-                        state.commit_surface_request(
-                            surface_id,
-                            pending,
-                            damage.damage,
-                            frame_callbacks,
-                            explicit_sync,
-                        );
-                    }
-                    Some(PendingSurfaceAttachment::RemoveContent) => {
-                        state.cancel_pending_acquire_commits_for_surface(
-                            surface_id,
-                            AcquireWatchCancelReason::Superseded,
-                        );
-                        let _ = data.take_pending_offset();
-                        data.commit_pending_viewport();
-                        data.commit_pending_buffer_scale();
-                        if state.is_cursor_surface(surface_id) {
-                            state.commit_cursor_surface_removal_request(
-                                surface_id,
-                                data,
-                                explicit_sync,
-                            );
-                        } else if explicit_sync.is_some() {
-                            state.commit_surface_without_buffer(
-                                surface_id,
-                                data,
-                                None,
-                                explicit_sync,
-                                window_geometry_changed,
-                            );
-                        } else {
-                            state.unmap_surface_content(surface_id);
-                            state.complete_frame_callbacks_now(data);
-                        }
-                    }
-                    None => {
-                        state.commit_surface_without_buffer(
-                            surface_id,
-                            data,
-                            damage.explicit(),
-                            explicit_sync,
-                            window_geometry_changed,
-                        );
-                    }
-                }
-                state.apply_pending_pointer_constraint_state_for_surface(surface_id);
-                state.apply_pending_subsurface_stack_for_parent(surface_id);
-                if input_region_changed {
-                    state.refresh_pointer_focus_at_last_position();
-                }
+                let offset = data.take_pending_offset();
+                let viewport_change = data.take_pending_viewport();
+                let buffer_scale_change = data.take_pending_buffer_scale();
+                let input_region_change = data.take_pending_input_region();
+                let presentation_feedbacks = state.take_surface_presentation_feedbacks(surface_id);
+                let attachment = data.take_pending();
+                let damage = match attachment {
+                    Some(PendingSurfaceAttachment::Buffer(_)) => Some(damage.damage),
+                    _ => damage.explicit(),
+                };
+                let commit = CachedSubsurfaceCommit {
+                    attachment,
+                    damage,
+                    frame_callbacks: data.take_frame_callbacks(),
+                    explicit_sync: explicit_sync.map(CapturedExplicitSyncState::capture),
+                    offset,
+                    viewport_destination: viewport_change,
+                    buffer_scale: buffer_scale_change,
+                    input_region: input_region_change,
+                    presentation_feedbacks,
+                    resize_commit: None,
+                    resize_capture_finalized: false,
+                    window_geometry_changed,
+                    cached_at: Instant::now(),
+                };
+                state.commit_surface_tree_request(surface_id, commit);
             }
             wl_surface::Request::Destroy => {
                 state.unregister_surface_resource(data.surface_id());
@@ -241,13 +201,19 @@ impl Dispatch<wl_subcompositor::WlSubcompositor, ()> for CompositorState {
             } => {
                 let surface_id = compositor_surface_id(&surface);
                 let parent_id = compositor_surface_id(&parent);
-                if !state.is_cursor_surface(surface_id) {
-                    state.set_surface_placement(
-                        surface_id,
-                        SurfacePlacement::subsurface(parent_id, 0, 0),
+                if state.is_cursor_surface(surface_id)
+                    || !state.register_subsurface_relationship(surface_id, parent_id)
+                {
+                    _resource.post_error(
+                        wl_subcompositor::Error::BadSurface,
+                        "surface has another role or would create a subsurface cycle".to_string(),
                     );
-                    state.register_subsurface_relationship(surface_id, parent_id);
+                    return;
                 }
+                state.set_surface_placement(
+                    surface_id,
+                    SurfacePlacement::subsurface(parent_id, 0, 0),
+                );
                 data_init.init(id, SubsurfaceData { surface, parent });
             }
             wl_subcompositor::Request::Destroy => {}
@@ -268,16 +234,11 @@ impl Dispatch<wl_subsurface::WlSubsurface, SubsurfaceData> for CompositorState {
     ) {
         match request {
             wl_subsurface::Request::SetPosition { x, y } => {
-                state.set_surface_placement(
-                    compositor_surface_id(&data.surface),
-                    SurfacePlacement::subsurface(compositor_surface_id(&data.parent), x, y),
-                );
+                state.set_pending_subsurface_position(compositor_surface_id(&data.surface), x, y);
             }
             wl_subsurface::Request::Destroy => {
                 let surface_id = compositor_surface_id(&data.surface);
-                state.unmap_surface_content(surface_id);
-                state.set_surface_placement(surface_id, SurfacePlacement::root());
-                state.cleanup_subsurface_stack_state_for_surface(surface_id);
+                state.destroy_subsurface_role(surface_id);
             }
             wl_subsurface::Request::PlaceAbove { sibling } => {
                 let surface_id = compositor_surface_id(&data.surface);
@@ -301,7 +262,18 @@ impl Dispatch<wl_subsurface::WlSubsurface, SubsurfaceData> for CompositorState {
                     );
                 }
             }
-            wl_subsurface::Request::SetSync | wl_subsurface::Request::SetDesync => {}
+            wl_subsurface::Request::SetSync => {
+                state.set_subsurface_sync_mode(
+                    compositor_surface_id(&data.surface),
+                    SubsurfaceSyncMode::Synchronized,
+                );
+            }
+            wl_subsurface::Request::SetDesync => {
+                state.set_subsurface_sync_mode(
+                    compositor_surface_id(&data.surface),
+                    SubsurfaceSyncMode::Desynchronized,
+                );
+            }
             _ => {}
         }
     }

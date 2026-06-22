@@ -438,6 +438,42 @@ fn explicit_sync_selects_newest_ready_commit_without_discarding_newer_wait() {
 }
 
 #[test]
+fn synchronized_tree_waits_until_every_acquire_dependency_is_ready() {
+    let mut state = CompositorState::default();
+    let first = ExplicitSyncPoint::for_tests(10, 20);
+    let second = ExplicitSyncPoint::for_tests(11, 30);
+    state
+        .pending_surface_tree_transactions
+        .push(PendingSurfaceTreeTransaction {
+            root_surface_id: 8,
+            nodes: Vec::new(),
+            dependencies: vec![
+                SurfaceTreeAcquireDependency {
+                    commit_id: AcquireCommitId::for_tests(1),
+                    surface_id: 9,
+                    buffer_id: 90,
+                    acquire: first.clone(),
+                    state: PendingAcquireState::EventfdBacked,
+                },
+                SurfaceTreeAcquireDependency {
+                    commit_id: AcquireCommitId::for_tests(2),
+                    surface_id: 10,
+                    buffer_id: 91,
+                    acquire: second.clone(),
+                    state: PendingAcquireState::EventfdBacked,
+                },
+            ],
+            received_at: Instant::now(),
+        });
+
+    assert!(state.mark_acquire_commit_ready(AcquireCommitId::for_tests(1), 9, &first));
+    assert!(!state.pending_surface_tree_transactions[0].is_ready());
+    assert!(!state.mark_acquire_commit_ready(AcquireCommitId::for_tests(99), 10, &second));
+    assert!(state.mark_acquire_commit_ready(AcquireCommitId::for_tests(2), 10, &second));
+    assert!(state.pending_surface_tree_transactions[0].is_ready());
+}
+
+#[test]
 fn left_top_resize_placement_uses_actual_cell_aligned_size() {
     let desired = PendingResizeConfigure {
         surface_id: 42,

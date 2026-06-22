@@ -15,7 +15,9 @@ impl Dispatch<wp_presentation::WpPresentation, ()> for CompositorState {
             wp_presentation::Request::Feedback { surface, callback } => {
                 let feedback = data_init.init(callback, ());
                 state
-                    .pending_presentation_feedbacks
+                    .pending_surface_presentation_feedbacks
+                    .entry(compositor_surface_id(&surface))
+                    .or_default()
                     .push(PendingPresentationFeedback {
                         surface_id: compositor_surface_id(&surface),
                         surface,

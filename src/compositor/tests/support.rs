@@ -205,6 +205,31 @@ struct RenderableSurfaceSnapshot {
     width: u32,
     height: u32,
     parent_surface_id: Option<u32>,
+    local_x: i32,
+    local_y: i32,
+    buffer_id: u64,
+    generation: u64,
+    resize_preview_active: bool,
+}
+
+struct SynchronizedCommitSnapshots {
+    before_parent: Vec<RenderableSurfaceSnapshot>,
+    after_parent: Vec<RenderableSurfaceSnapshot>,
+    before_child_generation: u64,
+    after_child_generation: u64,
+    after_parent_generation: u64,
+}
+
+struct RootBeforeChildSnapshots {
+    after_root: Vec<RenderableSurfaceSnapshot>,
+    after_child_without_parent: Vec<RenderableSurfaceSnapshot>,
+    after_next_parent: Vec<RenderableSurfaceSnapshot>,
+}
+
+struct MultipleSynchronizedCommitSnapshots {
+    before_parent: Vec<RenderableSurfaceSnapshot>,
+    after_parent: Vec<RenderableSurfaceSnapshot>,
+    superseded_buffer_releases: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4439,6 +4464,7 @@ fn create_toplevel_with_custom_input_subsurface_and_click_overlap(
     }
     child.set_input_region(Some(&region));
     commit_test_buffered_surface(&child, &shm, &qh, 160, 120)?;
+    parent.commit();
     connection.flush()?;
 
     let mut state = RegistryTestState {
@@ -4669,6 +4695,7 @@ fn create_overlapping_subsurfaces_then_place_above_after_parent_commit(
     let upper_subsurface = subcompositor.get_subsurface(&upper, &parent, &qh, ());
     upper_subsurface.set_position(0, 0);
     commit_test_buffered_surface(&upper, &shm, &qh, 81, 81)?;
+    parent.commit();
     connection.flush()?;
 
     let mut state = RegistryTestState {
@@ -5712,6 +5739,354 @@ fn create_subsurface_buffer_before_parent_buffer(
     Ok(())
 }
 
+fn capture_default_synchronized_child_before_and_after_parent_commit(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<SynchronizedCommitSnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let parent = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let child = compositor.create_surface(&qh, ());
+    let _subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+
+    let before_child_generation = capture_render_generation(commands);
+    commit_test_buffered_surface(&child, &shm, &qh, 11, 7)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let before_parent = capture_renderable_surface_snapshot(commands);
+    let after_child_generation = capture_render_generation(commands);
+
+    commit_test_buffered_surface(&parent, &shm, &qh, 20, 15)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_parent = capture_renderable_surface_snapshot(commands);
+    let after_parent_generation = capture_render_generation(commands);
+
+    Ok(SynchronizedCommitSnapshots {
+        before_parent,
+        after_parent,
+        before_child_generation,
+        after_child_generation,
+        after_parent_generation,
+    })
+}
+
+fn capture_subsurface_position_before_and_after_parent_commit(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<
+    (Vec<RenderableSurfaceSnapshot>, Vec<RenderableSurfaceSnapshot>),
+    Box<dyn std::error::Error>,
+> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let parent = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let child = compositor.create_surface(&qh, ());
+    let subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    commit_test_buffered_surface(&child, &shm, &qh, 11, 7)?;
+    commit_test_buffered_surface(&parent, &shm, &qh, 20, 15)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    subsurface.set_position(30, 40);
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let before_parent = capture_renderable_surface_snapshot(commands);
+
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_parent = capture_renderable_surface_snapshot(commands);
+    Ok((before_parent, after_parent))
+}
+
+fn capture_multiple_synchronized_child_commits(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<MultipleSynchronizedCommitSnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let parent = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let child = compositor.create_surface(&qh, ());
+    let _subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    commit_test_buffered_surface(&child, &shm, &qh, 5, 5)?;
+    commit_test_buffered_surface(&parent, &shm, &qh, 20, 15)?;
+    connection.flush()?;
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+
+    commit_test_buffered_surface(&child, &shm, &qh, 11, 7)?;
+    commit_test_buffered_surface(&child, &shm, &qh, 13, 9)?;
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    let before_parent = capture_renderable_surface_snapshot(commands);
+    let superseded_buffer_releases = state.buffer_release_count;
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    let after_parent = capture_renderable_surface_snapshot(commands);
+    Ok(MultipleSynchronizedCommitSnapshots {
+        before_parent,
+        after_parent,
+        superseded_buffer_releases,
+    })
+}
+
+fn capture_cached_child_before_and_after_set_desync(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<
+    (Vec<RenderableSurfaceSnapshot>, Vec<RenderableSurfaceSnapshot>),
+    Box<dyn std::error::Error>,
+> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let parent = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let child = compositor.create_surface(&qh, ());
+    let subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    commit_test_buffered_surface(&child, &shm, &qh, 5, 5)?;
+    commit_test_buffered_surface(&parent, &shm, &qh, 20, 15)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+
+    commit_test_buffered_surface(&child, &shm, &qh, 9, 7)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let before_desync = capture_renderable_surface_snapshot(commands);
+    subsurface.set_desync();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_desync = capture_renderable_surface_snapshot(commands);
+    Ok((before_desync, after_desync))
+}
+
+fn capture_effectively_synchronized_grandchild_update(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<
+    (Vec<RenderableSurfaceSnapshot>, Vec<RenderableSurfaceSnapshot>),
+    Box<dyn std::error::Error>,
+> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let root = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&root, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let child = compositor.create_surface(&qh, ());
+    let _child_role = subcompositor.get_subsurface(&child, &root, &qh, ());
+    let grandchild = compositor.create_surface(&qh, ());
+    let grandchild_role = subcompositor.get_subsurface(&grandchild, &child, &qh, ());
+    grandchild_role.set_desync();
+
+    commit_test_buffered_surface(&grandchild, &shm, &qh, 3, 3)?;
+    commit_test_buffered_surface(&child, &shm, &qh, 7, 7)?;
+    commit_test_buffered_surface(&root, &shm, &qh, 20, 15)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    commit_test_buffered_surface(&grandchild, &shm, &qh, 9, 5)?;
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let before_root = capture_renderable_surface_snapshot(commands);
+    root.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    let after_root = capture_renderable_surface_snapshot(commands);
+    Ok((before_root, after_root))
+}
+
+fn capture_decorated_tree_during_root_resize_commit(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<
+    (Vec<RenderableSurfaceSnapshot>, Vec<RenderableSurfaceSnapshot>),
+    Box<dyn std::error::Error>,
+> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let root = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&root, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let titlebar = compositor.create_surface(&qh, ());
+    let titlebar_role = subcompositor.get_subsurface(&titlebar, &root, &qh, ());
+    titlebar_role.set_position(0, 0);
+    let border = compositor.create_surface(&qh, ());
+    let border_role = subcompositor.get_subsurface(&border, &root, &qh, ());
+    border_role.set_position(0, 20);
+
+    commit_test_buffered_surface(&titlebar, &shm, &qh, 300, 20)?;
+    commit_test_buffered_surface(&border, &shm, &qh, 10, 180)?;
+    commit_test_buffered_surface(&root, &shm, &qh, 300, 200)?;
+    connection.flush()?;
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+
+    commands.send(ServerCommand::BeginFrameAction {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 304.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 204.0,
+    })?;
+    commands.send(ServerCommand::UpdateInteraction {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 344.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 234.0,
+    })?;
+    commands.send(ServerCommand::PrepareFrame)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let resized_width = usize::try_from(state.toplevel_width)?;
+    let resized_height = usize::try_from(state.toplevel_height)?;
+    commit_test_buffered_surface(&titlebar, &shm, &qh, resized_width, 20)?;
+    commit_test_buffered_surface(&border, &shm, &qh, 10, resized_height - 20)?;
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    let before_root = capture_renderable_surface_snapshot(commands);
+
+    commit_test_buffered_surface(&root, &shm, &qh, resized_width, resized_height)?;
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    let after_root = capture_renderable_surface_snapshot(commands);
+    commands.send(ServerCommand::EndInteraction)?;
+    wait_for_server_commands(commands);
+    Ok((before_root, after_root))
+}
+
+fn capture_synchronized_child_frame_callback_lifecycle(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<(bool, bool), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let parent = compositor.create_surface(&qh, ());
+    let child = compositor.create_surface(&qh, ());
+    let _subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    commit_test_buffered_surface(&child, &shm, &qh, 5, 5)?;
+    commit_test_buffered_surface(&parent, &shm, &qh, 20, 15)?;
+    connection.flush()?;
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+
+    let _callback = child.frame(&qh, ());
+    child.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PresentFrame)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let before_parent = state.frame_done;
+
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PresentFrame)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    Ok((before_parent, state.frame_done))
+}
+
+fn capture_root_commit_before_synchronized_child_update(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RootBeforeChildSnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let root = compositor.create_surface(&qh, ());
+    let child = compositor.create_surface(&qh, ());
+    let _subsurface = subcompositor.get_subsurface(&child, &root, &qh, ());
+    commit_test_buffered_surface(&child, &shm, &qh, 5, 5)?;
+    commit_test_buffered_surface(&root, &shm, &qh, 20, 15)?;
+    connection.flush()?;
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+
+    commit_test_buffered_surface(&root, &shm, &qh, 30, 25)?;
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    let after_root = capture_renderable_surface_snapshot(commands);
+    commit_test_buffered_surface(&child, &shm, &qh, 9, 7)?;
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    let after_child_without_parent = capture_renderable_surface_snapshot(commands);
+    root.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    let after_next_parent = capture_renderable_surface_snapshot(commands);
+    Ok(RootBeforeChildSnapshots {
+        after_root,
+        after_child_without_parent,
+        after_next_parent,
+    })
+}
+
 fn create_toplevel_then_attach_null_buffer(
     socket_path: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -5959,6 +6334,11 @@ fn spawn_controllable_test_server(
                                     width: surface.width,
                                     height: surface.height,
                                     parent_surface_id: surface.placement.parent_surface_id,
+                                    local_x: surface.placement.local_x,
+                                    local_y: surface.placement.local_y,
+                                    buffer_id: surface.buffer_id().get(),
+                                    generation: surface.generation,
+                                    resize_preview_active: surface.resize_preview.is_some(),
                                 })
                                 .collect(),
                         );
