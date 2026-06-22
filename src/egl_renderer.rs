@@ -1,4 +1,4 @@
-use std::{collections::HashMap, error::Error, ffi::c_void, io, os::fd::AsRawFd, ptr, sync::Arc};
+use std::{collections::HashMap, error::Error, ffi::c_void, io, ptr, sync::Arc};
 
 use glow::HasContext;
 use khronos_egl as egl;
@@ -9,7 +9,7 @@ use oblivion_one::{
     },
     render_backend::{
         RenderBackendProfile,
-        buffer::DmabufBufferHandle,
+        buffer::{DmabufImageKey, WeakBufferIdentity},
         egl_gles::{EGL_LINUX_DMA_BUF_EXT, EglGlesDmabufFeedback, EglGlesDmabufImportAttributes},
     },
 };
@@ -73,6 +73,9 @@ pub(crate) struct GlesSceneFrameStats {
     pub dmabuf_imports: usize,
     pub dmabuf_reuses: usize,
     pub dmabuf_import_failures: usize,
+    pub dmabuf_cache_entries: usize,
+    pub dmabuf_cache_peak_entries: usize,
+    pub dmabuf_cache_evictions: usize,
     pub repaint_mode: RepaintMode,
     pub buffer_age: Option<u32>,
     pub current_damage_rects: usize,
@@ -127,7 +130,8 @@ pub(crate) struct GlesSceneRenderer {
     cursor_resource: Option<EglImageResource>,
     shell_overlay_resource: Option<EglImageResource>,
     surface_resources: HashMap<u32, EglSurfaceResource>,
-    dmabuf_resource_cache: HashMap<DmabufResourceKey, EglImageResource>,
+    dmabuf_resource_cache: HashMap<DmabufImageKey, CachedDmabufResource<EglImageResource>>,
+    dmabuf_cache_peak_entries: usize,
     active_surface_ids: Vec<u32>,
     failed_surface_generations: HashMap<u32, u64>,
     frame_resources: HashMap<compositor::ServerFrameColor, EglImageResource>,
@@ -340,6 +344,7 @@ impl GlesSceneRenderer {
             shell_overlay_resource: None,
             surface_resources: HashMap::new(),
             dmabuf_resource_cache: HashMap::new(),
+            dmabuf_cache_peak_entries: 0,
             active_surface_ids: Vec::new(),
             failed_surface_generations: HashMap::new(),
             frame_resources: HashMap::new(),
@@ -680,6 +685,7 @@ impl GlesSceneRenderer {
         surfaces: &[RenderableSurface],
         client_cursor: Option<&RenderableSurface>,
     ) -> RendererResult<()> {
+        self.evict_dead_cached_dmabufs(egl, egl_display);
         self.active_surface_ids.clear();
         self.active_surface_ids
             .extend(surfaces.iter().map(|surface| surface.surface_id));
@@ -795,6 +801,8 @@ impl GlesSceneRenderer {
             }
         }
 
+        self.frame_stats.dmabuf_cache_entries = self.dmabuf_resource_cache.len();
+        self.frame_stats.dmabuf_cache_peak_entries = self.dmabuf_cache_peak_entries;
         Ok(())
     }
 
@@ -804,23 +812,41 @@ impl GlesSceneRenderer {
         egl_display: egl::Display,
         surface: &RenderableSurface,
     ) -> RendererResult<()> {
-        let Some(key) = DmabufResourceKey::from_surface(surface) else {
+        let Some(handle) = surface.dmabuf_handle() else {
             return Ok(());
         };
+        let key = DmabufImageKey::from_handle(surface.buffer_id(), handle);
 
-        if let Some(mut image) = self.dmabuf_resource_cache.remove(&key) {
-            image.generation = surface.generation;
+        if let Some(mut cached) = self.dmabuf_resource_cache.remove(&key) {
+            if native_egl_debug_enabled() {
+                eprintln!(
+                    "oblivion-one compositor: dmabuf cache=hit surface={} key={key:?} texture={:?} egl_image={:?}",
+                    surface.surface_id,
+                    cached.image.texture,
+                    cached.image.egl_image.map(|image| image.as_ptr()),
+                );
+            }
+            cached.image.generation = surface.generation;
             self.frame_stats.dmabuf_reuses = self.frame_stats.dmabuf_reuses.saturating_add(1);
             if let Some(old) = self.surface_resources.insert(
                 surface.surface_id,
                 EglSurfaceResource {
-                    image,
+                    image: cached.image,
                     dmabuf_key: Some(key),
+                    buffer_lifetime: Some(surface.buffer_identity().downgrade()),
                 },
             ) {
                 self.cache_or_destroy_dmabuf_resource(egl, egl_display, surface.surface_id, old);
             }
             return Ok(());
+        }
+
+        if native_egl_debug_enabled() {
+            eprintln!(
+                "oblivion-one compositor: dmabuf cache=miss surface={} key={key:?} layout={:?}",
+                surface.surface_id,
+                surface.dmabuf_handle(),
+            );
         }
 
         let Some(old) = self.surface_resources.remove(&surface.surface_id) else {
@@ -862,9 +888,36 @@ impl GlesSceneRenderer {
             destroy_surface_resource(&self.gl, egl, egl_display, resource);
             return;
         };
+        let Some(buffer_lifetime) = resource.buffer_lifetime else {
+            destroy_image_resource(&self.gl, egl, egl_display, resource.image);
+            return;
+        };
+        if !buffer_lifetime.is_alive() {
+            if native_egl_debug_enabled() {
+                eprintln!(
+                    "oblivion-one compositor: dmabuf cache=evict reason=dead-before-cache key={key:?}"
+                );
+            }
+            destroy_image_resource(&self.gl, egl, egl_display, resource.image);
+            self.frame_stats.dmabuf_cache_evictions =
+                self.frame_stats.dmabuf_cache_evictions.saturating_add(1);
+            return;
+        }
 
         self.prune_cached_dmabufs_for_surface(egl, egl_display, surface_id);
-        self.dmabuf_resource_cache.insert(key, resource.image);
+        if let Some(replaced) = self.dmabuf_resource_cache.insert(
+            key,
+            CachedDmabufResource {
+                image: resource.image,
+                buffer_lifetime,
+                surface_id,
+            },
+        ) {
+            destroy_image_resource(&self.gl, egl, egl_display, replaced.image);
+        }
+        self.dmabuf_cache_peak_entries = self
+            .dmabuf_cache_peak_entries
+            .max(self.dmabuf_resource_cache.len());
     }
 
     fn prune_cached_dmabufs_for_surface(
@@ -875,22 +928,28 @@ impl GlesSceneRenderer {
     ) {
         let cached = self
             .dmabuf_resource_cache
-            .keys()
-            .filter(|key| key.surface_id == surface_id)
+            .values()
+            .filter(|cached| cached.surface_id == surface_id)
             .count();
         if cached < MAX_CACHED_DMABUF_RESOURCES_PER_SURFACE {
             return;
         }
         let Some(key) = self
             .dmabuf_resource_cache
-            .keys()
-            .find(|key| key.surface_id == surface_id)
-            .cloned()
+            .iter()
+            .find_map(|(key, cached)| (cached.surface_id == surface_id).then_some(key.clone()))
         else {
             return;
         };
         if let Some(resource) = self.dmabuf_resource_cache.remove(&key) {
-            destroy_image_resource(&self.gl, egl, egl_display, resource);
+            if native_egl_debug_enabled() {
+                eprintln!(
+                    "oblivion-one compositor: dmabuf cache=evict reason=surface-bound key={key:?}"
+                );
+            }
+            destroy_image_resource(&self.gl, egl, egl_display, resource.image);
+            self.frame_stats.dmabuf_cache_evictions =
+                self.frame_stats.dmabuf_cache_evictions.saturating_add(1);
         }
     }
 
@@ -902,13 +961,35 @@ impl GlesSceneRenderer {
     ) {
         let keys = self
             .dmabuf_resource_cache
-            .keys()
-            .filter(|key| key.surface_id == surface_id)
-            .cloned()
+            .iter()
+            .filter_map(|(key, cached)| (cached.surface_id == surface_id).then_some(key.clone()))
             .collect::<Vec<_>>();
         for key in keys {
             if let Some(resource) = self.dmabuf_resource_cache.remove(&key) {
-                destroy_image_resource(&self.gl, egl, egl_display, resource);
+                if native_egl_debug_enabled() {
+                    eprintln!(
+                        "oblivion-one compositor: dmabuf cache=evict reason=surface-destroyed key={key:?}"
+                    );
+                }
+                destroy_image_resource(&self.gl, egl, egl_display, resource.image);
+                self.frame_stats.dmabuf_cache_evictions =
+                    self.frame_stats.dmabuf_cache_evictions.saturating_add(1);
+            }
+        }
+    }
+
+    fn evict_dead_cached_dmabufs(&mut self, egl: &EglInstance, egl_display: egl::Display) {
+        let dead = dead_cached_dmabuf_keys(&self.dmabuf_resource_cache);
+        for key in dead {
+            if let Some(cached) = self.dmabuf_resource_cache.remove(&key) {
+                if native_egl_debug_enabled() {
+                    eprintln!(
+                        "oblivion-one compositor: dmabuf cache=evict reason=buffer-dead key={key:?}"
+                    );
+                }
+                destroy_image_resource(&self.gl, egl, egl_display, cached.image);
+                self.frame_stats.dmabuf_cache_evictions =
+                    self.frame_stats.dmabuf_cache_evictions.saturating_add(1);
             }
         }
     }
@@ -1271,7 +1352,7 @@ impl GlesSceneRenderer {
             destroy_surface_resource(&self.gl, egl, egl_display, resource);
         }
         for (_, resource) in self.dmabuf_resource_cache.drain() {
-            destroy_image_resource(&self.gl, egl, egl_display, resource);
+            destroy_image_resource(&self.gl, egl, egl_display, resource.image);
         }
 
         unsafe {
@@ -1301,7 +1382,23 @@ struct EglImageResource {
 
 struct EglSurfaceResource {
     image: EglImageResource,
-    dmabuf_key: Option<DmabufResourceKey>,
+    dmabuf_key: Option<DmabufImageKey>,
+    buffer_lifetime: Option<WeakBufferIdentity>,
+}
+
+struct CachedDmabufResource<R> {
+    image: R,
+    buffer_lifetime: WeakBufferIdentity,
+    surface_id: u32,
+}
+
+fn dead_cached_dmabuf_keys<R>(
+    cache: &HashMap<DmabufImageKey, CachedDmabufResource<R>>,
+) -> Vec<DmabufImageKey> {
+    cache
+        .iter()
+        .filter_map(|(key, cached)| (!cached.buffer_lifetime.is_alive()).then_some(key.clone()))
+        .collect()
 }
 
 impl EglSurfaceResource {
@@ -1318,7 +1415,7 @@ impl EglSurfaceResource {
         }
         if surface
             .dmabuf_handle()
-            .and_then(|_| DmabufResourceKey::from_surface(surface))
+            .map(|handle| DmabufImageKey::from_handle(surface.buffer_id(), handle))
             .is_some_and(|key| self.dmabuf_key.as_ref() == Some(&key))
         {
             return EglSurfaceResourceUpdate::ReuseDmabuf;
@@ -1349,55 +1446,6 @@ enum EglSurfaceResourceUpdate {
     UploadDamage,
     Recreate,
     UnsupportedBuffer,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct DmabufResourceKey {
-    surface_id: u32,
-    width: u32,
-    height: u32,
-    format: u32,
-    planes: Vec<DmabufPlaneKey>,
-}
-
-impl DmabufResourceKey {
-    fn from_surface(surface: &RenderableSurface) -> Option<Self> {
-        Self::from_handle(surface.surface_id, surface.dmabuf_handle()?)
-    }
-
-    fn from_handle(surface_id: u32, handle: &DmabufBufferHandle) -> Option<Self> {
-        let size = handle.size();
-        let planes = handle
-            .planes()
-            .iter()
-            .map(|plane| {
-                let descriptor = plane.descriptor();
-                Some(DmabufPlaneKey {
-                    fd: plane.fd().as_raw_fd(),
-                    plane_index: descriptor.plane_index,
-                    offset: descriptor.offset,
-                    stride: descriptor.stride,
-                    modifier: descriptor.modifier.0,
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(Self {
-            surface_id,
-            width: size.width,
-            height: size.height,
-            format: handle.format().as_fourcc(),
-            planes,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct DmabufPlaneKey {
-    fd: i32,
-    plane_index: u32,
-    offset: u32,
-    stride: u32,
-    modifier: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1445,6 +1493,7 @@ impl EglSceneCacheKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EglSceneSurfaceSignature {
     surface_id: u32,
+    buffer_id: u64,
     x: i32,
     y: i32,
     width: u32,
@@ -1462,6 +1511,7 @@ fn egl_scene_surface_signatures(surfaces: &[RenderableSurface]) -> Vec<EglSceneS
             let preview = surface.resize_preview;
             EglSceneSurfaceSignature {
                 surface_id: surface.surface_id,
+                buffer_id: surface.buffer_id().get(),
                 x: surface.x,
                 y: surface.y,
                 width: surface.width,
@@ -1487,6 +1537,7 @@ fn egl_scene_surface_signature_hash(signatures: &[EglSceneSurfaceSignature]) -> 
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for signature in signatures {
         hash = fnv1a_u64(hash, u64::from(signature.surface_id));
+        hash = fnv1a_u64(hash, signature.buffer_id);
         hash = fnv1a_u64(hash, signature.x as u32 as u64);
         hash = fnv1a_u64(hash, signature.y as u32 as u64);
         hash = fnv1a_u64(hash, u64::from(signature.width));
@@ -1537,9 +1588,24 @@ fn create_surface_resource(
         return Err(io::Error::other("surface has no importable buffer").into());
     };
 
+    if native_egl_debug_enabled() && surface.dmabuf_handle().is_some() {
+        eprintln!(
+            "oblivion-one compositor: dmabuf cache=create surface={} buffer_id={} texture={:?} egl_image={:?}",
+            surface.surface_id,
+            surface.buffer_id().get(),
+            image.texture,
+            image.egl_image.map(|egl_image| egl_image.as_ptr()),
+        );
+    }
+
     Ok(EglSurfaceResource {
         image,
-        dmabuf_key: DmabufResourceKey::from_surface(surface),
+        dmabuf_key: surface
+            .dmabuf_handle()
+            .map(|handle| DmabufImageKey::from_handle(surface.buffer_id(), handle)),
+        buffer_lifetime: surface
+            .dmabuf_handle()
+            .map(|_| surface.buffer_identity().downgrade()),
     })
 }
 
@@ -2151,11 +2217,21 @@ pub(crate) fn egl_swap_buffers_with_damage(
 mod tests {
     use super::*;
     use oblivion_one::render_backend::buffer::{
-        BufferSize, DmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
+        BufferIdAllocator, BufferSize, DmabufBufferHandle, DmabufImageKey, DmabufPlane,
+        DmabufPlaneDescriptor, DrmFormat, DrmModifier,
     };
 
     const XR24: u32 = u32::from_le_bytes(*b"XR24");
     const AR24: u32 = u32::from_le_bytes(*b"AR24");
+
+    #[derive(Clone)]
+    struct DropProbe(std::rc::Rc<std::cell::Cell<usize>>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.set(self.0.get().saturating_add(1));
+        }
+    }
 
     fn native_candidate(config_id: egl::Int, native_visual_id: u32) -> NativeEglConfigCandidate {
         NativeEglConfigCandidate {
@@ -2389,6 +2465,7 @@ mod tests {
     fn scene_cache_key_invalidates_when_surface_geometry_changes() {
         let initial_signature = EglSceneSurfaceSignature {
             surface_id: 7,
+            buffer_id: 11,
             x: 10,
             y: 20,
             width: 800,
@@ -2413,6 +2490,7 @@ mod tests {
     fn scene_cache_key_invalidates_when_resize_preview_crop_changes() {
         let initial_signature = EglSceneSurfaceSignature {
             surface_id: 7,
+            buffer_id: 11,
             x: 10,
             y: 20,
             width: 800,
@@ -2434,24 +2512,114 @@ mod tests {
     }
 
     #[test]
+    fn scene_cache_key_invalidates_when_visible_buffer_identity_changes() {
+        let initial = EglSceneSurfaceSignature {
+            surface_id: 7,
+            buffer_id: 11,
+            x: 10,
+            y: 20,
+            width: 800,
+            height: 600,
+            preview_committed_width: 0,
+            preview_committed_height: 0,
+            preview_anchor_bits: 0,
+            generation: 1,
+        };
+        let replacement = EglSceneSurfaceSignature {
+            buffer_id: 12,
+            ..initial
+        };
+        let key = EglSceneCacheKey::new(1280, 800, 9, 120, &[initial]);
+
+        assert!(!key.is_current(1280, 800, 9, 120, &[replacement]));
+    }
+
+    #[test]
     fn dmabuf_resource_key_matches_same_handle_for_surface() {
+        let mut ids = BufferIdAllocator::default();
+        let identity = ids.allocate().expect("test buffer identity");
         let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
 
         assert_eq!(
-            DmabufResourceKey::from_handle(7, &handle),
-            DmabufResourceKey::from_handle(7, &handle)
+            DmabufImageKey::from_handle(identity.id(), &handle),
+            DmabufImageKey::from_handle(identity.id(), &handle)
         );
     }
 
     #[test]
-    fn dmabuf_resource_key_separates_swapchain_buffers() {
-        let first = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
-        let second = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+    fn dmabuf_resource_key_separates_buffer_ids_when_raw_fd_is_identical() {
+        let mut ids = BufferIdAllocator::default();
+        let first = ids.allocate().expect("first test buffer identity");
+        let second = ids.allocate().expect("second test buffer identity");
+        let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
 
         assert_ne!(
-            DmabufResourceKey::from_handle(7, &first),
-            DmabufResourceKey::from_handle(7, &second)
+            DmabufImageKey::from_handle(first.id(), &handle),
+            DmabufImageKey::from_handle(second.id(), &handle)
         );
+    }
+
+    #[test]
+    fn dmabuf_resource_key_separates_plane_layout_for_same_buffer_id() {
+        let mut ids = BufferIdAllocator::default();
+        let identity = ids.allocate().expect("test buffer identity");
+        let first = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+        let second = test_dmabuf_handle(256, 144, 2048, DrmModifier::LINEAR);
+
+        assert_ne!(
+            DmabufImageKey::from_handle(identity.id(), &first),
+            DmabufImageKey::from_handle(identity.id(), &second)
+        );
+    }
+
+    #[test]
+    fn dead_buffer_cache_entry_is_evicted_exactly_once() {
+        let mut ids = BufferIdAllocator::default();
+        let identity = ids.allocate().expect("test buffer identity");
+        let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+        let key = DmabufImageKey::from_handle(identity.id(), &handle);
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut cache = HashMap::from([(
+            key.clone(),
+            CachedDmabufResource {
+                image: DropProbe(std::rc::Rc::clone(&drops)),
+                buffer_lifetime: identity.downgrade(),
+                surface_id: 7,
+            },
+        )]);
+
+        drop(identity);
+        for dead in dead_cached_dmabuf_keys(&cache) {
+            drop(cache.remove(&dead));
+        }
+        assert!(dead_cached_dmabuf_keys(&cache).is_empty());
+        assert_eq!(drops.get(), 1);
+
+        drop(cache.remove(&key));
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn renderer_cache_recreation_drops_all_previous_generation_entries() {
+        let mut ids = BufferIdAllocator::default();
+        let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut cache = HashMap::new();
+        for surface_id in 1..=3 {
+            let identity = ids.allocate().expect("test buffer identity");
+            cache.insert(
+                DmabufImageKey::from_handle(identity.id(), &handle),
+                CachedDmabufResource {
+                    image: DropProbe(std::rc::Rc::clone(&drops)),
+                    buffer_lifetime: identity.downgrade(),
+                    surface_id,
+                },
+            );
+        }
+
+        drop(cache);
+
+        assert_eq!(drops.get(), 3);
     }
 
     fn test_dmabuf_handle(

@@ -12,6 +12,7 @@ use std::{
 use wayland_server::{WEnum, protocol::wl_shm};
 
 use super::RenderableSurfaceDamage;
+use crate::render_backend::buffer::BufferIdentity;
 
 pub(super) const WL_SHM_FORMAT_ABGR8888: u32 = 0x3432_4241;
 pub(super) const WL_SHM_FORMAT_XBGR8888: u32 = 0x3432_4258;
@@ -70,6 +71,7 @@ impl ShmPoolData {
 
 #[derive(Debug, Clone)]
 pub(super) struct ShmBufferData {
+    pub(super) identity: BufferIdentity,
     pub(super) pool_size: i32,
     pub(super) file: Arc<File>,
     pub(super) offset: i32,

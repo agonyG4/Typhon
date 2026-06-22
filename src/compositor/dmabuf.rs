@@ -14,8 +14,8 @@ use wayland_protocols::wp::linux_dmabuf::zv1::server::{
 use wayland_server::Resource;
 
 use crate::render_backend::buffer::{
-    BufferSize, DmabufBufferHandle, DmabufPlane as RenderDmabufPlane, DmabufPlaneDescriptor,
-    DrmFormat, DrmModifier,
+    BufferIdentity, BufferSize, DmabufBufferHandle, DmabufPlane as RenderDmabufPlane,
+    DmabufPlaneDescriptor, DrmFormat, DrmModifier,
 };
 use crate::render_backend::egl_gles::{EglGlesDmabufFeedback, EglGlesDmabufFormat};
 use crate::wayland_drm::server::wl_drm;
@@ -279,6 +279,7 @@ impl DmabufParamsData {
         height: i32,
         format: u32,
         feedback: &EglGlesDmabufFeedback,
+        identity: BufferIdentity,
     ) -> Option<DmabufBufferData> {
         if !self.validate_for_create(params, width, height, format, feedback) {
             return None;
@@ -301,7 +302,7 @@ impl DmabufParamsData {
             })
             .collect::<Vec<_>>();
         match DmabufBufferHandle::new(size, drm_format, planes) {
-            Ok(handle) => Some(DmabufBufferData { handle }),
+            Ok(handle) => Some(DmabufBufferData { identity, handle }),
             Err(_) => {
                 params.post_error(
                     zwp_linux_buffer_params_v1::Error::InvalidWlBuffer,
@@ -339,6 +340,7 @@ impl DmabufParamsData {
 
 #[derive(Debug, Clone)]
 pub(super) struct DmabufBufferData {
+    pub(super) identity: BufferIdentity,
     pub(super) handle: DmabufBufferHandle,
 }
 

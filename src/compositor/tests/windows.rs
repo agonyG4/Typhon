@@ -424,7 +424,7 @@ fn ack_configure_promotes_latest_resize_not_newer_than_ack_serial() {
 }
 
 #[test]
-fn pending_resize_commit_waits_for_committed_size_matching_configure() {
+fn pending_resize_commit_accepts_cell_aligned_committed_size() {
     let resize = PendingResizeCommit {
         serial: 7,
         width: 340,
@@ -433,20 +433,179 @@ fn pending_resize_commit_waits_for_committed_size_matching_configure() {
         edges: ResizeEdges::BOTTOM_RIGHT,
     };
 
-    assert!(!resize_commit_matches_size(
-        resize,
-        BufferSize {
-            width: 300,
-            height: 200,
-        }
-    ));
-    assert!(resize_commit_matches_size(
-        resize,
-        BufferSize {
-            width: 340,
-            height: 230,
-        }
-    ));
+    assert_eq!(
+        resize_commit_placement(
+            resize,
+            BufferSize {
+                width: 300,
+                height: 200,
+            }
+        ),
+        resize.placement
+    );
+    assert_eq!(
+        resize_commit_placement(
+            resize,
+            BufferSize {
+                width: 340,
+                height: 230,
+            }
+        ),
+        resize.placement
+    );
+}
+
+#[test]
+fn older_ack_cannot_replace_newer_acknowledged_resize_transaction() {
+    let mut state = CompositorState::default();
+    let surface_id = 42;
+    let older = PendingResizeCommit {
+        serial: 9,
+        width: 320,
+        height: 240,
+        placement: SurfacePlacement::root_at(10, 20),
+        edges: ResizeEdges::BOTTOM_RIGHT,
+    };
+    let newer = PendingResizeCommit {
+        serial: 12,
+        width: 400,
+        height: 300,
+        placement: SurfacePlacement::root_at(18, 26),
+        edges: ResizeEdges::BOTTOM_RIGHT,
+    };
+    state
+        .sent_resize_commits
+        .insert((surface_id, older.serial), older);
+    state.pending_resize_commits.insert(surface_id, newer);
+
+    state.ack_xdg_surface_configure(surface_id, older.serial);
+
+    assert_eq!(state.pending_resize_commits.get(&surface_id), Some(&newer));
+}
+
+#[test]
+fn commit_received_before_ack_cannot_complete_resize_after_delayed_acquire() {
+    let resize = PendingResizeCommit {
+        serial: 12,
+        width: 400,
+        height: 300,
+        placement: SurfacePlacement::root_at(18, 26),
+        edges: ResizeEdges::BOTTOM_RIGHT,
+    };
+
+    assert!(!resize_commit_serial_matches(None, resize));
+    assert!(!resize_commit_serial_matches(Some(9), resize));
+    assert!(resize_commit_serial_matches(Some(12), resize));
+}
+
+#[test]
+fn left_top_resize_placement_uses_actual_cell_aligned_size() {
+    let resize = PendingResizeCommit {
+        serial: 7,
+        width: 1003,
+        height: 701,
+        placement: SurfacePlacement::root_at(100, 200),
+        edges: ResizeEdges::new(true, false, true, false),
+    };
+
+    let placement = resize.placement_for_committed_size(1000, 696);
+
+    assert_eq!(placement.local_x, 103);
+    assert_eq!(placement.local_y, 205);
+}
+
+#[test]
+fn geometry_only_commit_completes_resize_and_clears_preview() {
+    let mut state = CompositorState::default();
+    let surface_id = 42;
+    let resize = PendingResizeCommit {
+        serial: 7,
+        width: 1003,
+        height: 701,
+        placement: SurfacePlacement::root_at(100, 200),
+        edges: ResizeEdges::new(true, false, true, false),
+    };
+    let identity = BufferIdAllocator::default()
+        .allocate()
+        .expect("test buffer identity");
+    state.renderable_surfaces.push(RenderableSurface {
+        surface_id,
+        x: 0,
+        y: 0,
+        width: 1000,
+        height: 696,
+        placement: resize.placement,
+        resize_preview: Some(ResizePreview {
+            committed_width: 900,
+            committed_height: 600,
+            anchor_right: true,
+            anchor_bottom: true,
+        }),
+        generation: 1,
+        buffer: crate::render_backend::buffer::CommittedSurfaceBuffer::shm_snapshot(
+            identity,
+            BufferSize::new(1000, 696).expect("test size"),
+            vec![0; 1000 * 696],
+        ),
+        damage: RenderableSurfaceDamage::Full,
+    });
+    state
+        .surface_window_geometries
+        .insert(surface_id, XdgWindowGeometry::new(0, 0, 1000, 696));
+    state.pending_resize_commits.insert(surface_id, resize);
+
+    assert!(state.complete_pending_resize_from_current_geometry(surface_id));
+
+    assert!(!state.pending_resize_commits.contains_key(&surface_id));
+    let surface = &state.renderable_surfaces[0];
+    assert_eq!(surface.resize_preview, None);
+    assert_eq!(surface.placement.local_x, 103);
+    assert_eq!(surface.placement.local_y, 205);
+}
+
+#[test]
+fn kitty_like_resize_swapchain_never_selects_destroyed_buffer_identity() {
+    let mut ids = BufferIdAllocator::default();
+    let old = ids.allocate().expect("old buffer identity");
+    let buffer_b = ids.allocate().expect("buffer B identity");
+    let buffer_c = ids.allocate().expect("buffer C identity");
+    let buffer_d = ids.allocate().expect("buffer D identity");
+    let handle = DmabufBufferHandle::new(
+        BufferSize::new(1000, 696).expect("cell-aligned test size"),
+        DrmFormat::Xrgb8888,
+        vec![RenderDmabufPlane::new(
+            File::open("/dev/null")
+                .expect("dmabuf identity test fd")
+                .into(),
+            DmabufPlaneDescriptor {
+                plane_index: 0,
+                offset: 0,
+                stride: 4000,
+                modifier: DrmModifier::LINEAR,
+            },
+        )],
+    )
+    .expect("valid fake dmabuf");
+    let old_key = crate::render_backend::buffer::DmabufImageKey::from_handle(old.id(), &handle);
+    let keys = [buffer_b, buffer_c, buffer_d].map(|identity| {
+        crate::render_backend::buffer::DmabufImageKey::from_handle(identity.id(), &handle)
+    });
+    let mut fake_renderer_cache = HashMap::from([(old_key.clone(), 'A')]);
+    let mut selected = Vec::new();
+
+    fake_renderer_cache.remove(&old_key);
+    for (key, frame) in keys.into_iter().zip(['B', 'C', 'D']) {
+        fake_renderer_cache.insert(key.clone(), frame);
+        selected.push(*fake_renderer_cache.get(&key).expect("new renderer input"));
+    }
+
+    assert_eq!(selected, ['B', 'C', 'D']);
+    assert!(!fake_renderer_cache.contains_key(&old_key));
+    assert!(
+        fake_renderer_cache
+            .keys()
+            .all(|key| key.buffer_id() != old.id())
+    );
 }
 
 #[test]

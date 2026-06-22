@@ -53,8 +53,8 @@ use wayland_server::{
 };
 
 use crate::render_backend::buffer::{
-    BufferSize, DmabufBufferHandle, DmabufPlane as RenderDmabufPlane, DmabufPlaneDescriptor,
-    DrmFormat, DrmModifier,
+    BufferIdAllocator, BufferIdentity, BufferSize, DmabufBufferHandle,
+    DmabufPlane as RenderDmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
 };
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
@@ -169,8 +169,18 @@ const DRM_FORMAT_ARGB8888: u32 = DrmFormat::ARGB8888_FOURCC;
 #[cfg(test)]
 const DRM_FORMAT_MOD_LINEAR: u64 = DrmModifier::LINEAR.0;
 
-fn resize_commit_matches_size(resize: PendingResizeCommit, committed_size: BufferSize) -> bool {
-    committed_size.width == resize.width && committed_size.height == resize.height
+fn resize_commit_placement(
+    resize: PendingResizeCommit,
+    committed_size: BufferSize,
+) -> SurfacePlacement {
+    resize.placement_for_committed_size(committed_size.width, committed_size.height)
+}
+
+fn resize_commit_serial_matches(
+    commit_resize_serial: Option<u32>,
+    resize: PendingResizeCommit,
+) -> bool {
+    commit_resize_serial == Some(resize.serial)
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +244,7 @@ pub struct CompositorState {
     pub last_app_id: Option<String>,
     pub renderable_surfaces: Vec<RenderableSurface>,
     next_surface_id: u32,
+    buffer_ids: BufferIdAllocator,
     surface_resources: HashMap<u32, wl_surface::WlSurface>,
     output_resources: Vec<wl_output::WlOutput>,
     fractional_scale_resources: HashMap<u32, Vec<wp_fractional_scale_v1::WpFractionalScaleV1>>,
@@ -274,6 +285,7 @@ pub struct CompositorState {
     pending_subsurface_stacks: HashMap<u32, Vec<u32>>,
     current_surface_buffers: HashMap<u32, PendingSurfaceBuffer>,
     surface_window_geometries: HashMap<u32, XdgWindowGeometry>,
+    pending_window_geometry_commits: HashSet<u32>,
     surface_entered_outputs: HashSet<(u32, u32)>,
     toplevel_surfaces: HashMap<u32, ToplevelSurface>,
     configured_xdg_surfaces: HashSet<u32>,
@@ -606,6 +618,10 @@ impl CompositorState {
             clipboard_bridge: Some(Box::new(NoopClipboardBridge)),
             ..Self::default()
         }
+    }
+
+    fn allocate_buffer_identity(&mut self) -> Option<BufferIdentity> {
+        self.buffer_ids.allocate()
     }
 
     fn next_render_generation_value(&self) -> u64 {
@@ -3706,11 +3722,13 @@ impl CompositorState {
         }
 
         let generation = self.next_render_generation_value();
-        let placement = match self.take_pending_resize_commit_placement(surface_id, &pending) {
-            Ok(Some(placement)) => placement,
-            Ok(None) => self.surface_placement(surface_id),
+        let resize_placement = match self.take_pending_resize_commit_placement(surface_id, &pending)
+        {
+            Ok(placement) => placement,
             Err(_) => return,
         };
+        let resize_commit_accepted = resize_placement.is_some();
+        let placement = resize_placement.unwrap_or_else(|| self.surface_placement(surface_id));
         self.store_surface_placement(surface_id, placement);
         let buffer_width = match pending.data.width() {
             Ok(width) => width,
@@ -3728,7 +3746,9 @@ impl CompositorState {
         let height = surface_size.height;
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
-                "oblivion-one compositor: commit surface {surface_id} buffer={}x{} surface={}x{} offset={},{} shm={} dmabuf={} pending_resize={:?}",
+                "oblivion-one compositor: commit surface={surface_id} wl_buffer={} buffer_id={} buffer={}x{} surface={}x{} offset={},{} shm={} dmabuf={} dmabuf_layout={:?} commit_resize_serial={:?} pending_resize={:?} window_geometry={:?}",
+                pending.resource.id().protocol_id(),
+                pending.data.buffer_id().get(),
                 buffer_width,
                 buffer_height,
                 width,
@@ -3737,7 +3757,10 @@ impl CompositorState {
                 pending.y,
                 pending.data.is_shm(),
                 pending.data.is_dmabuf(),
+                pending.data.dmabuf_handle(),
+                pending.resize_serial,
                 self.pending_resize_commits.get(&surface_id),
+                self.surface_window_geometries.get(&surface_id),
             );
         }
         if let Some(root_surface_id) = self.minimized_root_surface_id_for_surface(surface_id) {
@@ -3767,7 +3790,9 @@ impl CompositorState {
             .iter_mut()
             .find(|surface| surface.surface_id == surface_id)
         {
-            let damage = if existing.buffer_size() == buffer_size {
+            let damage = if existing.buffer_size() == buffer_size
+                && existing.buffer_id() == pending.data.buffer_id()
+            {
                 damage.normalized_for_surface(buffer_width, buffer_height)
             } else {
                 RenderableSurfaceDamage::Full
@@ -3785,6 +3810,12 @@ impl CompositorState {
             .is_err()
             {
                 return;
+            }
+            if resize_commit_accepted {
+                existing.width = width;
+                existing.height = height;
+                existing.placement = placement;
+                existing.resize_preview = None;
             }
             let visual_placement = existing.placement;
             self.store_surface_placement(surface_id, visual_placement);
@@ -3957,6 +3988,10 @@ impl CompositorState {
         frame_callbacks: Vec<wl_callback::WlCallback>,
         explicit_sync: Option<Arc<SyncobjSurfaceState>>,
     ) {
+        pending.resize_serial = self
+            .pending_resize_commits
+            .get(&surface_id)
+            .map(|resize| resize.serial);
         let mut superseded_callbacks = self.cancel_pending_acquire_commits_for_surface(
             surface_id,
             AcquireWatchCancelReason::Superseded,
@@ -4045,6 +4080,7 @@ impl CompositorState {
         data: &SurfaceData,
         damage: Option<RenderableSurfaceDamage>,
         explicit_sync: Option<Arc<SyncobjSurfaceState>>,
+        window_geometry_changed: bool,
     ) {
         if let Some(sync_state) = explicit_sync {
             let (acquire, release) = sync_state.take_points();
@@ -4083,10 +4119,70 @@ impl CompositorState {
         self.configure_xdg_surface_if_needed(surface_id);
         let surface_size = data.commit_pending_viewport();
         let buffer_scale = data.commit_pending_buffer_scale();
-        if let Some(damage) = damage {
+        let viewport_size_changed = surface_size.is_some_and(|surface_size| {
+            self.renderable_surfaces
+                .iter()
+                .find(|surface| surface.surface_id == surface_id)
+                .is_some_and(|surface| {
+                    surface.width != surface_size.width || surface.height != surface_size.height
+                })
+        });
+        if let Some(damage) =
+            damage.or(viewport_size_changed.then_some(RenderableSurfaceDamage::Full))
+        {
             self.commit_surface_damage_only(surface_id, damage, surface_size, buffer_scale);
         }
+        if window_geometry_changed || viewport_size_changed {
+            self.complete_pending_resize_from_current_geometry(surface_id);
+        }
         self.complete_frame_callbacks_now(data);
+    }
+
+    fn complete_pending_resize_from_current_geometry(&mut self, surface_id: u32) -> bool {
+        let Some(resize) = self.pending_resize_commits.remove(&surface_id) else {
+            return false;
+        };
+        let committed_size = self
+            .xdg_window_geometry_size(surface_id)
+            .map(|(width, height)| BufferSize { width, height })
+            .or_else(|| {
+                self.renderable_surfaces
+                    .iter()
+                    .find(|surface| surface.surface_id == surface_id)
+                    .map(|surface| BufferSize {
+                        width: surface.width,
+                        height: surface.height,
+                    })
+            });
+        let Some(committed_size) = committed_size else {
+            self.pending_resize_commits.insert(surface_id, resize);
+            return false;
+        };
+        let placement = resize_commit_placement(resize, committed_size);
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: resize commit surface={surface_id} decision=accepted reason=geometry-only serial={} requested={}x{} actual={}x{} placement={},{}",
+                resize.serial,
+                resize.width,
+                resize.height,
+                committed_size.width,
+                committed_size.height,
+                placement.local_x,
+                placement.local_y,
+            );
+        }
+        if let Some(surface) = self
+            .renderable_surfaces
+            .iter_mut()
+            .find(|surface| surface.surface_id == surface_id)
+        {
+            surface.placement = placement;
+            surface.resize_preview = None;
+            surface.damage = RenderableSurfaceDamage::Full;
+        }
+        self.store_surface_placement(surface_id, placement);
+        self.advance_render_generation(RenderGenerationCause::WindowResize);
+        true
     }
 
     fn unmap_surface_content(&mut self, surface_id: u32) -> bool {
@@ -4215,6 +4311,8 @@ impl CompositorState {
             .retain(|(surface_id, _), _| !surface_ids.contains(surface_id));
         self.pending_resize_commits
             .retain(|surface_id, _| !surface_ids.contains(surface_id));
+        self.pending_window_geometry_commits
+            .retain(|surface_id| !surface_ids.contains(surface_id));
         if self
             .window_interaction
             .is_some_and(|interaction| surface_ids.contains(&interaction.root_surface_id))
@@ -5886,6 +5984,16 @@ impl CompositorState {
         let Some(resize) = self.pending_resize_commits.remove(&surface_id) else {
             return Ok(None);
         };
+        if !resize_commit_serial_matches(pending.resize_serial, resize) {
+            if compositor_debug_surface_logging_enabled() {
+                eprintln!(
+                    "oblivion-one compositor: resize commit surface={surface_id} decision=deferred reason=serial-mismatch commit_serial={:?} pending_serial={} requested={}x{}",
+                    pending.resize_serial, resize.serial, resize.width, resize.height,
+                );
+            }
+            self.pending_resize_commits.insert(surface_id, resize);
+            return Ok(None);
+        }
         let buffer_width = pending.data.width()?;
         let buffer_height = pending.data.height()?;
         let committed_size = self
@@ -5896,12 +6004,19 @@ impl CompositorState {
                 width: buffer_width,
                 height: buffer_height,
             });
-        if !resize_commit_matches_size(resize, committed_size) {
-            self.pending_resize_commits.insert(surface_id, resize);
-            return Ok(None);
+        let placement = resize_commit_placement(resize, committed_size);
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: resize commit surface={surface_id} decision=accepted serial={} requested={}x{} actual={}x{} placement={},{}",
+                resize.serial,
+                resize.width,
+                resize.height,
+                committed_size.width,
+                committed_size.height,
+                placement.local_x,
+                placement.local_y,
+            );
         }
-        let placement =
-            resize.placement_for_committed_size(committed_size.width, committed_size.height);
         Ok(Some(placement))
     }
 
@@ -5917,7 +6032,12 @@ impl CompositorState {
             .retain(|(sent_surface_id, sent_serial), _| {
                 *sent_surface_id != surface_id || *sent_serial > serial
             });
-        if let Some(resize) = resize {
+        if let Some(resize) = resize
+            && self
+                .pending_resize_commits
+                .get(&surface_id)
+                .is_none_or(|pending| pending.serial < resize.serial)
+        {
             if compositor_debug_surface_logging_enabled() {
                 eprintln!(
                     "oblivion-one compositor: ack resize surface {surface_id} serial={serial} matched_serial={} size={}x{} placement={},{} edges={:?}",
@@ -6945,6 +7065,7 @@ fn update_renderable_surface_buffer(
         .map(|_| WindowGeometry::new(surface.placement, surface.width, surface.height));
     if pending.data.is_shm()
         && surface.buffer_size() == buffer_size
+        && surface.buffer_id() == pending.data.buffer_id()
         && let Some(pixels) = surface.shm_pixels_mut()
     {
         pending.data.read_pixels_into_with_damage(pixels, &damage)?;

@@ -2093,10 +2093,23 @@ const CURSOR_PATTERN: [&str; 17] = [
 mod tests {
     use super::*;
     use crate::compositor::SurfacePlacement;
-    use crate::render_backend::buffer::{BufferSize, CommittedSurfaceBuffer};
+    use crate::render_backend::buffer::{
+        BufferIdAllocator, BufferIdentity, BufferSize, CommittedSurfaceBuffer,
+    };
+    use std::sync::{Mutex, OnceLock};
+
+    fn test_buffer_identity() -> BufferIdentity {
+        static IDS: OnceLock<Mutex<BufferIdAllocator>> = OnceLock::new();
+        IDS.get_or_init(|| Mutex::new(BufferIdAllocator::default()))
+            .lock()
+            .expect("test buffer identity allocator")
+            .allocate()
+            .expect("test buffer identity")
+    }
 
     fn shm_buffer(width: u32, height: u32, pixels: Vec<u32>) -> CommittedSurfaceBuffer {
         CommittedSurfaceBuffer::shm_snapshot(
+            test_buffer_identity(),
             BufferSize::new(width, height).expect("test surfaces use non-zero sizes"),
             pixels,
         )

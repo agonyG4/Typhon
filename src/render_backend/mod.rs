@@ -231,6 +231,12 @@ mod tests {
     use super::*;
     use std::fs::File;
 
+    fn test_buffer_identity() -> buffer::BufferIdentity {
+        buffer::BufferIdAllocator::default()
+            .allocate()
+            .expect("test buffer identity")
+    }
+
     #[test]
     fn smithay_egl_backend_aliases_the_official_egl_gles_target() {
         let backend = RenderBackendProfile::smithay_egl_gles();
@@ -275,10 +281,12 @@ mod tests {
     #[test]
     fn committed_surface_buffers_keep_shm_and_dmabuf_separate() {
         let shm = buffer::CommittedSurfaceBuffer::shm_snapshot(
+            test_buffer_identity(),
             buffer::BufferSize::new(2, 2).unwrap(),
             vec![0xff00_0000; 4],
         );
         let dmabuf = buffer::CommittedSurfaceBuffer::dmabuf_handle(
+            test_buffer_identity(),
             buffer::DmabufBufferHandle::new(
                 buffer::BufferSize::new(2, 2).unwrap(),
                 buffer::DrmFormat::Argb8888,
@@ -354,6 +362,7 @@ mod tests {
             resize_preview: None,
             generation: 1,
             buffer: buffer::CommittedSurfaceBuffer::shm_snapshot(
+                test_buffer_identity(),
                 buffer::BufferSize::new(2, 2).unwrap(),
                 vec![0xff00_0000; 4],
             ),

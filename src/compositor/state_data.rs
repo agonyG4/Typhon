@@ -9,7 +9,9 @@ use wayland_server::{
     protocol::{wl_buffer, wl_callback, wl_surface},
 };
 
-use crate::render_backend::buffer::{BufferSize, CommittedSurfaceBuffer};
+use crate::render_backend::buffer::{
+    BufferId, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle,
+};
 
 use super::{
     RenderableSurface, RenderableSurfaceDamage, SurfaceDamageRect, SurfacePlacement,
@@ -94,6 +96,7 @@ impl SurfaceData {
                         y,
                         explicit_release: None,
                         surface_size: None,
+                        resize_serial: None,
                     }))
                 } else {
                     resource.data::<DmabufBufferData>().cloned().map(|data| {
@@ -104,6 +107,7 @@ impl SurfaceData {
                             y,
                             explicit_release: None,
                             surface_size: None,
+                            resize_serial: None,
                         })
                     })
                 }
@@ -407,6 +411,7 @@ pub(super) struct PendingSurfaceBuffer {
     pub(super) y: i32,
     pub(super) explicit_release: Option<ExplicitSyncPoint>,
     pub(super) surface_size: Option<BufferSize>,
+    pub(super) resize_serial: Option<u32>,
 }
 
 impl PendingSurfaceBuffer {
@@ -481,12 +486,26 @@ pub(super) enum PendingBufferData {
 }
 
 impl PendingBufferData {
+    pub(super) const fn buffer_id(&self) -> BufferId {
+        match self {
+            Self::Shm(data) => data.identity.id(),
+            Self::Dmabuf(data) => data.identity.id(),
+        }
+    }
+
     pub(super) const fn is_shm(&self) -> bool {
         matches!(self, Self::Shm(_))
     }
 
     pub(super) const fn is_dmabuf(&self) -> bool {
         matches!(self, Self::Dmabuf(_))
+    }
+
+    pub(super) fn dmabuf_handle(&self) -> Option<&DmabufBufferHandle> {
+        match self {
+            Self::Dmabuf(data) => Some(&data.handle),
+            Self::Shm(_) => None,
+        }
     }
 
     pub(super) fn width(&self) -> io::Result<u32> {
@@ -520,10 +539,14 @@ impl PendingBufferData {
     ) -> io::Result<CommittedSurfaceBuffer> {
         match self {
             Self::Shm(data) => Ok(CommittedSurfaceBuffer::shm_snapshot(
+                data.identity.clone(),
                 size,
                 data.read_pixels()?,
             )),
-            Self::Dmabuf(data) => Ok(CommittedSurfaceBuffer::dmabuf_handle(data.handle.clone())),
+            Self::Dmabuf(data) => Ok(CommittedSurfaceBuffer::dmabuf_handle(
+                data.identity.clone(),
+                data.handle.clone(),
+            )),
         }
     }
 }

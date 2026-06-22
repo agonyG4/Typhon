@@ -242,6 +242,27 @@ present in the protocol/buffer lifecycle and still needs real native GPU
 hardware validation before claiming driver-complete synchronization behavior;
 direct scanout remains a planned optimization, not an enabled scanout path.
 
+Every server-side `wl_buffer` receives a nonzero monotonic `BufferId` when its
+SHM, linux-dmabuf, or `wl_drm` representation is created. Cloned compositor
+state preserves that identity and its shared lifetime token. Renderer dmabuf
+keys use `BufferId` plus dimensions, format, plane index, offset, stride, and
+modifier; numeric plane fds are EGL import arguments and diagnostics only.
+Inactive images retain weak buffer lifetime references, so a live swapchain
+buffer can be reused while destroyed or superseded buffers are evicted and
+destroyed with the renderer context current. Recreating the renderer starts an
+empty cache generation.
+
+Interactive XDG resize state is serial-gated rather than exact-size-gated. An
+ACK promotes the newest eligible configure without replacing a newer
+acknowledged transaction. A content commit records that acknowledged serial at
+receipt, preventing a delayed explicit-sync commit from consuming later resize
+state. A matching commit accepts the client's actual logical buffer or window
+geometry, including cell-aligned and viewport sizes, and uses it to preserve
+the opposite edge for left/top resize. Geometry-only valid commits can complete
+the transaction; unrelated bufferless commits leave it pending. Successful
+acceptance clears resize preview state and makes the committed buffer identity
+part of renderer scene invalidation.
+
 The remaining gap before using normal desktop apps comfortably is protocol and
 WM breadth: real floating placement/move/resize, richer focus policy, and then
 decoration/activation details for bigger toolkits.

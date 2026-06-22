@@ -45,6 +45,8 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
             }
             wl_surface::Request::Commit => {
                 let surface_id = data.surface_id();
+                let window_geometry_changed =
+                    state.pending_window_geometry_commits.remove(&surface_id);
                 let damage = data.take_damage();
                 let explicit_sync = data.explicit_sync();
                 let input_region_changed = data.commit_pending_input_region();
@@ -91,6 +93,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                                 data,
                                 None,
                                 explicit_sync,
+                                window_geometry_changed,
                             );
                         } else {
                             state.unmap_surface_content(surface_id);
@@ -103,6 +106,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                             data,
                             damage.explicit(),
                             explicit_sync,
+                            window_geometry_changed,
                         );
                     }
                 }

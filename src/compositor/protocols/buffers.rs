@@ -26,7 +26,7 @@ impl Dispatch<wl_shm::WlShm, ()> for CompositorState {
 
 impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for CompositorState {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         resource: &wl_shm_pool::WlShmPool,
         request: wl_shm_pool::Request,
@@ -43,9 +43,13 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for CompositorState {
                 stride,
                 format,
             } => {
+                let Some(identity) = state.allocate_buffer_identity() else {
+                    return;
+                };
                 data_init.init(
                     id,
                     ShmBufferData {
+                        identity,
                         pool_size: data.size(),
                         file: Arc::clone(&data.file),
                         offset,
@@ -153,9 +157,9 @@ impl Dispatch<wl_drm::WlDrm, ()> for CompositorState {
                     offset0,
                     stride0,
                 };
-                if let Some(data) =
-                    wl_drm_prime_buffer_data(resource, request, &state.dmabuf_feedback)
-                {
+                if let Some(data) = state.allocate_buffer_identity().and_then(|identity| {
+                    wl_drm_prime_buffer_data(resource, request, &state.dmabuf_feedback, identity)
+                }) {
                     data_init.init(id, data);
                 }
             }
@@ -182,6 +186,7 @@ fn wl_drm_prime_buffer_data(
     drm: &wl_drm::WlDrm,
     request: WlDrmPrimeBufferRequest,
     feedback: &EglGlesDmabufFeedback,
+    identity: BufferIdentity,
 ) -> Option<DmabufBufferData> {
     if request.width <= 0 || request.height <= 0 || request.offset0 < 0 || request.stride0 <= 0 {
         drm.post_error(
@@ -232,7 +237,7 @@ fn wl_drm_prime_buffer_data(
         )],
     )
     .ok()?;
-    Some(DmabufBufferData { handle })
+    Some(DmabufBufferData { identity, handle })
 }
 
 impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for CompositorState {
@@ -322,12 +327,17 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, DmabufParamsDa
                 format,
                 ..
             } => {
+                let Some(identity) = state.allocate_buffer_identity() else {
+                    resource.failed();
+                    return;
+                };
                 let Some(buffer_data) = data.take_buffer_data_for_create(
                     resource,
                     width,
                     height,
                     format,
                     &state.dmabuf_feedback,
+                    identity,
                 ) else {
                     resource.failed();
                     return;
@@ -348,12 +358,16 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, DmabufParamsDa
                 format,
                 ..
             } => {
+                let Some(identity) = state.allocate_buffer_identity() else {
+                    return;
+                };
                 if let Some(buffer_data) = data.take_buffer_data_for_create(
                     resource,
                     width,
                     height,
                     format,
                     &state.dmabuf_feedback,
+                    identity,
                 ) {
                     _data_init.init(buffer_id, buffer_data);
                 }

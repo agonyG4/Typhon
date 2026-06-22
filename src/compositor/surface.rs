@@ -1,5 +1,6 @@
 use crate::render_backend::buffer::{
-    BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle, SurfaceBufferSource,
+    BufferId, BufferIdentity, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle,
+    SurfaceBufferSource,
 };
 
 #[derive(Debug, Clone)]
@@ -17,6 +18,14 @@ pub struct RenderableSurface {
 }
 
 impl RenderableSurface {
+    pub const fn buffer_id(&self) -> BufferId {
+        self.buffer.buffer_id()
+    }
+
+    pub fn buffer_identity(&self) -> &BufferIdentity {
+        self.buffer.buffer_identity()
+    }
+
     pub const fn buffer_source(&self) -> SurfaceBufferSource {
         self.buffer.source()
     }

@@ -4953,6 +4953,9 @@ struct NativePaintStats {
     dmabuf_imports: usize,
     dmabuf_reuses: usize,
     dmabuf_import_failures: usize,
+    dmabuf_cache_entries: usize,
+    dmabuf_cache_peak_entries: usize,
+    dmabuf_cache_evictions: usize,
     scene_rebuild: DesktopSceneRebuildKind,
     frame_copy: DesktopFrameCopyKind,
     total_us: u64,
@@ -4980,6 +4983,9 @@ impl NativePaintStats {
             NativePerfField::usize("dmabuf_imports", self.dmabuf_imports),
             NativePerfField::usize("dmabuf_reuses", self.dmabuf_reuses),
             NativePerfField::usize("dmabuf_import_failures", self.dmabuf_import_failures),
+            NativePerfField::usize("dmabuf_cache_entries", self.dmabuf_cache_entries),
+            NativePerfField::usize("dmabuf_cache_peak_entries", self.dmabuf_cache_peak_entries),
+            NativePerfField::usize("dmabuf_cache_evictions", self.dmabuf_cache_evictions),
             NativePerfField::str("scene_rebuild", self.scene_rebuild.as_str()),
             NativePerfField::str("frame_copy", self.frame_copy.as_str()),
             NativePerfField::u64("paint_us", self.total_us),
@@ -6636,6 +6642,9 @@ fn native_egl_gbm_paint_stats(
         dmabuf_imports: scene_stats.dmabuf_imports,
         dmabuf_reuses: scene_stats.dmabuf_reuses,
         dmabuf_import_failures: scene_stats.dmabuf_import_failures,
+        dmabuf_cache_entries: scene_stats.dmabuf_cache_entries,
+        dmabuf_cache_peak_entries: scene_stats.dmabuf_cache_peak_entries,
+        dmabuf_cache_evictions: scene_stats.dmabuf_cache_evictions,
         scene_rebuild: if scene_stats.scene_rebuilt {
             DesktopSceneRebuildKind::Full
         } else {
@@ -6771,6 +6780,9 @@ impl NativeGbmScanout {
             dmabuf_imports: 0,
             dmabuf_reuses: 0,
             dmabuf_import_failures: 0,
+            dmabuf_cache_entries: 0,
+            dmabuf_cache_peak_entries: 0,
+            dmabuf_cache_evictions: 0,
             scene_rebuild: rendered.scene_rebuild_kind,
             frame_copy: rendered.frame_copy_kind,
             total_us: elapsed_micros(total_start),
@@ -7069,6 +7081,9 @@ impl DumbFramebuffer {
             dmabuf_imports: 0,
             dmabuf_reuses: 0,
             dmabuf_import_failures: 0,
+            dmabuf_cache_entries: 0,
+            dmabuf_cache_peak_entries: 0,
+            dmabuf_cache_evictions: 0,
             scene_rebuild: rendered.scene_rebuild_kind,
             frame_copy: rendered.frame_copy_kind,
             total_us: elapsed_micros(total_start),
@@ -7511,8 +7526,20 @@ mod tests {
         DesktopVisualState, RenderableSurfaceDamage, SurfaceDamageRect, SurfacePlacement,
         compose_nested_output, render_scene_elements_for_surfaces, surface_origins,
     };
-    use oblivion_one::render_backend::buffer::{BufferSize, CommittedSurfaceBuffer};
+    use oblivion_one::render_backend::buffer::{
+        BufferIdAllocator, BufferIdentity, BufferSize, CommittedSurfaceBuffer,
+    };
     use oblivion_one::{CompositorAppGpuPreference, EffectiveCompositorAppGpuPolicy};
+    use std::sync::{Mutex, OnceLock};
+
+    fn test_buffer_identity() -> BufferIdentity {
+        static IDS: OnceLock<Mutex<BufferIdAllocator>> = OnceLock::new();
+        IDS.get_or_init(|| Mutex::new(BufferIdAllocator::default()))
+            .lock()
+            .expect("test buffer identity allocator")
+            .allocate()
+            .expect("test buffer identity")
+    }
 
     #[test]
     fn connected_connector_for_card_prefers_connected_matching_card_output() {
@@ -8055,6 +8082,7 @@ mod tests {
             resize_preview: None,
             generation: 0,
             buffer: CommittedSurfaceBuffer::shm_snapshot(
+                test_buffer_identity(),
                 size,
                 vec![0; width as usize * height as usize],
             ),

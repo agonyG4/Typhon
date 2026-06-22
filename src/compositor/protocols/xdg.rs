@@ -213,6 +213,7 @@ impl Dispatch<xdg_surface::XdgSurface, XdgSurfaceData> for CompositorState {
                     state
                         .surface_window_geometries
                         .insert(surface_id, XdgWindowGeometry::new(x, y, width, height));
+                    state.pending_window_geometry_commits.insert(surface_id);
                     if let Some(positioner) = state
                         .popup_surfaces
                         .get(&surface_id)

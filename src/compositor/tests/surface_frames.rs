@@ -289,6 +289,9 @@ fn shm_read_pixels_into_reuses_existing_pixel_storage_for_same_size() {
         create_test_shm_file(&[0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff]).unwrap(),
     );
     let data = ShmBufferData {
+        identity: BufferIdAllocator::default()
+            .allocate()
+            .expect("test buffer identity"),
         pool_size: 16,
         file,
         offset: 0,
@@ -315,6 +318,9 @@ fn shm_read_pixels_into_with_damage_updates_only_dirty_rect() {
         create_test_shm_file(&[0xff11_1111, 0xff22_2222, 0xff33_3333, 0xff44_4444]).unwrap(),
     );
     let data = ShmBufferData {
+        identity: BufferIdAllocator::default()
+            .allocate()
+            .expect("test buffer identity"),
         pool_size: 16,
         file,
         offset: 0,
