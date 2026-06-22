@@ -33,7 +33,7 @@ use crate::wayland_drm::server::wl_drm;
 use super::{
     AcquireCommitId, AcquireWatchChange, ClientCursorRenderState, CompositorState,
     ExplicitSyncPoint, FramePresentation, InputProtocolCapabilities, PresentationClock,
-    RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
+    RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
     SelectionProtocolCapabilities, ShellDockItem, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
@@ -268,6 +268,10 @@ impl OwnCompositorServer {
 
     pub fn render_generation_cause(&self) -> RenderGenerationCause {
         self.state.render_generation_cause()
+    }
+
+    pub const fn resize_flow_metrics(&self) -> ResizeFlowMetrics {
+        self.state.resize_flow_metrics
     }
 
     pub fn has_pending_frame_callbacks(&self) -> bool {

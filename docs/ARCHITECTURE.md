@@ -252,16 +252,34 @@ buffer can be reused while destroyed or superseded buffers are evicted and
 destroyed with the renderer context current. Recreating the renderer starts an
 empty cache generation.
 
-Interactive XDG resize state is serial-gated rather than exact-size-gated. An
-ACK promotes the newest eligible configure without replacing a newer
-acknowledged transaction. A content commit records that acknowledged serial at
-receipt, preventing a delayed explicit-sync commit from consuming later resize
-state. A matching commit accepts the client's actual logical buffer or window
-geometry, including cell-aligned and viewport sizes, and uses it to preserve
-the opposite edge for left/top resize. Geometry-only valid commits can complete
-the transaction; unrelated bufferless commits leave it pending. Successful
-acceptance clears resize preview state and makes the committed buffer identity
-part of renderer scene invalidation.
+Interactive XDG resize uses one flow-controlled transaction per root toplevel.
+At most one resize configure is in flight; pointer motion replaces one
+`queued_latest` target while the local preview remains responsive. Ending the
+grab preserves a separate final target with `resizing=false`. The in-flight
+metadata is retained until its exact ACK is captured by a root
+`wl_surface.commit` and applied, so pointer frequency cannot evict a legally
+ACKable serial. After application, only the final target or newest queued
+geometry is sent. Storage is therefore constant per surface.
+
+ACK does not mutate visible state. The next applicable root commit captures an
+immutable snapshot containing serial, flow and commit sequences, requested
+geometry, placement and edges, resizing state, actual window/buffer geometry
+when known, and an attached `BufferId` when present. Buffer, geometry-only,
+viewport-only, and no-attach commit paths share this capture rule; child
+commits cannot consume root state. A matching commit accepts cell-aligned and
+viewport sizes and preserves the opposite edge for left/top resize using the
+actual committed geometry.
+
+Explicit-sync waiting records own that same snapshot and never compare it with
+later mutable resize state. Per surface, the oldest waiting commit remains a
+progress candidate and one newest successor is retained; additional unready
+successors replace only the latter. If a successor becomes ready first, it
+explicitly supersedes older waits and their watches before application, so
+stale fence readiness cannot regress visible state. A newer unready successor
+never displaces an already ready state. This bounds the queue at two and avoids
+both perpetual replacement and head-of-line starvation. Applying the captured
+transaction clears preview once, records its age, invalidates geometry/resource
+damage as needed, and releases the flow to send the newest target.
 
 The remaining gap before using normal desktop apps comfortably is protocol and
 WM breadth: real floating placement/move/resize, richer focus policy, and then

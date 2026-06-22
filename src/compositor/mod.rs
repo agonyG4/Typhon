@@ -110,11 +110,13 @@ pub use input::{
     PointerConstraintBackendRequest, PointerConstraintMode, PointerConstraintState,
     PointerMotionSample, RelativePointerMotion,
 };
+#[cfg(test)]
+use interaction::PendingResizeCommit;
 use interaction::{
-    PendingResizeCommit, PendingResizeConfigure, PointerPress, PointerTarget, ResizeEdges,
-    RootSurfaceHit, WindowFrameHit, WindowInteraction, WindowInteractionKind,
-    interactive_resize_geometry, resize_drag_threshold_reached, resize_edges_for_window_point,
-    resize_edges_from_xdg, window_frame_action_for_local_point,
+    PendingResizeConfigure, PointerPress, PointerTarget, ResizeAckDecision, ResizeCommitSnapshot,
+    ResizeConfigureFlow, ResizeEdges, RootSurfaceHit, WindowFrameHit, WindowInteraction,
+    WindowInteractionKind, interactive_resize_geometry, resize_drag_threshold_reached,
+    resize_edges_for_window_point, resize_edges_from_xdg, window_frame_action_for_local_point,
 };
 use output::{
     OutputRefreshRate, OutputScale, OutputSize, send_output_description,
@@ -162,25 +164,39 @@ use window_state::{ToplevelMode, WindowGeometry, WindowState, xdg_toplevel_state
 
 const MIN_WINDOW_WIDTH: u32 = 160;
 const MIN_WINDOW_HEIGHT: u32 = 120;
-const MAX_SENT_RESIZE_COMMITS_PER_SURFACE: usize = 32;
 const WL_SEAT_NAME_SINCE: u32 = 2;
 #[cfg(test)]
 const DRM_FORMAT_ARGB8888: u32 = DrmFormat::ARGB8888_FOURCC;
 #[cfg(test)]
 const DRM_FORMAT_MOD_LINEAR: u64 = DrmModifier::LINEAR.0;
 
-fn resize_commit_placement(
-    resize: PendingResizeCommit,
-    committed_size: BufferSize,
-) -> SurfacePlacement {
-    resize.placement_for_committed_size(committed_size.width, committed_size.height)
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ResizeFlowMetrics {
+    pub configures_requested: u64,
+    pub configures_sent: u64,
+    pub geometries_coalesced: u64,
+    pub acks_matched: u64,
+    pub acks_stale: u64,
+    pub acks_unknown: u64,
+    pub commits_captured: u64,
+    pub commits_delayed_by_explicit_sync: u64,
+    pub preview_activations: u64,
+    pub preview_completions: u64,
+    pub max_preview_age_ms: u64,
+    pub max_in_flight_configures: usize,
+    pub max_pending_explicit_sync_commits: usize,
 }
 
-fn resize_commit_serial_matches(
-    commit_resize_serial: Option<u32>,
-    resize: PendingResizeCommit,
-) -> bool {
-    commit_resize_serial == Some(resize.serial)
+#[derive(Debug, Clone, Copy)]
+struct ResizePreviewMetadata {
+    flow_sequence: u64,
+    activated_at: Instant,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct XdgConfigureSerialState {
+    latest_sent: u32,
+    latest_acked: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -290,9 +306,12 @@ pub struct CompositorState {
     toplevel_surfaces: HashMap<u32, ToplevelSurface>,
     configured_xdg_surfaces: HashSet<u32>,
     window_interaction: Option<WindowInteraction>,
-    pending_resize_configure: Option<PendingResizeConfigure>,
-    sent_resize_commits: HashMap<(u32, u32), PendingResizeCommit>,
-    pending_resize_commits: HashMap<u32, PendingResizeCommit>,
+    resize_configure_flows: HashMap<u32, ResizeConfigureFlow>,
+    next_resize_configure_sequence: u64,
+    next_surface_commit_sequence: u64,
+    resize_flow_metrics: ResizeFlowMetrics,
+    resize_preview_metadata: HashMap<u32, ResizePreviewMetadata>,
+    xdg_configure_serials: HashMap<u32, XdgConfigureSerialState>,
     last_pointer_x: f64,
     last_pointer_y: f64,
     last_pointer_motion_usec: Option<u64>,
@@ -3717,6 +3736,7 @@ impl CompositorState {
         pending: PendingSurfaceBuffer,
         damage: RenderableSurfaceDamage,
     ) {
+        let resize_commit = pending.resize_commit.as_deref().copied();
         if let Some(surface) = self.surface_resource_by_id(surface_id) {
             self.ensure_surface_entered_outputs(&surface);
         }
@@ -3758,8 +3778,8 @@ impl CompositorState {
                 pending.data.is_shm(),
                 pending.data.is_dmabuf(),
                 pending.data.dmabuf_handle(),
-                pending.resize_serial,
-                self.pending_resize_commits.get(&surface_id),
+                pending.resize_commit.as_deref().map(|resize| resize.serial),
+                resize_commit.map(|resize| resize.serial),
                 self.surface_window_geometries.get(&surface_id),
             );
         }
@@ -3783,6 +3803,9 @@ impl CompositorState {
             }
             self.track_committed_buffer_lifetime(surface_id, &pending);
             self.current_surface_buffers.insert(surface_id, pending);
+            if let Some(resize_commit) = resize_commit {
+                self.complete_applied_resize_transaction(surface_id, resize_commit);
+            }
             return;
         }
         if let Some(existing) = self
@@ -3844,6 +3867,9 @@ impl CompositorState {
         self.track_committed_buffer_lifetime(surface_id, &pending);
         self.current_surface_buffers.insert(surface_id, pending);
         self.set_render_generation(generation, RenderGenerationCause::SurfaceCommit);
+        if let Some(resize_commit) = resize_commit {
+            self.complete_applied_resize_transaction(surface_id, resize_commit);
+        }
         if committed_popup {
             self.refresh_pointer_focus_at_last_position();
         }
@@ -3947,7 +3973,10 @@ impl CompositorState {
                 Ok(surface_size) => surface_size,
                 Err(_) => buffer_size,
             };
-        let resize_pending = self.pending_resize_commits.contains_key(&surface_id);
+        let resize_pending = self
+            .resize_configure_flows
+            .get(&surface_id)
+            .is_some_and(ResizeConfigureFlow::has_in_flight);
         let surface_size = damage_only_rendered_surface_size(
             BufferSize {
                 width: existing.width,
@@ -3967,7 +3996,9 @@ impl CompositorState {
                 surface_size.height,
                 current.data.is_shm(),
                 current.data.is_dmabuf(),
-                self.pending_resize_commits.get(&surface_id),
+                self.resize_configure_flows
+                    .get(&surface_id)
+                    .and_then(ResizeConfigureFlow::in_flight_serial),
             );
         }
         existing.x = current.x;
@@ -3988,21 +4019,22 @@ impl CompositorState {
         frame_callbacks: Vec<wl_callback::WlCallback>,
         explicit_sync: Option<Arc<SyncobjSurfaceState>>,
     ) {
-        pending.resize_serial = self
-            .pending_resize_commits
-            .get(&surface_id)
-            .map(|resize| resize.serial);
-        let mut superseded_callbacks = self.cancel_pending_acquire_commits_for_surface(
-            surface_id,
-            AcquireWatchCancelReason::Superseded,
-        );
-        superseded_callbacks.extend(frame_callbacks);
-        let frame_callbacks = superseded_callbacks;
         if !self.is_cursor_surface(surface_id) {
             self.configure_xdg_surface_if_needed(surface_id);
         }
         let Some(sync_state) = explicit_sync else {
-            self.commit_surface_buffer_by_role(surface_id, pending, damage, frame_callbacks);
+            let mut callbacks = self.cancel_pending_acquire_commits_for_surface(
+                surface_id,
+                AcquireWatchCancelReason::Superseded,
+            );
+            callbacks.extend(frame_callbacks);
+            pending.resize_commit = self
+                .capture_acked_resize_for_surface_commit(surface_id)
+                .map(|snapshot| {
+                    self.snapshot_resize_commit_for_buffer(surface_id, snapshot, &pending)
+                })
+                .map(Box::new);
+            self.commit_surface_buffer_by_role(surface_id, pending, damage, callbacks);
             return;
         };
 
@@ -4039,38 +4071,85 @@ impl CompositorState {
         }
 
         pending.explicit_release = Some(release);
-        if !self.external_acquire_readiness && acquire.is_signaled() {
-            self.commit_surface_buffer_by_role(surface_id, pending, damage, frame_callbacks);
-        } else {
-            let Some(commit_id) = self.acquire_commit_ids.allocate() else {
-                sync_state.post_error(
-                    SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
-                    "explicit sync commit identity space exhausted",
-                );
-                return;
-            };
-            let buffer_id = pending.resource.id().protocol_id();
-            let received_at = Instant::now();
-            self.pending_explicit_sync_commits
-                .push(PendingExplicitSyncCommit {
+        let acquire_ready = acquire.is_signaled();
+        if acquire_ready {
+            let mut callbacks = self.cancel_pending_acquire_commits_for_surface(
+                surface_id,
+                AcquireWatchCancelReason::Superseded,
+            );
+            callbacks.extend(frame_callbacks);
+            pending.resize_commit = self
+                .capture_acked_resize_for_surface_commit(surface_id)
+                .map(|snapshot| {
+                    self.snapshot_resize_commit_for_buffer(surface_id, snapshot, &pending)
+                })
+                .map(Box::new);
+            self.commit_surface_buffer_by_role(surface_id, pending, damage, callbacks);
+            return;
+        }
+
+        let Some(commit_id) = self.acquire_commit_ids.allocate() else {
+            sync_state.post_error(
+                SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
+                "explicit sync commit identity space exhausted",
+            );
+            return;
+        };
+        let mut callbacks = self.retain_oldest_pending_acquire_for_surface(surface_id);
+        callbacks.extend(frame_callbacks);
+        pending.resize_commit = self
+            .capture_acked_resize_for_surface_commit(surface_id)
+            .map(|snapshot| self.snapshot_resize_commit_for_buffer(surface_id, snapshot, &pending))
+            .map(Box::new);
+        let buffer_id = pending.resource.id().protocol_id();
+        let received_at = Instant::now();
+        self.pending_explicit_sync_commits
+            .push(PendingExplicitSyncCommit {
+                commit_id,
+                surface_id,
+                pending,
+                damage,
+                frame_callbacks: callbacks,
+                acquire: acquire.clone(),
+                acquire_state: PendingAcquireState::RegistrationPending,
+            });
+        self.resize_flow_metrics.commits_delayed_by_explicit_sync = self
+            .resize_flow_metrics
+            .commits_delayed_by_explicit_sync
+            .saturating_add(1);
+        self.resize_flow_metrics.max_pending_explicit_sync_commits = self
+            .resize_flow_metrics
+            .max_pending_explicit_sync_commits
+            .max(self.pending_explicit_sync_commits.len());
+        if compositor_debug_surface_logging_enabled() {
+            let pending = self
+                .pending_explicit_sync_commits
+                .last()
+                .expect("explicit-sync commit was just queued");
+            eprintln!(
+                "oblivion-one compositor: resize_flow surface={surface_id} decision=captured commit_generation={} commit_has_buffer=true explicit_sync=waiting acked_serial={:?} pending_explicit_sync={}",
+                pending
+                    .pending
+                    .resize_commit
+                    .as_deref()
+                    .map_or(0, |snapshot| snapshot.commit_sequence),
+                pending
+                    .pending
+                    .resize_commit
+                    .as_deref()
+                    .map(|snapshot| snapshot.serial),
+                self.pending_explicit_sync_commits.len(),
+            );
+        }
+        if self.external_acquire_readiness {
+            self.pending_acquire_watch_changes
+                .push(AcquireWatchChange::Register(AcquireWatchRequest {
                     commit_id,
                     surface_id,
-                    pending,
-                    damage,
-                    frame_callbacks,
-                    acquire: acquire.clone(),
-                    acquire_state: PendingAcquireState::RegistrationPending,
-                });
-            if self.external_acquire_readiness {
-                self.pending_acquire_watch_changes
-                    .push(AcquireWatchChange::Register(AcquireWatchRequest {
-                        commit_id,
-                        surface_id,
-                        buffer_id,
-                        acquire,
-                        received_at,
-                    }));
-            }
+                    buffer_id,
+                    acquire,
+                    received_at,
+                }));
         }
     }
 
@@ -4080,7 +4159,7 @@ impl CompositorState {
         data: &SurfaceData,
         damage: Option<RenderableSurfaceDamage>,
         explicit_sync: Option<Arc<SyncobjSurfaceState>>,
-        window_geometry_changed: bool,
+        _window_geometry_changed: bool,
     ) {
         if let Some(sync_state) = explicit_sync {
             let (acquire, release) = sync_state.take_points();
@@ -4117,8 +4196,23 @@ impl CompositorState {
         }
 
         self.configure_xdg_surface_if_needed(surface_id);
+        let mut resize_commit = self.capture_acked_resize_for_surface_commit(surface_id);
         let surface_size = data.commit_pending_viewport();
         let buffer_scale = data.commit_pending_buffer_scale();
+        if let Some(snapshot) = resize_commit.as_mut() {
+            let committed_size = self
+                .xdg_window_geometry_size(surface_id)
+                .or_else(|| surface_size.map(|size| (size.width, size.height)))
+                .or_else(|| {
+                    self.renderable_surfaces
+                        .iter()
+                        .find(|surface| surface.surface_id == surface_id)
+                        .map(|surface| (surface.width, surface.height))
+                });
+            if let Some((width, height)) = committed_size {
+                *snapshot = snapshot.with_committed_size(width, height);
+            }
+        }
         let viewport_size_changed = surface_size.is_some_and(|surface_size| {
             self.renderable_surfaces
                 .iter()
@@ -4132,18 +4226,19 @@ impl CompositorState {
         {
             self.commit_surface_damage_only(surface_id, damage, surface_size, buffer_scale);
         }
-        if window_geometry_changed || viewport_size_changed {
-            self.complete_pending_resize_from_current_geometry(surface_id);
+        if let Some(resize_commit) = resize_commit {
+            self.complete_pending_resize_from_current_geometry(surface_id, resize_commit);
         }
         self.complete_frame_callbacks_now(data);
     }
 
-    fn complete_pending_resize_from_current_geometry(&mut self, surface_id: u32) -> bool {
-        let Some(resize) = self.pending_resize_commits.remove(&surface_id) else {
-            return false;
-        };
-        let committed_size = self
-            .xdg_window_geometry_size(surface_id)
+    fn complete_pending_resize_from_current_geometry(
+        &mut self,
+        surface_id: u32,
+        resize: ResizeCommitSnapshot,
+    ) -> bool {
+        let committed_size = resize
+            .committed_size
             .map(|(width, height)| BufferSize { width, height })
             .or_else(|| {
                 self.renderable_surfaces
@@ -4155,10 +4250,10 @@ impl CompositorState {
                     })
             });
         let Some(committed_size) = committed_size else {
-            self.pending_resize_commits.insert(surface_id, resize);
             return false;
         };
-        let placement = resize_commit_placement(resize, committed_size);
+        let placement =
+            resize.placement_for_committed_size(committed_size.width, committed_size.height);
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
                 "oblivion-one compositor: resize commit surface={surface_id} decision=accepted reason=geometry-only serial={} requested={}x{} actual={}x{} placement={},{}",
@@ -4182,6 +4277,7 @@ impl CompositorState {
         }
         self.store_surface_placement(surface_id, placement);
         self.advance_render_generation(RenderGenerationCause::WindowResize);
+        self.complete_applied_resize_transaction(surface_id, resize);
         true
     }
 
@@ -4301,18 +4397,47 @@ impl CompositorState {
     }
 
     fn clear_resize_state_for_surfaces(&mut self, surface_ids: &[u32]) {
-        if self
-            .pending_resize_configure
-            .is_some_and(|pending| surface_ids.contains(&pending.surface_id))
-        {
-            self.pending_resize_configure = None;
-        }
-        self.sent_resize_commits
-            .retain(|(surface_id, _), _| !surface_ids.contains(surface_id));
-        self.pending_resize_commits
+        self.resize_configure_flows
             .retain(|surface_id, _| !surface_ids.contains(surface_id));
+        for commit in &mut self.pending_explicit_sync_commits {
+            if surface_ids.contains(&commit.surface_id) {
+                commit.pending.resize_commit = None;
+            }
+        }
         self.pending_window_geometry_commits
             .retain(|surface_id| !surface_ids.contains(surface_id));
+        self.resize_preview_metadata
+            .retain(|surface_id, _| !surface_ids.contains(surface_id));
+        let mut restored_placements = Vec::new();
+        for surface in &mut self.renderable_surfaces {
+            if surface_ids.contains(&surface.surface_id)
+                && let Some(preview) = surface.resize_preview.take()
+            {
+                if preview.anchor_right {
+                    let right = surface
+                        .placement
+                        .local_x
+                        .saturating_add(i32::try_from(surface.width).unwrap_or(i32::MAX));
+                    surface.placement.local_x = right
+                        .saturating_sub(i32::try_from(preview.committed_width).unwrap_or(i32::MAX));
+                }
+                if preview.anchor_bottom {
+                    let bottom = surface
+                        .placement
+                        .local_y
+                        .saturating_add(i32::try_from(surface.height).unwrap_or(i32::MAX));
+                    surface.placement.local_y = bottom.saturating_sub(
+                        i32::try_from(preview.committed_height).unwrap_or(i32::MAX),
+                    );
+                }
+                surface.width = preview.committed_width;
+                surface.height = preview.committed_height;
+                restored_placements.push((surface.surface_id, surface.placement));
+            }
+        }
+        for (surface_id, placement) in restored_placements {
+            self.surface_placements.insert(surface_id, placement);
+        }
         if self
             .window_interaction
             .is_some_and(|interaction| surface_ids.contains(&interaction.root_surface_id))
@@ -4849,6 +4974,7 @@ impl CompositorState {
         self.toplevel_surfaces.remove(&surface_id);
         self.surface_placements.remove(&surface_id);
         self.configured_xdg_surfaces.remove(&surface_id);
+        self.xdg_configure_serials.remove(&surface_id);
         self.clear_resize_state_for_surfaces(&[surface_id]);
     }
 
@@ -5362,7 +5488,6 @@ impl CompositorState {
 
     fn end_window_interaction(&mut self) {
         let interaction = self.window_interaction;
-        self.flush_pending_resize_configure();
         if let Some(interaction) = interaction
             && interaction.drag_committed
             && let WindowInteractionKind::Resize(edges) = interaction.kind
@@ -5450,6 +5575,7 @@ impl CompositorState {
         {
             return false;
         }
+        self.clear_resize_state_for_surfaces(&[surface_id]);
 
         let surface_placements = &self.surface_placements;
         let mut minimized_surfaces = Vec::new();
@@ -5523,6 +5649,7 @@ impl CompositorState {
         if !self.toplevel_surfaces.contains_key(&surface_id) {
             return false;
         }
+        self.clear_resize_state_for_surfaces(&[surface_id]);
         if self
             .toplevel_surfaces
             .get(&surface_id)
@@ -5561,6 +5688,7 @@ impl CompositorState {
     }
 
     fn restore_floating_root_window(&mut self, surface_id: u32) -> bool {
+        self.clear_resize_state_for_surfaces(&[surface_id]);
         let Some(restore_geometry) = self.toplevel_surfaces.get_mut(&surface_id).map(|toplevel| {
             toplevel.window.set_mode(ToplevelMode::Floating);
             toplevel.window.take_restore_geometry()
@@ -5727,11 +5855,25 @@ impl CompositorState {
             edges,
             resizing: true,
         };
-        let duplicate = self.pending_resize_configure == Some(pending);
-        if duplicate {
-            return false;
+        self.resize_flow_metrics.configures_requested = self
+            .resize_flow_metrics
+            .configures_requested
+            .saturating_add(1);
+        let flow = self.resize_configure_flows.entry(surface_id).or_default();
+        let was_blocked = flow.has_in_flight() || flow.latest_desired().is_some();
+        let queued = flow.queue(pending);
+        if queued && was_blocked {
+            self.resize_flow_metrics.geometries_coalesced = self
+                .resize_flow_metrics
+                .geometries_coalesced
+                .saturating_add(1);
+            if compositor_debug_surface_logging_enabled() {
+                eprintln!(
+                    "oblivion-one compositor: resize_flow surface={surface_id} decision=coalesced queued_serial=not-sent queued_size={}x{} final_pending=false preview_active=true",
+                    pending.width, pending.height,
+                );
+            }
         }
-        self.pending_resize_configure = Some(pending);
         self.preview_resize_root_window_to(surface_id, width, height, placement, edges)
     }
 
@@ -5797,6 +5939,16 @@ impl CompositorState {
         placement: SurfacePlacement,
         edges: ResizeEdges,
     ) -> bool {
+        let preview_was_active = self
+            .renderable_surfaces
+            .iter()
+            .find(|surface| surface.surface_id == surface_id)
+            .is_some_and(|surface| surface.resize_preview.is_some());
+        let flow_sequence = self
+            .resize_configure_flows
+            .get(&surface_id)
+            .and_then(ResizeConfigureFlow::in_flight_sequence)
+            .unwrap_or_else(|| self.next_resize_configure_sequence.saturating_add(1));
         let Some(surface) = self
             .renderable_surfaces
             .iter_mut()
@@ -5826,95 +5978,103 @@ impl CompositorState {
             anchor_bottom: edges.top,
         });
         surface.damage = RenderableSurfaceDamage::Full;
+        if !preview_was_active {
+            self.resize_preview_metadata.insert(
+                surface_id,
+                ResizePreviewMetadata {
+                    flow_sequence,
+                    activated_at: Instant::now(),
+                },
+            );
+            self.resize_flow_metrics.preview_activations = self
+                .resize_flow_metrics
+                .preview_activations
+                .saturating_add(1);
+        }
         self.store_surface_placement(surface_id, placement);
         self.advance_render_generation(RenderGenerationCause::WindowResize);
         true
     }
 
     fn flush_pending_resize_configure(&mut self) -> bool {
-        let Some(pending) = self.pending_resize_configure.take() else {
-            return false;
-        };
-        self.send_resize_configure_to(
-            pending.surface_id,
-            pending.width,
-            pending.height,
-            pending.placement,
-            pending.edges,
-            pending.resizing,
-        )
+        let surface_ids = self
+            .resize_configure_flows
+            .iter()
+            .filter_map(|(surface_id, flow)| flow.has_sendable().then_some(*surface_id))
+            .collect::<Vec<_>>();
+        let mut sent = false;
+        for surface_id in surface_ids {
+            let desired = self
+                .resize_configure_flows
+                .get_mut(&surface_id)
+                .and_then(ResizeConfigureFlow::take_sendable);
+            if let Some(desired) = desired {
+                sent |= self.send_resize_configure(desired);
+            }
+        }
+        sent
     }
 
     fn send_resize_end_configure(&mut self, surface_id: u32, edges: ResizeEdges) -> bool {
-        if let Some(pending) = self.pending_resize_configure.take() {
-            return self.send_resize_configure_to(
-                pending.surface_id,
-                pending.width,
-                pending.height,
-                pending.placement,
-                pending.edges,
-                false,
-            );
-        }
-
-        if let Some(resize) = self.pending_resize_commits.get(&surface_id).copied() {
-            return self.send_resize_configure_to(
-                surface_id,
-                resize.width,
-                resize.height,
-                resize.placement,
-                resize.edges,
-                false,
-            );
-        }
-
-        if let Some(resize) = self.latest_sent_resize_commit(surface_id) {
-            return self.send_resize_configure_to(
-                surface_id,
-                resize.width,
-                resize.height,
-                resize.placement,
-                resize.edges,
-                false,
-            );
-        }
-
-        let Some(geometry) = self.current_root_window_geometry(surface_id) else {
+        let desired = self
+            .resize_configure_flows
+            .get(&surface_id)
+            .and_then(ResizeConfigureFlow::latest_desired)
+            .map(|pending| PendingResizeConfigure {
+                resizing: false,
+                ..pending
+            })
+            .or_else(|| {
+                self.current_root_window_geometry(surface_id)
+                    .map(|geometry| PendingResizeConfigure {
+                        surface_id,
+                        width: geometry.width,
+                        height: geometry.height,
+                        placement: geometry.placement,
+                        edges,
+                        resizing: false,
+                    })
+            });
+        let Some(desired) = desired else {
             return false;
         };
-        self.send_resize_configure_to(
-            surface_id,
-            geometry.width,
-            geometry.height,
-            geometry.placement,
-            edges,
-            false,
-        )
+        self.resize_flow_metrics.configures_requested = self
+            .resize_flow_metrics
+            .configures_requested
+            .saturating_add(1);
+        self.resize_configure_flows
+            .entry(surface_id)
+            .or_default()
+            .queue_final(desired);
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: resize_flow surface={surface_id} decision=coalesced queued_serial=not-sent queued_size={}x{} final_pending=true preview_active={}",
+                desired.width,
+                desired.height,
+                self.resize_preview_metadata.contains_key(&surface_id),
+            );
+        }
+        self.flush_pending_resize_configure()
     }
 
     fn pending_resize_configure_is_flushable(&self) -> bool {
-        self.pending_resize_configure.is_some()
+        self.resize_configure_flows
+            .values()
+            .any(ResizeConfigureFlow::has_sendable)
     }
 
-    fn send_resize_configure_to(
-        &mut self,
-        surface_id: u32,
-        width: u32,
-        height: u32,
-        placement: SurfacePlacement,
-        edges: ResizeEdges,
-        resizing: bool,
-    ) -> bool {
+    fn send_resize_configure(&mut self, desired: PendingResizeConfigure) -> bool {
+        let surface_id = desired.surface_id;
         let geometry = self.clamp_resize_geometry(
             surface_id,
-            WindowGeometry::new(placement, width, height),
-            edges,
+            WindowGeometry::new(desired.placement, desired.width, desired.height),
+            desired.edges,
         );
         let width = geometry.width;
         let height = geometry.height;
         let placement = geometry.placement;
         let resizing_states = [xdg_toplevel::State::Resizing];
-        let states = if resizing {
+        let states = if desired.resizing {
             &resizing_states[..]
         } else {
             &[][..]
@@ -5928,83 +6088,59 @@ impl CompositorState {
             width: width.max(MIN_WINDOW_WIDTH),
             height: height.max(MIN_WINDOW_HEIGHT),
             placement,
-            edges,
-            resizing,
-        }
-        .resize_commit(serial);
-        self.sent_resize_commits
-            .insert((surface_id, serial), resize);
-        self.prune_sent_resize_commits(surface_id);
+            edges: desired.edges,
+            resizing: desired.resizing,
+        };
+        self.next_resize_configure_sequence = self.next_resize_configure_sequence.saturating_add(1);
+        let sequence = self.next_resize_configure_sequence;
+        self.resize_configure_flows
+            .entry(surface_id)
+            .or_default()
+            .mark_sent(resize, serial, sequence);
+        self.resize_flow_metrics.configures_sent =
+            self.resize_flow_metrics.configures_sent.saturating_add(1);
+        self.resize_flow_metrics.max_in_flight_configures = self
+            .resize_flow_metrics
+            .max_in_flight_configures
+            .max(usize::from(
+                self.resize_configure_flows
+                    .get(&surface_id)
+                    .is_some_and(ResizeConfigureFlow::has_in_flight),
+            ));
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
-                "oblivion-one compositor: resize configure surface {surface_id} serial={serial} size={}x{} placement={},{} edges={:?} resizing={}",
+                "oblivion-one compositor: resize_flow surface={surface_id} decision=sent serial={serial} sequence={sequence} size={}x{} placement={},{} edges={:?} resizing={} in_flight_serial={serial}",
                 resize.width,
                 resize.height,
                 resize.placement.local_x,
                 resize.placement.local_y,
                 resize.edges,
-                resizing,
+                resize.resizing,
             );
         }
         true
     }
 
-    fn prune_sent_resize_commits(&mut self, surface_id: u32) {
-        let mut serials = self
-            .sent_resize_commits
-            .keys()
-            .filter_map(|(sent_surface_id, serial)| {
-                (*sent_surface_id == surface_id).then_some(*serial)
-            })
-            .collect::<Vec<_>>();
-        if serials.len() <= MAX_SENT_RESIZE_COMMITS_PER_SURFACE {
-            return;
-        }
-        serials.sort_unstable();
-        let remove_count = serials.len() - MAX_SENT_RESIZE_COMMITS_PER_SURFACE;
-        for serial in serials.into_iter().take(remove_count) {
-            self.sent_resize_commits.remove(&(surface_id, serial));
-        }
-    }
-
-    fn latest_sent_resize_commit(&self, surface_id: u32) -> Option<PendingResizeCommit> {
-        self.sent_resize_commits
-            .iter()
-            .filter_map(|((sent_surface_id, _), resize)| {
-                (*sent_surface_id == surface_id).then_some(*resize)
-            })
-            .max_by_key(|resize| resize.serial)
-    }
-
     fn take_pending_resize_commit_placement(
-        &mut self,
+        &self,
         surface_id: u32,
         pending: &PendingSurfaceBuffer,
     ) -> io::Result<Option<SurfacePlacement>> {
-        let Some(resize) = self.pending_resize_commits.remove(&surface_id) else {
+        let Some(resize) = pending.resize_commit.as_deref().copied() else {
             return Ok(None);
         };
-        if !resize_commit_serial_matches(pending.resize_serial, resize) {
-            if compositor_debug_surface_logging_enabled() {
-                eprintln!(
-                    "oblivion-one compositor: resize commit surface={surface_id} decision=deferred reason=serial-mismatch commit_serial={:?} pending_serial={} requested={}x{}",
-                    pending.resize_serial, resize.serial, resize.width, resize.height,
-                );
-            }
-            self.pending_resize_commits.insert(surface_id, resize);
-            return Ok(None);
-        }
         let buffer_width = pending.data.width()?;
         let buffer_height = pending.data.height()?;
-        let committed_size = self
-            .xdg_window_geometry_size(surface_id)
+        let committed_size = resize
+            .committed_size
             .map(|(width, height)| BufferSize { width, height })
             .or(pending.surface_size)
             .unwrap_or(BufferSize {
                 width: buffer_width,
                 height: buffer_height,
             });
-        let placement = resize_commit_placement(resize, committed_size);
+        let placement =
+            resize.placement_for_committed_size(committed_size.width, committed_size.height);
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
                 "oblivion-one compositor: resize commit surface={surface_id} decision=accepted serial={} requested={}x{} actual={}x{} placement={},{}",
@@ -6021,36 +6157,156 @@ impl CompositorState {
     }
 
     fn ack_xdg_surface_configure(&mut self, surface_id: u32, serial: u32) {
-        let resize = self
-            .sent_resize_commits
-            .iter()
-            .filter_map(|((sent_surface_id, sent_serial), resize)| {
-                (*sent_surface_id == surface_id && *sent_serial <= serial).then_some(*resize)
-            })
-            .max_by_key(|resize| resize.serial);
-        self.sent_resize_commits
-            .retain(|(sent_surface_id, sent_serial), _| {
-                *sent_surface_id != surface_id || *sent_serial > serial
-            });
-        if let Some(resize) = resize
-            && self
-                .pending_resize_commits
-                .get(&surface_id)
-                .is_none_or(|pending| pending.serial < resize.serial)
-        {
+        if !self.toplevel_surfaces.contains_key(&surface_id) {
             if compositor_debug_surface_logging_enabled() {
                 eprintln!(
-                    "oblivion-one compositor: ack resize surface {surface_id} serial={serial} matched_serial={} size={}x{} placement={},{} edges={:?}",
-                    resize.serial,
-                    resize.width,
-                    resize.height,
-                    resize.placement.local_x,
-                    resize.placement.local_y,
-                    resize.edges,
+                    "oblivion-one compositor: resize_flow surface={surface_id} acked_serial={serial} decision=acked reason=matched_other_configure"
                 );
             }
-            self.pending_resize_commits.insert(surface_id, resize);
+            return;
         }
+        let resize_decision = self
+            .resize_configure_flows
+            .get_mut(&surface_id)
+            .map_or(ResizeAckDecision::Unknown, |flow| flow.ack(serial));
+        let serial_state = self.xdg_configure_serials.entry(surface_id).or_default();
+        let matched_other = resize_decision == ResizeAckDecision::Unknown
+            && serial == serial_state.latest_sent
+            && serial > serial_state.latest_acked;
+        let decision = if matched_other {
+            "matched_other_configure"
+        } else {
+            match resize_decision {
+                ResizeAckDecision::Matched => "matched_in_flight",
+                ResizeAckDecision::Duplicate => "duplicate_serial",
+                ResizeAckDecision::Stale => "stale_serial",
+                ResizeAckDecision::Unknown if serial <= serial_state.latest_sent => "stale_serial",
+                ResizeAckDecision::Unknown => "unknown_serial",
+            }
+        };
+        if matched_other || resize_decision == ResizeAckDecision::Matched {
+            serial_state.latest_acked = serial_state.latest_acked.max(serial);
+        }
+        match resize_decision {
+            ResizeAckDecision::Matched => {
+                self.resize_flow_metrics.acks_matched =
+                    self.resize_flow_metrics.acks_matched.saturating_add(1);
+            }
+            ResizeAckDecision::Stale | ResizeAckDecision::Duplicate => {
+                self.resize_flow_metrics.acks_stale =
+                    self.resize_flow_metrics.acks_stale.saturating_add(1);
+            }
+            ResizeAckDecision::Unknown => {
+                if !matched_other && serial > serial_state.latest_sent {
+                    self.resize_flow_metrics.acks_unknown =
+                        self.resize_flow_metrics.acks_unknown.saturating_add(1);
+                } else if !matched_other {
+                    self.resize_flow_metrics.acks_stale =
+                        self.resize_flow_metrics.acks_stale.saturating_add(1);
+                }
+            }
+        }
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: resize_flow surface={surface_id} acked_serial={serial} decision={} reason={decision}",
+                if resize_decision == ResizeAckDecision::Matched || matched_other {
+                    "acked"
+                } else {
+                    "ignored"
+                },
+            );
+        }
+    }
+
+    fn capture_acked_resize_for_surface_commit(
+        &mut self,
+        surface_id: u32,
+    ) -> Option<ResizeCommitSnapshot> {
+        if !self.toplevel_surfaces.contains_key(&surface_id) {
+            return None;
+        }
+        self.next_surface_commit_sequence = self.next_surface_commit_sequence.saturating_add(1);
+        let commit_sequence = self.next_surface_commit_sequence;
+        let snapshot = self
+            .resize_configure_flows
+            .get_mut(&surface_id)
+            .and_then(|flow| flow.capture(commit_sequence));
+        if let Some(snapshot) = snapshot {
+            self.resize_flow_metrics.commits_captured =
+                self.resize_flow_metrics.commits_captured.saturating_add(1);
+            if compositor_debug_surface_logging_enabled() {
+                eprintln!(
+                    "oblivion-one compositor: resize_flow surface={surface_id} decision=captured acked_serial={} sequence={} commit_generation={} resizing={}",
+                    snapshot.serial, snapshot.sequence, snapshot.commit_sequence, snapshot.resizing,
+                );
+            }
+        }
+        snapshot
+    }
+
+    fn snapshot_resize_commit_for_buffer(
+        &self,
+        surface_id: u32,
+        snapshot: ResizeCommitSnapshot,
+        pending: &PendingSurfaceBuffer,
+    ) -> ResizeCommitSnapshot {
+        let snapshot = snapshot.with_buffer_id(pending.data.buffer_id().get());
+        let committed_size = self
+            .xdg_window_geometry_size(surface_id)
+            .map(|(width, height)| BufferSize { width, height })
+            .or(pending.surface_size)
+            .or_else(|| {
+                Some(BufferSize {
+                    width: pending.data.width().ok()?,
+                    height: pending.data.height().ok()?,
+                })
+            });
+        committed_size.map_or(snapshot, |size| {
+            snapshot.with_committed_size(size.width, size.height)
+        })
+    }
+
+    fn complete_applied_resize_transaction(
+        &mut self,
+        surface_id: u32,
+        snapshot: ResizeCommitSnapshot,
+    ) -> bool {
+        let completed = self
+            .resize_configure_flows
+            .get_mut(&surface_id)
+            .is_some_and(|flow| flow.complete_applied(snapshot.sequence));
+        if !completed {
+            return false;
+        }
+        self.resize_flow_metrics.preview_completions = self
+            .resize_flow_metrics
+            .preview_completions
+            .saturating_add(1);
+        let preview_metadata = self.resize_preview_metadata.remove(&surface_id);
+        let preview_sequence = preview_metadata.map(|metadata| metadata.flow_sequence);
+        let preview_age = preview_metadata
+            .map(|metadata| metadata.activated_at.elapsed())
+            .unwrap_or_else(|| snapshot.emitted_at.elapsed());
+        let preview_age_ms = u64::try_from(preview_age.as_millis()).unwrap_or(u64::MAX);
+        self.resize_flow_metrics.max_preview_age_ms = self
+            .resize_flow_metrics
+            .max_preview_age_ms
+            .max(preview_age_ms);
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: resize_flow surface={surface_id} decision=applied serial={} sequence={} commit_generation={} buffer_id={:?} preview_sequence={preview_sequence:?} preview_active=false preview_age_ms={preview_age_ms}",
+                snapshot.serial, snapshot.sequence, snapshot.commit_sequence, snapshot.buffer_id,
+            );
+        }
+        self.flush_pending_resize_configure();
+        if self
+            .resize_configure_flows
+            .get(&surface_id)
+            .is_some_and(ResizeConfigureFlow::is_empty)
+        {
+            self.resize_configure_flows.remove(&surface_id);
+        }
+        true
     }
 
     fn send_resize_root_window_to(&mut self, surface_id: u32, width: u32, height: u32) -> bool {
@@ -6080,6 +6336,10 @@ impl CompositorState {
         let _ = toplevel
             .xdg_surface
             .send_event(xdg_surface::Event::Configure { serial });
+        self.xdg_configure_serials
+            .entry(surface_id)
+            .or_default()
+            .latest_sent = serial;
         Some(serial)
     }
 
@@ -6749,7 +7009,7 @@ impl CompositorState {
     }
 
     fn has_only_pending_surface_frame_callbacks(&self) -> bool {
-        self.pending_resize_configure.is_none()
+        !self.pending_resize_configure_is_flushable()
             && self.pending_frame_callbacks.is_empty()
             && self.pending_explicit_sync_commits.is_empty()
             && self.pending_presentation_feedbacks.is_empty()
@@ -6865,9 +7125,13 @@ impl CompositorState {
     ) -> Vec<wl_callback::WlCallback> {
         let mut retained = Vec::with_capacity(self.pending_explicit_sync_commits.len());
         let mut canceled_callbacks = Vec::new();
+        let mut canceled_resize_captures = Vec::new();
         for commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
             if commit.surface_id == surface_id {
                 canceled_callbacks.extend(commit.frame_callbacks);
+                if let Some(resize) = commit.pending.resize_commit.as_deref() {
+                    canceled_resize_captures.push(resize.commit_sequence);
+                }
                 if self.external_acquire_readiness {
                     self.pending_acquire_watch_changes
                         .push(AcquireWatchChange::Cancel {
@@ -6880,7 +7144,47 @@ impl CompositorState {
             }
         }
         self.pending_explicit_sync_commits = retained;
+        if let Some(flow) = self.resize_configure_flows.get_mut(&surface_id) {
+            for commit_sequence in canceled_resize_captures {
+                flow.release_capture(commit_sequence);
+            }
+        }
         canceled_callbacks
+    }
+
+    fn retain_oldest_pending_acquire_for_surface(
+        &mut self,
+        surface_id: u32,
+    ) -> Vec<wl_callback::WlCallback> {
+        let mut retained = Vec::with_capacity(self.pending_explicit_sync_commits.len());
+        let mut kept_oldest = false;
+        let mut superseded_callbacks = Vec::new();
+        let mut released_captures = Vec::new();
+        for commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
+            if commit.surface_id != surface_id || !kept_oldest {
+                kept_oldest |= commit.surface_id == surface_id;
+                retained.push(commit);
+                continue;
+            }
+            superseded_callbacks.extend(commit.frame_callbacks);
+            if let Some(resize) = commit.pending.resize_commit.as_deref() {
+                released_captures.push(resize.commit_sequence);
+            }
+            if self.external_acquire_readiness {
+                self.pending_acquire_watch_changes
+                    .push(AcquireWatchChange::Cancel {
+                        commit_id: commit.commit_id,
+                        reason: AcquireWatchCancelReason::Superseded,
+                    });
+            }
+        }
+        self.pending_explicit_sync_commits = retained;
+        if let Some(flow) = self.resize_configure_flows.get_mut(&surface_id) {
+            for commit_sequence in released_captures {
+                flow.release_capture(commit_sequence);
+            }
+        }
+        superseded_callbacks
     }
 
     fn cancel_pending_acquire_commits_for_buffer(
@@ -6905,6 +7209,7 @@ impl CompositorState {
         reason: AcquireWatchCancelReason,
     ) {
         let mut retained = Vec::with_capacity(self.pending_explicit_sync_commits.len());
+        let mut released_captures = Vec::new();
         for commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
             let uses_timeline = commit.acquire.timeline.same_timeline(timeline)
                 || commit
@@ -6913,6 +7218,9 @@ impl CompositorState {
                     .as_ref()
                     .is_some_and(|release| release.timeline.same_timeline(timeline));
             if uses_timeline {
+                if let Some(resize) = commit.pending.resize_commit.as_deref() {
+                    released_captures.push((commit.surface_id, resize.commit_sequence));
+                }
                 if self.external_acquire_readiness {
                     self.pending_acquire_watch_changes
                         .push(AcquireWatchChange::Cancel {
@@ -6925,6 +7233,11 @@ impl CompositorState {
             }
         }
         self.pending_explicit_sync_commits = retained;
+        for (surface_id, commit_sequence) in released_captures {
+            if let Some(flow) = self.resize_configure_flows.get_mut(&surface_id) {
+                flow.release_capture(commit_sequence);
+            }
+        }
     }
 
     fn enable_external_acquire_readiness(&mut self) {
@@ -6933,6 +7246,9 @@ impl CompositorState {
         }
         self.external_acquire_readiness = true;
         for commit in &self.pending_explicit_sync_commits {
+            if commit.acquire_state == PendingAcquireState::Ready {
+                continue;
+            }
             self.pending_acquire_watch_changes
                 .push(AcquireWatchChange::Register(AcquireWatchRequest {
                     commit_id: commit.commit_id,
@@ -6979,24 +7295,95 @@ impl CompositorState {
     }
 
     fn commit_ready_explicit_sync_buffers(&mut self) {
-        let mut waiting = Vec::new();
-        for mut commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
+        let mut commits = std::mem::take(&mut self.pending_explicit_sync_commits);
+        for commit in &mut commits {
             if !self.external_acquire_readiness && commit.acquire.is_signaled() {
                 commit.acquire_state.mark_ready();
             }
-            if commit.acquire_state == PendingAcquireState::Ready {
-                self.commit_surface_buffer_by_role(
+        }
+        let newest_ready = newest_ready_explicit_sync_commit_indices(
+            commits.iter().enumerate().map(|(index, commit)| {
+                (
+                    index,
                     commit.surface_id,
-                    commit.pending,
-                    commit.damage,
-                    commit.frame_callbacks,
-                );
+                    commit.acquire_state == PendingAcquireState::Ready,
+                )
+            }),
+        );
+
+        let mut waiting = Vec::new();
+        let mut ready = Vec::new();
+        let mut superseded_callbacks: HashMap<u32, Vec<wl_callback::WlCallback>> = HashMap::new();
+        let mut released_captures = Vec::new();
+        for (index, commit) in commits.into_iter().enumerate() {
+            let Some(&ready_index) = newest_ready.get(&commit.surface_id) else {
+                waiting.push(commit);
+                continue;
+            };
+            if index < ready_index {
+                superseded_callbacks
+                    .entry(commit.surface_id)
+                    .or_default()
+                    .extend(commit.frame_callbacks);
+                if let Some(resize) = commit.pending.resize_commit.as_deref() {
+                    released_captures.push((commit.surface_id, resize.commit_sequence));
+                }
+                if self.external_acquire_readiness {
+                    self.pending_acquire_watch_changes
+                        .push(AcquireWatchChange::Cancel {
+                            commit_id: commit.commit_id,
+                            reason: AcquireWatchCancelReason::Superseded,
+                        });
+                }
+            } else if index == ready_index {
+                ready.push(commit);
             } else {
                 waiting.push(commit);
             }
         }
         self.pending_explicit_sync_commits = waiting;
+        for (surface_id, commit_sequence) in released_captures {
+            if let Some(flow) = self.resize_configure_flows.get_mut(&surface_id) {
+                flow.release_capture(commit_sequence);
+            }
+        }
+        for mut commit in ready {
+            let mut callbacks = superseded_callbacks
+                .remove(&commit.surface_id)
+                .unwrap_or_default();
+            callbacks.extend(commit.frame_callbacks);
+            if commit.pending.resize_commit.is_none() {
+                commit.pending.resize_commit = self
+                    .capture_acked_resize_for_surface_commit(commit.surface_id)
+                    .map(|snapshot| {
+                        self.snapshot_resize_commit_for_buffer(
+                            commit.surface_id,
+                            snapshot,
+                            &commit.pending,
+                        )
+                    })
+                    .map(Box::new);
+            }
+            self.commit_surface_buffer_by_role(
+                commit.surface_id,
+                commit.pending,
+                commit.damage,
+                callbacks,
+            );
+        }
     }
+}
+
+fn newest_ready_explicit_sync_commit_indices(
+    commits: impl IntoIterator<Item = (usize, u32, bool)>,
+) -> HashMap<u32, usize> {
+    let mut newest_ready = HashMap::new();
+    for (index, surface_id, ready) in commits {
+        if ready {
+            newest_ready.insert(surface_id, index);
+        }
+    }
+    newest_ready
 }
 
 fn damage_only_rendered_surface_size(

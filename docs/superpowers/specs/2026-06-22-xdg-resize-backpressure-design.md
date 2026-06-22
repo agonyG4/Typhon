@@ -51,11 +51,12 @@ completes the in-flight flow once, and emits the newest queued/final request.
 ## Explicit-Sync Anti-Starvation
 
 The current visible buffer remains presentable. Per surface, the compositor
-retains the oldest waiting acquire commit as the next progress candidate and
-one newest waiting successor. Additional unready successors replace only the
-newest waiting successor, never the oldest candidate. A newly ready commit may
-supersede waiting commits because it is immediately presentable. Stale fence
-readiness is rejected by exact acquire commit identity.
+retains the oldest waiting acquire commit as a progress candidate and one
+newest waiting successor. Additional unready successors replace only the
+newest waiting successor, never the oldest candidate. If a successor becomes
+ready first, it explicitly supersedes older waits and cancels their watches
+before application; a newer unready successor cannot discard a ready state.
+Stale fence readiness is rejected by exact acquire commit identity.
 
 This bounds waiting state at two commits per surface while preventing rapid
 unready commits from indefinitely canceling every potential successor.

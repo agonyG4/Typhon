@@ -200,7 +200,7 @@ fn window_resize_drag_sends_configure_for_root_surface() {
 }
 
 #[test]
-fn resize_drag_coalesces_pointer_updates_until_present_frame() {
+fn resize_drag_coalesces_pointer_updates_behind_in_flight_configure() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -211,10 +211,10 @@ fn resize_drag_coalesces_pointer_updates_until_present_frame() {
     let origins = render::surface_origins(server.renderable_surfaces());
 
     let state = state.unwrap();
-    assert_eq!(state.toplevel_configure_count, 3);
+    assert_eq!(state.toplevel_configure_count, 2);
     assert_eq!(state.toplevel_width, 340);
     assert_eq!(state.toplevel_height, 230);
-    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Resizing));
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Resizing));
     assert_eq!(origins.first().copied(), Some(render::FIRST_SURFACE_OFFSET));
 }
 
@@ -233,7 +233,7 @@ fn resize_drag_configure_reports_resizing_state_while_active() {
 }
 
 #[test]
-fn resize_drag_sends_next_configure_without_waiting_for_client_commit() {
+fn resize_drag_does_not_send_next_configure_without_client_progress() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -246,9 +246,7 @@ fn resize_drag_sends_next_configure_without_waiting_for_client_commit() {
     let _server = stop_controllable_test_server(commands, server_thread);
 
     let state = state.unwrap();
-    assert_eq!(state.toplevel_configure_count, 3);
-    assert_eq!(state.toplevel_width, 380);
-    assert_eq!(state.toplevel_height, 260);
+    assert_eq!(state.toplevel_configure_count, 2);
 }
 
 #[test]
@@ -348,79 +346,43 @@ fn resize_drag_updates_visual_target_before_client_commit() {
 }
 
 #[test]
-fn ack_configure_promotes_matching_resize_commit() {
-    let mut state = CompositorState::default();
+fn matching_resize_ack_can_be_captured_once() {
     let surface_id = 42;
     let serial = 7;
-    let resize = PendingResizeCommit {
-        serial,
+    let desired = PendingResizeConfigure {
+        surface_id,
         width: 320,
         height: 240,
         placement: SurfacePlacement::root_at(10, 20),
         edges: ResizeEdges::BOTTOM_RIGHT,
+        resizing: true,
     };
-
-    state
-        .sent_resize_commits
-        .insert((surface_id, serial), resize);
-    state.ack_xdg_surface_configure(surface_id, serial);
-
-    assert_eq!(state.pending_resize_commits.get(&surface_id), Some(&resize));
-    assert!(
-        !state
-            .sent_resize_commits
-            .contains_key(&(surface_id, serial))
-    );
+    let mut flow = ResizeConfigureFlow::default();
+    flow.mark_sent(desired, serial, 1);
+    assert_eq!(flow.ack(serial), ResizeAckDecision::Matched);
+    let snapshot = flow.capture(1).expect("ACKed resize snapshot");
+    assert_eq!(snapshot.serial, serial);
+    assert!(flow.capture(2).is_none());
 }
 
 #[test]
-fn ack_configure_promotes_latest_resize_not_newer_than_ack_serial() {
-    let mut state = CompositorState::default();
+fn resize_flow_classifies_duplicate_stale_and_unknown_serials() {
     let surface_id = 42;
-    let older = PendingResizeCommit {
-        serial: 7,
+    let desired = PendingResizeConfigure {
+        surface_id,
         width: 320,
         height: 240,
         placement: SurfacePlacement::root_at(10, 20),
         edges: ResizeEdges::BOTTOM_RIGHT,
+        resizing: true,
     };
-    let latest_acked = PendingResizeCommit {
-        serial: 9,
-        width: 360,
-        height: 260,
-        placement: SurfacePlacement::root_at(14, 22),
-        edges: ResizeEdges::BOTTOM_RIGHT,
-    };
-    let newer = PendingResizeCommit {
-        serial: 12,
-        width: 400,
-        height: 300,
-        placement: SurfacePlacement::root_at(18, 26),
-        edges: ResizeEdges::BOTTOM_RIGHT,
-    };
+    let mut flow = ResizeConfigureFlow::default();
+    flow.mark_sent(desired, 9, 1);
 
-    state
-        .sent_resize_commits
-        .insert((surface_id, older.serial), older);
-    state
-        .sent_resize_commits
-        .insert((surface_id, latest_acked.serial), latest_acked);
-    state
-        .sent_resize_commits
-        .insert((surface_id, newer.serial), newer);
-
-    state.ack_xdg_surface_configure(surface_id, 10);
-
-    assert_eq!(
-        state.pending_resize_commits.get(&surface_id),
-        Some(&latest_acked)
-    );
-    assert!(!state.sent_resize_commits.contains_key(&(surface_id, 7)));
-    assert!(!state.sent_resize_commits.contains_key(&(surface_id, 9)));
-    assert_eq!(
-        state.sent_resize_commits.get(&(surface_id, 12)),
-        Some(&newer)
-    );
+    assert_eq!(flow.ack(9), ResizeAckDecision::Matched);
+    assert_eq!(flow.ack(9), ResizeAckDecision::Duplicate);
+    assert_eq!(flow.ack(7), ResizeAckDecision::Stale);
+    assert_eq!(flow.ack(12), ResizeAckDecision::Unknown);
 }
 
 #[test]
@@ -434,79 +396,61 @@ fn pending_resize_commit_accepts_cell_aligned_committed_size() {
     };
 
     assert_eq!(
-        resize_commit_placement(
-            resize,
-            BufferSize {
-                width: 300,
-                height: 200,
-            }
-        ),
+        resize.placement_for_committed_size(300, 200),
         resize.placement
     );
     assert_eq!(
-        resize_commit_placement(
-            resize,
-            BufferSize {
-                width: 340,
-                height: 230,
-            }
-        ),
+        resize.placement_for_committed_size(340, 230),
         resize.placement
     );
-}
-
-#[test]
-fn older_ack_cannot_replace_newer_acknowledged_resize_transaction() {
-    let mut state = CompositorState::default();
-    let surface_id = 42;
-    let older = PendingResizeCommit {
-        serial: 9,
-        width: 320,
-        height: 240,
-        placement: SurfacePlacement::root_at(10, 20),
-        edges: ResizeEdges::BOTTOM_RIGHT,
-    };
-    let newer = PendingResizeCommit {
-        serial: 12,
-        width: 400,
-        height: 300,
-        placement: SurfacePlacement::root_at(18, 26),
-        edges: ResizeEdges::BOTTOM_RIGHT,
-    };
-    state
-        .sent_resize_commits
-        .insert((surface_id, older.serial), older);
-    state.pending_resize_commits.insert(surface_id, newer);
-
-    state.ack_xdg_surface_configure(surface_id, older.serial);
-
-    assert_eq!(state.pending_resize_commits.get(&surface_id), Some(&newer));
 }
 
 #[test]
 fn commit_received_before_ack_cannot_complete_resize_after_delayed_acquire() {
-    let resize = PendingResizeCommit {
-        serial: 12,
+    let mut flow = ResizeConfigureFlow::default();
+    let desired = PendingResizeConfigure {
+        surface_id: 42,
         width: 400,
         height: 300,
         placement: SurfacePlacement::root_at(18, 26),
         edges: ResizeEdges::BOTTOM_RIGHT,
+        resizing: true,
     };
+    flow.mark_sent(desired, 12, 1);
 
-    assert!(!resize_commit_serial_matches(None, resize));
-    assert!(!resize_commit_serial_matches(Some(9), resize));
-    assert!(resize_commit_serial_matches(Some(12), resize));
+    assert!(flow.capture(1).is_none());
+    assert_eq!(flow.ack(12), ResizeAckDecision::Matched);
+    assert!(flow.capture(2).is_some());
+    assert!(flow.capture(3).is_none());
+}
+
+#[test]
+fn explicit_sync_selects_newest_ready_commit_without_discarding_newer_wait() {
+    let selected = newest_ready_explicit_sync_commit_indices([
+        (0, 8, false),
+        (1, 8, true),
+        (2, 9, true),
+        (3, 8, false),
+    ]);
+
+    assert_eq!(selected.get(&8), Some(&1));
+    assert_eq!(selected.get(&9), Some(&2));
 }
 
 #[test]
 fn left_top_resize_placement_uses_actual_cell_aligned_size() {
-    let resize = PendingResizeCommit {
-        serial: 7,
+    let desired = PendingResizeConfigure {
+        surface_id: 42,
         width: 1003,
         height: 701,
         placement: SurfacePlacement::root_at(100, 200),
         edges: ResizeEdges::new(true, false, true, false),
+        resizing: true,
     };
+    let mut flow = ResizeConfigureFlow::default();
+    flow.mark_sent(desired, 7, 1);
+    assert_eq!(flow.ack(7), ResizeAckDecision::Matched);
+    let resize = flow.capture(1).expect("geometry commit snapshot");
 
     let placement = resize.placement_for_committed_size(1000, 696);
 
@@ -518,13 +462,19 @@ fn left_top_resize_placement_uses_actual_cell_aligned_size() {
 fn geometry_only_commit_completes_resize_and_clears_preview() {
     let mut state = CompositorState::default();
     let surface_id = 42;
-    let resize = PendingResizeCommit {
-        serial: 7,
+    let desired = PendingResizeConfigure {
+        surface_id,
         width: 1003,
         height: 701,
         placement: SurfacePlacement::root_at(100, 200),
         edges: ResizeEdges::new(true, false, true, false),
+        resizing: true,
     };
+    let mut flow = ResizeConfigureFlow::default();
+    flow.mark_sent(desired, 7, 1);
+    assert_eq!(flow.ack(7), ResizeAckDecision::Matched);
+    let resize = flow.capture(1).expect("geometry commit snapshot");
+    state.resize_configure_flows.insert(surface_id, flow);
     let identity = BufferIdAllocator::default()
         .allocate()
         .expect("test buffer identity");
@@ -534,7 +484,7 @@ fn geometry_only_commit_completes_resize_and_clears_preview() {
         y: 0,
         width: 1000,
         height: 696,
-        placement: resize.placement,
+        placement: desired.placement,
         resize_preview: Some(ResizePreview {
             committed_width: 900,
             committed_height: 600,
@@ -552,11 +502,14 @@ fn geometry_only_commit_completes_resize_and_clears_preview() {
     state
         .surface_window_geometries
         .insert(surface_id, XdgWindowGeometry::new(0, 0, 1000, 696));
-    state.pending_resize_commits.insert(surface_id, resize);
+    assert!(state.complete_pending_resize_from_current_geometry(surface_id, resize));
 
-    assert!(state.complete_pending_resize_from_current_geometry(surface_id));
-
-    assert!(!state.pending_resize_commits.contains_key(&surface_id));
+    assert!(
+        !state
+            .resize_configure_flows
+            .get(&surface_id)
+            .is_some_and(ResizeConfigureFlow::has_in_flight)
+    );
     let surface = &state.renderable_surfaces[0];
     assert_eq!(surface.resize_preview, None);
     assert_eq!(surface.placement.local_x, 103);
@@ -637,13 +590,19 @@ fn resize_drag_end_clears_resizing_state() {
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
     let state = create_buffered_toplevel_then_resize_drag_and_release(&socket_path, &commands);
-    let _server = stop_controllable_test_server(commands, server_thread);
+    let server = stop_controllable_test_server(commands, server_thread);
 
     let state = state.unwrap();
     assert_eq!(state.toplevel_configure_count, 3);
     assert_eq!(state.toplevel_width, 340);
     assert_eq!(state.toplevel_height, 230);
     assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Resizing));
+    let metrics = server.resize_flow_metrics();
+    assert_eq!(metrics.max_in_flight_configures, 1);
+    assert_eq!(metrics.acks_unknown, 0);
+    assert!(metrics.configures_sent >= 2);
+    assert!(metrics.commits_captured >= 1);
+    assert!(metrics.preview_completions >= 1);
 }
 
 #[test]

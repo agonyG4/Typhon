@@ -17,6 +17,7 @@ use super::{
     RenderableSurface, RenderableSurfaceDamage, SurfaceDamageRect, SurfacePlacement,
     dmabuf::DmabufBufferData,
     explicit_sync::{ExplicitSyncPoint, SyncobjSurfaceState},
+    interaction::ResizeCommitSnapshot,
     popup::XdgPositionerState,
     same_buffer_resource,
     shm::{ShmBufferData, invalid_buffer_for_cpu_read, invalid_shm_buffer},
@@ -96,7 +97,7 @@ impl SurfaceData {
                         y,
                         explicit_release: None,
                         surface_size: None,
-                        resize_serial: None,
+                        resize_commit: None,
                     }))
                 } else {
                     resource.data::<DmabufBufferData>().cloned().map(|data| {
@@ -107,7 +108,7 @@ impl SurfaceData {
                             y,
                             explicit_release: None,
                             surface_size: None,
-                            resize_serial: None,
+                            resize_commit: None,
                         })
                     })
                 }
@@ -411,7 +412,7 @@ pub(super) struct PendingSurfaceBuffer {
     pub(super) y: i32,
     pub(super) explicit_release: Option<ExplicitSyncPoint>,
     pub(super) surface_size: Option<BufferSize>,
-    pub(super) resize_serial: Option<u32>,
+    pub(super) resize_commit: Option<Box<ResizeCommitSnapshot>>,
 }
 
 impl PendingSurfaceBuffer {

@@ -1584,12 +1584,32 @@ pub fn run(
             let before_generation = server.render_generation();
             server.prepare_frame();
             let after_generation = server.render_generation();
+            let resize = server.resize_flow_metrics();
             perf.log("native.prepare_frame", || {
                 vec![
                     NativePerfField::u64("elapsed_us", elapsed_micros(prepare_frame_start)),
                     NativePerfField::u64("render_generation", after_generation),
                     NativePerfField::bool("render_changed", after_generation != before_generation),
                     NativePerfField::bool("pending_frame_work", server.has_pending_frame_work()),
+                    NativePerfField::u64(
+                        "resize_configures_requested",
+                        resize.configures_requested,
+                    ),
+                    NativePerfField::u64("resize_configures_sent", resize.configures_sent),
+                    NativePerfField::u64(
+                        "resize_geometries_coalesced",
+                        resize.geometries_coalesced,
+                    ),
+                    NativePerfField::u64("resize_acks_matched", resize.acks_matched),
+                    NativePerfField::u64("resize_acks_stale", resize.acks_stale),
+                    NativePerfField::u64("resize_acks_unknown", resize.acks_unknown),
+                    NativePerfField::u64("resize_commits_captured", resize.commits_captured),
+                    NativePerfField::u64("resize_preview_max_age_ms", resize.max_preview_age_ms),
+                    NativePerfField::usize("resize_max_in_flight", resize.max_in_flight_configures),
+                    NativePerfField::usize(
+                        "resize_max_pending_explicit_sync",
+                        resize.max_pending_explicit_sync_commits,
+                    ),
                 ]
             });
         }

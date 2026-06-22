@@ -68,11 +68,19 @@ Current limits:
   scanout, cursor-plane migration, overlay planes, KMS in/out fences,
   `FB_DAMAGE_CLIPS`, hotplug policy, and multi-output commits are not
   implemented;
-- interactive resize now moves compositor visual geometry immediately, allows
-  multiple bounded resize configures in flight, crops stale content rather than
-  stretching it, and damages old/new bounds even when a browser commit changes
-  logical size. Zen/Gecko still need live TTY validation against NVIDIA and real
-  browser buffers;
+- interactive resize now moves compositor visual geometry immediately while
+  keeping one configure in flight and one newest target queued. It crops stale
+  content rather than stretching it and damages old/new bounds even when a
+  browser commit changes logical size. Zen/Gecko still need live TTY validation
+  against NVIDIA and real browser buffers;
+- `wl_surface.damage` and `wl_surface.damage_buffer` currently enter one damage
+  accumulator. This is conservative and correct for the compositor's current
+  scale/transform paths only when their coordinate spaces coincide; separating
+  and transforming the two coordinate spaces remains isolated follow-up work;
+- `clipboard_source_disconnect_clears_focused_target_selection` is a known
+  baseline failure: the focused target does not receive `selection(None)` when
+  the source client disconnects. TASK 05.2 reproduces this unchanged on its
+  starting commit `4791f55` and does not alter clipboard behavior;
 - nested output size and refresh are configurable through
   `start-oblivion-one --width W --height H --refresh R -- app`, but the selected
   nested refresh is a target advertised to clients and used for scheduling.
