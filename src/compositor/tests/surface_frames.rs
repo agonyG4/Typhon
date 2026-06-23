@@ -364,6 +364,116 @@ fn full_surface_damage_normalizes_to_full_upload() {
 }
 
 #[test]
+fn empty_surface_damage_does_not_become_full() {
+    let damage = RenderableSurfaceDamage::from_rects(Vec::new());
+
+    assert!(
+        !damage.is_full(),
+        "an empty rectangle list must mean no visual damage"
+    );
+}
+
+#[test]
+fn surface_damage_union_retains_every_commit_region() {
+    let damage = RenderableSurfaceDamage::Empty
+        .union(
+            RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            }]),
+            20,
+            10,
+        )
+        .union(
+            RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 8,
+                y: 0,
+                width: 4,
+                height: 4,
+            }]),
+            20,
+            10,
+        )
+        .union(
+            RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 16,
+                y: 0,
+                width: 4,
+                height: 4,
+            }]),
+            20,
+            10,
+        );
+
+    assert_eq!(damage.clipped_rects(20, 10).len(), 3);
+}
+
+#[test]
+fn surface_damage_union_normalizes_complete_coverage_to_full() {
+    let damage = RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+        x: 0,
+        y: 0,
+        width: 5,
+        height: 10,
+    }])
+    .union(
+        RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+            x: 5,
+            y: 0,
+            width: 5,
+            height: 10,
+        }]),
+        10,
+        10,
+    );
+
+    assert_eq!(damage, RenderableSurfaceDamage::Full);
+}
+
+#[test]
+fn surface_damage_journal_unions_unseen_commits_and_reports_loss() {
+    let mut journal = SurfaceDamageJournal::new(2);
+    let initial = journal.current_commit();
+    journal.record(
+        RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        }]),
+        10,
+        10,
+    );
+    let after_first = journal.current_commit();
+    journal.record(
+        RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+            x: 4,
+            y: 4,
+            width: 2,
+            height: 2,
+        }]),
+        10,
+        10,
+    );
+
+    assert!(matches!(
+        journal.damage_since(after_first, 10, 10),
+        DamageSince::Known(RenderableSurfaceDamage::Partial(rects)) if rects.len() == 1
+    ));
+    journal.record(RenderableSurfaceDamage::Empty, 10, 10);
+    assert_eq!(
+        journal.damage_since(initial, 10, 10),
+        DamageSince::HistoryLost
+    );
+    assert_eq!(
+        journal.damage_since(journal.current_commit(), 10, 10),
+        DamageSince::Empty
+    );
+}
+
+#[test]
 fn wayland_damage_rects_clip_to_surface_bounds() {
     let damage = RenderableSurfaceDamage::Partial(vec![
         SurfaceDamageRect::from_wayland_rect(-2, -1, 4, 3).unwrap(),

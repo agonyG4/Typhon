@@ -306,6 +306,32 @@ cannot discard a ready candidate. Supersession cancels watches, releases
 never-current buffers, transfers frame callbacks, discards presentation
 feedback, and rejects stale readiness by acquire identity.
 
+GLES frame preparation and presentation use separate commit points. Protocol
+dispatch and frame-callback policy may progress without producing a rendered
+frame. Empty logical output damage returns an explicit skipped outcome before
+GL execution, EGL swap, GBM front-buffer locking, framebuffer readiness, or KMS
+submission. A rendered candidate commits its presented-scene snapshot and
+buffer-age history only after a successful EGL swap; swap failure keeps the
+previous snapshot and invalidates preservation assumptions for a conservative
+retry. Legacy and Atomic KMS consume the same post-swap ready-buffer stream.
+
+Renderable surface damage has explicit empty, full, and partial states. Applied
+visual commits enter a bounded commit-counted journal, while the current
+single-output path also accumulates unseen damage until a successful rendered
+frame acknowledges it. `wl_surface.damage` is retained in surface coordinates
+and converted at commit using the captured integer scale or supported viewport
+destination. `damage_buffer` remains in attached-buffer coordinates. Both are
+clipped and unioned; missing or unsafe mapping falls back to full surface
+damage. New buffer identities and newly visible elements are full damage.
+
+Logical output damage is measured against the last successfully presented
+scene. Repair damage additionally includes retained logical damage required by
+the selected EGL buffer age. Successful swaps append logical damage only;
+skips do not rotate history, and resize, renderer recreation, invalid age, or
+swap failure invalidate it. Partial GLES repaint is currently opt-in through
+`OBLIVION_ONE_ENABLE_PARTIAL_REPAINT=1` and remains disabled by default pending
+the documented real-hardware validation matrix.
+
 The remaining gap before using normal desktop apps comfortably is protocol and
 WM breadth: real floating placement/move/resize, richer focus policy, and then
 decoration/activation details for bigger toolkits.

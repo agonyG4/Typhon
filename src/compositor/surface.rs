@@ -2,6 +2,94 @@ use crate::render_backend::buffer::{
     BufferId, BufferIdentity, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle,
     SurfaceBufferSource,
 };
+use std::collections::VecDeque;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SurfaceCommitCounter(pub u64);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DamageSince {
+    Empty,
+    Known(RenderableSurfaceDamage),
+    HistoryLost,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SurfaceDamageEntry {
+    commit: SurfaceCommitCounter,
+    damage: RenderableSurfaceDamage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceDamageJournal {
+    current_commit: SurfaceCommitCounter,
+    entries: VecDeque<SurfaceDamageEntry>,
+    capacity: usize,
+}
+
+impl SurfaceDamageJournal {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            current_commit: SurfaceCommitCounter::default(),
+            entries: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    pub const fn current_commit(&self) -> SurfaceCommitCounter {
+        self.current_commit
+    }
+
+    pub fn record(
+        &mut self,
+        damage: RenderableSurfaceDamage,
+        width: u32,
+        height: u32,
+    ) -> SurfaceCommitCounter {
+        self.current_commit = SurfaceCommitCounter(self.current_commit.0.wrapping_add(1).max(1));
+        self.entries.push_back(SurfaceDamageEntry {
+            commit: self.current_commit,
+            damage: damage.normalized_for_surface(width, height),
+        });
+        while self.entries.len() > self.capacity {
+            self.entries.pop_front();
+        }
+        self.current_commit
+    }
+
+    pub fn damage_since(
+        &self,
+        last_seen: SurfaceCommitCounter,
+        width: u32,
+        height: u32,
+    ) -> DamageSince {
+        if last_seen == self.current_commit {
+            return DamageSince::Empty;
+        }
+        if last_seen > self.current_commit {
+            return DamageSince::HistoryLost;
+        }
+        if self
+            .entries
+            .front()
+            .is_some_and(|oldest| last_seen.0.saturating_add(1) < oldest.commit.0)
+        {
+            return DamageSince::HistoryLost;
+        }
+        let damage = self
+            .entries
+            .iter()
+            .filter(|entry| entry.commit > last_seen)
+            .fold(RenderableSurfaceDamage::Empty, |damage, entry| {
+                damage.union(entry.damage.clone(), width, height)
+            });
+        if damage.is_empty() {
+            DamageSince::Empty
+        } else {
+            DamageSince::Known(damage)
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RenderableSurface {
@@ -57,21 +145,30 @@ pub struct ResizePreview {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderableSurfaceDamage {
+    Empty,
     Full,
     Partial(Vec<SurfaceDamageRect>),
 }
 
 impl RenderableSurfaceDamage {
+    pub const fn empty() -> Self {
+        Self::Empty
+    }
+
     pub const fn full() -> Self {
         Self::Full
     }
 
     pub fn from_rects(rects: Vec<SurfaceDamageRect>) -> Self {
         if rects.is_empty() {
-            Self::Full
+            Self::Empty
         } else {
             Self::Partial(rects)
         }
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
     }
 
     pub const fn is_full(&self) -> bool {
@@ -84,6 +181,7 @@ impl RenderableSurfaceDamage {
         }
 
         match self {
+            Self::Empty => Self::Empty,
             Self::Full => Self::Full,
             Self::Partial(rects) => {
                 let clipped_rects = rects
@@ -101,21 +199,45 @@ impl RenderableSurfaceDamage {
         }
 
         match self {
+            Self::Empty => false,
             Self::Full => true,
-            Self::Partial(rects) => rects.iter().any(|rect| {
-                rect.clipped_to_surface(surface_width, surface_height)
-                    .is_some_and(|rect| rect.covers_surface(surface_width, surface_height))
-            }),
+            Self::Partial(rects) => {
+                let surface_pixels = u64::from(surface_width) * u64::from(surface_height);
+                rects.iter().any(|rect| {
+                    rect.clipped_to_surface(surface_width, surface_height)
+                        .is_some_and(|rect| rect.covers_surface(surface_width, surface_height))
+                }) || rects
+                    .iter()
+                    .filter_map(|rect| rect.clipped_to_surface(surface_width, surface_height))
+                    .fold(0u64, |pixels, rect| {
+                        pixels.saturating_add(u64::from(rect.width) * u64::from(rect.height))
+                    })
+                    >= surface_pixels
+            }
         }
     }
 
     pub fn clipped_rects(&self, surface_width: u32, surface_height: u32) -> Vec<SurfaceDamageRect> {
         match self {
+            Self::Empty => Vec::new(),
             Self::Full => vec![SurfaceDamageRect::full(surface_width, surface_height)],
             Self::Partial(rects) => rects
                 .iter()
                 .filter_map(|rect| rect.clipped_to_surface(surface_width, surface_height))
                 .collect(),
+        }
+    }
+
+    pub fn union(self, other: Self, surface_width: u32, surface_height: u32) -> Self {
+        match (self, other) {
+            (Self::Full, _) | (_, Self::Full) => Self::Full,
+            (Self::Empty, damage) | (damage, Self::Empty) => {
+                damage.normalized_for_surface(surface_width, surface_height)
+            }
+            (Self::Partial(mut older), Self::Partial(newer)) => {
+                older.extend(newer);
+                Self::Partial(older).normalized_for_surface(surface_width, surface_height)
+            }
         }
     }
 }
@@ -138,7 +260,7 @@ impl SurfaceDamageRect {
         }
     }
 
-    pub(super) fn from_wayland_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Self> {
+    pub fn from_wayland_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Self> {
         if width <= 0 || height <= 0 {
             return None;
         }

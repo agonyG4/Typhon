@@ -160,7 +160,8 @@ use shm::{
 use state_data::*;
 use subsurface::{CachedSubsurfaceCommit, SubsurfaceSyncMode, SubsurfaceTransactionState};
 pub use surface::{
-    RenderableSurface, RenderableSurfaceDamage, ResizePreview, SurfaceDamageRect, SurfacePlacement,
+    DamageSince, RenderableSurface, RenderableSurfaceDamage, ResizePreview, SurfaceCommitCounter,
+    SurfaceDamageJournal, SurfaceDamageRect, SurfacePlacement,
 };
 use window_state::{ToplevelMode, WindowGeometry, WindowState, xdg_toplevel_state_bytes};
 
@@ -351,6 +352,8 @@ pub struct CompositorState {
     cursor_surface_ids: HashSet<u32>,
     active_client_cursor: Option<ActiveClientCursor>,
     client_cursor_surfaces: HashMap<u32, RenderableSurface>,
+    surface_damage_journals: HashMap<u32, SurfaceDamageJournal>,
+    presented_surface_commits: HashMap<u32, SurfaceCommitCounter>,
     surface_placements: HashMap<u32, SurfacePlacement>,
     committed_subsurface_stacks: HashMap<u32, Vec<u32>>,
     pending_subsurface_stacks: HashMap<u32, Vec<u32>>,
@@ -683,6 +686,46 @@ enum ClipboardSourceBackend {
 }
 
 impl CompositorState {
+    fn mark_render_damage_presented(&mut self) {
+        for surface in &mut self.renderable_surfaces {
+            if let Some(journal) = self.surface_damage_journals.get(&surface.surface_id) {
+                let last_seen = self
+                    .presented_surface_commits
+                    .get(&surface.surface_id)
+                    .copied()
+                    .unwrap_or_default();
+                let _ = journal.damage_since(
+                    last_seen,
+                    surface.buffer_size().width,
+                    surface.buffer_size().height,
+                );
+                self.presented_surface_commits
+                    .insert(surface.surface_id, journal.current_commit());
+            }
+            surface.damage = RenderableSurfaceDamage::Empty;
+        }
+        for surface in self.client_cursor_surfaces.values_mut() {
+            if let Some(journal) = self.surface_damage_journals.get(&surface.surface_id) {
+                self.presented_surface_commits
+                    .insert(surface.surface_id, journal.current_commit());
+            }
+            surface.damage = RenderableSurfaceDamage::Empty;
+        }
+    }
+
+    fn record_surface_damage_commit(
+        &mut self,
+        surface_id: u32,
+        damage: RenderableSurfaceDamage,
+        width: u32,
+        height: u32,
+    ) {
+        self.surface_damage_journals
+            .entry(surface_id)
+            .or_insert_with(|| SurfaceDamageJournal::new(64))
+            .record(damage, width, height);
+    }
+
     fn new(syncobj_device: Option<DrmSyncobjDevice>) -> Self {
         let default_dmabuf_device = default_dmabuf_main_device();
         Self {
@@ -1304,6 +1347,8 @@ impl CompositorState {
     }
 
     fn unregister_surface_resource(&mut self, surface_id: u32) {
+        self.surface_damage_journals.remove(&surface_id);
+        self.presented_surface_commits.remove(&surface_id);
         self.cancel_pending_surface_trees_for_surface(
             surface_id,
             AcquireWatchCancelReason::SurfaceDestroyed,
@@ -3879,7 +3924,7 @@ impl CompositorState {
                     height,
                     placement,
                     generation,
-                    damage,
+                    damage.clone(),
                 )
                 .is_err()
             {
@@ -3887,6 +3932,12 @@ impl CompositorState {
             }
             self.track_committed_buffer_lifetime(surface_id, &pending);
             self.current_surface_buffers.insert(surface_id, pending);
+            self.record_surface_damage_commit(
+                surface_id,
+                damage,
+                buffer_size.width,
+                buffer_size.height,
+            );
             if let Some(resize_commit) = resize_commit {
                 self.complete_applied_resize_transaction(surface_id, resize_commit);
             }
@@ -3927,7 +3978,7 @@ impl CompositorState {
             let visual_placement = existing.placement;
             self.store_surface_placement(surface_id, visual_placement);
         } else {
-            let damage = damage.normalized_for_surface(buffer_width, buffer_height);
+            let damage = RenderableSurfaceDamage::Full;
             let surface =
                 match pending.to_renderable_surface(surface_id, placement, generation, damage) {
                     Ok(surface) => surface,
@@ -3950,6 +4001,15 @@ impl CompositorState {
 
         self.track_committed_buffer_lifetime(surface_id, &pending);
         self.current_surface_buffers.insert(surface_id, pending);
+        if let Some(surface) = self
+            .renderable_surfaces
+            .iter()
+            .find(|surface| surface.surface_id == surface_id)
+        {
+            let damage = surface.damage.clone();
+            let size = surface.buffer_size();
+            self.record_surface_damage_commit(surface_id, damage, size.width, size.height);
+        }
         self.set_render_generation(generation, RenderGenerationCause::SurfaceCommit);
         if let Some(resize_commit) = resize_commit {
             self.complete_applied_resize_transaction(surface_id, resize_commit);
@@ -4090,7 +4150,19 @@ impl CompositorState {
         existing.width = surface_size.width;
         existing.height = surface_size.height;
         existing.generation = generation;
-        existing.damage = damage;
+        existing.damage = existing.damage.clone().union(
+            damage,
+            existing.buffer_size().width,
+            existing.buffer_size().height,
+        );
+        let journal_damage = existing.damage.clone();
+        let journal_size = existing.buffer_size();
+        self.record_surface_damage_commit(
+            surface_id,
+            journal_damage,
+            journal_size.width,
+            journal_size.height,
+        );
         self.set_render_generation(generation, RenderGenerationCause::SurfaceDamage);
         true
     }
@@ -4569,26 +4641,27 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
         pending: PendingSurfaceBuffer,
-        damage: RenderableSurfaceDamage,
+        _damage: RenderableSurfaceDamage,
         frame_callbacks: Vec<wl_callback::WlCallback>,
     ) {
         self.unmap_surface_content(surface_id);
         let generation = self.next_render_generation_value();
-        let Ok(buffer_width) = pending.data.width() else {
-            return;
-        };
-        let Ok(buffer_height) = pending.data.height() else {
-            return;
-        };
-        let damage = damage.normalized_for_surface(buffer_width, buffer_height);
+        let damage = RenderableSurfaceDamage::Full;
         let Ok(surface) =
             pending.to_renderable_surface(surface_id, SurfacePlacement::root(), generation, damage)
         else {
             return;
         };
+        let buffer_size = surface.buffer_size();
         self.track_committed_buffer_lifetime(surface_id, &pending);
         self.current_surface_buffers.insert(surface_id, pending);
         self.client_cursor_surfaces.insert(surface_id, surface);
+        self.record_surface_damage_commit(
+            surface_id,
+            RenderableSurfaceDamage::Full,
+            buffer_size.width,
+            buffer_size.height,
+        );
         self.set_render_generation(generation, RenderGenerationCause::CursorCommit);
         if self
             .active_client_cursor
@@ -4662,7 +4735,19 @@ impl CompositorState {
         existing.x = current.x;
         existing.y = current.y;
         existing.generation = generation;
-        existing.damage = damage;
+        existing.damage = existing.damage.clone().union(
+            damage,
+            existing.buffer_size().width,
+            existing.buffer_size().height,
+        );
+        let journal_damage = existing.damage.clone();
+        let journal_size = existing.buffer_size();
+        self.record_surface_damage_commit(
+            surface_id,
+            journal_damage,
+            journal_size.width,
+            journal_size.height,
+        );
         self.set_render_generation(generation, RenderGenerationCause::CursorCommit);
         true
     }
@@ -8553,7 +8638,10 @@ fn update_renderable_surface_buffer(
     surface.placement = placement;
     surface.resize_preview = None;
     surface.generation = generation;
-    surface.damage = damage;
+    surface.damage = surface
+        .damage
+        .clone()
+        .union(damage, buffer_size.width, buffer_size.height);
     if let Some(visual) = previous_visual
         && (visual.width != width || visual.height != height || visual.placement != placement)
     {

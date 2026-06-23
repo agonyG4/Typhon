@@ -156,9 +156,18 @@ The native backend currently:
   scissor passes, command replays, avoided pixels, swap-with-damage use, and
   conservative full-repaint reasons for native EGL frames;
 - supports `OBLIVION_ONE_FORCE_FULL_REPAINT=1` to force a full GLES clear and
-  replay for A/B validation. `OBLIVION_ONE_DISABLE_BUFFER_AGE=1` leaves damage
-  calculation active but disables buffer-age partial repaint, conservatively
-  falling back to full repaint;
+  replay for A/B validation. Partial repaint is disabled by default and is
+  enabled only with `OBLIVION_ONE_ENABLE_PARTIAL_REPAINT=1`.
+  `OBLIVION_ONE_DISABLE_BUFFER_AGE=1` leaves damage calculation active but
+  disables buffer-age repair, conservatively falling back to full repaint.
+  Precedence is force-full, then missing partial opt-in, then disabled/invalid
+  buffer age, then the partial planner;
+- distinguishes protocol/event-loop progress, a rendered frame, and a
+  KMS-presented frame. Empty logical damage performs no GL execution, EGL swap,
+  GBM front-buffer lock, ready-frame transition, or legacy/Atomic KMS submit.
+  Native diagnostics include `frame_decision`, logical/repair rectangles,
+  partial enablement, contradiction fallback, scene-snapshot commit, EGL swap,
+  GBM lock, and ready-frame fields when performance logging is enabled;
 - parses complete legacy or atomic DRM pageflip events and uses their kernel timestamp,
   sequence, CRTC ID, and unique submission token as native presentation
   metadata. `wp_presentation.clock_id` follows
@@ -176,6 +185,12 @@ The native backend currently:
   that change logical bounds also combine commit damage with old/new bounds so a
   stale previous rectangle is repainted. `gbm_bo_write` is now limited to the
   explicit CPU-write fallback and is not used by `native-egl-gbm` frames.
+- stores `wl_surface.damage` and `damage_buffer` separately until commit.
+  Surface-coordinate rectangles map through the captured integer buffer scale
+  or supported viewport destination; buffer-coordinate rectangles are already
+  in attached-buffer space. Checked conversion and clipping union both spaces,
+  and unsupported or ambiguous mapping becomes full surface damage. Applied
+  commits remain journaled/accumulated until a real rendered frame succeeds;
 - previews interactive resize with compositor-owned target geometry while
   waiting for client commits. Left/top edge resizes keep the opposite edge
   visually anchored. The shared CPU/GLES render plan draws stale client content

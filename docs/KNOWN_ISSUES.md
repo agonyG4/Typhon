@@ -73,10 +73,16 @@ Current limits:
   content rather than stretching it and damages old/new bounds even when a
   browser commit changes logical size. Zen/Gecko still need live TTY validation
   against NVIDIA and real browser buffers;
-- `wl_surface.damage` and `wl_surface.damage_buffer` currently enter one damage
-  accumulator. This is conservative and correct for the compositor's current
-  scale/transform paths only when their coordinate spaces coincide; separating
-  and transforming the two coordinate spaces remains isolated follow-up work;
+- `wl_surface.damage` and `wl_surface.damage_buffer` are now stored separately
+  and converted at commit for the integer-scale and viewport-destination paths
+  Typhon implements. Unsupported or ambiguous mappings conservatively repaint
+  the full surface. Arbitrary buffer transforms and viewport source cropping
+  remain unsupported protocol breadth, not an under-damage path;
+- partial GLES repaint remains opt-in with
+  `OBLIVION_ONE_ENABLE_PARTIAL_REPAINT=1`. The software swapchain oracle passes,
+  but the legacy/full, Atomic/full, legacy/partial, and Atomic/partial real-TTY
+  matrix has not been run in this development environment. Full repaint is the
+  default for every real visual frame until that hardware validation is done;
 - synchronized subsurface buffers, placement, stacking, callbacks, feedback,
   and acquire dependencies now publish as one parent-latched tree generation.
   Real-driver explicit-sync subtree waits and deeply nested libdecor trees still

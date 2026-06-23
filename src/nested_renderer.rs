@@ -1,6 +1,6 @@
 use std::{error::Error, io, num::NonZeroU32, sync::Arc};
 
-use crate::egl_renderer::{EglGlesFrameRenderer, EglSceneDrawRequest};
+use crate::egl_renderer::{EglFrameOutcome, EglGlesFrameRenderer, EglSceneDrawRequest};
 use oblivion_one::compositor::{
     DesktopComposeRequest, DesktopSceneRenderer, DesktopVisualState, RenderableSurface,
     ShellOverlayImage,
@@ -10,6 +10,12 @@ use softbuffer::{Context, Surface};
 use winit::window::Window;
 
 type RendererResult<T> = Result<T, Box<dyn Error>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NestedPaintOutcome {
+    Skipped,
+    Rendered,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputRendererPreference {
@@ -141,7 +147,7 @@ impl NestedOutputRenderer {
     pub fn draw_desktop_scene(
         &mut self,
         request: NestedSceneDrawRequest<'_>,
-    ) -> RendererResult<()> {
+    ) -> RendererResult<NestedPaintOutcome> {
         let NestedSceneDrawRequest {
             width,
             height,
@@ -155,30 +161,37 @@ impl NestedOutputRenderer {
         } = request;
 
         match &mut self.inner {
-            OutputRendererInner::EglGles(renderer) => renderer.draw_scene(EglSceneDrawRequest {
-                width,
-                height,
-                surfaces,
-                content_generation,
-                visual_state,
-                output_scale,
-                shell_overlay,
-                client_cursor,
-                current_damage: None,
-            }),
-            OutputRendererInner::Cpu(renderer) => renderer.draw(width, height, |frame| {
-                cpu_scene_renderer.compose_request(DesktopComposeRequest {
-                    frame,
-                    frame_width: width,
-                    frame_height: height,
-                    output_scale,
+            OutputRendererInner::EglGles(renderer) => renderer
+                .draw_scene(EglSceneDrawRequest {
+                    width,
+                    height,
                     surfaces,
                     content_generation,
                     visual_state,
+                    output_scale,
                     shell_overlay,
                     client_cursor,
-                });
-            }),
+                    current_damage: None,
+                })
+                .map(|outcome| match outcome {
+                    EglFrameOutcome::Skipped { .. } => NestedPaintOutcome::Skipped,
+                    EglFrameOutcome::Rendered { .. } => NestedPaintOutcome::Rendered,
+                }),
+            OutputRendererInner::Cpu(renderer) => renderer
+                .draw(width, height, |frame| {
+                    cpu_scene_renderer.compose_request(DesktopComposeRequest {
+                        frame,
+                        frame_width: width,
+                        frame_height: height,
+                        output_scale,
+                        surfaces,
+                        content_generation,
+                        visual_state,
+                        shell_overlay,
+                        client_cursor,
+                    });
+                })
+                .map(|()| NestedPaintOutcome::Rendered),
         }
     }
 

@@ -47,7 +47,6 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                 let surface_id = data.surface_id();
                 let window_geometry_changed =
                     state.pending_window_geometry_commits.remove(&surface_id);
-                let damage = data.take_damage();
                 let explicit_sync = data.explicit_sync();
                 let offset = data.take_pending_offset();
                 let viewport_change = data.take_pending_viewport();
@@ -55,7 +54,34 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                 let input_region_change = data.take_pending_input_region();
                 let presentation_feedbacks = state.take_surface_presentation_feedbacks(surface_id);
                 let attachment = data.take_pending();
+                let buffer_size = match attachment.as_ref() {
+                    Some(PendingSurfaceAttachment::Buffer(buffer)) => buffer
+                        .data
+                        .width()
+                        .ok()
+                        .zip(buffer.data.height().ok())
+                        .and_then(|(width, height)| BufferSize::new(width, height)),
+                    _ => state
+                        .current_surface_buffers
+                        .get(&surface_id)
+                        .and_then(|buffer| {
+                            buffer
+                                .data
+                                .width()
+                                .ok()
+                                .zip(buffer.data.height().ok())
+                                .and_then(|(width, height)| BufferSize::new(width, height))
+                        }),
+                };
+                let damage = data.take_damage(
+                    buffer_size,
+                    data.buffer_scale_for_change(buffer_scale_change),
+                    data.viewport_destination_for_change(viewport_change),
+                );
                 let damage = match attachment {
+                    Some(PendingSurfaceAttachment::Buffer(_)) if damage.damage.is_empty() => {
+                        Some(RenderableSurfaceDamage::Full)
+                    }
                     Some(PendingSurfaceAttachment::Buffer(_)) => Some(damage.damage),
                     _ => damage.explicit(),
                 };
@@ -84,14 +110,16 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                 y,
                 width,
                 height,
+            } => {
+                data.push_surface_damage(x, y, width, height);
             }
-            | wl_surface::Request::DamageBuffer {
+            wl_surface::Request::DamageBuffer {
                 x,
                 y,
                 width,
                 height,
             } => {
-                data.push_damage(x, y, width, height);
+                data.push_buffer_damage(x, y, width, height);
             }
             wl_surface::Request::SetInputRegion { region } => {
                 let input_region = region

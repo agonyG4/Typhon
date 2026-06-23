@@ -286,6 +286,7 @@ pub(crate) enum FullRepaintReason {
     TooManyRectangles,
     DamageAreaThreshold,
     ForcedFull,
+    PartialRepaintDisabled,
 }
 
 impl FullRepaintReason {
@@ -302,6 +303,7 @@ impl FullRepaintReason {
             Self::TooManyRectangles => "too_many_rectangles",
             Self::DamageAreaThreshold => "damage_area_threshold",
             Self::ForcedFull => "forced_full",
+            Self::PartialRepaintDisabled => "partial_repaint_disabled",
         }
     }
 }
@@ -317,7 +319,6 @@ pub(crate) struct RepaintPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RenderExecution {
-    Skip,
     Full,
     Scissored {
         scissors: Vec<[i32; 4]>,
@@ -332,7 +333,7 @@ impl RepaintPlan {
         output_height: u32,
     ) -> Option<RenderExecution> {
         match self.mode {
-            RepaintMode::Skip => Some(RenderExecution::Skip),
+            RepaintMode::Skip => None,
             RepaintMode::Full => Some(RenderExecution::Full),
             RepaintMode::Partial => Some(RenderExecution::Scissored {
                 scissors: self
@@ -355,6 +356,7 @@ pub(crate) struct PartialRepaintPlanner {
     history_valid: bool,
     capabilities: EglPartialRepaintCapabilities,
     force_full: bool,
+    partial_enabled: bool,
 }
 
 impl PartialRepaintPlanner {
@@ -368,10 +370,20 @@ impl PartialRepaintPlanner {
             history_valid: false,
             capabilities,
             force_full: force_full_repaint_enabled(),
+            partial_enabled: partial_repaint_enabled(),
         }
     }
 
     pub(crate) fn plan(&mut self, current_damage: OutputDamage, age: BufferAge) -> RepaintPlan {
+        if current_damage == OutputDamage::Empty {
+            return RepaintPlan {
+                current_damage,
+                repair_damage: OutputDamage::Empty,
+                buffer_age: age_value(age),
+                mode: RepaintMode::Skip,
+                fallback_reason: None,
+            };
+        }
         if current_damage == OutputDamage::Full {
             return self.full_plan(
                 current_damage,
@@ -384,6 +396,13 @@ impl PartialRepaintPlanner {
                 current_damage,
                 age_value(age),
                 FullRepaintReason::ForcedFull,
+            );
+        }
+        if !self.partial_enabled {
+            return self.full_plan(
+                current_damage,
+                age_value(age),
+                FullRepaintReason::PartialRepaintDisabled,
             );
         }
         if !self.capabilities.buffer_age {
@@ -549,6 +568,10 @@ impl PartialRepaintPlanner {
     pub(crate) const fn capabilities(&self) -> EglPartialRepaintCapabilities {
         self.capabilities
     }
+
+    pub(crate) const fn partial_enabled(&self) -> bool {
+        self.partial_enabled && !self.force_full
+    }
 }
 
 fn age_value(age: BufferAge) -> Option<u32> {
@@ -560,6 +583,10 @@ fn age_value(age: BufferAge) -> Option<u32> {
 
 fn force_full_repaint_enabled() -> bool {
     std::env::var_os("OBLIVION_ONE_FORCE_FULL_REPAINT").is_some_and(|value| value == "1")
+}
+
+fn partial_repaint_enabled() -> bool {
+    std::env::var_os("OBLIVION_ONE_ENABLE_PARTIAL_REPAINT").is_some_and(|value| value == "1")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -600,6 +627,14 @@ pub(super) struct EglOutputDamageTracker {
     last_cursor_rect: Option<SurfaceDamageRect>,
     last_shell_overlay: Option<ShellOverlayDamageState>,
     last_client_cursor: Option<ClientCursorDamageState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct EglPresentedDamageState {
+    output_size: (u32, u32),
+    cursor_rect: Option<SurfaceDamageRect>,
+    shell_overlay: Option<ShellOverlayDamageState>,
+    client_cursor: Option<ClientCursorDamageState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -647,7 +682,7 @@ impl ShellOverlayDamageState {
 impl EglOutputDamageTracker {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn damage_for_frame(
-        &mut self,
+        &self,
         width: u32,
         height: u32,
         scene_changed: bool,
@@ -660,7 +695,6 @@ impl EglOutputDamageTracker {
             .cursor
             .and_then(|(x, y)| cursor_damage_rect(x, y, width, height));
         let size_changed = self.output_size != (width, height);
-        self.output_size = (width, height);
 
         let mut damage = if size_changed {
             OutputDamage::Full
@@ -693,10 +727,31 @@ impl EglOutputDamageTracker {
             width,
             height,
         );
-        self.last_cursor_rect = cursor_rect;
-        self.last_shell_overlay = shell_overlay;
-        self.last_client_cursor = client_cursor;
         damage
+    }
+
+    pub(super) fn candidate_state(
+        width: u32,
+        height: u32,
+        visual_state: DesktopVisualState,
+        shell_overlay: Option<ShellOverlayDamageState>,
+        client_cursor: Option<ClientCursorDamageState>,
+    ) -> EglPresentedDamageState {
+        EglPresentedDamageState {
+            output_size: (width, height),
+            cursor_rect: visual_state
+                .cursor
+                .and_then(|(x, y)| cursor_damage_rect(x, y, width, height)),
+            shell_overlay,
+            client_cursor,
+        }
+    }
+
+    pub(super) fn commit_presented(&mut self, state: EglPresentedDamageState) {
+        self.output_size = state.output_size;
+        self.last_cursor_rect = state.cursor_rect;
+        self.last_shell_overlay = state.shell_overlay;
+        self.last_client_cursor = state.client_cursor;
     }
 }
 
@@ -748,6 +803,15 @@ mod partial_repaint_tests {
             buffer_age: true,
             swap_buffers_with_damage: true,
         }
+    }
+
+    fn partial_planner(
+        output_size: (u32, u32),
+        capabilities: EglPartialRepaintCapabilities,
+    ) -> PartialRepaintPlanner {
+        let mut planner = PartialRepaintPlanner::new(output_size, capabilities);
+        planner.partial_enabled = true;
+        planner
     }
 
     #[test]
@@ -820,12 +884,12 @@ mod partial_repaint_tests {
     #[test]
     fn first_frame_and_unsupported_buffer_age_force_full_repaint() {
         let current = OutputDamage::rects(100, 80, [rect(2, 3, 4, 5)]);
-        let mut planner = PartialRepaintPlanner::new((100, 80), partial_capabilities());
+        let mut planner = partial_planner((100, 80), partial_capabilities());
         assert_eq!(
             planner.plan(current.clone(), BufferAge::Value(1)).mode,
             RepaintMode::Full
         );
-        let mut unsupported = PartialRepaintPlanner::new(
+        let mut unsupported = partial_planner(
             (100, 80),
             EglPartialRepaintCapabilities {
                 buffer_age: false,
@@ -839,11 +903,22 @@ mod partial_repaint_tests {
     }
 
     #[test]
+    fn empty_logical_damage_skips_even_when_history_is_invalid() {
+        let mut planner = partial_planner((100, 80), partial_capabilities());
+
+        assert_eq!(
+            planner.plan(OutputDamage::Empty, BufferAge::Value(0)).mode,
+            RepaintMode::Skip
+        );
+        assert_eq!(planner.history_depth(), 0);
+    }
+
+    #[test]
     fn usable_ages_accumulate_only_required_logical_damage() {
         let first = OutputDamage::rects(100, 80, [rect(1, 1, 3, 3)]);
         let second = OutputDamage::rects(100, 80, [rect(20, 20, 3, 3)]);
         let third = OutputDamage::rects(100, 80, [rect(40, 40, 3, 3)]);
-        let mut planner = PartialRepaintPlanner::new((100, 80), partial_capabilities());
+        let mut planner = partial_planner((100, 80), partial_capabilities());
         let plan = planner.plan(first, BufferAge::Value(0));
         planner.commit_presented(&plan);
         let plan = planner.plan(second.clone(), BufferAge::Value(1));
@@ -868,7 +943,7 @@ mod partial_repaint_tests {
     #[test]
     fn invalid_age_history_and_resize_force_full_repaint() {
         let current = OutputDamage::rects(100, 80, [rect(2, 3, 4, 5)]);
-        let mut planner = PartialRepaintPlanner::new((100, 80), partial_capabilities());
+        let mut planner = partial_planner((100, 80), partial_capabilities());
         let first = planner.plan(OutputDamage::Full, BufferAge::Value(0));
         planner.commit_presented(&first);
         assert_eq!(
@@ -889,7 +964,7 @@ mod partial_repaint_tests {
     #[test]
     fn failed_swap_does_not_advance_history_and_empty_stays_empty() {
         let current = OutputDamage::rects(100, 80, [rect(2, 3, 4, 5)]);
-        let mut planner = PartialRepaintPlanner::new((100, 80), partial_capabilities());
+        let mut planner = partial_planner((100, 80), partial_capabilities());
         let first = planner.plan(OutputDamage::Full, BufferAge::Value(0));
         planner.commit_presented(&first);
         let failed = planner.plan(current, BufferAge::Value(1));
@@ -906,7 +981,7 @@ mod partial_repaint_tests {
 
     #[test]
     fn policy_falls_back_for_many_rectangles_or_near_full_area() {
-        let mut planner = PartialRepaintPlanner::new((100, 100), partial_capabilities());
+        let mut planner = partial_planner((100, 100), partial_capabilities());
         let first = planner.plan(OutputDamage::Full, BufferAge::Value(0));
         planner.commit_presented(&first);
         let many = OutputDamage::Rects(
@@ -923,6 +998,20 @@ mod partial_repaint_tests {
             planner.plan(near_full, BufferAge::Value(1)).mode,
             RepaintMode::Full
         );
+    }
+
+    #[test]
+    fn partial_repaint_is_disabled_by_default() {
+        let mut planner = PartialRepaintPlanner::new((100, 80), partial_capabilities());
+        let first = planner.plan(OutputDamage::Full, BufferAge::Value(0));
+        planner.commit_presented(&first);
+
+        let plan = planner.plan(
+            OutputDamage::rects(100, 80, [rect(4, 7, 9, 11)]),
+            BufferAge::Value(1),
+        );
+
+        assert_eq!(plan.mode, RepaintMode::Full);
     }
 
     #[test]
@@ -946,8 +1035,21 @@ mod partial_repaint_tests {
     }
 
     #[test]
+    fn skipped_plan_has_no_gl_execution() {
+        let plan = RepaintPlan {
+            current_damage: OutputDamage::Empty,
+            repair_damage: OutputDamage::Empty,
+            buffer_age: Some(1),
+            mode: RepaintMode::Skip,
+            fallback_reason: None,
+        };
+
+        assert_eq!(plan.render_execution(100, 80), None);
+    }
+
+    #[test]
     fn successful_swap_records_logical_damage_instead_of_expanded_repair() {
-        let mut planner = PartialRepaintPlanner::new((100, 80), partial_capabilities());
+        let mut planner = partial_planner((100, 80), partial_capabilities());
         let initial = planner.plan(
             OutputDamage::rects(100, 80, [rect(1, 1, 2, 2)]),
             BufferAge::Value(0),
@@ -987,7 +1089,7 @@ mod partial_repaint_tests {
 
     #[test]
     fn full_current_damage_wins_and_surface_invalidation_forces_full() {
-        let mut planner = PartialRepaintPlanner::new((100, 80), partial_capabilities());
+        let mut planner = partial_planner((100, 80), partial_capabilities());
         let first = planner.plan(OutputDamage::Full, BufferAge::Value(0));
         planner.commit_presented(&first);
         assert_eq!(
@@ -1004,12 +1106,125 @@ mod partial_repaint_tests {
 
     #[test]
     fn histories_are_isolated_per_planner_surface() {
-        let mut first = PartialRepaintPlanner::new((100, 80), partial_capabilities());
-        let second = PartialRepaintPlanner::new((100, 80), partial_capabilities());
+        let mut first = partial_planner((100, 80), partial_capabilities());
+        let second = partial_planner((100, 80), partial_capabilities());
         let plan = first.plan(OutputDamage::Full, BufferAge::Value(0));
         first.commit_presented(&plan);
 
         assert_eq!(first.history_depth(), 1);
         assert_eq!(second.history_depth(), 0);
+    }
+
+    #[test]
+    fn triple_buffer_swapchain_oracle_matches_full_reference() {
+        let mut planner = partial_planner((12, 1), partial_capabilities());
+        let mut buffers = [vec![0u8; 12], vec![0u8; 12], vec![0u8; 12]];
+        let mut last_presented = [None::<u32>; 3];
+        let serial = std::cell::Cell::new(0u32);
+
+        let mut present = |planner: &mut PartialRepaintPlanner,
+                           buffer_index: usize,
+                           reference: &[u8],
+                           logical: OutputDamage,
+                           fail_swap: bool| {
+            let age = last_presented[buffer_index]
+                .map(|last| serial.get().saturating_sub(last).saturating_add(1))
+                .unwrap_or(0);
+            let plan = planner.plan(logical, BufferAge::Value(age as i32));
+            assert_ne!(plan.mode, RepaintMode::Skip);
+            match &plan.repair_damage {
+                OutputDamage::Empty => panic!("rendered oracle plan cannot be empty"),
+                OutputDamage::Full => buffers[buffer_index].copy_from_slice(reference),
+                OutputDamage::Rects(rects) => {
+                    for rect in rects {
+                        let start = usize::try_from(rect.x.max(0)).unwrap();
+                        let end = start
+                            .saturating_add(rect.width as usize)
+                            .min(reference.len());
+                        buffers[buffer_index][start..end].copy_from_slice(&reference[start..end]);
+                    }
+                }
+            }
+            if fail_swap {
+                planner.swap_failed();
+                return;
+            }
+            assert_eq!(buffers[buffer_index], reference);
+            serial.set(serial.get().saturating_add(1));
+            last_presented[buffer_index] = Some(serial.get());
+            planner.commit_presented(&plan);
+        };
+
+        let mut reference = vec![0u8; 12];
+        reference[1] = 1;
+        present(&mut planner, 0, &reference, OutputDamage::Full, false);
+
+        reference[4] = 2;
+        present(
+            &mut planner,
+            1,
+            &reference,
+            OutputDamage::rects(12, 1, [rect(4, 0, 1, 1)]),
+            false,
+        );
+
+        reference[7] = 3;
+        present(
+            &mut planner,
+            2,
+            &reference,
+            OutputDamage::rects(12, 1, [rect(7, 0, 1, 1)]),
+            false,
+        );
+
+        reference[8] = 4;
+        present(
+            &mut planner,
+            2,
+            &reference,
+            OutputDamage::rects(12, 1, [rect(8, 0, 1, 1)]),
+            false,
+        );
+
+        let serial_before_skip = serial.get();
+        let skipped = planner.plan(OutputDamage::Empty, BufferAge::Value(3));
+        assert_eq!(skipped.mode, RepaintMode::Skip);
+        assert_eq!(serial.get(), serial_before_skip);
+
+        reference[1] = 0;
+        reference[2] = 5;
+        present(
+            &mut planner,
+            1,
+            &reference,
+            OutputDamage::rects(12, 1, [rect(1, 0, 2, 1)]),
+            false,
+        );
+
+        reference[10] = 6;
+        present(
+            &mut planner,
+            2,
+            &reference,
+            OutputDamage::rects(12, 1, [rect(10, 0, 1, 1)]),
+            true,
+        );
+        assert_eq!(serial.get(), serial_before_skip + 1);
+        present(
+            &mut planner,
+            2,
+            &reference,
+            OutputDamage::rects(12, 1, [rect(10, 0, 1, 1)]),
+            false,
+        );
+
+        planner.resize((16, 1));
+        let resized_reference = vec![9u8; 16];
+        let resized = planner.plan(OutputDamage::Full, BufferAge::Value(0));
+        assert_eq!(resized.mode, RepaintMode::Full);
+        let mut resized_buffer = vec![0u8; 16];
+        resized_buffer.copy_from_slice(&resized_reference);
+        assert_eq!(resized_buffer, resized_reference);
+        planner.commit_presented(&resized);
     }
 }

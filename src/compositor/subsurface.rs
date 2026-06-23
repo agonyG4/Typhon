@@ -100,6 +100,8 @@ fn merge_damage(
             older.extend(newer);
             Some(RenderableSurfaceDamage::Partial(older))
         }
+        (Some(RenderableSurfaceDamage::Empty), Some(damage))
+        | (Some(damage), Some(RenderableSurfaceDamage::Empty)) => Some(damage),
         (Some(damage), None) | (None, Some(damage)) => Some(damage),
         (None, None) => None,
     }

@@ -260,6 +260,10 @@ impl OwnCompositorServer {
         &self.state.renderable_surfaces
     }
 
+    pub fn mark_render_damage_presented(&mut self) {
+        self.state.mark_render_damage_presented();
+    }
+
     pub fn client_cursor_render_state(&self) -> Option<ClientCursorRenderState<'_>> {
         self.state.client_cursor_render_state()
     }

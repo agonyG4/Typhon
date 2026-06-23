@@ -945,6 +945,7 @@ fn partial_scene_damage_rects(
         }
 
         match &element.damage {
+            RenderableSurfaceDamage::Empty => {}
             RenderableSurfaceDamage::Full => {
                 if let Some(rect) = snapshot
                     .target

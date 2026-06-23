@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::nested_renderer::{
-    NestedOutputRenderer, NestedSceneDrawRequest, OutputRendererPreference,
+    NestedOutputRenderer, NestedPaintOutcome, NestedSceneDrawRequest, OutputRendererPreference,
 };
 use oblivion_one::{
     compositor::{
@@ -554,7 +554,7 @@ impl NestedOutputApp {
         let Some(output_renderer) = &mut self.output_renderer else {
             return Ok(());
         };
-        output_renderer.draw_desktop_scene(NestedSceneDrawRequest {
+        let paint_outcome = output_renderer.draw_desktop_scene(NestedSceneDrawRequest {
             width,
             height,
             output_scale,
@@ -565,14 +565,17 @@ impl NestedOutputApp {
             client_cursor,
             cpu_scene_renderer: &mut self.renderer,
         })?;
-        if debug_frame_logging_enabled() {
+        if paint_outcome == NestedPaintOutcome::Rendered && debug_frame_logging_enabled() {
             eprintln!(
                 "oblivion-one compositor: draw presented render_generation={} surfaces={}",
                 self.server.render_generation(),
                 self.server.renderable_surfaces().len()
             );
         }
-        self.perf.presented_frames = self.perf.presented_frames.saturating_add(1);
+        if paint_outcome == NestedPaintOutcome::Rendered {
+            self.perf.presented_frames = self.perf.presented_frames.saturating_add(1);
+            self.server.mark_render_damage_presented();
+        }
         self.server.finish_frame();
         Ok(())
     }

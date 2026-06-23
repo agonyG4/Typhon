@@ -54,7 +54,8 @@ pub(super) struct SurfaceData {
     surface_id: u32,
     pending_buffer: Mutex<Option<PendingSurfaceAttachment>>,
     pending_offset: Mutex<Option<(i32, i32)>>,
-    pending_damage: Mutex<Vec<SurfaceDamageRect>>,
+    pending_surface_damage: Mutex<Vec<PendingSurfaceDamageRect>>,
+    pending_buffer_damage: Mutex<Vec<PendingBufferDamageRect>>,
     frame_callbacks: Mutex<Vec<wl_callback::WlCallback>>,
     explicit_sync: Mutex<Option<Arc<SyncobjSurfaceState>>>,
     viewport: Mutex<SurfaceViewportState>,
@@ -65,14 +66,41 @@ pub(super) struct SurfaceData {
 #[derive(Debug)]
 pub(super) struct PendingSurfaceDamage {
     pub(super) damage: RenderableSurfaceDamage,
-    pub(super) explicit: bool,
 }
 
 impl PendingSurfaceDamage {
     pub(super) fn explicit(self) -> Option<RenderableSurfaceDamage> {
-        self.explicit.then_some(self.damage)
+        (!self.damage.is_empty()).then_some(self.damage)
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingDamageRect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+impl PendingDamageRect {
+    const fn new(x: i32, y: i32, width: i32, height: i32) -> Option<Self> {
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        Some(Self {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingSurfaceDamageRect(PendingDamageRect);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingBufferDamageRect(PendingDamageRect);
 
 impl SurfaceData {
     pub(super) fn new(surface_id: u32) -> Self {
@@ -137,26 +165,48 @@ impl SurfaceData {
         self.pending_offset.lock().ok()?.take()
     }
 
-    pub(super) fn push_damage(&self, x: i32, y: i32, width: i32, height: i32) {
-        let Some(rect) = SurfaceDamageRect::from_wayland_rect(x, y, width, height) else {
+    pub(super) fn push_surface_damage(&self, x: i32, y: i32, width: i32, height: i32) {
+        let Some(rect) = PendingDamageRect::new(x, y, width, height) else {
             return;
         };
-        if let Ok(mut damage) = self.pending_damage.lock() {
-            damage.push(rect);
+        if let Ok(mut damage) = self.pending_surface_damage.lock() {
+            damage.push(PendingSurfaceDamageRect(rect));
         }
     }
 
-    pub(super) fn take_damage(&self) -> PendingSurfaceDamage {
-        let rects: Vec<SurfaceDamageRect> = self
-            .pending_damage
+    pub(super) fn push_buffer_damage(&self, x: i32, y: i32, width: i32, height: i32) {
+        let Some(rect) = PendingDamageRect::new(x, y, width, height) else {
+            return;
+        };
+        if let Ok(mut damage) = self.pending_buffer_damage.lock() {
+            damage.push(PendingBufferDamageRect(rect));
+        }
+    }
+
+    pub(super) fn take_damage(
+        &self,
+        buffer_size: Option<BufferSize>,
+        buffer_scale: u32,
+        viewport_destination: Option<BufferSize>,
+    ) -> PendingSurfaceDamage {
+        let surface_rects = self
+            .pending_surface_damage
             .lock()
             .map(|mut damage| damage.drain(..).collect())
-            .unwrap_or_default();
-        let explicit = !rects.is_empty();
-        PendingSurfaceDamage {
-            damage: RenderableSurfaceDamage::from_rects(rects),
-            explicit,
-        }
+            .unwrap_or_else(|_| Vec::new());
+        let buffer_rects = self
+            .pending_buffer_damage
+            .lock()
+            .map(|mut damage| damage.drain(..).collect())
+            .unwrap_or_else(|_| Vec::new());
+        let damage = convert_pending_damage(
+            surface_rects,
+            buffer_rects,
+            buffer_size,
+            buffer_scale,
+            viewport_destination,
+        );
+        PendingSurfaceDamage { damage }
     }
 
     pub(super) fn push_frame_callback(&self, callback: wl_callback::WlCallback) {
@@ -317,6 +367,148 @@ impl SurfaceData {
     }
 }
 
+fn convert_pending_damage(
+    surface_rects: Vec<PendingSurfaceDamageRect>,
+    buffer_rects: Vec<PendingBufferDamageRect>,
+    buffer_size: Option<BufferSize>,
+    buffer_scale: u32,
+    viewport_destination: Option<BufferSize>,
+) -> RenderableSurfaceDamage {
+    if surface_rects.is_empty() && buffer_rects.is_empty() {
+        return RenderableSurfaceDamage::Empty;
+    }
+    let Some(buffer_size) = buffer_size else {
+        return RenderableSurfaceDamage::Full;
+    };
+    let mut converted = Vec::with_capacity(surface_rects.len() + buffer_rects.len());
+    for PendingBufferDamageRect(rect) in buffer_rects {
+        let Some(rect) = clip_pending_rect(rect, buffer_size.width, buffer_size.height) else {
+            continue;
+        };
+        converted.push(rect);
+    }
+    for PendingSurfaceDamageRect(rect) in surface_rects {
+        let mapped = match viewport_destination {
+            Some(destination) => map_viewport_damage(rect, destination, buffer_size),
+            None => map_scaled_surface_damage(rect, buffer_scale.max(1), buffer_size),
+        };
+        let Some(rect) = mapped else {
+            return RenderableSurfaceDamage::Full;
+        };
+        if let Some(rect) = rect {
+            converted.push(rect);
+        }
+    }
+    RenderableSurfaceDamage::from_rects(converted)
+        .normalized_for_surface(buffer_size.width, buffer_size.height)
+}
+
+fn map_scaled_surface_damage(
+    rect: PendingDamageRect,
+    scale: u32,
+    buffer_size: BufferSize,
+) -> Option<Option<SurfaceDamageRect>> {
+    let scale = i64::from(scale);
+    let left = i64::from(rect.x).checked_mul(scale)?;
+    let top = i64::from(rect.y).checked_mul(scale)?;
+    let right = i64::from(rect.x)
+        .checked_add(i64::from(rect.width))?
+        .checked_mul(scale)?;
+    let bottom = i64::from(rect.y)
+        .checked_add(i64::from(rect.height))?
+        .checked_mul(scale)?;
+    Some(clip_i64_rect(
+        left,
+        top,
+        right,
+        bottom,
+        buffer_size.width,
+        buffer_size.height,
+    ))
+}
+
+fn map_viewport_damage(
+    rect: PendingDamageRect,
+    destination: BufferSize,
+    buffer_size: BufferSize,
+) -> Option<Option<SurfaceDamageRect>> {
+    if destination.width == 0 || destination.height == 0 {
+        return None;
+    }
+    let left = i64::from(rect.x).clamp(0, i64::from(destination.width));
+    let top = i64::from(rect.y).clamp(0, i64::from(destination.height));
+    let right = i64::from(rect.x)
+        .checked_add(i64::from(rect.width))?
+        .clamp(0, i64::from(destination.width));
+    let bottom = i64::from(rect.y)
+        .checked_add(i64::from(rect.height))?
+        .clamp(0, i64::from(destination.height));
+    if right <= left || bottom <= top {
+        return Some(None);
+    }
+    let mapped_left =
+        left.checked_mul(i64::from(buffer_size.width))? / i64::from(destination.width);
+    let mapped_top =
+        top.checked_mul(i64::from(buffer_size.height))? / i64::from(destination.height);
+    let mapped_right = div_ceil_i64(
+        right.checked_mul(i64::from(buffer_size.width))?,
+        i64::from(destination.width),
+    )?;
+    let mapped_bottom = div_ceil_i64(
+        bottom.checked_mul(i64::from(buffer_size.height))?,
+        i64::from(destination.height),
+    )?;
+    Some(clip_i64_rect(
+        mapped_left,
+        mapped_top,
+        mapped_right,
+        mapped_bottom,
+        buffer_size.width,
+        buffer_size.height,
+    ))
+}
+
+fn div_ceil_i64(value: i64, divisor: i64) -> Option<i64> {
+    (divisor > 0).then_some(value.checked_add(divisor - 1)? / divisor)
+}
+
+fn clip_pending_rect(
+    rect: PendingDamageRect,
+    width: u32,
+    height: u32,
+) -> Option<SurfaceDamageRect> {
+    let right = i64::from(rect.x).checked_add(i64::from(rect.width))?;
+    let bottom = i64::from(rect.y).checked_add(i64::from(rect.height))?;
+    clip_i64_rect(
+        i64::from(rect.x),
+        i64::from(rect.y),
+        right,
+        bottom,
+        width,
+        height,
+    )
+}
+
+fn clip_i64_rect(
+    left: i64,
+    top: i64,
+    right: i64,
+    bottom: i64,
+    width: u32,
+    height: u32,
+) -> Option<SurfaceDamageRect> {
+    let left = left.clamp(0, i64::from(width));
+    let top = top.clamp(0, i64::from(height));
+    let right = right.clamp(0, i64::from(width));
+    let bottom = bottom.clamp(0, i64::from(height));
+    (right > left && bottom > top).then_some(SurfaceDamageRect {
+        x: left as u32,
+        y: top as u32,
+        width: (right - left) as u32,
+        height: (bottom - top) as u32,
+    })
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct SurfaceViewportState {
     destination: Option<BufferSize>,
@@ -327,6 +519,123 @@ struct SurfaceViewportState {
 struct SurfaceBufferScaleState {
     committed: u32,
     pending: Option<u32>,
+}
+
+#[cfg(test)]
+mod damage_space_tests {
+    use super::*;
+
+    fn size(width: u32, height: u32) -> BufferSize {
+        BufferSize::new(width, height).unwrap()
+    }
+
+    #[test]
+    fn surface_and_buffer_damage_match_at_scale_one() {
+        let surface = convert_pending_damage(
+            vec![PendingSurfaceDamageRect(
+                PendingDamageRect::new(2, 3, 4, 5).unwrap(),
+            )],
+            Vec::new(),
+            Some(size(20, 20)),
+            1,
+            None,
+        );
+        let buffer = convert_pending_damage(
+            Vec::new(),
+            vec![PendingBufferDamageRect(
+                PendingDamageRect::new(2, 3, 4, 5).unwrap(),
+            )],
+            Some(size(20, 20)),
+            1,
+            None,
+        );
+
+        assert_eq!(surface, buffer);
+    }
+
+    #[test]
+    fn surface_damage_uses_integer_buffer_scale() {
+        let damage = convert_pending_damage(
+            vec![PendingSurfaceDamageRect(
+                PendingDamageRect::new(2, 3, 4, 5).unwrap(),
+            )],
+            Vec::new(),
+            Some(size(40, 40)),
+            2,
+            None,
+        );
+
+        assert_eq!(
+            damage,
+            RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 4,
+                y: 6,
+                width: 8,
+                height: 10,
+            }])
+        );
+    }
+
+    #[test]
+    fn surface_damage_uses_supported_viewport_destination() {
+        let damage = convert_pending_damage(
+            vec![PendingSurfaceDamageRect(
+                PendingDamageRect::new(5, 5, 10, 10).unwrap(),
+            )],
+            Vec::new(),
+            Some(size(200, 100)),
+            1,
+            Some(size(100, 50)),
+        );
+
+        assert_eq!(
+            damage,
+            RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 10,
+                y: 10,
+                width: 20,
+                height: 20,
+            }])
+        );
+    }
+
+    #[test]
+    fn combined_damage_clips_every_buffer_edge() {
+        let damage = convert_pending_damage(
+            Vec::new(),
+            vec![
+                PendingBufferDamageRect(PendingDamageRect::new(-2, 2, 4, 3).unwrap()),
+                PendingBufferDamageRect(PendingDamageRect::new(8, 2, 4, 3).unwrap()),
+                PendingBufferDamageRect(PendingDamageRect::new(2, -2, 3, 4).unwrap()),
+                PendingBufferDamageRect(PendingDamageRect::new(2, 8, 3, 4).unwrap()),
+            ],
+            Some(size(10, 10)),
+            1,
+            None,
+        );
+
+        assert_eq!(damage.clipped_rects(10, 10).len(), 4);
+    }
+
+    #[test]
+    fn missing_mapping_falls_back_to_full_and_no_requests_stay_empty() {
+        assert_eq!(
+            convert_pending_damage(Vec::new(), Vec::new(), None, 1, None),
+            RenderableSurfaceDamage::Empty
+        );
+        assert_eq!(
+            convert_pending_damage(
+                vec![PendingSurfaceDamageRect(
+                    PendingDamageRect::new(0, 0, 1, 1).unwrap(),
+                )],
+                Vec::new(),
+                None,
+                1,
+                None,
+            ),
+            RenderableSurfaceDamage::Full
+        );
+    }
 }
 
 impl Default for SurfaceBufferScaleState {

@@ -18,13 +18,14 @@ use std::{
 };
 
 use crate::egl_renderer::dmabuf::{query_egl_dmabuf_feedback, query_egl_main_device};
-use crate::egl_renderer::{EglInstance, EglSwapBuffersWithDamage};
 use crate::egl_renderer::{
-    EglSceneDrawRequest, GlEglImageTargetTexture2DOes, GlesSceneFrameStats, GlesSceneRenderer,
-    OutputDamage, OutputRect as RendererOutputRect, choose_egl_config, choose_native_egl_config,
-    create_gles_context, detect_partial_repaint_capabilities, egl_swap_buffers_with_damage,
-    load_egl_image_target_texture_2d, load_swap_buffers_with_damage, native_visual_label,
+    EglFrameOutcome, EglSceneDrawRequest, GlEglImageTargetTexture2DOes, GlesSceneFrameStats,
+    GlesSceneRenderer, OutputDamage, OutputRect as RendererOutputRect, choose_egl_config,
+    choose_native_egl_config, create_gles_context, detect_partial_repaint_capabilities,
+    egl_swap_buffers_with_damage, load_egl_image_target_texture_2d, load_swap_buffers_with_damage,
+    native_visual_label,
 };
+use crate::egl_renderer::{EglInstance, EglSwapBuffersWithDamage};
 use gbm::AsRaw as GbmAsRaw;
 use khronos_egl as egl;
 #[cfg(test)]
@@ -918,7 +919,8 @@ pub fn run(
             )?
         }
         Err(error) => return Err(error.into()),
-    };
+    }
+    .require_rendered("initial native scanout")?;
     println!("native scanout backend active: {}", scanout.kind().as_str());
     let effective_app_gpu_policy =
         resolve_native_app_gpu_policy(app_gpu_preference, scanout.kind())?;
@@ -1045,13 +1047,15 @@ pub fn run(
             hardware_cursor = None;
             cursor_render_mode = NativeCursorRenderMode::Software;
             let fallback_damage = NativeOutputDamage::full_output(target.width, target.height);
-            let fallback_paint = scanout.paint_server_frame(
-                &mut frame_renderer,
-                &server,
-                &input_state,
-                cursor_render_mode,
-                &fallback_damage,
-            )?;
+            let fallback_paint = scanout
+                .paint_server_frame(
+                    &mut frame_renderer,
+                    &server,
+                    &input_state,
+                    cursor_render_mode,
+                    &fallback_damage,
+                )?
+                .require_rendered("software cursor fallback")?;
             perf.log("native.frame", || {
                 let mut fields = fallback_paint.fields();
                 fields.extend(fallback_damage.fields());
@@ -1755,118 +1759,152 @@ pub fn run(
                     .enabled()
                     .then(NativeProcessCpuSample::read_current)
                     .flatten();
-                let paint_stats = scanout.paint_server_frame(
+                let paint_outcome = scanout.paint_server_frame(
                     &mut frame_renderer,
                     &server,
                     &input_state,
                     cursor_render_mode,
                     &output_damage,
                 )?;
-                frame_rendered = true;
-                let cpu_after = perf
-                    .enabled()
-                    .then(NativeProcessCpuSample::read_current)
-                    .flatten();
-                let (cpu_user_us, cpu_system_us) = cpu_before
-                    .zip(cpu_after)
-                    .map(|(before, after)| after.delta_us_since(before))
-                    .unwrap_or((0, 0));
-                let repaint_present_start = Instant::now();
-                let present_result = scanout.present(&kms_backend).map_err(|error| {
-                    native_runtime_error(
-                        NativeRuntimeStage::Present,
-                        scanout.kind(),
-                        target.crtc_id,
-                        frame_index,
-                        error,
-                    )
-                })?;
-                let repaint_present_us = elapsed_micros(repaint_present_start);
-                let acquire_ready_to_render_submit_us = last_acquire_ready_at_ns
-                    .map(|ready_at| {
-                        monotonic_now_ns().map(|now| now.saturating_sub(ready_at) / 1_000)
-                    })
-                    .transpose()?
-                    .unwrap_or(0);
-                match present_result {
-                    NativePresentResult::AsyncSubmitted { token } => {
-                        frame_scheduler
-                            .note_async_submission(token, monotonic_now_ns()?)
-                            .map_err(io::Error::other)?;
-                        frame_submitted = true;
+                let paint_stats = paint_outcome.stats();
+                if matches!(paint_outcome, NativePaintOutcome::Skipped(_)) {
+                    frame_scheduler.note_immediate_completion();
+                    if server.has_pending_frame_work() {
+                        server.finish_frame();
+                        frame_completed = true;
                     }
-                    NativePresentResult::Immediate => {
-                        frame_scheduler.note_immediate_completion();
-                        if server.has_pending_frame_work() {
-                            let finish_frame_start = Instant::now();
-                            server.finish_frame();
-                            frame_completed = true;
-                            perf.log("native.finish_frame", || {
-                                vec![
-                                    NativePerfField::str("reason", "immediate_scanout"),
-                                    NativePerfField::u64(
-                                        "elapsed_us",
-                                        elapsed_micros(finish_frame_start),
-                                    ),
-                                    NativePerfField::usize(
-                                        "surfaces",
-                                        server.renderable_surfaces().len(),
-                                    ),
-                                    NativePerfField::u64(
-                                        "render_generation",
-                                        server.render_generation(),
-                                    ),
-                                ]
-                            });
+                    perf.log("native.frame_skip", || {
+                        let mut fields = paint_stats.fields();
+                        fields.extend(output_damage.fields());
+                        fields.extend([
+                            NativePerfField::str("reason", "renderer_no_logical_damage"),
+                            NativePerfField::bool("egl_swap_attempted", false),
+                            NativePerfField::bool("gbm_front_buffer_locked", false),
+                            NativePerfField::bool("ready_frame_created", false),
+                            NativePerfField::u64("render_generation", render_generation),
+                        ]);
+                        fields
+                    });
+                    queued_redraw_requested = false;
+                    last_render_generation = render_generation;
+                    last_renderable_surfaces = server.renderable_surfaces().to_vec();
+                } else {
+                    frame_rendered = true;
+                    let cpu_after = perf
+                        .enabled()
+                        .then(NativeProcessCpuSample::read_current)
+                        .flatten();
+                    let (cpu_user_us, cpu_system_us) = cpu_before
+                        .zip(cpu_after)
+                        .map(|(before, after)| after.delta_us_since(before))
+                        .unwrap_or((0, 0));
+                    let repaint_present_start = Instant::now();
+                    let present_result = scanout.present(&kms_backend).map_err(|error| {
+                        native_runtime_error(
+                            NativeRuntimeStage::Present,
+                            scanout.kind(),
+                            target.crtc_id,
+                            frame_index,
+                            error,
+                        )
+                    })?;
+                    let repaint_present_us = elapsed_micros(repaint_present_start);
+                    let acquire_ready_to_render_submit_us = last_acquire_ready_at_ns
+                        .map(|ready_at| {
+                            monotonic_now_ns().map(|now| now.saturating_sub(ready_at) / 1_000)
+                        })
+                        .transpose()?
+                        .unwrap_or(0);
+                    match present_result {
+                        NativePresentResult::AsyncSubmitted { token } => {
+                            frame_scheduler
+                                .note_async_submission(token, monotonic_now_ns()?)
+                                .map_err(io::Error::other)?;
+                            frame_submitted = true;
+                        }
+                        NativePresentResult::Immediate => {
+                            frame_scheduler.note_immediate_completion();
+                            if server.has_pending_frame_work() {
+                                let finish_frame_start = Instant::now();
+                                server.finish_frame();
+                                frame_completed = true;
+                                perf.log("native.finish_frame", || {
+                                    vec![
+                                        NativePerfField::str("reason", "immediate_scanout"),
+                                        NativePerfField::u64(
+                                            "elapsed_us",
+                                            elapsed_micros(finish_frame_start),
+                                        ),
+                                        NativePerfField::usize(
+                                            "surfaces",
+                                            server.renderable_surfaces().len(),
+                                        ),
+                                        NativePerfField::u64(
+                                            "render_generation",
+                                            server.render_generation(),
+                                        ),
+                                    ]
+                                });
+                            }
+                        }
+                        NativePresentResult::Noop => {
+                            return Err(io::Error::other(
+                                "native scanout rendered a frame but did not submit or complete it",
+                            )
+                            .into());
                         }
                     }
-                    NativePresentResult::Noop => {
-                        return Err(io::Error::other(
-                            "native scanout rendered a frame but did not submit or complete it",
-                        )
-                        .into());
-                    }
+                    server.mark_render_damage_presented();
+                    last_acquire_ready_at_ns = None;
+                    frame_index = frame_index.saturating_add(1);
+                    perf.log("native.frame", || {
+                        let mut fields = paint_stats.fields();
+                        fields.extend(output_damage.fields());
+                        fields.extend([
+                            NativePerfField::u64("index", frame_index),
+                            NativePerfField::str("phase", "repaint"),
+                            NativePerfField::str("mode", mode_label.clone()),
+                            NativePerfField::str("cursor", cursor_render_mode.as_str()),
+                            NativePerfField::u64("refresh_hz", u64::from(refresh_hz)),
+                            NativePerfField::usize("surfaces", server.renderable_surfaces().len()),
+                            NativePerfField::u64("render_generation", render_generation),
+                            NativePerfField::bool("render_changed", render_generation_changed),
+                            NativePerfField::str("render_cause", render_cause),
+                            NativePerfField::u64("tick_us", tick_us),
+                            NativePerfField::bool(
+                                "pageflip_pending_at_tick",
+                                pageflip_pending_at_tick,
+                            ),
+                            NativePerfField::u64("input_drain_us", input_drain_us),
+                            NativePerfField::usize("raw_input_events", raw_input_events),
+                            NativePerfField::usize(
+                                "coalesced_input_events",
+                                coalesced_input_events,
+                            ),
+                            NativePerfField::u64("pageflip_drain_us", pageflip_drain_us),
+                            NativePerfField::bool("pageflip_completed", pageflip_completed),
+                            NativePerfField::u64("present_us", present_us),
+                            NativePerfField::u64("repaint_present_us", repaint_present_us),
+                            NativePerfField::u64(
+                                "acquire_ready_to_render_submit_us",
+                                acquire_ready_to_render_submit_us,
+                            ),
+                            NativePerfField::u64("cpu_user_us", cpu_user_us),
+                            NativePerfField::u64("cpu_system_us", cpu_system_us),
+                            NativePerfField::bool("pending_frame_work", pending_frame_work),
+                            NativePerfField::bool("redraw_requested", redraw_requested),
+                            NativePerfField::usize(
+                                "skipped_input_repaints",
+                                skipped_input_repaints,
+                            ),
+                            NativePerfField::usize("accepted_clients", accepted),
+                        ]);
+                        fields
+                    });
+                    queued_redraw_requested = false;
+                    last_render_generation = render_generation;
+                    last_renderable_surfaces = server.renderable_surfaces().to_vec();
                 }
-                last_acquire_ready_at_ns = None;
-                frame_index = frame_index.saturating_add(1);
-                perf.log("native.frame", || {
-                    let mut fields = paint_stats.fields();
-                    fields.extend(output_damage.fields());
-                    fields.extend([
-                        NativePerfField::u64("index", frame_index),
-                        NativePerfField::str("phase", "repaint"),
-                        NativePerfField::str("mode", mode_label.clone()),
-                        NativePerfField::str("cursor", cursor_render_mode.as_str()),
-                        NativePerfField::u64("refresh_hz", u64::from(refresh_hz)),
-                        NativePerfField::usize("surfaces", server.renderable_surfaces().len()),
-                        NativePerfField::u64("render_generation", render_generation),
-                        NativePerfField::bool("render_changed", render_generation_changed),
-                        NativePerfField::str("render_cause", render_cause),
-                        NativePerfField::u64("tick_us", tick_us),
-                        NativePerfField::bool("pageflip_pending_at_tick", pageflip_pending_at_tick),
-                        NativePerfField::u64("input_drain_us", input_drain_us),
-                        NativePerfField::usize("raw_input_events", raw_input_events),
-                        NativePerfField::usize("coalesced_input_events", coalesced_input_events),
-                        NativePerfField::u64("pageflip_drain_us", pageflip_drain_us),
-                        NativePerfField::bool("pageflip_completed", pageflip_completed),
-                        NativePerfField::u64("present_us", present_us),
-                        NativePerfField::u64("repaint_present_us", repaint_present_us),
-                        NativePerfField::u64(
-                            "acquire_ready_to_render_submit_us",
-                            acquire_ready_to_render_submit_us,
-                        ),
-                        NativePerfField::u64("cpu_user_us", cpu_user_us),
-                        NativePerfField::u64("cpu_system_us", cpu_system_us),
-                        NativePerfField::bool("pending_frame_work", pending_frame_work),
-                        NativePerfField::bool("redraw_requested", redraw_requested),
-                        NativePerfField::usize("skipped_input_repaints", skipped_input_repaints),
-                        NativePerfField::usize("accepted_clients", accepted),
-                    ]);
-                    fields
-                });
-                queued_redraw_requested = false;
-                last_render_generation = render_generation;
-                last_renderable_surfaces = server.renderable_surfaces().to_vec();
             }
         } else if scheduler_decision == SchedulerDecision::CompleteProtocolOnly {
             perf.log("native.frame_skip", || {
@@ -5015,6 +5053,29 @@ struct NativePaintStats {
     swap_with_damage_used: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativePaintOutcome {
+    Skipped(NativePaintStats),
+    Rendered(NativePaintStats),
+}
+
+impl NativePaintOutcome {
+    const fn stats(self) -> NativePaintStats {
+        match self {
+            Self::Skipped(stats) | Self::Rendered(stats) => stats,
+        }
+    }
+
+    fn require_rendered(self, context: &str) -> io::Result<NativePaintStats> {
+        match self {
+            Self::Rendered(stats) => Ok(stats),
+            Self::Skipped(_) => Err(io::Error::other(format!(
+                "{context} unexpectedly produced no rendered frame"
+            ))),
+        }
+    }
+}
+
 impl NativePaintStats {
     fn fields(self) -> Vec<NativePerfField> {
         let mut fields = vec![
@@ -5050,7 +5111,19 @@ impl NativePaintStats {
         }
         if let Some(repaint) = self.gles_repaint {
             let output_pixels = u64::from(self.width).saturating_mul(u64::from(self.height));
+            let rendered = repaint.repaint_mode != crate::egl_renderer::RepaintMode::Skip;
             fields.extend([
+                NativePerfField::str("frame_decision", repaint.repaint_mode.as_str()),
+                NativePerfField::str(
+                    "logical_damage",
+                    if repaint.current_damage_pixels == 0 {
+                        "empty"
+                    } else if repaint.current_damage_pixels >= output_pixels {
+                        "full"
+                    } else {
+                        "rects"
+                    },
+                ),
                 NativePerfField::str("repaint_mode", repaint.repaint_mode.as_str()),
                 NativePerfField::usize("current_damage_rects", repaint.current_damage_rects),
                 NativePerfField::u64("current_damage_pixels", repaint.current_damage_pixels),
@@ -5064,6 +5137,16 @@ impl NativePaintStats {
                     output_pixels.saturating_sub(repaint.repair_damage_pixels),
                 ),
                 NativePerfField::bool("swap_with_damage", self.swap_with_damage_used),
+                NativePerfField::bool("partial_repaint_enabled", repaint.partial_repaint_enabled),
+                NativePerfField::bool(
+                    "contradictory_empty_damage",
+                    repaint.contradictory_empty_damage,
+                ),
+                NativePerfField::bool("scene_snapshot_committed", rendered),
+                NativePerfField::bool("egl_swap_attempted", rendered),
+                NativePerfField::bool("egl_swap_succeeded", rendered),
+                NativePerfField::bool("gbm_front_buffer_locked", rendered),
+                NativePerfField::bool("ready_frame_created", rendered),
             ]);
             if let Some(age) = repaint.buffer_age {
                 fields.push(NativePerfField::u64("egl_buffer_age", u64::from(age)));
@@ -6043,17 +6126,17 @@ impl NativeScanoutBackend {
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
         damage: &NativeOutputDamage,
-    ) -> io::Result<NativePaintStats> {
+    ) -> io::Result<NativePaintOutcome> {
         match self {
             Self::NativeEglGbm(scanout) => {
                 scanout.paint_server_frame(renderer, server, input_state, cursor_mode, damage)
             }
-            Self::Gbm(scanout) => {
-                scanout.paint_server_frame(renderer, server, input_state, cursor_mode, damage)
-            }
-            Self::Dumb(framebuffer) => {
-                framebuffer.paint_server_frame(renderer, server, input_state, cursor_mode, damage)
-            }
+            Self::Gbm(scanout) => scanout
+                .paint_server_frame(renderer, server, input_state, cursor_mode, damage)
+                .map(NativePaintOutcome::Rendered),
+            Self::Dumb(framebuffer) => framebuffer
+                .paint_server_frame(renderer, server, input_state, cursor_mode, damage)
+                .map(NativePaintOutcome::Rendered),
         }
     }
 
@@ -6502,7 +6585,7 @@ impl NativeEglGbmScanout {
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
         damage: &NativeOutputDamage,
-    ) -> io::Result<NativePaintStats> {
+    ) -> io::Result<NativePaintOutcome> {
         if !self.surface.has_free_buffers() {
             return Err(io::Error::other(
                 "native EGL/GBM surface has no free buffers",
@@ -6527,11 +6610,30 @@ impl NativeEglGbmScanout {
             Some(damage.as_renderer_damage(self.width, self.height)),
         );
         let draw_start = Instant::now();
-        let output_damage = self
+        let outcome = self
             .scene
             .draw_scene(&self.egl, self.egl_display, self.egl_surface, request)
             .map_err(native_egl_io_error)?;
         let draw_us = elapsed_micros(draw_start);
+        let EglFrameOutcome::Rendered {
+            plan: output_damage,
+            ..
+        } = outcome
+        else {
+            let EglFrameOutcome::Skipped { stats, .. } = outcome else {
+                unreachable!();
+            };
+            return Ok(NativePaintOutcome::Skipped(native_egl_gbm_paint_stats(
+                self.format as u32,
+                self.width,
+                self.height,
+                draw_us,
+                0,
+                elapsed_micros(total_start),
+                stats,
+                false,
+            )));
+        };
         let swap_with_damage_used = self.swap_buffers_with_damage.is_some()
             && output_damage
                 .swap_damage()
@@ -6560,7 +6662,7 @@ impl NativeEglGbmScanout {
         let fb_id = self.framebuffer_cache.fb_id_for(fd, &bo)?;
         self.buffers
             .set_ready(NativePresentedGbmBuffer { _bo: bo, fb_id });
-        Ok(native_egl_gbm_paint_stats(
+        Ok(NativePaintOutcome::Rendered(native_egl_gbm_paint_stats(
             self.format as u32,
             self.width,
             self.height,
@@ -6569,7 +6671,7 @@ impl NativeEglGbmScanout {
             elapsed_micros(total_start),
             scene_stats,
             swap_with_damage_used,
-        ))
+        )))
     }
 
     fn fb_id(&self) -> u32 {

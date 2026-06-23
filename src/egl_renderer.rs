@@ -27,10 +27,10 @@ mod program;
 
 use damage::{
     BufferAge, ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker,
-    EglPartialRepaintCapabilities, FullRepaintReason, PartialRepaintPlanner, RenderExecution,
-    RepaintMode, RepaintPlan, ShellOverlayDamageState,
+    EglPartialRepaintCapabilities, EglPresentedDamageState, FullRepaintReason,
+    PartialRepaintPlanner, RenderExecution, RepaintPlan, ShellOverlayDamageState,
 };
-pub(crate) use damage::{OutputDamage, OutputRect};
+pub(crate) use damage::{OutputDamage, OutputRect, RepaintMode};
 use dmabuf::{query_egl_dmabuf_feedback, query_egl_main_device};
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglRect, EglTexturedVertex, EglUvRect, MIN_VERTEX_BUFFER_BYTES,
@@ -86,6 +86,25 @@ pub(crate) struct GlesSceneFrameStats {
     pub draw_command_replays: usize,
     pub history_depth: usize,
     pub fallback_reason: Option<FullRepaintReason>,
+    pub partial_repaint_enabled: bool,
+    pub contradictory_empty_damage: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameSkipReason {
+    NoLogicalDamage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EglFrameOutcome {
+    Skipped {
+        reason: FrameSkipReason,
+        stats: GlesSceneFrameStats,
+    },
+    Rendered {
+        plan: RepaintPlan,
+        stats: GlesSceneFrameStats,
+    },
 }
 
 pub struct EglSceneDrawRequest<'a> {
@@ -126,6 +145,8 @@ pub(crate) struct GlesSceneRenderer {
     cursor_vertices: Vec<EglTexturedVertex>,
     cursor_commands: Vec<EglDrawCommand>,
     scene_cache_key: Option<EglSceneCacheKey>,
+    presented_scene_key: Option<EglSceneCacheKey>,
+    pending_scene_key: Option<EglSceneCacheKey>,
     wallpaper_resource: Option<EglImageResource>,
     cursor_resource: Option<EglImageResource>,
     shell_overlay_resource: Option<EglImageResource>,
@@ -137,6 +158,7 @@ pub(crate) struct GlesSceneRenderer {
     frame_resources: HashMap<compositor::ServerFrameColor, EglImageResource>,
     egl_image_target_texture_2d: Option<GlEglImageTargetTexture2DOes>,
     damage_tracker: EglOutputDamageTracker,
+    pending_damage_state: Option<EglPresentedDamageState>,
     repaint_planner: PartialRepaintPlanner,
     frame_stats: GlesSceneFrameStats,
 }
@@ -244,17 +266,24 @@ impl EglGlesFrameRenderer {
         self.dmabuf_main_device_path.as_deref()
     }
 
-    pub fn draw_scene(&mut self, request: EglSceneDrawRequest<'_>) -> RendererResult<()> {
+    pub fn draw_scene(
+        &mut self,
+        request: EglSceneDrawRequest<'_>,
+    ) -> RendererResult<EglFrameOutcome> {
         let width = request.width.max(1);
         let height = request.height.max(1);
         if self.scene.current_size() != (width, height) {
             self.wl_egl_surface
                 .resize(width as i32, height as i32, 0, 0);
         }
-        let plan = self
-            .scene
-            .draw_scene(&self.egl, self.egl_display, self.egl_surface, request)?;
-        self.swap_buffers(&plan)
+        let outcome =
+            self.scene
+                .draw_scene(&self.egl, self.egl_display, self.egl_surface, request)?;
+        let EglFrameOutcome::Rendered { plan, .. } = &outcome else {
+            return Ok(outcome);
+        };
+        self.swap_buffers(plan)?;
+        Ok(outcome)
     }
 
     fn swap_buffers(&mut self, plan: &RepaintPlan) -> RendererResult<()> {
@@ -339,6 +368,8 @@ impl GlesSceneRenderer {
             cursor_vertices: Vec::new(),
             cursor_commands: Vec::new(),
             scene_cache_key: None,
+            presented_scene_key: None,
+            pending_scene_key: None,
             wallpaper_resource: None,
             cursor_resource: None,
             shell_overlay_resource: None,
@@ -350,6 +381,7 @@ impl GlesSceneRenderer {
             frame_resources: HashMap::new(),
             egl_image_target_texture_2d,
             damage_tracker: EglOutputDamageTracker::default(),
+            pending_damage_state: None,
             repaint_planner: PartialRepaintPlanner::new(
                 (width, height),
                 partial_repaint_capabilities,
@@ -380,7 +412,7 @@ impl GlesSceneRenderer {
         egl_display: egl::Display,
         egl_surface: egl::Surface,
         request: EglSceneDrawRequest<'_>,
-    ) -> RendererResult<RepaintPlan> {
+    ) -> RendererResult<EglFrameOutcome> {
         let EglSceneDrawRequest {
             width,
             height,
@@ -416,7 +448,15 @@ impl GlesSceneRenderer {
         )?;
 
         let surface_signatures = egl_scene_surface_signatures(surfaces);
-        let scene_changed = !self.scene_cache_is_current(
+        let candidate_scene_key = EglSceneCacheKey::new(
+            width,
+            height,
+            content_generation,
+            output_scale_key,
+            &surface_signatures,
+        );
+        let scene_changed = self.presented_scene_key != Some(candidate_scene_key);
+        let commands_changed = !self.scene_cache_is_current(
             width,
             height,
             content_generation,
@@ -441,7 +481,7 @@ impl GlesSceneRenderer {
                 height,
             )
         });
-        let output_damage = self.damage_tracker.damage_for_frame(
+        let mut output_damage = self.damage_tracker.damage_for_frame(
             width,
             height,
             scene_changed,
@@ -450,8 +490,19 @@ impl GlesSceneRenderer {
             shell_overlay_damage,
             client_cursor_damage,
         );
+        if scene_changed && output_damage == OutputDamage::Empty {
+            self.frame_stats.contradictory_empty_damage = true;
+            output_damage = OutputDamage::Full;
+        }
+        self.pending_damage_state = Some(EglOutputDamageTracker::candidate_state(
+            width,
+            height,
+            scaled_visual_state,
+            shell_overlay_damage,
+            client_cursor_damage,
+        ));
 
-        if scene_changed {
+        if commands_changed {
             self.frame_stats.scene_rebuilt = true;
             self.rebuild_scene_commands(
                 width,
@@ -478,21 +529,41 @@ impl GlesSceneRenderer {
             self.repaint_planner.capabilities().buffer_age,
         );
         let plan = self.repaint_planner.plan(output_damage, buffer_age);
+        if plan.mode == RepaintMode::Skip {
+            self.pending_damage_state = None;
+            self.pending_scene_key = None;
+            self.record_repaint_stats(&plan);
+            return Ok(EglFrameOutcome::Skipped {
+                reason: FrameSkipReason::NoLogicalDamage,
+                stats: self.frame_stats,
+            });
+        }
+        self.pending_scene_key = Some(candidate_scene_key);
         if let Err(error) = self.draw_textured_layers(&plan) {
             self.repaint_planner.invalidate();
+            self.pending_scene_key = None;
             return Err(error);
         }
         self.record_repaint_stats(&plan);
-        Ok(plan)
+        Ok(EglFrameOutcome::Rendered {
+            plan,
+            stats: self.frame_stats,
+        })
     }
 
     pub(crate) fn frame_presented(&mut self, plan: &RepaintPlan) {
         self.repaint_planner.commit_presented(plan);
+        if let Some(state) = self.pending_damage_state.take() {
+            self.damage_tracker.commit_presented(state);
+        }
+        self.presented_scene_key = self.pending_scene_key.take();
         self.frame_stats.history_depth = self.repaint_planner.history_depth();
     }
 
     pub(crate) fn frame_swap_failed(&mut self) {
         self.repaint_planner.swap_failed();
+        self.pending_damage_state = None;
+        self.pending_scene_key = None;
         self.frame_stats.history_depth = 0;
     }
 
@@ -509,6 +580,7 @@ impl GlesSceneRenderer {
         self.frame_stats.repair_damage_pixels =
             plan.repair_damage.pixels(width, height).unwrap_or(u64::MAX);
         self.frame_stats.fallback_reason = plan.fallback_reason;
+        self.frame_stats.partial_repaint_enabled = self.repaint_planner.partial_enabled();
         self.frame_stats.history_depth = self.repaint_planner.history_depth();
     }
 
@@ -1218,7 +1290,6 @@ impl GlesSceneRenderer {
             .render_execution(self.current_size.0, self.current_size.1)
             .ok_or_else(|| io::Error::other("repaint execution conversion failed"))?;
         match execution {
-            RenderExecution::Skip => {}
             RenderExecution::Full => {
                 unsafe {
                     self.gl.disable(glow::SCISSOR_TEST);
@@ -2369,6 +2440,13 @@ mod tests {
             None,
             None,
         );
+        tracker.commit_presented(EglOutputDamageTracker::candidate_state(
+            1280,
+            800,
+            DesktopVisualState::wallpaper_only(),
+            None,
+            None,
+        ));
         let precise = OutputDamage::rects(1280, 800, [OutputRect::new(10, 20, 30, 40)]);
 
         assert_eq!(
@@ -2397,6 +2475,13 @@ mod tests {
             None,
             None,
         );
+        tracker.commit_presented(EglOutputDamageTracker::candidate_state(
+            1280,
+            800,
+            DesktopVisualState::with_cursor(10, 10),
+            None,
+            None,
+        ));
         let damage = tracker.damage_for_frame(
             1280,
             800,
@@ -2413,6 +2498,49 @@ mod tests {
             damage.pixels(1280, 800),
             Some(u64::from(cursor_width) * u64::from(cursor_height) * 2)
         );
+    }
+
+    #[test]
+    fn output_damage_tracker_repeats_candidate_damage_until_presented() {
+        let mut tracker = EglOutputDamageTracker::default();
+        tracker.damage_for_frame(
+            1280,
+            800,
+            true,
+            None,
+            DesktopVisualState::with_cursor(10, 10),
+            None,
+            None,
+        );
+        tracker.commit_presented(EglOutputDamageTracker::candidate_state(
+            1280,
+            800,
+            DesktopVisualState::with_cursor(10, 10),
+            None,
+            None,
+        ));
+
+        let first = tracker.damage_for_frame(
+            1280,
+            800,
+            false,
+            Some(OutputDamage::Empty),
+            DesktopVisualState::with_cursor(20, 22),
+            None,
+            None,
+        );
+        let retry = tracker.damage_for_frame(
+            1280,
+            800,
+            false,
+            Some(OutputDamage::Empty),
+            DesktopVisualState::with_cursor(20, 22),
+            None,
+            None,
+        );
+
+        assert_eq!(retry, first);
+        assert_ne!(retry, OutputDamage::Empty);
     }
 
     #[test]
@@ -2439,6 +2567,13 @@ mod tests {
             Some(ShellOverlayDamageState::new(1, [old])),
             None,
         );
+        tracker.commit_presented(EglOutputDamageTracker::candidate_state(
+            1280,
+            800,
+            DesktopVisualState::wallpaper_only(),
+            Some(ShellOverlayDamageState::new(1, [old])),
+            None,
+        ));
         let damage = tracker.damage_for_frame(
             1280,
             800,
