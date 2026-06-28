@@ -1,0 +1,122 @@
+use super::*;
+
+impl CompositorState {
+    pub(crate) fn release_cached_resources_for_shutdown(&mut self) {
+        let mut cached = self.subsurface_transactions.drain_cached_commits();
+        for transaction in self.pending_surface_tree_transactions.drain(..) {
+            cached.extend(transaction.nodes.into_iter().map(|(_, commit)| commit));
+        }
+        for commit in cached {
+            for feedback in commit.presentation_feedbacks {
+                feedback.feedback.discarded();
+            }
+            if let Some(PendingSurfaceAttachment::Buffer(buffer)) = commit.attachment {
+                buffer.release_target().release();
+            }
+        }
+        for commit in self.pending_explicit_sync_commits.drain(..) {
+            commit.pending.release_target().release();
+        }
+    }
+}
+
+pub(crate) fn empty_cached_subsurface_commit() -> CachedSubsurfaceCommit {
+    CachedSubsurfaceCommit {
+        commit_sequence: SurfaceCommitSequence::initial(),
+        attachment: None,
+        damage: None,
+        frame_callbacks: Vec::new(),
+        explicit_sync: None,
+        offset: None,
+        viewport_destination: None,
+        buffer_scale: None,
+        input_region: None,
+        presentation_feedbacks: Vec::new(),
+        resize_commit: None,
+        resize_capture_finalized: true,
+        window_geometry_changed: false,
+        cached_at: Instant::now(),
+    }
+}
+
+pub(crate) fn take_tree_resize_commit(
+    root_surface_id: u32,
+    nodes: &mut [(u32, CachedSubsurfaceCommit)],
+) -> Option<ResizeCommitSnapshot> {
+    let (_, root) = nodes
+        .iter_mut()
+        .find(|(surface_id, _)| *surface_id == root_surface_id)?;
+    match root.attachment.as_mut() {
+        Some(PendingSurfaceAttachment::Buffer(buffer)) => {
+            buffer.resize_commit.take().map(|resize| *resize)
+        }
+        _ => root.resize_commit.take(),
+    }
+}
+
+pub(crate) fn pending_node_resize_commit(
+    commit: &CachedSubsurfaceCommit,
+) -> Option<ResizeCommitSnapshot> {
+    match commit.attachment.as_ref() {
+        Some(PendingSurfaceAttachment::Buffer(buffer)) => buffer.resize_commit.as_deref().copied(),
+        _ => commit.resize_commit,
+    }
+}
+
+pub(crate) fn pending_attachment_buffer_protocol_id(
+    attachment: &PendingSurfaceAttachment,
+) -> Option<u32> {
+    match attachment {
+        PendingSurfaceAttachment::Buffer(buffer) => Some(buffer.resource.id().protocol_id()),
+        PendingSurfaceAttachment::RemoveContent => None,
+    }
+}
+
+pub(crate) fn remove_surface_tree_dependency(
+    transaction: &mut PendingSurfaceTreeTransaction,
+    surface_id: u32,
+    buffer_id: u32,
+) -> Option<SurfaceTreeAcquireDependency> {
+    let index = transaction.dependencies.iter().position(|dependency| {
+        dependency.surface_id == surface_id && dependency.buffer_id == buffer_id
+    })?;
+    Some(transaction.dependencies.remove(index))
+}
+
+pub(crate) fn newest_ready_explicit_sync_commit_indices(
+    commits: impl IntoIterator<Item = (usize, u32, bool)>,
+) -> HashMap<u32, usize> {
+    let mut newest_ready = HashMap::new();
+    for (index, surface_id, ready) in commits {
+        if ready {
+            newest_ready.insert(surface_id, index);
+        }
+    }
+    newest_ready
+}
+
+pub(crate) fn damage_only_rendered_surface_size(
+    existing: BufferSize,
+    requested: BufferSize,
+    resize_pending: bool,
+) -> BufferSize {
+    if resize_pending { existing } else { requested }
+}
+
+pub(crate) fn resource_belongs_to_surface_client<R>(
+    resource: &R,
+    surface: &wl_surface::WlSurface,
+) -> bool
+where
+    R: Resource,
+{
+    resource.id().same_client_as(&surface.id())
+}
+
+pub(crate) fn same_wayland_resource<L, R>(left: &L, right: &R) -> bool
+where
+    L: Resource,
+    R: Resource,
+{
+    left.id().protocol_id() == right.id().protocol_id() && left.id().same_client_as(&right.id())
+}

@@ -225,7 +225,7 @@ fn root_resize_publishes_content_and_synchronized_decorations_in_one_generation(
         .filter(|surface| surface.parent_surface_id.is_some())
         .collect::<Vec<_>>();
     assert_eq!((root.width, root.height), (340, 230));
-    assert!(!root.resize_preview_active);
+    assert!(root.resize_preview_active);
     assert!(
         after_children
             .iter()

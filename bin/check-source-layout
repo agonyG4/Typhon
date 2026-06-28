@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+prod_limit=1500
+test_limit=2000
+mod_limit=800
+
+allowed_oversized() {
+    case "$1" in
+        src/compositor/render.rs) return 0 ;;
+        src/egl_renderer.rs) return 0 ;;
+        src/nested_output.rs) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+limit_for() {
+    local path="$1"
+    if [[ "$(basename "$path")" == "mod.rs" ]]; then
+        printf '%s\n' "$mod_limit"
+    elif [[ "$path" == *"/tests/"* || "$path" == *"_tests.rs" ]]; then
+        printf '%s\n' "$test_limit"
+    else
+        printf '%s\n' "$prod_limit"
+    fi
+}
+
+status=0
+if rg -n 'include!\s*\(' src >/tmp/typhon-source-layout-includes 2>/dev/null; then
+    while IFS= read -r match; do
+        printf 'source-layout: architecture include! is not allowed: %s\n' "$match" >&2
+    done </tmp/typhon-source-layout-includes
+    status=1
+fi
+
+while IFS= read -r -d '' path; do
+    case "$path" in
+        target/*|*/target/*|.git/*) continue ;;
+    esac
+    lines=$(wc -l < "$path")
+    limit=$(limit_for "$path")
+    if (( lines > limit )) && ! allowed_oversized "$path"; then
+        printf 'source-layout: %s has %s lines, limit is %s\n' "$path" "$lines" "$limit" >&2
+        status=1
+    fi
+done < <(find src -type f -name '*.rs' -print0)
+
+exit "$status"

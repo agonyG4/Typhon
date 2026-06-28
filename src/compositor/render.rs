@@ -15,8 +15,6 @@ pub const SERVER_FRAME_BORDER_THICKNESS: i32 = 6;
 pub const SERVER_FRAME_BORDER_COLOR: u32 = 0xff0a_0d12;
 pub const SERVER_FRAME_TITLEBAR_COLOR: u32 = 0xff1a_2029;
 pub const SERVER_FRAME_SEPARATOR_COLOR: u32 = 0xff2e_3644;
-pub const RESIZE_PREVIEW_BACKDROP_COLOR: u32 = 0xff10_141c;
-pub const RESIZE_PREVIEW_OUTLINE_COLOR: u32 = 0xff7f_8ea3;
 pub const OUTPUT_SCALE_DENOMINATOR: u32 = 120;
 pub const MAX_BUFFER_AGE: u32 = 4;
 
@@ -191,15 +189,18 @@ struct SceneSurfaceSnapshot {
     surface_id: u32,
     generation: u64,
     target: SurfaceTargetRect,
+    visible_target: SurfaceTargetRect,
     buffer_width: u32,
     buffer_height: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RenderSceneElement {
     id: RenderSceneElementId,
     kind: RenderSceneElementKind,
     target: SurfaceTargetRect,
+    visible_target: SurfaceTargetRect,
+    content_uv: SurfaceUvRect,
     generation: u64,
     buffer_size: BufferSize,
     buffer_source: SurfaceBufferSource,
@@ -208,10 +209,13 @@ pub struct RenderSceneElement {
 
 impl RenderSceneElement {
     pub fn from_surface(surface: &RenderableSurface, target: SurfaceTargetRect) -> Self {
+        let plan = surface_render_plan(surface, target);
         Self {
             id: RenderSceneElementId::Surface(surface.surface_id),
             kind: RenderSceneElementKind::ClientSurface,
             target,
+            visible_target: plan.content_target,
+            content_uv: plan.content_uv,
             generation: surface.generation,
             buffer_size: surface.buffer_size(),
             buffer_source: surface.buffer_source(),
@@ -229,6 +233,14 @@ impl RenderSceneElement {
 
     pub const fn target(&self) -> SurfaceTargetRect {
         self.target
+    }
+
+    pub const fn visible_target(&self) -> SurfaceTargetRect {
+        self.visible_target
+    }
+
+    pub const fn content_uv(&self) -> SurfaceUvRect {
+        self.content_uv
     }
 
     pub const fn generation(&self) -> u64 {
@@ -862,6 +874,7 @@ fn scene_surface_snapshots_from_elements(
                 surface_id,
                 generation: element.generation,
                 target: element.target,
+                visible_target: element.visible_target,
                 buffer_width: element.buffer_size.width,
                 buffer_height: element.buffer_size.height,
             }
@@ -909,16 +922,17 @@ fn partial_scene_damage_rects(
             return None;
         }
 
-        if previous.target != snapshot.target {
+        if previous.target != snapshot.target || previous.visible_target != snapshot.visible_target
+        {
             if let Some(rect) = previous
-                .target
+                .visible_target
                 .output_rect()
                 .clipped_to_output(frame_width, frame_height)
             {
                 damage_rects.push(rect);
             }
             if let Some(rect) = snapshot
-                .target
+                .visible_target
                 .output_rect()
                 .clipped_to_output(frame_width, frame_height)
             {
@@ -931,7 +945,7 @@ fn partial_scene_damage_rects(
             || previous.buffer_height != snapshot.buffer_height
         {
             if let Some(rect) = snapshot
-                .target
+                .visible_target
                 .output_rect()
                 .clipped_to_output(frame_width, frame_height)
             {
@@ -948,7 +962,7 @@ fn partial_scene_damage_rects(
             RenderableSurfaceDamage::Empty => {}
             RenderableSurfaceDamage::Full => {
                 if let Some(rect) = snapshot
-                    .target
+                    .visible_target
                     .output_rect()
                     .clipped_to_output(frame_width, frame_height)
                 {
@@ -960,8 +974,9 @@ fn partial_scene_damage_rects(
                     .damage
                     .clipped_rects(element.buffer_size.width, element.buffer_size.height)
                 {
-                    let Some(rect) = output_damage_rect_for_element(element, snapshot.target, rect)
-                        .and_then(|rect| rect.clipped_to_output(frame_width, frame_height))
+                    let Some(rect) =
+                        output_damage_rect_for_element(element, snapshot.visible_target, rect)
+                            .and_then(|rect| rect.clipped_to_output(frame_width, frame_height))
                     else {
                         continue;
                     };
@@ -1013,26 +1028,16 @@ pub enum ServerFrameColor {
     Border,
     Titlebar,
     Separator,
-    ResizePreviewBackdrop,
-    ResizePreviewOutline,
 }
 
 impl ServerFrameColor {
-    pub const ALL: [Self; 5] = [
-        Self::Border,
-        Self::Titlebar,
-        Self::Separator,
-        Self::ResizePreviewBackdrop,
-        Self::ResizePreviewOutline,
-    ];
+    pub const ALL: [Self; 3] = [Self::Border, Self::Titlebar, Self::Separator];
 
     pub const fn pixel(self) -> u32 {
         match self {
             Self::Border => SERVER_FRAME_BORDER_COLOR,
             Self::Titlebar => SERVER_FRAME_TITLEBAR_COLOR,
             Self::Separator => SERVER_FRAME_SEPARATOR_COLOR,
-            Self::ResizePreviewBackdrop => RESIZE_PREVIEW_BACKDROP_COLOR,
-            Self::ResizePreviewOutline => RESIZE_PREVIEW_OUTLINE_COLOR,
         }
     }
 }
@@ -1080,6 +1085,16 @@ impl SurfaceTargetRect {
         self.height
     }
 
+    fn right(self) -> i32 {
+        self.x
+            .saturating_add(i32::try_from(self.width).unwrap_or(i32::MAX))
+    }
+
+    fn bottom(self) -> i32 {
+        self.y
+            .saturating_add(i32::try_from(self.height).unwrap_or(i32::MAX))
+    }
+
     const fn output_rect(self) -> OutputRect {
         OutputRect {
             x: self.x,
@@ -1112,107 +1127,66 @@ pub struct SurfaceRenderPlan {
     pub visual_target: SurfaceTargetRect,
     pub content_target: SurfaceTargetRect,
     pub content_uv: SurfaceUvRect,
-    pub preview_active: bool,
+    pub clip: Option<SurfaceTargetRect>,
 }
 
 pub fn surface_render_plan(
     surface: &RenderableSurface,
     visual_target: SurfaceTargetRect,
 ) -> SurfaceRenderPlan {
-    let Some(preview) = surface.resize_preview else {
-        return SurfaceRenderPlan {
-            visual_target,
-            content_target: visual_target,
-            content_uv: SurfaceUvRect::FULL,
-            preview_active: false,
-        };
-    };
-
-    let horizontal = preview_axis_plan(
-        preview.committed_width,
-        surface.width,
-        visual_target.width,
-        preview.anchor_right,
-    );
-    let vertical = preview_axis_plan(
-        preview.committed_height,
-        surface.height,
-        visual_target.height,
-        preview.anchor_bottom,
-    );
-
-    SurfaceRenderPlan {
+    let mut plan = SurfaceRenderPlan {
         visual_target,
-        content_target: SurfaceTargetRect {
-            x: visual_target.x.saturating_add(horizontal.offset),
-            y: visual_target.y.saturating_add(vertical.offset),
-            width: horizontal.extent,
-            height: vertical.extent,
-        },
-        content_uv: SurfaceUvRect {
-            left: horizontal.uv_start,
-            top: vertical.uv_start,
-            right: horizontal.uv_end,
-            bottom: vertical.uv_end,
-        },
-        preview_active: true,
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PreviewAxisPlan {
-    offset: i32,
-    extent: u32,
-    uv_start: f32,
-    uv_end: f32,
-}
-
-fn preview_axis_plan(
-    committed_extent: u32,
-    visual_extent: u32,
-    target_extent: u32,
-    anchor_far: bool,
-) -> PreviewAxisPlan {
-    if committed_extent == 0 || visual_extent == 0 || target_extent == 0 {
-        return PreviewAxisPlan {
-            offset: 0,
-            extent: 0,
-            uv_start: 0.0,
-            uv_end: 1.0,
-        };
-    }
-
-    if committed_extent <= visual_extent {
-        let extent = u32::try_from(
-            u64::from(committed_extent).saturating_mul(u64::from(target_extent))
-                / u64::from(visual_extent),
-        )
-        .unwrap_or(u32::MAX)
-        .clamp(1, target_extent);
-        let offset = if anchor_far && extent < target_extent {
-            i32::try_from(target_extent - extent).unwrap_or(i32::MAX)
-        } else {
-            0
-        };
-        return PreviewAxisPlan {
-            offset,
-            extent,
-            uv_start: 0.0,
-            uv_end: 1.0,
-        };
-    }
-
-    let span = (visual_extent as f32 / committed_extent as f32).clamp(0.0, 1.0);
-    let (uv_start, uv_end) = if anchor_far {
-        (1.0 - span, 1.0)
-    } else {
-        (0.0, span)
+        content_target: visual_target,
+        content_uv: SurfaceUvRect::FULL,
+        clip: surface.visual_clip,
     };
-    PreviewAxisPlan {
-        offset: 0,
-        extent: target_extent,
-        uv_start,
-        uv_end,
+    if let Some(clip) = surface.visual_clip {
+        plan = clip_surface_render_plan(plan, clip);
+    }
+    plan
+}
+
+pub fn clip_surface_render_plan(
+    plan: SurfaceRenderPlan,
+    clip: SurfaceTargetRect,
+) -> SurfaceRenderPlan {
+    let Some(intersection) = plan
+        .content_target
+        .output_rect()
+        .intersection(clip.output_rect())
+    else {
+        return SurfaceRenderPlan {
+            content_target: SurfaceTargetRect {
+                x: plan.content_target.x,
+                y: plan.content_target.y,
+                width: 0,
+                height: 0,
+            },
+            ..plan
+        };
+    };
+    let target = SurfaceTargetRect {
+        x: intersection.x,
+        y: intersection.y,
+        width: intersection.width,
+        height: intersection.height,
+    };
+    let original = plan.content_target;
+    let left_trim = (target.x - original.x) as f32 / original.width.max(1) as f32;
+    let top_trim = (target.y - original.y) as f32 / original.height.max(1) as f32;
+    let right_trim = (original.right() - target.right()) as f32 / original.width.max(1) as f32;
+    let bottom_trim = (original.bottom() - target.bottom()) as f32 / original.height.max(1) as f32;
+    let uv_width = plan.content_uv.right - plan.content_uv.left;
+    let uv_height = plan.content_uv.bottom - plan.content_uv.top;
+    SurfaceRenderPlan {
+        content_target: target,
+        content_uv: SurfaceUvRect {
+            left: (plan.content_uv.left + uv_width * left_trim).clamp(0.0, 1.0),
+            top: (plan.content_uv.top + uv_height * top_trim).clamp(0.0, 1.0),
+            right: (plan.content_uv.right - uv_width * right_trim).clamp(0.0, 1.0),
+            bottom: (plan.content_uv.bottom - uv_height * bottom_trim).clamp(0.0, 1.0),
+        },
+        ..plan
     }
 }
 
@@ -1324,56 +1298,8 @@ pub fn server_frame_rects_by_surface(surfaces: &[RenderableSurface]) -> Vec<Vec<
         .collect()
 }
 
-pub fn server_frame_rects_for_surface(surface: &RenderableSurface) -> Vec<ServerFrameRect> {
-    if surface.resize_preview.is_none() {
-        return Vec::new();
-    }
-
-    let width = surface.width;
-    let height = surface.height;
-    let outline = 1;
-    let mut rects = vec![ServerFrameRect {
-        color: ServerFrameColor::ResizePreviewBackdrop,
-        x: 0,
-        y: 0,
-        width,
-        height,
-    }];
-    if width == 0 || height == 0 {
-        return rects;
-    }
-
-    rects.extend([
-        ServerFrameRect {
-            color: ServerFrameColor::ResizePreviewOutline,
-            x: 0,
-            y: 0,
-            width,
-            height: outline,
-        },
-        ServerFrameRect {
-            color: ServerFrameColor::ResizePreviewOutline,
-            x: 0,
-            y: i32::try_from(height.saturating_sub(outline)).unwrap_or(i32::MAX),
-            width,
-            height: outline,
-        },
-        ServerFrameRect {
-            color: ServerFrameColor::ResizePreviewOutline,
-            x: 0,
-            y: 0,
-            width: outline,
-            height,
-        },
-        ServerFrameRect {
-            color: ServerFrameColor::ResizePreviewOutline,
-            x: i32::try_from(width.saturating_sub(outline)).unwrap_or(i32::MAX),
-            y: 0,
-            width: outline,
-            height,
-        },
-    ]);
-    rects
+pub fn server_frame_rects_for_surface(_surface: &RenderableSurface) -> Vec<ServerFrameRect> {
+    Vec::new()
 }
 
 pub fn surface_origins(surfaces: &[RenderableSurface]) -> Vec<(i32, i32)> {
@@ -1456,8 +1382,8 @@ fn resolve_surface_origin(
 
     resolving[index] = true;
     let surface = &surfaces[index];
-    let origin = surface
-        .placement
+    let placement = surface.render_placement.unwrap_or(surface.placement);
+    let origin = placement
         .parent_surface_id
         .and_then(|parent_id| index_by_id.get(&parent_id).copied())
         .filter(|parent_index| *parent_index != index)
@@ -1471,8 +1397,8 @@ fn resolve_surface_origin(
                 resolving,
             );
             (
-                parent_origin.0 + surface.placement.local_x + surface.x,
-                parent_origin.1 + surface.placement.local_y + surface.y,
+                parent_origin.0 + placement.local_x + surface.x,
+                parent_origin.1 + placement.local_y + surface.y,
             )
         })
         .unwrap_or_else(|| root_surface_origin(index, surface, root_ordinals));
@@ -1495,9 +1421,10 @@ fn root_surface_origin(
 
 fn root_surface_origin_for_ordinal(root_index: usize, surface: &RenderableSurface) -> (i32, i32) {
     let cascade = root_index as i32 * SURFACE_CASCADE_STEP;
+    let placement = surface.render_placement.unwrap_or(surface.placement);
     (
-        FIRST_SURFACE_OFFSET.0 + cascade + surface.placement.local_x + surface.x,
-        FIRST_SURFACE_OFFSET.1 + cascade + surface.placement.local_y + surface.y,
+        FIRST_SURFACE_OFFSET.0 + cascade + placement.local_x + surface.x,
+        FIRST_SURFACE_OFFSET.1 + cascade + placement.local_y + surface.y,
     )
 }
 
@@ -1779,14 +1706,10 @@ fn blit_surface_to_rect_clipped(
 
     let target_width = target.width as i64;
     let target_height = target.height as i64;
-    let uv_left = plan.content_uv.left.clamp(0.0, 1.0);
-    let uv_top = plan.content_uv.top.clamp(0.0, 1.0);
-    let uv_width = (plan.content_uv.right - plan.content_uv.left)
-        .abs()
-        .clamp(0.0, 1.0);
-    let uv_height = (plan.content_uv.bottom - plan.content_uv.top)
-        .abs()
-        .clamp(0.0, 1.0);
+    let uv_left = plan.content_uv.left;
+    let uv_top = plan.content_uv.top;
+    let uv_width = plan.content_uv.right - plan.content_uv.left;
+    let uv_height = plan.content_uv.bottom - plan.content_uv.top;
     for row_y in start_y..end_y {
         let local_y = row_y - i64::from(target.y);
         let source_y = ((uv_top * buffer_size.height as f32)
@@ -2093,6 +2016,7 @@ const CURSOR_PATTERN: [&str; 17] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compositor::SurfaceCommitSequence;
     use crate::compositor::SurfacePlacement;
     use crate::render_backend::buffer::{
         BufferIdAllocator, BufferIdentity, BufferSize, CommittedSurfaceBuffer,
@@ -2159,8 +2083,10 @@ mod tests {
             width: 2,
             height: 2,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 0,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(
                 2,
                 2,
@@ -2194,150 +2120,123 @@ mod tests {
     }
 
     #[test]
-    fn resize_preview_does_not_upscale_undersized_committed_buffer() {
+    fn task_05_8_interactive_render_uses_full_uv_and_real_surface_size() {
         let surface = RenderableSurface {
             surface_id: 7,
             x: 0,
             y: 0,
-            width: 4,
-            height: 2,
+            width: 800,
+            height: 600,
             placement: SurfacePlacement::root(),
-            resize_preview: Some(crate::compositor::ResizePreview {
-                committed_width: 2,
-                committed_height: 2,
-                anchor_right: false,
-                anchor_bottom: false,
-            }),
+            render_placement: None,
+            visual_clip: Some(SurfaceTargetRect::new(0, 0, 1000, 700)),
             generation: 1,
-            buffer: shm_buffer(2, 2, vec![0xffff_0000; 4]),
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(800, 600, vec![0xffff_0000; 800 * 600]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
-        let mut frame = vec![0; 96 * 96];
 
-        compose_nested_output(
-            &mut frame,
-            96,
-            96,
-            std::slice::from_ref(&surface),
-            DesktopVisualState::wallpaper_only(),
-        );
+        let plan = surface_render_plan(&surface, SurfaceTargetRect::new(0, 0, 800, 600));
 
-        let row = FIRST_SURFACE_OFFSET.1 as usize * 96 + FIRST_SURFACE_OFFSET.0 as usize;
-        assert_eq!(frame[row], 0xffff_0000);
-        assert_eq!(frame[row + 1], 0xffff_0000);
-        assert_eq!(frame[row + 2], RESIZE_PREVIEW_OUTLINE_COLOR);
-        assert_eq!(frame[row + 3], RESIZE_PREVIEW_OUTLINE_COLOR);
+        assert_eq!(plan.content_target.width(), 800);
+        assert_eq!(plan.content_target.height(), 600);
+        assert_eq!(plan.content_uv, SurfaceUvRect::FULL);
+        assert_eq!(plan.clip, Some(SurfaceTargetRect::new(0, 0, 1000, 700)));
     }
 
     #[test]
-    fn resize_preview_shrink_crops_stale_content_without_scaling() {
-        let surface = RenderableSurface {
+    fn task_05_8_shrink_clips_without_scaling() {
+        let near_surface = RenderableSurface {
             surface_id: 7,
             x: 0,
             y: 0,
-            width: 2,
-            height: 1,
+            width: 1000,
+            height: 700,
             placement: SurfacePlacement::root(),
-            resize_preview: Some(crate::compositor::ResizePreview {
-                committed_width: 4,
-                committed_height: 1,
-                anchor_right: false,
-                anchor_bottom: false,
-            }),
+            render_placement: None,
+            visual_clip: Some(SurfaceTargetRect::new(0, 0, 800, 600)),
             generation: 1,
-            buffer: shm_buffer(
-                4,
-                1,
-                vec![0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff],
-            ),
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(1000, 700, vec![0xffff_0000; 1000 * 700]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
-        let mut frame = vec![0; 96 * 96];
-
-        compose_nested_output(
-            &mut frame,
-            96,
-            96,
-            std::slice::from_ref(&surface),
-            DesktopVisualState::wallpaper_only(),
+        let near = surface_render_plan(&near_surface, SurfaceTargetRect::new(0, 0, 1000, 700));
+        assert_eq!(
+            (near.content_target.width(), near.content_target.height()),
+            (800, 600)
         );
+        assert_eq!(near.content_uv.left, 0.0);
+        assert_eq!(near.content_uv.top, 0.0);
+        assert_eq!(near.content_uv.right, 0.8);
+        assert!((near.content_uv.bottom - (600.0 / 700.0)).abs() < f32::EPSILON);
 
-        let row = FIRST_SURFACE_OFFSET.1 as usize * 96 + FIRST_SURFACE_OFFSET.0 as usize;
-        assert_eq!(frame[row], 0xffff_0000);
-        assert_eq!(frame[row + 1], 0xff00_ff00);
-
-        let anchored_right = RenderableSurface {
-            resize_preview: Some(crate::compositor::ResizePreview {
-                committed_width: 4,
-                committed_height: 1,
-                anchor_right: true,
-                anchor_bottom: false,
-            }),
-            ..surface
+        let far_surface = RenderableSurface {
+            visual_clip: Some(SurfaceTargetRect::new(200, 100, 800, 600)),
+            ..near_surface
         };
-        let mut right_frame = vec![0; 96 * 96];
-        compose_nested_output(
-            &mut right_frame,
-            96,
-            96,
-            &[anchored_right],
-            DesktopVisualState::wallpaper_only(),
+        let far = surface_render_plan(&far_surface, SurfaceTargetRect::new(0, 0, 1000, 700));
+        assert_eq!((far.content_target.x(), far.content_target.y()), (200, 100));
+        assert_eq!(
+            (far.content_target.width(), far.content_target.height()),
+            (800, 600)
         );
-
-        assert_eq!(right_frame[row], 0xff00_00ff);
-        assert_eq!(right_frame[row + 1], 0xffff_ffff);
+        assert_eq!(far.content_uv.left, 0.2);
+        assert!((far.content_uv.top - (100.0 / 700.0)).abs() < f32::EPSILON);
+        assert_eq!(far.content_uv.right, 1.0);
+        assert_eq!(far.content_uv.bottom, 1.0);
     }
 
     #[test]
-    fn desktop_scene_renderer_repairs_old_and_new_bounds_when_surface_target_changes() {
-        let mut renderer = DesktopSceneRenderer::default();
-        let mut frame = vec![0; 96 * 96];
-        let initial_surface = RenderableSurface {
+    fn task_05_8_scene_snapshot_tracks_visual_clip_changes() {
+        let previous = RenderableSurface {
             surface_id: 7,
             x: 0,
             y: 0,
-            width: 4,
-            height: 4,
+            width: 1000,
+            height: 700,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: Some(SurfaceTargetRect::new(
+                FIRST_SURFACE_OFFSET.0,
+                FIRST_SURFACE_OFFSET.1,
+                1000,
+                700,
+            )),
             generation: 1,
-            buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(1000, 700, vec![0xffff_0000; 1000 * 700]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
+        let mut current = previous.clone();
+        current.visual_clip = Some(SurfaceTargetRect::new(
+            FIRST_SURFACE_OFFSET.0,
+            FIRST_SURFACE_OFFSET.1,
+            800,
+            600,
+        ));
+        current.generation = 2;
 
-        renderer.compose_with_generation(
-            &mut frame,
-            96,
-            96,
-            std::slice::from_ref(&initial_surface),
-            1,
-            DesktopVisualState::wallpaper_only(),
-        );
-
-        let resized_surface = RenderableSurface {
-            width: 8,
-            height: 4,
-            generation: 2,
-            resize_preview: Some(crate::compositor::ResizePreview {
-                committed_width: 4,
-                committed_height: 4,
-                anchor_right: false,
-                anchor_bottom: false,
-            }),
-            ..initial_surface
-        };
-        renderer.compose_with_generation(
-            &mut frame,
-            96,
-            96,
-            std::slice::from_ref(&resized_surface),
-            2,
-            DesktopVisualState::wallpaper_only(),
-        );
+        let previous_snapshot = scene_surface_snapshots(std::slice::from_ref(&previous), 1.0);
+        let current_elements =
+            render_scene_elements_for_surfaces(std::slice::from_ref(&current), 1.0);
+        let current_snapshot = scene_surface_snapshots(std::slice::from_ref(&current), 1.0);
+        let damage = partial_scene_damage_rects(
+            &previous_snapshot,
+            &current_elements,
+            &current_snapshot,
+            1200,
+            900,
+        )
+        .expect("same surface can produce partial damage");
 
         assert_eq!(
-            renderer.last_rebuild_kind(),
-            DesktopSceneRebuildKind::Partial
+            damage,
+            vec![OutputRect {
+                x: FIRST_SURFACE_OFFSET.0,
+                y: FIRST_SURFACE_OFFSET.1,
+                width: 1000,
+                height: 700,
+            }]
         );
     }
 
@@ -2352,8 +2251,10 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
@@ -2374,12 +2275,8 @@ mod tests {
             width: 8,
             height: 6,
             generation: 2,
-            resize_preview: Some(crate::compositor::ResizePreview {
-                committed_width: 4,
-                committed_height: 4,
-                anchor_right: false,
-                anchor_bottom: false,
-            }),
+            render_placement: None,
+            visual_clip: None,
             ..initial_surface
         };
         renderer.compose_reusing_frame(DesktopComposeRequest {
@@ -2425,8 +2322,10 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
@@ -2449,8 +2348,10 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 2,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, updated_pixels),
             damage: crate::compositor::RenderableSurfaceDamage::Partial(vec![
                 crate::compositor::SurfaceDamageRect {
@@ -2491,8 +2392,10 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
@@ -2519,8 +2422,10 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 2,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, updated_pixels),
             damage: crate::compositor::RenderableSurfaceDamage::Partial(vec![
                 crate::compositor::SurfaceDamageRect {
@@ -2574,8 +2479,10 @@ mod tests {
             width: 4,
             height: 2,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 3,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(8, 4, vec![0xffff_0000; 8 * 4]),
             damage: crate::compositor::RenderableSurfaceDamage::Partial(vec![
                 crate::compositor::SurfaceDamageRect {
@@ -2654,8 +2561,10 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
@@ -2717,8 +2626,10 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
@@ -2729,8 +2640,10 @@ mod tests {
             width: 2,
             height: 2,
             placement: SurfacePlacement::subsurface(7, 1, 1),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(2, 2, vec![0xff00_ff00; 2 * 2]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
@@ -2753,8 +2666,10 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 2,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, updated_pixels),
             damage: crate::compositor::RenderableSurfaceDamage::Partial(vec![
                 crate::compositor::SurfaceDamageRect {
@@ -2789,8 +2704,10 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
@@ -2811,8 +2728,10 @@ mod tests {
             width: 4,
             height: 4,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 2,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xff00_00ff; 4 * 4]),
             damage: crate::compositor::RenderableSurfaceDamage::Partial(vec![
                 crate::compositor::SurfaceDamageRect {
@@ -2926,8 +2845,10 @@ mod tests {
             width: 2,
             height: 2,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 0,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(
                 2,
                 2,
@@ -2961,8 +2882,10 @@ mod tests {
             width: 2,
             height: 2,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 0,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(
                 2,
                 2,
@@ -2989,8 +2912,10 @@ mod tests {
             width: 12,
             height: 8,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 0,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(12, 8, vec![0xffff_ffff; 12 * 8]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
@@ -3019,8 +2944,10 @@ mod tests {
             width: 1,
             height: 1,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 0,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(1, 1, vec![0x0000_0000]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
@@ -3055,8 +2982,10 @@ mod tests {
             width: 1,
             height: 1,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 0,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(1, 1, vec![0x8080_0000]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
@@ -3083,8 +3012,10 @@ mod tests {
             width: 2,
             height: 2,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(2, 2, vec![0xff00_ff00; 4]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
@@ -3158,8 +3089,10 @@ mod tests {
             width: 100,
             height: 80,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 0,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(100, 80, vec![0; 100 * 80]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
@@ -3184,8 +3117,10 @@ mod tests {
             width: 100,
             height: 80,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 0,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(100, 80, vec![0; 100 * 80]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
@@ -3196,8 +3131,10 @@ mod tests {
             width: 20,
             height: 10,
             placement: SurfacePlacement::subsurface(1, 10, 12),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 0,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(20, 10, vec![0; 20 * 10]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
@@ -3216,8 +3153,10 @@ mod tests {
             width: 100,
             height: 80,
             placement: SurfacePlacement::root_at(5, 6),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 0,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(100, 80, vec![0; 100 * 80]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
@@ -3228,8 +3167,10 @@ mod tests {
             width: 20,
             height: 10,
             placement: SurfacePlacement::root_at(9, 10),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 0,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(20, 10, vec![0; 20 * 10]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };

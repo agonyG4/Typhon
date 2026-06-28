@@ -121,10 +121,10 @@ binds them as GL textures through `GL_OES_EGL_image`.
 Committed dmabuf buffers stay owned by the compositor until the surface commits
 a replacement buffer or is destroyed, so the client cannot recycle a buffer that
 is still backing an active GL texture.
-Window shadows are disabled in all active compositor render paths. The current
-window visual model treats visible bounds as client content plus temporary
-resize preview backdrop/outline only; shadow extents do not participate in hit
-testing, damage, scene bounds, or GPU command generation.
+Window shadows are disabled in all active compositor render paths. Interactive
+resize changes compositor-owned visual bounds without adding a compositor
+backdrop, border, tint, shadow, or outline; shadow extents do not participate in
+hit testing, damage, scene bounds, or GPU command generation.
 Clients receive `wl_surface.frame.done` after the nested output presents a frame,
 and the registry now includes `wl_subcompositor`, `wl_data_device_manager`, one
 `wl_output`, plus a pointer/keyboard-capable `wl_seat`. Keyboard clients can
@@ -252,34 +252,57 @@ buffer can be reused while destroyed or superseded buffers are evicted and
 destroyed with the renderer context current. Recreating the renderer starts an
 empty cache generation.
 
-Interactive XDG resize uses one flow-controlled transaction per root toplevel.
-At most one resize configure is in flight; pointer motion replaces one
-`queued_latest` target while the local preview remains responsive. Ending the
-grab preserves a separate final target with `resizing=false`. The in-flight
-metadata is retained until its exact ACK is captured by a root
-`wl_surface.commit` and applied, so pointer frequency cannot evict a legally
-ACKable serial. After application, only the final target or newest queued
-geometry is sent. Storage is therefore constant per surface.
+Interactive XDG resize uses one frame-paced flow per root toplevel. Raw pointer
+motion replaces one pending target; `prepare_frame()` consumes the latest target
+at most once per output frame opportunity, updates stable visual geometry, and
+queues at most one latest configure. Sent configures live in a bounded ledger,
+so a newer size can be reported without waiting for every older buffer commit.
+Ending the grab preserves a separate final target with `resizing=false`.
+Storage remains bounded per surface.
+
+Each pointer-driven resize gesture receives a monotonic interaction ID. Pending
+configures, sent configures, pending ACK state, captured resize snapshots, and
+active toplevel visual resize state carry that ID. Starting a newer resize
+discards obsolete unsent queued/final state from older interactions, but keeps
+already-sent configures processable. A delayed older commit can update committed
+client content, but it cannot clear active visual resize state owned by a newer
+interaction.
 
 ACK does not mutate visible state. The next applicable root commit captures an
 immutable snapshot containing serial, flow and commit sequences, requested
-geometry, placement and edges, resizing state, actual window/buffer geometry
-when known, and an attached `BufferId` when present. Buffer, geometry-only,
-viewport-only, and no-attach commit paths share this capture rule; child
-commits cannot consume root state. A matching commit accepts cell-aligned and
-viewport sizes and preserves the opposite edge for left/top resize using the
-actual committed geometry.
+geometry, placement and edges, resizing state, logical committed surface content
+size when known, and an attached `BufferId` when present. ACKed resize state is
+moved into pending surface commit state, then a concrete buffer, geometry-only
+commit, explicit-sync wait, or surface-tree transaction owns the snapshot.
+Committed or presenting buffers do not consume configure-send capacity. Buffer,
+geometry-only, viewport-only, and no-attach commit paths share this capture
+rule; child commits cannot consume root state. A matching commit accepts
+cell-aligned and viewport sizes and preserves the opposite edge for left/top
+resize using the actual committed content size.
+
+Pointer-driven resize start uses current toplevel visual geometry first.
+`ToplevelVisualGeometry` is compositor-owned window geometry; `RenderableSurface`
+width and height remain committed `wl_surface` content dimensions. XDG window
+geometry remains shell geometry for CSD margins, placement, resize edges, and
+configure calculations; it aligns the surface tree inside the visual window but
+is not renderable client content size. The root origin is visual origin minus
+the XDG window-geometry offset. During interactive resize, surfaces render at
+their committed 1:1 logical size with valid `[0,1]` UVs and are clipped by the
+visual toplevel box. Growth leaves areas without committed content unfilled;
+shrinking crops through clipping. Intermediate `resizing=true` commits update
+committed content without moving the visual box backward; only the matching
+final `resizing=false` commit completes it. The compositor emits no
+resize-specific border, backdrop, shadow, tint, or outline.
 
 Explicit-sync waiting records own that same snapshot and never compare it with
-later mutable resize state. Per surface, the oldest waiting commit remains a
-progress candidate and one newest successor is retained; additional unready
-successors replace only the latter. If a successor becomes ready first, it
-explicitly supersedes older waits and their watches before application, so
-stale fence readiness cannot regress visible state. A newer unready successor
-never displaces an already ready state. This bounds the queue at two and avoids
-both perpetual replacement and head-of-line starvation. Applying the captured
-transaction clears preview once, records its age, invalidates geometry/resource
-damage as needed, and releases the flow to send the newest target.
+later mutable resize state. Per root, surface-tree commits are coalesced into a
+bounded ready/waiting representation: at most one presentable ready successor
+and one newer blocked successor. Metadata-only commits merge into the newest
+ordered successor instead of publishing ahead of inherited blocked state. A
+newer unready attachment never displaces the only ready successor; additional
+unready successors replace only the waiting slot. Applying the captured
+transaction updates committed content or ends the matching active visual resize,
+records its age, and invalidates geometry/resource damage as needed.
 
 Wayland subsurfaces use a separate transactional role model. Every role records
 its immutable parent, requested synchronization mode, cached commit, and
@@ -290,21 +313,27 @@ cached state only when that ancestry constraint disappears.
 
 `wl_surface.commit` first captures attachment/removal, damage, offset, viewport,
 scale, input region, callbacks, presentation feedback, and explicit-sync points
-without changing renderer-visible state. Effectively synchronized commits merge
-in the role cache; replacement buffers are released once and callbacks
-accumulate. A parent commit collects cached descendants recursively and applies
-the root, child state, position, and stacking under one reserved render
-generation. Renderer scene collection, hit testing, damage history, and resize
-preview therefore observe only the complete old or complete new tree.
+without changing renderer-visible state. `attachment: None` means no new attach
+request and preserves any ordered pending attachment inherited from an earlier
+blocked transaction. `RemoveContent` is different: it explicitly replaces that
+pending attachment and unmaps content at the transaction's publication point.
+Effectively synchronized commits merge in the role cache; replacement buffers
+are released once and callbacks accumulate. A parent commit collects cached
+descendants recursively and applies the root, child state, position, and
+stacking under one reserved render generation. Renderer scene collection, hit
+testing, damage history, and resize preview therefore observe only the complete
+old or complete new tree.
 
 A tree containing unsignaled explicit-sync acquires remains prepared while the
 old tree stays current. Watches are owned by the tree transaction, and all
-dependencies must become ready before any node publishes. Per root the
-compositor retains an oldest waiting candidate and one newest successor; a
-ready successor explicitly supersedes older waits, while a newer unready tree
-cannot discard a ready candidate. Supersession cancels watches, releases
-never-current buffers, transfers frame callbacks, discards presentation
-feedback, and rejects stale readiness by acquire identity.
+dependencies must become ready before any node publishes. Dependencies are
+identified by exact surface, pending buffer, transaction slot, acquire point,
+and commit ID. A metadata-only merge preserves the dependency and readiness
+state and does not register or cancel an eventfd watch. A new buffer attachment
+or explicit detach replaces only the affected node's older pending attachment,
+cancels that node's dependency when present, and releases the replaced buffer
+once. Frame callbacks and presentation feedback remain attached to the merged
+transaction until that transaction is actually published or destroyed.
 
 GLES frame preparation and presentation use separate commit points. Protocol
 dispatch and frame-callback policy may progress without producing a rendered
@@ -369,3 +398,22 @@ still a transitional implementation. See `docs/NATIVE_SESSION.md` for the
 session launcher, logging path, input/keymap contract, and the production gaps
 that remain before it should be treated like a mature KWin/Hyprland-class TTY
 backend.
+## Source Layout
+
+The source tree now separates binary runtime adapters from reusable library
+infrastructure. `src/native/` remains the reusable DRM/KMS, event-loop,
+explicit-sync, and scheduler layer. `src/native_output/` is the binary-private
+native output runtime that depends on `crate::egl_renderer` and drives
+`OwnCompositorServer`.
+
+`src/compositor/protocols/` stays focused on Wayland request decoding and
+protocol events/errors. `src/compositor/state/` contains the mechanically split
+`CompositorState` implementation by domain while preserving the existing state
+model. These are real Rust modules, not `include!()` slices.
+
+`src/native_output/runtime/` now has a `NativeRuntime` configuration/object
+boundary for the native output entry point. The legacy runtime loop body remains
+the next architecture target: split it into bootstrap, input, acquire, frame,
+presentation, metrics, and shutdown phases without changing native ordering.
+See `docs/SOURCE_LAYOUT.md` for the current dependency directions, the
+`include!()` prohibition, and file-size guardrails.

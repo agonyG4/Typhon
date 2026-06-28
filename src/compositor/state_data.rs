@@ -14,7 +14,8 @@ use crate::render_backend::buffer::{
 };
 
 use super::{
-    RenderableSurface, RenderableSurfaceDamage, SurfaceDamageRect, SurfacePlacement,
+    RenderableSurface, RenderableSurfaceDamage, SurfaceCommitSequence, SurfaceDamageRect,
+    SurfacePlacement,
     dmabuf::DmabufBufferData,
     explicit_sync::{ExplicitSyncPoint, SyncobjSurfaceState},
     interaction::ResizeCommitSnapshot,
@@ -125,6 +126,7 @@ impl SurfaceData {
                         y,
                         explicit_release: None,
                         surface_size: None,
+                        commit_sequence: SurfaceCommitSequence::initial(),
                         resize_commit: None,
                         resize_capture_finalized: false,
                     }))
@@ -137,6 +139,7 @@ impl SurfaceData {
                             y,
                             explicit_release: None,
                             surface_size: None,
+                            commit_sequence: SurfaceCommitSequence::initial(),
                             resize_commit: None,
                             resize_capture_finalized: false,
                         })
@@ -768,6 +771,7 @@ pub(super) struct PendingSurfaceBuffer {
     pub(super) y: i32,
     pub(super) explicit_release: Option<ExplicitSyncPoint>,
     pub(super) surface_size: Option<BufferSize>,
+    pub(super) commit_sequence: SurfaceCommitSequence,
     pub(super) resize_commit: Option<Box<ResizeCommitSnapshot>>,
     pub(super) resize_capture_finalized: bool,
 }
@@ -821,8 +825,10 @@ impl PendingSurfaceBuffer {
             width: surface_size.width,
             height: surface_size.height,
             placement,
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation,
+            commit_sequence: self.commit_sequence,
             buffer: self.data.to_committed_buffer_for_size(size)?,
             damage,
         })

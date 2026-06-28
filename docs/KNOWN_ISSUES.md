@@ -37,9 +37,10 @@ Current limits:
   `gbm-cpu-write` and KMS dumb framebuffer paths remain explicit fallback/debug
   modes. Legacy values such as `gbm` and `gbm-egl` still select the CPU-write
   path;
-- compositor-owned window shadows are disabled. Resize feedback is intentionally
-  plain: a temporary backdrop and outline show the compositor-owned visual
-  target while decorations/shadows remain deferred to a later milestone;
+- compositor-owned window shadows are disabled. Interactive resize uses the
+  compositor-owned visual target without adding a backdrop, border, tint,
+  shadow, or outline; richer decorations/shadows remain deferred to a later
+  milestone;
 - startup fallback is limited to backend creation and the first paint before
   clients are launched. Once the session is running, GPU scanout failures are
   fatal runtime errors with stage/backend/frame diagnostics and a recommended
@@ -68,11 +69,18 @@ Current limits:
   scanout, cursor-plane migration, overlay planes, KMS in/out fences,
   `FB_DAMAGE_CLIPS`, hotplug policy, and multi-output commits are not
   implemented;
-- interactive resize now moves compositor visual geometry immediately while
-  keeping one configure in flight and one newest target queued. It crops stale
-  content rather than stretching it and damages old/new bounds even when a
-  browser commit changes logical size. Zen/Gecko still need live TTY validation
-  against NVIDIA and real browser buffers;
+- interactive resize now frame-paces raw pointer targets, keeps visual geometry
+  independent from committed client content, and uses a bounded sent-configure
+  ledger with coalesced ACKs so newer browser sizes can be reported without
+  waiting for every older buffer commit. It crops stale content rather than
+  stretching it and damages old/new bounds even when a browser commit changes
+  logical size. Rapid re-resize uses interaction IDs so obsolete unsent final
+  state from an older drag cannot outrank a newer active resize, and delayed
+  older commits cannot clear a newer active visual resize. Intermediate
+  `resizing=true` commits preserve the visual box; final `resizing=false`
+  commits complete it. Zen/Gecko
+  and Kitty rapid release/re-grab cycles still need live TTY validation against
+  NVIDIA and real browser/terminal buffers;
 - `wl_surface.damage` and `wl_surface.damage_buffer` are now stored separately
   and converted at commit for the integer-scale and viewport-destination paths
   Typhon implements. Unsupported or ambiguous mappings conservatively repaint
@@ -85,8 +93,13 @@ Current limits:
   default for every real visual frame until that hardware validation is done;
 - synchronized subsurface buffers, placement, stacking, callbacks, feedback,
   and acquire dependencies now publish as one parent-latched tree generation.
-  Real-driver explicit-sync subtree waits and deeply nested libdecor trees still
-  require live TTY validation on supported DRM hardware;
+  Bufferless commits after a blocked dmabuf root now merge into the ordered
+  waiting surface tree instead of canceling the inherited acquire-backed
+  attachment. This addresses the Kitty resize/input freeze where later
+  damage/geometry/frame-callback commits could make the original ready wakeup
+  stale before the new buffer became current. Real-driver explicit-sync subtree
+  waits, deeply nested libdecor trees, and the legacy/Atomic KMS Kitty matrix
+  still require live TTY validation on supported DRM hardware;
 - `clipboard_source_disconnect_clears_focused_target_selection` is a known
   baseline failure: the focused target does not receive `selection(None)` when
   the source client disconnects. TASK 05.2 reproduces this unchanged on its

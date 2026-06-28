@@ -348,7 +348,7 @@ mod tests {
     #[test]
     fn native_egl_gbm_plan_accepts_render_scene_elements_for_gpu_composition() {
         use crate::compositor::{
-            RenderableSurface, RenderableSurfaceDamage, SurfacePlacement,
+            RenderableSurface, RenderableSurfaceDamage, SurfaceCommitSequence, SurfacePlacement,
             render_scene_elements_for_surfaces,
         };
 
@@ -359,8 +359,10 @@ mod tests {
             width: 2,
             height: 2,
             placement: SurfacePlacement::root(),
-            resize_preview: None,
+            render_placement: None,
+            visual_clip: None,
             generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
             buffer: buffer::CommittedSurfaceBuffer::shm_snapshot(
                 test_buffer_identity(),
                 buffer::BufferSize::new(2, 2).unwrap(),

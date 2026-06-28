@@ -1,0 +1,1109 @@
+#[derive(Default)]
+struct RegistryTestState {
+    frame_done: bool,
+    frame_done_time: Option<u32>,
+    keyboard_key: bool,
+    keyboard_key_serial: Option<u32>,
+    keyboard_keys: Vec<u32>,
+    keyboard_keymap: bool,
+    keyboard_keymap_bytes: Vec<u8>,
+    keyboard_keymap_size: u32,
+    keyboard_mods_depressed: Vec<u32>,
+    keyboard_repeat_info: bool,
+    pointer_enter: bool,
+    pointer_enter_count: usize,
+    pointer_leave_count: usize,
+    pointer_enter_serial: Option<u32>,
+    pointer_enter_serials: Vec<(u32, u32)>,
+    pointer_motion: bool,
+    pointer_button: bool,
+    pointer_button_serial: Option<u32>,
+    pointer_enter_surface_id: Option<u32>,
+    pointer_button_surface_id: Option<u32>,
+    pointer_button_surface_ids: Vec<u32>,
+    pointer_axis: bool,
+    pointer_vertical_axis: Option<f64>,
+    pointer_horizontal_axis: Option<f64>,
+    pointer_frame_count: usize,
+    pointer_frame_resource_ids: Vec<u32>,
+    pointer_enter_frame_count: usize,
+    pointer_enter_without_frame_count: usize,
+    pointer_event_log: Vec<&'static str>,
+    pointer_surface_x: Option<f64>,
+    pointer_surface_y: Option<f64>,
+    relative_motion_count: usize,
+    relative_motion_utime: Option<u64>,
+    relative_motion_dx: Option<f64>,
+    relative_motion_dy: Option<f64>,
+    relative_motion_dx_unaccel: Option<f64>,
+    relative_motion_dy_unaccel: Option<f64>,
+    relative_motion_resource_ids: Vec<u32>,
+    sdl_pending_relative_motion_count: usize,
+    sdl_camera_motion_count: usize,
+    locked_count: usize,
+    unlocked_count: usize,
+    confined_count: usize,
+    unconfined_count: usize,
+    parent_surface_id: Option<u32>,
+    child_surface_id: Option<u32>,
+    second_child_surface_id: Option<u32>,
+    keyboard_enter_surface_id: Option<u32>,
+    keyboard_enter_count: usize,
+    keyboard_leave_count: usize,
+    keyboard_event_log: Vec<&'static str>,
+    surface_enter_count: usize,
+    seat_has_keyboard: bool,
+    output_done: bool,
+    output_mode_count: usize,
+    output_scale_count: usize,
+    output_name: bool,
+    output_description: bool,
+    output_width: i32,
+    output_height: i32,
+    output_refresh_millihertz: i32,
+    seat_name: bool,
+    seat_has_pointer: bool,
+    surface_configured: bool,
+    surface_configure_count: usize,
+    surface_configure_serials: Vec<u32>,
+    popup_configured: bool,
+    popup_configure_count: usize,
+    popup_repositioned_token: Option<u32>,
+    popup_x: i32,
+    popup_y: i32,
+    popup_width: i32,
+    popup_height: i32,
+    popup_done: bool,
+    configured_before_initial_commit: bool,
+    configured_after_initial_commit: bool,
+    toplevel_configured: bool,
+    toplevel_configure_count: usize,
+    toplevel_width: i32,
+    toplevel_height: i32,
+    toplevel_states: Vec<u8>,
+    dmabuf_modifier: bool,
+    dmabuf_failed: bool,
+    dmabuf_created: bool,
+    dmabuf_feedback_main_device: bool,
+    dmabuf_feedback_format_table: bool,
+    dmabuf_feedback_format_table_size: u32,
+    dmabuf_feedback_tranche_formats: bool,
+    dmabuf_feedback_done: bool,
+    wl_drm_device: bool,
+    wl_drm_capabilities: bool,
+    wl_drm_format: bool,
+    wl_drm_authenticated: bool,
+    buffer_release_count: usize,
+    presentation_presented_count: usize,
+    presentation_discarded_count: usize,
+    presentation_kind: Option<client_wp_presentation_feedback::Kind>,
+    presentation_clock_id: Option<u32>,
+    presentation_timestamp: Option<(u32, u32, u32)>,
+    presentation_sequence: Option<(u32, u32)>,
+    fractional_preferred_scales: Vec<u32>,
+    data_device_selection_offer: Option<client_wl_data_offer::WlDataOffer>,
+    data_offer_mime_types: Vec<String>,
+    data_source_send_mime_types: Vec<String>,
+    data_source_cancelled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct XdgRoleSnapshot {
+    surface_registered: bool,
+    configured: bool,
+    toplevel_count: usize,
+    toplevel_registered: bool,
+    popup_count: usize,
+    window_geometry_present: bool,
+    placement: Option<SurfacePlacement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderableSurfaceSnapshot {
+    surface_id: u32,
+    width: u32,
+    height: u32,
+    parent_surface_id: Option<u32>,
+    local_x: i32,
+    local_y: i32,
+    buffer_id: u64,
+    generation: u64,
+    resize_preview_active: bool,
+}
+
+struct SynchronizedCommitSnapshots {
+    before_parent: Vec<RenderableSurfaceSnapshot>,
+    after_parent: Vec<RenderableSurfaceSnapshot>,
+    before_child_generation: u64,
+    after_child_generation: u64,
+    after_parent_generation: u64,
+}
+
+struct RootBeforeChildSnapshots {
+    after_root: Vec<RenderableSurfaceSnapshot>,
+    after_child_without_parent: Vec<RenderableSurfaceSnapshot>,
+    after_next_parent: Vec<RenderableSurfaceSnapshot>,
+}
+
+struct MultipleSynchronizedCommitSnapshots {
+    before_parent: Vec<RenderableSurfaceSnapshot>,
+    after_parent: Vec<RenderableSurfaceSnapshot>,
+    superseded_buffer_releases: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClientCursorSnapshot {
+    surface_id: u32,
+    logical_x: i32,
+    logical_y: i32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug)]
+struct CursorSurfaceCommitSnapshot {
+    renderable_count: usize,
+    cursor: Option<ClientCursorSnapshot>,
+    callback_state: Option<(bool, bool)>,
+    cause: RenderGenerationCause,
+}
+
+#[derive(Debug)]
+struct CursorTransitionSnapshots {
+    initial: Option<ClientCursorSnapshot>,
+    hotspot_changed: Option<ClientCursorSnapshot>,
+    hidden: Option<ClientCursorSnapshot>,
+    reselected: Option<ClientCursorSnapshot>,
+    destroyed: Option<ClientCursorSnapshot>,
+}
+
+#[derive(Debug)]
+struct CompositorOnlyCursorMotionSnapshot {
+    cursor: Option<ClientCursorSnapshot>,
+    visual_changed: bool,
+    render_generation_before: u64,
+    render_generation_after: u64,
+    scene_generation_before: u64,
+    scene_generation_after: u64,
+    cause: RenderGenerationCause,
+    pointer_event_log_before: Vec<&'static str>,
+    pointer_event_log_after: Vec<&'static str>,
+    relative_motion_count_before: usize,
+    relative_motion_count_after: usize,
+    pointer_focus_surface_before: Option<u32>,
+    pointer_focus_surface_after: Option<u32>,
+}
+
+impl RegistryTestState {
+    fn toplevel_has_state(&self, expected: client_xdg_toplevel::State) -> bool {
+        let expected = (expected as u32).to_ne_bytes();
+        self.toplevel_states
+            .chunks_exact(4)
+            .any(|state| state == expected)
+    }
+}
+
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_registry::WlRegistry,
+        _event: wl_registry::Event,
+        _data: &GlobalListContents,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wl_compositor::WlCompositor, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wl_compositor::WlCompositor,
+        _event: client_wl_compositor::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wl_surface::WlSurface, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_wl_surface::WlSurface,
+        event: client_wl_surface::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let client_wl_surface::Event::Enter { .. } = event {
+            state.surface_enter_count += 1;
+        }
+    }
+}
+
+impl Dispatch<client_wl_subcompositor::WlSubcompositor, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wl_subcompositor::WlSubcompositor,
+        _event: client_wl_subcompositor::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wl_subsurface::WlSubsurface, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wl_subsurface::WlSubsurface,
+        _event: client_wl_subsurface::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wl_region::WlRegion, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wl_region::WlRegion,
+        _event: client_wl_region::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wl_data_device_manager::WlDataDeviceManager, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wl_data_device_manager::WlDataDeviceManager,
+        _event: client_wl_data_device_manager::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wl_data_device::WlDataDevice, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_wl_data_device::WlDataDevice,
+        event: client_wl_data_device::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_wl_data_device::Event::DataOffer { .. } => {}
+            client_wl_data_device::Event::Selection { id } => {
+                state.data_device_selection_offer = id;
+            }
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(
+        RegistryTestState,
+        client_wl_data_device::WlDataDevice,
+        [0 => (client_wl_data_offer::WlDataOffer, ())]
+    );
+}
+
+impl Dispatch<client_wl_data_offer::WlDataOffer, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_wl_data_offer::WlDataOffer,
+        event: client_wl_data_offer::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let client_wl_data_offer::Event::Offer { mime_type } = event {
+            state.data_offer_mime_types.push(mime_type);
+        }
+    }
+}
+
+impl Dispatch<client_wl_data_source::WlDataSource, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_wl_data_source::WlDataSource,
+        event: client_wl_data_source::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_wl_data_source::Event::Send { mime_type, fd } => {
+                state.data_source_send_mime_types.push(mime_type);
+                let mut file = File::from(fd);
+                let _ = file.write_all(b"clipboard payload");
+            }
+            client_wl_data_source::Event::Cancelled => {
+                state.data_source_cancelled = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<client_wl_callback::WlCallback, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_wl_callback::WlCallback,
+        event: client_wl_callback::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let client_wl_callback::Event::Done { callback_data } = event {
+            state.frame_done = true;
+            state.frame_done_time = Some(callback_data);
+        }
+    }
+}
+
+impl Dispatch<client_wl_output::WlOutput, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_wl_output::WlOutput,
+        event: client_wl_output::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_wl_output::Event::Done => {
+                state.output_done = true;
+            }
+            client_wl_output::Event::Mode {
+                width,
+                height,
+                refresh,
+                ..
+            } => {
+                state.output_mode_count += 1;
+                state.output_width = width;
+                state.output_height = height;
+                state.output_refresh_millihertz = refresh;
+            }
+            client_wl_output::Event::Scale { .. } => {
+                state.output_scale_count += 1;
+            }
+            client_wl_output::Event::Name { .. } => {
+                state.output_name = true;
+            }
+            client_wl_output::Event::Description { .. } => {
+                state.output_description = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<client_wl_seat::WlSeat, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_wl_seat::WlSeat,
+        event: client_wl_seat::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let client_wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(capabilities),
+        } = event
+        {
+            state.seat_has_pointer = capabilities.contains(client_wl_seat::Capability::Pointer);
+            state.seat_has_keyboard = capabilities.contains(client_wl_seat::Capability::Keyboard);
+        } else if let client_wl_seat::Event::Name { .. } = event {
+            state.seat_name = true;
+        }
+    }
+}
+
+impl Dispatch<client_wl_keyboard::WlKeyboard, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_wl_keyboard::WlKeyboard,
+        event: client_wl_keyboard::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_wl_keyboard::Event::Enter { surface, .. } => {
+                state.keyboard_enter_surface_id = Some(surface.id().protocol_id());
+                state.keyboard_enter_count += 1;
+                state.keyboard_event_log.push("keyboard_enter");
+            }
+            client_wl_keyboard::Event::Leave { .. } => {
+                state.keyboard_leave_count += 1;
+                state.keyboard_event_log.push("keyboard_leave");
+            }
+            client_wl_keyboard::Event::Keymap { fd, size, .. } => {
+                state.keyboard_keymap = true;
+                state.keyboard_keymap_size = size;
+                let mut bytes = vec![0; size as usize];
+                let mut file = File::from(fd);
+                let _ = file.read_exact(&mut bytes);
+                state.keyboard_keymap_bytes = bytes;
+            }
+            client_wl_keyboard::Event::Key { serial, key, .. } => {
+                state.keyboard_key = true;
+                state.keyboard_key_serial = Some(serial);
+                state.keyboard_keys.push(key);
+                state.keyboard_event_log.push("keyboard_key");
+            }
+            client_wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
+                state.keyboard_mods_depressed.push(mods_depressed);
+                state.keyboard_event_log.push("keyboard_modifiers");
+            }
+            client_wl_keyboard::Event::RepeatInfo { .. } => {
+                state.keyboard_repeat_info = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_wl_pointer::WlPointer,
+        event: client_wl_pointer::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_wl_pointer::Event::Enter {
+                serial, surface, ..
+            } => {
+                state.pointer_enter = true;
+                state.pointer_enter_count += 1;
+                state.pointer_enter_serial = Some(serial);
+                state
+                    .pointer_enter_serials
+                    .push((_proxy.id().protocol_id(), serial));
+                state.pointer_enter_surface_id = Some(surface.id().protocol_id());
+                state.pointer_event_log.push("enter");
+            }
+            client_wl_pointer::Event::Leave { .. } => {
+                state.pointer_leave_count += 1;
+                state.pointer_enter_surface_id = None;
+                state.pointer_event_log.push("leave");
+            }
+            client_wl_pointer::Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                state.pointer_motion = true;
+                state.pointer_surface_x = Some(surface_x);
+                state.pointer_surface_y = Some(surface_y);
+                state.pointer_event_log.push("motion");
+            }
+            client_wl_pointer::Event::Button { serial, state: button_state, .. } => {
+                state.pointer_button = true;
+                state.pointer_button_serial = Some(serial);
+                state.pointer_button_surface_id = state.pointer_enter_surface_id;
+                if let Some(surface_id) = state.pointer_enter_surface_id {
+                    state.pointer_button_surface_ids.push(surface_id);
+                }
+                match button_state {
+                    WEnum::Value(client_wl_pointer::ButtonState::Pressed) => {
+                        state.pointer_event_log.push("button_pressed");
+                    }
+                    WEnum::Value(client_wl_pointer::ButtonState::Released) => {
+                        state.pointer_event_log.push("button_released");
+                    }
+                    _ => state.pointer_event_log.push("button"),
+                }
+            }
+            client_wl_pointer::Event::Axis {
+                axis: WEnum::Value(axis),
+                value,
+                ..
+            } => {
+                state.pointer_axis = true;
+                match axis {
+                    client_wl_pointer::Axis::VerticalScroll => {
+                        state.pointer_vertical_axis = Some(value);
+                    }
+                    client_wl_pointer::Axis::HorizontalScroll => {
+                        state.pointer_horizontal_axis = Some(value);
+                    }
+                    _ => {}
+                }
+                state.pointer_event_log.push("axis");
+            }
+            client_wl_pointer::Event::Frame => {
+                state.pointer_frame_count += 1;
+                state
+                    .pointer_frame_resource_ids
+                    .push(_proxy.id().protocol_id());
+                if state.pointer_event_log.last() == Some(&"enter") {
+                    state.pointer_enter_frame_count += 1;
+                }
+                if state.sdl_pending_relative_motion_count > 0 {
+                    state.sdl_camera_motion_count += state.sdl_pending_relative_motion_count;
+                    state.sdl_pending_relative_motion_count = 0;
+                }
+                state.pointer_event_log.push("frame");
+                if state.pointer_event_log.contains(&"enter")
+                    && !state
+                        .pointer_event_log
+                        .windows(2)
+                        .any(|events| events == ["enter", "frame"])
+                {
+                    state.pointer_enter_without_frame_count += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
+        _event: client_zwp_relative_pointer_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_zwp_relative_pointer_v1::ZwpRelativePointerV1,
+        event: client_zwp_relative_pointer_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let client_zwp_relative_pointer_v1::Event::RelativeMotion {
+            utime_hi,
+            utime_lo,
+            dx,
+            dy,
+            dx_unaccel,
+            dy_unaccel,
+        } = event
+        {
+            state.relative_motion_count += 1;
+            state.relative_motion_resource_ids.push(_proxy.id().protocol_id());
+            state.relative_motion_utime =
+                Some((u64::from(utime_hi) << 32) | u64::from(utime_lo));
+            state.relative_motion_dx = Some(dx);
+            state.relative_motion_dy = Some(dy);
+            state.relative_motion_dx_unaccel = Some(dx_unaccel);
+            state.relative_motion_dy_unaccel = Some(dy_unaccel);
+            state.sdl_pending_relative_motion_count += 1;
+            state.pointer_event_log.push("relative");
+        }
+    }
+}
+
+impl Dispatch<client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1,
+        _event: client_zwp_pointer_constraints_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_zwp_locked_pointer_v1::ZwpLockedPointerV1, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_zwp_locked_pointer_v1::ZwpLockedPointerV1,
+        event: client_zwp_locked_pointer_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_zwp_locked_pointer_v1::Event::Locked => {
+                state.locked_count += 1;
+                state.pointer_event_log.push("locked");
+            }
+            client_zwp_locked_pointer_v1::Event::Unlocked => {
+                state.unlocked_count += 1;
+                state.pointer_event_log.push("unlocked");
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<client_zwp_confined_pointer_v1::ZwpConfinedPointerV1, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_zwp_confined_pointer_v1::ZwpConfinedPointerV1,
+        event: client_zwp_confined_pointer_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_zwp_confined_pointer_v1::Event::Confined => state.confined_count += 1,
+            client_zwp_confined_pointer_v1::Event::Unconfined => state.unconfined_count += 1,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<client_wp_pointer_warp_v1::WpPointerWarpV1, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wp_pointer_warp_v1::WpPointerWarpV1,
+        _event: client_wp_pointer_warp_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
+        _event: client_zwp_idle_inhibit_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
+        _event: client_zwp_idle_inhibitor_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wl_shm::WlShm, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wl_shm::WlShm,
+        _event: client_wl_shm::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wl_shm_pool::WlShmPool, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wl_shm_pool::WlShmPool,
+        _event: client_wl_shm_pool::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wl_buffer::WlBuffer, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_wl_buffer::WlBuffer,
+        event: client_wl_buffer::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let client_wl_buffer::Event::Release = event {
+            state.buffer_release_count += 1;
+        }
+    }
+}
+
+impl Dispatch<client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+        event: client_zwp_linux_dmabuf_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_zwp_linux_dmabuf_v1::Event::Modifier {
+                format,
+                modifier_hi,
+                modifier_lo,
+            } => {
+                let modifier = ((modifier_hi as u64) << 32) | u64::from(modifier_lo);
+                state.dmabuf_modifier |=
+                    format == DRM_FORMAT_ARGB8888 && modifier == DRM_FORMAT_MOD_LINEAR;
+            }
+            client_zwp_linux_dmabuf_v1::Event::Format { format } => {
+                state.dmabuf_modifier |= format == DRM_FORMAT_ARGB8888;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<client_zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+        event: client_zwp_linux_buffer_params_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_zwp_linux_buffer_params_v1::Event::Failed => {
+                state.dmabuf_failed = true;
+            }
+            client_zwp_linux_buffer_params_v1::Event::Created { .. } => {
+                state.dmabuf_created = true;
+            }
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(
+        RegistryTestState,
+        client_zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+        [
+            0 => (client_wl_buffer::WlBuffer, ())
+        ]
+    );
+}
+
+impl Dispatch<client_wl_drm::WlDrm, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_wl_drm::WlDrm,
+        event: client_wl_drm::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_wl_drm::Event::Device { name } => {
+                state.wl_drm_device |= name.starts_with("/dev/dri/");
+            }
+            client_wl_drm::Event::Capabilities { value } => {
+                state.wl_drm_capabilities |= value & 1 == 1;
+            }
+            client_wl_drm::Event::Format { format } => {
+                state.wl_drm_format |= format == DRM_FORMAT_ARGB8888;
+            }
+            client_wl_drm::Event::Authenticated => {
+                state.wl_drm_authenticated = true;
+            }
+        }
+    }
+}
+
+impl Dispatch<client_zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        state: &mut Self,
+        _proxy: &client_zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
+        event: client_zwp_linux_dmabuf_feedback_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_zwp_linux_dmabuf_feedback_v1::Event::MainDevice { device } => {
+                state.dmabuf_feedback_main_device |= !device.is_empty();
+            }
+            client_zwp_linux_dmabuf_feedback_v1::Event::FormatTable { fd: _, size } => {
+                state.dmabuf_feedback_format_table |= size >= 16;
+                state.dmabuf_feedback_format_table_size = size;
+            }
+            client_zwp_linux_dmabuf_feedback_v1::Event::TrancheFormats { indices } => {
+                state.dmabuf_feedback_tranche_formats |= indices.len() >= 2;
+            }
+            client_zwp_linux_dmabuf_feedback_v1::Event::Done => {
+                state.dmabuf_feedback_done = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<client_wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1,
+        _event: client_wp_linux_drm_syncobj_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1,
+        _event: client_wp_linux_drm_syncobj_timeline_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1,
+        _event: client_wp_linux_drm_syncobj_surface_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wp_presentation::WpPresentation, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_wp_presentation::WpPresentation,
+        event: client_wp_presentation::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let client_wp_presentation::Event::ClockId { clk_id } = event {
+            state.presentation_clock_id = Some(clk_id);
+        }
+    }
+}
+
+impl Dispatch<client_wp_presentation_feedback::WpPresentationFeedback, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_wp_presentation_feedback::WpPresentationFeedback,
+        event: client_wp_presentation_feedback::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_wp_presentation_feedback::Event::Presented {
+                tv_sec_hi,
+                tv_sec_lo,
+                tv_nsec,
+                seq_hi,
+                seq_lo,
+                flags,
+                ..
+            } => {
+                state.presentation_presented_count += 1;
+                state.presentation_timestamp = Some((tv_sec_hi, tv_sec_lo, tv_nsec));
+                state.presentation_sequence = Some((seq_hi, seq_lo));
+                if let WEnum::Value(flags) = flags {
+                    state.presentation_kind = Some(flags);
+                }
+            }
+            client_wp_presentation_feedback::Event::Discarded => {
+                state.presentation_discarded_count += 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<client_wp_viewporter::WpViewporter, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wp_viewporter::WpViewporter,
+        _event: client_wp_viewporter::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wp_viewport::WpViewport, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wp_viewport::WpViewport,
+        _event: client_wp_viewport::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+        _event: client_wp_fractional_scale_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_wp_fractional_scale_v1::WpFractionalScaleV1, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_wp_fractional_scale_v1::WpFractionalScaleV1,
+        event: client_wp_fractional_scale_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let client_wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
+            state.fractional_preferred_scales.push(scale);
+        }
+    }
+}
+
+impl Dispatch<client_xdg_wm_base::XdgWmBase, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        proxy: &client_xdg_wm_base::XdgWmBase,
+        event: client_xdg_wm_base::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let client_xdg_wm_base::Event::Ping { serial } = event {
+            proxy.pong(serial);
+        }
+    }
+}
+
+impl Dispatch<client_xdg_surface::XdgSurface, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        proxy: &client_xdg_surface::XdgSurface,
+        event: client_xdg_surface::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let client_xdg_surface::Event::Configure { serial } = event {
+            state.surface_configured = true;
+            state.surface_configure_count += 1;
+            state.surface_configure_serials.push(serial);
+            proxy.ack_configure(serial);
+        }
+    }
+}
+
+impl Dispatch<client_xdg_toplevel::XdgToplevel, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_xdg_toplevel::XdgToplevel,
+        event: client_xdg_toplevel::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let client_xdg_toplevel::Event::Configure {
+            width,
+            height,
+            states,
+        } = event
+        {
+            state.toplevel_configured = true;
+            state.toplevel_configure_count += 1;
+            state.toplevel_width = width;
+            state.toplevel_height = height;
+            state.toplevel_states = states;
+        }
+    }
+}
+
+impl Dispatch<client_xdg_positioner::XdgPositioner, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_xdg_positioner::XdgPositioner,
+        _event: client_xdg_positioner::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_xdg_popup::XdgPopup, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_xdg_popup::XdgPopup,
+        event: client_xdg_popup::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_xdg_popup::Event::Configure {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                state.popup_configured = true;
+                state.popup_configure_count += 1;
+                state.popup_x = x;
+                state.popup_y = y;
+                state.popup_width = width;
+                state.popup_height = height;
+            }
+            client_xdg_popup::Event::Repositioned { token } => {
+                state.popup_repositioned_token = Some(token);
+            }
+            client_xdg_popup::Event::PopupDone => {
+                state.popup_done = true;
+            }
+            _ => {}
+        }
+    }
+}
+

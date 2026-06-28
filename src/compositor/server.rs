@@ -484,6 +484,7 @@ impl OwnCompositorServer {
     pub fn prepare_frame(&mut self) {
         self.state.commit_ready_explicit_sync_buffers();
         color::flush_pending_color_info(&mut self.state);
+        self.state.apply_pending_interactive_resize_update();
         self.state.flush_pending_resize_configure();
         let _ = self.display.flush_clients();
     }

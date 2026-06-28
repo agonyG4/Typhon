@@ -3,7 +3,7 @@ use std::{collections::HashMap, time::Instant};
 use wayland_server::protocol::wl_callback;
 
 use super::{
-    BufferSize, RenderableSurfaceDamage, SurfaceInputRegion,
+    BufferSize, RenderableSurfaceDamage, SurfaceCommitSequence, SurfaceInputRegion,
     explicit_sync::{CapturedExplicitSyncState, PendingPresentationFeedback},
     state_data::{PendingSurfaceAttachment, SurfaceBufferRelease},
 };
@@ -17,6 +17,7 @@ pub(super) enum SubsurfaceSyncMode {
 
 #[derive(Debug)]
 pub(super) struct CachedSubsurfaceCommit {
+    pub(super) commit_sequence: SurfaceCommitSequence,
     pub(super) attachment: Option<PendingSurfaceAttachment>,
     pub(super) damage: Option<RenderableSurfaceDamage>,
     pub(super) frame_callbacks: Vec<wl_callback::WlCallback>,
@@ -35,6 +36,7 @@ pub(super) struct CachedSubsurfaceCommit {
 impl CachedSubsurfaceCommit {
     pub(super) fn merge(&mut self, newer: Self) -> Option<SurfaceBufferRelease> {
         let Self {
+            commit_sequence,
             attachment,
             damage,
             frame_callbacks,
@@ -49,6 +51,7 @@ impl CachedSubsurfaceCommit {
             window_geometry_changed,
             cached_at: _,
         } = newer;
+        self.commit_sequence = commit_sequence;
         let attachment_changed = attachment.is_some();
         let superseded = attachment.and_then(|attachment| {
             self.attachment

@@ -79,10 +79,17 @@ pub(super) enum EglDrawLayer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SurfaceSampling {
+    ExactNearest,
+    ScaledLinear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct EglDrawCommand {
     pub(super) layer: EglDrawLayer,
     pub(super) vertex_start: u32,
     pub(super) vertex_count: u32,
+    pub(super) sampling: SurfaceSampling,
 }
 
 #[repr(C)]
@@ -109,17 +116,20 @@ pub(super) fn push_draw_command(
         layer,
         rect,
         EglUvRect::FULL,
+        SurfaceSampling::ScaledLinear,
         output_width,
         output_height,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn push_draw_command_with_uv(
     vertices: &mut Vec<EglTexturedVertex>,
     commands: &mut Vec<EglDrawCommand>,
     layer: EglDrawLayer,
     rect: EglRect,
     uv: EglUvRect,
+    sampling: SurfaceSampling,
     output_width: u32,
     output_height: u32,
 ) {
@@ -131,7 +141,32 @@ pub(super) fn push_draw_command_with_uv(
             layer,
             vertex_start,
             vertex_count,
+            sampling,
         });
+    }
+}
+
+pub(super) fn surface_sampling_for_plan(
+    source_width: u32,
+    source_height: u32,
+    target_x: i32,
+    target_y: i32,
+    target_width: u32,
+    target_height: u32,
+    uv: EglUvRect,
+) -> SurfaceSampling {
+    if source_width == target_width
+        && source_height == target_height
+        && target_x >= 0
+        && target_y >= 0
+        && uv.left == 0.0
+        && uv.top == 0.0
+        && uv.right == 1.0
+        && uv.bottom == 1.0
+    {
+        SurfaceSampling::ExactNearest
+    } else {
+        SurfaceSampling::ScaledLinear
     }
 }
 

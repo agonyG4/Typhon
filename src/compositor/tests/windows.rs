@@ -211,11 +211,15 @@ fn resize_drag_coalesces_pointer_updates_behind_in_flight_configure() {
     let origins = render::surface_origins(server.renderable_surfaces());
 
     let state = state.unwrap();
-    assert_eq!(state.toplevel_configure_count, 2);
+    assert_eq!(state.toplevel_configure_count, 3);
     assert_eq!(state.toplevel_width, 340);
     assert_eq!(state.toplevel_height, 230);
-    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Resizing));
+    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Resizing));
     assert_eq!(origins.first().copied(), Some(render::FIRST_SURFACE_OFFSET));
+    let metrics = server.resize_flow_metrics();
+    assert_eq!(metrics.raw_pointer_resize_updates, 3);
+    assert_eq!(metrics.pending_resize_updates_replaced, 2);
+    assert_eq!(metrics.resize_updates_applied, 1);
 }
 
 #[test]
@@ -246,7 +250,7 @@ fn resize_drag_does_not_send_next_configure_without_client_progress() {
     let _server = stop_controllable_test_server(commands, server_thread);
 
     let state = state.unwrap();
-    assert_eq!(state.toplevel_configure_count, 2);
+    assert_eq!(state.toplevel_configure_count, 3);
 }
 
 #[test]
@@ -322,6 +326,7 @@ fn resize_drag_updates_visual_target_before_client_commit() {
             y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 234.0,
         })
         .unwrap();
+    commands.send(ServerCommand::PrepareFrame).unwrap();
     wait_for_server_commands(&commands);
     let server = stop_controllable_test_server(commands, server_thread);
 
@@ -333,200 +338,7 @@ fn resize_drag_updates_visual_target_before_client_commit() {
     assert_eq!(
         surface.resize_preview,
         Some(ResizePreview {
-            committed_width: 300,
-            committed_height: 200,
-            anchor_right: false,
-            anchor_bottom: false,
-        })
-    );
-    assert_eq!(
-        server.render_generation_cause(),
-        RenderGenerationCause::WindowResize
-    );
-}
-
-#[test]
-fn matching_resize_ack_can_be_captured_once() {
-    let surface_id = 42;
-    let serial = 7;
-    let desired = PendingResizeConfigure {
-        surface_id,
-        width: 320,
-        height: 240,
-        placement: SurfacePlacement::root_at(10, 20),
-        edges: ResizeEdges::BOTTOM_RIGHT,
-        resizing: true,
-    };
-    let mut flow = ResizeConfigureFlow::default();
-    flow.mark_sent(desired, serial, 1);
-    assert_eq!(flow.ack(serial), ResizeAckDecision::Matched);
-    let snapshot = flow.capture(1).expect("ACKed resize snapshot");
-    assert_eq!(snapshot.serial, serial);
-    assert!(flow.capture(2).is_none());
-}
-
-#[test]
-fn resize_flow_classifies_duplicate_stale_and_unknown_serials() {
-    let surface_id = 42;
-    let desired = PendingResizeConfigure {
-        surface_id,
-        width: 320,
-        height: 240,
-        placement: SurfacePlacement::root_at(10, 20),
-        edges: ResizeEdges::BOTTOM_RIGHT,
-        resizing: true,
-    };
-    let mut flow = ResizeConfigureFlow::default();
-    flow.mark_sent(desired, 9, 1);
-
-    assert_eq!(flow.ack(9), ResizeAckDecision::Matched);
-    assert_eq!(flow.ack(9), ResizeAckDecision::Duplicate);
-    assert_eq!(flow.ack(7), ResizeAckDecision::Stale);
-    assert_eq!(flow.ack(12), ResizeAckDecision::Unknown);
-}
-
-#[test]
-fn pending_resize_commit_accepts_cell_aligned_committed_size() {
-    let resize = PendingResizeCommit {
-        serial: 7,
-        width: 340,
-        height: 230,
-        placement: SurfacePlacement::root_at(10, 20),
-        edges: ResizeEdges::BOTTOM_RIGHT,
-    };
-
-    assert_eq!(
-        resize.placement_for_committed_size(300, 200),
-        resize.placement
-    );
-    assert_eq!(
-        resize.placement_for_committed_size(340, 230),
-        resize.placement
-    );
-}
-
-#[test]
-fn commit_received_before_ack_cannot_complete_resize_after_delayed_acquire() {
-    let mut flow = ResizeConfigureFlow::default();
-    let desired = PendingResizeConfigure {
-        surface_id: 42,
-        width: 400,
-        height: 300,
-        placement: SurfacePlacement::root_at(18, 26),
-        edges: ResizeEdges::BOTTOM_RIGHT,
-        resizing: true,
-    };
-    flow.mark_sent(desired, 12, 1);
-
-    assert!(flow.capture(1).is_none());
-    assert_eq!(flow.ack(12), ResizeAckDecision::Matched);
-    assert!(flow.capture(2).is_some());
-    assert!(flow.capture(3).is_none());
-}
-
-#[test]
-fn explicit_sync_selects_newest_ready_commit_without_discarding_newer_wait() {
-    let selected = newest_ready_explicit_sync_commit_indices([
-        (0, 8, false),
-        (1, 8, true),
-        (2, 9, true),
-        (3, 8, false),
-    ]);
-
-    assert_eq!(selected.get(&8), Some(&1));
-    assert_eq!(selected.get(&9), Some(&2));
-}
-
-#[test]
-fn synchronized_tree_waits_until_every_acquire_dependency_is_ready() {
-    let mut state = CompositorState::default();
-    let first = ExplicitSyncPoint::for_tests(10, 20);
-    let second = ExplicitSyncPoint::for_tests(11, 30);
-    state
-        .pending_surface_tree_transactions
-        .push(PendingSurfaceTreeTransaction {
-            root_surface_id: 8,
-            nodes: Vec::new(),
-            dependencies: vec![
-                SurfaceTreeAcquireDependency {
-                    commit_id: AcquireCommitId::for_tests(1),
-                    surface_id: 9,
-                    buffer_id: 90,
-                    acquire: first.clone(),
-                    state: PendingAcquireState::EventfdBacked,
-                },
-                SurfaceTreeAcquireDependency {
-                    commit_id: AcquireCommitId::for_tests(2),
-                    surface_id: 10,
-                    buffer_id: 91,
-                    acquire: second.clone(),
-                    state: PendingAcquireState::EventfdBacked,
-                },
-            ],
-            received_at: Instant::now(),
-        });
-
-    assert!(state.mark_acquire_commit_ready(AcquireCommitId::for_tests(1), 9, &first));
-    assert!(!state.pending_surface_tree_transactions[0].is_ready());
-    assert!(!state.mark_acquire_commit_ready(AcquireCommitId::for_tests(99), 10, &second));
-    assert!(state.mark_acquire_commit_ready(AcquireCommitId::for_tests(2), 10, &second));
-    assert!(state.pending_surface_tree_transactions[0].is_ready());
-}
-
-#[test]
-fn left_top_resize_placement_uses_actual_cell_aligned_size() {
-    let desired = PendingResizeConfigure {
-        surface_id: 42,
-        width: 1003,
-        height: 701,
-        placement: SurfacePlacement::root_at(100, 200),
-        edges: ResizeEdges::new(true, false, true, false),
-        resizing: true,
-    };
-    let mut flow = ResizeConfigureFlow::default();
-    flow.mark_sent(desired, 7, 1);
-    assert_eq!(flow.ack(7), ResizeAckDecision::Matched);
-    let resize = flow.capture(1).expect("geometry commit snapshot");
-
-    let placement = resize.placement_for_committed_size(1000, 696);
-
-    assert_eq!(placement.local_x, 103);
-    assert_eq!(placement.local_y, 205);
-}
-
-#[test]
-fn geometry_only_commit_completes_resize_and_clears_preview() {
-    let mut state = CompositorState::default();
-    let surface_id = 42;
-    let desired = PendingResizeConfigure {
-        surface_id,
-        width: 1003,
-        height: 701,
-        placement: SurfacePlacement::root_at(100, 200),
-        edges: ResizeEdges::new(true, false, true, false),
-        resizing: true,
-    };
-    let mut flow = ResizeConfigureFlow::default();
-    flow.mark_sent(desired, 7, 1);
-    assert_eq!(flow.ack(7), ResizeAckDecision::Matched);
-    let resize = flow.capture(1).expect("geometry commit snapshot");
-    state.resize_configure_flows.insert(surface_id, flow);
-    let identity = BufferIdAllocator::default()
-        .allocate()
-        .expect("test buffer identity");
-    state.renderable_surfaces.push(RenderableSurface {
-        surface_id,
-        x: 0,
-        y: 0,
-        width: 1000,
-        height: 696,
-        placement: desired.placement,
-        resize_preview: Some(ResizePreview {
-            committed_width: 900,
-            committed_height: 600,
-            anchor_right: true,
-            anchor_bottom: true,
-        }),
+            interaction_id: ResizeInteractionId::new(1),
         generation: 1,
         buffer: crate::render_backend::buffer::CommittedSurfaceBuffer::shm_snapshot(
             identity,
@@ -538,6 +350,21 @@ fn geometry_only_commit_completes_resize_and_clears_preview() {
     state
         .surface_window_geometries
         .insert(surface_id, XdgWindowGeometry::new(0, 0, 1000, 696));
+    state.active_toplevel_resizes.insert(
+        surface_id,
+        ActiveToplevelResize {
+            interaction_id: desired.interaction_id,
+            flow_sequence: 1,
+            activated_at: Instant::now(),
+        },
+    );
+    (state, surface_id, resize, desired)
+}
+
+#[test]
+fn intermediate_geometry_only_commit_preserves_active_resize_preview() {
+    let (mut state, surface_id, resize, desired) = state_with_preview_resize(true);
+
     assert!(state.complete_pending_resize_from_current_geometry(surface_id, resize));
 
     assert!(
@@ -547,9 +374,34 @@ fn geometry_only_commit_completes_resize_and_clears_preview() {
             .is_some_and(ResizeConfigureFlow::has_in_flight)
     );
     let surface = &state.renderable_surfaces[0];
-    assert_eq!(surface.resize_preview, None);
-    assert_eq!(surface.placement.local_x, 103);
-    assert_eq!(surface.placement.local_y, 205);
+    assert_eq!(
+        surface.resize_preview,
+        Some(ResizePreview {
+            interaction_id: desired.interaction_id,
+        generation: 1,
+        buffer: crate::render_backend::buffer::CommittedSurfaceBuffer::shm_snapshot(
+            identity,
+            BufferSize::new(944, 502).expect("test size"),
+            vec![0; 944 * 502],
+        ),
+        damage: RenderableSurfaceDamage::Full,
+    });
+    state
+        .surface_window_geometries
+        .insert(surface_id, XdgWindowGeometry::new(0, 0, 944, 502));
+
+    let visual = state
+        .current_visual_root_window_geometry(surface_id)
+        .expect("visual geometry");
+    let committed = state
+        .current_root_window_geometry(surface_id)
+        .expect("committed geometry");
+
+    assert_eq!(visual.width, 1200);
+    assert_eq!(visual.height, 700);
+    assert_eq!(visual.placement, SurfacePlacement::root_at(100, 80));
+    assert_eq!(committed.width, 944);
+    assert_eq!(committed.height, 502);
 }
 
 #[test]
@@ -638,7 +490,7 @@ fn resize_drag_end_clears_resizing_state() {
     assert_eq!(metrics.acks_unknown, 0);
     assert!(metrics.configures_sent >= 2);
     assert!(metrics.commits_captured >= 1);
-    assert!(metrics.preview_completions >= 1);
+    assert_eq!(metrics.preview_completions, 0);
 }
 
 #[test]

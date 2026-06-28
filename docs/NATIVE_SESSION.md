@@ -99,8 +99,8 @@ The native backend currently:
 - renders normal native GPU frames through GLES. The CPU scene renderer is still
   used by `gbm-cpu-write` and dumb-framebuffer fallback modes;
 - keeps compositor-owned window shadows disabled. Native damage and scene bounds
-  include client content plus temporary resize preview backdrop/outline only;
-  shadow extents are not generated or tracked in the active paths;
+  include client content and resize visual bounds, but no compositor-owned
+  resize backdrop, border, tint, shadow, or outline;
 - prefers `libseat + libinput udev` for keyboard, pointer motion, buttons, and
   scroll;
 - suspends/resumes libinput when the libseat input owner receives
@@ -150,8 +150,20 @@ The native backend currently:
   `perf native.pageflip_watchdog`, and `perf native.explicit_sync` report
   readiness masks, kernel wait time, deadlines, scheduling, watch counts,
   registrations, wakeups, cancellations, fallback activation, stale/duplicate
-  tokens, and acquire latency. Reliable libinput motion timestamps also produce
-  `perf native.input_dispatch` latency fields.
+  tokens, and acquire latency. `perf native.prepare_frame` also reports
+  rapid resize generation counters: interactions started, rapid re-resize
+  interactions, obsolete queued/final state discarded, stale interaction
+  commits applied, stale commits preserving newer preview, preview ownership
+  transfers, final configures sent, interactions completed/canceled, visual
+  geometry resize starts, raw pointer resize updates, replaced pending targets,
+  paced updates applied, unchanged rounded targets skipped, duplicate configure
+  sizes skipped, and retained configure peaks. It also reports
+  surface-tree merge counters: bufferless tree commits merged, metadata-only
+  nodes merged, attachments replaced, explicit detaches, acquire dependencies
+  preserved/replaced, callbacks and feedbacks merged, resize snapshots
+  preserved/replaced, root-wide supersessions, waiting transactions published,
+  and ready/waiting slot peaks per root. Reliable libinput motion timestamps
+  also produce `perf native.input_dispatch` latency fields.
 - reports logical and repair damage, EGL buffer age, retained history depth,
   scissor passes, command replays, avoided pixels, swap-with-damage use, and
   conservative full-repaint reasons for native EGL frames;
@@ -192,18 +204,29 @@ The native backend currently:
   and unsupported or ambiguous mapping becomes full surface damage. Applied
   commits remain journaled/accumulated until a real rendered frame succeeds;
 - previews interactive resize with compositor-owned target geometry while
-  waiting for client commits. Left/top edge resizes keep the opposite edge
-  visually anchored. The shared CPU/GLES render plan draws stale client content
-  at committed size without upscaling; when the visual target is smaller than
-  committed content, it crops the sampled source UVs instead of squeezing the
-  buffer. Temporary preview backdrop and outline layers show the pointer-
-  following target until a compatible commit arrives. Native `prepare_frame`
-  flushes the latest queued resize configure without waiting for an older
-  resize commit, so slow clients reduce content freshness rather than pointer
-  responsiveness. On the GBM/KMS path, buffer releases, frame callbacks, and
+  waiting for client commits. Raw pointer updates replace one pending target,
+  and native `prepare_frame` applies at most the latest target per output frame
+  opportunity. Left/top edge resizes keep the opposite edge visually anchored.
+  The shared CPU/GLES render plan draws stale client content at committed size
+  without upscaling; when the visual target is smaller than committed content,
+  it clips the committed surface instead of squeezing the buffer. Rapid
+  re-resize starts from the current toplevel visual geometry and uses resize
+  interaction IDs so delayed commits from an older drag cannot clear a newer
+  active visual resize or send an obsolete final before the active target. The
+  bounded configure ledger allows newer sizes to be sent without waiting for
+  every older resize buffer commit, while coalesced ACKs attach the newest ACKed
+  resize state to the next root commit. Intermediate `resizing=true` commits
+  preserve preview; only a matching final `resizing=false` commit completes it.
+  The compositor renders no resize-specific border, backdrop, shadow, tint, or
+  outline. On the GBM/KMS path, buffer releases, frame callbacks, and
   presentation feedback now wait for DRM pageflip completion instead of being
-  completed immediately after pageflip submission. The xdg configure/ACK path
-  still decides the committed client size; ACK alone does not replace content.
+  completed immediately after pageflip submission. Surface-tree commits that
+  contain no new attachment merge into an older explicit-sync wait for the same
+  root, preserving the inherited buffer, acquire watch, callbacks, presentation
+  feedback, and resize snapshot. Explicit `RemoveContent` and new buffer
+  attachments still replace only the affected node's pending attachment. The
+  xdg configure/ACK path still decides the committed client size; ACK alone
+  does not replace content.
 - keeps minimized toplevels hidden across later client commits. Hidden commits
   update the minimized surface snapshot so restore shows the latest buffer
   without letting active browsers redraw themselves back into the visible scene.

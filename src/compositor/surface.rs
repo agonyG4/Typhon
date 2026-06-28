@@ -7,6 +7,19 @@ use std::collections::VecDeque;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SurfaceCommitCounter(pub u64);
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SurfaceCommitSequence(pub u64);
+
+impl SurfaceCommitSequence {
+    pub const fn initial() -> Self {
+        Self(0)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DamageSince {
     Empty,
@@ -96,11 +109,17 @@ pub struct RenderableSurface {
     pub surface_id: u32,
     pub x: i32,
     pub y: i32,
+    // Logical extent of the currently committed wl_surface content.
+    // Pointer resize, configure ACK, and visual window changes must not mutate it.
     pub width: u32,
+    // Logical extent of the currently committed wl_surface content.
+    // Pointer resize, configure ACK, and visual window changes must not mutate it.
     pub height: u32,
     pub placement: SurfacePlacement,
-    pub resize_preview: Option<ResizePreview>,
+    pub render_placement: Option<SurfacePlacement>,
+    pub visual_clip: Option<super::render::SurfaceTargetRect>,
     pub generation: u64,
+    pub commit_sequence: SurfaceCommitSequence,
     pub buffer: CommittedSurfaceBuffer,
     pub damage: RenderableSurfaceDamage,
 }
@@ -133,14 +152,6 @@ impl RenderableSurface {
     pub(super) fn shm_pixels_mut(&mut self) -> Option<&mut Vec<u32>> {
         self.buffer.shm_pixels_mut()
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResizePreview {
-    pub committed_width: u32,
-    pub committed_height: u32,
-    pub anchor_right: bool,
-    pub anchor_bottom: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

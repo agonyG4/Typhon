@@ -45,6 +45,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
             }
             wl_surface::Request::Commit => {
                 let surface_id = data.surface_id();
+                let commit_sequence = state.allocate_surface_commit_sequence();
                 let window_geometry_changed =
                     state.pending_window_geometry_commits.remove(&surface_id);
                 let explicit_sync = data.explicit_sync();
@@ -53,7 +54,16 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                 let buffer_scale_change = data.take_pending_buffer_scale();
                 let input_region_change = data.take_pending_input_region();
                 let presentation_feedbacks = state.take_surface_presentation_feedbacks(surface_id);
-                let attachment = data.take_pending();
+                let mut attachment = data.take_pending();
+                if let Some(PendingSurfaceAttachment::Buffer(buffer)) = attachment.as_mut() {
+                    buffer.commit_sequence = commit_sequence;
+                }
+                let has_attachment_change = attachment.is_some();
+                state.record_surface_commit_received(
+                    surface_id,
+                    commit_sequence,
+                    has_attachment_change,
+                );
                 let buffer_size = match attachment.as_ref() {
                     Some(PendingSurfaceAttachment::Buffer(buffer)) => buffer
                         .data
@@ -86,6 +96,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     _ => damage.explicit(),
                 };
                 let commit = CachedSubsurfaceCommit {
+                    commit_sequence,
                     attachment,
                     damage,
                     frame_callbacks: data.take_frame_callbacks(),
