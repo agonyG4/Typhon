@@ -11,14 +11,15 @@ impl CompositorState {
         };
         let buffer_width = pending.data.width()?;
         let buffer_height = pending.data.height()?;
-        let committed_size = resize
-            .committed_size
-            .map(|(width, height)| BufferSize { width, height })
-            .or(pending.surface_size)
-            .unwrap_or(BufferSize {
+        let committed_size = self.committed_logical_resize_size(
+            surface_id,
+            resize.committed_window_geometry,
+            pending.surface_size,
+            Some(BufferSize {
                 width: buffer_width,
                 height: buffer_height,
-            });
+            }),
+        );
         let placement =
             resize.placement_for_committed_size(committed_size.width, committed_size.height);
         if compositor_debug_surface_logging_enabled() {
@@ -162,6 +163,7 @@ impl CompositorState {
         surface_id: u32,
         snapshot: ResizeCommitSnapshot,
         pending: &PendingSurfaceBuffer,
+        window_geometry: Option<XdgWindowGeometry>,
     ) -> ResizeCommitSnapshot {
         let raw_buffer_size = || {
             Some(BufferSize {
@@ -173,6 +175,7 @@ impl CompositorState {
             surface_id,
             snapshot,
             pending.data.buffer_id().get(),
+            window_geometry,
             pending.surface_size,
             raw_buffer_size(),
         )
@@ -180,17 +183,45 @@ impl CompositorState {
 
     pub(in crate::compositor) fn snapshot_resize_commit_for_pending_buffer_size(
         &self,
-        _surface_id: u32,
+        surface_id: u32,
         snapshot: ResizeCommitSnapshot,
         buffer_id: u64,
+        window_geometry: Option<XdgWindowGeometry>,
         surface_size: Option<BufferSize>,
         raw_buffer_size: Option<BufferSize>,
     ) -> ResizeCommitSnapshot {
         let snapshot = snapshot.with_buffer_id(buffer_id);
-        let committed_size = surface_size.or(raw_buffer_size);
-        committed_size.map_or(snapshot, |size| {
-            snapshot.with_committed_size(size.width, size.height)
-        })
+        let snapshot = window_geometry.map_or(snapshot, |geometry| {
+            snapshot.with_committed_window_geometry(geometry)
+        });
+        let committed_size = self.committed_logical_resize_size(
+            surface_id,
+            window_geometry,
+            surface_size,
+            raw_buffer_size,
+        );
+        snapshot.with_committed_size(committed_size.width, committed_size.height)
+    }
+
+    pub(in crate::compositor) fn committed_logical_resize_size(
+        &self,
+        surface_id: u32,
+        commit_window_geometry: Option<XdgWindowGeometry>,
+        surface_size: Option<BufferSize>,
+        raw_buffer_size: Option<BufferSize>,
+    ) -> BufferSize {
+        commit_window_geometry
+            .or_else(|| self.surface_window_geometries.get(&surface_id).copied())
+            .map(|geometry| BufferSize {
+                width: geometry.width as u32,
+                height: geometry.height as u32,
+            })
+            .or(surface_size)
+            .or(raw_buffer_size)
+            .unwrap_or(BufferSize {
+                width: 1,
+                height: 1,
+            })
     }
 
     pub(in crate::compositor) fn current_committed_surface_content_size(
@@ -212,13 +243,21 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
         pending: &mut PendingSurfaceBuffer,
+        window_geometry: Option<XdgWindowGeometry>,
     ) {
         if pending.resize_capture_finalized {
             return;
         }
         pending.resize_commit = self
             .capture_acked_resize_for_surface_commit(surface_id)
-            .map(|snapshot| self.snapshot_resize_commit_for_buffer(surface_id, snapshot, pending))
+            .map(|snapshot| {
+                self.snapshot_resize_commit_for_buffer(
+                    surface_id,
+                    snapshot,
+                    pending,
+                    window_geometry,
+                )
+            })
             .map(Box::new);
         pending.resize_capture_finalized = true;
     }
@@ -228,6 +267,13 @@ impl CompositorState {
         surface_id: u32,
         snapshot: ResizeCommitSnapshot,
     ) -> bool {
+        let completed = self
+            .resize_configure_flows
+            .get_mut(&surface_id)
+            .is_some_and(|flow| flow.complete_applied(snapshot.sequence));
+        if !completed {
+            return false;
+        }
         self.resize_flow_metrics.resize_captures_completed = self
             .resize_flow_metrics
             .resize_captures_completed

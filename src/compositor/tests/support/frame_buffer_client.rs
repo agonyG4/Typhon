@@ -297,17 +297,116 @@ pub(in crate::compositor::tests) fn create_syncobj_dmabuf_surface_and_present(
     Ok(state)
 }
 
+pub(in crate::compositor::tests) fn capture_syncobj_resize_window_geometry_snapshots(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    acquire_timeline: &DrmSyncobjTimeline,
+    release_timeline: &DrmSyncobjTimeline,
+) -> Result<ExplicitSyncWindowGeometrySnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 = globals.bind(&qh, 3..=3, ())?;
+    let syncobj: client_wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let sync_surface = syncobj.get_surface(&surface, &qh, ());
+    let acquire_timeline_fd = acquire_timeline.export_timeline_fd()?;
+    let release_timeline_fd = release_timeline.export_timeline_fd()?;
+    let sync_acquire_timeline = syncobj.import_timeline(acquire_timeline_fd.as_fd(), &qh, ());
+    let sync_release_timeline = syncobj.import_timeline(release_timeline_fd.as_fd(), &qh, ());
+    let first_buffer = create_test_dmabuf_buffer_with_size(&dmabuf, &qh, 0xff44_4444, 332, 242)?;
+    let second_buffer = create_test_dmabuf_buffer_with_size(&dmabuf, &qh, 0xff55_5555, 372, 272)?;
+
+    acquire_timeline.signal_point(1)?;
+    xdg_surface.set_window_geometry(16, 10, 300, 200);
+    sync_surface.set_acquire_point(&sync_acquire_timeline, 0, 1);
+    sync_surface.set_release_point(&sync_release_timeline, 0, 2);
+    surface.attach(Some(&first_buffer), 0, 0);
+    surface.damage_buffer(0, 0, 332, 242);
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::BeginResize {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 200.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 120.0,
+    })?;
+    commands.send(ServerCommand::UpdateInteraction {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 240.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 150.0,
+    })?;
+    commands.send(ServerCommand::PresentFrame)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let before_blocked_commit = capture_renderable_surface_snapshot(commands);
+    let before_blocked_geometry = capture_committed_window_geometry(commands);
+
+    xdg_surface.set_window_geometry(16, 30, state.toplevel_width, state.toplevel_height);
+    sync_surface.set_acquire_point(&sync_acquire_timeline, 0, 3);
+    sync_surface.set_release_point(&sync_release_timeline, 0, 4);
+    surface.attach(Some(&second_buffer), 0, 0);
+    surface.damage_buffer(0, 0, 372, 272);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::UpdateInteraction {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 260.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 165.0,
+    })?;
+    wait_for_server_commands(commands);
+    let while_acquire_blocked = capture_renderable_surface_snapshot(commands);
+    let blocked_geometry = capture_committed_window_geometry(commands);
+
+    acquire_timeline.signal_point(3)?;
+    commands.send(ServerCommand::PresentFrame)?;
+    wait_for_server_commands(commands);
+    let after_acquire_ready = capture_renderable_surface_snapshot(commands);
+    let after_acquire_geometry = capture_committed_window_geometry(commands);
+
+    commands.send(ServerCommand::EndInteraction)?;
+    wait_for_server_commands(commands);
+    Ok(ExplicitSyncWindowGeometrySnapshots {
+        before_blocked_commit,
+        before_blocked_geometry,
+        while_acquire_blocked,
+        blocked_geometry,
+        after_acquire_ready,
+        after_acquire_geometry,
+    })
+}
+
 pub(in crate::compositor::tests) fn create_test_dmabuf_buffer(
     dmabuf: &client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
     qh: &QueueHandle<RegistryTestState>,
     pixel: u32,
 ) -> Result<client_wl_buffer::WlBuffer, Box<dyn std::error::Error>> {
-    let file = create_test_shm_file(&[pixel, pixel, pixel, pixel])?;
+    create_test_dmabuf_buffer_with_size(dmabuf, qh, pixel, 2, 2)
+}
+
+pub(in crate::compositor::tests) fn create_test_dmabuf_buffer_with_size(
+    dmabuf: &client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+    qh: &QueueHandle<RegistryTestState>,
+    pixel: u32,
+    width: i32,
+    height: i32,
+) -> Result<client_wl_buffer::WlBuffer, Box<dyn std::error::Error>> {
+    let pixels = vec![pixel; usize::try_from(width.saturating_mul(height))?];
+    let file = create_test_shm_file(&pixels)?;
+    let stride = u32::try_from(width.saturating_mul(4))?;
     let params = dmabuf.create_params(qh, ());
-    params.add(file.as_fd(), 0, 0, 8, 0, 0);
+    params.add(file.as_fd(), 0, 0, stride, 0, 0);
     Ok(params.create_immed(
-        2,
-        2,
+        width,
+        height,
         DRM_FORMAT_ARGB8888,
         client_zwp_linux_buffer_params_v1::Flags::empty(),
         qh,

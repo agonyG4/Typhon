@@ -98,10 +98,20 @@ impl CompositorState {
                         return;
                     }
                 }
-                self.finalize_pending_buffer_resize_capture(surface_id, pending);
+                self.finalize_pending_buffer_resize_capture(
+                    surface_id,
+                    pending,
+                    commit.window_geometry,
+                );
             }
             _ => {
-                commit.resize_commit = self.capture_acked_resize_for_surface_commit(surface_id);
+                commit.resize_commit = self
+                    .capture_acked_resize_for_surface_commit(surface_id)
+                    .map(|snapshot| {
+                        commit.window_geometry.map_or(snapshot, |window_geometry| {
+                            snapshot.with_committed_window_geometry(window_geometry)
+                        })
+                    });
                 commit.resize_capture_finalized = true;
             }
         }
@@ -759,8 +769,12 @@ impl CompositorState {
             return;
         };
         if let Some(PendingSurfaceAttachment::Buffer(buffer)) = root.attachment.as_mut() {
-            let resize_commit =
-                self.snapshot_resize_commit_for_buffer(root_surface_id, resize_commit, buffer);
+            let resize_commit = self.snapshot_resize_commit_for_buffer(
+                root_surface_id,
+                resize_commit,
+                buffer,
+                root.window_geometry,
+            );
             buffer.resize_commit = Some(Box::new(resize_commit));
             buffer.resize_capture_finalized = true;
         } else {
@@ -934,7 +948,7 @@ impl CompositorState {
             presentation_feedbacks,
             resize_commit,
             resize_capture_finalized,
-            window_geometry_changed,
+            window_geometry,
             cached_at: _,
         } = commit;
         let Some(surface) = self.surface_resource_by_id(surface_id) else {
@@ -946,7 +960,9 @@ impl CompositorState {
         let surface_size = data.apply_viewport_change(viewport_destination);
         let committed_buffer_scale = data.apply_buffer_scale_change(buffer_scale);
         let input_region_changed = data.apply_input_region_change(input_region);
-        let damage = damage.or(window_geometry_changed.then_some(RenderableSurfaceDamage::Full));
+        let damage = damage.or(window_geometry
+            .is_some()
+            .then_some(RenderableSurfaceDamage::Full));
         match attachment {
             Some(PendingSurfaceAttachment::Buffer(mut pending)) => {
                 if let Some((x, y)) = offset {
@@ -962,6 +978,7 @@ impl CompositorState {
                     damage.unwrap_or_else(RenderableSurfaceDamage::full),
                     frame_callbacks,
                     explicit_sync,
+                    window_geometry,
                 );
             }
             Some(PendingSurfaceAttachment::RemoveContent) => {
@@ -1011,6 +1028,7 @@ impl CompositorState {
                         buffer_scale: committed_buffer_scale,
                         resize_commit,
                         resize_capture_finalized,
+                        window_geometry,
                     },
                 );
                 if self

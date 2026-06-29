@@ -29,7 +29,7 @@ pub(super) struct CachedSubsurfaceCommit {
     pub(super) presentation_feedbacks: Vec<PendingPresentationFeedback>,
     pub(super) resize_commit: Option<super::ResizeCommitSnapshot>,
     pub(super) resize_capture_finalized: bool,
-    pub(super) window_geometry_changed: bool,
+    pub(super) window_geometry: Option<super::XdgWindowGeometry>,
     pub(super) cached_at: Instant,
 }
 
@@ -48,7 +48,7 @@ impl CachedSubsurfaceCommit {
             presentation_feedbacks,
             resize_commit,
             resize_capture_finalized,
-            window_geometry_changed,
+            window_geometry,
             cached_at: _,
         } = newer;
         self.commit_sequence = commit_sequence;
@@ -83,7 +83,9 @@ impl CachedSubsurfaceCommit {
             self.resize_commit = resize_commit;
             self.resize_capture_finalized = true;
         }
-        self.window_geometry_changed |= window_geometry_changed;
+        if window_geometry.is_some() {
+            self.window_geometry = window_geometry;
+        }
         superseded
     }
 }
@@ -107,6 +109,48 @@ fn merge_damage(
         | (Some(damage), Some(RenderableSurfaceDamage::Empty)) => Some(damage),
         (Some(damage), None) | (None, Some(damage)) => Some(damage),
         (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod window_geometry_tests {
+    use super::*;
+    use crate::compositor::XdgWindowGeometry;
+
+    fn cached_commit_with_window_geometry(
+        sequence: u64,
+        window_geometry: XdgWindowGeometry,
+    ) -> CachedSubsurfaceCommit {
+        CachedSubsurfaceCommit {
+            commit_sequence: SurfaceCommitSequence(sequence),
+            attachment: None,
+            damage: None,
+            frame_callbacks: Vec::new(),
+            explicit_sync: None,
+            offset: None,
+            viewport_destination: None,
+            buffer_scale: None,
+            input_region: None,
+            presentation_feedbacks: Vec::new(),
+            resize_commit: None,
+            resize_capture_finalized: true,
+            window_geometry: Some(window_geometry),
+            cached_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn cached_window_geometry_uses_latest_committed_value() {
+        let mut cached =
+            cached_commit_with_window_geometry(1, XdgWindowGeometry::new(1, 2, 300, 200));
+        let newer = cached_commit_with_window_geometry(2, XdgWindowGeometry::new(8, 9, 320, 220));
+
+        cached.merge(newer);
+
+        assert_eq!(
+            cached.window_geometry,
+            Some(XdgWindowGeometry::new(8, 9, 320, 220))
+        );
     }
 }
 

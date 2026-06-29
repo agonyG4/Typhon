@@ -139,6 +139,58 @@ pub(in crate::compositor::tests) struct RenderableSurfaceSnapshot {
     pub(in crate::compositor::tests) resize_preview_active: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct ToplevelVisualGeometrySnapshot {
+    pub(in crate::compositor::tests) local_x: i32,
+    pub(in crate::compositor::tests) local_y: i32,
+    pub(in crate::compositor::tests) width: u32,
+    pub(in crate::compositor::tests) height: u32,
+    pub(in crate::compositor::tests) active_resize: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct CsdResizeRegressionSnapshot {
+    pub(in crate::compositor::tests) toplevel_width: i32,
+    pub(in crate::compositor::tests) toplevel_height: i32,
+    pub(in crate::compositor::tests) toplevel_configure_count: usize,
+    pub(in crate::compositor::tests) surfaces: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) visual: Option<ToplevelVisualGeometrySnapshot>,
+    pub(in crate::compositor::tests) window_geometry: Option<XdgWindowGeometry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct CsdConsecutiveResizeSnapshots {
+    pub(in crate::compositor::tests) first_final: CsdResizeRegressionSnapshot,
+    pub(in crate::compositor::tests) second_preview: CsdResizeRegressionSnapshot,
+    pub(in crate::compositor::tests) second_final: CsdResizeRegressionSnapshot,
+    pub(in crate::compositor::tests) third_preview: CsdResizeRegressionSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct CsdTopLeftResizeSnapshot {
+    pub(in crate::compositor::tests) first_final: CsdResizeRegressionSnapshot,
+    pub(in crate::compositor::tests) top_left_preview: CsdResizeRegressionSnapshot,
+}
+
+pub(in crate::compositor::tests) struct WindowGeometryCommitSnapshots {
+    pub(in crate::compositor::tests) before_pending: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) before_pending_geometry: Option<XdgWindowGeometry>,
+    pub(in crate::compositor::tests) after_pending_without_commit: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) after_pending_without_commit_geometry:
+        Option<XdgWindowGeometry>,
+    pub(in crate::compositor::tests) after_geometry_commit: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) after_geometry_commit_geometry: Option<XdgWindowGeometry>,
+}
+
+pub(in crate::compositor::tests) struct ExplicitSyncWindowGeometrySnapshots {
+    pub(in crate::compositor::tests) before_blocked_commit: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) before_blocked_geometry: Option<XdgWindowGeometry>,
+    pub(in crate::compositor::tests) while_acquire_blocked: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) blocked_geometry: Option<XdgWindowGeometry>,
+    pub(in crate::compositor::tests) after_acquire_ready: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) after_acquire_geometry: Option<XdgWindowGeometry>,
+}
+
 pub(in crate::compositor::tests) struct SynchronizedCommitSnapshots {
     pub(in crate::compositor::tests) before_parent: Vec<RenderableSurfaceSnapshot>,
     pub(in crate::compositor::tests) after_parent: Vec<RenderableSurfaceSnapshot>,

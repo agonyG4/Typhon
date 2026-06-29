@@ -163,6 +163,7 @@ pub(super) struct PendingExplicitSyncCommit {
     pub(super) commit_sequence: SurfaceCommitSequence,
     pub(super) pending: PendingSurfaceBuffer,
     pub(super) damage: RenderableSurfaceDamage,
+    pub(super) window_geometry: Option<super::XdgWindowGeometry>,
     pub(super) frame_callbacks: Vec<wl_callback::WlCallback>,
     pub(super) acquire: ExplicitSyncPoint,
     pub(super) acquire_state: PendingAcquireState,

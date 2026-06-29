@@ -1,5 +1,19 @@
 use super::*;
 
+fn root_surface_origin(surfaces: &[RenderableSurfaceSnapshot]) -> Option<(i32, i32)> {
+    surfaces
+        .iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .map(|surface| (surface.local_x, surface.local_y))
+}
+
+fn root_buffer_id(surfaces: &[RenderableSurfaceSnapshot]) -> Option<u64> {
+    surfaces
+        .iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .map(|surface| surface.buffer_id)
+}
+
 #[test]
 fn window_drag_moves_root_surface_without_moving_children_independently() {
     let socket_name = unique_socket_name();
@@ -211,10 +225,10 @@ fn resize_drag_coalesces_pointer_updates_behind_in_flight_configure() {
     let origins = render::surface_origins(server.renderable_surfaces());
 
     let state = state.unwrap();
-    assert_eq!(state.toplevel_configure_count, 3);
+    assert_eq!(state.toplevel_configure_count, 2);
     assert_eq!(state.toplevel_width, 340);
     assert_eq!(state.toplevel_height, 230);
-    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Resizing));
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Resizing));
     assert_eq!(origins.first().copied(), Some(render::FIRST_SURFACE_OFFSET));
     let metrics = server.resize_flow_metrics();
     assert_eq!(metrics.raw_pointer_resize_updates, 3);
@@ -250,7 +264,7 @@ fn resize_drag_does_not_send_next_configure_without_client_progress() {
     let _server = stop_controllable_test_server(commands, server_thread);
 
     let state = state.unwrap();
-    assert_eq!(state.toplevel_configure_count, 3);
+    assert_eq!(state.toplevel_configure_count, 2);
 }
 
 #[test]
@@ -374,6 +388,7 @@ fn state_with_preview_resize(
         resizing,
         emitted_at: Instant::now(),
         committed_size: Some((944, 502)),
+        committed_window_geometry: None,
         buffer_id: Some(identity.id().get()),
         interaction_id: desired.interaction_id,
     };
@@ -416,7 +431,23 @@ fn state_with_preview_resize(
         desired.edges,
         desired.interaction_id,
     ));
+    install_captured_resize_snapshot(&mut state, surface_id, desired, resize);
     (state, surface_id, resize, desired)
+}
+
+fn install_captured_resize_snapshot(
+    state: &mut CompositorState,
+    surface_id: u32,
+    desired: PendingResizeConfigure,
+    snapshot: ResizeCommitSnapshot,
+) {
+    let flow = state.resize_configure_flows.entry(surface_id).or_default();
+    flow.mark_sent(desired, snapshot.serial, snapshot.sequence);
+    assert_eq!(flow.ack(snapshot.serial), ResizeAckDecision::Matched);
+    let captured = flow
+        .capture(snapshot.commit_sequence)
+        .expect("resize snapshot should be captured");
+    assert_eq!(captured.sequence, snapshot.sequence);
 }
 
 #[test]
@@ -449,6 +480,100 @@ fn intermediate_geometry_only_commit_preserves_active_resize_preview() {
     assert_eq!(visual.placement, SurfacePlacement::root_at(100, 80));
     assert_eq!(committed.width, 944);
     assert_eq!(committed.height, 502);
+}
+
+#[test]
+fn applied_resize_capture_is_removed_from_runtime_flow() {
+    let (mut state, surface_id, resize, _desired) = state_with_preview_resize(true);
+
+    assert_eq!(
+        state
+            .resize_configure_flows
+            .get(&surface_id)
+            .map_or(0, ResizeConfigureFlow::captured_count),
+        1
+    );
+
+    assert!(state.complete_applied_resize_transaction(surface_id, resize));
+
+    assert!(!state.resize_configure_flows.contains_key(&surface_id));
+}
+
+#[test]
+fn sequential_successful_resize_commits_do_not_stall_runtime_flow() {
+    let (mut state, surface_id, mut resize, desired) = state_with_preview_resize(true);
+
+    for sequence in 1..=17 {
+        resize.sequence = sequence;
+        resize.commit_sequence = sequence;
+        assert!(state.complete_applied_resize_transaction(surface_id, resize));
+        if sequence < 17 {
+            let next = ResizeCommitSnapshot {
+                sequence: sequence + 1,
+                commit_sequence: sequence + 1,
+                ..resize
+            };
+            install_captured_resize_snapshot(&mut state, surface_id, desired, next);
+            assert_eq!(
+                state
+                    .resize_configure_flows
+                    .get(&surface_id)
+                    .map_or(0, ResizeConfigureFlow::in_flight_configure_count),
+                1
+            );
+        }
+    }
+
+    assert!(!state.resize_configure_flows.contains_key(&surface_id));
+    assert_eq!(state.resize_flow_metrics.resize_captures_completed, 17);
+}
+
+#[test]
+fn resize_flow_keeps_queued_latest_until_current_capture_completes() {
+    let (mut state, surface_id, resize, desired) = state_with_preview_resize(true);
+    state
+        .resize_configure_flows
+        .get_mut(&surface_id)
+        .expect("flow")
+        .queue(PendingResizeConfigure {
+            width: desired.width + 10,
+            ..desired
+        });
+
+    let flow = state
+        .resize_configure_flows
+        .get_mut(&surface_id)
+        .expect("queued flow remains");
+    assert!(flow.complete_applied(resize.sequence));
+    let next = flow.take_sendable().expect("queued latest");
+    assert_eq!(next.width, desired.width + 10);
+    assert!(flow.is_empty());
+}
+
+#[test]
+fn repeated_resize_completion_does_not_leave_stale_active_preview() {
+    let (mut state, surface_id, intermediate, desired) = state_with_preview_resize(true);
+    assert!(state.complete_applied_resize_transaction(surface_id, intermediate));
+
+    let final_resize = ResizeCommitSnapshot {
+        sequence: 2,
+        commit_sequence: 2,
+        resizing: false,
+        ..intermediate
+    };
+    install_captured_resize_snapshot(&mut state, surface_id, desired, final_resize);
+
+    assert!(state.complete_pending_resize_from_current_geometry(surface_id, final_resize));
+
+    assert!(!state.active_toplevel_resizes.contains_key(&surface_id));
+    assert_eq!(
+        state
+            .toplevel_visual_geometries
+            .get(&surface_id)
+            .and_then(|visual| visual.active_resize),
+        None
+    );
+    assert!(!state.resize_configure_flows.contains_key(&surface_id));
 }
 
 #[test]
@@ -533,7 +658,7 @@ fn resize_drag_end_clears_resizing_state() {
     assert_eq!(state.toplevel_height, 230);
     assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Resizing));
     let metrics = server.resize_flow_metrics();
-    assert_eq!(metrics.max_in_flight_configures, 2);
+    assert_eq!(metrics.max_in_flight_configures, 1);
     assert_eq!(metrics.acks_unknown, 0);
     assert!(metrics.configures_sent >= 2);
     assert!(metrics.commits_captured >= 1);
@@ -582,6 +707,222 @@ fn csd_buffer_margin_resize_release_keeps_configure_at_window_geometry() {
     assert_eq!(state.toplevel_width, 340);
     assert_eq!(state.toplevel_height, 230);
     assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Resizing));
+}
+
+#[test]
+fn pending_window_geometry_does_not_move_current_buffer_before_commit() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots =
+        capture_csd_window_geometry_pending_and_committed_resize_snapshots(&socket_path, &commands)
+            .unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(
+        root_surface_origin(&snapshots.before_pending),
+        root_surface_origin(&snapshots.after_pending_without_commit)
+    );
+    assert_eq!(
+        snapshots.before_pending_geometry,
+        snapshots.after_pending_without_commit_geometry
+    );
+}
+
+#[test]
+fn geometry_only_commit_is_applied_at_commit_time() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots =
+        capture_csd_window_geometry_pending_and_committed_resize_snapshots(&socket_path, &commands)
+            .unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_ne!(
+        snapshots.after_pending_without_commit_geometry,
+        snapshots.after_geometry_commit_geometry
+    );
+}
+
+#[test]
+fn csd_geometry_only_final_commit_keeps_logical_visual_size() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots =
+        capture_csd_consecutive_resize_regression_snapshots(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(snapshots.first_final.toplevel_width, 340);
+    assert_eq!(snapshots.first_final.toplevel_height, 230);
+    assert_eq!(
+        snapshots.first_final.visual,
+        Some(ToplevelVisualGeometrySnapshot {
+            local_x: 0,
+            local_y: 0,
+            width: 340,
+            height: 230,
+            active_resize: false,
+        })
+    );
+    assert_eq!(
+        snapshots.first_final.window_geometry,
+        Some(XdgWindowGeometry::new(16, 10, 340, 230))
+    );
+    assert!(
+        snapshots
+            .first_final
+            .surfaces
+            .iter()
+            .all(|surface| !surface.resize_preview_active)
+    );
+}
+
+#[test]
+fn next_csd_resize_starts_from_window_geometry_not_buffer_size() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots =
+        capture_csd_consecutive_resize_regression_snapshots(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(snapshots.first_final.toplevel_width, 340);
+    assert_eq!(snapshots.second_preview.toplevel_width, 336);
+    assert_eq!(snapshots.second_preview.toplevel_height, 230);
+    assert_eq!(
+        snapshots.second_preview.visual,
+        Some(ToplevelVisualGeometrySnapshot {
+            local_x: 0,
+            local_y: 0,
+            width: 336,
+            height: 230,
+            active_resize: true,
+        })
+    );
+    assert!(
+        snapshots
+            .second_preview
+            .surfaces
+            .iter()
+            .all(|surface| surface.resize_preview_active)
+    );
+}
+
+#[test]
+fn one_pixel_csd_shrink_never_grows_by_buffer_margins() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots =
+        capture_csd_consecutive_resize_regression_snapshots(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(snapshots.second_final.toplevel_width, 336);
+    assert_eq!(snapshots.third_preview.toplevel_width, 333);
+    assert_eq!(snapshots.third_preview.toplevel_height, 230);
+    assert!(
+        snapshots.third_preview.toplevel_width < snapshots.second_final.toplevel_width,
+        "a small CSD shrink must not grow from the raw buffer margin"
+    );
+    assert!(
+        snapshots
+            .second_final
+            .surfaces
+            .iter()
+            .all(|surface| !surface.resize_preview_active)
+    );
+}
+
+#[test]
+fn left_top_csd_resize_anchors_using_logical_window_size() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots =
+        capture_csd_top_left_resize_regression_snapshot(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(
+        snapshots.top_left_preview.visual,
+        Some(ToplevelVisualGeometrySnapshot {
+            local_x: snapshots.first_final.visual.unwrap().local_x + 4,
+            local_y: snapshots.first_final.visual.unwrap().local_y + 5,
+            width: 336,
+            height: 225,
+            active_resize: true,
+        })
+    );
+    let visual = snapshots
+        .top_left_preview
+        .visual
+        .expect("top-left preview should be active");
+    assert_eq!(
+        visual.local_x + i32::try_from(visual.width).unwrap(),
+        snapshots.first_final.visual.unwrap().local_x + snapshots.first_final.toplevel_width
+    );
+    assert_eq!(
+        visual.local_y + i32::try_from(visual.height).unwrap(),
+        snapshots.first_final.visual.unwrap().local_y + snapshots.first_final.toplevel_height
+    );
+}
+
+#[test]
+fn explicit_sync_resize_applies_buffer_and_window_geometry_atomically() {
+    let Some(acquire_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let Some(release_timeline) =
+        test_syncobj_device().and_then(|device| device.create_timeline_for_tests().ok())
+    else {
+        return;
+    };
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots = capture_syncobj_resize_window_geometry_snapshots(
+        &socket_path,
+        &commands,
+        &acquire_timeline,
+        &release_timeline,
+    )
+    .unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(
+        root_surface_origin(&snapshots.before_blocked_commit),
+        root_surface_origin(&snapshots.while_acquire_blocked)
+    );
+    assert_eq!(
+        root_buffer_id(&snapshots.before_blocked_commit),
+        root_buffer_id(&snapshots.while_acquire_blocked)
+    );
+    assert_eq!(
+        snapshots.before_blocked_geometry,
+        snapshots.blocked_geometry
+    );
+    assert_ne!(snapshots.blocked_geometry, snapshots.after_acquire_geometry);
+    assert_ne!(
+        root_buffer_id(&snapshots.while_acquire_blocked),
+        root_buffer_id(&snapshots.after_acquire_ready)
+    );
 }
 
 #[test]

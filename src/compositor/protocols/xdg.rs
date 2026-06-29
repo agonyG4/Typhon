@@ -211,31 +211,8 @@ impl Dispatch<xdg_surface::XdgSurface, XdgSurfaceData> for CompositorState {
                 let surface_id = compositor_surface_id(&data.surface);
                 if width > 0 && height > 0 {
                     state
-                        .surface_window_geometries
+                        .pending_surface_window_geometries
                         .insert(surface_id, XdgWindowGeometry::new(x, y, width, height));
-                    state.pending_window_geometry_commits.insert(surface_id);
-                    if let Some(positioner) = state
-                        .popup_surfaces
-                        .get(&surface_id)
-                        .map(|popup| popup.positioner)
-                        && positioner.reactive
-                        && state.configured_xdg_surfaces.contains(&surface_id)
-                    {
-                        state.configure_popup_surface(surface_id, positioner, None);
-                    }
-                    let child_popups = state
-                        .popup_surfaces
-                        .iter()
-                        .filter_map(|(popup_surface_id, popup)| {
-                            (popup.parent_surface_id == Some(surface_id)
-                                && popup.positioner.reactive
-                                && state.configured_xdg_surfaces.contains(popup_surface_id))
-                            .then_some((*popup_surface_id, popup.positioner))
-                        })
-                        .collect::<Vec<_>>();
-                    for (popup_surface_id, positioner) in child_popups {
-                        state.configure_popup_surface(popup_surface_id, positioner, None);
-                    }
                 }
             }
             xdg_surface::Request::AckConfigure { serial } => {

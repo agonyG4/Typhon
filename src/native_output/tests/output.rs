@@ -476,13 +476,13 @@ fn task_05_8_native_damage_for_window_resize_covers_visual_clip_changes() {
     )])[0];
     let previous = RenderableSurface {
         visual_clip: Some(oblivion_one::compositor::SurfaceTargetRect::new(
-            origin.0, origin.1, 300, 200,
+            0, 0, 300, 200,
         )),
         ..test_renderable_surface(7, 0, 0, 300, 200, RenderableSurfaceDamage::Full)
     };
     let current = RenderableSurface {
         visual_clip: Some(oblivion_one::compositor::SurfaceTargetRect::new(
-            origin.0, origin.1, 220, 160,
+            0, 0, 220, 160,
         )),
         generation: 1,
         ..test_renderable_surface(7, 0, 0, 300, 200, RenderableSurfaceDamage::Full)

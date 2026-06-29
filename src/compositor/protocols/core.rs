@@ -46,8 +46,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
             wl_surface::Request::Commit => {
                 let surface_id = data.surface_id();
                 let commit_sequence = state.allocate_surface_commit_sequence();
-                let window_geometry_changed =
-                    state.pending_window_geometry_commits.remove(&surface_id);
+                let window_geometry = state.pending_surface_window_geometries.remove(&surface_id);
                 let explicit_sync = data.explicit_sync();
                 let offset = data.take_pending_offset();
                 let viewport_change = data.take_pending_viewport();
@@ -108,7 +107,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     presentation_feedbacks,
                     resize_commit: None,
                     resize_capture_finalized: false,
-                    window_geometry_changed,
+                    window_geometry,
                     cached_at: Instant::now(),
                 };
                 state.commit_surface_tree_request(surface_id, commit);

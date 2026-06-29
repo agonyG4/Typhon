@@ -52,9 +52,33 @@ mod task_05_8_tests {
             resizing,
             emitted_at: Instant::now(),
             committed_size: Some((width, height)),
+            committed_window_geometry: None,
             buffer_id: None,
             interaction_id,
         }
+    }
+
+    fn install_captured_snapshot(
+        state: &mut CompositorState,
+        surface_id: u32,
+        snapshot: ResizeCommitSnapshot,
+    ) {
+        let desired = PendingResizeConfigure {
+            surface_id,
+            width: snapshot.width,
+            height: snapshot.height,
+            placement: snapshot.placement,
+            edges: snapshot.edges,
+            resizing: snapshot.resizing,
+            interaction_id: snapshot.interaction_id,
+        };
+        let flow = state.resize_configure_flows.entry(surface_id).or_default();
+        flow.mark_sent(desired, snapshot.serial, snapshot.sequence);
+        assert_eq!(flow.ack(snapshot.serial), ResizeAckDecision::Matched);
+        let captured = flow
+            .capture(snapshot.commit_sequence)
+            .expect("snapshot should be captured before completion");
+        assert_eq!(captured.sequence, snapshot.sequence);
     }
 
     #[test]
@@ -147,27 +171,22 @@ mod task_05_8_tests {
     }
 
     #[test]
-    pub(in crate::compositor) fn task_05_8_ack_moves_to_pending_surface_and_frees_configure_capacity()
-     {
+    pub(in crate::compositor) fn task_05_8_ack_waits_for_commit_before_freeing_configure_capacity()
+    {
         let mut flow = ResizeConfigureFlow::default();
-        for (serial, sequence, width) in [(10, 1, 1000), (11, 2, 1050), (12, 3, 1100)] {
-            flow.mark_sent(
-                PendingResizeConfigure {
-                    surface_id: 42,
-                    width,
-                    height: 700,
-                    placement: SurfacePlacement::root(),
-                    edges: ResizeEdges::BOTTOM_RIGHT,
-                    resizing: true,
-                    interaction_id: ResizeInteractionId::new(1),
-                },
-                serial,
-                sequence,
-            );
-        }
+        let desired = PendingResizeConfigure {
+            surface_id: 42,
+            width: 1000,
+            height: 700,
+            placement: SurfacePlacement::root(),
+            edges: ResizeEdges::BOTTOM_RIGHT,
+            resizing: true,
+            interaction_id: ResizeInteractionId::new(1),
+        };
+        flow.mark_sent(desired, 10, 1);
 
-        assert_eq!(flow.ack(12), ResizeAckDecision::Matched);
-        assert_eq!(flow.retained_configure_count(), 0);
+        assert_eq!(flow.ack(10), ResizeAckDecision::Matched);
+        assert_eq!(flow.retained_configure_count(), 1);
         assert_eq!(flow.captured_count(), 0);
         assert!(flow.queue(PendingResizeConfigure {
             surface_id: 42,
@@ -178,6 +197,9 @@ mod task_05_8_tests {
             resizing: true,
             interaction_id: ResizeInteractionId::new(1),
         }));
+        assert!(flow.take_sendable().is_none());
+        let snapshot = flow.capture(90).expect("ACKed resize snapshot");
+        assert!(flow.complete_applied(snapshot.sequence));
         assert!(flow.take_sendable().is_some());
     }
 
@@ -197,6 +219,7 @@ mod task_05_8_tests {
         assert_eq!(flow.ack(10), ResizeAckDecision::Matched);
         let snapshot_a = flow.capture(90).expect("snapshot A");
 
+        assert!(flow.complete_applied(snapshot_a.sequence));
         flow.mark_sent(
             PendingResizeConfigure {
                 width: 1100,
@@ -210,8 +233,8 @@ mod task_05_8_tests {
 
         assert_eq!(snapshot_a.commit_sequence, 90);
         assert_eq!(snapshot_b.commit_sequence, 91);
-        assert_eq!(flow.captured_count(), 2);
-        assert_eq!(flow.retained_configure_count(), 2);
+        assert_eq!(flow.captured_count(), 1);
+        assert_eq!(flow.retained_configure_count(), 1);
     }
 
     #[test]
@@ -242,12 +265,18 @@ mod task_05_8_tests {
         );
 
         let intermediate = test_resize_snapshot(surface_id, interaction_id, true, 1000, 620);
+        install_captured_snapshot(&mut state, surface_id, intermediate);
         assert!(state.complete_pending_resize_from_current_geometry(surface_id, intermediate));
         let visual = state.toplevel_visual_geometries.get(&surface_id).unwrap();
         assert_eq!((visual.width, visual.height), (1200, 700));
         assert!(state.active_toplevel_resizes.contains_key(&surface_id));
 
-        let final_snapshot = test_resize_snapshot(surface_id, interaction_id, false, 1000, 620);
+        let final_snapshot = ResizeCommitSnapshot {
+            sequence: 2,
+            commit_sequence: 2,
+            ..test_resize_snapshot(surface_id, interaction_id, false, 1000, 620)
+        };
+        install_captured_snapshot(&mut state, surface_id, final_snapshot);
         assert!(state.complete_pending_resize_from_current_geometry(surface_id, final_snapshot));
         assert!(!state.active_toplevel_resizes.contains_key(&surface_id));
         let visual = state.toplevel_visual_geometries.get(&surface_id).unwrap();
@@ -284,6 +313,125 @@ mod task_05_8_tests {
         assert_eq!(
             state.renderable_surfaces[0].render_placement,
             Some(SurfacePlacement::root_at(160, 140))
+        );
+        assert_eq!(state.renderable_surfaces[0].visual_clip, None);
+    }
+
+    #[test]
+    pub(in crate::compositor) fn inactive_visual_geometry_does_not_install_preview_clip() {
+        let mut state = CompositorState::default();
+        let surface_id = 42;
+        state
+            .renderable_surfaces
+            .push(test_surface(surface_id, 944, 502));
+        state.toplevel_visual_geometries.insert(
+            surface_id,
+            ToplevelVisualGeometry {
+                placement: SurfacePlacement::root_at(100, 100),
+                width: 944,
+                height: 502,
+                active_resize: None,
+            },
+        );
+
+        state.update_toplevel_visual_render_assignment(surface_id);
+
+        assert_eq!(state.renderable_surfaces[0].visual_clip, None);
+        assert_eq!(
+            state.renderable_surfaces[0].render_placement,
+            Some(SurfacePlacement::root_at(100, 100))
+        );
+    }
+
+    #[test]
+    pub(in crate::compositor) fn final_resize_clears_preview_clip_and_keeps_root_render_placement()
+    {
+        let mut state = CompositorState::default();
+        let surface_id = 42;
+        let interaction_id = ResizeInteractionId::new(1);
+        state
+            .renderable_surfaces
+            .push(test_surface(surface_id, 944, 502));
+        state
+            .surface_window_geometries
+            .insert(surface_id, XdgWindowGeometry::new(16, 10, 944, 502));
+        state.active_toplevel_resizes.insert(
+            surface_id,
+            ActiveToplevelResize {
+                interaction_id,
+                flow_sequence: 1,
+                edges: ResizeEdges::new(false, false, false, true),
+                activated_at: Instant::now(),
+            },
+        );
+        assert!(state.preview_resize_root_window_to(
+            surface_id,
+            1000,
+            502,
+            SurfacePlacement::root_at(100, 80),
+            ResizeEdges::new(false, false, false, true),
+            interaction_id,
+        ));
+
+        let final_snapshot = test_resize_snapshot(surface_id, interaction_id, false, 1000, 502);
+        install_captured_snapshot(&mut state, surface_id, final_snapshot);
+
+        assert!(state.complete_pending_resize_from_current_geometry(surface_id, final_snapshot));
+        assert_eq!(state.renderable_surfaces[0].visual_clip, None);
+        assert_eq!(
+            state.renderable_surfaces[0].render_placement,
+            Some(SurfacePlacement::root_at(84, 90))
+        );
+    }
+
+    #[test]
+    pub(in crate::compositor) fn inactive_visual_geometry_clears_preview_clip_from_subsurfaces() {
+        let mut state = CompositorState::default();
+        let root_id = 42;
+        let child_id = 43;
+        let interaction_id = ResizeInteractionId::new(1);
+        state
+            .renderable_surfaces
+            .push(test_surface(root_id, 944, 502));
+        let mut child = test_surface(child_id, 100, 40);
+        child.placement = SurfacePlacement {
+            parent_surface_id: Some(root_id),
+            local_x: 12,
+            local_y: 8,
+        };
+        state.surface_placements.insert(child_id, child.placement);
+        state.renderable_surfaces.push(child);
+        assert!(state.preview_resize_root_window_to(
+            root_id,
+            1000,
+            520,
+            SurfacePlacement::root_at(100, 80),
+            ResizeEdges::BOTTOM_RIGHT,
+            interaction_id,
+        ));
+        assert!(
+            state
+                .renderable_surfaces
+                .iter()
+                .all(|surface| surface.visual_clip.is_some())
+        );
+        state.toplevel_visual_geometries.insert(
+            root_id,
+            ToplevelVisualGeometry {
+                placement: SurfacePlacement::root_at(100, 80),
+                width: 1000,
+                height: 520,
+                active_resize: None,
+            },
+        );
+
+        state.update_toplevel_visual_render_assignment(root_id);
+
+        assert!(
+            state
+                .renderable_surfaces
+                .iter()
+                .all(|surface| surface.visual_clip.is_none())
         );
     }
 }

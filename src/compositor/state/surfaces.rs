@@ -1015,6 +1015,7 @@ impl CompositorState {
         self.surface_placements.remove(&surface_id);
         self.current_surface_buffers.remove(&surface_id);
         self.surface_window_geometries.remove(&surface_id);
+        self.pending_surface_window_geometries.remove(&surface_id);
         self.configured_xdg_surfaces.remove(&surface_id);
         self.surface_entered_outputs
             .retain(|(entered_surface_id, _)| *entered_surface_id != surface_id);

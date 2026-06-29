@@ -142,6 +142,7 @@ pub use render::{
     output_scale_key, render_scene_elements_for_surfaces, scale_desktop_visual_state,
     scale_logical_coordinate, scale_logical_extent, server_frame_rects_by_surface,
     server_frame_rects_for_surface, surface_origin, surface_origins, surface_render_plan,
+    surface_render_plan_with_clip, surface_render_space_assignments,
 };
 use runtime_files::{compositor_debug_surface_logging_enabled, unique_runtime_file_path};
 pub use selection::{SelectionOfferRecord, SelectionState};
@@ -370,6 +371,7 @@ struct BufferlessSurfaceCommitState {
     buffer_scale: u32,
     resize_commit: Option<ResizeCommitSnapshot>,
     resize_capture_finalized: bool,
+    window_geometry: Option<XdgWindowGeometry>,
 }
 
 impl PendingSurfaceTreeTransaction {
@@ -487,7 +489,7 @@ pub struct CompositorState {
     subsurface_transaction_metrics: SubsurfaceTransactionMetrics,
     current_surface_buffers: HashMap<u32, PendingSurfaceBuffer>,
     surface_window_geometries: HashMap<u32, XdgWindowGeometry>,
-    pending_window_geometry_commits: HashSet<u32>,
+    pending_surface_window_geometries: HashMap<u32, XdgWindowGeometry>,
     surface_entered_outputs: HashSet<(u32, u32)>,
     toplevel_surfaces: HashMap<u32, ToplevelSurface>,
     configured_xdg_surfaces: HashSet<u32>,

@@ -591,6 +591,265 @@ pub(in crate::compositor::tests) fn create_csd_toplevel_then_resize_drag_commit_
     Ok(state)
 }
 
+fn capture_csd_resize_regression_snapshot(
+    commands: &Sender<ServerCommand>,
+    state: &RegistryTestState,
+) -> CsdResizeRegressionSnapshot {
+    CsdResizeRegressionSnapshot {
+        toplevel_width: state.toplevel_width,
+        toplevel_height: state.toplevel_height,
+        toplevel_configure_count: state.toplevel_configure_count,
+        surfaces: capture_renderable_surface_snapshot(commands),
+        visual: capture_toplevel_visual_geometry(commands),
+        window_geometry: capture_committed_window_geometry(commands),
+    }
+}
+
+pub(in crate::compositor::tests) fn capture_csd_consecutive_resize_regression_snapshots(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<CsdConsecutiveResizeSnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let (surface, xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 332, 242)?;
+    xdg_surface.set_window_geometry(16, 10, 300, 200);
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+
+    commands.send(ServerCommand::BeginResize {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 200.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 120.0,
+    })?;
+    commands.send(ServerCommand::UpdateInteraction {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 240.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 150.0,
+    })?;
+    commands.send(ServerCommand::PresentFrame)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    xdg_surface.set_window_geometry(16, 10, state.toplevel_width, state.toplevel_height);
+    commit_test_buffered_surface(
+        &surface,
+        &shm,
+        &qh,
+        usize::try_from(state.toplevel_width + 32)?,
+        usize::try_from(state.toplevel_height + 42)?,
+    )?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    commands.send(ServerCommand::EndInteraction)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    xdg_surface.set_window_geometry(16, 10, state.toplevel_width, state.toplevel_height);
+    surface.commit();
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    let first_final = capture_csd_resize_regression_snapshot(commands, &state);
+
+    commands.send(ServerCommand::BeginResize {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 300.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 180.0,
+    })?;
+    commands.send(ServerCommand::UpdateInteraction {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 296.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 180.0,
+    })?;
+    commands.send(ServerCommand::PresentFrame)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let second_preview = capture_csd_resize_regression_snapshot(commands, &state);
+
+    xdg_surface.set_window_geometry(16, 10, state.toplevel_width, state.toplevel_height);
+    commit_test_buffered_surface(
+        &surface,
+        &shm,
+        &qh,
+        usize::try_from(state.toplevel_width + 32)?,
+        usize::try_from(state.toplevel_height + 42)?,
+    )?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    commands.send(ServerCommand::EndInteraction)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    xdg_surface.set_window_geometry(16, 10, state.toplevel_width, state.toplevel_height);
+    surface.commit();
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    let second_final = capture_csd_resize_regression_snapshot(commands, &state);
+
+    commands.send(ServerCommand::BeginResize {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 300.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 180.0,
+    })?;
+    commands.send(ServerCommand::UpdateInteraction {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 297.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 180.0,
+    })?;
+    commands.send(ServerCommand::PresentFrame)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let third_preview = capture_csd_resize_regression_snapshot(commands, &state);
+
+    commands.send(ServerCommand::EndInteraction)?;
+    wait_for_server_commands(commands);
+
+    Ok(CsdConsecutiveResizeSnapshots {
+        first_final,
+        second_preview,
+        second_final,
+        third_preview,
+    })
+}
+
+pub(in crate::compositor::tests) fn capture_csd_top_left_resize_regression_snapshot(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<CsdTopLeftResizeSnapshot, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let (surface, xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 332, 242)?;
+    xdg_surface.set_window_geometry(16, 10, 300, 200);
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+
+    commands.send(ServerCommand::BeginResize {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 200.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 120.0,
+    })?;
+    commands.send(ServerCommand::UpdateInteraction {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 240.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 150.0,
+    })?;
+    commands.send(ServerCommand::PresentFrame)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    xdg_surface.set_window_geometry(16, 10, state.toplevel_width, state.toplevel_height);
+    commit_test_buffered_surface(
+        &surface,
+        &shm,
+        &qh,
+        usize::try_from(state.toplevel_width + 32)?,
+        usize::try_from(state.toplevel_height + 42)?,
+    )?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    commands.send(ServerCommand::EndInteraction)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    xdg_surface.set_window_geometry(16, 10, state.toplevel_width, state.toplevel_height);
+    surface.commit();
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    let first_final = capture_csd_resize_regression_snapshot(commands, &state);
+
+    commands.send(ServerCommand::BeginResize {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 8.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 8.0,
+    })?;
+    commands.send(ServerCommand::UpdateInteraction {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 12.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 13.0,
+    })?;
+    commands.send(ServerCommand::PresentFrame)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let top_left_preview = capture_csd_resize_regression_snapshot(commands, &state);
+
+    commands.send(ServerCommand::EndInteraction)?;
+    wait_for_server_commands(commands);
+
+    Ok(CsdTopLeftResizeSnapshot {
+        first_final,
+        top_left_preview,
+    })
+}
+
+pub(in crate::compositor::tests) fn capture_csd_window_geometry_pending_and_committed_resize_snapshots(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<WindowGeometryCommitSnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let (surface, xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 332, 242)?;
+    xdg_surface.set_window_geometry(16, 10, 300, 200);
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::BeginResize {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 200.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 120.0,
+    })?;
+    commands.send(ServerCommand::UpdateInteraction {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 240.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 150.0,
+    })?;
+    commands.send(ServerCommand::PresentFrame)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let before_pending = capture_renderable_surface_snapshot(commands);
+    let before_pending_geometry = capture_committed_window_geometry(commands);
+    xdg_surface.set_window_geometry(16, 30, state.toplevel_width, state.toplevel_height);
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    commands.send(ServerCommand::UpdateInteraction {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 260.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 165.0,
+    })?;
+    wait_for_server_commands(commands);
+    let after_pending_without_commit = capture_renderable_surface_snapshot(commands);
+    let after_pending_without_commit_geometry = capture_committed_window_geometry(commands);
+
+    surface.commit();
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    let after_geometry_commit = capture_renderable_surface_snapshot(commands);
+    let after_geometry_commit_geometry = capture_committed_window_geometry(commands);
+
+    commands.send(ServerCommand::EndInteraction)?;
+    wait_for_server_commands(commands);
+    Ok(WindowGeometryCommitSnapshots {
+        before_pending,
+        before_pending_geometry,
+        after_pending_without_commit,
+        after_pending_without_commit_geometry,
+        after_geometry_commit,
+        after_geometry_commit_geometry,
+    })
+}
+
 pub(in crate::compositor::tests) fn create_buffered_toplevel_then_measure_configure_only_resize_generation(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,

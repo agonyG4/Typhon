@@ -8,6 +8,7 @@ impl CompositorState {
         surface_id: u32,
         pending: PendingSurfaceBuffer,
         damage: RenderableSurfaceDamage,
+        window_geometry: Option<XdgWindowGeometry>,
         source: SurfacePublicationSource,
     ) {
         let resize_commit = pending.resize_commit.as_deref().copied();
@@ -17,6 +18,7 @@ impl CompositorState {
         }
 
         let generation = self.next_render_generation_value();
+        self.apply_committed_window_geometry(surface_id, window_geometry);
         let resize_placement = match self.take_pending_resize_commit_placement(surface_id, &pending)
         {
             Ok(placement) => placement,
@@ -64,7 +66,9 @@ impl CompositorState {
                 pending.data.dmabuf_handle(),
                 pending.resize_commit.as_deref().map(|resize| resize.serial),
                 resize_commit.map(|resize| resize.serial),
-                self.surface_window_geometries.get(&surface_id),
+                window_geometry
+                    .as_ref()
+                    .or_else(|| self.surface_window_geometries.get(&surface_id)),
             );
         }
         if let Some(root_surface_id) = self.minimized_root_surface_id_for_surface(surface_id) {
@@ -101,6 +105,12 @@ impl CompositorState {
                 buffer_size.width,
                 buffer_size.height,
             );
+            if self
+                .toplevel_visual_geometries
+                .contains_key(&root_surface_id)
+            {
+                self.update_toplevel_visual_render_assignment(root_surface_id);
+            }
             if let Some(resize_commit) = resize_commit {
                 self.complete_applied_resize_transaction(surface_id, resize_commit);
             }
@@ -143,6 +153,19 @@ impl CompositorState {
                     Err(_) => return,
                 };
             self.renderable_surfaces.push(surface);
+        }
+        if window_geometry.is_some()
+            && self.update_popup_surface_placement_from_committed_state(surface_id)
+        {
+            let placement = self.surface_placement(surface_id);
+            if let Some(surface) = self
+                .renderable_surfaces
+                .iter_mut()
+                .find(|surface| surface.surface_id == surface_id)
+            {
+                surface.placement = placement;
+            }
+            self.invalidate_surface_origin_cache();
         }
         self.reorder_renderable_surfaces_by_committed_stack();
         if self
@@ -251,6 +274,7 @@ impl CompositorState {
         damage: RenderableSurfaceDamage,
         surface_size: Option<BufferSize>,
         buffer_scale: u32,
+        window_geometry: Option<XdgWindowGeometry>,
     ) -> bool {
         let Some(current) = self.current_surface_buffers.get(&surface_id).cloned() else {
             return false;
@@ -265,6 +289,7 @@ impl CompositorState {
             return false;
         };
         let generation = self.next_render_generation_value();
+        self.apply_committed_window_geometry(surface_id, window_geometry);
         let Some(existing) = self
             .renderable_surfaces
             .iter_mut()
@@ -341,7 +366,52 @@ impl CompositorState {
             journal_size.height,
         );
         self.set_render_generation(generation, RenderGenerationCause::SurfaceDamage);
+        let root_surface_id = self.root_surface_id_for_surface(surface_id);
+        if self
+            .toplevel_visual_geometries
+            .contains_key(&root_surface_id)
+        {
+            self.update_toplevel_visual_render_assignment(root_surface_id);
+        }
         true
+    }
+
+    pub(in crate::compositor) fn apply_committed_window_geometry(
+        &mut self,
+        surface_id: u32,
+        window_geometry: Option<XdgWindowGeometry>,
+    ) -> bool {
+        let Some(window_geometry) = window_geometry else {
+            return false;
+        };
+        let changed = self
+            .surface_window_geometries
+            .insert(surface_id, window_geometry)
+            != Some(window_geometry);
+        self.update_popup_surface_placement_from_committed_state(surface_id);
+        if let Some(positioner) = self
+            .popup_surfaces
+            .get(&surface_id)
+            .map(|popup| popup.positioner)
+            && positioner.reactive
+            && self.configured_xdg_surfaces.contains(&surface_id)
+        {
+            self.configure_popup_surface(surface_id, positioner, None);
+        }
+        let child_popups = self
+            .popup_surfaces
+            .iter()
+            .filter_map(|(popup_surface_id, popup)| {
+                (popup.parent_surface_id == Some(surface_id)
+                    && popup.positioner.reactive
+                    && self.configured_xdg_surfaces.contains(popup_surface_id))
+                .then_some((*popup_surface_id, popup.positioner))
+            })
+            .collect::<Vec<_>>();
+        for (popup_surface_id, positioner) in child_popups {
+            self.configure_popup_surface(popup_surface_id, positioner, None);
+        }
+        changed
     }
 
     pub(in crate::compositor) fn commit_surface_request_with_captured_sync(
@@ -353,6 +423,7 @@ impl CompositorState {
         damage: RenderableSurfaceDamage,
         frame_callbacks: Vec<wl_callback::WlCallback>,
         explicit_sync: Option<CapturedExplicitSyncState>,
+        window_geometry: Option<XdgWindowGeometry>,
     ) {
         pending.commit_sequence = commit_sequence;
         if !self.is_cursor_surface(surface_id) {
@@ -371,8 +442,15 @@ impl CompositorState {
                 AcquireWatchCancelReason::Superseded,
             ));
             callbacks.extend(frame_callbacks);
-            self.finalize_pending_buffer_resize_capture(surface_id, &mut pending);
-            self.commit_surface_buffer_by_role(surface_id, pending, damage, callbacks, source);
+            self.finalize_pending_buffer_resize_capture(surface_id, &mut pending, window_geometry);
+            self.commit_surface_buffer_by_role(
+                surface_id,
+                pending,
+                damage,
+                callbacks,
+                source,
+                window_geometry,
+            );
             return;
         };
 
@@ -417,8 +495,15 @@ impl CompositorState {
                 AcquireWatchCancelReason::Superseded,
             ));
             callbacks.extend(frame_callbacks);
-            self.finalize_pending_buffer_resize_capture(surface_id, &mut pending);
-            self.commit_surface_buffer_by_role(surface_id, pending, damage, callbacks, source);
+            self.finalize_pending_buffer_resize_capture(surface_id, &mut pending, window_geometry);
+            self.commit_surface_buffer_by_role(
+                surface_id,
+                pending,
+                damage,
+                callbacks,
+                source,
+                window_geometry,
+            );
             return;
         }
 
@@ -431,7 +516,7 @@ impl CompositorState {
         };
         let mut callbacks = self.retain_oldest_pending_acquire_for_surface(surface_id);
         callbacks.extend(frame_callbacks);
-        self.finalize_pending_buffer_resize_capture(surface_id, &mut pending);
+        self.finalize_pending_buffer_resize_capture(surface_id, &mut pending, window_geometry);
         let buffer_id = pending.resource.id().protocol_id();
         let received_at = Instant::now();
         self.pending_explicit_sync_commits
@@ -441,6 +526,7 @@ impl CompositorState {
                 commit_sequence,
                 pending,
                 damage,
+                window_geometry,
                 frame_callbacks: callbacks,
                 acquire: acquire.clone(),
                 acquire_state: PendingAcquireState::RegistrationPending,
@@ -499,6 +585,7 @@ impl CompositorState {
             buffer_scale,
             resize_commit: captured_resize_commit,
             resize_capture_finalized,
+            window_geometry,
         } = state;
         let _ = commit_sequence;
         if let Some(sync_state) = explicit_sync {
@@ -540,12 +627,22 @@ impl CompositorState {
             self.capture_acked_resize_for_surface_commit(surface_id)
         };
         if let Some(snapshot) = resize_commit.as_mut() {
-            let committed_size = surface_size
-                .or_else(|| self.current_committed_surface_content_size(surface_id))
-                .map(|size| (size.width, size.height));
-            if let Some((width, height)) = committed_size {
-                *snapshot = snapshot.with_committed_size(width, height);
+            if let Some(window_geometry) = window_geometry {
+                *snapshot = snapshot.with_committed_window_geometry(window_geometry);
             }
+            let committed_size = window_geometry
+                .or_else(|| self.surface_window_geometries.get(&surface_id).copied())
+                .map(|geometry| BufferSize {
+                    width: geometry.width as u32,
+                    height: geometry.height as u32,
+                })
+                .or(surface_size)
+                .or_else(|| self.current_committed_surface_content_size(surface_id))
+                .unwrap_or(BufferSize {
+                    width: 1,
+                    height: 1,
+                });
+            *snapshot = snapshot.with_committed_size(committed_size.width, committed_size.height);
         }
         let viewport_size_changed = surface_size.is_some_and(|surface_size| {
             self.renderable_surfaces
@@ -555,10 +652,21 @@ impl CompositorState {
                     surface.width != surface_size.width || surface.height != surface_size.height
                 })
         });
-        if let Some(damage) =
-            damage.or(viewport_size_changed.then_some(RenderableSurfaceDamage::Full))
+        if let Some(damage) = damage
+            .or(viewport_size_changed.then_some(RenderableSurfaceDamage::Full))
+            .or(window_geometry
+                .is_some()
+                .then_some(RenderableSurfaceDamage::Full))
         {
-            self.commit_surface_damage_only(surface_id, damage, surface_size, buffer_scale);
+            self.commit_surface_damage_only(
+                surface_id,
+                damage,
+                surface_size,
+                buffer_scale,
+                window_geometry,
+            );
+        } else {
+            self.apply_committed_window_geometry(surface_id, window_geometry);
         }
         if let Some(resize_commit) = resize_commit {
             self.complete_pending_resize_from_current_geometry(surface_id, resize_commit);
@@ -572,8 +680,17 @@ impl CompositorState {
         resize: ResizeCommitSnapshot,
     ) -> bool {
         let committed_size = resize
-            .committed_size
-            .map(|(width, height)| BufferSize { width, height })
+            .committed_window_geometry
+            .or_else(|| self.surface_window_geometries.get(&surface_id).copied())
+            .map(|geometry| BufferSize {
+                width: geometry.width as u32,
+                height: geometry.height as u32,
+            })
+            .or_else(|| {
+                resize
+                    .committed_size
+                    .map(|(width, height)| BufferSize { width, height })
+            })
             .or_else(|| self.current_committed_surface_content_size(surface_id));
         let Some(committed_size) = committed_size else {
             return false;
@@ -798,8 +915,6 @@ impl CompositorState {
                 }
             }
         }
-        self.pending_window_geometry_commits
-            .retain(|surface_id| !surface_ids.contains(surface_id));
         let before_previews = self.active_toplevel_resizes.len();
         self.active_toplevel_resizes
             .retain(|surface_id, _| !surface_ids.contains(surface_id));
@@ -907,6 +1022,7 @@ impl CompositorState {
         damage: RenderableSurfaceDamage,
         frame_callbacks: Vec<wl_callback::WlCallback>,
         source: SurfacePublicationSource,
+        window_geometry: Option<XdgWindowGeometry>,
     ) {
         if self.is_cursor_surface(surface_id) {
             self.commit_cursor_surface_buffer(surface_id, pending, damage, frame_callbacks);
@@ -915,7 +1031,13 @@ impl CompositorState {
             let buffer_id = pending.data.buffer_id();
             match self.surface_publication_decision(surface_id, commit_sequence) {
                 SurfacePublicationDecision::Publish => {
-                    self.commit_surface_buffer(surface_id, pending, damage, source);
+                    self.commit_surface_buffer(
+                        surface_id,
+                        pending,
+                        damage,
+                        window_geometry,
+                        source,
+                    );
                     self.pending_frame_callbacks.extend(frame_callbacks);
                 }
                 decision => {

@@ -3,12 +3,10 @@ use std::{collections::VecDeque, time::Instant};
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 use wayland_server::{WEnum, protocol::wl_surface};
 
-use super::{SurfacePlacement, render};
+use super::{SurfacePlacement, XdgWindowGeometry, render};
 
 const MIN_WINDOW_WIDTH: u32 = 160;
 const MIN_WINDOW_HEIGHT: u32 = 120;
-const MAX_OUTSTANDING_RESIZE_CONFIGURES: usize = 16;
-const MAX_RETAINED_RESIZE_CONFIGURES: usize = 16;
 const WINDOW_FRAME_RESIZE_THICKNESS: f64 = render::SERVER_FRAME_BORDER_THICKNESS as f64;
 const WINDOW_RESIZE_DRAG_THRESHOLD: i32 = 3;
 
@@ -167,6 +165,7 @@ pub(super) struct ResizeCommitSnapshot {
     pub(super) resizing: bool,
     pub(super) emitted_at: Instant,
     pub(super) committed_size: Option<(u32, u32)>,
+    pub(super) committed_window_geometry: Option<XdgWindowGeometry>,
     pub(super) buffer_id: Option<u64>,
     pub(super) interaction_id: ResizeInteractionId,
 }
@@ -189,6 +188,14 @@ impl ResizeCommitSnapshot {
 
     pub(super) const fn with_committed_size(mut self, width: u32, height: u32) -> Self {
         self.committed_size = Some((width, height));
+        self
+    }
+
+    pub(super) const fn with_committed_window_geometry(
+        mut self,
+        window_geometry: XdgWindowGeometry,
+    ) -> Self {
+        self.committed_window_geometry = Some(window_geometry);
         self
     }
 
@@ -281,9 +288,7 @@ impl ResizeConfigureFlow {
     }
 
     pub(super) fn take_sendable(&mut self) -> Option<PendingResizeConfigure> {
-        if self.outstanding.len() >= MAX_OUTSTANDING_RESIZE_CONFIGURES
-            || self.retained_in_flight_configure_count() >= MAX_RETAINED_RESIZE_CONFIGURES
-        {
+        if self.in_flight_configure_count() > 0 {
             return None;
         }
         self.queued_latest
@@ -297,9 +302,7 @@ impl ResizeConfigureFlow {
         serial: u32,
         sequence: u64,
     ) {
-        if self.outstanding.len() >= MAX_OUTSTANDING_RESIZE_CONFIGURES
-            || self.retained_in_flight_configure_count() >= MAX_RETAINED_RESIZE_CONFIGURES
-        {
+        if self.in_flight_configure_count() > 0 {
             return;
         }
         self.outstanding.push_back(SentResizeConfigure {
@@ -364,7 +367,6 @@ impl ResizeConfigureFlow {
         Some(snapshot)
     }
 
-    #[cfg(test)]
     pub(super) fn complete_applied(&mut self, sequence: u64) -> bool {
         let Some(index) = self
             .captured
@@ -422,6 +424,10 @@ impl ResizeConfigureFlow {
         self.captured.len()
     }
 
+    pub(super) fn in_flight_configure_count(&self) -> usize {
+        self.outstanding.len() + usize::from(self.acked_uncaptured.is_some()) + self.captured.len()
+    }
+
     pub(super) fn has_acked_uncaptured(&self) -> bool {
         self.acked_uncaptured.is_some()
     }
@@ -431,12 +437,11 @@ impl ResizeConfigureFlow {
     }
 
     pub(super) fn has_in_flight(&self) -> bool {
-        !self.outstanding.is_empty() || self.acked_uncaptured.is_some() || !self.captured.is_empty()
+        self.in_flight_configure_count() > 0
     }
 
     pub(super) fn has_sendable(&self) -> bool {
-        self.outstanding.len() < MAX_OUTSTANDING_RESIZE_CONFIGURES
-            && self.retained_in_flight_configure_count() < MAX_RETAINED_RESIZE_CONFIGURES
+        self.in_flight_configure_count() == 0
             && (self.final_pending.is_some() || self.queued_latest.is_some())
     }
 
@@ -458,7 +463,7 @@ impl ResizeConfigureFlow {
     }
 
     fn retained_in_flight_configure_count(&self) -> usize {
-        self.outstanding.len() + self.captured.len()
+        self.in_flight_configure_count()
     }
 
     fn sent_or_acked_matches(&self, desired: PendingResizeConfigure) -> bool {
@@ -467,7 +472,14 @@ impl ResizeConfigureFlow {
                 && sent.resizing == desired.resizing
                 && sent.interaction_id == desired.interaction_id
         };
-        self.outstanding.iter().any(matches) || self.acked_uncaptured.as_ref().is_some_and(matches)
+        let captured_matches = |snapshot: &ResizeCommitSnapshot| {
+            snapshot.resize_commit() == desired.resize_commit(snapshot.serial)
+                && snapshot.resizing == desired.resizing
+                && snapshot.interaction_id == desired.interaction_id
+        };
+        self.outstanding.iter().any(matches)
+            || self.acked_uncaptured.as_ref().is_some_and(matches)
+            || self.captured.iter().any(captured_matches)
     }
 }
 
@@ -486,6 +498,7 @@ fn snapshot_from_sent_resize(
         resizing: sent.resizing,
         emitted_at: sent.emitted_at,
         committed_size: None,
+        committed_window_geometry: None,
         buffer_id: None,
         interaction_id: sent.interaction_id,
     }
@@ -771,69 +784,75 @@ mod tests {
     }
 
     #[test]
-    fn resize_flow_sends_newest_configure_without_waiting_for_prior_commit() {
+    fn resize_flow_does_not_send_newest_configure_before_prior_commit() {
         let mut flow = ResizeConfigureFlow::default();
         flow.queue(desired_resize(1000, true));
         let first = flow.take_sendable().expect("first configure");
         flow.mark_sent(first, 308, 1);
         flow.queue(desired_resize(1200, true));
 
-        let second = flow.take_sendable().expect("second configure");
-
-        assert_eq!(second.width, 1200);
-        assert_eq!(flow.retained_configure_count(), 1);
+        assert!(flow.take_sendable().is_none());
+        assert_eq!(flow.queued_latest().map(|resize| resize.width), Some(1200));
+        assert_eq!(flow.in_flight_configure_count(), 1);
     }
 
     #[test]
-    fn resize_flow_ack_coalesces_older_outstanding_configures() {
+    fn resize_flow_keeps_at_most_one_sent_configure_in_flight() {
         let mut flow = ResizeConfigureFlow::default();
-        for (serial, sequence, width) in [(308, 1, 1000), (309, 2, 1100), (310, 3, 1200)] {
-            let desired = desired_resize(width, true);
-            flow.mark_sent(desired, serial, sequence);
-        }
+        flow.mark_sent(desired_resize(1000, true), 308, 1);
+        flow.mark_sent(desired_resize(1100, true), 309, 2);
+        flow.mark_sent(desired_resize(1200, true), 310, 3);
 
+        assert_eq!(flow.in_flight_configure_count(), 1);
+        assert_eq!(flow.in_flight_serial(), Some(308));
         assert_eq!(flow.ack(310), ResizeAckDecision::Matched);
-        let snapshot = flow.capture(77).expect("newest ACKed configure");
-
-        assert_eq!(snapshot.serial, 310);
-        assert_eq!(snapshot.width, 1200);
-        assert_eq!(flow.retained_configure_count(), 1);
+        let snapshot = flow.capture(77).expect("only sent configure is ACKed");
+        assert_eq!(snapshot.serial, 308);
     }
 
     #[test]
-    fn resize_flow_retains_latest_target_when_outstanding_ledger_is_full() {
+    fn resize_flow_sends_newest_target_after_prior_commit_applies() {
         let mut flow = ResizeConfigureFlow::default();
-        for index in 0..MAX_OUTSTANDING_RESIZE_CONFIGURES {
-            let desired = desired_resize(1000 + u32::try_from(index).unwrap(), true);
-            flow.mark_sent(
-                desired,
-                300 + u32::try_from(index).unwrap(),
-                index as u64 + 1,
-            );
-        }
+        flow.mark_sent(desired_resize(1000, true), 308, 1);
+        flow.queue(desired_resize(1100, true));
+        flow.queue(desired_resize(1200, true));
+        assert_eq!(flow.ack(308), ResizeAckDecision::Matched);
+        let snapshot = flow.capture(77).expect("ACKed configure");
+
+        assert!(flow.take_sendable().is_none());
+        assert!(flow.complete_applied(snapshot.sequence));
+        let next = flow.take_sendable().expect("latest queued target");
+        assert_eq!(next.width, 1200);
+    }
+
+    #[test]
+    fn resize_flow_retains_latest_target_while_single_configure_is_in_flight() {
+        let mut flow = ResizeConfigureFlow::default();
+        flow.mark_sent(desired_resize(1000, true), 300, 1);
         flow.queue(desired_resize(2000, true));
 
         assert!(flow.take_sendable().is_none());
         assert_eq!(flow.queued_latest().map(|resize| resize.width), Some(2000));
 
-        assert_eq!(flow.ack(315), ResizeAckDecision::Matched);
+        assert_eq!(flow.ack(300), ResizeAckDecision::Matched);
+        let snapshot = flow.capture(77).expect("ACKed configure");
+        assert!(flow.complete_applied(snapshot.sequence));
         let next = flow.take_sendable().expect("latest retained target");
         assert_eq!(next.width, 2000);
     }
 
     #[test]
-    fn resize_flow_newer_ack_replaces_uncaptured_older_ack() {
+    fn resize_flow_duplicate_or_future_ack_does_not_replace_uncaptured_ack() {
         let mut flow = ResizeConfigureFlow::default();
-        for (serial, sequence, width) in [(308, 1, 1000), (309, 2, 1100), (310, 3, 1200)] {
-            flow.mark_sent(desired_resize(width, true), serial, sequence);
-        }
+        flow.mark_sent(desired_resize(1000, true), 308, 1);
 
-        assert_eq!(flow.ack(309), ResizeAckDecision::Matched);
-        assert_eq!(flow.ack(310), ResizeAckDecision::Matched);
-        let snapshot = flow.capture(77).expect("newer ACK supersedes older ACK");
+        assert_eq!(flow.ack(308), ResizeAckDecision::Matched);
+        assert_eq!(flow.ack(308), ResizeAckDecision::Duplicate);
+        assert_eq!(flow.ack(310), ResizeAckDecision::Unknown);
+        let snapshot = flow.capture(77).expect("original ACK survives");
 
-        assert_eq!(snapshot.serial, 310);
-        assert_eq!(snapshot.width, 1200);
+        assert_eq!(snapshot.serial, 308);
+        assert_eq!(snapshot.width, 1000);
     }
 
     #[test]
@@ -843,36 +862,42 @@ mod tests {
         assert_eq!(flow.ack(308), ResizeAckDecision::Matched);
         let capture_a = flow.capture(90).expect("capture A");
 
-        flow.mark_sent(desired_resize(1100, true), 309, 2);
-        flow.mark_sent(desired_resize(1200, true), 310, 3);
-        assert_eq!(flow.ack(310), ResizeAckDecision::Matched);
+        flow.queue(desired_resize(1100, true));
+        flow.queue(desired_resize(1200, true));
+        assert!(flow.take_sendable().is_none());
 
         assert_eq!(flow.captured_sequences(), vec![capture_a.sequence]);
-        assert_eq!(flow.acked_uncaptured_sequence(), Some(3));
+        assert_eq!(flow.acked_uncaptured_sequence(), None);
+        assert!(flow.complete_applied(capture_a.sequence));
+        let configure_c = flow.take_sendable().expect("latest configure");
+        assert_eq!(configure_c.width, 1200);
+        flow.mark_sent(configure_c, 310, 3);
+        assert_eq!(flow.ack(310), ResizeAckDecision::Matched);
         let capture_c = flow.capture(91).expect("capture C");
         assert_eq!(capture_c.serial, 310);
         assert_eq!(capture_c.sequence, 3);
-        assert_eq!(flow.captured_sequences(), vec![capture_a.sequence, 3]);
+        assert_eq!(flow.captured_sequences(), vec![3]);
         assert_eq!(flow.acked_uncaptured_sequence(), None);
-        assert_eq!(flow.retained_configure_count(), 2);
+        assert_eq!(flow.retained_configure_count(), 1);
     }
 
     #[test]
-    fn task_05_7_multiple_captures_complete_by_exact_sequence() {
+    fn task_05_7_captures_complete_by_exact_sequence() {
         let mut flow = ResizeConfigureFlow::default();
         flow.mark_sent(desired_resize(1000, true), 308, 1);
         assert_eq!(flow.ack(308), ResizeAckDecision::Matched);
         let capture_a = flow.capture(90).expect("capture A");
 
+        flow.queue(desired_resize(1200, true));
+        assert!(flow.take_sendable().is_none());
+        assert!(flow.complete_applied(capture_a.sequence));
         flow.mark_sent(desired_resize(1200, true), 310, 3);
         assert_eq!(flow.ack(310), ResizeAckDecision::Matched);
         let capture_c = flow.capture(91).expect("capture C");
 
         assert!(flow.complete_applied(capture_c.sequence));
-        assert_eq!(flow.captured_sequences(), vec![capture_a.sequence]);
-        assert!(!flow.complete_applied(capture_c.sequence));
-        assert!(flow.complete_applied(capture_a.sequence));
         assert!(flow.captured_sequences().is_empty());
+        assert!(!flow.complete_applied(capture_c.sequence));
         assert!(!flow.complete_applied(capture_a.sequence));
     }
 
@@ -885,13 +910,14 @@ mod tests {
         flow.queue(desired_resize(1400, true));
         flow.queue_final(desired_resize(1500, false));
 
+        assert!(flow.take_sendable().is_none());
+        assert_eq!(flow.ack(308), ResizeAckDecision::Matched);
+        let snapshot = flow.capture(78).expect("ACKed resize snapshot");
+        assert!(flow.complete_applied(snapshot.sequence));
         let final_resize = flow.take_sendable().expect("final configure");
         assert_eq!(final_resize.width, 1500);
         assert!(!final_resize.resizing);
         flow.mark_sent(final_resize, 309, 2);
-        assert_eq!(flow.ack(308), ResizeAckDecision::Matched);
-        let snapshot = flow.capture(78).expect("ACKed resize snapshot");
-        assert!(flow.complete_applied(snapshot.sequence));
         assert_eq!(flow.in_flight_serial(), Some(309));
     }
 
@@ -905,11 +931,12 @@ mod tests {
         let transaction_a = flow.capture(90).expect("transaction A");
         flow.queue(desired_resize(1400, true));
 
+        assert!(flow.take_sendable().is_none());
+        assert!(flow.complete_applied(transaction_a.sequence));
         let second = flow.take_sendable().expect("configure B");
         assert_eq!(second.width, 1400);
         flow.mark_sent(second, 309, 2);
         assert_eq!(flow.in_flight_serial(), Some(309));
-        assert!(flow.complete_applied(transaction_a.sequence));
         assert_eq!(flow.in_flight_serial(), Some(309));
     }
 

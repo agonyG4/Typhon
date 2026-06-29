@@ -34,7 +34,7 @@ pub(in crate::compositor) fn empty_cached_subsurface_commit() -> CachedSubsurfac
         presentation_feedbacks: Vec::new(),
         resize_commit: None,
         resize_capture_finalized: true,
-        window_geometry_changed: false,
+        window_geometry: None,
         cached_at: Instant::now(),
     }
 }

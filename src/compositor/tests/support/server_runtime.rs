@@ -110,6 +110,8 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureRenderGenerationCause(Sender<RenderGenerationCause>),
     CaptureRenderableSurfaceCount(Sender<usize>),
     CaptureRenderableSurfaceSnapshot(Sender<Vec<RenderableSurfaceSnapshot>>),
+    CaptureCommittedWindowGeometry(Sender<Option<XdgWindowGeometry>>),
+    CaptureToplevelVisualGeometry(Sender<Option<ToplevelVisualGeometrySnapshot>>),
     CaptureClientCursorSnapshot(Sender<Option<ClientCursorSnapshot>>),
     CaptureXdgRoleSnapshot {
         surface_id: u32,
@@ -245,6 +247,44 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 })
                                 .collect(),
                         );
+                    }
+                    ServerCommand::CaptureCommittedWindowGeometry(reply) => {
+                        let geometry =
+                            if server.state.toplevel_surfaces.len() == 1 {
+                                server.state.toplevel_surfaces.keys().next().and_then(
+                                    |surface_id| {
+                                        server
+                                            .state
+                                            .surface_window_geometries
+                                            .get(surface_id)
+                                            .copied()
+                                    },
+                                )
+                            } else {
+                                None
+                            };
+                        let _ = reply.send(geometry);
+                    }
+                    ServerCommand::CaptureToplevelVisualGeometry(reply) => {
+                        let visual =
+                            if server.state.toplevel_surfaces.len() == 1 {
+                                server.state.toplevel_surfaces.keys().next().and_then(
+                                    |surface_id| {
+                                        server.state.toplevel_visual_geometries.get(surface_id).map(
+                                            |visual| ToplevelVisualGeometrySnapshot {
+                                                local_x: visual.placement.local_x,
+                                                local_y: visual.placement.local_y,
+                                                width: visual.width,
+                                                height: visual.height,
+                                                active_resize: visual.active_resize.is_some(),
+                                            },
+                                        )
+                                    },
+                                )
+                            } else {
+                                None
+                            };
+                        let _ = reply.send(visual);
                     }
                     ServerCommand::CaptureClientCursorSnapshot(reply) => {
                         let snapshot = server.client_cursor_render_state().map(|cursor| {
@@ -455,6 +495,30 @@ pub(in crate::compositor::tests) fn capture_renderable_surface_snapshot(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report renderable surface snapshot")
+}
+
+pub(in crate::compositor::tests) fn capture_committed_window_geometry(
+    commands: &Sender<ServerCommand>,
+) -> Option<XdgWindowGeometry> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureCommittedWindowGeometry(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report committed window geometry")
+}
+
+pub(in crate::compositor::tests) fn capture_toplevel_visual_geometry(
+    commands: &Sender<ServerCommand>,
+) -> Option<ToplevelVisualGeometrySnapshot> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureToplevelVisualGeometry(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report toplevel visual geometry")
 }
 
 pub(in crate::compositor::tests) fn capture_client_cursor_snapshot(

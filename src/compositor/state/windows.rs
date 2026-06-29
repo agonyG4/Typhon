@@ -85,6 +85,7 @@ impl CompositorState {
         self.unregister_toplevel_surface(surface_id);
         self.unregister_popup_surface(surface_id);
         self.surface_window_geometries.remove(&surface_id);
+        self.pending_surface_window_geometries.remove(&surface_id);
         self.configured_xdg_surfaces.remove(&surface_id);
         self.surface_placements.remove(&surface_id);
         self.popup_grab_stack.retain(|id| *id != surface_id);
@@ -134,6 +135,7 @@ impl CompositorState {
         self.surface_placements.remove(&surface_id);
         self.configured_xdg_surfaces.remove(&surface_id);
         self.surface_window_geometries.remove(&surface_id);
+        self.pending_surface_window_geometries.remove(&surface_id);
         self.clear_resize_state_for_surfaces(&[surface_id]);
         if self
             .focused_surface
@@ -253,36 +255,7 @@ impl CompositorState {
         };
         let geometry = positioner
             .constrained_geometry(self.popup_constraint_target(&popup_surface, positioner));
-        let parent_window_geometry = popup_surface
-            .parent_surface_id
-            .and_then(|surface_id| self.surface_window_geometries.get(&surface_id).copied());
-        let popup_window_geometry = self.surface_window_geometries.get(&surface_id).copied();
-        let local_x = parent_window_geometry
-            .map(|geometry| geometry.x)
-            .unwrap_or_default()
-            .saturating_add(geometry.x)
-            .saturating_sub(
-                popup_window_geometry
-                    .map(|geometry| geometry.x)
-                    .unwrap_or_default(),
-            );
-        let local_y = parent_window_geometry
-            .map(|geometry| geometry.y)
-            .unwrap_or_default()
-            .saturating_add(geometry.y)
-            .saturating_sub(
-                popup_window_geometry
-                    .map(|geometry| geometry.y)
-                    .unwrap_or_default(),
-            );
-        let placement = popup_surface
-            .parent_surface_id
-            .map(|parent_surface_id| {
-                SurfacePlacement::subsurface(parent_surface_id, local_x, local_y)
-            })
-            .unwrap_or_else(|| SurfacePlacement::root_at(local_x, local_y));
-
-        self.store_surface_placement(surface_id, placement);
+        let placement = self.store_popup_surface_placement(surface_id, &popup_surface, geometry);
         if let Some(token) = reposition_token {
             let _ = popup_surface
                 .popup
@@ -320,6 +293,73 @@ impl CompositorState {
             );
         }
         true
+    }
+
+    pub(in crate::compositor) fn update_popup_surface_placement_from_committed_state(
+        &mut self,
+        surface_id: u32,
+    ) -> bool {
+        let Some(popup_surface) = self.popup_surfaces.get(&surface_id).cloned() else {
+            return false;
+        };
+        let geometry = popup_surface.positioner.constrained_geometry(
+            self.popup_constraint_target(&popup_surface, popup_surface.positioner),
+        );
+        self.store_popup_surface_placement(surface_id, &popup_surface, geometry);
+        true
+    }
+
+    fn store_popup_surface_placement(
+        &mut self,
+        surface_id: u32,
+        popup_surface: &PopupSurface,
+        geometry: PopupRect,
+    ) -> SurfacePlacement {
+        let parent_window_geometry = popup_surface.parent_surface_id.and_then(|surface_id| {
+            self.surface_window_geometries
+                .get(&surface_id)
+                .copied()
+                .or_else(|| {
+                    self.pending_surface_window_geometries
+                        .get(&surface_id)
+                        .copied()
+                })
+        });
+        let popup_window_geometry = self
+            .surface_window_geometries
+            .get(&surface_id)
+            .copied()
+            .or_else(|| {
+                self.pending_surface_window_geometries
+                    .get(&surface_id)
+                    .copied()
+            });
+        let local_x = parent_window_geometry
+            .map(|geometry| geometry.x)
+            .unwrap_or_default()
+            .saturating_add(geometry.x)
+            .saturating_sub(
+                popup_window_geometry
+                    .map(|geometry| geometry.x)
+                    .unwrap_or_default(),
+            );
+        let local_y = parent_window_geometry
+            .map(|geometry| geometry.y)
+            .unwrap_or_default()
+            .saturating_add(geometry.y)
+            .saturating_sub(
+                popup_window_geometry
+                    .map(|geometry| geometry.y)
+                    .unwrap_or_default(),
+            );
+        let placement = popup_surface
+            .parent_surface_id
+            .map(|parent_surface_id| {
+                SurfacePlacement::subsurface(parent_surface_id, local_x, local_y)
+            })
+            .unwrap_or_else(|| SurfacePlacement::root_at(local_x, local_y));
+        self.store_surface_placement(surface_id, placement);
+        placement
     }
 
     pub(in crate::compositor) fn configure_xdg_surface_if_needed(
@@ -1321,6 +1361,7 @@ impl CompositorState {
             visual.width,
             visual.height,
         );
+        let visual_clip = visual.active_resize.is_some().then_some(clip);
         let placements = &self.surface_placements;
         for surface in &mut self.renderable_surfaces {
             if root_surface_id_for_surface_in_placements(placements, surface.surface_id)
@@ -1328,7 +1369,7 @@ impl CompositorState {
             {
                 continue;
             }
-            surface.visual_clip = Some(clip);
+            surface.visual_clip = visual_clip;
             if surface.surface_id == root_surface_id {
                 surface.render_placement = Some(root_render_placement);
             }
@@ -1478,7 +1519,7 @@ impl CompositorState {
             self.resize_flow_metrics.max_in_flight_configures.max(
                 self.resize_configure_flows
                     .get(&surface_id)
-                    .map_or(0, ResizeConfigureFlow::retained_configure_count),
+                    .map_or(0, ResizeConfigureFlow::in_flight_configure_count),
             );
         if compositor_debug_surface_logging_enabled() {
             eprintln!(

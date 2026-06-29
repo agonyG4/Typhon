@@ -1115,7 +1115,11 @@ impl GlesSceneRenderer {
         );
 
         let origins = compositor::surface_origins(surfaces);
-        for (surface, (origin_x, origin_y)) in surfaces.iter().zip(origins) {
+        let render_assignments =
+            compositor::surface_render_space_assignments(surfaces, output_scale);
+        for ((surface, (origin_x, origin_y)), render_assignment) in
+            surfaces.iter().zip(origins).zip(render_assignments)
+        {
             for rect in compositor::server_frame_rects_for_surface(surface) {
                 push_draw_command(
                     &mut self.vertices,
@@ -1137,13 +1141,11 @@ impl GlesSceneRenderer {
                     height,
                 );
             }
-            let visual_target = compositor::SurfaceTargetRect::new(
-                compositor::scale_logical_coordinate(origin_x, output_scale),
-                compositor::scale_logical_coordinate(origin_y, output_scale),
-                compositor::scale_logical_extent(surface.width, output_scale),
-                compositor::scale_logical_extent(surface.height, output_scale),
+            let render_plan = compositor::surface_render_plan_with_clip(
+                surface,
+                render_assignment.target,
+                render_assignment.visual_clip,
             );
-            let render_plan = compositor::surface_render_plan(surface, visual_target);
             let uv = EglUvRect::new(
                 render_plan.content_uv.left,
                 render_plan.content_uv.top,

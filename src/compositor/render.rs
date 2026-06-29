@@ -209,7 +209,15 @@ pub struct RenderSceneElement {
 
 impl RenderSceneElement {
     pub fn from_surface(surface: &RenderableSurface, target: SurfaceTargetRect) -> Self {
-        let plan = surface_render_plan(surface, target);
+        Self::from_surface_with_clip(surface, target, surface.visual_clip)
+    }
+
+    pub fn from_surface_with_clip(
+        surface: &RenderableSurface,
+        target: SurfaceTargetRect,
+        visual_clip: Option<SurfaceTargetRect>,
+    ) -> Self {
+        let plan = surface_render_plan_with_clip(surface, target, visual_clip);
         Self {
             id: RenderSceneElementId::Surface(surface.surface_id),
             kind: RenderSceneElementKind::ClientSurface,
@@ -855,11 +863,17 @@ pub fn render_scene_elements_for_surfaces(
     surfaces: &[RenderableSurface],
     output_scale: f64,
 ) -> Vec<RenderSceneElement> {
-    let targets = surface_target_rects(surfaces, output_scale);
+    let assignments = surface_render_space_assignments(surfaces, output_scale);
     surfaces
         .iter()
-        .zip(targets)
-        .map(|(surface, target)| RenderSceneElement::from_surface(surface, target))
+        .zip(assignments)
+        .map(|(surface, assignment)| {
+            RenderSceneElement::from_surface_with_clip(
+                surface,
+                assignment.target,
+                assignment.visual_clip,
+            )
+        })
         .collect()
 }
 
@@ -882,22 +896,70 @@ fn scene_surface_snapshots_from_elements(
         .collect()
 }
 
-fn surface_target_rects(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceRenderSpaceAssignment {
+    pub target: SurfaceTargetRect,
+    pub visual_clip: Option<SurfaceTargetRect>,
+}
+
+pub fn surface_render_space_assignments(
     surfaces: &[RenderableSurface],
     output_scale: f64,
-) -> Vec<SurfaceTargetRect> {
+) -> Vec<SurfaceRenderSpaceAssignment> {
     let output_scale = normalized_output_scale(output_scale);
     let origins = surface_origins(surfaces);
+    let root_indices = surface_root_indices(surfaces);
     surfaces
         .iter()
-        .zip(origins)
-        .map(|(surface, (origin_x, origin_y))| SurfaceTargetRect {
-            x: scale_logical_coordinate(origin_x, output_scale),
-            y: scale_logical_coordinate(origin_y, output_scale),
-            width: scale_logical_extent(surface.width, output_scale),
-            height: scale_logical_extent(surface.height, output_scale),
+        .enumerate()
+        .zip(origins.iter().copied())
+        .map(|((index, surface), (origin_x, origin_y))| {
+            let root_index = root_indices.get(index).copied().unwrap_or(index);
+            let root = &surfaces[root_index];
+            let root_origin = origins
+                .get(root_index)
+                .copied()
+                .unwrap_or((origin_x, origin_y));
+            let root_placement = root.render_placement.unwrap_or(root.placement);
+            let root_clip_base = (
+                root_origin.0.saturating_sub(root_placement.local_x),
+                root_origin.1.saturating_sub(root_placement.local_y),
+            );
+            SurfaceRenderSpaceAssignment {
+                target: render_space_rect_from_logical(
+                    (origin_x, origin_y),
+                    surface.width,
+                    surface.height,
+                    output_scale,
+                ),
+                visual_clip: surface.visual_clip.map(|clip| {
+                    render_space_rect_from_logical(
+                        (
+                            root_clip_base.0.saturating_add(clip.x()),
+                            root_clip_base.1.saturating_add(clip.y()),
+                        ),
+                        clip.width(),
+                        clip.height(),
+                        output_scale,
+                    )
+                }),
+            }
         })
         .collect()
+}
+
+fn render_space_rect_from_logical(
+    origin: (i32, i32),
+    width: u32,
+    height: u32,
+    output_scale: f64,
+) -> SurfaceTargetRect {
+    SurfaceTargetRect {
+        x: scale_logical_coordinate(origin.0, output_scale),
+        y: scale_logical_coordinate(origin.1, output_scale),
+        width: scale_logical_extent(width, output_scale),
+        height: scale_logical_extent(height, output_scale),
+    }
 }
 
 fn partial_scene_damage_rects(
@@ -1134,13 +1196,21 @@ pub fn surface_render_plan(
     surface: &RenderableSurface,
     visual_target: SurfaceTargetRect,
 ) -> SurfaceRenderPlan {
+    surface_render_plan_with_clip(surface, visual_target, surface.visual_clip)
+}
+
+pub fn surface_render_plan_with_clip(
+    _surface: &RenderableSurface,
+    visual_target: SurfaceTargetRect,
+    visual_clip: Option<SurfaceTargetRect>,
+) -> SurfaceRenderPlan {
     let mut plan = SurfaceRenderPlan {
         visual_target,
         content_target: visual_target,
         content_uv: SurfaceUvRect::FULL,
-        clip: surface.visual_clip,
+        clip: visual_clip,
     };
-    if let Some(clip) = surface.visual_clip {
+    if let Some(clip) = visual_clip {
         plan = clip_surface_render_plan(plan, clip);
     }
     plan
@@ -1340,6 +1410,66 @@ pub fn surface_origins(surfaces: &[RenderableSurface]) -> Vec<(i32, i32)> {
         .enumerate()
         .map(|(index, origin)| origin.unwrap_or_else(|| surface_origin(index, &surfaces[index])))
         .collect()
+}
+
+fn surface_root_indices(surfaces: &[RenderableSurface]) -> Vec<usize> {
+    if surfaces
+        .iter()
+        .all(|surface| surface.placement.parent_surface_id.is_none())
+    {
+        return (0..surfaces.len()).collect();
+    }
+
+    let index_by_id: HashMap<u32, usize> = surfaces
+        .iter()
+        .enumerate()
+        .map(|(index, surface)| (surface.surface_id, index))
+        .collect();
+    let mut roots = vec![None; surfaces.len()];
+    let mut resolving = vec![false; surfaces.len()];
+
+    for index in 0..surfaces.len() {
+        let root =
+            resolve_surface_root_index(index, surfaces, &index_by_id, &mut roots, &mut resolving);
+        roots[index] = Some(root);
+    }
+
+    roots
+        .into_iter()
+        .enumerate()
+        .map(|(index, root)| root.unwrap_or(index))
+        .collect()
+}
+
+fn resolve_surface_root_index(
+    index: usize,
+    surfaces: &[RenderableSurface],
+    index_by_id: &HashMap<u32, usize>,
+    roots: &mut [Option<usize>],
+    resolving: &mut [bool],
+) -> usize {
+    if let Some(root) = roots[index] {
+        return root;
+    }
+    if resolving[index] {
+        return index;
+    }
+
+    resolving[index] = true;
+    let placement = surfaces[index]
+        .render_placement
+        .unwrap_or(surfaces[index].placement);
+    let root = placement
+        .parent_surface_id
+        .and_then(|parent_id| index_by_id.get(&parent_id).copied())
+        .filter(|parent_index| *parent_index != index)
+        .map(|parent_index| {
+            resolve_surface_root_index(parent_index, surfaces, index_by_id, roots, resolving)
+        })
+        .unwrap_or(index);
+    resolving[index] = false;
+    roots[index] = Some(root);
+    root
 }
 
 fn root_surface_ordinals(
@@ -2187,6 +2317,220 @@ mod tests {
     }
 
     #[test]
+    fn active_resize_clip_uses_default_root_render_space_origin() {
+        let surface = RenderableSurface {
+            surface_id: 7,
+            x: 0,
+            y: 0,
+            width: 300,
+            height: 200,
+            placement: SurfacePlacement::root(),
+            render_placement: None,
+            visual_clip: Some(SurfaceTargetRect::new(0, 0, 340, 230)),
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(300, 200, vec![0xffff_0000; 300 * 200]),
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+
+        let element = render_scene_elements_for_surfaces(&[surface], 1.0)
+            .pop()
+            .expect("render element");
+
+        assert_eq!(
+            element.target(),
+            SurfaceTargetRect::new(FIRST_SURFACE_OFFSET.0, FIRST_SURFACE_OFFSET.1, 300, 200)
+        );
+        assert_eq!(
+            element.visible_target(),
+            SurfaceTargetRect::new(FIRST_SURFACE_OFFSET.0, FIRST_SURFACE_OFFSET.1, 300, 200)
+        );
+    }
+
+    #[test]
+    fn active_resize_clip_uses_cascaded_root_render_space_origin() {
+        let first = RenderableSurface {
+            surface_id: 7,
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 80,
+            placement: SurfacePlacement::root(),
+            render_placement: None,
+            visual_clip: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(120, 80, vec![0xffff_0000; 120 * 80]),
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+        let second = RenderableSurface {
+            surface_id: 8,
+            width: 300,
+            height: 200,
+            visual_clip: Some(SurfaceTargetRect::new(0, 0, 340, 230)),
+            buffer: shm_buffer(300, 200, vec![0xffff_0000; 300 * 200]),
+            ..first.clone()
+        };
+
+        let elements = render_scene_elements_for_surfaces(&[first, second], 1.0);
+        let second = &elements[1];
+        let origin = (
+            FIRST_SURFACE_OFFSET.0 + SURFACE_CASCADE_STEP,
+            FIRST_SURFACE_OFFSET.1 + SURFACE_CASCADE_STEP,
+        );
+
+        assert_eq!(
+            second.visible_target(),
+            SurfaceTargetRect::new(origin.0, origin.1, 300, 200)
+        );
+    }
+
+    #[test]
+    fn active_resize_clip_preserves_csd_window_geometry_offset() {
+        let surface = RenderableSurface {
+            surface_id: 7,
+            x: 0,
+            y: 0,
+            width: 372,
+            height: 272,
+            placement: SurfacePlacement::root(),
+            render_placement: Some(SurfacePlacement::root_at(-16, -10)),
+            visual_clip: Some(SurfaceTargetRect::new(0, 0, 340, 230)),
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(372, 272, vec![0xffff_0000; 372 * 272]),
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+
+        let element = render_scene_elements_for_surfaces(&[surface], 1.0)
+            .pop()
+            .expect("render element");
+
+        assert_eq!(
+            element.target(),
+            SurfaceTargetRect::new(
+                FIRST_SURFACE_OFFSET.0 - 16,
+                FIRST_SURFACE_OFFSET.1 - 10,
+                372,
+                272
+            )
+        );
+        assert_eq!(
+            element.visible_target(),
+            SurfaceTargetRect::new(FIRST_SURFACE_OFFSET.0, FIRST_SURFACE_OFFSET.1, 340, 230)
+        );
+    }
+
+    #[test]
+    fn active_resize_clip_uses_same_output_scale_rounding_as_target() {
+        let surface = RenderableSurface {
+            surface_id: 7,
+            x: 1,
+            y: 1,
+            width: 301,
+            height: 201,
+            placement: SurfacePlacement::root_at(1, 1),
+            render_placement: None,
+            visual_clip: Some(SurfaceTargetRect::new(1, 1, 301, 201)),
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(301, 201, vec![0xffff_0000; 301 * 201]),
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+
+        let element = render_scene_elements_for_surfaces(&[surface], 1.25)
+            .pop()
+            .expect("render element");
+
+        assert_eq!(element.visible_target(), element.target());
+    }
+
+    #[test]
+    fn active_resize_clip_keeps_all_resize_edges_in_render_space() {
+        for clip in [
+            SurfaceTargetRect::new(0, 0, 260, 200),
+            SurfaceTargetRect::new(40, 0, 260, 200),
+            SurfaceTargetRect::new(0, 30, 300, 170),
+            SurfaceTargetRect::new(40, 30, 260, 170),
+            SurfaceTargetRect::new(0, 0, 300, 170),
+        ] {
+            let surface = RenderableSurface {
+                surface_id: 7,
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 200,
+                placement: SurfacePlacement::root(),
+                render_placement: None,
+                visual_clip: Some(clip),
+                generation: 1,
+                commit_sequence: SurfaceCommitSequence::initial(),
+                buffer: shm_buffer(300, 200, vec![0xffff_0000; 300 * 200]),
+                damage: crate::compositor::RenderableSurfaceDamage::full(),
+            };
+
+            let element = render_scene_elements_for_surfaces(&[surface], 1.0)
+                .pop()
+                .expect("render element");
+
+            assert_eq!(
+                element.visible_target(),
+                SurfaceTargetRect::new(
+                    FIRST_SURFACE_OFFSET.0 + clip.x(),
+                    FIRST_SURFACE_OFFSET.1 + clip.y(),
+                    clip.width(),
+                    clip.height()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn active_resize_clip_applies_to_subsurface_in_root_render_space() {
+        let root = RenderableSurface {
+            surface_id: 7,
+            x: 0,
+            y: 0,
+            width: 300,
+            height: 200,
+            placement: SurfacePlacement::root(),
+            render_placement: None,
+            visual_clip: Some(SurfaceTargetRect::new(0, 0, 320, 220)),
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(300, 200, vec![0xffff_0000; 300 * 200]),
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+        let child = RenderableSurface {
+            surface_id: 8,
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 30,
+            placement: SurfacePlacement::subsurface(7, 260, 20),
+            render_placement: None,
+            visual_clip: Some(SurfaceTargetRect::new(0, 0, 280, 220)),
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(40, 30, vec![0xffff_0000; 40 * 30]),
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+
+        let elements = render_scene_elements_for_surfaces(&[root, child], 1.0);
+        let child = &elements[1];
+
+        assert_eq!(
+            child.visible_target(),
+            SurfaceTargetRect::new(
+                FIRST_SURFACE_OFFSET.0 + 260,
+                FIRST_SURFACE_OFFSET.1 + 20,
+                20,
+                30
+            )
+        );
+    }
+
+    #[test]
     fn task_05_8_scene_snapshot_tracks_visual_clip_changes() {
         let previous = RenderableSurface {
             surface_id: 7,
@@ -2196,24 +2540,14 @@ mod tests {
             height: 700,
             placement: SurfacePlacement::root(),
             render_placement: None,
-            visual_clip: Some(SurfaceTargetRect::new(
-                FIRST_SURFACE_OFFSET.0,
-                FIRST_SURFACE_OFFSET.1,
-                1000,
-                700,
-            )),
+            visual_clip: Some(SurfaceTargetRect::new(0, 0, 1000, 700)),
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(1000, 700, vec![0xffff_0000; 1000 * 700]),
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
         let mut current = previous.clone();
-        current.visual_clip = Some(SurfaceTargetRect::new(
-            FIRST_SURFACE_OFFSET.0,
-            FIRST_SURFACE_OFFSET.1,
-            800,
-            600,
-        ));
+        current.visual_clip = Some(SurfaceTargetRect::new(0, 0, 800, 600));
         current.generation = 2;
 
         let previous_snapshot = scene_surface_snapshots(std::slice::from_ref(&previous), 1.0);

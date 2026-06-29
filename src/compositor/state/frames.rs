@@ -510,6 +510,7 @@ impl CompositorState {
                             commit.surface_id,
                             snapshot,
                             &commit.pending,
+                            commit.window_geometry,
                         )
                     })
                     .map(Box::new);
@@ -520,6 +521,7 @@ impl CompositorState {
                 commit.damage,
                 callbacks,
                 SurfacePublicationSource::ExplicitSync,
+                commit.window_geometry,
             );
         }
         self.commit_ready_surface_tree_transactions();
