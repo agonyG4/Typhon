@@ -1,4 +1,5 @@
 use super::*;
+use crate::native_output::runtime::NativeFrameRequest;
 use oblivion_one::compositor::{
     DesktopVisualState, RenderableSurfaceDamage, SurfaceCommitSequence, SurfaceDamageRect,
     SurfacePlacement, compose_nested_output, render_scene_elements_for_surfaces, surface_origins,
@@ -18,4 +19,7 @@ fn test_buffer_identity() -> BufferIdentity {
         .expect("test buffer identity")
 }
 
-mod all;
+mod frame;
+mod input;
+mod output;
+mod scanout;

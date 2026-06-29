@@ -168,6 +168,29 @@ eventfds, and one `CLOCK_MONOTONIC` timerfd. Dynamic sources use
 slot-plus-generation tokens rather than numeric fds, so queued stale events
 cannot resolve to a reused slot or fd.
 
+The native output implementation is physically organized under
+`src/native_output/`:
+
+```text
+input/       native input backend selection, event translation, routing, state
+output/      discovery, target selection, cursor, damage, sysfs helpers
+scanout/     native-egl-gbm, gbm-cpu-write, and dumb-framebuffer backends
+runtime/     NativeRuntime owner, bootstrap, cycle, frame, presentation phases
+tests/       connected native white-box tests by output/input/scanout/frame
+```
+
+`NativeRuntime` is the native backend owner. It holds the compositor server,
+DRM/KMS device and backend, selected target and timing metadata, scanout
+backend, frame renderer, input state/backend, cursor policy/backend,
+explicit-sync acquire notifier and watch registry, event loop, frame scheduler,
+startup-launch state, runtime metrics, resize metrics, and pointer-constraint
+backend. `NativeRuntime::bootstrap` performs the real native startup sequence:
+host-display guard, KMS device discovery, seat/session probe, DRM backend open,
+syncobj and presentation clock setup, mode/output selection, scanout backend
+creation, initial paint, KMS backend initialization, cursor setup, input backend
+open, event-loop registration, scheduler setup, acquire-watch setup, optional
+startup launch, then ownership transfer into the steady native cycle.
+
 Native explicit-sync imports use a close-on-exec duplicate of the active DRM
 file description. An unsignaled acquire point receives an exact compositor
 commit ID and registers `DRM_IOCTL_SYNCOBJ_EVENTFD` for signal completion.
@@ -176,14 +199,30 @@ that commit becomes renderable. Unsupported ioctl implementations use one
 absolute retry deadline only while fallback points remain blocked;
 eventfd-backed watches are never included in fallback scans.
 
-Each native cycle drains pageflip metadata, dispatches Wayland, routes input,
-applies acquire-watch changes, prepares eligible state, and reevaluates
-scheduling. An acquire ready while a pageflip is pending is not promoted into
-the outstanding frame's callback or release batch. The scheduler owns
-visual/protocol work, pageflip state, absolute refresh deadlines, and the
-pageflip watchdog. A timer cannot invent acquire readiness or presentation
-completion; asynchronous completion requires a matching DRM flip-complete
-event.
+Each native cycle is split into visible runtime phases. `run` loops over
+`run_cycle`; the cycle waits for event-loop wakeups and drains DRM pageflip
+metadata, dispatches Wayland and input, processes acquire-watch readiness,
+prepares eligible state, renders and presents, updates metrics, handles launch
+state, and arms the next scheduler/acquire deadline. An acquire ready while a
+pageflip is pending is not promoted into the outstanding frame's callback or
+release batch. The scheduler owns visual/protocol work, pageflip state,
+absolute refresh deadlines, and the pageflip watchdog. A timer cannot invent
+acquire readiness or presentation completion; asynchronous completion requires a
+matching DRM flip-complete event.
+
+The compositor state implementation is split under `src/compositor/state/` as
+real Rust child modules with inherent `impl CompositorState` blocks. Child
+modules use restricted visibility for state-internal collaboration, while
+protocol-facing behavior continues to flow through `CompositorState` and
+`OwnCompositorServer`. Temporary crate-level lint suppressions are not part of
+the state boundary contract.
+
+Compositor white-box tests are connected through `src/compositor/tests/mod.rs`.
+Shared Wayland client setup, registry binding, server commands, output helpers,
+input clients, subsurface helpers, and frame/buffer helpers live in
+`src/compositor/tests/support/`. Behavioral test groups live in named modules
+such as `protocol_buffers`, `subsurface`, `surface_frames`, `windows`, `xdg`,
+and `input_output`.
 
 Native display programming has explicit atomic and legacy backends under
 `src/native/kms/`. `OBLIVION_ONE_KMS_MODE=auto` probes
@@ -411,9 +450,9 @@ protocol events/errors. `src/compositor/state/` contains the mechanically split
 `CompositorState` implementation by domain while preserving the existing state
 model. These are real Rust modules, not `include!()` slices.
 
-`src/native_output/runtime/` now has a `NativeRuntime` configuration/object
-boundary for the native output entry point. The legacy runtime loop body remains
-the next architecture target: split it into bootstrap, input, acquire, frame,
-presentation, metrics, and shutdown phases without changing native ordering.
-See `docs/SOURCE_LAYOUT.md` for the current dependency directions, the
-`include!()` prohibition, and file-size guardrails.
+`src/native_output/runtime/` has a `NativeRuntime` object boundary for the
+native output entry point. Backend startup, event wait/drain, input routing,
+acquire readiness, frame scheduling, presentation, launch bookkeeping, and
+metrics are split across runtime modules while preserving native ordering. See
+`docs/SOURCE_LAYOUT.md` for the current dependency directions, the `include!()`
+prohibition, connected test-module checks, and file-size guardrails.

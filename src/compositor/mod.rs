@@ -546,7 +546,7 @@ pub struct CompositorState {
 }
 
 #[derive(Debug, Clone)]
-struct ActiveLockedPointerRouting {
+pub(in crate::compositor) struct ActiveLockedPointerRouting {
     constraint_id: u64,
     generation: u64,
     pointer: wl_pointer::WlPointer,
@@ -557,7 +557,7 @@ struct ActiveLockedPointerRouting {
 }
 
 #[derive(Debug, Clone)]
-struct ActiveConfinedPointerRouting {
+pub(in crate::compositor) struct ActiveConfinedPointerRouting {
     constraint_id: u64,
     generation: u64,
     pointer: wl_pointer::WlPointer,
@@ -615,7 +615,7 @@ struct PointerConstraint {
 }
 
 #[derive(Debug, Clone)]
-struct PointerConstraintRegistration {
+pub(in crate::compositor) struct PointerConstraintRegistration {
     id: u64,
     mode: PointerConstraintMode,
     lifetime: PointerConstraintLifetime,

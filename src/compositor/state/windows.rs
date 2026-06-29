@@ -1,7 +1,7 @@
 use super::*;
 
 impl CompositorState {
-    pub(crate) fn register_toplevel_surface(
+    pub(in crate::compositor) fn register_toplevel_surface(
         &mut self,
         surface: wl_surface::WlSurface,
         xdg_surface: xdg_surface::XdgSurface,
@@ -31,7 +31,7 @@ impl CompositorState {
         self.focus_surface(surface);
     }
 
-    pub(crate) fn register_popup_surface(
+    pub(in crate::compositor) fn register_popup_surface(
         &mut self,
         surface: wl_surface::WlSurface,
         parent: Option<wl_surface::WlSurface>,
@@ -61,7 +61,7 @@ impl CompositorState {
         self.note_xdg_popup_created();
     }
 
-    pub(crate) fn unregister_toplevel_surface(&mut self, surface_id: u32) {
+    pub(in crate::compositor) fn unregister_toplevel_surface(&mut self, surface_id: u32) {
         self.unmap_xdg_role_surfaces(surface_id);
         self.toplevel_surfaces.remove(&surface_id);
         self.surface_placements.remove(&surface_id);
@@ -70,7 +70,7 @@ impl CompositorState {
         self.clear_resize_state_for_surfaces(&[surface_id]);
     }
 
-    pub(crate) fn unregister_xdg_surface_role(&mut self, surface_id: u32) {
+    pub(in crate::compositor) fn unregister_xdg_surface_role(&mut self, surface_id: u32) {
         let child_popup_ids = self
             .popup_surfaces
             .iter()
@@ -93,7 +93,7 @@ impl CompositorState {
         self.clear_resize_state_for_surfaces(&[surface_id]);
     }
 
-    pub(crate) fn grab_popup_surface(
+    pub(in crate::compositor) fn grab_popup_surface(
         &mut self,
         surface: &wl_surface::WlSurface,
         seat: &wl_seat::WlSeat,
@@ -114,7 +114,7 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn unregister_popup_surface(&mut self, surface_id: u32) {
+    pub(in crate::compositor) fn unregister_popup_surface(&mut self, surface_id: u32) {
         let parent_surface_id = self
             .popup_surfaces
             .get(&surface_id)
@@ -158,7 +158,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn dismiss_popup_surface(&mut self, surface_id: u32) -> bool {
+    pub(in crate::compositor) fn dismiss_popup_surface(&mut self, surface_id: u32) -> bool {
         let child_popup_ids = self
             .popup_surfaces
             .iter()
@@ -178,7 +178,7 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn popup_grab_to_dismiss_for_pointer_target(
+    pub(in crate::compositor) fn popup_grab_to_dismiss_for_pointer_target(
         &self,
         target: Option<&PointerTarget>,
     ) -> Option<u32> {
@@ -193,7 +193,10 @@ impl CompositorState {
         Some(popup_surface_id)
     }
 
-    pub(crate) fn pointer_target_allowed_by_popup_grab(&self, target: &PointerTarget) -> bool {
+    pub(in crate::compositor) fn pointer_target_allowed_by_popup_grab(
+        &self,
+        target: &PointerTarget,
+    ) -> bool {
         let Some(popup_surface_id) = self.topmost_popup_grab_surface_id() else {
             return true;
         };
@@ -201,7 +204,7 @@ impl CompositorState {
         self.surface_is_descendant_of(target_surface_id, popup_surface_id)
     }
 
-    pub(crate) fn topmost_popup_grab_surface_id(&self) -> Option<u32> {
+    pub(in crate::compositor) fn topmost_popup_grab_surface_id(&self) -> Option<u32> {
         self.popup_grab_stack
             .iter()
             .rev()
@@ -209,7 +212,7 @@ impl CompositorState {
             .find(|surface_id| self.popup_surfaces.contains_key(surface_id))
     }
 
-    pub(crate) fn surface_is_descendant_of(
+    pub(in crate::compositor) fn surface_is_descendant_of(
         &self,
         surface_id: u32,
         ancestor_surface_id: u32,
@@ -236,7 +239,7 @@ impl CompositorState {
         false
     }
 
-    pub(crate) fn configure_popup_surface(
+    pub(in crate::compositor) fn configure_popup_surface(
         &mut self,
         surface_id: u32,
         positioner: XdgPositionerState,
@@ -319,7 +322,10 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn configure_xdg_surface_if_needed(&mut self, surface_id: u32) -> bool {
+    pub(in crate::compositor) fn configure_xdg_surface_if_needed(
+        &mut self,
+        surface_id: u32,
+    ) -> bool {
         if self.configured_xdg_surfaces.contains(&surface_id) {
             return false;
         }
@@ -365,7 +371,7 @@ impl CompositorState {
         false
     }
 
-    pub(crate) fn popup_constraint_target(
+    pub(in crate::compositor) fn popup_constraint_target(
         &self,
         popup_surface: &PopupSurface,
         positioner: XdgPositionerState,
@@ -397,11 +403,11 @@ impl CompositorState {
         )
     }
 
-    pub(crate) fn begin_window_move_at(&mut self, x: f64, y: f64) -> bool {
+    pub(in crate::compositor) fn begin_window_move_at(&mut self, x: f64, y: f64) -> bool {
         self.begin_window_interaction_at(x, y, WindowInteractionKind::Move)
     }
 
-    pub(crate) fn begin_window_resize_at(&mut self, x: f64, y: f64) -> bool {
+    pub(in crate::compositor) fn begin_window_resize_at(&mut self, x: f64, y: f64) -> bool {
         let Some(surface_id) = self.surface_id_at(x, y) else {
             self.window_interaction = None;
             return false;
@@ -426,14 +432,14 @@ impl CompositorState {
         )
     }
 
-    pub(crate) fn begin_window_frame_action_at(&mut self, x: f64, y: f64) -> bool {
+    pub(in crate::compositor) fn begin_window_frame_action_at(&mut self, x: f64, y: f64) -> bool {
         let Some(hit) = self.window_frame_hit_at(x, y) else {
             return false;
         };
         self.begin_window_interaction_for_root(hit.root_surface_id, x, y, hit.kind)
     }
 
-    pub(crate) fn begin_window_interaction_at(
+    pub(in crate::compositor) fn begin_window_interaction_at(
         &mut self,
         x: f64,
         y: f64,
@@ -447,7 +453,7 @@ impl CompositorState {
         self.begin_window_interaction_for_root(root_surface_id, x, y, kind)
     }
 
-    pub(crate) fn begin_client_window_move(
+    pub(in crate::compositor) fn begin_client_window_move(
         &mut self,
         surface: &wl_surface::WlSurface,
         serial: u32,
@@ -460,7 +466,7 @@ impl CompositorState {
         self.begin_window_interaction_for_root(root_surface_id, x, y, WindowInteractionKind::Move)
     }
 
-    pub(crate) fn begin_client_window_resize(
+    pub(in crate::compositor) fn begin_client_window_resize(
         &mut self,
         surface: &wl_surface::WlSurface,
         serial: u32,
@@ -479,7 +485,7 @@ impl CompositorState {
         )
     }
 
-    pub(crate) fn begin_window_interaction_for_root(
+    pub(in crate::compositor) fn begin_window_interaction_for_root(
         &mut self,
         root_surface_id: u32,
         x: f64,
@@ -564,12 +570,12 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn allocate_resize_interaction_id(&mut self) -> ResizeInteractionId {
+    pub(in crate::compositor) fn allocate_resize_interaction_id(&mut self) -> ResizeInteractionId {
         self.next_resize_interaction_id = self.next_resize_interaction_id.saturating_add(1);
         ResizeInteractionId::new(self.next_resize_interaction_id.max(1))
     }
 
-    pub(crate) fn valid_pointer_press_for_surface(
+    pub(in crate::compositor) fn valid_pointer_press_for_surface(
         &self,
         root_surface_id: u32,
         surface: &wl_surface::WlSurface,
@@ -581,7 +587,11 @@ impl CompositorState {
         (press.serial == serial && valid_surface).then_some((press.output_x, press.output_y))
     }
 
-    pub(crate) fn window_frame_hit_at(&mut self, x: f64, y: f64) -> Option<WindowFrameHit> {
+    pub(in crate::compositor) fn window_frame_hit_at(
+        &mut self,
+        x: f64,
+        y: f64,
+    ) -> Option<WindowFrameHit> {
         if let Some(hit) = self.root_surface_hit_at(x, y) {
             let kind = window_frame_action_for_local_point(
                 hit.local_x,
@@ -598,7 +608,7 @@ impl CompositorState {
         None
     }
 
-    pub(crate) fn update_window_interaction(&mut self, x: f64, y: f64) -> bool {
+    pub(in crate::compositor) fn update_window_interaction(&mut self, x: f64, y: f64) -> bool {
         let Some(mut interaction) = self.window_interaction else {
             return false;
         };
@@ -661,7 +671,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn end_window_interaction(&mut self) {
+    pub(in crate::compositor) fn end_window_interaction(&mut self) {
         let interaction = self.window_interaction;
         if let Some(interaction) = interaction
             && interaction.drag_committed
@@ -679,7 +689,7 @@ impl CompositorState {
         self.window_interaction = None;
     }
 
-    pub(crate) fn apply_pending_interactive_resize_update(&mut self) -> bool {
+    pub(in crate::compositor) fn apply_pending_interactive_resize_update(&mut self) -> bool {
         let Some(update) = self.pending_interactive_resize_update.take() else {
             return false;
         };
@@ -705,11 +715,15 @@ impl CompositorState {
         applied
     }
 
-    pub(crate) fn window_interaction_active(&self) -> bool {
+    pub(in crate::compositor) fn window_interaction_active(&self) -> bool {
         self.window_interaction.is_some()
     }
 
-    pub(crate) fn resize_focused_window_to(&mut self, width: u32, height: u32) -> bool {
+    pub(in crate::compositor) fn resize_focused_window_to(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> bool {
         let Some(surface_id) = self.focused_surface.as_ref().map(compositor_surface_id) else {
             return false;
         };
@@ -717,14 +731,14 @@ impl CompositorState {
         self.resize_root_window_to(root_surface_id, width, height)
     }
 
-    pub(crate) fn minimize_focused_window(&mut self) -> bool {
+    pub(in crate::compositor) fn minimize_focused_window(&mut self) -> bool {
         let Some(surface_id) = self.focused_root_surface_id() else {
             return false;
         };
         self.minimize_root_window(surface_id)
     }
 
-    pub(crate) fn restore_next_minimized_window(&mut self) -> bool {
+    pub(in crate::compositor) fn restore_next_minimized_window(&mut self) -> bool {
         let Some(surface_id) = self
             .toplevel_surfaces
             .iter()
@@ -738,7 +752,7 @@ impl CompositorState {
         self.restore_minimized_root_window(surface_id)
     }
 
-    pub(crate) fn activate_root_window(&mut self, surface_id: u32) -> bool {
+    pub(in crate::compositor) fn activate_root_window(&mut self, surface_id: u32) -> bool {
         if !self.toplevel_surfaces.contains_key(&surface_id) {
             return false;
         }
@@ -760,21 +774,21 @@ impl CompositorState {
         focused || raised
     }
 
-    pub(crate) fn toggle_maximize_focused_window(&mut self) -> bool {
+    pub(in crate::compositor) fn toggle_maximize_focused_window(&mut self) -> bool {
         let Some(surface_id) = self.focused_root_surface_id() else {
             return false;
         };
         self.toggle_root_window_mode(surface_id, ToplevelMode::Maximized)
     }
 
-    pub(crate) fn toggle_fullscreen_focused_window(&mut self) -> bool {
+    pub(in crate::compositor) fn toggle_fullscreen_focused_window(&mut self) -> bool {
         let Some(surface_id) = self.focused_root_surface_id() else {
             return false;
         };
         self.toggle_root_window_mode(surface_id, ToplevelMode::Fullscreen)
     }
 
-    pub(crate) fn minimize_root_window(&mut self, surface_id: u32) -> bool {
+    pub(in crate::compositor) fn minimize_root_window(&mut self, surface_id: u32) -> bool {
         if !self.toplevel_surfaces.contains_key(&surface_id)
             || self
                 .toplevel_surfaces
@@ -820,7 +834,7 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn restore_minimized_root_window(&mut self, surface_id: u32) -> bool {
+    pub(in crate::compositor) fn restore_minimized_root_window(&mut self, surface_id: u32) -> bool {
         let Some(minimized_surfaces) = self
             .toplevel_surfaces
             .get_mut(&surface_id)
@@ -837,7 +851,11 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn toggle_root_window_mode(&mut self, surface_id: u32, mode: ToplevelMode) -> bool {
+    pub(in crate::compositor) fn toggle_root_window_mode(
+        &mut self,
+        surface_id: u32,
+        mode: ToplevelMode,
+    ) -> bool {
         let Some(current_mode) = self
             .toplevel_surfaces
             .get(&surface_id)
@@ -853,7 +871,11 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn set_root_window_mode(&mut self, surface_id: u32, mode: ToplevelMode) -> bool {
+    pub(in crate::compositor) fn set_root_window_mode(
+        &mut self,
+        surface_id: u32,
+        mode: ToplevelMode,
+    ) -> bool {
         if !self.toplevel_surfaces.contains_key(&surface_id) {
             return false;
         }
@@ -895,7 +917,7 @@ impl CompositorState {
         configured
     }
 
-    pub(crate) fn restore_floating_root_window(&mut self, surface_id: u32) -> bool {
+    pub(in crate::compositor) fn restore_floating_root_window(&mut self, surface_id: u32) -> bool {
         self.clear_resize_state_for_surfaces(&[surface_id]);
         let Some(restore_geometry) = self.toplevel_surfaces.get_mut(&surface_id).map(|toplevel| {
             toplevel.window.set_mode(ToplevelMode::Floating);
@@ -923,13 +945,16 @@ impl CompositorState {
         configured
     }
 
-    pub(crate) fn focused_root_surface_id(&self) -> Option<u32> {
+    pub(in crate::compositor) fn focused_root_surface_id(&self) -> Option<u32> {
         self.focused_surface
             .as_ref()
             .map(|surface| self.root_surface_id_for_surface(compositor_surface_id(surface)))
     }
 
-    pub(crate) fn current_root_window_geometry(&self, surface_id: u32) -> Option<WindowGeometry> {
+    pub(in crate::compositor) fn current_root_window_geometry(
+        &self,
+        surface_id: u32,
+    ) -> Option<WindowGeometry> {
         let surface = self
             .renderable_surfaces
             .iter()
@@ -951,7 +976,7 @@ impl CompositorState {
         ))
     }
 
-    pub(crate) fn current_visual_root_window_geometry(
+    pub(in crate::compositor) fn current_visual_root_window_geometry(
         &self,
         surface_id: u32,
     ) -> Option<WindowGeometry> {
@@ -974,7 +999,10 @@ impl CompositorState {
         Some(WindowGeometry::new(surface.placement, width, height))
     }
 
-    pub(crate) fn xdg_window_geometry_size(&self, surface_id: u32) -> Option<(u32, u32)> {
+    pub(in crate::compositor) fn xdg_window_geometry_size(
+        &self,
+        surface_id: u32,
+    ) -> Option<(u32, u32)> {
         let geometry = self.surface_window_geometries.get(&surface_id)?;
         Some((
             u32::try_from(geometry.width).ok()?,
@@ -982,7 +1010,7 @@ impl CompositorState {
         ))
     }
 
-    pub(crate) fn focus_topmost_renderable_toplevel(&mut self) -> bool {
+    pub(in crate::compositor) fn focus_topmost_renderable_toplevel(&mut self) -> bool {
         let Some(surface_id) = self.renderable_surfaces.iter().rev().find_map(|surface| {
             let root_surface_id = self.root_surface_id_for_surface(surface.surface_id);
             self.toplevel_surfaces
@@ -998,7 +1026,7 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn raise_root_window(&mut self, surface_id: u32) -> bool {
+    pub(in crate::compositor) fn raise_root_window(&mut self, surface_id: u32) -> bool {
         let surface_placements = &self.surface_placements;
         let mut raised_surfaces = Vec::new();
         let mut lower_surfaces = Vec::with_capacity(self.renderable_surfaces.len());
@@ -1021,7 +1049,7 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn shell_dock_items(&self) -> Vec<ShellDockItem> {
+    pub(in crate::compositor) fn shell_dock_items(&self) -> Vec<ShellDockItem> {
         let focused_root_surface_id = self.focused_root_surface_id();
         let mut surface_ids = self
             .renderable_surfaces
@@ -1055,7 +1083,7 @@ impl CompositorState {
             .collect()
     }
 
-    pub(crate) fn resize_root_window_to(
+    pub(in crate::compositor) fn resize_root_window_to(
         &mut self,
         surface_id: u32,
         width: u32,
@@ -1064,7 +1092,7 @@ impl CompositorState {
         self.send_resize_root_window_to(surface_id, width, height)
     }
 
-    pub(crate) fn queue_resize_root_window_to(
+    pub(in crate::compositor) fn queue_resize_root_window_to(
         &mut self,
         surface_id: u32,
         width: u32,
@@ -1129,7 +1157,7 @@ impl CompositorState {
         )
     }
 
-    pub(crate) fn clamp_resize_geometry(
+    pub(in crate::compositor) fn clamp_resize_geometry(
         &self,
         surface_id: u32,
         geometry: WindowGeometry,
@@ -1156,7 +1184,7 @@ impl CompositorState {
         WindowGeometry::new(placement, width, height)
     }
 
-    pub(crate) fn clamp_toplevel_width(&self, surface_id: u32, width: u32) -> u32 {
+    pub(in crate::compositor) fn clamp_toplevel_width(&self, surface_id: u32, width: u32) -> u32 {
         let constraints = self.toplevel_constraints(surface_id);
         let min_width = constraints.min_width.unwrap_or(MIN_WINDOW_WIDTH);
         let mut clamped = width.max(min_width);
@@ -1166,7 +1194,7 @@ impl CompositorState {
         clamped
     }
 
-    pub(crate) fn clamp_toplevel_height(&self, surface_id: u32, height: u32) -> u32 {
+    pub(in crate::compositor) fn clamp_toplevel_height(&self, surface_id: u32, height: u32) -> u32 {
         let constraints = self.toplevel_constraints(surface_id);
         let min_height = constraints.min_height.unwrap_or(MIN_WINDOW_HEIGHT);
         let mut clamped = height.max(min_height);
@@ -1176,14 +1204,17 @@ impl CompositorState {
         clamped
     }
 
-    pub(crate) fn toplevel_constraints(&self, surface_id: u32) -> ToplevelSizeConstraints {
+    pub(in crate::compositor) fn toplevel_constraints(
+        &self,
+        surface_id: u32,
+    ) -> ToplevelSizeConstraints {
         self.toplevel_surfaces
             .get(&surface_id)
             .map(|toplevel| toplevel.constraints)
             .unwrap_or_default()
     }
 
-    pub(crate) fn preview_resize_root_window_to(
+    pub(in crate::compositor) fn preview_resize_root_window_to(
         &mut self,
         surface_id: u32,
         width: u32,
@@ -1263,7 +1294,10 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn update_toplevel_visual_render_assignment(&mut self, root_surface_id: u32) {
+    pub(in crate::compositor) fn update_toplevel_visual_render_assignment(
+        &mut self,
+        root_surface_id: u32,
+    ) {
         let Some(visual) = self
             .toplevel_visual_geometries
             .get(&root_surface_id)
@@ -1302,7 +1336,10 @@ impl CompositorState {
         self.invalidate_surface_origin_cache();
     }
 
-    pub(crate) fn clear_toplevel_visual_render_assignment(&mut self, root_surface_id: u32) {
+    pub(in crate::compositor) fn clear_toplevel_visual_render_assignment(
+        &mut self,
+        root_surface_id: u32,
+    ) {
         let placements = &self.surface_placements;
         for surface in &mut self.renderable_surfaces {
             if root_surface_id_for_surface_in_placements(placements, surface.surface_id)
@@ -1315,7 +1352,7 @@ impl CompositorState {
         self.invalidate_surface_origin_cache();
     }
 
-    pub(crate) fn flush_pending_resize_configure(&mut self) -> bool {
+    pub(in crate::compositor) fn flush_pending_resize_configure(&mut self) -> bool {
         let surface_ids = self
             .resize_configure_flows
             .iter()
@@ -1334,7 +1371,7 @@ impl CompositorState {
         sent
     }
 
-    pub(crate) fn send_resize_end_configure(
+    pub(in crate::compositor) fn send_resize_end_configure(
         &mut self,
         surface_id: u32,
         edges: ResizeEdges,
@@ -1384,13 +1421,16 @@ impl CompositorState {
         self.flush_pending_resize_configure()
     }
 
-    pub(crate) fn pending_resize_configure_is_flushable(&self) -> bool {
+    pub(in crate::compositor) fn pending_resize_configure_is_flushable(&self) -> bool {
         self.resize_configure_flows
             .values()
             .any(ResizeConfigureFlow::has_sendable)
     }
 
-    pub(crate) fn send_resize_configure(&mut self, desired: PendingResizeConfigure) -> bool {
+    pub(in crate::compositor) fn send_resize_configure(
+        &mut self,
+        desired: PendingResizeConfigure,
+    ) -> bool {
         let surface_id = desired.surface_id;
         let geometry = self.clamp_resize_geometry(
             surface_id,

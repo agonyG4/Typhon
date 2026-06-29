@@ -222,6 +222,7 @@ pub(super) struct ResizeConfigureFlow {
     active_interaction: Option<ResizeInteractionId>,
     outstanding: VecDeque<SentResizeConfigure>,
     acked_uncaptured: Option<SentResizeConfigure>,
+    captured: VecDeque<ResizeCommitSnapshot>,
     queued_latest: Option<PendingResizeConfigure>,
     final_pending: Option<PendingResizeConfigure>,
 }
@@ -358,18 +359,34 @@ impl ResizeConfigureFlow {
         if !sent.acknowledged {
             return None;
         }
-        Some(snapshot_from_sent_resize(sent, commit_sequence))
+        let snapshot = snapshot_from_sent_resize(sent, commit_sequence);
+        self.captured.push_back(snapshot);
+        Some(snapshot)
     }
 
     #[cfg(test)]
     pub(super) fn complete_applied(&mut self, sequence: u64) -> bool {
-        let _ = sequence;
-        false
+        let Some(index) = self
+            .captured
+            .iter()
+            .position(|snapshot| snapshot.sequence == sequence)
+        else {
+            return false;
+        };
+        self.captured.remove(index);
+        true
     }
 
     pub(super) fn release_capture(&mut self, commit_sequence: u64) -> bool {
-        let _ = commit_sequence;
-        false
+        let Some(index) = self
+            .captured
+            .iter()
+            .position(|snapshot| snapshot.commit_sequence == commit_sequence)
+        else {
+            return false;
+        };
+        self.captured.remove(index);
+        true
     }
 
     pub(super) fn in_flight_serial(&self) -> Option<u32> {
@@ -395,11 +412,14 @@ impl ResizeConfigureFlow {
 
     #[cfg(test)]
     pub(super) fn captured_sequences(&self) -> Vec<u64> {
-        Vec::new()
+        self.captured
+            .iter()
+            .map(|snapshot| snapshot.sequence)
+            .collect()
     }
 
     pub(super) fn captured_count(&self) -> usize {
-        0
+        self.captured.len()
     }
 
     pub(super) fn has_acked_uncaptured(&self) -> bool {
@@ -411,7 +431,7 @@ impl ResizeConfigureFlow {
     }
 
     pub(super) fn has_in_flight(&self) -> bool {
-        !self.outstanding.is_empty() || self.acked_uncaptured.is_some()
+        !self.outstanding.is_empty() || self.acked_uncaptured.is_some() || !self.captured.is_empty()
     }
 
     pub(super) fn has_sendable(&self) -> bool {
@@ -438,7 +458,7 @@ impl ResizeConfigureFlow {
     }
 
     fn retained_in_flight_configure_count(&self) -> usize {
-        self.outstanding.len()
+        self.outstanding.len() + self.captured.len()
     }
 
     fn sent_or_acked_matches(&self, desired: PendingResizeConfigure) -> bool {

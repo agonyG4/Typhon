@@ -1,7 +1,7 @@
 use super::*;
 
 impl CompositorState {
-    pub(crate) fn add_idle_inhibitor(
+    pub(in crate::compositor) fn add_idle_inhibitor(
         &mut self,
         inhibitor: zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
     ) {
@@ -9,7 +9,7 @@ impl CompositorState {
         self.idle_manager.inhibit();
     }
 
-    pub(crate) fn remove_idle_inhibitor(
+    pub(in crate::compositor) fn remove_idle_inhibitor(
         &mut self,
         inhibitor: &zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
     ) {
@@ -31,7 +31,7 @@ impl CompositorState {
         self.idle_manager.is_inhibited()
     }
 
-    pub(crate) fn add_relative_pointer_resource(
+    pub(in crate::compositor) fn add_relative_pointer_resource(
         &mut self,
         pointer: zwp_relative_pointer_v1::ZwpRelativePointerV1,
         source_pointer: wl_pointer::WlPointer,
@@ -49,7 +49,7 @@ impl CompositorState {
             });
     }
 
-    pub(crate) fn remove_relative_pointer_resource(
+    pub(in crate::compositor) fn remove_relative_pointer_resource(
         &mut self,
         pointer: &zwp_relative_pointer_v1::ZwpRelativePointerV1,
     ) {
@@ -62,7 +62,7 @@ impl CompositorState {
             .retain(|resource| !same_wayland_resource(&resource.resource, pointer));
     }
 
-    pub(crate) fn send_relative_pointer_motion(
+    pub(in crate::compositor) fn send_relative_pointer_motion(
         &mut self,
         timestamp_usec: u64,
         motion: RelativePointerMotion,
@@ -104,7 +104,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn dispatch_locked_relative_pointer_motion(
+    pub(in crate::compositor) fn dispatch_locked_relative_pointer_motion(
         &mut self,
         timestamp_usec: u64,
         motion: RelativePointerMotion,
@@ -294,7 +294,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn dispatch_relative_pointer_motion_to_surface_client(
+    pub(in crate::compositor) fn dispatch_relative_pointer_motion_to_surface_client(
         &mut self,
         timestamp_usec: u64,
         motion: RelativePointerMotion,
@@ -335,7 +335,7 @@ impl CompositorState {
         dispatched_resource_ids.len()
     }
 
-    pub(crate) fn remember_held_pointer_button(&mut self, press: PointerPress) {
+    pub(in crate::compositor) fn remember_held_pointer_button(&mut self, press: PointerPress) {
         if self
             .held_pointer_buttons
             .iter()
@@ -356,7 +356,7 @@ impl CompositorState {
         self.held_pointer_buttons.push(press);
     }
 
-    pub(crate) fn forget_held_pointer_button(&mut self, button: u32) {
+    pub(in crate::compositor) fn forget_held_pointer_button(&mut self, button: u32) {
         let before = self.held_pointer_buttons.len();
         self.held_pointer_buttons
             .retain(|held| held.button != button);
@@ -371,7 +371,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn implicit_pointer_grab_surface(
+    pub(in crate::compositor) fn implicit_pointer_grab_surface(
         &mut self,
         reason: &'static str,
     ) -> Option<wl_surface::WlSurface> {
@@ -388,7 +388,7 @@ impl CompositorState {
         Some(grab.surface)
     }
 
-    pub(crate) fn begin_implicit_pointer_grab(&mut self, press: &PointerPress) {
+    pub(in crate::compositor) fn begin_implicit_pointer_grab(&mut self, press: &PointerPress) {
         if self.implicit_pointer_grab.is_some() {
             return;
         }
@@ -403,7 +403,7 @@ impl CompositorState {
         ));
     }
 
-    pub(crate) fn end_implicit_pointer_grab(&mut self, reason: &'static str) {
+    pub(in crate::compositor) fn end_implicit_pointer_grab(&mut self, reason: &'static str) {
         let Some(grab) = self.implicit_pointer_grab.take() else {
             return;
         };
@@ -414,7 +414,7 @@ impl CompositorState {
         ));
     }
 
-    pub(crate) fn cancel_implicit_pointer_grab_for_surface_ids(
+    pub(in crate::compositor) fn cancel_implicit_pointer_grab_for_surface_ids(
         &mut self,
         surface_ids: &[u32],
         reason: &'static str,
@@ -439,7 +439,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn pointer_target_for_grabbed_surface_at_output(
+    pub(in crate::compositor) fn pointer_target_for_grabbed_surface_at_output(
         &mut self,
         surface: &wl_surface::WlSurface,
         x: f64,
@@ -459,7 +459,11 @@ impl CompositorState {
         })
     }
 
-    pub(crate) fn send_implicit_pointer_grab_motion(&mut self, x: f64, y: f64) -> bool {
+    pub(in crate::compositor) fn send_implicit_pointer_grab_motion(
+        &mut self,
+        x: f64,
+        y: f64,
+    ) -> bool {
         let Some(surface) = self.implicit_pointer_grab_surface("surface-destroyed") else {
             return false;
         };
@@ -493,7 +497,7 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn send_pointer_button(&mut self, button: u32, pressed: bool) {
+    pub(in crate::compositor) fn send_pointer_button(&mut self, button: u32, pressed: bool) {
         if let Some(locked_surface) = self.locked_pointer_input_surface() {
             self.ensure_pointer_focus(&locked_surface);
             if let Some(active) = self.active_locked_pointer_binding() {
@@ -679,7 +683,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn send_pointer_axis(&mut self, horizontal: f64, vertical: f64) {
+    pub(in crate::compositor) fn send_pointer_axis(&mut self, horizontal: f64, vertical: f64) {
         if horizontal == 0.0 && vertical == 0.0 {
             return;
         }

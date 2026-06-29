@@ -1,201 +1,212 @@
+#![allow(unused_imports)]
+use super::super::*;
+use super::{
+    client_setup::*, clipboard_dmabuf::*, frame_buffer_client::*, input_client::*,
+    locked_relative::*, output_bindings::*, server_runtime::*, subsurface_client::*, window_ops::*,
+};
 #[derive(Default)]
-struct RegistryTestState {
-    frame_done: bool,
-    frame_done_time: Option<u32>,
-    keyboard_key: bool,
-    keyboard_key_serial: Option<u32>,
-    keyboard_keys: Vec<u32>,
-    keyboard_keymap: bool,
-    keyboard_keymap_bytes: Vec<u8>,
-    keyboard_keymap_size: u32,
-    keyboard_mods_depressed: Vec<u32>,
-    keyboard_repeat_info: bool,
-    pointer_enter: bool,
-    pointer_enter_count: usize,
-    pointer_leave_count: usize,
-    pointer_enter_serial: Option<u32>,
-    pointer_enter_serials: Vec<(u32, u32)>,
-    pointer_motion: bool,
-    pointer_button: bool,
-    pointer_button_serial: Option<u32>,
-    pointer_enter_surface_id: Option<u32>,
-    pointer_button_surface_id: Option<u32>,
-    pointer_button_surface_ids: Vec<u32>,
-    pointer_axis: bool,
-    pointer_vertical_axis: Option<f64>,
-    pointer_horizontal_axis: Option<f64>,
-    pointer_frame_count: usize,
-    pointer_frame_resource_ids: Vec<u32>,
-    pointer_enter_frame_count: usize,
-    pointer_enter_without_frame_count: usize,
-    pointer_event_log: Vec<&'static str>,
-    pointer_surface_x: Option<f64>,
-    pointer_surface_y: Option<f64>,
-    relative_motion_count: usize,
-    relative_motion_utime: Option<u64>,
-    relative_motion_dx: Option<f64>,
-    relative_motion_dy: Option<f64>,
-    relative_motion_dx_unaccel: Option<f64>,
-    relative_motion_dy_unaccel: Option<f64>,
-    relative_motion_resource_ids: Vec<u32>,
-    sdl_pending_relative_motion_count: usize,
-    sdl_camera_motion_count: usize,
-    locked_count: usize,
-    unlocked_count: usize,
-    confined_count: usize,
-    unconfined_count: usize,
-    parent_surface_id: Option<u32>,
-    child_surface_id: Option<u32>,
-    second_child_surface_id: Option<u32>,
-    keyboard_enter_surface_id: Option<u32>,
-    keyboard_enter_count: usize,
-    keyboard_leave_count: usize,
-    keyboard_event_log: Vec<&'static str>,
-    surface_enter_count: usize,
-    seat_has_keyboard: bool,
-    output_done: bool,
-    output_mode_count: usize,
-    output_scale_count: usize,
-    output_name: bool,
-    output_description: bool,
-    output_width: i32,
-    output_height: i32,
-    output_refresh_millihertz: i32,
-    seat_name: bool,
-    seat_has_pointer: bool,
-    surface_configured: bool,
-    surface_configure_count: usize,
-    surface_configure_serials: Vec<u32>,
-    popup_configured: bool,
-    popup_configure_count: usize,
-    popup_repositioned_token: Option<u32>,
-    popup_x: i32,
-    popup_y: i32,
-    popup_width: i32,
-    popup_height: i32,
-    popup_done: bool,
-    configured_before_initial_commit: bool,
-    configured_after_initial_commit: bool,
-    toplevel_configured: bool,
-    toplevel_configure_count: usize,
-    toplevel_width: i32,
-    toplevel_height: i32,
-    toplevel_states: Vec<u8>,
-    dmabuf_modifier: bool,
-    dmabuf_failed: bool,
-    dmabuf_created: bool,
-    dmabuf_feedback_main_device: bool,
-    dmabuf_feedback_format_table: bool,
-    dmabuf_feedback_format_table_size: u32,
-    dmabuf_feedback_tranche_formats: bool,
-    dmabuf_feedback_done: bool,
-    wl_drm_device: bool,
-    wl_drm_capabilities: bool,
-    wl_drm_format: bool,
-    wl_drm_authenticated: bool,
-    buffer_release_count: usize,
-    presentation_presented_count: usize,
-    presentation_discarded_count: usize,
-    presentation_kind: Option<client_wp_presentation_feedback::Kind>,
-    presentation_clock_id: Option<u32>,
-    presentation_timestamp: Option<(u32, u32, u32)>,
-    presentation_sequence: Option<(u32, u32)>,
-    fractional_preferred_scales: Vec<u32>,
-    data_device_selection_offer: Option<client_wl_data_offer::WlDataOffer>,
-    data_offer_mime_types: Vec<String>,
-    data_source_send_mime_types: Vec<String>,
-    data_source_cancelled: bool,
+pub(in crate::compositor::tests) struct RegistryTestState {
+    pub(in crate::compositor::tests) frame_done: bool,
+    pub(in crate::compositor::tests) frame_done_time: Option<u32>,
+    pub(in crate::compositor::tests) keyboard_key: bool,
+    pub(in crate::compositor::tests) keyboard_key_serial: Option<u32>,
+    pub(in crate::compositor::tests) keyboard_keys: Vec<u32>,
+    pub(in crate::compositor::tests) keyboard_keymap: bool,
+    pub(in crate::compositor::tests) keyboard_keymap_bytes: Vec<u8>,
+    pub(in crate::compositor::tests) keyboard_keymap_size: u32,
+    pub(in crate::compositor::tests) keyboard_mods_depressed: Vec<u32>,
+    pub(in crate::compositor::tests) keyboard_repeat_info: bool,
+    pub(in crate::compositor::tests) pointer_enter: bool,
+    pub(in crate::compositor::tests) pointer_enter_count: usize,
+    pub(in crate::compositor::tests) pointer_leave_count: usize,
+    pub(in crate::compositor::tests) pointer_enter_serial: Option<u32>,
+    pub(in crate::compositor::tests) pointer_enter_serials: Vec<(u32, u32)>,
+    pub(in crate::compositor::tests) pointer_motion: bool,
+    pub(in crate::compositor::tests) pointer_button: bool,
+    pub(in crate::compositor::tests) pointer_button_serial: Option<u32>,
+    pub(in crate::compositor::tests) pointer_enter_surface_id: Option<u32>,
+    pub(in crate::compositor::tests) pointer_button_surface_id: Option<u32>,
+    pub(in crate::compositor::tests) pointer_button_surface_ids: Vec<u32>,
+    pub(in crate::compositor::tests) pointer_axis: bool,
+    pub(in crate::compositor::tests) pointer_vertical_axis: Option<f64>,
+    pub(in crate::compositor::tests) pointer_horizontal_axis: Option<f64>,
+    pub(in crate::compositor::tests) pointer_frame_count: usize,
+    pub(in crate::compositor::tests) pointer_frame_resource_ids: Vec<u32>,
+    pub(in crate::compositor::tests) pointer_enter_frame_count: usize,
+    pub(in crate::compositor::tests) pointer_enter_without_frame_count: usize,
+    pub(in crate::compositor::tests) pointer_event_log: Vec<&'static str>,
+    pub(in crate::compositor::tests) pointer_surface_x: Option<f64>,
+    pub(in crate::compositor::tests) pointer_surface_y: Option<f64>,
+    pub(in crate::compositor::tests) relative_motion_count: usize,
+    pub(in crate::compositor::tests) relative_motion_utime: Option<u64>,
+    pub(in crate::compositor::tests) relative_motion_dx: Option<f64>,
+    pub(in crate::compositor::tests) relative_motion_dy: Option<f64>,
+    pub(in crate::compositor::tests) relative_motion_dx_unaccel: Option<f64>,
+    pub(in crate::compositor::tests) relative_motion_dy_unaccel: Option<f64>,
+    pub(in crate::compositor::tests) relative_motion_resource_ids: Vec<u32>,
+    pub(in crate::compositor::tests) sdl_pending_relative_motion_count: usize,
+    pub(in crate::compositor::tests) sdl_camera_motion_count: usize,
+    pub(in crate::compositor::tests) locked_count: usize,
+    pub(in crate::compositor::tests) unlocked_count: usize,
+    pub(in crate::compositor::tests) confined_count: usize,
+    pub(in crate::compositor::tests) unconfined_count: usize,
+    pub(in crate::compositor::tests) parent_surface_id: Option<u32>,
+    pub(in crate::compositor::tests) child_surface_id: Option<u32>,
+    pub(in crate::compositor::tests) second_child_surface_id: Option<u32>,
+    pub(in crate::compositor::tests) keyboard_enter_surface_id: Option<u32>,
+    pub(in crate::compositor::tests) keyboard_enter_count: usize,
+    pub(in crate::compositor::tests) keyboard_leave_count: usize,
+    pub(in crate::compositor::tests) keyboard_event_log: Vec<&'static str>,
+    pub(in crate::compositor::tests) surface_enter_count: usize,
+    pub(in crate::compositor::tests) seat_has_keyboard: bool,
+    pub(in crate::compositor::tests) output_done: bool,
+    pub(in crate::compositor::tests) output_mode_count: usize,
+    pub(in crate::compositor::tests) output_scale_count: usize,
+    pub(in crate::compositor::tests) output_name: bool,
+    pub(in crate::compositor::tests) output_description: bool,
+    pub(in crate::compositor::tests) output_width: i32,
+    pub(in crate::compositor::tests) output_height: i32,
+    pub(in crate::compositor::tests) output_refresh_millihertz: i32,
+    pub(in crate::compositor::tests) seat_name: bool,
+    pub(in crate::compositor::tests) seat_has_pointer: bool,
+    pub(in crate::compositor::tests) surface_configured: bool,
+    pub(in crate::compositor::tests) surface_configure_count: usize,
+    pub(in crate::compositor::tests) surface_configure_serials: Vec<u32>,
+    pub(in crate::compositor::tests) popup_configured: bool,
+    pub(in crate::compositor::tests) popup_configure_count: usize,
+    pub(in crate::compositor::tests) popup_repositioned_token: Option<u32>,
+    pub(in crate::compositor::tests) popup_x: i32,
+    pub(in crate::compositor::tests) popup_y: i32,
+    pub(in crate::compositor::tests) popup_width: i32,
+    pub(in crate::compositor::tests) popup_height: i32,
+    pub(in crate::compositor::tests) popup_done: bool,
+    pub(in crate::compositor::tests) configured_before_initial_commit: bool,
+    pub(in crate::compositor::tests) configured_after_initial_commit: bool,
+    pub(in crate::compositor::tests) toplevel_configured: bool,
+    pub(in crate::compositor::tests) toplevel_configure_count: usize,
+    pub(in crate::compositor::tests) toplevel_width: i32,
+    pub(in crate::compositor::tests) toplevel_height: i32,
+    pub(in crate::compositor::tests) toplevel_states: Vec<u8>,
+    pub(in crate::compositor::tests) dmabuf_modifier: bool,
+    pub(in crate::compositor::tests) dmabuf_failed: bool,
+    pub(in crate::compositor::tests) dmabuf_created: bool,
+    pub(in crate::compositor::tests) dmabuf_feedback_main_device: bool,
+    pub(in crate::compositor::tests) dmabuf_feedback_format_table: bool,
+    pub(in crate::compositor::tests) dmabuf_feedback_format_table_size: u32,
+    pub(in crate::compositor::tests) dmabuf_feedback_tranche_formats: bool,
+    pub(in crate::compositor::tests) dmabuf_feedback_done: bool,
+    pub(in crate::compositor::tests) wl_drm_device: bool,
+    pub(in crate::compositor::tests) wl_drm_capabilities: bool,
+    pub(in crate::compositor::tests) wl_drm_format: bool,
+    pub(in crate::compositor::tests) wl_drm_authenticated: bool,
+    pub(in crate::compositor::tests) buffer_release_count: usize,
+    pub(in crate::compositor::tests) presentation_presented_count: usize,
+    pub(in crate::compositor::tests) presentation_discarded_count: usize,
+    pub(in crate::compositor::tests) presentation_kind:
+        Option<client_wp_presentation_feedback::Kind>,
+    pub(in crate::compositor::tests) presentation_clock_id: Option<u32>,
+    pub(in crate::compositor::tests) presentation_timestamp: Option<(u32, u32, u32)>,
+    pub(in crate::compositor::tests) presentation_sequence: Option<(u32, u32)>,
+    pub(in crate::compositor::tests) fractional_preferred_scales: Vec<u32>,
+    pub(in crate::compositor::tests) data_device_selection_offer:
+        Option<client_wl_data_offer::WlDataOffer>,
+    pub(in crate::compositor::tests) data_offer_mime_types: Vec<String>,
+    pub(in crate::compositor::tests) data_source_send_mime_types: Vec<String>,
+    pub(in crate::compositor::tests) data_source_cancelled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct XdgRoleSnapshot {
-    surface_registered: bool,
-    configured: bool,
-    toplevel_count: usize,
-    toplevel_registered: bool,
-    popup_count: usize,
-    window_geometry_present: bool,
-    placement: Option<SurfacePlacement>,
+pub(in crate::compositor::tests) struct XdgRoleSnapshot {
+    pub(in crate::compositor::tests) surface_registered: bool,
+    pub(in crate::compositor::tests) configured: bool,
+    pub(in crate::compositor::tests) toplevel_count: usize,
+    pub(in crate::compositor::tests) toplevel_registered: bool,
+    pub(in crate::compositor::tests) popup_count: usize,
+    pub(in crate::compositor::tests) window_geometry_present: bool,
+    pub(in crate::compositor::tests) placement: Option<SurfacePlacement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RenderableSurfaceSnapshot {
-    surface_id: u32,
-    width: u32,
-    height: u32,
-    parent_surface_id: Option<u32>,
-    local_x: i32,
-    local_y: i32,
-    buffer_id: u64,
-    generation: u64,
-    resize_preview_active: bool,
+pub(in crate::compositor::tests) struct RenderableSurfaceSnapshot {
+    pub(in crate::compositor::tests) surface_id: u32,
+    pub(in crate::compositor::tests) width: u32,
+    pub(in crate::compositor::tests) height: u32,
+    pub(in crate::compositor::tests) parent_surface_id: Option<u32>,
+    pub(in crate::compositor::tests) local_x: i32,
+    pub(in crate::compositor::tests) local_y: i32,
+    pub(in crate::compositor::tests) buffer_id: u64,
+    pub(in crate::compositor::tests) generation: u64,
+    pub(in crate::compositor::tests) resize_preview_active: bool,
 }
 
-struct SynchronizedCommitSnapshots {
-    before_parent: Vec<RenderableSurfaceSnapshot>,
-    after_parent: Vec<RenderableSurfaceSnapshot>,
-    before_child_generation: u64,
-    after_child_generation: u64,
-    after_parent_generation: u64,
+pub(in crate::compositor::tests) struct SynchronizedCommitSnapshots {
+    pub(in crate::compositor::tests) before_parent: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) after_parent: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) before_child_generation: u64,
+    pub(in crate::compositor::tests) after_child_generation: u64,
+    pub(in crate::compositor::tests) after_parent_generation: u64,
 }
 
-struct RootBeforeChildSnapshots {
-    after_root: Vec<RenderableSurfaceSnapshot>,
-    after_child_without_parent: Vec<RenderableSurfaceSnapshot>,
-    after_next_parent: Vec<RenderableSurfaceSnapshot>,
+pub(in crate::compositor::tests) struct RootBeforeChildSnapshots {
+    pub(in crate::compositor::tests) after_root: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) after_child_without_parent: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) after_next_parent: Vec<RenderableSurfaceSnapshot>,
 }
 
-struct MultipleSynchronizedCommitSnapshots {
-    before_parent: Vec<RenderableSurfaceSnapshot>,
-    after_parent: Vec<RenderableSurfaceSnapshot>,
-    superseded_buffer_releases: usize,
+pub(in crate::compositor::tests) struct MultipleSynchronizedCommitSnapshots {
+    pub(in crate::compositor::tests) before_parent: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) after_parent: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) superseded_buffer_releases: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ClientCursorSnapshot {
-    surface_id: u32,
-    logical_x: i32,
-    logical_y: i32,
-    width: u32,
-    height: u32,
+pub(in crate::compositor::tests) struct ClientCursorSnapshot {
+    pub(in crate::compositor::tests) surface_id: u32,
+    pub(in crate::compositor::tests) logical_x: i32,
+    pub(in crate::compositor::tests) logical_y: i32,
+    pub(in crate::compositor::tests) width: u32,
+    pub(in crate::compositor::tests) height: u32,
 }
 
 #[derive(Debug)]
-struct CursorSurfaceCommitSnapshot {
-    renderable_count: usize,
-    cursor: Option<ClientCursorSnapshot>,
-    callback_state: Option<(bool, bool)>,
-    cause: RenderGenerationCause,
+pub(in crate::compositor::tests) struct CursorSurfaceCommitSnapshot {
+    pub(in crate::compositor::tests) renderable_count: usize,
+    pub(in crate::compositor::tests) cursor: Option<ClientCursorSnapshot>,
+    pub(in crate::compositor::tests) callback_state: Option<(bool, bool)>,
+    pub(in crate::compositor::tests) cause: RenderGenerationCause,
 }
 
 #[derive(Debug)]
-struct CursorTransitionSnapshots {
-    initial: Option<ClientCursorSnapshot>,
-    hotspot_changed: Option<ClientCursorSnapshot>,
-    hidden: Option<ClientCursorSnapshot>,
-    reselected: Option<ClientCursorSnapshot>,
-    destroyed: Option<ClientCursorSnapshot>,
+pub(in crate::compositor::tests) struct CursorTransitionSnapshots {
+    pub(in crate::compositor::tests) initial: Option<ClientCursorSnapshot>,
+    pub(in crate::compositor::tests) hotspot_changed: Option<ClientCursorSnapshot>,
+    pub(in crate::compositor::tests) hidden: Option<ClientCursorSnapshot>,
+    pub(in crate::compositor::tests) reselected: Option<ClientCursorSnapshot>,
+    pub(in crate::compositor::tests) destroyed: Option<ClientCursorSnapshot>,
 }
 
 #[derive(Debug)]
-struct CompositorOnlyCursorMotionSnapshot {
-    cursor: Option<ClientCursorSnapshot>,
-    visual_changed: bool,
-    render_generation_before: u64,
-    render_generation_after: u64,
-    scene_generation_before: u64,
-    scene_generation_after: u64,
-    cause: RenderGenerationCause,
-    pointer_event_log_before: Vec<&'static str>,
-    pointer_event_log_after: Vec<&'static str>,
-    relative_motion_count_before: usize,
-    relative_motion_count_after: usize,
-    pointer_focus_surface_before: Option<u32>,
-    pointer_focus_surface_after: Option<u32>,
+pub(in crate::compositor::tests) struct CompositorOnlyCursorMotionSnapshot {
+    pub(in crate::compositor::tests) cursor: Option<ClientCursorSnapshot>,
+    pub(in crate::compositor::tests) visual_changed: bool,
+    pub(in crate::compositor::tests) render_generation_before: u64,
+    pub(in crate::compositor::tests) render_generation_after: u64,
+    pub(in crate::compositor::tests) scene_generation_before: u64,
+    pub(in crate::compositor::tests) scene_generation_after: u64,
+    pub(in crate::compositor::tests) cause: RenderGenerationCause,
+    pub(in crate::compositor::tests) pointer_event_log_before: Vec<&'static str>,
+    pub(in crate::compositor::tests) pointer_event_log_after: Vec<&'static str>,
+    pub(in crate::compositor::tests) relative_motion_count_before: usize,
+    pub(in crate::compositor::tests) relative_motion_count_after: usize,
+    pub(in crate::compositor::tests) pointer_focus_surface_before: Option<u32>,
+    pub(in crate::compositor::tests) pointer_focus_surface_after: Option<u32>,
 }
 
 impl RegistryTestState {
-    fn toplevel_has_state(&self, expected: client_xdg_toplevel::State) -> bool {
+    pub(in crate::compositor::tests) fn toplevel_has_state(
+        &self,
+        expected: client_xdg_toplevel::State,
+    ) -> bool {
         let expected = (expected as u32).to_ne_bytes();
         self.toplevel_states
             .chunks_exact(4)
@@ -510,7 +521,11 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                 state.pointer_surface_y = Some(surface_y);
                 state.pointer_event_log.push("motion");
             }
-            client_wl_pointer::Event::Button { serial, state: button_state, .. } => {
+            client_wl_pointer::Event::Button {
+                serial,
+                state: button_state,
+                ..
+            } => {
                 state.pointer_button = true;
                 state.pointer_button_serial = Some(serial);
                 state.pointer_button_surface_id = state.pointer_enter_surface_id;
@@ -604,9 +619,10 @@ impl Dispatch<client_zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for Regi
         } = event
         {
             state.relative_motion_count += 1;
-            state.relative_motion_resource_ids.push(_proxy.id().protocol_id());
-            state.relative_motion_utime =
-                Some((u64::from(utime_hi) << 32) | u64::from(utime_lo));
+            state
+                .relative_motion_resource_ids
+                .push(_proxy.id().protocol_id());
+            state.relative_motion_utime = Some((u64::from(utime_hi) << 32) | u64::from(utime_lo));
             state.relative_motion_dx = Some(dx);
             state.relative_motion_dy = Some(dy);
             state.relative_motion_dx_unaccel = Some(dx_unaccel);
@@ -1106,4 +1122,3 @@ impl Dispatch<client_xdg_popup::XdgPopup, ()> for RegistryTestState {
         }
     }
 }
-

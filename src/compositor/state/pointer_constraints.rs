@@ -2,7 +2,7 @@ use super::*;
 
 impl CompositorState {
     #[cfg(test)]
-    pub(crate) fn activate_pointer_constraint_for_focused_surface(
+    pub(in crate::compositor) fn activate_pointer_constraint_for_focused_surface(
         &mut self,
         mode: PointerConstraintMode,
     ) -> bool {
@@ -14,11 +14,11 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn clear_pointer_constraint(&mut self) {
+    pub(in crate::compositor) fn clear_pointer_constraint(&mut self) {
         self.pointer_constraint.clear();
     }
 
-    pub(crate) fn sync_cursor_visibility_request(&mut self) {
+    pub(in crate::compositor) fn sync_cursor_visibility_request(&mut self) {
         let desired_visible = self.cursor_visibility.desired_visible();
         if self.cursor_visibility.visible == desired_visible {
             return;
@@ -41,15 +41,15 @@ impl CompositorState {
         );
     }
 
-    pub(crate) fn begin_client_dispatch_cycle(&mut self) {
+    pub(in crate::compositor) fn begin_client_dispatch_cycle(&mut self) {
         self.dispatch_epoch = self.dispatch_epoch.saturating_add(1);
     }
 
-    pub(crate) fn finish_client_dispatch_cycle(&mut self) {
+    pub(in crate::compositor) fn finish_client_dispatch_cycle(&mut self) {
         self.finalize_pending_locked_pointer_reveal_after_dispatch();
     }
 
-    pub(crate) fn begin_pending_locked_pointer_reveal(
+    pub(in crate::compositor) fn begin_pending_locked_pointer_reveal(
         &mut self,
         backend_id: PointerConstraintBackendId,
         pointer: wl_pointer::WlPointer,
@@ -74,7 +74,7 @@ impl CompositorState {
         });
     }
 
-    pub(crate) fn cancel_pending_locked_pointer_reveal_for_id(
+    pub(in crate::compositor) fn cancel_pending_locked_pointer_reveal_for_id(
         &mut self,
         id: PointerConstraintBackendId,
         reason: &str,
@@ -92,7 +92,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn cancel_pending_locked_pointer_reveal_for_constraint(
+    pub(in crate::compositor) fn cancel_pending_locked_pointer_reveal_for_constraint(
         &mut self,
         constraint_id: u64,
         reason: &str,
@@ -110,7 +110,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn pending_locked_pointer_reveal_matches(
+    pub(in crate::compositor) fn pending_locked_pointer_reveal_matches(
         &self,
         pointer: &wl_pointer::WlPointer,
         surface: &wl_surface::WlSurface,
@@ -123,7 +123,7 @@ impl CompositorState {
             })
     }
 
-    pub(crate) fn finalize_pending_locked_pointer_reveal(&mut self, reason: &str) {
+    pub(in crate::compositor) fn finalize_pending_locked_pointer_reveal(&mut self, reason: &str) {
         let Some(pending) = self.pending_locked_pointer_reveal.take() else {
             return;
         };
@@ -150,7 +150,7 @@ impl CompositorState {
         self.sync_cursor_visibility_request();
     }
 
-    pub(crate) fn finalize_pending_locked_pointer_reveal_after_dispatch(&mut self) {
+    pub(in crate::compositor) fn finalize_pending_locked_pointer_reveal_after_dispatch(&mut self) {
         let should_finalize = self
             .pending_locked_pointer_reveal
             .as_ref()
@@ -162,7 +162,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn allocate_internal_pointer_constraint_id(&mut self) -> u64 {
+    pub(in crate::compositor) fn allocate_internal_pointer_constraint_id(&mut self) -> u64 {
         self.next_internal_pointer_constraint_id = self
             .next_internal_pointer_constraint_id
             .saturating_add(1)
@@ -170,7 +170,9 @@ impl CompositorState {
         self.next_internal_pointer_constraint_id
     }
 
-    pub(crate) fn active_locked_pointer_binding(&self) -> Option<ActiveLockedPointerRouting> {
+    pub(in crate::compositor) fn active_locked_pointer_binding(
+        &self,
+    ) -> Option<ActiveLockedPointerRouting> {
         let active = self.active_locked_pointer_routing.as_ref()?;
         let constraint = self.pointer_constraints.get(&active.constraint_id)?;
         if constraint.generation != active.generation
@@ -186,11 +188,14 @@ impl CompositorState {
         Some(active.clone())
     }
 
-    pub(crate) fn clear_active_locked_pointer_routing(&mut self) {
+    pub(in crate::compositor) fn clear_active_locked_pointer_routing(&mut self) {
         self.active_locked_pointer_routing = None;
     }
 
-    pub(crate) fn pin_locked_pointer_focus(&mut self, active: &ActiveLockedPointerRouting) {
+    pub(in crate::compositor) fn pin_locked_pointer_focus(
+        &mut self,
+        active: &ActiveLockedPointerRouting,
+    ) {
         self.ensure_pointer_focus(&active.surface);
         if !self.pointer_resource_entered_surface(&active.pointer, &active.surface) {
             let target = PointerTarget {
@@ -202,12 +207,16 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn locked_pointer_input_surface(&self) -> Option<wl_surface::WlSurface> {
+    pub(in crate::compositor) fn locked_pointer_input_surface(
+        &self,
+    ) -> Option<wl_surface::WlSurface> {
         self.active_locked_pointer_binding()
             .map(|active| active.surface)
     }
 
-    pub(crate) fn active_confined_pointer_binding(&self) -> Option<ActiveConfinedPointerRouting> {
+    pub(in crate::compositor) fn active_confined_pointer_binding(
+        &self,
+    ) -> Option<ActiveConfinedPointerRouting> {
         let active = self.active_confined_pointer_routing.as_ref()?;
         let constraint = self.pointer_constraints.get(&active.constraint_id)?;
         if constraint.generation != active.generation
@@ -223,11 +232,14 @@ impl CompositorState {
         Some(active.clone())
     }
 
-    pub(crate) fn clear_active_confined_pointer_routing(&mut self) {
+    pub(in crate::compositor) fn clear_active_confined_pointer_routing(&mut self) {
         self.active_confined_pointer_routing = None;
     }
 
-    pub(crate) fn pin_confined_pointer_focus(&mut self, active: &ActiveConfinedPointerRouting) {
+    pub(in crate::compositor) fn pin_confined_pointer_focus(
+        &mut self,
+        active: &ActiveConfinedPointerRouting,
+    ) {
         if !self
             .pointer_surface
             .as_ref()
@@ -251,7 +263,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn send_confined_pointer_motion(&mut self, x: f64, y: f64) {
+    pub(in crate::compositor) fn send_confined_pointer_motion(&mut self, x: f64, y: f64) {
         let Some(active) = self.active_confined_pointer_binding() else {
             return;
         };
@@ -287,7 +299,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn register_pointer_constraint(
+    pub(in crate::compositor) fn register_pointer_constraint(
         &mut self,
         registration: PointerConstraintRegistration,
     ) -> bool {
@@ -342,7 +354,10 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn maybe_request_pointer_constraint_activation(&mut self, constraint_id: u64) {
+    pub(in crate::compositor) fn maybe_request_pointer_constraint_activation(
+        &mut self,
+        constraint_id: u64,
+    ) {
         let Some((pointer, surface)) =
             self.pointer_constraints
                 .get(&constraint_id)
@@ -455,7 +470,7 @@ impl CompositorState {
             .push(request);
     }
 
-    pub(crate) fn pointer_constraint_activation_anchor(
+    pub(in crate::compositor) fn pointer_constraint_activation_anchor(
         &self,
         constraint_id: u64,
         region: Option<&OutputRegion>,
@@ -488,7 +503,7 @@ impl CompositorState {
         Some(region.closest_point(current))
     }
 
-    pub(crate) fn pointer_constraint_output_region(
+    pub(in crate::compositor) fn pointer_constraint_output_region(
         &mut self,
         constraint_id: u64,
     ) -> Option<OutputRegion> {
@@ -568,7 +583,10 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn pointer_constraint_backend_activated(&mut self, id: PointerConstraintBackendId) {
+    pub(in crate::compositor) fn pointer_constraint_backend_activated(
+        &mut self,
+        id: PointerConstraintBackendId,
+    ) {
         if self.pending_backend_constraint != Some(id) {
             pointer_debug_log(format!(
                 "backend activated stale id={:?} current_active={:?} current_pending={:?}",
@@ -739,7 +757,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn pointer_constraint_backend_activation_current(
+    pub(in crate::compositor) fn pointer_constraint_backend_activation_current(
         &self,
         id: PointerConstraintBackendId,
     ) -> bool {
@@ -755,7 +773,7 @@ impl CompositorState {
                 })
     }
 
-    pub(crate) fn pointer_constraint_backend_failed(
+    pub(in crate::compositor) fn pointer_constraint_backend_failed(
         &mut self,
         id: PointerConstraintBackendId,
         _reason: &str,
@@ -777,7 +795,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn pointer_constraint_backend_deactivated(
+    pub(in crate::compositor) fn pointer_constraint_backend_deactivated(
         &mut self,
         id: PointerConstraintBackendId,
     ) {
@@ -787,7 +805,7 @@ impl CompositorState {
         self.deactivate_pointer_constraint_by_id(id.constraint_id, true, true, false);
     }
 
-    pub(crate) fn cancel_pending_pointer_constraint_backend_requests(
+    pub(in crate::compositor) fn cancel_pending_pointer_constraint_backend_requests(
         &mut self,
         id: PointerConstraintBackendId,
     ) {
@@ -821,7 +839,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn deactivate_pointer_constraint_by_id(
+    pub(in crate::compositor) fn deactivate_pointer_constraint_by_id(
         &mut self,
         constraint_id: u64,
         compositor_driven: bool,
@@ -993,7 +1011,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn valid_cursor_hint_output_position(
+    pub(in crate::compositor) fn valid_cursor_hint_output_position(
         &mut self,
         surface: &wl_surface::WlSurface,
         cursor_position_hint: Option<(f64, f64)>,
@@ -1010,7 +1028,11 @@ impl CompositorState {
         Some(OutputPosition { x, y })
     }
 
-    pub(crate) fn apply_pointer_warp(&mut self, position: OutputPosition, send_motion: bool) {
+    pub(in crate::compositor) fn apply_pointer_warp(
+        &mut self,
+        position: OutputPosition,
+        send_motion: bool,
+    ) {
         let before = OutputPosition {
             x: self.last_pointer_x,
             y: self.last_pointer_y,
@@ -1027,7 +1049,10 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn send_pointer_motion_after_warp(&mut self, position: OutputPosition) {
+    pub(in crate::compositor) fn send_pointer_motion_after_warp(
+        &mut self,
+        position: OutputPosition,
+    ) {
         if self.active_locked_pointer_binding().is_some() {
             pointer_debug_log("pointer warp motion suppressed reason=active_lock");
             return;
@@ -1059,7 +1084,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn remove_pointer_constraint(&mut self, constraint_id: u64) {
+    pub(in crate::compositor) fn remove_pointer_constraint(&mut self, constraint_id: u64) {
         self.cancel_pending_locked_pointer_reveal_for_constraint(
             constraint_id,
             "constraint_removed",
@@ -1089,7 +1114,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn deactivate_pointer_constraints_for_pointer(
+    pub(in crate::compositor) fn deactivate_pointer_constraints_for_pointer(
         &mut self,
         pointer: &wl_pointer::WlPointer,
         emit_event: bool,
@@ -1110,7 +1135,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn deactivate_pointer_constraints_for_surface(
+    pub(in crate::compositor) fn deactivate_pointer_constraints_for_surface(
         &mut self,
         surface_id: u32,
         emit_event: bool,
@@ -1131,7 +1156,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn deactivate_pointer_constraints_for_surface_focus_loss(
+    pub(in crate::compositor) fn deactivate_pointer_constraints_for_surface_focus_loss(
         &mut self,
         surface_id: u32,
         emit_event: bool,
@@ -1147,7 +1172,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn set_pointer_constraint_pending_region(
+    pub(in crate::compositor) fn set_pointer_constraint_pending_region(
         &mut self,
         constraint_id: u64,
         region: SurfaceInputRegion,
@@ -1157,7 +1182,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn set_pointer_constraint_pending_cursor_position_hint(
+    pub(in crate::compositor) fn set_pointer_constraint_pending_cursor_position_hint(
         &mut self,
         constraint_id: u64,
         surface_x: f64,
@@ -1175,7 +1200,10 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn apply_pending_pointer_constraint_state_for_surface(&mut self, surface_id: u32) {
+    pub(in crate::compositor) fn apply_pending_pointer_constraint_state_for_surface(
+        &mut self,
+        surface_id: u32,
+    ) {
         let ids = self
             .pointer_constraints
             .values()
@@ -1192,7 +1220,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn update_active_confined_pointer_region(
+    pub(in crate::compositor) fn update_active_confined_pointer_region(
         &mut self,
         constraint_id: u64,
         reason: &'static str,
@@ -1236,14 +1264,17 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn update_all_active_confined_pointer_regions(&mut self, reason: &'static str) {
+    pub(in crate::compositor) fn update_all_active_confined_pointer_regions(
+        &mut self,
+        reason: &'static str,
+    ) {
         let Some(active) = self.active_confined_pointer_binding() else {
             return;
         };
         self.update_active_confined_pointer_region(active.constraint_id, reason);
     }
 
-    pub(crate) fn take_pointer_constraint_backend_requests(
+    pub(in crate::compositor) fn take_pointer_constraint_backend_requests(
         &mut self,
     ) -> Vec<PointerConstraintBackendRequest> {
         std::mem::take(&mut self.pending_pointer_constraint_backend_requests)

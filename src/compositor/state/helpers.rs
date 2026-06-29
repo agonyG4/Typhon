@@ -1,20 +1,22 @@
 use super::*;
 
-pub(crate) fn same_surface_resource(
+pub(in crate::compositor) fn same_surface_resource(
     left: &wl_surface::WlSurface,
     right: &wl_surface::WlSurface,
 ) -> bool {
     same_wayland_resource(left, right)
 }
 
-pub(crate) fn same_buffer_resource(
+pub(in crate::compositor) fn same_buffer_resource(
     left: &wl_buffer::WlBuffer,
     right: &wl_buffer::WlBuffer,
 ) -> bool {
     same_wayland_resource(left, right)
 }
 
-pub(crate) fn normalize_selection_mime_types(mime_types: Vec<String>) -> Vec<String> {
+pub(in crate::compositor) fn normalize_selection_mime_types(
+    mime_types: Vec<String>,
+) -> Vec<String> {
     const MAX_SOURCE_MIME_TYPES: usize = 128;
     const MAX_MIME_TYPE_LEN: usize = 4096;
     let mut normalized = Vec::new();
@@ -34,7 +36,7 @@ pub(crate) fn normalize_selection_mime_types(mime_types: Vec<String>) -> Vec<Str
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn update_renderable_surface_buffer(
+pub(in crate::compositor) fn update_renderable_surface_buffer(
     surface: &mut RenderableSurface,
     pending: &PendingSurfaceBuffer,
     buffer_size: BufferSize,
@@ -69,7 +71,7 @@ pub(crate) fn update_renderable_surface_buffer(
     Ok(())
 }
 
-pub(crate) fn root_surface_id_for_surface_in_placements(
+pub(in crate::compositor) fn root_surface_id_for_surface_in_placements(
     placements: &HashMap<u32, SurfacePlacement>,
     surface_id: u32,
 ) -> u32 {

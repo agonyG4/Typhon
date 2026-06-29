@@ -45,4 +45,52 @@ while IFS= read -r -d '' path; do
     fi
 done < <(find src -type f -name '*.rs' -print0)
 
+python3 - <<'PY' || status=1
+from pathlib import Path
+import re
+import sys
+
+roots = [
+    Path("src/native_output/tests"),
+    Path("src/compositor/tests"),
+]
+mod_re = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0-9_]+)\s*;", re.MULTILINE)
+
+def visit(path: Path, seen: set[Path]) -> None:
+    path = path.resolve()
+    if path in seen or not path.exists():
+        return
+    seen.add(path)
+    text = path.read_text()
+    base = path.parent
+    for name in mod_re.findall(text):
+        file_child = base / f"{name}.rs"
+        dir_child = base / name / "mod.rs"
+        if file_child.exists():
+            visit(file_child, seen)
+        elif dir_child.exists():
+            visit(dir_child, seen)
+        else:
+            print(
+                f"source-layout: {path.relative_to(Path.cwd())} declares missing test module {name}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
+for root in roots:
+    if not root.exists():
+        continue
+    seen: set[Path] = set()
+    visit(root / "mod.rs", seen)
+    retained = {path.resolve() for path in root.rglob("*.rs")}
+    missing = sorted(retained - seen)
+    for path in missing:
+        print(
+            f"source-layout: disconnected test source {path.relative_to(Path.cwd())}",
+            file=sys.stderr,
+        )
+    if missing:
+        raise SystemExit(1)
+PY
+
 exit "$status"

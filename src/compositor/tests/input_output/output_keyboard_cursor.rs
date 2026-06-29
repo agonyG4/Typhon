@@ -1,3 +1,4 @@
+use super::*;
 #[test]
 fn idle_inhibit_capability_registers_protocol_and_tracks_inhibitor() {
     let socket_name = unique_socket_name();

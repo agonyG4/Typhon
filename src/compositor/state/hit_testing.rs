@@ -1,7 +1,7 @@
 use super::*;
 
 impl CompositorState {
-    pub(crate) fn surface_id_at(&mut self, x: f64, y: f64) -> Option<u32> {
+    pub(in crate::compositor) fn surface_id_at(&mut self, x: f64, y: f64) -> Option<u32> {
         self.refresh_surface_origin_cache();
         let origins = &self.surface_origin_cache;
         for (index, renderable) in self.renderable_surfaces.iter().enumerate().rev() {
@@ -21,7 +21,11 @@ impl CompositorState {
         None
     }
 
-    pub(crate) fn root_surface_hit_at(&mut self, x: f64, y: f64) -> Option<RootSurfaceHit> {
+    pub(in crate::compositor) fn root_surface_hit_at(
+        &mut self,
+        x: f64,
+        y: f64,
+    ) -> Option<RootSurfaceHit> {
         self.refresh_surface_origin_cache();
         let origins = &self.surface_origin_cache;
         for (index, renderable) in self.renderable_surfaces.iter().enumerate().rev() {
@@ -74,11 +78,11 @@ impl CompositorState {
         None
     }
 
-    pub(crate) fn root_surface_id_for_surface(&self, surface_id: u32) -> u32 {
+    pub(in crate::compositor) fn root_surface_id_for_surface(&self, surface_id: u32) -> u32 {
         root_surface_id_for_surface_in_placements(&self.surface_placements, surface_id)
     }
 
-    pub(crate) fn root_window_local_point_at(
+    pub(in crate::compositor) fn root_window_local_point_at(
         &mut self,
         root_surface_id: u32,
         x: f64,
@@ -112,7 +116,11 @@ impl CompositorState {
         Some((local_x, local_y, geometry.width, geometry.height))
     }
 
-    pub(crate) fn pointer_target_at(&mut self, x: f64, y: f64) -> Option<PointerTarget> {
+    pub(in crate::compositor) fn pointer_target_at(
+        &mut self,
+        x: f64,
+        y: f64,
+    ) -> Option<PointerTarget> {
         self.refresh_surface_origin_cache();
         let origins = &self.surface_origin_cache;
         for (index, renderable) in self.renderable_surfaces.iter().enumerate().rev() {
@@ -149,7 +157,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn pointer_target_for_surface_at_output(
+    pub(in crate::compositor) fn pointer_target_for_surface_at_output(
         &mut self,
         surface: &wl_surface::WlSurface,
         x: f64,
@@ -172,7 +180,7 @@ impl CompositorState {
         })
     }
 
-    pub(crate) fn surface_accepts_input_at(
+    pub(in crate::compositor) fn surface_accepts_input_at(
         &self,
         surface: &RenderableSurface,
         surface_x: f64,
@@ -187,7 +195,7 @@ impl CompositorState {
             .unwrap_or(true)
     }
 
-    pub(crate) fn refresh_pointer_focus_at_last_position(&mut self) {
+    pub(in crate::compositor) fn refresh_pointer_focus_at_last_position(&mut self) {
         if self.active_locked_pointer_binding().is_some() {
             if let Some(active) = self.active_locked_pointer_binding() {
                 self.pin_locked_pointer_focus(&active);
@@ -211,7 +219,7 @@ impl CompositorState {
         self.send_pointer_enter_if_needed(&target);
     }
 
-    pub(crate) fn refresh_pointer_focus_after_implicit_grab(
+    pub(in crate::compositor) fn refresh_pointer_focus_after_implicit_grab(
         &mut self,
         old_surface_id: Option<u32>,
     ) {
@@ -245,7 +253,7 @@ impl CompositorState {
         self.send_pointer_enter_if_needed(&target);
     }
 
-    pub(crate) fn restore_locked_pointer_position(
+    pub(in crate::compositor) fn restore_locked_pointer_position(
         &mut self,
         surface: &wl_surface::WlSurface,
         cursor_position_hint: Option<(f64, f64)>,
@@ -293,7 +301,7 @@ impl CompositorState {
         Some(position)
     }
 
-    pub(crate) fn output_position_for_valid_cursor_hint(
+    pub(in crate::compositor) fn output_position_for_valid_cursor_hint(
         &mut self,
         surface: &wl_surface::WlSurface,
         surface_x: f64,
@@ -324,11 +332,14 @@ impl CompositorState {
         ))
     }
 
-    pub(crate) fn surface_resource_by_id(&self, surface_id: u32) -> Option<wl_surface::WlSurface> {
+    pub(in crate::compositor) fn surface_resource_by_id(
+        &self,
+        surface_id: u32,
+    ) -> Option<wl_surface::WlSurface> {
         self.surface_resources.get(&surface_id).cloned()
     }
 
-    pub(crate) fn ensure_pointer_focus(&mut self, surface: &wl_surface::WlSurface) {
+    pub(in crate::compositor) fn ensure_pointer_focus(&mut self, surface: &wl_surface::WlSurface) {
         if let Some(active) = self.active_locked_pointer_binding()
             && !same_surface_resource(&active.surface, surface)
         {
@@ -359,7 +370,7 @@ impl CompositorState {
         self.pointer_surface = Some(surface.clone());
     }
 
-    pub(crate) fn pointer_resource_entered_surface(
+    pub(in crate::compositor) fn pointer_resource_entered_surface(
         &self,
         pointer: &wl_pointer::WlPointer,
         surface: &wl_surface::WlSurface,
@@ -372,7 +383,7 @@ impl CompositorState {
             })
     }
 
-    pub(crate) fn pointer_has_current_enter_serial(
+    pub(in crate::compositor) fn pointer_has_current_enter_serial(
         &self,
         pointer: &wl_pointer::WlPointer,
         serial: u32,
@@ -385,7 +396,7 @@ impl CompositorState {
         })
     }
 
-    pub(crate) fn pointer_has_current_enter_serial_for_client(
+    pub(in crate::compositor) fn pointer_has_current_enter_serial_for_client(
         &self,
         pointer: &wl_pointer::WlPointer,
         serial: u32,
@@ -395,7 +406,7 @@ impl CompositorState {
             && self.has_recent_input_serial_for_surface(serial, surface)
     }
 
-    pub(crate) fn warp_pointer_protocol_request(
+    pub(in crate::compositor) fn warp_pointer_protocol_request(
         &mut self,
         surface: wl_surface::WlSurface,
         pointer: wl_pointer::WlPointer,
@@ -477,7 +488,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn remember_pointer_enter_serial(
+    pub(in crate::compositor) fn remember_pointer_enter_serial(
         &mut self,
         pointer: &wl_pointer::WlPointer,
         surface: &wl_surface::WlSurface,
@@ -492,12 +503,15 @@ impl CompositorState {
         });
     }
 
-    pub(crate) fn forget_pointer_enter_serial(&mut self, pointer: &wl_pointer::WlPointer) {
+    pub(in crate::compositor) fn forget_pointer_enter_serial(
+        &mut self,
+        pointer: &wl_pointer::WlPointer,
+    ) {
         self.pointer_enter_serials
             .retain(|entry| !same_wayland_resource(&entry.pointer, pointer));
     }
 
-    pub(crate) fn synchronize_pointer_resource_focus(
+    pub(in crate::compositor) fn synchronize_pointer_resource_focus(
         &mut self,
         pointer: &wl_pointer::WlPointer,
     ) -> bool {
@@ -520,7 +534,7 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn send_pointer_enter_to_resource(
+    pub(in crate::compositor) fn send_pointer_enter_to_resource(
         &mut self,
         pointer: &wl_pointer::WlPointer,
         target: &PointerTarget,
@@ -565,7 +579,7 @@ impl CompositorState {
             .push((pointer.clone(), target.surface.clone()));
     }
 
-    pub(crate) fn send_pointer_enter_if_needed(&mut self, target: &PointerTarget) {
+    pub(in crate::compositor) fn send_pointer_enter_if_needed(&mut self, target: &PointerTarget) {
         self.pointer_resources.retain(Resource::is_alive);
         let pointers = self
             .pointer_resources
@@ -589,7 +603,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn clear_pointer_focus(&mut self) {
+    pub(in crate::compositor) fn clear_pointer_focus(&mut self) {
         if let Some(active) = self.active_locked_pointer_binding() {
             pointer_debug_log(format!(
                 "pointer focus clear suppressed by locked route id={} surface={}",

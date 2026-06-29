@@ -1,12 +1,12 @@
 use super::*;
 
 impl CompositorState {
-    pub(crate) fn complete_frame_callbacks_now(&mut self, data: &SurfaceData) {
+    pub(in crate::compositor) fn complete_frame_callbacks_now(&mut self, data: &SurfaceData) {
         let callbacks = data.take_frame_callbacks();
         self.complete_frame_callbacks(callbacks);
     }
 
-    pub(crate) fn complete_pending_frame_callbacks(&mut self) {
+    pub(in crate::compositor) fn complete_pending_frame_callbacks(&mut self) {
         let mut callbacks = std::mem::take(&mut self.pending_frame_callbacks);
         for surface in self.surface_resources.values() {
             if let Some(data) = surface.data::<SurfaceData>() {
@@ -16,7 +16,7 @@ impl CompositorState {
         self.complete_frame_callbacks(callbacks);
     }
 
-    pub(crate) fn has_pending_frame_callbacks(&self) -> bool {
+    pub(in crate::compositor) fn has_pending_frame_callbacks(&self) -> bool {
         !self.pending_frame_callbacks.is_empty()
             || self.pending_explicit_sync_commits.iter().any(|commit| {
                 !self.external_acquire_readiness && !commit.frame_callbacks.is_empty()
@@ -33,7 +33,7 @@ impl CompositorState {
                 .any(SurfaceData::has_frame_callbacks)
     }
 
-    pub(crate) fn has_only_pending_surface_frame_callbacks(&self) -> bool {
+    pub(in crate::compositor) fn has_only_pending_surface_frame_callbacks(&self) -> bool {
         !self.pending_resize_configure_is_flushable()
             && self.pending_frame_callbacks.is_empty()
             && self.pending_explicit_sync_commits.is_empty()
@@ -46,7 +46,7 @@ impl CompositorState {
                 .any(SurfaceData::has_frame_callbacks)
     }
 
-    pub(crate) fn has_pending_frame_prepare_work(&self) -> bool {
+    pub(in crate::compositor) fn has_pending_frame_prepare_work(&self) -> bool {
         self.pending_interactive_resize_update.is_some()
             || self.pending_resize_configure_is_flushable()
             || self.pending_explicit_sync_commits.iter().any(|commit| {
@@ -60,19 +60,19 @@ impl CompositorState {
             || !self.pending_color_info.is_empty()
     }
 
-    pub(crate) fn has_pending_explicit_sync_work(&self) -> bool {
+    pub(in crate::compositor) fn has_pending_explicit_sync_work(&self) -> bool {
         !self.pending_explicit_sync_commits.is_empty()
             || !self.pending_surface_tree_transactions.is_empty()
     }
 
-    pub(crate) fn has_pending_frame_work(&self) -> bool {
+    pub(in crate::compositor) fn has_pending_frame_work(&self) -> bool {
         self.pending_interactive_resize_update.is_some()
             || self.pending_resize_configure_is_flushable()
             || self.has_pending_frame_callbacks()
             || !self.pending_presentation_feedbacks.is_empty()
     }
 
-    pub(crate) fn complete_pending_presentation_feedbacks(
+    pub(in crate::compositor) fn complete_pending_presentation_feedbacks(
         &mut self,
         presentation: FramePresentation,
     ) {
@@ -112,7 +112,10 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn discard_pending_presentation_feedbacks_for_surface(&mut self, surface_id: u32) {
+    pub(in crate::compositor) fn discard_pending_presentation_feedbacks_for_surface(
+        &mut self,
+        surface_id: u32,
+    ) {
         let mut pending_feedbacks = Vec::new();
         for pending in std::mem::take(&mut self.pending_presentation_feedbacks) {
             if pending.surface_id == surface_id {
@@ -124,7 +127,7 @@ impl CompositorState {
         self.pending_presentation_feedbacks = pending_feedbacks;
     }
 
-    pub(crate) fn discard_all_pending_presentation_feedbacks(&mut self) {
+    pub(in crate::compositor) fn discard_all_pending_presentation_feedbacks(&mut self) {
         for pending in std::mem::take(&mut self.pending_presentation_feedbacks) {
             pending.feedback.discarded();
         }
@@ -137,7 +140,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn release_pending_buffers(&mut self) {
+    pub(in crate::compositor) fn release_pending_buffers(&mut self) {
         let buffers = std::mem::take(&mut self.pending_buffer_releases);
         for buffer in buffers {
             let _ = buffer.send_event(wl_buffer::Event::Release);
@@ -152,7 +155,10 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn complete_frame_callbacks(&mut self, callbacks: Vec<wl_callback::WlCallback>) {
+    pub(in crate::compositor) fn complete_frame_callbacks(
+        &mut self,
+        callbacks: Vec<wl_callback::WlCallback>,
+    ) {
         let time = self.frame_callback_time_ms();
         for callback in callbacks {
             let _ = callback.send_event(wl_callback::Event::Done {
@@ -161,7 +167,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn cancel_pending_acquire_commits_for_surface(
+    pub(in crate::compositor) fn cancel_pending_acquire_commits_for_surface(
         &mut self,
         surface_id: u32,
         reason: AcquireWatchCancelReason,
@@ -193,7 +199,7 @@ impl CompositorState {
         canceled_callbacks
     }
 
-    pub(crate) fn retain_oldest_pending_acquire_for_surface(
+    pub(in crate::compositor) fn retain_oldest_pending_acquire_for_surface(
         &mut self,
         surface_id: u32,
     ) -> Vec<wl_callback::WlCallback> {
@@ -226,7 +232,7 @@ impl CompositorState {
         superseded_callbacks
     }
 
-    pub(crate) fn cancel_pending_acquire_commits_for_buffer(
+    pub(in crate::compositor) fn cancel_pending_acquire_commits_for_buffer(
         &mut self,
         buffer: &wl_buffer::WlBuffer,
         reason: AcquireWatchCancelReason,
@@ -261,7 +267,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn cancel_pending_acquire_commits_for_timeline(
+    pub(in crate::compositor) fn cancel_pending_acquire_commits_for_timeline(
         &mut self,
         timeline: &crate::syncobj::DrmSyncobjTimeline,
         reason: AcquireWatchCancelReason,
@@ -317,7 +323,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn enable_external_acquire_readiness(&mut self) {
+    pub(in crate::compositor) fn enable_external_acquire_readiness(&mut self) {
         if self.external_acquire_readiness {
             return;
         }
@@ -352,11 +358,11 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn take_acquire_watch_changes(&mut self) -> Vec<AcquireWatchChange> {
+    pub(in crate::compositor) fn take_acquire_watch_changes(&mut self) -> Vec<AcquireWatchChange> {
         std::mem::take(&mut self.pending_acquire_watch_changes)
     }
 
-    pub(crate) fn mark_acquire_commit_eventfd_backed(
+    pub(in crate::compositor) fn mark_acquire_commit_eventfd_backed(
         &mut self,
         commit_id: AcquireCommitId,
     ) -> bool {
@@ -375,7 +381,7 @@ impl CompositorState {
             .is_some_and(|dependency| dependency.state.mark_eventfd_backed())
     }
 
-    pub(crate) fn mark_acquire_commit_fallback_backed(
+    pub(in crate::compositor) fn mark_acquire_commit_fallback_backed(
         &mut self,
         commit_id: AcquireCommitId,
     ) -> bool {
@@ -394,7 +400,7 @@ impl CompositorState {
             .is_some_and(|dependency| dependency.state.mark_fallback_backed())
     }
 
-    pub(crate) fn mark_acquire_commit_ready(
+    pub(in crate::compositor) fn mark_acquire_commit_ready(
         &mut self,
         commit_id: AcquireCommitId,
         surface_id: u32,
@@ -423,7 +429,7 @@ impl CompositorState {
             .is_some_and(|dependency| dependency.state.mark_ready())
     }
 
-    pub(crate) fn commit_ready_explicit_sync_buffers(&mut self) {
+    pub(in crate::compositor) fn commit_ready_explicit_sync_buffers(&mut self) {
         let mut commits = std::mem::take(&mut self.pending_explicit_sync_commits);
         for commit in &mut commits {
             if !self.external_acquire_readiness && commit.acquire.is_signaled() {
@@ -519,7 +525,7 @@ impl CompositorState {
         self.commit_ready_surface_tree_transactions();
     }
 
-    pub(crate) fn commit_ready_surface_tree_transactions(&mut self) {
+    pub(in crate::compositor) fn commit_ready_surface_tree_transactions(&mut self) {
         let mut transactions = std::mem::take(&mut self.pending_surface_tree_transactions);
         if !self.external_acquire_readiness {
             for transaction in &mut transactions {

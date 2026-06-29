@@ -1,12 +1,14 @@
 use super::*;
 
 impl CompositorState {
-    pub(crate) fn allocate_surface_commit_sequence(&mut self) -> SurfaceCommitSequence {
+    pub(in crate::compositor) fn allocate_surface_commit_sequence(
+        &mut self,
+    ) -> SurfaceCommitSequence {
         self.next_surface_commit_sequence = self.next_surface_commit_sequence.saturating_add(1);
         SurfaceCommitSequence(self.next_surface_commit_sequence)
     }
 
-    pub(crate) fn record_surface_commit_received(
+    pub(in crate::compositor) fn record_surface_commit_received(
         &mut self,
         surface_id: u32,
         commit_sequence: SurfaceCommitSequence,
@@ -23,7 +25,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn surface_publication_decision(
+    pub(in crate::compositor) fn surface_publication_decision(
         &self,
         surface_id: u32,
         commit_sequence: SurfaceCommitSequence,
@@ -46,7 +48,7 @@ impl CompositorState {
         SurfacePublicationDecision::Publish
     }
 
-    pub(crate) fn record_surface_publication(
+    pub(in crate::compositor) fn record_surface_publication(
         &mut self,
         surface_id: u32,
         root_surface_id: u32,
@@ -95,7 +97,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn record_surface_publication_rejection(
+    pub(in crate::compositor) fn record_surface_publication_rejection(
         &mut self,
         surface_id: u32,
         commit_sequence: SurfaceCommitSequence,
@@ -141,7 +143,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn supersede_older_pending_attachments_for_surface(
+    pub(in crate::compositor) fn supersede_older_pending_attachments_for_surface(
         &mut self,
         surface_id: u32,
         new_sequence: SurfaceCommitSequence,
@@ -221,7 +223,7 @@ impl CompositorState {
         callbacks
     }
 
-    pub(crate) fn mark_render_damage_presented(&mut self) {
+    pub(in crate::compositor) fn mark_render_damage_presented(&mut self) {
         for surface in &mut self.renderable_surfaces {
             if let Some(journal) = self.surface_damage_journals.get(&surface.surface_id) {
                 let last_seen = self
@@ -248,7 +250,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn record_surface_damage_commit(
+    pub(in crate::compositor) fn record_surface_damage_commit(
         &mut self,
         surface_id: u32,
         damage: RenderableSurfaceDamage,
@@ -261,7 +263,7 @@ impl CompositorState {
             .record(damage, width, height);
     }
 
-    pub(crate) fn new(syncobj_device: Option<DrmSyncobjDevice>) -> Self {
+    pub(in crate::compositor) fn new(syncobj_device: Option<DrmSyncobjDevice>) -> Self {
         let default_dmabuf_device = default_dmabuf_main_device();
         Self {
             frame_clock_start: Some(Instant::now()),
@@ -277,25 +279,29 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn allocate_buffer_identity(&mut self) -> Option<BufferIdentity> {
+    pub(in crate::compositor) fn allocate_buffer_identity(&mut self) -> Option<BufferIdentity> {
         self.buffer_ids.allocate()
     }
 
-    pub(crate) fn next_render_generation_value(&self) -> u64 {
+    pub(in crate::compositor) fn next_render_generation_value(&self) -> u64 {
         self.surface_tree_generation
             .unwrap_or_else(|| self.render_generation.saturating_add(1))
     }
 
-    pub(crate) fn begin_surface_tree_publication(&mut self) {
+    pub(in crate::compositor) fn begin_surface_tree_publication(&mut self) {
         debug_assert!(self.surface_tree_generation.is_none());
         self.surface_tree_generation = Some(self.render_generation.saturating_add(1));
     }
 
-    pub(crate) fn finish_surface_tree_publication(&mut self) {
+    pub(in crate::compositor) fn finish_surface_tree_publication(&mut self) {
         self.surface_tree_generation = None;
     }
 
-    pub(crate) fn set_render_generation(&mut self, generation: u64, cause: RenderGenerationCause) {
+    pub(in crate::compositor) fn set_render_generation(
+        &mut self,
+        generation: u64,
+        cause: RenderGenerationCause,
+    ) {
         self.render_generation = generation;
         self.render_generation_cause = cause;
         if !matches!(
@@ -308,18 +314,21 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn advance_render_generation(&mut self, cause: RenderGenerationCause) -> u64 {
+    pub(in crate::compositor) fn advance_render_generation(
+        &mut self,
+        cause: RenderGenerationCause,
+    ) -> u64 {
         let generation = self.next_render_generation_value();
         self.set_render_generation(generation, cause);
         self.update_all_active_confined_pointer_regions(cause.as_str());
         generation
     }
 
-    pub(crate) fn render_generation_cause(&self) -> RenderGenerationCause {
+    pub(in crate::compositor) fn render_generation_cause(&self) -> RenderGenerationCause {
         self.render_generation_cause
     }
 
-    pub(crate) fn set_dmabuf_feedback(
+    pub(in crate::compositor) fn set_dmabuf_feedback(
         &mut self,
         feedback: EglGlesDmabufFeedback,
         main_device: Option<u64>,
@@ -330,7 +339,7 @@ impl CompositorState {
         self.dmabuf_main_device_path = main_device_path.filter(|path| !path.is_empty());
     }
 
-    pub(crate) fn set_output_size(&mut self, width: u32, height: u32) -> bool {
+    pub(in crate::compositor) fn set_output_size(&mut self, width: u32, height: u32) -> bool {
         let output_size = OutputSize::new(width, height);
         if self.output_size == output_size {
             return false;
@@ -342,7 +351,7 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn set_output_scale_factor(&mut self, scale_factor: f64) -> bool {
+    pub(in crate::compositor) fn set_output_scale_factor(&mut self, scale_factor: f64) -> bool {
         let output_scale = OutputScale::from_factor(scale_factor);
         if self.output_scale == output_scale {
             return false;
@@ -355,7 +364,7 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn set_output_refresh_hz(&mut self, refresh_hz: u32) -> bool {
+    pub(in crate::compositor) fn set_output_refresh_hz(&mut self, refresh_hz: u32) -> bool {
         let output_refresh = OutputRefreshRate::from_hz(refresh_hz);
         if self.output_refresh == output_refresh {
             return false;
@@ -371,30 +380,30 @@ impl CompositorState {
         self.last_app_id = Some(app_id.into());
     }
 
-    pub(crate) fn note_xdg_popup_created(&mut self) {
+    pub(in crate::compositor) fn note_xdg_popup_created(&mut self) {
         self.xdg_popups += 1;
     }
 
-    pub(crate) fn next_configure_serial(&mut self) -> u32 {
+    pub(in crate::compositor) fn next_configure_serial(&mut self) -> u32 {
         self.next_configure_serial = self.next_configure_serial.saturating_add(1);
         self.next_configure_serial
     }
 
-    pub(crate) fn allocate_surface_id(&mut self) -> u32 {
+    pub(in crate::compositor) fn allocate_surface_id(&mut self) -> u32 {
         self.next_surface_id = self.next_surface_id.saturating_add(1).max(1);
         self.next_surface_id
     }
 
-    pub(crate) fn frame_callback_time_ms(&mut self) -> u32 {
+    pub(in crate::compositor) fn frame_callback_time_ms(&mut self) -> u32 {
         let start = self.frame_clock_start.get_or_insert_with(Instant::now);
         start.elapsed().as_millis() as u32
     }
 
-    pub(crate) fn focus_surface(&mut self, surface: wl_surface::WlSurface) {
+    pub(in crate::compositor) fn focus_surface(&mut self, surface: wl_surface::WlSurface) {
         self.set_desktop_focus(surface, "focus");
     }
 
-    pub(crate) fn set_desktop_focus(
+    pub(in crate::compositor) fn set_desktop_focus(
         &mut self,
         surface: wl_surface::WlSurface,
         reason: &'static str,
@@ -416,20 +425,24 @@ impl CompositorState {
         self.apply_pending_pointer_constraint_state_for_surface(new_surface_id);
     }
 
-    pub(crate) fn focused_client_id(&self) -> Option<ClientId> {
+    pub(in crate::compositor) fn focused_client_id(&self) -> Option<ClientId> {
         self.focused_surface
             .as_ref()
             .and_then(Resource::client)
             .map(|client| client.id())
     }
 
-    pub(crate) fn client_has_focus(&self, client_id: &ClientId) -> bool {
+    pub(in crate::compositor) fn client_has_focus(&self, client_id: &ClientId) -> bool {
         self.focused_client_id()
             .as_ref()
             .is_some_and(|focused_client_id| focused_client_id == client_id)
     }
 
-    pub(crate) fn remember_input_serial(&mut self, serial: u32, surface: wl_surface::WlSurface) {
+    pub(in crate::compositor) fn remember_input_serial(
+        &mut self,
+        serial: u32,
+        surface: wl_surface::WlSurface,
+    ) {
         self.recent_input_serials
             .retain(|input| input.serial != serial);
         self.recent_input_serials
@@ -444,7 +457,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn has_recent_input_serial_for_surface(
+    pub(in crate::compositor) fn has_recent_input_serial_for_surface(
         &self,
         serial: u32,
         surface: &wl_surface::WlSurface,
@@ -454,7 +467,11 @@ impl CompositorState {
             .any(|input| input.serial == serial && input.surface.id().same_client_as(&surface.id()))
     }
 
-    pub(crate) fn client_has_recent_input_serial(&self, client_id: &ClientId, serial: u32) -> bool {
+    pub(in crate::compositor) fn client_has_recent_input_serial(
+        &self,
+        client_id: &ClientId,
+        serial: u32,
+    ) -> bool {
         self.recent_input_serials.iter().any(|input| {
             input.serial == serial
                 && input
@@ -464,7 +481,7 @@ impl CompositorState {
         })
     }
 
-    pub(crate) fn register_data_source(
+    pub(in crate::compositor) fn register_data_source(
         &mut self,
         source: wl_data_source::WlDataSource,
         client_id: ClientId,
@@ -480,7 +497,7 @@ impl CompositorState {
         );
     }
 
-    pub(crate) fn offer_data_source_mime_type(
+    pub(in crate::compositor) fn offer_data_source_mime_type(
         &mut self,
         source: &wl_data_source::WlDataSource,
         mime_type: String,
@@ -503,7 +520,10 @@ impl CompositorState {
         binding.mime_types.push(mime_type);
     }
 
-    pub(crate) fn remove_data_source(&mut self, source: &wl_data_source::WlDataSource) {
+    pub(in crate::compositor) fn remove_data_source(
+        &mut self,
+        source: &wl_data_source::WlDataSource,
+    ) {
         self.data_sources.remove(&source.id());
         self.selection_state
             .remove_source(source.id().protocol_id());
@@ -524,11 +544,28 @@ impl CompositorState {
                 let _ = bridge.clear_internal_selection();
             }
             self.data_offers.clear();
-            self.publish_clipboard_to_focused_client();
+            self.publish_clipboard_clear_to_data_devices();
         }
     }
 
-    pub(crate) fn register_data_device(
+    pub(in crate::compositor) fn clear_dead_active_clipboard_source(&mut self) {
+        let active_source = self.active_clipboard.as_ref().and_then(|selection| {
+            if let ClipboardSourceBackend::InternalWayland { source, .. } = &selection.source {
+                Some(source.clone())
+            } else {
+                None
+            }
+        });
+        let Some(source) = active_source else {
+            return;
+        };
+        if source.is_alive() && source.client().is_some() {
+            return;
+        }
+        self.remove_data_source(&source);
+    }
+
+    pub(in crate::compositor) fn register_data_device(
         &mut self,
         device: wl_data_device::WlDataDevice,
         client_id: ClientId,
@@ -546,7 +583,10 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn remove_data_device(&mut self, device: &wl_data_device::WlDataDevice) {
+    pub(in crate::compositor) fn remove_data_device(
+        &mut self,
+        device: &wl_data_device::WlDataDevice,
+    ) {
         self.data_devices
             .retain(|binding| !same_wayland_resource(&binding.device, device));
         self.data_offers.retain(|_, offer| {
@@ -554,7 +594,7 @@ impl CompositorState {
         });
     }
 
-    pub(crate) fn set_clipboard_selection(
+    pub(in crate::compositor) fn set_clipboard_selection(
         &mut self,
         client_id: &ClientId,
         source: Option<wl_data_source::WlDataSource>,
@@ -616,7 +656,7 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn install_host_clipboard_selection(
+    pub(in crate::compositor) fn install_host_clipboard_selection(
         &mut self,
         offer_id: HostClipboardOfferId,
         mime_types: Vec<String>,
@@ -636,7 +676,7 @@ impl CompositorState {
         self.publish_clipboard_to_focused_client();
     }
 
-    pub(crate) fn clear_host_clipboard_selection(&mut self) {
+    pub(in crate::compositor) fn clear_host_clipboard_selection(&mut self) {
         self.next_clipboard_generation = self.next_clipboard_generation.saturating_add(1);
         if self.active_clipboard.as_ref().is_some_and(|selection| {
             matches!(selection.source, ClipboardSourceBackend::HostBridge { .. })
@@ -647,7 +687,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn poll_clipboard_bridge(&mut self) {
+    pub(in crate::compositor) fn poll_clipboard_bridge(&mut self) {
         let Some(bridge) = self.clipboard_bridge.as_mut() else {
             return;
         };
@@ -663,7 +703,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn publish_clipboard_to_focused_client(&mut self) {
+    pub(in crate::compositor) fn publish_clipboard_to_focused_client(&mut self) {
         let Some(client_id) = self.focused_client_id() else {
             return;
         };
@@ -682,7 +722,21 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn publish_clipboard_to_data_device(
+    pub(in crate::compositor) fn publish_clipboard_clear_to_data_devices(&mut self) {
+        let devices = self
+            .data_devices
+            .iter()
+            .filter(|binding| {
+                binding.device.is_alive() && binding.seat_id.interface().name == "wl_seat"
+            })
+            .map(|binding| binding.device.clone())
+            .collect::<Vec<_>>();
+        for device in devices {
+            let _ = device.send_event(wl_data_device::Event::Selection { id: None });
+        }
+    }
+
+    pub(in crate::compositor) fn publish_clipboard_to_data_device(
         &mut self,
         device: &wl_data_device::WlDataDevice,
     ) {
@@ -733,7 +787,7 @@ impl CompositorState {
         let _ = device.send_event(wl_data_device::Event::Selection { id: Some(offer) });
     }
 
-    pub(crate) fn receive_clipboard_offer(
+    pub(in crate::compositor) fn receive_clipboard_offer(
         &mut self,
         offer: &wl_data_offer::WlDataOffer,
         client_id: &ClientId,
@@ -776,7 +830,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn register_surface_resource(
+    pub(in crate::compositor) fn register_surface_resource(
         &mut self,
         surface_id: u32,
         surface: wl_surface::WlSurface,
@@ -784,7 +838,7 @@ impl CompositorState {
         self.surface_resources.entry(surface_id).or_insert(surface);
     }
 
-    pub(crate) fn register_output_resource(&mut self, output: wl_output::WlOutput) {
+    pub(in crate::compositor) fn register_output_resource(&mut self, output: wl_output::WlOutput) {
         if self
             .output_resources
             .iter()
@@ -802,7 +856,10 @@ impl CompositorState {
         self.output_resources.push(output);
     }
 
-    pub(crate) fn unregister_output_resource(&mut self, output: &wl_output::WlOutput) {
+    pub(in crate::compositor) fn unregister_output_resource(
+        &mut self,
+        output: &wl_output::WlOutput,
+    ) {
         let output_id = output.id().protocol_id();
         self.output_resources
             .retain(|resource| !same_wayland_resource(resource, output));
@@ -810,21 +867,21 @@ impl CompositorState {
             .retain(|(_, entered_output_id)| *entered_output_id != output_id);
     }
 
-    pub(crate) fn send_output_mode_to_bound_outputs(&self) {
+    pub(in crate::compositor) fn send_output_mode_to_bound_outputs(&self) {
         for output in &self.output_resources {
             send_output_mode(output, self.output_size, self.output_refresh);
             send_output_done_if_supported(output);
         }
     }
 
-    pub(crate) fn send_output_scale_to_bound_outputs(&self) {
+    pub(in crate::compositor) fn send_output_scale_to_bound_outputs(&self) {
         for output in &self.output_resources {
             send_output_scale(output, self.output_scale);
             send_output_done_if_supported(output);
         }
     }
 
-    pub(crate) fn register_fractional_scale_resource(
+    pub(in crate::compositor) fn register_fractional_scale_resource(
         &mut self,
         surface: &wl_surface::WlSurface,
         fractional_scale: wp_fractional_scale_v1::WpFractionalScaleV1,
@@ -838,11 +895,14 @@ impl CompositorState {
             .push(fractional_scale);
     }
 
-    pub(crate) fn unregister_fractional_scale_resources_for_surface(&mut self, surface_id: u32) {
+    pub(in crate::compositor) fn unregister_fractional_scale_resources_for_surface(
+        &mut self,
+        surface_id: u32,
+    ) {
         self.fractional_scale_resources.remove(&surface_id);
     }
 
-    pub(crate) fn unregister_fractional_scale_resource(
+    pub(in crate::compositor) fn unregister_fractional_scale_resource(
         &mut self,
         surface_id: u32,
         resource_id: u32,
@@ -855,7 +915,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn send_fractional_scale_to_bound_surfaces(&self) {
+    pub(in crate::compositor) fn send_fractional_scale_to_bound_surfaces(&self) {
         for fractional_scales in self.fractional_scale_resources.values() {
             for fractional_scale in fractional_scales {
                 fractional_scale.preferred_scale(self.output_scale.preferred_scale());
@@ -863,7 +923,10 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn ensure_surface_entered_outputs(&mut self, surface: &wl_surface::WlSurface) {
+    pub(in crate::compositor) fn ensure_surface_entered_outputs(
+        &mut self,
+        surface: &wl_surface::WlSurface,
+    ) {
         let surface_id = compositor_surface_id(surface);
         for output in &self.output_resources {
             if !resource_belongs_to_surface_client(output, surface) {
@@ -879,7 +942,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn reconfigure_stateful_windows_for_output_size(&mut self) {
+    pub(in crate::compositor) fn reconfigure_stateful_windows_for_output_size(&mut self) {
         let toplevels = self
             .toplevel_surfaces
             .iter()
@@ -900,7 +963,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn unregister_surface_resource(&mut self, surface_id: u32) {
+    pub(in crate::compositor) fn unregister_surface_resource(&mut self, surface_id: u32) {
         self.surface_damage_journals.remove(&surface_id);
         self.presented_surface_commits.remove(&surface_id);
         self.cancel_pending_surface_trees_for_surface(

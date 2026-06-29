@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn coalesce_output_row_rects(rects: Vec<OutputRect>) -> Vec<OutputRect> {
+pub(in crate::compositor) fn coalesce_output_row_rects(rects: Vec<OutputRect>) -> Vec<OutputRect> {
     let mut coalesced: Vec<OutputRect> = Vec::new();
     for rect in rects {
         if let Some(last) = coalesced.last_mut()
@@ -36,7 +36,7 @@ impl Default for CursorVisibilityState {
 }
 
 impl CursorVisibilityState {
-    pub(crate) fn desired_visible(&self) -> bool {
+    pub(in crate::compositor) fn desired_visible(&self) -> bool {
         self.client_hidden_pointer.is_none()
             && self.client_cursor_pointer.is_none()
             && self.lock_hidden_constraint_id.is_none()
@@ -58,25 +58,25 @@ pub(crate) struct ActiveClientCursor {
     pub(crate) hotspot_y: i32,
 }
 
-pub(crate) fn pointer_debug_log(message: impl AsRef<str>) {
+pub(in crate::compositor) fn pointer_debug_log(message: impl AsRef<str>) {
     if std::env::var_os("TYPHON_POINTER_DEBUG").is_some() {
         eprintln!("typhon pointer: {}", message.as_ref());
     }
 }
 
 impl RelativeMotionDebugState {
-    pub(crate) fn note_dispatch(&mut self, message: String) {
+    pub(in crate::compositor) fn note_dispatch(&mut self, message: String) {
         self.dispatch_total = self.dispatch_total.saturating_add(1);
         pointer_debug_log(message);
     }
 
-    pub(crate) fn note_drop(&mut self, reason: impl Into<String>) {
+    pub(in crate::compositor) fn note_drop(&mut self, reason: impl Into<String>) {
         self.pending_drop_count = self.pending_drop_count.saturating_add(1);
         self.pending_drop_reason = Some(reason.into());
         self.flush_drops(false);
     }
 
-    pub(crate) fn should_log_route_snapshot(&mut self) -> bool {
+    pub(in crate::compositor) fn should_log_route_snapshot(&mut self) -> bool {
         if std::env::var_os("TYPHON_POINTER_DEBUG").is_none() {
             return false;
         }
@@ -90,7 +90,7 @@ impl RelativeMotionDebugState {
         should_log
     }
 
-    pub(crate) fn flush_drops(&mut self, force: bool) {
+    pub(in crate::compositor) fn flush_drops(&mut self, force: bool) {
         let Some(reason) = self.pending_drop_reason.take() else {
             return;
         };
@@ -115,7 +115,7 @@ impl RelativeMotionDebugState {
     }
 }
 
-pub(crate) fn wayland_resource_client_label(resource: &impl Resource) -> String {
+pub(in crate::compositor) fn wayland_resource_client_label(resource: &impl Resource) -> String {
     resource
         .client()
         .map(|client| format!("{:?}", client.id()))

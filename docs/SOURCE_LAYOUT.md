@@ -20,6 +20,9 @@ native_output runtime ──> reusable native KMS/event-loop primitives
 - `src/native_output/` is the binary-private native DRM/KMS output runtime. It
   owns launch policy, native input adapters, output selection, damage, cursor,
   scanout backends, and the runtime loop that calls `OwnCompositorServer`.
+  The runtime entry point is `NativeRuntime`; it owns the long-lived native
+  backend state and transfers control from bootstrap to the native cycle
+  implementation.
 - `src/compositor/protocols/` decodes Wayland requests and emits protocol
   events/errors.
 - `src/compositor/state/` contains the physical implementation split for
@@ -27,7 +30,11 @@ native_output runtime ──> reusable native KMS/event-loop primitives
   inherent `impl CompositorState` blocks; the current split is intentionally
   mechanical and preserves the existing state model.
 - `src/compositor/tests/` keeps unit tests under the compositor module so
-  white-box coverage can continue using private helpers.
+  white-box coverage can continue using private helpers. Shared client/server
+  harness code lives under `src/compositor/tests/support/`; individual test
+  modules remain connected through `src/compositor/tests/mod.rs`.
+- `src/native_output/tests/` is the connected white-box test tree for native
+  output, scanout, input, and frame-scheduling helpers.
 - `src/egl_renderer.rs` remains the GLES renderer facade. Its existing
   submodules own damage, dmabuf probing, geometry, and shader program helpers.
 
@@ -41,6 +48,13 @@ depends on binary-private renderer modules.
 Architecture code must use Rust modules, not `include!()`. The source-layout
 guard rejects `include!()` in `src/` because include-based organization hides
 module boundaries from rust-analyzer, contributors, and coding agents.
+Disconnected `.rs` fragments are not allowed: every retained source or test
+file must be reachable from the Rust module tree.
+
+Production files are capped at 1,500 lines, test files at 2,000 lines, and
+`mod.rs` facades at 800 lines unless explicitly documented below. New runtime
+or test splits should keep facades small and move behavior into named modules
+that own a clear concern.
 
 This refactor does not remove the nested backend and does not split the crate;
 both would change public/runtime behavior outside the architecture-only scope.
@@ -57,7 +71,7 @@ would obscure baseline failures:
 
 The original 10,000-line modules are not allowlisted.
 
-`src/native_output/runtime/cycle.rs` is no longer allowlisted. It still contains
-the legacy native loop body and should be the next runtime architecture target:
-split the loop into bootstrap, input, acquire, frame, presentation, metrics, and
-shutdown phases without changing ordering.
+`src/native_output/runtime/cycle.rs` is no longer allowlisted. Native bootstrap,
+event/input dispatch, acquire processing, frame preparation, presentation, and
+metrics now live in named runtime modules and phase methods without changing
+ordering.

@@ -3,7 +3,7 @@
 use super::*;
 
 impl CompositorState {
-    pub(crate) fn commit_surface_buffer(
+    pub(in crate::compositor) fn commit_surface_buffer(
         &mut self,
         surface_id: u32,
         pending: PendingSurfaceBuffer,
@@ -192,7 +192,10 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn minimized_root_surface_id_for_surface(&self, surface_id: u32) -> Option<u32> {
+    pub(in crate::compositor) fn minimized_root_surface_id_for_surface(
+        &self,
+        surface_id: u32,
+    ) -> Option<u32> {
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
         self.toplevel_surfaces
             .get(&root_surface_id)
@@ -201,7 +204,7 @@ impl CompositorState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn commit_minimized_surface_buffer(
+    pub(in crate::compositor) fn commit_minimized_surface_buffer(
         &mut self,
         root_surface_id: u32,
         surface_id: u32,
@@ -242,7 +245,7 @@ impl CompositorState {
         Ok(())
     }
 
-    pub(crate) fn commit_surface_damage_only(
+    pub(in crate::compositor) fn commit_surface_damage_only(
         &mut self,
         surface_id: u32,
         damage: RenderableSurfaceDamage,
@@ -341,7 +344,7 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn commit_surface_request_with_captured_sync(
+    pub(in crate::compositor) fn commit_surface_request_with_captured_sync(
         &mut self,
         surface_id: u32,
         commit_sequence: SurfaceCommitSequence,
@@ -482,7 +485,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn commit_surface_without_buffer(
+    pub(in crate::compositor) fn commit_surface_without_buffer(
         &mut self,
         surface_id: u32,
         data: &SurfaceData,
@@ -563,7 +566,7 @@ impl CompositorState {
         self.complete_frame_callbacks_now(data);
     }
 
-    pub(crate) fn complete_pending_resize_from_current_geometry(
+    pub(in crate::compositor) fn complete_pending_resize_from_current_geometry(
         &mut self,
         surface_id: u32,
         resize: ResizeCommitSnapshot,
@@ -614,7 +617,7 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn commit_surface_remove_content(
+    pub(in crate::compositor) fn commit_surface_remove_content(
         &mut self,
         surface_id: u32,
         commit_sequence: SurfaceCommitSequence,
@@ -653,7 +656,7 @@ impl CompositorState {
         self.complete_frame_callbacks(callbacks);
     }
 
-    pub(crate) fn unmap_surface_content(&mut self, surface_id: u32) -> bool {
+    pub(in crate::compositor) fn unmap_surface_content(&mut self, surface_id: u32) -> bool {
         let renderable_ids = self
             .renderable_surfaces
             .iter()
@@ -712,7 +715,7 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn unmap_xdg_role_surfaces(&mut self, surface_id: u32) -> bool {
+    pub(in crate::compositor) fn unmap_xdg_role_surfaces(&mut self, surface_id: u32) -> bool {
         let renderable_ids = self
             .renderable_surfaces
             .iter()
@@ -768,7 +771,7 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn clear_resize_state_for_surfaces(&mut self, surface_ids: &[u32]) {
+    pub(in crate::compositor) fn clear_resize_state_for_surfaces(&mut self, surface_ids: &[u32]) {
         let before_flows = self.resize_configure_flows.len();
         self.resize_configure_flows
             .retain(|surface_id, _| !surface_ids.contains(surface_id));
@@ -825,7 +828,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn track_committed_buffer_lifetime(
+    pub(in crate::compositor) fn track_committed_buffer_lifetime(
         &mut self,
         surface_id: u32,
         pending: &PendingSurfaceBuffer,
@@ -848,15 +851,18 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn queue_buffer_release(&mut self, buffer: wl_buffer::WlBuffer) {
+    pub(in crate::compositor) fn queue_buffer_release(&mut self, buffer: wl_buffer::WlBuffer) {
         self.pending_buffer_releases.push(buffer);
     }
 
-    pub(crate) fn queue_dmabuf_buffer_release(&mut self, release: SurfaceBufferRelease) {
+    pub(in crate::compositor) fn queue_dmabuf_buffer_release(
+        &mut self,
+        release: SurfaceBufferRelease,
+    ) {
         self.pending_dmabuf_buffer_releases.push(release);
     }
 
-    pub(crate) fn commit_cursor_surface_buffer(
+    pub(in crate::compositor) fn commit_cursor_surface_buffer(
         &mut self,
         surface_id: u32,
         pending: PendingSurfaceBuffer,
@@ -894,7 +900,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn commit_surface_buffer_by_role(
+    pub(in crate::compositor) fn commit_surface_buffer_by_role(
         &mut self,
         surface_id: u32,
         pending: PendingSurfaceBuffer,
@@ -927,7 +933,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn commit_cursor_surface_damage_only(
+    pub(in crate::compositor) fn commit_cursor_surface_damage_only(
         &mut self,
         surface_id: u32,
         damage: RenderableSurfaceDamage,
@@ -989,7 +995,7 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn commit_cursor_surface_removal_request(
+    pub(in crate::compositor) fn commit_cursor_surface_removal_request(
         &mut self,
         surface_id: u32,
         data: &SurfaceData,
@@ -1028,14 +1034,18 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn surface_placement(&self, surface_id: u32) -> SurfacePlacement {
+    pub(in crate::compositor) fn surface_placement(&self, surface_id: u32) -> SurfacePlacement {
         self.surface_placements
             .get(&surface_id)
             .copied()
             .unwrap_or_default()
     }
 
-    pub(crate) fn store_surface_placement(&mut self, surface_id: u32, placement: SurfacePlacement) {
+    pub(in crate::compositor) fn store_surface_placement(
+        &mut self,
+        surface_id: u32,
+        placement: SurfacePlacement,
+    ) {
         self.invalidate_surface_origin_cache();
         if placement == SurfacePlacement::root() {
             self.surface_placements.remove(&surface_id);

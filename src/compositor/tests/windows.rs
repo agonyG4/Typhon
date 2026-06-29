@@ -332,38 +332,96 @@ fn resize_drag_updates_visual_target_before_client_commit() {
 
     let surface = &server.renderable_surfaces()[0];
     assert_eq!(server.renderable_surfaces().len(), 1);
-    assert_eq!(surface.width, 340);
-    assert_eq!(surface.height, 230);
+    assert_eq!(surface.width, 300);
+    assert_eq!(surface.height, 200);
     assert_eq!(surface.generation, 1);
     assert_eq!(
-        surface.resize_preview,
-        Some(ResizePreview {
-            interaction_id: ResizeInteractionId::new(1),
+        surface.visual_clip,
+        Some(render::SurfaceTargetRect::new(0, 0, 340, 230))
+    );
+}
+
+fn state_with_preview_resize(
+    resizing: bool,
+) -> (
+    CompositorState,
+    u32,
+    ResizeCommitSnapshot,
+    PendingResizeConfigure,
+) {
+    let mut state = CompositorState::default();
+    let surface_id = 42;
+    let identity = BufferIdAllocator::default()
+        .allocate()
+        .expect("test buffer identity");
+    let desired = PendingResizeConfigure {
+        surface_id,
+        width: 1200,
+        height: 700,
+        placement: SurfacePlacement::root_at(100, 80),
+        edges: ResizeEdges::BOTTOM_RIGHT,
+        resizing,
+        interaction_id: ResizeInteractionId::new(1),
+    };
+    let resize = ResizeCommitSnapshot {
+        serial: 7,
+        sequence: 1,
+        commit_sequence: 1,
+        width: desired.width,
+        height: desired.height,
+        placement: desired.placement,
+        edges: desired.edges,
+        resizing,
+        emitted_at: Instant::now(),
+        committed_size: Some((944, 502)),
+        buffer_id: Some(identity.id().get()),
+        interaction_id: desired.interaction_id,
+    };
+
+    state.renderable_surfaces.push(RenderableSurface {
+        surface_id,
+        x: 0,
+        y: 0,
+        width: 944,
+        height: 502,
+        placement: SurfacePlacement::root(),
+        render_placement: None,
+        visual_clip: None,
         generation: 1,
+        commit_sequence: SurfaceCommitSequence::initial(),
         buffer: crate::render_backend::buffer::CommittedSurfaceBuffer::shm_snapshot(
             identity,
-            BufferSize::new(1000, 696).expect("test size"),
-            vec![0; 1000 * 696],
+            BufferSize::new(944, 502).expect("test size"),
+            vec![0; 944 * 502],
         ),
         damage: RenderableSurfaceDamage::Full,
     });
     state
         .surface_window_geometries
-        .insert(surface_id, XdgWindowGeometry::new(0, 0, 1000, 696));
+        .insert(surface_id, XdgWindowGeometry::new(0, 0, 944, 502));
     state.active_toplevel_resizes.insert(
         surface_id,
         ActiveToplevelResize {
             interaction_id: desired.interaction_id,
             flow_sequence: 1,
+            edges: desired.edges,
             activated_at: Instant::now(),
         },
     );
+    assert!(state.preview_resize_root_window_to(
+        surface_id,
+        desired.width,
+        desired.height,
+        desired.placement,
+        desired.edges,
+        desired.interaction_id,
+    ));
     (state, surface_id, resize, desired)
 }
 
 #[test]
 fn intermediate_geometry_only_commit_preserves_active_resize_preview() {
-    let (mut state, surface_id, resize, desired) = state_with_preview_resize(true);
+    let (mut state, surface_id, resize, _desired) = state_with_preview_resize(true);
 
     assert!(state.complete_pending_resize_from_current_geometry(surface_id, resize));
 
@@ -375,20 +433,9 @@ fn intermediate_geometry_only_commit_preserves_active_resize_preview() {
     );
     let surface = &state.renderable_surfaces[0];
     assert_eq!(
-        surface.resize_preview,
-        Some(ResizePreview {
-            interaction_id: desired.interaction_id,
-        generation: 1,
-        buffer: crate::render_backend::buffer::CommittedSurfaceBuffer::shm_snapshot(
-            identity,
-            BufferSize::new(944, 502).expect("test size"),
-            vec![0; 944 * 502],
-        ),
-        damage: RenderableSurfaceDamage::Full,
-    });
-    state
-        .surface_window_geometries
-        .insert(surface_id, XdgWindowGeometry::new(0, 0, 944, 502));
+        surface.visual_clip,
+        Some(render::SurfaceTargetRect::new(100, 80, 1200, 700))
+    );
 
     let visual = state
         .current_visual_root_window_geometry(surface_id)
@@ -486,7 +533,7 @@ fn resize_drag_end_clears_resizing_state() {
     assert_eq!(state.toplevel_height, 230);
     assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Resizing));
     let metrics = server.resize_flow_metrics();
-    assert_eq!(metrics.max_in_flight_configures, 1);
+    assert_eq!(metrics.max_in_flight_configures, 2);
     assert_eq!(metrics.acks_unknown, 0);
     assert!(metrics.configures_sent >= 2);
     assert!(metrics.commits_captured >= 1);
@@ -644,8 +691,12 @@ fn left_edge_resize_shrink_updates_visual_target_before_client_commit() {
 
     assert_eq!(state.toplevel_width, 260);
     assert_eq!(state.toplevel_height, 200);
-    assert_eq!(server.renderable_surfaces()[0].width, 260);
+    assert_eq!(server.renderable_surfaces()[0].width, 300);
     assert_eq!(server.renderable_surfaces()[0].height, 200);
+    assert_eq!(
+        server.renderable_surfaces()[0].visual_clip,
+        Some(render::SurfaceTargetRect::new(40, 0, 260, 200))
+    );
     assert_eq!(
         origins.first().copied(),
         Some((
@@ -653,10 +704,7 @@ fn left_edge_resize_shrink_updates_visual_target_before_client_commit() {
             render::FIRST_SURFACE_OFFSET.1,
         ))
     );
-    assert_eq!(
-        origins[0].0 + server.renderable_surfaces()[0].width as i32,
-        render::FIRST_SURFACE_OFFSET.0 + 300
-    );
+    assert_eq!(origins[0].0 + 260, render::FIRST_SURFACE_OFFSET.0 + 300);
 }
 
 #[test]
@@ -677,7 +725,11 @@ fn resize_preview_clamps_to_toplevel_min_size_before_client_commit() {
         .renderable_surfaces()
         .first()
         .expect("toplevel should remain renderable");
-    assert_eq!((surface.width, surface.height), (280, 180));
+    assert_eq!((surface.width, surface.height), (320, 220));
+    assert_eq!(
+        surface.visual_clip,
+        Some(render::SurfaceTargetRect::new(0, 0, 280, 180))
+    );
 }
 
 #[test]

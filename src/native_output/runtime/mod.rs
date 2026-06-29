@@ -1,10 +1,39 @@
 use super::*;
 
+mod bootstrap;
 mod cycle;
 mod frame;
+mod presentation;
 
-pub(crate) use cycle::*;
-pub(crate) use frame::*;
+pub(crate) use cycle::run;
+pub(crate) use frame::{
+    NativeCursorPreference, NativeCursorRenderMode, NativeFrameRenderer,
+    NativePointerConstraintBackend, earliest_native_deadline, native_pointer_debug_log,
+    normalize_refresh_hz,
+};
+#[cfg(test)]
+pub(crate) use frame::{
+    NativeFrameRequest, NativePointerConstraint, NativePointerConstraintBackendAction,
+    NativeRepaintDecision, NativeRepaintInputs, native_repaint_decision,
+};
+
+pub(super) struct NativeCycleState {
+    pub(super) wakeup: NativeWakeup,
+    pub(super) pageflip_drain_us: u64,
+    pub(super) pageflip_completed: bool,
+    pub(super) frame_completed: bool,
+    pub(super) frame_rendered: bool,
+    pub(super) frame_submitted: bool,
+    pub(super) present_us: u64,
+    pub(super) pageflip_pending_at_tick: bool,
+    pub(super) tick_us: u64,
+    pub(super) accepted: usize,
+    pub(super) redraw_requested: bool,
+    pub(super) skipped_input_repaints: usize,
+    pub(super) input_drain_us: u64,
+    pub(super) raw_input_events: usize,
+    pub(super) coalesced_input_events: usize,
+}
 
 pub(crate) struct NativeRuntimeConfig {
     pub(crate) server: OwnCompositorServer,
@@ -13,20 +42,47 @@ pub(crate) struct NativeRuntimeConfig {
 }
 
 pub(crate) struct NativeRuntime {
-    config: NativeRuntimeConfig,
+    server: OwnCompositorServer,
+    perf: NativePerfLogger,
+    kms: NativeDrmDevice,
+    kms_backend: KmsBackendSelection,
+    target: KmsTarget,
+    mode_label: String,
+    refresh_hz: u32,
+    drm_file_generation: u64,
+    drm_timestamp_clock: DrmTimestampClock,
+    presentation_clock: PresentationClock,
+    scanout: NativeScanoutBackend,
+    frame_renderer: NativeFrameRenderer,
+    input_state: NativeInputState,
+    cursor_preference: NativeCursorPreference,
+    cursor_render_mode: NativeCursorRenderMode,
+    hardware_cursor: Option<NativeHardwareCursor>,
+    input_devices: NativeInputBackend,
+    acquire_notifier: DrmAcquirePointNotifier,
+    acquire_watches: ExplicitSyncWatchRegistry,
+    event_loop: NativeEventLoop,
+    frame_scheduler: NativeFrameScheduler,
+    effective_app_gpu_policy: EffectiveCompositorAppGpuPolicy,
+    last_render_generation: u64,
+    last_renderable_surfaces: Vec<RenderableSurface>,
+    queued_redraw_requested: bool,
+    frame_index: u64,
+    known_toplevels: usize,
+    pending_launches: VecDeque<NativeAppLaunchPerf>,
+    mismatched_pageflip_events: u64,
+    stale_pageflip_events: u64,
+    last_acquire_ready_at_ns: Option<u64>,
+    resize_perf: NativeResizePerfState,
+    pointer_constraint_backend: NativePointerConstraintBackend,
 }
 
 impl NativeRuntime {
     pub(crate) fn bootstrap(config: NativeRuntimeConfig) -> NativeResult<Self> {
-        Ok(Self { config })
+        Self::bootstrap_native(config)
     }
 
-    pub(crate) fn run(self) -> NativeResult<()> {
-        let NativeRuntimeConfig {
-            server,
-            app,
-            app_gpu_preference,
-        } = self.config;
-        run_legacy_native_runtime(server, app, app_gpu_preference)
+    pub(crate) fn run(&mut self) -> NativeResult<()> {
+        self.run_native_cycle()
     }
 }

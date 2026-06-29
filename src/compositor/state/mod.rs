@@ -1,5 +1,3 @@
-#![allow(private_interfaces, unused_imports)]
-
 use super::*;
 
 mod frames;
@@ -16,19 +14,32 @@ mod surface_commits;
 mod surfaces;
 mod windows;
 
-pub(crate) use frames::*;
-pub(crate) use helpers::*;
-pub(crate) use hit_testing::*;
-pub(crate) use input_dispatch::*;
-pub(crate) use input_resources::*;
-pub(crate) use pointer_constraints::*;
-pub(crate) use resize::*;
-pub(crate) use shutdown::*;
-pub(crate) use subsurfaces::*;
-pub(crate) use support_types::*;
-pub(crate) use surface_commits::*;
-pub(crate) use surfaces::*;
-pub(crate) use windows::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use frames::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use helpers::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use hit_testing::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use input_dispatch::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use input_resources::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use pointer_constraints::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use resize::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use shutdown::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use subsurfaces::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use support_types::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use surface_commits::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use surfaces::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use windows::*;
 
 #[cfg(test)]
 mod task_05_8_tests;

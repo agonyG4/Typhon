@@ -1,7 +1,7 @@
 use super::*;
 
 impl CompositorState {
-    pub(crate) fn take_pending_resize_commit_placement(
+    pub(in crate::compositor) fn take_pending_resize_commit_placement(
         &self,
         surface_id: u32,
         pending: &PendingSurfaceBuffer,
@@ -36,7 +36,11 @@ impl CompositorState {
         Ok(Some(placement))
     }
 
-    pub(crate) fn ack_xdg_surface_configure(&mut self, surface_id: u32, serial: u32) {
+    pub(in crate::compositor) fn ack_xdg_surface_configure(
+        &mut self,
+        surface_id: u32,
+        serial: u32,
+    ) {
         if !self.toplevel_surfaces.contains_key(&surface_id) {
             if compositor_debug_surface_logging_enabled() {
                 eprintln!(
@@ -119,7 +123,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn capture_acked_resize_for_surface_commit(
+    pub(in crate::compositor) fn capture_acked_resize_for_surface_commit(
         &mut self,
         surface_id: u32,
     ) -> Option<ResizeCommitSnapshot> {
@@ -153,7 +157,7 @@ impl CompositorState {
         snapshot
     }
 
-    pub(crate) fn snapshot_resize_commit_for_buffer(
+    pub(in crate::compositor) fn snapshot_resize_commit_for_buffer(
         &self,
         surface_id: u32,
         snapshot: ResizeCommitSnapshot,
@@ -174,7 +178,7 @@ impl CompositorState {
         )
     }
 
-    pub(crate) fn snapshot_resize_commit_for_pending_buffer_size(
+    pub(in crate::compositor) fn snapshot_resize_commit_for_pending_buffer_size(
         &self,
         _surface_id: u32,
         snapshot: ResizeCommitSnapshot,
@@ -189,7 +193,7 @@ impl CompositorState {
         })
     }
 
-    pub(crate) fn current_committed_surface_content_size(
+    pub(in crate::compositor) fn current_committed_surface_content_size(
         &self,
         surface_id: u32,
     ) -> Option<BufferSize> {
@@ -204,7 +208,7 @@ impl CompositorState {
             })
     }
 
-    pub(crate) fn finalize_pending_buffer_resize_capture(
+    pub(in crate::compositor) fn finalize_pending_buffer_resize_capture(
         &mut self,
         surface_id: u32,
         pending: &mut PendingSurfaceBuffer,
@@ -219,7 +223,7 @@ impl CompositorState {
         pending.resize_capture_finalized = true;
     }
 
-    pub(crate) fn complete_applied_resize_transaction(
+    pub(in crate::compositor) fn complete_applied_resize_transaction(
         &mut self,
         surface_id: u32,
         snapshot: ResizeCommitSnapshot,
@@ -303,7 +307,10 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn update_resize_captures_pending_metrics(&mut self, surface_id: u32) {
+    pub(in crate::compositor) fn update_resize_captures_pending_metrics(
+        &mut self,
+        surface_id: u32,
+    ) {
         let pending = self
             .resize_configure_flows
             .get(&surface_id)
@@ -315,7 +322,11 @@ impl CompositorState {
             .max(pending);
     }
 
-    pub(crate) fn release_resize_capture(&mut self, surface_id: u32, commit_sequence: u64) -> bool {
+    pub(in crate::compositor) fn release_resize_capture(
+        &mut self,
+        surface_id: u32,
+        commit_sequence: u64,
+    ) -> bool {
         let released = self
             .resize_configure_flows
             .get_mut(&surface_id)
@@ -330,7 +341,7 @@ impl CompositorState {
         released
     }
 
-    pub(crate) fn update_resize_retained_configure_peak(&mut self, surface_id: u32) {
+    pub(in crate::compositor) fn update_resize_retained_configure_peak(&mut self, surface_id: u32) {
         let retained = self
             .resize_configure_flows
             .get(&surface_id)
@@ -341,7 +352,7 @@ impl CompositorState {
             .max(retained);
     }
 
-    pub(crate) fn send_resize_root_window_to(
+    pub(in crate::compositor) fn send_resize_root_window_to(
         &mut self,
         surface_id: u32,
         width: u32,
@@ -351,7 +362,7 @@ impl CompositorState {
             .is_some()
     }
 
-    pub(crate) fn send_configure_root_window_to(
+    pub(in crate::compositor) fn send_configure_root_window_to(
         &mut self,
         surface_id: u32,
         width: u32,

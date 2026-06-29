@@ -527,6 +527,7 @@ impl OwnCompositorServer {
         self.state.begin_client_dispatch_cycle();
         self.display.dispatch_clients(&mut self.state)?;
         self.state.finish_client_dispatch_cycle();
+        self.state.clear_dead_active_clipboard_source();
         self.state.poll_clipboard_bridge();
         self.display.flush_clients()?;
         Ok(accepted)

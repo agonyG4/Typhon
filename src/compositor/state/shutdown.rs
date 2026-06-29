@@ -1,7 +1,7 @@
 use super::*;
 
 impl CompositorState {
-    pub(crate) fn release_cached_resources_for_shutdown(&mut self) {
+    pub(in crate::compositor) fn release_cached_resources_for_shutdown(&mut self) {
         let mut cached = self.subsurface_transactions.drain_cached_commits();
         for transaction in self.pending_surface_tree_transactions.drain(..) {
             cached.extend(transaction.nodes.into_iter().map(|(_, commit)| commit));
@@ -20,7 +20,7 @@ impl CompositorState {
     }
 }
 
-pub(crate) fn empty_cached_subsurface_commit() -> CachedSubsurfaceCommit {
+pub(in crate::compositor) fn empty_cached_subsurface_commit() -> CachedSubsurfaceCommit {
     CachedSubsurfaceCommit {
         commit_sequence: SurfaceCommitSequence::initial(),
         attachment: None,
@@ -39,7 +39,7 @@ pub(crate) fn empty_cached_subsurface_commit() -> CachedSubsurfaceCommit {
     }
 }
 
-pub(crate) fn take_tree_resize_commit(
+pub(in crate::compositor) fn take_tree_resize_commit(
     root_surface_id: u32,
     nodes: &mut [(u32, CachedSubsurfaceCommit)],
 ) -> Option<ResizeCommitSnapshot> {
@@ -54,7 +54,7 @@ pub(crate) fn take_tree_resize_commit(
     }
 }
 
-pub(crate) fn pending_node_resize_commit(
+pub(in crate::compositor) fn pending_node_resize_commit(
     commit: &CachedSubsurfaceCommit,
 ) -> Option<ResizeCommitSnapshot> {
     match commit.attachment.as_ref() {
@@ -63,7 +63,7 @@ pub(crate) fn pending_node_resize_commit(
     }
 }
 
-pub(crate) fn pending_attachment_buffer_protocol_id(
+pub(in crate::compositor) fn pending_attachment_buffer_protocol_id(
     attachment: &PendingSurfaceAttachment,
 ) -> Option<u32> {
     match attachment {
@@ -72,7 +72,7 @@ pub(crate) fn pending_attachment_buffer_protocol_id(
     }
 }
 
-pub(crate) fn remove_surface_tree_dependency(
+pub(in crate::compositor) fn remove_surface_tree_dependency(
     transaction: &mut PendingSurfaceTreeTransaction,
     surface_id: u32,
     buffer_id: u32,
@@ -83,7 +83,7 @@ pub(crate) fn remove_surface_tree_dependency(
     Some(transaction.dependencies.remove(index))
 }
 
-pub(crate) fn newest_ready_explicit_sync_commit_indices(
+pub(in crate::compositor) fn newest_ready_explicit_sync_commit_indices(
     commits: impl IntoIterator<Item = (usize, u32, bool)>,
 ) -> HashMap<u32, usize> {
     let mut newest_ready = HashMap::new();
@@ -95,7 +95,7 @@ pub(crate) fn newest_ready_explicit_sync_commit_indices(
     newest_ready
 }
 
-pub(crate) fn damage_only_rendered_surface_size(
+pub(in crate::compositor) fn damage_only_rendered_surface_size(
     existing: BufferSize,
     requested: BufferSize,
     resize_pending: bool,
@@ -103,7 +103,7 @@ pub(crate) fn damage_only_rendered_surface_size(
     if resize_pending { existing } else { requested }
 }
 
-pub(crate) fn resource_belongs_to_surface_client<R>(
+pub(in crate::compositor) fn resource_belongs_to_surface_client<R>(
     resource: &R,
     surface: &wl_surface::WlSurface,
 ) -> bool
@@ -113,7 +113,7 @@ where
     resource.id().same_client_as(&surface.id())
 }
 
-pub(crate) fn same_wayland_resource<L, R>(left: &L, right: &R) -> bool
+pub(in crate::compositor) fn same_wayland_resource<L, R>(left: &L, right: &R) -> bool
 where
     L: Resource,
     R: Resource,

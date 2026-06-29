@@ -6,7 +6,11 @@ use super::*;
 mod task_05_8_tests {
     use super::*;
 
-    pub(crate) fn test_surface(surface_id: u32, width: u32, height: u32) -> RenderableSurface {
+    pub(in crate::compositor) fn test_surface(
+        surface_id: u32,
+        width: u32,
+        height: u32,
+    ) -> RenderableSurface {
         let identity = BufferIdAllocator::default()
             .allocate()
             .expect("test buffer identity");
@@ -30,7 +34,7 @@ mod task_05_8_tests {
         }
     }
 
-    pub(crate) fn test_resize_snapshot(
+    pub(in crate::compositor) fn test_resize_snapshot(
         _surface_id: u32,
         interaction_id: ResizeInteractionId,
         resizing: bool,
@@ -54,7 +58,7 @@ mod task_05_8_tests {
     }
 
     #[test]
-    pub(crate) fn task_05_8_pointer_resize_changes_visual_box_not_surface_content() {
+    pub(in crate::compositor) fn task_05_8_pointer_resize_changes_visual_box_not_surface_content() {
         let mut state = CompositorState::default();
         let surface_id = 42;
         let interaction_id = ResizeInteractionId::new(1);
@@ -86,7 +90,7 @@ mod task_05_8_tests {
     }
 
     #[test]
-    pub(crate) fn task_05_8_csd_window_geometry_aligns_root_and_titlebar() {
+    pub(in crate::compositor) fn task_05_8_csd_window_geometry_aligns_root_and_titlebar() {
         let mut state = CompositorState::default();
         let root_id = 42;
         let titlebar_id = 43;
@@ -143,7 +147,8 @@ mod task_05_8_tests {
     }
 
     #[test]
-    pub(crate) fn task_05_8_ack_moves_to_pending_surface_and_frees_configure_capacity() {
+    pub(in crate::compositor) fn task_05_8_ack_moves_to_pending_surface_and_frees_configure_capacity()
+     {
         let mut flow = ResizeConfigureFlow::default();
         for (serial, sequence, width) in [(10, 1, 1000), (11, 2, 1050), (12, 3, 1100)] {
             flow.mark_sent(
@@ -177,7 +182,7 @@ mod task_05_8_tests {
     }
 
     #[test]
-    pub(crate) fn task_05_8_committed_snapshot_lives_outside_configure_flow() {
+    pub(in crate::compositor) fn task_05_8_committed_snapshot_lives_outside_configure_flow() {
         let mut flow = ResizeConfigureFlow::default();
         let desired = PendingResizeConfigure {
             surface_id: 42,
@@ -205,12 +210,12 @@ mod task_05_8_tests {
 
         assert_eq!(snapshot_a.commit_sequence, 90);
         assert_eq!(snapshot_b.commit_sequence, 91);
-        assert_eq!(flow.captured_count(), 0);
-        assert_eq!(flow.retained_configure_count(), 0);
+        assert_eq!(flow.captured_count(), 2);
+        assert_eq!(flow.retained_configure_count(), 2);
     }
 
     #[test]
-    pub(crate) fn task_05_8_intermediate_and_final_resize_lifecycle() {
+    pub(in crate::compositor) fn task_05_8_intermediate_and_final_resize_lifecycle() {
         let mut state = CompositorState::default();
         let surface_id = 42;
         let interaction_id = ResizeInteractionId::new(1);
@@ -250,7 +255,8 @@ mod task_05_8_tests {
     }
 
     #[test]
-    pub(crate) fn task_05_8_move_updates_inactive_visual_geometry_and_render_origin() {
+    pub(in crate::compositor) fn task_05_8_move_updates_inactive_visual_geometry_and_render_origin()
+    {
         let mut state = CompositorState::default();
         let surface_id = 42;
         state

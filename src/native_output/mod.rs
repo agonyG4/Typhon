@@ -50,7 +50,7 @@ use oblivion_one::native::{
         DrmPresentationEvent, DrmTimestampClock, drain_drm_page_flip_events,
         query_drm_timestamp_clock, sample_clock_microseconds,
     },
-    event_loop::{NativeEventLoop, NativeEventSource, monotonic_now_ns},
+    event_loop::{NativeEventLoop, NativeEventSource, NativeWakeup, monotonic_now_ns},
     explicit_sync::{
         AcquireReadyResult, AcquireRegistrationResult, DrmAcquirePointNotifier,
         ExplicitSyncWatchRegistry,
@@ -78,7 +78,10 @@ pub(crate) use input::*;
 pub(crate) use launch::*;
 pub(crate) use output::*;
 pub(crate) use perf::*;
-pub(crate) use runtime::*;
+pub(crate) use runtime::{
+    NativeCursorRenderMode, NativeFrameRenderer, NativePointerConstraintBackend,
+    native_pointer_debug_log, run,
+};
 pub(crate) use scanout::*;
 
 #[cfg(test)]

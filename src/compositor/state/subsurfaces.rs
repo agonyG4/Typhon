@@ -3,7 +3,7 @@
 use super::*;
 
 impl CompositorState {
-    pub(crate) fn register_subsurface_relationship(
+    pub(in crate::compositor) fn register_subsurface_relationship(
         &mut self,
         surface_id: u32,
         parent_id: u32,
@@ -24,12 +24,19 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn is_effectively_synchronized_subsurface(&self, surface_id: u32) -> bool {
+    pub(in crate::compositor) fn is_effectively_synchronized_subsurface(
+        &self,
+        surface_id: u32,
+    ) -> bool {
         self.subsurface_transactions
             .is_effectively_synchronized(surface_id)
     }
 
-    pub(crate) fn set_subsurface_sync_mode(&mut self, surface_id: u32, mode: SubsurfaceSyncMode) {
+    pub(in crate::compositor) fn set_subsurface_sync_mode(
+        &mut self,
+        surface_id: u32,
+        mode: SubsurfaceSyncMode,
+    ) {
         if !self.subsurface_transactions.set_mode(surface_id, mode) {
             return;
         }
@@ -49,12 +56,17 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn set_pending_subsurface_position(&mut self, surface_id: u32, x: i32, y: i32) {
+    pub(in crate::compositor) fn set_pending_subsurface_position(
+        &mut self,
+        surface_id: u32,
+        x: i32,
+        y: i32,
+    ) {
         self.subsurface_transactions
             .set_pending_position(surface_id, x, y);
     }
 
-    pub(crate) fn commit_surface_tree_request(
+    pub(in crate::compositor) fn commit_surface_tree_request(
         &mut self,
         surface_id: u32,
         mut commit: CachedSubsurfaceCommit,
@@ -102,7 +114,7 @@ impl CompositorState {
         self.submit_surface_tree_nodes(surface_id, nodes);
     }
 
-    pub(crate) fn submit_surface_tree_nodes(
+    pub(in crate::compositor) fn submit_surface_tree_nodes(
         &mut self,
         surface_id: u32,
         mut nodes: Vec<(u32, CachedSubsurfaceCommit)>,
@@ -123,7 +135,7 @@ impl CompositorState {
         self.merge_or_queue_surface_tree_transaction(surface_id, nodes, dependencies);
     }
 
-    pub(crate) fn merge_or_queue_surface_tree_transaction(
+    pub(in crate::compositor) fn merge_or_queue_surface_tree_transaction(
         &mut self,
         root_surface_id: u32,
         nodes: Vec<(u32, CachedSubsurfaceCommit)>,
@@ -206,7 +218,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn merge_surface_tree_nodes_into_transaction(
+    pub(in crate::compositor) fn merge_surface_tree_nodes_into_transaction(
         &mut self,
         root_surface_id: u32,
         transaction: &mut PendingSurfaceTreeTransaction,
@@ -315,7 +327,10 @@ impl CompositorState {
         stats
     }
 
-    pub(crate) fn record_surface_tree_merge_metrics(&mut self, stats: &SurfaceTreeMergeStats) {
+    pub(in crate::compositor) fn record_surface_tree_merge_metrics(
+        &mut self,
+        stats: &SurfaceTreeMergeStats,
+    ) {
         self.subsurface_transaction_metrics
             .bufferless_tree_commits_merged = self
             .subsurface_transaction_metrics
@@ -364,7 +379,7 @@ impl CompositorState {
             .saturating_add(stats.resize_snapshots_replaced as u64);
     }
 
-    pub(crate) fn update_surface_tree_slot_metrics(&mut self, root_surface_id: u32) {
+    pub(in crate::compositor) fn update_surface_tree_slot_metrics(&mut self, root_surface_id: u32) {
         let mut ready = 0usize;
         let mut waiting = 0usize;
         for transaction in self
@@ -390,7 +405,7 @@ impl CompositorState {
             .max(waiting);
     }
 
-    pub(crate) fn prepare_surface_tree_surface_state(
+    pub(in crate::compositor) fn prepare_surface_tree_surface_state(
         &self,
         nodes: &mut [(u32, CachedSubsurfaceCommit)],
     ) -> bool {
@@ -417,7 +432,7 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn prepare_surface_tree_acquires(
+    pub(in crate::compositor) fn prepare_surface_tree_acquires(
         &mut self,
         nodes: &mut [(u32, CachedSubsurfaceCommit)],
     ) -> Option<Vec<SurfaceTreeAcquireDependency>> {
@@ -491,7 +506,7 @@ impl CompositorState {
         Some(dependencies)
     }
 
-    pub(crate) fn queue_waiting_surface_tree(
+    pub(in crate::compositor) fn queue_waiting_surface_tree(
         &mut self,
         root_surface_id: u32,
         mut nodes: Vec<(u32, CachedSubsurfaceCommit)>,
@@ -578,7 +593,7 @@ impl CompositorState {
             .max(pending_acquires);
     }
 
-    pub(crate) fn publish_surface_tree_nodes(
+    pub(in crate::compositor) fn publish_surface_tree_nodes(
         &mut self,
         root_surface_id: u32,
         mut nodes: Vec<(u32, CachedSubsurfaceCommit)>,
@@ -623,7 +638,7 @@ impl CompositorState {
         self.publish_surface_tree(root_surface_id, root_commit, nodes);
     }
 
-    pub(crate) fn cancel_pending_surface_trees_for_root(
+    pub(in crate::compositor) fn cancel_pending_surface_trees_for_root(
         &mut self,
         root_surface_id: u32,
         reason: AcquireWatchCancelReason,
@@ -655,7 +670,7 @@ impl CompositorState {
         released
     }
 
-    pub(crate) fn cancel_pending_surface_trees_for_surface(
+    pub(in crate::compositor) fn cancel_pending_surface_trees_for_surface(
         &mut self,
         surface_id: u32,
         reason: AcquireWatchCancelReason,
@@ -682,7 +697,7 @@ impl CompositorState {
         self.complete_frame_callbacks(callbacks);
     }
 
-    pub(crate) fn release_pending_surface_tree_transaction(
+    pub(in crate::compositor) fn release_pending_surface_tree_transaction(
         &mut self,
         mut transaction: PendingSurfaceTreeTransaction,
         reason: AcquireWatchCancelReason,
@@ -705,7 +720,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn release_unpublished_surface_tree_nodes(
+    pub(in crate::compositor) fn release_unpublished_surface_tree_nodes(
         &mut self,
         nodes: Vec<(u32, CachedSubsurfaceCommit)>,
     ) {
@@ -714,7 +729,7 @@ impl CompositorState {
         self.complete_frame_callbacks(callbacks);
     }
 
-    pub(crate) fn release_resize_captures_for_tree_nodes(
+    pub(in crate::compositor) fn release_resize_captures_for_tree_nodes(
         &mut self,
         nodes: &[(u32, CachedSubsurfaceCommit)],
     ) {
@@ -731,7 +746,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn install_tree_resize_commit(
+    pub(in crate::compositor) fn install_tree_resize_commit(
         &self,
         root_surface_id: u32,
         nodes: &mut [(u32, CachedSubsurfaceCommit)],
@@ -754,7 +769,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn release_detached_resize_capture(
+    pub(in crate::compositor) fn release_detached_resize_capture(
         &mut self,
         surface_id: u32,
         resize_commit: ResizeCommitSnapshot,
@@ -762,7 +777,7 @@ impl CompositorState {
         self.release_resize_capture(surface_id, resize_commit.commit_sequence);
     }
 
-    pub(crate) fn take_unpublished_surface_tree_callbacks(
+    pub(in crate::compositor) fn take_unpublished_surface_tree_callbacks(
         &mut self,
         nodes: Vec<(u32, CachedSubsurfaceCommit)>,
     ) -> Vec<wl_callback::WlCallback> {
@@ -779,7 +794,7 @@ impl CompositorState {
         callbacks
     }
 
-    pub(crate) fn cache_synchronized_subsurface_commit(
+    pub(in crate::compositor) fn cache_synchronized_subsurface_commit(
         &mut self,
         surface_id: u32,
         mut commit: CachedSubsurfaceCommit,
@@ -836,7 +851,10 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn apply_pending_subsurface_parent_state(&mut self, parent_id: u32) -> bool {
+    pub(in crate::compositor) fn apply_pending_subsurface_parent_state(
+        &mut self,
+        parent_id: u32,
+    ) -> bool {
         let positions = self
             .subsurface_transactions
             .take_pending_positions_for_parent(parent_id);
@@ -853,7 +871,7 @@ impl CompositorState {
         changed
     }
 
-    pub(crate) fn publish_surface_tree(
+    pub(in crate::compositor) fn publish_surface_tree(
         &mut self,
         root_id: u32,
         root_commit: CachedSubsurfaceCommit,
@@ -898,7 +916,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn apply_cached_subsurface_commit(
+    pub(in crate::compositor) fn apply_cached_subsurface_commit(
         &mut self,
         surface_id: u32,
         commit: CachedSubsurfaceCommit,
@@ -1013,7 +1031,10 @@ impl CompositorState {
             .extend(presentation_feedbacks);
     }
 
-    pub(crate) fn pending_stack_for_parent(&mut self, parent_id: u32) -> &mut Vec<u32> {
+    pub(in crate::compositor) fn pending_stack_for_parent(
+        &mut self,
+        parent_id: u32,
+    ) -> &mut Vec<u32> {
         self.pending_subsurface_stacks
             .entry(parent_id)
             .or_insert_with(|| {
@@ -1024,7 +1045,7 @@ impl CompositorState {
             })
     }
 
-    pub(crate) fn restack_subsurface(
+    pub(in crate::compositor) fn restack_subsurface(
         &mut self,
         surface_id: u32,
         parent_id: u32,
@@ -1060,7 +1081,10 @@ impl CompositorState {
         true
     }
 
-    pub(crate) fn apply_pending_subsurface_stack_for_parent(&mut self, parent_id: u32) -> bool {
+    pub(in crate::compositor) fn apply_pending_subsurface_stack_for_parent(
+        &mut self,
+        parent_id: u32,
+    ) -> bool {
         let Some(mut stack) = self.pending_subsurface_stacks.remove(&parent_id) else {
             return false;
         };
@@ -1087,7 +1111,10 @@ impl CompositorState {
         changed
     }
 
-    pub(crate) fn cleanup_subsurface_stack_state_for_surface(&mut self, surface_id: u32) {
+    pub(in crate::compositor) fn cleanup_subsurface_stack_state_for_surface(
+        &mut self,
+        surface_id: u32,
+    ) {
         self.committed_subsurface_stacks.remove(&surface_id);
         self.pending_subsurface_stacks.remove(&surface_id);
         for stack in self.committed_subsurface_stacks.values_mut() {
@@ -1107,7 +1134,7 @@ impl CompositorState {
         self.reorder_renderable_surfaces_by_committed_stack();
     }
 
-    pub(crate) fn destroy_subsurface_role(&mut self, surface_id: u32) {
+    pub(in crate::compositor) fn destroy_subsurface_role(&mut self, surface_id: u32) {
         let parent_id = self.subsurface_transactions.parent(surface_id);
         if let Some(commit) = self.subsurface_transactions.remove_role(surface_id) {
             self.release_cached_subsurface_commits(vec![commit]);
@@ -1128,7 +1155,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn release_cached_subsurface_commits(
+    pub(in crate::compositor) fn release_cached_subsurface_commits(
         &mut self,
         commits: Vec<CachedSubsurfaceCommit>,
     ) {
@@ -1142,7 +1169,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn debug_assert_surface_tree_invariants(&self) {
+    pub(in crate::compositor) fn debug_assert_surface_tree_invariants(&self) {
         #[cfg(debug_assertions)]
         {
             let mut renderable_ids = HashSet::new();
@@ -1160,7 +1187,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn take_surface_presentation_feedbacks(
+    pub(in crate::compositor) fn take_surface_presentation_feedbacks(
         &mut self,
         surface_id: u32,
     ) -> Vec<PendingPresentationFeedback> {
@@ -1169,7 +1196,7 @@ impl CompositorState {
             .unwrap_or_default()
     }
 
-    pub(crate) fn reorder_renderable_surfaces_by_committed_stack(&mut self) -> bool {
+    pub(in crate::compositor) fn reorder_renderable_surfaces_by_committed_stack(&mut self) -> bool {
         if self.renderable_surfaces.len() <= 1 {
             return false;
         }
@@ -1221,7 +1248,7 @@ impl CompositorState {
         changed
     }
 
-    pub(crate) fn append_surface_tree_order(
+    pub(in crate::compositor) fn append_surface_tree_order(
         &self,
         surface_id: u32,
         visible_ids: &HashSet<u32>,
@@ -1258,7 +1285,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn set_surface_placement(
+    pub(in crate::compositor) fn set_surface_placement(
         &mut self,
         surface_id: u32,
         placement: SurfacePlacement,
@@ -1270,7 +1297,7 @@ impl CompositorState {
         )
     }
 
-    pub(crate) fn set_surface_placement_with_cause(
+    pub(in crate::compositor) fn set_surface_placement_with_cause(
         &mut self,
         surface_id: u32,
         placement: SurfacePlacement,
@@ -1307,7 +1334,7 @@ impl CompositorState {
         false
     }
 
-    pub(crate) fn refresh_surface_origin_cache(&mut self) {
+    pub(in crate::compositor) fn refresh_surface_origin_cache(&mut self) {
         if self.surface_origin_cache_generation != Some(self.render_generation)
             || self.surface_origin_cache.len() != self.renderable_surfaces.len()
         {
@@ -1316,11 +1343,11 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn invalidate_surface_origin_cache(&mut self) {
+    pub(in crate::compositor) fn invalidate_surface_origin_cache(&mut self) {
         self.surface_origin_cache_generation = None;
     }
 
-    pub(crate) fn raise_renderable_surface_tree(&mut self, surface_id: u32) -> bool {
+    pub(in crate::compositor) fn raise_renderable_surface_tree(&mut self, surface_id: u32) -> bool {
         let tree_ids = self
             .renderable_surfaces
             .iter()

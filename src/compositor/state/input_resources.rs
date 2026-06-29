@@ -1,7 +1,7 @@
 use super::*;
 
 impl CompositorState {
-    pub(crate) fn clear_pointer_button_state_for_removed_surfaces(
+    pub(in crate::compositor) fn clear_pointer_button_state_for_removed_surfaces(
         &mut self,
         removed_surface_ids: &[u32],
         reason: &'static str,
@@ -19,7 +19,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn register_keyboard(&mut self, keyboard: wl_keyboard::WlKeyboard) {
+    pub(in crate::compositor) fn register_keyboard(&mut self, keyboard: wl_keyboard::WlKeyboard) {
         if self
             .keyboard_resources
             .iter()
@@ -33,7 +33,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn register_pointer(&mut self, pointer: wl_pointer::WlPointer) {
+    pub(in crate::compositor) fn register_pointer(&mut self, pointer: wl_pointer::WlPointer) {
         if self
             .pointer_resources
             .iter()
@@ -45,12 +45,15 @@ impl CompositorState {
         self.synchronize_pointer_resource_focus(&pointer);
     }
 
-    pub(crate) fn unregister_keyboard(&mut self, keyboard: &wl_keyboard::WlKeyboard) {
+    pub(in crate::compositor) fn unregister_keyboard(
+        &mut self,
+        keyboard: &wl_keyboard::WlKeyboard,
+    ) {
         self.keyboard_resources
             .retain(|resource| !same_wayland_resource(resource, keyboard));
     }
 
-    pub(crate) fn unregister_pointer(&mut self, pointer: &wl_pointer::WlPointer) {
+    pub(in crate::compositor) fn unregister_pointer(&mut self, pointer: &wl_pointer::WlPointer) {
         self.pointer_resources
             .retain(|resource| !same_wayland_resource(resource, pointer));
         self.pointer_entered_surfaces
@@ -92,7 +95,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn set_pointer_cursor(
+    pub(in crate::compositor) fn set_pointer_cursor(
         &mut self,
         pointer: &wl_pointer::WlPointer,
         serial: u32,
@@ -170,11 +173,13 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn is_cursor_surface(&self, surface_id: u32) -> bool {
+    pub(in crate::compositor) fn is_cursor_surface(&self, surface_id: u32) -> bool {
         self.cursor_surface_ids.contains(&surface_id)
     }
 
-    pub(crate) fn client_cursor_render_state(&self) -> Option<ClientCursorRenderState<'_>> {
+    pub(in crate::compositor) fn client_cursor_render_state(
+        &self,
+    ) -> Option<ClientCursorRenderState<'_>> {
         if self.cursor_visibility.lock_hidden_constraint_id.is_some() {
             return None;
         }
@@ -187,13 +192,13 @@ impl CompositorState {
         })
     }
 
-    pub(crate) fn active_client_cursor_has_content(&self) -> bool {
+    pub(in crate::compositor) fn active_client_cursor_has_content(&self) -> bool {
         self.active_client_cursor
             .as_ref()
             .is_some_and(|active| self.client_cursor_surfaces.contains_key(&active.surface_id))
     }
 
-    pub(crate) fn send_keyboard_key(&mut self, key: u32, pressed: bool) {
+    pub(in crate::compositor) fn send_keyboard_key(&mut self, key: u32, pressed: bool) {
         let modifiers_changed = self.keyboard_modifiers.update_key(key, pressed);
         let Some(surface) = self.focused_surface.clone() else {
             return;
@@ -226,7 +231,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn ensure_keyboard_focus(&mut self, surface: &wl_surface::WlSurface) {
+    pub(in crate::compositor) fn ensure_keyboard_focus(&mut self, surface: &wl_surface::WlSurface) {
         if self
             .keyboard_surface
             .as_ref()
@@ -271,7 +276,11 @@ impl CompositorState {
         self.publish_clipboard_to_focused_client();
     }
 
-    pub(crate) fn send_keyboard_modifiers(&mut self, surface: &wl_surface::WlSurface, serial: u32) {
+    pub(in crate::compositor) fn send_keyboard_modifiers(
+        &mut self,
+        surface: &wl_surface::WlSurface,
+        serial: u32,
+    ) {
         self.keyboard_resources.retain(Resource::is_alive);
         for keyboard in self
             .keyboard_resources
@@ -288,7 +297,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn clear_keyboard_focus(&mut self) {
+    pub(in crate::compositor) fn clear_keyboard_focus(&mut self) {
         let Some(surface) = self.keyboard_surface.take() else {
             return;
         };
@@ -317,7 +326,7 @@ impl CompositorState {
         ));
     }
 
-    pub(crate) fn send_pointer_motion(&mut self, x: f64, y: f64) {
+    pub(in crate::compositor) fn send_pointer_motion(&mut self, x: f64, y: f64) {
         if let Some(active) = self.active_locked_pointer_binding() {
             pointer_debug_log(format!(
                 "pointer.motion locked=true absolute_suppressed=true requested_output=({},{}) anchor_output=({},{})",
@@ -360,7 +369,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn update_pointer_position(&mut self, x: f64, y: f64) {
+    pub(in crate::compositor) fn update_pointer_position(&mut self, x: f64, y: f64) {
         let changed = self.last_pointer_x != x || self.last_pointer_y != y;
         let moves_client_cursor = changed && self.client_cursor_render_state().is_some();
         self.last_pointer_x = x;
@@ -370,7 +379,7 @@ impl CompositorState {
         }
     }
 
-    pub(crate) fn update_pointer_position_without_client_dispatch(
+    pub(in crate::compositor) fn update_pointer_position_without_client_dispatch(
         &mut self,
         x: f64,
         y: f64,
@@ -380,7 +389,10 @@ impl CompositorState {
         self.render_generation != before
     }
 
-    pub(crate) fn send_pointer_motion_sample(&mut self, sample: PointerMotionSample) {
+    pub(in crate::compositor) fn send_pointer_motion_sample(
+        &mut self,
+        sample: PointerMotionSample,
+    ) {
         self.last_pointer_motion_usec = Some(sample.timestamp_usec);
         if let Some(relative) = sample.relative {
             self.last_relative_pointer_motion = Some(relative);

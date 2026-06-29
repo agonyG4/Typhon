@@ -1,5 +1,4 @@
 use super::*;
-
 #[test]
 fn pointer_motion_sample_preserves_relative_deltas_in_compositor_state() {
     let socket_name = unique_socket_name();
@@ -1879,4 +1878,3 @@ fn active_lock_then_oneshot_warp_fallback_does_not_block_next_lock() {
 
     assert_eq!(state.locked_count, 2);
 }
-

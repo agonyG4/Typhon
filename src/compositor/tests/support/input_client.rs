@@ -1,4 +1,10 @@
-fn create_focused_toplevel_and_receive_key(
+#![allow(unused_imports)]
+use super::super::*;
+use super::{
+    client_setup::*, clipboard_dmabuf::*, frame_buffer_client::*, locked_relative::*,
+    output_bindings::*, registry_state::*, server_runtime::*, subsurface_client::*, window_ops::*,
+};
+pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_key(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
@@ -27,7 +33,7 @@ fn create_focused_toplevel_and_receive_key(
     Ok(state)
 }
 
-fn create_focused_toplevel_without_keypress(
+pub(in crate::compositor::tests) fn create_focused_toplevel_without_keypress(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
@@ -53,7 +59,7 @@ fn create_focused_toplevel_without_keypress(
     Ok(state)
 }
 
-fn create_focused_toplevel_then_press_tab(
+pub(in crate::compositor::tests) fn create_focused_toplevel_then_press_tab(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
@@ -85,7 +91,7 @@ fn create_focused_toplevel_then_press_tab(
     Ok(state)
 }
 
-fn create_focused_toplevel_and_receive_two_keys(
+pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_two_keys(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
@@ -121,7 +127,7 @@ fn create_focused_toplevel_and_receive_two_keys(
     Ok(state)
 }
 
-fn create_focused_toplevel_and_receive_ctrl_modified_key(
+pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_ctrl_modified_key(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
@@ -157,14 +163,14 @@ fn create_focused_toplevel_and_receive_ctrl_modified_key(
     Ok(state)
 }
 
-fn create_focused_toplevel_and_receive_pointer_motion(
+pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_pointer_motion(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     create_focused_toplevel_and_receive_pointer_motion_at_seat_version(socket_path, commands, 7)
 }
 
-fn create_focused_toplevel_and_receive_pointer_motion_at_seat_version(
+pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_pointer_motion_at_seat_version(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
     seat_version: u32,
@@ -191,7 +197,7 @@ fn create_focused_toplevel_and_receive_pointer_motion_at_seat_version(
     Ok(state)
 }
 
-fn create_focused_toplevel_and_receive_relative_pointer_motion(
+pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_relative_pointer_motion(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
     sample: PointerMotionSample,
@@ -230,7 +236,7 @@ fn create_focused_toplevel_and_receive_relative_pointer_motion(
     Ok(state)
 }
 
-fn create_locked_focused_toplevel_and_receive_pointer_motion_sample(
+pub(in crate::compositor::tests) fn create_locked_focused_toplevel_and_receive_pointer_motion_sample(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
     sample: PointerMotionSample,
@@ -274,22 +280,23 @@ fn create_locked_focused_toplevel_and_receive_pointer_motion_sample(
     Ok(state)
 }
 
-fn capture_pointer_constraint_backend_requests(
+pub(in crate::compositor::tests) fn capture_pointer_constraint_backend_requests(
     commands: &Sender<ServerCommand>,
 ) -> Vec<PointerConstraintBackendRequest> {
     let (reply, receiver) = mpsc::channel();
     commands
-        .send(ServerCommand::CapturePointerConstraintBackendRequests(reply))
+        .send(ServerCommand::CapturePointerConstraintBackendRequests(
+            reply,
+        ))
         .unwrap();
     receiver.recv().unwrap()
 }
 
-fn request_lock_activate_and_receive_pointer_motion_sample(
+pub(in crate::compositor::tests) fn request_lock_activate_and_receive_pointer_motion_sample(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
     sample: PointerMotionSample,
-) -> Result<(RegistryTestState, Vec<PointerConstraintBackendRequest>), Box<dyn std::error::Error>>
-{
+) -> Result<(RegistryTestState, Vec<PointerConstraintBackendRequest>), Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
@@ -352,7 +359,7 @@ fn request_lock_activate_and_receive_pointer_motion_sample(
     Ok((state, requests))
 }
 
-fn create_late_pointer_after_focus(
+pub(in crate::compositor::tests) fn create_late_pointer_after_focus(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
@@ -386,12 +393,11 @@ fn create_late_pointer_after_focus(
     Ok(state)
 }
 
-fn late_pointer_lock_activate_and_receive_relative_motion(
+pub(in crate::compositor::tests) fn late_pointer_lock_activate_and_receive_relative_motion(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
     sample: PointerMotionSample,
-) -> Result<(RegistryTestState, Vec<PointerConstraintBackendRequest>), Box<dyn std::error::Error>>
-{
+) -> Result<(RegistryTestState, Vec<PointerConstraintBackendRequest>), Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
@@ -456,7 +462,7 @@ fn late_pointer_lock_activate_and_receive_relative_motion(
     Ok((state, requests))
 }
 
-fn lock_activation_repairs_missing_source_pointer_enter_state(
+pub(in crate::compositor::tests) fn lock_activation_repairs_missing_source_pointer_enter_state(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
     sample: PointerMotionSample,
@@ -526,7 +532,7 @@ fn lock_activation_repairs_missing_source_pointer_enter_state(
     Ok(state)
 }
 
-fn relative_motion_for_focused_client_is_not_broadcast_to_other_client(
+pub(in crate::compositor::tests) fn relative_motion_for_focused_client_is_not_broadcast_to_other_client(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
@@ -585,7 +591,7 @@ fn relative_motion_for_focused_client_is_not_broadcast_to_other_client(
     Ok(other_state)
 }
 
-fn create_focused_toplevel_and_receive_pointer_axis(
+pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_pointer_axis(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
@@ -618,7 +624,7 @@ fn create_focused_toplevel_and_receive_pointer_axis(
     Ok(state)
 }
 
-fn create_toplevel_then_click_and_move_pointer_on_same_surface(
+pub(in crate::compositor::tests) fn create_toplevel_then_click_and_move_pointer_on_same_surface(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
@@ -660,7 +666,7 @@ fn create_toplevel_then_click_and_move_pointer_on_same_surface(
     Ok(state)
 }
 
-fn create_toplevel_then_set_and_commit_cursor_surface(
+pub(in crate::compositor::tests) fn create_toplevel_then_set_and_commit_cursor_surface(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
     remove_content: bool,
@@ -736,7 +742,7 @@ fn create_toplevel_then_set_and_commit_cursor_surface(
     })
 }
 
-fn exercise_client_cursor_state_transitions(
+pub(in crate::compositor::tests) fn exercise_client_cursor_state_transitions(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
 ) -> Result<CursorTransitionSnapshots, Box<dyn std::error::Error>> {
@@ -762,7 +768,9 @@ fn exercise_client_cursor_state_transitions(
     })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
-    let serial = state.pointer_enter_serial.ok_or("missing pointer enter serial")?;
+    let serial = state
+        .pointer_enter_serial
+        .ok_or("missing pointer enter serial")?;
 
     let cursor_surface = compositor.create_surface(&qh, ());
     pointer.set_cursor(serial, Some(&cursor_surface), 1, 1);
@@ -801,7 +809,7 @@ fn exercise_client_cursor_state_transitions(
     })
 }
 
-fn create_client_cursor_then_update_position_without_dispatch(
+pub(in crate::compositor::tests) fn create_client_cursor_then_update_position_without_dispatch(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
     x: f64,
@@ -829,7 +837,9 @@ fn create_client_cursor_then_update_position_without_dispatch(
     })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
-    let serial = state.pointer_enter_serial.ok_or("missing pointer enter serial")?;
+    let serial = state
+        .pointer_enter_serial
+        .ok_or("missing pointer enter serial")?;
 
     let cursor_surface = compositor.create_surface(&qh, ());
     pointer.set_cursor(serial, Some(&cursor_surface), 3, 4);
@@ -844,11 +854,7 @@ fn create_client_cursor_then_update_position_without_dispatch(
     let relative_motion_count_before = state.relative_motion_count;
     let pointer_focus_surface_before = capture_pointer_focus_surface_id(commands);
     let (reply, receiver) = mpsc::channel();
-    commands.send(ServerCommand::UpdatePointerPositionWithoutClientDispatch {
-        x,
-        y,
-        reply,
-    })?;
+    commands.send(ServerCommand::UpdatePointerPositionWithoutClientDispatch { x, y, reply })?;
     let visual_changed = receiver.recv_timeout(Duration::from_secs(1))?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
@@ -870,7 +876,7 @@ fn create_client_cursor_then_update_position_without_dispatch(
     })
 }
 
-fn create_buffered_toplevel_and_receive_surface_local_pointer_motion(
+pub(in crate::compositor::tests) fn create_buffered_toplevel_and_receive_surface_local_pointer_motion(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
@@ -918,14 +924,14 @@ fn create_buffered_toplevel_and_receive_surface_local_pointer_motion(
     Ok(state)
 }
 
-fn create_toplevel_with_empty_input_subsurface_and_click_overlap(
+pub(in crate::compositor::tests) fn create_toplevel_with_empty_input_subsurface_and_click_overlap(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     create_toplevel_with_custom_input_subsurface_and_click_overlap(socket_path, commands, None)
 }
 
-fn create_toplevel_with_custom_input_subsurface_and_click_overlap(
+pub(in crate::compositor::tests) fn create_toplevel_with_custom_input_subsurface_and_click_overlap(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
     child_region: Option<(i32, i32, i32, i32)>,
@@ -981,4 +987,3 @@ fn create_toplevel_with_custom_input_subsurface_and_click_overlap(
     queue.roundtrip(&mut state)?;
     Ok(state)
 }
-

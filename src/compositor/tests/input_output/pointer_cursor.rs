@@ -1,3 +1,4 @@
+use super::*;
 #[test]
 fn pointer_warp_global_is_capability_gated() {
     let baseline_socket = unique_socket_name();
@@ -1933,4 +1934,3 @@ fn backend_pointer_constraint_failure_marks_constraint_defunct() {
 
     assert_eq!(state.locked_count, 0);
 }
-
