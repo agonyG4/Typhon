@@ -122,11 +122,7 @@ mod task_05_8_tests {
             .renderable_surfaces
             .push(test_surface(root_id, 944, 502));
         let mut titlebar = test_surface(titlebar_id, 944, 24);
-        titlebar.placement = SurfacePlacement {
-            parent_surface_id: Some(root_id),
-            local_x: 0,
-            local_y: -24,
-        };
+        titlebar.placement = SurfacePlacement::subsurface(root_id, 0, -24);
         state
             .surface_placements
             .insert(titlebar_id, titlebar.placement);
@@ -394,11 +390,7 @@ mod task_05_8_tests {
             .renderable_surfaces
             .push(test_surface(root_id, 944, 502));
         let mut child = test_surface(child_id, 100, 40);
-        child.placement = SurfacePlacement {
-            parent_surface_id: Some(root_id),
-            local_x: 12,
-            local_y: 8,
-        };
+        child.placement = SurfacePlacement::subsurface(root_id, 12, 8);
         state.surface_placements.insert(child_id, child.placement);
         state.renderable_surfaces.push(child);
         assert!(state.preview_resize_root_window_to(

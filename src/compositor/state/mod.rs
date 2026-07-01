@@ -7,6 +7,7 @@ mod input_dispatch;
 mod input_resources;
 mod pointer_constraints;
 mod resize;
+mod shortcuts;
 mod shutdown;
 mod subsurfaces;
 mod support_types;
@@ -28,6 +29,8 @@ pub(in crate::compositor) use input_resources::*;
 pub(in crate::compositor) use pointer_constraints::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use resize::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use shortcuts::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use shutdown::*;
 #[allow(unused_imports)]

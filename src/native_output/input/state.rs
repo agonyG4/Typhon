@@ -13,11 +13,9 @@ pub(crate) struct NativeInputState {
     pub(crate) window_interaction_active: bool,
     pub(crate) keyboard_shortcuts_inhibited: bool,
     pub(crate) pointer_constraint: NativePointerConstraintState,
+    pub(crate) binding_manager: AstreaBindingManager,
     pub(crate) cursor_visible: bool,
     pub(crate) forwarded_control_keys: Vec<u16>,
-    pub(crate) suppressed_window_shortcut_keys: Vec<u16>,
-    pub(crate) spotlight: SpotlightModel,
-    pub(crate) shell_generation: u64,
 }
 
 impl NativeInputState {
@@ -34,29 +32,10 @@ impl NativeInputState {
             window_interaction_active: false,
             keyboard_shortcuts_inhibited: false,
             pointer_constraint: NativePointerConstraintState::None,
+            binding_manager: AstreaBindingManager::default(),
             cursor_visible: true,
             forwarded_control_keys: Vec::new(),
-            suppressed_window_shortcut_keys: Vec::new(),
-            spotlight: SpotlightModel::default(),
-            shell_generation: 0,
         }
-    }
-
-    pub(crate) fn spotlight_visible(&self) -> bool {
-        self.spotlight.is_visible()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn spotlight_query(&self) -> &str {
-        self.spotlight.query()
-    }
-
-    pub(crate) const fn shell_generation(&self) -> u64 {
-        self.shell_generation
-    }
-
-    pub(crate) const fn spotlight(&self) -> &SpotlightModel {
-        &self.spotlight
     }
 
     #[cfg(test)]
@@ -153,7 +132,14 @@ impl NativeInputState {
 
         if is_shift_key(code) {
             self.shift_pressed = pressed;
-            if !self.spotlight_visible() && !repeated {
+            if !pressed
+                && let AstreaBindingMatch::Consumed(action) = self
+                    .binding_manager
+                    .handle_modifier_release(ModifierMask::SHIFT)
+            {
+                self.apply_binding_action(action, repeated, &mut effect);
+            }
+            if !repeated {
                 effect
                     .keyboard_events
                     .push(NativeKeyboardEvent::new(code, pressed));
@@ -164,6 +150,14 @@ impl NativeInputState {
 
         if is_alt_key(code) {
             self.alt_pressed = pressed;
+            if !pressed
+                && let AstreaBindingMatch::Consumed(action) = self
+                    .binding_manager
+                    .handle_modifier_release(ModifierMask::ALT)
+            {
+                self.apply_binding_action(action, repeated, &mut effect);
+                return effect;
+            }
             if self.keyboard_shortcuts_inhibited && !repeated {
                 effect
                     .keyboard_events
@@ -182,6 +176,13 @@ impl NativeInputState {
 
         if is_super_key(code) {
             self.super_pressed = pressed;
+            if !pressed
+                && let AstreaBindingMatch::Consumed(action) = self
+                    .binding_manager
+                    .handle_modifier_release(ModifierMask::SUPER)
+            {
+                self.apply_binding_action(action, repeated, &mut effect);
+            }
             if self.keyboard_shortcuts_inhibited && !repeated {
                 effect
                     .keyboard_events
@@ -193,8 +194,12 @@ impl NativeInputState {
 
         if is_control_key(code) {
             self.ctrl_pressed = pressed;
-            if self.spotlight_visible() {
-                return effect;
+            if !pressed
+                && let AstreaBindingMatch::Consumed(action) = self
+                    .binding_manager
+                    .handle_modifier_release(ModifierMask::CTRL)
+            {
+                self.apply_binding_action(action, repeated, &mut effect);
             }
             if pressed {
                 if !self.forwarded_control_keys.contains(&code) {
@@ -213,51 +218,49 @@ impl NativeInputState {
             return effect;
         }
 
-        if pressed && !repeated && self.alt_pressed && code == KEY_P {
-            effect.exit_requested = true;
+        match self.binding_manager.handle_key(
+            self.active_modifier_mask(),
+            code,
+            pressed,
+            repeated,
+            self.keyboard_shortcuts_inhibited,
+        ) {
+            AstreaBindingMatch::Consumed(action) => {
+                self.apply_binding_action(action, repeated, &mut effect);
+                return effect;
+            }
+            AstreaBindingMatch::Pass => {}
+        }
+
+        if pressed
+            && !repeated
+            && self.super_pressed
+            && code == KEY_SPACE
+            && let Some(command) = external_spotlight_command()
+        {
+            effect.launch_command = Some(command);
+            effect.launch_source = Some(NativeLaunchSource::Spotlight);
             return effect;
         }
 
-        if self.keyboard_shortcuts_inhibited && !self.spotlight_visible() {
+        if pressed
+            && !repeated
+            && self.alt_pressed
+            && code == KEY_TAB
+            && let Some(command) = external_alt_tab_command()
+        {
+            effect.launch_command = Some(command);
+            effect.launch_source = Some(NativeLaunchSource::AltTab);
+            return effect;
+        }
+
+        if self.keyboard_shortcuts_inhibited {
             if !repeated {
                 effect
                     .keyboard_events
                     .push(NativeKeyboardEvent::new(code, pressed));
                 effect.request_redraw();
             }
-            return effect;
-        }
-
-        if !pressed && self.release_suppressed_window_shortcut_key(code) {
-            return effect;
-        }
-
-        if pressed && !repeated && self.is_spotlight_toggle_key(code) {
-            effect
-                .keyboard_events
-                .extend(self.release_forwarded_control_modifiers());
-            self.spotlight.toggle();
-            self.bump_shell_generation();
-            effect.request_visual_redraw();
-            return effect;
-        }
-
-        if self.spotlight_visible() {
-            if pressed {
-                self.handle_spotlight_key(code, &mut effect);
-            }
-            return effect;
-        }
-
-        if let Some(shortcut) = native_window_management_shortcut(self.alt_pressed, code) {
-            if pressed && !repeated && self.suppress_window_shortcut_key(code) {
-                effect.window_actions.push(shortcut.into_action());
-                effect.request_visual_redraw();
-            }
-            return effect;
-        }
-
-        if self.alt_pressed {
             return effect;
         }
 
@@ -270,55 +273,11 @@ impl NativeInputState {
         effect
     }
 
-    pub(crate) fn handle_spotlight_key(&mut self, code: u16, effect: &mut NativeInputEffect) {
-        match code {
-            KEY_ESC => {
-                self.spotlight.hide();
-                self.bump_shell_generation();
-                effect.request_visual_redraw();
-            }
-            KEY_BACKSPACE => {
-                if self.spotlight.backspace() {
-                    self.bump_shell_generation();
-                    effect.request_visual_redraw();
-                }
-            }
-            KEY_DOWN => {
-                if self.spotlight.select_next() {
-                    self.bump_shell_generation();
-                    effect.request_visual_redraw();
-                }
-            }
-            KEY_UP => {
-                if self.spotlight.select_previous() {
-                    self.bump_shell_generation();
-                    effect.request_visual_redraw();
-                }
-            }
-            KEY_ENTER => {
-                effect.launch_command = self.spotlight.selected_launch_command();
-                self.spotlight.hide();
-                self.bump_shell_generation();
-                effect.request_visual_redraw();
-            }
-            _ => {
-                if let Some(text) = evdev_key_to_text(code, self.shift_pressed) {
-                    self.spotlight.push_text(text);
-                    self.bump_shell_generation();
-                    effect.request_visual_redraw();
-                }
-            }
-        }
-    }
-
     pub(crate) fn handle_pointer_button(
         &mut self,
         button: u32,
         pressed: bool,
     ) -> NativeInputEffect {
-        if self.spotlight_visible() {
-            return NativeInputEffect::default();
-        }
         let mut effect = NativeInputEffect::default();
         if self.window_interaction_active && !pressed {
             self.window_interaction_active = false;
@@ -329,14 +288,17 @@ impl NativeInputState {
             return effect;
         }
 
-        if pressed
-            && let Some(action) =
-                native_window_drag_action(self.alt_pressed, button, self.cursor_x, self.cursor_y)
-        {
-            self.window_interaction_active = true;
-            effect.window_actions.push(action);
-            effect.request_visual_redraw();
-            return effect;
+        match self.binding_manager.handle_pointer_button(
+            self.active_modifier_mask(),
+            button,
+            pressed,
+            self.keyboard_shortcuts_inhibited,
+        ) {
+            AstreaBindingMatch::Consumed(action) => {
+                self.apply_binding_action(action, false, &mut effect);
+                return effect;
+            }
+            AstreaBindingMatch::Pass => {}
         }
 
         effect
@@ -362,10 +324,8 @@ impl NativeInputState {
             ..NativeInputEffect::default()
         };
         let locked_at_start = self.pointer_constraint.locked();
-        let shell_captures_pointer = self.spotlight_visible();
         if let Some(relative) = sample.relative {
-            effect.relative_motion =
-                (!shell_captures_pointer && !relative.is_zero()).then_some(relative);
+            effect.relative_motion = (!relative.is_zero()).then_some(relative);
             if !self.pointer_constraint.locked() {
                 let proposed = CompositorOutputPosition {
                     x: (self.cursor_x + relative.dx).clamp(0.0, f64::from(self.output_width - 1)),
@@ -387,7 +347,7 @@ impl NativeInputState {
             self.cursor_x = constrained.x;
             self.cursor_y = constrained.y;
         }
-        if !self.pointer_constraint.locked() && !self.spotlight_visible() {
+        if !self.pointer_constraint.locked() {
             if self.window_interaction_active {
                 effect
                     .window_actions
@@ -428,16 +388,12 @@ impl NativeInputState {
         horizontal: f64,
         vertical: f64,
     ) -> NativeInputEffect {
-        let mut effect = NativeInputEffect::default();
-        if !self.spotlight_visible() {
-            effect.pointer_axis = Some((horizontal, vertical));
-            effect.request_redraw();
-        }
+        let mut effect = NativeInputEffect {
+            pointer_axis: Some((horizontal, vertical)),
+            ..Default::default()
+        };
+        effect.request_redraw();
         effect
-    }
-
-    pub(crate) fn is_spotlight_toggle_key(&self, code: u16) -> bool {
-        code == KEY_SPACE && (self.super_pressed || self.ctrl_pressed)
     }
 
     pub(crate) fn release_forwarded_control_key(&mut self, code: u16) -> bool {
@@ -452,36 +408,73 @@ impl NativeInputState {
         true
     }
 
-    pub(crate) fn release_forwarded_control_modifiers(&mut self) -> Vec<NativeKeyboardEvent> {
-        self.forwarded_control_keys
-            .drain(..)
-            .map(|key| NativeKeyboardEvent::new(key, false))
-            .collect()
-    }
-
-    pub(crate) fn suppress_window_shortcut_key(&mut self, code: u16) -> bool {
-        if self.suppressed_window_shortcut_keys.contains(&code) {
-            return false;
+    pub(crate) fn active_modifier_mask(&self) -> ModifierMask {
+        let mut mask = ModifierMask::EMPTY;
+        if self.alt_pressed {
+            mask = mask | ModifierMask::ALT;
         }
-        self.suppressed_window_shortcut_keys.push(code);
-        true
+        if self.shift_pressed {
+            mask = mask | ModifierMask::SHIFT;
+        }
+        if self.super_pressed {
+            mask = mask | ModifierMask::SUPER;
+        }
+        if self.ctrl_pressed {
+            mask = mask | ModifierMask::CTRL;
+        }
+        mask
     }
 
-    pub(crate) fn release_suppressed_window_shortcut_key(&mut self, code: u16) -> bool {
-        let Some(index) = self
-            .suppressed_window_shortcut_keys
-            .iter()
-            .position(|suppressed| *suppressed == code)
-        else {
-            return false;
-        };
-
-        self.suppressed_window_shortcut_keys.swap_remove(index);
-        true
-    }
-
-    pub(crate) fn bump_shell_generation(&mut self) {
-        self.shell_generation = self.shell_generation.wrapping_add(1);
+    fn apply_binding_action(
+        &mut self,
+        action: BindingAction,
+        repeated: bool,
+        effect: &mut NativeInputEffect,
+    ) {
+        match action {
+            BindingAction::ExitCompositor => {
+                effect.exit_requested = true;
+            }
+            BindingAction::CloseActiveWindow => {
+                effect
+                    .window_actions
+                    .push(NativeWindowAction::CloseActiveWindow);
+                effect.request_visual_redraw();
+            }
+            BindingAction::ToggleFullscreen => {
+                effect
+                    .window_actions
+                    .push(NativeWindowAction::ToggleFullscreen);
+                effect.request_visual_redraw();
+            }
+            BindingAction::LaunchCommand(command) => {
+                effect.launch_command = Some(command);
+                effect.launch_source = Some(NativeLaunchSource::Binding);
+            }
+            BindingAction::BeginMove => {
+                self.window_interaction_active = true;
+                effect.window_actions.push(NativeWindowAction::BeginMove {
+                    x: self.cursor_x,
+                    y: self.cursor_y,
+                });
+                effect.request_visual_redraw();
+            }
+            BindingAction::BeginResize => {
+                self.window_interaction_active = true;
+                effect.window_actions.push(NativeWindowAction::BeginResize {
+                    x: self.cursor_x,
+                    y: self.cursor_y,
+                });
+                effect.request_visual_redraw();
+            }
+            BindingAction::EmitShortcut { namespace, name } => {
+                effect.shortcut_events.push(AstreaShortcutEvent {
+                    namespace,
+                    name,
+                    repeated,
+                });
+            }
+        }
     }
 }
 
@@ -503,40 +496,4 @@ pub(crate) fn is_control_key(code: u16) -> bool {
 
 pub(crate) fn is_pointer_button(code: u16) -> bool {
     matches!(code, BTN_LEFT | BTN_RIGHT | BTN_MIDDLE)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NativeWindowManagementShortcut {
-    Minimize,
-    RestoreMinimized,
-    ToggleMaximize,
-    ToggleFullscreen,
-}
-
-impl NativeWindowManagementShortcut {
-    pub(crate) const fn into_action(self) -> NativeWindowAction {
-        match self {
-            Self::Minimize => NativeWindowAction::Minimize,
-            Self::RestoreMinimized => NativeWindowAction::RestoreMinimized,
-            Self::ToggleMaximize => NativeWindowAction::ToggleMaximize,
-            Self::ToggleFullscreen => NativeWindowAction::ToggleFullscreen,
-        }
-    }
-}
-
-pub(crate) fn native_window_management_shortcut(
-    alt_pressed: bool,
-    code: u16,
-) -> Option<NativeWindowManagementShortcut> {
-    if !alt_pressed {
-        return None;
-    }
-
-    match code {
-        KEY_M => Some(NativeWindowManagementShortcut::Minimize),
-        KEY_R => Some(NativeWindowManagementShortcut::RestoreMinimized),
-        KEY_F => Some(NativeWindowManagementShortcut::ToggleMaximize),
-        KEY_ENTER | KEY_F11 => Some(NativeWindowManagementShortcut::ToggleFullscreen),
-        _ => None,
-    }
 }

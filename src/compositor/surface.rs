@@ -316,10 +316,17 @@ impl SurfaceDamageRect {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootPlacementMode {
+    CascadedWindow,
+    Absolute,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SurfacePlacement {
     pub parent_surface_id: Option<u32>,
     pub local_x: i32,
     pub local_y: i32,
+    pub root_mode: RootPlacementMode,
 }
 
 impl SurfacePlacement {
@@ -328,6 +335,7 @@ impl SurfacePlacement {
             parent_surface_id: None,
             local_x: 0,
             local_y: 0,
+            root_mode: RootPlacementMode::CascadedWindow,
         }
     }
 
@@ -336,6 +344,16 @@ impl SurfacePlacement {
             parent_surface_id: None,
             local_x,
             local_y,
+            root_mode: RootPlacementMode::CascadedWindow,
+        }
+    }
+
+    pub const fn absolute_root_at(local_x: i32, local_y: i32) -> Self {
+        Self {
+            parent_surface_id: None,
+            local_x,
+            local_y,
+            root_mode: RootPlacementMode::Absolute,
         }
     }
 
@@ -344,6 +362,7 @@ impl SurfacePlacement {
             parent_surface_id: Some(parent_surface_id),
             local_x,
             local_y,
+            root_mode: RootPlacementMode::CascadedWindow,
         }
     }
 }

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use super::shell::{ShellOverlayImage, blend_shell_overlay_argb};
 use super::{
-    ClientCursorRenderState, RenderableSurface, RenderableSurfaceDamage, SurfaceDamageRect,
+    ClientCursorRenderState, RenderableSurface, RenderableSurfaceDamage, RootPlacementMode,
+    SurfaceDamageRect,
 };
 use crate::render_backend::buffer::{BufferSize, SurfaceBufferSource};
 
@@ -52,9 +52,9 @@ pub struct DesktopComposeRequest<'a> {
     pub frame_height: u32,
     pub output_scale: f64,
     pub surfaces: &'a [RenderableSurface],
+    pub external_overlay_surface_ids: Vec<u32>,
     pub content_generation: u64,
     pub visual_state: DesktopVisualState,
-    pub shell_overlay: Option<&'a ShellOverlayImage>,
     pub client_cursor: Option<ClientCursorRenderState<'a>>,
 }
 
@@ -314,7 +314,6 @@ struct ReusableFrameKey {
     width: u32,
     height: u32,
     output_scale_key: u32,
-    shell_overlay_generation: Option<u64>,
     visual_state: DesktopVisualState,
 }
 
@@ -392,28 +391,37 @@ impl DesktopSceneRenderer {
             frame_height,
             output_scale,
             surfaces,
+            external_overlay_surface_ids,
             content_generation,
             visual_state,
-            shell_overlay,
             client_cursor,
         } = request;
+        let (base_surfaces, overlay_surfaces) =
+            split_external_overlay_surfaces(surfaces, &external_overlay_surface_ids);
+        let scene_surfaces = if external_overlay_surface_ids.is_empty() {
+            surfaces
+        } else {
+            base_surfaces.as_slice()
+        };
 
         self.rebuild_scene(
             frame_width,
             frame_height,
-            surfaces,
+            scene_surfaces,
             content_generation,
             output_scale,
-            buffer_age,
+            if external_overlay_surface_ids.is_empty() {
+                buffer_age
+            } else {
+                BufferAge::Reset
+            },
         );
         let output_scale_key = output_scale_key(output_scale);
-        let shell_overlay_generation = shell_overlay.map(|overlay| overlay.generation);
         let scaled_visual_state = scale_desktop_visual_state(visual_state, output_scale);
         let frame_key = ReusableFrameKey {
             width: frame_width,
             height: frame_height,
             output_scale_key,
-            shell_overlay_generation,
             visual_state: scaled_visual_state,
         };
         let partial_frame_copy = reuse_frame
@@ -438,18 +446,14 @@ impl DesktopSceneRenderer {
         } else {
             self.copy_scene_to_frame(frame, frame_width, frame_height);
         }
-        if let Some(shell_overlay) = shell_overlay {
-            if partial_frame_copy {
-                blend_shell_overlay_in_rects(
-                    frame,
-                    frame_width,
-                    frame_height,
-                    shell_overlay,
-                    &self.last_rebuild_damage_rects,
-                );
-            } else if !no_frame_copy {
-                blend_shell_overlay(frame, frame_width, frame_height, shell_overlay);
-            }
+        if !overlay_surfaces.is_empty() {
+            draw_client_surfaces_scaled(
+                frame,
+                frame_width,
+                frame_height,
+                &overlay_surfaces,
+                output_scale,
+            );
         }
         if client_cursor.is_none()
             && let Some((cursor_x, cursor_y)) = scaled_visual_state.cursor
@@ -733,6 +737,19 @@ fn draw_client_cursor(
         target,
         None,
     );
+}
+
+fn split_external_overlay_surfaces(
+    surfaces: &[RenderableSurface],
+    external_overlay_surface_ids: &[u32],
+) -> (Vec<RenderableSurface>, Vec<RenderableSurface>) {
+    if external_overlay_surface_ids.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    surfaces
+        .iter()
+        .cloned()
+        .partition(|surface| !external_overlay_surface_ids.contains(&surface.surface_id))
 }
 
 fn copy_scene_rect_to_frame(scene: &[u32], frame: &mut [u32], frame_width: u32, rect: OutputRect) {
@@ -1550,12 +1567,20 @@ fn root_surface_origin(
 }
 
 fn root_surface_origin_for_ordinal(root_index: usize, surface: &RenderableSurface) -> (i32, i32) {
-    let cascade = root_index as i32 * SURFACE_CASCADE_STEP;
     let placement = surface.render_placement.unwrap_or(surface.placement);
-    (
-        FIRST_SURFACE_OFFSET.0 + cascade + placement.local_x + surface.x,
-        FIRST_SURFACE_OFFSET.1 + cascade + placement.local_y + surface.y,
-    )
+    match placement.root_mode {
+        RootPlacementMode::CascadedWindow => {
+            let cascade = root_index as i32 * SURFACE_CASCADE_STEP;
+            (
+                FIRST_SURFACE_OFFSET.0 + cascade + placement.local_x + surface.x,
+                FIRST_SURFACE_OFFSET.1 + cascade + placement.local_y + surface.y,
+            )
+        }
+        RootPlacementMode::Absolute => (
+            placement.local_x.saturating_add(surface.x),
+            placement.local_y.saturating_add(surface.y),
+        ),
+    }
 }
 
 pub fn surface_origin(index: usize, surface: &RenderableSurface) -> (i32, i32) {
@@ -1961,134 +1986,6 @@ fn fill_rect(frame: &mut [u32], frame_width: u32, frame_height: u32, rect: Serve
         let row_end = row_start + (end_x - start_x) as usize;
         if let Some(row) = frame.get_mut(row_start..row_end) {
             row.fill(color);
-        }
-    }
-}
-
-fn blend_shell_overlay(
-    frame: &mut [u32],
-    frame_width: u32,
-    frame_height: u32,
-    shell_overlay: &ShellOverlayImage,
-) {
-    blend_shell_overlay_with_clip(frame, frame_width, frame_height, shell_overlay, None);
-}
-
-fn blend_shell_overlay_in_rects(
-    frame: &mut [u32],
-    frame_width: u32,
-    frame_height: u32,
-    shell_overlay: &ShellOverlayImage,
-    clip_rects: &[OutputRect],
-) {
-    if clip_rects.is_empty() {
-        return;
-    }
-    blend_shell_overlay_with_clip(
-        frame,
-        frame_width,
-        frame_height,
-        shell_overlay,
-        Some(clip_rects),
-    );
-}
-
-fn blend_shell_overlay_with_clip(
-    frame: &mut [u32],
-    frame_width: u32,
-    frame_height: u32,
-    shell_overlay: &ShellOverlayImage,
-    clip_rects: Option<&[OutputRect]>,
-) {
-    if shell_overlay.width == 0 || shell_overlay.height == 0 {
-        return;
-    }
-
-    for region in shell_overlay.regions() {
-        let bounds = region.output;
-        let texture = region.texture;
-        let region_rect = OutputRect {
-            x: i32::try_from(bounds.x).unwrap_or(i32::MAX),
-            y: i32::try_from(bounds.y).unwrap_or(i32::MAX),
-            width: bounds.width.min(texture.width),
-            height: bounds.height.min(texture.height),
-        };
-        let output_rect = OutputRect::full(frame_width, frame_height);
-        let Some(region_rect) = region_rect.intersection(output_rect) else {
-            continue;
-        };
-        if let Some(clip_rects) = clip_rects {
-            for clip_rect in clip_rects {
-                let Some(clipped_rect) = region_rect.intersection(*clip_rect) else {
-                    continue;
-                };
-                blend_shell_overlay_region_rect(
-                    frame,
-                    frame_width,
-                    shell_overlay,
-                    bounds,
-                    texture,
-                    clipped_rect,
-                );
-            }
-        } else {
-            blend_shell_overlay_region_rect(
-                frame,
-                frame_width,
-                shell_overlay,
-                bounds,
-                texture,
-                region_rect,
-            );
-        }
-    }
-}
-
-fn blend_shell_overlay_region_rect(
-    frame: &mut [u32],
-    frame_width: u32,
-    shell_overlay: &ShellOverlayImage,
-    bounds: super::shell::ShellOverlayBounds,
-    texture: super::shell::ShellOverlayBounds,
-    rect: OutputRect,
-) {
-    let left = rect.x.max(0) as u32;
-    let top = rect.y.max(0) as u32;
-    let right = rect
-        .x
-        .saturating_add(i32::try_from(rect.width).unwrap_or(i32::MAX))
-        .max(0) as u32;
-    let bottom = rect
-        .y
-        .saturating_add(i32::try_from(rect.height).unwrap_or(i32::MAX))
-        .max(0) as u32;
-    if left >= right || top >= bottom {
-        return;
-    }
-
-    let row_width = (right - left) as usize;
-    let source_width = shell_overlay.width as usize;
-    let source_x = texture.x.saturating_add(left.saturating_sub(bounds.x)) as usize;
-    let source_y = texture.y.saturating_add(top.saturating_sub(bounds.y)) as usize;
-    for output_y in top..bottom {
-        let source_row_index = source_y + output_y.saturating_sub(top) as usize;
-        let source_start = source_row_index
-            .saturating_mul(source_width)
-            .saturating_add(source_x);
-        let target_start = output_y as usize * frame_width as usize + left as usize;
-        let Some(source_row) = shell_overlay
-            .pixels
-            .get(source_start..source_start + row_width)
-        else {
-            continue;
-        };
-        let Some(target_row) = frame.get_mut(target_start..target_start + row_width) else {
-            continue;
-        };
-        for (source, target) in source_row.iter().copied().zip(target_row.iter_mut()) {
-            if source >> 24 != 0 {
-                *target = blend_shell_overlay_argb(source, *target);
-            }
         }
     }
 }
@@ -2599,9 +2496,9 @@ mod tests {
             frame_height: 96,
             output_scale: 1.0,
             surfaces: std::slice::from_ref(&initial_surface),
+            external_overlay_surface_ids: Vec::new(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
-            shell_overlay: None,
             client_cursor: None,
         });
 
@@ -2619,9 +2516,9 @@ mod tests {
             frame_height: 96,
             output_scale: 1.0,
             surfaces: std::slice::from_ref(&resized_surface),
+            external_overlay_surface_ids: Vec::new(),
             content_generation: 2,
             visual_state: DesktopVisualState::wallpaper_only(),
-            shell_overlay: None,
             client_cursor: None,
         });
 
@@ -2740,9 +2637,9 @@ mod tests {
             frame_height: 96,
             output_scale: 1.0,
             surfaces: &[initial_surface],
+            external_overlay_surface_ids: Vec::new(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
-            shell_overlay: None,
             client_cursor: None,
         });
         assert_eq!(renderer.last_frame_copy_kind(), DesktopFrameCopyKind::Full);
@@ -2777,9 +2674,9 @@ mod tests {
             frame_height: 96,
             output_scale: 1.0,
             surfaces: &[updated_surface],
+            external_overlay_surface_ids: Vec::new(),
             content_generation: 2,
             visual_state: DesktopVisualState::wallpaper_only(),
-            shell_overlay: None,
             client_cursor: None,
         });
 
@@ -2910,9 +2807,9 @@ mod tests {
                 frame_height: 96,
                 output_scale: 1.0,
                 surfaces: std::slice::from_ref(&initial_surface),
+                external_overlay_surface_ids: Vec::new(),
                 content_generation: 1,
                 visual_state: DesktopVisualState::wallpaper_only(),
-                shell_overlay: None,
                 client_cursor: None,
             },
             BufferAge::Reset,
@@ -2937,9 +2834,9 @@ mod tests {
                 frame_height: 96,
                 output_scale: 1.0,
                 surfaces: &[updated_surface],
+                external_overlay_surface_ids: Vec::new(),
                 content_generation: 2,
                 visual_state: DesktopVisualState::wallpaper_only(),
-                shell_overlay: None,
                 client_cursor: None,
             },
             BufferAge::Reset,
@@ -3090,57 +2987,6 @@ mod tests {
         draw_wallpaper(&mut wallpaper, 96, 96);
         assert_eq!(frame[72 * 96 + 72], wallpaper[72 * 96 + 72]);
         assert_eq!(frame[72 * 96 + 74], 0xff00_00ff);
-    }
-
-    #[test]
-    fn desktop_scene_renderer_places_cropped_shell_overlay_at_bounds() {
-        use crate::compositor::shell::{ShellOverlayRenderer, ShellOverlayState, ShellTopbarModel};
-
-        let mut overlay_renderer = ShellOverlayRenderer::default();
-        let overlay = overlay_renderer
-            .render(
-                320,
-                200,
-                &ShellOverlayState {
-                    topbar: ShellTopbarModel::visible("Oblivion One"),
-                    dock_items: Vec::new(),
-                    spotlight: Default::default(),
-                    generation: 1,
-                },
-            )
-            .clone();
-        let bounds = overlay.content_bounds().expect("topbar should draw");
-        let sample_x = bounds.x + bounds.width / 2;
-        let sample_y = bounds.y + bounds.height / 2;
-        let sample_index = sample_y as usize * 320 + sample_x as usize;
-
-        let mut base_frame = vec![0; 320 * 200];
-        let mut overlay_frame = vec![0; 320 * 200];
-        let mut renderer = DesktopSceneRenderer::default();
-        renderer.compose_request(DesktopComposeRequest {
-            frame: &mut base_frame,
-            frame_width: 320,
-            frame_height: 200,
-            output_scale: 1.0,
-            surfaces: &[],
-            content_generation: 1,
-            visual_state: DesktopVisualState::wallpaper_only(),
-            shell_overlay: None,
-            client_cursor: None,
-        });
-        renderer.compose_request(DesktopComposeRequest {
-            frame: &mut overlay_frame,
-            frame_width: 320,
-            frame_height: 200,
-            output_scale: 1.0,
-            surfaces: &[],
-            content_generation: 1,
-            visual_state: DesktopVisualState::wallpaper_only(),
-            shell_overlay: Some(&overlay),
-            client_cursor: None,
-        });
-
-        assert_ne!(overlay_frame[sample_index], base_frame[sample_index]);
     }
 
     #[test]
@@ -3362,9 +3208,9 @@ mod tests {
             frame_height: 16,
             output_scale: 1.0,
             surfaces: &[],
+            external_overlay_surface_ids: Vec::new(),
             content_generation: 1,
             visual_state: DesktopVisualState::with_cursor(0, 0),
-            shell_overlay: None,
             client_cursor: Some(crate::compositor::ClientCursorRenderState {
                 surface: &cursor_surface,
                 logical_x: 2,
@@ -3380,9 +3226,9 @@ mod tests {
             frame_height: 16,
             output_scale: 1.0,
             surfaces: &[],
+            external_overlay_surface_ids: Vec::new(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
-            shell_overlay: None,
             client_cursor: Some(crate::compositor::ClientCursorRenderState {
                 surface: &cursor_surface,
                 logical_x: 8,
@@ -3400,9 +3246,9 @@ mod tests {
             frame_height: 16,
             output_scale: 1.0,
             surfaces: &[],
+            external_overlay_surface_ids: Vec::new(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
-            shell_overlay: None,
             client_cursor: None,
         });
         assert_ne!(frame[9 * 16 + 8], 0xff00_ff00);

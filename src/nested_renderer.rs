@@ -3,7 +3,6 @@ use std::{error::Error, io, num::NonZeroU32, sync::Arc};
 use crate::egl_renderer::{EglFrameOutcome, EglGlesFrameRenderer, EglSceneDrawRequest};
 use oblivion_one::compositor::{
     DesktopComposeRequest, DesktopSceneRenderer, DesktopVisualState, RenderableSurface,
-    ShellOverlayImage,
 };
 use oblivion_one::render_backend::egl_gles::EglGlesDmabufFeedback;
 use softbuffer::{Context, Surface};
@@ -48,9 +47,9 @@ pub struct NestedSceneDrawRequest<'a> {
     pub height: u32,
     pub output_scale: f64,
     pub surfaces: &'a [RenderableSurface],
+    pub external_overlay_surface_ids: Vec<u32>,
     pub content_generation: u64,
     pub visual_state: DesktopVisualState,
-    pub shell_overlay: Option<&'a ShellOverlayImage>,
     pub client_cursor: Option<oblivion_one::compositor::ClientCursorRenderState<'a>>,
     pub cpu_scene_renderer: &'a mut DesktopSceneRenderer,
 }
@@ -153,9 +152,9 @@ impl NestedOutputRenderer {
             height,
             output_scale,
             surfaces,
+            external_overlay_surface_ids,
             content_generation,
             visual_state,
-            shell_overlay,
             client_cursor,
             cpu_scene_renderer,
         } = request;
@@ -166,10 +165,10 @@ impl NestedOutputRenderer {
                     width,
                     height,
                     surfaces,
+                    external_overlay_surface_ids: external_overlay_surface_ids.clone(),
                     content_generation,
                     visual_state,
                     output_scale,
-                    shell_overlay,
                     client_cursor,
                     current_damage: None,
                 })
@@ -185,9 +184,9 @@ impl NestedOutputRenderer {
                         frame_height: height,
                         output_scale,
                         surfaces,
+                        external_overlay_surface_ids,
                         content_generation,
                         visual_state,
-                        shell_overlay,
                         client_cursor,
                     });
                 })

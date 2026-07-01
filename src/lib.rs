@@ -1,3 +1,4 @@
+pub mod astrea_shortcuts;
 pub mod compositor;
 pub mod core;
 mod defaults;
@@ -406,6 +407,26 @@ mod tests {
         assert_eq!(
             env.get("WAYLAND_DISPLAY").and_then(Option::as_deref),
             Some("oblivion-one-test")
+        );
+        assert_eq!(
+            env.get("XDG_CURRENT_DESKTOP").and_then(Option::as_deref),
+            Some("Astrea")
+        );
+        assert_eq!(
+            env.get("XDG_SESSION_DESKTOP").and_then(Option::as_deref),
+            Some("Astrea")
+        );
+        assert_eq!(
+            env.get("DESKTOP_SESSION").and_then(Option::as_deref),
+            Some("Astrea")
+        );
+        assert_eq!(
+            env.get("XDG_SESSION_TYPE").and_then(Option::as_deref),
+            Some("wayland")
+        );
+        assert_eq!(
+            env.get("MOZ_ENABLE_WAYLAND").and_then(Option::as_deref),
+            Some("1")
         );
         for key in [
             "WAYLAND_SOCKET",

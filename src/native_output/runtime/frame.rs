@@ -57,7 +57,6 @@ pub(crate) fn normalize_refresh_hz(refresh_hz: u32) -> u32 {
 #[derive(Debug, Default)]
 pub(crate) struct NativeFrameRenderer {
     pub(crate) scene_renderer: DesktopSceneRenderer,
-    pub(crate) shell_overlay_renderer: ShellOverlayRenderer,
     pub(crate) frame: Vec<u32>,
 }
 
@@ -328,9 +327,7 @@ impl NativeFrameRenderer {
             width,
             height,
             surfaces: server.renderable_surfaces(),
-            dock_items: server.shell_dock_items(),
-            spotlight: input_state.spotlight(),
-            shell_generation: input_state.shell_generation(),
+            external_overlay_surface_ids: server.external_overlay_surface_ids(),
             visual_state: input_state.desktop_visual_state(cursor_mode),
             render_generation: server.scene_render_generation(),
             client_cursor: server.client_cursor_render_state(),
@@ -345,24 +342,13 @@ impl NativeFrameRenderer {
             width,
             height,
             surfaces,
-            dock_items,
-            spotlight,
-            shell_generation,
             visual_state,
             render_generation,
             client_cursor,
+            external_overlay_surface_ids,
         } = request;
         let pixel_count = width.saturating_mul(height) as usize;
         self.frame.resize(pixel_count, 0);
-        let shell_state = ShellOverlayState {
-            topbar: ShellTopbarModel::visible("Oblivion One").with_trailing_text("Super+Space"),
-            dock_items,
-            spotlight: spotlight.clone(),
-            generation: shell_generation,
-        };
-        let shell_overlay = self
-            .shell_overlay_renderer
-            .render(width, height, &shell_state);
         self.scene_renderer
             .compose_reusing_frame(DesktopComposeRequest {
                 frame: &mut self.frame,
@@ -370,12 +356,9 @@ impl NativeFrameRenderer {
                 frame_height: height,
                 output_scale: 1.0,
                 surfaces,
-                content_generation: native_scene_content_generation(
-                    render_generation,
-                    shell_overlay.generation,
-                ),
+                external_overlay_surface_ids,
+                content_generation: native_scene_content_generation(render_generation),
                 visual_state,
-                shell_overlay: Some(shell_overlay),
                 client_cursor,
             });
         NativeRenderedFrame {
@@ -394,26 +377,14 @@ impl NativeFrameRenderer {
         cursor_mode: NativeCursorRenderMode,
         current_damage: Option<OutputDamage>,
     ) -> EglSceneDrawRequest<'a> {
-        let shell_state = ShellOverlayState {
-            topbar: ShellTopbarModel::visible("Oblivion One").with_trailing_text("Super+Space"),
-            dock_items: server.shell_dock_items(),
-            spotlight: input_state.spotlight().clone(),
-            generation: input_state.shell_generation(),
-        };
-        let shell_overlay = self
-            .shell_overlay_renderer
-            .render(width, height, &shell_state);
         EglSceneDrawRequest {
             width,
             height,
             surfaces: server.renderable_surfaces(),
-            content_generation: native_scene_content_generation(
-                server.scene_render_generation(),
-                shell_overlay.generation,
-            ),
+            external_overlay_surface_ids: server.external_overlay_surface_ids(),
+            content_generation: native_scene_content_generation(server.scene_render_generation()),
             visual_state: input_state.desktop_visual_state(cursor_mode),
             output_scale: 1.0,
-            shell_overlay: Some(shell_overlay),
             client_cursor: server.client_cursor_render_state(),
             current_damage,
         }
@@ -430,19 +401,12 @@ pub(crate) struct NativeFrameRequest<'a> {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) surfaces: &'a [RenderableSurface],
-    pub(crate) dock_items: Vec<ShellDockItem>,
-    pub(crate) spotlight: &'a SpotlightModel,
-    pub(crate) shell_generation: u64,
+    pub(crate) external_overlay_surface_ids: Vec<u32>,
     pub(crate) visual_state: DesktopVisualState,
     pub(crate) render_generation: u64,
     pub(crate) client_cursor: Option<oblivion_one::compositor::ClientCursorRenderState<'a>>,
 }
 
-pub(crate) const fn native_scene_content_generation(
-    render_generation: u64,
-    shell_overlay_generation: u64,
-) -> u64 {
+pub(crate) const fn native_scene_content_generation(render_generation: u64) -> u64 {
     render_generation
-        .wrapping_mul(1_000_003)
-        .wrapping_add(shell_overlay_generation)
 }

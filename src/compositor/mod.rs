@@ -1,11 +1,13 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::File,
     io,
     os::fd::{AsFd, OwnedFd},
     sync::{Arc, Mutex},
     time::Instant,
 };
+
+use crate::astrea_shortcuts::server::astrea_shortcut_v1;
 
 pub use clipboard_bridge::{
     ClipboardBridge, ClipboardBridgeError, ClipboardBridgeEvent, HostClipboardOfferId,
@@ -39,9 +41,11 @@ use wayland_protocols::wp::{
     viewporter::server::{wp_viewport, wp_viewporter},
 };
 use wayland_protocols::xdg::{
+    activation::v1::server::{xdg_activation_token_v1, xdg_activation_v1},
     decoration::zv1::server::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1},
     shell::server::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base},
 };
+use wayland_protocols_wlr::layer_shell::v1::server::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
     backend::{ClientId, ObjectId},
@@ -67,6 +71,7 @@ mod explicit_sync;
 mod idle;
 mod input;
 mod interaction;
+mod layer_shell;
 mod output;
 mod plan;
 mod popup;
@@ -76,7 +81,6 @@ mod render;
 mod runtime_files;
 mod selection;
 mod server;
-mod shell;
 mod shm;
 mod state_data;
 mod subsurface;
@@ -118,6 +122,7 @@ use interaction::{
     WindowInteractionKind, interactive_resize_geometry, resize_drag_threshold_reached,
     resize_edges_for_window_point, resize_edges_from_xdg, window_frame_action_for_local_point,
 };
+use layer_shell::LayerSurfaceRole;
 use output::{
     OutputRefreshRate, OutputScale, OutputSize, send_output_description,
     send_output_done_if_supported, send_output_mode, send_output_scale,
@@ -137,21 +142,16 @@ pub use presentation::{
 pub use render::{
     BufferAge, DesktopComposeRequest, DesktopFrameCopyKind, DesktopSceneRebuildKind,
     DesktopSceneRenderer, DesktopVisualState, NESTED_OUTPUT_BACKGROUND, RenderSceneElement,
-    RenderSceneElementId, RenderSceneElementKind, ServerFrameColor, SurfaceTargetRect,
-    compose_nested_output, cursor_texture_pixels, cursor_texture_size, draw_wallpaper,
-    output_scale_key, render_scene_elements_for_surfaces, scale_desktop_visual_state,
-    scale_logical_coordinate, scale_logical_extent, server_frame_rects_by_surface,
-    server_frame_rects_for_surface, surface_origin, surface_origins, surface_render_plan,
-    surface_render_plan_with_clip, surface_render_space_assignments,
+    RenderSceneElementId, RenderSceneElementKind, ServerFrameColor, SurfaceRenderSpaceAssignment,
+    SurfaceTargetRect, compose_nested_output, cursor_texture_pixels, cursor_texture_size,
+    draw_wallpaper, output_scale_key, render_scene_elements_for_surfaces,
+    scale_desktop_visual_state, scale_logical_coordinate, scale_logical_extent,
+    server_frame_rects_by_surface, server_frame_rects_for_surface, surface_origin, surface_origins,
+    surface_render_plan, surface_render_plan_with_clip, surface_render_space_assignments,
 };
 use runtime_files::{compositor_debug_surface_logging_enabled, unique_runtime_file_path};
 pub use selection::{SelectionOfferRecord, SelectionState};
 pub use server::{CompositorError, OwnCompositorServer};
-pub use shell::{
-    ShellDockItem, ShellLaunchSuggestion, ShellOverlayBounds, ShellOverlayImage,
-    ShellOverlayRenderer, ShellOverlayState, ShellTopbarModel, SpotlightModel, dock_item_at,
-    launcher_suggestions,
-};
 use shm::{
     ShmBufferData, ShmPoolData, WL_SHM_FORMAT_ABGR8888, WL_SHM_FORMAT_ABGR2101010,
     WL_SHM_FORMAT_ARGB2101010, WL_SHM_FORMAT_XBGR8888, WL_SHM_FORMAT_XBGR2101010,
@@ -160,8 +160,9 @@ use shm::{
 use state_data::*;
 use subsurface::{CachedSubsurfaceCommit, SubsurfaceSyncMode, SubsurfaceTransactionState};
 pub use surface::{
-    DamageSince, RenderableSurface, RenderableSurfaceDamage, SurfaceCommitCounter,
-    SurfaceCommitSequence, SurfaceDamageJournal, SurfaceDamageRect, SurfacePlacement,
+    DamageSince, RenderableSurface, RenderableSurfaceDamage, RootPlacementMode,
+    SurfaceCommitCounter, SurfaceCommitSequence, SurfaceDamageJournal, SurfaceDamageRect,
+    SurfacePlacement,
 };
 use window_state::{ToplevelMode, WindowGeometry, WindowState, xdg_toplevel_state_bytes};
 
@@ -492,6 +493,10 @@ pub struct CompositorState {
     pending_surface_window_geometries: HashMap<u32, XdgWindowGeometry>,
     surface_entered_outputs: HashSet<(u32, u32)>,
     toplevel_surfaces: HashMap<u32, ToplevelSurface>,
+    layer_surfaces: HashMap<u32, LayerSurfaceRole>,
+    layer_surface_order: u64,
+    exclusive_keyboard_layer_surface: Option<u32>,
+    last_application_keyboard_focus: Option<wl_surface::WlSurface>,
     configured_xdg_surfaces: HashSet<u32>,
     window_interaction: Option<WindowInteraction>,
     pending_interactive_resize_update: Option<PendingInteractiveResizeUpdate>,
@@ -544,7 +549,22 @@ pub struct CompositorState {
     next_clipboard_generation: u64,
     popup_surfaces: HashMap<u32, PopupSurface>,
     popup_grab_stack: Vec<u32>,
+    popup_nodes: HashMap<u32, PopupNode>,
+    popup_grab: Option<PopupGrab>,
+    next_popup_grab_generation: u64,
+    activation_tokens: HashMap<String, ActivationTokenState>,
+    pending_activation_tokens: HashMap<u32, PendingActivationToken>,
+    next_activation_token_serial: u64,
     pending_color_info: Vec<color::PendingColorInfo>,
+    astrea_shortcuts: Vec<AstreaShortcutRegistration>,
+    astrea_shell_client_pids: HashSet<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct AstreaShortcutRegistration {
+    resource: astrea_shortcut_v1::AstreaShortcutV1,
+    namespace: String,
+    name: String,
 }
 
 #[derive(Debug, Clone)]

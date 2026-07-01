@@ -109,13 +109,9 @@ re-raising/re-stacking the surface tree.
 The shell dock item has a `minimized` flag and is drawn differently when
 minimized.
 
-Evidence:
-
-- `src/compositor/shell/dock.rs:3-19`
-- `src/compositor/shell/dock.rs:78-90`
-
-`shell_dock_items()` includes renderable toplevel roots first, then any
-toplevels not already known. This keeps minimized-only toplevels in the dock.
+The former compositor-rendered dock was removed. External shells should derive
+window lists through their supported Wayland/protocol integration instead of
+Typhon maintaining a compositor-private dock model.
 
 Evidence:
 

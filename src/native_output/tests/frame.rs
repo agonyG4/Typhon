@@ -78,7 +78,6 @@ fn native_xrgb_copy_damage_caps_overlapping_rects_at_full_frame_copy() {
 
 #[test]
 fn native_frame_renderer_repairs_surface_bounds_change_with_partial_scene_rebuild() {
-    let spotlight = SpotlightModel::default();
     let mut renderer = NativeFrameRenderer::default();
     let initial_surface = test_renderable_surface(7, 0, 0, 4, 4, RenderableSurfaceDamage::Full);
 
@@ -86,9 +85,7 @@ fn native_frame_renderer_repairs_surface_bounds_change_with_partial_scene_rebuil
         width: 96,
         height: 96,
         surfaces: &[initial_surface],
-        dock_items: Vec::new(),
-        spotlight: &spotlight,
-        shell_generation: 1,
+        external_overlay_surface_ids: Vec::new(),
         visual_state: DesktopVisualState::wallpaper_only(),
         render_generation: 1,
         client_cursor: None,
@@ -113,9 +110,7 @@ fn native_frame_renderer_repairs_surface_bounds_change_with_partial_scene_rebuil
         width: 96,
         height: 96,
         surfaces: &[moved_surface],
-        dock_items: Vec::new(),
-        spotlight: &spotlight,
-        shell_generation: 1,
+        external_overlay_surface_ids: Vec::new(),
         visual_state: DesktopVisualState::wallpaper_only(),
         render_generation: 2,
         client_cursor: None,
@@ -127,7 +122,6 @@ fn native_frame_renderer_repairs_surface_bounds_change_with_partial_scene_rebuil
 
 #[test]
 fn native_frame_renderer_reports_full_scene_rebuild_when_surface_identity_changes() {
-    let spotlight = SpotlightModel::default();
     let mut renderer = NativeFrameRenderer::default();
     let initial_surface = test_renderable_surface(7, 0, 0, 4, 4, RenderableSurfaceDamage::Full);
 
@@ -135,9 +129,7 @@ fn native_frame_renderer_reports_full_scene_rebuild_when_surface_identity_change
         width: 96,
         height: 96,
         surfaces: &[initial_surface],
-        dock_items: Vec::new(),
-        spotlight: &spotlight,
-        shell_generation: 1,
+        external_overlay_surface_ids: Vec::new(),
         visual_state: DesktopVisualState::wallpaper_only(),
         render_generation: 1,
         client_cursor: None,
@@ -162,9 +154,7 @@ fn native_frame_renderer_reports_full_scene_rebuild_when_surface_identity_change
         width: 96,
         height: 96,
         surfaces: &[replacement_surface],
-        dock_items: Vec::new(),
-        spotlight: &spotlight,
-        shell_generation: 1,
+        external_overlay_surface_ids: Vec::new(),
         visual_state: DesktopVisualState::wallpaper_only(),
         render_generation: 2,
         client_cursor: None,

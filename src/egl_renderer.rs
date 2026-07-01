@@ -4,8 +4,8 @@ use glow::HasContext;
 use khronos_egl as egl;
 use oblivion_one::{
     compositor::{
-        self, DesktopVisualState, RenderableSurface, ShellOverlayImage, SurfaceDamageRect,
-        cursor_texture_pixels, cursor_texture_size,
+        self, DesktopVisualState, RenderableSurface, SurfaceDamageRect, cursor_texture_pixels,
+        cursor_texture_size,
     },
     render_backend::{
         RenderBackendProfile,
@@ -28,7 +28,7 @@ mod program;
 use damage::{
     BufferAge, ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker,
     EglPartialRepaintCapabilities, EglPresentedDamageState, FullRepaintReason,
-    PartialRepaintPlanner, RenderExecution, RepaintPlan, ShellOverlayDamageState,
+    PartialRepaintPlanner, RenderExecution, RepaintPlan,
 };
 pub(crate) use damage::{OutputDamage, OutputRect, RepaintMode};
 use dmabuf::{query_egl_dmabuf_feedback, query_egl_main_device};
@@ -112,10 +112,10 @@ pub struct EglSceneDrawRequest<'a> {
     pub width: u32,
     pub height: u32,
     pub surfaces: &'a [RenderableSurface],
+    pub external_overlay_surface_ids: Vec<u32>,
     pub content_generation: u64,
     pub visual_state: DesktopVisualState,
     pub output_scale: f64,
-    pub shell_overlay: Option<&'a ShellOverlayImage>,
     pub client_cursor: Option<compositor::ClientCursorRenderState<'a>>,
     pub(crate) current_damage: Option<OutputDamage>,
 }
@@ -150,7 +150,6 @@ pub(crate) struct GlesSceneRenderer {
     pending_scene_key: Option<EglSceneCacheKey>,
     wallpaper_resource: Option<EglImageResource>,
     cursor_resource: Option<EglImageResource>,
-    shell_overlay_resource: Option<EglImageResource>,
     surface_resources: HashMap<u32, EglSurfaceResource>,
     dmabuf_resource_cache: HashMap<DmabufImageKey, CachedDmabufResource<EglImageResource>>,
     dmabuf_cache_peak_entries: usize,
@@ -373,7 +372,6 @@ impl GlesSceneRenderer {
             pending_scene_key: None,
             wallpaper_resource: None,
             cursor_resource: None,
-            shell_overlay_resource: None,
             surface_resources: HashMap::new(),
             dmabuf_resource_cache: HashMap::new(),
             dmabuf_cache_peak_entries: 0,
@@ -418,10 +416,10 @@ impl GlesSceneRenderer {
             width,
             height,
             surfaces,
+            external_overlay_surface_ids,
             content_generation,
             visual_state,
             output_scale,
-            shell_overlay,
             client_cursor,
             current_damage,
         } = request;
@@ -440,7 +438,6 @@ impl GlesSceneRenderer {
         if scaled_visual_state.cursor.is_some() {
             self.ensure_cursor_resource(egl, egl_display)?;
         }
-        self.ensure_shell_overlay_resource(egl, egl_display, shell_overlay)?;
         self.sync_surface_resources(
             egl,
             egl_display,
@@ -448,6 +445,13 @@ impl GlesSceneRenderer {
             client_cursor.map(|cursor| cursor.surface),
         )?;
 
+        let (base_surfaces, overlay_surfaces) =
+            split_external_overlay_surfaces(surfaces, &external_overlay_surface_ids);
+        let scene_surfaces = if external_overlay_surface_ids.is_empty() {
+            surfaces
+        } else {
+            base_surfaces.as_slice()
+        };
         let surface_signatures = egl_scene_surface_signatures(surfaces);
         let candidate_scene_key = EglSceneCacheKey::new(
             width,
@@ -464,7 +468,6 @@ impl GlesSceneRenderer {
             output_scale_key,
             &surface_signatures,
         );
-        let shell_overlay_damage = shell_overlay.and_then(shell_overlay_damage_state);
         let client_cursor_damage = client_cursor.map(|cursor| {
             ClientCursorDamageState::new(
                 compositor::scale_logical_coordinate(
@@ -488,7 +491,6 @@ impl GlesSceneRenderer {
             scene_changed,
             current_damage,
             scaled_visual_state,
-            shell_overlay_damage,
             client_cursor_damage,
         );
         if scene_changed && output_damage == OutputDamage::Empty {
@@ -499,7 +501,6 @@ impl GlesSceneRenderer {
             width,
             height,
             scaled_visual_state,
-            shell_overlay_damage,
             client_cursor_damage,
         ));
 
@@ -508,7 +509,7 @@ impl GlesSceneRenderer {
             self.rebuild_scene_commands(
                 width,
                 height,
-                surfaces,
+                scene_surfaces,
                 content_generation,
                 output_scale,
                 output_scale_key,
@@ -519,7 +520,7 @@ impl GlesSceneRenderer {
             width,
             height,
             scaled_visual_state,
-            shell_overlay,
+            &overlay_surfaces,
             client_cursor,
             output_scale,
         );
@@ -601,9 +602,6 @@ impl GlesSceneRenderer {
         if let Some(resource) = self.wallpaper_resource.take() {
             destroy_image_resource(&self.gl, egl, egl_display, resource);
         }
-        if let Some(resource) = self.shell_overlay_resource.take() {
-            destroy_image_resource(&self.gl, egl, egl_display, resource);
-        }
         self.scene_cache_key = None;
         unsafe {
             self.gl.viewport(0, 0, width as i32, height as i32);
@@ -676,58 +674,6 @@ impl GlesSceneRenderer {
         }
         resource.generation = 1;
         self.cursor_resource = Some(resource);
-        Ok(())
-    }
-
-    fn ensure_shell_overlay_resource(
-        &mut self,
-        egl: &EglInstance,
-        egl_display: egl::Display,
-        shell_overlay: Option<&ShellOverlayImage>,
-    ) -> RendererResult<()> {
-        let Some(shell_overlay) = shell_overlay else {
-            if let Some(old) = self.shell_overlay_resource.take() {
-                destroy_image_resource(&self.gl, egl, egl_display, old);
-            }
-            return Ok(());
-        };
-        if shell_overlay.width == 0 || shell_overlay.height == 0 {
-            return Ok(());
-        }
-        if shell_overlay.content_bounds().is_none() {
-            if let Some(old) = self.shell_overlay_resource.take() {
-                destroy_image_resource(&self.gl, egl, egl_display, old);
-            }
-            return Ok(());
-        }
-        let update = self
-            .shell_overlay_resource
-            .as_ref()
-            .is_none_or(|resource| resource.size != (shell_overlay.width, shell_overlay.height));
-        if update {
-            if let Some(old) = self.shell_overlay_resource.take() {
-                destroy_image_resource(&self.gl, egl, egl_display, old);
-            }
-            self.shell_overlay_resource = Some(create_uploaded_resource(
-                &self.gl,
-                shell_overlay.width,
-                shell_overlay.height,
-            )?);
-        }
-
-        let Some(resource) = self.shell_overlay_resource.as_mut() else {
-            return Ok(());
-        };
-        if resource.generation != shell_overlay.generation {
-            write_argb_pixels_to_resource(
-                &self.gl,
-                resource,
-                SurfaceDamageRect::full(shell_overlay.width, shell_overlay.height),
-                &shell_overlay.pixels,
-                &mut self.texture_upload_rgba,
-            );
-            resource.generation = shell_overlay.generation;
-        }
         Ok(())
     }
 
@@ -1192,43 +1138,30 @@ impl GlesSceneRenderer {
         width: u32,
         height: u32,
         visual_state: DesktopVisualState,
-        shell_overlay: Option<&ShellOverlayImage>,
+        overlay_surfaces: &[RenderableSurface],
         client_cursor: Option<compositor::ClientCursorRenderState<'_>>,
         output_scale: f64,
     ) {
         self.cursor_vertices.clear();
         self.cursor_commands.clear();
-        if let Some(shell_overlay) = shell_overlay
-            && self.shell_overlay_resource.is_some()
+
+        let origins = compositor::surface_origins(overlay_surfaces);
+        let render_assignments =
+            compositor::surface_render_space_assignments(overlay_surfaces, output_scale);
+        for ((surface, (origin_x, origin_y)), render_assignment) in
+            overlay_surfaces.iter().zip(origins).zip(render_assignments)
         {
-            for region in shell_overlay.regions() {
-                let bounds = region.output;
-                let texture = region.texture;
-                let rect = EglRect::new(
-                    bounds.x as f32,
-                    bounds.y as f32,
-                    bounds.width as f32,
-                    bounds.height as f32,
-                );
-                let uv = EglUvRect::from_pixel_bounds(
-                    texture.x,
-                    texture.y,
-                    texture.width,
-                    texture.height,
-                    shell_overlay.width,
-                    shell_overlay.height,
-                );
-                push_draw_command_with_uv(
-                    &mut self.cursor_vertices,
-                    &mut self.cursor_commands,
-                    EglDrawLayer::ShellOverlay,
-                    rect,
-                    uv,
-                    SurfaceSampling::ScaledLinear,
-                    width,
-                    height,
-                );
-            }
+            push_egl_surface_commands(
+                &mut self.cursor_vertices,
+                &mut self.cursor_commands,
+                width,
+                height,
+                surface,
+                origin_x,
+                origin_y,
+                render_assignment,
+                output_scale,
+            );
         }
 
         if let Some((cursor_x, cursor_y)) = visual_state.cursor
@@ -1436,10 +1369,6 @@ impl GlesSceneRenderer {
                 .cursor_resource
                 .as_ref()
                 .map(|resource| resource.texture),
-            EglDrawLayer::ShellOverlay => self
-                .shell_overlay_resource
-                .as_ref()
-                .map(|resource| resource.texture),
         }
     }
 
@@ -1448,9 +1377,6 @@ impl GlesSceneRenderer {
             destroy_image_resource(&self.gl, egl, egl_display, resource);
         }
         if let Some(resource) = self.cursor_resource.take() {
-            destroy_image_resource(&self.gl, egl, egl_display, resource);
-        }
-        if let Some(resource) = self.shell_overlay_resource.take() {
             destroy_image_resource(&self.gl, egl, egl_display, resource);
         }
         for (_, resource) in self.frame_resources.drain() {
@@ -1614,6 +1540,88 @@ struct EglSceneSurfaceSignature {
     clip_width: u32,
     clip_height: u32,
     generation: u64,
+}
+
+fn split_external_overlay_surfaces(
+    surfaces: &[RenderableSurface],
+    external_overlay_surface_ids: &[u32],
+) -> (Vec<RenderableSurface>, Vec<RenderableSurface>) {
+    if external_overlay_surface_ids.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    surfaces
+        .iter()
+        .cloned()
+        .partition(|surface| !external_overlay_surface_ids.contains(&surface.surface_id))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "EGL command emission keeps draw target, surface, and placement data explicit"
+)]
+fn push_egl_surface_commands(
+    vertices: &mut Vec<EglTexturedVertex>,
+    commands: &mut Vec<EglDrawCommand>,
+    width: u32,
+    height: u32,
+    surface: &RenderableSurface,
+    origin_x: i32,
+    origin_y: i32,
+    render_assignment: compositor::SurfaceRenderSpaceAssignment,
+    output_scale: f64,
+) {
+    for rect in compositor::server_frame_rects_for_surface(surface) {
+        push_draw_command(
+            vertices,
+            commands,
+            EglDrawLayer::Solid(rect.color),
+            EglRect::new(
+                compositor::scale_logical_coordinate(origin_x.saturating_add(rect.x), output_scale)
+                    as f32,
+                compositor::scale_logical_coordinate(origin_y.saturating_add(rect.y), output_scale)
+                    as f32,
+                compositor::scale_logical_extent(rect.width, output_scale) as f32,
+                compositor::scale_logical_extent(rect.height, output_scale) as f32,
+            ),
+            width,
+            height,
+        );
+    }
+    let render_plan = compositor::surface_render_plan_with_clip(
+        surface,
+        render_assignment.target,
+        render_assignment.visual_clip,
+    );
+    let uv = EglUvRect::new(
+        render_plan.content_uv.left,
+        render_plan.content_uv.top,
+        render_plan.content_uv.right,
+        render_plan.content_uv.bottom,
+    );
+    let sampling = surface_sampling_for_plan(
+        surface.buffer_size().width,
+        surface.buffer_size().height,
+        render_plan.content_target.x(),
+        render_plan.content_target.y(),
+        render_plan.content_target.width(),
+        render_plan.content_target.height(),
+        uv,
+    );
+    push_draw_command_with_uv(
+        vertices,
+        commands,
+        EglDrawLayer::Surface(surface.surface_id),
+        EglRect::new(
+            render_plan.content_target.x() as f32,
+            render_plan.content_target.y() as f32,
+            render_plan.content_target.width() as f32,
+            render_plan.content_target.height() as f32,
+        ),
+        uv,
+        sampling,
+        width,
+        height,
+    );
 }
 
 fn egl_scene_surface_signatures(surfaces: &[RenderableSurface]) -> Vec<EglSceneSurfaceSignature> {
@@ -1856,27 +1864,6 @@ fn write_argb_pixels_to_resource(
 ) -> usize {
     pack_argb_pixels_rgba(pixels, upload_rgba);
     write_rgba_bytes_to_resource(gl, resource, rect, upload_rgba)
-}
-
-fn shell_overlay_damage_state(
-    shell_overlay: &ShellOverlayImage,
-) -> Option<ShellOverlayDamageState> {
-    if shell_overlay.regions().is_empty() {
-        return None;
-    }
-
-    Some(ShellOverlayDamageState::new(
-        shell_overlay.generation,
-        shell_overlay.regions().iter().map(|region| {
-            let bounds = region.output;
-            SurfaceDamageRect {
-                x: bounds.x,
-                y: bounds.y,
-                width: bounds.width,
-                height: bounds.height,
-            }
-        }),
-    ))
 }
 
 fn write_rgba_bytes_to_resource(
@@ -2480,13 +2467,11 @@ mod tests {
             None,
             DesktopVisualState::wallpaper_only(),
             None,
-            None,
         );
         tracker.commit_presented(EglOutputDamageTracker::candidate_state(
             1280,
             800,
             DesktopVisualState::wallpaper_only(),
-            None,
             None,
         ));
         let precise = OutputDamage::rects(1280, 800, [OutputRect::new(10, 20, 30, 40)]);
@@ -2498,7 +2483,6 @@ mod tests {
                 true,
                 Some(precise.clone()),
                 DesktopVisualState::wallpaper_only(),
-                None,
                 None,
             ),
             precise
@@ -2515,13 +2499,11 @@ mod tests {
             None,
             DesktopVisualState::with_cursor(10, 10),
             None,
-            None,
         );
         tracker.commit_presented(EglOutputDamageTracker::candidate_state(
             1280,
             800,
             DesktopVisualState::with_cursor(10, 10),
-            None,
             None,
         ));
         let damage = tracker.damage_for_frame(
@@ -2530,7 +2512,6 @@ mod tests {
             false,
             Some(OutputDamage::Empty),
             DesktopVisualState::with_cursor(20, 22),
-            None,
             None,
         );
 
@@ -2552,13 +2533,11 @@ mod tests {
             None,
             DesktopVisualState::with_cursor(10, 10),
             None,
-            None,
         );
         tracker.commit_presented(EglOutputDamageTracker::candidate_state(
             1280,
             800,
             DesktopVisualState::with_cursor(10, 10),
-            None,
             None,
         ));
 
@@ -2569,7 +2548,6 @@ mod tests {
             Some(OutputDamage::Empty),
             DesktopVisualState::with_cursor(20, 22),
             None,
-            None,
         );
         let retry = tracker.damage_for_frame(
             1280,
@@ -2578,55 +2556,10 @@ mod tests {
             Some(OutputDamage::Empty),
             DesktopVisualState::with_cursor(20, 22),
             None,
-            None,
         );
 
         assert_eq!(retry, first);
         assert_ne!(retry, OutputDamage::Empty);
-    }
-
-    #[test]
-    fn output_damage_tracker_limits_shell_overlay_change_to_overlay_bounds() {
-        let mut tracker = EglOutputDamageTracker::default();
-        let old = SurfaceDamageRect {
-            x: 16,
-            y: 10,
-            width: 420,
-            height: 32,
-        };
-        let new = SurfaceDamageRect {
-            x: 16,
-            y: 50,
-            width: 520,
-            height: 32,
-        };
-        tracker.damage_for_frame(
-            1280,
-            800,
-            true,
-            None,
-            DesktopVisualState::wallpaper_only(),
-            Some(ShellOverlayDamageState::new(1, [old])),
-            None,
-        );
-        tracker.commit_presented(EglOutputDamageTracker::candidate_state(
-            1280,
-            800,
-            DesktopVisualState::wallpaper_only(),
-            Some(ShellOverlayDamageState::new(1, [old])),
-            None,
-        ));
-        let damage = tracker.damage_for_frame(
-            1280,
-            800,
-            false,
-            Some(OutputDamage::Empty),
-            DesktopVisualState::wallpaper_only(),
-            Some(ShellOverlayDamageState::new(2, [new])),
-            None,
-        );
-
-        assert_eq!(damage.rect_count(), 2);
     }
 
     #[test]

@@ -72,6 +72,14 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) surface_configured: bool,
     pub(in crate::compositor::tests) surface_configure_count: usize,
     pub(in crate::compositor::tests) surface_configure_serials: Vec<u32>,
+    pub(in crate::compositor::tests) layer_surface_configured: bool,
+    pub(in crate::compositor::tests) layer_surface_configure_count: usize,
+    pub(in crate::compositor::tests) layer_surface_configure_serials: Vec<u32>,
+    pub(in crate::compositor::tests) layer_surface_configures: Vec<(u32, u32, u32)>,
+    pub(in crate::compositor::tests) layer_surface_width: u32,
+    pub(in crate::compositor::tests) layer_surface_height: u32,
+    pub(in crate::compositor::tests) layer_surface_closed: bool,
+    pub(in crate::compositor::tests) suppress_layer_surface_ack: bool,
     pub(in crate::compositor::tests) popup_configured: bool,
     pub(in crate::compositor::tests) popup_configure_count: usize,
     pub(in crate::compositor::tests) popup_repositioned_token: Option<u32>,
@@ -113,6 +121,10 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) data_offer_mime_types: Vec<String>,
     pub(in crate::compositor::tests) data_source_send_mime_types: Vec<String>,
     pub(in crate::compositor::tests) data_source_cancelled: bool,
+    pub(in crate::compositor::tests) activation_token_done: Option<String>,
+    pub(in crate::compositor::tests) astrea_shortcut_pressed_count: usize,
+    pub(in crate::compositor::tests) astrea_shortcut_pressed_serials: Vec<u32>,
+    pub(in crate::compositor::tests) astrea_shortcut_pressed_timestamps: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +134,8 @@ pub(in crate::compositor::tests) struct XdgRoleSnapshot {
     pub(in crate::compositor::tests) toplevel_count: usize,
     pub(in crate::compositor::tests) toplevel_registered: bool,
     pub(in crate::compositor::tests) popup_count: usize,
+    pub(in crate::compositor::tests) popup_node_count: usize,
+    pub(in crate::compositor::tests) popup_grab_active: bool,
     pub(in crate::compositor::tests) window_geometry_present: bool,
     pub(in crate::compositor::tests) placement: Option<SurfacePlacement>,
 }
@@ -134,6 +148,8 @@ pub(in crate::compositor::tests) struct RenderableSurfaceSnapshot {
     pub(in crate::compositor::tests) parent_surface_id: Option<u32>,
     pub(in crate::compositor::tests) local_x: i32,
     pub(in crate::compositor::tests) local_y: i32,
+    pub(in crate::compositor::tests) origin_x: i32,
+    pub(in crate::compositor::tests) origin_y: i32,
     pub(in crate::compositor::tests) buffer_id: u64,
     pub(in crate::compositor::tests) generation: u64,
     pub(in crate::compositor::tests) resize_preview_active: bool,
@@ -287,6 +303,37 @@ impl Dispatch<client_wl_compositor::WlCompositor, ()> for RegistryTestState {
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<client_astrea_shortcuts_manager_v1::AstreaShortcutsManagerV1, ()>
+    for RegistryTestState
+{
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_astrea_shortcuts_manager_v1::AstreaShortcutsManagerV1,
+        _event: client_astrea_shortcuts_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_astrea_shortcut_v1::AstreaShortcutV1, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_astrea_shortcut_v1::AstreaShortcutV1,
+        event: client_astrea_shortcut_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let client_astrea_shortcut_v1::Event::Pressed { serial, timestamp } = event {
+            state.astrea_shortcut_pressed_count += 1;
+            state.astrea_shortcut_pressed_serials.push(serial);
+            state.astrea_shortcut_pressed_timestamps.push(timestamp);
+        }
     }
 }
 
@@ -1083,6 +1130,78 @@ impl Dispatch<client_xdg_wm_base::XdgWmBase, ()> for RegistryTestState {
     ) {
         if let client_xdg_wm_base::Event::Ping { serial } = event {
             proxy.pong(serial);
+        }
+    }
+}
+
+impl Dispatch<client_xdg_activation_v1::XdgActivationV1, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_xdg_activation_v1::XdgActivationV1,
+        _event: client_xdg_activation_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_xdg_activation_token_v1::XdgActivationTokenV1, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_xdg_activation_token_v1::XdgActivationTokenV1,
+        event: client_xdg_activation_token_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let client_xdg_activation_token_v1::Event::Done { token } = event {
+            state.activation_token_done = Some(token);
+        }
+    }
+}
+
+impl Dispatch<client_zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_zwlr_layer_shell_v1::ZwlrLayerShellV1,
+        _event: client_zwlr_layer_shell_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        proxy: &client_zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        event: client_zwlr_layer_surface_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_zwlr_layer_surface_v1::Event::Configure {
+                serial,
+                width,
+                height,
+            } => {
+                state.layer_surface_configured = true;
+                state.layer_surface_configure_count += 1;
+                state.layer_surface_configure_serials.push(serial);
+                state.layer_surface_configures.push((serial, width, height));
+                state.layer_surface_width = width;
+                state.layer_surface_height = height;
+                if !state.suppress_layer_surface_ack {
+                    proxy.ack_configure(serial);
+                }
+            }
+            client_zwlr_layer_surface_v1::Event::Closed => {
+                state.layer_surface_closed = true;
+            }
+            _ => {}
         }
     }
 }

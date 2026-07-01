@@ -149,9 +149,10 @@ fn configure_compositor_app_command_with_environment_and_policy(
     remove_host_desktop_activation_environment(command);
     apply_nested_app_runtime_guards(command);
     command.env("WAYLAND_DISPLAY", &environment.wayland_display);
-    command.env("XDG_CURRENT_DESKTOP", "OblivionOne");
-    command.env("XDG_SESSION_DESKTOP", "OblivionOne");
+    command.env("XDG_CURRENT_DESKTOP", "Astrea");
+    command.env("XDG_SESSION_DESKTOP", "Astrea");
     command.env("XDG_SESSION_TYPE", "wayland");
+    command.env("DESKTOP_SESSION", "Astrea");
     command.env("ELECTRON_OZONE_PLATFORM_HINT", "wayland");
     command.env("MOZ_ENABLE_WAYLAND", "1");
     command.env("OBLIVION_ONE_DE", "1");

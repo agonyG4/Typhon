@@ -1,5 +1,7 @@
 use super::*;
 
+const ECLIPSE_ROOT: &str = "/home/agony/GitHub/Eclipse";
+
 pub(crate) fn launch_native_shell_command(
     server: &OwnCompositorServer,
     command: Vec<String>,
@@ -41,6 +43,63 @@ pub(crate) fn launch_native_shell_command(
         ))
         .into()),
     }
+}
+
+pub(crate) fn external_shell_command() -> Option<Vec<String>> {
+    command_from_env("OBLIVION_ONE_SHELL_COMMAND")
+}
+
+pub(crate) fn external_spotlight_command() -> Option<Vec<String>> {
+    command_from_env("OBLIVION_ONE_SPOTLIGHT_COMMAND")
+        .or_else(|| eclipse_command("Spotlight", "astrea-spotlight", &["--toggle"]))
+        .or_else(|| path_command("astrea-spotlight", &["--toggle"]))
+}
+
+pub(crate) fn external_alt_tab_command() -> Option<Vec<String>> {
+    command_from_env("OBLIVION_ONE_ALT_TAB_COMMAND")
+        .or_else(|| eclipse_command("AltTab", "astrea-alt-tab", &["--next"]))
+        .or_else(|| path_command("astrea-alt-tab", &["--next"]))
+}
+
+fn command_from_env(name: &str) -> Option<Vec<String>> {
+    let command = std::env::var(name).ok()?;
+    let command = command.trim();
+    (!command.is_empty()).then(|| vec!["sh".to_string(), "-lc".to_string(), command.to_string()])
+}
+
+fn eclipse_command(project: &str, binary: &str, args: &[&str]) -> Option<Vec<String>> {
+    let candidates = [
+        Path::new(ECLIPSE_ROOT)
+            .join(project)
+            .join("build")
+            .join(binary),
+        Path::new(ECLIPSE_ROOT).join("build").join(binary),
+        Path::new(ECLIPSE_ROOT)
+            .join("build")
+            .join(project)
+            .join(binary),
+    ];
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .map(|path| command_with_args(path.display().to_string(), args))
+}
+
+fn path_command(binary: &str, args: &[&str]) -> Option<Vec<String>> {
+    command_available(binary).then(|| command_with_args(binary.to_string(), args))
+}
+
+fn command_with_args(program: String, args: &[&str]) -> Vec<String> {
+    std::iter::once(program)
+        .chain(args.iter().map(|arg| (*arg).to_string()))
+        .collect()
+}
+
+fn command_available(program: &str) -> bool {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_var).any(|dir| dir.join(program).is_file())
 }
 
 pub(crate) fn native_launch_request(

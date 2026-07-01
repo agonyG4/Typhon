@@ -165,13 +165,13 @@ resize, the steady generation churn is expected to be real client commits.
   `src/compositor/render.rs:146-186`). This avoids rebuilding scene pixels when
   only the cursor moves, but `copy_scene_to_frame()` still copies the full frame
   every compose (`src/compositor/render.rs:188-194`).
-- `ShellOverlayRenderer` caches overlay atlas pixels by computed overlay
-  generation and dimensions (`src/compositor/shell.rs:85-135`).
+- External shell UI now renders through normal layer-shell surfaces, so it uses
+  the same surface texture/cache path as other Wayland clients.
 - `OwnCompositorState` caches surface origins for hit/render calculations and
   invalidates the cache by render generation
   (`src/compositor/mod.rs:1196-1207`).
-- The EGL renderer caches GL resources for wallpaper, cursor, shell overlay,
-  server-frame colors, and client surfaces (`src/egl_renderer.rs:78-88`,
+- The EGL renderer caches GL resources for wallpaper, cursor, server-frame
+  colors, and client surfaces (`src/egl_renderer.rs:78-88`,
   `src/egl_renderer.rs:307-432`, `src/egl_renderer.rs:435-512`).
 - The EGL renderer can upload only SHM surface damage when the surface resource
   is reusable (`src/egl_renderer.rs:455-468`).
@@ -225,7 +225,7 @@ Add debug-only or perf-only generation cause counters before changing behavior:
 - `surface_placement_change`
 - `stacking_raise`
 - `window_minimize_restore`
-- `shell_generation`
+- `layer_surface_geometry_change`
 - `resize_configure_only`
 
 Goal: prove the `raw_input_events=0` churn is dominated by surface commits and

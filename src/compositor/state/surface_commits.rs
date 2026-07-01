@@ -71,6 +71,18 @@ impl CompositorState {
                     .or_else(|| self.surface_window_geometries.get(&surface_id)),
             );
         }
+        if self.popup_surfaces.contains_key(&surface_id) && !self.popup_node_is_alive(surface_id) {
+            pending.release_target().release();
+            self.record_surface_publication(
+                surface_id,
+                root_surface_id,
+                commit_sequence,
+                None,
+                source,
+                None,
+            );
+            return;
+        }
         if let Some(root_surface_id) = self.minimized_root_surface_id_for_surface(surface_id) {
             let damage = damage.normalized_for_surface(buffer_width, buffer_height);
             if self
@@ -177,6 +189,9 @@ impl CompositorState {
 
         let committed_popup = self.popup_surfaces.contains_key(&surface_id);
         if committed_popup {
+            if let Some(node) = self.popup_nodes.get_mut(&surface_id) {
+                node.mapped = true;
+            }
             if compositor_debug_surface_logging_enabled() {
                 eprintln!(
                     "oblivion-one compositor: popup surface {surface_id} committed {width}x{height} at buffer offset {},{}",
@@ -427,6 +442,14 @@ impl CompositorState {
     ) {
         pending.commit_sequence = commit_sequence;
         if !self.is_cursor_surface(surface_id) {
+            let pending_surface_size = pending.surface_size.or_else(|| {
+                BufferSize::new(pending.data.width().ok()?, pending.data.height().ok()?)
+            });
+            if !self.layer_surface_can_publish_buffer(surface_id, pending_surface_size) {
+                pending.release_target().release();
+                self.complete_frame_callbacks(frame_callbacks);
+                return;
+            }
             self.configure_xdg_surface_if_needed(surface_id);
         }
         let Some(CapturedExplicitSyncState {
@@ -620,6 +643,9 @@ impl CompositorState {
             return;
         }
 
+        if !self.apply_layer_surface_commit(surface_id) {
+            return;
+        }
         self.configure_xdg_surface_if_needed(surface_id);
         let mut resize_commit = if resize_capture_finalized {
             captured_resize_commit
@@ -761,7 +787,12 @@ impl CompositorState {
         ));
         callbacks.extend(frame_callbacks);
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
+        if let Some(node) = self.popup_nodes.get_mut(&surface_id) {
+            node.mapped = false;
+        }
+        self.dismiss_popup_children_for_parent(surface_id);
         self.unmap_surface_content(surface_id);
+        self.note_layer_surface_unmapped(surface_id);
         self.record_surface_publication(
             surface_id,
             root_surface_id,
@@ -798,6 +829,7 @@ impl CompositorState {
         self.clear_resize_state_for_surfaces(&removed_surface_ids);
         self.renderable_surfaces
             .retain(|surface| !removed_surface_ids.contains(&surface.surface_id));
+        self.clear_popup_grab_for_surface_ids(&removed_surface_ids);
         self.popup_grab_stack
             .retain(|surface_id| !removed_surface_ids.contains(surface_id));
         self.recent_input_serials
@@ -849,6 +881,7 @@ impl CompositorState {
         let previous_renderable_count = self.renderable_surfaces.len();
         self.renderable_surfaces
             .retain(|surface| !removed_surface_ids.contains(&surface.surface_id));
+        self.clear_popup_grab_for_surface_ids(&removed_surface_ids);
         self.popup_grab_stack
             .retain(|surface_id| !removed_surface_ids.contains(surface_id));
         self.recent_input_serials
@@ -1038,6 +1071,7 @@ impl CompositorState {
                         window_geometry,
                         source,
                     );
+                    self.note_layer_surface_buffer_published(surface_id);
                     self.pending_frame_callbacks.extend(frame_callbacks);
                 }
                 decision => {

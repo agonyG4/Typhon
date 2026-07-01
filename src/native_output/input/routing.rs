@@ -800,19 +800,6 @@ pub(crate) fn apply_native_input_effect(
         });
     }
     for event in effect.pointer_buttons {
-        if event.pressed && event.button == u32::from(BTN_LEFT) {
-            let dock_items = server.shell_dock_items();
-            if let Some(surface_id) = dock_item_at(
-                event.output_width,
-                event.output_height,
-                &dock_items,
-                event.x.round().max(0.0) as i32,
-                event.y.round().max(0.0) as i32,
-            ) {
-                application.redraw_requested |= server.activate_window(surface_id);
-                continue;
-            }
-        }
         server.send_pointer_button(event.button, event.pressed);
     }
     if let Some((horizontal, vertical)) = effect.pointer_axis {
@@ -822,12 +809,38 @@ pub(crate) fn apply_native_input_effect(
         application.redraw_requested |=
             apply_native_window_action(action, server, perf, resize_perf);
     }
+    for shortcut in effect.shortcut_events {
+        let dispatched = server.emit_astrea_shortcut_pressed(
+            &shortcut.namespace,
+            &shortcut.name,
+            effect
+                .pointer_motion_usec
+                .and_then(|timestamp| u32::try_from(timestamp / 1_000).ok())
+                .unwrap_or(0),
+        );
+        perf.log("shortcut_emit", || {
+            vec![
+                NativePerfField::str("namespace", shortcut.namespace.clone()),
+                NativePerfField::str("name", shortcut.name.clone()),
+                NativePerfField::bool("repeated", shortcut.repeated),
+            ]
+        });
+        perf.log("shortcut_client_dispatch", || {
+            vec![
+                NativePerfField::str("namespace", shortcut.namespace),
+                NativePerfField::str("name", shortcut.name),
+                NativePerfField::usize("clients", dispatched),
+            ]
+        });
+    }
     if let Some(command) = effect.launch_command {
         application.launch = launch_native_shell_command(
             server,
             command,
             app_gpu_policy,
-            NativeLaunchSource::Spotlight,
+            effect
+                .launch_source
+                .unwrap_or(NativeLaunchSource::Spotlight),
         )?;
     }
     Ok(application)
@@ -989,9 +1002,7 @@ pub(crate) fn apply_native_window_action(
             server.end_window_interaction();
             was_active
         }
-        NativeWindowAction::Minimize => server.minimize_focused_window(),
-        NativeWindowAction::RestoreMinimized => server.restore_next_minimized_window(),
-        NativeWindowAction::ToggleMaximize => server.toggle_maximize_focused_window(),
+        NativeWindowAction::CloseActiveWindow => false,
         NativeWindowAction::ToggleFullscreen => server.toggle_fullscreen_focused_window(),
     };
     resize_perf.observe_action(action, changed, perf);

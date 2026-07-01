@@ -1,0 +1,17 @@
+agony@Kaiser ~/G/Typhon (main)>   INFO: Launching config: "/home/agony/.config/quickshell/shell.qml"
+  INFO: Shell ID: "65d8b3fd3a6d5a3b8d71d0317d263b72" Path ID "65d8b3fd3a6d5a3b8d71d0317d263b72"
+  INFO: Saving logs to "/run/user/1000/quickshell/by-id/xrh3l3wght/log.qslog"
+  WARN: $HYPRLAND_INSTANCE_SIGNATURE is unset. Cannot connect to hyprland.
+  WARN: The active compositor does not support hyprland_global_shortcuts_v1.
+  WARN: GlobalShortcut will not work.
+  WARN: The active compositor does not support hyprland_global_shortcuts_v1.
+  WARN: GlobalShortcut will not work.
+  WARN: The active compositor does not support hyprland_global_shortcuts_v1.
+  WARN: GlobalShortcut will not work.
+  WARN: The active compositor does not support hyprland_global_shortcuts_v1.
+  WARN: GlobalShortcut will not work.
+  INFO: Configuration Loaded
+zwlr_layer_surface_v1#44: error 0: layer surface buffer committed before configure was acknowledged
+  WARN qt.qpa.wayland: eglSwapBuffers failed with 0x3000, surface: 0x7f45e6fe5d00
+  WARN qt.qpa.wayland: eglSwapBuffers failed with 0x3000, surface: 0x7f45e619e180
+  WARN: The Wayland connection experienced a fatal error: Erro de protocolo

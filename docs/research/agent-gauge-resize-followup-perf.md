@@ -302,9 +302,9 @@ Hypotheses requiring fresh validation:
    hitting `scene_rebuild=partial` or falling back to `full`.
 
 5. Split render timing in a future instrumentation pass.
-   `render_us` currently includes scene rebuild, full scene-to-frame copy, shell
-   overlay blend, and cursor handling. Add debug-only fields later such as
-   `scene_rebuild_us`, `scene_copy_us`, `shell_overlay_us`, and
+   `render_us` currently includes scene rebuild, full scene-to-frame copy, layer
+   surface composition, and cursor handling. Add debug-only fields later such as
+   `scene_rebuild_us`, `scene_copy_us`, `layer_surface_us`, and
    `cursor_blend_us`.
 
 6. Keep GBM write optimization as a later, higher-risk item.

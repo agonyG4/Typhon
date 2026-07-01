@@ -1230,7 +1230,8 @@ impl CompositorState {
             .map(|surface| (surface.surface_id, surface))
             .collect::<HashMap<_, _>>();
         let visible_ids = by_id.keys().copied().collect::<HashSet<_>>();
-        let mut ordered_ids = Vec::new();
+        let mut roots_with_trees = Vec::new();
+        let mut seen_ids = HashSet::new();
         let root_ids = original_order
             .iter()
             .copied()
@@ -1243,13 +1244,34 @@ impl CompositorState {
             .collect::<Vec<_>>();
 
         for root_id in root_ids {
-            self.append_surface_tree_order(root_id, &visible_ids, &mut ordered_ids);
+            let mut tree_ids = Vec::new();
+            self.append_surface_tree_order(root_id, &visible_ids, &mut tree_ids);
+            for surface_id in &tree_ids {
+                seen_ids.insert(*surface_id);
+            }
+            roots_with_trees.push((root_id, tree_ids));
         }
         for surface_id in &original_order {
-            if visible_ids.contains(surface_id) && !ordered_ids.contains(surface_id) {
-                self.append_surface_tree_order(*surface_id, &visible_ids, &mut ordered_ids);
+            if visible_ids.contains(surface_id) && !seen_ids.contains(surface_id) {
+                let root_id = *surface_id;
+                let mut tree_ids = Vec::new();
+                self.append_surface_tree_order(root_id, &visible_ids, &mut tree_ids);
+                for surface_id in &tree_ids {
+                    seen_ids.insert(*surface_id);
+                }
+                roots_with_trees.push((root_id, tree_ids));
             }
         }
+        roots_with_trees.sort_by_key(|(root_id, _)| {
+            (
+                self.surface_scene_rank(*root_id),
+                self.surface_scene_order(*root_id),
+            )
+        });
+        let ordered_ids = roots_with_trees
+            .into_iter()
+            .flat_map(|(_, tree_ids)| tree_ids)
+            .collect::<Vec<_>>();
 
         self.renderable_surfaces = ordered_ids
             .into_iter()

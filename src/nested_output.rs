@@ -12,8 +12,7 @@ use oblivion_one::{
     compositor::{
         DesktopSceneRenderer, DesktopVisualState, OutputPosition, OwnCompositorServer,
         PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample,
-        RelativePointerMotion, ShellOverlayRenderer, ShellOverlayState, ShellTopbarModel,
-        SpotlightModel, dock_item_at,
+        RelativePointerMotion, surface_origins,
     },
     spawn_compositor_app,
 };
@@ -22,7 +21,7 @@ use winit::{
     dpi::{LogicalPosition, LogicalSize},
     event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{Key, KeyCode, PhysicalKey},
+    keyboard::{KeyCode, PhysicalKey},
     monitor::MonitorHandle,
     window::{CursorGrabMode, Window, WindowAttributes, WindowId},
 };
@@ -76,14 +75,12 @@ struct NestedOutputApp {
     window: Option<Arc<Window>>,
     output_renderer: Option<NestedOutputRenderer>,
     renderer: DesktopSceneRenderer,
-    shell_overlay_renderer: ShellOverlayRenderer,
     renderer_preference: OutputRendererPreference,
     config: NestedOutputConfig,
     active_wakeup_interval: Duration,
     app_command: Vec<String>,
     app_launched: bool,
-    spotlight: SpotlightModel,
-    shell_generation: u64,
+    external_shell_launched: bool,
     last_render_generation: u64,
     last_toplevel_count: usize,
     last_popup_count: usize,
@@ -132,7 +129,6 @@ enum NestedPointerConstraintMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NestedPointerMotionDisposition {
-    Captured,
     Forwarded,
 }
 
@@ -159,14 +155,12 @@ impl NestedOutputApp {
             window: None,
             output_renderer: None,
             renderer: DesktopSceneRenderer::default(),
-            shell_overlay_renderer: ShellOverlayRenderer::default(),
             renderer_preference,
             config,
             active_wakeup_interval: refresh_interval(config.refresh_hz),
             app_command,
             app_launched: false,
-            spotlight: SpotlightModel::default(),
-            shell_generation: 0,
+            external_shell_launched: false,
             last_render_generation: 0,
             last_toplevel_count: 0,
             last_popup_count: 0,
@@ -230,9 +224,8 @@ impl NestedOutputApp {
             if debug_frame_logging_enabled() {
                 let retry = self.redraw_pending;
                 eprintln!(
-                    "oblivion-one compositor: request_redraw render_generation={} shell_generation={} retry={retry}",
-                    self.server.render_generation(),
-                    self.shell_generation
+                    "oblivion-one compositor: request_redraw render_generation={} retry={retry}",
+                    self.server.render_generation()
                 );
             }
             window.request_redraw();
@@ -240,10 +233,6 @@ impl NestedOutputApp {
             self.redraw_pending = true;
             self.redraw_requested_at = Some(now);
         }
-    }
-
-    fn bump_shell_generation(&mut self) {
-        self.shell_generation = self.shell_generation.wrapping_add(1);
     }
 
     fn tick_server(&mut self, event_loop: &ActiveEventLoop) {
@@ -281,6 +270,21 @@ impl NestedOutputApp {
         if debug_surface_logging_enabled() && surface_count != self.last_surface_count {
             self.last_surface_count = surface_count;
             println!("renderable surfaces: {surface_count}");
+            let surfaces = self.server.renderable_surfaces();
+            let origins = surface_origins(surfaces);
+            for (surface, (origin_x, origin_y)) in surfaces.iter().zip(origins) {
+                println!(
+                    "renderable surface id={} parent={:?} local={},{} origin={},{} size={}x{}",
+                    surface.surface_id,
+                    surface.placement.parent_surface_id,
+                    surface.placement.local_x,
+                    surface.placement.local_y,
+                    origin_x,
+                    origin_y,
+                    surface.width,
+                    surface.height,
+                );
+            }
         }
     }
 
@@ -501,9 +505,7 @@ impl NestedOutputApp {
     }
 
     fn forward_host_relative_mouse_delta(&mut self, dx: f64, dy: f64) -> bool {
-        if !self.host_window_focused
-            || shell_overlay_captures_client_input(self.spotlight.is_visible())
-        {
+        if !self.host_window_focused {
             return false;
         }
         let Some(sample) = host_relative_delta_sample(
@@ -532,19 +534,8 @@ impl NestedOutputApp {
         let height = size.height.max(1);
         let output_scale = output_scale_for_window(window);
         self.server.prepare_frame();
-        let shell_state = ShellOverlayState {
-            topbar: ShellTopbarModel::visible("Oblivion One").with_trailing_text("Super+Space"),
-            dock_items: self.server.shell_dock_items(),
-            spotlight: self.spotlight.clone(),
-            generation: self.shell_generation,
-        };
-        let shell_overlay = self
-            .shell_overlay_renderer
-            .render(width, height, &shell_state);
-        let content_generation = nested_scene_content_generation(
-            self.server.scene_render_generation(),
-            shell_overlay.generation,
-        );
+        let content_generation =
+            nested_scene_content_generation(self.server.scene_render_generation());
         let client_cursor = self.server.client_cursor_render_state();
         let visual_state = if self.host_cursor_client_visible {
             nested_visual_state(self.cursor_x, self.cursor_y)
@@ -559,9 +550,9 @@ impl NestedOutputApp {
             height,
             output_scale,
             surfaces: self.server.renderable_surfaces(),
+            external_overlay_surface_ids: self.server.external_overlay_surface_ids(),
             content_generation,
             visual_state,
-            shell_overlay: Some(shell_overlay),
             client_cursor,
             cpu_scene_renderer: &mut self.renderer,
         })?;
@@ -654,15 +645,6 @@ impl NestedOutputApp {
     fn route_logical_pointer_motion(&mut self, x: f64, y: f64) -> NestedPointerMotionDisposition {
         self.cursor_x = x.round() as i32;
         self.cursor_y = y.round() as i32;
-        if shell_overlay_captures_client_input(self.spotlight.is_visible()) {
-            let client_cursor_moved = self
-                .server
-                .update_pointer_position_without_client_dispatch(x, y);
-            if client_cursor_moved || !nested_output_uses_host_cursor() {
-                self.request_redraw();
-            }
-            return NestedPointerMotionDisposition::Captured;
-        }
 
         self.send_client_pointer_motion(x, y);
         if !nested_output_uses_host_cursor() {
@@ -688,6 +670,12 @@ impl NestedOutputApp {
     }
 
     fn launch_app_if_needed(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.external_shell_launched {
+            self.external_shell_launched = true;
+            if let Some(command) = external_shell_command() {
+                self.launch_shell_command(event_loop, command);
+            }
+        }
         if self.app_launched || self.app_command.is_empty() {
             return;
         }
@@ -786,15 +774,6 @@ impl NestedOutputApp {
         true
     }
 
-    fn release_forwarded_control_modifiers(&mut self) {
-        let forwarded = std::mem::take(&mut self.forwarded_control_keys);
-        for code in forwarded {
-            if let Some(key) = keycode_to_evdev_key(code) {
-                self.send_client_keyboard_key(key, false);
-            }
-        }
-    }
-
     fn apply_window_management_shortcut(&mut self, shortcut: WindowManagementShortcut) -> bool {
         match shortcut {
             WindowManagementShortcut::Minimize => self.server.minimize_focused_window(),
@@ -806,71 +785,6 @@ impl NestedOutputApp {
             }
             WindowManagementShortcut::ToggleFullscreen => {
                 self.server.toggle_fullscreen_focused_window()
-            }
-        }
-    }
-
-    fn toggle_spotlight(&mut self) {
-        self.spotlight.toggle();
-        self.bump_shell_generation();
-        self.request_redraw();
-    }
-
-    fn handle_spotlight_key(
-        &mut self,
-        code: KeyCode,
-        pressed: bool,
-        text: Option<&str>,
-    ) -> Option<Vec<String>> {
-        if !self.spotlight.is_visible() {
-            return None;
-        }
-        if !pressed {
-            return None;
-        }
-
-        match code {
-            KeyCode::Escape => {
-                self.spotlight.hide();
-                self.bump_shell_generation();
-                self.request_redraw();
-                None
-            }
-            KeyCode::Backspace => {
-                if self.spotlight.backspace() {
-                    self.bump_shell_generation();
-                    self.request_redraw();
-                }
-                None
-            }
-            KeyCode::ArrowDown => {
-                if self.spotlight.select_next() {
-                    self.bump_shell_generation();
-                    self.request_redraw();
-                }
-                None
-            }
-            KeyCode::ArrowUp => {
-                if self.spotlight.select_previous() {
-                    self.bump_shell_generation();
-                    self.request_redraw();
-                }
-                None
-            }
-            KeyCode::Enter => {
-                let command = self.spotlight.selected_launch_command();
-                self.spotlight.hide();
-                self.bump_shell_generation();
-                self.request_redraw();
-                command
-            }
-            _ => {
-                if let Some(text) = text {
-                    self.spotlight.push_text(text);
-                    self.bump_shell_generation();
-                    self.request_redraw();
-                }
-                None
             }
         }
     }
@@ -935,13 +849,18 @@ impl ApplicationHandler for NestedOutputApp {
                     return;
                 }
             };
+        if output_renderer.backend() == crate::nested_renderer::OutputRendererBackend::Gpu {
+            self.server.enable_gpu_buffer_protocols();
+        }
         self.server.set_dmabuf_feedback(
             output_renderer.dmabuf_feedback(),
             output_renderer.dmabuf_main_device(),
             output_renderer.dmabuf_main_device_path(),
         );
         println!("output renderer: {}", output_renderer.backend().as_str());
-        println!("Spotlight: focus the nested output and press Super+Space (Ctrl+Space fallback)");
+        println!(
+            "external shell: set OBLIVION_ONE_SHELL_COMMAND; Super+Space dispatches external Spotlight"
+        );
         self.output_renderer = Some(output_renderer);
         self.window = Some(window);
         self.launch_app_if_needed(event_loop);
@@ -1036,35 +955,6 @@ impl ApplicationHandler for NestedOutputApp {
                 let _ = self.route_logical_pointer_motion(x, y);
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if shell_overlay_captures_client_input(self.spotlight.is_visible()) {
-                    if state == ElementState::Pressed && button == MouseButton::Left {
-                        self.request_redraw();
-                    }
-                    return;
-                }
-
-                if state == ElementState::Pressed
-                    && button == MouseButton::Left
-                    && !self.spotlight.is_visible()
-                    && let Some(window) = &self.window
-                {
-                    let size = window.inner_size();
-                    let dock_items = self.server.shell_dock_items();
-                    if let Some(surface_id) = dock_item_at(
-                        size.width,
-                        size.height,
-                        &dock_items,
-                        self.cursor_physical_x.max(0),
-                        self.cursor_physical_y.max(0),
-                    ) {
-                        if self.server.activate_window(surface_id) {
-                            self.bump_shell_generation();
-                            self.request_redraw();
-                        }
-                        return;
-                    }
-                }
-
                 if state == ElementState::Pressed
                     && let Some(intent) = window_drag_intent(self.alt_pressed, button, state)
                 {
@@ -1109,10 +999,6 @@ impl ApplicationHandler for NestedOutputApp {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if shell_overlay_captures_client_input(self.spotlight.is_visible()) {
-                    return;
-                }
-
                 let output_scale = self
                     .window
                     .as_deref()
@@ -1145,12 +1031,10 @@ impl ApplicationHandler for NestedOutputApp {
                     if is_control_key(code) {
                         self.ctrl_pressed = event.state == ElementState::Pressed;
                         if event.state == ElementState::Pressed {
-                            if !self.spotlight.is_visible() {
-                                self.track_forwarded_control_key(code);
-                                self.send_client_keyboard_key(key, true);
-                                if forwarded_client_input_requests_redraw(true) {
-                                    self.request_redraw();
-                                }
+                            self.track_forwarded_control_key(code);
+                            self.send_client_keyboard_key(key, true);
+                            if forwarded_client_input_requests_redraw(true) {
+                                self.request_redraw();
                             }
                             return;
                         }
@@ -1171,20 +1055,17 @@ impl ApplicationHandler for NestedOutputApp {
                     if is_spotlight_toggle_shortcut(self.shortcut_modifiers(), code) {
                         if event.state == ElementState::Pressed
                             && self.suppress_window_shortcut_key(code)
+                            && let Some(command) = external_spotlight_command()
                         {
-                            self.release_forwarded_control_modifiers();
-                            self.toggle_spotlight();
+                            self.launch_shell_command(event_loop, command);
                         }
                         return;
                     }
-                    if self.spotlight.is_visible() {
-                        let text =
-                            spotlight_text_for_key(event.text.as_deref(), &event.logical_key);
-                        if let Some(command) = self.handle_spotlight_key(
-                            code,
-                            event.state == ElementState::Pressed,
-                            text.as_deref(),
-                        ) {
+                    if event.state == ElementState::Pressed
+                        && self.alt_pressed
+                        && code == KeyCode::Tab
+                    {
+                        if let Some(command) = external_alt_tab_command() {
                             self.launch_shell_command(event_loop, command);
                         }
                         return;
@@ -1520,13 +1401,8 @@ fn should_issue_redraw_request(
         })
 }
 
-const fn nested_scene_content_generation(
-    render_generation: u64,
-    shell_overlay_generation: u64,
-) -> u64 {
+const fn nested_scene_content_generation(render_generation: u64) -> u64 {
     render_generation
-        .wrapping_mul(1_000_003)
-        .wrapping_add(shell_overlay_generation)
 }
 
 fn window_drag_intent(
@@ -1564,7 +1440,7 @@ struct ShortcutModifiers {
 }
 
 fn is_spotlight_toggle_shortcut(modifiers: ShortcutModifiers, code: KeyCode) -> bool {
-    code == KeyCode::Space && (modifiers.super_pressed || modifiers.ctrl_pressed)
+    code == KeyCode::Space && modifiers.super_pressed
 }
 
 fn window_management_shortcut(
@@ -1612,18 +1488,65 @@ const fn forwarded_client_input_requests_redraw(forwarded: bool) -> bool {
     forwarded
 }
 
-const fn shell_overlay_captures_client_input(spotlight_visible: bool) -> bool {
-    spotlight_visible
+const ECLIPSE_ROOT: &str = "/home/agony/GitHub/Eclipse";
+
+fn external_shell_command() -> Option<Vec<String>> {
+    command_from_env("OBLIVION_ONE_SHELL_COMMAND")
 }
 
-fn spotlight_text_for_key(event_text: Option<&str>, logical_key: &Key) -> Option<String> {
-    event_text
-        .filter(|text| !text.is_empty())
-        .map(str::to_string)
-        .or_else(|| match logical_key {
-            Key::Character(text) if !text.is_empty() => Some(text.to_string()),
-            _ => None,
-        })
+fn external_spotlight_command() -> Option<Vec<String>> {
+    command_from_env("OBLIVION_ONE_SPOTLIGHT_COMMAND")
+        .or_else(|| eclipse_command("Spotlight", "astrea-spotlight", &["--toggle"]))
+        .or_else(|| path_command("astrea-spotlight", &["--toggle"]))
+}
+
+fn external_alt_tab_command() -> Option<Vec<String>> {
+    command_from_env("OBLIVION_ONE_ALT_TAB_COMMAND")
+        .or_else(|| eclipse_command("AltTab", "astrea-alt-tab", &["--next"]))
+        .or_else(|| path_command("astrea-alt-tab", &["--next"]))
+}
+
+fn command_from_env(name: &str) -> Option<Vec<String>> {
+    let command = std::env::var(name).ok()?;
+    let command = command.trim();
+    (!command.is_empty()).then(|| vec!["sh".to_string(), "-lc".to_string(), command.to_string()])
+}
+
+fn eclipse_command(project: &str, binary: &str, args: &[&str]) -> Option<Vec<String>> {
+    let candidates = [
+        std::path::Path::new(ECLIPSE_ROOT)
+            .join(project)
+            .join("build")
+            .join(binary),
+        std::path::Path::new(ECLIPSE_ROOT)
+            .join("build")
+            .join(binary),
+        std::path::Path::new(ECLIPSE_ROOT)
+            .join("build")
+            .join(project)
+            .join(binary),
+    ];
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .map(|path| command_with_args(path.display().to_string(), args))
+}
+
+fn path_command(binary: &str, args: &[&str]) -> Option<Vec<String>> {
+    command_available(binary).then(|| command_with_args(binary.to_string(), args))
+}
+
+fn command_with_args(program: String, args: &[&str]) -> Vec<String> {
+    std::iter::once(program)
+        .chain(args.iter().map(|arg| (*arg).to_string()))
+        .collect()
+}
+
+fn command_available(program: &str) -> bool {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_var).any(|dir| dir.join(program).is_file())
 }
 
 fn keycode_to_evdev_key(code: KeyCode) -> Option<u32> {
@@ -1720,8 +1643,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use winit::dpi::PhysicalPosition;
-    use winit::keyboard::NamedKey;
-
     fn nested_test_app() -> NestedOutputApp {
         static NEXT_SOCKET: AtomicU64 = AtomicU64::new(1);
         let socket_name = format!(
@@ -1969,7 +1890,7 @@ mod tests {
             },
             KeyCode::Space
         ));
-        assert!(is_spotlight_toggle_shortcut(
+        assert!(!is_spotlight_toggle_shortcut(
             ShortcutModifiers {
                 super_pressed: false,
                 ctrl_pressed: true,
@@ -1993,60 +1914,8 @@ mod tests {
     }
 
     #[test]
-    fn spotlight_text_falls_back_to_logical_character_when_event_text_is_missing() {
-        assert_eq!(
-            spotlight_text_for_key(None, &Key::Character("fire".into())).as_deref(),
-            Some("fire")
-        );
-        assert_eq!(
-            spotlight_text_for_key(Some("br"), &Key::Character("ignored".into())).as_deref(),
-            Some("br")
-        );
-        assert_eq!(
-            spotlight_text_for_key(None, &Key::Named(NamedKey::Enter)),
-            None
-        );
-    }
-
-    #[test]
-    fn visible_spotlight_captures_client_pointer_input() {
-        assert!(shell_overlay_captures_client_input(true));
-        assert!(!shell_overlay_captures_client_input(false));
-    }
-
-    #[test]
-    fn nested_spotlight_cursor_moved_updates_visual_position_without_dispatch() {
+    fn nested_normal_motion_forwards_after_internal_shell_removal() {
         let mut app = nested_test_app();
-        app.toggle_spotlight();
-
-        let disposition = app.route_logical_pointer_motion(210.0, 145.0);
-
-        assert_eq!(app.cursor_x, 210);
-        assert_eq!(app.cursor_y, 145);
-        assert!(matches!(
-            disposition,
-            NestedPointerMotionDisposition::Captured
-        ));
-    }
-
-    #[test]
-    fn nested_spotlight_suppresses_device_relative_motion() {
-        let mut app = nested_test_app();
-        app.toggle_spotlight();
-
-        assert!(!app.forward_host_relative_mouse_delta(12.0, -4.0));
-    }
-
-    #[test]
-    fn nested_normal_motion_resumes_after_spotlight_closes() {
-        let mut app = nested_test_app();
-        app.toggle_spotlight();
-        assert!(matches!(
-            app.route_logical_pointer_motion(200.0, 140.0),
-            NestedPointerMotionDisposition::Captured
-        ));
-
-        app.toggle_spotlight();
 
         assert_eq!(
             app.route_logical_pointer_motion(220.0, 150.0),
@@ -2108,14 +1977,11 @@ mod tests {
     }
 
     #[test]
-    fn nested_scene_generation_tracks_shell_overlay_generation() {
+    fn nested_scene_generation_tracks_render_generation() {
+        assert_eq!(nested_scene_content_generation(42), 42);
         assert_ne!(
-            nested_scene_content_generation(42, 1),
-            nested_scene_content_generation(42, 99)
-        );
-        assert_ne!(
-            nested_scene_content_generation(41, 99),
-            nested_scene_content_generation(42, 99)
+            nested_scene_content_generation(41),
+            nested_scene_content_generation(42)
         );
     }
 

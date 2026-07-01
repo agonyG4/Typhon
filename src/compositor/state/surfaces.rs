@@ -347,6 +347,7 @@ impl CompositorState {
 
         self.output_size = output_size;
         self.send_output_mode_to_bound_outputs();
+        self.reconfigure_layer_surfaces_for_output_change();
         self.reconfigure_stateful_windows_for_output_size();
         true
     }
@@ -419,10 +420,19 @@ impl CompositorState {
                 "focus change reason={} old={:?} new={}",
                 reason, old_surface_id, new_surface_id
             ));
+            focus_debug_log(|| {
+                format!("focus_enter reason={reason} old={old_surface_id:?} new={new_surface_id}")
+            });
         }
         self.focused_surface = Some(surface.clone());
         self.ensure_keyboard_focus(&surface);
         self.apply_pending_pointer_constraint_state_for_surface(new_surface_id);
+        if !self
+            .layer_surfaces
+            .contains_key(&self.root_surface_id_for_surface(new_surface_id))
+        {
+            self.last_application_keyboard_focus = Some(surface);
+        }
     }
 
     pub(in crate::compositor) fn focused_client_id(&self) -> Option<ClientId> {
@@ -1019,8 +1029,9 @@ impl CompositorState {
         self.configured_xdg_surfaces.remove(&surface_id);
         self.surface_entered_outputs
             .retain(|(entered_surface_id, _)| *entered_surface_id != surface_id);
-        self.toplevel_surfaces.remove(&surface_id);
-        self.popup_surfaces.remove(&surface_id);
+        self.unregister_toplevel_surface(surface_id);
+        self.unregister_popup_surface(surface_id);
+        self.teardown_layer_surface(surface_id);
         self.clear_resize_state_for_surfaces(&[surface_id]);
         self.surface_placements
             .retain(|_, placement| placement.parent_surface_id != Some(surface_id));
@@ -1033,6 +1044,7 @@ impl CompositorState {
         );
         removed_surface_ids.sort_unstable();
         removed_surface_ids.dedup();
+        self.clear_popup_grab_for_surface_ids(&removed_surface_ids);
         self.popup_grab_stack
             .retain(|surface_id| !removed_surface_ids.contains(surface_id));
         self.recent_input_serials
@@ -1043,7 +1055,7 @@ impl CompositorState {
         );
 
         for removed_surface_id in &removed_surface_ids {
-            self.popup_surfaces.remove(removed_surface_id);
+            self.unregister_popup_surface(*removed_surface_id);
             if let Some(buffer) = self.active_dmabuf_buffers.remove(removed_surface_id) {
                 self.queue_dmabuf_buffer_release(buffer);
             }
@@ -1063,6 +1075,7 @@ impl CompositorState {
             .is_some_and(|surface| compositor_surface_id(surface) == surface_id)
         {
             self.focused_surface = None;
+            focus_debug_log(|| format!("focus_leave reason=surface_destroyed old={surface_id}"));
         }
 
         if self
@@ -1088,5 +1101,12 @@ impl CompositorState {
             .retain(|(_, surface)| !removed_surface_ids.contains(&compositor_surface_id(surface)));
         self.pointer_enter_serials
             .retain(|entry| !removed_surface_ids.contains(&compositor_surface_id(&entry.surface)));
+    }
+}
+
+fn focus_debug_log(message: impl FnOnce() -> String) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("OBLIVION_ONE_FOCUS_DEBUG").is_some()) {
+        eprintln!("oblivion-one focus: {}", message());
     }
 }

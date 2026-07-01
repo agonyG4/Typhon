@@ -15,6 +15,16 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for CompositorState {
                 data_init.init(id, Arc::new(Mutex::new(XdgPositionerState::default())));
             }
             xdg_wm_base::Request::GetXdgSurface { id, surface } => {
+                if _state
+                    .layer_surfaces
+                    .contains_key(&compositor_surface_id(&surface))
+                {
+                    _resource.post_error(
+                        xdg_wm_base::Error::Role,
+                        "wl_surface already has a layer-shell role".to_string(),
+                    );
+                    return;
+                }
                 data_init.init(id, XdgSurfaceData { surface });
             }
             xdg_wm_base::Request::Destroy | xdg_wm_base::Request::Pong { .. } => {}
@@ -162,6 +172,16 @@ impl Dispatch<xdg_surface::XdgSurface, XdgSurfaceData> for CompositorState {
     ) {
         match request {
             xdg_surface::Request::GetToplevel { id } => {
+                if state
+                    .layer_surfaces
+                    .contains_key(&compositor_surface_id(&data.surface))
+                {
+                    resource.post_error(
+                        xdg_wm_base::Error::Role,
+                        "wl_surface already has a layer-shell role".to_string(),
+                    );
+                    return;
+                }
                 let toplevel = data_init.init(
                     id,
                     XdgToplevelData {

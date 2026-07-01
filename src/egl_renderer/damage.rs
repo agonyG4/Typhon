@@ -625,7 +625,6 @@ impl EglDamageRects {
 pub(super) struct EglOutputDamageTracker {
     output_size: (u32, u32),
     last_cursor_rect: Option<SurfaceDamageRect>,
-    last_shell_overlay: Option<ShellOverlayDamageState>,
     last_client_cursor: Option<ClientCursorDamageState>,
 }
 
@@ -633,7 +632,6 @@ pub(super) struct EglOutputDamageTracker {
 pub(super) struct EglPresentedDamageState {
     output_size: (u32, u32),
     cursor_rect: Option<SurfaceDamageRect>,
-    shell_overlay: Option<ShellOverlayDamageState>,
     client_cursor: Option<ClientCursorDamageState>,
 }
 
@@ -660,25 +658,6 @@ impl ClientCursorDamageState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ShellOverlayDamageState {
-    generation: u64,
-    rects: [Option<SurfaceDamageRect>; 4],
-}
-
-impl ShellOverlayDamageState {
-    pub(super) fn new(generation: u64, rects: impl IntoIterator<Item = SurfaceDamageRect>) -> Self {
-        let mut values = [None, None, None, None];
-        for (slot, rect) in values.iter_mut().zip(rects) {
-            *slot = Some(rect);
-        }
-        Self {
-            generation,
-            rects: values,
-        }
-    }
-}
-
 impl EglOutputDamageTracker {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn damage_for_frame(
@@ -688,7 +667,6 @@ impl EglOutputDamageTracker {
         scene_changed: bool,
         authoritative_scene_damage: Option<OutputDamage>,
         visual_state: DesktopVisualState,
-        shell_overlay: Option<ShellOverlayDamageState>,
         client_cursor: Option<ClientCursorDamageState>,
     ) -> OutputDamage {
         let cursor_rect = visual_state
@@ -706,14 +684,6 @@ impl EglOutputDamageTracker {
             OutputDamage::Empty
         };
         let mut overlay_rects = Vec::new();
-        if self.last_shell_overlay != shell_overlay {
-            if let Some(previous) = self.last_shell_overlay {
-                overlay_rects.extend(previous.rects.into_iter().flatten());
-            }
-            if let Some(current) = shell_overlay {
-                overlay_rects.extend(current.rects.into_iter().flatten());
-            }
-        }
         if self.last_cursor_rect != cursor_rect {
             overlay_rects.extend(self.last_cursor_rect);
             overlay_rects.extend(cursor_rect);
@@ -734,7 +704,6 @@ impl EglOutputDamageTracker {
         width: u32,
         height: u32,
         visual_state: DesktopVisualState,
-        shell_overlay: Option<ShellOverlayDamageState>,
         client_cursor: Option<ClientCursorDamageState>,
     ) -> EglPresentedDamageState {
         EglPresentedDamageState {
@@ -742,7 +711,6 @@ impl EglOutputDamageTracker {
             cursor_rect: visual_state
                 .cursor
                 .and_then(|(x, y)| cursor_damage_rect(x, y, width, height)),
-            shell_overlay,
             client_cursor,
         }
     }
@@ -750,7 +718,6 @@ impl EglOutputDamageTracker {
     pub(super) fn commit_presented(&mut self, state: EglPresentedDamageState) {
         self.output_size = state.output_size;
         self.last_cursor_rect = state.cursor_rect;
-        self.last_shell_overlay = state.shell_overlay;
         self.last_client_cursor = state.client_cursor;
     }
 }

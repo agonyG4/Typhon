@@ -15,15 +15,27 @@ pub fn run(
 
 impl NativeRuntime {
     pub(super) fn run_native_cycle(&mut self) -> NativeResult<()> {
-        loop {
+        while self.shutdown_state != ShutdownState::Complete {
             self.run_cycle()?;
         }
+        native_shutdown_debug_log("shutdown_complete");
+        Ok(())
     }
 
     fn run_cycle(&mut self) -> NativeResult<()> {
+        if self.shutdown_state != ShutdownState::Running {
+            self.shutdown_state = ShutdownState::Complete;
+            return Ok(());
+        }
         let mut cycle = self.wait_for_events_and_pageflips()?;
         self.dispatch_wayland_and_input(&mut cycle)?;
+        if self.shutdown_state != ShutdownState::Running {
+            return Ok(());
+        }
         self.process_acquire_and_prepare(&cycle)?;
+        if self.shutdown_state != ShutdownState::Running {
+            return Ok(());
+        }
         self.render_present_and_update_metrics(&mut cycle)?;
         Ok(())
     }
@@ -65,6 +77,7 @@ impl NativeRuntime {
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
+            shutdown_state: _,
         } = self;
         let wakeup = event_loop.wait()?;
         let scheduler_state_before = frame_scheduler.state();
@@ -249,6 +262,7 @@ impl NativeRuntime {
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
+            shutdown_state,
         } = self;
         let present_us = 0;
         let pageflip_pending_at_tick = scanout.page_flip_pending();
@@ -349,12 +363,50 @@ impl NativeRuntime {
                 *effective_app_gpu_policy,
             )?;
             if application.exit_requested {
+                if !shutdown_state.request() {
+                    native_shutdown_debug_log("shortcut_exit_requested_duplicate");
+                    continue;
+                }
+                native_shutdown_debug_log("shortcut_exit_requested");
+                native_shutdown_debug_log("shutdown_begin");
                 println!("native input exit requested; shutting down cleanly");
+                native_shutdown_debug_log("event_loop_break");
+                native_shutdown_debug_log("frame_scheduler_stop");
+                *shutdown_state = ShutdownState::Draining;
+                native_shutdown_debug_log("pageflip_drain_begin");
+                if scanout.page_flip_pending() {
+                    let drain_started = Instant::now();
+                    while scanout.page_flip_pending() && drain_started.elapsed().as_millis() < 250 {
+                        let drain = scanout
+                            .drain_page_flip_events(kms.file().as_raw_fd())
+                            .map_err(|error| {
+                                native_runtime_error(
+                                    NativeRuntimeStage::DrainPageFlipEvents,
+                                    scanout.kind(),
+                                    target.crtc_id,
+                                    *frame_index,
+                                    error,
+                                )
+                            })?;
+                        if let Some(pageflip) = drain.completion {
+                            let _ = frame_scheduler
+                                .note_page_flip_completion(pageflip.user_data, monotonic_now_ns()?);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                native_shutdown_debug_log("pageflip_drain_end");
+                native_shutdown_debug_log("input_backend_stop");
                 acquire_watches.shutdown(event_loop)?;
+                native_shutdown_debug_log("shell_children_stop");
                 if let Some(cursor) = hardware_cursor.as_mut() {
                     let _ = cursor.disable();
                 }
+                *shutdown_state = ShutdownState::Restoring;
+                native_shutdown_debug_log("kms_restore_begin");
                 let restoration = kms_backend.restore()?;
+                native_shutdown_debug_log("kms_restore_end");
                 perf.log("native.kms_restore", || {
                     vec![
                         NativePerfField::str("backend", kms_backend.effective_kind().as_str()),
@@ -362,6 +414,9 @@ impl NativeRuntime {
                         NativePerfField::bool("pageflip_pending", scanout.page_flip_pending()),
                     ]
                 });
+                native_shutdown_debug_log("drm_release");
+                native_shutdown_debug_log("vt_restore");
+                *shutdown_state = ShutdownState::Complete;
                 return Ok(());
             }
             if let Some(launch) = application.launch {
@@ -452,6 +507,7 @@ impl NativeRuntime {
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
+            shutdown_state: _,
         } = self;
         let acquire_changes = server.take_acquire_watch_changes();
         let acquire_change_count = acquire_changes.len();

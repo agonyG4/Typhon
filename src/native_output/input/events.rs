@@ -3,60 +3,22 @@ use super::*;
 pub(crate) const WAYLAND_SCROLL_LINE_DISTANCE: f64 = 15.0;
 pub(crate) const EV_KEY: u16 = 0x01;
 pub(crate) const EV_REL: u16 = 0x02;
-pub(crate) const KEY_ESC: u16 = 1;
-pub(crate) const KEY_1: u16 = 2;
-pub(crate) const KEY_2: u16 = 3;
-pub(crate) const KEY_3: u16 = 4;
-pub(crate) const KEY_4: u16 = 5;
-pub(crate) const KEY_5: u16 = 6;
-pub(crate) const KEY_6: u16 = 7;
-pub(crate) const KEY_7: u16 = 8;
-pub(crate) const KEY_8: u16 = 9;
-pub(crate) const KEY_9: u16 = 10;
-pub(crate) const KEY_0: u16 = 11;
-pub(crate) const KEY_MINUS: u16 = 12;
-pub(crate) const KEY_EQUAL: u16 = 13;
-pub(crate) const KEY_BACKSPACE: u16 = 14;
+pub(crate) const KEY_TAB: u16 = 15;
 pub(crate) const KEY_Q: u16 = 16;
-pub(crate) const KEY_W: u16 = 17;
-pub(crate) const KEY_E: u16 = 18;
-pub(crate) const KEY_R: u16 = 19;
-pub(crate) const KEY_T: u16 = 20;
-pub(crate) const KEY_Y: u16 = 21;
-pub(crate) const KEY_U: u16 = 22;
-pub(crate) const KEY_I: u16 = 23;
-pub(crate) const KEY_O: u16 = 24;
 pub(crate) const KEY_P: u16 = 25;
-pub(crate) const KEY_ENTER: u16 = 28;
 pub(crate) const KEY_LEFTCTRL: u16 = 29;
-pub(crate) const KEY_A: u16 = 30;
-pub(crate) const KEY_S: u16 = 31;
-pub(crate) const KEY_D: u16 = 32;
 pub(crate) const KEY_F: u16 = 33;
-pub(crate) const KEY_G: u16 = 34;
-pub(crate) const KEY_H: u16 = 35;
-pub(crate) const KEY_J: u16 = 36;
-pub(crate) const KEY_K: u16 = 37;
-pub(crate) const KEY_L: u16 = 38;
 pub(crate) const KEY_LEFTSHIFT: u16 = 42;
+#[cfg(test)]
 pub(crate) const KEY_Z: u16 = 44;
-pub(crate) const KEY_X: u16 = 45;
 pub(crate) const KEY_C: u16 = 46;
-pub(crate) const KEY_V: u16 = 47;
-pub(crate) const KEY_B: u16 = 48;
-pub(crate) const KEY_N: u16 = 49;
-pub(crate) const KEY_M: u16 = 50;
-pub(crate) const KEY_COMMA: u16 = 51;
-pub(crate) const KEY_DOT: u16 = 52;
-pub(crate) const KEY_SLASH: u16 = 53;
 pub(crate) const KEY_RIGHTSHIFT: u16 = 54;
 pub(crate) const KEY_LEFTALT: u16 = 56;
 pub(crate) const KEY_SPACE: u16 = 57;
+#[cfg(test)]
 pub(crate) const KEY_F11: u16 = 87;
 pub(crate) const KEY_RIGHTCTRL: u16 = 97;
 pub(crate) const KEY_RIGHTALT: u16 = 100;
-pub(crate) const KEY_UP: u16 = 103;
-pub(crate) const KEY_DOWN: u16 = 108;
 pub(crate) const KEY_LEFTMETA: u16 = 125;
 pub(crate) const KEY_RIGHTMETA: u16 = 126;
 pub(crate) const BTN_LEFT: u16 = 0x110;
@@ -207,10 +169,26 @@ pub(crate) enum NativeWindowAction {
     BeginResize { x: f64, y: f64 },
     UpdateInteraction { x: f64, y: f64 },
     EndInteraction,
-    Minimize,
-    RestoreMinimized,
-    ToggleMaximize,
+    CloseActiveWindow,
     ToggleFullscreen,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AstreaShortcutEvent {
+    pub(crate) namespace: String,
+    pub(crate) name: String,
+    pub(crate) repeated: bool,
+}
+
+impl AstreaShortcutEvent {
+    #[cfg(test)]
+    pub(crate) fn pressed(namespace: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            name: name.into(),
+            repeated: false,
+        }
+    }
 }
 
 impl NativeHardwareInputEvent {
@@ -275,7 +253,9 @@ pub(crate) struct NativeInputEffect {
     pub(crate) pointer_buttons: Vec<NativePointerButtonEvent>,
     pub(crate) pointer_axis: Option<(f64, f64)>,
     pub(crate) window_actions: Vec<NativeWindowAction>,
+    pub(crate) shortcut_events: Vec<AstreaShortcutEvent>,
     pub(crate) launch_command: Option<Vec<String>>,
+    pub(crate) launch_source: Option<NativeLaunchSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

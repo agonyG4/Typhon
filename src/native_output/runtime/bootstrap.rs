@@ -305,6 +305,24 @@ impl NativeRuntime {
         let last_acquire_ready_at_ns = None;
         let resize_perf = NativeResizePerfState::default();
         let pointer_constraint_backend = NativePointerConstraintBackend::new();
+        if let Some(command) = external_shell_command()
+            && let Some(launch) = launch_native_shell_command(
+                &server,
+                command,
+                effective_app_gpu_policy,
+                NativeLaunchSource::ExternalShell,
+            )
+            .map_err(|error| {
+                eprintln!("native external shell launch failed: {error}");
+                error
+            })
+            .ok()
+            .flatten()
+        {
+            server.authorize_astrea_shell_pid(launch.pid);
+            log_native_app_spawn(perf, &launch);
+            pending_launches.push_back(launch);
+        }
         if let Some(command) = startup_app
             && let Some(launch) = launch_native_shell_command(
                 &server,
@@ -350,6 +368,7 @@ impl NativeRuntime {
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
+            shutdown_state: ShutdownState::Running,
         })
     }
 

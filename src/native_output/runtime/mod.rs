@@ -75,6 +75,33 @@ pub(crate) struct NativeRuntime {
     last_acquire_ready_at_ns: Option<u64>,
     resize_perf: NativeResizePerfState,
     pointer_constraint_backend: NativePointerConstraintBackend,
+    shutdown_state: ShutdownState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShutdownState {
+    Running,
+    Requested,
+    Draining,
+    Restoring,
+    Complete,
+}
+
+impl ShutdownState {
+    pub(crate) fn request(&mut self) -> bool {
+        if *self == Self::Running {
+            *self = Self::Requested;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+pub(crate) fn native_shutdown_debug_log(marker: &str) {
+    if std::env::var_os("OBLIVION_ONE_SHUTDOWN_DEBUG").is_some() {
+        eprintln!("native shutdown: {marker}");
+    }
 }
 
 impl NativeRuntime {

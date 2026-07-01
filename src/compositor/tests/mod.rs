@@ -72,10 +72,23 @@ use wayland_protocols::wp::relative_pointer::zv1::client::{
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport as client_wp_viewport, wp_viewporter as client_wp_viewporter,
 };
+use wayland_protocols::xdg::activation::v1::client::{
+    xdg_activation_token_v1 as client_xdg_activation_token_v1,
+    xdg_activation_v1 as client_xdg_activation_v1,
+};
 use wayland_protocols::xdg::shell::client::{
     xdg_popup as client_xdg_popup, xdg_positioner as client_xdg_positioner,
     xdg_surface as client_xdg_surface, xdg_toplevel as client_xdg_toplevel,
     xdg_wm_base as client_xdg_wm_base,
+};
+use wayland_protocols_wlr::layer_shell::v1::client::{
+    zwlr_layer_shell_v1 as client_zwlr_layer_shell_v1,
+    zwlr_layer_surface_v1 as client_zwlr_layer_surface_v1,
+};
+
+use crate::astrea_shortcuts::client::{
+    astrea_shortcut_v1 as client_astrea_shortcut_v1,
+    astrea_shortcuts_manager_v1 as client_astrea_shortcuts_manager_v1,
 };
 
 mod support;
@@ -91,7 +104,9 @@ use support::server_runtime::*;
 use support::subsurface_client::*;
 use support::window_ops::*;
 
+mod astrea_shortcuts;
 mod input_output;
+mod layer_shell;
 mod lifecycle;
 mod plan;
 mod protocol_buffers;

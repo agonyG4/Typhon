@@ -154,9 +154,9 @@ movement work, not plain pointer motion.
 - Output damage rects are likely overlapping or too broad. The evidence is
   `damaged_pixels` and `copy_bytes` exceeding a full frame on many
   `surface_damage` frames.
-- Shell overlay generation may be forcing CPU scene/content generation more
-  often than expected, because `NativeFrameRenderer::render_frame()` includes
-  `shell_overlay.generation` in `native_scene_content_generation(...)`.
+- External shell UI now contributes through normal layer-shell surface commits,
+  so scene/content generation is driven by the same render generation as other
+  client surfaces.
 - `copy_scene_to_frame()` is still an unconditional CPU copy after scene
   rebuild/no-rebuild. The log cannot isolate it from other `render_us` work, but
   current source confirms it exists.

@@ -544,7 +544,7 @@ fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
     let server = match output_backend {
         ResolvedCompositorOutputBackend::Nested => OwnCompositorServer::bind_with_capabilities(
             &options.socket_name,
-            true,
+            false,
             InputProtocolCapabilities::nested_winit(),
             SelectionProtocolCapabilities::core_clipboard(),
             renderer_protocol_capabilities_for_output_backend(output_backend),
@@ -568,9 +568,10 @@ fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
 
     match output_backend {
         ResolvedCompositorOutputBackend::Nested => {
+            println!("gpu buffer protocols: deferred until the nested renderer is known");
             println!("Opening nested output window. Close the window or press Ctrl+C to stop.");
             println!(
-                "Spotlight is built into that nested output window: press Super+Space or Ctrl+Space."
+                "External shell integration: set OBLIVION_ONE_SHELL_COMMAND; Super+Space dispatches OBLIVION_ONE_SPOTLIGHT_COMMAND or astrea-spotlight --toggle."
             );
             nested_output::run(server, options.renderer, options.nested_output, options.app)
         }
@@ -593,6 +594,12 @@ fn compositor_protocol_names_for_output_backend(
         )
         .into_iter()
         .map(|protocol| protocol.name())
+        .filter(|protocol| {
+            !matches!(
+                *protocol,
+                "zwp_linux_dmabuf_v1" | "wp_linux_drm_syncobj_manager_v1" | "wl_drm"
+            )
+        })
         .collect();
     }
     if output_backend == ResolvedCompositorOutputBackend::Native {
@@ -886,7 +893,10 @@ Compositor --width/--height/--refresh configure the nested host output only; nat
 Its production renderer is GPU/EGL/GLES. CPU remains a fallback/debug renderer.
 Owned compositor app launches are Wayland-only by default; X11 compatibility must go through an Oblivion-owned XWayland bridge.
 DE is currently legacy lab glue while the owned compositor is built.
-Prototype opens the visual shell mockup only. Nested uses gamescope as the fallback low-level lab backend.
+Prototype opens the old standalone mockup only. Nested uses gamescope as the fallback low-level lab backend.
+External shells can be autostarted with OBLIVION_ONE_SHELL_COMMAND.
+Super+Space dispatches OBLIVION_ONE_SPOTLIGHT_COMMAND or astrea-spotlight --toggle when available.
+Alt+Tab dispatches OBLIVION_ONE_ALT_TAB_COMMAND or astrea-alt-tab --next when available.
 SDDM is available as an experimental native session through bin/install-start-oblivion-one --sddm-session.
 "#
     );

@@ -1,10 +1,13 @@
+mod activation;
 mod advanced;
 mod buffers;
 mod core;
 mod data_device;
 mod globals;
 mod input;
+mod layer_shell;
 mod presentation;
+mod shortcuts;
 mod syncobj;
 mod viewport;
 mod xdg;

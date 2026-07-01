@@ -37,9 +37,8 @@ use oblivion_one::compositor::{
     PointerConstraintBackendId, PointerConstraintBackendRequest, PointerConstraintMode,
     PointerMotionSample as CompositorPointerMotionSample, PresentationClock,
     RelativePointerMotion as CompositorRelativePointerMotion, RenderGenerationCause,
-    RenderSceneElement, RenderSceneElementId, RenderableSurface, ShellDockItem,
-    ShellOverlayRenderer, ShellOverlayState, ShellTopbarModel, SpotlightModel,
-    cursor_texture_pixels, cursor_texture_size, dock_item_at, render_scene_elements_for_surfaces,
+    RenderSceneElement, RenderSceneElementId, RenderableSurface, cursor_texture_pixels,
+    cursor_texture_size, render_scene_elements_for_surfaces,
 };
 use oblivion_one::native::kms::{
     AtomicCommitState, AtomicCompletion, ConnectorId, CrtcId, FramebufferId, KmsBackendSelection,

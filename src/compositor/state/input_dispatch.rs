@@ -619,6 +619,8 @@ impl CompositorState {
                 .is_some_and(|popup_id| self.surface_is_descendant_of(surface_id, popup_id))
             {
                 self.focus_surface(surface.clone());
+            } else if self.layer_surfaces.contains_key(&root_surface_id) {
+                let _ = self.activate_ondemand_layer_surface(root_surface_id);
             } else if let Some(root_surface) = self.surface_resource_by_id(root_surface_id) {
                 self.focus_surface(root_surface);
             }

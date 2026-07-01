@@ -5,8 +5,6 @@ edition = "2024"
 
 [dependencies]
 ab_glyph = "0.2.32"
-astrea-framework = { path = "AstreaFramework" }
-exodus = { path = "Exodus" }
 bytemuck = "1.25.0"
 drm-ffi = "0.9.1"
 drm-sys = "0.8.1"
@@ -21,7 +19,9 @@ serde_json = "1.0"
 softbuffer = "0.4.6"
 unicode-normalization = "0.1"
 wayland-protocols = { version = "0.32.12", features = ["client", "server", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client", "server"] }
 wayland-backend = "0.3.15"
+wayland-client = "0.31.14"
 wayland-server = "0.31.13"
 wayland-egl = "0.32.11"
 wayland-scanner = "0.31.10"
@@ -29,9 +29,6 @@ wayland-sys = "0.31.11"
 winit = "0.30.12"
 zbus = { version = "5.16.0", default-features = false, features = ["async-io"] }
 
-[dev-dependencies]
-wayland-client = "0.31.14"
-
 [workspace]
-members = [".", "AstreaFramework", "Exodus"]
+members = ["."]
 resolver = "3"

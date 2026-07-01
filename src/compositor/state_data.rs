@@ -6,6 +6,7 @@ use std::{
 use wayland_protocols::xdg::shell::server::{xdg_popup, xdg_surface, xdg_toplevel};
 use wayland_server::{
     Resource,
+    backend::ClientId,
     protocol::{wl_buffer, wl_callback, wl_surface},
 };
 
@@ -48,6 +49,75 @@ pub(super) struct PopupSurface {
     pub(super) xdg_surface: xdg_surface::XdgSurface,
     pub(super) popup: xdg_popup::XdgPopup,
     pub(super) positioner: XdgPositionerState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PopupOwner {
+    Toplevel(u32),
+    LayerSurface(u32),
+    Popup(u32),
+}
+
+impl PopupOwner {
+    pub(super) const fn surface_id(self) -> u32 {
+        match self {
+            Self::Toplevel(surface_id)
+            | Self::LayerSurface(surface_id)
+            | Self::Popup(surface_id) => surface_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PopupLifecycle {
+    Alive,
+    Inert,
+    Destroyed,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PopupNode {
+    pub(super) owner_root_id: u32,
+    pub(super) parent: PopupOwner,
+    pub(super) children: Vec<u32>,
+    pub(super) lifecycle: PopupLifecycle,
+    pub(super) mapped: bool,
+    pub(super) configured: bool,
+    pub(super) popup_done_sent: bool,
+    pub(super) grab_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PopupGrab {
+    pub(super) owner_client: ClientId,
+    pub(super) owner_root_id: u32,
+    pub(super) tree_root_popup_id: u32,
+    pub(super) focused_popup_id: u32,
+    pub(super) serial: u32,
+    pub(super) generation: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PendingActivationToken {
+    pub(super) client_id: ClientId,
+    pub(super) serial: Option<u32>,
+    pub(super) surface_id: Option<u32>,
+    pub(super) app_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ActivationTokenState {
+    pub(super) client_id: ClientId,
+    pub(super) serial: Option<u32>,
+    pub(super) surface_id: Option<u32>,
+    pub(super) app_id: Option<String>,
+    pub(super) generation: u64,
+    pub(super) used: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct LayerSurfaceData {
+    pub(super) surface: wl_surface::WlSurface,
 }
 
 #[derive(Debug, Default)]

@@ -453,17 +453,14 @@ fn native_pageflip_buffers_finish_initial_scanout_promotes_ready() {
 }
 
 #[test]
-fn native_initial_frame_paints_real_topbar() {
+fn native_initial_frame_has_no_builtin_compositor_ui() {
     let mut renderer = NativeFrameRenderer::default();
-    let spotlight = SpotlightModel::default();
     let frame = renderer
         .render_frame(NativeFrameRequest {
             width: 320,
             height: 200,
             surfaces: &[],
-            dock_items: Vec::new(),
-            spotlight: &spotlight,
-            shell_generation: 0,
+            external_overlay_surface_ids: Vec::new(),
             visual_state: DesktopVisualState::wallpaper_only(),
             render_generation: 0,
             client_cursor: None,
@@ -479,5 +476,5 @@ fn native_initial_frame_paints_real_topbar() {
         DesktopVisualState::wallpaper_only(),
     );
 
-    assert_ne!(frame[16 * 320 + 160], wallpaper[16 * 320 + 160]);
+    assert_eq!(frame, wallpaper);
 }

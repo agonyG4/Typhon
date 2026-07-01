@@ -46,27 +46,6 @@ impl EglUvRect {
             bottom,
         }
     }
-
-    pub(super) fn from_pixel_bounds(
-        x: u32,
-        y: u32,
-        width: u32,
-        height: u32,
-        texture_width: u32,
-        texture_height: u32,
-    ) -> Self {
-        if texture_width == 0 || texture_height == 0 {
-            return Self::FULL;
-        }
-        let texture_width = texture_width as f32;
-        let texture_height = texture_height as f32;
-        Self {
-            left: x as f32 / texture_width,
-            top: y as f32 / texture_height,
-            right: x.saturating_add(width) as f32 / texture_width,
-            bottom: y.saturating_add(height) as f32 / texture_height,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +54,6 @@ pub(super) enum EglDrawLayer {
     Solid(ServerFrameColor),
     Surface(u32),
     Cursor,
-    ShellOverlay,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

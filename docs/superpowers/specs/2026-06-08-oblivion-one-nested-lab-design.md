@@ -18,9 +18,8 @@ compositor core itself.
 - `oblivion-one doctor` reports whether `gamescope`, `kitty`, Rust, and DBus
   helpers are present.
 - `oblivion-one smoke` prints a non-GUI launch preview.
-- `oblivion-one prototype` opens a native visual shell mockup with topbar, dock,
-  workspaces, simulated app windows, focus cycling, click activation, and real
-  app launchers.
+- `oblivion-one prototype` opens a standalone visual mockup with simulated
+  panels, app windows, focus cycling, click activation, and launchers.
 - `oblivion-one nested` starts the nested lab and writes
   `~/.local/state/oblivion-one/session.env`.
 - `oblivion-one run <command>` launches another app into the active nested

@@ -16,23 +16,6 @@ fn wayland_client_can_create_xdg_toplevel_on_oblivion_server() {
 }
 
 #[test]
-fn shell_dock_items_track_open_toplevel_app_ids() {
-    let socket_name = unique_socket_name();
-    let server = OwnCompositorServer::bind(&socket_name).unwrap();
-    let socket_path = runtime_socket_path(&socket_name);
-    let (running, server_thread) = spawn_test_server(server);
-
-    create_client_toplevel_with_app_id_and_sized_shm_buffer(&socket_path, "kitty", 300, 200)
-        .unwrap();
-    let server = stop_test_server(running, server_thread);
-
-    let dock_items = server.shell_dock_items();
-    assert_eq!(dock_items.len(), 1);
-    assert_eq!(dock_items[0].label, "kitty");
-    assert!(dock_items[0].active);
-}
-
-#[test]
 fn wayland_client_receives_xdg_toplevel_and_surface_configure() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -45,6 +28,62 @@ fn wayland_client_receives_xdg_toplevel_and_surface_configure() {
     let state = state.unwrap();
     assert!(state.toplevel_configured);
     assert!(state.surface_configured);
+}
+
+#[test]
+fn xdg_activation_token_focuses_requested_toplevel_once() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let activation: client_xdg_activation_v1::XdgActivationV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+
+    let target_surface = compositor.create_surface(&qh, ());
+    let target_xdg = wm_base.get_xdg_surface(&target_surface, &qh, ());
+    let _target_toplevel = target_xdg.get_toplevel(&qh, ());
+    target_surface.commit();
+
+    let focused_surface = compositor.create_surface(&qh, ());
+    let focused_xdg = wm_base.get_xdg_surface(&focused_surface, &qh, ());
+    let _focused_toplevel = focused_xdg.get_toplevel(&qh, ());
+    focused_surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    let initial_focus = capture_focused_surface_id(&commands).expect("second toplevel focused");
+
+    let activation_token = activation.get_activation_token(&qh, ());
+    activation_token.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let token = state
+        .activation_token_done
+        .take()
+        .expect("activation token should be committed");
+
+    activation.activate(token.clone(), &target_surface);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let activated_focus = capture_focused_surface_id(&commands).expect("target toplevel focused");
+    assert_ne!(activated_focus, initial_focus);
+
+    activation.activate(token, &focused_surface);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    assert_eq!(capture_focused_surface_id(&commands), Some(activated_focus));
+
+    let _server = stop_controllable_test_server(commands, server_thread);
 }
 
 #[test]
@@ -284,4 +323,152 @@ fn xdg_popup_grab_suppresses_pointer_axis_outside_popup() {
 
     assert!(!state.pointer_axis);
     assert_eq!(state.pointer_vertical_axis, None);
+}
+
+#[test]
+fn xdg_parent_unmap_dismisses_popup_and_late_destroy_is_idempotent() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let mut state = RegistryTestState::default();
+
+    let (parent_surface, parent_xdg_surface, _parent_toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 120, 90).unwrap();
+    parent_surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    let popup_surface = compositor.create_surface(&qh, ());
+    let popup_surface_id = popup_surface.id().protocol_id();
+    let popup_xdg_surface = wm_base.get_xdg_surface(&popup_surface, &qh, ());
+    let positioner = wm_base.create_positioner(&qh, ());
+    positioner.set_size(60, 40);
+    positioner.set_anchor_rect(10, 10, 1, 1);
+    let popup = popup_xdg_surface.get_popup(Some(&parent_xdg_surface), &positioner, &qh, ());
+    popup_surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&popup_surface, &shm, &qh, 60, 40).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(capture_renderable_surface_count(&commands), 2);
+
+    parent_surface.attach(None, 0, 0);
+    parent_surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    let snapshot = capture_xdg_role_snapshot(&commands, popup_surface_id);
+    assert_eq!(snapshot.popup_count, 1);
+    assert_eq!(snapshot.popup_node_count, 1);
+    assert_eq!(capture_renderable_surface_count(&commands), 0);
+
+    popup.destroy();
+    popup_surface.destroy();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    let snapshot = capture_xdg_role_snapshot(&commands, popup_surface_id);
+    assert_eq!(snapshot.popup_count, 0);
+    assert_eq!(snapshot.popup_node_count, 0);
+    assert!(!snapshot.popup_grab_active);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn rapid_xdg_popup_cycles_leave_no_stale_popup_state() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let mut state = RegistryTestState::default();
+
+    let (parent_surface, parent_xdg_surface, _parent_toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 120, 90).unwrap();
+    parent_surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    for index in 0..1000 {
+        let popup_surface = compositor.create_surface(&qh, ());
+        let popup_surface_id = popup_surface.id().protocol_id();
+        let popup_xdg_surface = wm_base.get_xdg_surface(&popup_surface, &qh, ());
+        let positioner = wm_base.create_positioner(&qh, ());
+        positioner.set_size(60, 40);
+        positioner.set_anchor_rect(10, 10, 1, 1);
+        let popup = popup_xdg_surface.get_popup(Some(&parent_xdg_surface), &positioner, &qh, ());
+        popup_surface.commit();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+        commit_test_buffered_surface(&popup_surface, &shm, &qh, 60, 40).unwrap();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+
+        if index % 100 == 0 {
+            let child_surface = compositor.create_surface(&qh, ());
+            let child_xdg_surface = wm_base.get_xdg_surface(&child_surface, &qh, ());
+            let child_positioner = wm_base.create_positioner(&qh, ());
+            child_positioner.set_size(24, 24);
+            child_positioner.set_anchor_rect(2, 2, 1, 1);
+            let child_popup =
+                child_xdg_surface.get_popup(Some(&popup_xdg_surface), &child_positioner, &qh, ());
+            child_surface.commit();
+            connection.flush().unwrap();
+            queue.roundtrip(&mut state).unwrap();
+            commit_test_buffered_surface(&child_surface, &shm, &qh, 24, 24).unwrap();
+            connection.flush().unwrap();
+            queue.roundtrip(&mut state).unwrap();
+            child_popup.destroy();
+            child_surface.destroy();
+        }
+
+        if index % 200 == 199 {
+            parent_surface.attach(None, 0, 0);
+            parent_surface.commit();
+            connection.flush().unwrap();
+            queue.roundtrip(&mut state).unwrap();
+        }
+
+        popup.destroy();
+        popup_surface.destroy();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+
+        if index % 200 == 199 {
+            commit_test_buffered_surface(&parent_surface, &shm, &qh, 120, 90).unwrap();
+            connection.flush().unwrap();
+            queue.roundtrip(&mut state).unwrap();
+        }
+
+        if index % 100 == 99 {
+            let snapshot = capture_xdg_role_snapshot(&commands, popup_surface_id);
+            assert_eq!(snapshot.popup_count, 0);
+            assert_eq!(snapshot.popup_node_count, 0);
+            assert!(!snapshot.popup_grab_active);
+        }
+    }
+
+    let snapshot = capture_xdg_role_snapshot(&commands, 0);
+    assert_eq!(snapshot.popup_count, 0);
+    assert_eq!(snapshot.popup_node_count, 0);
+    assert!(!snapshot.popup_grab_active);
+    assert_eq!(capture_renderable_surface_count(&commands), 1);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
 }

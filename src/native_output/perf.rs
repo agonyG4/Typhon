@@ -124,14 +124,20 @@ pub(crate) struct NativeAppLaunchPerf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeLaunchSource {
     Startup,
+    ExternalShell,
     Spotlight,
+    AltTab,
+    Binding,
 }
 
 impl NativeLaunchSource {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Startup => "startup",
+            Self::ExternalShell => "external-shell",
             Self::Spotlight => "spotlight",
+            Self::AltTab => "alt-tab",
+            Self::Binding => "binding",
         }
     }
 }

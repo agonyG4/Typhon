@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+cd /home/agony/GitHub/Typhon || exit 1
+
+exec env \
+    -u WAYLAND_DISPLAY \
+    -u WAYLAND_SOCKET \
+    -u DISPLAY \
+    OBLIVION_ONE_CURSOR=hardware \
+    OBLIVION_ONE_PROFILE=release \
+    OBLIVION_ONE_SHELL_COMMAND="qs -p /home/agony/.local/share/Astrea-Typhon/Quickshell" \
+    ./bin/start-oblivion-one-tty

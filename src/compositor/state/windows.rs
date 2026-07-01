@@ -49,6 +49,19 @@ impl CompositorState {
         }
         self.configured_xdg_surfaces.remove(&surface_id);
         self.clear_resize_state_for_surfaces(&[surface_id]);
+        let parent_owner = parent
+            .as_ref()
+            .map(compositor_surface_id)
+            .map(|parent_id| self.popup_owner_for_parent(parent_id))
+            .unwrap_or(PopupOwner::Toplevel(surface_id));
+        let owner_root_id = match parent_owner {
+            PopupOwner::Popup(parent_id) => self
+                .popup_nodes
+                .get(&parent_id)
+                .map(|node| node.owner_root_id)
+                .unwrap_or(parent_id),
+            PopupOwner::LayerSurface(parent_id) | PopupOwner::Toplevel(parent_id) => parent_id,
+        };
         self.popup_surfaces.insert(
             surface_id,
             PopupSurface {
@@ -58,6 +71,24 @@ impl CompositorState {
                 positioner,
             },
         );
+        self.attach_popup_node(
+            surface_id,
+            PopupNode {
+                owner_root_id,
+                parent: parent_owner,
+                children: Vec::new(),
+                lifecycle: PopupLifecycle::Alive,
+                mapped: false,
+                configured: false,
+                popup_done_sent: false,
+                grab_generation: None,
+            },
+        );
+        popup_debug_log(|| {
+            format!(
+                "popup_create popup={surface_id} owner_root={owner_root_id} parent={parent_owner:?}"
+            )
+        });
         self.note_xdg_popup_created();
     }
 
@@ -71,16 +102,7 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn unregister_xdg_surface_role(&mut self, surface_id: u32) {
-        let child_popup_ids = self
-            .popup_surfaces
-            .iter()
-            .filter_map(|(child_surface_id, popup)| {
-                (popup.parent_surface_id == Some(surface_id)).then_some(*child_surface_id)
-            })
-            .collect::<Vec<_>>();
-        for child_surface_id in child_popup_ids {
-            self.unregister_popup_surface(child_surface_id);
-        }
+        self.destroy_popup_children_for_parent(surface_id);
 
         self.unregister_toplevel_surface(surface_id);
         self.unregister_popup_surface(surface_id);
@@ -88,6 +110,7 @@ impl CompositorState {
         self.pending_surface_window_geometries.remove(&surface_id);
         self.configured_xdg_surfaces.remove(&surface_id);
         self.surface_placements.remove(&surface_id);
+        self.clear_popup_grab_for_surface_ids(&[surface_id]);
         self.popup_grab_stack.retain(|id| *id != surface_id);
         self.recent_input_serials
             .retain(|input| compositor_surface_id(&input.surface) != surface_id);
@@ -101,7 +124,7 @@ impl CompositorState {
         serial: u32,
     ) -> bool {
         let surface_id = compositor_surface_id(surface);
-        if !self.popup_surfaces.contains_key(&surface_id)
+        if !self.popup_node_is_alive(surface_id)
             || !resource_belongs_to_surface_client(seat, surface)
             || !self.has_recent_input_serial_for_surface(serial, surface)
         {
@@ -109,13 +132,61 @@ impl CompositorState {
             return false;
         }
 
+        let Some(owner_client) = surface.client().map(|client| client.id()) else {
+            self.dismiss_popup_surface(surface_id);
+            return false;
+        };
+        let Some(owner_root_id) = self
+            .popup_nodes
+            .get(&surface_id)
+            .map(|node| node.owner_root_id)
+        else {
+            self.dismiss_popup_surface(surface_id);
+            return false;
+        };
+        let tree_root_popup_id = self.popup_tree_root(surface_id);
+        if let Some(active) = &self.popup_grab
+            && (active.owner_client != owner_client || active.owner_root_id != owner_root_id)
+        {
+            self.dismiss_popup_surface(active.tree_root_popup_id);
+        }
+        self.next_popup_grab_generation = self.next_popup_grab_generation.saturating_add(1);
+        let generation = self.next_popup_grab_generation;
+        if let Some(node) = self.popup_nodes.get_mut(&surface_id) {
+            node.grab_generation = Some(generation);
+        }
+        self.popup_grab = Some(PopupGrab {
+            owner_client,
+            owner_root_id,
+            tree_root_popup_id,
+            focused_popup_id: surface_id,
+            serial,
+            generation,
+        });
         self.popup_grab_stack.retain(|id| *id != surface_id);
         self.popup_grab_stack.push(surface_id);
         self.focus_surface(surface.clone());
+        popup_debug_log(|| {
+            format!(
+                "popup_grab popup={surface_id} owner_root={owner_root_id} generation={generation} serial={serial}"
+            )
+        });
         true
     }
 
     pub(in crate::compositor) fn unregister_popup_surface(&mut self, surface_id: u32) {
+        self.destroy_popup_role(surface_id);
+    }
+
+    fn destroy_popup_role(&mut self, surface_id: u32) {
+        let children = self
+            .popup_nodes
+            .get(&surface_id)
+            .map(|node| node.children.clone())
+            .unwrap_or_default();
+        for child_surface_id in children {
+            self.destroy_popup_role(child_surface_id);
+        }
         let parent_surface_id = self
             .popup_surfaces
             .get(&surface_id)
@@ -128,15 +199,18 @@ impl CompositorState {
         {
             self.clear_pointer_focus();
         }
+        self.clear_popup_grab_for_surface_ids(&[surface_id]);
         self.popup_grab_stack.retain(|id| *id != surface_id);
         self.recent_input_serials
             .retain(|input| compositor_surface_id(&input.surface) != surface_id);
         self.popup_surfaces.remove(&surface_id);
+        self.detach_popup_node(surface_id, PopupLifecycle::Destroyed);
         self.surface_placements.remove(&surface_id);
         self.configured_xdg_surfaces.remove(&surface_id);
         self.surface_window_geometries.remove(&surface_id);
         self.pending_surface_window_geometries.remove(&surface_id);
         self.clear_resize_state_for_surfaces(&[surface_id]);
+        popup_debug_log(|| format!("popup_destroy_role popup={surface_id}"));
         if self
             .focused_surface
             .as_ref()
@@ -161,22 +235,37 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn dismiss_popup_surface(&mut self, surface_id: u32) -> bool {
-        let child_popup_ids = self
-            .popup_surfaces
-            .iter()
-            .filter_map(|(child_surface_id, popup)| {
-                (popup.parent_surface_id == Some(surface_id)).then_some(*child_surface_id)
-            })
-            .collect::<Vec<_>>();
+        let Some(node) = self.popup_nodes.get(&surface_id).cloned() else {
+            return false;
+        };
+        if node.lifecycle == PopupLifecycle::Destroyed {
+            return false;
+        }
+        let child_popup_ids = node.children.clone();
         for child_surface_id in child_popup_ids {
             self.dismiss_popup_surface(child_surface_id);
         }
 
-        let Some(popup_surface) = self.popup_surfaces.get(&surface_id).cloned() else {
-            return false;
-        };
-        let _ = popup_surface.popup.send_event(xdg_popup::Event::PopupDone);
-        self.unregister_popup_surface(surface_id);
+        if let Some(popup_node) = self.popup_nodes.get_mut(&surface_id) {
+            popup_node.lifecycle = PopupLifecycle::Inert;
+            popup_node.mapped = false;
+        }
+        if !node.popup_done_sent {
+            if let Some(popup_surface) = self.popup_surfaces.get(&surface_id) {
+                let _ = popup_surface.popup.send_event(xdg_popup::Event::PopupDone);
+            }
+            if let Some(popup_node) = self.popup_nodes.get_mut(&surface_id) {
+                popup_node.popup_done_sent = true;
+            }
+        }
+        self.unmap_xdg_role_surfaces(surface_id);
+        self.clear_popup_grab_for_surface_ids(&[surface_id]);
+        popup_debug_log(|| {
+            format!(
+                "popup_dismiss popup={surface_id} owner_root={} mapped=false inert=true",
+                node.owner_root_id
+            )
+        });
         true
     }
 
@@ -207,11 +296,17 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn topmost_popup_grab_surface_id(&self) -> Option<u32> {
-        self.popup_grab_stack
-            .iter()
-            .rev()
-            .copied()
-            .find(|surface_id| self.popup_surfaces.contains_key(surface_id))
+        self.popup_grab
+            .as_ref()
+            .map(|grab| grab.focused_popup_id)
+            .filter(|surface_id| self.popup_node_is_alive(*surface_id))
+            .or_else(|| {
+                self.popup_grab_stack
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|surface_id| self.popup_node_is_alive(*surface_id))
+            })
     }
 
     pub(in crate::compositor) fn surface_is_descendant_of(
@@ -241,12 +336,192 @@ impl CompositorState {
         false
     }
 
+    fn popup_owner_for_parent(&self, parent_id: u32) -> PopupOwner {
+        if self.popup_nodes.contains_key(&parent_id) {
+            PopupOwner::Popup(parent_id)
+        } else if self.layer_surfaces.contains_key(&parent_id) {
+            PopupOwner::LayerSurface(parent_id)
+        } else {
+            PopupOwner::Toplevel(parent_id)
+        }
+    }
+
+    pub(in crate::compositor) fn popup_node_is_alive(&self, surface_id: u32) -> bool {
+        self.popup_nodes.get(&surface_id).is_some_and(|node| {
+            node.lifecycle == PopupLifecycle::Alive && self.popup_surfaces.contains_key(&surface_id)
+        })
+    }
+
+    fn popup_tree_root(&self, surface_id: u32) -> u32 {
+        let mut current = surface_id;
+        for _ in 0..self.popup_nodes.len().saturating_add(1) {
+            let Some(node) = self.popup_nodes.get(&current) else {
+                return current;
+            };
+            match node.parent {
+                PopupOwner::Popup(parent_id) if parent_id != current => current = parent_id,
+                _ => return current,
+            }
+        }
+        surface_id
+    }
+
+    fn attach_popup_node(&mut self, surface_id: u32, node: PopupNode) {
+        if let Some(old_node) = self.popup_nodes.get(&surface_id).cloned() {
+            self.unlink_popup_from_parent(surface_id, old_node.parent);
+        }
+        if let PopupOwner::Popup(parent_id) = node.parent
+            && self.popup_would_create_cycle(surface_id, parent_id)
+        {
+            popup_debug_log(|| {
+                format!(
+                    "popup_associate popup={surface_id} parent_popup={parent_id} rejected=cycle"
+                )
+            });
+            return;
+        }
+        let parent = node.parent;
+        self.popup_nodes.insert(surface_id, node);
+        self.link_popup_to_parent(surface_id, parent);
+    }
+
+    pub(in crate::compositor) fn relink_popup_node(
+        &mut self,
+        surface_id: u32,
+        parent: PopupOwner,
+        owner_root_id: u32,
+    ) {
+        let Some(old_parent) = self.popup_nodes.get(&surface_id).map(|node| node.parent) else {
+            return;
+        };
+        if let PopupOwner::Popup(parent_id) = parent
+            && self.popup_would_create_cycle(surface_id, parent_id)
+        {
+            popup_debug_log(|| {
+                format!(
+                    "popup_associate popup={surface_id} parent_popup={parent_id} rejected=cycle"
+                )
+            });
+            return;
+        }
+        self.unlink_popup_from_parent(surface_id, old_parent);
+        if let Some(node) = self.popup_nodes.get_mut(&surface_id) {
+            node.parent = parent;
+            node.owner_root_id = owner_root_id;
+        }
+        self.link_popup_to_parent(surface_id, parent);
+        popup_debug_log(|| {
+            format!(
+                "popup_associate popup={surface_id} owner_root={owner_root_id} parent={parent:?}"
+            )
+        });
+    }
+
+    fn link_popup_to_parent(&mut self, surface_id: u32, parent: PopupOwner) {
+        if let PopupOwner::Popup(parent_id) = parent
+            && let Some(parent_node) = self.popup_nodes.get_mut(&parent_id)
+            && !parent_node.children.contains(&surface_id)
+        {
+            parent_node.children.push(surface_id);
+        }
+    }
+
+    fn unlink_popup_from_parent(&mut self, surface_id: u32, parent: PopupOwner) {
+        if let PopupOwner::Popup(parent_id) = parent
+            && let Some(parent_node) = self.popup_nodes.get_mut(&parent_id)
+        {
+            parent_node
+                .children
+                .retain(|child_id| *child_id != surface_id);
+        }
+    }
+
+    fn popup_would_create_cycle(&self, surface_id: u32, parent_id: u32) -> bool {
+        let mut current = parent_id;
+        for _ in 0..self.popup_nodes.len().saturating_add(1) {
+            if current == surface_id {
+                return true;
+            }
+            let Some(parent_node) = self.popup_nodes.get(&current) else {
+                return false;
+            };
+            match parent_node.parent {
+                PopupOwner::Popup(next_id) if next_id != current => current = next_id,
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    fn detach_popup_node(&mut self, surface_id: u32, lifecycle: PopupLifecycle) {
+        let Some(mut node) = self.popup_nodes.remove(&surface_id) else {
+            return;
+        };
+        node.lifecycle = lifecycle;
+        self.unlink_popup_from_parent(surface_id, node.parent);
+        self.clear_popup_grab_for_surface_ids(&[surface_id]);
+    }
+
+    pub(in crate::compositor) fn dismiss_popup_children_for_parent(
+        &mut self,
+        parent_surface_id: u32,
+    ) {
+        let child_popup_ids = self
+            .popup_nodes
+            .iter()
+            .filter_map(|(popup_surface_id, node)| {
+                (node.parent.surface_id() == parent_surface_id).then_some(*popup_surface_id)
+            })
+            .collect::<Vec<_>>();
+        for popup_surface_id in child_popup_ids {
+            self.dismiss_popup_surface(popup_surface_id);
+        }
+    }
+
+    fn destroy_popup_children_for_parent(&mut self, parent_surface_id: u32) {
+        let child_popup_ids = self
+            .popup_nodes
+            .iter()
+            .filter_map(|(popup_surface_id, node)| {
+                (node.parent.surface_id() == parent_surface_id).then_some(*popup_surface_id)
+            })
+            .collect::<Vec<_>>();
+        for popup_surface_id in child_popup_ids {
+            self.destroy_popup_role(popup_surface_id);
+        }
+    }
+
+    pub(in crate::compositor) fn clear_popup_grab_for_surface_ids(&mut self, surface_ids: &[u32]) {
+        let active = self.popup_grab.as_ref().is_some_and(|grab| {
+            surface_ids.contains(&grab.focused_popup_id)
+                || surface_ids.contains(&grab.tree_root_popup_id)
+                || surface_ids.contains(&grab.owner_root_id)
+        });
+        if active && let Some(grab) = self.popup_grab.take() {
+            popup_debug_log(|| {
+                format!(
+                    "popup_grab_clear owner_root={} tree_root={} focused={} serial={} generation={}",
+                    grab.owner_root_id,
+                    grab.tree_root_popup_id,
+                    grab.focused_popup_id,
+                    grab.serial,
+                    grab.generation
+                )
+            });
+        }
+        self.popup_grab_stack
+            .retain(|surface_id| !surface_ids.contains(surface_id));
+    }
+
     pub(in crate::compositor) fn configure_popup_surface(
         &mut self,
         surface_id: u32,
         positioner: XdgPositionerState,
         reposition_token: Option<u32>,
     ) -> bool {
+        if !self.popup_node_is_alive(surface_id) {
+            return false;
+        }
         if let Some(popup_surface) = self.popup_surfaces.get_mut(&surface_id) {
             popup_surface.positioner = positioner;
         }
@@ -292,6 +567,22 @@ impl CompositorState {
                 placement.parent_surface_id
             );
         }
+        if let Some(node) = self.popup_nodes.get_mut(&surface_id) {
+            node.configured = true;
+        }
+        popup_debug_log(|| {
+            format!(
+                "popup_configure popup={surface_id} owner_root={} placement={},{} size={}x{}",
+                self.popup_nodes
+                    .get(&surface_id)
+                    .map(|node| node.owner_root_id)
+                    .unwrap_or(surface_id),
+                placement.local_x,
+                placement.local_y,
+                geometry.width,
+                geometry.height
+            )
+        });
         true
     }
 
@@ -299,6 +590,9 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
     ) -> bool {
+        if !self.popup_node_is_alive(surface_id) {
+            return false;
+        }
         let Some(popup_surface) = self.popup_surfaces.get(&surface_id).cloned() else {
             return false;
         };
@@ -1089,40 +1383,6 @@ impl CompositorState {
         true
     }
 
-    pub(in crate::compositor) fn shell_dock_items(&self) -> Vec<ShellDockItem> {
-        let focused_root_surface_id = self.focused_root_surface_id();
-        let mut surface_ids = self
-            .renderable_surfaces
-            .iter()
-            .map(|surface| self.root_surface_id_for_surface(surface.surface_id))
-            .filter(|surface_id| self.toplevel_surfaces.contains_key(surface_id))
-            .collect::<Vec<_>>();
-        surface_ids.sort_unstable();
-        surface_ids.dedup();
-        let mut known_surface_ids = surface_ids.iter().copied().collect::<HashSet<_>>();
-        for surface_id in self.toplevel_surfaces.keys().copied() {
-            if known_surface_ids.insert(surface_id) {
-                surface_ids.push(surface_id);
-            }
-        }
-        surface_ids
-            .into_iter()
-            .filter_map(|surface_id| {
-                let toplevel = self.toplevel_surfaces.get(&surface_id)?;
-                let label = toplevel
-                    .app_id
-                    .clone()
-                    .unwrap_or_else(|| format!("app-{surface_id}"));
-                Some(ShellDockItem::new(
-                    surface_id,
-                    label,
-                    focused_root_surface_id == Some(surface_id),
-                    toplevel.window.is_minimized(),
-                ))
-            })
-            .collect()
-    }
-
     pub(in crate::compositor) fn resize_root_window_to(
         &mut self,
         surface_id: u32,
@@ -1533,5 +1793,12 @@ impl CompositorState {
             );
         }
         true
+    }
+}
+
+fn popup_debug_log(message: impl FnOnce() -> String) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("OBLIVION_ONE_POPUP_DEBUG").is_some()) {
+        eprintln!("oblivion-one popup: {}", message());
     }
 }

@@ -2,117 +2,39 @@ use super::*;
 use crate::native_output::runtime::{
     NativePointerConstraint, NativePointerConstraintBackendAction,
 };
-#[test]
-fn native_initial_frame_does_not_draw_closed_spotlight_panel() {
-    let mut renderer = NativeFrameRenderer::default();
-    let spotlight = SpotlightModel::default();
-    let frame = renderer
-        .render_frame(NativeFrameRequest {
-            width: 320,
-            height: 200,
-            surfaces: &[],
-            dock_items: Vec::new(),
-            spotlight: &spotlight,
-            shell_generation: 0,
-            visual_state: DesktopVisualState::wallpaper_only(),
-            render_generation: 0,
-            client_cursor: None,
-        })
-        .pixels
-        .to_vec();
+use std::sync::Mutex;
 
-    let mut wallpaper = vec![0; 320 * 200];
-    compose_nested_output(
-        &mut wallpaper,
-        320,
-        200,
-        &[],
-        DesktopVisualState::wallpaper_only(),
-    );
-
-    assert_eq!(frame[100 * 320 + 160], wallpaper[100 * 320 + 160]);
-}
+static EXTERNAL_COMMAND_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
-fn native_input_ctrl_space_opens_spotlight_without_forwarding_space() {
+fn native_input_super_space_emits_astrea_spotlight_without_forwarding_space() {
+    let _guard = EXTERNAL_COMMAND_ENV_LOCK.lock().unwrap();
+    // SAFETY: this test serializes access to the process environment with
+    // EXTERNAL_COMMAND_ENV_LOCK.
+    unsafe {
+        std::env::set_var("OBLIVION_ONE_SPOTLIGHT_COMMAND", "printf spotlight");
+    }
     let mut input = NativeInputState::new(320, 200);
 
-    let ctrl = input.handle_key_event(KEY_LEFTCTRL, 1);
+    let super_key = input.handle_key_event(KEY_LEFTMETA, 1);
     let space = input.handle_key_event(KEY_SPACE, 1);
 
+    assert!(super_key.keyboard_events.is_empty());
+    assert!(space.keyboard_events.is_empty());
+    assert_eq!(space.launch_command, None);
+    assert_eq!(space.launch_source, None);
     assert_eq!(
-        ctrl.keyboard_events,
-        vec![NativeKeyboardEvent::new(KEY_LEFTCTRL, true)]
+        space.shortcut_events,
+        vec![AstreaShortcutEvent::pressed(
+            "astrea-shell",
+            "spotlight_toggle"
+        )]
     );
-    assert!(space.redraw_requested);
-    assert_eq!(
-        space.keyboard_events,
-        vec![NativeKeyboardEvent::new(KEY_LEFTCTRL, false)]
-    );
-    assert!(space.requires_frame_repaint(NativeCursorRenderMode::Hardware));
-    assert!(input.spotlight_visible());
-}
 
-#[test]
-fn native_input_visible_spotlight_collects_typed_letters() {
-    let mut input = NativeInputState::new(320, 200);
-    input.handle_key_event(KEY_LEFTCTRL, 1);
-    input.handle_key_event(KEY_SPACE, 1);
-
-    let effect = input.handle_key_event(KEY_Z, 1);
-
-    assert!(effect.redraw_requested);
-    assert!(effect.keyboard_events.is_empty());
-    assert_eq!(input.spotlight_query(), "z");
-}
-
-#[test]
-fn spotlight_motion_updates_visual_cursor_without_forwarding_client_motion() {
-    let mut input = NativeInputState::new(320, 200);
-    input.handle_key_event(KEY_LEFTCTRL, 1);
-    input.handle_key_event(KEY_SPACE, 1);
-
-    let effect = input.handle_pointer_motion_delta(24.0, 12.0);
-
-    assert_eq!(input.cursor_position(), (184, 112));
-    assert_eq!(effect.cursor_position, Some((184, 112)));
-    assert_eq!(effect.pointer_motion, None);
-    assert_eq!(effect.relative_motion, None);
-}
-
-#[test]
-fn spotlight_locked_motion_does_not_leak_relative_or_absolute_motion() {
-    let mut input = NativeInputState::new(320, 200);
-    let anchor = input.cursor_position_f64();
-    input.set_pointer_locked_at(anchor);
-    input.handle_key_event(KEY_LEFTCTRL, 1);
-    input.handle_key_event(KEY_SPACE, 1);
-
-    let effect = input.handle_pointer_motion_delta(24.0, 12.0);
-
-    assert_eq!(input.cursor_position_f64(), anchor);
-    assert_eq!(effect.cursor_position, None);
-    assert_eq!(effect.pointer_motion, None);
-    assert_eq!(effect.relative_motion, None);
-}
-
-#[test]
-fn spotlight_client_cursor_repaints_even_with_hardware_cursor_mode() {
-    let mut input = NativeInputState::new(320, 200);
-    input.handle_key_event(KEY_LEFTCTRL, 1);
-    input.handle_key_event(KEY_SPACE, 1);
-    let effect = input.handle_pointer_motion_delta(24.0, 12.0);
-    let mut updated_position = None;
-
-    let compositor_visual_changed = apply_compositor_only_pointer_position(&effect, |x, y| {
-        updated_position = Some((x, y));
-        true
-    });
-    let redraw_requested = effect.requires_frame_repaint(NativeCursorRenderMode::Hardware)
-        || compositor_visual_changed;
-
-    assert_eq!(updated_position, Some((184.0, 112.0)));
-    assert!(redraw_requested);
+    // SAFETY: guarded by EXTERNAL_COMMAND_ENV_LOCK.
+    unsafe {
+        std::env::remove_var("OBLIVION_ONE_SPOTLIGHT_COMMAND");
+    }
 }
 
 #[test]
@@ -140,6 +62,46 @@ fn native_input_alt_p_requests_session_exit_without_forwarding_p() {
 }
 
 #[test]
+fn native_input_alt_tab_sequence_emits_astrea_shortcuts() {
+    let mut input = NativeInputState::new(320, 200);
+
+    input.handle_key_event(KEY_LEFTALT, 1);
+    let next = input.handle_key_event(KEY_TAB, 1);
+    let commit = input.handle_key_event(KEY_LEFTALT, 0);
+
+    assert_eq!(
+        next.shortcut_events,
+        vec![AstreaShortcutEvent::pressed("astrea-shell", "alt_tab_next")]
+    );
+    assert!(next.keyboard_events.is_empty());
+    assert_eq!(
+        commit.shortcut_events,
+        vec![AstreaShortcutEvent::pressed(
+            "astrea-shell",
+            "alt_tab_commit"
+        )]
+    );
+}
+
+#[test]
+fn native_input_alt_shift_tab_sequence_emits_previous() {
+    let mut input = NativeInputState::new(320, 200);
+
+    input.handle_key_event(KEY_LEFTALT, 1);
+    input.handle_key_event(KEY_LEFTSHIFT, 1);
+    let previous = input.handle_key_event(KEY_TAB, 1);
+
+    assert_eq!(
+        previous.shortcut_events,
+        vec![AstreaShortcutEvent::pressed(
+            "astrea-shell",
+            "alt_tab_previous"
+        )]
+    );
+    assert!(previous.keyboard_events.is_empty());
+}
+
+#[test]
 fn native_input_ctrl_c_is_forwarded_to_clients() {
     let mut input = NativeInputState::new(320, 200);
 
@@ -158,9 +120,9 @@ fn native_input_ctrl_c_is_forwarded_to_clients() {
 }
 
 #[test]
-fn native_input_alt_mouse_buttons_start_window_interactions() {
+fn native_input_super_mouse_buttons_start_window_interactions() {
     let mut input = NativeInputState::new(320, 200);
-    input.handle_key_event(KEY_LEFTALT, 1);
+    input.handle_key_event(KEY_LEFTMETA, 1);
 
     let move_start = input.handle_pointer_button(u32::from(BTN_LEFT), true);
     let motion = input.handle_pointer_motion_delta(24.0, 12.0);
@@ -595,9 +557,9 @@ fn native_pointer_constraint_backend_tracks_cursor_visibility_changes() {
 }
 
 #[test]
-fn native_input_alt_right_starts_window_resize() {
+fn native_input_super_right_starts_window_resize() {
     let mut input = NativeInputState::new(320, 200);
-    input.handle_key_event(KEY_RIGHTALT, 1);
+    input.handle_key_event(KEY_RIGHTMETA, 1);
 
     let effect = input.handle_pointer_button(u32::from(BTN_RIGHT), true);
 
@@ -609,40 +571,30 @@ fn native_input_alt_right_starts_window_resize() {
 }
 
 #[test]
-fn native_input_alt_release_ends_active_window_interaction() {
+fn native_input_super_release_does_not_end_active_window_interaction() {
     let mut input = NativeInputState::new(320, 200);
-    input.handle_key_event(KEY_LEFTALT, 1);
+    input.handle_key_event(KEY_LEFTMETA, 1);
     input.handle_pointer_button(u32::from(BTN_LEFT), true);
 
-    let effect = input.handle_key_event(KEY_LEFTALT, 0);
+    let effect = input.handle_key_event(KEY_LEFTMETA, 0);
 
-    assert_eq!(
-        effect.window_actions,
-        vec![NativeWindowAction::EndInteraction]
-    );
+    assert!(effect.window_actions.is_empty());
 }
 
 #[test]
-fn native_input_alt_keyboard_shortcuts_map_to_window_actions() {
+fn native_input_astrea_keyboard_shortcuts_map_to_actions_and_events() {
     let mut input = NativeInputState::new(320, 200);
-    input.handle_key_event(KEY_LEFTALT, 1);
+    input.handle_key_event(KEY_LEFTMETA, 1);
 
-    let minimize = input.handle_key_event(KEY_M, 1);
-    let minimize_release = input.handle_key_event(KEY_M, 0);
-    let restore = input.handle_key_event(KEY_R, 1);
-    let maximize = input.handle_key_event(KEY_F, 1);
-    let fullscreen = input.handle_key_event(KEY_F11, 1);
+    let launch = input.handle_key_event(KEY_Q, 1);
+    let close = input.handle_key_event(KEY_C, 1);
+    let fullscreen = input.handle_key_event(KEY_F, 1);
 
-    assert_eq!(minimize.window_actions, vec![NativeWindowAction::Minimize]);
-    assert!(minimize.keyboard_events.is_empty());
-    assert!(minimize_release.keyboard_events.is_empty());
+    assert_eq!(launch.launch_command, Some(vec!["kitty".to_string()]));
+    assert!(launch.keyboard_events.is_empty());
     assert_eq!(
-        restore.window_actions,
-        vec![NativeWindowAction::RestoreMinimized]
-    );
-    assert_eq!(
-        maximize.window_actions,
-        vec![NativeWindowAction::ToggleMaximize]
+        close.window_actions,
+        vec![NativeWindowAction::CloseActiveWindow]
     );
     assert_eq!(
         fullscreen.window_actions,
@@ -822,7 +774,7 @@ fn native_forwarded_pointer_axis_skips_frame_repaint_without_local_visual_change
 #[test]
 fn native_input_window_interaction_still_repaints_with_hardware_cursor() {
     let mut input = NativeInputState::new(320, 200);
-    input.handle_key_event(KEY_LEFTALT, 1);
+    input.handle_key_event(KEY_LEFTMETA, 1);
     input.handle_pointer_button(u32::from(BTN_LEFT), true);
 
     let effect = input.handle_hardware_input_event(NativeHardwareInputEvent::PointerMotion(

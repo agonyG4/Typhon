@@ -17,8 +17,10 @@ use wayland_protocols::wp::{
     viewporter::server::wp_viewporter,
 };
 use wayland_protocols::xdg::{
-    decoration::zv1::server::zxdg_decoration_manager_v1, shell::server::xdg_wm_base,
+    activation::v1::server::xdg_activation_v1, decoration::zv1::server::zxdg_decoration_manager_v1,
+    shell::server::xdg_wm_base,
 };
+use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1;
 use wayland_server::{
     Display, DisplayHandle, ListeningSocket,
     protocol::{
@@ -26,15 +28,16 @@ use wayland_server::{
     },
 };
 
+use crate::astrea_shortcuts::server::astrea_shortcuts_manager_v1;
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
 
 use super::{
     AcquireCommitId, AcquireWatchChange, ClientCursorRenderState, CompositorState,
-    ExplicitSyncPoint, FramePresentation, InputProtocolCapabilities, PresentationClock,
+    ExplicitSyncPoint, FramePresentation, InputProtocolCapabilities, OutputRect, PresentationClock,
     RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
-    SelectionProtocolCapabilities, ShellDockItem, SubsurfaceTransactionMetrics, color,
+    SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 
@@ -260,6 +263,10 @@ impl OwnCompositorServer {
         &self.state.renderable_surfaces
     }
 
+    pub fn external_overlay_surface_ids(&self) -> Vec<u32> {
+        self.state.external_overlay_surface_ids()
+    }
+
     pub fn mark_render_damage_presented(&mut self) {
         self.state.mark_render_damage_presented();
     }
@@ -278,6 +285,10 @@ impl OwnCompositorServer {
 
     pub fn render_generation_cause(&self) -> RenderGenerationCause {
         self.state.render_generation_cause()
+    }
+
+    pub fn usable_output_geometry(&self) -> OutputRect {
+        self.state.usable_output_geometry()
     }
 
     pub const fn resize_flow_metrics(&self) -> ResizeFlowMetrics {
@@ -306,10 +317,6 @@ impl OwnCompositorServer {
 
     pub fn has_pending_frame_work(&self) -> bool {
         self.state.has_pending_frame_work()
-    }
-
-    pub fn shell_dock_items(&self) -> Vec<ShellDockItem> {
-        self.state.shell_dock_items()
     }
 
     pub fn set_dmabuf_feedback(
@@ -445,6 +452,23 @@ impl OwnCompositorServer {
         self.state.window_interaction_active()
     }
 
+    pub fn emit_astrea_shortcut_pressed(
+        &mut self,
+        namespace: &str,
+        name: &str,
+        timestamp: u32,
+    ) -> usize {
+        let dispatched = self
+            .state
+            .emit_astrea_shortcut_pressed(namespace, name, timestamp);
+        let _ = self.display.flush_clients();
+        dispatched
+    }
+
+    pub fn authorize_astrea_shell_pid(&mut self, pid: u32) {
+        self.state.authorize_astrea_shell_pid(pid);
+    }
+
     pub fn resize_focused_window_to(&mut self, width: u32, height: u32) -> bool {
         let resized = self.state.resize_focused_window_to(width, height);
         let _ = self.display.flush_clients();
@@ -558,6 +582,7 @@ fn register_minimum_globals(
         _,
     >(1, ());
     display.create_global::<CompositorState, wp_presentation::WpPresentation, _>(2, ());
+    display.create_global::<CompositorState, zwlr_layer_shell_v1::ZwlrLayerShellV1, _>(4, ());
     if renderer_capabilities.color_management {
         color::register_color_management_global(display);
     }
@@ -607,6 +632,12 @@ fn register_minimum_globals(
     if gpu_buffers_enabled {
         register_gpu_buffer_globals(display, syncobj_available);
     }
+    display.create_global::<CompositorState, xdg_activation_v1::XdgActivationV1, _>(1, ());
+    display
+        .create_global::<CompositorState, astrea_shortcuts_manager_v1::AstreaShortcutsManagerV1, _>(
+            1,
+            (),
+        );
     display.create_global::<CompositorState, xdg_wm_base::XdgWmBase, _>(6, ());
     display.create_global::<CompositorState, wl_output::WlOutput, _>(4, ());
     display.create_global::<CompositorState, wl_seat::WlSeat, _>(7, ());

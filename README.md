@@ -108,7 +108,7 @@ apps run inside our compositor.
 - `doctor`: checks local tools useful for the lab.
 - `bin/install-start-oblivion-one --sddm-session`: installs the experimental
   native SDDM Wayland session entry.
-- `prototype`: opens the native Rust visual shell prototype.
+- `prototype`: opens the old standalone visual mockup.
 - `de --backend oblivion`: alias path for the owned compositor backend.
 - `de --backend hyprland`: legacy nested Hyprland lab backend.
 - `nested`: legacy Gamescope lab backend.
@@ -189,11 +189,11 @@ Done:
 - Basic real-client popups: xdg-popup menus receive configure events and render
   as child surfaces, so browser menus/settings popovers can map inside the
   compositor.
-- A temporary compositor-rendered dock shows open real app toplevels. A simple
-  Spotlight lab overlay opens with `Super+Space` (`Ctrl+Space` fallback) and launches commands on the
-  Oblivion Wayland socket. Browser suggestions such as Brave, Zen Browser,
-  Firefox, and Chromium use isolated lab profiles so they do not reuse a host
-  browser process.
+- External shells render through normal Wayland protocols. Set
+  `OBLIVION_ONE_SHELL_COMMAND` to autostart Quickshell or another shell client.
+  `Super+Space` dispatches `OBLIVION_ONE_SPOTLIGHT_COMMAND` or
+  `astrea-spotlight --toggle` when available; `Alt+Tab` dispatches
+  `OBLIVION_ONE_ALT_TAB_COMMAND` or `astrea-alt-tab --next` when available.
 - Initial `linux-dmabuf` v3 path: Oblivion advertises ARGB/XRGB modifiers,
   keeps async `create` on the safe `failed()` path, accepts `create_immed` into
   typed `DmabufBufferHandle` surfaces, and the native EGL/GLES renderer imports
@@ -213,7 +213,7 @@ Next:
 
 ## Prototype Controls
 
-`prototype` is still a visual shell mockup:
+`prototype` is still a standalone visual mockup:
 
 If you see the dock and fake windows shown by `prototype`, you are not testing
 the real compositor path yet. Use `./bin/oblivion-one compositor` for the owned
@@ -227,10 +227,9 @@ Real compositor path:
 - Press `Alt+R` to restore the next minimized real app window.
 - Press `Alt+F` to maximize/restore the focused real app window.
 - Press `Alt+Enter` or `Alt+F11` to toggle fullscreen for the focused real app window.
-- Press `Super+Space` (`Ctrl+Space` fallback) to open the simple Spotlight,
-  type an app/command, use `Up`/`Down` to select, and press `Enter` to launch
-  it inside Oblivion.
-- Click a dock item to focus or restore that open real app window.
+- Press `Super+Space` to dispatch the configured external Spotlight command.
+- Press `Alt+Tab` to dispatch the configured external AltTab command when
+  available.
 
 - Click a simulated window to focus it.
 - Drag a titlebar to move a simulated window.

@@ -125,6 +125,15 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CapturePointerConstraintIds(Sender<Vec<u64>>),
     CaptureLastPointerPosition(Sender<(f64, f64)>),
     CapturePointerFocusSurfaceId(Sender<Option<u32>>),
+    CaptureFocusedSurfaceId(Sender<Option<u32>>),
+    CaptureUsableOutputGeometry(Sender<OutputRect>),
+    AuthorizeAstreaShellPid(u32),
+    EmitAstreaShortcut {
+        namespace: String,
+        name: String,
+        timestamp: u32,
+        reply: Sender<usize>,
+    },
     UpdatePointerPositionWithoutClientDispatch {
         x: f64,
         y: f64,
@@ -230,21 +239,27 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                         let _ = reply.send(server.renderable_surfaces().len());
                     }
                     ServerCommand::CaptureRenderableSurfaceSnapshot(reply) => {
+                        let surfaces = server.renderable_surfaces();
+                        let origins = render::surface_origins(surfaces);
                         let _ = reply.send(
-                            server
-                                .renderable_surfaces()
+                            surfaces
                                 .iter()
-                                .map(|surface| RenderableSurfaceSnapshot {
-                                    surface_id: surface.surface_id,
-                                    width: surface.width,
-                                    height: surface.height,
-                                    parent_surface_id: surface.placement.parent_surface_id,
-                                    local_x: surface.placement.local_x,
-                                    local_y: surface.placement.local_y,
-                                    buffer_id: surface.buffer_id().get(),
-                                    generation: surface.generation,
-                                    resize_preview_active: surface.visual_clip.is_some(),
-                                })
+                                .zip(origins)
+                                .map(
+                                    |(surface, (origin_x, origin_y))| RenderableSurfaceSnapshot {
+                                        surface_id: surface.surface_id,
+                                        width: surface.width,
+                                        height: surface.height,
+                                        parent_surface_id: surface.placement.parent_surface_id,
+                                        local_x: surface.placement.local_x,
+                                        local_y: surface.placement.local_y,
+                                        origin_x,
+                                        origin_y,
+                                        buffer_id: surface.buffer_id().get(),
+                                        generation: surface.generation,
+                                        resize_preview_active: surface.visual_clip.is_some(),
+                                    },
+                                )
                                 .collect(),
                         );
                     }
@@ -323,6 +338,8 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .toplevel_surfaces
                                 .contains_key(&tracked_surface_id),
                             popup_count: server.state.popup_surfaces.len(),
+                            popup_node_count: server.state.popup_nodes.len(),
+                            popup_grab_active: server.state.popup_grab.is_some(),
                             window_geometry_present: server
                                 .state
                                 .surface_window_geometries
@@ -364,6 +381,31 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .pointer_surface
                                 .as_ref()
                                 .map(compositor_surface_id),
+                        );
+                    }
+                    ServerCommand::CaptureFocusedSurfaceId(reply) => {
+                        let _ = reply.send(
+                            server
+                                .state
+                                .focused_surface
+                                .as_ref()
+                                .map(compositor_surface_id),
+                        );
+                    }
+                    ServerCommand::CaptureUsableOutputGeometry(reply) => {
+                        let _ = reply.send(server.state.usable_output_geometry());
+                    }
+                    ServerCommand::AuthorizeAstreaShellPid(pid) => {
+                        server.authorize_astrea_shell_pid(pid);
+                    }
+                    ServerCommand::EmitAstreaShortcut {
+                        namespace,
+                        name,
+                        timestamp,
+                        reply,
+                    } => {
+                        let _ = reply.send(
+                            server.emit_astrea_shortcut_pressed(&namespace, &name, timestamp),
                         );
                     }
                     ServerCommand::UpdatePointerPositionWithoutClientDispatch { x, y, reply } => {
@@ -495,6 +537,30 @@ pub(in crate::compositor::tests) fn capture_renderable_surface_snapshot(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report renderable surface snapshot")
+}
+
+pub(in crate::compositor::tests) fn capture_focused_surface_id(
+    commands: &Sender<ServerCommand>,
+) -> Option<u32> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFocusedSurfaceId(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report keyboard focus surface")
+}
+
+pub(in crate::compositor::tests) fn capture_usable_output_geometry(
+    commands: &Sender<ServerCommand>,
+) -> OutputRect {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureUsableOutputGeometry(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report usable output geometry")
 }
 
 pub(in crate::compositor::tests) fn capture_committed_window_geometry(

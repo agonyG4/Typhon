@@ -171,6 +171,50 @@ fn native_base_registry_can_publish_gpu_buffer_globals_after_backend_is_known() 
 }
 
 #[test]
+fn deferred_renderer_registry_omits_gpu_buffer_globals_until_renderer_enables_them() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_with_capabilities(
+        &socket_name,
+        false,
+        InputProtocolCapabilities::nested_winit(),
+        SelectionProtocolCapabilities::core_clipboard(),
+        RendererProtocolCapabilities::unsupported(),
+    )
+    .unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let result = read_registry_globals(&socket_path);
+    stop_test_server(running, server_thread);
+
+    let globals = result.unwrap();
+    assert!(globals.contains(&"wl_shm".to_string()));
+    assert!(!globals.contains(&"zwp_linux_dmabuf_v1".to_string()));
+    assert!(!globals.contains(&"wp_linux_drm_syncobj_manager_v1".to_string()));
+    assert!(!globals.contains(&"wl_drm".to_string()));
+
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_with_capabilities(
+        &socket_name,
+        false,
+        InputProtocolCapabilities::nested_winit(),
+        SelectionProtocolCapabilities::core_clipboard(),
+        RendererProtocolCapabilities::unsupported(),
+    )
+    .unwrap();
+    server.enable_gpu_buffer_protocols();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let result = read_registry_globals(&socket_path);
+    stop_test_server(running, server_thread);
+
+    let globals = result.unwrap();
+    assert!(globals.contains(&"zwp_linux_dmabuf_v1".to_string()));
+    assert!(globals.contains(&"wl_drm".to_string()));
+}
+
+#[test]
 fn presentation_feedback_request_does_not_panic_server_tick() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
