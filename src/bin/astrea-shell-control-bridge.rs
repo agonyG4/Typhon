@@ -1,14 +1,43 @@
-use std::{
-    env,
-    process::{Command, ExitCode, Stdio},
+#![allow(
+    dead_code,
+    missing_docs,
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    unused_imports,
+    unused_unsafe,
+    unused_variables,
+    clippy::all
+)]
+
+#[path = "../astrea_shell_control.rs"]
+mod astrea_shell_control;
+
+use std::{env, process::ExitCode};
+
+use astrea_shell_control::client::{astrea_launch_request_v1, astrea_shell_control_manager_v1};
+use wayland_client::{
+    Connection, Dispatch, QueueHandle,
+    globals::{GlobalListContents, registry_queue_init},
+    protocol::wl_registry,
 };
 
 const MAX_JSON_BYTES: usize = 64 * 1024;
 const MAX_DESKTOP_ID_BYTES: usize = 1024;
 
+#[derive(Default)]
+struct BridgeState {
+    done: bool,
+    accepted_pid: Option<u32>,
+    error: Option<String>,
+}
+
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(pid) => {
+            println!("accepted {pid}");
+            ExitCode::SUCCESS
+        }
         Err(err) => {
             eprintln!("astrea-shell-control-bridge: {err}");
             ExitCode::FAILURE
@@ -16,7 +45,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<u32, String> {
     let mut args = env::args().skip(1);
     let op = args.next().ok_or_else(usage)?;
     let payload = args.next().ok_or_else(usage)?;
@@ -24,38 +53,45 @@ fn run() -> Result<(), String> {
         return Err(usage());
     }
 
-    let launch_args = match op.as_str() {
-        "launch-desktop" => {
-            validate_desktop_id(&payload)?;
-            vec!["--desktop".to_string(), payload]
-        }
-        "launch-argv-json" => {
-            validate_argv_json(&payload)?;
-            vec!["--argv-json".to_string(), payload]
-        }
+    match op.as_str() {
+        "launch-desktop" | "--desktop" => validate_desktop_id(&payload)?,
+        "launch-argv-json" | "--argv-json" => validate_argv_json(&payload)?,
         _ => return Err(usage()),
-    };
-
-    let mut command = Command::new(find_astrea_launch());
-    command
-        .args(launch_args)
-        .env("ASTREA_LAUNCH_BYPASS_DAEMON", "1")
-        .env("ASTREA_LAUNCH_FORCE_DIRECT", "1")
-        .env("ASTREA_COMPOSITOR", "TYPHON")
-        .env("XDG_CURRENT_DESKTOP", "Astrea")
-        .env("XDG_SESSION_DESKTOP", "Astrea")
-        .env("XDG_SESSION_TYPE", "wayland")
-        .env("DESKTOP_SESSION", "Astrea")
-        .env_remove("DISPLAY")
-        .env_remove("HYPRLAND_INSTANCE_SIGNATURE")
-        .stdin(Stdio::null());
-    let status = command
-        .status()
-        .map_err(|err| format!("failed to run astrea-launch: {err}"))?;
-    if !status.success() {
-        return Err(format!("astrea-launch exited with {status}"));
     }
-    Ok(())
+
+    let connection =
+        Connection::connect_to_env().map_err(|err| format!("connect failed: {err}"))?;
+    let (globals, mut queue) = registry_queue_init::<BridgeState>(&connection)
+        .map_err(|err| format!("registry failed: {err}"))?;
+    let qh = queue.handle();
+    let manager: astrea_shell_control_manager_v1::AstreaShellControlManagerV1 = globals
+        .bind(&qh, 1..=1, ())
+        .map_err(|err| format!("shell-control global unavailable: {err}"))?;
+    match op.as_str() {
+        "launch-desktop" | "--desktop" => {
+            let _request = manager.launch_desktop(payload, &qh, ());
+        }
+        "launch-argv-json" | "--argv-json" => {
+            let _request = manager.launch_argv_json(payload, &qh, ());
+        }
+        _ => unreachable!(),
+    }
+    connection
+        .flush()
+        .map_err(|err| format!("flush failed: {err}"))?;
+
+    let mut state = BridgeState::default();
+    while !state.done {
+        queue
+            .blocking_dispatch(&mut state)
+            .map_err(|err| format!("dispatch failed: {err}"))?;
+        connection
+            .flush()
+            .map_err(|err| format!("flush failed: {err}"))?;
+    }
+    state
+        .accepted_pid
+        .ok_or_else(|| state.error.unwrap_or_else(|| "request failed".to_string()))
 }
 
 fn usage() -> String {
@@ -73,8 +109,8 @@ fn validate_desktop_id(value: &str) -> Result<(), String> {
     if value.bytes().any(|byte| byte == 0) {
         return Err("desktop id contains NUL".to_string());
     }
-    if value.contains('/') || value.contains('\\') {
-        return Err("desktop id must not contain path separators".to_string());
+    if value.contains('/') || value.contains('\\') || value.contains("..") {
+        return Err("desktop id must not be a path".to_string());
     }
     if !value
         .chars()
@@ -103,14 +139,52 @@ fn validate_argv_json(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn find_astrea_launch() -> String {
-    if let Ok(root) = env::var("ASTREA_ROOT") {
-        let candidate = std::path::Path::new(&root)
-            .join("bin")
-            .join("astrea-launch");
-        if candidate.is_file() {
-            return candidate.to_string_lossy().into_owned();
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for BridgeState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_registry::WlRegistry,
+        _event: wl_registry::Event,
+        _data: &GlobalListContents,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<astrea_shell_control_manager_v1::AstreaShellControlManagerV1, ()> for BridgeState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &astrea_shell_control_manager_v1::AstreaShellControlManagerV1,
+        _event: astrea_shell_control_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<astrea_launch_request_v1::AstreaLaunchRequestV1, ()> for BridgeState {
+    fn event(
+        state: &mut Self,
+        _proxy: &astrea_launch_request_v1::AstreaLaunchRequestV1,
+        event: astrea_launch_request_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            astrea_launch_request_v1::Event::Accepted { pid } => {
+                state.accepted_pid = Some(pid);
+                state.done = true;
+            }
+            astrea_launch_request_v1::Event::Failed { code, message } => {
+                state.error = Some(format!("request failed ({code}): {message}"));
+                state.done = true;
+            }
+            astrea_launch_request_v1::Event::Finished { status } => {
+                state.error = Some(format!("child exited before mapping a surface: {status}"));
+                state.done = true;
+            }
         }
     }
-    "astrea-launch".to_string()
 }

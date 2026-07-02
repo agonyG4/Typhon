@@ -349,6 +349,11 @@ impl NativeSeatSession {
         inner.seat.dispatch(0).map(|_| ()).map_err(io::Error::from)
     }
 
+    pub(crate) fn switch_session(&self, session: i32) -> io::Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.seat.switch_session(session).map_err(io::Error::from)
+    }
+
     pub(crate) fn wait_for_activation(&self) -> io::Result<()> {
         for _ in 0..10 {
             if self.active.get() {
@@ -778,6 +783,7 @@ pub(crate) fn apply_native_input_effect(
     resize_perf: &mut NativeResizePerfState,
     cursor_mode: NativeCursorRenderMode,
     app_gpu_policy: EffectiveCompositorAppGpuPolicy,
+    seat_session: Option<&NativeSeatSession>,
 ) -> NativeResult<NativeInputApplication> {
     let mut application = NativeInputApplication {
         redraw_requested: effect.requires_frame_repaint(cursor_mode),
@@ -831,6 +837,14 @@ pub(crate) fn apply_native_input_effect(
                 NativePerfField::str("name", shortcut.name),
                 NativePerfField::usize("clients", dispatched),
             ]
+        });
+    }
+    if let Some(vt) = effect.vt_switch
+        && let Some(session) = seat_session
+    {
+        session.switch_session(i32::from(vt))?;
+        perf.log("vt.switch", || {
+            vec![NativePerfField::u64("vt", u64::from(vt))]
         });
     }
     if let Some(command) = effect.launch_command {

@@ -228,6 +228,21 @@ fn native_input_session_switch_shortcuts_launch_exact_configured_command() {
 }
 
 #[test]
+fn native_input_ctrl_alt_function_key_requests_vt_switch_without_shell_command() {
+    let mut input = NativeInputState::new(320, 200);
+    input.handle_key_event(KEY_LEFTCTRL, 1);
+    input.handle_key_event(KEY_LEFTALT, 1);
+
+    let switch = input.handle_key_event(KEY_F2, 1);
+    let f2_after_reset = input.handle_key_event(KEY_F2, 0);
+
+    assert_eq!(switch.vt_switch, Some(2));
+    assert!(switch.launch_command.is_none());
+    assert!(switch.keyboard_events.is_empty());
+    assert!(f2_after_reset.keyboard_events.is_empty());
+}
+
+#[test]
 fn native_input_ctrl_c_is_forwarded_to_clients() {
     let mut input = NativeInputState::new(320, 200);
 

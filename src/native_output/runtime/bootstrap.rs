@@ -352,6 +352,7 @@ impl NativeRuntime {
             cursor_render_mode,
             hardware_cursor,
             input_devices,
+            seat_session,
             acquire_notifier,
             acquire_watches,
             event_loop,

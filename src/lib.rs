@@ -1,3 +1,4 @@
+pub mod astrea_shell_control;
 pub mod astrea_shortcuts;
 pub mod compositor;
 pub mod core;
@@ -424,13 +425,9 @@ mod tests {
             env.get("XDG_SESSION_TYPE").and_then(Option::as_deref),
             Some("wayland")
         );
-        assert_eq!(
-            env.get("MOZ_ENABLE_WAYLAND").and_then(Option::as_deref),
-            Some("1")
-        );
+        assert!(!env.contains_key("MOZ_ENABLE_WAYLAND"));
         for key in [
             "WAYLAND_SOCKET",
-            "DBUS_SESSION_BUS_ADDRESS",
             "DESKTOP_STARTUP_ID",
             "GIO_LAUNCHED_DESKTOP_FILE",
             "GIO_LAUNCHED_DESKTOP_FILE_PID",
@@ -440,6 +437,11 @@ mod tests {
         ] {
             assert_eq!(env.get(key), Some(&None), "{key} should be removed");
         }
+        assert_eq!(
+            env.get("DBUS_SESSION_BUS_ADDRESS")
+                .and_then(Option::as_deref),
+            Some("unix:path=/run/user/1000/bus")
+        );
         assert!(
             env.get("XDG_DESKTOP_PORTAL_DIR")
                 .and_then(Option::as_deref)
@@ -466,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn compositor_app_env_disables_host_portal_accessibility_gvfs_and_lsfg_noise() {
+    fn compositor_app_env_preserves_portals_and_disables_accessibility_gvfs_and_lsfg_noise() {
         let launch_env = CompositorAppEnvironment::wayland_only("oblivion-one-test");
         let mut command = Command::new("true");
         command.env("GTK_USE_PORTAL", "1");
@@ -484,16 +486,10 @@ mod tests {
 
         assert_eq!(
             env.get("GTK_USE_PORTAL").and_then(Option::as_deref),
-            Some("0")
-        );
-        assert_eq!(
-            env.get("QT_NO_USE_PORTAL").and_then(Option::as_deref),
             Some("1")
         );
-        assert_eq!(
-            env.get("GIO_USE_PORTALS").and_then(Option::as_deref),
-            Some("0")
-        );
+        assert_eq!(env.get("QT_NO_USE_PORTAL").and_then(Option::as_deref), None);
+        assert_eq!(env.get("GIO_USE_PORTALS").and_then(Option::as_deref), None);
         assert_eq!(env.get("GTK_A11Y").and_then(Option::as_deref), Some("none"));
         assert_eq!(
             env.get("NO_AT_BRIDGE").and_then(Option::as_deref),
@@ -514,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn compositor_app_spawn_wraps_apps_in_a_private_dbus_session() {
+    fn compositor_app_spawn_private_dbus_is_diagnostic_only() {
         let app = vec!["kitty".to_string()];
 
         let argv = compositor_app_spawn_argv(&app, true).unwrap();
@@ -538,61 +534,70 @@ mod tests {
     }
 
     #[test]
-    fn compositor_app_spawn_isolates_firefox_profiles() {
-        let app = vec!["firefox".to_string()];
+    fn desktop_entry_exec_removes_field_codes_without_browser_mutation() {
+        let entry = "[Desktop Entry]\nType=Application\nName=Zen\nExec=zen-browser %U\n";
 
-        let argv = compositor_app_spawn_argv(&app, true).unwrap();
-        let joined = argv.join(" ");
+        let launch = parse_desktop_entry(entry, None).unwrap();
 
-        assert_eq!(argv.first().map(String::as_str), Some("dbus-run-session"));
-        assert!(joined.contains("--no-remote"));
-        assert!(joined.contains("--profile"));
-        assert!(joined.contains("oblivion-one/app-profiles/firefox"));
+        assert_eq!(launch.argv, vec!["zen-browser"]);
     }
 
     #[test]
-    fn cpu_compositor_app_spawn_can_force_zen_isolated_for_diagnostics() {
+    fn desktop_entry_exec_preserves_explicit_user_arguments() {
+        let entry = "[Desktop Entry]\nType=Application\nName=Firefox\nExec=firefox --new-window \"about:blank\" %%\n";
+
+        let launch = parse_desktop_entry(entry, None).unwrap();
+
+        assert_eq!(
+            launch.argv,
+            vec!["firefox", "--new-window", "about:blank", "%"]
+        );
+    }
+
+    #[test]
+    fn compositor_app_spawn_isolates_firefox_profiles() {
+        let app = vec!["firefox".to_string()];
+
+        let argv = compositor_app_spawn_argv(&app, false).unwrap();
+
+        assert_eq!(argv, vec!["firefox"]);
+    }
+
+    #[test]
+    fn cpu_compositor_app_spawn_preserves_explicit_user_zen_args() {
         let app = vec![
             "/opt/zen-browser-bin/zen-bin".to_string(),
             "--profile".to_string(),
             "/tmp/zen".to_string(),
         ];
 
-        let argv = compositor_cpu_app_spawn_argv(&app, true).unwrap();
+        let argv = compositor_cpu_app_spawn_argv(&app, false).unwrap();
         let joined = argv.join(" ");
 
-        assert_eq!(argv.first().map(String::as_str), Some("dbus-run-session"));
+        assert_eq!(
+            argv.first().map(String::as_str),
+            Some("/opt/zen-browser-bin/zen-bin")
+        );
         assert!(joined.contains("--profile /tmp/zen"));
         assert!(!joined.contains("oblivion-one/app-profiles/zen-bin"));
     }
 
     #[test]
-    fn compositor_app_spawn_isolates_chromium_browser_profiles() {
+    fn compositor_app_spawn_preserves_chromium_argv_too() {
         let app = vec!["brave".to_string(), "%U".to_string()];
 
-        let argv = compositor_app_spawn_argv(&app, true).unwrap();
-        let joined = argv.join(" ");
+        let argv = compositor_app_spawn_argv(&app, false).unwrap();
 
-        assert_eq!(argv.first().map(String::as_str), Some("dbus-run-session"));
-        assert!(joined.contains("--user-data-dir="));
-        assert!(joined.contains("oblivion-one/app-profiles/brave"));
-        assert!(!joined.contains("%U"));
+        assert_eq!(argv, vec!["brave"]);
     }
 
     #[test]
-    fn cpu_compositor_chromium_args_disable_gpu_buffer_paths() {
+    fn cpu_compositor_spawn_does_not_rewrite_browser_argv() {
         let app = vec!["brave".to_string(), "%U".to_string()];
 
-        let argv = compositor_cpu_app_spawn_argv(&app, true).unwrap();
-        let joined = argv.join(" ");
+        let argv = compositor_cpu_app_spawn_argv(&app, false).unwrap();
 
-        assert!(joined.contains("--user-data-dir="));
-        assert!(joined.contains("--ozone-platform=wayland"));
-        assert!(joined.contains("--disable-gpu"));
-        assert!(joined.contains("--disable-gpu-compositing"));
-        assert!(joined.contains("--disable-zero-copy"));
-        assert!(!joined.contains("--use-gl=egl-angle"));
-        assert!(!joined.contains("%U"));
+        assert_eq!(argv, vec!["brave"]);
     }
 
     #[test]
@@ -656,10 +661,7 @@ mod tests {
                 .and_then(Option::as_deref),
             Some("1")
         );
-        assert_eq!(
-            env.get("MOZ_WEBRENDER_SOFTWARE").and_then(Option::as_deref),
-            Some("1")
-        );
+        assert!(!env.contains_key("MOZ_WEBRENDER_SOFTWARE"));
         assert_eq!(
             env.get("WEBKIT_DISABLE_DMABUF_RENDERER")
                 .and_then(Option::as_deref),

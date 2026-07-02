@@ -18,8 +18,18 @@ pub(crate) const KEY_C: u16 = 46;
 pub(crate) const KEY_RIGHTSHIFT: u16 = 54;
 pub(crate) const KEY_LEFTALT: u16 = 56;
 pub(crate) const KEY_SPACE: u16 = 57;
-#[cfg(test)]
+pub(crate) const KEY_F1: u16 = 59;
+pub(crate) const KEY_F2: u16 = 60;
+pub(crate) const KEY_F3: u16 = 61;
+pub(crate) const KEY_F4: u16 = 62;
+pub(crate) const KEY_F5: u16 = 63;
+pub(crate) const KEY_F6: u16 = 64;
+pub(crate) const KEY_F7: u16 = 65;
+pub(crate) const KEY_F8: u16 = 66;
+pub(crate) const KEY_F9: u16 = 67;
+pub(crate) const KEY_F10: u16 = 68;
 pub(crate) const KEY_F11: u16 = 87;
+pub(crate) const KEY_F12: u16 = 88;
 pub(crate) const KEY_RIGHTCTRL: u16 = 97;
 pub(crate) const KEY_RIGHTALT: u16 = 100;
 pub(crate) const KEY_LEFTMETA: u16 = 125;
@@ -259,6 +269,7 @@ pub(crate) struct NativeInputEffect {
     pub(crate) shortcut_events: Vec<AstreaShortcutEvent>,
     pub(crate) launch_command: Option<Vec<String>>,
     pub(crate) launch_source: Option<NativeLaunchSource>,
+    pub(crate) vt_switch: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

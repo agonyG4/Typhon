@@ -18,6 +18,7 @@ pub(crate) struct NativeInputState {
     pub(crate) forwarded_control_keys: Vec<u16>,
     pub(crate) pressed_deferred_modifier_keys: Vec<u16>,
     pub(crate) forwarded_deferred_modifier_keys: Vec<u16>,
+    pub(crate) suppressed_vt_switch_keys: Vec<u16>,
 }
 
 impl NativeInputState {
@@ -39,6 +40,7 @@ impl NativeInputState {
             forwarded_control_keys: Vec::new(),
             pressed_deferred_modifier_keys: Vec::new(),
             forwarded_deferred_modifier_keys: Vec::new(),
+            suppressed_vt_switch_keys: Vec::new(),
         }
     }
 
@@ -134,6 +136,10 @@ impl NativeInputState {
         let repeated = value == 2;
         let mut effect = NativeInputEffect::default();
 
+        if !pressed && self.release_suppressed_vt_switch_key(code) {
+            return effect;
+        }
+
         if is_shift_key(code) {
             self.shift_pressed = pressed;
             if !pressed
@@ -225,6 +231,18 @@ impl NativeInputState {
                     .push(NativeKeyboardEvent::new(code, false));
                 effect.request_redraw();
             }
+            return effect;
+        }
+
+        if pressed
+            && !repeated
+            && self.ctrl_pressed
+            && self.alt_pressed
+            && let Some(vt) = vt_number_for_function_key(code)
+        {
+            effect.vt_switch = Some(vt);
+            self.suppress_vt_switch_key(code);
+            self.clear_pressed_state_for_session_switch();
             return effect;
         }
 
@@ -461,6 +479,24 @@ impl NativeInputState {
         true
     }
 
+    fn suppress_vt_switch_key(&mut self, code: u16) {
+        if !self.suppressed_vt_switch_keys.contains(&code) {
+            self.suppressed_vt_switch_keys.push(code);
+        }
+    }
+
+    fn release_suppressed_vt_switch_key(&mut self, code: u16) -> bool {
+        let Some(index) = self
+            .suppressed_vt_switch_keys
+            .iter()
+            .position(|suppressed| *suppressed == code)
+        else {
+            return false;
+        };
+        self.suppressed_vt_switch_keys.swap_remove(index);
+        true
+    }
+
     fn replay_deferred_modifiers(&mut self, effect: &mut NativeInputEffect) {
         for code in self.pressed_deferred_modifier_keys.clone() {
             self.forward_deferred_modifier_key(code, effect);
@@ -541,6 +577,18 @@ impl NativeInputState {
             }
         }
     }
+
+    pub(crate) fn clear_pressed_state_for_session_switch(&mut self) {
+        self.alt_pressed = false;
+        self.ctrl_pressed = false;
+        self.super_pressed = false;
+        self.shift_pressed = false;
+        self.window_interaction_active = false;
+        self.forwarded_control_keys.clear();
+        self.pressed_deferred_modifier_keys.clear();
+        self.forwarded_deferred_modifier_keys.clear();
+        self.pointer_constraint = NativePointerConstraintState::None;
+    }
 }
 
 pub(crate) fn is_shift_key(code: u16) -> bool {
@@ -561,4 +609,22 @@ pub(crate) fn is_control_key(code: u16) -> bool {
 
 pub(crate) fn is_pointer_button(code: u16) -> bool {
     matches!(code, BTN_LEFT | BTN_RIGHT | BTN_MIDDLE)
+}
+
+pub(crate) const fn vt_number_for_function_key(code: u16) -> Option<u8> {
+    match code {
+        KEY_F1 => Some(1),
+        KEY_F2 => Some(2),
+        KEY_F3 => Some(3),
+        KEY_F4 => Some(4),
+        KEY_F5 => Some(5),
+        KEY_F6 => Some(6),
+        KEY_F7 => Some(7),
+        KEY_F8 => Some(8),
+        KEY_F9 => Some(9),
+        KEY_F10 => Some(10),
+        KEY_F11 => Some(11),
+        KEY_F12 => Some(12),
+        _ => None,
+    }
 }

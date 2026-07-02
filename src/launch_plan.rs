@@ -172,7 +172,6 @@ env = QT_QPA_PLATFORM,wayland
 env = SDL_VIDEODRIVER,wayland
 env = CLUTTER_BACKEND,wayland
 env = ELECTRON_OZONE_PLATFORM_HINT,wayland
-env = MOZ_ENABLE_WAYLAND,1
 env = OBLIVION_ONE_DE,1
 
 exec-once = {exec_command}

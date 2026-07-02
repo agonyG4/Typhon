@@ -347,3 +347,36 @@ fn committed_surfaces_from_distinct_clients_are_tracked_separately() {
 
     assert_eq!(count, 2);
 }
+
+#[test]
+fn abrupt_client_disconnect_removes_mapped_toplevel_surface() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    server.enable_cleanup_live_disconnected_test_clients();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let client = LiveTestClient::connect(&socket_path).unwrap();
+    let surface = client
+        .create_toplevel_surface("oblivion.disconnect-test", 64, 48)
+        .unwrap();
+    let surface_id = surface.id().protocol_id();
+    wait_for_server_commands(&commands);
+    assert_eq!(capture_renderable_surface_count(&commands), 1);
+    assert!(
+        capture_xdg_role_snapshot(&commands, surface_id).toplevel_registered,
+        "mapped toplevel should be registered before disconnect"
+    );
+
+    drop(surface);
+    drop(client);
+    thread::sleep(Duration::from_millis(20));
+    wait_for_server_commands(&commands);
+
+    assert_eq!(capture_renderable_surface_count(&commands), 0);
+    assert!(!capture_xdg_role_snapshot(&commands, surface_id).surface_registered);
+    assert!(!capture_xdg_role_snapshot(&commands, surface_id).toplevel_registered);
+    assert_eq!(capture_focused_surface_id(&commands), None);
+
+    stop_controllable_test_server(commands, server_thread);
+}

@@ -205,3 +205,24 @@ fn astrea_shell_shortcuts_allow_authorized_shell_descendant_pid() {
         Some,
     ));
 }
+
+#[test]
+fn astrea_shell_shortcuts_allow_authorized_shell_uid_when_process_is_reparented() {
+    let authorized_pids = HashSet::new();
+    let authorized_uids = HashSet::from([1000]);
+
+    assert!(astrea_shell_identity_is_authorized_with_lookup(
+        30,
+        1000,
+        &authorized_pids,
+        &authorized_uids,
+        |_| None,
+    ));
+    assert!(!astrea_shell_identity_is_authorized_with_lookup(
+        30,
+        1001,
+        &authorized_pids,
+        &authorized_uids,
+        |_| None,
+    ));
+}

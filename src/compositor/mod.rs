@@ -436,6 +436,22 @@ pub struct ClientCursorRenderState<'a> {
     pub logical_y: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(in crate::compositor) enum SurfaceTeardownReason {
+    ExplicitDestroy,
+    ClientDisconnected,
+    ProtocolError,
+    RoleDestroyed,
+    CompositorShutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) struct SurfaceTeardownResult {
+    pub removed_resource: bool,
+    pub removed_renderables: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct CompositorState {
     pub accepted_clients: usize,
@@ -478,6 +494,7 @@ pub struct CompositorState {
     pointer_entered_surfaces: Vec<(wl_pointer::WlPointer, wl_surface::WlSurface)>,
     pointer_enter_serials: Vec<PointerEnterSerial>,
     surface_roles: HashMap<u32, SurfaceRole>,
+    surface_client_ids: HashMap<u32, ClientId>,
     cursor_surface_ids: HashSet<u32>,
     active_client_cursor: Option<ActiveClientCursor>,
     client_cursor_surfaces: HashMap<u32, RenderableSurface>,
@@ -559,6 +576,8 @@ pub struct CompositorState {
     pending_color_info: Vec<color::PendingColorInfo>,
     astrea_shortcuts: Vec<AstreaShortcutRegistration>,
     astrea_shell_client_pids: HashSet<u32>,
+    astrea_shell_client_uids: HashSet<u32>,
+    typhon_socket_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]

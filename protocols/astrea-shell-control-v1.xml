@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="astrea_shell_control_v1">
+  <copyright>
+    Copyright 2026 Astrea
+  </copyright>
+
+  <interface name="astrea_shell_control_manager_v1" version="1">
+    <enum name="error">
+      <entry name="unauthorized" value="0"/>
+      <entry name="invalid_desktop_id" value="1"/>
+      <entry name="invalid_argv_json" value="2"/>
+    </enum>
+
+    <request name="launch_desktop">
+      <arg name="request" type="new_id" interface="astrea_launch_request_v1"/>
+      <arg name="desktop_id" type="string"/>
+    </request>
+
+    <request name="launch_argv_json">
+      <arg name="request" type="new_id" interface="astrea_launch_request_v1"/>
+      <arg name="argv_json" type="string"/>
+    </request>
+
+    <request name="destroy" type="destructor"/>
+  </interface>
+
+  <interface name="astrea_launch_request_v1" version="1">
+    <event name="accepted">
+      <arg name="pid" type="uint"/>
+    </event>
+
+    <event name="failed">
+      <arg name="code" type="uint"/>
+      <arg name="message" type="string"/>
+    </event>
+
+    <event name="finished">
+      <arg name="status" type="int"/>
+    </event>
+
+    <request name="destroy" type="destructor"/>
+  </interface>
+</protocol>

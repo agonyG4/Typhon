@@ -848,6 +848,38 @@ impl CompositorState {
         self.surface_resources.entry(surface_id).or_insert(surface);
     }
 
+    pub(in crate::compositor) fn register_surface_client(
+        &mut self,
+        surface_id: u32,
+        client_id: ClientId,
+    ) {
+        self.surface_client_ids
+            .entry(surface_id)
+            .or_insert(client_id);
+    }
+
+    pub(in crate::compositor) fn teardown_surfaces_for_client(
+        &mut self,
+        client_id: &ClientId,
+    ) -> usize {
+        let mut surface_ids = self
+            .surface_client_ids
+            .iter()
+            .filter_map(|(surface_id, owner)| (owner == client_id).then_some(*surface_id))
+            .collect::<Vec<_>>();
+        surface_ids.sort_unstable();
+        surface_ids.dedup();
+        let mut removed = 0usize;
+        for surface_id in surface_ids {
+            let result = self
+                .teardown_surface_resource(surface_id, SurfaceTeardownReason::ClientDisconnected);
+            if result.removed_resource || result.removed_renderables > 0 {
+                removed = removed.saturating_add(1);
+            }
+        }
+        removed
+    }
+
     pub(in crate::compositor) fn register_output_resource(&mut self, output: wl_output::WlOutput) {
         if self
             .output_resources
@@ -973,6 +1005,31 @@ impl CompositorState {
         }
     }
 
+    pub(in crate::compositor) fn teardown_surface_resource(
+        &mut self,
+        surface_id: u32,
+        reason: SurfaceTeardownReason,
+    ) -> SurfaceTeardownResult {
+        let resource_known = self.surface_resources.contains_key(&surface_id)
+            || self
+                .renderable_surfaces
+                .iter()
+                .any(|surface| surface.surface_id == surface_id);
+        let before = self.renderable_surfaces.len();
+        self.unregister_surface_resource(surface_id);
+        let removed = before.saturating_sub(self.renderable_surfaces.len());
+        if compositor_debug_surface_logging_enabled() {
+            eprintln!(
+                "oblivion-one compositor: surface_teardown surface={} reason={:?} known={} removed_renderables={}",
+                surface_id, reason, resource_known, removed
+            );
+        }
+        SurfaceTeardownResult {
+            removed_resource: resource_known,
+            removed_renderables: removed,
+        }
+    }
+
     pub(in crate::compositor) fn unregister_surface_resource(&mut self, surface_id: u32) {
         self.surface_damage_journals.remove(&surface_id);
         self.presented_surface_commits.remove(&surface_id);
@@ -998,6 +1055,7 @@ impl CompositorState {
         self.release_cached_subsurface_commits(cached);
         self.cleanup_subsurface_stack_state_for_surface(surface_id);
         self.surface_resources.remove(&surface_id);
+        self.surface_client_ids.remove(&surface_id);
         self.clear_surface_role(surface_id);
         self.cursor_surface_ids.remove(&surface_id);
         let removed_cursor_content = self.client_cursor_surfaces.remove(&surface_id).is_some();

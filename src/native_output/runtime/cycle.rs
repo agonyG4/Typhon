@@ -61,6 +61,7 @@ impl NativeRuntime {
             cursor_render_mode,
             hardware_cursor,
             input_devices,
+            seat_session: _,
             acquire_notifier,
             acquire_watches,
             event_loop,
@@ -262,6 +263,7 @@ impl NativeRuntime {
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
+            seat_session,
             shutdown_state,
         } = self;
         let present_us = 0;
@@ -361,6 +363,7 @@ impl NativeRuntime {
                 resize_perf,
                 *cursor_render_mode,
                 *effective_app_gpu_policy,
+                seat_session.as_ref(),
             )?;
             if application.exit_requested {
                 if !shutdown_state.request() {
@@ -507,6 +510,7 @@ impl NativeRuntime {
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
+            seat_session: _,
             shutdown_state: _,
         } = self;
         let acquire_changes = server.take_acquire_watch_changes();

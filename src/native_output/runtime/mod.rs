@@ -59,6 +59,7 @@ pub(crate) struct NativeRuntime {
     cursor_render_mode: NativeCursorRenderMode,
     hardware_cursor: Option<NativeHardwareCursor>,
     input_devices: NativeInputBackend,
+    seat_session: Option<NativeSeatSession>,
     acquire_notifier: DrmAcquirePointNotifier,
     acquire_watches: ExplicitSyncWatchRegistry,
     event_loop: NativeEventLoop,

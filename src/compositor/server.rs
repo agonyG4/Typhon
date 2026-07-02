@@ -1,7 +1,8 @@
 use std::{
+    collections::HashMap,
     fmt, io,
     os::fd::{AsFd, BorrowedFd},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use wayland_protocols::ext::data_control::v1::server::ext_data_control_manager_v1;
@@ -23,11 +24,13 @@ use wayland_protocols::xdg::{
 use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1;
 use wayland_server::{
     Display, DisplayHandle, ListeningSocket,
+    backend::{ClientData, ClientId, DisconnectReason},
     protocol::{
         wl_compositor, wl_data_device_manager, wl_output, wl_seat, wl_shm, wl_subcompositor,
     },
 };
 
+use crate::astrea_shell_control::server::astrea_shell_control_manager_v1;
 use crate::astrea_shortcuts::server::astrea_shortcuts_manager_v1;
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
@@ -47,7 +50,36 @@ pub struct OwnCompositorServer {
     pub(super) socket: ListeningSocket,
     pub(super) socket_name: String,
     pub(super) state: CompositorState,
+    disconnected_clients: Arc<Mutex<Vec<DisconnectedClient>>>,
+    client_pids: Arc<Mutex<HashMap<ClientId, i32>>>,
+    #[cfg(test)]
+    cleanup_live_disconnected_test_clients: bool,
     gpu_buffer_protocols_enabled: bool,
+}
+
+#[derive(Debug)]
+struct TyphonClientData {
+    disconnected_clients: Arc<Mutex<Vec<DisconnectedClient>>>,
+    client_pids: Arc<Mutex<HashMap<ClientId, i32>>>,
+}
+
+#[derive(Debug, Clone)]
+struct DisconnectedClient {
+    client_id: ClientId,
+    pid: Option<i32>,
+}
+
+impl ClientData for TyphonClientData {
+    fn disconnected(&self, client_id: ClientId, _reason: DisconnectReason) {
+        let pid = self
+            .client_pids
+            .lock()
+            .ok()
+            .and_then(|mut pids| pids.remove(&client_id));
+        if let Ok(mut clients) = self.disconnected_clients.lock() {
+            clients.push(DisconnectedClient { client_id, pid });
+        }
+    }
 }
 
 impl Drop for OwnCompositorServer {
@@ -170,11 +202,19 @@ impl OwnCompositorServer {
         let socket = ListeningSocket::bind(&socket_name)
             .map_err(|error| CompositorError::Bind(error.to_string()))?;
 
+        let mut state = CompositorState::new(syncobj_device);
+        state.set_typhon_socket_name(socket_name.clone());
+        let disconnected_clients = Arc::new(Mutex::new(Vec::new()));
+        let client_pids = Arc::new(Mutex::new(HashMap::new()));
         Ok(Self {
             display,
             socket,
             socket_name,
-            state: CompositorState::new(syncobj_device),
+            state,
+            disconnected_clients,
+            client_pids,
+            #[cfg(test)]
+            cleanup_live_disconnected_test_clients: false,
             gpu_buffer_protocols_enabled: gpu_buffers_enabled,
         })
     }
@@ -185,6 +225,11 @@ impl OwnCompositorServer {
         }
         register_gpu_buffer_globals(&self.display.handle(), self.state.syncobj_device.is_some());
         self.gpu_buffer_protocols_enabled = true;
+    }
+
+    #[cfg(test)]
+    pub(super) fn enable_cleanup_live_disconnected_test_clients(&mut self) {
+        self.cleanup_live_disconnected_test_clients = true;
     }
 
     #[doc(hidden)]
@@ -542,7 +587,18 @@ impl OwnCompositorServer {
         let mut accepted = 0;
         while let Some(stream) = self.socket.accept()? {
             let mut handle = self.display.handle();
-            handle.insert_client(stream, Arc::new(()))?;
+            let client = handle.insert_client(
+                stream,
+                Arc::new(TyphonClientData {
+                    disconnected_clients: self.disconnected_clients.clone(),
+                    client_pids: self.client_pids.clone(),
+                }),
+            )?;
+            if let Ok(credentials) = client.get_credentials(&handle)
+                && let Ok(mut client_pids) = self.client_pids.lock()
+            {
+                client_pids.insert(client.id(), credentials.pid);
+            }
             accepted += 1;
         }
 
@@ -551,11 +607,59 @@ impl OwnCompositorServer {
         self.state.begin_client_dispatch_cycle();
         self.display.dispatch_clients(&mut self.state)?;
         self.state.finish_client_dispatch_cycle();
+        self.teardown_disconnected_clients();
         self.state.clear_dead_active_clipboard_source();
         self.state.poll_clipboard_bridge();
         self.display.flush_clients()?;
         Ok(accepted)
     }
+
+    fn teardown_disconnected_clients(&mut self) {
+        let disconnected = self
+            .disconnected_clients
+            .lock()
+            .map(|mut clients| std::mem::take(&mut *clients))
+            .unwrap_or_default();
+        let mut still_alive = Vec::new();
+        for disconnected in disconnected {
+            if self.should_teardown_disconnected_client(disconnected.pid) {
+                self.state
+                    .teardown_surfaces_for_client(&disconnected.client_id);
+            } else {
+                still_alive.push(disconnected);
+            }
+        }
+        if !still_alive.is_empty()
+            && let Ok(mut clients) = self.disconnected_clients.lock()
+        {
+            clients.extend(still_alive);
+        }
+    }
+
+    fn should_teardown_disconnected_client(&self, pid: Option<i32>) -> bool {
+        #[cfg(test)]
+        if self.cleanup_live_disconnected_test_clients {
+            return true;
+        }
+        pid.is_none_or(|pid| !process_is_alive(pid))
+    }
+}
+
+fn process_is_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let stat_path = std::path::Path::new("/proc")
+        .join(pid.to_string())
+        .join("stat");
+    let Ok(stat) = std::fs::read_to_string(stat_path) else {
+        return false;
+    };
+    let Some(comm_end) = stat.rfind(')') else {
+        return true;
+    };
+    let state = stat[comm_end.saturating_add(2)..].split_whitespace().next();
+    !matches!(state, Some("Z" | "X" | "x"))
 }
 
 fn register_minimum_globals(
@@ -638,6 +742,11 @@ fn register_minimum_globals(
             1,
             (),
         );
+    display.create_global::<
+        CompositorState,
+        astrea_shell_control_manager_v1::AstreaShellControlManagerV1,
+        _,
+    >(1, ());
     display.create_global::<CompositorState, xdg_wm_base::XdgWmBase, _>(6, ());
     display.create_global::<CompositorState, wl_output::WlOutput, _>(4, ());
     display.create_global::<CompositorState, wl_seat::WlSeat, _>(7, ());

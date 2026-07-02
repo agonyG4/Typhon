@@ -23,7 +23,9 @@ use wayland_client::{
 };
 
 #[derive(Default)]
-struct BridgeState;
+struct BridgeState {
+    rejected: bool,
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -43,16 +45,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _shortcut = manager.register_shortcut(namespace, name, description, &qh, ());
     connection.flush()?;
 
-    let mut state = BridgeState;
+    let mut state = BridgeState::default();
     loop {
         queue.blocking_dispatch(&mut state)?;
         connection.flush()?;
+        if state.rejected {
+            return Err("shortcut registration was rejected by Typhon".into());
+        }
     }
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for BridgeState {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _proxy: &wl_registry::WlRegistry,
         _event: wl_registry::Event,
         _data: &GlobalListContents,
@@ -64,7 +69,7 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for BridgeState {
 
 impl Dispatch<astrea_shortcuts_manager_v1::AstreaShortcutsManagerV1, ()> for BridgeState {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _proxy: &astrea_shortcuts_manager_v1::AstreaShortcutsManagerV1,
         _event: astrea_shortcuts_manager_v1::Event,
         _data: &(),
@@ -76,7 +81,7 @@ impl Dispatch<astrea_shortcuts_manager_v1::AstreaShortcutsManagerV1, ()> for Bri
 
 impl Dispatch<astrea_shortcut_v1::AstreaShortcutV1, ()> for BridgeState {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _proxy: &astrea_shortcut_v1::AstreaShortcutV1,
         event: astrea_shortcut_v1::Event,
         _data: &(),
@@ -95,6 +100,11 @@ impl Dispatch<astrea_shortcut_v1::AstreaShortcutV1, ()> for BridgeState {
                 let _ = writeln!(stdout, "released {serial} {timestamp}");
             }
             astrea_shortcut_v1::Event::Cancelled { serial } => {
+                state.rejected = true;
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "cancelled {serial}: shortcut registration rejected"
+                );
                 let _ = writeln!(stdout, "cancelled {serial}");
             }
         }

@@ -92,42 +92,22 @@ impl EffectiveCompositorAppGpuPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BrowserProfilePolicy {
-    Normal,
-    Isolated,
-}
-
-impl BrowserProfilePolicy {
-    pub fn from_env_for_app(app_name: &str) -> Self {
-        match env::var("OBLIVION_ONE_BROWSER_PROFILE_POLICY")
-            .ok()
-            .as_deref()
-        {
-            Some("normal") => Self::Normal,
-            Some("isolated") => Self::Isolated,
-            _ if is_zen_browser(app_name) => Self::Normal,
-            _ => Self::Isolated,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppDbusPolicy {
     Session,
-    Private,
+    DiagnosticPrivate,
 }
 
 impl AppDbusPolicy {
     pub fn from_env() -> Self {
         match env::var("OBLIVION_ONE_APP_DBUS_POLICY").ok().as_deref() {
-            Some("private") => Self::Private,
+            Some("diagnostic-private") => Self::DiagnosticPrivate,
             Some("session") => Self::Session,
             _ => Self::Session,
         }
     }
 
     pub const fn private_dbus(self, dbus_run_session_available: bool) -> bool {
-        matches!(self, Self::Private) && dbus_run_session_available
+        matches!(self, Self::DiagnosticPrivate) && dbus_run_session_available
     }
 }
 
@@ -203,7 +183,6 @@ fn configure_compositor_app_command_with_environment_and_policy(
         installed_tool_path("astrea-shell-control-bridge"),
     );
     command.env("ELECTRON_OZONE_PLATFORM_HINT", "wayland");
-    command.env("MOZ_ENABLE_WAYLAND", "1");
     command.env("OBLIVION_ONE_DE", "1");
     if gpu_policy == EffectiveCompositorAppGpuPolicy::CpuOnly {
         apply_cpu_composition_app_runtime_guards(command);
@@ -258,7 +237,8 @@ fn compositor_app_spawn_argv_with_policy(
     if app.is_empty() {
         return None;
     }
-    let app = isolate_single_instance_app_argv(&app, gpu_policy);
+    let _ = gpu_policy;
+    let app = app.to_vec();
     Some(wrap_private_dbus_session(app, private_dbus))
 }
 
@@ -268,7 +248,6 @@ pub fn spawn_compositor_app(socket_name: &str, app: &[String]) -> io::Result<Opt
     let Some(argv) = compositor_app_spawn_argv(app, private_dbus) else {
         return Ok(None);
     };
-    ensure_compositor_app_profile_dirs(&argv)?;
     install_oblivion_portal_runtime()?;
     let Some((program, args)) = argv.split_first() else {
         return Ok(None);
@@ -287,7 +266,6 @@ pub fn spawn_cpu_compositor_app(socket_name: &str, app: &[String]) -> io::Result
     let Some(argv) = compositor_cpu_app_spawn_argv(app, private_dbus) else {
         return Ok(None);
     };
-    ensure_compositor_app_profile_dirs(&argv)?;
     install_oblivion_portal_runtime()?;
     let Some((program, args)) = argv.split_first() else {
         return Ok(None);
@@ -375,7 +353,6 @@ pub fn app_launch_env_for(
     env.insert("QT_QPA_PLATFORM".to_string(), "wayland".to_string());
     env.insert("SDL_VIDEODRIVER".to_string(), "wayland".to_string());
     env.insert("CLUTTER_BACKEND".to_string(), "wayland".to_string());
-    env.insert("MOZ_ENABLE_WAYLAND".to_string(), "1".to_string());
     env.insert(
         "ELECTRON_OZONE_PLATFORM_HINT".to_string(),
         "wayland".to_string(),
@@ -416,16 +393,16 @@ pub fn oblivion_app_state_dir(app_id: &str) -> std::path::PathBuf {
 fn remove_host_desktop_activation_environment(command: &mut Command) {
     for key in [
         "WAYLAND_SOCKET",
-        "DBUS_SESSION_BUS_ADDRESS",
-        "DBUS_STARTER_ADDRESS",
-        "DBUS_STARTER_BUS_TYPE",
+        "GAMESCOPE_WAYLAND_DISPLAY",
+        "DISPLAY",
         "DESKTOP_STARTUP_ID",
         "XDG_ACTIVATION_TOKEN",
         "GIO_LAUNCHED_DESKTOP_FILE",
         "GIO_LAUNCHED_DESKTOP_FILE_PID",
         "HYPRLAND_INSTANCE_SIGNATURE",
+        "SWAYSOCK",
+        "I3SOCK",
         "AT_SPI_BUS_ADDRESS",
-        "XDG_DESKTOP_PORTAL_DIR",
         "GTK_MODULES",
     ] {
         command.env_remove(key);
@@ -445,9 +422,6 @@ fn apply_nested_app_runtime_guards(command: &mut Command) {
             env::var("XDG_DATA_DIRS").ok().as_deref(),
         ),
     );
-    command.env("GTK_USE_PORTAL", "0");
-    command.env("GIO_USE_PORTALS", "0");
-    command.env("QT_NO_USE_PORTAL", "1");
     command.env("GTK_A11Y", "none");
     command.env("NO_AT_BRIDGE", "1");
     command.env("GIO_USE_VFS", "local");
@@ -466,7 +440,6 @@ fn install_oblivion_portal_runtime() -> io::Result<()> {
 
 fn apply_cpu_composition_app_runtime_guards(command: &mut Command) {
     command.env("OBLIVION_ONE_CPU_COMPOSITION", "1");
-    command.env("MOZ_WEBRENDER_SOFTWARE", "1");
     command.env("LIBGL_ALWAYS_SOFTWARE", "1");
     command.env("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     command.env("GSK_RENDERER", "cairo");
@@ -486,99 +459,6 @@ fn is_desktop_field_code_arg(arg: &str) -> bool {
     )
 }
 
-fn isolate_single_instance_app_argv(
-    app: &[String],
-    gpu_policy: EffectiveCompositorAppGpuPolicy,
-) -> Vec<String> {
-    let Some(program) = app.first() else {
-        return Vec::new();
-    };
-    let app_name = executable_name(program);
-    if is_gecko_browser(&app_name) {
-        return gecko_browser_argv(
-            app,
-            &app_name,
-            BrowserProfilePolicy::from_env_for_app(&app_name),
-        );
-    }
-    if is_chromium_browser(&app_name) {
-        return chromium_browser_argv(app, &app_name, gpu_policy);
-    }
-    app.to_vec()
-}
-
-fn gecko_browser_argv(
-    app: &[String],
-    app_name: &str,
-    profile_policy: BrowserProfilePolicy,
-) -> Vec<String> {
-    if profile_policy == BrowserProfilePolicy::Normal {
-        return app.to_vec();
-    }
-    let mut argv = Vec::with_capacity(app.len() + 4);
-    argv.push(app[0].clone());
-    if !app
-        .iter()
-        .any(|arg| arg == "--no-remote" || arg == "-no-remote")
-    {
-        argv.push("--no-remote".to_string());
-    }
-    if !app
-        .iter()
-        .any(|arg| arg == "--profile" || arg == "-profile")
-    {
-        argv.push("--profile".to_string());
-        argv.push(browser_profile_dir(app_name).to_string_lossy().into_owned());
-    }
-    argv.extend(app.iter().skip(1).cloned());
-    argv
-}
-
-fn chromium_browser_argv(
-    app: &[String],
-    app_name: &str,
-    gpu_policy: EffectiveCompositorAppGpuPolicy,
-) -> Vec<String> {
-    let mut argv = Vec::with_capacity(app.len() + 11);
-    argv.push(app[0].clone());
-    if !app.iter().any(|arg| arg.starts_with("--user-data-dir=")) {
-        argv.push(format!(
-            "--user-data-dir={}",
-            browser_profile_dir(app_name).to_string_lossy()
-        ));
-    }
-    let accelerated_args = [
-        "--use-gl=egl-angle",
-        "--use-angle=opengles",
-        "--disable-features=Vulkan",
-        "--disable-vulkan",
-    ];
-    let cpu_args = [
-        "--disable-gpu",
-        "--disable-gpu-compositing",
-        "--disable-gpu-rasterization",
-        "--disable-zero-copy",
-        "--disable-features=Vulkan,DefaultANGLEVulkan,VizDisplayCompositor",
-        "--disable-vulkan",
-    ];
-    let browser_args = [
-        "--ozone-platform=wayland",
-        "--enable-features=UseOzonePlatform",
-    ]
-    .into_iter()
-    .chain(match gpu_policy {
-        EffectiveCompositorAppGpuPolicy::Accelerated => accelerated_args.as_slice().iter().copied(),
-        EffectiveCompositorAppGpuPolicy::CpuOnly => cpu_args.as_slice().iter().copied(),
-    });
-    for arg in browser_args {
-        if !app.iter().any(|existing| existing == arg) {
-            argv.push(arg.to_string());
-        }
-    }
-    argv.extend(app.iter().skip(1).cloned());
-    argv
-}
-
 fn wrap_private_dbus_session(app: Vec<String>, private_dbus: bool) -> Vec<String> {
     if !private_dbus {
         return app;
@@ -590,98 +470,204 @@ fn wrap_private_dbus_session(app: Vec<String>, private_dbus: bool) -> Vec<String
     argv
 }
 
-fn ensure_compositor_app_profile_dirs(argv: &[String]) -> io::Result<()> {
-    let mut dirs = Vec::new();
-    for (index, arg) in argv.iter().enumerate() {
-        if (arg == "--profile" || arg == "-profile")
-            && let Some(path) = argv.get(index + 1)
-        {
-            dirs.push(PathBuf::from(path));
-        }
-        if let Some(path) = arg.strip_prefix("--user-data-dir=") {
-            dirs.push(PathBuf::from(path));
-        }
-    }
-    for dir in dirs {
-        fs::create_dir_all(dir)?;
-    }
-    Ok(())
-}
-
-fn browser_profile_dir(app_name: &str) -> PathBuf {
-    default_state_dir()
-        .join("app-profiles")
-        .join(sanitize_app_id(app_name))
-}
-
-fn executable_name(program: &str) -> String {
-    Path::new(program)
-        .file_stem()
-        .or_else(|| Path::new(program).file_name())
-        .map(|value| value.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_else(|| program.to_ascii_lowercase())
-}
-
-fn sanitize_app_id(value: &str) -> String {
-    let sanitized = value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    if sanitized.is_empty() {
-        "app".to_string()
-    } else {
-        sanitized
-    }
-}
-
-fn is_gecko_browser(app_name: &str) -> bool {
-    matches!(
-        app_name,
-        "firefox"
-            | "firefox-bin"
-            | "zen"
-            | "zen-bin"
-            | "librewolf"
-            | "librewolf-bin"
-            | "floorp"
-            | "waterfox"
-            | "thunderbird"
-    )
-}
-
-fn is_zen_browser(app_name: &str) -> bool {
-    matches!(app_name, "zen" | "zen-bin")
-}
-
-fn is_chromium_browser(app_name: &str) -> bool {
-    matches!(
-        app_name,
-        "brave"
-            | "brave-browser"
-            | "brave-bin"
-            | "chromium"
-            | "chromium-browser"
-            | "google-chrome"
-            | "google-chrome-stable"
-            | "chrome"
-            | "vivaldi"
-            | "vivaldi-stable"
-            | "microsoft-edge"
-            | "microsoft-edge-stable"
-    )
-}
-
 fn command_available(program: &str) -> bool {
     let Some(path_var) = env::var_os("PATH") else {
         return false;
     };
     env::split_paths(&path_var).any(|dir| dir.join(program).is_file())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopLaunch {
+    pub argv: Vec<String>,
+    pub working_dir: Option<PathBuf>,
+}
+
+pub fn desktop_launch_for_id(desktop_id: &str) -> Result<DesktopLaunch, String> {
+    validate_desktop_id(desktop_id)?;
+    let path = find_desktop_entry(desktop_id)
+        .ok_or_else(|| format!("desktop entry not found: {desktop_id}"))?;
+    parse_desktop_entry_file(&path)
+}
+
+pub fn validate_desktop_id(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("desktop id is empty".to_string());
+    }
+    if value.len() > 1024 {
+        return Err("desktop id is too large".to_string());
+    }
+    if value.bytes().any(|byte| byte == 0) {
+        return Err("desktop id contains NUL".to_string());
+    }
+    if value.contains('/') || value.contains('\\') || value.contains("..") {
+        return Err("desktop id must not be a path".to_string());
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return Err("desktop id contains unsupported characters".to_string());
+    }
+    Ok(())
+}
+
+fn find_desktop_entry(desktop_id: &str) -> Option<PathBuf> {
+    desktop_search_dirs()
+        .into_iter()
+        .map(|dir| dir.join(desktop_id))
+        .find(|path| path.is_file())
+}
+
+fn desktop_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(value) = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+        dirs.push(PathBuf::from(value).join("applications"));
+    }
+    if let Some(value) = env::var_os("XDG_DATA_DIRS").filter(|value| !value.is_empty()) {
+        dirs.extend(env::split_paths(&value).map(|dir| dir.join("applications")));
+    }
+    if let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) {
+        dirs.push(PathBuf::from(home).join(".local/share/applications"));
+    }
+    dirs.push(PathBuf::from("/usr/local/share/applications"));
+    dirs.push(PathBuf::from("/usr/share/applications"));
+    dirs
+}
+
+fn parse_desktop_entry_file(path: &Path) -> Result<DesktopLaunch, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    parse_desktop_entry(&contents, path.parent())
+}
+
+pub fn parse_desktop_entry(
+    contents: &str,
+    base_dir: Option<&Path>,
+) -> Result<DesktopLaunch, String> {
+    let mut in_entry = false;
+    let mut values = HashMap::new();
+    for raw in contents.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_entry = line == "[Desktop Entry]";
+            continue;
+        }
+        if !in_entry {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        values.entry(key.to_string()).or_insert(value.to_string());
+    }
+    if values.get("Type").map(String::as_str) != Some("Application") {
+        return Err("desktop entry is not Type=Application".to_string());
+    }
+    if values
+        .get("Hidden")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        return Err("desktop entry is Hidden=true".to_string());
+    }
+    if let Some(try_exec) = values.get("TryExec")
+        && !program_available(try_exec)
+    {
+        return Err(format!("TryExec is not available: {try_exec}"));
+    }
+    let exec = values
+        .get("Exec")
+        .ok_or_else(|| "desktop entry has no Exec".to_string())?;
+    let argv = sanitize_desktop_exec_argv(parse_exec_argv(exec)?);
+    if argv.is_empty() {
+        return Err("desktop Exec produced no argv".to_string());
+    }
+    if argv.len() > 256 || argv.iter().map(String::len).sum::<usize>() > 64 * 1024 {
+        return Err("desktop Exec argv is too large".to_string());
+    }
+    let working_dir = values.get("Path").and_then(|value| {
+        let path = PathBuf::from(value);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            base_dir.map(|base| base.join(&path)).unwrap_or(path)
+        };
+        path.is_dir().then_some(path)
+    });
+    Ok(DesktopLaunch { argv, working_dir })
+}
+
+fn parse_exec_argv(exec: &str) -> Result<Vec<String>, String> {
+    let mut argv = Vec::new();
+    let mut current = String::new();
+    let mut chars = exec.chars();
+    let mut quote = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => quote = !quote,
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            ch if ch.is_whitespace() && !quote => {
+                if !current.is_empty() {
+                    argv.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if quote {
+        return Err("unterminated quote in Exec".to_string());
+    }
+    if !current.is_empty() {
+        argv.push(current);
+    }
+    Ok(argv)
+}
+
+fn sanitize_desktop_exec_argv(argv: Vec<String>) -> Vec<String> {
+    argv.into_iter()
+        .filter_map(|arg| sanitize_desktop_exec_arg(&arg))
+        .filter(|arg| !arg.is_empty())
+        .collect()
+}
+
+fn sanitize_desktop_exec_arg(arg: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = arg.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('%') => out.push('%'),
+            Some('f' | 'F' | 'u' | 'U' | 'i' | 'c' | 'k' | 'v' | 'm') => {
+                if arg.len() == 2 {
+                    return None;
+                }
+            }
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    Some(out)
+}
+
+fn program_available(program: &str) -> bool {
+    let path = Path::new(program);
+    if path.components().count() > 1 {
+        return path.is_file();
+    }
+    command_available(program)
 }
 
 fn installed_tool_path(binary: &str) -> String {

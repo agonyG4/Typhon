@@ -42,6 +42,7 @@ impl NativeRuntime {
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
+            seat_session: _,
             shutdown_state: _,
         } = self;
         let wakeup = &cycle.wakeup;

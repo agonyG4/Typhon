@@ -3,7 +3,7 @@ use super::super::*;
 impl Dispatch<wl_compositor::WlCompositor, ()> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         _resource: &wl_compositor::WlCompositor,
         request: wl_compositor::Request,
         _data: &(),
@@ -15,6 +15,7 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for CompositorState {
                 let surface_id = state.allocate_surface_id();
                 let surface = data_init.init(id, SurfaceData::new(surface_id));
                 state.register_surface_resource(surface_id, surface.clone());
+                state.register_surface_client(surface_id, client.id());
                 state.focused_surface.get_or_insert_with(|| surface.clone());
             }
             wl_compositor::Request::CreateRegion { id } => {
@@ -113,7 +114,10 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                 state.commit_surface_tree_request(surface_id, commit);
             }
             wl_surface::Request::Destroy => {
-                state.unregister_surface_resource(data.surface_id());
+                state.teardown_surface_resource(
+                    data.surface_id(),
+                    SurfaceTeardownReason::ExplicitDestroy,
+                );
             }
             wl_surface::Request::Damage {
                 x,

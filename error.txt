@@ -1,17 +1,36 @@
-agony@Kaiser ~/G/Typhon (main)>   INFO: Launching config: "/home/agony/.config/quickshell/shell.qml"
-  INFO: Shell ID: "65d8b3fd3a6d5a3b8d71d0317d263b72" Path ID "65d8b3fd3a6d5a3b8d71d0317d263b72"
-  INFO: Saving logs to "/run/user/1000/quickshell/by-id/xrh3l3wght/log.qslog"
-  WARN: $HYPRLAND_INSTANCE_SIGNATURE is unset. Cannot connect to hyprland.
-  WARN: The active compositor does not support hyprland_global_shortcuts_v1.
-  WARN: GlobalShortcut will not work.
-  WARN: The active compositor does not support hyprland_global_shortcuts_v1.
-  WARN: GlobalShortcut will not work.
-  WARN: The active compositor does not support hyprland_global_shortcuts_v1.
-  WARN: GlobalShortcut will not work.
-  WARN: The active compositor does not support hyprland_global_shortcuts_v1.
-  WARN: GlobalShortcut will not work.
-  INFO: Configuration Loaded
-zwlr_layer_surface_v1#44: error 0: layer surface buffer committed before configure was acknowledged
-  WARN qt.qpa.wayland: eglSwapBuffers failed with 0x3000, surface: 0x7f45e6fe5d00
-  WARN qt.qpa.wayland: eglSwapBuffers failed with 0x3000, surface: 0x7f45e619e180
-  WARN: The Wayland connection experienced a fatal error: Erro de protocolo
+agony@Kaiser ~/G/Typhon (main) [SIGABRT]> flatpak run org.vinegarhq.Sober
+sober: /usr/lib/x86_64-linux-gnu/libcurl.so.4: no version information available (required by sober)
+/proc/self/exe: /usr/lib/x86_64-linux-gnu/libcurl.so.4: no version information available (required by /proc/self/exe)
+info: app: lifecycle: app_start delta=3.3000484108924866e-05ms
+info: app: lifecycle: logging_started delta=149.79461699910462ms
+info: app: app tag: s0113-2546-x86_64-gnu
+info: app: cpu model: Intel(R) Core(TM) i5-10400F CPU @ 2.90GHz
+info: app: os release: GNOME
+info: app: host os release: AstreaOS Linux
+info: app: desktop: Astrea (on wayland)
+info: app: lifecycle: init_app_info delta=0.03164999932050705ms
+info: window: using C.UTF-8 locale
+info: app: lifecycle: runtime_handler delta=79.66137600131333ms
+info: app: lifecycle: update_flags_from_remote_manifest delta=0.3884800001978874ms
+info: state: using manifest object: {"app_settings":{"FStringRenderTextureBudgetByRam":""},"r1":1,"u":1,"use_new_text_renderer":false}
+info: app: lifecycle: fs_init delta=49.53216599859297ms
+info: app: lifecycle: check_security delta=312.4067560005933ms
+info: app$json: {"product_name":"System Product Name","product_version":"System Version","type":"device_product_info"}
+info: app: lifecycle: core_runtime delta=0.08894399926066399ms
+info: app: lifecycle: app_core delta=372.51793800108135ms
+info: app: lifecycle: devices_init delta=553.6892349999398ms
+info: app: lifecycle: global_window_init delta=0.010672999545931816ms
+info: window: global_window_init
+info: window: Will load Vulkan libs
+info: window: Loaded Vulkan libs successfully
+info: window: Will create window; create_hidpi=true, create_vulkan=true, create_opengl=false
+
+(exe:2): Gdk-WARNING **: 17:41:05.895: Settings portal not found: Cannot autolaunch D-Bus without X11 $DISPLAY
+
+(exe:2): Gtk-WARNING **: 17:41:05.972: Could not load a pixbuf from icon theme.
+This may indicate that pixbuf loaders or the mime database could not be found.
+Bail out! Gtk:ERROR:../gtk/gtkiconhelper.c:495:ensure_surface_for_gicon: assertion failed (error == NULL): Failed to load /usr/share/icons/Adwaita/scalable/status/image-missing.svg: Loader process exited early with status '1'Command:  env -i XDG_RUNTIME_DIR="/run/user/1000" "flatpak-spawn" "--sandbox" "--watch-bus" "--directory=/" "--forward-fd=60" "prlimit" "--as=17012097024" "/usr/libexec/glycin-loaders/2+/glycin-svg" "--dbus-fd" "60" (gdk-pixbuf-error-quark, 0)
+**
+Gtk:ERROR:../gtk/gtkiconhelper.c:495:ensure_surface_for_gicon: assertion failed (error == NULL): Failed to load /usr/share/icons/Adwaita/scalable/status/image-missing.svg: Loader process exited early with status '1'Command:
+ env -i XDG_RUNTIME_DIR="/run/user/1000" "flatpak-spawn" "--sandbox" "--watch-bus" "--directory=/" "--forward-fd=60" "prlimit" "--as=17012097024" "/usr/libexec/glycin-loaders/2+/glycin-svg" "--dbus-fd" "60" (gdk-pixbuf-error-quark, 0)
+agony@Kaiser ~/G/Typhon (main) [SIGABRT]> 
