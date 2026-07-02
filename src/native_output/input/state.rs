@@ -16,6 +16,8 @@ pub(crate) struct NativeInputState {
     pub(crate) binding_manager: AstreaBindingManager,
     pub(crate) cursor_visible: bool,
     pub(crate) forwarded_control_keys: Vec<u16>,
+    pub(crate) pressed_deferred_modifier_keys: Vec<u16>,
+    pub(crate) forwarded_deferred_modifier_keys: Vec<u16>,
 }
 
 impl NativeInputState {
@@ -35,6 +37,8 @@ impl NativeInputState {
             binding_manager: AstreaBindingManager::default(),
             cursor_visible: true,
             forwarded_control_keys: Vec::new(),
+            pressed_deferred_modifier_keys: Vec::new(),
+            forwarded_deferred_modifier_keys: Vec::new(),
         }
     }
 
@@ -150,6 +154,7 @@ impl NativeInputState {
 
         if is_alt_key(code) {
             self.alt_pressed = pressed;
+            self.set_deferred_modifier_pressed(code, pressed);
             if !pressed
                 && let AstreaBindingMatch::Consumed(action) = self
                     .binding_manager
@@ -158,11 +163,13 @@ impl NativeInputState {
                 self.apply_binding_action(action, repeated, &mut effect);
                 return effect;
             }
-            if self.keyboard_shortcuts_inhibited && !repeated {
+            if !repeated && self.release_forwarded_deferred_modifier_key(code) {
                 effect
                     .keyboard_events
                     .push(NativeKeyboardEvent::new(code, pressed));
                 effect.request_redraw();
+            } else if self.keyboard_shortcuts_inhibited && pressed && !repeated {
+                self.forward_deferred_modifier_key(code, &mut effect);
             }
             if !pressed && self.window_interaction_active {
                 self.window_interaction_active = false;
@@ -176,6 +183,7 @@ impl NativeInputState {
 
         if is_super_key(code) {
             self.super_pressed = pressed;
+            self.set_deferred_modifier_pressed(code, pressed);
             if !pressed
                 && let AstreaBindingMatch::Consumed(action) = self
                     .binding_manager
@@ -183,11 +191,13 @@ impl NativeInputState {
             {
                 self.apply_binding_action(action, repeated, &mut effect);
             }
-            if self.keyboard_shortcuts_inhibited && !repeated {
+            if !repeated && self.release_forwarded_deferred_modifier_key(code) {
                 effect
                     .keyboard_events
                     .push(NativeKeyboardEvent::new(code, pressed));
                 effect.request_redraw();
+            } else if self.keyboard_shortcuts_inhibited && pressed && !repeated {
+                self.forward_deferred_modifier_key(code, &mut effect);
             }
             return effect;
         }
@@ -256,6 +266,7 @@ impl NativeInputState {
 
         if self.keyboard_shortcuts_inhibited {
             if !repeated {
+                self.replay_deferred_modifiers(&mut effect);
                 effect
                     .keyboard_events
                     .push(NativeKeyboardEvent::new(code, pressed));
@@ -265,6 +276,9 @@ impl NativeInputState {
         }
 
         if !repeated {
+            if pressed {
+                self.replay_deferred_modifiers(&mut effect);
+            }
             effect
                 .keyboard_events
                 .push(NativeKeyboardEvent::new(code, pressed));
@@ -408,6 +422,51 @@ impl NativeInputState {
         true
     }
 
+    fn forward_deferred_modifier_key(&mut self, code: u16, effect: &mut NativeInputEffect) {
+        if self.forwarded_deferred_modifier_keys.contains(&code) {
+            return;
+        }
+        self.forwarded_deferred_modifier_keys.push(code);
+        effect
+            .keyboard_events
+            .push(NativeKeyboardEvent::new(code, true));
+        effect.request_redraw();
+    }
+
+    fn set_deferred_modifier_pressed(&mut self, code: u16, pressed: bool) {
+        if pressed {
+            if !self.pressed_deferred_modifier_keys.contains(&code) {
+                self.pressed_deferred_modifier_keys.push(code);
+            }
+            return;
+        }
+        if let Some(index) = self
+            .pressed_deferred_modifier_keys
+            .iter()
+            .position(|pressed_code| *pressed_code == code)
+        {
+            self.pressed_deferred_modifier_keys.swap_remove(index);
+        }
+    }
+
+    fn release_forwarded_deferred_modifier_key(&mut self, code: u16) -> bool {
+        let Some(index) = self
+            .forwarded_deferred_modifier_keys
+            .iter()
+            .position(|forwarded| *forwarded == code)
+        else {
+            return false;
+        };
+        self.forwarded_deferred_modifier_keys.swap_remove(index);
+        true
+    }
+
+    fn replay_deferred_modifiers(&mut self, effect: &mut NativeInputEffect) {
+        for code in self.pressed_deferred_modifier_keys.clone() {
+            self.forward_deferred_modifier_key(code, effect);
+        }
+    }
+
     pub(crate) fn active_modifier_mask(&self) -> ModifierMask {
         let mut mask = ModifierMask::EMPTY;
         if self.alt_pressed {
@@ -450,6 +509,12 @@ impl NativeInputState {
             BindingAction::LaunchCommand(command) => {
                 effect.launch_command = Some(command);
                 effect.launch_source = Some(NativeLaunchSource::Binding);
+            }
+            BindingAction::LaunchSessionCommand(index) => {
+                if let Some(command) = external_session_switch_command(index) {
+                    effect.launch_command = Some(command);
+                    effect.launch_source = Some(NativeLaunchSource::Binding);
+                }
             }
             BindingAction::BeginMove => {
                 self.window_interaction_active = true;

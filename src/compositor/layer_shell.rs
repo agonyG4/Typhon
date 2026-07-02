@@ -474,8 +474,12 @@ impl CompositorState {
             layer_shell_debug_log(|| format!("ack surface={surface_id} serial={serial} unknown"));
             return;
         };
-        let Some(configure) = role.pending_configures.remove(position) else {
-            return;
+        let configure = {
+            let mut acknowledged = role.pending_configures.drain(..=position);
+            let Some(configure) = acknowledged.next_back() else {
+                return;
+            };
+            configure
         };
         role.acked_configure = Some(configure);
         role.committed = configure.committed_state;

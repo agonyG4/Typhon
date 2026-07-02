@@ -91,6 +91,46 @@ impl EffectiveCompositorAppGpuPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserProfilePolicy {
+    Normal,
+    Isolated,
+}
+
+impl BrowserProfilePolicy {
+    pub fn from_env_for_app(app_name: &str) -> Self {
+        match env::var("OBLIVION_ONE_BROWSER_PROFILE_POLICY")
+            .ok()
+            .as_deref()
+        {
+            Some("normal") => Self::Normal,
+            Some("isolated") => Self::Isolated,
+            _ if is_zen_browser(app_name) => Self::Normal,
+            _ => Self::Isolated,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppDbusPolicy {
+    Session,
+    Private,
+}
+
+impl AppDbusPolicy {
+    pub fn from_env() -> Self {
+        match env::var("OBLIVION_ONE_APP_DBUS_POLICY").ok().as_deref() {
+            Some("private") => Self::Private,
+            Some("session") => Self::Session,
+            _ => Self::Session,
+        }
+    }
+
+    pub const fn private_dbus(self, dbus_run_session_available: bool) -> bool {
+        matches!(self, Self::Private) && dbus_run_session_available
+    }
+}
+
 impl CompositorAppEnvironment {
     pub fn wayland_only(wayland_display: impl Into<String>) -> Self {
         Self {
@@ -153,6 +193,15 @@ fn configure_compositor_app_command_with_environment_and_policy(
     command.env("XDG_SESSION_DESKTOP", "Astrea");
     command.env("XDG_SESSION_TYPE", "wayland");
     command.env("DESKTOP_SESSION", "Astrea");
+    command.env("ASTREA_COMPOSITOR", "TYPHON");
+    command.env(
+        "ASTREA_SHORTCUT_BRIDGE",
+        installed_tool_path("astrea-shortcut-bridge"),
+    );
+    command.env(
+        "ASTREA_SHELL_CONTROL_BRIDGE",
+        installed_tool_path("astrea-shell-control-bridge"),
+    );
     command.env("ELECTRON_OZONE_PLATFORM_HINT", "wayland");
     command.env("MOZ_ENABLE_WAYLAND", "1");
     command.env("OBLIVION_ONE_DE", "1");
@@ -214,7 +263,9 @@ fn compositor_app_spawn_argv_with_policy(
 }
 
 pub fn spawn_compositor_app(socket_name: &str, app: &[String]) -> io::Result<Option<u32>> {
-    let Some(argv) = compositor_app_spawn_argv(app, command_available("dbus-run-session")) else {
+    let private_dbus =
+        AppDbusPolicy::from_env().private_dbus(command_available("dbus-run-session"));
+    let Some(argv) = compositor_app_spawn_argv(app, private_dbus) else {
         return Ok(None);
     };
     ensure_compositor_app_profile_dirs(&argv)?;
@@ -231,8 +282,9 @@ pub fn spawn_compositor_app(socket_name: &str, app: &[String]) -> io::Result<Opt
 }
 
 pub fn spawn_cpu_compositor_app(socket_name: &str, app: &[String]) -> io::Result<Option<u32>> {
-    let Some(argv) = compositor_cpu_app_spawn_argv(app, command_available("dbus-run-session"))
-    else {
+    let private_dbus =
+        AppDbusPolicy::from_env().private_dbus(command_available("dbus-run-session"));
+    let Some(argv) = compositor_cpu_app_spawn_argv(app, private_dbus) else {
         return Ok(None);
     };
     ensure_compositor_app_profile_dirs(&argv)?;
@@ -443,7 +495,11 @@ fn isolate_single_instance_app_argv(
     };
     let app_name = executable_name(program);
     if is_gecko_browser(&app_name) {
-        return gecko_browser_argv(app, &app_name);
+        return gecko_browser_argv(
+            app,
+            &app_name,
+            BrowserProfilePolicy::from_env_for_app(&app_name),
+        );
     }
     if is_chromium_browser(&app_name) {
         return chromium_browser_argv(app, &app_name, gpu_policy);
@@ -451,7 +507,14 @@ fn isolate_single_instance_app_argv(
     app.to_vec()
 }
 
-fn gecko_browser_argv(app: &[String], app_name: &str) -> Vec<String> {
+fn gecko_browser_argv(
+    app: &[String],
+    app_name: &str,
+    profile_policy: BrowserProfilePolicy,
+) -> Vec<String> {
+    if profile_policy == BrowserProfilePolicy::Normal {
+        return app.to_vec();
+    }
     let mut argv = Vec::with_capacity(app.len() + 4);
     argv.push(app[0].clone());
     if !app
@@ -592,6 +655,10 @@ fn is_gecko_browser(app_name: &str) -> bool {
     )
 }
 
+fn is_zen_browser(app_name: &str) -> bool {
+    matches!(app_name, "zen" | "zen-bin")
+}
+
 fn is_chromium_browser(app_name: &str) -> bool {
     matches!(
         app_name,
@@ -615,4 +682,22 @@ fn command_available(program: &str) -> bool {
         return false;
     };
     env::split_paths(&path_var).any(|dir| dir.join(program).is_file())
+}
+
+fn installed_tool_path(binary: &str) -> String {
+    if let Ok(current_exe) = env::current_exe()
+        && let Some(dir) = current_exe.parent()
+    {
+        let beside = dir.join(binary);
+        if beside.is_file() {
+            return beside.to_string_lossy().into_owned();
+        }
+        if let Some(prefix) = dir.parent() {
+            let libexec = prefix.join("libexec").join("typhon").join(binary);
+            if libexec.is_file() {
+                return libexec.to_string_lossy().into_owned();
+            }
+        }
+    }
+    binary.to_string()
 }

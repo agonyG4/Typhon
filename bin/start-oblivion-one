@@ -166,6 +166,9 @@ if [[ "$output" == "native" ]]; then
     mkdir -p -- "$(dirname -- "$log_file")"
     {
         printf '\n[%s] start-oblivion-one output=%s renderer=%s profile=%s socket=%s\n' "$(date --iso-8601=seconds)" "$output" "$renderer" "$profile" "$socket"
+        if [[ "$output" == "native" ]]; then
+            printf '[%s] native launch socket=%s broker=typhon-shell-control display=unset-before-compositor\n' "$(date --iso-8601=seconds)" "$socket"
+        fi
         printf '[%s] command:' "$(date --iso-8601=seconds)"
         printf ' %q' "${command[@]}"
         printf '\n'
@@ -173,11 +176,15 @@ if [[ "$output" == "native" ]]; then
     exec >> >(tee -a "$log_file") 2>&1
 fi
 
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE DESKTOP_SESSION OBLIVION_ONE_SESSION_ID >/dev/null 2>&1 || true
-fi
-if command -v dbus-update-activation-environment >/dev/null 2>&1; then
-    dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE DESKTOP_SESSION OBLIVION_ONE_SESSION_ID >/dev/null 2>&1 || true
+if [[ "$output" != "native" ]]; then
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE DESKTOP_SESSION OBLIVION_ONE_SESSION_ID >/dev/null 2>&1 || true
+    fi
+    if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+        dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE DESKTOP_SESSION OBLIVION_ONE_SESSION_ID >/dev/null 2>&1 || true
+    fi
+else
+    echo "start-oblivion-one: native mode skipped pre-socket systemd/dbus WAYLAND_DISPLAY import; Typhon-owned launches use socket '$socket'."
 fi
 
 exec "${command[@]}"

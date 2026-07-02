@@ -61,6 +61,16 @@ pub(crate) fn external_alt_tab_command() -> Option<Vec<String>> {
         .or_else(|| path_command("astrea-alt-tab", &["--next"]))
 }
 
+pub(crate) fn external_session_switch_command(index: u8) -> Option<Vec<String>> {
+    let name = match index {
+        1 => "OBLIVION_ONE_SESSION_1_COMMAND",
+        2 => "OBLIVION_ONE_SESSION_2_COMMAND",
+        3 => "OBLIVION_ONE_SESSION_3_COMMAND",
+        _ => return None,
+    };
+    command_from_env(name)
+}
+
 fn command_from_env(name: &str) -> Option<Vec<String>> {
     let command = std::env::var(name).ok()?;
     let command = command.trim();

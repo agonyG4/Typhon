@@ -1509,6 +1509,62 @@ fn mapped_layer_surface_can_commit_old_buffer_while_new_configure_is_pending() {
 }
 
 #[test]
+fn acking_latest_configure_maps_and_repaints_without_stale_configure_error() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let (surface, layer_surface) = create_layer_surface(
+        &compositor,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "quickshell-latest-ack-repaint",
+    );
+    layer_surface.set_anchor(
+        client_zwlr_layer_surface_v1::Anchor::Top
+            | client_zwlr_layer_surface_v1::Anchor::Left
+            | client_zwlr_layer_surface_v1::Anchor::Right,
+    );
+    layer_surface.set_size(0, 32);
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState {
+        suppress_layer_surface_ack: true,
+        ..RegistryTestState::default()
+    };
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.layer_surface_configures[0].1, 1280);
+
+    commands
+        .send(ServerCommand::SetOutputSize {
+            width: 900,
+            height: 700,
+        })
+        .unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.layer_surface_configures.len(), 2);
+    let (serial_b, width_b, height_b) = state.layer_surface_configures[1];
+    assert_eq!((width_b, height_b), (900, 32));
+
+    layer_surface.ack_configure(serial_b);
+    commit_test_buffered_surface(&surface, &shm, &qh, width_b as usize, height_b as usize).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(capture_renderable_surface_count(&commands), 1);
+
+    commit_test_buffered_surface(&surface, &shm, &qh, width_b as usize, height_b as usize).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(capture_renderable_surface_count(&commands), 1);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+}
+
+#[test]
 fn layer_popup_renders_above_top_parent_and_gets_input_first() {
     let socket_name = unique_socket_name();
     let socket_path = runtime_socket_path(&socket_name);

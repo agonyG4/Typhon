@@ -62,6 +62,83 @@ fn native_input_alt_p_requests_session_exit_without_forwarding_p() {
 }
 
 #[test]
+fn native_input_unbound_alt_z_replays_alt_before_key_and_releases_it() {
+    let mut input = NativeInputState::new(320, 200);
+
+    let alt_press = input.handle_key_event(KEY_LEFTALT, 1);
+    let z_press = input.handle_key_event(KEY_Z, 1);
+    let z_release = input.handle_key_event(KEY_Z, 0);
+    let alt_release = input.handle_key_event(KEY_LEFTALT, 0);
+
+    assert!(alt_press.keyboard_events.is_empty());
+    assert_eq!(
+        z_press.keyboard_events,
+        vec![
+            NativeKeyboardEvent::new(KEY_LEFTALT, true),
+            NativeKeyboardEvent::new(KEY_Z, true),
+        ]
+    );
+    assert_eq!(
+        z_release.keyboard_events,
+        vec![NativeKeyboardEvent::new(KEY_Z, false)]
+    );
+    assert_eq!(
+        alt_release.keyboard_events,
+        vec![NativeKeyboardEvent::new(KEY_LEFTALT, false)]
+    );
+}
+
+#[test]
+fn native_input_unbound_super_z_replays_super_before_key_and_releases_it() {
+    let mut input = NativeInputState::new(320, 200);
+
+    input.handle_key_event(KEY_RIGHTMETA, 1);
+    let z_press = input.handle_key_event(KEY_Z, 1);
+    let super_release = input.handle_key_event(KEY_RIGHTMETA, 0);
+
+    assert_eq!(
+        z_press.keyboard_events,
+        vec![
+            NativeKeyboardEvent::new(KEY_RIGHTMETA, true),
+            NativeKeyboardEvent::new(KEY_Z, true),
+        ]
+    );
+    assert_eq!(
+        super_release.keyboard_events,
+        vec![NativeKeyboardEvent::new(KEY_RIGHTMETA, false)]
+    );
+}
+
+#[test]
+fn native_input_unbound_ctrl_shift_alt_z_forwards_each_modifier_once() {
+    let mut input = NativeInputState::new(320, 200);
+
+    let ctrl = input.handle_key_event(KEY_RIGHTCTRL, 1);
+    let shift = input.handle_key_event(KEY_RIGHTSHIFT, 1);
+    let alt = input.handle_key_event(KEY_RIGHTALT, 1);
+    let z = input.handle_key_event(KEY_Z, 1);
+    let repeat = input.handle_key_event(KEY_Z, 2);
+
+    assert_eq!(
+        ctrl.keyboard_events,
+        vec![NativeKeyboardEvent::new(KEY_RIGHTCTRL, true)]
+    );
+    assert_eq!(
+        shift.keyboard_events,
+        vec![NativeKeyboardEvent::new(KEY_RIGHTSHIFT, true)]
+    );
+    assert!(alt.keyboard_events.is_empty());
+    assert_eq!(
+        z.keyboard_events,
+        vec![
+            NativeKeyboardEvent::new(KEY_RIGHTALT, true),
+            NativeKeyboardEvent::new(KEY_Z, true),
+        ]
+    );
+    assert!(repeat.keyboard_events.is_empty());
+}
+
+#[test]
 fn native_input_alt_tab_sequence_emits_astrea_shortcuts() {
     let mut input = NativeInputState::new(320, 200);
 
@@ -99,6 +176,55 @@ fn native_input_alt_shift_tab_sequence_emits_previous() {
         )]
     );
     assert!(previous.keyboard_events.is_empty());
+}
+
+#[test]
+fn native_input_session_switch_shortcuts_launch_exact_configured_command() {
+    let _guard = EXTERNAL_COMMAND_ENV_LOCK.lock().unwrap();
+    unsafe {
+        std::env::set_var("OBLIVION_ONE_SESSION_1_COMMAND", "switch-one");
+        std::env::set_var("OBLIVION_ONE_SESSION_2_COMMAND", "switch-two");
+        std::env::set_var("OBLIVION_ONE_SESSION_3_COMMAND", "switch-three");
+    }
+    let mut input = NativeInputState::new(320, 200);
+    input.handle_key_event(KEY_LEFTCTRL, 1);
+    input.handle_key_event(KEY_LEFTSHIFT, 1);
+    input.handle_key_event(KEY_LEFTALT, 1);
+
+    let one = input.handle_key_event(KEY_1, 1);
+    let two = input.handle_key_event(KEY_2, 1);
+    let three = input.handle_key_event(KEY_3, 1);
+
+    assert_eq!(
+        one.launch_command,
+        Some(vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            "switch-one".to_string()
+        ])
+    );
+    assert_eq!(
+        two.launch_command,
+        Some(vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            "switch-two".to_string()
+        ])
+    );
+    assert_eq!(
+        three.launch_command,
+        Some(vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            "switch-three".to_string()
+        ])
+    );
+
+    unsafe {
+        std::env::remove_var("OBLIVION_ONE_SESSION_1_COMMAND");
+        std::env::remove_var("OBLIVION_ONE_SESSION_2_COMMAND");
+        std::env::remove_var("OBLIVION_ONE_SESSION_3_COMMAND");
+    }
 }
 
 #[test]

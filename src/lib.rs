@@ -452,6 +452,17 @@ mod tests {
                 .and_then(Option::as_deref)
                 .is_some_and(|path| path.contains("oblivion-one/portal-share"))
         );
+        assert_eq!(
+            env.get("ASTREA_COMPOSITOR").and_then(Option::as_deref),
+            Some("TYPHON")
+        );
+        for key in ["ASTREA_SHORTCUT_BRIDGE", "ASTREA_SHELL_CONTROL_BRIDGE"] {
+            let value = env
+                .get(key)
+                .and_then(Option::as_deref)
+                .expect("bridge path should be exported");
+            assert!(!value.contains("/home/agony/GitHub/Typhon/"));
+        }
     }
 
     #[test]
@@ -512,8 +523,23 @@ mod tests {
     }
 
     #[test]
-    fn compositor_app_spawn_isolates_gecko_browser_profiles() {
+    fn compositor_app_spawn_uses_normal_zen_profile_by_default() {
         let app = vec!["/opt/zen-browser-bin/zen-bin".to_string()];
+
+        let argv = compositor_app_spawn_argv(&app, false).unwrap();
+        let joined = argv.join(" ");
+
+        assert_eq!(
+            argv.first().map(String::as_str),
+            Some("/opt/zen-browser-bin/zen-bin")
+        );
+        assert!(!joined.contains("--no-remote"));
+        assert!(!joined.contains("--profile"));
+    }
+
+    #[test]
+    fn compositor_app_spawn_isolates_firefox_profiles() {
+        let app = vec!["firefox".to_string()];
 
         let argv = compositor_app_spawn_argv(&app, true).unwrap();
         let joined = argv.join(" ");
@@ -521,20 +547,23 @@ mod tests {
         assert_eq!(argv.first().map(String::as_str), Some("dbus-run-session"));
         assert!(joined.contains("--no-remote"));
         assert!(joined.contains("--profile"));
-        assert!(joined.contains("oblivion-one/app-profiles/zen-bin"));
+        assert!(joined.contains("oblivion-one/app-profiles/firefox"));
     }
 
     #[test]
-    fn cpu_compositor_app_spawn_keeps_gecko_isolated_for_software_rendering() {
-        let app = vec!["/opt/zen-browser-bin/zen-bin".to_string()];
+    fn cpu_compositor_app_spawn_can_force_zen_isolated_for_diagnostics() {
+        let app = vec![
+            "/opt/zen-browser-bin/zen-bin".to_string(),
+            "--profile".to_string(),
+            "/tmp/zen".to_string(),
+        ];
 
         let argv = compositor_cpu_app_spawn_argv(&app, true).unwrap();
         let joined = argv.join(" ");
 
         assert_eq!(argv.first().map(String::as_str), Some("dbus-run-session"));
-        assert!(joined.contains("--no-remote"));
-        assert!(joined.contains("--profile"));
-        assert!(joined.contains("oblivion-one/app-profiles/zen-bin"));
+        assert!(joined.contains("--profile /tmp/zen"));
+        assert!(!joined.contains("oblivion-one/app-profiles/zen-bin"));
     }
 
     #[test]
