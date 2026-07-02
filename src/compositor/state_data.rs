@@ -14,6 +14,40 @@ use crate::render_backend::buffer::{
     BufferId, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewportSourceRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl ViewportSourceRect {
+    pub(in crate::compositor) fn new(x: f64, y: f64, width: f64, height: f64) -> Option<Self> {
+        (x >= 0.0 && y >= 0.0 && width > 0.0 && height > 0.0).then_some(Self {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    pub(in crate::compositor) fn logical_size(self) -> Option<BufferSize> {
+        let width = self.width.ceil();
+        let height = self.height.ceil();
+        if !(width.is_finite() && height.is_finite()) || width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        BufferSize::new(width as u32, height as u32)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(in crate::compositor) struct SurfaceViewportCommit {
+    pub(in crate::compositor) source: Option<ViewportSourceRect>,
+    pub(in crate::compositor) destination: Option<BufferSize>,
+}
+
 use super::{
     RenderableSurface, RenderableSurfaceDamage, SurfaceCommitSequence, SurfaceDamageRect,
     SurfacePlacement,
@@ -196,6 +230,7 @@ impl SurfaceData {
                         y,
                         explicit_release: None,
                         surface_size: None,
+                        viewport_source: None,
                         commit_sequence: SurfaceCommitSequence::initial(),
                         resize_commit: None,
                         resize_capture_finalized: false,
@@ -209,6 +244,7 @@ impl SurfaceData {
                             y,
                             explicit_release: None,
                             surface_size: None,
+                            viewport_source: None,
                             commit_sequence: SurfaceCommitSequence::initial(),
                             resize_commit: None,
                             resize_capture_finalized: false,
@@ -260,7 +296,7 @@ impl SurfaceData {
         &self,
         buffer_size: Option<BufferSize>,
         buffer_scale: u32,
-        viewport_destination: Option<BufferSize>,
+        viewport: SurfaceViewportCommit,
     ) -> PendingSurfaceDamage {
         let surface_rects = self
             .pending_surface_damage
@@ -277,7 +313,7 @@ impl SurfaceData {
             buffer_rects,
             buffer_size,
             buffer_scale,
-            viewport_destination,
+            viewport,
         );
         PendingSurfaceDamage { damage }
     }
@@ -329,38 +365,54 @@ impl SurfaceData {
         }
     }
 
-    pub(super) fn take_pending_viewport(&self) -> Option<Option<BufferSize>> {
-        self.viewport
-            .lock()
-            .ok()
-            .and_then(|mut viewport| viewport.pending_destination.take())
+    pub(super) fn set_pending_viewport_source(&self, source: Option<ViewportSourceRect>) {
+        if let Ok(mut viewport) = self.viewport.lock() {
+            viewport.pending_source = Some(source);
+        }
     }
 
-    pub(super) fn apply_viewport_change(
-        &self,
-        destination: Option<Option<BufferSize>>,
-    ) -> Option<BufferSize> {
+    pub(super) fn take_pending_viewport(&self) -> PendingViewportChange {
         self.viewport
             .lock()
-            .map(|mut viewport| {
-                if let Some(destination) = destination {
-                    viewport.destination = destination;
-                }
-                viewport.destination
+            .map(|mut viewport| PendingViewportChange {
+                source: viewport.pending_source.take(),
+                destination: viewport.pending_destination.take(),
             })
             .unwrap_or_default()
     }
 
-    pub(super) fn viewport_destination_for_change(
+    pub(super) fn apply_viewport_change(
         &self,
-        destination: Option<Option<BufferSize>>,
-    ) -> Option<BufferSize> {
-        destination.unwrap_or_else(|| {
-            self.viewport
-                .lock()
-                .map(|viewport| viewport.destination)
-                .unwrap_or_default()
-        })
+        change: PendingViewportChange,
+    ) -> SurfaceViewportCommit {
+        self.viewport
+            .lock()
+            .map(|mut viewport| {
+                if let Some(source) = change.source {
+                    viewport.source = source;
+                }
+                if let Some(destination) = change.destination {
+                    viewport.destination = destination;
+                }
+                SurfaceViewportCommit {
+                    source: viewport.source,
+                    destination: viewport.destination,
+                }
+            })
+            .unwrap_or_default()
+    }
+
+    pub(super) fn viewport_for_change(
+        &self,
+        change: PendingViewportChange,
+    ) -> SurfaceViewportCommit {
+        self.viewport
+            .lock()
+            .map(|viewport| SurfaceViewportCommit {
+                source: change.source.unwrap_or(viewport.source),
+                destination: change.destination.unwrap_or(viewport.destination),
+            })
+            .unwrap_or_default()
     }
 
     pub(super) fn set_pending_buffer_scale(&self, scale: u32) {
@@ -445,7 +497,7 @@ fn convert_pending_damage(
     buffer_rects: Vec<PendingBufferDamageRect>,
     buffer_size: Option<BufferSize>,
     buffer_scale: u32,
-    viewport_destination: Option<BufferSize>,
+    viewport: SurfaceViewportCommit,
 ) -> RenderableSurfaceDamage {
     if surface_rects.is_empty() && buffer_rects.is_empty() {
         return RenderableSurfaceDamage::Empty;
@@ -461,8 +513,10 @@ fn convert_pending_damage(
         converted.push(rect);
     }
     for PendingSurfaceDamageRect(rect) in surface_rects {
-        let mapped = match viewport_destination {
-            Some(destination) => map_viewport_damage(rect, destination, buffer_size),
+        let mapped = match viewport.destination {
+            Some(destination) => {
+                map_viewport_damage(rect, destination, buffer_size, viewport.source)
+            }
             None => map_scaled_surface_damage(rect, buffer_scale.max(1), buffer_size),
         };
         let Some(rect) = mapped else {
@@ -504,6 +558,7 @@ fn map_viewport_damage(
     rect: PendingDamageRect,
     destination: BufferSize,
     buffer_size: BufferSize,
+    source: Option<ViewportSourceRect>,
 ) -> Option<Option<SurfaceDamageRect>> {
     if destination.width == 0 || destination.height == 0 {
         return None;
@@ -519,18 +574,20 @@ fn map_viewport_damage(
     if right <= left || bottom <= top {
         return Some(None);
     }
-    let mapped_left =
-        left.checked_mul(i64::from(buffer_size.width))? / i64::from(destination.width);
-    let mapped_top =
-        top.checked_mul(i64::from(buffer_size.height))? / i64::from(destination.height);
-    let mapped_right = div_ceil_i64(
-        right.checked_mul(i64::from(buffer_size.width))?,
-        i64::from(destination.width),
-    )?;
-    let mapped_bottom = div_ceil_i64(
-        bottom.checked_mul(i64::from(buffer_size.height))?,
-        i64::from(destination.height),
-    )?;
+    let (source_x, source_y, source_width, source_height) = source
+        .map(|source| (source.x, source.y, source.width, source.height))
+        .unwrap_or((
+            0.0,
+            0.0,
+            f64::from(buffer_size.width),
+            f64::from(buffer_size.height),
+        ));
+    let scale_x = source_width / f64::from(destination.width);
+    let scale_y = source_height / f64::from(destination.height);
+    let mapped_left = (source_x + left as f64 * scale_x).floor() as i64;
+    let mapped_top = (source_y + top as f64 * scale_y).floor() as i64;
+    let mapped_right = (source_x + right as f64 * scale_x).ceil() as i64;
+    let mapped_bottom = (source_y + bottom as f64 * scale_y).ceil() as i64;
     Some(clip_i64_rect(
         mapped_left,
         mapped_top,
@@ -539,10 +596,6 @@ fn map_viewport_damage(
         buffer_size.width,
         buffer_size.height,
     ))
-}
-
-fn div_ceil_i64(value: i64, divisor: i64) -> Option<i64> {
-    (divisor > 0).then_some(value.checked_add(divisor - 1)? / divisor)
 }
 
 fn clip_pending_rect(
@@ -584,8 +637,16 @@ fn clip_i64_rect(
 
 #[derive(Debug, Default, Clone, Copy)]
 struct SurfaceViewportState {
+    source: Option<ViewportSourceRect>,
     destination: Option<BufferSize>,
+    pending_source: Option<Option<ViewportSourceRect>>,
     pending_destination: Option<Option<BufferSize>>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(super) struct PendingViewportChange {
+    pub(super) source: Option<Option<ViewportSourceRect>>,
+    pub(super) destination: Option<Option<BufferSize>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -611,7 +672,7 @@ mod damage_space_tests {
             Vec::new(),
             Some(size(20, 20)),
             1,
-            None,
+            SurfaceViewportCommit::default(),
         );
         let buffer = convert_pending_damage(
             Vec::new(),
@@ -620,7 +681,7 @@ mod damage_space_tests {
             )],
             Some(size(20, 20)),
             1,
-            None,
+            SurfaceViewportCommit::default(),
         );
 
         assert_eq!(surface, buffer);
@@ -635,7 +696,7 @@ mod damage_space_tests {
             Vec::new(),
             Some(size(40, 40)),
             2,
-            None,
+            SurfaceViewportCommit::default(),
         );
 
         assert_eq!(
@@ -658,7 +719,10 @@ mod damage_space_tests {
             Vec::new(),
             Some(size(200, 100)),
             1,
-            Some(size(100, 50)),
+            SurfaceViewportCommit {
+                source: None,
+                destination: Some(size(100, 50)),
+            },
         );
 
         assert_eq!(
@@ -668,6 +732,32 @@ mod damage_space_tests {
                 y: 10,
                 width: 20,
                 height: 20,
+            }])
+        );
+    }
+
+    #[test]
+    fn surface_damage_with_viewport_source_maps_inside_source_region() {
+        let damage = convert_pending_damage(
+            vec![PendingSurfaceDamageRect(
+                PendingDamageRect::new(0, 0, 200, 100).unwrap(),
+            )],
+            Vec::new(),
+            Some(size(200, 100)),
+            1,
+            SurfaceViewportCommit {
+                source: ViewportSourceRect::new(20.0, 10.0, 100.0, 50.0),
+                destination: Some(size(400, 200)),
+            },
+        );
+
+        assert_eq!(
+            damage,
+            RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 20,
+                y: 10,
+                width: 50,
+                height: 25,
             }])
         );
     }
@@ -684,7 +774,7 @@ mod damage_space_tests {
             ],
             Some(size(10, 10)),
             1,
-            None,
+            SurfaceViewportCommit::default(),
         );
 
         assert_eq!(damage.clipped_rects(10, 10).len(), 4);
@@ -693,7 +783,13 @@ mod damage_space_tests {
     #[test]
     fn missing_mapping_falls_back_to_full_and_no_requests_stay_empty() {
         assert_eq!(
-            convert_pending_damage(Vec::new(), Vec::new(), None, 1, None),
+            convert_pending_damage(
+                Vec::new(),
+                Vec::new(),
+                None,
+                1,
+                SurfaceViewportCommit::default()
+            ),
             RenderableSurfaceDamage::Empty
         );
         assert_eq!(
@@ -704,7 +800,7 @@ mod damage_space_tests {
                 Vec::new(),
                 None,
                 1,
-                None,
+                SurfaceViewportCommit::default(),
             ),
             RenderableSurfaceDamage::Full
         );
@@ -828,6 +924,7 @@ impl InputRegionRect {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub(super) enum PendingSurfaceAttachment {
     Buffer(PendingSurfaceBuffer),
     RemoveContent,
@@ -841,6 +938,7 @@ pub(super) struct PendingSurfaceBuffer {
     pub(super) y: i32,
     pub(super) explicit_release: Option<ExplicitSyncPoint>,
     pub(super) surface_size: Option<BufferSize>,
+    pub(super) viewport_source: Option<ViewportSourceRect>,
     pub(super) commit_sequence: SurfaceCommitSequence,
     pub(super) resize_commit: Option<Box<ResizeCommitSnapshot>>,
     pub(super) resize_capture_finalized: bool,
@@ -849,22 +947,42 @@ pub(super) struct PendingSurfaceBuffer {
 impl PendingSurfaceBuffer {
     pub(super) fn apply_committed_surface_state(
         &mut self,
-        viewport_destination: Option<BufferSize>,
+        viewport: SurfaceViewportCommit,
         buffer_scale: u32,
     ) -> io::Result<()> {
-        self.surface_size = Some(self.surface_size_for_state(viewport_destination, buffer_scale)?);
+        self.viewport_source = viewport.source;
+        self.surface_size = Some(self.surface_size_for_state(viewport, buffer_scale)?);
         Ok(())
     }
 
     pub(super) fn surface_size_for_state(
         &self,
-        viewport_destination: Option<BufferSize>,
+        viewport: SurfaceViewportCommit,
         buffer_scale: u32,
     ) -> io::Result<BufferSize> {
-        if let Some(destination) = viewport_destination {
+        self.validate_viewport_source(viewport.source)?;
+        if let Some(destination) = viewport.destination {
             return Ok(destination);
         }
+        if let Some(source) = viewport.source.and_then(ViewportSourceRect::logical_size) {
+            return Ok(source);
+        }
         self.surface_size_for_buffer_scale(buffer_scale)
+    }
+
+    fn validate_viewport_source(&self, source: Option<ViewportSourceRect>) -> io::Result<()> {
+        let Some(source) = source else {
+            return Ok(());
+        };
+        let width = f64::from(self.data.width()?);
+        let height = f64::from(self.data.height()?);
+        let tolerance = 1.0 / 256.0;
+        if source.x + source.width > width + tolerance
+            || source.y + source.height > height + tolerance
+        {
+            return Err(invalid_shm_buffer());
+        }
+        Ok(())
     }
 
     pub(super) fn surface_size_for_buffer_scale(
@@ -900,6 +1018,7 @@ impl PendingSurfaceBuffer {
             generation,
             commit_sequence: self.commit_sequence,
             buffer: self.data.to_committed_buffer_for_size(size)?,
+            viewport_source: self.viewport_source,
             damage,
         })
     }

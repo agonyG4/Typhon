@@ -1,3 +1,4 @@
+use super::ViewportSourceRect;
 use crate::render_backend::buffer::{
     BufferId, BufferIdentity, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle,
     SurfaceBufferSource,
@@ -121,6 +122,7 @@ pub struct RenderableSurface {
     pub generation: u64,
     pub commit_sequence: SurfaceCommitSequence,
     pub buffer: CommittedSurfaceBuffer,
+    pub viewport_source: Option<ViewportSourceRect>,
     pub damage: RenderableSurfaceDamage,
 }
 

@@ -28,7 +28,7 @@ pub(in crate::compositor) fn empty_cached_subsurface_commit() -> CachedSubsurfac
         frame_callbacks: Vec::new(),
         explicit_sync: None,
         offset: None,
-        viewport_destination: None,
+        viewport_destination: PendingViewportChange::default(),
         buffer_scale: None,
         input_region: None,
         presentation_feedbacks: Vec::new(),

@@ -329,11 +329,16 @@ impl CompositorState {
             return false;
         }
 
-        let requested_surface_size =
-            match current.surface_size_for_state(surface_size, buffer_scale) {
-                Ok(surface_size) => surface_size,
-                Err(_) => buffer_size,
-            };
+        let requested_surface_size = match current.surface_size_for_state(
+            SurfaceViewportCommit {
+                source: current.viewport_source,
+                destination: surface_size,
+            },
+            buffer_scale,
+        ) {
+            Ok(surface_size) => surface_size,
+            Err(_) => buffer_size,
+        };
         let resize_pending = self
             .resize_configure_flows
             .get(&surface_id)
@@ -1048,6 +1053,97 @@ impl CompositorState {
         }
     }
 
+    pub(in crate::compositor) fn commit_unassigned_surface_buffer(
+        &mut self,
+        surface_id: u32,
+        pending: PendingSurfaceBuffer,
+        frame_callbacks: Vec<wl_callback::WlCallback>,
+        source: SurfacePublicationSource,
+    ) {
+        let commit_sequence = pending.commit_sequence;
+        let buffer_id = pending.data.buffer_id();
+        let root_surface_id = self.root_surface_id_for_surface(surface_id);
+        if surface_tree_debug_enabled() {
+            eprintln!(
+                "oblivion-one compositor: surface_commit surface={surface_id} role=unassigned decision=retain_not_publish buffer_id={}",
+                buffer_id.get()
+            );
+        }
+        self.renderable_surfaces
+            .retain(|surface| surface.surface_id != surface_id);
+        self.track_committed_buffer_lifetime(surface_id, &pending);
+        self.current_surface_buffers.insert(surface_id, pending);
+        self.record_surface_publication(
+            surface_id,
+            root_surface_id,
+            commit_sequence,
+            Some(buffer_id),
+            source,
+            None,
+        );
+        self.complete_frame_callbacks(frame_callbacks);
+    }
+
+    pub(in crate::compositor) fn adopt_current_surface_content_for_role(
+        &mut self,
+        surface_id: u32,
+    ) -> bool {
+        if matches!(
+            self.surface_role(surface_id),
+            SurfaceRole::Unassigned | SurfaceRole::Cursor
+        ) {
+            return false;
+        }
+        if self
+            .renderable_surfaces
+            .iter()
+            .any(|surface| surface.surface_id == surface_id)
+        {
+            debug_assert!(
+                !matches!(
+                    self.surface_role(surface_id),
+                    SurfaceRole::Subsurface { .. }
+                ) || self
+                    .renderable_surfaces
+                    .iter()
+                    .find(|surface| surface.surface_id == surface_id)
+                    .is_some_and(|surface| surface.placement.parent_surface_id.is_some())
+            );
+            return false;
+        }
+        let Some(current) = self.current_surface_buffers.get(&surface_id).cloned() else {
+            return false;
+        };
+        let generation = self.next_render_generation_value();
+        let placement = self.surface_placement(surface_id);
+        let Ok(surface) = current.to_renderable_surface(
+            surface_id,
+            placement,
+            generation,
+            RenderableSurfaceDamage::Full,
+        ) else {
+            return false;
+        };
+        let buffer_size = surface.buffer_size();
+        self.renderable_surfaces
+            .retain(|surface| surface.surface_id != surface_id);
+        self.renderable_surfaces.push(surface);
+        self.record_surface_damage_commit(
+            surface_id,
+            RenderableSurfaceDamage::Full,
+            buffer_size.width,
+            buffer_size.height,
+        );
+        self.reorder_renderable_surfaces_by_committed_stack();
+        self.set_render_generation(generation, RenderGenerationCause::SurfaceCommit);
+        if surface_tree_debug_enabled() {
+            eprintln!(
+                "oblivion-one compositor: surface_adopt surface={surface_id} had_buffer=true removed_root_node=false transactions_rekeyed=0"
+            );
+        }
+        true
+    }
+
     pub(in crate::compositor) fn commit_surface_buffer_by_role(
         &mut self,
         surface_id: u32,
@@ -1057,33 +1153,42 @@ impl CompositorState {
         source: SurfacePublicationSource,
         window_geometry: Option<XdgWindowGeometry>,
     ) {
-        if self.is_cursor_surface(surface_id) {
-            self.commit_cursor_surface_buffer(surface_id, pending, damage, frame_callbacks);
-        } else {
-            let commit_sequence = pending.commit_sequence;
-            let buffer_id = pending.data.buffer_id();
-            match self.surface_publication_decision(surface_id, commit_sequence) {
-                SurfacePublicationDecision::Publish => {
-                    self.commit_surface_buffer(
-                        surface_id,
-                        pending,
-                        damage,
-                        window_geometry,
-                        source,
-                    );
-                    self.note_layer_surface_buffer_published(surface_id);
-                    self.pending_frame_callbacks.extend(frame_callbacks);
-                }
-                decision => {
-                    self.record_surface_publication_rejection(
-                        surface_id,
-                        commit_sequence,
-                        Some(buffer_id),
-                        source,
-                        decision,
-                    );
-                    pending.release_target().release();
-                    self.complete_frame_callbacks(frame_callbacks);
+        match self.surface_role(surface_id) {
+            SurfaceRole::Cursor => {
+                self.commit_cursor_surface_buffer(surface_id, pending, damage, frame_callbacks);
+            }
+            SurfaceRole::Unassigned => {
+                self.commit_unassigned_surface_buffer(surface_id, pending, frame_callbacks, source);
+            }
+            SurfaceRole::XdgToplevel
+            | SurfaceRole::XdgPopup
+            | SurfaceRole::LayerSurface
+            | SurfaceRole::Subsurface { .. } => {
+                let commit_sequence = pending.commit_sequence;
+                let buffer_id = pending.data.buffer_id();
+                match self.surface_publication_decision(surface_id, commit_sequence) {
+                    SurfacePublicationDecision::Publish => {
+                        self.commit_surface_buffer(
+                            surface_id,
+                            pending,
+                            damage,
+                            window_geometry,
+                            source,
+                        );
+                        self.note_layer_surface_buffer_published(surface_id);
+                        self.pending_frame_callbacks.extend(frame_callbacks);
+                    }
+                    decision => {
+                        self.record_surface_publication_rejection(
+                            surface_id,
+                            commit_sequence,
+                            Some(buffer_id),
+                            source,
+                            decision,
+                        );
+                        pending.release_target().release();
+                        self.complete_frame_callbacks(frame_callbacks);
+                    }
                 }
             }
         }
@@ -1127,7 +1232,13 @@ impl CompositorState {
         {
             return false;
         }
-        if let Ok(size) = current.surface_size_for_state(surface_size, buffer_scale) {
+        if let Ok(size) = current.surface_size_for_state(
+            SurfaceViewportCommit {
+                source: current.viewport_source,
+                destination: surface_size,
+            },
+            buffer_scale,
+        ) {
             existing.width = size.width;
             existing.height = size.height;
         }

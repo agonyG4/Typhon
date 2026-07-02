@@ -368,6 +368,7 @@ mod tests {
                 buffer::BufferSize::new(2, 2).unwrap(),
                 vec![0xff00_0000; 4],
             ),
+            viewport_source: None,
             damage: RenderableSurfaceDamage::full(),
         };
         let elements = render_scene_elements_for_surfaces(std::slice::from_ref(&surface), 1.0);

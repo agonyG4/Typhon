@@ -409,6 +409,7 @@ fn state_with_preview_resize(
             BufferSize::new(944, 502).expect("test size"),
             vec![0; 944 * 502],
         ),
+        viewport_source: None,
         damage: RenderableSurfaceDamage::Full,
     });
     state

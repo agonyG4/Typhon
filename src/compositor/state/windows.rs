@@ -95,6 +95,7 @@ impl CompositorState {
     pub(in crate::compositor) fn unregister_toplevel_surface(&mut self, surface_id: u32) {
         self.unmap_xdg_role_surfaces(surface_id);
         self.toplevel_surfaces.remove(&surface_id);
+        self.clear_surface_role_if(surface_id, SurfaceRole::XdgToplevel);
         self.surface_placements.remove(&surface_id);
         self.configured_xdg_surfaces.remove(&surface_id);
         self.xdg_configure_serials.remove(&surface_id);
@@ -204,6 +205,7 @@ impl CompositorState {
         self.recent_input_serials
             .retain(|input| compositor_surface_id(&input.surface) != surface_id);
         self.popup_surfaces.remove(&surface_id);
+        self.clear_surface_role_if(surface_id, SurfaceRole::XdgPopup);
         self.detach_popup_node(surface_id, PopupLifecycle::Destroyed);
         self.surface_placements.remove(&surface_id);
         self.configured_xdg_surfaces.remove(&surface_id);

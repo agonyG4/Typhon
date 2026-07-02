@@ -141,6 +141,15 @@ impl CompositorState {
             return;
         };
         let surface_id = compositor_surface_id(&surface);
+        if let Err(error) = self.assign_surface_role(surface_id, SurfaceRole::Cursor) {
+            pointer_debug_log(format!(
+                "cursor request rejected pointer={} surface={} reason={}",
+                pointer.id().protocol_id(),
+                surface_id,
+                error.message()
+            ));
+            return;
+        }
         self.cursor_surface_ids.insert(surface_id);
         self.unmap_surface_content(surface_id);
         let changed = self.active_client_cursor.as_ref().is_none_or(|active| {

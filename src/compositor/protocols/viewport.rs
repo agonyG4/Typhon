@@ -35,6 +35,7 @@ impl Dispatch<wp_viewport::WpViewport, ViewportData> for CompositorState {
         };
         match request {
             wp_viewport::Request::Destroy => {
+                surface_data.set_pending_viewport_source(None);
                 surface_data.set_pending_viewport_destination(None);
             }
             wp_viewport::Request::SetDestination { width, height } => {
@@ -43,11 +44,40 @@ impl Dispatch<wp_viewport::WpViewport, ViewportData> for CompositorState {
                 } else if width > 0 && height > 0 {
                     BufferSize::new(width as u32, height as u32)
                 } else {
+                    _resource.post_error(
+                        wp_viewport::Error::BadValue,
+                        "viewport destination must be unset or positive".to_string(),
+                    );
                     return;
                 };
                 surface_data.set_pending_viewport_destination(destination);
             }
-            wp_viewport::Request::SetSource { .. } => {}
+            wp_viewport::Request::SetSource {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                let source = if x == -1.0 && y == -1.0 && width == -1.0 && height == -1.0 {
+                    None
+                } else if x == -1.0 || y == -1.0 || width == -1.0 || height == -1.0 {
+                    _resource.post_error(
+                        wp_viewport::Error::BadValue,
+                        "viewport source unset sentinel must use all -1 values".to_string(),
+                    );
+                    return;
+                } else if let Some(source) = ViewportSourceRect::new(x, y, width, height) {
+                    Some(source)
+                } else {
+                    _resource.post_error(
+                        wp_viewport::Error::BadValue,
+                        "viewport source must have a non-negative origin and positive size"
+                            .to_string(),
+                    );
+                    return;
+                };
+                surface_data.set_pending_viewport_source(source);
+            }
             _ => {}
         }
     }

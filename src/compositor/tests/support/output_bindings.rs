@@ -184,6 +184,7 @@ pub(in crate::compositor::tests) fn create_client_surface_with_buffer_scale(
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let surface = compositor.create_surface(&qh, ());
+    assign_test_toplevel(&globals, &qh, &surface)?;
     surface.set_buffer_scale(buffer_scale);
     commit_test_buffered_surface(
         &surface,

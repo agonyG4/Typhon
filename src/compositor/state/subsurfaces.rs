@@ -88,11 +88,10 @@ impl CompositorState {
                 if let Some(surface) = self.surface_resource_by_id(surface_id)
                     && let Some(data) = surface.data::<SurfaceData>()
                 {
-                    let viewport_destination =
-                        data.viewport_destination_for_change(commit.viewport_destination);
+                    let viewport = data.viewport_for_change(commit.viewport_destination);
                     let buffer_scale = data.buffer_scale_for_change(commit.buffer_scale);
                     if pending
-                        .apply_committed_surface_state(viewport_destination, buffer_scale)
+                        .apply_committed_surface_state(viewport, buffer_scale)
                         .is_err()
                     {
                         return;
@@ -429,11 +428,10 @@ impl CompositorState {
             let Some(data) = surface.data::<SurfaceData>() else {
                 return false;
             };
-            let viewport_destination =
-                data.viewport_destination_for_change(commit.viewport_destination);
+            let viewport = data.viewport_for_change(commit.viewport_destination);
             let buffer_scale = data.buffer_scale_for_change(commit.buffer_scale);
             if pending
-                .apply_committed_surface_state(viewport_destination, buffer_scale)
+                .apply_committed_surface_state(viewport, buffer_scale)
                 .is_err()
             {
                 return false;
@@ -957,7 +955,10 @@ impl CompositorState {
         let Some(data) = surface.data::<SurfaceData>() else {
             return;
         };
-        let surface_size = data.apply_viewport_change(viewport_destination);
+        let viewport = data.apply_viewport_change(viewport_destination);
+        let surface_size = viewport
+            .destination
+            .or_else(|| viewport.source.and_then(ViewportSourceRect::logical_size));
         let committed_buffer_scale = data.apply_buffer_scale_change(buffer_scale);
         let input_region_changed = data.apply_input_region_change(input_region);
         let damage = damage.or(window_geometry
@@ -1158,6 +1159,11 @@ impl CompositorState {
             self.release_cached_subsurface_commits(vec![commit]);
         }
         self.unmap_surface_content(surface_id);
+        if let Some(parent_id) = parent_id {
+            self.clear_surface_role_if(surface_id, SurfaceRole::Subsurface { parent_id });
+        } else {
+            self.clear_surface_role(surface_id);
+        }
         self.set_surface_placement(surface_id, SurfacePlacement::root());
         for stack in self.committed_subsurface_stacks.values_mut() {
             stack.retain(|id| *id != surface_id);

@@ -30,6 +30,7 @@ mod task_05_8_tests {
                 BufferSize::new(width, height).expect("test size"),
                 vec![0; width as usize * height as usize],
             ),
+            viewport_source: None,
             damage: RenderableSurfaceDamage::Full,
         }
     }

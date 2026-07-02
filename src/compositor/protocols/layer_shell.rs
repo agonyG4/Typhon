@@ -42,12 +42,18 @@ impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for CompositorState {
                     );
                     return;
                 }
+                if let Err(error) = state.assign_surface_role(surface_id, SurfaceRole::LayerSurface)
+                {
+                    resource.post_error(zwlr_layer_shell_v1::Error::Role, error.message());
+                    return;
+                }
                 if state.current_surface_buffers.contains_key(&surface_id)
                     || state
                         .renderable_surfaces
                         .iter()
                         .any(|renderable| renderable.surface_id == surface_id)
                 {
+                    state.clear_surface_role_if(surface_id, SurfaceRole::LayerSurface);
                     resource.post_error(
                         zwlr_layer_shell_v1::Error::AlreadyConstructed,
                         "wl_surface already has committed content".to_string(),
@@ -68,6 +74,7 @@ impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for CompositorState {
                     },
                 );
                 state.register_layer_surface(surface, layer_surface, output, namespace, layer);
+                state.adopt_current_surface_content_for_role(surface_id);
             }
             zwlr_layer_shell_v1::Request::Destroy => {}
             _ => {}

@@ -587,6 +587,7 @@ pub(super) fn test_renderable_surface(
             size,
             vec![0; width as usize * height as usize],
         ),
+        viewport_source: None,
         damage,
     }
 }

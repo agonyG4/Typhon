@@ -66,6 +66,42 @@ fn subsurface_committed_before_parent_stays_above_parent_when_parent_maps() {
 }
 
 #[test]
+fn gecko_pre_role_surface_is_adopted_as_single_subsurface_node() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots = capture_gecko_pre_role_subsurface_adoption(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(snapshots.after_roleless_commit.is_empty());
+    let parent = snapshots
+        .after_adoption
+        .iter()
+        .find(|surface| surface.width == 1992 && surface.height == 1189)
+        .expect("parent should be renderable");
+    let child_nodes = snapshots
+        .after_adoption
+        .iter()
+        .filter(|surface| surface.width == 1920 && surface.height == 1080)
+        .collect::<Vec<_>>();
+    assert_eq!(child_nodes.len(), 1);
+    assert_eq!(child_nodes[0].parent_surface_id, Some(parent.surface_id));
+    let parent_index = snapshots
+        .after_adoption
+        .iter()
+        .position(|surface| surface.surface_id == parent.surface_id)
+        .expect("parent should be renderable");
+    let child_index = snapshots
+        .after_adoption
+        .iter()
+        .position(|surface| surface.surface_id == child_nodes[0].surface_id)
+        .expect("child should be renderable");
+    assert!(child_index > parent_index);
+}
+
+#[test]
 fn default_synchronized_child_is_invisible_until_parent_commit() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

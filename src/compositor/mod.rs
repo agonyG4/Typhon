@@ -477,6 +477,7 @@ pub struct CompositorState {
     cursor_visibility: CursorVisibilityState,
     pointer_entered_surfaces: Vec<(wl_pointer::WlPointer, wl_surface::WlSurface)>,
     pointer_enter_serials: Vec<PointerEnterSerial>,
+    surface_roles: HashMap<u32, SurfaceRole>,
     cursor_surface_ids: HashSet<u32>,
     active_client_cursor: Option<ActiveClientCursor>,
     client_cursor_surfaces: HashMap<u32, RenderableSurface>,

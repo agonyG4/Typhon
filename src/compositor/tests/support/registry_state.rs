@@ -221,6 +221,11 @@ pub(in crate::compositor::tests) struct RootBeforeChildSnapshots {
     pub(in crate::compositor::tests) after_next_parent: Vec<RenderableSurfaceSnapshot>,
 }
 
+pub(in crate::compositor::tests) struct GeckoPreRoleAdoptionSnapshots {
+    pub(in crate::compositor::tests) after_roleless_commit: Vec<RenderableSurfaceSnapshot>,
+    pub(in crate::compositor::tests) after_adoption: Vec<RenderableSurfaceSnapshot>,
+}
+
 pub(in crate::compositor::tests) struct MultipleSynchronizedCommitSnapshots {
     pub(in crate::compositor::tests) before_parent: Vec<RenderableSurfaceSnapshot>,
     pub(in crate::compositor::tests) after_parent: Vec<RenderableSurfaceSnapshot>,

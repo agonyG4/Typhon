@@ -998,6 +998,7 @@ impl CompositorState {
         self.release_cached_subsurface_commits(cached);
         self.cleanup_subsurface_stack_state_for_surface(surface_id);
         self.surface_resources.remove(&surface_id);
+        self.clear_surface_role(surface_id);
         self.cursor_surface_ids.remove(&surface_id);
         let removed_cursor_content = self.client_cursor_surfaces.remove(&surface_id).is_some();
         let active_cursor_pointer = self

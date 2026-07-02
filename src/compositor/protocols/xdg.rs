@@ -172,14 +172,10 @@ impl Dispatch<xdg_surface::XdgSurface, XdgSurfaceData> for CompositorState {
     ) {
         match request {
             xdg_surface::Request::GetToplevel { id } => {
-                if state
-                    .layer_surfaces
-                    .contains_key(&compositor_surface_id(&data.surface))
+                let surface_id = compositor_surface_id(&data.surface);
+                if let Err(error) = state.assign_surface_role(surface_id, SurfaceRole::XdgToplevel)
                 {
-                    resource.post_error(
-                        xdg_wm_base::Error::Role,
-                        "wl_surface already has a layer-shell role".to_string(),
-                    );
+                    resource.post_error(xdg_wm_base::Error::Role, error.message());
                     return;
                 }
                 let toplevel = data_init.init(
@@ -194,12 +190,18 @@ impl Dispatch<xdg_surface::XdgSurface, XdgSurfaceData> for CompositorState {
                     resource.clone(),
                     toplevel.clone(),
                 );
+                state.adopt_current_surface_content_for_role(surface_id);
             }
             xdg_surface::Request::GetPopup {
                 id,
                 parent,
                 positioner,
             } => {
+                let surface_id = compositor_surface_id(&data.surface);
+                if let Err(error) = state.assign_surface_role(surface_id, SurfaceRole::XdgPopup) {
+                    resource.post_error(xdg_wm_base::Error::Role, error.message());
+                    return;
+                }
                 let parent_surface = parent
                     .as_ref()
                     .and_then(|parent| parent.data::<XdgSurfaceData>())
@@ -221,6 +223,7 @@ impl Dispatch<xdg_surface::XdgSurface, XdgSurfaceData> for CompositorState {
                     popup,
                     positioner_state,
                 );
+                state.adopt_current_surface_content_for_role(surface_id);
             }
             xdg_surface::Request::SetWindowGeometry {
                 x,

@@ -4,6 +4,17 @@ use super::{
     client_setup::*, clipboard_dmabuf::*, input_client::*, locked_relative::*, output_bindings::*,
     registry_state::*, server_runtime::*, subsurface_client::*, window_ops::*,
 };
+
+pub(in crate::compositor::tests) fn assign_test_toplevel(
+    globals: &wayland_client::globals::GlobalList,
+    qh: &QueueHandle<RegistryTestState>,
+    surface: &client_wl_surface::WlSurface,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(qh, 1..=6, ())?;
+    let xdg_surface = wm_base.get_xdg_surface(surface, qh, ());
+    let _toplevel = xdg_surface.get_toplevel(qh, ());
+    Ok(())
+}
 pub(in crate::compositor::tests) fn create_surface_with_frame_callback(
     socket_path: &PathBuf,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
@@ -44,6 +55,7 @@ pub(in crate::compositor::tests) fn create_surface_with_unpresented_buffer_frame
     let pool = shm.create_pool(file.as_fd(), 16, &qh, ());
     let buffer = pool.create_buffer(0, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
     let surface = compositor.create_surface(&qh, ());
+    assign_test_toplevel(&globals, &qh, &surface)?;
     let _callback = surface.frame(&qh, ());
     surface.attach(Some(&buffer), 0, 0);
     surface.damage_buffer(0, 0, 2, 2);
@@ -69,6 +81,7 @@ pub(in crate::compositor::tests) fn create_visible_surface_frame_callback_withou
     let pool = shm.create_pool(file.as_fd(), 16, &qh, ());
     let buffer = pool.create_buffer(0, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
     let surface = compositor.create_surface(&qh, ());
+    assign_test_toplevel(&globals, &qh, &surface)?;
     surface.attach(Some(&buffer), 0, 0);
     surface.damage_buffer(0, 0, 2, 2);
     surface.commit();
@@ -104,6 +117,7 @@ pub(in crate::compositor::tests) fn create_visible_surface_frame_callback_withou
     let pool = shm.create_pool(file.as_fd(), 16, &qh, ());
     let buffer = pool.create_buffer(0, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
     let surface = compositor.create_surface(&qh, ());
+    assign_test_toplevel(&globals, &qh, &surface)?;
     surface.attach(Some(&buffer), 0, 0);
     surface.damage_buffer(0, 0, 2, 2);
     surface.commit();
@@ -139,6 +153,7 @@ pub(in crate::compositor::tests) fn create_surface_with_delayed_buffer_frame_cal
     let pool = shm.create_pool(file.as_fd(), 16, &qh, ());
     let buffer = pool.create_buffer(0, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
     let surface = compositor.create_surface(&qh, ());
+    assign_test_toplevel(&globals, &qh, &surface)?;
     let _callback = surface.frame(&qh, ());
     surface.attach(Some(&buffer), 0, 0);
     surface.damage_buffer(0, 0, 2, 2);

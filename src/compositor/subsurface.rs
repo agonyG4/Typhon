@@ -3,9 +3,9 @@ use std::{collections::HashMap, time::Instant};
 use wayland_server::protocol::wl_callback;
 
 use super::{
-    BufferSize, RenderableSurfaceDamage, SurfaceCommitSequence, SurfaceInputRegion,
+    RenderableSurfaceDamage, SurfaceCommitSequence, SurfaceInputRegion,
     explicit_sync::{CapturedExplicitSyncState, PendingPresentationFeedback},
-    state_data::{PendingSurfaceAttachment, SurfaceBufferRelease},
+    state_data::{PendingSurfaceAttachment, PendingViewportChange, SurfaceBufferRelease},
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -23,7 +23,7 @@ pub(super) struct CachedSubsurfaceCommit {
     pub(super) frame_callbacks: Vec<wl_callback::WlCallback>,
     pub(super) explicit_sync: Option<CapturedExplicitSyncState>,
     pub(super) offset: Option<(i32, i32)>,
-    pub(super) viewport_destination: Option<Option<BufferSize>>,
+    pub(super) viewport_destination: PendingViewportChange,
     pub(super) buffer_scale: Option<u32>,
     pub(super) input_region: Option<SurfaceInputRegion>,
     pub(super) presentation_feedbacks: Vec<PendingPresentationFeedback>,
@@ -69,7 +69,7 @@ impl CachedSubsurfaceCommit {
         if offset.is_some() {
             self.offset = offset;
         }
-        if viewport_destination.is_some() {
+        if viewport_destination.source.is_some() || viewport_destination.destination.is_some() {
             self.viewport_destination = viewport_destination;
         }
         if buffer_scale.is_some() {
@@ -128,7 +128,7 @@ mod window_geometry_tests {
             frame_callbacks: Vec::new(),
             explicit_sync: None,
             offset: None,
-            viewport_destination: None,
+            viewport_destination: PendingViewportChange::default(),
             buffer_scale: None,
             input_region: None,
             presentation_feedbacks: Vec::new(),

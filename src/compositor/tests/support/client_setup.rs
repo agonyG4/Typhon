@@ -750,6 +750,7 @@ pub(in crate::compositor::tests) fn create_client_surface_and_wait_for_enter(
     let _output: client_wl_output::WlOutput = globals.bind(&qh, 1..=4, ())?;
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let surface = compositor.create_surface(&qh, ());
+    assign_test_toplevel(&globals, &qh, &surface)?;
     commit_test_buffered_surface(&surface, &shm, &qh, 40, 30)?;
     connection.flush()?;
 

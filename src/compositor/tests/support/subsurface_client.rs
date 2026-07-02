@@ -179,6 +179,51 @@ pub(in crate::compositor::tests) fn create_toplevel_then_map_subsurface_before_b
     Ok(state)
 }
 
+pub(in crate::compositor::tests) fn capture_gecko_pre_role_subsurface_adoption(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<GeckoPreRoleAdoptionSnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
+    let viewporter: client_wp_viewporter::WpViewporter = globals.bind(&qh, 1..=1, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let child = compositor.create_surface(&qh, ());
+    attach_test_buffered_surface(&child, &shm, &qh, 1, 1)?;
+    child.commit();
+    connection.flush()?;
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    let after_roleless_commit = capture_renderable_surface_snapshot(commands);
+
+    let parent = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    commit_test_buffered_surface(&parent, &shm, &qh, 1992, 1189)?;
+
+    let viewport = viewporter.get_viewport(&child, &qh, ());
+    viewport.set_destination(1920, 1080);
+    let subsurface = subcompositor.get_subsurface(&child, &parent, &qh, ());
+    subsurface.set_position(10, 10);
+    subsurface.set_desync();
+    commit_test_buffered_surface(&child, &shm, &qh, 1972, 1132)?;
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+
+    let after_adoption = capture_renderable_surface_snapshot(commands);
+    Ok(GeckoPreRoleAdoptionSnapshots {
+        after_roleless_commit,
+        after_adoption,
+    })
+}
+
 pub(in crate::compositor::tests) fn create_overlapping_subsurfaces_then_place_above_after_parent_commit(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,

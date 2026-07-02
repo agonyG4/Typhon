@@ -46,6 +46,7 @@ pub(in crate::compositor::tests) fn create_client_surface_with_viewport_destinat
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let viewporter: client_wp_viewporter::WpViewporter = globals.bind(&qh, 1..=1, ())?;
     let surface = compositor.create_surface(&qh, ());
+    assign_test_toplevel(&globals, &qh, &surface)?;
     let viewport = viewporter.get_viewport(&surface, &qh, ());
     viewport.set_destination(destination_width as i32, destination_height as i32);
     commit_test_buffered_surface(
@@ -73,6 +74,7 @@ pub(in crate::compositor::tests) fn create_client_surface_with_buffer_offset(
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let surface = compositor.create_surface(&qh, ());
+    assign_test_toplevel(&globals, &qh, &surface)?;
     attach_test_buffered_surface(&surface, &shm, &qh, 40, 30)?;
     surface.offset(5, 7);
     surface.commit();
@@ -949,6 +951,7 @@ pub(in crate::compositor::tests) fn create_toplevel_request_move_from_client_chr
     let qh = queue.handle();
 
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let subcompositor: client_wl_subcompositor::WlSubcompositor = globals.bind(&qh, 1..=1, ())?;
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
@@ -978,9 +981,12 @@ pub(in crate::compositor::tests) fn create_toplevel_request_move_from_client_chr
         (),
     );
     let chrome = compositor.create_surface(&qh, ());
+    let chrome_subsurface = subcompositor.get_subsurface(&chrome, &surface, &qh, ());
+    chrome_subsurface.set_position(render::SURFACE_CASCADE_STEP, render::SURFACE_CASCADE_STEP);
     chrome.attach(Some(&chrome_buffer), 0, 0);
     chrome.damage_buffer(0, 0, chrome_width as i32, chrome_height as i32);
     chrome.commit();
+    surface.commit();
     connection.flush()?;
 
     let mut state = RegistryTestState::default();

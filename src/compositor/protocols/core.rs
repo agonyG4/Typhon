@@ -85,7 +85,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                 let damage = data.take_damage(
                     buffer_size,
                     data.buffer_scale_for_change(buffer_scale_change),
-                    data.viewport_destination_for_change(viewport_change),
+                    data.viewport_for_change(viewport_change),
                 );
                 let damage = match attachment {
                     Some(PendingSurfaceAttachment::Buffer(_)) if damage.damage.is_empty() => {
@@ -239,9 +239,14 @@ impl Dispatch<wl_subcompositor::WlSubcompositor, ()> for CompositorState {
             } => {
                 let surface_id = compositor_surface_id(&surface);
                 let parent_id = compositor_surface_id(&parent);
-                if state.is_cursor_surface(surface_id)
-                    || !state.register_subsurface_relationship(surface_id, parent_id)
+                if let Err(error) =
+                    state.assign_surface_role(surface_id, SurfaceRole::Subsurface { parent_id })
                 {
+                    _resource.post_error(wl_subcompositor::Error::BadSurface, error.message());
+                    return;
+                }
+                if !state.register_subsurface_relationship(surface_id, parent_id) {
+                    state.clear_surface_role_if(surface_id, SurfaceRole::Subsurface { parent_id });
                     _resource.post_error(
                         wl_subcompositor::Error::BadSurface,
                         "surface has another role or would create a subsurface cycle".to_string(),
@@ -252,6 +257,7 @@ impl Dispatch<wl_subcompositor::WlSubcompositor, ()> for CompositorState {
                     surface_id,
                     SurfacePlacement::subsurface(parent_id, 0, 0),
                 );
+                state.adopt_current_surface_content_for_role(surface_id);
                 data_init.init(id, SubsurfaceData { surface, parent });
             }
             wl_subcompositor::Request::Destroy => {}

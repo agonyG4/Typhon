@@ -1217,20 +1217,38 @@ pub fn surface_render_plan(
 }
 
 pub fn surface_render_plan_with_clip(
-    _surface: &RenderableSurface,
+    surface: &RenderableSurface,
     visual_target: SurfaceTargetRect,
     visual_clip: Option<SurfaceTargetRect>,
 ) -> SurfaceRenderPlan {
     let mut plan = SurfaceRenderPlan {
         visual_target,
         content_target: visual_target,
-        content_uv: SurfaceUvRect::FULL,
+        content_uv: surface_base_uv(surface),
         clip: visual_clip,
     };
     if let Some(clip) = visual_clip {
         plan = clip_surface_render_plan(plan, clip);
     }
     plan
+}
+
+fn surface_base_uv(surface: &RenderableSurface) -> SurfaceUvRect {
+    let Some(source) = surface.viewport_source else {
+        return SurfaceUvRect::FULL;
+    };
+    let buffer_size = surface.buffer_size();
+    if buffer_size.width == 0 || buffer_size.height == 0 {
+        return SurfaceUvRect::FULL;
+    }
+    let buffer_width = f64::from(buffer_size.width);
+    let buffer_height = f64::from(buffer_size.height);
+    SurfaceUvRect {
+        left: (source.x / buffer_width) as f32,
+        top: (source.y / buffer_height) as f32,
+        right: ((source.x + source.width) / buffer_width) as f32,
+        bottom: ((source.y + source.height) / buffer_height) as f32,
+    }
 }
 
 pub fn clip_surface_render_plan(
@@ -2043,8 +2061,7 @@ const CURSOR_PATTERN: [&str; 17] = [
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compositor::SurfaceCommitSequence;
-    use crate::compositor::SurfacePlacement;
+    use crate::compositor::{SurfaceCommitSequence, SurfacePlacement, ViewportSourceRect};
     use crate::render_backend::buffer::{
         BufferIdAllocator, BufferIdentity, BufferSize, CommittedSurfaceBuffer,
     };
@@ -2119,6 +2136,7 @@ mod tests {
                 2,
                 vec![0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff],
             ),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
         let mut renderer = DesktopSceneRenderer::default();
@@ -2160,6 +2178,7 @@ mod tests {
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(800, 600, vec![0xffff_0000; 800 * 600]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
 
@@ -2169,6 +2188,39 @@ mod tests {
         assert_eq!(plan.content_target.height(), 600);
         assert_eq!(plan.content_uv, SurfaceUvRect::FULL);
         assert_eq!(plan.clip, Some(SurfaceTargetRect::new(0, 0, 1000, 700)));
+    }
+
+    #[test]
+    fn viewport_source_selects_source_uv_without_changing_target() {
+        let surface = RenderableSurface {
+            surface_id: 7,
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 50,
+            placement: SurfacePlacement::root(),
+            render_placement: None,
+            visual_clip: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(200, 100, vec![0xffff_0000; 200 * 100]),
+            viewport_source: ViewportSourceRect::new(20.0, 10.0, 100.0, 50.0),
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+
+        let plan = surface_render_plan(&surface, SurfaceTargetRect::new(0, 0, 100, 50));
+
+        assert_eq!(plan.content_target.width(), 100);
+        assert_eq!(plan.content_target.height(), 50);
+        assert_eq!(
+            plan.content_uv,
+            SurfaceUvRect {
+                left: 0.1,
+                top: 0.1,
+                right: 0.6,
+                bottom: 0.6,
+            }
+        );
     }
 
     #[test]
@@ -2185,6 +2237,7 @@ mod tests {
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(1000, 700, vec![0xffff_0000; 1000 * 700]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
         let near = surface_render_plan(&near_surface, SurfaceTargetRect::new(0, 0, 1000, 700));
@@ -2227,6 +2280,7 @@ mod tests {
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(300, 200, vec![0xffff_0000; 300 * 200]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
 
@@ -2258,6 +2312,7 @@ mod tests {
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(120, 80, vec![0xffff_0000; 120 * 80]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
         let second = RenderableSurface {
@@ -2296,6 +2351,7 @@ mod tests {
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(372, 272, vec![0xffff_0000; 372 * 272]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
 
@@ -2332,6 +2388,7 @@ mod tests {
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(301, 201, vec![0xffff_0000; 301 * 201]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
 
@@ -2363,6 +2420,7 @@ mod tests {
                 generation: 1,
                 commit_sequence: SurfaceCommitSequence::initial(),
                 buffer: shm_buffer(300, 200, vec![0xffff_0000; 300 * 200]),
+                viewport_source: None,
                 damage: crate::compositor::RenderableSurfaceDamage::full(),
             };
 
@@ -2396,6 +2454,7 @@ mod tests {
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(300, 200, vec![0xffff_0000; 300 * 200]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
         let child = RenderableSurface {
@@ -2410,6 +2469,7 @@ mod tests {
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(40, 30, vec![0xffff_0000; 40 * 30]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
 
@@ -2441,6 +2501,7 @@ mod tests {
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(1000, 700, vec![0xffff_0000; 1000 * 700]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
         let mut current = previous.clone();
@@ -2487,6 +2548,7 @@ mod tests {
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
 
@@ -2558,6 +2620,7 @@ mod tests {
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
 
@@ -2584,6 +2647,7 @@ mod tests {
             generation: 2,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, updated_pixels),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::Partial(vec![
                 crate::compositor::SurfaceDamageRect {
                     x: 1,
@@ -2628,6 +2692,7 @@ mod tests {
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
 
@@ -2658,6 +2723,7 @@ mod tests {
             generation: 2,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, updated_pixels),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::Partial(vec![
                 crate::compositor::SurfaceDamageRect {
                     x: 1,
@@ -2715,6 +2781,7 @@ mod tests {
             generation: 3,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(8, 4, vec![0xffff_0000; 8 * 4]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::Partial(vec![
                 crate::compositor::SurfaceDamageRect {
                     x: 2,
@@ -2797,6 +2864,7 @@ mod tests {
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
 
@@ -2862,6 +2930,7 @@ mod tests {
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
         let top = RenderableSurface {
@@ -2876,6 +2945,7 @@ mod tests {
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(2, 2, vec![0xff00_ff00; 2 * 2]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
 
@@ -2902,6 +2972,7 @@ mod tests {
             generation: 2,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, updated_pixels),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::Partial(vec![
                 crate::compositor::SurfaceDamageRect {
                     x: 1,
@@ -2940,6 +3011,7 @@ mod tests {
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
 
@@ -2964,6 +3036,7 @@ mod tests {
             generation: 2,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xff00_00ff; 4 * 4]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::Partial(vec![
                 crate::compositor::SurfaceDamageRect {
                     x: 0,
@@ -3034,6 +3107,7 @@ mod tests {
                 2,
                 vec![0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff],
             ),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
         let mut frame = vec![0; 96 * 96];
@@ -3071,6 +3145,7 @@ mod tests {
                 2,
                 vec![0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff],
             ),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
         let background = 0xff00_0000;
@@ -3097,6 +3172,7 @@ mod tests {
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(12, 8, vec![0xffff_ffff; 12 * 8]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
         let mut frame = vec![0; 120 * 120];
@@ -3129,6 +3205,7 @@ mod tests {
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(1, 1, vec![0x0000_0000]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
         let mut wallpaper = vec![0; 96 * 96];
@@ -3167,6 +3244,7 @@ mod tests {
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(1, 1, vec![0x8080_0000]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
         let blue_background = 0xff00_00ff;
@@ -3197,6 +3275,7 @@ mod tests {
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(2, 2, vec![0xff00_ff00; 4]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
         let mut renderer = DesktopSceneRenderer::default();
@@ -3274,6 +3353,7 @@ mod tests {
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(100, 80, vec![0; 100 * 80]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
 
@@ -3302,6 +3382,7 @@ mod tests {
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(100, 80, vec![0; 100 * 80]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
         let child = RenderableSurface {
@@ -3316,6 +3397,7 @@ mod tests {
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(20, 10, vec![0; 20 * 10]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
 
@@ -3338,6 +3420,7 @@ mod tests {
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(100, 80, vec![0; 100 * 80]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
         let second = RenderableSurface {
@@ -3352,6 +3435,7 @@ mod tests {
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(20, 10, vec![0; 20 * 10]),
+            viewport_source: None,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
 

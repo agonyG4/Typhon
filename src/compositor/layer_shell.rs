@@ -452,6 +452,7 @@ impl CompositorState {
             role.initial_configure_sent = false;
         }
         self.layer_surfaces.remove(&surface_id);
+        self.clear_surface_role_if(surface_id, SurfaceRole::LayerSurface);
         self.unmap_surface_content(surface_id);
         self.arrange_layer_surfaces();
         self.reorder_renderable_surfaces_by_committed_stack();
