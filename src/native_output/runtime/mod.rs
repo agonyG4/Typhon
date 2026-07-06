@@ -4,6 +4,7 @@ mod bootstrap;
 mod cycle;
 mod frame;
 mod presentation;
+mod shutdown;
 
 pub(crate) use cycle::run;
 pub(crate) use frame::{
@@ -16,11 +17,15 @@ pub(crate) use frame::{
     NativeFrameRequest, NativePointerConstraint, NativePointerConstraintBackendAction,
     NativeRepaintDecision, NativeRepaintInputs, native_repaint_decision,
 };
+pub(crate) use shutdown::{
+    NativeShutdownLifecycle, ShutdownState, ShutdownTransition, native_shutdown_debug_log,
+};
 
 pub(super) struct NativeCycleState {
     pub(super) wakeup: NativeWakeup,
     pub(super) pageflip_drain_us: u64,
     pub(super) pageflip_completed: bool,
+    pub(super) completed_pageflip_token: Option<u64>,
     pub(super) frame_completed: bool,
     pub(super) frame_rendered: bool,
     pub(super) frame_submitted: bool,
@@ -33,6 +38,7 @@ pub(super) struct NativeCycleState {
     pub(super) input_drain_us: u64,
     pub(super) raw_input_events: usize,
     pub(super) coalesced_input_events: usize,
+    pub(super) shutdown_requested: bool,
 }
 
 pub(crate) struct NativeRuntimeConfig {
@@ -76,33 +82,8 @@ pub(crate) struct NativeRuntime {
     last_acquire_ready_at_ns: Option<u64>,
     resize_perf: NativeResizePerfState,
     pointer_constraint_backend: NativePointerConstraintBackend,
-    shutdown_state: ShutdownState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ShutdownState {
-    Running,
-    Requested,
-    Draining,
-    Restoring,
-    Complete,
-}
-
-impl ShutdownState {
-    pub(crate) fn request(&mut self) -> bool {
-        if *self == Self::Running {
-            *self = Self::Requested;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-pub(crate) fn native_shutdown_debug_log(marker: &str) {
-    if std::env::var_os("OBLIVION_ONE_SHUTDOWN_DEBUG").is_some() {
-        eprintln!("native shutdown: {marker}");
-    }
+    process_supervisor: ChildSupervisor,
+    shutdown: NativeShutdownLifecycle,
 }
 
 impl NativeRuntime {

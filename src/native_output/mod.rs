@@ -56,12 +56,13 @@ use oblivion_one::native::{
     },
     scheduler::{NativeFrameScheduler, PageFlipCompletionResult, SchedulerDecision},
 };
+use oblivion_one::process::{ChildSupervisor, ProcessKind, ProcessOptions, RestartPolicy};
 use oblivion_one::render_backend::egl_gles::EglGlesDmabufFeedback;
 use oblivion_one::session::NativeSessionProbe;
 use oblivion_one::syncobj::DrmSyncobjDevice;
 use oblivion_one::{
-    CompositorAppGpuPreference, EffectiveCompositorAppGpuPolicy, shell_quote,
-    spawn_compositor_app_with_policy,
+    CompositorAppGpuPreference, EffectiveCompositorAppGpuPolicy,
+    compositor_app_command_with_policy, shell_quote,
 };
 
 type NativeResult<T> = Result<T, Box<dyn Error>>;

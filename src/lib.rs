@@ -9,6 +9,7 @@ pub mod native;
 mod options;
 mod paths;
 pub mod portal;
+pub mod process;
 mod prototype_scene;
 pub mod render_backend;
 pub mod session;

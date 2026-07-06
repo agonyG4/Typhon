@@ -9,12 +9,14 @@ use crate::nested_renderer::{
     NestedOutputRenderer, NestedPaintOutcome, NestedSceneDrawRequest, OutputRendererPreference,
 };
 use oblivion_one::{
+    EffectiveCompositorAppGpuPolicy,
     compositor::{
         DesktopSceneRenderer, DesktopVisualState, OutputPosition, OwnCompositorServer,
         PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample,
         RelativePointerMotion, surface_origins,
     },
-    spawn_compositor_app,
+    compositor_app_command_with_policy,
+    process::{ChildSupervisor, ProcessKind, ProcessOptions},
 };
 use winit::{
     application::ApplicationHandler,
@@ -79,6 +81,7 @@ struct NestedOutputApp {
     config: NestedOutputConfig,
     active_wakeup_interval: Duration,
     app_command: Vec<String>,
+    process_supervisor: ChildSupervisor,
     app_launched: bool,
     external_shell_launched: bool,
     last_render_generation: u64,
@@ -159,6 +162,7 @@ impl NestedOutputApp {
             config,
             active_wakeup_interval: refresh_interval(config.refresh_hz),
             app_command,
+            process_supervisor: ChildSupervisor::new(),
             app_launched: false,
             external_shell_launched: false,
             last_render_generation: 0,
@@ -209,8 +213,31 @@ impl NestedOutputApp {
             self.server
                 .pointer_constraint_backend_deactivated(constraint.id);
         }
+        self.shutdown_supervised_children();
         // EGL's wl_egl_window must be destroyed before winit drops the underlying wl_surface.
         drop_renderer_before_window(&mut self.output_renderer, &mut self.window);
+    }
+
+    fn shutdown_supervised_children(&mut self) {
+        if self.process_supervisor.active_count() == 0 {
+            return;
+        }
+        let now = Instant::now();
+        if let Err(error) = self.process_supervisor.begin_shutdown(now) {
+            eprintln!("oblivion-one process: nested shutdown begin failed: {error}");
+            return;
+        }
+        let deadline = now + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match self.process_supervisor.advance_shutdown(Instant::now()) {
+                Ok(true) => return,
+                Ok(false) => std::thread::sleep(Duration::from_millis(10)),
+                Err(error) => {
+                    eprintln!("oblivion-one process: nested shutdown advance failed: {error}");
+                    return;
+                }
+            }
+        }
     }
 
     fn request_redraw(&mut self) {
@@ -236,6 +263,13 @@ impl NestedOutputApp {
     }
 
     fn tick_server(&mut self, event_loop: &ActiveEventLoop) {
+        if let Err(error) = self.process_supervisor.reap_exited() {
+            self.fail(
+                event_loop,
+                format!("oblivion-one compositor: child reap failed: {error}"),
+            );
+            return;
+        }
         match self.server.tick() {
             Ok(accepted) => {
                 if accepted > 0 {
@@ -684,8 +718,27 @@ impl NestedOutputApp {
             return;
         };
         let socket_name = self.server.socket_name().to_string();
-        match spawn_compositor_app(&socket_name, &self.app_command) {
-            Ok(Some(pid)) => {
+        match compositor_app_command_with_policy(
+            &socket_name,
+            &self.app_command,
+            EffectiveCompositorAppGpuPolicy::Accelerated,
+        ) {
+            Ok(Some(command)) => {
+                let pid = match self.process_supervisor.spawn(
+                    command,
+                    ProcessOptions::new(ProcessKind::Application).session_owned(false),
+                ) {
+                    Ok(pid) => pid,
+                    Err(error) => {
+                        self.fail(
+                            event_loop,
+                            format!(
+                                "oblivion-one compositor: failed to spawn `{program}`: {error}"
+                            ),
+                        );
+                        return;
+                    }
+                };
                 println!(
                     "spawned `{program}` on Oblivion Wayland socket `{socket_name}` as pid {pid}"
                 );
@@ -717,8 +770,27 @@ impl NestedOutputApp {
             return;
         };
         let socket_name = self.server.socket_name().to_string();
-        match spawn_compositor_app(&socket_name, &command) {
-            Ok(Some(pid)) => {
+        match compositor_app_command_with_policy(
+            &socket_name,
+            &command,
+            EffectiveCompositorAppGpuPolicy::Accelerated,
+        ) {
+            Ok(Some(command)) => {
+                let pid = match self
+                    .process_supervisor
+                    .spawn(command, ProcessOptions::new(ProcessKind::SessionService))
+                {
+                    Ok(pid) => pid,
+                    Err(error) => {
+                        self.fail(
+                            event_loop,
+                            format!(
+                                "oblivion-one compositor: failed to spawn `{program}`: {error}"
+                            ),
+                        );
+                        return;
+                    }
+                };
                 println!(
                     "spawned `{program}` from Spotlight on Oblivion Wayland socket `{socket_name}` as pid {pid}"
                 );

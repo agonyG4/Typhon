@@ -14,6 +14,15 @@ pub(in crate::compositor) fn same_buffer_resource(
     same_wayland_resource(left, right)
 }
 
+pub(in crate::compositor) fn resource_owned_by_client<R>(resource: &R, client_id: &ClientId) -> bool
+where
+    R: Resource,
+{
+    resource
+        .client()
+        .is_some_and(|client| client.id() == *client_id)
+}
+
 pub(in crate::compositor) fn normalize_selection_mime_types(
     mime_types: Vec<String>,
 ) -> Vec<String> {

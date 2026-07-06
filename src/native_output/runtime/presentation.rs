@@ -43,7 +43,8 @@ impl NativeRuntime {
             resize_perf,
             pointer_constraint_backend,
             seat_session: _,
-            shutdown_state: _,
+            process_supervisor: _,
+            shutdown: _,
         } = self;
         let wakeup = &cycle.wakeup;
         let mut frame_completed = cycle.frame_completed;

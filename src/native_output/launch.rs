@@ -4,6 +4,7 @@ const ECLIPSE_ROOT: &str = "/home/agony/GitHub/Eclipse";
 
 pub(crate) fn launch_native_shell_command(
     server: &OwnCompositorServer,
+    supervisor: &mut ChildSupervisor,
     command: Vec<String>,
     app_gpu_policy: EffectiveCompositorAppGpuPolicy,
     source: NativeLaunchSource,
@@ -13,10 +14,31 @@ pub(crate) fn launch_native_shell_command(
     };
     let socket_name = server.socket_name().to_string();
     let spawn_start = Instant::now();
-    let spawn_result =
-        spawn_compositor_app_with_policy(&socket_name, &request.argv, request.gpu_policy);
+    let process_options = native_process_options(&request);
+    let spawn_result = match request.source {
+        NativeLaunchSource::ExternalShell => {
+            let socket_name = socket_name.clone();
+            let argv = request.argv.clone();
+            let gpu_policy = request.gpu_policy;
+            supervisor.spawn_restartable(
+                move || {
+                    compositor_app_command_with_policy(&socket_name, &argv, gpu_policy)?
+                        .ok_or_else(|| io::Error::other("native shell command is empty"))
+                },
+                process_options,
+            )
+        }
+        _ => match compositor_app_command_with_policy(
+            &socket_name,
+            &request.argv,
+            request.gpu_policy,
+        )? {
+            Some(command) => supervisor.spawn(command, process_options),
+            None => return Ok(None),
+        },
+    };
     match spawn_result {
-        Ok(Some(pid)) => {
+        Ok(pid) => {
             let spawn_us = elapsed_micros(spawn_start);
             println!(
                 "spawned `{}` from native {} on Oblivion Wayland socket `{socket_name}` as pid {pid} (gpu policy {})",
@@ -34,7 +56,6 @@ pub(crate) fn launch_native_shell_command(
                 source: request.source,
             }))
         }
-        Ok(None) => Ok(None),
         Err(error) => Err(io::Error::other(format!(
             "failed to spawn `{}` from native {} with app policy {}: {error}",
             request.program,
@@ -42,6 +63,22 @@ pub(crate) fn launch_native_shell_command(
             request.gpu_policy.as_str()
         ))
         .into()),
+    }
+}
+
+fn native_process_options(request: &NativeLaunchRequest) -> ProcessOptions {
+    match request.source {
+        NativeLaunchSource::ExternalShell => ProcessOptions::new(ProcessKind::ShellSessionCritical)
+            .with_restart_policy(RestartPolicy::CriticalSessionComponent)
+            .with_label(request.program.clone()),
+        NativeLaunchSource::Startup => ProcessOptions::new(ProcessKind::Application)
+            .session_owned(false)
+            .with_label(request.program.clone()),
+        NativeLaunchSource::Spotlight
+        | NativeLaunchSource::AltTab
+        | NativeLaunchSource::Binding => {
+            ProcessOptions::new(ProcessKind::SessionService).with_label(request.program.clone())
+        }
     }
 }
 

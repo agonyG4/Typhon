@@ -35,6 +35,16 @@ pub(in crate::compositor::tests) fn request_presentation_feedback(
     Ok(connection)
 }
 
+pub(in crate::compositor::tests) fn retain_live_test_connection(connection: Connection) {
+    static RETAINED_CONNECTIONS: std::sync::OnceLock<Mutex<Vec<Connection>>> =
+        std::sync::OnceLock::new();
+    RETAINED_CONNECTIONS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(connection);
+}
+
 pub(in crate::compositor::tests) fn create_surface_with_presentation_feedback_and_present(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
@@ -67,7 +77,7 @@ pub(in crate::compositor::tests) fn create_surface_with_presentation_feedback_an
 
 pub(in crate::compositor::tests) fn create_surface_with_unpresented_presentation_feedback(
     socket_path: &PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Connection, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
@@ -87,7 +97,7 @@ pub(in crate::compositor::tests) fn create_surface_with_unpresented_presentation
     connection.flush()?;
     queue.roundtrip(&mut RegistryTestState::default())?;
 
-    Ok(())
+    Ok(connection)
 }
 
 pub(in crate::compositor::tests) fn create_client_toplevel(

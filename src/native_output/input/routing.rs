@@ -778,45 +778,46 @@ pub(crate) fn read_linux_input_event(device: &mut NativeInputDevice) -> Option<L
 
 pub(crate) fn apply_native_input_effect(
     effect: NativeInputEffect,
-    server: &mut OwnCompositorServer,
-    perf: NativePerfLogger,
-    resize_perf: &mut NativeResizePerfState,
-    cursor_mode: NativeCursorRenderMode,
-    app_gpu_policy: EffectiveCompositorAppGpuPolicy,
-    seat_session: Option<&NativeSeatSession>,
+    context: NativeInputApplyContext<'_>,
 ) -> NativeResult<NativeInputApplication> {
     let mut application = NativeInputApplication {
-        redraw_requested: effect.requires_frame_repaint(cursor_mode),
+        redraw_requested: effect.requires_frame_repaint(context.cursor_mode),
         exit_requested: effect.exit_requested,
         launch: None,
     };
     application.redraw_requested |= apply_compositor_only_pointer_position(&effect, |x, y| {
-        server.update_pointer_position_without_client_dispatch(x, y)
+        context
+            .server
+            .update_pointer_position_without_client_dispatch(x, y)
     });
     for event in effect.keyboard_events {
-        server.send_keyboard_key(event.key, event.pressed);
+        context.server.send_keyboard_key(event.key, event.pressed);
     }
     if effect.pointer_motion.is_some() || effect.relative_motion.is_some() {
-        server.send_pointer_motion_sample(CompositorPointerMotionSample {
-            timestamp_usec: effect.pointer_motion_usec.unwrap_or(0),
-            absolute: effect
-                .pointer_motion
-                .map(|(x, y)| CompositorOutputPosition { x, y }),
-            relative: effect.relative_motion.map(Into::into),
-        });
+        context
+            .server
+            .send_pointer_motion_sample(CompositorPointerMotionSample {
+                timestamp_usec: effect.pointer_motion_usec.unwrap_or(0),
+                absolute: effect
+                    .pointer_motion
+                    .map(|(x, y)| CompositorOutputPosition { x, y }),
+                relative: effect.relative_motion.map(Into::into),
+            });
     }
     for event in effect.pointer_buttons {
-        server.send_pointer_button(event.button, event.pressed);
+        context
+            .server
+            .send_pointer_button(event.button, event.pressed);
     }
     if let Some((horizontal, vertical)) = effect.pointer_axis {
-        server.send_pointer_axis(horizontal, vertical);
+        context.server.send_pointer_axis(horizontal, vertical);
     }
     for action in effect.window_actions {
         application.redraw_requested |=
-            apply_native_window_action(action, server, perf, resize_perf);
+            apply_native_window_action(action, context.server, context.perf, context.resize_perf);
     }
     for shortcut in effect.shortcut_events {
-        let dispatched = server.emit_astrea_shortcut_pressed(
+        let dispatched = context.server.emit_astrea_shortcut_pressed(
             &shortcut.namespace,
             &shortcut.name,
             effect
@@ -824,14 +825,14 @@ pub(crate) fn apply_native_input_effect(
                 .and_then(|timestamp| u32::try_from(timestamp / 1_000).ok())
                 .unwrap_or(0),
         );
-        perf.log("shortcut_emit", || {
+        context.perf.log("shortcut_emit", || {
             vec![
                 NativePerfField::str("namespace", shortcut.namespace.clone()),
                 NativePerfField::str("name", shortcut.name.clone()),
                 NativePerfField::bool("repeated", shortcut.repeated),
             ]
         });
-        perf.log("shortcut_client_dispatch", || {
+        context.perf.log("shortcut_client_dispatch", || {
             vec![
                 NativePerfField::str("namespace", shortcut.namespace),
                 NativePerfField::str("name", shortcut.name),
@@ -840,24 +841,35 @@ pub(crate) fn apply_native_input_effect(
         });
     }
     if let Some(vt) = effect.vt_switch
-        && let Some(session) = seat_session
+        && let Some(session) = context.seat_session
     {
         session.switch_session(i32::from(vt))?;
-        perf.log("vt.switch", || {
+        context.perf.log("vt.switch", || {
             vec![NativePerfField::u64("vt", u64::from(vt))]
         });
     }
     if let Some(command) = effect.launch_command {
         application.launch = launch_native_shell_command(
-            server,
+            context.server,
+            context.process_supervisor,
             command,
-            app_gpu_policy,
+            context.app_gpu_policy,
             effect
                 .launch_source
                 .unwrap_or(NativeLaunchSource::Spotlight),
         )?;
     }
     Ok(application)
+}
+
+pub(crate) struct NativeInputApplyContext<'a> {
+    pub(crate) server: &'a mut OwnCompositorServer,
+    pub(crate) perf: NativePerfLogger,
+    pub(crate) resize_perf: &'a mut NativeResizePerfState,
+    pub(crate) cursor_mode: NativeCursorRenderMode,
+    pub(crate) app_gpu_policy: EffectiveCompositorAppGpuPolicy,
+    pub(crate) seat_session: Option<&'a NativeSeatSession>,
+    pub(crate) process_supervisor: &'a mut ChildSupervisor,
 }
 
 pub(crate) fn apply_compositor_only_pointer_position(

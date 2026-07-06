@@ -269,6 +269,7 @@ impl NativeRuntime {
             ExplicitSyncWatchRegistry::new(refresh_interval_ns, drm_file_generation);
         server.enable_external_acquire_readiness();
         let mut event_loop = NativeEventLoop::new()?;
+        let mut process_supervisor = ChildSupervisor::with_sigchld_reaper()?;
         event_loop.register(kms.file().as_raw_fd(), NativeEventSource::Drm)?;
         event_loop.register(
             server.listener_fd().as_raw_fd(),
@@ -282,6 +283,9 @@ impl NativeRuntime {
             let index = u16::try_from(index)
                 .map_err(|_| io::Error::other("too many native input event sources"))?;
             event_loop.register(fd, NativeEventSource::Input(index))?;
+        }
+        if let Some(fd) = process_supervisor.signal_fd() {
+            event_loop.register(fd, NativeEventSource::ChildSignal)?;
         }
         let scheduler_anchor_ns = monotonic_now_ns()?;
         let mut frame_scheduler = NativeFrameScheduler::new(refresh_hz, scheduler_anchor_ns);
@@ -308,6 +312,7 @@ impl NativeRuntime {
         if let Some(command) = external_shell_command()
             && let Some(launch) = launch_native_shell_command(
                 &server,
+                &mut process_supervisor,
                 command,
                 effective_app_gpu_policy,
                 NativeLaunchSource::ExternalShell,
@@ -326,6 +331,7 @@ impl NativeRuntime {
         if let Some(command) = startup_app
             && let Some(launch) = launch_native_shell_command(
                 &server,
+                &mut process_supervisor,
                 command,
                 effective_app_gpu_policy,
                 NativeLaunchSource::Startup,
@@ -369,7 +375,8 @@ impl NativeRuntime {
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
-            shutdown_state: ShutdownState::Running,
+            process_supervisor,
+            shutdown: NativeShutdownLifecycle::new(),
         })
     }
 

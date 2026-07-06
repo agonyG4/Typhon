@@ -52,8 +52,6 @@ pub struct OwnCompositorServer {
     pub(super) state: CompositorState,
     disconnected_clients: Arc<Mutex<Vec<DisconnectedClient>>>,
     client_pids: Arc<Mutex<HashMap<ClientId, i32>>>,
-    #[cfg(test)]
-    cleanup_live_disconnected_test_clients: bool,
     gpu_buffer_protocols_enabled: bool,
 }
 
@@ -213,8 +211,6 @@ impl OwnCompositorServer {
             state,
             disconnected_clients,
             client_pids,
-            #[cfg(test)]
-            cleanup_live_disconnected_test_clients: false,
             gpu_buffer_protocols_enabled: gpu_buffers_enabled,
         })
     }
@@ -225,11 +221,6 @@ impl OwnCompositorServer {
         }
         register_gpu_buffer_globals(&self.display.handle(), self.state.syncobj_device.is_some());
         self.gpu_buffer_protocols_enabled = true;
-    }
-
-    #[cfg(test)]
-    pub(super) fn enable_cleanup_live_disconnected_test_clients(&mut self) {
-        self.cleanup_live_disconnected_test_clients = true;
     }
 
     #[doc(hidden)]
@@ -620,46 +611,23 @@ impl OwnCompositorServer {
             .lock()
             .map(|mut clients| std::mem::take(&mut *clients))
             .unwrap_or_default();
-        let mut still_alive = Vec::new();
         for disconnected in disconnected {
-            if self.should_teardown_disconnected_client(disconnected.pid) {
-                self.state
-                    .teardown_surfaces_for_client(&disconnected.client_id);
-            } else {
-                still_alive.push(disconnected);
-            }
-        }
-        if !still_alive.is_empty()
-            && let Ok(mut clients) = self.disconnected_clients.lock()
-        {
-            clients.extend(still_alive);
+            let summary = self
+                .state
+                .teardown_client_resources(&disconnected.client_id);
+            eprintln!(
+                "oblivion-one compositor: client_disconnect client={:?} pid={} surfaces_removed={} visible_removed={} repaint_scheduled={}",
+                disconnected.client_id,
+                disconnected
+                    .pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                summary.surfaces_removed,
+                summary.renderables_removed,
+                summary.repaint_scheduled
+            );
         }
     }
-
-    fn should_teardown_disconnected_client(&self, pid: Option<i32>) -> bool {
-        #[cfg(test)]
-        if self.cleanup_live_disconnected_test_clients {
-            return true;
-        }
-        pid.is_none_or(|pid| !process_is_alive(pid))
-    }
-}
-
-fn process_is_alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    let stat_path = std::path::Path::new("/proc")
-        .join(pid.to_string())
-        .join("stat");
-    let Ok(stat) = std::fs::read_to_string(stat_path) else {
-        return false;
-    };
-    let Some(comm_end) = stat.rfind(')') else {
-        return true;
-    };
-    let state = stat[comm_end.saturating_add(2)..].split_whitespace().next();
-    !matches!(state, Some("Z" | "X" | "x"))
 }
 
 fn register_minimum_globals(

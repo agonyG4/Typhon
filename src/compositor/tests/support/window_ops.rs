@@ -11,6 +11,7 @@ pub(in crate::compositor::tests) fn create_idle_inhibitor_for_surface_and_captur
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -39,6 +40,7 @@ pub(in crate::compositor::tests) fn create_client_surface_with_viewport_destinat
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -68,6 +70,7 @@ pub(in crate::compositor::tests) fn create_client_surface_with_buffer_offset(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -93,6 +96,7 @@ pub(in crate::compositor::tests) fn create_configured_client_toplevel_then_resiz
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -118,6 +122,7 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_resize_drag(
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -207,6 +212,7 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_window_command
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -234,6 +240,7 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_coalesced_resi
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -278,6 +285,7 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_active_resize_
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -311,6 +319,7 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_resize_drag_wi
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -352,6 +361,7 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_queue_resize_c
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -386,6 +396,7 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_queue_resize_c
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -424,6 +435,7 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_prepare_queued
 ) -> Result<(bool, bool), Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -461,6 +473,7 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_resize_drag_an
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -503,6 +516,7 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_alt_top_left_r
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -550,6 +564,7 @@ pub(in crate::compositor::tests) fn create_csd_toplevel_then_resize_drag_commit_
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -613,6 +628,7 @@ pub(in crate::compositor::tests) fn capture_csd_consecutive_resize_regression_sn
 ) -> Result<CsdConsecutiveResizeSnapshots, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -721,6 +737,7 @@ pub(in crate::compositor::tests) fn capture_csd_top_left_resize_regression_snaps
 ) -> Result<CsdTopLeftResizeSnapshot, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -795,6 +812,7 @@ pub(in crate::compositor::tests) fn capture_csd_window_geometry_pending_and_comm
 ) -> Result<WindowGeometryCommitSnapshots, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -858,6 +876,7 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_measure_config
 ) -> Result<(u64, u64), Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -896,6 +915,7 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_request_move_and_dr
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -947,6 +967,7 @@ pub(in crate::compositor::tests) fn create_toplevel_request_move_from_client_chr
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -1027,6 +1048,7 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_request_top_left_re
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -1086,6 +1108,7 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_frame_corner_r
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -1121,6 +1144,7 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_frame_corner_r
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -1154,6 +1178,7 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_left_edge_shri
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 

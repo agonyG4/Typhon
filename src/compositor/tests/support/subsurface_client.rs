@@ -10,6 +10,7 @@ pub(in crate::compositor::tests) fn create_min_size_toplevel_then_shrink_resize_
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -44,6 +45,7 @@ pub(in crate::compositor::tests) fn create_scaled_buffer_toplevel_then_right_edg
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
@@ -85,6 +87,7 @@ pub(in crate::compositor::tests) fn create_scaled_buffer_toplevel_then_left_edge
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
+    retain_live_test_connection(connection.clone());
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 

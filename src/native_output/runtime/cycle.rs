@@ -15,7 +15,7 @@ pub fn run(
 
 impl NativeRuntime {
     pub(super) fn run_native_cycle(&mut self) -> NativeResult<()> {
-        while self.shutdown_state != ShutdownState::Complete {
+        while !self.shutdown.is_complete() {
             self.run_cycle()?;
         }
         native_shutdown_debug_log("shutdown_complete");
@@ -23,21 +23,228 @@ impl NativeRuntime {
     }
 
     fn run_cycle(&mut self) -> NativeResult<()> {
-        if self.shutdown_state != ShutdownState::Running {
-            self.shutdown_state = ShutdownState::Complete;
+        let mut cycle = self.wait_for_events_and_pageflips()?;
+        self.reap_supervised_children(&cycle)?;
+        self.advance_shutdown_lifecycle(&cycle)?;
+        if !self.shutdown.is_running() {
             return Ok(());
         }
-        let mut cycle = self.wait_for_events_and_pageflips()?;
         self.dispatch_wayland_and_input(&mut cycle)?;
-        if self.shutdown_state != ShutdownState::Running {
+        if cycle.shutdown_requested {
+            self.request_native_shutdown()?;
+        }
+        if !self.shutdown.is_running() {
             return Ok(());
         }
         self.process_acquire_and_prepare(&cycle)?;
-        if self.shutdown_state != ShutdownState::Running {
+        if !self.shutdown.is_running() {
             return Ok(());
         }
         self.render_present_and_update_metrics(&mut cycle)?;
         Ok(())
+    }
+
+    fn reap_supervised_children(&mut self, cycle: &NativeCycleState) -> NativeResult<()> {
+        if !cycle.wakeup.reasons.child_signal()
+            && self.shutdown.state() != ShutdownState::StoppingChildren
+        {
+            return Ok(());
+        }
+        for exit in self.process_supervisor.reap_exited()? {
+            self.perf.log("process.exit", || {
+                vec![
+                    NativePerfField::str("kind", exit.kind.as_str()),
+                    NativePerfField::u64("pid", u64::from(exit.pid)),
+                    NativePerfField::str(
+                        "exit_code",
+                        exit.status
+                            .code()
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "signal_or_unknown".to_string()),
+                    ),
+                    NativePerfField::u64("restarted_pid", exit.restarted_pid.map_or(0, u64::from)),
+                ]
+            });
+        }
+        Ok(())
+    }
+
+    fn request_native_shutdown(&mut self) -> NativeResult<()> {
+        let now_ns = monotonic_now_ns()?;
+        let pending_pageflip_token = self
+            .scanout
+            .pending_page_flip_token()
+            .or_else(|| self.frame_scheduler.pending_page_flip_token());
+        match self
+            .shutdown
+            .request_shutdown(now_ns, pending_pageflip_token)
+        {
+            Some(transition) => {
+                native_shutdown_debug_log("shortcut_exit_requested");
+                native_shutdown_debug_log("shutdown_begin");
+                println!("native input exit requested; shutting down cleanly");
+                self.log_shutdown_transition(transition);
+            }
+            None => {
+                native_shutdown_debug_log("shortcut_exit_requested_duplicate");
+            }
+        }
+        self.advance_shutdown_lifecycle_without_cycle()
+    }
+
+    fn advance_shutdown_lifecycle_without_cycle(&mut self) -> NativeResult<()> {
+        let cycle = NativeCycleState {
+            wakeup: NativeWakeup {
+                reasons: Default::default(),
+                ready_sources: 0,
+                blocked_ns: 0,
+                timer_lateness_ns: None,
+                explicit_sync_acquire_tokens: Vec::new(),
+            },
+            pageflip_drain_us: 0,
+            pageflip_completed: false,
+            completed_pageflip_token: None,
+            frame_completed: false,
+            frame_rendered: false,
+            frame_submitted: false,
+            present_us: 0,
+            pageflip_pending_at_tick: self.scanout.page_flip_pending(),
+            tick_us: 0,
+            accepted: 0,
+            redraw_requested: false,
+            skipped_input_repaints: 0,
+            input_drain_us: 0,
+            raw_input_events: 0,
+            coalesced_input_events: 0,
+            shutdown_requested: false,
+        };
+        self.advance_shutdown_lifecycle(&cycle)
+    }
+
+    fn advance_shutdown_lifecycle(&mut self, cycle: &NativeCycleState) -> NativeResult<()> {
+        loop {
+            match self.shutdown.state() {
+                ShutdownState::Running | ShutdownState::Complete => return Ok(()),
+                ShutdownState::Requested => {
+                    if let Some(transition) = self.shutdown.advance_requested() {
+                        self.log_shutdown_transition(transition);
+                        if self.shutdown.state() == ShutdownState::Draining {
+                            native_shutdown_debug_log("pageflip_drain_begin");
+                            self.arm_shutdown_deadline()?;
+                            return Ok(());
+                        }
+                    }
+                }
+                ShutdownState::Draining => {
+                    if let Some(token) = cycle.completed_pageflip_token
+                        && let Some(transition) = self.shutdown.note_pageflip_event(token)
+                    {
+                        native_shutdown_debug_log("pageflip_drain_confirmed");
+                        self.log_shutdown_transition(transition);
+                        continue;
+                    }
+                    if cycle.wakeup.reasons.drm() && !cycle.pageflip_completed {
+                        let _ = self.shutdown.note_empty_nonblocking_drm_read();
+                    }
+                    let now_ns = monotonic_now_ns()?;
+                    if let Some(transition) = self.shutdown.advance_pageflip_timeout(now_ns) {
+                        native_shutdown_debug_log("pageflip_drain_forced_timeout");
+                        self.log_shutdown_transition(transition);
+                        self.perf.log("native.shutdown_pageflip_timeout", || {
+                            vec![
+                                NativePerfField::u64(
+                                    "expected_token",
+                                    self.shutdown.expected_pageflip_token().unwrap_or(0),
+                                ),
+                                NativePerfField::bool(
+                                    "scanout_pageflip_pending",
+                                    self.scanout.page_flip_pending(),
+                                ),
+                            ]
+                        });
+                        continue;
+                    }
+                    self.arm_shutdown_deadline()?;
+                    return Ok(());
+                }
+                ShutdownState::StoppingChildren => {
+                    if self.shutdown.mark_child_stop_started() {
+                        native_shutdown_debug_log("shell_children_stop");
+                        self.perf.log("native.shutdown_children", || {
+                            vec![NativePerfField::str("stage", "begin")]
+                        });
+                        self.process_supervisor.begin_shutdown(Instant::now())?;
+                    }
+                    if self.process_supervisor.advance_shutdown(Instant::now())?
+                        && let Some(transition) = self.shutdown.note_session_children_stopped()
+                    {
+                        self.log_shutdown_transition(transition);
+                        continue;
+                    }
+                    self.event_loop
+                        .arm_deadline(Some(monotonic_now_ns()?.saturating_add(50_000_000)))?;
+                    return Ok(());
+                }
+                ShutdownState::Restoring => {
+                    self.restore_kms_for_shutdown()?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    fn restore_kms_for_shutdown(&mut self) -> NativeResult<()> {
+        let Some(reason) = self.shutdown.begin_kms_restore() else {
+            return Ok(());
+        };
+        native_shutdown_debug_log("input_backend_stop");
+        self.acquire_watches.shutdown(&mut self.event_loop)?;
+        if let Some(cursor) = self.hardware_cursor.as_mut() {
+            let _ = cursor.disable();
+        }
+        native_shutdown_debug_log("kms_restore_begin");
+        let restoration = self.kms_backend.restore()?;
+        native_shutdown_debug_log("kms_restore_end");
+        self.perf.log("native.kms_restore", || {
+            vec![
+                NativePerfField::str("backend", self.kms_backend.effective_kind().as_str()),
+                NativePerfField::str("outcome", restoration.as_str()),
+                NativePerfField::str("shutdown_pageflip", reason.as_str()),
+                NativePerfField::bool("pageflip_pending", self.scanout.page_flip_pending()),
+            ]
+        });
+        native_shutdown_debug_log("drm_release");
+        native_shutdown_debug_log("vt_restore");
+        if let Some(transition) = self.shutdown.note_kms_restore_complete() {
+            self.log_shutdown_transition(transition);
+        }
+        self.event_loop.arm_deadline(None)?;
+        Ok(())
+    }
+
+    fn arm_shutdown_deadline(&mut self) -> NativeResult<()> {
+        self.event_loop
+            .arm_deadline(self.shutdown.pageflip_deadline_ns())?;
+        Ok(())
+    }
+
+    fn log_shutdown_transition(&self, transition: ShutdownTransition) {
+        self.perf.log("native.shutdown_transition", || {
+            vec![
+                NativePerfField::str("from", transition.from.as_str()),
+                NativePerfField::str("to", transition.to.as_str()),
+                NativePerfField::str("reason", transition.reason.as_str()),
+                NativePerfField::u64(
+                    "pending_pageflip_token",
+                    self.shutdown.expected_pageflip_token().unwrap_or(0),
+                ),
+            ]
+        });
+        native_shutdown_debug_log(&format!(
+            "state_{}_to_{}",
+            transition.from.as_str(),
+            transition.to.as_str()
+        ));
     }
 
     #[allow(unused_variables)]
@@ -78,7 +285,8 @@ impl NativeRuntime {
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
-            shutdown_state: _,
+            process_supervisor: _,
+            shutdown,
         } = self;
         let wakeup = event_loop.wait()?;
         let scheduler_state_before = frame_scheduler.state();
@@ -110,8 +318,10 @@ impl NativeRuntime {
 
         input_devices.dispatch_session_events();
         let pageflip_drain_start = Instant::now();
-        let should_drain_pageflips =
-            wakeup.reasons.drm() || (wakeup.reasons.timer() && frame_scheduler.page_flip_pending());
+        let should_drain_pageflips = wakeup.reasons.drm()
+            || (wakeup.reasons.timer()
+                && (frame_scheduler.page_flip_pending()
+                    || shutdown.state() == ShutdownState::Draining));
         let pageflip_drain = if should_drain_pageflips {
             scanout
                 .drain_page_flip_events(kms.file().as_raw_fd())
@@ -154,10 +364,12 @@ impl NativeRuntime {
             });
         }
         let pageflip_completed = pageflip_drain.completion.is_some();
+        let mut completed_pageflip_token = None;
         let mut frame_completed = false;
         let frame_rendered = false;
         let frame_submitted = false;
         if let Some(pageflip) = pageflip_drain.completion {
+            completed_pageflip_token = Some(pageflip.user_data);
             let compositor_receive_ns = monotonic_now_ns()?;
             let scheduler_state_at_completion = frame_scheduler.state();
             let completion = frame_scheduler
@@ -211,6 +423,7 @@ impl NativeRuntime {
             wakeup,
             pageflip_drain_us,
             pageflip_completed,
+            completed_pageflip_token,
             frame_completed,
             frame_rendered,
             frame_submitted,
@@ -223,6 +436,7 @@ impl NativeRuntime {
             input_drain_us: 0,
             raw_input_events: 0,
             coalesced_input_events: 0,
+            shutdown_requested: false,
         })
     }
 
@@ -264,7 +478,8 @@ impl NativeRuntime {
             resize_perf,
             pointer_constraint_backend,
             seat_session,
-            shutdown_state,
+            process_supervisor,
+            shutdown: _,
         } = self;
         let present_us = 0;
         let pageflip_pending_at_tick = scanout.page_flip_pending();
@@ -358,69 +573,19 @@ impl NativeRuntime {
             }
             let application = apply_native_input_effect(
                 effect,
-                server,
-                perf,
-                resize_perf,
-                *cursor_render_mode,
-                *effective_app_gpu_policy,
-                seat_session.as_ref(),
+                NativeInputApplyContext {
+                    server,
+                    perf,
+                    resize_perf,
+                    cursor_mode: *cursor_render_mode,
+                    app_gpu_policy: *effective_app_gpu_policy,
+                    seat_session: seat_session.as_ref(),
+                    process_supervisor,
+                },
             )?;
             if application.exit_requested {
-                if !shutdown_state.request() {
-                    native_shutdown_debug_log("shortcut_exit_requested_duplicate");
-                    continue;
-                }
-                native_shutdown_debug_log("shortcut_exit_requested");
-                native_shutdown_debug_log("shutdown_begin");
-                println!("native input exit requested; shutting down cleanly");
-                native_shutdown_debug_log("event_loop_break");
-                native_shutdown_debug_log("frame_scheduler_stop");
-                *shutdown_state = ShutdownState::Draining;
-                native_shutdown_debug_log("pageflip_drain_begin");
-                if scanout.page_flip_pending() {
-                    let drain_started = Instant::now();
-                    while scanout.page_flip_pending() && drain_started.elapsed().as_millis() < 250 {
-                        let drain = scanout
-                            .drain_page_flip_events(kms.file().as_raw_fd())
-                            .map_err(|error| {
-                                native_runtime_error(
-                                    NativeRuntimeStage::DrainPageFlipEvents,
-                                    scanout.kind(),
-                                    target.crtc_id,
-                                    *frame_index,
-                                    error,
-                                )
-                            })?;
-                        if let Some(pageflip) = drain.completion {
-                            let _ = frame_scheduler
-                                .note_page_flip_completion(pageflip.user_data, monotonic_now_ns()?);
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                native_shutdown_debug_log("pageflip_drain_end");
-                native_shutdown_debug_log("input_backend_stop");
-                acquire_watches.shutdown(event_loop)?;
-                native_shutdown_debug_log("shell_children_stop");
-                if let Some(cursor) = hardware_cursor.as_mut() {
-                    let _ = cursor.disable();
-                }
-                *shutdown_state = ShutdownState::Restoring;
-                native_shutdown_debug_log("kms_restore_begin");
-                let restoration = kms_backend.restore()?;
-                native_shutdown_debug_log("kms_restore_end");
-                perf.log("native.kms_restore", || {
-                    vec![
-                        NativePerfField::str("backend", kms_backend.effective_kind().as_str()),
-                        NativePerfField::str("outcome", restoration.as_str()),
-                        NativePerfField::bool("pageflip_pending", scanout.page_flip_pending()),
-                    ]
-                });
-                native_shutdown_debug_log("drm_release");
-                native_shutdown_debug_log("vt_restore");
-                *shutdown_state = ShutdownState::Complete;
-                return Ok(());
+                cycle.shutdown_requested = true;
+                break;
             }
             if let Some(launch) = application.launch {
                 log_native_app_spawn(perf, &launch);
@@ -511,7 +676,8 @@ impl NativeRuntime {
             resize_perf,
             pointer_constraint_backend,
             seat_session: _,
-            shutdown_state: _,
+            process_supervisor: _,
+            shutdown: _,
         } = self;
         let acquire_changes = server.take_acquire_watch_changes();
         let acquire_change_count = acquire_changes.len();

@@ -696,6 +696,7 @@ pub(in crate::compositor::tests) fn create_client_toplevel_with_app_id_and_sized
     surface.commit();
     connection.flush()?;
     connection.roundtrip()?;
+    retain_live_test_connection(connection);
     Ok(())
 }
 
@@ -883,6 +884,7 @@ pub(in crate::compositor::tests) fn create_client_toplevel_with_positioned_subsu
     parent.commit();
     connection.flush()?;
     connection.roundtrip()?;
+    retain_live_test_connection(connection);
     Ok(())
 }
 

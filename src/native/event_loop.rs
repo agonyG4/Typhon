@@ -15,6 +15,7 @@ pub enum NativeEventSource {
     Input(u16),
     Timer,
     ExplicitSyncAcquire,
+    ChildSignal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -62,6 +63,7 @@ impl WakeReasons {
     const INPUT: u32 = 1 << 3;
     const TIMER: u32 = 1 << 4;
     const EXPLICIT_SYNC_ACQUIRE: u32 = 1 << 5;
+    const CHILD_SIGNAL: u32 = 1 << 6;
 
     pub const fn drm(self) -> bool {
         self.0 & Self::DRM != 0
@@ -87,6 +89,10 @@ impl WakeReasons {
         self.0 & Self::EXPLICIT_SYNC_ACQUIRE != 0
     }
 
+    pub const fn child_signal(self) -> bool {
+        self.0 & Self::CHILD_SIGNAL != 0
+    }
+
     pub const fn bits(self) -> u32 {
         self.0
     }
@@ -99,6 +105,7 @@ impl WakeReasons {
             NativeEventSource::Input(_) => Self::INPUT,
             NativeEventSource::Timer => Self::TIMER,
             NativeEventSource::ExplicitSyncAcquire => Self::EXPLICIT_SYNC_ACQUIRE,
+            NativeEventSource::ChildSignal => Self::CHILD_SIGNAL,
         };
     }
 }
@@ -611,6 +618,20 @@ mod tests {
 
         assert!(wakeup.reasons.explicit_sync_acquire());
         assert_eq!(wakeup.explicit_sync_acquire_tokens, vec![token]);
+    }
+
+    #[test]
+    fn child_signal_readiness_requests_reap() {
+        let signal_fd = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        event_loop
+            .register(signal_fd.as_raw_fd(), NativeEventSource::ChildSignal)
+            .unwrap();
+
+        signal(signal_fd.as_raw_fd());
+        let wakeup = event_loop.wait().unwrap();
+
+        assert!(wakeup.reasons.child_signal());
     }
 
     #[test]

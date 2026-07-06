@@ -858,28 +858,6 @@ impl CompositorState {
             .or_insert(client_id);
     }
 
-    pub(in crate::compositor) fn teardown_surfaces_for_client(
-        &mut self,
-        client_id: &ClientId,
-    ) -> usize {
-        let mut surface_ids = self
-            .surface_client_ids
-            .iter()
-            .filter_map(|(surface_id, owner)| (owner == client_id).then_some(*surface_id))
-            .collect::<Vec<_>>();
-        surface_ids.sort_unstable();
-        surface_ids.dedup();
-        let mut removed = 0usize;
-        for surface_id in surface_ids {
-            let result = self
-                .teardown_surface_resource(surface_id, SurfaceTeardownReason::ClientDisconnected);
-            if result.removed_resource || result.removed_renderables > 0 {
-                removed = removed.saturating_add(1);
-            }
-        }
-        removed
-    }
-
     pub(in crate::compositor) fn register_output_resource(&mut self, output: wl_output::WlOutput) {
         if self
             .output_resources

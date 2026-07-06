@@ -243,38 +243,28 @@ fn compositor_app_spawn_argv_with_policy(
 }
 
 pub fn spawn_compositor_app(socket_name: &str, app: &[String]) -> io::Result<Option<u32>> {
-    let private_dbus =
-        AppDbusPolicy::from_env().private_dbus(command_available("dbus-run-session"));
-    let Some(argv) = compositor_app_spawn_argv(app, private_dbus) else {
+    let Some(mut command) = compositor_app_command_with_policy(
+        socket_name,
+        app,
+        EffectiveCompositorAppGpuPolicy::Accelerated,
+    )?
+    else {
         return Ok(None);
     };
-    install_oblivion_portal_runtime()?;
-    let Some((program, args)) = argv.split_first() else {
-        return Ok(None);
-    };
-
-    let mut child = Command::new(program);
-    child.args(args);
-    configure_compositor_app_command(&mut child, socket_name);
-    let child = child.spawn()?;
+    let child = command.spawn()?;
     Ok(Some(child.id()))
 }
 
 pub fn spawn_cpu_compositor_app(socket_name: &str, app: &[String]) -> io::Result<Option<u32>> {
-    let private_dbus =
-        AppDbusPolicy::from_env().private_dbus(command_available("dbus-run-session"));
-    let Some(argv) = compositor_cpu_app_spawn_argv(app, private_dbus) else {
+    let Some(mut command) = compositor_app_command_with_policy(
+        socket_name,
+        app,
+        EffectiveCompositorAppGpuPolicy::CpuOnly,
+    )?
+    else {
         return Ok(None);
     };
-    install_oblivion_portal_runtime()?;
-    let Some((program, args)) = argv.split_first() else {
-        return Ok(None);
-    };
-
-    let mut child = Command::new(program);
-    child.args(args);
-    configure_cpu_compositor_app_command(&mut child, socket_name);
-    let child = child.spawn()?;
+    let child = command.spawn()?;
     Ok(Some(child.id()))
 }
 
@@ -287,6 +277,50 @@ pub fn spawn_compositor_app_with_policy(
         EffectiveCompositorAppGpuPolicy::Accelerated => spawn_compositor_app(socket_name, app),
         EffectiveCompositorAppGpuPolicy::CpuOnly => spawn_cpu_compositor_app(socket_name, app),
     }
+}
+
+pub fn compositor_app_command_with_policy(
+    socket_name: &str,
+    app: &[String],
+    gpu_policy: EffectiveCompositorAppGpuPolicy,
+) -> io::Result<Option<Command>> {
+    let Some(argv) = compositor_app_spawn_argv_for_policy(app, gpu_policy) else {
+        return Ok(None);
+    };
+    install_oblivion_portal_runtime()?;
+    Ok(compositor_app_command_from_argv(
+        socket_name,
+        &argv,
+        gpu_policy,
+    ))
+}
+
+pub fn compositor_app_spawn_argv_for_policy(
+    app: &[String],
+    gpu_policy: EffectiveCompositorAppGpuPolicy,
+) -> Option<Vec<String>> {
+    let private_dbus =
+        AppDbusPolicy::from_env().private_dbus(command_available("dbus-run-session"));
+    compositor_app_spawn_argv_with_policy(app, private_dbus, gpu_policy)
+}
+
+pub fn compositor_app_command_from_argv(
+    socket_name: &str,
+    argv: &[String],
+    gpu_policy: EffectiveCompositorAppGpuPolicy,
+) -> Option<Command> {
+    let (program, args) = argv.split_first()?;
+    let mut command = Command::new(program);
+    command.args(args);
+    match gpu_policy {
+        EffectiveCompositorAppGpuPolicy::Accelerated => {
+            configure_compositor_app_command(&mut command, socket_name);
+        }
+        EffectiveCompositorAppGpuPolicy::CpuOnly => {
+            configure_cpu_compositor_app_command(&mut command, socket_name);
+        }
+    }
+    Some(command)
 }
 
 pub fn parse_session_env(contents: &str) -> HashMap<String, String> {
