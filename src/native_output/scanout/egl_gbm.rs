@@ -323,6 +323,9 @@ impl NativeEglGbmScanout {
         cursor_mode: NativeCursorRenderMode,
         damage: &NativeOutputDamage,
     ) -> io::Result<NativePaintOutcome> {
+        if !self.surface.has_free_buffers() && self.buffers.ready.is_some() {
+            self.buffers.ready = None;
+        }
         if !self.surface.has_free_buffers() {
             return Err(io::Error::other(
                 "native EGL/GBM surface has no free buffers",
@@ -482,6 +485,10 @@ impl NativeEglGbmScanout {
 
     pub(crate) fn page_flip_pending(&self) -> bool {
         self.page_flip.is_pending()
+    }
+
+    pub(crate) fn ready_frame_queued(&self) -> bool {
+        self.buffers.ready.is_some()
     }
 }
 

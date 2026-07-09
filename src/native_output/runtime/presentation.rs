@@ -39,6 +39,7 @@ impl NativeRuntime {
             pending_launches,
             mismatched_pageflip_events,
             stale_pageflip_events,
+            presentation_cadence,
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
@@ -106,7 +107,57 @@ impl NativeRuntime {
             ))
             .into());
         }
-        if scheduler_decision == SchedulerDecision::Render {
+        if scheduler_decision == SchedulerDecision::SubmitReady {
+            let repaint_present_start = Instant::now();
+            let present_result = scanout.present(kms_backend).map_err(|error| {
+                native_runtime_error(
+                    NativeRuntimeStage::Present,
+                    scanout.kind(),
+                    target.crtc_id,
+                    *frame_index,
+                    error,
+                )
+            })?;
+            let repaint_present_us = elapsed_micros(repaint_present_start);
+            match present_result {
+                NativePresentResult::AsyncSubmitted { token } => {
+                    frame_scheduler
+                        .note_ready_submission(token, monotonic_now_ns()?)
+                        .map_err(io::Error::other)?;
+                    frame_submitted = true;
+                    server.mark_render_damage_presented();
+                    *frame_index = frame_index.saturating_add(1);
+                    perf.log("native.frame", || {
+                        vec![
+                            NativePerfField::u64("index", *frame_index),
+                            NativePerfField::str("phase", "ready-submit"),
+                            NativePerfField::str("mode", mode_label.clone()),
+                            NativePerfField::str("cursor", cursor_render_mode.as_str()),
+                            NativePerfField::u64("refresh_hz", u64::from(*refresh_hz)),
+                            NativePerfField::u64("repaint_present_us", repaint_present_us),
+                            NativePerfField::u64("pageflip_token", token),
+                            NativePerfField::bool("render_ahead_ready", true),
+                        ]
+                    });
+                }
+                NativePresentResult::Immediate => {
+                    frame_scheduler.note_immediate_completion();
+                }
+                NativePresentResult::Noop => {
+                    perf.log("native.frame_skip", || {
+                        vec![
+                            NativePerfField::str("reason", "ready_submit_without_ready_frame"),
+                            NativePerfField::bool("scanout_ready", scanout.ready_frame_queued()),
+                        ]
+                    });
+                    frame_scheduler.note_immediate_completion();
+                }
+            }
+        } else if matches!(
+            scheduler_decision,
+            SchedulerDecision::Render | SchedulerDecision::RenderAhead
+        ) {
+            let render_ahead = scheduler_decision == SchedulerDecision::RenderAhead;
             let effective_redraw_requested = redraw_requested || *queued_redraw_requested;
             let render_cause = native_repaint_cause_label(
                 render_generation_cause,
@@ -214,15 +265,19 @@ impl NativeRuntime {
                         .map(|(before, after)| after.delta_us_since(before))
                         .unwrap_or((0, 0));
                     let repaint_present_start = Instant::now();
-                    let present_result = scanout.present(kms_backend).map_err(|error| {
-                        native_runtime_error(
-                            NativeRuntimeStage::Present,
-                            scanout.kind(),
-                            target.crtc_id,
-                            *frame_index,
-                            error,
-                        )
-                    })?;
+                    let present_result = if render_ahead {
+                        NativePresentResult::Noop
+                    } else {
+                        scanout.present(kms_backend).map_err(|error| {
+                            native_runtime_error(
+                                NativeRuntimeStage::Present,
+                                scanout.kind(),
+                                target.crtc_id,
+                                *frame_index,
+                                error,
+                            )
+                        })?
+                    };
                     let repaint_present_us = elapsed_micros(repaint_present_start);
                     let acquire_ready_to_render_submit_us = last_acquire_ready_at_ns
                         .map(|ready_at| {
@@ -263,21 +318,36 @@ impl NativeRuntime {
                             }
                         }
                         NativePresentResult::Noop => {
-                            return Err(io::Error::other(
-                                "native scanout rendered a frame but did not submit or complete it",
-                            )
-                            .into());
+                            if render_ahead {
+                                frame_scheduler.note_render_ahead_ready();
+                            } else {
+                                return Err(io::Error::other(
+                                    "native scanout rendered a frame but did not submit or complete it",
+                                )
+                                .into());
+                            }
                         }
                     }
-                    server.mark_render_damage_presented();
+                    if !render_ahead {
+                        server.mark_render_damage_presented();
+                    }
                     *last_acquire_ready_at_ns = None;
-                    *frame_index = frame_index.saturating_add(1);
+                    if !render_ahead {
+                        *frame_index = frame_index.saturating_add(1);
+                    }
                     perf.log("native.frame", || {
                         let mut fields = paint_stats.fields();
                         fields.extend(output_damage.fields());
                         fields.extend([
                             NativePerfField::u64("index", *frame_index),
-                            NativePerfField::str("phase", "repaint"),
+                            NativePerfField::str(
+                                "phase",
+                                if render_ahead {
+                                    "render-ahead"
+                                } else {
+                                    "repaint"
+                                },
+                            ),
                             NativePerfField::str("mode", mode_label.clone()),
                             NativePerfField::str("cursor", cursor_render_mode.as_str()),
                             NativePerfField::u64("refresh_hz", u64::from(*refresh_hz)),
@@ -300,6 +370,11 @@ impl NativeRuntime {
                             NativePerfField::bool("pageflip_completed", pageflip_completed),
                             NativePerfField::u64("present_us", present_us),
                             NativePerfField::u64("repaint_present_us", repaint_present_us),
+                            NativePerfField::bool("render_ahead", render_ahead),
+                            NativePerfField::bool(
+                                "render_ahead_ready",
+                                scanout.ready_frame_queued(),
+                            ),
                             NativePerfField::u64(
                                 "acquire_ready_to_render_submit_us",
                                 acquire_ready_to_render_submit_us,
@@ -399,10 +474,16 @@ impl NativeRuntime {
     ) -> NativeResult<()> {
         let perf = self.perf;
         perf.log("native.scheduler", || {
+            let fullscreen = self.server.fullscreen_render_plan_metrics();
             vec![
                 NativePerfField::str("decision", format!("{scheduler_decision:?}")),
                 NativePerfField::str("state_after", format!("{:?}", self.frame_scheduler.state())),
                 NativePerfField::bool("pageflip_pending", self.frame_scheduler.page_flip_pending()),
+                NativePerfField::bool(
+                    "ready_frame_queued",
+                    self.frame_scheduler.ready_frame_queued(),
+                ),
+                NativePerfField::bool("scanout_ready_frame", self.scanout.ready_frame_queued()),
                 NativePerfField::bool(
                     "visual_work_queued",
                     self.frame_scheduler.visual_work_queued(),
@@ -423,6 +504,36 @@ impl NativeRuntime {
                     self.mismatched_pageflip_events,
                 ),
                 NativePerfField::u64("stale_pageflip_events", self.stale_pageflip_events),
+                NativePerfField::u64("presentations", self.presentation_cadence.presentations()),
+                NativePerfField::u64(
+                    "presentation_sequence_gaps",
+                    self.presentation_cadence.sequence_gaps(),
+                ),
+                NativePerfField::bool("fullscreen_active", fullscreen.fullscreen_active),
+                NativePerfField::str(
+                    "fullscreen_owner_root",
+                    fullscreen
+                        .owner_root_surface_id
+                        .map(|owner| owner.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                ),
+                NativePerfField::bool("solitary_tree_active", fullscreen.solitary_tree_active),
+                NativePerfField::usize(
+                    "fullscreen_culled_surfaces",
+                    fullscreen.culled_surface_count,
+                ),
+                NativePerfField::bool("fullscreen_wallpaper_culled", fullscreen.wallpaper_culled),
+                NativePerfField::usize(
+                    "fullscreen_visible_overlays",
+                    fullscreen.visible_overlay_count,
+                ),
+                NativePerfField::str(
+                    "fullscreen_rejection",
+                    fullscreen
+                        .rejection
+                        .map(FullscreenPresentationRejection::as_str)
+                        .unwrap_or("none"),
+                ),
             ]
         });
         self.event_loop.arm_deadline(earliest_native_deadline(

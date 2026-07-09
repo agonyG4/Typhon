@@ -62,6 +62,19 @@ impl CompositorState {
         self.typhon_socket_name = Some(socket_name);
     }
 
+    pub(in crate::compositor) fn queue_pending_process_launch(
+        &mut self,
+        launch: PendingProcessLaunch,
+    ) {
+        self.pending_process_launches.push_back(launch);
+    }
+
+    pub(in crate::compositor) fn take_pending_process_launches(
+        &mut self,
+    ) -> Vec<PendingProcessLaunch> {
+        self.pending_process_launches.drain(..).collect()
+    }
+
     pub(in crate::compositor) fn register_astrea_shortcut(
         &mut self,
         resource: astrea_shortcut_v1::AstreaShortcutV1,

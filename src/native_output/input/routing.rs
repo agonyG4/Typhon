@@ -793,7 +793,14 @@ pub(crate) fn apply_native_input_effect(
     for event in effect.keyboard_events {
         context.server.send_keyboard_key(event.key, event.pressed);
     }
-    if effect.pointer_motion.is_some() || effect.relative_motion.is_some() {
+    if let Some((x, y)) = effect.pointer_motion
+        && context.server.window_interaction_active()
+    {
+        let action = NativeWindowAction::UpdateInteraction { x, y };
+        let changed =
+            apply_native_window_action(action, context.server, context.perf, context.resize_perf);
+        application.redraw_requested |= changed;
+    } else if effect.pointer_motion.is_some() || effect.relative_motion.is_some() {
         context
             .server
             .send_pointer_motion_sample(CompositorPointerMotionSample {
@@ -805,6 +812,19 @@ pub(crate) fn apply_native_input_effect(
             });
     }
     for event in effect.pointer_buttons {
+        if !event.pressed
+            && context
+                .server
+                .end_window_interaction_for_button(event.button)
+        {
+            context.resize_perf.observe_action(
+                NativeWindowAction::EndInteraction,
+                true,
+                context.perf,
+            );
+            application.redraw_requested = true;
+            continue;
+        }
         context
             .server
             .send_pointer_button(event.button, event.pressed);
@@ -1020,8 +1040,28 @@ pub(crate) fn apply_native_window_action(
     resize_perf: &mut NativeResizePerfState,
 ) -> bool {
     let changed = match action {
-        NativeWindowAction::BeginMove { x, y } => server.begin_window_move_at(x, y),
-        NativeWindowAction::BeginResize { x, y } => server.begin_window_resize_at(x, y),
+        NativeWindowAction::BeginMove {
+            x,
+            y,
+            trigger_button,
+        } => {
+            if let Some(button) = trigger_button {
+                server.begin_window_move_at_with_trigger(x, y, button)
+            } else {
+                server.begin_window_move_at(x, y)
+            }
+        }
+        NativeWindowAction::BeginResize {
+            x,
+            y,
+            trigger_button,
+        } => {
+            if let Some(button) = trigger_button {
+                server.begin_window_resize_at_with_trigger(x, y, button)
+            } else {
+                server.begin_window_resize_at(x, y)
+            }
+        }
         NativeWindowAction::UpdateInteraction { x, y } => server.update_window_interaction(x, y),
         NativeWindowAction::EndInteraction => {
             let was_active = server.window_interaction_active();

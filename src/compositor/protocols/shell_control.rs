@@ -1,7 +1,7 @@
 use crate::astrea_shell_control::server::{
     astrea_launch_request_v1, astrea_shell_control_manager_v1,
 };
-use crate::{desktop_launch_for_id, spawn_compositor_app, validate_desktop_id};
+use crate::{desktop_launch_for_id, validate_desktop_id};
 
 use super::super::*;
 
@@ -53,10 +53,10 @@ impl Dispatch<astrea_shell_control_manager_v1::AstreaShellControlManagerV1, ()>
                     launch.failed(1, message);
                     return;
                 }
-                match desktop_launch_for_id(&desktop_id)
-                    .and_then(|launch| state.spawn_shell_control_argv(&launch.argv))
-                {
-                    Ok(pid) => launch.accepted(pid),
+                match desktop_launch_for_id(&desktop_id).and_then(|desktop| {
+                    state.queue_shell_control_launch(desktop.argv, launch.clone())
+                }) {
+                    Ok(()) => {}
                     Err(message) => launch.failed(2, message),
                 }
             }
@@ -84,8 +84,8 @@ impl Dispatch<astrea_shell_control_manager_v1::AstreaShellControlManagerV1, ()>
                         return;
                     }
                 };
-                match state.spawn_shell_control_argv(&argv) {
-                    Ok(pid) => launch.accepted(pid),
+                match state.queue_shell_control_launch(argv, launch.clone()) {
+                    Ok(()) => {}
                     Err(message) => launch.failed(4, message),
                 }
             }
@@ -109,13 +109,18 @@ impl Dispatch<astrea_launch_request_v1::AstreaLaunchRequestV1, AstreaLaunchReque
 }
 
 impl CompositorState {
-    fn spawn_shell_control_argv(&self, argv: &[String]) -> Result<u32, String> {
-        let socket_name = self
-            .typhon_socket_name
-            .as_deref()
-            .ok_or_else(|| "Typhon socket name is not available".to_string())?;
-        spawn_compositor_app(socket_name, argv)
-            .map_err(|err| format!("spawn failed: {err}"))?
-            .ok_or_else(|| "empty command".to_string())
+    fn queue_shell_control_launch(
+        &mut self,
+        argv: Vec<String>,
+        request: astrea_launch_request_v1::AstreaLaunchRequestV1,
+    ) -> Result<(), String> {
+        if self.typhon_socket_name.is_none() {
+            return Err("Typhon socket name is not available".to_string());
+        }
+        if argv.is_empty() {
+            return Err("empty command".to_string());
+        }
+        self.queue_pending_process_launch(PendingProcessLaunch { argv, request });
+        Ok(())
     }
 }

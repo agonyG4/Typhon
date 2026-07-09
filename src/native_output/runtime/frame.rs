@@ -58,6 +58,7 @@ pub(crate) fn normalize_refresh_hz(refresh_hz: u32) -> u32 {
 pub(crate) struct NativeFrameRenderer {
     pub(crate) scene_renderer: DesktopSceneRenderer,
     pub(crate) frame: Vec<u32>,
+    pub(crate) frame_surfaces: Vec<RenderableSurface>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,10 +324,11 @@ impl NativeFrameRenderer {
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
     ) -> NativeRenderedFrame<'_> {
+        let surfaces = server.native_frame_renderable_surfaces();
         self.render_frame(NativeFrameRequest {
             width,
             height,
-            surfaces: server.renderable_surfaces(),
+            surfaces: surfaces.as_ref(),
             external_overlay_surface_ids: server.external_overlay_surface_ids(),
             visual_state: input_state.desktop_visual_state(cursor_mode),
             render_generation: server.scene_render_generation(),
@@ -377,10 +379,13 @@ impl NativeFrameRenderer {
         cursor_mode: NativeCursorRenderMode,
         current_damage: Option<OutputDamage>,
     ) -> EglSceneDrawRequest<'a> {
+        let surfaces = server.native_frame_renderable_surfaces();
+        self.frame_surfaces.clear();
+        self.frame_surfaces.extend_from_slice(surfaces.as_ref());
         EglSceneDrawRequest {
             width,
             height,
-            surfaces: server.renderable_surfaces(),
+            surfaces: &self.frame_surfaces,
             external_overlay_surface_ids: server.external_overlay_surface_ids(),
             content_generation: native_scene_content_generation(server.scene_render_generation()),
             visual_state: input_state.desktop_visual_state(cursor_mode),

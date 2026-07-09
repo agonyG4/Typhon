@@ -14,6 +14,50 @@ fn root_buffer_id(surfaces: &[RenderableSurfaceSnapshot]) -> Option<u64> {
         .map(|surface| surface.buffer_id)
 }
 
+fn map_exclusive_top_panel(
+    socket_path: &PathBuf,
+) -> (
+    Connection,
+    EventQueue<RegistryTestState>,
+    client_wl_surface::WlSurface,
+    client_zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+) {
+    let stream = UnixStream::connect(socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let layer_shell: client_zwlr_layer_shell_v1::ZwlrLayerShellV1 =
+        globals.bind(&qh, 4..=4, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let panel = layer_shell.get_layer_surface(
+        &surface,
+        None,
+        client_zwlr_layer_shell_v1::Layer::Top,
+        "reserved-panel".to_string(),
+        &qh,
+        (),
+    );
+    panel.set_anchor(
+        client_zwlr_layer_surface_v1::Anchor::Top
+            | client_zwlr_layer_surface_v1::Anchor::Left
+            | client_zwlr_layer_surface_v1::Anchor::Right,
+    );
+    panel.set_size(0, 32);
+    panel.set_exclusive_zone(32);
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 1280, 32).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    (connection, queue, surface, panel)
+}
+
 #[test]
 fn window_drag_moves_root_surface_without_moving_children_independently() {
     let socket_name = unique_socket_name();
@@ -168,6 +212,23 @@ fn window_maximize_uses_current_output_size() {
 }
 
 #[test]
+fn maximized_uses_reserved_usable_geometry() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let _panel = map_exclusive_top_panel(&socket_path);
+
+    let state = create_buffered_toplevel_then_toggle_maximize(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(state.toplevel_width, 1280);
+    assert_eq!(state.toplevel_height, 768);
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+}
+
+#[test]
 fn window_unmaximize_restores_previous_toplevel_geometry() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -196,6 +257,23 @@ fn window_fullscreen_configures_focused_toplevel_and_restores_geometry() {
     assert_eq!(state.toplevel_width, 1280);
     assert_eq!(state.toplevel_height, 800);
     assert!(state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+}
+
+#[test]
+fn fullscreen_ignores_layer_shell_exclusive_zone_for_main_geometry() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let _panel = map_exclusive_top_panel(&socket_path);
+
+    let state = create_buffered_toplevel_then_toggle_fullscreen(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(state.toplevel_width, 1280);
+    assert_eq!(state.toplevel_height, 800);
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
 }
 
 #[test]

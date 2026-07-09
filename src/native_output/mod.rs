@@ -32,7 +32,7 @@ use khronos_egl as egl;
 use oblivion_one::compositor::OutputRect;
 use oblivion_one::compositor::{
     AcquireWatchChange, DesktopComposeRequest, DesktopFrameCopyKind, DesktopSceneRebuildKind,
-    DesktopSceneRenderer, DesktopVisualState, FramePresentation,
+    DesktopSceneRenderer, DesktopVisualState, FramePresentation, FullscreenPresentationRejection,
     OutputPosition as CompositorOutputPosition, OutputRegion, OwnCompositorServer,
     PointerConstraintBackendId, PointerConstraintBackendRequest, PointerConstraintMode,
     PointerMotionSample as CompositorPointerMotionSample, PresentationClock,
@@ -54,7 +54,10 @@ use oblivion_one::native::{
         AcquireReadyResult, AcquireRegistrationResult, DrmAcquirePointNotifier,
         ExplicitSyncWatchRegistry,
     },
-    scheduler::{NativeFrameScheduler, PageFlipCompletionResult, SchedulerDecision},
+    scheduler::{
+        NativeFrameScheduler, PageFlipCompletionResult, PresentationCadenceMetrics,
+        SchedulerDecision,
+    },
 };
 use oblivion_one::process::{ChildSupervisor, ProcessKind, ProcessOptions, RestartPolicy};
 use oblivion_one::render_backend::egl_gles::EglGlesDmabufFeedback;

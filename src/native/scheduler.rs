@@ -6,6 +6,8 @@ const DEFAULT_PAGE_FLIP_WATCHDOG_NS: u64 = 1_000_000_000;
 pub enum SchedulerDecision {
     Idle,
     Render,
+    RenderAhead,
+    SubmitReady,
     CompleteProtocolOnly,
     WaitForRefresh,
     WaitForPageFlip,
@@ -19,6 +21,7 @@ pub enum SchedulerState {
     ProtocolWorkQueued,
     RefreshDeadlineArmed,
     PageFlipPending,
+    ReadyFrameQueued,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,11 +39,68 @@ pub struct NativeFrameScheduler {
     protocol_work_queued: bool,
     pending_page_flip_token: Option<u64>,
     pending_page_flip_submitted_at_ns: Option<u64>,
+    ready_frame_queued: bool,
     refresh_deadline_ns: Option<u64>,
     watchdog_deadline_ns: Option<u64>,
     watchdog_interval_ns: u64,
     watchdog_timeout_count: u64,
     watchdog_reported: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PresentationCadenceMetrics {
+    presentations: u64,
+    sequence_gaps: u64,
+    last_sequence: Option<u32>,
+    last_timestamp_us: Option<u64>,
+    last_interval_us: Option<u64>,
+    last_sequence_delta: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentationCadenceSample {
+    pub presentations: u64,
+    pub interval_us: Option<u64>,
+    pub sequence_delta: Option<u32>,
+    pub sequence_gap: bool,
+    pub estimated_hz_millihz: Option<u64>,
+    pub sequence_gaps: u64,
+}
+
+impl PresentationCadenceMetrics {
+    pub fn record(&mut self, sequence: u32, timestamp_us: u64) -> PresentationCadenceSample {
+        self.presentations = self.presentations.saturating_add(1);
+        let interval_us = self
+            .last_timestamp_us
+            .map(|last| timestamp_us.saturating_sub(last));
+        let sequence_delta = self.last_sequence.map(|last| sequence.wrapping_sub(last));
+        let sequence_gap = sequence_delta.is_some_and(|delta| delta > 1);
+        if sequence_gap {
+            self.sequence_gaps = self.sequence_gaps.saturating_add(1);
+        }
+        self.last_sequence = Some(sequence);
+        self.last_timestamp_us = Some(timestamp_us);
+        self.last_interval_us = interval_us;
+        self.last_sequence_delta = sequence_delta;
+        PresentationCadenceSample {
+            presentations: self.presentations,
+            interval_us,
+            sequence_delta,
+            sequence_gap,
+            estimated_hz_millihz: interval_us
+                .filter(|interval| *interval > 0)
+                .map(|interval| 1_000_000_000 / interval),
+            sequence_gaps: self.sequence_gaps,
+        }
+    }
+
+    pub const fn presentations(&self) -> u64 {
+        self.presentations
+    }
+
+    pub const fn sequence_gaps(&self) -> u64 {
+        self.sequence_gaps
+    }
 }
 
 impl NativeFrameScheduler {
@@ -61,6 +121,7 @@ impl NativeFrameScheduler {
             protocol_work_queued: false,
             pending_page_flip_token: None,
             pending_page_flip_submitted_at_ns: None,
+            ready_frame_queued: false,
             refresh_deadline_ns: None,
             watchdog_deadline_ns: None,
             watchdog_interval_ns: watchdog_interval_ns.max(1),
@@ -91,6 +152,9 @@ impl NativeFrameScheduler {
 
     pub fn decision(&mut self, now_ns: u64) -> SchedulerDecision {
         if self.pending_page_flip_token.is_some() {
+            if self.visual_work_queued {
+                return SchedulerDecision::RenderAhead;
+            }
             if self
                 .watchdog_deadline_ns
                 .is_some_and(|deadline| now_ns >= deadline)
@@ -105,6 +169,9 @@ impl NativeFrameScheduler {
         }
         if self.visual_work_queued {
             return SchedulerDecision::Render;
+        }
+        if self.ready_frame_queued {
+            return SchedulerDecision::SubmitReady;
         }
         if self.protocol_work_queued {
             let deadline = match self.refresh_deadline_ns {
@@ -142,6 +209,19 @@ impl NativeFrameScheduler {
         Ok(())
     }
 
+    pub fn note_render_ahead_ready(&mut self) {
+        self.visual_work_queued = false;
+        self.protocol_work_queued = false;
+        self.refresh_deadline_ns = None;
+        self.ready_frame_queued = true;
+    }
+
+    pub fn note_ready_submission(&mut self, token: u64, now_ns: u64) -> Result<(), &'static str> {
+        self.note_async_submission(token, now_ns)?;
+        self.ready_frame_queued = false;
+        Ok(())
+    }
+
     pub fn note_page_flip_completion(
         &mut self,
         token: u64,
@@ -175,12 +255,15 @@ impl NativeFrameScheduler {
     pub fn note_immediate_completion(&mut self) {
         self.visual_work_queued = false;
         self.protocol_work_queued = false;
+        self.ready_frame_queued = false;
         self.refresh_deadline_ns = None;
     }
 
     pub fn next_deadline_ns(&self) -> Option<u64> {
         if self.pending_page_flip_token.is_some() {
             self.watchdog_deadline_ns
+        } else if self.ready_frame_queued {
+            Some(self.anchor_ns)
         } else {
             self.refresh_deadline_ns
         }
@@ -198,6 +281,10 @@ impl NativeFrameScheduler {
         self.pending_page_flip_token.is_some()
     }
 
+    pub fn ready_frame_queued(&self) -> bool {
+        self.ready_frame_queued
+    }
+
     pub fn pending_page_flip_token(&self) -> Option<u64> {
         self.pending_page_flip_token
     }
@@ -209,6 +296,8 @@ impl NativeFrameScheduler {
     pub fn state(&self) -> SchedulerState {
         if self.pending_page_flip_token.is_some() {
             SchedulerState::PageFlipPending
+        } else if self.ready_frame_queued {
+            SchedulerState::ReadyFrameQueued
         } else if self.visual_work_queued {
             SchedulerState::VisualWorkQueued
         } else if self.refresh_deadline_ns.is_some() {
@@ -319,8 +408,83 @@ mod tests {
         scheduler.note_async_submission(41, 10).unwrap();
         scheduler.queue_visual_work();
 
-        assert_eq!(scheduler.decision(20), SchedulerDecision::WaitForPageFlip);
+        assert_eq!(scheduler.decision(20), SchedulerDecision::RenderAhead);
         assert!(scheduler.visual_work_queued());
+    }
+
+    #[test]
+    fn scheduler_can_render_ahead_with_pending_pageflip() {
+        let mut scheduler = NativeFrameScheduler::new(165, 0);
+        scheduler.queue_visual_work();
+        scheduler.note_async_submission(41, 10).unwrap();
+        scheduler.queue_visual_work();
+
+        assert_eq!(scheduler.decision(11), SchedulerDecision::RenderAhead);
+    }
+
+    #[test]
+    fn pending_pageflip_blocks_second_kms_submit_until_completion() {
+        let mut scheduler = NativeFrameScheduler::new(165, 0);
+        scheduler.queue_visual_work();
+        scheduler.note_async_submission(41, 10).unwrap();
+
+        assert_eq!(
+            scheduler.note_async_submission(42, 11),
+            Err("page flip already pending")
+        );
+    }
+
+    #[test]
+    fn ready_frame_submits_immediately_after_expected_pageflip() {
+        let mut scheduler = NativeFrameScheduler::new(165, 0);
+        scheduler.queue_visual_work();
+        scheduler.note_async_submission(41, 10).unwrap();
+        scheduler.queue_visual_work();
+        assert_eq!(scheduler.decision(11), SchedulerDecision::RenderAhead);
+        scheduler.note_render_ahead_ready();
+        assert!(scheduler.ready_frame_queued());
+
+        assert_eq!(
+            scheduler.note_page_flip_completion(41, 20),
+            PageFlipCompletionResult::Completed {
+                submitted_at_ns: 10
+            }
+        );
+
+        assert_eq!(scheduler.decision(20), SchedulerDecision::SubmitReady);
+        scheduler.note_ready_submission(42, 20).unwrap();
+        assert_eq!(scheduler.pending_page_flip_token(), Some(42));
+        assert!(!scheduler.ready_frame_queued());
+    }
+
+    #[test]
+    fn ready_frame_is_latest_frame_wins() {
+        let mut scheduler = NativeFrameScheduler::new(165, 0);
+        scheduler.queue_visual_work();
+        scheduler.note_async_submission(41, 10).unwrap();
+        scheduler.queue_visual_work();
+        scheduler.note_render_ahead_ready();
+        scheduler.queue_visual_work();
+
+        assert_eq!(scheduler.decision(12), SchedulerDecision::RenderAhead);
+        scheduler.note_render_ahead_ready();
+
+        assert!(scheduler.ready_frame_queued());
+        assert!(!scheduler.visual_work_queued());
+    }
+
+    #[test]
+    fn bounded_pipeline_never_accumulates_unbounded_frames() {
+        let mut scheduler = NativeFrameScheduler::new(165, 0);
+        scheduler.queue_visual_work();
+        scheduler.note_async_submission(41, 10).unwrap();
+
+        for now in 11..100 {
+            scheduler.queue_visual_work();
+            assert_eq!(scheduler.decision(now), SchedulerDecision::RenderAhead);
+            scheduler.note_render_ahead_ready();
+            assert!(scheduler.ready_frame_queued());
+        }
     }
 
     #[test]
@@ -443,5 +607,31 @@ mod tests {
             PageFlipCompletionResult::Mismatched { expected: 42 }
         );
         assert_eq!(scheduler.pending_page_flip_token(), Some(42));
+    }
+
+    #[test]
+    fn presentation_interval_uses_drm_timestamp_and_sequence() {
+        let mut metrics = PresentationCadenceMetrics::default();
+        assert_eq!(metrics.record(10, 1_000_000).interval_us, None);
+
+        let sample = metrics.record(11, 1_006_060);
+
+        assert_eq!(sample.interval_us, Some(6_060));
+        assert_eq!(sample.sequence_delta, Some(1));
+        assert_eq!(sample.estimated_hz_millihz, Some(165_016));
+        assert!(!sample.sequence_gap);
+    }
+
+    #[test]
+    fn sequence_gap_metric_detects_missed_presentations() {
+        let mut metrics = PresentationCadenceMetrics::default();
+        metrics.record(10, 1_000_000);
+
+        let sample = metrics.record(13, 1_018_180);
+
+        assert_eq!(sample.sequence_delta, Some(3));
+        assert!(sample.sequence_gap);
+        assert_eq!(sample.sequence_gaps, 1);
+        assert_eq!(metrics.sequence_gaps(), 1);
     }
 }

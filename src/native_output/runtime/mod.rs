@@ -79,6 +79,7 @@ pub(crate) struct NativeRuntime {
     pending_launches: VecDeque<NativeAppLaunchPerf>,
     mismatched_pageflip_events: u64,
     stale_pageflip_events: u64,
+    presentation_cadence: PresentationCadenceMetrics,
     last_acquire_ready_at_ns: Option<u64>,
     resize_perf: NativeResizePerfState,
     pointer_constraint_backend: NativePointerConstraintBackend,

@@ -271,17 +271,26 @@ fn native_input_super_mouse_buttons_start_window_interactions() {
 
     assert_eq!(
         move_start.window_actions,
-        vec![NativeWindowAction::BeginMove { x: 160.0, y: 100.0 }]
+        vec![NativeWindowAction::BeginMove {
+            x: 160.0,
+            y: 100.0,
+            trigger_button: Some(u32::from(BTN_LEFT)),
+        }]
     );
     assert!(move_start.pointer_buttons.is_empty());
+    assert!(motion.window_actions.is_empty());
+    assert_eq!(motion.pointer_motion, Some((184.0, 112.0)));
+    assert!(move_end.window_actions.is_empty());
     assert_eq!(
-        motion.window_actions,
-        vec![NativeWindowAction::UpdateInteraction { x: 184.0, y: 112.0 }]
-    );
-    assert!(motion.pointer_motion.is_none());
-    assert_eq!(
-        move_end.window_actions,
-        vec![NativeWindowAction::EndInteraction]
+        move_end.pointer_buttons,
+        vec![NativePointerButtonEvent::new_at(
+            u32::from(BTN_LEFT),
+            false,
+            184.0,
+            112.0,
+            320,
+            200,
+        )]
     );
 }
 
@@ -706,7 +715,11 @@ fn native_input_super_right_starts_window_resize() {
 
     assert_eq!(
         effect.window_actions,
-        vec![NativeWindowAction::BeginResize { x: 160.0, y: 100.0 }]
+        vec![NativeWindowAction::BeginResize {
+            x: 160.0,
+            y: 100.0,
+            trigger_button: Some(u32::from(BTN_RIGHT)),
+        }]
     );
     assert!(effect.pointer_buttons.is_empty());
 }
@@ -720,6 +733,39 @@ fn native_input_super_release_does_not_end_active_window_interaction() {
     let effect = input.handle_key_event(KEY_LEFTMETA, 0);
 
     assert!(effect.window_actions.is_empty());
+}
+
+#[test]
+fn modifier_release_does_not_end_button_owned_resize() {
+    let mut input = NativeInputState::new(320, 200);
+    input.handle_key_event(KEY_LEFTMETA, 1);
+    input.handle_pointer_button(u32::from(BTN_RIGHT), true);
+
+    let effect = input.handle_key_event(KEY_LEFTMETA, 0);
+
+    assert!(effect.window_actions.is_empty());
+}
+
+#[test]
+fn non_trigger_button_release_does_not_end_resize() {
+    let mut input = NativeInputState::new(320, 200);
+    input.handle_key_event(KEY_LEFTMETA, 1);
+    input.handle_pointer_button(u32::from(BTN_RIGHT), true);
+
+    let effect = input.handle_pointer_button(u32::from(BTN_LEFT), false);
+
+    assert!(effect.window_actions.is_empty());
+    assert_eq!(
+        effect.pointer_buttons,
+        vec![NativePointerButtonEvent::new_at(
+            u32::from(BTN_LEFT),
+            false,
+            160.0,
+            100.0,
+            320,
+            200,
+        )]
+    );
 }
 
 #[test]
@@ -913,7 +959,7 @@ fn native_forwarded_pointer_axis_skips_frame_repaint_without_local_visual_change
 }
 
 #[test]
-fn native_input_window_interaction_still_repaints_with_hardware_cursor() {
+fn native_input_window_interaction_motion_routes_through_compositor_owner() {
     let mut input = NativeInputState::new(320, 200);
     input.handle_key_event(KEY_LEFTMETA, 1);
     input.handle_pointer_button(u32::from(BTN_LEFT), true);
@@ -922,11 +968,9 @@ fn native_input_window_interaction_still_repaints_with_hardware_cursor() {
         PointerMotionSample::relative(10, RelativeMotion::accelerated_only(12.0, -4.0)),
     ));
 
-    assert_eq!(
-        effect.window_actions,
-        vec![NativeWindowAction::UpdateInteraction { x: 172.0, y: 96.0 }]
-    );
-    assert!(effect.requires_frame_repaint(NativeCursorRenderMode::Hardware));
+    assert!(effect.window_actions.is_empty());
+    assert_eq!(effect.pointer_motion, Some((172.0, 96.0)));
+    assert!(!effect.requires_frame_repaint(NativeCursorRenderMode::Hardware));
 }
 
 #[test]

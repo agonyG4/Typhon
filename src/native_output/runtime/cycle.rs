@@ -36,6 +36,13 @@ impl NativeRuntime {
         if !self.shutdown.is_running() {
             return Ok(());
         }
+        drain_pending_process_launches(
+            &mut self.server,
+            &mut self.process_supervisor,
+            self.effective_app_gpu_policy,
+            self.perf,
+            &mut self.pending_launches,
+        );
         self.process_acquire_and_prepare(&cycle)?;
         if !self.shutdown.is_running() {
             return Ok(());
@@ -83,6 +90,7 @@ impl NativeRuntime {
                 native_shutdown_debug_log("shortcut_exit_requested");
                 native_shutdown_debug_log("shutdown_begin");
                 println!("native input exit requested; shutting down cleanly");
+                self.process_supervisor.begin_quiesce();
                 self.log_shutdown_transition(transition);
             }
             None => {
@@ -282,6 +290,7 @@ impl NativeRuntime {
             pending_launches,
             mismatched_pageflip_events,
             stale_pageflip_events,
+            presentation_cadence,
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
@@ -385,6 +394,7 @@ impl NativeRuntime {
                 let kernel_timestamp_us = u64::from(pageflip.timestamp.seconds)
                     .saturating_mul(1_000_000)
                     .saturating_add(u64::from(pageflip.timestamp.microseconds));
+                let cadence = presentation_cadence.record(pageflip.sequence, kernel_timestamp_us);
                 let finish_frame_start = Instant::now();
                 server.finish_frame_with_presentation(presentation);
                 if !server.has_pending_frame_work() {
@@ -402,6 +412,21 @@ impl NativeRuntime {
                         NativePerfField::u64("backend_generation", *drm_file_generation),
                         NativePerfField::u64("kernel_sequence", u64::from(pageflip.sequence)),
                         NativePerfField::u64("kernel_timestamp_us", kernel_timestamp_us),
+                        NativePerfField::u64("presentations", cadence.presentations),
+                        NativePerfField::u64(
+                            "presentation_interval_us",
+                            cadence.interval_us.unwrap_or(0),
+                        ),
+                        NativePerfField::u64(
+                            "presentation_sequence_delta",
+                            cadence.sequence_delta.map(u64::from).unwrap_or(0),
+                        ),
+                        NativePerfField::bool("presentation_sequence_gap", cadence.sequence_gap),
+                        NativePerfField::u64(
+                            "presented_hz_millihz",
+                            cadence.estimated_hz_millihz.unwrap_or(0),
+                        ),
+                        NativePerfField::u64("presentation_sequence_gaps", cadence.sequence_gaps),
                         NativePerfField::u64("compositor_receive_us", compositor_receive_us),
                         NativePerfField::u64(
                             "receive_delay_us",
@@ -474,6 +499,7 @@ impl NativeRuntime {
             pending_launches,
             mismatched_pageflip_events,
             stale_pageflip_events,
+            presentation_cadence: _,
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
@@ -672,6 +698,7 @@ impl NativeRuntime {
             pending_launches,
             mismatched_pageflip_events,
             stale_pageflip_events,
+            presentation_cadence: _,
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
@@ -850,6 +877,10 @@ impl NativeRuntime {
                     NativePerfField::u64(
                         "resize_obsolete_queued_targets_discarded",
                         resize.obsolete_queued_targets_discarded,
+                    ),
+                    NativePerfField::u64(
+                        "resize_obsolete_in_flight_configures_discarded",
+                        resize.obsolete_in_flight_configures_discarded,
                     ),
                     NativePerfField::u64(
                         "resize_stale_interaction_commits_applied",

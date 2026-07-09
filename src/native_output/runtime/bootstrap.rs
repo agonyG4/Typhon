@@ -306,6 +306,7 @@ impl NativeRuntime {
         let mut pending_launches = VecDeque::<NativeAppLaunchPerf>::new();
         let mismatched_pageflip_events = 0u64;
         let stale_pageflip_events = 0u64;
+        let presentation_cadence = PresentationCadenceMetrics::default();
         let last_acquire_ready_at_ns = None;
         let resize_perf = NativeResizePerfState::default();
         let pointer_constraint_backend = NativePointerConstraintBackend::new();
@@ -372,6 +373,7 @@ impl NativeRuntime {
             pending_launches,
             mismatched_pageflip_events,
             stale_pageflip_events,
+            presentation_cadence,
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,

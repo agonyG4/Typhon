@@ -201,6 +201,37 @@ mod task_05_8_tests {
     }
 
     #[test]
+    pub(in crate::compositor) fn resize_flow_stall_does_not_block_future_interaction_forever() {
+        let mut flow = ResizeConfigureFlow::default();
+        let old = PendingResizeConfigure {
+            surface_id: 42,
+            width: 1000,
+            height: 700,
+            placement: SurfacePlacement::root(),
+            edges: ResizeEdges::BOTTOM_RIGHT,
+            resizing: true,
+            interaction_id: ResizeInteractionId::new(1),
+        };
+        flow.mark_sent(old, 10, 1);
+        assert_eq!(flow.ack(10), ResizeAckDecision::Matched);
+        let _snapshot = flow.capture(90).expect("old captured resize");
+
+        let result = flow.begin_interaction(ResizeInteractionId::new(2));
+        assert_eq!(result.obsolete_in_flight_discarded, 1);
+        assert!(flow.queue(PendingResizeConfigure {
+            surface_id: 42,
+            width: 1200,
+            height: 760,
+            placement: SurfacePlacement::root(),
+            edges: ResizeEdges::BOTTOM_RIGHT,
+            resizing: true,
+            interaction_id: ResizeInteractionId::new(2),
+        }));
+
+        assert!(flow.take_sendable().is_some());
+    }
+
+    #[test]
     pub(in crate::compositor) fn task_05_8_committed_snapshot_lives_outside_configure_flow() {
         let mut flow = ResizeConfigureFlow::default();
         let desired = PendingResizeConfigure {

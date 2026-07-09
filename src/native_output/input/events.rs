@@ -178,9 +178,20 @@ pub(crate) enum NativeHardwareInputEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum NativeWindowAction {
-    BeginMove { x: f64, y: f64 },
-    BeginResize { x: f64, y: f64 },
-    UpdateInteraction { x: f64, y: f64 },
+    BeginMove {
+        x: f64,
+        y: f64,
+        trigger_button: Option<u32>,
+    },
+    BeginResize {
+        x: f64,
+        y: f64,
+        trigger_button: Option<u32>,
+    },
+    UpdateInteraction {
+        x: f64,
+        y: f64,
+    },
     EndInteraction,
     CloseActiveWindow,
     ToggleFullscreen,

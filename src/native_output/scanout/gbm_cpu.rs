@@ -209,6 +209,10 @@ impl NativeGbmScanout {
         self.page_flip.is_pending()
     }
 
+    pub(crate) fn ready_frame_queued(&self) -> bool {
+        self.ready_index.is_some()
+    }
+
     pub(crate) fn next_render_index(&self) -> io::Result<usize> {
         if let Some(index) = self.ready_index {
             return Ok(index);

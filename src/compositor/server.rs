@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fmt, io,
     os::fd::{AsFd, BorrowedFd},
@@ -38,9 +39,10 @@ use crate::wayland_drm::server::wl_drm;
 
 use super::{
     AcquireCommitId, AcquireWatchChange, ClientCursorRenderState, CompositorState,
-    ExplicitSyncPoint, FramePresentation, InputProtocolCapabilities, OutputRect, PresentationClock,
-    RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
-    SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, color,
+    ExplicitSyncPoint, FramePresentation, FullscreenRenderPlanMetrics, InputProtocolCapabilities,
+    OutputRect, PendingProcessLaunch, PresentationClock, RenderGenerationCause, RenderableSurface,
+    RendererProtocolCapabilities, ResizeFlowMetrics, SelectionProtocolCapabilities,
+    SubsurfaceTransactionMetrics, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 
@@ -299,6 +301,10 @@ impl OwnCompositorServer {
         &self.state.renderable_surfaces
     }
 
+    pub fn native_frame_renderable_surfaces(&self) -> Cow<'_, [RenderableSurface]> {
+        self.state.native_frame_renderable_surfaces()
+    }
+
     pub fn external_overlay_surface_ids(&self) -> Vec<u32> {
         self.state.external_overlay_surface_ids()
     }
@@ -333,6 +339,10 @@ impl OwnCompositorServer {
 
     pub const fn subsurface_transaction_metrics(&self) -> SubsurfaceTransactionMetrics {
         self.state.subsurface_transaction_metrics
+    }
+
+    pub fn fullscreen_render_plan_metrics(&self) -> FullscreenRenderPlanMetrics {
+        self.state.fullscreen_render_plan_metrics()
     }
 
     pub fn has_pending_frame_callbacks(&self) -> bool {
@@ -428,6 +438,11 @@ impl OwnCompositorServer {
         self.state.take_pointer_constraint_backend_requests()
     }
 
+    #[doc(hidden)]
+    pub fn take_pending_process_launches(&mut self) -> Vec<PendingProcessLaunch> {
+        self.state.take_pending_process_launches()
+    }
+
     pub fn pointer_constraint_backend_activated(&mut self, id: PointerConstraintBackendId) {
         self.state.pointer_constraint_backend_activated(id);
         let _ = self.display.flush_clients();
@@ -461,8 +476,34 @@ impl OwnCompositorServer {
         started
     }
 
+    pub fn begin_window_move_at_with_trigger(
+        &mut self,
+        x: f64,
+        y: f64,
+        trigger_button: u32,
+    ) -> bool {
+        let started = self
+            .state
+            .begin_window_move_at_with_trigger(x, y, trigger_button);
+        let _ = self.display.flush_clients();
+        started
+    }
+
     pub fn begin_window_resize_at(&mut self, x: f64, y: f64) -> bool {
         let started = self.state.begin_window_resize_at(x, y);
+        let _ = self.display.flush_clients();
+        started
+    }
+
+    pub fn begin_window_resize_at_with_trigger(
+        &mut self,
+        x: f64,
+        y: f64,
+        trigger_button: u32,
+    ) -> bool {
+        let started = self
+            .state
+            .begin_window_resize_at_with_trigger(x, y, trigger_button);
         let _ = self.display.flush_clients();
         started
     }
@@ -484,8 +525,18 @@ impl OwnCompositorServer {
         let _ = self.display.flush_clients();
     }
 
+    pub fn end_window_interaction_for_button(&mut self, button: u32) -> bool {
+        let ended = self.state.end_window_interaction_for_button(button);
+        let _ = self.display.flush_clients();
+        ended
+    }
+
     pub fn window_interaction_active(&self) -> bool {
         self.state.window_interaction_active()
+    }
+
+    pub fn active_window_interaction_trigger_button(&self) -> Option<u32> {
+        self.state.active_window_interaction_trigger_button()
     }
 
     pub fn emit_astrea_shortcut_pressed(

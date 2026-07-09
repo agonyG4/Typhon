@@ -339,6 +339,14 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn ready_frame_queued(&self) -> bool {
+        match self {
+            Self::NativeEglGbm(scanout) => scanout.ready_frame_queued(),
+            Self::Gbm(scanout) => scanout.ready_frame_queued(),
+            Self::Dumb(_) => false,
+        }
+    }
+
     pub(crate) fn pending_page_flip_token(&self) -> Option<u64> {
         match self {
             Self::NativeEglGbm(scanout) => {

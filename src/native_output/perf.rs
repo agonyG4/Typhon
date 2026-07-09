@@ -127,7 +127,9 @@ pub(crate) enum NativeLaunchSource {
     ExternalShell,
     Spotlight,
     AltTab,
-    Binding,
+    BindingApplication,
+    BindingSessionCommand,
+    ShellControl,
 }
 
 impl NativeLaunchSource {
@@ -137,7 +139,9 @@ impl NativeLaunchSource {
             Self::ExternalShell => "external-shell",
             Self::Spotlight => "spotlight",
             Self::AltTab => "alt-tab",
-            Self::Binding => "binding",
+            Self::BindingApplication => "binding-application",
+            Self::BindingSessionCommand => "binding-session-command",
+            Self::ShellControl => "shell-control",
         }
     }
 }
@@ -224,13 +228,24 @@ impl NativeResizePerfState {
         perf: NativePerfLogger,
     ) {
         match action {
-            NativeWindowAction::BeginResize { x, y } if changed => {
+            NativeWindowAction::BeginResize {
+                x,
+                y,
+                trigger_button,
+            } if changed => {
                 self.active = Some(NativeResizePerf {
                     started_at: Instant::now(),
                     updates: 0,
                 });
                 perf.log("resize.begin", || {
-                    vec![NativePerfField::f64("x", x), NativePerfField::f64("y", y)]
+                    vec![
+                        NativePerfField::f64("x", x),
+                        NativePerfField::f64("y", y),
+                        NativePerfField::u64(
+                            "trigger_button",
+                            trigger_button.map(u64::from).unwrap_or(0),
+                        ),
+                    ]
                 });
             }
             NativeWindowAction::UpdateInteraction { x, y } => {

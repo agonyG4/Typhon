@@ -7,6 +7,7 @@ use std::{
     time::Instant,
 };
 
+use crate::astrea_shell_control::server::astrea_launch_request_v1;
 use crate::astrea_shortcuts::server::astrea_shortcut_v1;
 
 pub use clipboard_bridge::{
@@ -68,6 +69,7 @@ mod clipboard_bridge;
 mod color;
 mod dmabuf;
 mod explicit_sync;
+mod fullscreen;
 mod idle;
 mod input;
 mod interaction;
@@ -105,6 +107,10 @@ use explicit_sync::{
     SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT, SYNCOBJ_SURFACE_ERROR_NO_SURFACE,
     SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER, SyncobjSurfaceState, SyncobjTimelineData,
 };
+pub use fullscreen::{
+    FullscreenPresentationEligibility, FullscreenPresentationRejection,
+    FullscreenPresentationState, FullscreenRenderPlanMetrics,
+};
 pub use idle::{IdleManager, IdleState};
 use input::{
     InputSerial, KeyboardModifierState, PointerConstraintLifetime, send_keyboard_initial_state,
@@ -115,14 +121,15 @@ pub use input::{
     PointerConstraintBackendRequest, PointerConstraintMode, PointerConstraintState,
     PointerMotionSample, RelativePointerMotion,
 };
-pub use interaction::ResizeInteractionId;
 use interaction::{
     PendingResizeConfigure, PointerPress, PointerTarget, ResizeAckDecision, ResizeCommitSnapshot,
     ResizeConfigureFlow, ResizeEdges, RootSurfaceHit, WindowFrameHit, WindowInteraction,
-    WindowInteractionKind, interactive_resize_geometry, resize_drag_threshold_reached,
-    resize_edges_for_window_point, resize_edges_from_xdg, window_frame_action_for_local_point,
+    WindowInteractionKind, WindowInteractionSource, interactive_resize_geometry,
+    resize_drag_threshold_reached, resize_edges_for_window_point, resize_edges_from_xdg,
+    window_frame_action_for_local_point,
 };
-use layer_shell::LayerSurfaceRole;
+pub use interaction::{ResizeInteractionId, WindowInteractionId};
+use layer_shell::{Layer, LayerSurfaceRole};
 use output::{
     OutputRefreshRate, OutputScale, OutputSize, send_output_description,
     send_output_done_if_supported, send_output_mode, send_output_scale,
@@ -198,6 +205,7 @@ pub struct ResizeFlowMetrics {
     pub rapid_reresize_interactions: u64,
     pub obsolete_finals_discarded: u64,
     pub obsolete_queued_targets_discarded: u64,
+    pub obsolete_in_flight_configures_discarded: u64,
     pub stale_interaction_commits_applied: u64,
     pub stale_commits_preserved_preview: u64,
     pub preview_ownership_transfers: u64,
@@ -517,10 +525,12 @@ pub struct CompositorState {
     last_application_keyboard_focus: Option<wl_surface::WlSurface>,
     configured_xdg_surfaces: HashSet<u32>,
     window_interaction: Option<WindowInteraction>,
+    fullscreen_presentation: Option<FullscreenPresentationState>,
     pending_interactive_resize_update: Option<PendingInteractiveResizeUpdate>,
     resize_configure_flows: HashMap<u32, ResizeConfigureFlow>,
     toplevel_visual_geometries: HashMap<u32, ToplevelVisualGeometry>,
     active_toplevel_resizes: HashMap<u32, ActiveToplevelResize>,
+    next_window_interaction_id: u64,
     next_resize_interaction_id: u64,
     next_resize_configure_sequence: u64,
     next_surface_commit_sequence: u64,
@@ -578,6 +588,13 @@ pub struct CompositorState {
     astrea_shell_client_pids: HashSet<u32>,
     astrea_shell_client_uids: HashSet<u32>,
     typhon_socket_name: Option<String>,
+    pending_process_launches: VecDeque<PendingProcessLaunch>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingProcessLaunch {
+    pub argv: Vec<String>,
+    pub request: astrea_launch_request_v1::AstreaLaunchRequestV1,
 }
 
 #[derive(Debug, Clone)]

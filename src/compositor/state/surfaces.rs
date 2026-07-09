@@ -974,12 +974,21 @@ impl CompositorState {
             .collect::<Vec<_>>();
 
         for (surface_id, mode) in toplevels {
+            let geometry = self.window_geometry_for_mode(mode);
             self.send_configure_root_window_to(
                 surface_id,
-                self.output_size.width,
-                self.output_size.height,
+                geometry.width,
+                geometry.height,
                 mode.xdg_states(),
             );
+            self.set_surface_placement_with_cause(
+                surface_id,
+                geometry.placement,
+                RenderGenerationCause::OutputChange,
+            );
+            if mode == ToplevelMode::Fullscreen {
+                self.refresh_fullscreen_presentation_owner(surface_id);
+            }
         }
     }
 

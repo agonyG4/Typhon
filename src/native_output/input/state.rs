@@ -10,7 +10,6 @@ pub(crate) struct NativeInputState {
     pub(crate) ctrl_pressed: bool,
     pub(crate) super_pressed: bool,
     pub(crate) shift_pressed: bool,
-    pub(crate) window_interaction_active: bool,
     pub(crate) keyboard_shortcuts_inhibited: bool,
     pub(crate) pointer_constraint: NativePointerConstraintState,
     pub(crate) binding_manager: AstreaBindingManager,
@@ -32,7 +31,6 @@ impl NativeInputState {
             ctrl_pressed: false,
             super_pressed: false,
             shift_pressed: false,
-            window_interaction_active: false,
             keyboard_shortcuts_inhibited: false,
             pointer_constraint: NativePointerConstraintState::None,
             binding_manager: AstreaBindingManager::default(),
@@ -147,7 +145,7 @@ impl NativeInputState {
                     .binding_manager
                     .handle_modifier_release(ModifierMask::SHIFT)
             {
-                self.apply_binding_action(action, repeated, &mut effect);
+                self.apply_binding_action(action, repeated, None, &mut effect);
             }
             if !repeated {
                 effect
@@ -166,7 +164,7 @@ impl NativeInputState {
                     .binding_manager
                     .handle_modifier_release(ModifierMask::ALT)
             {
-                self.apply_binding_action(action, repeated, &mut effect);
+                self.apply_binding_action(action, repeated, None, &mut effect);
                 return effect;
             }
             if !repeated && self.release_forwarded_deferred_modifier_key(code) {
@@ -176,13 +174,6 @@ impl NativeInputState {
                 effect.request_redraw();
             } else if self.keyboard_shortcuts_inhibited && pressed && !repeated {
                 self.forward_deferred_modifier_key(code, &mut effect);
-            }
-            if !pressed && self.window_interaction_active {
-                self.window_interaction_active = false;
-                effect
-                    .window_actions
-                    .push(NativeWindowAction::EndInteraction);
-                effect.request_visual_redraw();
             }
             return effect;
         }
@@ -195,7 +186,7 @@ impl NativeInputState {
                     .binding_manager
                     .handle_modifier_release(ModifierMask::SUPER)
             {
-                self.apply_binding_action(action, repeated, &mut effect);
+                self.apply_binding_action(action, repeated, None, &mut effect);
             }
             if !repeated && self.release_forwarded_deferred_modifier_key(code) {
                 effect
@@ -215,7 +206,7 @@ impl NativeInputState {
                     .binding_manager
                     .handle_modifier_release(ModifierMask::CTRL)
             {
-                self.apply_binding_action(action, repeated, &mut effect);
+                self.apply_binding_action(action, repeated, None, &mut effect);
             }
             if pressed {
                 if !self.forwarded_control_keys.contains(&code) {
@@ -254,7 +245,7 @@ impl NativeInputState {
             self.keyboard_shortcuts_inhibited,
         ) {
             AstreaBindingMatch::Consumed(action) => {
-                self.apply_binding_action(action, repeated, &mut effect);
+                self.apply_binding_action(action, repeated, None, &mut effect);
                 return effect;
             }
             AstreaBindingMatch::Pass => {}
@@ -311,14 +302,6 @@ impl NativeInputState {
         pressed: bool,
     ) -> NativeInputEffect {
         let mut effect = NativeInputEffect::default();
-        if self.window_interaction_active && !pressed {
-            self.window_interaction_active = false;
-            effect
-                .window_actions
-                .push(NativeWindowAction::EndInteraction);
-            effect.request_visual_redraw();
-            return effect;
-        }
 
         match self.binding_manager.handle_pointer_button(
             self.active_modifier_mask(),
@@ -327,7 +310,7 @@ impl NativeInputState {
             self.keyboard_shortcuts_inhibited,
         ) {
             AstreaBindingMatch::Consumed(action) => {
-                self.apply_binding_action(action, false, &mut effect);
+                self.apply_binding_action(action, false, Some(button), &mut effect);
                 return effect;
             }
             AstreaBindingMatch::Pass => {}
@@ -380,17 +363,7 @@ impl NativeInputState {
             self.cursor_y = constrained.y;
         }
         if !self.pointer_constraint.locked() {
-            if self.window_interaction_active {
-                effect
-                    .window_actions
-                    .push(NativeWindowAction::UpdateInteraction {
-                        x: self.cursor_x,
-                        y: self.cursor_y,
-                    });
-                effect.request_visual_redraw();
-            } else {
-                effect.pointer_motion = Some((self.cursor_x, self.cursor_y));
-            }
+            effect.pointer_motion = Some((self.cursor_x, self.cursor_y));
         }
         if !self.pointer_constraint.locked() {
             effect.mark_cursor_moved(self.cursor_x, self.cursor_y);
@@ -524,6 +497,7 @@ impl NativeInputState {
         &mut self,
         action: BindingAction,
         repeated: bool,
+        trigger_button: Option<u32>,
         effect: &mut NativeInputEffect,
     ) {
         match action {
@@ -544,27 +518,27 @@ impl NativeInputState {
             }
             BindingAction::LaunchCommand(command) => {
                 effect.launch_command = Some(command);
-                effect.launch_source = Some(NativeLaunchSource::Binding);
+                effect.launch_source = Some(NativeLaunchSource::BindingApplication);
             }
             BindingAction::LaunchSessionCommand(index) => {
                 if let Some(command) = external_session_switch_command(index) {
                     effect.launch_command = Some(command);
-                    effect.launch_source = Some(NativeLaunchSource::Binding);
+                    effect.launch_source = Some(NativeLaunchSource::BindingSessionCommand);
                 }
             }
             BindingAction::BeginMove => {
-                self.window_interaction_active = true;
                 effect.window_actions.push(NativeWindowAction::BeginMove {
                     x: self.cursor_x,
                     y: self.cursor_y,
+                    trigger_button,
                 });
                 effect.request_visual_redraw();
             }
             BindingAction::BeginResize => {
-                self.window_interaction_active = true;
                 effect.window_actions.push(NativeWindowAction::BeginResize {
                     x: self.cursor_x,
                     y: self.cursor_y,
+                    trigger_button,
                 });
                 effect.request_visual_redraw();
             }
@@ -583,7 +557,6 @@ impl NativeInputState {
         self.ctrl_pressed = false;
         self.super_pressed = false;
         self.shift_pressed = false;
-        self.window_interaction_active = false;
         self.forwarded_control_keys.clear();
         self.pressed_deferred_modifier_keys.clear();
         self.forwarded_deferred_modifier_keys.clear();

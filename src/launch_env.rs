@@ -242,43 +242,6 @@ fn compositor_app_spawn_argv_with_policy(
     Some(wrap_private_dbus_session(app, private_dbus))
 }
 
-pub fn spawn_compositor_app(socket_name: &str, app: &[String]) -> io::Result<Option<u32>> {
-    let Some(mut command) = compositor_app_command_with_policy(
-        socket_name,
-        app,
-        EffectiveCompositorAppGpuPolicy::Accelerated,
-    )?
-    else {
-        return Ok(None);
-    };
-    let child = command.spawn()?;
-    Ok(Some(child.id()))
-}
-
-pub fn spawn_cpu_compositor_app(socket_name: &str, app: &[String]) -> io::Result<Option<u32>> {
-    let Some(mut command) = compositor_app_command_with_policy(
-        socket_name,
-        app,
-        EffectiveCompositorAppGpuPolicy::CpuOnly,
-    )?
-    else {
-        return Ok(None);
-    };
-    let child = command.spawn()?;
-    Ok(Some(child.id()))
-}
-
-pub fn spawn_compositor_app_with_policy(
-    socket_name: &str,
-    app: &[String],
-    gpu_policy: EffectiveCompositorAppGpuPolicy,
-) -> io::Result<Option<u32>> {
-    match gpu_policy {
-        EffectiveCompositorAppGpuPolicy::Accelerated => spawn_compositor_app(socket_name, app),
-        EffectiveCompositorAppGpuPolicy::CpuOnly => spawn_cpu_compositor_app(socket_name, app),
-    }
-}
-
 pub fn compositor_app_command_with_policy(
     socket_name: &str,
     app: &[String],

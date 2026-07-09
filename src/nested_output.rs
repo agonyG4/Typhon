@@ -286,6 +286,7 @@ impl NestedOutputApp {
                 );
             }
         }
+        self.drain_pending_process_launches();
         self.process_pointer_constraint_backend_requests();
 
         let toplevel_count = self.server.xdg_toplevels();
@@ -318,6 +319,47 @@ impl NestedOutputApp {
                     surface.width,
                     surface.height,
                 );
+            }
+        }
+    }
+
+    fn drain_pending_process_launches(&mut self) {
+        let socket_name = self.server.socket_name().to_string();
+        for pending in self.server.take_pending_process_launches() {
+            let Some(program) = pending.argv.first().cloned() else {
+                pending.request.failed(5, "empty command".to_string());
+                continue;
+            };
+            let command = match compositor_app_command_with_policy(
+                &socket_name,
+                &pending.argv,
+                EffectiveCompositorAppGpuPolicy::Accelerated,
+            ) {
+                Ok(Some(command)) => command,
+                Ok(None) => {
+                    pending.request.failed(5, "empty command".to_string());
+                    continue;
+                }
+                Err(error) => {
+                    pending
+                        .request
+                        .failed(5, format!("spawn preparation failed: {error}"));
+                    continue;
+                }
+            };
+            match self.process_supervisor.spawn(
+                command,
+                ProcessOptions::new(ProcessKind::Application).session_owned(false),
+            ) {
+                Ok(pid) => {
+                    pending.request.accepted(pid);
+                    println!(
+                        "spawned `{program}` from shell-control on Oblivion Wayland socket `{socket_name}` as pid {pid}"
+                    );
+                }
+                Err(error) => {
+                    pending.request.failed(5, format!("spawn failed: {error}"));
+                }
             }
         }
     }

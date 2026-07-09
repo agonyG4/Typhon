@@ -48,6 +48,26 @@ pub(super) enum WindowInteractionKind {
     Resize(ResizeEdges),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WindowInteractionId(u64);
+
+impl WindowInteractionId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WindowInteractionSource {
+    NativeBinding,
+    XdgToplevelMove,
+    XdgToplevelResize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ResizeEdges {
     pub(super) top: bool,
@@ -89,8 +109,12 @@ impl ResizeInteractionId {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct WindowInteraction {
+    pub(super) id: WindowInteractionId,
     pub(super) root_surface_id: u32,
     pub(super) kind: WindowInteractionKind,
+    pub(super) source: WindowInteractionSource,
+    pub(super) trigger_button: Option<u32>,
+    pub(super) trigger_serial: Option<u32>,
     pub(super) start_pointer_x: f64,
     pub(super) start_pointer_y: f64,
     pub(super) start_placement: SurfacePlacement,
@@ -238,6 +262,7 @@ pub(super) struct ResizeConfigureFlow {
 pub(super) struct ResizeInteractionBeginResult {
     pub(super) obsolete_queued_discarded: bool,
     pub(super) obsolete_final_discarded: bool,
+    pub(super) obsolete_in_flight_discarded: usize,
 }
 
 impl ResizeConfigureFlow {
@@ -252,9 +277,14 @@ impl ResizeConfigureFlow {
             return ResizeInteractionBeginResult::default();
         }
         self.active_interaction = Some(interaction_id);
+        let before_in_flight = self.in_flight_configure_count();
+        self.captured
+            .retain(|snapshot| snapshot.interaction_id >= interaction_id);
+        let after_in_flight = self.in_flight_configure_count();
         ResizeInteractionBeginResult {
             obsolete_queued_discarded: self.queued_latest.take().is_some(),
             obsolete_final_discarded: self.final_pending.take().is_some(),
+            obsolete_in_flight_discarded: before_in_flight.saturating_sub(after_in_flight),
         }
     }
 
@@ -653,8 +683,12 @@ mod tests {
 
     fn resize_interaction(edges: ResizeEdges) -> WindowInteraction {
         WindowInteraction {
+            id: WindowInteractionId::new(1),
             root_surface_id: 1,
             kind: WindowInteractionKind::Resize(edges),
+            source: WindowInteractionSource::NativeBinding,
+            trigger_button: Some(0x111),
+            trigger_serial: None,
             start_pointer_x: 0.0,
             start_pointer_y: 0.0,
             start_placement: SurfacePlacement::root_at(72, 72),

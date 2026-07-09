@@ -129,6 +129,7 @@ pub struct ChildSupervisor {
     children: HashMap<u32, ManagedChild>,
     restart_guard: RestartGuard,
     restart_suppression_count: u64,
+    quiescing: bool,
     shutdown: Option<SupervisorShutdown>,
     sigchld_fd: Option<OwnedFd>,
 }
@@ -141,6 +142,7 @@ impl ChildSupervisor {
             children: HashMap::new(),
             restart_guard: RestartGuard::default(),
             restart_suppression_count: 0,
+            quiescing: false,
             shutdown: None,
             sigchld_fd: None,
         }
@@ -258,7 +260,7 @@ impl ChildSupervisor {
         child: &mut ManagedChild,
         status: ExitStatus,
     ) -> io::Result<Option<u32>> {
-        if self.shutdown.is_some() {
+        if self.quiescing {
             return Ok(None);
         }
         let should_restart = match child.options.restart_policy {
@@ -307,16 +309,32 @@ impl ChildSupervisor {
                 return Ok(None);
             }
         };
-        let pid = self.spawn_inner(
+        let pid = match self.spawn_inner(
             &mut command,
             child.options.clone(),
             Some(factory),
             child.restart_history.clone(),
-        )?;
+        ) {
+            Ok(pid) => pid,
+            Err(error) => {
+                self.restart_suppression_count = self.restart_suppression_count.saturating_add(1);
+                eprintln!(
+                    "oblivion-one process: restart suppressed kind={} reason=restart_spawn_failed error={}",
+                    child.options.kind.as_str(),
+                    error
+                );
+                return Ok(None);
+            }
+        };
         Ok(Some(pid))
     }
 
+    pub fn begin_quiesce(&mut self) {
+        self.quiescing = true;
+    }
+
     pub fn begin_shutdown(&mut self, now: Instant) -> io::Result<()> {
+        self.begin_quiesce();
         if self.shutdown.is_some() {
             return Ok(());
         }
@@ -465,6 +483,10 @@ fn exit_status_label(status: ExitStatus) -> String {
 mod tests {
     use std::{
         process::Command,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         thread,
         time::{Duration, Instant},
     };
@@ -565,6 +587,54 @@ mod tests {
         }
 
         assert_eq!(supervisor.restart_suppression_count(), 1);
+        assert_eq!(supervisor.active_count(), 0);
+    }
+
+    #[test]
+    fn critical_child_restart_spawn_failure_does_not_fail_supervisor_reap() {
+        let mut supervisor = ChildSupervisor::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        supervisor
+            .spawn_restartable(
+                {
+                    let attempts = Arc::clone(&attempts);
+                    move || {
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            Ok(shell_command("exit 1"))
+                        } else {
+                            Ok(Command::new("/definitely/not/a/typhon-test-binary"))
+                        }
+                    }
+                },
+                ProcessOptions::new(ProcessKind::ShellSessionCritical)
+                    .with_restart_policy(RestartPolicy::CriticalSessionComponent),
+            )
+            .expect("spawn child");
+
+        let exits = wait_for_reap(&mut supervisor);
+
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].restarted_pid, None);
+        assert_eq!(supervisor.restart_suppression_count(), 1);
+        assert_eq!(supervisor.active_count(), 0);
+    }
+
+    #[test]
+    fn quiesce_suppresses_critical_child_restart_before_shutdown_signals() {
+        let mut supervisor = ChildSupervisor::new();
+        supervisor
+            .spawn_restartable(
+                || Ok(shell_command("exit 1")),
+                ProcessOptions::new(ProcessKind::ShellSessionCritical)
+                    .with_restart_policy(RestartPolicy::CriticalSessionComponent),
+            )
+            .expect("spawn child");
+
+        supervisor.begin_quiesce();
+        let exits = wait_for_reap(&mut supervisor);
+
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].restarted_pid, None);
         assert_eq!(supervisor.active_count(), 0);
     }
 

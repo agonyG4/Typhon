@@ -66,6 +66,64 @@ pub(crate) fn launch_native_shell_command(
     }
 }
 
+pub(crate) fn drain_pending_process_launches(
+    server: &mut OwnCompositorServer,
+    supervisor: &mut ChildSupervisor,
+    app_gpu_policy: EffectiveCompositorAppGpuPolicy,
+    perf: NativePerfLogger,
+    pending_launches: &mut VecDeque<NativeAppLaunchPerf>,
+) {
+    let socket_name = server.socket_name().to_string();
+    for pending in server.take_pending_process_launches() {
+        let Some(request) = native_launch_request(
+            pending.argv,
+            app_gpu_policy,
+            NativeLaunchSource::ShellControl,
+        ) else {
+            pending.request.failed(5, "empty command".to_string());
+            continue;
+        };
+        let spawn_start = Instant::now();
+        let process_options = native_process_options(&request);
+        let command = match compositor_app_command_with_policy(
+            &socket_name,
+            &request.argv,
+            request.gpu_policy,
+        ) {
+            Ok(Some(command)) => command,
+            Ok(None) => {
+                pending.request.failed(5, "empty command".to_string());
+                continue;
+            }
+            Err(error) => {
+                pending
+                    .request
+                    .failed(5, format!("spawn preparation failed: {error}"));
+                continue;
+            }
+        };
+        match supervisor.spawn(command, process_options) {
+            Ok(pid) => {
+                pending.request.accepted(pid);
+                let launch = NativeAppLaunchPerf {
+                    program: request.program,
+                    command: request.command,
+                    pid,
+                    spawn_us: elapsed_micros(spawn_start),
+                    started_at: spawn_start,
+                    gpu_policy: request.gpu_policy,
+                    source: request.source,
+                };
+                log_native_app_spawn(perf, &launch);
+                pending_launches.push_back(launch);
+            }
+            Err(error) => {
+                pending.request.failed(5, format!("spawn failed: {error}"));
+            }
+        }
+    }
+}
+
 fn native_process_options(request: &NativeLaunchRequest) -> ProcessOptions {
     match request.source {
         NativeLaunchSource::ExternalShell => ProcessOptions::new(ProcessKind::ShellSessionCritical)
@@ -74,9 +132,14 @@ fn native_process_options(request: &NativeLaunchRequest) -> ProcessOptions {
         NativeLaunchSource::Startup => ProcessOptions::new(ProcessKind::Application)
             .session_owned(false)
             .with_label(request.program.clone()),
+        NativeLaunchSource::BindingApplication | NativeLaunchSource::ShellControl => {
+            ProcessOptions::new(ProcessKind::Application)
+                .session_owned(false)
+                .with_label(request.program.clone())
+        }
         NativeLaunchSource::Spotlight
         | NativeLaunchSource::AltTab
-        | NativeLaunchSource::Binding => {
+        | NativeLaunchSource::BindingSessionCommand => {
             ProcessOptions::new(ProcessKind::SessionService).with_label(request.program.clone())
         }
     }
@@ -180,4 +243,45 @@ pub(crate) fn log_native_app_spawn(perf: NativePerfLogger, launch: &NativeAppLau
             NativePerfField::str("app_policy", launch.gpu_policy.as_str()),
         ]
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_for_source(source: NativeLaunchSource) -> NativeLaunchRequest {
+        native_launch_request(
+            vec!["app".to_string()],
+            EffectiveCompositorAppGpuPolicy::CpuOnly,
+            source,
+        )
+        .expect("launch request")
+    }
+
+    #[test]
+    fn binding_application_launches_are_not_session_owned() {
+        let options =
+            native_process_options(&request_for_source(NativeLaunchSource::BindingApplication));
+
+        assert_eq!(options.kind, ProcessKind::Application);
+        assert!(!options.session_owned);
+    }
+
+    #[test]
+    fn binding_session_commands_remain_session_owned() {
+        let options = native_process_options(&request_for_source(
+            NativeLaunchSource::BindingSessionCommand,
+        ));
+
+        assert_eq!(options.kind, ProcessKind::SessionService);
+        assert!(options.session_owned);
+    }
+
+    #[test]
+    fn shell_control_launches_are_supervised_applications() {
+        let options = native_process_options(&request_for_source(NativeLaunchSource::ShellControl));
+
+        assert_eq!(options.kind, ProcessKind::Application);
+        assert!(!options.session_owned);
+    }
 }
