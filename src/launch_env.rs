@@ -7,21 +7,8 @@ use std::{
 
 use crate::{
     default_state_dir,
-    paths::shell_quote,
     portal::{PortalRuntime, prepend_data_dir},
 };
-
-const SESSION_ENV_KEYS: &[&str] = &[
-    "WAYLAND_DISPLAY",
-    "GAMESCOPE_WAYLAND_DISPLAY",
-    "DISPLAY",
-    "XDG_RUNTIME_DIR",
-    "XDG_CURRENT_DESKTOP",
-    "XDG_SESSION_DESKTOP",
-    "XDG_SESSION_TYPE",
-    "DESKTOP_SESSION",
-    "OBLIVION_ONE_SESSION_ID",
-];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum X11Bridge {
@@ -167,7 +154,7 @@ fn configure_compositor_app_command_with_environment_and_policy(
     gpu_policy: EffectiveCompositorAppGpuPolicy,
 ) {
     remove_host_desktop_activation_environment(command);
-    apply_nested_app_runtime_guards(command);
+    apply_compositor_app_runtime_guards(command);
     command.env("WAYLAND_DISPLAY", &environment.wayland_display);
     command.env("XDG_CURRENT_DESKTOP", "Astrea");
     command.env("XDG_SESSION_DESKTOP", "Astrea");
@@ -286,111 +273,9 @@ pub fn compositor_app_command_from_argv(
     Some(command)
 }
 
-pub fn parse_session_env(contents: &str) -> HashMap<String, String> {
-    let mut env: HashMap<String, String> = contents
-        .lines()
-        .filter_map(|line| line.split_once('='))
-        .filter(|(key, _)| SESSION_ENV_KEYS.contains(key))
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect();
-
-    if !env.contains_key("WAYLAND_DISPLAY")
-        && let Some(value) = env.get("GAMESCOPE_WAYLAND_DISPLAY").cloned()
-    {
-        env.insert("WAYLAND_DISPLAY".to_string(), value);
-    }
-
-    env
-}
-
-pub fn export_lines(env: &HashMap<String, String>) -> Vec<String> {
-    SESSION_ENV_KEYS
-        .iter()
-        .filter_map(|key| {
-            env.get(*key)
-                .map(|value| format!("export {key}={}", shell_quote(value)))
-        })
-        .collect()
-}
-
-pub fn app_launch_env(current_env: &HashMap<String, String>) -> HashMap<String, String> {
-    app_launch_env_for(current_env, None)
-}
-
-pub fn app_launch_env_for(
-    current_env: &HashMap<String, String>,
-    isolated_app_id: Option<&str>,
-) -> HashMap<String, String> {
-    let mut env = HashMap::new();
-
-    if let Some(display) = current_env
-        .get("GAMESCOPE_WAYLAND_DISPLAY")
-        .filter(|display| !display.is_empty())
-        .or_else(|| {
-            current_env
-                .get("WAYLAND_DISPLAY")
-                .filter(|display| !display.is_empty())
-        })
-    {
-        env.insert("WAYLAND_DISPLAY".to_string(), display.clone());
-    }
-
-    for key in [
-        "GAMESCOPE_WAYLAND_DISPLAY",
-        "DISPLAY",
-        "XDG_RUNTIME_DIR",
-        "DBUS_SESSION_BUS_ADDRESS",
-    ] {
-        if let Some(value) = current_env.get(key).filter(|value| !value.is_empty()) {
-            env.insert(key.to_string(), value.clone());
-        }
-    }
-
-    env.insert("GDK_BACKEND".to_string(), "wayland".to_string());
-    env.insert("QT_QPA_PLATFORM".to_string(), "wayland".to_string());
-    env.insert("SDL_VIDEODRIVER".to_string(), "wayland".to_string());
-    env.insert("CLUTTER_BACKEND".to_string(), "wayland".to_string());
-    env.insert(
-        "ELECTRON_OZONE_PLATFORM_HINT".to_string(),
-        "wayland".to_string(),
-    );
-    env.insert("OBLIVION_ONE_DE".to_string(), "1".to_string());
-
-    if let Some(app_id) = isolated_app_id {
-        let app_dir = oblivion_app_state_dir(app_id);
-        env.insert(
-            "OBLIVION_ONE_APP_DIR".to_string(),
-            app_dir.to_string_lossy().into_owned(),
-        );
-        env.insert(
-            "XDG_CONFIG_HOME".to_string(),
-            app_dir.join("config").to_string_lossy().into_owned(),
-        );
-        env.insert(
-            "XDG_CACHE_HOME".to_string(),
-            app_dir.join("cache").to_string_lossy().into_owned(),
-        );
-        env.insert(
-            "XDG_DATA_HOME".to_string(),
-            app_dir.join("data").to_string_lossy().into_owned(),
-        );
-        env.insert(
-            "XDG_STATE_HOME".to_string(),
-            app_dir.join("state").to_string_lossy().into_owned(),
-        );
-    }
-
-    env
-}
-
-pub fn oblivion_app_state_dir(app_id: &str) -> std::path::PathBuf {
-    default_state_dir().join("apps").join(app_id)
-}
-
 fn remove_host_desktop_activation_environment(command: &mut Command) {
     for key in [
         "WAYLAND_SOCKET",
-        "GAMESCOPE_WAYLAND_DISPLAY",
         "DISPLAY",
         "DESKTOP_STARTUP_ID",
         "XDG_ACTIVATION_TOKEN",
@@ -406,7 +291,7 @@ fn remove_host_desktop_activation_environment(command: &mut Command) {
     }
 }
 
-fn apply_nested_app_runtime_guards(command: &mut Command) {
+fn apply_compositor_app_runtime_guards(command: &mut Command) {
     let runtime = current_portal_runtime();
     command.env(
         "XDG_DESKTOP_PORTAL_DIR",

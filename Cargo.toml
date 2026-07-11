@@ -16,17 +16,13 @@ khronos-egl = { version = "6.0.0", features = ["dynamic"] }
 libseat = { version = "0.2.4", default-features = false }
 libc = "0.2.186"
 serde_json = "1.0"
-softbuffer = "0.4.6"
 unicode-normalization = "0.1"
 wayland-protocols = { version = "0.32.12", features = ["client", "server", "staging", "unstable"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client", "server"] }
 wayland-backend = "0.3.15"
 wayland-client = "0.31.14"
 wayland-server = "0.31.13"
-wayland-egl = "0.32.11"
 wayland-scanner = "0.31.10"
-wayland-sys = "0.31.11"
-winit = "0.30.12"
 zbus = { version = "5.16.0", default-features = false, features = ["async-io"] }
 
 [workspace]

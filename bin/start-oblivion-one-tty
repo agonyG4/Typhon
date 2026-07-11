@@ -13,7 +13,6 @@ while [[ -L "$script_path" ]]; do
 done
 script_dir="$(CDPATH= cd -- "$(dirname -- "$script_path")" && pwd)"
 
-export OBLIVION_ONE_OUTPUT="${OBLIVION_ONE_OUTPUT:-native}"
 export OBLIVION_ONE_PROFILE="${OBLIVION_ONE_PROFILE:-release}"
 export OBLIVION_ONE_SOCKET="${OBLIVION_ONE_SOCKET:-oblivion-one-tty}"
 export OBLIVION_ONE_MODE="${OBLIVION_ONE_MODE:-1920x1080@165}"

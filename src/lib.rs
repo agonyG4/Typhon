@@ -4,13 +4,10 @@ pub mod compositor;
 pub mod core;
 mod defaults;
 mod launch_env;
-mod launch_plan;
 pub mod native;
-mod options;
 mod paths;
 pub mod portal;
 pub mod process;
-mod prototype_scene;
 pub mod render_backend;
 pub mod session;
 pub mod shell;
@@ -19,17 +16,14 @@ pub mod wayland_drm;
 pub mod wm;
 pub mod xwayland;
 
+pub use core::Rect;
 pub use defaults::*;
 pub use launch_env::*;
-pub use launch_plan::{HyprlandLaunchPlan, NestedLaunchPlan};
-pub use options::*;
 pub use paths::*;
-pub use prototype_scene::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::launch_plan::ENV_WRITER_SCRIPT;
     use std::{collections::HashMap, path::PathBuf, process::Command};
 
     #[test]
@@ -38,8 +32,6 @@ mod tests {
 
         assert_eq!(plan.socket_name, "oblivion-one-0");
         assert!(!plan.uses_external_compositor());
-        assert!(!plan.command_preview().contains("Hyprland"));
-        assert!(!plan.command_preview().contains("gamescope"));
     }
 
     #[test]
@@ -67,311 +59,12 @@ mod tests {
     }
 
     #[test]
-    fn nested_launch_plan_wraps_app_with_environment_writer() {
-        let options = NestedOptions {
-            width: 1280,
-            height: 720,
-            refresh: 60,
-            app: vec![
-                "kitty".to_string(),
-                "--class".to_string(),
-                "OblivionOne".to_string(),
-            ],
-            state_dir: PathBuf::from("/tmp/oblivion-one-test"),
-        };
-
-        let plan = NestedLaunchPlan::new(options);
-
-        assert_eq!(plan.program, "gamescope");
-        assert!(plan.args.starts_with(&[
-            "-W".to_string(),
-            "1280".to_string(),
-            "-H".to_string(),
-            "720".to_string(),
-            "-r".to_string(),
-            "60".to_string(),
-        ]));
-        assert!(plan.args.contains(&"--".to_string()));
-        assert_eq!(
-            plan.env_file,
-            PathBuf::from("/tmp/oblivion-one-test/session.env")
-        );
-        assert_eq!(plan.session_id, "nested");
-    }
-
-    #[test]
-    fn session_env_parser_keeps_known_wayland_keys() {
-        let env = parse_session_env(
-            "WAYLAND_DISPLAY=gamescope-0\nXDG_RUNTIME_DIR=/run/user/1000\nXDG_CURRENT_DESKTOP=OblivionOne\nDESKTOP_SESSION=oblivion-one\nIGNORED=value\n",
-        );
-
-        assert_eq!(
-            env.get("WAYLAND_DISPLAY").map(String::as_str),
-            Some("gamescope-0")
-        );
-        assert_eq!(
-            env.get("XDG_RUNTIME_DIR").map(String::as_str),
-            Some("/run/user/1000")
-        );
-        assert_eq!(
-            env.get("XDG_CURRENT_DESKTOP").map(String::as_str),
-            Some("OblivionOne")
-        );
-        assert_eq!(
-            env.get("DESKTOP_SESSION").map(String::as_str),
-            Some("oblivion-one")
-        );
-        assert!(!env.contains_key("IGNORED"));
-    }
-
-    #[test]
-    fn session_env_parser_normalizes_gamescope_wayland_display() {
-        let env = parse_session_env(
-            "GAMESCOPE_WAYLAND_DISPLAY=gamescope-0\nDISPLAY=:2\nXDG_RUNTIME_DIR=/run/user/1000\n",
-        );
-
-        assert_eq!(
-            env.get("WAYLAND_DISPLAY").map(String::as_str),
-            Some("gamescope-0")
-        );
-        assert_eq!(env.get("DISPLAY").map(String::as_str), Some(":2"));
-    }
-
-    #[test]
     fn default_state_dir_uses_home_local_state() {
         let state_dir = default_state_dir_from_home("/home/agony");
 
         assert_eq!(
             state_dir,
             PathBuf::from("/home/agony/.local/state/oblivion-one")
-        );
-    }
-
-    #[test]
-    fn prototype_scene_contains_mac_style_shell_parts() {
-        let scene = PrototypeScene::default();
-
-        assert_eq!(scene.size, (1280, 800));
-        assert_eq!(scene.windows.len(), 3);
-        assert_eq!(scene.windows[0].title, "Explorer");
-        assert_eq!(scene.dock_items[0].label, "Terminal");
-        assert_eq!(scene.dock_items[1].label, "Explorer");
-        assert_eq!(scene.dock_items[4].program(), "quickshell");
-        assert!(scene.topbar_rect().contains(12, 12));
-        assert!(scene.dock_rect().contains(640, 748));
-    }
-
-    #[test]
-    fn prototype_scene_can_activate_window_by_point() {
-        let mut scene = PrototypeScene::default();
-
-        let activated = scene.activate_at(600, 210);
-
-        assert_eq!(activated, Some("settings"));
-        assert_eq!(scene.active_window, 1);
-    }
-
-    #[test]
-    fn prototype_scene_cycles_active_window() {
-        let mut scene = PrototypeScene::default();
-
-        scene.cycle_active();
-
-        assert_eq!(scene.active_window, 1);
-    }
-
-    #[test]
-    fn prototype_scene_resolves_dock_item_from_click_point() {
-        let scene = PrototypeScene::default();
-        let terminal_rect = scene.dock_item_rect(0).unwrap();
-
-        let item = scene
-            .dock_item_at(terminal_rect.x + 8, terminal_rect.y + 8)
-            .unwrap();
-
-        assert_eq!(item.id, "terminal");
-        assert_eq!(item.command, &["kitty", "--class", "OblivionOneTerminal"]);
-    }
-
-    #[test]
-    fn prototype_runtime_state_records_real_launches() {
-        let scene = PrototypeScene::default();
-        let mut runtime = PrototypeRuntimeState::default();
-
-        runtime.record_launch(&scene.dock_items[2], 4242);
-
-        assert_eq!(runtime.launch_count_for("browser"), 1);
-        assert_eq!(runtime.launches[0].label, "Browser");
-    }
-
-    #[test]
-    fn prototype_scene_moves_active_window() {
-        let mut scene = PrototypeScene::default();
-        let before = scene.active_window().unwrap().rect;
-
-        scene.move_active_by(32, 18);
-
-        assert_eq!(scene.active_window().unwrap().rect.x, before.x + 32);
-        assert_eq!(scene.active_window().unwrap().rect.y, before.y + 18);
-    }
-
-    #[test]
-    fn prototype_scene_resizes_active_window_with_minimum() {
-        let mut scene = PrototypeScene::default();
-
-        scene.resize_active_by(-10_000, -10_000);
-
-        assert_eq!(scene.active_window().unwrap().rect.width, 260);
-        assert_eq!(scene.active_window().unwrap().rect.height, 160);
-    }
-
-    #[test]
-    fn prototype_scene_minimizes_and_restores_window() {
-        let mut scene = PrototypeScene::default();
-
-        scene.minimize_active();
-        let restored = scene.restore_next_minimized();
-
-        assert_eq!(restored, Some("explorer"));
-        assert!(!scene.active_window().unwrap().minimized);
-        assert_eq!(scene.active_window, 0);
-    }
-
-    #[test]
-    fn prototype_scene_toggles_maximize_and_restore() {
-        let mut scene = PrototypeScene::default();
-        let before = scene.active_window().unwrap().rect;
-
-        scene.toggle_maximize_active();
-        assert!(scene.active_window().unwrap().maximized);
-        assert_ne!(scene.active_window().unwrap().rect, before);
-
-        scene.toggle_maximize_active();
-        assert!(!scene.active_window().unwrap().maximized);
-        assert_eq!(scene.active_window().unwrap().rect, before);
-    }
-
-    #[test]
-    fn prototype_scene_closes_active_window() {
-        let mut scene = PrototypeScene::default();
-
-        let closed = scene.close_active();
-
-        assert_eq!(closed, Some("explorer"));
-        assert_eq!(scene.windows.len(), 2);
-        assert_eq!(scene.active_window().unwrap().id, "settings");
-    }
-
-    #[test]
-    fn desktop_nested_options_runs_prototype_as_primary_child() {
-        let options = DesktopOptions {
-            width: 1440,
-            height: 900,
-            refresh: 60,
-            state_dir: PathBuf::from("/tmp/oblivion-one-de"),
-            executable: PathBuf::from("/tmp/oblivion-one"),
-            backend: NestedBackend::Gamescope,
-        };
-
-        let nested = options.into_nested_options();
-
-        assert_eq!(
-            nested.app,
-            vec![
-                "/tmp/oblivion-one".to_string(),
-                "prototype".to_string(),
-                "--inside-de".to_string()
-            ]
-        );
-        assert_eq!(nested.width, 1440);
-        assert_eq!(nested.state_dir, PathBuf::from("/tmp/oblivion-one-de"));
-    }
-
-    #[test]
-    fn desktop_options_default_to_oblivion_owned_compositor() {
-        let options = DesktopOptions::with_defaults(
-            PathBuf::from("/tmp/oblivion-one-de"),
-            PathBuf::from("/tmp/oblivion-one"),
-        );
-
-        assert_eq!(options.backend, NestedBackend::Oblivion);
-    }
-
-    #[test]
-    fn hyprland_launch_plan_writes_floating_window_session_config() {
-        let options = DesktopOptions {
-            width: 1440,
-            height: 900,
-            refresh: 60,
-            state_dir: PathBuf::from("/tmp/oblivion-one-de"),
-            executable: PathBuf::from("/tmp/oblivion-one"),
-            backend: NestedBackend::Hyprland,
-        };
-
-        let plan = HyprlandLaunchPlan::new(options);
-
-        assert_eq!(plan.program, "Hyprland");
-        assert_eq!(
-            plan.args,
-            vec![
-                "--config".to_string(),
-                "/tmp/oblivion-one-de/hyprland.conf".to_string()
-            ]
-        );
-        assert!(
-            plan.config_contents
-                .contains("bindm = $mainMod, mouse:272, movewindow")
-        );
-        assert!(
-            plan.config_contents
-                .contains("bindm = $mainMod, mouse:273, resizewindow")
-        );
-        assert!(plan.config_contents.contains("float = yes"));
-        assert!(plan.config_contents.contains("exec-once = env"));
-        assert!(
-            plan.config_contents
-                .contains("/tmp/oblivion-one prototype --inside-de")
-        );
-    }
-
-    #[test]
-    fn app_launch_env_prefers_gamescope_display_for_children() {
-        let env = HashMap::from([
-            ("WAYLAND_DISPLAY".to_string(), "wayland-1".to_string()),
-            (
-                "GAMESCOPE_WAYLAND_DISPLAY".to_string(),
-                "gamescope-0".to_string(),
-            ),
-            ("DISPLAY".to_string(), ":2".to_string()),
-            ("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string()),
-        ]);
-
-        let child_env = app_launch_env(&env);
-
-        assert_eq!(
-            child_env.get("WAYLAND_DISPLAY").map(String::as_str),
-            Some("gamescope-0")
-        );
-        assert_eq!(child_env.get("DISPLAY").map(String::as_str), Some(":2"));
-        assert_eq!(
-            child_env.get("GDK_BACKEND").map(String::as_str),
-            Some("wayland")
-        );
-        assert_eq!(
-            child_env.get("QT_QPA_PLATFORM").map(String::as_str),
-            Some("wayland")
-        );
-    }
-
-    #[test]
-    fn app_launch_env_preserves_regular_wayland_display_without_gamescope() {
-        let env = HashMap::from([("WAYLAND_DISPLAY".to_string(), "wayland-1".to_string())]);
-
-        let child_env = app_launch_env(&env);
-
-        assert_eq!(
-            child_env.get("WAYLAND_DISPLAY").map(String::as_str),
-            Some("wayland-1")
         );
     }
 
@@ -696,50 +389,6 @@ mod tests {
     }
 
     #[test]
-    fn nested_env_writer_exports_nested_display_before_exec() {
-        assert!(ENV_WRITER_SCRIPT.contains("export WAYLAND_DISPLAY=\"$wayland_display\""));
-        assert!(
-            ENV_WRITER_SCRIPT.contains("export GAMESCOPE_WAYLAND_DISPLAY=\"$gamescope_display\"")
-        );
-        assert!(
-            ENV_WRITER_SCRIPT
-                .contains("wayland_display=\"${GAMESCOPE_WAYLAND_DISPLAY:-${WAYLAND_DISPLAY:-}}\"")
-        );
-    }
-
-    #[test]
-    fn nested_env_writer_does_not_invent_gamescope_display_for_hyprland() {
-        assert!(ENV_WRITER_SCRIPT.contains("gamescope_display=\"${GAMESCOPE_WAYLAND_DISPLAY:-}\""));
-        assert!(ENV_WRITER_SCRIPT.contains("if [ -n \"$gamescope_display\" ]; then"));
-        assert!(ENV_WRITER_SCRIPT.contains("unset GAMESCOPE_WAYLAND_DISPLAY"));
-    }
-
-    #[test]
-    fn isolated_app_launch_env_uses_per_app_xdg_dirs() {
-        let env = HashMap::from([(
-            "GAMESCOPE_WAYLAND_DISPLAY".to_string(),
-            "gamescope-0".to_string(),
-        )]);
-
-        let child_env = app_launch_env_for(&env, Some("browser"));
-
-        assert_eq!(
-            child_env.get("WAYLAND_DISPLAY").map(String::as_str),
-            Some("gamescope-0")
-        );
-        assert!(
-            child_env
-                .get("XDG_CONFIG_HOME")
-                .is_some_and(|path| path.ends_with("/oblivion-one/apps/browser/config"))
-        );
-        assert!(
-            child_env
-                .get("OBLIVION_ONE_APP_DIR")
-                .is_some_and(|path| path.ends_with("/oblivion-one/apps/browser"))
-        );
-    }
-
-    #[test]
     fn portal_runtime_files_describe_oblivion_backend() {
         let runtime = portal::PortalRuntime::new(
             PathBuf::from("/tmp/oblivion-one-test"),
@@ -800,50 +449,6 @@ mod tests {
             Some(&portal::PortalSettingValue::U32(1))
         );
         assert!(!values.contains_key("org.unknown"));
-    }
-
-    #[test]
-    fn browser_dock_item_uses_isolated_profile_wrapper() {
-        let scene = PrototypeScene::default();
-        let browser = scene
-            .dock_items
-            .iter()
-            .find(|item| item.id == "browser")
-            .unwrap();
-
-        assert!(browser.isolated_profile);
-        assert_eq!(browser.program(), "sh");
-        assert!(
-            browser
-                .command
-                .join(" ")
-                .contains("--user-data-dir=\"$OBLIVION_ONE_APP_DIR/brave-profile\"")
-        );
-    }
-
-    #[test]
-    fn browser_dock_item_uses_wayland_egl_angle_without_vulkan() {
-        let scene = PrototypeScene::default();
-        let browser = scene
-            .dock_items
-            .iter()
-            .find(|item| item.id == "browser")
-            .unwrap();
-
-        let command = browser.command.join(" ");
-
-        assert!(command.contains("--ozone-platform=wayland"));
-        assert!(command.contains("--enable-features=UseOzonePlatform"));
-        assert!(command.contains("--use-gl=egl-angle"));
-        assert!(command.contains("--use-angle=opengles"));
-        assert!(
-            !command
-                .split_whitespace()
-                .any(|arg| arg == "--use-gl=angle")
-        );
-        assert!(!command.split_whitespace().any(|arg| arg == "--use-gl=egl"));
-        assert!(command.contains("--disable-features=Vulkan"));
-        assert!(command.contains("--disable-vulkan"));
     }
 
     #[test]

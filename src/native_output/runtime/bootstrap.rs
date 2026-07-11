@@ -421,17 +421,10 @@ impl NativeRuntime {
             perf,
         );
 
-        if host_display_variables_available() && !native_scanout_forced() {
-            return Err(io::Error::other(
-            "native scanout guarded because a host display is active; set OBLIVION_ONE_NATIVE_SCANOUT=1 to take over the DRM output",
-        )
-        .into());
-        }
-
         let Some(kms_device) = bootstrap.kms_device.as_deref() else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "no /dev/dri/card* KMS device found",
+                "native DRM initialization: no /dev/dri/card* KMS device found",
             )
             .into());
         };

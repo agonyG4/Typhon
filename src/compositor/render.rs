@@ -6,7 +6,7 @@ use super::{
 };
 use crate::render_backend::buffer::{BufferSize, SurfaceBufferSource};
 
-pub const NESTED_OUTPUT_BACKGROUND: u32 = 0xff08_0a0e;
+pub const OUTPUT_BACKGROUND: u32 = 0xff08_0a0e;
 pub const CURSOR_FILL: u32 = 0xffff_ffff;
 pub const CURSOR_OUTLINE: u32 = 0xff10_1116;
 pub const FIRST_SURFACE_OFFSET: (i32, i32) = (72, 72);
@@ -650,7 +650,7 @@ impl DesktopSceneRenderer {
         if self.scene.len() == self.wallpaper.len() {
             self.scene.copy_from_slice(&self.wallpaper);
         } else {
-            self.scene.resize(pixel_count, NESTED_OUTPUT_BACKGROUND);
+            self.scene.resize(pixel_count, OUTPUT_BACKGROUND);
             draw_wallpaper(&mut self.scene, frame_width, frame_height);
         }
 
@@ -704,7 +704,7 @@ impl DesktopSceneRenderer {
 
         self.wallpaper_width = frame_width;
         self.wallpaper_height = frame_height;
-        self.wallpaper.resize(pixel_count, NESTED_OUTPUT_BACKGROUND);
+        self.wallpaper.resize(pixel_count, OUTPUT_BACKGROUND);
         draw_wallpaper(&mut self.wallpaper, frame_width, frame_height);
         self.wallpaper_generation = self.wallpaper_generation.saturating_add(1);
     }
@@ -791,7 +791,7 @@ impl Rgb {
     }
 }
 
-pub fn compose_nested_output(
+pub fn compose_output(
     frame: &mut [u32],
     frame_width: u32,
     frame_height: u32,
@@ -1632,7 +1632,7 @@ pub fn surface_local_point_at_origin(
 
 pub fn draw_wallpaper(frame: &mut [u32], frame_width: u32, frame_height: u32) {
     if frame_width == 0 || frame_height == 0 {
-        frame.fill(NESTED_OUTPUT_BACKGROUND);
+        frame.fill(OUTPUT_BACKGROUND);
         return;
     }
 
@@ -3063,10 +3063,10 @@ mod tests {
     }
 
     #[test]
-    fn compose_nested_output_draws_desktop_wallpaper_when_empty() {
+    fn compose_output_draws_desktop_wallpaper_when_empty() {
         let mut frame = vec![0; 12 * 8];
 
-        compose_nested_output(&mut frame, 12, 8, &[], DesktopVisualState::wallpaper_only());
+        compose_output(&mut frame, 12, 8, &[], DesktopVisualState::wallpaper_only());
 
         assert_eq!(frame[0] >> 24, 0xff);
         assert_ne!(frame[0], frame[11]);
@@ -3074,10 +3074,10 @@ mod tests {
     }
 
     #[test]
-    fn compose_nested_output_draws_cursor_over_scene() {
+    fn compose_output_draws_cursor_over_scene() {
         let mut frame = vec![0; 48 * 48];
 
-        compose_nested_output(
+        compose_output(
             &mut frame,
             48,
             48,
@@ -3090,7 +3090,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_nested_output_draws_surface_pixels() {
+    fn compose_output_draws_surface_pixels() {
         let surface = RenderableSurface {
             surface_id: 7,
             x: 0,
@@ -3112,7 +3112,7 @@ mod tests {
         };
         let mut frame = vec![0; 96 * 96];
 
-        compose_nested_output(
+        compose_output(
             &mut frame,
             96,
             96,
@@ -3159,7 +3159,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_nested_output_keeps_server_frame_hidden() {
+    fn compose_output_keeps_server_frame_hidden() {
         let surface = RenderableSurface {
             surface_id: 7,
             x: 0,
@@ -3177,7 +3177,7 @@ mod tests {
         };
         let mut frame = vec![0; 120 * 120];
 
-        compose_nested_output(
+        compose_output(
             &mut frame,
             120,
             120,
@@ -3192,7 +3192,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_nested_output_preserves_scene_under_transparent_surface_pixels() {
+    fn compose_output_preserves_scene_under_transparent_surface_pixels() {
         let transparent_surface = RenderableSurface {
             surface_id: 7,
             x: 0,
@@ -3211,14 +3211,14 @@ mod tests {
         let mut wallpaper = vec![0; 96 * 96];
         let mut with_surface = vec![0; 96 * 96];
 
-        compose_nested_output(
+        compose_output(
             &mut wallpaper,
             96,
             96,
             &[],
             DesktopVisualState::wallpaper_only(),
         );
-        compose_nested_output(
+        compose_output(
             &mut with_surface,
             96,
             96,
@@ -3231,7 +3231,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_nested_output_blends_premultiplied_alpha_surface_pixels() {
+    fn compose_output_blends_premultiplied_alpha_surface_pixels() {
         let half_red_premultiplied = RenderableSurface {
             surface_id: 7,
             x: 0,

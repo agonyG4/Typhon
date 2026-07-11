@@ -5,25 +5,6 @@ use std::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionTrack {
-    OwnedNestedCompositor,
-    LegacyExternalBackend,
-    Tty,
-    Sddm,
-}
-
-impl SessionTrack {
-    pub const fn status(self) -> &'static str {
-        match self {
-            Self::OwnedNestedCompositor => "active",
-            Self::LegacyExternalBackend => "legacy",
-            Self::Tty => "experimental",
-            Self::Sddm => "experimental",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeInputStrategy {
     SeatManaged,
     RawEvdevFallback,
@@ -274,12 +255,6 @@ fn first_readable_input_event(root: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tty_and_sddm_tracks_are_experimental() {
-        assert_eq!(SessionTrack::Tty.status(), "experimental");
-        assert_eq!(SessionTrack::Sddm.status(), "experimental");
-    }
 
     #[test]
     fn native_session_plan_prefers_seat_managed_input_when_available() {

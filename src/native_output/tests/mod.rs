@@ -2,7 +2,7 @@ use super::*;
 use crate::native_output::runtime::NativeFrameRequest;
 use oblivion_one::compositor::{
     DesktopVisualState, RenderableSurfaceDamage, SurfaceCommitSequence, SurfaceDamageRect,
-    SurfacePlacement, compose_nested_output, render_scene_elements_for_surfaces, surface_origins,
+    SurfacePlacement, compose_output, render_scene_elements_for_surfaces, surface_origins,
 };
 use oblivion_one::render_backend::buffer::{
     BufferIdAllocator, BufferIdentity, BufferSize, CommittedSurfaceBuffer,

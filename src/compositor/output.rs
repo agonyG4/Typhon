@@ -114,7 +114,7 @@ pub(super) fn send_output_description(
         physical_height: 215,
         subpixel: WEnum::Value(wl_output::Subpixel::Unknown),
         make: "Oblivion".to_string(),
-        model: "Nested Output".to_string(),
+        model: "Native Output".to_string(),
         transform: WEnum::Value(wl_output::Transform::Normal),
     });
     send_output_mode(output, output_size, output_refresh);
@@ -126,7 +126,7 @@ pub(super) fn send_output_description(
     }
     if output.version() >= WL_OUTPUT_DESCRIPTION_SINCE {
         let _ = output.send_event(wl_output::Event::Description {
-            description: "Oblivion One nested output".to_string(),
+            description: "Typhon native output".to_string(),
         });
     }
     send_output_done_if_supported(output);
@@ -188,7 +188,7 @@ mod tests {
     }
 
     #[test]
-    fn output_refresh_rate_accepts_nested_cli_range() {
+    fn output_refresh_rate_accepts_native_refresh_range() {
         let refresh = OutputRefreshRate::from_hz(1_000);
 
         assert_eq!(refresh.wl_output_millihertz(), 1_000_000);

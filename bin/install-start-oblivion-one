@@ -55,7 +55,7 @@ install_sddm_session() {
 [Desktop Entry]
 Name=Oblivion One
 Comment=Oblivion One native Wayland compositor session
-Exec=env OBLIVION_ONE_PROFILE=release OBLIVION_ONE_OUTPUT=native OBLIVION_ONE_MODE=1920x1080@165 OBLIVION_ONE_SDDM_SESSION=1 OBLIVION_ONE_LOG=info${perf_env} $source_script
+Exec=env OBLIVION_ONE_PROFILE=release OBLIVION_ONE_MODE=1920x1080@165 OBLIVION_ONE_SDDM_SESSION=1 OBLIVION_ONE_LOG=info${perf_env} $source_script
 Type=Application
 DesktopNames=OblivionOne
 Keywords=wayland;compositor;desktop;

@@ -15,35 +15,25 @@ script_dir="$(CDPATH= cd -- "$(dirname -- "$script_path")" && pwd)"
 repo_dir="$(CDPATH= cd -- "$script_dir/.." && pwd)"
 
 socket="${OBLIVION_ONE_SOCKET:-oblivion-one-sddm}"
-renderer="${OBLIVION_ONE_RENDERER:-gpu}"
 profile="${OBLIVION_ONE_PROFILE:-auto}"
-output="${OBLIVION_ONE_OUTPUT:-auto}"
 state_dir="${OBLIVION_ONE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/oblivion-one}"
 log_file="${OBLIVION_ONE_LOG_FILE:-$state_dir/session.log}"
-host_display_present=0
-if [[ -n "${WAYLAND_DISPLAY:-}" || -n "${WAYLAND_SOCKET:-}" || -n "${DISPLAY:-}" ]]; then
-    host_display_present=1
-fi
 
 usage() {
     cat <<EOF
 start-oblivion-one
 
-Starts Oblivion One's owned compositor from a graphical terminal or nested
-development session.
+Starts Typhon as a native TTY/SDDM Wayland compositor.
 
 Usage:
   start-oblivion-one [-- compositor args...]
-  start-oblivion-one --width 1920 --height 1080 --refresh 165 -- zen-browser
 
 Environment:
   OBLIVION_ONE_SOCKET    Wayland socket name (default: oblivion-one-sddm)
-  OBLIVION_ONE_RENDERER  auto, gpu, or cpu (default: gpu)
-  OBLIVION_ONE_OUTPUT    auto, nested, or native (default: auto)
   OBLIVION_ONE_MODE      native KMS mode: auto, preferred, highres, highrr, or WIDTHxHEIGHT@HZ
   OBLIVION_ONE_CURSOR    native cursor backend: auto, hardware, or software
   OBLIVION_ONE_SCANOUT_BACKEND native scanout: auto, gpu/native-egl-gbm, gbm-cpu-write/cpu, or dumb
-  OBLIVION_ONE_NATIVE_APP_GPU  native apps: auto derives from active scanout, gpu requires native-egl-gbm, cpu for recovery
+  OBLIVION_ONE_NATIVE_APP_GPU  native apps: auto, gpu, or cpu
   OBLIVION_ONE_PROFILE   auto, debug, or release (default: auto; native uses release)
   OBLIVION_ONE_PERF_LOG  set to 1/true/debug to emit structured native perf logs
   OBLIVION_ONE_LOG_FILE  native-session log path (default: ~/.local/state/oblivion-one/session.log)
@@ -51,18 +41,16 @@ Environment:
 Examples:
   start-oblivion-one
   OBLIVION_ONE_PROFILE=release start-oblivion-one
-  start-oblivion-one --width 1600 --height 900 --refresh 165 -- zen-browser
+  start-oblivion-one -- kitty --class TyphonTerminal
   start-oblivion-one -- pavucontrol
 
---width/--height/--refresh are forwarded to the Rust compositor and apply to
-nested output only. Native KMS mode selection uses OBLIVION_ONE_MODE.
+Inherited WAYLAND_DISPLAY, WAYLAND_SOCKET, and DISPLAY variables do not select
+another runtime. Native seat/DRM initialization either succeeds or fails with
+native startup context.
 EOF
 }
 
 warn_native_input_permissions() {
-    if [[ "$output" != "native" ]]; then
-        return
-    fi
     if [[ "${OBLIVION_ONE_SKIP_INPUT_GROUP_CHECK:-0}" == "1" ]]; then
         return
     fi
@@ -97,55 +85,37 @@ case "${1:-}" in
         ;;
 esac
 
-case "$output" in
-    auto)
-        if [[ -z "${WAYLAND_DISPLAY:-}" && -z "${WAYLAND_SOCKET:-}" && -z "${DISPLAY:-}" ]]; then
-            output="native"
-        else
-            output="nested"
-        fi
-        ;;
-    nested|native) ;;
-    *)
-        echo "start-oblivion-one: OBLIVION_ONE_OUTPUT must be auto, nested, or native, got '$output'" >&2
+for removed_env in OBLIVION_ONE_OUTPUT OBLIVION_ONE_RENDERER; do
+    if [[ -n "${!removed_env:-}" ]]; then
+        echo "start-oblivion-one: $removed_env is no longer supported; Typhon starts natively." >&2
         exit 1
-        ;;
-esac
+    fi
+done
 
 if [[ "$profile" == "auto" ]]; then
-    if [[ "$output" == "native" ]]; then
-        profile="release"
-    else
-        profile="debug"
-    fi
+    profile="release"
 fi
 
 export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}"
 export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-OblivionOne}"
 export XDG_SESSION_DESKTOP="${XDG_SESSION_DESKTOP:-OblivionOne}"
 export DESKTOP_SESSION="${DESKTOP_SESSION:-oblivion-one}"
-export OBLIVION_ONE_SESSION_ID="${OBLIVION_ONE_SESSION_ID:-$output}"
-if [[ "$output" == "native" ]]; then
-    if [[ "$host_display_present" == "1" && "${OBLIVION_ONE_SDDM_SESSION:-0}" != "1" && "${OBLIVION_ONE_NATIVE_SCANOUT:-0}" != "1" ]]; then
-        echo "start-oblivion-one: refusing native scanout because host display variables are set." >&2
-        echo "start-oblivion-one: start from SDDM or set OBLIVION_ONE_NATIVE_SCANOUT=1 if you intentionally want to take over DRM from this session." >&2
-        exit 1
-    fi
-    export OBLIVION_ONE_SESSION_WAYLAND_DISPLAY="${OBLIVION_ONE_SESSION_WAYLAND_DISPLAY:-$socket}"
-    unset WAYLAND_DISPLAY
-    unset WAYLAND_SOCKET
-    unset DISPLAY
-fi
+
+# Host display variables are irrelevant to native startup. Remove them before
+# the compositor starts so only Typhon's own Wayland socket is used by children.
+unset WAYLAND_DISPLAY
+unset WAYLAND_SOCKET
+unset DISPLAY
 
 command=()
 if [[ "$profile" == "release" ]]; then
     release_binary="$repo_dir/target/release/oblivion-one"
-    command=("$release_binary" compositor --socket "$socket" --renderer "$renderer" --output "$output" "$@")
-elif [[ "$profile" != "debug" ]]; then
+    command=("$release_binary" compositor --socket "$socket" "$@")
+elif [[ "$profile" == "debug" ]]; then
+    command=(cargo run --manifest-path "$repo_dir/Cargo.toml" -- compositor --socket "$socket" "$@")
+else
     echo "start-oblivion-one: OBLIVION_ONE_PROFILE must be auto, debug, or release, got '$profile'" >&2
     exit 1
-else
-    command=(cargo run --manifest-path "$repo_dir/Cargo.toml" -- compositor --socket "$socket" --renderer "$renderer" --output "$output" "$@")
 fi
 
 warn_native_input_permissions
@@ -162,29 +132,14 @@ if [[ "$profile" == "release" && ! -x "${command[0]}" ]]; then
     exit 1
 fi
 
-if [[ "$output" == "native" ]]; then
-    mkdir -p -- "$(dirname -- "$log_file")"
-    {
-        printf '\n[%s] start-oblivion-one output=%s renderer=%s profile=%s socket=%s\n' "$(date --iso-8601=seconds)" "$output" "$renderer" "$profile" "$socket"
-        if [[ "$output" == "native" ]]; then
-            printf '[%s] native launch socket=%s broker=typhon-shell-control display=unset-before-compositor\n' "$(date --iso-8601=seconds)" "$socket"
-        fi
-        printf '[%s] command:' "$(date --iso-8601=seconds)"
-        printf ' %q' "${command[@]}"
-        printf '\n'
-    } >>"$log_file"
-    exec >> >(tee -a "$log_file") 2>&1
-fi
-
-if [[ "$output" != "native" ]]; then
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE DESKTOP_SESSION OBLIVION_ONE_SESSION_ID >/dev/null 2>&1 || true
-    fi
-    if command -v dbus-update-activation-environment >/dev/null 2>&1; then
-        dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE DESKTOP_SESSION OBLIVION_ONE_SESSION_ID >/dev/null 2>&1 || true
-    fi
-else
-    echo "start-oblivion-one: native mode skipped pre-socket systemd/dbus WAYLAND_DISPLAY import; Typhon-owned launches use socket '$socket'."
-fi
+mkdir -p -- "$(dirname -- "$log_file")"
+{
+    printf '\n[%s] start-oblivion-one runtime=native profile=%s socket=%s\n' "$(date --iso-8601=seconds)" "$profile" "$socket"
+    printf '[%s] native launch broker=typhon-shell-control display=unset-before-compositor\n' "$(date --iso-8601=seconds)"
+    printf '[%s] command:' "$(date --iso-8601=seconds)"
+    printf ' %q' "${command[@]}"
+    printf '\n'
+} >>"$log_file"
+exec >> >(tee -a "$log_file") 2>&1
 
 exec "${command[@]}"

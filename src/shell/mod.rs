@@ -9,7 +9,7 @@ pub enum ShellSurface {
 impl ShellSurface {
     pub const fn status(self) -> &'static str {
         match self {
-            Self::Dock => "prototype",
+            Self::Dock => "deferred",
             Self::Topbar => "deferred",
             Self::Launcher => "deferred",
             Self::Settings => "deferred",

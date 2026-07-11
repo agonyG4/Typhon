@@ -251,7 +251,7 @@ pub(crate) fn probe_native_egl_gbm_device(
     let has_pbuffer = ext_str.contains("EGL_KHR_pbuffer_context");
 
     let config_count = egl.get_config_count(display).unwrap_or_default();
-    let has_config = choose_egl_config(&egl, display).is_ok();
+    let has_config = config_count > 0;
     let has_native_xrgb_config =
         choose_native_egl_config(&egl, display, gbm::Format::Xrgb8888 as u32).is_ok();
     let has_native_argb_config =

@@ -238,14 +238,7 @@ fn native_input_zero_owner_spotlight_press_launches_one_fallback() {
     let launch = application.launch.expect("fallback should launch once");
     assert_eq!(launch.source, NativeLaunchSource::Spotlight);
     assert_eq!(process_supervisor.active_count(), 1);
-    for _ in 0..100 {
-        if process_supervisor.reap_exited().unwrap().is_empty() {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        if process_supervisor.active_count() == 0 {
-            break;
-        }
-    }
+    wait_for_no_active_children(&mut process_supervisor);
     assert_eq!(process_supervisor.active_count(), 0);
 }
 
@@ -287,15 +280,18 @@ fn native_input_zero_owner_alt_tab_next_launches_one_fallback() {
     let launch = application.launch.expect("fallback should launch once");
     assert_eq!(launch.source, NativeLaunchSource::AltTab);
     assert_eq!(process_supervisor.active_count(), 1);
-    for _ in 0..100 {
-        if process_supervisor.reap_exited().unwrap().is_empty() {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        if process_supervisor.active_count() == 0 {
-            break;
+    wait_for_no_active_children(&mut process_supervisor);
+    assert_eq!(process_supervisor.active_count(), 0);
+}
+
+fn wait_for_no_active_children(process_supervisor: &mut ChildSupervisor) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while process_supervisor.active_count() > 0 && std::time::Instant::now() < deadline {
+        process_supervisor.reap_exited().unwrap();
+        if process_supervisor.active_count() > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
-    assert_eq!(process_supervisor.active_count(), 0);
 }
 
 #[test]

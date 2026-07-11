@@ -134,34 +134,6 @@ fn unsupported_gaming_protocol_stubs_are_hidden_from_public_plan() {
 }
 
 #[test]
-fn nested_winit_profile_advertises_serviced_pointer_lock_protocols() {
-    let protocols = client_protocols_for_capabilities(
-        InputProtocolCapabilities::nested_winit(),
-        SelectionProtocolCapabilities::core_clipboard(),
-        RendererProtocolCapabilities::unsupported(),
-    );
-    let names: Vec<_> = protocols.into_iter().map(ProtocolGlobal::name).collect();
-
-    assert!(names.contains(&"zwp_relative_pointer_manager_v1"));
-    assert!(names.contains(&"zwp_pointer_constraints_v1"));
-    assert!(names.contains(&"wp_pointer_warp_v1"));
-
-    let baseline_protocols = client_protocols_for_capabilities(
-        InputProtocolCapabilities::desktop_baseline(),
-        SelectionProtocolCapabilities::core_clipboard(),
-        RendererProtocolCapabilities::unsupported(),
-    );
-    let baseline_names: Vec<_> = baseline_protocols
-        .into_iter()
-        .map(ProtocolGlobal::name)
-        .collect();
-
-    assert!(!baseline_names.contains(&"zwp_relative_pointer_manager_v1"));
-    assert!(!baseline_names.contains(&"zwp_pointer_constraints_v1"));
-    assert!(!baseline_names.contains(&"wp_pointer_warp_v1"));
-}
-
-#[test]
 fn native_libinput_profile_advertises_serviced_pointer_lock_protocols_only() {
     let protocols = client_protocols_for_capabilities(
         InputProtocolCapabilities::native_libinput(),

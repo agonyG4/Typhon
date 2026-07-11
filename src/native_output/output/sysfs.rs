@@ -1,15 +1,5 @@
 use super::*;
 
-pub(crate) fn host_display_variables_available() -> bool {
-    std::env::var_os("WAYLAND_DISPLAY").is_some()
-        || std::env::var_os("WAYLAND_SOCKET").is_some()
-        || std::env::var_os("DISPLAY").is_some()
-}
-
-pub(crate) fn native_scanout_forced() -> bool {
-    std::env::var_os("OBLIVION_ONE_NATIVE_SCANOUT").is_some_and(|value| value == "1")
-}
-
 pub(crate) fn native_test_fail_native_egl_gbm_enabled() -> bool {
     if !cfg!(any(test, debug_assertions)) {
         return false;

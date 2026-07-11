@@ -27,21 +27,19 @@ fn start_launcher_uses_native_output_without_host_display() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.contains("gamescope"));
     assert!(stdout.contains("compositor"));
-    assert!(stdout.contains("--output"));
-    assert!(stdout.contains("native"));
+    assert!(!stdout.contains("--output"));
     assert!(stdout.contains("target/release/oblivion-one"));
     assert!(!stdout.contains("cargo run"));
 }
 
 #[test]
-fn start_launcher_uses_nested_output_when_host_display_is_available() {
+fn start_launcher_ignores_inherited_host_display_variables_and_stays_native() {
     let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(repo_dir.join("bin/start-oblivion-one"))
         .env("OBLIVION_ONE_DRY_RUN", "1")
         .env("WAYLAND_DISPLAY", "wayland-test")
-        .env_remove("DISPLAY")
+        .env("DISPLAY", ":0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -53,58 +51,17 @@ fn start_launcher_uses_nested_output_when_host_display_is_available() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.contains("gamescope"));
     assert!(stdout.contains("compositor"));
-    assert!(stdout.contains("--output"));
-    assert!(stdout.contains("nested"));
-    assert!(!stdout.contains("--release"));
+    assert!(!stdout.contains("--output"));
+    assert!(!stdout.contains("nested"));
 }
 
 #[test]
-fn start_launcher_forwards_nested_output_size_and_refresh_before_app_args() {
+fn start_launcher_rejects_removed_output_selector_environment() {
     let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(repo_dir.join("bin/start-oblivion-one"))
         .env("OBLIVION_ONE_DRY_RUN", "1")
-        .env("WAYLAND_DISPLAY", "wayland-test")
-        .env_remove("DISPLAY")
-        .args([
-            "--width",
-            "1920",
-            "--height",
-            "1080",
-            "--refresh",
-            "165",
-            "--",
-            "zen-browser",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("start launcher should run");
-
-    assert!(
-        output.status.success(),
-        "launcher failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("--output nested"));
-    assert!(stdout.contains("--width 1920"));
-    assert!(stdout.contains("--height 1080"));
-    assert!(stdout.contains("--refresh 165"));
-    assert!(stdout.contains("-- zen-browser"));
-    assert!(stdout.find("--refresh 165").unwrap() < stdout.find("-- zen-browser").unwrap());
-}
-
-#[test]
-fn start_launcher_blocks_manual_native_output_inside_host_display() {
-    let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let output = Command::new(repo_dir.join("bin/start-oblivion-one"))
-        .env("OBLIVION_ONE_DRY_RUN", "1")
-        .env("OBLIVION_ONE_OUTPUT", "native")
-        .env("WAYLAND_DISPLAY", "wayland-host")
-        .env_remove("WAYLAND_SOCKET")
-        .env_remove("DISPLAY")
+        .env("OBLIVION_ONE_OUTPUT", "nested")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -112,15 +69,14 @@ fn start_launcher_blocks_manual_native_output_inside_host_display() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("refusing native scanout because host display variables are set"));
+    assert!(stderr.contains("OBLIVION_ONE_OUTPUT is no longer supported"));
 }
 
 #[test]
-fn start_launcher_allows_sddm_native_output_with_inherited_display_variables() {
+fn start_launcher_accepts_sddm_native_launch_with_inherited_display_variables() {
     let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(repo_dir.join("bin/start-oblivion-one"))
         .env("OBLIVION_ONE_DRY_RUN", "1")
-        .env("OBLIVION_ONE_OUTPUT", "native")
         .env("OBLIVION_ONE_SDDM_SESSION", "1")
         .env("WAYLAND_DISPLAY", "wayland-from-greeter")
         .env("DISPLAY", ":0")
@@ -135,8 +91,8 @@ fn start_launcher_allows_sddm_native_output_with_inherited_display_variables() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("--output"));
-    assert!(stdout.contains("native"));
+    assert!(!stdout.contains("--output"));
+    assert!(stdout.contains("compositor"));
 }
 
 #[test]
@@ -162,8 +118,7 @@ fn tty_start_launcher_forces_native_release_output() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--socket"));
     assert!(stdout.contains("oblivion-one-tty"));
-    assert!(stdout.contains("--output"));
-    assert!(stdout.contains("native"));
+    assert!(!stdout.contains("--output"));
     assert!(stdout.contains("target/release/oblivion-one"));
     assert!(tty_script.contains("OBLIVION_ONE_MODE=\"${OBLIVION_ONE_MODE:-1920x1080@165}\""));
 }
@@ -204,8 +159,7 @@ fn start_launcher_resolves_repo_when_invoked_through_installed_symlink() {
         )),
         "launcher used the wrong release binary path: {stdout}"
     );
-    assert!(stdout.contains("--output"));
-    assert!(stdout.contains("native"));
+    assert!(!stdout.contains("--output"));
 }
 
 #[test]
@@ -262,7 +216,7 @@ fn install_launcher_writes_sddm_session_entry_to_target_dir() {
     assert!(desktop_entry.contains("Type=Application"));
     assert!(desktop_entry.contains("DesktopNames=OblivionOne"));
     assert!(desktop_entry.contains("OBLIVION_ONE_PROFILE=release"));
-    assert!(desktop_entry.contains("OBLIVION_ONE_OUTPUT=native"));
+    assert!(!desktop_entry.contains("OBLIVION_ONE_OUTPUT"));
     assert!(desktop_entry.contains("OBLIVION_ONE_MODE=1920x1080@165"));
     assert!(desktop_entry.contains("OBLIVION_ONE_SDDM_SESSION=1"));
     assert!(desktop_entry.contains("start-oblivion-one"));

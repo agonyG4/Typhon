@@ -9,7 +9,6 @@ allowed_oversized() {
     case "$1" in
         src/compositor/render.rs) return 0 ;;
         src/egl_renderer.rs) return 0 ;;
-        src/nested_output.rs) return 0 ;;
         *) return 1 ;;
     esac
 }

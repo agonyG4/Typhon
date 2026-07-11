@@ -176,7 +176,7 @@ fn deferred_renderer_registry_omits_gpu_buffer_globals_until_renderer_enables_th
     let server = OwnCompositorServer::bind_with_capabilities(
         &socket_name,
         false,
-        InputProtocolCapabilities::nested_winit(),
+        InputProtocolCapabilities::native_libinput(),
         SelectionProtocolCapabilities::core_clipboard(),
         RendererProtocolCapabilities::unsupported(),
     )
@@ -197,7 +197,7 @@ fn deferred_renderer_registry_omits_gpu_buffer_globals_until_renderer_enables_th
     let mut server = OwnCompositorServer::bind_with_capabilities(
         &socket_name,
         false,
-        InputProtocolCapabilities::nested_winit(),
+        InputProtocolCapabilities::native_libinput(),
         SelectionProtocolCapabilities::core_clipboard(),
         RendererProtocolCapabilities::unsupported(),
     )

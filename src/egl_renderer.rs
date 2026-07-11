@@ -1,4 +1,4 @@
-use std::{collections::HashMap, error::Error, ffi::c_void, io, ptr, sync::Arc};
+use std::{collections::HashMap, error::Error, ffi::c_void, io, ptr};
 
 use glow::HasContext;
 use khronos_egl as egl;
@@ -8,16 +8,9 @@ use oblivion_one::{
         cursor_texture_size,
     },
     render_backend::{
-        RenderBackendProfile,
         buffer::{DmabufImageKey, WeakBufferIdentity},
-        egl_gles::{EGL_LINUX_DMA_BUF_EXT, EglGlesDmabufFeedback, EglGlesDmabufImportAttributes},
+        egl_gles::{EGL_LINUX_DMA_BUF_EXT, EglGlesDmabufImportAttributes},
     },
-};
-use wayland_egl::WlEglSurface;
-use wayland_sys::client::wl_proxy;
-use winit::{
-    raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle},
-    window::Window,
 };
 
 mod damage;
@@ -31,7 +24,6 @@ use damage::{
     PartialRepaintPlanner, RenderExecution, RepaintPlan,
 };
 pub(crate) use damage::{OutputDamage, OutputRect, RepaintMode};
-use dmabuf::{query_egl_dmabuf_feedback, query_egl_main_device};
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglRect, EglTexturedVertex, EglUvRect, MIN_VERTEX_BUFFER_BYTES,
     SurfaceSampling, VERTEX_STRIDE, push_draw_command, push_draw_command_with_uv,
@@ -120,19 +112,6 @@ pub struct EglSceneDrawRequest<'a> {
     pub(crate) current_damage: Option<OutputDamage>,
 }
 
-pub struct EglGlesFrameRenderer {
-    egl: EglInstance,
-    egl_display: egl::Display,
-    egl_context: egl::Context,
-    egl_surface: egl::Surface,
-    wl_egl_surface: WlEglSurface,
-    scene: GlesSceneRenderer,
-    swap_buffers_with_damage: Option<EglSwapBuffersWithDamage>,
-    dmabuf_feedback: EglGlesDmabufFeedback,
-    dmabuf_main_device: Option<u64>,
-    dmabuf_main_device_path: Option<String>,
-}
-
 pub(crate) struct GlesSceneRenderer {
     gl: glow::Context,
     program: GlProgram,
@@ -168,144 +147,6 @@ pub(crate) struct GlesRendererInfo {
     pub vendor: String,
     pub renderer: String,
     pub version: String,
-}
-
-impl EglGlesFrameRenderer {
-    pub fn new(window: Arc<Window>) -> RendererResult<Self> {
-        let initial_size = window.inner_size();
-        let width = initial_size.width.max(1);
-        let height = initial_size.height.max(1);
-        let (wl_display, wl_surface) = wayland_handles_for_window(window.as_ref())?;
-
-        let egl = unsafe { EglInstance::load_required()? };
-        let egl_display = unsafe { egl.get_display(wl_display) }
-            .ok_or_else(|| io::Error::other("EGL could not open the Wayland display"))?;
-        egl.initialize(egl_display)?;
-        egl.bind_api(egl::OPENGL_ES_API)?;
-
-        let egl_config = choose_egl_config(&egl, egl_display)?;
-        let egl_context = create_gles_context(&egl, egl_display, egl_config)?;
-        let wl_egl_surface =
-            unsafe { WlEglSurface::new_from_raw(wl_surface, width as i32, height as i32)? };
-        let egl_surface = unsafe {
-            egl.create_window_surface(
-                egl_display,
-                egl_config,
-                wl_egl_surface.ptr() as egl::NativeWindowType,
-                None,
-            )?
-        };
-        egl.make_current(
-            egl_display,
-            Some(egl_surface),
-            Some(egl_surface),
-            Some(egl_context),
-        )?;
-        if let Err(error) = egl.swap_interval(egl_display, 1) {
-            eprintln!("oblivion-one compositor: EGL swap interval unavailable: {error}");
-        }
-
-        let egl_image_target_texture_2d =
-            load_egl_image_target_texture_2d(&egl).or_else(|| {
-                eprintln!(
-                    "oblivion-one compositor: GL_OES_EGL_image entry point unavailable; dmabuf surfaces will be skipped"
-                );
-                None
-        });
-        let swap_buffers_with_damage = load_swap_buffers_with_damage(&egl, egl_display);
-        let partial_repaint_capabilities = detect_partial_repaint_capabilities(
-            &egl,
-            egl_display,
-            swap_buffers_with_damage.is_some(),
-        );
-        let scene = GlesSceneRenderer::new_current(
-            &egl,
-            width,
-            height,
-            egl_image_target_texture_2d,
-            partial_repaint_capabilities,
-        )?;
-        let dmabuf_feedback = query_egl_dmabuf_feedback(&egl, egl_display);
-        let (dmabuf_main_device_path, dmabuf_main_device) =
-            match query_egl_main_device(&egl, egl_display) {
-                Some((path, main_device)) => (Some(path), Some(main_device)),
-                None => (None, None),
-            };
-
-        let vendor = unsafe { scene.gl.get_parameter_string(glow::VENDOR) };
-        let renderer = unsafe { scene.gl.get_parameter_string(glow::RENDERER) };
-        let version = unsafe { scene.gl.get_parameter_string(glow::VERSION) };
-        eprintln!(
-            "oblivion-one compositor: EGL/GLES3 renderer active: {vendor} {renderer} ({version}, profile {})",
-            RenderBackendProfile::egl_gles().kind.as_str()
-        );
-
-        Ok(Self {
-            egl,
-            egl_display,
-            egl_context,
-            egl_surface,
-            wl_egl_surface,
-            scene,
-            swap_buffers_with_damage,
-            dmabuf_feedback,
-            dmabuf_main_device,
-            dmabuf_main_device_path,
-        })
-    }
-
-    pub fn dmabuf_feedback(&self) -> &EglGlesDmabufFeedback {
-        &self.dmabuf_feedback
-    }
-
-    pub const fn dmabuf_main_device(&self) -> Option<u64> {
-        self.dmabuf_main_device
-    }
-
-    pub fn dmabuf_main_device_path(&self) -> Option<&str> {
-        self.dmabuf_main_device_path.as_deref()
-    }
-
-    pub fn draw_scene(
-        &mut self,
-        request: EglSceneDrawRequest<'_>,
-    ) -> RendererResult<EglFrameOutcome> {
-        let width = request.width.max(1);
-        let height = request.height.max(1);
-        if self.scene.current_size() != (width, height) {
-            self.wl_egl_surface
-                .resize(width as i32, height as i32, 0, 0);
-        }
-        let outcome =
-            self.scene
-                .draw_scene(&self.egl, self.egl_display, self.egl_surface, request)?;
-        let EglFrameOutcome::Rendered { plan, .. } = &outcome else {
-            return Ok(outcome);
-        };
-        self.swap_buffers(plan)?;
-        Ok(outcome)
-    }
-
-    fn swap_buffers(&mut self, plan: &RepaintPlan) -> RendererResult<()> {
-        let result = egl_swap_buffers_with_damage(
-            &self.egl,
-            self.egl_display,
-            self.egl_surface,
-            self.swap_buffers_with_damage,
-            plan.swap_damage(),
-            self.scene.current_size(),
-        );
-        match result {
-            Ok(()) => {
-                self.scene.frame_presented(plan);
-                Ok(())
-            }
-            Err(error) => {
-                self.scene.frame_swap_failed();
-                Err(error)
-            }
-        }
-    }
 }
 
 impl GlesSceneRenderer {
@@ -387,10 +228,6 @@ impl GlesSceneRenderer {
             ),
             frame_stats: GlesSceneFrameStats::default(),
         })
-    }
-
-    pub(crate) const fn current_size(&self) -> (u32, u32) {
-        self.current_size
     }
 
     pub(crate) const fn last_frame_stats(&self) -> GlesSceneFrameStats {
@@ -624,8 +461,7 @@ impl GlesSceneRenderer {
             return Ok(());
         }
 
-        let mut pixels =
-            vec![compositor::NESTED_OUTPUT_BACKGROUND; width as usize * height as usize];
+        let mut pixels = vec![compositor::OUTPUT_BACKGROUND; width as usize * height as usize];
         compositor::draw_wallpaper(&mut pixels, width, height);
         let mut resource = create_uploaded_resource(&self.gl, width, height)?;
         write_argb_pixels_to_resource(
@@ -1397,16 +1233,6 @@ impl GlesSceneRenderer {
     }
 }
 
-impl Drop for EglGlesFrameRenderer {
-    fn drop(&mut self) {
-        self.scene.destroy(&self.egl, self.egl_display);
-        let _ = self.egl.make_current(self.egl_display, None, None, None);
-        let _ = self.egl.destroy_surface(self.egl_display, self.egl_surface);
-        let _ = self.egl.destroy_context(self.egl_display, self.egl_context);
-        let _ = self.egl.terminate(self.egl_display);
-    }
-}
-
 struct EglImageResource {
     texture: GlTexture,
     size: (u32, u32),
@@ -2012,49 +1838,6 @@ fn ensure_vertex_buffer_capacity(
     *current_capacity = capacity;
 }
 
-fn wayland_handles_for_window(
-    window: &Window,
-) -> RendererResult<(egl::NativeDisplayType, *mut wl_proxy)> {
-    let display_handle = window.display_handle()?.as_raw();
-    let window_handle = window.window_handle()?.as_raw();
-    let RawDisplayHandle::Wayland(display) = display_handle else {
-        return Err(io::Error::other("EGL/GLES output requires a Wayland display").into());
-    };
-    let RawWindowHandle::Wayland(window) = window_handle else {
-        return Err(io::Error::other("EGL/GLES output requires a Wayland window").into());
-    };
-    Ok((
-        display.display.as_ptr(),
-        window.surface.as_ptr().cast::<wl_proxy>(),
-    ))
-}
-
-pub(crate) fn choose_egl_config(
-    egl: &EglInstance,
-    display: egl::Display,
-) -> RendererResult<egl::Config> {
-    egl.choose_first_config(display, egl_window_config_attributes())?
-        .ok_or_else(|| io::Error::other("EGL has no GLES3-capable window config").into())
-}
-
-fn egl_window_config_attributes() -> &'static [egl::Int] {
-    &[
-        egl::SURFACE_TYPE,
-        egl::WINDOW_BIT,
-        egl::RENDERABLE_TYPE,
-        egl::OPENGL_ES3_BIT,
-        egl::RED_SIZE,
-        8,
-        egl::GREEN_SIZE,
-        8,
-        egl::BLUE_SIZE,
-        8,
-        egl::ALPHA_SIZE,
-        8,
-        egl::NONE,
-    ]
-}
-
 pub(crate) fn choose_native_egl_config(
     egl: &EglInstance,
     display: egl::Display,
@@ -2352,15 +2135,6 @@ mod tests {
             .take_while(|pair| pair[0] != egl::NONE)
             .find(|pair| pair[0] == key)
             .map(|pair| pair[1])
-    }
-
-    #[test]
-    fn egl_window_config_attributes_request_gles3_only() {
-        let renderable_type =
-            config_attribute_value(egl_window_config_attributes(), egl::RENDERABLE_TYPE).unwrap();
-
-        assert_eq!(renderable_type, egl::OPENGL_ES3_BIT);
-        assert_eq!(renderable_type & egl::OPENGL_ES2_BIT, 0);
     }
 
     #[test]

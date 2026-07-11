@@ -71,16 +71,6 @@ impl InputProtocolCapabilities {
         }
     }
 
-    pub const fn nested_winit() -> Self {
-        Self {
-            relative_pointer: true,
-            pointer_constraints: true,
-            pointer_warp: true,
-            keyboard_shortcuts_inhibit: false,
-            idle_inhibit: false,
-        }
-    }
-
     pub const fn native_libinput() -> Self {
         Self {
             relative_pointer: true,
@@ -211,7 +201,7 @@ impl Default for CompositorArchitecture {
             layers: vec![
                 ArchitectureLayer {
                     name: "core",
-                    responsibility: "shared geometry, paths, process plans, and platform contracts",
+                    responsibility: "shared geometry, paths, and platform contracts",
                     status: "active",
                 },
                 ArchitectureLayer {
@@ -231,7 +221,7 @@ impl Default for CompositorArchitecture {
                 },
                 ArchitectureLayer {
                     name: "session",
-                    responsibility: "nested runner first, then TTY and SDDM lifecycle",
+                    responsibility: "TTY and SDDM lifecycle",
                     status: "active",
                 },
             ],

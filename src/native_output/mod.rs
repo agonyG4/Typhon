@@ -20,10 +20,9 @@ use std::{
 use crate::egl_renderer::dmabuf::{query_egl_dmabuf_feedback, query_egl_main_device};
 use crate::egl_renderer::{
     EglFrameOutcome, EglSceneDrawRequest, GlEglImageTargetTexture2DOes, GlesSceneFrameStats,
-    GlesSceneRenderer, OutputDamage, OutputRect as RendererOutputRect, choose_egl_config,
-    choose_native_egl_config, create_gles_context, detect_partial_repaint_capabilities,
-    egl_swap_buffers_with_damage, load_egl_image_target_texture_2d, load_swap_buffers_with_damage,
-    native_visual_label,
+    GlesSceneRenderer, OutputDamage, OutputRect as RendererOutputRect, choose_native_egl_config,
+    create_gles_context, detect_partial_repaint_capabilities, egl_swap_buffers_with_damage,
+    load_egl_image_target_texture_2d, load_swap_buffers_with_damage, native_visual_label,
 };
 use crate::egl_renderer::{EglInstance, EglSwapBuffersWithDamage};
 use gbm::AsRaw as GbmAsRaw;

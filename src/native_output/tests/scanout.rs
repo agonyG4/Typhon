@@ -557,7 +557,7 @@ fn native_initial_frame_has_no_builtin_compositor_ui() {
         .pixels
         .to_vec();
     let mut wallpaper = vec![0; 320 * 200];
-    compose_nested_output(
+    compose_output(
         &mut wallpaper,
         320,
         200,

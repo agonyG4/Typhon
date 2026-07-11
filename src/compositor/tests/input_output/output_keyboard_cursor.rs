@@ -210,7 +210,7 @@ fn wl_keyboard_v1_bind_does_not_receive_repeat_info() {
 }
 
 #[test]
-fn wayland_client_receives_keyboard_key_from_nested_input_bridge() {
+fn wayland_client_receives_keyboard_key_from_native_input_bridge() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -315,7 +315,7 @@ fn keyboard_input_ignores_resources_from_other_wayland_clients() {
 }
 
 #[test]
-fn wayland_client_receives_pointer_motion_from_nested_input_bridge() {
+fn wayland_client_receives_pointer_motion_from_native_input_bridge() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -330,7 +330,7 @@ fn wayland_client_receives_pointer_motion_from_nested_input_bridge() {
 }
 
 #[test]
-fn wayland_client_receives_pointer_axis_from_nested_input_bridge() {
+fn wayland_client_receives_pointer_axis_from_native_input_bridge() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
