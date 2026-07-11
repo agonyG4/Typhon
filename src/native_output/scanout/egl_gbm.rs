@@ -7,6 +7,18 @@ pub(crate) struct NativePageFlipBuffers<T> {
     pub(crate) pending: Option<T>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativePageFlipBufferSlot {
+    Current,
+    Ready,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativePageFlipRecovery {
+    pub(crate) slot: NativePageFlipBufferSlot,
+    pub(crate) framebuffer_id: u32,
+}
+
 impl<T> Default for NativePageFlipBuffers<T> {
     fn default() -> Self {
         Self {
@@ -51,6 +63,167 @@ impl<T> NativePageFlipBuffers<T> {
         self.current = Some(buffer);
         true
     }
+
+    pub(crate) fn prepare_session_recovery(
+        &self,
+        framebuffer_id: impl Fn(&T) -> u32,
+    ) -> io::Result<NativePageFlipRecovery> {
+        let (slot, buffer) = if let Some(buffer) = self.ready.as_ref() {
+            (NativePageFlipBufferSlot::Ready, buffer)
+        } else if let Some(buffer) = self.current.as_ref() {
+            (NativePageFlipBufferSlot::Current, buffer)
+        } else {
+            return Err(io::Error::other(
+                "native pageflip recovery has no current or ready buffer",
+            ));
+        };
+        let framebuffer_id = framebuffer_id(buffer);
+        if framebuffer_id == 0 {
+            return Err(io::Error::other(
+                "native pageflip recovery framebuffer ID is zero",
+            ));
+        }
+        Ok(NativePageFlipRecovery {
+            slot,
+            framebuffer_id,
+        })
+    }
+
+    pub(crate) fn complete_session_recovery(
+        &mut self,
+        recovery: NativePageFlipRecovery,
+        framebuffer_id: impl Fn(&T) -> u32,
+    ) -> io::Result<()> {
+        let selected = match recovery.slot {
+            NativePageFlipBufferSlot::Current => self.current.as_ref(),
+            NativePageFlipBufferSlot::Ready => self.ready.as_ref(),
+        };
+        if selected.map(&framebuffer_id) != Some(recovery.framebuffer_id) {
+            return Err(io::Error::other(
+                "native pageflip recovery buffer changed before completion",
+            ));
+        }
+        if recovery.slot == NativePageFlipBufferSlot::Ready {
+            self.current = self.ready.take();
+        }
+        self.pending = None;
+        Ok(())
+    }
+
+    pub(crate) fn quarantine_pending_for_session_suspend(&mut self) {
+        // The pending buffer remains locked until a synchronous recovery modeset
+        // proves that the old scanout reference has been replaced.
+    }
+}
+
+#[cfg(test)]
+mod session_buffer_tests {
+    use super::NativePageFlipBuffers;
+
+    #[test]
+    fn suspend_retains_pending_buffer_until_recovery_modeset() {
+        let mut buffers = NativePageFlipBuffers {
+            current: Some(1),
+            ready: None,
+            pending: Some(2),
+        };
+
+        buffers.quarantine_pending_for_session_suspend();
+        assert_eq!(buffers.pending.as_ref(), Some(&2));
+        let recovery = buffers
+            .prepare_session_recovery(|buffer| *buffer)
+            .expect("current buffer should be selected for recovery");
+        buffers
+            .complete_session_recovery(recovery, |buffer| *buffer)
+            .expect("recovery should retire the pending buffer");
+        assert!(buffers.pending.is_none());
+    }
+
+    #[test]
+    fn session_recovery_promotes_the_selected_ready_buffer_to_current() {
+        let mut buffers = NativePageFlipBuffers {
+            current: Some(10),
+            ready: Some(20),
+            pending: Some(30),
+        };
+
+        let recovery = buffers
+            .prepare_session_recovery(|buffer| *buffer)
+            .expect("ready buffer should be selected for recovery");
+        assert_eq!(recovery.framebuffer_id, 20);
+
+        buffers
+            .complete_session_recovery(recovery, |buffer| *buffer)
+            .expect("selected ready buffer should become current");
+
+        assert_eq!(buffers.current, Some(20));
+        assert_eq!(buffers.ready, None);
+        assert_eq!(buffers.pending, None);
+        assert_eq!(buffers.take_ready(), None);
+    }
+
+    #[test]
+    fn session_recovery_keeps_the_selected_current_buffer_current() {
+        let mut buffers = NativePageFlipBuffers {
+            current: Some(10),
+            ready: None,
+            pending: Some(30),
+        };
+
+        let recovery = buffers
+            .prepare_session_recovery(|buffer| *buffer)
+            .expect("current buffer should be selected for recovery");
+        assert_eq!(recovery.framebuffer_id, 10);
+
+        buffers
+            .complete_session_recovery(recovery, |buffer| *buffer)
+            .expect("selected current buffer should remain current");
+
+        assert_eq!(buffers.current, Some(10));
+        assert_eq!(buffers.ready, None);
+        assert_eq!(buffers.pending, None);
+    }
+
+    #[test]
+    fn session_recovery_rejects_a_different_ready_buffer_after_preparation() {
+        let mut buffers = NativePageFlipBuffers {
+            current: Some(10),
+            ready: Some(20),
+            pending: Some(30),
+        };
+
+        let recovery = buffers
+            .prepare_session_recovery(|buffer| *buffer)
+            .expect("ready buffer should be selected for recovery");
+        buffers.ready = Some(40);
+
+        assert!(
+            buffers
+                .complete_session_recovery(recovery, |buffer| *buffer)
+                .is_err()
+        );
+        assert_eq!(buffers.current, Some(10));
+        assert_eq!(buffers.ready, Some(40));
+        assert_eq!(buffers.pending, Some(30));
+    }
+
+    #[test]
+    fn failed_session_recovery_does_not_mutate_buffer_ownership() {
+        let buffers = NativePageFlipBuffers {
+            current: Some(10),
+            ready: Some(20),
+            pending: Some(30),
+        };
+
+        let _recovery = buffers
+            .prepare_session_recovery(|buffer| *buffer)
+            .expect("ready buffer should be selected for recovery");
+
+        // A KMS failure returns before completion is called.
+        assert_eq!(buffers.current, Some(10));
+        assert_eq!(buffers.ready, Some(20));
+        assert_eq!(buffers.pending, Some(30));
+    }
 }
 
 pub(crate) struct NativeEglGbmScanout {
@@ -73,6 +246,7 @@ pub(crate) struct NativeEglGbmScanout {
     pub(crate) buffers: NativePageFlipBuffers<NativePresentedGbmBuffer>,
     pub(crate) page_flip: AtomicCommitState,
     pub(crate) backend_generation: u64,
+    pub(crate) drm_cleanup_armed: bool,
 }
 
 // A locked GBM front buffer must stay alive while KMS may scan it out. Ready is
@@ -312,6 +486,7 @@ impl NativeEglGbmScanout {
             buffers: NativePageFlipBuffers::default(),
             page_flip: AtomicCommitState::default(),
             backend_generation,
+            drm_cleanup_armed: true,
         })
     }
 
@@ -421,6 +596,18 @@ impl NativeEglGbmScanout {
             .unwrap_or(0)
     }
 
+    pub(crate) fn prepare_session_recovery(&self) -> io::Result<NativePageFlipRecovery> {
+        self.buffers.prepare_session_recovery(|buffer| buffer.fb_id)
+    }
+
+    pub(crate) fn complete_session_recovery(
+        &mut self,
+        recovery: NativePageFlipRecovery,
+    ) -> io::Result<()> {
+        self.buffers
+            .complete_session_recovery(recovery, |buffer| buffer.fb_id)
+    }
+
     pub(crate) fn finish_initial_scanout(&mut self) {
         self.buffers.finish_initial_scanout();
     }
@@ -487,8 +674,25 @@ impl NativeEglGbmScanout {
         self.page_flip.is_pending()
     }
 
+    pub(crate) fn suspend_page_flip(&mut self) {
+        self.page_flip.abandon();
+        self.buffers.quarantine_pending_for_session_suspend();
+    }
+
+    pub(crate) fn rebind_session_generation(&mut self, generation: u64) {
+        self.backend_generation = generation;
+    }
+
+    pub(crate) fn disarm_drm_cleanup(&mut self) {
+        self.drm_cleanup_armed = false;
+    }
+
     pub(crate) fn ready_frame_queued(&self) -> bool {
         self.buffers.ready.is_some()
+    }
+
+    pub(crate) fn render_target_available(&self) -> bool {
+        self.surface.has_free_buffers() || self.buffers.ready.is_some()
     }
 }
 
@@ -507,8 +711,12 @@ impl Drop for NativeEglGbmScanout {
         let _ = self.egl.destroy_surface(self.egl_display, self.egl_surface);
         let _ = self.egl.destroy_context(self.egl_display, self.egl_context);
         let _ = self.egl.terminate(self.egl_display);
-        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        self.framebuffer_cache.clear(fd);
+        if self.drm_cleanup_armed {
+            let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+            self.framebuffer_cache.clear(fd);
+        } else {
+            self.framebuffer_cache.entries.clear();
+        }
     }
 }
 

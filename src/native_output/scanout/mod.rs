@@ -180,6 +180,28 @@ pub(crate) enum NativeScanoutBackend {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeScanoutRecovery {
+    NativeEglGbm(NativePageFlipRecovery),
+    Gbm(NativeIndexedScanoutRecovery),
+    Dumb(FramebufferId),
+}
+
+impl NativeScanoutRecovery {
+    pub(crate) fn framebuffer_id(self) -> FramebufferId {
+        match self {
+            Self::NativeEglGbm(recovery) => {
+                // A recovery token cannot be created with a zero framebuffer ID.
+                FramebufferId::new(recovery.framebuffer_id).expect("validated recovery framebuffer")
+            }
+            Self::Gbm(recovery) => {
+                FramebufferId::new(recovery.framebuffer_id).expect("validated recovery framebuffer")
+            }
+            Self::Dumb(framebuffer) => framebuffer,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativePresentResult {
     Noop,
     AsyncSubmitted { token: u64 },
@@ -296,6 +318,42 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn prepare_session_recovery(&self) -> io::Result<NativeScanoutRecovery> {
+        match self {
+            Self::NativeEglGbm(scanout) => scanout
+                .prepare_session_recovery()
+                .map(NativeScanoutRecovery::NativeEglGbm),
+            Self::Gbm(scanout) => scanout
+                .prepare_session_recovery()
+                .map(NativeScanoutRecovery::Gbm),
+            Self::Dumb(framebuffer) => FramebufferId::new(framebuffer.fb_id)
+                .map(NativeScanoutRecovery::Dumb)
+                .ok_or_else(|| io::Error::other("dumb recovery framebuffer ID is zero")),
+        }
+    }
+
+    pub(crate) fn complete_session_recovery(
+        &mut self,
+        recovery: NativeScanoutRecovery,
+    ) -> io::Result<()> {
+        match (self, recovery) {
+            (Self::NativeEglGbm(scanout), NativeScanoutRecovery::NativeEglGbm(recovery)) => {
+                scanout.complete_session_recovery(recovery)
+            }
+            (Self::Gbm(scanout), NativeScanoutRecovery::Gbm(recovery)) => {
+                scanout.complete_session_recovery(recovery)
+            }
+            (Self::Dumb(framebuffer), NativeScanoutRecovery::Dumb(recovery))
+                if framebuffer.fb_id == recovery.get() =>
+            {
+                Ok(())
+            }
+            _ => Err(io::Error::other(
+                "scanout recovery token does not match the active backend",
+            )),
+        }
+    }
+
     pub(crate) fn scanout_format(&self) -> u32 {
         match self {
             Self::NativeEglGbm(scanout) => scanout.format as u32,
@@ -339,11 +397,43 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn suspend_page_flip(&mut self) {
+        match self {
+            Self::NativeEglGbm(scanout) => scanout.suspend_page_flip(),
+            Self::Gbm(scanout) => scanout.suspend_page_flip(),
+            Self::Dumb(_) => {}
+        }
+    }
+
+    pub(crate) fn rebind_session_generation(&mut self, generation: u64) {
+        match self {
+            Self::NativeEglGbm(scanout) => scanout.rebind_session_generation(generation),
+            Self::Gbm(scanout) => scanout.rebind_session_generation(generation),
+            Self::Dumb(_) => {}
+        }
+    }
+
+    pub(crate) fn disarm_drm_cleanup(&mut self) {
+        match self {
+            Self::NativeEglGbm(scanout) => scanout.disarm_drm_cleanup(),
+            Self::Gbm(scanout) => scanout.disarm_drm_cleanup(),
+            Self::Dumb(framebuffer) => framebuffer.drm_cleanup_armed = false,
+        }
+    }
+
     pub(crate) fn ready_frame_queued(&self) -> bool {
         match self {
             Self::NativeEglGbm(scanout) => scanout.ready_frame_queued(),
             Self::Gbm(scanout) => scanout.ready_frame_queued(),
             Self::Dumb(_) => false,
+        }
+    }
+
+    pub(crate) fn render_target_available(&self) -> bool {
+        match self {
+            Self::NativeEglGbm(scanout) => scanout.render_target_available(),
+            Self::Gbm(scanout) => scanout.render_target_available(),
+            Self::Dumb(_) => true,
         }
     }
 

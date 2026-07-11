@@ -4,6 +4,8 @@ mod bootstrap;
 mod cycle;
 mod frame;
 mod presentation;
+mod session;
+mod session_io;
 mod shutdown;
 
 pub(crate) use cycle::run;
@@ -16,6 +18,13 @@ pub(crate) use frame::{
 pub(crate) use frame::{
     NativeFrameRequest, NativePointerConstraint, NativePointerConstraintBackendAction,
     NativeRepaintDecision, NativeRepaintInputs, native_repaint_decision,
+};
+pub(crate) use session::{NativeSessionLifecycle, NativeSessionTransition};
+#[cfg(test)]
+pub(crate) use session_io::NativeIoRecorder;
+pub(crate) use session_io::{
+    NativeIoOperation, NativeSessionIo, NativeSuspendedReadiness, quiesce_and_acknowledge,
+    recover_native_output, service_suspended_sources, teardown_without_drm_io,
 };
 pub(crate) use shutdown::{
     NativeShutdownLifecycle, ShutdownState, ShutdownTransition, native_shutdown_debug_log,
@@ -50,25 +59,31 @@ pub(crate) struct NativeRuntimeConfig {
 pub(crate) struct NativeRuntime {
     server: OwnCompositorServer,
     perf: NativePerfLogger,
-    kms: NativeDrmDevice,
-    kms_backend: KmsBackendSelection,
     target: KmsTarget,
     mode_label: String,
     refresh_hz: u32,
     drm_file_generation: u64,
     drm_timestamp_clock: DrmTimestampClock,
     presentation_clock: PresentationClock,
-    scanout: NativeScanoutBackend,
+    scanout: mem::ManuallyDrop<NativeScanoutBackend>,
+    kms_backend: KmsBackendSelection,
     frame_renderer: NativeFrameRenderer,
     input_state: NativeInputState,
     cursor_preference: NativeCursorPreference,
     cursor_render_mode: NativeCursorRenderMode,
     hardware_cursor: Option<NativeHardwareCursor>,
+    kms: NativeDrmDevice,
     input_devices: NativeInputBackend,
     seat_session: Option<NativeSeatSession>,
+    session: NativeSessionLifecycle,
+    pending_session_recovery: Option<NativeScanoutRecovery>,
+    #[cfg(test)]
+    native_io_recorder: NativeIoRecorder,
     acquire_notifier: DrmAcquirePointNotifier,
     acquire_watches: ExplicitSyncWatchRegistry,
+    parked_acquire_watches: Vec<oblivion_one::compositor::AcquireWatchRequest>,
     event_loop: NativeEventLoop,
+    drm_reactor_token: Option<ReactorToken>,
     frame_scheduler: NativeFrameScheduler,
     effective_app_gpu_policy: EffectiveCompositorAppGpuPolicy,
     last_render_generation: u64,
@@ -94,5 +109,21 @@ impl NativeRuntime {
 
     pub(crate) fn run(&mut self) -> NativeResult<()> {
         self.run_native_cycle()
+    }
+}
+
+impl Drop for NativeRuntime {
+    fn drop(&mut self) {
+        if !self.session.permits_output() {
+            self.scanout.disarm_drm_cleanup();
+            self.kms_backend.disarm_drm_io();
+            if let Some(cursor) = self.hardware_cursor.as_mut() {
+                cursor.disarm_drm_cleanup();
+            }
+        }
+        // SAFETY: scanout is wrapped solely so inactive managed-session
+        // teardown can disarm DRM cleanup before its normal resource drop.
+        // It is dropped exactly once here, while `kms` is still alive.
+        unsafe { mem::ManuallyDrop::drop(&mut self.scanout) };
     }
 }

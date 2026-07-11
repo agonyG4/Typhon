@@ -93,6 +93,40 @@ pub enum AcquireRegistrationResult {
 }
 
 #[derive(Debug)]
+struct AcquireRegistrationFailure {
+    error: io::Error,
+    request: Option<AcquireWatchRequest>,
+}
+
+impl AcquireRegistrationFailure {
+    fn with_request(error: io::Error, request: AcquireWatchRequest) -> Self {
+        Self {
+            error,
+            request: Some(request),
+        }
+    }
+
+    fn owned_by_registry(error: io::Error) -> Self {
+        Self {
+            error,
+            request: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct AcquireRearmFailure {
+    error: io::Error,
+    parked: Vec<AcquireWatchRequest>,
+}
+
+impl AcquireRearmFailure {
+    pub fn into_parts(self) -> (io::Error, Vec<AcquireWatchRequest>) {
+        (self.error, self.parked)
+    }
+}
+
+#[derive(Debug)]
 pub enum AcquireReadyResult {
     Ready(AcquireWatchRequest),
     Pending,
@@ -141,6 +175,12 @@ impl ExplicitSyncWatchRegistry {
         self.fallback_schedule.next_deadline_ns()
     }
 
+    pub fn set_drm_file_generation(&mut self, generation: u64) {
+        debug_assert!(self.watches_by_token.is_empty());
+        debug_assert!(self.fallback_requests.is_empty());
+        self.drm_file_generation = generation;
+    }
+
     pub fn register<N: AcquirePointNotifier>(
         &mut self,
         request: AcquireWatchRequest,
@@ -148,12 +188,28 @@ impl ExplicitSyncWatchRegistry {
         now_ns: u64,
         notifier: &N,
     ) -> io::Result<AcquireRegistrationResult> {
+        self.register_owned(request, event_loop, now_ns, notifier)
+            .map_err(|failure| failure.error)
+    }
+
+    fn register_owned<N: AcquirePointNotifier>(
+        &mut self,
+        request: AcquireWatchRequest,
+        event_loop: &mut NativeEventLoop,
+        now_ns: u64,
+        notifier: &N,
+    ) -> Result<AcquireRegistrationResult, AcquireRegistrationFailure> {
+        let request_for_error = request.clone();
         self.cancel_commit(
             request.commit_id,
             AcquireWatchCancelReason::Superseded,
             event_loop,
-        )?;
-        if notifier.point_signaled(&request.acquire)? {
+        )
+        .map_err(|error| AcquireRegistrationFailure::with_request(error, request_for_error))?;
+        if notifier
+            .point_signaled(&request.acquire)
+            .map_err(|error| AcquireRegistrationFailure::with_request(error, request.clone()))?
+        {
             self.metrics.already_signaled = self.metrics.already_signaled.saturating_add(1);
             self.note_ready_latency(&request);
             return Ok(AcquireRegistrationResult::AlreadyReady(request));
@@ -197,7 +253,12 @@ impl ExplicitSyncWatchRegistry {
                     self.insert_fallback(request, now_ns);
                     return Ok(AcquireRegistrationResult::FallbackBacked(id));
                 }
-                SyncobjEventfdErrnoClass::Failure(_) => return Err(error.into_io_error()),
+                SyncobjEventfdErrnoClass::Failure(_) => {
+                    return Err(AcquireRegistrationFailure::with_request(
+                        error.into_io_error(),
+                        request,
+                    ));
+                }
             }
         }
         self.capability = SyncobjEventfdCapability::Supported;
@@ -238,22 +299,76 @@ impl ExplicitSyncWatchRegistry {
             .expect("new acquire watch must exist");
         let final_signaled = match notifier.point_signaled(&final_request.acquire) {
             Ok(signaled) => signaled,
-            Err(error) => {
-                self.remove_eventfd_watch(token, event_loop)?;
-                return Err(error);
-            }
+            Err(error) => return Err(AcquireRegistrationFailure::owned_by_registry(error)),
         };
         if final_signaled {
-            let request = self
-                .remove_eventfd_watch(token, event_loop)?
-                .ok_or_else(|| {
-                    io::Error::other("new acquire watch disappeared during final readiness check")
-                })?;
+            let request = match self.remove_eventfd_watch(token, event_loop) {
+                Ok(Some(request)) => request,
+                Ok(None) => {
+                    return Err(AcquireRegistrationFailure::with_request(
+                        io::Error::other(
+                            "new acquire watch disappeared during final readiness check",
+                        ),
+                        final_request,
+                    ));
+                }
+                Err(error) => return Err(AcquireRegistrationFailure::owned_by_registry(error)),
+            };
             self.metrics.already_signaled = self.metrics.already_signaled.saturating_add(1);
             self.note_ready_latency(&request);
             return Ok(AcquireRegistrationResult::AlreadyReady(request));
         }
         Ok(AcquireRegistrationResult::EventfdBacked(commit_id))
+    }
+
+    pub fn rearm_parked_requests<N: AcquirePointNotifier>(
+        &mut self,
+        mut parked: Vec<AcquireWatchRequest>,
+        event_loop: &mut NativeEventLoop,
+        now_ns: u64,
+        notifier: &N,
+    ) -> Result<Vec<AcquireWatchRequest>, AcquireRearmFailure> {
+        let mut already_ready = Vec::new();
+        while !parked.is_empty() {
+            let request = parked.remove(0);
+            let registration = match self.register_owned(request, event_loop, now_ns, notifier) {
+                Ok(registration) => registration,
+                Err(failure) => {
+                    let mut restored = match self.park_for_session_suspend(event_loop) {
+                        Ok(registered) => registered,
+                        Err(error) => {
+                            // If the rollback itself cannot unregister a native watch, that
+                            // watch remains owned by this registry. The failed request and the
+                            // untouched suffix still remain recoverable in the parked queue.
+                            let mut preserved = failure.request.into_iter().collect::<Vec<_>>();
+                            preserved.append(&mut already_ready);
+                            preserved.append(&mut parked);
+                            return Err(AcquireRearmFailure {
+                                error,
+                                parked: preserved,
+                            });
+                        }
+                    };
+                    if let Some(request) = failure.request {
+                        restored.push(request);
+                    }
+                    restored.append(&mut already_ready);
+                    // Registry iteration is keyed by commit ID, so rollback order is not
+                    // semantic; request identity and exactly-once ownership are the contract.
+                    restored.append(&mut parked);
+                    return Err(AcquireRearmFailure {
+                        error: failure.error,
+                        parked: restored,
+                    });
+                }
+            };
+            match registration {
+                AcquireRegistrationResult::AlreadyReady(request) => already_ready.push(request),
+                AcquireRegistrationResult::EventfdBacked(_)
+                | AcquireRegistrationResult::FallbackBacked(_) => {}
+            }
+        }
+        Ok(already_ready)
     }
 
     pub fn handle_ready<N: AcquirePointNotifier>(
@@ -363,6 +478,20 @@ impl ExplicitSyncWatchRegistry {
             ));
         }
         Ok(())
+    }
+
+    pub fn park_for_session_suspend(
+        &mut self,
+        event_loop: &mut NativeEventLoop,
+    ) -> io::Result<Vec<AcquireWatchRequest>> {
+        let parked = self
+            .watches_by_token
+            .values()
+            .map(|watch| watch.request.clone())
+            .chain(self.fallback_requests.values().cloned())
+            .collect::<Vec<_>>();
+        self.shutdown(event_loop)?;
+        Ok(parked)
     }
 
     fn insert_fallback(&mut self, request: AcquireWatchRequest, now_ns: u64) {
@@ -523,6 +652,8 @@ mod tests {
         signaled: Cell<bool>,
         signal_during_registration: bool,
         registration_errno: Option<i32>,
+        registration_calls: Cell<usize>,
+        fail_registration_on: Option<usize>,
     }
 
     impl FakeNotifier {
@@ -531,6 +662,15 @@ mod tests {
                 signaled: Cell::new(false),
                 signal_during_registration: false,
                 registration_errno: None,
+                registration_calls: Cell::new(0),
+                fail_registration_on: None,
+            }
+        }
+
+        fn failing_on_registration(number: usize) -> Self {
+            Self {
+                fail_registration_on: Some(number),
+                ..Self::pending()
             }
         }
     }
@@ -545,6 +685,11 @@ mod tests {
             _point: &ExplicitSyncPoint,
             _event_fd: BorrowedFd<'_>,
         ) -> Result<(), SyncobjEventfdError> {
+            let registration = self.registration_calls.get() + 1;
+            self.registration_calls.set(registration);
+            if self.fail_registration_on == Some(registration) {
+                return Err(SyncobjEventfdError::from_errno(libc::EINVAL));
+            }
             if let Some(errno) = self.registration_errno {
                 return Err(SyncobjEventfdError::from_errno(errno));
             }
@@ -552,6 +697,33 @@ mod tests {
                 self.signaled.set(true);
             }
             Ok(())
+        }
+    }
+
+    struct ReadyThenFailNotifier {
+        point_calls: Cell<usize>,
+        registration_calls: Cell<usize>,
+    }
+
+    impl AcquirePointNotifier for ReadyThenFailNotifier {
+        fn point_signaled(&self, _point: &ExplicitSyncPoint) -> io::Result<bool> {
+            let call = self.point_calls.get() + 1;
+            self.point_calls.set(call);
+            Ok(call == 2)
+        }
+
+        fn register_eventfd(
+            &self,
+            _point: &ExplicitSyncPoint,
+            _event_fd: BorrowedFd<'_>,
+        ) -> Result<(), SyncobjEventfdError> {
+            let call = self.registration_calls.get() + 1;
+            self.registration_calls.set(call);
+            if call == 2 {
+                Err(SyncobjEventfdError::from_errno(libc::EINVAL))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -650,6 +822,8 @@ mod tests {
             signaled: Cell::new(false),
             signal_during_registration: true,
             registration_errno: None,
+            registration_calls: Cell::new(0),
+            fail_registration_on: None,
         };
         let mut event_loop = NativeEventLoop::new().unwrap();
         let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
@@ -669,6 +843,8 @@ mod tests {
             signaled: Cell::new(false),
             signal_during_registration: false,
             registration_errno: Some(libc::ENOTTY),
+            registration_calls: Cell::new(0),
+            fail_registration_on: None,
         };
         let mut event_loop = NativeEventLoop::new().unwrap();
         let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
@@ -778,5 +954,210 @@ mod tests {
         assert_eq!(metrics.active_fallback_watches, 0);
         assert_eq!(registry.next_fallback_deadline_ns(), None);
         assert_eq!(metrics.leaked_watch_assertions, 0);
+    }
+
+    #[test]
+    fn park_for_session_suspend_returns_every_removed_request() {
+        let notifier = FakeNotifier::pending();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        registry
+            .register(request(1, 20), &mut event_loop, 100, &notifier)
+            .unwrap();
+        registry.capability = SyncobjEventfdCapability::Unsupported;
+        registry
+            .register(request(2, 21), &mut event_loop, 100, &notifier)
+            .unwrap();
+
+        let parked = registry.park_for_session_suspend(&mut event_loop).unwrap();
+
+        assert_eq!(parked.len(), 2);
+        assert_eq!(registry.metrics().active_eventfd_watches, 0);
+        assert_eq!(registry.metrics().active_fallback_watches, 0);
+    }
+
+    #[test]
+    fn parked_watch_rearms_in_new_generation_and_old_token_stays_stale() {
+        let notifier = FakeNotifier::pending();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        let AcquireRegistrationResult::EventfdBacked(id) = registry
+            .register(request(1, 20), &mut event_loop, 100, &notifier)
+            .unwrap()
+        else {
+            panic!("expected eventfd watch");
+        };
+        let old_token = registry.watch_by_commit[&id];
+        let parked = registry.park_for_session_suspend(&mut event_loop).unwrap();
+        registry.set_drm_file_generation(8);
+        registry
+            .register(
+                parked.into_iter().next().unwrap(),
+                &mut event_loop,
+                200,
+                &notifier,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            registry
+                .handle_ready(old_token, &mut event_loop, 8, &notifier)
+                .unwrap(),
+            AcquireReadyResult::Stale
+        ));
+        assert_eq!(registry.watches_by_token.len(), 1);
+        assert_eq!(
+            registry
+                .watches_by_token
+                .values()
+                .next()
+                .unwrap()
+                .drm_file_generation,
+            8
+        );
+    }
+
+    fn request_ids(requests: &[AcquireWatchRequest]) -> Vec<u64> {
+        let mut ids = requests
+            .iter()
+            .map(|request| request.commit_id.get())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn parked_requests(count: u64) -> Vec<AcquireWatchRequest> {
+        (1..=count).map(|id| request(id, 20 + id as u32)).collect()
+    }
+
+    #[test]
+    fn parked_rearm_failure_on_first_request_preserves_every_request() {
+        let notifier = FakeNotifier::failing_on_registration(1);
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+
+        let failure = registry
+            .rearm_parked_requests(parked_requests(3), &mut event_loop, 100, &notifier)
+            .expect_err("first registration should fail");
+
+        assert_eq!(registry.metrics().active_eventfd_watches, 0);
+        assert_eq!(registry.metrics().active_fallback_watches, 0);
+        let (_, parked) = failure.into_parts();
+        assert_eq!(request_ids(&parked), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn parked_rearm_failure_in_middle_rolls_back_registered_requests_and_suffix() {
+        let notifier = FakeNotifier::failing_on_registration(3);
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+
+        let failure = registry
+            .rearm_parked_requests(parked_requests(5), &mut event_loop, 100, &notifier)
+            .expect_err("third registration should fail");
+
+        assert_eq!(registry.metrics().active_eventfd_watches, 0);
+        assert_eq!(registry.metrics().active_fallback_watches, 0);
+        let (_, parked) = failure.into_parts();
+        assert_eq!(request_ids(&parked), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn parked_rearm_failure_restores_provisional_ready_requests() {
+        let notifier = ReadyThenFailNotifier {
+            point_calls: Cell::new(0),
+            registration_calls: Cell::new(0),
+        };
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+
+        let failure = registry
+            .rearm_parked_requests(parked_requests(3), &mut event_loop, 100, &notifier)
+            .expect_err("second registration should fail after the first is ready");
+
+        let (_, parked) = failure.into_parts();
+        assert_eq!(registry.metrics().active_eventfd_watches, 0);
+        assert_eq!(registry.metrics().active_fallback_watches, 0);
+        assert_eq!(request_ids(&parked), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn parked_rearm_failure_on_final_request_preserves_all_requests() {
+        let notifier = FakeNotifier::failing_on_registration(3);
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+
+        let failure = registry
+            .rearm_parked_requests(parked_requests(3), &mut event_loop, 100, &notifier)
+            .expect_err("final registration should fail");
+
+        assert_eq!(registry.metrics().active_eventfd_watches, 0);
+        assert_eq!(registry.metrics().active_fallback_watches, 0);
+        let (_, parked) = failure.into_parts();
+        assert_eq!(request_ids(&parked), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn parked_rearm_full_success_activates_each_request_once() {
+        let notifier = FakeNotifier::pending();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+
+        let already_ready = registry
+            .rearm_parked_requests(parked_requests(3), &mut event_loop, 100, &notifier)
+            .expect("all registrations should succeed");
+
+        assert!(already_ready.is_empty());
+        assert_eq!(registry.metrics().active_eventfd_watches, 3);
+        assert_eq!(registry.metrics().active_fallback_watches, 0);
+        assert_eq!(
+            request_ids(
+                &registry
+                    .watches_by_token
+                    .values()
+                    .map(|watch| watch.request.clone())
+                    .collect::<Vec<_>>()
+            ),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn failed_rearm_can_be_retried_in_the_current_generation_without_duplicates() {
+        let initial_notifier = FakeNotifier::pending();
+        let failing_notifier = FakeNotifier::failing_on_registration(2);
+        let success_notifier = FakeNotifier::pending();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+
+        let AcquireRegistrationResult::EventfdBacked(old_commit_id) = registry
+            .register(request(99, 119), &mut event_loop, 100, &initial_notifier)
+            .unwrap()
+        else {
+            panic!("expected old-generation eventfd watch");
+        };
+        let old_token = registry.watch_by_commit[&old_commit_id];
+        let mut parked = registry.park_for_session_suspend(&mut event_loop).unwrap();
+        registry.set_drm_file_generation(8);
+        parked.extend(parked_requests(3));
+
+        let failure = registry
+            .rearm_parked_requests(parked, &mut event_loop, 100, &failing_notifier)
+            .expect_err("second registration should fail");
+        let (_, parked) = failure.into_parts();
+        let already_ready = registry
+            .rearm_parked_requests(parked, &mut event_loop, 200, &success_notifier)
+            .expect("preserved requests should rearm later");
+
+        assert!(already_ready.is_empty());
+        assert_eq!(registry.drm_file_generation, 8);
+        assert_eq!(registry.metrics().active_eventfd_watches, 4);
+        assert_eq!(registry.metrics().active_fallback_watches, 0);
+        assert!(matches!(
+            registry
+                .handle_ready(old_token, &mut event_loop, 8, &success_notifier)
+                .unwrap(),
+            AcquireReadyResult::Stale
+        ));
     }
 }

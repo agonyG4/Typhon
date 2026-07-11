@@ -179,7 +179,15 @@ runtime/     NativeRuntime owner, bootstrap, cycle, frame, presentation phases
 tests/       connected native white-box tests by output/input/scanout/frame
 ```
 
-`NativeRuntime` is the native backend owner. It holds the compositor server,
+`NativeRuntime` is the native backend owner and sole authority for a managed
+libseat lifecycle. Its reactor owns the libseat fd and the session state machine
+(`Active -> Suspending -> Suspended -> Resuming -> Active`). It quiesces DRM,
+pageflip, scanout, cursor, and explicit-sync work before disable acknowledgment,
+and only resumes input after synchronous full-pipeline KMS recovery. Pending
+scanout storage is quarantined until that modeset succeeds; acquire watches are
+parked and re-armed under a new DRM generation. Suspended shutdown disarms
+DRM-I/O destructors before resource drop. Wayland dispatch continues while
+input is drained without delivery. It holds the compositor server,
 DRM/KMS device and backend, selected target and timing metadata, scanout
 backend, frame renderer, input state/backend, cursor policy/backend,
 explicit-sync acquire notifier and watch registry, event loop, frame scheduler,

@@ -77,6 +77,10 @@ impl NativeHardwareCursor {
         Ok(())
     }
 
+    pub(crate) fn disarm_drm_cleanup(&mut self) {
+        self.active = false;
+    }
+
     pub(crate) fn handle(&self) -> u32 {
         unsafe { self.bo.handle().u32_ }
     }

@@ -284,9 +284,15 @@ selection remains under `OBLIVION_ONE_MODE`, for example
 `OBLIVION_ONE_MODE=1920x1080@165`. Use `hyprctl monitors` on Hyprland hosts to
 check the monitor refresh that can physically pace the nested window.
 
-This path is still experimental. The native backend now prefers `libseat` for
-both DRM device ownership and libinput keyboard/pointer input, with direct DRM,
-direct libinput, and raw evdev kept as fallback/debug paths. In `auto` scanout
+This path is still experimental. `NativeRuntime` owns the pollable `libseat`
+lifecycle for managed DRM independently of the selected input backend. It
+quiesces KMS/pageflip/scanout/cursor/explicit-sync work before disable
+acknowledgment. Resume performs a synchronous complete KMS pipeline modeset,
+re-arms parked explicit-sync work, then restores input and normal scheduling.
+Pending scanout buffers remain quarantined until recovery. The native backend
+prefers `libseat` for DRM device ownership and libinput keyboard/pointer input;
+direct DRM is an explicit debug preference, while direct libinput and raw evdev
+remain input fallbacks. In `auto` scanout
 mode it now tries `native-egl-gbm` first: the shared EGL/GLES scene renderer
 draws into a GBM-backed EGL surface, locks the rendered front buffer, caches a
 DRM framebuffer ID for that BO, and presents it through KMS pageflip. Set

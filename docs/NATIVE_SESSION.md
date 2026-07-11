@@ -77,8 +77,9 @@ The native backend currently:
   `WIDTHxHEIGHT@HZ` selects an exact resolution with nearest refresh fallback.
   Native mode selection is separate from nested `--width`, `--height`, and
   `--refresh` flags;
-- opens DRM through the shared libseat session when available, with a direct DRM
-  fallback kept for development sessions;
+- opens DRM through the shared libseat session when available. Once a managed
+  seat has been acquired, `auto` does not silently fall back to direct DRM;
+  direct DRM requires the explicit development/debug preference;
 - selects KMS through `OBLIVION_ONE_KMS_MODE=auto|atomic|legacy`. `auto`
   enables the atomic client capability, discovers connector/CRTC/primary-plane
   properties, validates the complete initial state with a test-only commit, and
@@ -103,16 +104,37 @@ The native backend currently:
   resize backdrop, border, tint, shadow, or outline;
 - prefers `libseat + libinput udev` for keyboard, pointer motion, buttons, and
   scroll;
-- suspends/resumes libinput when the libseat input owner receives
-  disable/enable events;
+- makes `NativeRuntime` the sole owner of libseat lifecycle dispatch. libseat
+  0.2.4 exposes a pollable seat fd, which the native reactor registers as its
+  own source independently of the selected input backend. Disable first moves
+  the runtime to `Suspending`, blocks output work, suspends input, quarantines
+  pending pageflip storage, parks explicit-sync watches, unregisters DRM
+  readiness, and disables the hardware cursor; only then does it acknowledge
+  libseat and enter `Suspended`. Enable enters `Resuming`. Atomic recovery
+  synchronously revalidates the live connector/CRTC/primary-plane target and
+  replays the complete pipeline with `ALLOW_MODESET`; legacy recovery
+  revalidates the connector/CRTC/mode and synchronously reissues `set_crtc`. The
+  runtime then retires quarantined scanout state, re-arms explicit sync under a
+  new DRM generation, restores cursor/DRM reactor/scheduler state, resumes
+  input, and finally returns to `Active`;
+- makes teardown session-aware. Active shutdown performs the normal KMS restore
+  and ordered framebuffer cleanup. If managed ownership is inactive, KMS,
+  mode-blob, cursor, and scanout DRM cleanup are disarmed before resource
+  destructors run; resource memory/EGL/GBM state is still released, but no
+  revoked-fd ioctl is issued. Process exit and device-fd closure reclaim the
+  remaining kernel resources;
 - keeps direct libinput and the older `/dev/input/event*` raw evdev reader as
   fallback/diagnostic paths;
 - forwards the normalized keyboard and pointer events into `OwnCompositorServer`;
 - coalesces consecutive pointer motion events before applying input effects, so
   high-rate mice do less duplicate compositor work per native loop tick;
-- registers DRM, Wayland listener/client, libinput or raw evdev, and monotonic
-  timer fds in a level-triggered `epoll` reactor. With no work or deadline the
-  native thread blocks indefinitely in `epoll_wait`;
+- registers DRM, libseat, Wayland listener/client, libinput or raw evdev, and
+  monotonic timer fds in a level-triggered `epoll` reactor. While suspended,
+  DRM and explicit-sync sources are unregistered, timers are parked except for
+  bounded shutdown progress, Wayland remains dispatchable, and input readiness
+  is drained and discarded so neither level-triggered spin nor stale replay is
+  possible. With no work or deadline the native thread blocks indefinitely in
+  `epoll_wait`;
 - registers pending explicit-sync acquire points with
   `DRM_IOCTL_SYNCOBJ_EVENTFD` on the active DRM file and adds each nonblocking,
   close-on-exec eventfd to epoll. Supported watches do not arm a refresh polling
@@ -318,21 +340,19 @@ architecture milestones are:
 - complete protocol-owned pointer constraints and keyboard-shortcuts-inhibit
   activation before advertising them in normal sessions;
 - add VRR capability detection and a conservative `off/on/fullscreen` policy;
-- centralize output suspend/resume and device revoke handling in the session
-  abstraction;
-- add a tight-damage software cursor fallback, suspend recovery, direct scanout,
+- add a tight-damage software cursor fallback, direct scanout,
   and driver-specific validation for GBM/EGL-native presentation.
 
 Atomic KMS is only a foundation here. VRR policy, direct scanout, atomic cursor
 planes, overlay promotion, KMS in/out fences, framebuffer damage clips,
 hotplug, and multi-output commits remain unimplemented.
 
-The current `libseat` crate API does not expose the seat event fd, so libseat
-lifecycle dispatch runs before other work whenever another registered source
-wakes the reactor. No periodic idle timer is used as a workaround. Explicit
-sync acquire points are independent epoll sources where syncobj eventfd is
-supported; the bounded retry timer is armed only for blocked points on kernels
-or drivers that reject that ioctl.
+`libseat` 0.2.4 exposes a pollable seat fd. `NativeRuntime` registers it as a
+dedicated reactor source and dispatches it before lifecycle-sensitive output
+work, independently of the input backend. Explicit-sync acquire points are
+independent epoll sources where syncobj eventfd is supported; the bounded retry
+timer is armed only for blocked points on kernels or drivers that reject that
+ioctl.
 
 Research notes for the current native push live in:
 

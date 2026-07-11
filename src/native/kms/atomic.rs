@@ -74,24 +74,69 @@ pub trait ModeBlobIo {
 
 #[derive(Debug)]
 pub struct ModeBlob<I: ModeBlobIo> {
-    io: I,
+    io: Option<I>,
     id: BlobId,
 }
 
 impl<I: ModeBlobIo> ModeBlob<I> {
     pub fn create(io: I, mode: &drm_sys::drm_mode_modeinfo) -> Result<Self, AtomicKmsError> {
         let id = io.create_mode_blob(mode)?;
-        Ok(Self { io, id })
+        Ok(Self { io: Some(io), id })
     }
 
     pub const fn id(&self) -> BlobId {
         self.id
     }
+
+    pub fn disarm(&mut self) {
+        self.io = None;
+    }
+}
+
+#[cfg(test)]
+mod mode_blob_session_tests {
+    use std::{cell::Cell, rc::Rc};
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct FakeBlobIo(Rc<Cell<usize>>);
+
+    impl ModeBlobIo for FakeBlobIo {
+        fn create_mode_blob(
+            &self,
+            _mode: &drm_sys::drm_mode_modeinfo,
+        ) -> Result<BlobId, AtomicKmsError> {
+            Ok(BlobId::new(7).unwrap())
+        }
+
+        fn destroy_mode_blob(&self, _blob: BlobId) -> Result<(), AtomicKmsError> {
+            self.0.set(self.0.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn disarmed_mode_blob_drop_performs_no_drm_io() {
+        let destroys = Rc::new(Cell::new(0));
+        let mut blob = ModeBlob::create(
+            FakeBlobIo(Rc::clone(&destroys)),
+            &drm_sys::drm_mode_modeinfo::default(),
+        )
+        .unwrap();
+        blob.disarm();
+        drop(blob);
+
+        assert_eq!(destroys.get(), 0);
+    }
 }
 
 impl<I: ModeBlobIo> Drop for ModeBlob<I> {
     fn drop(&mut self) {
-        if let Err(error) = self.io.destroy_mode_blob(self.id) {
+        let Some(io) = self.io.as_ref() else {
+            return;
+        };
+        if let Err(error) = io.destroy_mode_blob(self.id) {
             eprintln!(
                 "atomic KMS: failed to destroy mode blob {}: {error}",
                 self.id.get()
@@ -249,6 +294,31 @@ impl AtomicRequest {
         request.set_plane(plane, plane_props.crtc_w, geometry.crtc_w)?;
         request.set_plane(plane, plane_props.crtc_h, geometry.crtc_h)?;
         Ok(request)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume_modeset(
+        connector: ConnectorId,
+        crtc: CrtcId,
+        plane: PlaneId,
+        connector_props: &AtomicConnectorProperties,
+        crtc_props: &AtomicCrtcProperties,
+        plane_props: &AtomicPlaneProperties,
+        mode_blob: BlobId,
+        framebuffer: FramebufferId,
+        geometry: AtomicPlaneGeometry,
+    ) -> Result<Self, AtomicKmsError> {
+        Self::initial_modeset(
+            connector,
+            crtc,
+            plane,
+            connector_props,
+            crtc_props,
+            plane_props,
+            mode_blob,
+            framebuffer,
+            geometry,
+        )
     }
 
     pub fn primary_flip(
@@ -438,6 +508,14 @@ impl AtomicSubmission {
             request,
             flags: AtomicCommitFlags::page_flip(),
             user_data: token.get(),
+        }
+    }
+
+    pub fn resume_modeset(request: AtomicRequest) -> Self {
+        Self {
+            request,
+            flags: AtomicCommitFlags::allow_modeset(),
+            user_data: 0,
         }
     }
 }

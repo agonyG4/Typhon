@@ -270,7 +270,11 @@ impl NativeRuntime {
         server.enable_external_acquire_readiness();
         let mut event_loop = NativeEventLoop::new()?;
         let mut process_supervisor = ChildSupervisor::with_sigchld_reaper()?;
-        event_loop.register(kms.file().as_raw_fd(), NativeEventSource::Drm)?;
+        let drm_reactor_token =
+            event_loop.register(kms.file().as_raw_fd(), NativeEventSource::Drm)?;
+        if let Some(session) = seat_session.as_ref() {
+            event_loop.register(session.event_fd()?, NativeEventSource::Seat)?;
+        }
         event_loop.register(
             server.listener_fd().as_raw_fd(),
             NativeEventSource::WaylandListener,
@@ -352,7 +356,7 @@ impl NativeRuntime {
             drm_file_generation,
             drm_timestamp_clock,
             presentation_clock,
-            scanout,
+            scanout: mem::ManuallyDrop::new(scanout),
             frame_renderer,
             input_state,
             cursor_preference,
@@ -360,9 +364,15 @@ impl NativeRuntime {
             hardware_cursor,
             input_devices,
             seat_session,
+            session: NativeSessionLifecycle::default(),
+            pending_session_recovery: None,
+            #[cfg(test)]
+            native_io_recorder: NativeIoRecorder::default(),
             acquire_notifier,
             acquire_watches,
+            parked_acquire_watches: Vec::new(),
             event_loop,
+            drm_reactor_token: Some(drm_reactor_token),
             frame_scheduler,
             effective_app_gpu_policy,
             last_render_generation,

@@ -23,12 +23,71 @@ fn test_window_interaction(
     }
 }
 
+fn test_renderable_surface(surface_id: u32, width: u32, height: u32) -> RenderableSurface {
+    let identity = BufferIdAllocator::default()
+        .allocate()
+        .expect("test buffer identity");
+    RenderableSurface {
+        surface_id,
+        x: 0,
+        y: 0,
+        width,
+        height,
+        placement: SurfacePlacement::root(),
+        render_placement: None,
+        visual_clip: None,
+        generation: 1,
+        commit_sequence: SurfaceCommitSequence::initial(),
+        buffer: crate::render_backend::buffer::CommittedSurfaceBuffer::shm_snapshot(
+            identity,
+            BufferSize::new(width, height).expect("test size"),
+            vec![0; width as usize * height as usize],
+        ),
+        viewport_source: None,
+        damage: RenderableSurfaceDamage::Full,
+    }
+}
+
 #[test]
 fn failed_begin_does_not_capture_native_input() {
     let mut state = CompositorState::default();
 
     assert!(!state.begin_window_resize_at_with_trigger(100.0, 100.0, 0x111));
 
+    assert!(!state.window_interaction_active());
+}
+
+#[test]
+fn failed_begin_with_missing_resource_does_not_mutate_resize_flow() {
+    let mut state = CompositorState::default();
+    state
+        .renderable_surfaces
+        .push(test_renderable_surface(42, 300, 200));
+    let mut flow = ResizeConfigureFlow::default();
+    flow.mark_sent(
+        PendingResizeConfigure {
+            surface_id: 42,
+            width: 320,
+            height: 220,
+            placement: SurfacePlacement::root(),
+            edges: ResizeEdges::BOTTOM_RIGHT,
+            resizing: true,
+            interaction_id: ResizeInteractionId::new(1),
+        },
+        10,
+        1,
+    );
+    state.resize_configure_flows.insert(42, flow);
+
+    assert!(!state.begin_window_resize_at_with_trigger(
+        f64::from(render::FIRST_SURFACE_OFFSET.0) + 299.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.1) + 199.0,
+        0x111,
+    ));
+
+    let flow = state.resize_configure_flows.get(&42).expect("resize flow");
+    assert_eq!(flow.retained_configure_count(), 1);
+    assert_eq!(state.resize_flow_metrics.resize_interactions_started, 0);
     assert!(!state.window_interaction_active());
 }
 

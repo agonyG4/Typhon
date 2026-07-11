@@ -40,6 +40,8 @@ use oblivion_one::compositor::{
     RenderSceneElement, RenderSceneElementId, RenderableSurface, cursor_texture_pixels,
     cursor_texture_size, render_scene_elements_for_surfaces,
 };
+#[cfg(test)]
+use oblivion_one::native::kms::KmsBackendKind;
 use oblivion_one::native::kms::{
     AtomicCommitState, AtomicCompletion, ConnectorId, CrtcId, FramebufferId, KmsBackendSelection,
     KmsPolicy, PageFlipToken,
@@ -49,7 +51,9 @@ use oblivion_one::native::{
         DrmPresentationEvent, DrmTimestampClock, drain_drm_page_flip_events,
         query_drm_timestamp_clock, sample_clock_microseconds,
     },
-    event_loop::{NativeEventLoop, NativeEventSource, NativeWakeup, monotonic_now_ns},
+    event_loop::{
+        NativeEventLoop, NativeEventSource, NativeWakeup, ReactorToken, monotonic_now_ns,
+    },
     explicit_sync::{
         AcquireReadyResult, AcquireRegistrationResult, DrmAcquirePointNotifier,
         ExplicitSyncWatchRegistry,

@@ -10,6 +10,7 @@ pub enum SchedulerDecision {
     SubmitReady,
     CompleteProtocolOnly,
     WaitForRefresh,
+    WaitForBuffer,
     WaitForPageFlip,
     PageFlipWatchdogExpired,
 }
@@ -151,8 +152,19 @@ impl NativeFrameScheduler {
     }
 
     pub fn decision(&mut self, now_ns: u64) -> SchedulerDecision {
+        self.decision_with_render_target(now_ns, true)
+    }
+
+    pub fn decision_with_render_target(
+        &mut self,
+        now_ns: u64,
+        render_target_available: bool,
+    ) -> SchedulerDecision {
         if self.pending_page_flip_token.is_some() {
             if self.visual_work_queued {
+                if !render_target_available {
+                    return SchedulerDecision::WaitForBuffer;
+                }
                 return SchedulerDecision::RenderAhead;
             }
             if self
@@ -257,6 +269,17 @@ impl NativeFrameScheduler {
         self.protocol_work_queued = false;
         self.ready_frame_queued = false;
         self.refresh_deadline_ns = None;
+    }
+
+    /// A libseat disable revokes KMS access. Pending presentation is deliberately
+    /// abandoned and rebuilt after output recovery rather than drained on a revoked fd.
+    pub fn abandon_for_session_suspend(&mut self) {
+        self.pending_page_flip_token = None;
+        self.pending_page_flip_submitted_at_ns = None;
+        self.ready_frame_queued = false;
+        self.refresh_deadline_ns = None;
+        self.watchdog_deadline_ns = None;
+        self.watchdog_reported = false;
     }
 
     pub fn next_deadline_ns(&self) -> Option<u64> {
@@ -435,6 +458,20 @@ mod tests {
     }
 
     #[test]
+    fn session_suspend_retires_exact_pending_token_and_late_completion_is_stale() {
+        let mut scheduler = NativeFrameScheduler::new(165, 0);
+        scheduler.note_async_submission(52, 10).unwrap();
+
+        scheduler.abandon_for_session_suspend();
+
+        assert_eq!(scheduler.pending_page_flip_token(), None);
+        assert_eq!(
+            scheduler.note_page_flip_completion(52, 20),
+            PageFlipCompletionResult::Stale
+        );
+    }
+
+    #[test]
     fn ready_frame_submits_immediately_after_expected_pageflip() {
         let mut scheduler = NativeFrameScheduler::new(165, 0);
         scheduler.queue_visual_work();
@@ -485,6 +522,20 @@ mod tests {
             scheduler.note_render_ahead_ready();
             assert!(scheduler.ready_frame_queued());
         }
+    }
+
+    #[test]
+    fn no_free_render_target_waits_without_clearing_visual_work() {
+        let mut scheduler = NativeFrameScheduler::new(165, 0);
+        scheduler.queue_visual_work();
+        scheduler.note_async_submission(41, 10).unwrap();
+        scheduler.queue_visual_work();
+
+        assert_eq!(
+            scheduler.decision_with_render_target(11, false),
+            SchedulerDecision::WaitForBuffer
+        );
+        assert!(scheduler.visual_work_queued());
     }
 
     #[test]

@@ -10,6 +10,7 @@ const MAX_READY_EVENTS: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeEventSource {
     Drm,
+    Seat,
     WaylandListener,
     WaylandClients,
     Input(u16),
@@ -58,6 +59,7 @@ pub struct WakeReasons(u32);
 
 impl WakeReasons {
     const DRM: u32 = 1 << 0;
+    const SEAT: u32 = 1 << 7;
     const WAYLAND_LISTENER: u32 = 1 << 1;
     const WAYLAND_CLIENTS: u32 = 1 << 2;
     const INPUT: u32 = 1 << 3;
@@ -67,6 +69,10 @@ impl WakeReasons {
 
     pub const fn drm(self) -> bool {
         self.0 & Self::DRM != 0
+    }
+
+    pub const fn seat(self) -> bool {
+        self.0 & Self::SEAT != 0
     }
 
     pub const fn wayland_listener(self) -> bool {
@@ -100,6 +106,7 @@ impl WakeReasons {
     fn insert(&mut self, source: NativeEventSource) {
         self.0 |= match source {
             NativeEventSource::Drm => Self::DRM,
+            NativeEventSource::Seat => Self::SEAT,
             NativeEventSource::WaylandListener => Self::WAYLAND_LISTENER,
             NativeEventSource::WaylandClients => Self::WAYLAND_CLIENTS,
             NativeEventSource::Input(_) => Self::INPUT,
@@ -464,6 +471,37 @@ mod tests {
     }
 
     #[test]
+    fn seat_readiness_sets_dedicated_wakeup_reason() {
+        let seat = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let token = event_loop
+            .register(seat.as_raw_fd(), NativeEventSource::Seat)
+            .unwrap();
+        assert_eq!(
+            event_loop.source_for_token(token),
+            Some(NativeEventSource::Seat)
+        );
+        signal(seat.as_raw_fd());
+        let wakeup = event_loop.wait().unwrap();
+        assert!(wakeup.reasons.seat());
+        assert!(!wakeup.reasons.input());
+    }
+
+    #[test]
+    fn seat_fd_is_registered_as_native_reactor_source() {
+        let seat = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let token = event_loop
+            .register(seat.as_raw_fd(), NativeEventSource::Seat)
+            .unwrap();
+
+        assert_eq!(
+            event_loop.source_for_token(token),
+            Some(NativeEventSource::Seat)
+        );
+    }
+
+    #[test]
     fn listener_readiness_requests_client_acceptance() {
         let listener = event_fd();
         let mut event_loop = NativeEventLoop::new().unwrap();
@@ -487,6 +525,36 @@ mod tests {
         signal(clients.as_raw_fd());
 
         assert!(event_loop.wait().unwrap().reasons.wayland_clients());
+    }
+
+    #[test]
+    fn consumed_wayland_readiness_does_not_repeat_while_suspended() {
+        let clients = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        event_loop
+            .register(clients.as_raw_fd(), NativeEventSource::WaylandClients)
+            .unwrap();
+        signal(clients.as_raw_fd());
+        assert!(event_loop.wait().unwrap().reasons.wayland_clients());
+        let mut counter = 0u64;
+        assert_eq!(
+            unsafe {
+                libc::read(
+                    clients.as_raw_fd(),
+                    (&mut counter as *mut u64).cast(),
+                    std::mem::size_of::<u64>(),
+                )
+            },
+            std::mem::size_of::<u64>() as isize
+        );
+        event_loop
+            .arm_deadline(Some(monotonic_now_ns().unwrap() + 1_000_000))
+            .unwrap();
+
+        let wakeup = event_loop.wait().unwrap();
+
+        assert!(wakeup.reasons.timer());
+        assert!(!wakeup.reasons.wayland_clients());
     }
 
     #[test]

@@ -18,12 +18,12 @@ backend has already reached production parity.
 
 Current limits:
 
-- input now prefers libseat + libinput and handles libseat enable/disable for
-  libinput, coalesces native pointer motion batches, and uses `Alt+P` as the
+- input now prefers libseat + libinput, but `NativeRuntime` owns libseat
+  enable/disable for all input backends, coalesces native pointer motion batches, and uses `Alt+P` as the
   native emergency exit shortcut, but direct libinput/raw fallbacks remain for
   diagnostics;
-- DRM/KMS is opened through the shared libseat session when possible, but direct
-  DRM fallback remains for diagnostics;
+- DRM/KMS is opened through the shared libseat session when possible. After a
+  managed seat is selected, auto mode does not fall back to direct DRM;
 - Atomic KMS is selected by default when capability discovery and the initial
   test-only transaction succeed. `OBLIVION_ONE_KMS_MODE=atomic` requires it and
   `OBLIVION_ONE_KMS_MODE=legacy` retains the old path. Real atomic takeover,
@@ -56,9 +56,10 @@ Current limits:
   feedback complete only after a token-matched DRM pageflip completion and use
   its kernel timestamp and sequence. Accurate real-hardware validation across
   drivers remains outstanding;
-- `libseat` 0.2.4 does not expose a seat event fd through its safe API. Seat
-  lifecycle dispatch therefore runs on other reactor wakeups rather than as an
-  independently registered source. Explicit-sync acquire points use syncobj
+- `libseat` 0.2.4 exposes a pollable seat event fd through its safe API. The
+  runtime registers and dispatches it independently of input. Suspend/resume
+  hardware validation across physical TTY/KMS drivers remains outstanding.
+  Explicit-sync acquire points use syncobj
   eventfds on supported native DRM devices. Drivers returning `ENOTTY`,
   `EOPNOTSUPP`, or `ENOSYS` use a bounded absolute retry deadline only while a
   fallback point remains blocked. Cross-driver real-hardware coverage remains
@@ -110,13 +111,13 @@ Current limits:
   nested refresh is a target advertised to clients and used for scheduling.
   Actual physical presentation can still be capped by the host compositor,
   host monitor refresh, or application rendering cadence;
-- output revoke/suspend/resume handling is not yet centralized around pageflip
-  recovery.
+- output revoke/suspend/resume is runtime-owned and deterministically tested;
+  physical VT/libseat recovery still needs validation across target drivers.
 
 Expected direction:
 
-Validate native EGL/GLES over GBM/KMS on real TTY sessions, then wire output
-revoke/resume and direct scanout before treating SDDM
+Validate native EGL/GLES and the implemented revoke/resume recovery over
+GBM/KMS on real TTY sessions, then wire direct scanout before treating SDDM
 performance as comparable to KWin, Hyprland, or other mature compositors.
 
 ## Brave/Chromium Vulkan warning on Wayland

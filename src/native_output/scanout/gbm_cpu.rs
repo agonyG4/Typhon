@@ -11,7 +11,63 @@ pub(crate) struct NativeGbmScanout {
     pub(crate) pending_index: Option<usize>,
     pub(crate) page_flip: AtomicCommitState,
     pub(crate) backend_generation: u64,
+    pub(crate) drm_cleanup_armed: bool,
     pub(crate) staging: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeIndexedScanoutRecovery {
+    pub(crate) index: usize,
+    pub(crate) framebuffer_id: u32,
+}
+
+pub(crate) fn prepare_indexed_session_recovery(
+    framebuffer_ids: &[u32],
+    current_index: usize,
+    ready_index: Option<usize>,
+) -> io::Result<NativeIndexedScanoutRecovery> {
+    let index = ready_index.unwrap_or(current_index);
+    let framebuffer_id = *framebuffer_ids
+        .get(index)
+        .ok_or_else(|| io::Error::other("indexed recovery buffer index is out of range"))?;
+    if framebuffer_id == 0 {
+        return Err(io::Error::other("indexed recovery framebuffer ID is zero"));
+    }
+    Ok(NativeIndexedScanoutRecovery {
+        index,
+        framebuffer_id,
+    })
+}
+
+pub(crate) fn complete_indexed_session_recovery(
+    framebuffer_ids: &[u32],
+    current_index: &mut usize,
+    ready_index: &mut Option<usize>,
+    pending_index: &mut Option<usize>,
+    recovery: NativeIndexedScanoutRecovery,
+) -> io::Result<()> {
+    let framebuffer_id = *framebuffer_ids
+        .get(recovery.index)
+        .ok_or_else(|| io::Error::other("indexed recovery buffer index is out of range"))?;
+    if framebuffer_id != recovery.framebuffer_id {
+        return Err(io::Error::other(
+            "indexed recovery buffer changed before completion",
+        ));
+    }
+    match *ready_index {
+        Some(index) if index == recovery.index => {
+            *ready_index = None;
+            *current_index = recovery.index;
+        }
+        None if *current_index == recovery.index => {}
+        _ => {
+            return Err(io::Error::other(
+                "indexed recovery slot changed before completion",
+            ));
+        }
+    }
+    *pending_index = None;
+    Ok(())
 }
 
 pub(crate) struct NativeGbmScanoutBuffer {
@@ -63,6 +119,7 @@ impl NativeGbmScanout {
             pending_index: None,
             page_flip: AtomicCommitState::default(),
             backend_generation,
+            drm_cleanup_armed: true,
             staging: Vec::new(),
         })
     }
@@ -134,6 +191,15 @@ impl NativeGbmScanout {
         self.ready_index
             .map(|index| self.buffers[index].fb_id)
             .unwrap_or_else(|| self.buffers[self.current_index].fb_id)
+    }
+
+    pub(crate) fn prepare_session_recovery(&self) -> io::Result<NativeIndexedScanoutRecovery> {
+        let framebuffer_ids = self
+            .buffers
+            .iter()
+            .map(|buffer| buffer.fb_id)
+            .collect::<Vec<_>>();
+        prepare_indexed_session_recovery(&framebuffer_ids, self.current_index, self.ready_index)
     }
 
     pub(crate) fn finish_initial_scanout(&mut self) {
@@ -209,29 +275,75 @@ impl NativeGbmScanout {
         self.page_flip.is_pending()
     }
 
+    pub(crate) fn suspend_page_flip(&mut self) {
+        self.page_flip.abandon();
+        // pending_index remains quarantined and is excluded from rendering until
+        // a synchronous recovery modeset retires the old scanout generation.
+    }
+
+    pub(crate) fn complete_session_recovery(
+        &mut self,
+        recovery: NativeIndexedScanoutRecovery,
+    ) -> io::Result<()> {
+        let framebuffer_ids = self
+            .buffers
+            .iter()
+            .map(|buffer| buffer.fb_id)
+            .collect::<Vec<_>>();
+        complete_indexed_session_recovery(
+            &framebuffer_ids,
+            &mut self.current_index,
+            &mut self.ready_index,
+            &mut self.pending_index,
+            recovery,
+        )
+    }
+
+    pub(crate) fn rebind_session_generation(&mut self, generation: u64) {
+        self.backend_generation = generation;
+    }
+
+    pub(crate) fn disarm_drm_cleanup(&mut self) {
+        self.drm_cleanup_armed = false;
+    }
+
     pub(crate) fn ready_frame_queued(&self) -> bool {
         self.ready_index.is_some()
+    }
+
+    pub(crate) fn render_target_available(&self) -> bool {
+        self.next_render_index().is_ok()
     }
 
     pub(crate) fn next_render_index(&self) -> io::Result<usize> {
         if let Some(index) = self.ready_index {
             return Ok(index);
         }
-        self.buffers
-            .iter()
-            .enumerate()
-            .map(|(index, _)| index)
-            .find(|index| {
-                Some(*index) != self.pending_index
-                    && Some(*index) != self.ready_index
-                    && *index != self.current_index
-            })
-            .ok_or_else(|| io::Error::other("no free GBM scanout buffer is available"))
+        next_free_scanout_index(
+            self.buffers.len(),
+            self.current_index,
+            self.ready_index,
+            self.pending_index,
+        )
+        .ok_or_else(|| io::Error::other("no free GBM scanout buffer is available"))
     }
+}
+
+pub(crate) fn next_free_scanout_index(
+    buffer_count: usize,
+    current: usize,
+    ready: Option<usize>,
+    pending: Option<usize>,
+) -> Option<usize> {
+    (0..buffer_count)
+        .find(|index| Some(*index) != pending && Some(*index) != ready && *index != current)
 }
 
 impl Drop for NativeGbmScanout {
     fn drop(&mut self) {
+        if !self.drm_cleanup_armed {
+            return;
+        }
         let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
         for buffer in &self.buffers {
             let _ = drm_ffi::mode::rm_fb(fd, buffer.fb_id);

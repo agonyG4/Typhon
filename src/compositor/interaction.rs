@@ -254,6 +254,7 @@ pub(super) struct ResizeConfigureFlow {
     outstanding: VecDeque<SentResizeConfigure>,
     acked_uncaptured: Option<SentResizeConfigure>,
     captured: VecDeque<ResizeCommitSnapshot>,
+    retired_serials: VecDeque<u32>,
     queued_latest: Option<PendingResizeConfigure>,
     final_pending: Option<PendingResizeConfigure>,
 }
@@ -278,6 +279,22 @@ impl ResizeConfigureFlow {
         }
         self.active_interaction = Some(interaction_id);
         let before_in_flight = self.in_flight_configure_count();
+        let mut retained_outstanding = VecDeque::with_capacity(self.outstanding.len());
+        while let Some(sent) = self.outstanding.pop_front() {
+            if sent.interaction_id >= interaction_id {
+                retained_outstanding.push_back(sent);
+            } else {
+                self.retire_serial(sent.resize.serial);
+            }
+        }
+        self.outstanding = retained_outstanding;
+        if self
+            .acked_uncaptured
+            .is_some_and(|sent| sent.interaction_id < interaction_id)
+            && let Some(sent) = self.acked_uncaptured.take()
+        {
+            self.retire_serial(sent.resize.serial);
+        }
         self.captured
             .retain(|snapshot| snapshot.interaction_id >= interaction_id);
         let after_in_flight = self.in_flight_configure_count();
@@ -346,6 +363,9 @@ impl ResizeConfigureFlow {
     }
 
     pub(super) fn ack(&mut self, serial: u32) -> ResizeAckDecision {
+        if self.retired_serials.contains(&serial) {
+            return ResizeAckDecision::Stale;
+        }
         if self
             .acked_uncaptured
             .is_some_and(|sent| sent.resize.serial == serial)
@@ -494,6 +514,14 @@ impl ResizeConfigureFlow {
 
     fn retained_in_flight_configure_count(&self) -> usize {
         self.in_flight_configure_count()
+    }
+
+    fn retire_serial(&mut self, serial: u32) {
+        const MAX_RETIRED_SERIALS: usize = 32;
+        self.retired_serials.push_back(serial);
+        while self.retired_serials.len() > MAX_RETIRED_SERIALS {
+            self.retired_serials.pop_front();
+        }
     }
 
     fn sent_or_acked_matches(&self, desired: PendingResizeConfigure) -> bool {
@@ -1027,11 +1055,9 @@ mod tests {
 
         flow.begin_interaction(second);
         flow.queue(desired_resize_for(second, 1400, true));
-        assert_eq!(flow.ack(308), ResizeAckDecision::Matched);
-        let snapshot_a = flow.capture(200).expect("A snapshot");
-        assert_eq!(snapshot_a.interaction_id, first);
+        assert_eq!(flow.ack(308), ResizeAckDecision::Stale);
+        assert!(flow.capture(200).is_none());
 
-        assert!(flow.complete_applied(snapshot_a.sequence));
         let next = flow.take_sendable().expect("B configure");
         assert_eq!(next.interaction_id, second);
         assert!(next.resizing);
@@ -1052,13 +1078,87 @@ mod tests {
         flow.begin_interaction(second);
         flow.queue(desired_resize_for(second, 1400, true));
         flow.queue_final(desired_resize_for(second, 1450, false));
-        assert_eq!(flow.ack(308), ResizeAckDecision::Matched);
-        let snapshot_a = flow.capture(201).expect("A snapshot");
+        assert_eq!(flow.ack(308), ResizeAckDecision::Stale);
+        assert!(flow.capture(201).is_none());
 
-        assert!(flow.complete_applied(snapshot_a.sequence));
         let next = flow.take_sendable().expect("B final");
         assert_eq!(next.interaction_id, second);
         assert!(!next.resizing);
         assert_eq!(next.width, 1450);
+    }
+
+    #[test]
+    fn old_outstanding_configure_does_not_block_new_interaction() {
+        let mut flow = ResizeConfigureFlow::default();
+        let first = ResizeInteractionId::new(1);
+        let second = ResizeInteractionId::new(2);
+        flow.queue(desired_resize_for(first, 1000, true));
+        let configure_a = flow.take_sendable().expect("configure A");
+        flow.mark_sent(configure_a, 308, 1);
+
+        flow.begin_interaction(second);
+        flow.queue(desired_resize_for(second, 1400, true));
+
+        let next = flow.take_sendable().expect("B configure");
+        assert_eq!(next.interaction_id, second);
+        assert_eq!(next.width, 1400);
+    }
+
+    #[test]
+    fn old_acked_uncaptured_configure_does_not_block_new_interaction() {
+        let mut flow = ResizeConfigureFlow::default();
+        let first = ResizeInteractionId::new(1);
+        let second = ResizeInteractionId::new(2);
+        flow.queue(desired_resize_for(first, 1000, true));
+        let configure_a = flow.take_sendable().expect("configure A");
+        flow.mark_sent(configure_a, 308, 1);
+        assert_eq!(flow.ack(308), ResizeAckDecision::Matched);
+
+        flow.begin_interaction(second);
+        flow.queue(desired_resize_for(second, 1400, true));
+
+        let next = flow.take_sendable().expect("B configure");
+        assert_eq!(next.interaction_id, second);
+        assert_eq!(next.width, 1400);
+    }
+
+    #[test]
+    fn late_ack_for_superseded_interaction_is_stale_and_nonblocking() {
+        let mut flow = ResizeConfigureFlow::default();
+        let first = ResizeInteractionId::new(1);
+        let second = ResizeInteractionId::new(2);
+        flow.queue(desired_resize_for(first, 1000, true));
+        let configure_a = flow.take_sendable().expect("configure A");
+        flow.mark_sent(configure_a, 308, 1);
+        flow.begin_interaction(second);
+        flow.queue(desired_resize_for(second, 1400, true));
+
+        assert_eq!(flow.ack(308), ResizeAckDecision::Stale);
+        assert_eq!(
+            flow.take_sendable()
+                .map(|configure| configure.interaction_id),
+            Some(second)
+        );
+    }
+
+    #[test]
+    fn late_commit_for_superseded_interaction_does_not_replace_new_preview() {
+        let mut flow = ResizeConfigureFlow::default();
+        let first = ResizeInteractionId::new(1);
+        let second = ResizeInteractionId::new(2);
+        flow.queue(desired_resize_for(first, 1000, true));
+        let configure_a = flow.take_sendable().expect("configure A");
+        flow.mark_sent(configure_a, 308, 1);
+        assert_eq!(flow.ack(308), ResizeAckDecision::Matched);
+
+        flow.begin_interaction(second);
+        flow.queue(desired_resize_for(second, 1400, true));
+
+        assert!(flow.capture(200).is_none());
+        assert_eq!(
+            flow.take_sendable()
+                .map(|configure| configure.interaction_id),
+            Some(second)
+        );
     }
 }

@@ -28,7 +28,9 @@ impl NativeRuntime {
             input_devices,
             acquire_notifier,
             acquire_watches,
+            parked_acquire_watches: _,
             event_loop,
+            drm_reactor_token: _,
             frame_scheduler,
             effective_app_gpu_policy,
             last_render_generation,
@@ -46,6 +48,10 @@ impl NativeRuntime {
             seat_session: _,
             process_supervisor: _,
             shutdown: _,
+            session: _,
+            #[cfg(test)]
+            native_io_recorder,
+            ..
         } = self;
         let wakeup = &cycle.wakeup;
         let mut frame_completed = cycle.frame_completed;
@@ -80,7 +86,8 @@ impl NativeRuntime {
         } else if repaint_decision.protocol_only_present {
             frame_scheduler.queue_protocol_work(monotonic_now_ns()?);
         }
-        let scheduler_decision = frame_scheduler.decision(monotonic_now_ns()?);
+        let scheduler_decision = frame_scheduler
+            .decision_with_render_target(monotonic_now_ns()?, scanout.render_target_available());
         if scheduler_decision == SchedulerDecision::PageFlipWatchdogExpired {
             perf.log("native.pageflip_watchdog", || {
                 vec![
@@ -118,9 +125,18 @@ impl NativeRuntime {
                     error,
                 )
             })?;
+            #[cfg(test)]
+            native_io_recorder.record(NativeIoOperation::ScanoutPresent);
             let repaint_present_us = elapsed_micros(repaint_present_start);
             match present_result {
                 NativePresentResult::AsyncSubmitted { token } => {
+                    #[cfg(test)]
+                    native_io_recorder.record(NativeIoOperation::PageflipSubmit);
+                    #[cfg(test)]
+                    native_io_recorder.record(match kms_backend.effective_kind() {
+                        KmsBackendKind::Atomic => NativeIoOperation::AtomicCommit,
+                        KmsBackendKind::Legacy => NativeIoOperation::LegacyCommit,
+                    });
                     frame_scheduler
                         .note_ready_submission(token, monotonic_now_ns()?)
                         .map_err(io::Error::other)?;
@@ -278,6 +294,10 @@ impl NativeRuntime {
                             )
                         })?
                     };
+                    #[cfg(test)]
+                    if !render_ahead {
+                        native_io_recorder.record(NativeIoOperation::ScanoutPresent);
+                    }
                     let repaint_present_us = elapsed_micros(repaint_present_start);
                     let acquire_ready_to_render_submit_us = last_acquire_ready_at_ns
                         .map(|ready_at| {
@@ -287,6 +307,13 @@ impl NativeRuntime {
                         .unwrap_or(0);
                     match present_result {
                         NativePresentResult::AsyncSubmitted { token } => {
+                            #[cfg(test)]
+                            native_io_recorder.record(NativeIoOperation::PageflipSubmit);
+                            #[cfg(test)]
+                            native_io_recorder.record(match kms_backend.effective_kind() {
+                                KmsBackendKind::Atomic => NativeIoOperation::AtomicCommit,
+                                KmsBackendKind::Legacy => NativeIoOperation::LegacyCommit,
+                            });
                             frame_scheduler
                                 .note_async_submission(token, monotonic_now_ns()?)
                                 .map_err(io::Error::other)?;
@@ -424,13 +451,27 @@ impl NativeRuntime {
                     NativePerfField::u64("render_generation", server.render_generation()),
                 ]
             });
-        } else if scheduler_decision == SchedulerDecision::WaitForPageFlip {
+        } else if matches!(
+            scheduler_decision,
+            SchedulerDecision::WaitForPageFlip | SchedulerDecision::WaitForBuffer
+        ) {
             perf.log("native.frame_skip", || {
                 vec![
-                    NativePerfField::str("reason", "pageflip_pending"),
+                    NativePerfField::str(
+                        "reason",
+                        if scheduler_decision == SchedulerDecision::WaitForBuffer {
+                            "render_target_unavailable"
+                        } else {
+                            "pageflip_pending"
+                        },
+                    ),
                     NativePerfField::usize("skipped_input_repaints", skipped_input_repaints),
                     NativePerfField::u64("tick_us", tick_us),
                     NativePerfField::bool("pageflip_pending_at_tick", pageflip_pending_at_tick),
+                    NativePerfField::bool(
+                        "render_target_available",
+                        scanout.render_target_available(),
+                    ),
                     NativePerfField::u64("input_drain_us", input_drain_us),
                     NativePerfField::usize("raw_input_events", raw_input_events),
                     NativePerfField::usize("coalesced_input_events", coalesced_input_events),

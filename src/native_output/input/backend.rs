@@ -102,7 +102,7 @@ impl NativeDrmBackendPlan {
             },
             NativeDrmBackendPreference::Auto if choice.seat_available => Self {
                 primary: NativeDrmBackendKind::Libseat,
-                fallbacks: vec![NativeDrmBackendKind::Direct],
+                fallbacks: Vec::new(),
             },
             NativeDrmBackendPreference::Auto => Self {
                 primary: NativeDrmBackendKind::Direct,

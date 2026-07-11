@@ -26,6 +26,10 @@ impl NativeRuntime {
         let mut cycle = self.wait_for_events_and_pageflips()?;
         self.reap_supervised_children(&cycle)?;
         self.advance_shutdown_lifecycle(&cycle)?;
+        if !self.session.permits_output() {
+            self.dispatch_suspended_sources(&cycle)?;
+            return Ok(());
+        }
         if !self.shutdown.is_running() {
             return Ok(());
         }
@@ -33,7 +37,7 @@ impl NativeRuntime {
         if cycle.shutdown_requested {
             self.request_native_shutdown()?;
         }
-        if !self.shutdown.is_running() {
+        if !self.shutdown.is_running() || !self.session.permits_output() {
             return Ok(());
         }
         drain_pending_process_launches(
@@ -44,7 +48,7 @@ impl NativeRuntime {
             &mut self.pending_launches,
         );
         self.process_acquire_and_prepare(&cycle)?;
-        if !self.shutdown.is_running() {
+        if !self.shutdown.is_running() || !self.session.permits_output() {
             return Ok(());
         }
         self.render_present_and_update_metrics(&mut cycle)?;
@@ -207,10 +211,25 @@ impl NativeRuntime {
         };
         native_shutdown_debug_log("input_backend_stop");
         self.acquire_watches.shutdown(&mut self.event_loop)?;
+        if !self.session.permits_output() {
+            teardown_without_drm_io(self);
+            self.parked_acquire_watches.clear();
+            self.perf.log("native.shutdown_session", || {
+                vec![NativePerfField::str(
+                    "action",
+                    "skip_kms_restore_while_seat_inactive",
+                )]
+            });
+            if let Some(transition) = self.shutdown.note_kms_restore_complete() {
+                self.log_shutdown_transition(transition);
+            }
+            return Ok(());
+        }
         if let Some(cursor) = self.hardware_cursor.as_mut() {
             let _ = cursor.disable();
         }
         native_shutdown_debug_log("kms_restore_begin");
+        NativeSessionIo::observe(self, NativeIoOperation::KmsRestore);
         let restoration = self.kms_backend.restore()?;
         native_shutdown_debug_log("kms_restore_end");
         self.perf.log("native.kms_restore", || {
@@ -257,6 +276,14 @@ impl NativeRuntime {
 
     #[allow(unused_variables)]
     fn wait_for_events_and_pageflips(&mut self) -> NativeResult<NativeCycleState> {
+        let wakeup = self.event_loop.wait()?;
+        self.dispatch_runtime_seat_events(&wakeup)?;
+        if self.session.permits_output()
+            && (wakeup.reasons.drm()
+                || (wakeup.reasons.timer() && self.scanout.page_flip_pending()))
+        {
+            NativeSessionIo::observe(self, NativeIoOperation::PageflipDrain);
+        }
         let perf = self.perf;
         let Self {
             server,
@@ -277,9 +304,12 @@ impl NativeRuntime {
             hardware_cursor,
             input_devices,
             seat_session: _,
+            session: _,
             acquire_notifier,
             acquire_watches,
+            parked_acquire_watches: _,
             event_loop,
+            drm_reactor_token: _,
             frame_scheduler,
             effective_app_gpu_policy,
             last_render_generation,
@@ -296,8 +326,8 @@ impl NativeRuntime {
             pointer_constraint_backend,
             process_supervisor: _,
             shutdown,
+            ..
         } = self;
-        let wakeup = event_loop.wait()?;
         let scheduler_state_before = frame_scheduler.state();
         perf.log("native.wakeup", || {
             vec![
@@ -325,7 +355,27 @@ impl NativeRuntime {
             });
         }
 
-        input_devices.dispatch_session_events();
+        if !self.session.permits_output() {
+            return Ok(NativeCycleState {
+                wakeup,
+                pageflip_drain_us: 0,
+                pageflip_completed: false,
+                completed_pageflip_token: None,
+                frame_completed: false,
+                frame_rendered: false,
+                frame_submitted: false,
+                present_us: 0,
+                pageflip_pending_at_tick: false,
+                tick_us: 0,
+                accepted: 0,
+                redraw_requested: false,
+                skipped_input_repaints: 0,
+                input_drain_us: 0,
+                raw_input_events: 0,
+                coalesced_input_events: 0,
+                shutdown_requested: false,
+            });
+        }
         let pageflip_drain_start = Instant::now();
         let should_drain_pageflips = wakeup.reasons.drm()
             || (wakeup.reasons.timer()
@@ -465,8 +515,149 @@ impl NativeRuntime {
         })
     }
 
+    fn dispatch_runtime_seat_events(&mut self, wakeup: &NativeWakeup) -> NativeResult<()> {
+        if !wakeup.reasons.seat() {
+            return Ok(());
+        }
+        let Some(seat) = self.seat_session.clone() else {
+            return Ok(());
+        };
+        NativeSessionIo::observe(self, NativeIoOperation::SeatDispatch);
+        seat.dispatch()?;
+        for event in seat.drain_events() {
+            match self.session.begin_for_event(event) {
+                Some(NativeSessionTransition::BeginSuspend) => {
+                    self.suspend_native_session(&seat)?
+                }
+                Some(NativeSessionTransition::BeginResume) if self.shutdown.is_running() => {
+                    self.resume_native_session()?
+                }
+                Some(NativeSessionTransition::BeginResume) => {
+                    self.session.cancel_resume_for_shutdown();
+                    self.log_session_transition(
+                        "suspended",
+                        "suspended",
+                        "enable_ignored_after_shutdown",
+                    )
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn suspend_native_session(&mut self, seat: &NativeSeatSession) -> NativeResult<()> {
+        self.log_session_transition("active", "suspending", "seat_disable");
+        self.perf.log("native.session_suspend", || {
+            vec![
+                NativePerfField::str("pageflip_policy", "quarantine_until_recovery_modeset"),
+                NativePerfField::bool("pageflip_pending", self.scanout.page_flip_pending()),
+                NativePerfField::str("explicit_sync_policy", "park_and_rearm"),
+            ]
+        });
+        quiesce_and_acknowledge(self, |io| {
+            if seat.acknowledge_disable()? {
+                io.observe(NativeIoOperation::SeatDisableAcknowledged);
+                Ok(())
+            } else {
+                Err(io::Error::other("stale libseat disable acknowledgment").into())
+            }
+        })?;
+        self.session.finish_suspend();
+        self.log_session_transition("suspending", "suspended", "disable_acknowledged");
+        self.event_loop
+            .arm_deadline(self.shutdown.suspended_reactor_deadline_ns())?;
+        Ok(())
+    }
+
+    fn resume_native_session(&mut self) -> NativeResult<()> {
+        self.log_session_transition("suspended", "resuming", "seat_enable");
+        let result = recover_native_output(self);
+        if let Err(error) = result {
+            if let Some(token) = self.drm_reactor_token.take() {
+                let _ = self.event_loop.unregister(token);
+            }
+            if let Ok(parked) = self
+                .acquire_watches
+                .park_for_session_suspend(&mut self.event_loop)
+            {
+                self.parked_acquire_watches.extend(parked);
+            }
+            if let Some(mut cursor) = self.hardware_cursor.take() {
+                cursor.disarm_drm_cleanup();
+            }
+            self.pending_session_recovery = None;
+            teardown_without_drm_io(self);
+            self.session.fail_resume();
+            self.log_session_transition("resuming", "failed", "recovery_failed");
+            return Err(error);
+        }
+        self.session.finish_resume();
+        self.log_session_transition("resuming", "active", "output_recovered");
+        Ok(())
+    }
+
+    pub(super) fn rearm_parked_acquire_watches(&mut self) -> NativeResult<()> {
+        let now_ns = monotonic_now_ns()?;
+        let parked = std::mem::take(&mut self.parked_acquire_watches);
+        let already_ready = match self.acquire_watches.rearm_parked_requests(
+            parked,
+            &mut self.event_loop,
+            now_ns,
+            &self.acquire_notifier,
+        ) {
+            Ok(already_ready) => already_ready,
+            Err(failure) => {
+                let (error, parked) = failure.into_parts();
+                self.parked_acquire_watches = parked;
+                return Err(error.into());
+            }
+        };
+        for request in already_ready {
+            let _ = self.server.mark_acquire_commit_ready(
+                request.commit_id,
+                request.surface_id,
+                &request.acquire,
+            );
+        }
+        Ok(())
+    }
+
+    fn dispatch_suspended_sources(&mut self, cycle: &NativeCycleState) -> NativeResult<()> {
+        service_suspended_sources(
+            self,
+            NativeSuspendedReadiness {
+                wayland: cycle.wakeup.reasons.wayland_listener()
+                    || cycle.wakeup.reasons.wayland_clients(),
+                input: cycle.wakeup.reasons.input(),
+                drm: cycle.wakeup.reasons.drm(),
+                timer: cycle.wakeup.reasons.timer(),
+                explicit_sync: cycle.wakeup.reasons.explicit_sync_acquire(),
+                redraw: false,
+                cursor: false,
+            },
+        )
+    }
+
+    fn log_session_transition(&self, from: &str, to: &str, reason: &str) {
+        self.perf.log("native.session_transition", || {
+            vec![
+                NativePerfField::str("from", from),
+                NativePerfField::str("to", to),
+                NativePerfField::str("reason", reason),
+                NativePerfField::bool("pageflip_pending", self.scanout.page_flip_pending()),
+                NativePerfField::str("shutdown_state", self.shutdown.state().as_str()),
+                NativePerfField::str("drm_backend", self.kms.kind().as_str()),
+                NativePerfField::str("input_backend", self.input_devices.kind().as_str()),
+            ]
+        });
+    }
+
     #[allow(unused_variables)]
     fn dispatch_wayland_and_input(&mut self, cycle: &mut NativeCycleState) -> NativeResult<()> {
+        if cycle.wakeup.reasons.input() {
+            NativeSessionIo::observe(self, NativeIoOperation::RawInputAction);
+        }
         let perf = self.perf;
         let Self {
             server,
@@ -488,7 +679,9 @@ impl NativeRuntime {
             input_devices,
             acquire_notifier,
             acquire_watches,
+            parked_acquire_watches: _,
             event_loop,
+            drm_reactor_token: _,
             frame_scheduler,
             effective_app_gpu_policy,
             last_render_generation,
@@ -506,6 +699,8 @@ impl NativeRuntime {
             seat_session,
             process_supervisor,
             shutdown: _,
+            session: _,
+            ..
         } = self;
         let present_us = 0;
         let pageflip_pending_at_tick = scanout.page_flip_pending();
@@ -666,6 +861,7 @@ impl NativeRuntime {
     #[allow(unused_variables)]
     fn process_acquire_and_prepare(&mut self, cycle: &NativeCycleState) -> NativeResult<()> {
         let wakeup = &cycle.wakeup;
+        NativeSessionIo::observe(self, NativeIoOperation::ExplicitSyncNotifier);
         let perf = self.perf;
         let Self {
             server,
@@ -687,7 +883,9 @@ impl NativeRuntime {
             input_devices,
             acquire_notifier,
             acquire_watches,
+            parked_acquire_watches: _,
             event_loop,
+            drm_reactor_token: _,
             frame_scheduler,
             effective_app_gpu_policy,
             last_render_generation,
@@ -705,6 +903,8 @@ impl NativeRuntime {
             seat_session: _,
             process_supervisor: _,
             shutdown: _,
+            session: _,
+            ..
         } = self;
         let acquire_changes = server.take_acquire_watch_changes();
         let acquire_change_count = acquire_changes.len();

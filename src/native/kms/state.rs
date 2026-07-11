@@ -46,6 +46,12 @@ impl AtomicCommitState {
         }
     }
 
+    /// Forget a flip after libseat has revoked the DRM fd; the corresponding
+    /// kernel event must be treated as stale after recovery.
+    pub fn abandon(&mut self) {
+        *self = Self::Idle;
+    }
+
     pub fn complete(&mut self, token: PageFlipToken, backend_generation: u64) -> AtomicCompletion {
         let Self::Pending {
             token: expected,

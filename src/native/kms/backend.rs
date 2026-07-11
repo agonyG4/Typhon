@@ -30,6 +30,15 @@ pub struct AtomicDiscovery {
     pub plane_formats: Vec<u32>,
 }
 
+fn mode_matches(
+    candidate: &drm_sys::drm_mode_modeinfo,
+    expected: &drm_sys::drm_mode_modeinfo,
+) -> bool {
+    candidate.hdisplay == expected.hdisplay
+        && candidate.vdisplay == expected.vdisplay
+        && candidate.vrefresh == expected.vrefresh
+}
+
 impl AtomicDiscovery {
     pub fn discover(
         fd: BorrowedFd<'_>,
@@ -149,6 +158,101 @@ impl AtomicDiscovery {
             plane_formats: selected_formats,
         })
     }
+
+    fn validate_live_pipeline(
+        &self,
+        fd: BorrowedFd<'_>,
+        expected_mode: &drm_sys::drm_mode_modeinfo,
+    ) -> Result<(), AtomicKmsError> {
+        let mut crtcs = Vec::new();
+        let mut connectors = Vec::new();
+        drm_ffi::mode::get_resources(fd, None, Some(&mut crtcs), Some(&mut connectors), None)
+            .map_err(|error| {
+                AtomicKmsError::new(
+                    AtomicKmsErrorKind::DeviceLost,
+                    format!("revalidate DRM resources before session recovery failed: {error}"),
+                )
+            })?;
+        if !crtcs.contains(&self.pipeline.crtc.get()) {
+            return Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::DeviceLost,
+                format!(
+                    "recovery CRTC {} is no longer present",
+                    self.pipeline.crtc.get()
+                ),
+            ));
+        }
+        if !connectors.contains(&self.pipeline.connector.get()) {
+            return Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::DeviceLost,
+                format!(
+                    "recovery connector {} is no longer present",
+                    self.pipeline.connector.get()
+                ),
+            ));
+        }
+
+        let mut modes = Vec::new();
+        let connector = drm_ffi::mode::get_connector(
+            fd,
+            self.pipeline.connector.get(),
+            None,
+            None,
+            Some(&mut modes),
+            None,
+            true,
+        )
+        .map_err(|error| {
+            AtomicKmsError::new(
+                AtomicKmsErrorKind::DeviceLost,
+                format!("revalidate connector mode before session recovery failed: {error}"),
+            )
+        })?;
+        if connector.connection != 1 || !modes.iter().any(|mode| mode_matches(mode, expected_mode))
+        {
+            return Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::DeviceLost,
+                format!(
+                    "recovery connector {} no longer exposes the selected mode",
+                    self.pipeline.connector.get()
+                ),
+            ));
+        }
+
+        let mut planes = Vec::new();
+        drm_ffi::mode::get_plane_resources(fd, Some(&mut planes)).map_err(|error| {
+            AtomicKmsError::new(
+                AtomicKmsErrorKind::DeviceLost,
+                format!("revalidate DRM planes before session recovery failed: {error}"),
+            )
+        })?;
+        if !planes.contains(&self.pipeline.plane.get()) {
+            return Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::DeviceLost,
+                format!(
+                    "recovery primary plane {} is no longer present",
+                    self.pipeline.plane.get()
+                ),
+            ));
+        }
+
+        let connector_properties = object_properties(
+            fd,
+            self.pipeline.connector.get(),
+            drm_sys::DRM_MODE_OBJECT_CONNECTOR,
+        )?;
+        AtomicConnectorProperties::discover(&connector_properties)?;
+        let crtc_properties =
+            object_properties(fd, self.pipeline.crtc.get(), drm_sys::DRM_MODE_OBJECT_CRTC)?;
+        AtomicCrtcProperties::discover(&crtc_properties)?;
+        let plane_properties = object_properties(
+            fd,
+            self.pipeline.plane.get(),
+            drm_sys::DRM_MODE_OBJECT_PLANE,
+        )?;
+        AtomicPlaneProperties::discover(&plane_properties)?;
+        Ok(())
+    }
 }
 
 fn property_value(properties: &[DrmProperty], name: &str) -> Option<u64> {
@@ -185,10 +289,13 @@ pub struct DrmAtomicBackend {
     fd: RawFd,
     discovery: AtomicDiscovery,
     mode_blob: ModeBlob<DrmModeBlobIo>,
+    mode: Box<drm_sys::drm_mode_modeinfo>,
+    geometry: AtomicPlaneGeometry,
     initial_property_count: usize,
     test_only_us: u64,
     initial_commit_us: u64,
     restored: bool,
+    restore_on_drop: bool,
 }
 
 impl DrmAtomicBackend {
@@ -206,6 +313,7 @@ impl DrmAtomicBackend {
         enable_atomic_client_capability(fd)?;
         let discovery = AtomicDiscovery::discover(fd, connector, crtc, framebuffer_format)?;
         let mode_blob = ModeBlob::create(DrmModeBlobIo::new(fd.as_raw_fd()), &mode)?;
+        let geometry = AtomicPlaneGeometry::fullscreen(width, height)?;
         let request = AtomicRequest::initial_modeset(
             connector,
             crtc,
@@ -215,7 +323,7 @@ impl DrmAtomicBackend {
             &discovery.pipeline.plane_props,
             mode_blob.id(),
             framebuffer,
-            AtomicPlaneGeometry::fullscreen(width, height)?,
+            geometry,
         )?;
         let test = AtomicSubmission {
             request: request.clone(),
@@ -251,10 +359,13 @@ impl DrmAtomicBackend {
             fd: fd.as_raw_fd(),
             discovery,
             mode_blob,
+            mode: Box::new(mode),
+            geometry,
             initial_property_count,
             test_only_us,
             initial_commit_us,
             restored: false,
+            restore_on_drop: true,
         })
     }
 
@@ -276,6 +387,36 @@ impl DrmAtomicBackend {
             AtomicKmsErrorKind::FlipRejected,
             "atomic primary-plane flip",
         )
+    }
+
+    pub fn recover(&self, framebuffer: FramebufferId) -> Result<(), AtomicKmsError> {
+        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        self.discovery.validate_live_pipeline(fd, &self.mode)?;
+        let pipeline = &self.discovery.pipeline;
+        let request = AtomicRequest::resume_modeset(
+            pipeline.connector,
+            pipeline.crtc,
+            pipeline.plane,
+            &pipeline.connector_props,
+            &pipeline.crtc_props,
+            &pipeline.plane_props,
+            self.mode_blob.id(),
+            framebuffer,
+            self.geometry,
+        )?;
+        let submission = AtomicSubmission::resume_modeset(request);
+        submit_atomic(
+            fd,
+            &submission,
+            AtomicKmsErrorKind::InitialCommitRejected,
+            "atomic native-session recovery modeset",
+        )
+    }
+
+    pub fn disarm_drm_io(&mut self) {
+        self.restore_on_drop = false;
+        self.restored = true;
+        self.mode_blob.disarm();
     }
 
     pub const fn discovery(&self) -> &AtomicDiscovery {
@@ -315,7 +456,10 @@ fn elapsed_micros(started: Instant) -> u64 {
 
 impl Drop for DrmAtomicBackend {
     fn drop(&mut self) {
-        if let Err(error) = self.restore() {
+        if self.restore_on_drop
+            && !self.restored
+            && let Err(error) = self.restore()
+        {
             eprintln!("atomic KMS restore failed: {error}");
         }
     }
@@ -485,6 +629,20 @@ impl KmsBackendSelection {
         match &mut self.backend {
             KmsDisplayBackend::Atomic(backend) => backend.restore(),
             KmsDisplayBackend::Legacy(backend) => backend.restore(),
+        }
+    }
+
+    pub fn recover(&self, framebuffer: FramebufferId) -> Result<(), AtomicKmsError> {
+        match &self.backend {
+            KmsDisplayBackend::Atomic(backend) => backend.recover(framebuffer),
+            KmsDisplayBackend::Legacy(backend) => backend.recover(framebuffer),
+        }
+    }
+
+    pub fn disarm_drm_io(&mut self) {
+        match &mut self.backend {
+            KmsDisplayBackend::Atomic(backend) => backend.disarm_drm_io(),
+            KmsDisplayBackend::Legacy(backend) => backend.disarm_drm_io(),
         }
     }
 

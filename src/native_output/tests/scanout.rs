@@ -136,7 +136,7 @@ fn native_drm_backend_plan_prefers_libseat_when_available() {
     });
 
     assert_eq!(plan.primary, NativeDrmBackendKind::Libseat);
-    assert_eq!(plan.fallbacks, vec![NativeDrmBackendKind::Direct]);
+    assert!(plan.fallbacks.is_empty());
 }
 
 #[test]
@@ -450,6 +450,95 @@ fn native_pageflip_buffers_finish_initial_scanout_promotes_ready() {
 
     assert_eq!(buffers.ready_or_current(), Some(&20));
     assert_eq!(buffers.take_ready(), None);
+}
+
+#[test]
+fn suspended_cpu_gbm_pending_index_is_not_renderable_before_recovery() {
+    assert_eq!(next_free_scanout_index(3, 0, None, Some(1)), Some(2));
+}
+
+#[test]
+fn cpu_gbm_session_recovery_promotes_ready_index_and_keeps_it_out_of_render_targets() {
+    let framebuffers = [10, 20, 30];
+    let mut current_index = 0;
+    let mut ready_index = Some(1);
+    let mut pending_index = Some(2);
+    let recovery = prepare_indexed_session_recovery(&framebuffers, current_index, ready_index)
+        .expect("ready index should be selected for recovery");
+
+    assert_eq!(recovery.framebuffer_id, 20);
+
+    complete_indexed_session_recovery(
+        &framebuffers,
+        &mut current_index,
+        &mut ready_index,
+        &mut pending_index,
+        recovery,
+    )
+    .expect("selected ready index should become current");
+
+    assert_eq!(current_index, 1);
+    assert_eq!(ready_index, None);
+    assert_eq!(pending_index, None);
+    assert_eq!(
+        next_free_scanout_index(
+            framebuffers.len(),
+            current_index,
+            ready_index,
+            pending_index
+        ),
+        Some(0)
+    );
+}
+
+#[test]
+fn cpu_gbm_session_recovery_keeps_current_index_when_no_ready_index_exists() {
+    let framebuffers = [10, 20, 30];
+    let mut current_index = 0;
+    let mut ready_index = None;
+    let mut pending_index = Some(1);
+    let recovery = prepare_indexed_session_recovery(&framebuffers, current_index, ready_index)
+        .expect("current index should be selected for recovery");
+
+    assert_eq!(recovery.framebuffer_id, 10);
+
+    complete_indexed_session_recovery(
+        &framebuffers,
+        &mut current_index,
+        &mut ready_index,
+        &mut pending_index,
+        recovery,
+    )
+    .expect("selected current index should remain current");
+
+    assert_eq!(current_index, 0);
+    assert_eq!(ready_index, None);
+    assert_eq!(pending_index, None);
+}
+
+#[test]
+fn cpu_gbm_session_recovery_rejects_a_different_ready_index_after_preparation() {
+    let framebuffers = [10, 20, 30];
+    let mut current_index = 0;
+    let mut ready_index = Some(1);
+    let mut pending_index = Some(2);
+    let recovery = prepare_indexed_session_recovery(&framebuffers, current_index, ready_index)
+        .expect("ready index should be selected for recovery");
+    ready_index = Some(2);
+
+    assert!(
+        complete_indexed_session_recovery(
+            &framebuffers,
+            &mut current_index,
+            &mut ready_index,
+            &mut pending_index,
+            recovery,
+        )
+        .is_err()
+    );
+    assert_eq!(current_index, 0);
+    assert_eq!(ready_index, Some(2));
+    assert_eq!(pending_index, Some(2));
 }
 
 #[test]

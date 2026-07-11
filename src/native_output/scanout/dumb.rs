@@ -9,6 +9,7 @@ pub(crate) struct DumbFramebuffer {
     pub(crate) pitch: u32,
     pub(crate) size: usize,
     pub(crate) mapping: *mut c_void,
+    pub(crate) drm_cleanup_armed: bool,
 }
 
 impl DumbFramebuffer {
@@ -63,6 +64,7 @@ impl DumbFramebuffer {
             pitch: dumb.pitch,
             size: dumb.size as usize,
             mapping,
+            drm_cleanup_armed: true,
         })
     }
 
@@ -121,8 +123,11 @@ impl DumbFramebuffer {
 
 impl Drop for DumbFramebuffer {
     fn drop(&mut self) {
-        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
         let _ = unsafe { libc::munmap(self.mapping, self.size) };
+        if !self.drm_cleanup_armed {
+            return;
+        }
+        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
         let _ = drm_ffi::mode::rm_fb(fd, self.fb_id);
         let _ = drm_ffi::mode::dumbbuffer::destroy(fd, self.handle);
     }

@@ -188,6 +188,17 @@ impl CompositorState {
             root_surface.width,
             root_surface.height,
         );
+        let start_geometry = match kind {
+            WindowInteractionKind::Resize(_) => self
+                .current_visual_root_window_geometry(root_surface_id)
+                .unwrap_or(fallback_geometry),
+            WindowInteractionKind::Move => self
+                .current_root_window_geometry(root_surface_id)
+                .unwrap_or(fallback_geometry),
+        };
+        let Some(root_resource) = self.surface_resource_by_id(root_surface_id) else {
+            return false;
+        };
         let resize_interaction_id = match kind {
             WindowInteractionKind::Resize(_) => {
                 let id = self.allocate_resize_interaction_id();
@@ -232,14 +243,6 @@ impl CompositorState {
             }
             WindowInteractionKind::Move => None,
         };
-        let start_geometry = match kind {
-            WindowInteractionKind::Resize(_) => self
-                .current_visual_root_window_geometry(root_surface_id)
-                .unwrap_or(fallback_geometry),
-            WindowInteractionKind::Move => self
-                .current_root_window_geometry(root_surface_id)
-                .unwrap_or(fallback_geometry),
-        };
         if matches!(kind, WindowInteractionKind::Resize(_)) {
             self.resize_flow_metrics.visual_geometry_resize_starts = self
                 .resize_flow_metrics
@@ -249,9 +252,6 @@ impl CompositorState {
         let start_width = start_geometry.width;
         let start_height = start_geometry.height;
         let start_placement = start_geometry.placement;
-        let Some(root_resource) = self.surface_resource_by_id(root_surface_id) else {
-            return false;
-        };
 
         self.focus_surface(root_resource);
         let id = self.allocate_window_interaction_id();

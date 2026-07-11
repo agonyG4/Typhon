@@ -95,9 +95,31 @@ impl NativeInputBackend {
         }
     }
 
-    pub(crate) fn dispatch_session_events(&mut self) {
-        if let Self::LibseatLibinput(backend) = self {
-            backend.sync_seat_lifecycle();
+    pub(crate) fn suspend_for_session(&mut self) {
+        match self {
+            Self::LibseatLibinput(backend) | Self::DirectLibinput(backend) => {
+                backend.suspend_for_session();
+            }
+            Self::RawEvdev(backend) => backend.suspend_for_session(),
+        }
+    }
+
+    pub(crate) fn resume_after_session(&mut self) -> io::Result<()> {
+        match self {
+            Self::LibseatLibinput(backend) | Self::DirectLibinput(backend) => {
+                backend.resume_after_session()?;
+            }
+            Self::RawEvdev(backend) => backend.resume_after_session(),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn discard_suspended_events(&mut self) {
+        match self {
+            Self::LibseatLibinput(backend) | Self::DirectLibinput(backend) => {
+                backend.discard_events_unconditionally();
+            }
+            Self::RawEvdev(backend) => backend.discard_events_unconditionally(),
         }
     }
 
@@ -113,12 +135,11 @@ impl NativeInputBackend {
 
 pub(crate) struct LibinputInputBackend {
     pub(crate) input: ::input::Libinput,
-    pub(crate) seat_session: Option<NativeSeatSession>,
-    pub(crate) seat_lifecycle: NativeSeatLifecycle,
     pub(crate) seat_name: String,
     pub(crate) output_width: u32,
     pub(crate) output_height: u32,
     pub(crate) device_count: usize,
+    pub(crate) suspended: bool,
 }
 
 impl LibinputInputBackend {
@@ -143,12 +164,11 @@ impl LibinputInputBackend {
         );
         Ok(Self {
             input,
-            seat_session: Some(seat_session),
-            seat_lifecycle: NativeSeatLifecycle::default(),
             seat_name: assigned_seat,
             output_width,
             output_height,
             device_count,
+            suspended: false,
         })
     }
 
@@ -166,18 +186,23 @@ impl LibinputInputBackend {
         println!("native input: libinput assigned {seat_name}, {device_count} device(s)");
         Ok(Self {
             input,
-            seat_session: None,
-            seat_lifecycle: NativeSeatLifecycle::default(),
             seat_name: seat_name.to_string(),
             output_width,
             output_height,
             device_count,
+            suspended: false,
         })
     }
 
     pub(crate) fn drain_events(&mut self) -> Vec<NativeHardwareInputEvent> {
+        if self.suspended {
+            return Vec::new();
+        }
+        self.drain_events_unconditionally()
+    }
+
+    fn drain_events_unconditionally(&mut self) -> Vec<NativeHardwareInputEvent> {
         let mut events = Vec::new();
-        self.sync_seat_lifecycle();
         if let Err(error) = self.input.dispatch() {
             eprintln!("native input: libinput dispatch failed: {error}");
             return events;
@@ -195,6 +220,25 @@ impl LibinputInputBackend {
         events
     }
 
+    fn discard_events_unconditionally(&mut self) {
+        while self.drain_events_unconditionally().len() == 256 {}
+    }
+
+    fn suspend_for_session(&mut self) {
+        self.suspended = true;
+        self.input.suspend();
+        self.discard_events_unconditionally();
+    }
+
+    fn resume_after_session(&mut self) -> io::Result<()> {
+        self.input
+            .resume()
+            .map_err(|()| io::Error::other("failed to resume libinput"))?;
+        self.suspended = false;
+        self.discard_events_unconditionally();
+        Ok(())
+    }
+
     pub(crate) fn ensure_initial_devices(&self) -> io::Result<()> {
         if self.device_count == 0 {
             Err(io::Error::other(format!(
@@ -205,30 +249,6 @@ impl LibinputInputBackend {
             Ok(())
         }
     }
-
-    pub(crate) fn sync_seat_lifecycle(&mut self) {
-        let Some(session) = self.seat_session.as_ref() else {
-            return;
-        };
-        if let Err(error) = session.dispatch() {
-            eprintln!("native input: libseat dispatch failed: {error}");
-        }
-        for event in session.drain_events() {
-            match self.seat_lifecycle.apply_event(event) {
-                Some(NativeSeatInputAction::Suspend) => {
-                    println!("native input: seat disabled; suspending libinput");
-                    self.input.suspend();
-                }
-                Some(NativeSeatInputAction::Resume) => {
-                    println!("native input: seat enabled; resuming libinput");
-                    if let Err(()) = self.input.resume() {
-                        eprintln!("native input: failed to resume libinput after seat enable");
-                    }
-                }
-                None => {}
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,45 +257,12 @@ pub(crate) enum NativeSeatEvent {
     Disabled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NativeSeatInputAction {
-    Resume,
-    Suspend,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NativeSeatLifecycle {
-    pub(crate) active: bool,
-}
-
-impl Default for NativeSeatLifecycle {
-    fn default() -> Self {
-        Self { active: true }
-    }
-}
-
-impl NativeSeatLifecycle {
-    pub(crate) fn apply_event(&mut self, event: NativeSeatEvent) -> Option<NativeSeatInputAction> {
-        match event {
-            NativeSeatEvent::Enabled if !self.active => {
-                self.active = true;
-                Some(NativeSeatInputAction::Resume)
-            }
-            NativeSeatEvent::Enabled => None,
-            NativeSeatEvent::Disabled if self.active => {
-                self.active = false;
-                Some(NativeSeatInputAction::Suspend)
-            }
-            NativeSeatEvent::Disabled => None,
-        }
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct NativeSeatSession {
     pub(crate) inner: Rc<RefCell<NativeSeatSessionInner>>,
     pub(crate) events: Rc<RefCell<Vec<NativeSeatEvent>>>,
     pub(crate) active: Rc<Cell<bool>>,
+    pub(crate) disable_pending: Rc<Cell<bool>>,
 }
 
 pub(crate) struct NativeSeatSessionInner {
@@ -310,18 +297,20 @@ impl NativeSeatSession {
     pub(crate) fn open() -> io::Result<Self> {
         let active = Rc::new(Cell::new(false));
         let events = Rc::new(RefCell::new(Vec::new()));
+        let disable_pending = Rc::new(Cell::new(false));
         let callback_active = Rc::clone(&active);
         let callback_events = Rc::clone(&events);
-        let seat = libseat::Seat::open(move |seat, event| match event {
+        let callback_disable_pending = Rc::clone(&disable_pending);
+        let seat = libseat::Seat::open(move |_seat, event| match event {
             libseat::SeatEvent::Enable => {
+                callback_disable_pending.set(false);
                 callback_active.set(true);
                 callback_events.borrow_mut().push(NativeSeatEvent::Enabled);
             }
             libseat::SeatEvent::Disable => {
                 callback_active.set(false);
-                callback_events.borrow_mut().push(NativeSeatEvent::Disabled);
-                if let Err(error) = seat.disable() {
-                    eprintln!("native seat: failed to acknowledge libseat disable: {error}");
+                if !callback_disable_pending.replace(true) {
+                    callback_events.borrow_mut().push(NativeSeatEvent::Disabled);
                 }
             }
         })
@@ -334,6 +323,7 @@ impl NativeSeatSession {
             })),
             events,
             active,
+            disable_pending,
         };
         session.wait_for_activation()?;
         Ok(session)
@@ -347,6 +337,23 @@ impl NativeSeatSession {
     pub(crate) fn dispatch(&self) -> io::Result<()> {
         let mut inner = self.inner.borrow_mut();
         inner.seat.dispatch(0).map(|_| ()).map_err(io::Error::from)
+    }
+
+    pub(crate) fn event_fd(&self) -> io::Result<RawFd> {
+        let mut inner = self.inner.borrow_mut();
+        inner
+            .seat
+            .get_fd()
+            .map(|fd| fd.as_raw_fd())
+            .map_err(io::Error::from)
+    }
+
+    pub(crate) fn acknowledge_disable(&self) -> io::Result<bool> {
+        if !self.disable_pending.replace(false) {
+            return Ok(false);
+        }
+        let mut inner = self.inner.borrow_mut();
+        inner.seat.disable().map(|()| true).map_err(io::Error::from)
     }
 
     pub(crate) fn switch_session(&self, session: i32) -> io::Result<()> {
@@ -645,6 +652,7 @@ pub(crate) struct NativeInputDevice {
 #[derive(Debug, Default)]
 pub(crate) struct NativeInputDevices {
     pub(crate) devices: Vec<NativeInputDevice>,
+    pub(crate) suspended: bool,
 }
 
 impl NativeInputDevices {
@@ -686,10 +694,20 @@ impl NativeInputDevices {
         } else {
             println!("native input: opened {} device(s)", devices.len());
         }
-        Self { devices }
+        Self {
+            devices,
+            suspended: false,
+        }
     }
 
     pub(crate) fn drain_events(&mut self) -> Vec<NativeHardwareInputEvent> {
+        if self.suspended {
+            return Vec::new();
+        }
+        self.drain_events_unconditionally()
+    }
+
+    fn drain_events_unconditionally(&mut self) -> Vec<NativeHardwareInputEvent> {
         let mut events = Vec::new();
         for device in &mut self.devices {
             while let Some(event) = read_linux_input_event(device) {
@@ -702,6 +720,21 @@ impl NativeInputDevices {
             }
         }
         events
+    }
+
+    fn discard_events_unconditionally(&mut self) {
+        while !self.drain_events_unconditionally().is_empty() {}
+    }
+
+    pub(crate) fn suspend_for_session(&mut self) {
+        self.suspended = true;
+        self.discard_events_unconditionally();
+    }
+
+    pub(crate) fn resume_after_session(&mut self) {
+        self.discard_events_unconditionally();
+        self.suspended = false;
+        self.discard_events_unconditionally();
     }
 }
 

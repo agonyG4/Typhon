@@ -123,6 +123,14 @@ impl NativeShutdownLifecycle {
         self.pageflip_deadline_ns
     }
 
+    pub(crate) const fn suspended_reactor_deadline_ns(&self) -> Option<u64> {
+        if self.is_running() {
+            None
+        } else {
+            self.pageflip_deadline_ns
+        }
+    }
+
     #[cfg(test)]
     pub(crate) const fn pageflip_outcome(&self) -> Option<ShutdownPageflipOutcome> {
         self.pageflip_outcome
@@ -320,6 +328,14 @@ mod tests {
 
         assert_eq!(transition.to, ShutdownState::Draining);
         assert_eq!(shutdown.expected_pageflip_token(), Some(41));
+    }
+
+    #[test]
+    fn seat_disable_during_pageflip_drain_preserves_bounded_deadline() {
+        let shutdown = requested_with_pending_token();
+        let deadline = shutdown.pageflip_deadline_ns();
+
+        assert_eq!(shutdown.suspended_reactor_deadline_ns(), deadline);
     }
 
     #[test]

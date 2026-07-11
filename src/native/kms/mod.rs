@@ -406,6 +406,28 @@ mod tests {
     }
 
     #[test]
+    fn resume_modeset_rebuilds_complete_pipeline_with_allow_modeset() {
+        let (connector, crtc, plane, connector_props, crtc_props, plane_props) = ids();
+        let request = AtomicRequest::resume_modeset(
+            connector,
+            crtc,
+            plane,
+            &connector_props,
+            &crtc_props,
+            &plane_props,
+            BlobId::new(91).unwrap(),
+            FramebufferId::new(81).unwrap(),
+            AtomicPlaneGeometry::fullscreen(1920, 1080).unwrap(),
+        )
+        .unwrap();
+        let submission = AtomicSubmission::resume_modeset(request);
+
+        assert_eq!(submission.request.assignment_count(), 13);
+        assert!(submission.flags.contains_allow_modeset());
+        assert_eq!(submission.user_data, 0);
+    }
+
+    #[test]
     fn pageflip_submission_preserves_full_nonzero_u64_token() {
         let (_, _, plane, _, _, plane_props) = ids();
         let request =
@@ -473,6 +495,33 @@ mod tests {
             .unwrap();
         assert!(state.submission_failed(token));
         assert!(!state.is_pending());
+    }
+
+    #[test]
+    fn resumed_pageflip_generation_rejects_old_generation_events() {
+        let mut state = AtomicCommitState::Idle;
+        let old = PageFlipToken::new(51).unwrap();
+        let resumed = PageFlipToken::new(52).unwrap();
+        state
+            .begin(old, FramebufferId::new(80).unwrap(), 7, Instant::now())
+            .unwrap();
+
+        state.abandon();
+        state
+            .begin(resumed, FramebufferId::new(81).unwrap(), 8, Instant::now())
+            .unwrap();
+
+        assert_eq!(
+            state.complete(resumed, 7),
+            AtomicCompletion::StaleGeneration
+        );
+        assert_eq!(state.complete(old, 8), AtomicCompletion::Mismatched);
+        assert_eq!(
+            state.complete(resumed, 8),
+            AtomicCompletion::Completed {
+                framebuffer: FramebufferId::new(81).unwrap()
+            }
+        );
     }
 
     #[derive(Clone)]

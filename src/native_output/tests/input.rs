@@ -3,8 +3,91 @@ use crate::native_output::runtime::{
     NativePointerConstraint, NativePointerConstraintBackendAction,
 };
 use std::sync::Mutex;
+use std::{
+    fs,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    path::PathBuf,
+};
 
 static EXTERNAL_COMMAND_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn raw_evdev_events_discarded_during_suspend_do_not_replay() {
+    let mut pipe = [0; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+        0
+    );
+    let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    let mut devices = NativeInputDevices {
+        devices: vec![NativeInputDevice {
+            file: fs::File::from(read),
+            path: PathBuf::from("test-event"),
+        }],
+        suspended: false,
+    };
+    let event = LinuxInputEvent {
+        _time: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        type_: EV_KEY,
+        code: KEY_P,
+        value: 1,
+    };
+    let written = unsafe {
+        libc::write(
+            write.as_raw_fd(),
+            (&event as *const LinuxInputEvent).cast(),
+            std::mem::size_of::<LinuxInputEvent>(),
+        )
+    };
+    assert_eq!(written as usize, std::mem::size_of::<LinuxInputEvent>());
+
+    devices.suspend_for_session();
+
+    assert!(devices.drain_events().is_empty());
+}
+
+#[test]
+fn raw_evdev_events_arriving_after_suspend_are_not_delivered() {
+    let mut pipe = [0; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+        0
+    );
+    let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    let mut backend = NativeInputBackend::RawEvdev(NativeInputDevices {
+        devices: vec![NativeInputDevice {
+            file: fs::File::from(read),
+            path: PathBuf::from("test-event"),
+        }],
+        suspended: false,
+    });
+
+    backend.suspend_for_session();
+    let event = LinuxInputEvent {
+        _time: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        type_: EV_KEY,
+        code: KEY_P,
+        value: 1,
+    };
+    let written = unsafe {
+        libc::write(
+            write.as_raw_fd(),
+            (&event as *const LinuxInputEvent).cast(),
+            std::mem::size_of::<LinuxInputEvent>(),
+        )
+    };
+    assert_eq!(written as usize, std::mem::size_of::<LinuxInputEvent>());
+
+    assert!(backend.drain_events().is_empty());
+}
 
 #[test]
 fn native_input_super_space_emits_astrea_spotlight_without_forwarding_space() {
@@ -881,17 +964,15 @@ fn native_input_backend_plan_falls_back_to_raw_when_libinput_is_unavailable() {
 
 #[test]
 
-fn native_seat_lifecycle_requests_suspend_then_resume() {
-    let mut lifecycle = NativeSeatLifecycle::default();
-
-    assert_eq!(
-        lifecycle.apply_event(NativeSeatEvent::Disabled),
-        Some(NativeSeatInputAction::Suspend)
-    );
-    assert_eq!(
-        lifecycle.apply_event(NativeSeatEvent::Enabled),
-        Some(NativeSeatInputAction::Resume)
-    );
+fn native_input_backend_no_longer_owns_seat_lifecycle() {
+    // NativeSessionLifecycle is runtime-owned; input backend plans remain independent.
+    let plan = NativeInputBackendPlan::choose(NativeInputBackendChoice {
+        preference: NativeInputBackendPreference::Auto,
+        libseat_available: true,
+        libinput_available: true,
+        raw_evdev_available: true,
+    });
+    assert_eq!(plan.primary, NativeInputBackendKind::LibseatLibinputUdev);
 }
 
 #[test]

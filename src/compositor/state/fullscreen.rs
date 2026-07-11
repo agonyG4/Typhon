@@ -110,12 +110,12 @@ impl CompositorState {
             && geometry.placement.local_x == -render::FIRST_SURFACE_OFFSET.0
             && geometry.placement.local_y == -render::FIRST_SURFACE_OFFSET.1;
         let overlays_visible = self.visible_fullscreen_overlay_count() > 0;
-        let fully_opaque = exactly_covers_output;
+        let fully_opaque = false;
         let software_cursor_visible = false;
         let rejection = if !exactly_covers_output {
             Some(FullscreenPresentationRejection::OwnerDoesNotCoverOutput)
-        } else if overlays_visible {
-            Some(FullscreenPresentationRejection::OverlayVisible)
+        } else if !fully_opaque {
+            Some(FullscreenPresentationRejection::OwnerOpacityUnknown)
         } else if software_cursor_visible {
             Some(FullscreenPresentationRejection::SoftwareCursorVisible)
         } else {
@@ -152,7 +152,7 @@ impl CompositorState {
             owner_root_surface_id,
             solitary_tree_active: eligibility.eligible,
             culled_surface_count,
-            wallpaper_culled: eligibility.eligible,
+            wallpaper_culled: false,
             visible_overlay_count,
             rejection: eligibility.rejection,
         }
