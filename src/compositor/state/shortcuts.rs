@@ -1,5 +1,141 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstreaShortcutPhase {
+    Pressed,
+    Repeated,
+    Released,
+}
+
+impl AstreaShortcutPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pressed => "pressed",
+            Self::Repeated => "repeated",
+            Self::Released => "released",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AstreaShortcutKey {
+    namespace: String,
+    name: String,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AstreaShortcutRegistry {
+    shell_owners: HashMap<AstreaShortcutKey, AstreaShortcutRegistration>,
+    other_registrations: Vec<AstreaShortcutRegistration>,
+}
+
+impl AstreaShortcutRegistry {
+    fn register(
+        &mut self,
+        resource: astrea_shortcut_v1::AstreaShortcutV1,
+        namespace: String,
+        name: String,
+        cancellation_serial: u32,
+    ) {
+        self.remove_dead();
+        self.unregister(&resource);
+        let registration = AstreaShortcutRegistration {
+            resource,
+            namespace: namespace.clone(),
+            name: name.clone(),
+        };
+        if namespace == "astrea-shell" {
+            let key = AstreaShortcutKey { namespace, name };
+            if let Some(previous) = self.shell_owners.remove(&key)
+                && !same_shortcut_resource(&previous.resource, &registration.resource)
+            {
+                previous.resource.cancelled(cancellation_serial);
+            }
+            self.shell_owners.insert(key, registration);
+        } else {
+            self.other_registrations.push(registration);
+        }
+    }
+
+    fn unregister(&mut self, resource: &astrea_shortcut_v1::AstreaShortcutV1) {
+        let resource_id = resource.id().protocol_id();
+        self.shell_owners.retain(|_, registration| {
+            registration.resource.id().protocol_id() != resource_id
+                || !registration.resource.id().same_client_as(&resource.id())
+        });
+        self.other_registrations.retain(|registration| {
+            registration.resource.id().protocol_id() != resource_id
+                || !registration.resource.id().same_client_as(&resource.id())
+        });
+    }
+
+    fn emit(
+        &mut self,
+        namespace: &str,
+        name: &str,
+        phase: AstreaShortcutPhase,
+        serial: u32,
+        timestamp: u32,
+    ) -> usize {
+        self.remove_dead();
+        if namespace == "astrea-shell" {
+            let key = AstreaShortcutKey {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+            };
+            let Some(registration) = self.shell_owners.get(&key) else {
+                return 0;
+            };
+            if !registration.resource.is_alive() {
+                self.shell_owners.remove(&key);
+                return 0;
+            }
+            send_astrea_shortcut_event(&registration.resource, phase, serial, timestamp);
+            return 1;
+        }
+
+        let mut dispatched = 0usize;
+        self.other_registrations.retain(|registration| {
+            if !registration.resource.is_alive() {
+                return false;
+            }
+            if registration.namespace == namespace && registration.name == name {
+                send_astrea_shortcut_event(&registration.resource, phase, serial, timestamp);
+                dispatched = dispatched.saturating_add(1);
+            }
+            true
+        });
+        dispatched
+    }
+
+    fn remove_dead(&mut self) {
+        self.shell_owners
+            .retain(|_, registration| registration.resource.is_alive());
+        self.other_registrations
+            .retain(|registration| registration.resource.is_alive());
+    }
+}
+
+fn same_shortcut_resource(
+    left: &astrea_shortcut_v1::AstreaShortcutV1,
+    right: &astrea_shortcut_v1::AstreaShortcutV1,
+) -> bool {
+    left.id().protocol_id() == right.id().protocol_id() && left.id().same_client_as(&right.id())
+}
+
+fn send_astrea_shortcut_event(
+    resource: &astrea_shortcut_v1::AstreaShortcutV1,
+    phase: AstreaShortcutPhase,
+    serial: u32,
+    timestamp: u32,
+) {
+    match phase {
+        AstreaShortcutPhase::Pressed => resource.pressed(serial, timestamp),
+        AstreaShortcutPhase::Repeated => resource.repeated(serial, timestamp),
+        AstreaShortcutPhase::Released => resource.released(serial, timestamp),
+    }
+}
+
 const ASTREA_SHELL_PID_ANCESTOR_LIMIT: usize = 32;
 
 impl CompositorState {
@@ -8,6 +144,12 @@ impl CompositorState {
         if let Some(uid) = proc_uid(pid) {
             self.astrea_shell_client_uids.insert(uid);
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::compositor) fn clear_astrea_shell_authorization(&mut self) {
+        self.astrea_shell_client_pids.clear();
+        self.astrea_shell_client_uids.clear();
     }
 
     pub(in crate::compositor) fn astrea_shortcut_registration_allowed(
@@ -81,42 +223,39 @@ impl CompositorState {
         namespace: String,
         name: String,
     ) {
-        self.unregister_astrea_shortcut(&resource);
-        self.astrea_shortcuts.push(AstreaShortcutRegistration {
-            resource,
-            namespace,
-            name,
-        });
+        let cancellation_serial = self.next_configure_serial();
+        self.astrea_shortcut_registry
+            .register(resource, namespace, name, cancellation_serial);
     }
 
     pub(in crate::compositor) fn unregister_astrea_shortcut(
         &mut self,
         resource: &astrea_shortcut_v1::AstreaShortcutV1,
     ) {
-        let resource_id = resource.id().protocol_id();
-        self.astrea_shortcuts
-            .retain(|registration| registration.resource.id().protocol_id() != resource_id);
+        self.astrea_shortcut_registry.unregister(resource);
     }
 
-    pub(in crate::compositor) fn emit_astrea_shortcut_pressed(
+    pub(in crate::compositor) fn emit_astrea_shortcut(
         &mut self,
         namespace: &str,
         name: &str,
+        phase: AstreaShortcutPhase,
         timestamp: u32,
     ) -> usize {
         let serial = self.next_configure_serial();
-        let mut dispatched = 0usize;
-        self.astrea_shortcuts.retain(|registration| {
-            if !registration.resource.is_alive() {
-                return false;
-            }
-            if registration.namespace == namespace && registration.name == name {
-                registration.resource.pressed(serial, timestamp);
-                dispatched = dispatched.saturating_add(1);
-            }
-            true
+        self.astrea_shortcut_registry
+            .emit(namespace, name, phase, serial, timestamp)
+    }
+
+    pub(in crate::compositor) fn remove_pending_process_launch(
+        &mut self,
+        request: &astrea_launch_request_v1::AstreaLaunchRequestV1,
+    ) {
+        let request_id = request.id().protocol_id();
+        self.pending_process_launches.retain(|pending| {
+            pending.request.id().protocol_id() != request_id
+                || !pending.request.id().same_client_as(&request.id())
         });
-        dispatched
     }
 }
 

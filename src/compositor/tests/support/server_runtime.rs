@@ -128,9 +128,11 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureFocusedSurfaceId(Sender<Option<u32>>),
     CaptureUsableOutputGeometry(Sender<OutputRect>),
     AuthorizeAstreaShellPid(u32),
+    ClearAstreaShellAuthorization,
     EmitAstreaShortcut {
         namespace: String,
         name: String,
+        phase: AstreaShortcutPhase,
         timestamp: u32,
         reply: Sender<usize>,
     },
@@ -398,15 +400,18 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::AuthorizeAstreaShellPid(pid) => {
                         server.authorize_astrea_shell_pid(pid);
                     }
+                    ServerCommand::ClearAstreaShellAuthorization => {
+                        server.clear_astrea_shell_authorization();
+                    }
                     ServerCommand::EmitAstreaShortcut {
                         namespace,
                         name,
+                        phase,
                         timestamp,
                         reply,
                     } => {
-                        let _ = reply.send(
-                            server.emit_astrea_shortcut_pressed(&namespace, &name, timestamp),
-                        );
+                        let _ = reply
+                            .send(server.emit_astrea_shortcut(&namespace, &name, phase, timestamp));
                     }
                     ServerCommand::UpdatePointerPositionWithoutClientDispatch { x, y, reply } => {
                         let _ = reply

@@ -141,11 +141,11 @@ impl NativeInputState {
         if is_shift_key(code) {
             self.shift_pressed = pressed;
             if !pressed
-                && let AstreaBindingMatch::Consumed(action) = self
+                && let AstreaBindingMatch::Consumed { action, phase } = self
                     .binding_manager
                     .handle_modifier_release(ModifierMask::SHIFT)
             {
-                self.apply_binding_action(action, repeated, None, &mut effect);
+                self.apply_binding_action(action, phase, None, &mut effect);
             }
             if !repeated {
                 effect
@@ -160,11 +160,11 @@ impl NativeInputState {
             self.alt_pressed = pressed;
             self.set_deferred_modifier_pressed(code, pressed);
             if !pressed
-                && let AstreaBindingMatch::Consumed(action) = self
+                && let AstreaBindingMatch::Consumed { action, phase } = self
                     .binding_manager
                     .handle_modifier_release(ModifierMask::ALT)
             {
-                self.apply_binding_action(action, repeated, None, &mut effect);
+                self.apply_binding_action(action, phase, None, &mut effect);
                 return effect;
             }
             if !repeated && self.release_forwarded_deferred_modifier_key(code) {
@@ -182,11 +182,11 @@ impl NativeInputState {
             self.super_pressed = pressed;
             self.set_deferred_modifier_pressed(code, pressed);
             if !pressed
-                && let AstreaBindingMatch::Consumed(action) = self
+                && let AstreaBindingMatch::Consumed { action, phase } = self
                     .binding_manager
                     .handle_modifier_release(ModifierMask::SUPER)
             {
-                self.apply_binding_action(action, repeated, None, &mut effect);
+                self.apply_binding_action(action, phase, None, &mut effect);
             }
             if !repeated && self.release_forwarded_deferred_modifier_key(code) {
                 effect
@@ -202,11 +202,11 @@ impl NativeInputState {
         if is_control_key(code) {
             self.ctrl_pressed = pressed;
             if !pressed
-                && let AstreaBindingMatch::Consumed(action) = self
+                && let AstreaBindingMatch::Consumed { action, phase } = self
                     .binding_manager
                     .handle_modifier_release(ModifierMask::CTRL)
             {
-                self.apply_binding_action(action, repeated, None, &mut effect);
+                self.apply_binding_action(action, phase, None, &mut effect);
             }
             if pressed {
                 if !self.forwarded_control_keys.contains(&code) {
@@ -244,33 +244,11 @@ impl NativeInputState {
             repeated,
             self.keyboard_shortcuts_inhibited,
         ) {
-            AstreaBindingMatch::Consumed(action) => {
-                self.apply_binding_action(action, repeated, None, &mut effect);
+            AstreaBindingMatch::Consumed { action, phase } => {
+                self.apply_binding_action(action, phase, None, &mut effect);
                 return effect;
             }
             AstreaBindingMatch::Pass => {}
-        }
-
-        if pressed
-            && !repeated
-            && self.super_pressed
-            && code == KEY_SPACE
-            && let Some(command) = external_spotlight_command()
-        {
-            effect.launch_command = Some(command);
-            effect.launch_source = Some(NativeLaunchSource::Spotlight);
-            return effect;
-        }
-
-        if pressed
-            && !repeated
-            && self.alt_pressed
-            && code == KEY_TAB
-            && let Some(command) = external_alt_tab_command()
-        {
-            effect.launch_command = Some(command);
-            effect.launch_source = Some(NativeLaunchSource::AltTab);
-            return effect;
         }
 
         if self.keyboard_shortcuts_inhibited {
@@ -309,8 +287,8 @@ impl NativeInputState {
             pressed,
             self.keyboard_shortcuts_inhibited,
         ) {
-            AstreaBindingMatch::Consumed(action) => {
-                self.apply_binding_action(action, false, Some(button), &mut effect);
+            AstreaBindingMatch::Consumed { action, phase } => {
+                self.apply_binding_action(action, phase, Some(button), &mut effect);
                 return effect;
             }
             AstreaBindingMatch::Pass => {}
@@ -496,7 +474,7 @@ impl NativeInputState {
     fn apply_binding_action(
         &mut self,
         action: BindingAction,
-        repeated: bool,
+        phase: AstreaShortcutPhase,
         trigger_button: Option<u32>,
         effect: &mut NativeInputEffect,
     ) {
@@ -546,7 +524,7 @@ impl NativeInputState {
                 effect.shortcut_events.push(AstreaShortcutEvent {
                     namespace,
                     name,
-                    repeated,
+                    phase,
                 });
             }
         }

@@ -31,11 +31,11 @@ use khronos_egl as egl;
 #[cfg(test)]
 use oblivion_one::compositor::OutputRect;
 use oblivion_one::compositor::{
-    AcquireWatchChange, DesktopComposeRequest, DesktopFrameCopyKind, DesktopSceneRebuildKind,
-    DesktopSceneRenderer, DesktopVisualState, FramePresentation, FullscreenPresentationRejection,
-    OutputPosition as CompositorOutputPosition, OutputRegion, OwnCompositorServer,
-    PointerConstraintBackendId, PointerConstraintBackendRequest, PointerConstraintMode,
-    PointerMotionSample as CompositorPointerMotionSample, PresentationClock,
+    AcquireWatchChange, AstreaShortcutPhase, DesktopComposeRequest, DesktopFrameCopyKind,
+    DesktopSceneRebuildKind, DesktopSceneRenderer, DesktopVisualState, FramePresentation,
+    FullscreenPresentationRejection, OutputPosition as CompositorOutputPosition, OutputRegion,
+    OwnCompositorServer, PointerConstraintBackendId, PointerConstraintBackendRequest,
+    PointerConstraintMode, PointerMotionSample as CompositorPointerMotionSample, PresentationClock,
     RelativePointerMotion as CompositorRelativePointerMotion, RenderGenerationCause,
     RenderSceneElement, RenderSceneElementId, RenderableSurface, cursor_texture_pixels,
     cursor_texture_size, render_scene_elements_for_surfaces,
@@ -71,8 +71,15 @@ use oblivion_one::{
     CompositorAppGpuPreference, EffectiveCompositorAppGpuPolicy,
     compositor_app_command_with_policy, shell_quote,
 };
+use wayland_server::Resource;
+
+#[cfg(test)]
+use std::sync::Mutex;
 
 type NativeResult<T> = Result<T, Box<dyn Error>>;
+
+#[cfg(test)]
+pub(crate) static ASTREA_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 mod input;
 mod launch;

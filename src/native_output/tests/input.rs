@@ -2,14 +2,11 @@ use super::*;
 use crate::native_output::runtime::{
     NativePointerConstraint, NativePointerConstraintBackendAction,
 };
-use std::sync::Mutex;
 use std::{
     fs,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::PathBuf,
 };
-
-static EXTERNAL_COMMAND_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn raw_evdev_events_discarded_during_suspend_do_not_replay() {
@@ -91,9 +88,9 @@ fn raw_evdev_events_arriving_after_suspend_are_not_delivered() {
 
 #[test]
 fn native_input_super_space_emits_astrea_spotlight_without_forwarding_space() {
-    let _guard = EXTERNAL_COMMAND_ENV_LOCK.lock().unwrap();
+    let _guard = ASTREA_ENV_LOCK.lock().unwrap();
     // SAFETY: this test serializes access to the process environment with
-    // EXTERNAL_COMMAND_ENV_LOCK.
+    // ASTREA_ENV_LOCK.
     unsafe {
         std::env::set_var("OBLIVION_ONE_SPOTLIGHT_COMMAND", "printf spotlight");
     }
@@ -114,9 +111,241 @@ fn native_input_super_space_emits_astrea_spotlight_without_forwarding_space() {
         )]
     );
 
-    // SAFETY: guarded by EXTERNAL_COMMAND_ENV_LOCK.
+    // SAFETY: guarded by ASTREA_ENV_LOCK.
     unsafe {
         std::env::remove_var("OBLIVION_ONE_SPOTLIGHT_COMMAND");
+    }
+}
+
+#[test]
+fn native_input_repeat_enabled_shortcut_emits_repeated_phase() {
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager = AstreaBindingManager::with_bindings(vec![Binding {
+        modifiers: ModifierMask::EMPTY,
+        trigger: BindingTrigger::Press,
+        input: BindingInput::Key(KEY_Z),
+        action: BindingAction::EmitShortcut {
+            namespace: "astrea-shell".to_string(),
+            name: "test_repeat".to_string(),
+        },
+        repeat: RepeatPolicy::Enabled,
+        inhibition: InhibitionPolicy::Respect,
+        reserved: false,
+    }]);
+
+    let pressed = input.handle_key_event(KEY_Z, 1);
+    let repeated = input.handle_key_event(KEY_Z, 2);
+
+    assert_eq!(pressed.shortcut_events.len(), 1);
+    assert_eq!(
+        pressed.shortcut_events[0].phase,
+        AstreaShortcutPhase::Pressed
+    );
+    assert_eq!(repeated.shortcut_events.len(), 1);
+    assert_eq!(
+        repeated.shortcut_events[0].phase,
+        AstreaShortcutPhase::Repeated
+    );
+}
+
+#[test]
+fn native_input_repeat_disabled_shortcut_suppresses_repeat() {
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager = AstreaBindingManager::with_bindings(vec![Binding {
+        modifiers: ModifierMask::EMPTY,
+        trigger: BindingTrigger::Press,
+        input: BindingInput::Key(KEY_Z),
+        action: BindingAction::EmitShortcut {
+            namespace: "astrea-shell".to_string(),
+            name: "test_no_repeat".to_string(),
+        },
+        repeat: RepeatPolicy::Disabled,
+        inhibition: InhibitionPolicy::Respect,
+        reserved: false,
+    }]);
+
+    let pressed = input.handle_key_event(KEY_Z, 1);
+    let repeated = input.handle_key_event(KEY_Z, 2);
+
+    assert_eq!(pressed.shortcut_events.len(), 1);
+    assert_eq!(
+        pressed.shortcut_events[0].phase,
+        AstreaShortcutPhase::Pressed
+    );
+    assert!(repeated.shortcut_events.is_empty());
+}
+
+#[test]
+fn native_input_release_trigger_shortcut_emits_released_phase() {
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager = AstreaBindingManager::with_bindings(vec![Binding {
+        modifiers: ModifierMask::EMPTY,
+        trigger: BindingTrigger::Release,
+        input: BindingInput::Key(KEY_Z),
+        action: BindingAction::EmitShortcut {
+            namespace: "astrea-shell".to_string(),
+            name: "test_release".to_string(),
+        },
+        repeat: RepeatPolicy::Disabled,
+        inhibition: InhibitionPolicy::Respect,
+        reserved: false,
+    }]);
+
+    let release = input.handle_key_event(KEY_Z, 0);
+
+    assert_eq!(release.shortcut_events.len(), 1);
+    assert_eq!(
+        release.shortcut_events[0].phase,
+        AstreaShortcutPhase::Released
+    );
+}
+
+#[test]
+fn native_input_zero_owner_spotlight_press_launches_one_fallback() {
+    let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+    unsafe {
+        std::env::set_var("OBLIVION_ONE_SPOTLIGHT_COMMAND", "exit 0");
+    }
+    let mut server =
+        OwnCompositorServer::bind(format!("typhon-shortcut-fallback-{}", std::process::id()))
+            .unwrap();
+    let mut process_supervisor = ChildSupervisor::new();
+    let mut resize_perf = NativeResizePerfState::default();
+    let application = apply_native_input_effect(
+        NativeInputEffect {
+            shortcut_events: vec![AstreaShortcutEvent {
+                namespace: "astrea-shell".to_string(),
+                name: "spotlight_toggle".to_string(),
+                phase: AstreaShortcutPhase::Pressed,
+            }],
+            ..NativeInputEffect::default()
+        },
+        NativeInputApplyContext {
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            seat_session: None,
+            process_supervisor: &mut process_supervisor,
+        },
+    )
+    .unwrap();
+    unsafe {
+        std::env::remove_var("OBLIVION_ONE_SPOTLIGHT_COMMAND");
+    }
+
+    let launch = application.launch.expect("fallback should launch once");
+    assert_eq!(launch.source, NativeLaunchSource::Spotlight);
+    assert_eq!(process_supervisor.active_count(), 1);
+    for _ in 0..100 {
+        if process_supervisor.reap_exited().unwrap().is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        if process_supervisor.active_count() == 0 {
+            break;
+        }
+    }
+    assert_eq!(process_supervisor.active_count(), 0);
+}
+
+#[test]
+fn native_input_zero_owner_alt_tab_next_launches_one_fallback() {
+    let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+    unsafe {
+        std::env::set_var("OBLIVION_ONE_ALT_TAB_COMMAND", "exit 0");
+    }
+    let mut server =
+        OwnCompositorServer::bind(format!("typhon-alt-tab-fallback-{}", std::process::id()))
+            .unwrap();
+    let mut process_supervisor = ChildSupervisor::new();
+    let mut resize_perf = NativeResizePerfState::default();
+    let application = apply_native_input_effect(
+        NativeInputEffect {
+            shortcut_events: vec![AstreaShortcutEvent {
+                namespace: "astrea-shell".to_string(),
+                name: "alt_tab_next".to_string(),
+                phase: AstreaShortcutPhase::Pressed,
+            }],
+            ..NativeInputEffect::default()
+        },
+        NativeInputApplyContext {
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            seat_session: None,
+            process_supervisor: &mut process_supervisor,
+        },
+    )
+    .unwrap();
+    unsafe {
+        std::env::remove_var("OBLIVION_ONE_ALT_TAB_COMMAND");
+    }
+
+    let launch = application.launch.expect("fallback should launch once");
+    assert_eq!(launch.source, NativeLaunchSource::AltTab);
+    assert_eq!(process_supervisor.active_count(), 1);
+    for _ in 0..100 {
+        if process_supervisor.reap_exited().unwrap().is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        if process_supervisor.active_count() == 0 {
+            break;
+        }
+    }
+    assert_eq!(process_supervisor.active_count(), 0);
+}
+
+#[test]
+fn native_input_zero_owner_repeat_and_alt_tab_non_next_do_not_launch_fallback() {
+    let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+    unsafe {
+        std::env::set_var("OBLIVION_ONE_SPOTLIGHT_COMMAND", "exit 0");
+        std::env::set_var("OBLIVION_ONE_ALT_TAB_COMMAND", "exit 0");
+    }
+    for (name, phase) in [
+        ("spotlight_toggle", AstreaShortcutPhase::Repeated),
+        ("alt_tab_previous", AstreaShortcutPhase::Pressed),
+        ("alt_tab_commit", AstreaShortcutPhase::Pressed),
+    ] {
+        let mut server = OwnCompositorServer::bind(format!(
+            "typhon-shortcut-no-fallback-{}-{}",
+            std::process::id(),
+            name
+        ))
+        .unwrap();
+        let mut process_supervisor = ChildSupervisor::new();
+        let mut resize_perf = NativeResizePerfState::default();
+        let application = apply_native_input_effect(
+            NativeInputEffect {
+                shortcut_events: vec![AstreaShortcutEvent {
+                    namespace: "astrea-shell".to_string(),
+                    name: name.to_string(),
+                    phase,
+                }],
+                ..NativeInputEffect::default()
+            },
+            NativeInputApplyContext {
+                server: &mut server,
+                perf: NativePerfLogger::from_env(),
+                resize_perf: &mut resize_perf,
+                cursor_mode: NativeCursorRenderMode::Software,
+                app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+                seat_session: None,
+                process_supervisor: &mut process_supervisor,
+            },
+        )
+        .unwrap();
+        assert!(
+            application.launch.is_none(),
+            "unexpected fallback for {name}"
+        );
+    }
+    unsafe {
+        std::env::remove_var("OBLIVION_ONE_SPOTLIGHT_COMMAND");
+        std::env::remove_var("OBLIVION_ONE_ALT_TAB_COMMAND");
     }
 }
 
@@ -263,7 +492,7 @@ fn native_input_alt_shift_tab_sequence_emits_previous() {
 
 #[test]
 fn native_input_session_switch_shortcuts_launch_exact_configured_command() {
-    let _guard = EXTERNAL_COMMAND_ENV_LOCK.lock().unwrap();
+    let _guard = ASTREA_ENV_LOCK.lock().unwrap();
     unsafe {
         std::env::set_var("OBLIVION_ONE_SESSION_1_COMMAND", "switch-one");
         std::env::set_var("OBLIVION_ONE_SESSION_2_COMMAND", "switch-two");

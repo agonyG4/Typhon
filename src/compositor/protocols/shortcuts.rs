@@ -49,7 +49,7 @@ impl Dispatch<astrea_shortcuts_manager_v1::AstreaShortcutsManagerV1, ()> for Com
                 if state.astrea_shortcut_registration_allowed(&namespace, client, dhandle) {
                     state.register_astrea_shortcut(shortcut, namespace, name);
                 } else {
-                    shortcut.cancelled(0);
+                    shortcut.cancelled(state.next_configure_serial());
                 }
             }
         }

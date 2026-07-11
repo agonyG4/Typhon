@@ -85,7 +85,10 @@ pub(crate) struct AstreaBindingManager {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AstreaBindingMatch {
-    Consumed(BindingAction),
+    Consumed {
+        action: BindingAction,
+        phase: AstreaShortcutPhase,
+    },
     Pass,
 }
 
@@ -99,6 +102,14 @@ impl AstreaBindingManager {
     pub(crate) fn with_default_bindings() -> Self {
         Self {
             bindings: default_astrea_bindings(),
+            active_sequences: ActiveBindingState::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_bindings(bindings: Vec<Binding>) -> Self {
+        Self {
+            bindings,
             active_sequences: ActiveBindingState::default(),
         }
     }
@@ -121,7 +132,9 @@ impl AstreaBindingManager {
         else {
             return AstreaBindingMatch::Pass;
         };
+        let trigger = binding.trigger;
         let action = binding.action.clone();
+        let phase = shortcut_phase(trigger, repeated);
         if matches!(
             action,
             BindingAction::EmitShortcut { ref namespace, ref name }
@@ -130,7 +143,7 @@ impl AstreaBindingManager {
         {
             self.active_sequences.alt_tab_active = true;
         }
-        AstreaBindingMatch::Consumed(action)
+        AstreaBindingMatch::Consumed { action, phase }
     }
 
     pub(crate) fn handle_pointer_button(
@@ -147,17 +160,23 @@ impl AstreaBindingManager {
         };
         let input = BindingInput::PointerButton(button);
         self.match_binding(modifiers, trigger, input, false, inhibited)
-            .map(|binding| AstreaBindingMatch::Consumed(binding.action.clone()))
+            .map(|binding| AstreaBindingMatch::Consumed {
+                action: binding.action.clone(),
+                phase: shortcut_phase(binding.trigger, false),
+            })
             .unwrap_or(AstreaBindingMatch::Pass)
     }
 
     pub(crate) fn handle_modifier_release(&mut self, released: ModifierMask) -> AstreaBindingMatch {
         if released == ModifierMask::ALT && self.active_sequences.alt_tab_active {
             self.active_sequences.alt_tab_active = false;
-            return AstreaBindingMatch::Consumed(BindingAction::EmitShortcut {
-                namespace: "astrea-shell".to_string(),
-                name: "alt_tab_commit".to_string(),
-            });
+            return AstreaBindingMatch::Consumed {
+                action: BindingAction::EmitShortcut {
+                    namespace: "astrea-shell".to_string(),
+                    name: "alt_tab_commit".to_string(),
+                },
+                phase: AstreaShortcutPhase::Pressed,
+            };
         }
         AstreaBindingMatch::Pass
     }
@@ -177,6 +196,19 @@ impl AstreaBindingManager {
                 && (!repeated || binding.repeat == RepeatPolicy::Enabled)
                 && (!inhibited || binding.inhibition == InhibitionPolicy::Bypass)
         })
+    }
+}
+
+const fn shortcut_phase(trigger: BindingTrigger, repeated: bool) -> AstreaShortcutPhase {
+    match trigger {
+        BindingTrigger::Press | BindingTrigger::PointerPress => {
+            if repeated {
+                AstreaShortcutPhase::Repeated
+            } else {
+                AstreaShortcutPhase::Pressed
+            }
+        }
+        BindingTrigger::Release | BindingTrigger::PointerRelease => AstreaShortcutPhase::Released,
     }
 }
 

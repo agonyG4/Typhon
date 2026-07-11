@@ -125,6 +125,17 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) astrea_shortcut_pressed_count: usize,
     pub(in crate::compositor::tests) astrea_shortcut_pressed_serials: Vec<u32>,
     pub(in crate::compositor::tests) astrea_shortcut_pressed_timestamps: Vec<u32>,
+    pub(in crate::compositor::tests) astrea_shortcut_cancelled_count: usize,
+    pub(in crate::compositor::tests) astrea_shortcut_cancelled_serials: Vec<u32>,
+    pub(in crate::compositor::tests) astrea_shortcut_events: Vec<AstreaShortcutEventRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::compositor::tests) enum AstreaShortcutEventRecord {
+    Pressed { serial: u32, timestamp: u32 },
+    Repeated { serial: u32, timestamp: u32 },
+    Released { serial: u32, timestamp: u32 },
+    Cancelled { serial: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -334,10 +345,32 @@ impl Dispatch<client_astrea_shortcut_v1::AstreaShortcutV1, ()> for RegistryTestS
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
-        if let client_astrea_shortcut_v1::Event::Pressed { serial, timestamp } = event {
-            state.astrea_shortcut_pressed_count += 1;
-            state.astrea_shortcut_pressed_serials.push(serial);
-            state.astrea_shortcut_pressed_timestamps.push(timestamp);
+        match event {
+            client_astrea_shortcut_v1::Event::Pressed { serial, timestamp } => {
+                state.astrea_shortcut_pressed_count += 1;
+                state.astrea_shortcut_pressed_serials.push(serial);
+                state.astrea_shortcut_pressed_timestamps.push(timestamp);
+                state
+                    .astrea_shortcut_events
+                    .push(AstreaShortcutEventRecord::Pressed { serial, timestamp });
+            }
+            client_astrea_shortcut_v1::Event::Cancelled { serial } => {
+                state.astrea_shortcut_cancelled_count += 1;
+                state.astrea_shortcut_cancelled_serials.push(serial);
+                state
+                    .astrea_shortcut_events
+                    .push(AstreaShortcutEventRecord::Cancelled { serial });
+            }
+            client_astrea_shortcut_v1::Event::Repeated { serial, timestamp } => {
+                state
+                    .astrea_shortcut_events
+                    .push(AstreaShortcutEventRecord::Repeated { serial, timestamp });
+            }
+            client_astrea_shortcut_v1::Event::Released { serial, timestamp } => {
+                state
+                    .astrea_shortcut_events
+                    .push(AstreaShortcutEventRecord::Released { serial, timestamp });
+            }
         }
     }
 }

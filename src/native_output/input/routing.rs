@@ -810,7 +810,7 @@ pub(crate) fn read_linux_input_event(device: &mut NativeInputDevice) -> Option<L
 }
 
 pub(crate) fn apply_native_input_effect(
-    effect: NativeInputEffect,
+    mut effect: NativeInputEffect,
     context: NativeInputApplyContext<'_>,
 ) -> NativeResult<NativeInputApplication> {
     let mut application = NativeInputApplication {
@@ -869,10 +869,12 @@ pub(crate) fn apply_native_input_effect(
         application.redraw_requested |=
             apply_native_window_action(action, context.server, context.perf, context.resize_perf);
     }
+    let mut fallback_attempt = None;
     for shortcut in effect.shortcut_events {
-        let dispatched = context.server.emit_astrea_shortcut_pressed(
+        let dispatched = context.server.emit_astrea_shortcut(
             &shortcut.namespace,
             &shortcut.name,
+            shortcut.phase,
             effect
                 .pointer_motion_usec
                 .and_then(|timestamp| u32::try_from(timestamp / 1_000).ok())
@@ -882,16 +884,61 @@ pub(crate) fn apply_native_input_effect(
             vec![
                 NativePerfField::str("namespace", shortcut.namespace.clone()),
                 NativePerfField::str("name", shortcut.name.clone()),
-                NativePerfField::bool("repeated", shortcut.repeated),
+                NativePerfField::str("phase", shortcut.phase.as_str()),
             ]
         });
         context.perf.log("shortcut_client_dispatch", || {
             vec![
-                NativePerfField::str("namespace", shortcut.namespace),
-                NativePerfField::str("name", shortcut.name),
+                NativePerfField::str("namespace", shortcut.namespace.clone()),
+                NativePerfField::str("name", shortcut.name.clone()),
                 NativePerfField::usize("clients", dispatched),
             ]
         });
+        if dispatched > 0 {
+            context.perf.log("shortcut.protocol_dispatched", || {
+                vec![
+                    NativePerfField::str("namespace", shortcut.namespace.clone()),
+                    NativePerfField::str("name", shortcut.name.clone()),
+                    NativePerfField::str("phase", shortcut.phase.as_str()),
+                    NativePerfField::usize("protocol_clients", dispatched),
+                ]
+            });
+            continue;
+        }
+
+        let Some(kind) = astrea_shortcut_fallback_kind(&shortcut, dispatched) else {
+            context.perf.log("shortcut.fallback_unavailable", || {
+                vec![
+                    NativePerfField::str("namespace", shortcut.namespace.clone()),
+                    NativePerfField::str("name", shortcut.name.clone()),
+                    NativePerfField::str("phase", shortcut.phase.as_str()),
+                    NativePerfField::usize("protocol_clients", dispatched),
+                    NativePerfField::str("fallback_kind", "none"),
+                    NativePerfField::bool("fallback_available", false),
+                    NativePerfField::u64("fallback_pid", 0),
+                ]
+            });
+            continue;
+        };
+        let Some(command) = kind.command() else {
+            context.perf.log("shortcut.fallback_unavailable", || {
+                vec![
+                    NativePerfField::str("namespace", shortcut.namespace.clone()),
+                    NativePerfField::str("name", shortcut.name.clone()),
+                    NativePerfField::str("phase", shortcut.phase.as_str()),
+                    NativePerfField::usize("protocol_clients", dispatched),
+                    NativePerfField::str("fallback_kind", kind.as_str()),
+                    NativePerfField::bool("fallback_available", false),
+                    NativePerfField::u64("fallback_pid", 0),
+                ]
+            });
+            continue;
+        };
+        if effect.launch_command.is_none() {
+            effect.launch_command = Some(command);
+            effect.launch_source = Some(kind.source());
+            fallback_attempt = Some((shortcut.clone(), kind));
+        }
     }
     if let Some(vt) = effect.vt_switch
         && let Some(session) = context.seat_session
@@ -902,15 +949,52 @@ pub(crate) fn apply_native_input_effect(
         });
     }
     if let Some(command) = effect.launch_command {
-        application.launch = launch_native_shell_command(
+        let source = effect
+            .launch_source
+            .unwrap_or(NativeLaunchSource::Spotlight);
+        let launch_result = launch_native_shell_command(
             context.server,
             context.process_supervisor,
             command,
             context.app_gpu_policy,
-            effect
-                .launch_source
-                .unwrap_or(NativeLaunchSource::Spotlight),
-        )?;
+            source,
+        );
+        match launch_result {
+            Ok(launch) => {
+                if let Some((shortcut, kind)) = &fallback_attempt
+                    && let Some(launch) = &launch
+                {
+                    context.perf.log("shortcut.fallback_launched", || {
+                        vec![
+                            NativePerfField::str("namespace", shortcut.namespace.clone()),
+                            NativePerfField::str("name", shortcut.name.clone()),
+                            NativePerfField::str("phase", shortcut.phase.as_str()),
+                            NativePerfField::usize("protocol_clients", 0),
+                            NativePerfField::str("fallback_kind", kind.as_str()),
+                            NativePerfField::bool("fallback_available", true),
+                            NativePerfField::u64("fallback_pid", u64::from(launch.pid)),
+                        ]
+                    });
+                }
+                application.launch = launch;
+            }
+            Err(error) => {
+                if let Some((shortcut, kind)) = &fallback_attempt {
+                    context.perf.log("shortcut.fallback_spawn_failed", || {
+                        vec![
+                            NativePerfField::str("namespace", shortcut.namespace.clone()),
+                            NativePerfField::str("name", shortcut.name.clone()),
+                            NativePerfField::str("phase", shortcut.phase.as_str()),
+                            NativePerfField::usize("protocol_clients", 0),
+                            NativePerfField::str("fallback_kind", kind.as_str()),
+                            NativePerfField::bool("fallback_available", true),
+                            NativePerfField::u64("fallback_pid", 0),
+                        ]
+                    });
+                }
+                return Err(error);
+            }
+        }
     }
     Ok(application)
 }

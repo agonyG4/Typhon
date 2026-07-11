@@ -164,6 +164,7 @@ use shm::{
     WL_SHM_FORMAT_ARGB2101010, WL_SHM_FORMAT_XBGR8888, WL_SHM_FORMAT_XBGR2101010,
     WL_SHM_FORMAT_XRGB2101010,
 };
+pub use state::AstreaShortcutPhase;
 use state_data::*;
 use subsurface::{CachedSubsurfaceCommit, SubsurfaceSyncMode, SubsurfaceTransactionState};
 pub use surface::{
@@ -584,7 +585,7 @@ pub struct CompositorState {
     pending_activation_tokens: HashMap<u32, PendingActivationToken>,
     next_activation_token_serial: u64,
     pending_color_info: Vec<color::PendingColorInfo>,
-    astrea_shortcuts: Vec<AstreaShortcutRegistration>,
+    astrea_shortcut_registry: AstreaShortcutRegistry,
     astrea_shell_client_pids: HashSet<u32>,
     astrea_shell_client_uids: HashSet<u32>,
     typhon_socket_name: Option<String>,

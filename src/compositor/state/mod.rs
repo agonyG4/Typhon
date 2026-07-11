@@ -39,6 +39,7 @@ pub(in crate::compositor) use pointer_constraints::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use resize::*;
 pub(in crate::compositor) use roles::*;
+pub use shortcuts::AstreaShortcutPhase;
 #[allow(unused_imports)]
 pub(in crate::compositor) use shortcuts::*;
 #[allow(unused_imports)]

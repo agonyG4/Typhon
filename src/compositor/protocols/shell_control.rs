@@ -97,14 +97,28 @@ impl Dispatch<astrea_launch_request_v1::AstreaLaunchRequestV1, AstreaLaunchReque
     for CompositorState
 {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
-        _resource: &astrea_launch_request_v1::AstreaLaunchRequestV1,
-        _request: astrea_launch_request_v1::Request,
+        resource: &astrea_launch_request_v1::AstreaLaunchRequestV1,
+        request: astrea_launch_request_v1::Request,
         _data: &AstreaLaunchRequestData,
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
+        match request {
+            astrea_launch_request_v1::Request::Destroy => {
+                state.remove_pending_process_launch(resource);
+            }
+        }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _client: ClientId,
+        resource: &astrea_launch_request_v1::AstreaLaunchRequestV1,
+        _data: &AstreaLaunchRequestData,
+    ) {
+        state.remove_pending_process_launch(resource);
     }
 }
 

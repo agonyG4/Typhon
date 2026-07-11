@@ -1,6 +1,96 @@
 use super::*;
+use oblivion_one::astrea_shell_control::server::astrea_launch_request_v1;
 
-const ECLIPSE_ROOT: &str = "/home/agony/GitHub/Eclipse";
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+#[derive(Debug, Default)]
+pub(crate) struct AstreaLaunchLifecycleTracker {
+    observers: HashMap<u32, astrea_launch_request_v1::AstreaLaunchRequestV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AstreaShortcutFallbackKind {
+    Spotlight,
+    AltTab,
+}
+
+impl AstreaShortcutFallbackKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Spotlight => "spotlight",
+            Self::AltTab => "alt_tab",
+        }
+    }
+
+    pub(crate) fn command(self) -> Option<Vec<String>> {
+        match self {
+            Self::Spotlight => external_spotlight_command(),
+            Self::AltTab => external_alt_tab_command(),
+        }
+    }
+
+    pub(crate) const fn source(self) -> NativeLaunchSource {
+        match self {
+            Self::Spotlight => NativeLaunchSource::Spotlight,
+            Self::AltTab => NativeLaunchSource::AltTab,
+        }
+    }
+}
+
+pub(crate) fn astrea_shortcut_fallback_kind(
+    shortcut: &AstreaShortcutEvent,
+    protocol_clients: usize,
+) -> Option<AstreaShortcutFallbackKind> {
+    if protocol_clients > 0 || shortcut.phase != AstreaShortcutPhase::Pressed {
+        return None;
+    }
+    match (shortcut.namespace.as_str(), shortcut.name.as_str()) {
+        ("astrea-shell", "spotlight_toggle") => Some(AstreaShortcutFallbackKind::Spotlight),
+        ("astrea-shell", "alt_tab_next") => Some(AstreaShortcutFallbackKind::AltTab),
+        _ => None,
+    }
+}
+
+impl AstreaLaunchLifecycleTracker {
+    pub(crate) fn track(
+        &mut self,
+        pid: u32,
+        request: astrea_launch_request_v1::AstreaLaunchRequestV1,
+    ) {
+        self.observers.insert(pid, request);
+    }
+
+    pub(crate) fn complete(&mut self, pid: u32, status: std::process::ExitStatus) -> bool {
+        let Some(request) = self.observers.remove(&pid) else {
+            return false;
+        };
+        if request.is_alive() {
+            request.finished(astrea_launch_finished_status(status));
+        }
+        true
+    }
+
+    pub(crate) fn prune_dead(&mut self) {
+        self.observers.retain(|_, request| request.is_alive());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.observers.len()
+    }
+}
+
+pub(crate) fn astrea_launch_finished_status(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
+        return -signal;
+    }
+    -255
+}
 
 pub(crate) fn launch_native_shell_command(
     server: &OwnCompositorServer,
@@ -69,12 +159,16 @@ pub(crate) fn launch_native_shell_command(
 pub(crate) fn drain_pending_process_launches(
     server: &mut OwnCompositorServer,
     supervisor: &mut ChildSupervisor,
+    launch_tracker: &mut AstreaLaunchLifecycleTracker,
     app_gpu_policy: EffectiveCompositorAppGpuPolicy,
     perf: NativePerfLogger,
     pending_launches: &mut VecDeque<NativeAppLaunchPerf>,
 ) {
     let socket_name = server.socket_name().to_string();
     for pending in server.take_pending_process_launches() {
+        if !pending.request.is_alive() {
+            continue;
+        }
         let Some(request) = native_launch_request(
             pending.argv,
             app_gpu_policy,
@@ -104,6 +198,7 @@ pub(crate) fn drain_pending_process_launches(
         };
         match supervisor.spawn(command, process_options) {
             Ok(pid) => {
+                launch_tracker.track(pid, pending.request.clone());
                 pending.request.accepted(pid);
                 let launch = NativeAppLaunchPerf {
                     program: request.program,
@@ -150,15 +245,35 @@ pub(crate) fn external_shell_command() -> Option<Vec<String>> {
 }
 
 pub(crate) fn external_spotlight_command() -> Option<Vec<String>> {
-    command_from_env("OBLIVION_ONE_SPOTLIGHT_COMMAND")
-        .or_else(|| eclipse_command("Spotlight", "astrea-spotlight", &["--toggle"]))
-        .or_else(|| path_command("astrea-spotlight", &["--toggle"]))
+    resolve_astrea_utility_command(
+        "OBLIVION_ONE_SPOTLIGHT_COMMAND",
+        "Spotlight",
+        "astrea-spotlight",
+        &["--toggle"],
+    )
 }
 
 pub(crate) fn external_alt_tab_command() -> Option<Vec<String>> {
-    command_from_env("OBLIVION_ONE_ALT_TAB_COMMAND")
-        .or_else(|| eclipse_command("AltTab", "astrea-alt-tab", &["--next"]))
-        .or_else(|| path_command("astrea-alt-tab", &["--next"]))
+    resolve_astrea_utility_command(
+        "OBLIVION_ONE_ALT_TAB_COMMAND",
+        "AltTab",
+        "astrea-alt-tab",
+        &["--next"],
+    )
+}
+
+pub(crate) fn resolve_astrea_utility_command(
+    explicit_env: &str,
+    project: &str,
+    binary: &str,
+    args: &[&str],
+) -> Option<Vec<String>> {
+    command_from_env(explicit_env)
+        .or_else(|| {
+            let root = std::env::var_os("ASTREA_ECLIPSE_ROOT")?;
+            (!root.is_empty()).then(|| eclipse_command(Path::new(&root), project, binary, args))?
+        })
+        .or_else(|| path_command(binary, args))
 }
 
 pub(crate) fn external_session_switch_command(index: u8) -> Option<Vec<String>> {
@@ -177,21 +292,15 @@ fn command_from_env(name: &str) -> Option<Vec<String>> {
     (!command.is_empty()).then(|| vec!["sh".to_string(), "-lc".to_string(), command.to_string()])
 }
 
-fn eclipse_command(project: &str, binary: &str, args: &[&str]) -> Option<Vec<String>> {
+fn eclipse_command(root: &Path, project: &str, binary: &str, args: &[&str]) -> Option<Vec<String>> {
     let candidates = [
-        Path::new(ECLIPSE_ROOT)
-            .join(project)
-            .join("build")
-            .join(binary),
-        Path::new(ECLIPSE_ROOT).join("build").join(binary),
-        Path::new(ECLIPSE_ROOT)
-            .join("build")
-            .join(project)
-            .join(binary),
+        root.join(project).join("build").join(binary),
+        root.join("build").join(binary),
+        root.join("build").join(project).join(binary),
     ];
     candidates
         .into_iter()
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| executable_file(candidate))
         .map(|path| command_with_args(path.display().to_string(), args))
 }
 
@@ -209,7 +318,24 @@ fn command_available(program: &str) -> bool {
     let Some(path_var) = std::env::var_os("PATH") else {
         return false;
     };
-    std::env::split_paths(&path_var).any(|dir| dir.join(program).is_file())
+    std::env::split_paths(&path_var).any(|dir| executable_file(&dir.join(program)))
+}
+
+fn executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 pub(crate) fn native_launch_request(
@@ -248,6 +374,7 @@ pub(crate) fn log_native_app_spawn(perf: NativePerfLogger, launch: &NativeAppLau
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::ExitStatus};
 
     fn request_for_source(source: NativeLaunchSource) -> NativeLaunchRequest {
         native_launch_request(
@@ -283,5 +410,191 @@ mod tests {
 
         assert_eq!(options.kind, ProcessKind::Application);
         assert!(!options.session_owned);
+    }
+
+    #[test]
+    fn astrea_fallback_is_protocol_first_and_pressed_only() {
+        let pressed = AstreaShortcutEvent {
+            namespace: "astrea-shell".to_string(),
+            name: "spotlight_toggle".to_string(),
+            phase: AstreaShortcutPhase::Pressed,
+        };
+        assert_eq!(
+            astrea_shortcut_fallback_kind(&pressed, 0),
+            Some(AstreaShortcutFallbackKind::Spotlight)
+        );
+        assert_eq!(astrea_shortcut_fallback_kind(&pressed, 1), None);
+
+        for phase in [AstreaShortcutPhase::Repeated, AstreaShortcutPhase::Released] {
+            let event = AstreaShortcutEvent {
+                phase,
+                ..pressed.clone()
+            };
+            assert_eq!(astrea_shortcut_fallback_kind(&event, 0), None);
+        }
+
+        for name in ["alt_tab_previous", "alt_tab_commit", "unknown"] {
+            let event = AstreaShortcutEvent {
+                namespace: "astrea-shell".to_string(),
+                name: name.to_string(),
+                phase: AstreaShortcutPhase::Pressed,
+            };
+            assert_eq!(astrea_shortcut_fallback_kind(&event, 0), None);
+        }
+    }
+
+    #[test]
+    fn astrea_finished_status_encodes_exit_code_and_signal() {
+        use std::os::unix::process::ExitStatusExt;
+
+        assert_eq!(
+            astrea_launch_finished_status(ExitStatus::from_raw(7 << 8)),
+            7
+        );
+        assert_eq!(
+            astrea_launch_finished_status(ExitStatus::from_raw(libc::SIGTERM)),
+            -libc::SIGTERM
+        );
+    }
+
+    #[test]
+    fn astrea_utility_explicit_override_wins_over_development_root() {
+        let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+        let root = temporary_utility_root("override");
+        let candidate = root
+            .join("Spotlight")
+            .join("build")
+            .join("astrea-spotlight");
+        fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+        write_executable(&candidate);
+        unsafe {
+            std::env::set_var("OBLIVION_ONE_SPOTLIGHT_COMMAND", "custom-spotlight --dev");
+            std::env::set_var("ASTREA_ECLIPSE_ROOT", &root);
+        }
+
+        let command = resolve_astrea_utility_command(
+            "OBLIVION_ONE_SPOTLIGHT_COMMAND",
+            "Spotlight",
+            "astrea-spotlight",
+            &["--toggle"],
+        );
+
+        unsafe {
+            std::env::remove_var("OBLIVION_ONE_SPOTLIGHT_COMMAND");
+            std::env::remove_var("ASTREA_ECLIPSE_ROOT");
+        }
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            command,
+            Some(vec![
+                "sh".to_string(),
+                "-lc".to_string(),
+                "custom-spotlight --dev".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn astrea_utility_development_root_resolves_supported_build_layout() {
+        let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+        let root = temporary_utility_root("development");
+        let previous_path = std::env::var_os("PATH");
+        let candidate = root.join("build").join("astrea-alt-tab");
+        fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+        write_executable(&candidate);
+        unsafe {
+            std::env::remove_var("OBLIVION_ONE_ALT_TAB_COMMAND");
+            std::env::set_var("ASTREA_ECLIPSE_ROOT", &root);
+            std::env::set_var("PATH", "/definitely/no/astrea-utilities");
+        }
+
+        let command = resolve_astrea_utility_command(
+            "OBLIVION_ONE_ALT_TAB_COMMAND",
+            "AltTab",
+            "astrea-alt-tab",
+            &["--next"],
+        );
+
+        unsafe {
+            std::env::remove_var("ASTREA_ECLIPSE_ROOT");
+            restore_env("PATH", previous_path);
+        }
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            command,
+            Some(vec![candidate.display().to_string(), "--next".to_string()])
+        );
+    }
+
+    #[test]
+    fn astrea_utility_path_resolution_requires_executable_candidate() {
+        let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+        let root = temporary_utility_root("path");
+        let previous_path = std::env::var_os("PATH");
+        let candidate = root.join("astrea-spotlight");
+        fs::create_dir_all(&root).unwrap();
+        write_executable(&candidate);
+        unsafe {
+            std::env::remove_var("OBLIVION_ONE_SPOTLIGHT_COMMAND");
+            std::env::remove_var("ASTREA_ECLIPSE_ROOT");
+            std::env::set_var("PATH", &root);
+        }
+
+        let command = resolve_astrea_utility_command(
+            "OBLIVION_ONE_SPOTLIGHT_COMMAND",
+            "Spotlight",
+            "astrea-spotlight",
+            &["--toggle"],
+        );
+
+        restore_env("PATH", previous_path);
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            command,
+            Some(vec!["astrea-spotlight".to_string(), "--toggle".to_string()])
+        );
+    }
+
+    #[test]
+    fn astrea_utility_resolution_returns_none_when_unavailable() {
+        let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+        let root = temporary_utility_root("missing");
+        let previous_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::remove_var("OBLIVION_ONE_ALT_TAB_COMMAND");
+            std::env::remove_var("ASTREA_ECLIPSE_ROOT");
+            std::env::set_var("PATH", &root);
+        }
+
+        let command = resolve_astrea_utility_command(
+            "OBLIVION_ONE_ALT_TAB_COMMAND",
+            "AltTab",
+            "astrea-alt-tab",
+            &["--next"],
+        );
+
+        restore_env("PATH", previous_path);
+        assert_eq!(command, None);
+    }
+
+    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+    }
+
+    fn temporary_utility_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "typhon-astrea-utility-{label}-{}",
+            std::process::id()
+        ))
+    }
+
+    fn write_executable(path: &std::path::Path) {
+        fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
     }
 }

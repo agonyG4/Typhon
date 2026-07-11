@@ -201,7 +201,7 @@ pub(crate) enum NativeWindowAction {
 pub(crate) struct AstreaShortcutEvent {
     pub(crate) namespace: String,
     pub(crate) name: String,
-    pub(crate) repeated: bool,
+    pub(crate) phase: AstreaShortcutPhase,
 }
 
 impl AstreaShortcutEvent {
@@ -210,7 +210,7 @@ impl AstreaShortcutEvent {
         Self {
             namespace: namespace.into(),
             name: name.into(),
-            repeated: false,
+            phase: AstreaShortcutPhase::Pressed,
         }
     }
 }

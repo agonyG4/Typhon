@@ -388,6 +388,7 @@ impl NativeRuntime {
             resize_perf,
             pointer_constraint_backend,
             process_supervisor,
+            astrea_launch_tracker: AstreaLaunchLifecycleTracker::default(),
             shutdown: NativeShutdownLifecycle::new(),
         })
     }

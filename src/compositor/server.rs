@@ -38,11 +38,11 @@ use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
 
 use super::{
-    AcquireCommitId, AcquireWatchChange, ClientCursorRenderState, CompositorState,
-    ExplicitSyncPoint, FramePresentation, FullscreenRenderPlanMetrics, InputProtocolCapabilities,
-    OutputRect, PendingProcessLaunch, PresentationClock, RenderGenerationCause, RenderableSurface,
-    RendererProtocolCapabilities, ResizeFlowMetrics, SelectionProtocolCapabilities,
-    SubsurfaceTransactionMetrics, color,
+    AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, ClientCursorRenderState,
+    CompositorState, ExplicitSyncPoint, FramePresentation, FullscreenRenderPlanMetrics,
+    InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PresentationClock,
+    RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
+    SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 
@@ -539,21 +539,27 @@ impl OwnCompositorServer {
         self.state.active_window_interaction_trigger_button()
     }
 
-    pub fn emit_astrea_shortcut_pressed(
+    pub fn emit_astrea_shortcut(
         &mut self,
         namespace: &str,
         name: &str,
+        phase: AstreaShortcutPhase,
         timestamp: u32,
     ) -> usize {
         let dispatched = self
             .state
-            .emit_astrea_shortcut_pressed(namespace, name, timestamp);
+            .emit_astrea_shortcut(namespace, name, phase, timestamp);
         let _ = self.display.flush_clients();
         dispatched
     }
 
     pub fn authorize_astrea_shell_pid(&mut self, pid: u32) {
         self.state.authorize_astrea_shell_pid(pid);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_astrea_shell_authorization(&mut self) {
+        self.state.clear_astrea_shell_authorization();
     }
 
     pub fn resize_focused_window_to(&mut self, width: u32, height: u32) -> bool {

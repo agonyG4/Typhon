@@ -23,3 +23,4 @@ mod frame;
 mod input;
 mod output;
 mod scanout;
+mod shell_control;

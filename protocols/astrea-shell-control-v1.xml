@@ -25,6 +25,13 @@
   </interface>
 
   <interface name="astrea_launch_request_v1" version="1">
+    <description summary="supervised Astrea shell-control launch">
+      accepted means supervision began for the reported PID. A successful
+      accepted request emits exactly one finished event after that exact child
+      exits. Destroying the request removes only the Wayland observer; it does
+      not kill the supervised child.
+    </description>
+
     <event name="accepted">
       <arg name="pid" type="uint"/>
     </event>
@@ -35,6 +42,11 @@
     </event>
 
     <event name="finished">
+      <description summary="supervised child completion">
+        status is the normal exit code from 0 through 255, or the negative
+        signal number when the child was terminated by signal. -255 is used
+        when the platform provides neither a normal exit code nor a signal.
+      </description>
       <arg name="status" type="int"/>
     </event>
 

@@ -99,6 +99,7 @@ pub(crate) struct NativeRuntime {
     resize_perf: NativeResizePerfState,
     pointer_constraint_backend: NativePointerConstraintBackend,
     process_supervisor: ChildSupervisor,
+    astrea_launch_tracker: AstreaLaunchLifecycleTracker,
     shutdown: NativeShutdownLifecycle,
 }
 

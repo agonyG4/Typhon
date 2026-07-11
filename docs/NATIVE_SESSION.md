@@ -305,7 +305,13 @@ backend are ready:
 
 Spotlight launches and the initial command use the same spawn path and the same
 effective app GPU policy. Their perf events carry `source=startup` or
-`source=spotlight`.
+`source=spotlight`. Native shortcut dispatch is protocol-first: a registered
+Astrea shell owner suppresses fallback, while a zero-owner pressed Spotlight or
+Alt+Tab-next action may launch its configured external utility. Repeats,
+releases, Alt+Tab-previous, and Alt+Tab-commit never spawn that fallback.
+Shell-control launch requests report `accepted(pid)` before the supervised
+child's terminal `finished(status)` event; normal status is the exit code and
+signal termination is encoded as the negative signal number.
 
 Startup fallback and runtime recovery are different. `auto` can fall back from
 `native-egl-gbm` to CPU/dumb while opening the backend or painting the first

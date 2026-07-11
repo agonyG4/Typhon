@@ -14,7 +14,11 @@
     <description summary="Astrea compositor-owned shortcut registry">
       Registers client-owned shortcut resources. Matching and ownership policy
       are compositor-side; this protocol only receives compositor-dispatched
-      shortcut events.
+      shortcut events. For the reserved astrea-shell namespace, each
+      namespace/name pair has one live owner. A newest valid registration
+      replaces the previous owner, which receives cancelled, and the replaced
+      owner is never restored. Other namespaces retain their existing shared
+      registration behavior.
     </description>
 
     <request name="destroy" type="destructor"/>
@@ -30,7 +34,11 @@
   <interface name="astrea_shortcut_v1" version="1">
     <description summary="registered Astrea shortcut">
       A registered shortcut receives compositor-dispatched shortcut lifecycle
-      events for its namespace/name pair.
+      events for its namespace/name pair. pressed is an initial action,
+      repeated is a key-repeat action, released is an explicit release-trigger
+      action, and cancelled means ownership was replaced or registration was
+      rejected. Synthetic actions such as alt_tab_commit are separate logical
+      action presses; they are not releases of another shortcut.
     </description>
 
     <request name="destroy" type="destructor"/>

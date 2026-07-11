@@ -43,6 +43,7 @@ impl NativeRuntime {
         drain_pending_process_launches(
             &mut self.server,
             &mut self.process_supervisor,
+            &mut self.astrea_launch_tracker,
             self.effective_app_gpu_policy,
             self.perf,
             &mut self.pending_launches,
@@ -56,26 +57,30 @@ impl NativeRuntime {
     }
 
     fn reap_supervised_children(&mut self, cycle: &NativeCycleState) -> NativeResult<()> {
+        self.astrea_launch_tracker.prune_dead();
         if !cycle.wakeup.reasons.child_signal()
             && self.shutdown.state() != ShutdownState::StoppingChildren
         {
             return Ok(());
         }
         for exit in self.process_supervisor.reap_exited()? {
+            let finished_status = astrea_launch_finished_status(exit.status);
             self.perf.log("process.exit", || {
                 vec![
                     NativePerfField::str("kind", exit.kind.as_str()),
                     NativePerfField::u64("pid", u64::from(exit.pid)),
-                    NativePerfField::str(
-                        "exit_code",
-                        exit.status
-                            .code()
-                            .map(|code| code.to_string())
-                            .unwrap_or_else(|| "signal_or_unknown".to_string()),
-                    ),
+                    NativePerfField::str("exit_code", finished_status.to_string()),
                     NativePerfField::u64("restarted_pid", exit.restarted_pid.map_or(0, u64::from)),
                 ]
             });
+            if self.astrea_launch_tracker.complete(exit.pid, exit.status) {
+                self.perf.log("shell_control.finished", || {
+                    vec![
+                        NativePerfField::u64("pid", u64::from(exit.pid)),
+                        NativePerfField::str("status", finished_status.to_string()),
+                    ]
+                });
+            }
         }
         Ok(())
     }

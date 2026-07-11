@@ -225,6 +225,15 @@ protocol-facing behavior continues to flow through `CompositorState` and
 `OwnCompositorServer`. Temporary crate-level lint suppressions are not part of
 the state boundary contract.
 
+Astrea shell shortcuts are owned by the compositor registry. Each
+`(astrea-shell, name)` pair has one live owner; a newer authorized registration
+cancels and permanently replaces the old owner. Native input carries an
+explicit pressed/repeated/released phase to one phase-aware server dispatch.
+The native path first counts protocol dispatch and only when it is zero resolves
+the defined Spotlight or Alt+Tab-next external fallback. Shell-control launches
+are queued in the compositor, then tracked in `NativeRuntime` by the exact
+supervised PID from `accepted` through one `finished(status)` event.
+
 Compositor white-box tests are connected through `src/compositor/tests/mod.rs`.
 Shared Wayland client setup, registry binding, server commands, output helpers,
 input clients, subsurface helpers, and frame/buffer helpers live in

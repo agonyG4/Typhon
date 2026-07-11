@@ -191,9 +191,15 @@ Done:
   compositor.
 - External shells render through normal Wayland protocols. Set
   `OBLIVION_ONE_SHELL_COMMAND` to autostart Quickshell or another shell client.
-  `Super+Space` dispatches `OBLIVION_ONE_SPOTLIGHT_COMMAND` or
-  `astrea-spotlight --toggle` when available; `Alt+Tab` dispatches
-  `OBLIVION_ONE_ALT_TAB_COMMAND` or `astrea-alt-tab --next` when available.
+  The `astrea-shell` shortcut namespace gives each shortcut name one live,
+  newest-registration-wins owner; the replaced owner receives cancellation.
+  `Super+Space` dispatches to that owner first, then falls back to
+  `OBLIVION_ONE_SPOTLIGHT_COMMAND`, an explicitly configured
+  `ASTREA_ECLIPSE_ROOT` build, or `astrea-spotlight --toggle` on `PATH`.
+  `Alt+Tab` follows the same protocol-first order and only its next action
+  falls back to `OBLIVION_ONE_ALT_TAB_COMMAND`, an explicit Eclipse root, or
+  `astrea-alt-tab --next`. Previous and commit actions remain consumed without
+  inventing unsupported external flags.
 - Initial `linux-dmabuf` v3 path: Oblivion advertises ARGB/XRGB modifiers,
   keeps async `create` on the safe `failed()` path, accepts `create_immed` into
   typed `DmabufBufferHandle` surfaces, and the native EGL/GLES renderer imports
