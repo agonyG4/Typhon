@@ -299,6 +299,122 @@ fn native_input_zero_owner_alt_tab_next_launches_one_fallback() {
 }
 
 #[test]
+fn native_input_spotlight_fallback_spawn_failure_is_non_fatal_and_recorded() {
+    let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+    let previous_path = std::env::var_os("PATH");
+    unsafe {
+        std::env::set_var("OBLIVION_ONE_SPOTLIGHT_COMMAND", "exit 0");
+        std::env::set_var("PATH", "/definitely-not-a-command-path");
+    }
+    assert!(external_spotlight_command().is_some());
+
+    let mut server = OwnCompositorServer::bind(format!(
+        "typhon-shortcut-fallback-failure-{}",
+        std::process::id()
+    ))
+    .unwrap();
+    let mut process_supervisor = ChildSupervisor::new();
+    let mut resize_perf = NativeResizePerfState::default();
+    let application = apply_native_input_effect(
+        NativeInputEffect {
+            shortcut_events: vec![AstreaShortcutEvent::pressed(
+                "astrea-shell",
+                "spotlight_toggle",
+            )],
+            ..NativeInputEffect::default()
+        },
+        NativeInputApplyContext {
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            seat_session: None,
+            process_supervisor: &mut process_supervisor,
+        },
+    )
+    .expect("optional fallback spawn failure must not fail input handling");
+
+    unsafe {
+        match previous_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        std::env::remove_var("OBLIVION_ONE_SPOTLIGHT_COMMAND");
+    }
+
+    assert_eq!(application.fallback_attempts, 1);
+    assert_eq!(
+        application.fallback_spawn_failed,
+        Some(AstreaShortcutFallbackKind::Spotlight)
+    );
+    assert!(application.launch.is_none());
+    assert_eq!(process_supervisor.active_count(), 0);
+}
+
+#[test]
+fn native_input_alt_tab_fallback_spawn_failure_is_non_fatal_and_recorded() {
+    let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+    let previous_path = std::env::var_os("PATH");
+    unsafe {
+        std::env::set_var("OBLIVION_ONE_ALT_TAB_COMMAND", "exit 0");
+        std::env::set_var("PATH", "/definitely-not-a-command-path");
+    }
+    assert!(external_alt_tab_command().is_some());
+
+    let mut server = OwnCompositorServer::bind(format!(
+        "typhon-alt-tab-fallback-failure-{}",
+        std::process::id()
+    ))
+    .unwrap();
+    let mut process_supervisor = ChildSupervisor::new();
+    let mut resize_perf = NativeResizePerfState::default();
+    let application = apply_native_input_effect(
+        NativeInputEffect {
+            shortcut_events: vec![AstreaShortcutEvent::pressed("astrea-shell", "alt_tab_next")],
+            ..NativeInputEffect::default()
+        },
+        NativeInputApplyContext {
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            seat_session: None,
+            process_supervisor: &mut process_supervisor,
+        },
+    )
+    .expect("optional fallback spawn failure must not fail input handling");
+
+    unsafe {
+        match previous_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        std::env::remove_var("OBLIVION_ONE_ALT_TAB_COMMAND");
+    }
+
+    assert_eq!(application.fallback_attempts, 1);
+    assert_eq!(
+        application.fallback_spawn_failed,
+        Some(AstreaShortcutFallbackKind::AltTab)
+    );
+    assert!(application.launch.is_none());
+    assert_eq!(process_supervisor.active_count(), 0);
+}
+
+#[test]
+fn native_input_registered_shortcut_owner_suppresses_fallback_spawn() {
+    let shortcut = AstreaShortcutEvent::pressed("astrea-shell", "spotlight_toggle");
+
+    assert_eq!(
+        astrea_shortcut_fallback_kind(&shortcut, 1),
+        None,
+        "a registered protocol owner must suppress the external fallback"
+    );
+}
+
+#[test]
 fn native_input_zero_owner_repeat_and_alt_tab_non_next_do_not_launch_fallback() {
     let _guard = ASTREA_ENV_LOCK.lock().unwrap();
     unsafe {

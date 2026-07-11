@@ -817,6 +817,8 @@ pub(crate) fn apply_native_input_effect(
         redraw_requested: effect.requires_frame_repaint(context.cursor_mode),
         exit_requested: effect.exit_requested,
         launch: None,
+        fallback_attempts: 0,
+        fallback_spawn_failed: None,
     };
     application.redraw_requested |= apply_compositor_only_pointer_position(&effect, |x, y| {
         context
@@ -937,6 +939,7 @@ pub(crate) fn apply_native_input_effect(
         if effect.launch_command.is_none() {
             effect.launch_command = Some(command);
             effect.launch_source = Some(kind.source());
+            application.fallback_attempts += 1;
             fallback_attempt = Some((shortcut.clone(), kind));
         }
     }
@@ -980,6 +983,12 @@ pub(crate) fn apply_native_input_effect(
             }
             Err(error) => {
                 if let Some((shortcut, kind)) = &fallback_attempt {
+                    eprintln!(
+                        "native input: fallback_spawn_failed namespace={} name={} kind={}: {error}",
+                        shortcut.namespace,
+                        shortcut.name,
+                        kind.as_str(),
+                    );
                     context.perf.log("shortcut.fallback_spawn_failed", || {
                         vec![
                             NativePerfField::str("namespace", shortcut.namespace.clone()),
@@ -991,8 +1000,10 @@ pub(crate) fn apply_native_input_effect(
                             NativePerfField::u64("fallback_pid", 0),
                         ]
                     });
+                    application.fallback_spawn_failed = Some(*kind);
+                } else {
+                    return Err(error);
                 }
-                return Err(error);
             }
         }
     }
@@ -1148,6 +1159,8 @@ pub(crate) struct NativeInputApplication {
     pub(crate) redraw_requested: bool,
     pub(crate) exit_requested: bool,
     pub(crate) launch: Option<NativeAppLaunchPerf>,
+    pub(crate) fallback_attempts: usize,
+    pub(crate) fallback_spawn_failed: Option<AstreaShortcutFallbackKind>,
 }
 
 pub(crate) fn apply_native_window_action(
