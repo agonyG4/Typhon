@@ -1482,6 +1482,7 @@ fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion(
     assert!(application.redraw_requested);
     assert!(server.client_cursor_request_active());
     assert!(server.client_cursor_render_state().is_none());
+    assert_eq!(server.last_pointer_position(), (x, y));
     client_commands.send(ClientCommand::CaptureActive).unwrap();
     let active = pump_native_input_server_until(&mut server, &client_events);
     assert_eq!(
@@ -1557,6 +1558,7 @@ fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion(
         },
     )
     .unwrap();
+    assert_eq!(server.last_pointer_position(), (next_x, next_y));
 
     let cursor_after_next_motion = server
         .client_cursor_render_state()

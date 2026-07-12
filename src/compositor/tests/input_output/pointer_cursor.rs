@@ -2141,3 +2141,99 @@ fn window_interaction_motion_preserves_exact_subsurface_target() {
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();
 }
+
+fn run_resize_motion_coordinate_regression(
+    start_local: (f64, f64),
+    update_output: (f64, f64),
+    expected_local: (f64, f64),
+) {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _pointer = seat.get_pointer(&qh, ());
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=2, ()).unwrap();
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    let start_output = (
+        f64::from(render::FIRST_SURFACE_OFFSET.0) + start_local.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.1) + start_local.1,
+    );
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: start_output.0,
+            y: start_output.1,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let enter_count = state.pointer_enter_count;
+    let leave_count = state.pointer_leave_count;
+    state.pointer_motion = false;
+    state.pointer_surface_x = None;
+    state.pointer_surface_y = None;
+
+    commands
+        .send(ServerCommand::BeginResize {
+            x: start_output.0,
+            y: start_output.1,
+        })
+        .unwrap();
+    let (update_reply, update_receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::UpdateInteractionResult {
+            x: update_output.0,
+            y: update_output.1,
+            reply: update_reply,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(update_receiver.recv().unwrap());
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::SendWindowInteractionPointerMotion {
+            timestamp_usec: 44_000,
+            x: update_output.0,
+            y: update_output.1,
+            reply,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    assert_eq!(receiver.recv().unwrap(), 1);
+    assert!(state.pointer_motion);
+    assert_eq!(state.pointer_surface_x, Some(expected_local.0));
+    assert_eq!(state.pointer_surface_y, Some(expected_local.1));
+    assert_eq!(state.pointer_enter_count, enter_count);
+    assert_eq!(state.pointer_leave_count, leave_count);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn left_resize_dispatches_client_motion_using_updated_surface_origin() {
+    run_resize_motion_coordinate_regression((0.0, 40.0), (52.0, 112.0), (0.0, 40.0));
+}
+
+#[test]
+fn top_resize_dispatches_client_motion_using_updated_surface_origin() {
+    run_resize_motion_coordinate_regression((40.0, 0.0), (112.0, 52.0), (40.0, 0.0));
+}
+
+#[test]
+fn right_bottom_resize_dispatches_client_motion_without_origin_change() {
+    run_resize_motion_coordinate_regression((159.0, 119.0), (251.0, 211.0), (179.0, 139.0));
+}

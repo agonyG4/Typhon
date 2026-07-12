@@ -451,7 +451,23 @@ impl CompositorState {
             .renderable_surfaces
             .iter()
             .position(|renderable| renderable.surface_id == surface_id)?;
-        let origin = self.surface_origin_cache.get(index).copied()?;
+        let mut origin = self.surface_origin_cache.get(index).copied()?;
+        if let Some(interaction) = self.window_interaction
+            && let Some(pending) = self.pending_interactive_resize_update
+            && pending.root_surface_id == interaction.root_surface_id
+            && self.root_surface_id_for_surface(surface_id) == interaction.root_surface_id
+        {
+            let current_placement = self
+                .current_visual_root_window_geometry(interaction.root_surface_id)
+                .map(|geometry| geometry.placement)
+                .unwrap_or_else(|| self.surface_placement(interaction.root_surface_id));
+            origin.0 = origin
+                .0
+                .saturating_add(pending.placement.local_x - current_placement.local_x);
+            origin.1 = origin
+                .1
+                .saturating_add(pending.placement.local_y - current_placement.local_y);
+        }
         Some(PointerTarget {
             surface: surface.clone(),
             surface_x: x - f64::from(origin.0),
