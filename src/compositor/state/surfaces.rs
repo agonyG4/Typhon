@@ -106,9 +106,16 @@ impl CompositorState {
         source: SurfacePublicationSource,
         decision: SurfacePublicationDecision,
     ) {
-        self.note_explicit_commit_rejected(
+        let publication = self
+            .surface_publications
+            .get(&surface_id)
+            .copied()
+            .unwrap_or_default();
+        self.note_explicit_commit_publication_rejected(
             SurfaceCommitId::from_sequence(commit_sequence),
-            "surface_publication_rejected",
+            decision,
+            publication.latest_published,
+            publication.latest_attachment_received,
         );
         self.resize_flow_metrics.surface_content_stale_rejections = self
             .resize_flow_metrics

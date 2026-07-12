@@ -35,6 +35,10 @@ pub(crate) struct ExplicitSyncCommitMetrics {
     pub(crate) explicit_sync_commits_published: u64,
     pub(crate) ready_commits_superseded: u64,
     pub(crate) unready_commits_superseded: u64,
+    pub(crate) ready_commits_rejected_stale: u64,
+    pub(crate) ready_commits_rejected_newer_attachment: u64,
+    pub(crate) unready_commits_rejected_stale: u64,
+    pub(crate) unready_commits_rejected_newer_attachment: u64,
     pub(crate) callbacks_merged_from_superseded: u64,
     pub(crate) callbacks_completed_from_published: u64,
     pub(crate) callbacks_completed_from_unpublished: u64,
@@ -53,6 +57,34 @@ impl ExplicitSyncCommitMetrics {
         } else {
             self.unready_commits_superseded = self.unready_commits_superseded.saturating_add(1);
             SurfaceCommitDisposition::SupersededWhileUnready
+        }
+    }
+
+    pub(in crate::compositor) fn note_publication_rejected(
+        &mut self,
+        state: PendingAcquireState,
+        decision: super::SurfacePublicationDecision,
+    ) {
+        match (state == PendingAcquireState::Ready, decision) {
+            (true, super::SurfacePublicationDecision::StaleAlreadyPublished) => {
+                self.ready_commits_rejected_stale =
+                    self.ready_commits_rejected_stale.saturating_add(1);
+            }
+            (true, super::SurfacePublicationDecision::SupersededByNewerAttachment) => {
+                self.ready_commits_rejected_newer_attachment = self
+                    .ready_commits_rejected_newer_attachment
+                    .saturating_add(1);
+            }
+            (false, super::SurfacePublicationDecision::StaleAlreadyPublished) => {
+                self.unready_commits_rejected_stale =
+                    self.unready_commits_rejected_stale.saturating_add(1);
+            }
+            (false, super::SurfacePublicationDecision::SupersededByNewerAttachment) => {
+                self.unready_commits_rejected_newer_attachment = self
+                    .unready_commits_rejected_newer_attachment
+                    .saturating_add(1);
+            }
+            (_, super::SurfacePublicationDecision::Publish) => {}
         }
     }
 }
@@ -320,6 +352,46 @@ impl super::CompositorState {
         );
     }
 
+    pub(in crate::compositor) fn note_explicit_commit_publication_rejected(
+        &mut self,
+        id: SurfaceCommitId,
+        decision: super::SurfacePublicationDecision,
+        latest_published: Option<super::SurfaceCommitSequence>,
+        latest_attachment: Option<super::SurfaceCommitSequence>,
+    ) {
+        let _disposition = SurfaceCommitDisposition::Rejected;
+        let Some(live) = self.commit_debug.live.remove(&id) else {
+            return;
+        };
+        self.commit_debug
+            .metrics
+            .note_publication_rejected(live.acquire_state, decision);
+        if self.commit_debug.enabled {
+            println!(
+                "typhon commit: event=publication_rejected commit_id={} surface={} root={} sequence={} acquire_state={} decision={} latest_published={} latest_attachment_received={}",
+                id.get(),
+                live.surface,
+                live.root,
+                live.sequence,
+                if live.acquire_state == PendingAcquireState::Ready {
+                    "ready"
+                } else {
+                    "unready"
+                },
+                match decision {
+                    super::SurfacePublicationDecision::Publish => "publish",
+                    super::SurfacePublicationDecision::StaleAlreadyPublished => "stale",
+                    super::SurfacePublicationDecision::SupersededByNewerAttachment =>
+                        "newer_attachment",
+                },
+                latest_published
+                    .map_or_else(|| "none".to_string(), |value| value.get().to_string()),
+                latest_attachment
+                    .map_or_else(|| "none".to_string(), |value| value.get().to_string()),
+            );
+        }
+    }
+
     pub(in crate::compositor) fn note_explicit_commit_rejected(
         &mut self,
         id: SurfaceCommitId,
@@ -409,17 +481,31 @@ impl super::CompositorState {
         }
         let m = self.commit_debug.metrics;
         println!(
-            "typhon commit: event=summary captured={} became_ready={} published={} ready_superseded={} unready_superseded={} callbacks_moved={} callbacks_completed_from_published={} callbacks_completed_from_unpublished={} published_without_visual_generation={} visual_generations={} live_commits={} live_callbacks={}",
+            "typhon commit: event=summary captured={} became_ready={} published={} ready_superseded={} unready_superseded={} ready_rejected_stale={} ready_rejected_newer_attachment={} unready_rejected_stale={} unready_rejected_newer_attachment={} callbacks_moved={} callbacks_completed_from_published={} callbacks_completed_from_unpublished={} published_without_visual_generation={} visual_generations={} queue_overflow={} max_queue_depth={} all_ready_pressure={} unready_retirements={} live_commits={} live_callbacks={}",
             m.explicit_sync_commits_captured,
             m.explicit_sync_commits_became_ready,
             m.explicit_sync_commits_published,
             m.ready_commits_superseded,
             m.unready_commits_superseded,
+            m.ready_commits_rejected_stale,
+            m.ready_commits_rejected_newer_attachment,
+            m.unready_commits_rejected_stale,
+            m.unready_commits_rejected_newer_attachment,
             m.callbacks_merged_from_superseded,
             m.callbacks_completed_from_published,
             m.callbacks_completed_from_unpublished,
             m.published_commits_without_visual_generation,
             m.visual_generations_from_explicit_sync,
+            self.subsurface_transaction_metrics
+                .explicit_sync_queue_overflow,
+            self.subsurface_transaction_metrics
+                .maximum_ready_slots_per_root
+                .saturating_add(
+                    self.subsurface_transaction_metrics
+                        .maximum_waiting_slots_per_root
+                ),
+            self.subsurface_transaction_metrics.all_ready_queue_pressure,
+            m.unready_commits_superseded,
             self.commit_debug.live.len(),
             self.commit_debug.callbacks.len()
         );
@@ -542,5 +628,17 @@ mod tests {
         let next = SurfaceCommitId::from_sequence(super::super::SurfaceCommitSequence(13));
         assert!(next.get() > id.get());
         assert!(!state.commit_debug.live.contains_key(&id));
+    }
+
+    #[test]
+    fn ready_newer_attachment_publication_rejection_is_counted() {
+        let mut metrics = ExplicitSyncCommitMetrics::default();
+        metrics.note_publication_rejected(
+            PendingAcquireState::Ready,
+            super::super::SurfacePublicationDecision::SupersededByNewerAttachment,
+        );
+
+        assert_eq!(metrics.ready_commits_rejected_newer_attachment, 1);
+        assert_eq!(metrics.ready_commits_rejected_stale, 0);
     }
 }

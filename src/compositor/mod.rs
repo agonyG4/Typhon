@@ -248,6 +248,7 @@ pub struct SubsurfaceTransactionMetrics {
     pub tree_transactions_waiting_on_acquire: u64,
     pub tree_transactions_superseded: u64,
     pub explicit_sync_queue_overflow: u64,
+    pub all_ready_queue_pressure: u64,
     pub bufferless_tree_commits_merged: u64,
     pub metadata_only_nodes_merged: u64,
     pub attachments_replaced: u64,
