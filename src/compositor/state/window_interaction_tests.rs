@@ -342,10 +342,12 @@ fn xdg_resize_trigger_button_release_ends_interaction() {
 #[test]
 fn destroyed_target_cancels_active_interaction() {
     let mut state = CompositorState {
-        window_interaction: Some(test_window_interaction(
+        window_interaction: Some(test_window_interaction_with_target(
             1,
             WindowInteractionKind::Move,
+            WindowInteractionSource::NativeBinding,
             Some(0x110),
+            Some(42),
         )),
         interaction_cursor_override: Some(InteractionCursorOverride {
             shape: InteractionCursorShape::Move,
@@ -445,10 +447,12 @@ fn locked_client_rejects_window_interaction_begin_without_cursor_override() {
 #[test]
 fn ending_window_interaction_clears_cursor_override_and_only_advances_cursor_generation() {
     let mut state = CompositorState {
-        window_interaction: Some(test_window_interaction(
+        window_interaction: Some(test_window_interaction_with_target(
             1,
             WindowInteractionKind::Move,
+            WindowInteractionSource::NativeBinding,
             Some(0x110),
+            Some(42),
         )),
         interaction_cursor_override: Some(InteractionCursorOverride {
             shape: InteractionCursorShape::Move,
@@ -498,10 +502,12 @@ fn interaction_cursor_motion_advances_cursor_generation_only() {
 #[test]
 fn fullscreen_transition_clears_interaction_cursor_override() {
     let mut state = CompositorState {
-        window_interaction: Some(test_window_interaction(
+        window_interaction: Some(test_window_interaction_with_target(
             1,
             WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+            WindowInteractionSource::NativeBinding,
             Some(0x110),
+            Some(42),
         )),
         interaction_cursor_override: Some(InteractionCursorOverride {
             shape: InteractionCursorShape::ResizeDiagonalNwSe,
@@ -518,10 +524,12 @@ fn fullscreen_transition_clears_interaction_cursor_override() {
 #[test]
 fn maximize_transition_clears_interaction_cursor_override() {
     let mut state = CompositorState {
-        window_interaction: Some(test_window_interaction(
+        window_interaction: Some(test_window_interaction_with_target(
             1,
             WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+            WindowInteractionSource::NativeBinding,
             Some(0x110),
+            Some(42),
         )),
         interaction_cursor_override: Some(InteractionCursorOverride {
             shape: InteractionCursorShape::ResizeDiagonalNwSe,
@@ -538,10 +546,12 @@ fn maximize_transition_clears_interaction_cursor_override() {
 #[test]
 fn client_disconnect_cleanup_path_clears_interaction_cursor_override() {
     let mut state = CompositorState {
-        window_interaction: Some(test_window_interaction(
+        window_interaction: Some(test_window_interaction_with_target(
             1,
             WindowInteractionKind::Move,
+            WindowInteractionSource::NativeBinding,
             Some(0x110),
+            Some(42),
         )),
         interaction_cursor_override: Some(InteractionCursorOverride {
             shape: InteractionCursorShape::Move,
