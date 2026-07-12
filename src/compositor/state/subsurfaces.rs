@@ -174,15 +174,24 @@ impl CompositorState {
         // blocked successor. Metadata-only commits merge into the newest ordered
         // successor; a newer unready attachment never makes an existing ready
         // successor unpresentable.
-        if incoming_has_unready_acquire
+        if incoming_has_attachment_change
             && self.pending_surface_tree_transactions[target_index].is_ready()
         {
-            self.subsurface_transaction_metrics
-                .ready_transactions_preserved_from_newer_unready = self
-                .subsurface_transaction_metrics
-                .ready_transactions_preserved_from_newer_unready
-                .saturating_add(1);
+            if incoming_has_unready_acquire {
+                self.subsurface_transaction_metrics
+                    .ready_transactions_preserved_from_newer_unready = self
+                    .subsurface_transaction_metrics
+                    .ready_transactions_preserved_from_newer_unready
+                    .saturating_add(1);
+            } else {
+                self.subsurface_transaction_metrics
+                    .ready_transactions_preserved_from_newer_ready = self
+                    .subsurface_transaction_metrics
+                    .ready_transactions_preserved_from_newer_ready
+                    .saturating_add(1);
+            }
             self.queue_waiting_surface_tree(root_surface_id, nodes, dependencies);
+            self.commit_ready_surface_tree_transactions();
             return;
         }
 
@@ -540,6 +549,17 @@ impl CompositorState {
         mut nodes: Vec<(u32, CachedSubsurfaceCommit)>,
         dependencies: Vec<SurfaceTreeAcquireDependency>,
     ) {
+        let at_capacity_with_only_ready = {
+            let matching = self
+                .pending_surface_tree_transactions
+                .iter()
+                .filter(|transaction| transaction.root_surface_id == root_surface_id)
+                .collect::<Vec<_>>();
+            matching.len() >= 3 && matching.iter().all(|transaction| transaction.is_ready())
+        };
+        if at_capacity_with_only_ready {
+            self.commit_ready_surface_tree_transactions();
+        }
         let matching = self
             .pending_surface_tree_transactions
             .iter()
@@ -548,13 +568,26 @@ impl CompositorState {
                 (transaction.root_surface_id == root_surface_id).then_some(index)
             })
             .collect::<Vec<_>>();
-        if matching.len() >= 2 {
-            let remove_index = matching
-                .iter()
-                .rev()
-                .copied()
-                .find(|index| !self.pending_surface_tree_transactions[*index].is_ready())
-                .unwrap_or(matching[0]);
+        if matching.len() >= 3 {
+            self.subsurface_transaction_metrics
+                .explicit_sync_queue_overflow = self
+                .subsurface_transaction_metrics
+                .explicit_sync_queue_overflow
+                .saturating_add(1);
+            let remove_index = explicit_sync_overflow_unready_index(matching.iter().map(|index| {
+                (
+                    *index,
+                    self.pending_surface_tree_transactions[*index].is_ready(),
+                )
+            }));
+            let Some(remove_index) = remove_index else {
+                debug_assert!(
+                    false,
+                    "ready explicit-sync queue must publish before overflow"
+                );
+                self.release_unpublished_surface_tree_nodes(nodes);
+                return;
+            };
             let superseded = self.pending_surface_tree_transactions.remove(remove_index);
             let released = self.release_pending_surface_tree_transaction(
                 superseded,

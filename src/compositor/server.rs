@@ -662,7 +662,16 @@ impl OwnCompositorServer {
         let _ = self.display.flush_clients();
     }
 
+    pub fn capture_frame_callbacks_for_render(&mut self) {
+        self.state.capture_frame_callbacks_for_render();
+    }
+
+    pub fn mark_prepared_frame_submitted(&mut self) {
+        self.state.mark_prepared_frame_submitted();
+    }
+
     pub fn finish_frame(&mut self) {
+        self.state.capture_frame_callbacks_for_render();
         let Ok(presentation) = FramePresentation::software_now(self.state.presentation_clock)
         else {
             self.state.discard_all_pending_presentation_feedbacks();
@@ -675,6 +684,9 @@ impl OwnCompositorServer {
     }
 
     pub fn finish_frame_with_presentation(&mut self, presentation: FramePresentation) {
+        if !self.state.has_submitted_frame_batch() {
+            self.state.capture_frame_callbacks_for_render();
+        }
         self.state.release_pending_buffers();
         self.state.complete_pending_frame_callbacks();
         self.state

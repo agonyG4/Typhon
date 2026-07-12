@@ -563,6 +563,40 @@ impl CompositorState {
         let acquire_ready = acquire.is_signaled();
         if acquire_ready {
             self.note_explicit_commit_ready(surface_commit_id);
+            let older_ready_is_queued = self.pending_explicit_sync_commits.iter().any(|commit| {
+                commit.surface_id == surface_id
+                    && commit.commit_sequence < commit_sequence
+                    && commit.acquire_state == PendingAcquireState::Ready
+            });
+            if older_ready_is_queued {
+                let Some(commit_id) = self.acquire_commit_ids.allocate() else {
+                    sync_state.post_error(
+                        SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
+                        "explicit sync commit identity space exhausted",
+                    );
+                    return;
+                };
+                self.finalize_pending_buffer_resize_capture(
+                    surface_id,
+                    &mut pending,
+                    window_geometry,
+                );
+                self.pending_explicit_sync_commits
+                    .push(PendingExplicitSyncCommit {
+                        surface_commit_id,
+                        commit_id,
+                        surface_id,
+                        commit_sequence,
+                        pending,
+                        damage,
+                        window_geometry,
+                        frame_callbacks,
+                        acquire,
+                        acquire_state: PendingAcquireState::Ready,
+                    });
+                self.commit_ready_explicit_sync_buffers();
+                return;
+            }
             let mut callbacks =
                 self.supersede_older_pending_attachments_for_surface(surface_id, commit_sequence);
             callbacks.extend(self.cancel_pending_acquire_commits_for_surface(

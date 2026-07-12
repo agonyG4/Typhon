@@ -145,6 +145,7 @@ impl NativeRuntime {
             let repaint_present_us = elapsed_micros(repaint_present_start);
             match present_result {
                 NativePresentResult::AsyncSubmitted { token } => {
+                    server.mark_prepared_frame_submitted();
                     #[cfg(test)]
                     native_io_recorder.record(NativeIoOperation::PageflipSubmit);
                     #[cfg(test)]
@@ -265,6 +266,7 @@ impl NativeRuntime {
                 *last_render_generation = render_generation;
                 *last_renderable_surfaces = server.renderable_surfaces().to_vec();
             } else {
+                server.capture_frame_callbacks_for_render();
                 let cpu_before = perf
                     .enabled()
                     .then(NativeProcessCpuSample::read_current)
@@ -353,6 +355,7 @@ impl NativeRuntime {
                         .unwrap_or(0);
                     match present_result {
                         NativePresentResult::AsyncSubmitted { token } => {
+                            server.mark_prepared_frame_submitted();
                             #[cfg(test)]
                             native_io_recorder.record(NativeIoOperation::PageflipSubmit);
                             #[cfg(test)]

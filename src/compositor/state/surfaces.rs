@@ -157,6 +157,10 @@ impl CompositorState {
         let mut retained_explicit = Vec::new();
         for commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
             if commit.surface_id == surface_id && commit.commit_sequence < new_sequence {
+                if commit.acquire_state == PendingAcquireState::Ready {
+                    retained_explicit.push(commit);
+                    continue;
+                }
                 self.note_explicit_commit_superseded(
                     commit.surface_commit_id,
                     commit.acquire_state,
@@ -209,6 +213,10 @@ impl CompositorState {
                     && commit.attachment.is_some()
             });
             if supersedes {
+                if transaction.is_ready() {
+                    retained_trees.push(transaction);
+                    continue;
+                }
                 let root_surface_id = transaction.root_surface_id;
                 let replacement = SurfaceCommitId::from_sequence(new_sequence);
                 let acquire_state = if transaction.is_ready() {

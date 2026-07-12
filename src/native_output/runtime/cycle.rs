@@ -1070,7 +1070,7 @@ impl NativeRuntime {
                 ]
             });
         }
-        if !scanout.page_flip_pending() && server.has_pending_frame_prepare_work() {
+        if server.has_pending_frame_prepare_work() {
             let prepare_frame_start = Instant::now();
             let before_generation = server.render_generation();
             server.prepare_frame();
@@ -1214,6 +1214,14 @@ impl NativeRuntime {
                     NativePerfField::u64(
                         "subsurface_ready_preserved_from_newer_unready",
                         subsurface.ready_transactions_preserved_from_newer_unready,
+                    ),
+                    NativePerfField::u64(
+                        "subsurface_ready_preserved_from_newer_ready",
+                        subsurface.ready_transactions_preserved_from_newer_ready,
+                    ),
+                    NativePerfField::u64(
+                        "explicit_sync_queue_overflow",
+                        subsurface.explicit_sync_queue_overflow,
                     ),
                     NativePerfField::u64(
                         "subsurface_callbacks_merged",

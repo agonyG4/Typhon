@@ -7,17 +7,48 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn complete_pending_frame_callbacks(&mut self) {
-        let mut callbacks = std::mem::take(&mut self.pending_frame_callbacks);
+        let callbacks = if self.submitted_frame_callback_batch {
+            self.submitted_frame_callback_batch = false;
+            std::mem::take(&mut self.submitted_frame_callbacks)
+        } else {
+            std::mem::take(&mut self.prepared_frame_callbacks)
+        };
+        self.complete_frame_callbacks(callbacks);
+    }
+
+    pub(in crate::compositor) fn capture_frame_callbacks_for_render(&mut self) {
+        self.prepared_frame_callbacks
+            .append(&mut self.pending_frame_callbacks);
         for surface in self.surface_resources.values() {
             if let Some(data) = surface.data::<SurfaceData>() {
-                callbacks.extend(data.take_frame_callbacks());
+                self.prepared_frame_callbacks
+                    .extend(data.take_frame_callbacks());
             }
         }
-        self.complete_frame_callbacks(callbacks);
+        self.prepared_presentation_feedbacks
+            .append(&mut self.pending_presentation_feedbacks);
+    }
+
+    pub(in crate::compositor) fn mark_prepared_frame_submitted(&mut self) {
+        debug_assert!(!self.submitted_frame_callback_batch);
+        self.submitted_frame_callback_batch = true;
+        self.submitted_frame_callbacks
+            .append(&mut self.prepared_frame_callbacks);
+        debug_assert!(!self.submitted_presentation_feedback_batch);
+        self.submitted_presentation_feedback_batch = true;
+        self.submitted_presentation_feedbacks
+            .append(&mut self.prepared_presentation_feedbacks);
+    }
+
+    pub(in crate::compositor) fn has_submitted_frame_batch(&self) -> bool {
+        self.submitted_frame_callback_batch || self.submitted_presentation_feedback_batch
     }
 
     pub(in crate::compositor) fn has_pending_frame_callbacks(&self) -> bool {
         !self.pending_frame_callbacks.is_empty()
+            || !self.prepared_frame_callbacks.is_empty()
+            || !self.submitted_frame_callbacks.is_empty()
+            || self.submitted_frame_callback_batch
             || self.pending_explicit_sync_commits.iter().any(|commit| {
                 !self.external_acquire_readiness && !commit.frame_callbacks.is_empty()
             })
@@ -36,9 +67,15 @@ impl CompositorState {
     pub(in crate::compositor) fn has_only_pending_surface_frame_callbacks(&self) -> bool {
         !self.pending_resize_configure_is_flushable()
             && self.pending_frame_callbacks.is_empty()
+            && self.prepared_frame_callbacks.is_empty()
+            && self.submitted_frame_callbacks.is_empty()
+            && !self.submitted_frame_callback_batch
             && self.pending_explicit_sync_commits.is_empty()
             && self.pending_surface_tree_transactions.is_empty()
             && self.pending_presentation_feedbacks.is_empty()
+            && self.prepared_presentation_feedbacks.is_empty()
+            && self.submitted_presentation_feedbacks.is_empty()
+            && !self.submitted_presentation_feedback_batch
             && self
                 .surface_resources
                 .values()
@@ -70,13 +107,21 @@ impl CompositorState {
             || self.pending_resize_configure_is_flushable()
             || self.has_pending_frame_callbacks()
             || !self.pending_presentation_feedbacks.is_empty()
+            || !self.prepared_presentation_feedbacks.is_empty()
+            || !self.submitted_presentation_feedbacks.is_empty()
+            || self.submitted_presentation_feedback_batch
     }
 
     pub(in crate::compositor) fn complete_pending_presentation_feedbacks(
         &mut self,
         presentation: FramePresentation,
     ) {
-        let feedbacks = std::mem::take(&mut self.pending_presentation_feedbacks);
+        let feedbacks = if self.submitted_presentation_feedback_batch {
+            self.submitted_presentation_feedback_batch = false;
+            std::mem::take(&mut self.submitted_presentation_feedbacks)
+        } else {
+            std::mem::take(&mut self.prepared_presentation_feedbacks)
+        };
         if feedbacks.is_empty() {
             return;
         }
@@ -142,21 +187,32 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
     ) {
-        let mut pending_feedbacks = Vec::new();
-        for pending in std::mem::take(&mut self.pending_presentation_feedbacks) {
-            if pending.surface_id == surface_id {
-                pending.feedback.discarded();
-            } else {
-                pending_feedbacks.push(pending);
-            }
+        fn discard_surface(feedbacks: &mut Vec<PendingPresentationFeedback>, surface_id: u32) {
+            feedbacks.retain(|pending| {
+                if pending.surface_id == surface_id {
+                    pending.feedback.discarded();
+                    false
+                } else {
+                    true
+                }
+            });
         }
-        self.pending_presentation_feedbacks = pending_feedbacks;
+        discard_surface(&mut self.pending_presentation_feedbacks, surface_id);
+        discard_surface(&mut self.prepared_presentation_feedbacks, surface_id);
+        discard_surface(&mut self.submitted_presentation_feedbacks, surface_id);
     }
 
     pub(in crate::compositor) fn discard_all_pending_presentation_feedbacks(&mut self) {
-        for pending in std::mem::take(&mut self.pending_presentation_feedbacks) {
-            pending.feedback.discarded();
+        for feedbacks in [
+            &mut self.pending_presentation_feedbacks,
+            &mut self.prepared_presentation_feedbacks,
+            &mut self.submitted_presentation_feedbacks,
+        ] {
+            for pending in std::mem::take(feedbacks) {
+                pending.feedback.discarded();
+            }
         }
+        self.submitted_presentation_feedback_batch = false;
         for feedbacks in
             std::mem::take(&mut self.pending_surface_presentation_feedbacks).into_values()
         {
@@ -533,7 +589,7 @@ impl CompositorState {
         for commit_id in newly_ready {
             self.note_explicit_commit_ready(commit_id);
         }
-        let newest_ready = newest_ready_explicit_sync_commit_indices(
+        let oldest_ready = oldest_ready_explicit_sync_commit_indices(
             commits.iter().enumerate().map(|(index, commit)| {
                 (
                     index,
@@ -542,7 +598,7 @@ impl CompositorState {
                 )
             }),
         );
-        let replacements = newest_ready
+        let replacements = oldest_ready
             .iter()
             .map(|(surface, index)| (*surface, commits[*index].surface_commit_id))
             .collect::<HashMap<_, _>>();
@@ -552,7 +608,7 @@ impl CompositorState {
         let mut superseded_callbacks: HashMap<u32, Vec<wl_callback::WlCallback>> = HashMap::new();
         let mut released_captures = Vec::new();
         for (index, commit) in commits.into_iter().enumerate() {
-            let Some(&ready_index) = newest_ready.get(&commit.surface_id) else {
+            let Some(&ready_index) = oldest_ready.get(&commit.surface_id) else {
                 waiting.push(commit);
                 continue;
             };
@@ -562,7 +618,7 @@ impl CompositorState {
                     commit.acquire_state,
                     commit.frame_callbacks.len(),
                     replacements[&commit.surface_id],
-                    "newest_ready_selected",
+                    "unready_head_superseded",
                 );
                 superseded_callbacks
                     .entry(commit.surface_id)
@@ -650,11 +706,11 @@ impl CompositorState {
         for commit_id in newly_ready {
             self.note_explicit_commit_ready(commit_id);
         }
-        let newest_ready =
-            newest_ready_explicit_sync_commit_indices(transactions.iter().enumerate().map(
+        let oldest_ready =
+            oldest_ready_explicit_sync_commit_indices(transactions.iter().enumerate().map(
                 |(index, transaction)| (index, transaction.root_surface_id, transaction.is_ready()),
             ));
-        let replacements = newest_ready
+        let replacements = oldest_ready
             .iter()
             .filter_map(|(root, index)| {
                 transactions[*index]
@@ -668,7 +724,7 @@ impl CompositorState {
         let mut superseded_callbacks: HashMap<u32, Vec<wl_callback::WlCallback>> = HashMap::new();
         let mut superseded_resize_commits: HashMap<u32, ResizeCommitSnapshot> = HashMap::new();
         for (index, transaction) in transactions.into_iter().enumerate() {
-            let Some(&ready_index) = newest_ready.get(&transaction.root_surface_id) else {
+            let Some(&ready_index) = oldest_ready.get(&transaction.root_surface_id) else {
                 waiting.push(transaction);
                 continue;
             };
@@ -687,7 +743,7 @@ impl CompositorState {
                             acquire_state,
                             commit.frame_callbacks.len(),
                             replacement,
-                            "newest_ready_surface_tree_selected",
+                            "unready_surface_tree_head_superseded",
                         );
                     }
                 }
@@ -750,5 +806,32 @@ impl CompositorState {
         for (root_surface_id, resize_commit) in superseded_resize_commits {
             self.release_detached_resize_capture(root_surface_id, resize_commit);
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_consumption_tests {
+    use super::*;
+
+    #[test]
+    fn empty_submitted_frame_batch_is_still_owned_until_completion() {
+        let mut state = CompositorState::default();
+        state.capture_frame_callbacks_for_render();
+        state.mark_prepared_frame_submitted();
+
+        assert!(state.has_submitted_frame_batch());
+        state.complete_pending_frame_callbacks();
+        assert!(state.submitted_presentation_feedback_batch);
+        state.complete_pending_presentation_feedbacks(
+            FramePresentation::software_now(state.presentation_clock).unwrap(),
+        );
+        assert!(!state.has_submitted_frame_batch());
+    }
+
+    #[test]
+    fn prepare_publication_does_not_create_a_submitted_frame_batch() {
+        let mut state = CompositorState::default();
+        state.commit_ready_explicit_sync_buffers();
+        assert!(!state.has_submitted_frame_batch());
     }
 }

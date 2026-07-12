@@ -88,16 +88,24 @@ pub(in crate::compositor) fn remove_surface_tree_dependency(
     Some(transaction.dependencies.remove(index))
 }
 
-pub(in crate::compositor) fn newest_ready_explicit_sync_commit_indices(
+pub(in crate::compositor) fn oldest_ready_explicit_sync_commit_indices(
     commits: impl IntoIterator<Item = (usize, u32, bool)>,
 ) -> HashMap<u32, usize> {
-    let mut newest_ready = HashMap::new();
+    let mut oldest_ready = HashMap::new();
     for (index, surface_id, ready) in commits {
         if ready {
-            newest_ready.insert(surface_id, index);
+            oldest_ready.entry(surface_id).or_insert(index);
         }
     }
-    newest_ready
+    oldest_ready
+}
+
+pub(in crate::compositor) fn explicit_sync_overflow_unready_index(
+    ready_states: impl IntoIterator<Item = (usize, bool)>,
+) -> Option<usize> {
+    ready_states
+        .into_iter()
+        .find_map(|(index, ready)| (!ready).then_some(index))
 }
 
 pub(in crate::compositor) fn damage_only_rendered_surface_size(
@@ -131,20 +139,17 @@ mod explicit_sync_commit_accounting_tests {
     use super::*;
 
     #[test]
-    fn ready_explicit_sync_commit_is_superseded_before_publication() {
-        let newest = newest_ready_explicit_sync_commit_indices([(0, 7, true), (1, 7, true)]);
-        assert_eq!(newest.get(&7), Some(&1));
-
-        let mut metrics = ExplicitSyncCommitMetrics::default();
-        let disposition = metrics.note_superseded(PendingAcquireState::Ready);
-        assert_eq!(disposition, SurfaceCommitDisposition::SupersededWhileReady);
-        assert_eq!(metrics.ready_commits_superseded, 1);
+    fn ready_commits_publish_in_sequence() {
+        let oldest = oldest_ready_explicit_sync_commit_indices([(0, 7, true), (1, 7, true)]);
+        assert_eq!(oldest.get(&7), Some(&0));
+        let next = oldest_ready_explicit_sync_commit_indices([(1, 7, true)]);
+        assert_eq!(next.get(&7), Some(&1));
     }
 
     #[test]
     fn unready_explicit_sync_commit_can_be_superseded_by_newer_state() {
-        let newest = newest_ready_explicit_sync_commit_indices([(0, 7, false), (1, 7, true)]);
-        assert_eq!(newest.get(&7), Some(&1));
+        let oldest = oldest_ready_explicit_sync_commit_indices([(0, 7, false), (1, 7, true)]);
+        assert_eq!(oldest.get(&7), Some(&1));
 
         let mut metrics = ExplicitSyncCommitMetrics::default();
         let disposition = metrics.note_superseded(PendingAcquireState::RegistrationPending);
@@ -154,5 +159,17 @@ mod explicit_sync_commit_accounting_tests {
         );
         assert_eq!(metrics.unready_commits_superseded, 1);
         assert_eq!(metrics.ready_commits_superseded, 0);
+    }
+
+    #[test]
+    fn queue_overflow_retires_oldest_unready_and_never_ready() {
+        assert_eq!(
+            explicit_sync_overflow_unready_index([(4, true), (7, false), (9, false)]),
+            Some(7)
+        );
+        assert_eq!(
+            explicit_sync_overflow_unready_index([(4, true), (7, true), (9, true)]),
+            None
+        );
     }
 }
