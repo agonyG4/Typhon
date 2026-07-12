@@ -548,6 +548,64 @@ fn compositor_only_pointer_motion_preserves_client_dispatch_state() {
 }
 
 #[test]
+fn compositor_only_interaction_motion_prevents_post_grab_cursor_teleport() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let x = f64::from(render::FIRST_SURFACE_OFFSET.0) + 60.0;
+    let y = f64::from(render::FIRST_SURFACE_OFFSET.1) + 44.0;
+
+    let snapshots =
+        create_client_cursor_then_synchronize_compositor_only_motion_and_send_normal_sample(
+            &socket_path,
+            &commands,
+            x,
+            y,
+        )
+        .unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let initial_cursor = snapshots.initial.cursor.unwrap();
+    let compositor_only_cursor = snapshots.compositor_only.cursor.unwrap();
+    let normal_motion_cursor = snapshots.normal_motion.cursor.unwrap();
+    assert_ne!(compositor_only_cursor, initial_cursor);
+    assert_eq!(compositor_only_cursor.logical_x, x.round() as i32 - 3);
+    assert_eq!(compositor_only_cursor.logical_y, y.round() as i32 - 4);
+    assert!(snapshots.compositor_only.visual_changed);
+    assert!(snapshots.compositor_only.render_generation > snapshots.initial.render_generation);
+    assert_eq!(
+        snapshots.compositor_only.scene_generation,
+        snapshots.initial.scene_generation
+    );
+    assert_eq!(
+        snapshots.compositor_only.cause,
+        RenderGenerationCause::CursorMotion
+    );
+    assert_eq!(
+        snapshots.compositor_only.pointer_event_log,
+        snapshots.initial.pointer_event_log
+    );
+    assert_eq!(
+        snapshots.compositor_only.pointer_motion_count,
+        snapshots.initial.pointer_motion_count
+    );
+    assert_eq!(
+        snapshots.compositor_only.relative_motion_count,
+        snapshots.initial.relative_motion_count
+    );
+    assert_eq!(
+        snapshots.compositor_only.pointer_focus_surface,
+        snapshots.initial.pointer_focus_surface
+    );
+    assert_eq!(normal_motion_cursor, compositor_only_cursor);
+    assert_eq!(
+        snapshots.normal_motion.render_generation,
+        snapshots.compositor_only.render_generation
+    );
+}
+
+#[test]
 fn compositor_only_pointer_motion_without_client_cursor_does_not_advance_generation() {
     let socket_name = unique_socket_name();
     let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();

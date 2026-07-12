@@ -286,6 +286,26 @@ pub(in crate::compositor::tests) struct CompositorOnlyCursorMotionSnapshot {
     pub(in crate::compositor::tests) pointer_focus_surface_after: Option<u32>,
 }
 
+#[derive(Debug)]
+pub(in crate::compositor::tests) struct CursorMotionStateSnapshot {
+    pub(in crate::compositor::tests) cursor: Option<ClientCursorSnapshot>,
+    pub(in crate::compositor::tests) visual_changed: bool,
+    pub(in crate::compositor::tests) render_generation: u64,
+    pub(in crate::compositor::tests) scene_generation: u64,
+    pub(in crate::compositor::tests) cause: RenderGenerationCause,
+    pub(in crate::compositor::tests) pointer_event_log: Vec<&'static str>,
+    pub(in crate::compositor::tests) pointer_motion_count: usize,
+    pub(in crate::compositor::tests) relative_motion_count: usize,
+    pub(in crate::compositor::tests) pointer_focus_surface: Option<u32>,
+}
+
+#[derive(Debug)]
+pub(in crate::compositor::tests) struct CompositorOnlyCursorSynchronizationSnapshots {
+    pub(in crate::compositor::tests) initial: CursorMotionStateSnapshot,
+    pub(in crate::compositor::tests) compositor_only: CursorMotionStateSnapshot,
+    pub(in crate::compositor::tests) normal_motion: CursorMotionStateSnapshot,
+}
+
 impl RegistryTestState {
     pub(in crate::compositor::tests) fn toplevel_has_state(
         &self,

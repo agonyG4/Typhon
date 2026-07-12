@@ -876,6 +876,87 @@ pub(in crate::compositor::tests) fn create_client_cursor_then_update_position_wi
     })
 }
 
+pub(in crate::compositor::tests) fn create_client_cursor_then_synchronize_compositor_only_motion_and_send_normal_sample(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    x: f64,
+    y: f64,
+) -> Result<CompositorOnlyCursorSynchronizationSnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let pointer = seat.get_pointer(&qh, ());
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120)?;
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let serial = state
+        .pointer_enter_serial
+        .ok_or("missing pointer enter serial")?;
+
+    let cursor_surface = compositor.create_surface(&qh, ());
+    pointer.set_cursor(serial, Some(&cursor_surface), 3, 4);
+    commit_test_buffered_surface(&cursor_surface, &shm, &qh, 24, 24)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let initial = capture_cursor_motion_state(&state, commands, false);
+    let (reply, receiver) = mpsc::channel();
+    commands.send(ServerCommand::UpdatePointerPositionWithoutClientDispatch { x, y, reply })?;
+    let visual_changed = receiver.recv_timeout(Duration::from_secs(1))?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let compositor_only = capture_cursor_motion_state(&state, commands, visual_changed);
+
+    commands.send(ServerCommand::PointerMotion { x, y })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let normal_motion = capture_cursor_motion_state(&state, commands, false);
+
+    Ok(CompositorOnlyCursorSynchronizationSnapshots {
+        initial,
+        compositor_only,
+        normal_motion,
+    })
+}
+
+fn capture_cursor_motion_state(
+    state: &RegistryTestState,
+    commands: &Sender<ServerCommand>,
+    visual_changed: bool,
+) -> CursorMotionStateSnapshot {
+    CursorMotionStateSnapshot {
+        cursor: capture_client_cursor_snapshot(commands),
+        visual_changed,
+        render_generation: capture_render_generation(commands),
+        scene_generation: capture_scene_render_generation(commands),
+        cause: capture_render_generation_cause(commands),
+        pointer_event_log: state.pointer_event_log.clone(),
+        pointer_motion_count: state
+            .pointer_event_log
+            .iter()
+            .filter(|event| **event == "motion")
+            .count(),
+        relative_motion_count: state.relative_motion_count,
+        pointer_focus_surface: capture_pointer_focus_surface_id(commands),
+    }
+}
+
 pub(in crate::compositor::tests) fn create_buffered_toplevel_and_receive_surface_local_pointer_motion(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
