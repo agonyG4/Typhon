@@ -311,6 +311,7 @@ impl NativeRuntime {
         let mismatched_pageflip_events = 0u64;
         let stale_pageflip_events = 0u64;
         let presentation_cadence = PresentationCadenceMetrics::default();
+        let frame_pacing = NativeFramePacing::from_env();
         let last_acquire_ready_at_ns = None;
         let resize_perf = NativeResizePerfState::default();
         let pointer_constraint_backend = NativePointerConstraintBackend::new();
@@ -384,6 +385,7 @@ impl NativeRuntime {
             mismatched_pageflip_events,
             stale_pageflip_events,
             presentation_cadence,
+            frame_pacing,
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,

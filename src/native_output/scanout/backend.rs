@@ -8,6 +8,17 @@ pub(crate) enum NativeScanoutKind {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeScanoutBufferSnapshot {
+    pub(crate) backend: NativeScanoutKind,
+    pub(crate) capacity: Option<usize>,
+    pub(crate) current: Option<usize>,
+    pub(crate) pending: Option<usize>,
+    pub(crate) ready: Option<usize>,
+    pub(crate) free_count: Option<usize>,
+    pub(crate) gbm_surface_has_free_buffers: Option<bool>,
+}
+
 impl NativeScanoutKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {

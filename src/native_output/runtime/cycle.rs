@@ -326,6 +326,7 @@ impl NativeRuntime {
             mismatched_pageflip_events,
             stale_pageflip_events,
             presentation_cadence,
+            frame_pacing,
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
@@ -439,6 +440,7 @@ impl NativeRuntime {
             let completion = frame_scheduler
                 .note_page_flip_completion(pageflip.user_data, compositor_receive_ns);
             if let PageFlipCompletionResult::Completed { submitted_at_ns } = completion {
+                let completed_frame_id = frame_pacing.pending;
                 let presentation = FramePresentation::synchronized(
                     *presentation_clock,
                     pageflip.timestamp.seconds,
@@ -449,6 +451,23 @@ impl NativeRuntime {
                 let kernel_timestamp_us = u64::from(pageflip.timestamp.seconds)
                     .saturating_mul(1_000_000)
                     .saturating_add(u64::from(pageflip.timestamp.microseconds));
+                let receive_delay_us = compositor_receive_us.saturating_sub(kernel_timestamp_us);
+                let presented_at_ns =
+                    compositor_receive_ns.saturating_sub(receive_delay_us.saturating_mul(1_000));
+                frame_pacing.note_pageflip(
+                    presented_at_ns,
+                    submitted_at_ns,
+                    pageflip.user_data,
+                    1_000_000u64 / u64::from((*refresh_hz).max(1)),
+                );
+                let mut pacing_fields = vec![
+                    frame_id_field(completed_frame_id),
+                    PacingField::u64("render_generation", server.render_generation()),
+                    PacingField::u64("pageflip_token", pageflip.user_data),
+                    PacingField::u64("pageflip_complete_ns", presented_at_ns),
+                ];
+                pacing_fields.extend(snapshot_fields(scanout.buffer_snapshot()));
+                frame_pacing.log("frame_complete", pacing_fields);
                 let cadence = presentation_cadence.record(pageflip.sequence, kernel_timestamp_us);
                 let finish_frame_start = Instant::now();
                 server.finish_frame_with_presentation(presentation);

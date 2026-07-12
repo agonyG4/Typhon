@@ -95,6 +95,7 @@ pub(crate) struct NativeRuntime {
     mismatched_pageflip_events: u64,
     stale_pageflip_events: u64,
     presentation_cadence: PresentationCadenceMetrics,
+    frame_pacing: NativeFramePacing,
     last_acquire_ready_at_ns: Option<u64>,
     resize_perf: NativeResizePerfState,
     pointer_constraint_backend: NativePointerConstraintBackend,
@@ -115,6 +116,9 @@ impl NativeRuntime {
 
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
+        if self.frame_pacing.enabled() {
+            println!("{}", self.frame_pacing.summary_line());
+        }
         if !self.session.permits_output() {
             self.scanout.disarm_drm_cleanup();
             self.kms_backend.disarm_drm_io();

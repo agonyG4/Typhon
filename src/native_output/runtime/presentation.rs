@@ -42,6 +42,7 @@ impl NativeRuntime {
             mismatched_pageflip_events,
             stale_pageflip_events,
             presentation_cadence,
+            frame_pacing,
             last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
@@ -80,7 +81,9 @@ impl NativeRuntime {
             redraw_requested,
             page_flip_pending: false,
         });
+        let pacing_now_ns = monotonic_now_ns()?;
         if repaint_decision.repaint {
+            frame_pacing.queue_visual(pacing_now_ns, render_generation);
             frame_scheduler.queue_visual_work();
             *queued_redraw_requested |= redraw_requested;
         } else if repaint_decision.protocol_only_present {
@@ -88,6 +91,18 @@ impl NativeRuntime {
         }
         let scheduler_decision = frame_scheduler
             .decision_with_render_target(monotonic_now_ns()?, scanout.render_target_available());
+        let mut decision_fields = vec![
+            frame_id_field(frame_pacing.active),
+            PacingField::u64("render_generation", render_generation),
+            PacingField::str("scheduler_decision", format!("{scheduler_decision:?}")),
+            PacingField::bool("render_target_available", scanout.render_target_available()),
+            PacingField::u64(
+                "pageflip_token",
+                scanout.pending_page_flip_token().unwrap_or(0),
+            ),
+        ];
+        decision_fields.extend(snapshot_fields(scanout.buffer_snapshot()));
+        frame_pacing.log("decision", decision_fields);
         if scheduler_decision == SchedulerDecision::PageFlipWatchdogExpired {
             perf.log("native.pageflip_watchdog", || {
                 vec![
@@ -140,6 +155,7 @@ impl NativeRuntime {
                     frame_scheduler
                         .note_ready_submission(token, monotonic_now_ns()?)
                         .map_err(io::Error::other)?;
+                    frame_pacing.note_submit(token, monotonic_now_ns()?, true);
                     frame_submitted = true;
                     server.mark_render_damage_presented();
                     *frame_index = frame_index.saturating_add(1);
@@ -174,6 +190,18 @@ impl NativeRuntime {
             SchedulerDecision::Render | SchedulerDecision::RenderAhead
         ) {
             let render_ahead = scheduler_decision == SchedulerDecision::RenderAhead;
+            if render_ahead {
+                frame_pacing.render_ahead_attempts += 1;
+            }
+            let render_begin_ns = monotonic_now_ns()?;
+            let mut render_begin_fields = vec![
+                frame_id_field(frame_pacing.active),
+                PacingField::u64("render_generation", render_generation),
+                PacingField::u64("render_begin_ns", render_begin_ns),
+                PacingField::bool("render_ahead", render_ahead),
+            ];
+            render_begin_fields.extend(snapshot_fields(scanout.buffer_snapshot()));
+            frame_pacing.log("render_begin", render_begin_fields);
             let effective_redraw_requested = redraw_requested || *queued_redraw_requested;
             let render_cause = native_repaint_cause_label(
                 render_generation_cause,
@@ -249,6 +277,18 @@ impl NativeRuntime {
                     &output_damage,
                 )?;
                 let paint_stats = paint_outcome.stats();
+                frame_pacing.log(
+                    "render_complete",
+                    vec![
+                        frame_id_field(frame_pacing.active),
+                        PacingField::u64("render_generation", render_generation),
+                        PacingField::u64("render_begin_ns", render_begin_ns),
+                        PacingField::u64("render_end_ns", monotonic_now_ns()?),
+                        PacingField::u64("gpu_draw_us", paint_stats.gpu_draw_us),
+                        PacingField::u64("egl_swap_us", paint_stats.egl_swap_us),
+                        PacingField::u64("render_total_us", paint_stats.total_us),
+                    ],
+                );
                 if matches!(paint_outcome, NativePaintOutcome::Skipped(_)) {
                     frame_scheduler.note_immediate_completion();
                     if server.has_pending_frame_work() {
@@ -272,6 +312,12 @@ impl NativeRuntime {
                     *last_renderable_surfaces = server.renderable_surfaces().to_vec();
                 } else {
                     frame_rendered = true;
+                    let mut ready_fields = vec![
+                        frame_id_field(frame_pacing.active),
+                        PacingField::u64("render_generation", render_generation),
+                    ];
+                    ready_fields.extend(snapshot_fields(scanout.buffer_snapshot()));
+                    frame_pacing.log("ready_queued", ready_fields);
                     let cpu_after = perf
                         .enabled()
                         .then(NativeProcessCpuSample::read_current)
@@ -317,6 +363,7 @@ impl NativeRuntime {
                             frame_scheduler
                                 .note_async_submission(token, monotonic_now_ns()?)
                                 .map_err(io::Error::other)?;
+                            frame_pacing.note_submit(token, monotonic_now_ns()?, false);
                             frame_submitted = true;
                         }
                         NativePresentResult::Immediate => {
@@ -347,6 +394,7 @@ impl NativeRuntime {
                         NativePresentResult::Noop => {
                             if render_ahead {
                                 frame_scheduler.note_render_ahead_ready();
+                                frame_pacing.note_render_ahead_ready(monotonic_now_ns()?);
                             } else {
                                 return Err(io::Error::other(
                                     "native scanout rendered a frame but did not submit or complete it",
@@ -455,6 +503,32 @@ impl NativeRuntime {
             scheduler_decision,
             SchedulerDecision::WaitForPageFlip | SchedulerDecision::WaitForBuffer
         ) {
+            let snapshot = scanout.buffer_snapshot();
+            let event = if scheduler_decision == SchedulerDecision::WaitForBuffer {
+                frame_pacing.wait_for_buffer_count += 1;
+                "wait_for_buffer"
+            } else {
+                "wait_for_pageflip"
+            };
+            let now_ns = monotonic_now_ns()?;
+            let mut fields = vec![
+                frame_id_field(frame_pacing.active),
+                PacingField::bool("pageflip_pending", scanout.page_flip_pending()),
+                PacingField::u64(
+                    "time_since_last_pageflip_us",
+                    frame_pacing
+                        .last_pageflip_ns()
+                        .map_or(0, |last| now_ns.saturating_sub(last) / 1_000),
+                ),
+                PacingField::u64(
+                    "time_since_visual_queued_us",
+                    frame_pacing
+                        .active_queued_ns
+                        .map_or(0, |queued| now_ns.saturating_sub(queued) / 1_000),
+                ),
+            ];
+            fields.extend(snapshot_fields(snapshot));
+            frame_pacing.log(event, fields);
             perf.log("native.frame_skip", || {
                 vec![
                     NativePerfField::str(

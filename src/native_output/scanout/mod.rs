@@ -437,6 +437,49 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn buffer_snapshot(&self) -> NativeScanoutBufferSnapshot {
+        match self {
+            Self::NativeEglGbm(scanout) => NativeScanoutBufferSnapshot {
+                backend: NativeScanoutKind::NativeEglGbm,
+                capacity: None,
+                current: None,
+                pending: None,
+                ready: None,
+                free_count: None,
+                gbm_surface_has_free_buffers: Some(scanout.surface.has_free_buffers()),
+            },
+            Self::Gbm(scanout) => {
+                let occupied = [
+                    Some(scanout.current_index),
+                    scanout.pending_index,
+                    scanout.ready_index,
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+                NativeScanoutBufferSnapshot {
+                    backend: NativeScanoutKind::GbmCpuWritePageFlip,
+                    capacity: Some(scanout.buffers.len()),
+                    current: Some(scanout.current_index),
+                    pending: scanout.pending_index,
+                    ready: scanout.ready_index,
+                    free_count: Some(scanout.buffers.len().saturating_sub(occupied)),
+                    gbm_surface_has_free_buffers: None,
+                }
+            }
+            Self::Dumb(_) => NativeScanoutBufferSnapshot {
+                backend: NativeScanoutKind::DumbFramebuffer,
+                capacity: Some(1),
+                current: Some(0),
+                pending: None,
+                ready: None,
+                free_count: Some(0),
+                gbm_surface_has_free_buffers: None,
+            },
+        }
+    }
+
     pub(crate) fn pending_page_flip_token(&self) -> Option<u64> {
         match self {
             Self::NativeEglGbm(scanout) => {

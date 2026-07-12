@@ -83,6 +83,7 @@ pub(crate) static ASTREA_ENV_LOCK: Mutex<()> = Mutex::new(());
 mod input;
 mod launch;
 mod output;
+mod pacing;
 mod perf;
 mod runtime;
 mod scanout;
@@ -90,6 +91,7 @@ mod scanout;
 pub(crate) use input::*;
 pub(crate) use launch::*;
 pub(crate) use output::*;
+use pacing::*;
 pub(crate) use perf::*;
 pub(crate) use runtime::{
     NativeCursorRenderMode, NativeFrameRenderer, NativePointerConstraintBackend,
