@@ -16,10 +16,7 @@ impl CompositorState {
             return;
         }
         self.configured_xdg_surfaces.remove(&surface_id);
-        self.clear_resize_state_for_surfaces_with_reason(
-            &[surface_id],
-            WindowInteractionEndReason::ExplicitCancel,
-        );
+        self.clear_resize_state_for_surfaces(&[surface_id]);
         self.toplevel_surfaces.insert(
             surface_id,
             ToplevelSurface {
@@ -821,7 +818,10 @@ impl CompositorState {
         {
             return false;
         }
-        self.clear_resize_state_for_surfaces(&[surface_id]);
+        self.clear_resize_state_for_surfaces_with_reason(
+            &[surface_id],
+            WindowInteractionEndReason::ExplicitCancel,
+        );
         self.clear_fullscreen_presentation_owner(surface_id);
 
         let surface_placements = &self.surface_placements;
