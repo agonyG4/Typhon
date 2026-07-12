@@ -169,11 +169,6 @@ impl CompositorState {
             }
             return;
         };
-
-        // Keep each root bounded to the presentable ready successor plus the newest
-        // blocked successor. Metadata-only commits merge into the newest ordered
-        // successor; a newer unready attachment never makes an existing ready
-        // successor unpresentable.
         if incoming_has_attachment_change
             && self.pending_surface_tree_transactions[target_index].is_ready()
         {
@@ -554,22 +549,7 @@ impl CompositorState {
         mut nodes: Vec<(u32, CachedSubsurfaceCommit)>,
         dependencies: Vec<SurfaceTreeAcquireDependency>,
     ) {
-        let at_capacity_with_only_ready = {
-            let matching = self
-                .pending_surface_tree_transactions
-                .iter()
-                .filter(|transaction| transaction.root_surface_id == root_surface_id)
-                .collect::<Vec<_>>();
-            matching.len() >= 3 && matching.iter().all(|transaction| transaction.is_ready())
-        };
-        if at_capacity_with_only_ready {
-            self.subsurface_transaction_metrics.all_ready_queue_pressure = self
-                .subsurface_transaction_metrics
-                .all_ready_queue_pressure
-                .saturating_add(1);
-            self.commit_ready_surface_tree_transactions();
-        }
-        let matching = self
+        let mut matching = self
             .pending_surface_tree_transactions
             .iter()
             .enumerate()
@@ -577,6 +557,18 @@ impl CompositorState {
                 (transaction.root_surface_id == root_surface_id).then_some(index)
             })
             .collect::<Vec<_>>();
+        let at_capacity_with_only_ready = matching.len() >= 3
+            && matching
+                .iter()
+                .all(|index| self.pending_surface_tree_transactions[*index].is_ready());
+        if at_capacity_with_only_ready {
+            self.subsurface_transaction_metrics.all_ready_queue_pressure = self
+                .subsurface_transaction_metrics
+                .all_ready_queue_pressure
+                .saturating_add(1);
+            self.commit_ready_surface_tree_transactions();
+            matching.clear();
+        }
         if matching.len() >= 3 {
             self.subsurface_transaction_metrics
                 .explicit_sync_queue_overflow = self
