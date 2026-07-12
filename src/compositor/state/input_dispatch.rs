@@ -461,12 +461,18 @@ impl CompositorState {
                 .current_visual_root_window_geometry(interaction.root_surface_id)
                 .map(|geometry| geometry.placement)
                 .unwrap_or_else(|| self.surface_placement(interaction.root_surface_id));
-            origin.0 = origin
-                .0
-                .saturating_add(pending.placement.local_x - current_placement.local_x);
-            origin.1 = origin
-                .1
-                .saturating_add(pending.placement.local_y - current_placement.local_y);
+            origin.0 = origin.0.saturating_add(
+                pending
+                    .placement
+                    .local_x
+                    .saturating_sub(current_placement.local_x),
+            );
+            origin.1 = origin.1.saturating_add(
+                pending
+                    .placement
+                    .local_y
+                    .saturating_sub(current_placement.local_y),
+            );
         }
         Some(PointerTarget {
             surface: surface.clone(),
