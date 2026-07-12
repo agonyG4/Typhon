@@ -8,12 +8,6 @@ impl CompositorState {
         SurfaceCommitSequence(self.next_surface_commit_sequence)
     }
 
-    pub(in crate::compositor) fn allocate_surface_commit_id(&mut self) -> SurfaceCommitId {
-        self.surface_commit_ids
-            .allocate()
-            .expect("surface commit identity space exhausted")
-    }
-
     pub(in crate::compositor) fn record_surface_commit_received(
         &mut self,
         surface_id: u32,

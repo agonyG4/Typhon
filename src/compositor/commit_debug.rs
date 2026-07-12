@@ -19,18 +19,6 @@ impl SurfaceCommitId {
     }
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct SurfaceCommitIdAllocator {
-    next: u64,
-}
-
-impl SurfaceCommitIdAllocator {
-    pub(crate) fn allocate(&mut self) -> Option<SurfaceCommitId> {
-        self.next = self.next.checked_add(1)?;
-        Some(SurfaceCommitId(NonZeroU64::new(self.next)?))
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SurfaceCommitDisposition {
     Published,
@@ -500,11 +488,10 @@ mod tests {
 
     #[test]
     fn surface_commits_receive_unique_ids() {
-        let mut allocator = SurfaceCommitIdAllocator::default();
-        let first = allocator.allocate().unwrap();
-        let second = allocator.allocate().unwrap();
+        let first = SurfaceCommitId::from_sequence(super::super::SurfaceCommitSequence(11));
+        let second = SurfaceCommitId::from_sequence(super::super::SurfaceCommitSequence(13));
         assert_ne!(first, second);
-        assert_eq!(second.get(), first.get() + 1);
+        assert!(second.get() > first.get());
     }
 
     #[test]
@@ -519,7 +506,7 @@ mod tests {
     #[test]
     fn commit_id_survives_ready_visual_and_publication_transitions() {
         let mut state = super::super::CompositorState::default();
-        let id = state.allocate_surface_commit_id();
+        let id = SurfaceCommitId::from_sequence(super::super::SurfaceCommitSequence(11));
         state.note_explicit_commit_captured(id, 7, 11, Some(19), &[]);
         state.note_explicit_commit_ready(id);
         state.note_explicit_commit_visual_generation(id, 23);
@@ -549,10 +536,10 @@ mod tests {
     #[test]
     fn surface_destruction_retires_live_commit_id_without_reuse() {
         let mut state = super::super::CompositorState::default();
-        let id = state.allocate_surface_commit_id();
+        let id = SurfaceCommitId::from_sequence(super::super::SurfaceCommitSequence(11));
         state.note_explicit_commit_captured(id, 7, 11, None, &[]);
         state.note_explicit_commit_destroyed(id, "surface_destroyed");
-        let next = state.allocate_surface_commit_id();
+        let next = SurfaceCommitId::from_sequence(super::super::SurfaceCommitSequence(13));
         assert!(next.get() > id.get());
         assert!(!state.commit_debug.live.contains_key(&id));
     }

@@ -544,7 +544,6 @@ pub struct CompositorState {
     next_resize_interaction_id: u64,
     next_resize_configure_sequence: u64,
     next_surface_commit_sequence: u64,
-    surface_commit_ids: SurfaceCommitIdAllocator,
     commit_debug: CommitDebugState,
     resize_flow_metrics: ResizeFlowMetrics,
     xdg_configure_serials: HashMap<u32, XdgConfigureSerialState>,

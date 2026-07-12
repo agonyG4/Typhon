@@ -64,7 +64,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
             wl_surface::Request::Commit => {
                 let surface_id = data.surface_id();
                 let commit_sequence = state.allocate_surface_commit_sequence();
-                let commit_id = state.allocate_surface_commit_id();
+                let commit_id = SurfaceCommitId::from_sequence(commit_sequence);
                 let window_geometry = state.pending_surface_window_geometries.remove(&surface_id);
                 let explicit_sync = data.explicit_sync();
                 let offset = data.take_pending_offset();
