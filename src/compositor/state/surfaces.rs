@@ -29,19 +29,21 @@ impl CompositorState {
         &self,
         surface_id: u32,
         commit_sequence: SurfaceCommitSequence,
+        context: SurfacePublicationContext,
     ) -> SurfacePublicationDecision {
         let Some(state) = self.surface_publications.get(&surface_id) else {
             return SurfacePublicationDecision::Publish;
         };
         if state
             .latest_published
-            .is_some_and(|published| commit_sequence < published)
+            .is_some_and(|published| commit_sequence <= published)
         {
             return SurfacePublicationDecision::StaleAlreadyPublished;
         }
-        if state
-            .latest_attachment_received
-            .is_some_and(|attachment| commit_sequence < attachment)
+        if context == SurfacePublicationContext::ImmediateLatestAttachment
+            && state
+                .latest_attachment_received
+                .is_some_and(|attachment| commit_sequence < attachment)
         {
             return SurfacePublicationDecision::SupersededByNewerAttachment;
         }
@@ -1201,5 +1203,55 @@ fn focus_debug_log(message: impl FnOnce() -> String) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ENABLED.get_or_init(|| std::env::var_os("OBLIVION_ONE_FOCUS_DEBUG").is_some()) {
         eprintln!("oblivion-one focus: {}", message());
+    }
+}
+
+#[cfg(test)]
+mod ordered_publication_tests {
+    use super::*;
+
+    #[test]
+    fn ordered_ready_commit_ignores_newer_received_attachment() {
+        let mut state = CompositorState::default();
+        state.record_surface_commit_received(7, SurfaceCommitSequence(10), true);
+        state.record_surface_commit_received(7, SurfaceCommitSequence(11), true);
+
+        assert_eq!(
+            state.surface_publication_decision(
+                7,
+                SurfaceCommitSequence(10),
+                SurfacePublicationContext::OrderedExplicitSyncQueue,
+            ),
+            SurfacePublicationDecision::Publish
+        );
+        assert_eq!(
+            state.surface_publication_decision(
+                7,
+                SurfaceCommitSequence(10),
+                SurfacePublicationContext::ImmediateLatestAttachment,
+            ),
+            SurfacePublicationDecision::SupersededByNewerAttachment
+        );
+    }
+
+    #[test]
+    fn ordered_queue_rejects_already_published_sequence() {
+        let mut state = CompositorState::default();
+        state.surface_publications.insert(
+            7,
+            SurfacePublicationState {
+                latest_published: Some(SurfaceCommitSequence(11)),
+                ..SurfacePublicationState::default()
+            },
+        );
+
+        assert_eq!(
+            state.surface_publication_decision(
+                7,
+                SurfaceCommitSequence(11),
+                SurfacePublicationContext::OrderedExplicitSyncQueue,
+            ),
+            SurfacePublicationDecision::StaleAlreadyPublished
+        );
     }
 }

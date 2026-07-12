@@ -265,6 +265,7 @@ pub struct SubsurfaceTransactionMetrics {
     pub waiting_transactions_published: u64,
     pub maximum_ready_slots_per_root: usize,
     pub maximum_waiting_slots_per_root: usize,
+    pub maximum_explicit_sync_queue_depth: usize,
     pub maximum_cached_nodes: usize,
     pub maximum_tree_depth: usize,
     pub maximum_transaction_wait_ms: u64,
@@ -345,6 +346,12 @@ enum SurfacePublicationDecision {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfacePublicationContext {
+    ImmediateLatestAttachment,
+    OrderedExplicitSyncQueue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 enum SurfacePublicationSource {
     Immediate,
@@ -360,6 +367,17 @@ impl SurfacePublicationSource {
             Self::ExplicitSync => "explicit_sync",
             Self::SurfaceTree => "surface_tree",
             Self::RemoveContent => "remove_content",
+        }
+    }
+
+    const fn publication_context(self) -> SurfacePublicationContext {
+        match self {
+            Self::ExplicitSync | Self::SurfaceTree => {
+                SurfacePublicationContext::OrderedExplicitSyncQueue
+            }
+            Self::Immediate | Self::RemoveContent => {
+                SurfacePublicationContext::ImmediateLatestAttachment
+            }
         }
     }
 }

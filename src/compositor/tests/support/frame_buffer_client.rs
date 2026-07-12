@@ -66,7 +66,82 @@ pub(in crate::compositor::tests) fn create_surface_with_unpresented_buffer_frame
     Ok(())
 }
 
-pub(in crate::compositor::tests) fn create_visible_surface_frame_callback_without_commit_and_present(
+pub(in crate::compositor::tests) fn exercise_uncommitted_frame_callback_ownership(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<(bool, bool), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+
+    let callback_surface = compositor.create_surface(&qh, ());
+    let _callback = callback_surface.frame(&qh, ());
+
+    let (render_surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 32, 32)?;
+    render_surface.commit();
+    connection.flush()?;
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PresentFrame)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let before_commit = state.frame_done;
+
+    callback_surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PresentFrame)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    Ok((before_commit, state.frame_done))
+}
+
+pub(in crate::compositor::tests) fn exercise_committed_frame_callback_order(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<(Vec<u32>, Vec<u32>), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 32, 32)?;
+
+    let a = surface.frame(&qh, ());
+    let b = surface.frame(&qh, ());
+    let expected_a = a.id().protocol_id();
+    let expected_b = b.id().protocol_id();
+    surface.commit();
+    connection.flush()?;
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+
+    let c = surface.frame(&qh, ());
+    let expected_c = c.id().protocol_id();
+    surface.damage_buffer(0, 0, 1, 1);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PresentFrame)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    Ok((
+        vec![expected_a, expected_b, expected_c],
+        state.frame_done_callbacks,
+    ))
+}
+
+pub(in crate::compositor::tests) fn create_visible_surface_frame_callback_commit_and_present(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
@@ -93,6 +168,7 @@ pub(in crate::compositor::tests) fn create_visible_surface_frame_callback_withou
     queue.roundtrip(&mut state)?;
 
     let _callback = surface.frame(&qh, ());
+    surface.commit();
     connection.flush()?;
     queue.roundtrip(&mut state)?;
     assert!(!state.frame_done);

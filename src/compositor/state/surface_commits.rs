@@ -594,6 +594,13 @@ impl CompositorState {
                         acquire,
                         acquire_state: PendingAcquireState::Ready,
                     });
+                debug_assert!(
+                    self.pending_explicit_sync_commits
+                        .iter()
+                        .filter(|commit| commit.surface_id == surface_id)
+                        .count()
+                        <= 3
+                );
                 self.commit_ready_explicit_sync_buffers();
                 return;
             }
@@ -660,6 +667,13 @@ impl CompositorState {
                 acquire: acquire.clone(),
                 acquire_state: PendingAcquireState::RegistrationPending,
             });
+        debug_assert!(
+            self.pending_explicit_sync_commits
+                .iter()
+                .filter(|commit| commit.surface_id == surface_id)
+                .count()
+                <= 3
+        );
         self.note_explicit_commit_acquire_wait(surface_commit_id, callback_count);
         self.resize_flow_metrics.commits_delayed_by_explicit_sync = self
             .resize_flow_metrics
@@ -704,7 +718,6 @@ impl CompositorState {
     pub(in crate::compositor) fn commit_surface_without_buffer(
         &mut self,
         surface_id: u32,
-        data: &SurfaceData,
         state: BufferlessSurfaceCommitState,
     ) {
         let BufferlessSurfaceCommitState {
@@ -737,15 +750,6 @@ impl CompositorState {
                     surface_size,
                     buffer_scale,
                 );
-            }
-            let callbacks = data.take_frame_callbacks();
-            if self
-                .client_cursor_render_state()
-                .is_some_and(|cursor| cursor.surface.surface_id == surface_id)
-            {
-                self.pending_frame_callbacks.extend(callbacks);
-            } else {
-                self.complete_frame_callbacks(callbacks);
             }
             return;
         }
@@ -805,7 +809,6 @@ impl CompositorState {
         if let Some(resize_commit) = resize_commit {
             self.complete_pending_resize_from_current_geometry(surface_id, resize_commit);
         }
-        self.complete_frame_callbacks_now(data);
     }
 
     pub(in crate::compositor) fn complete_pending_resize_from_current_geometry(
@@ -875,7 +878,11 @@ impl CompositorState {
         frame_callbacks: Vec<wl_callback::WlCallback>,
         source: SurfacePublicationSource,
     ) {
-        let decision = self.surface_publication_decision(surface_id, commit_sequence);
+        let decision = self.surface_publication_decision(
+            surface_id,
+            commit_sequence,
+            source.publication_context(),
+        );
         if decision != SurfacePublicationDecision::Publish {
             self.record_surface_publication_rejection(
                 surface_id,
@@ -1289,7 +1296,11 @@ impl CompositorState {
             | SurfaceRole::Subsurface { .. } => {
                 let commit_sequence = pending.commit_sequence;
                 let buffer_id = pending.data.buffer_id();
-                match self.surface_publication_decision(surface_id, commit_sequence) {
+                match self.surface_publication_decision(
+                    surface_id,
+                    commit_sequence,
+                    source.publication_context(),
+                ) {
                     SurfacePublicationDecision::Publish => {
                         self.commit_surface_buffer(
                             surface_id,
@@ -1388,7 +1399,6 @@ impl CompositorState {
     pub(in crate::compositor) fn commit_cursor_surface_removal_request(
         &mut self,
         surface_id: u32,
-        data: &SurfaceData,
         explicit_sync: Option<Arc<SyncobjSurfaceState>>,
     ) {
         if let Some(sync_state) = explicit_sync {
@@ -1401,9 +1411,6 @@ impl CompositorState {
                 return;
             }
         }
-        let was_visible = self
-            .client_cursor_render_state()
-            .is_some_and(|cursor| cursor.surface.surface_id == surface_id);
         let removed = self.client_cursor_surfaces.remove(&surface_id).is_some();
         self.current_surface_buffers.remove(&surface_id);
         if let Some(release) = self.active_dmabuf_buffers.remove(&surface_id) {
@@ -1415,12 +1422,6 @@ impl CompositorState {
                 "cursor surface buffer removed surface={}",
                 surface_id
             ));
-        }
-        let callbacks = data.take_frame_callbacks();
-        if was_visible && removed {
-            self.pending_frame_callbacks.extend(callbacks);
-        } else {
-            self.complete_frame_callbacks(callbacks);
         }
     }
 

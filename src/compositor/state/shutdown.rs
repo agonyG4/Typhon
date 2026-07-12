@@ -88,16 +88,16 @@ pub(in crate::compositor) fn remove_surface_tree_dependency(
     Some(transaction.dependencies.remove(index))
 }
 
-pub(in crate::compositor) fn oldest_ready_explicit_sync_commit_indices(
+pub(in crate::compositor) fn ready_explicit_sync_prefix_end_indices(
     commits: impl IntoIterator<Item = (usize, u32, bool)>,
 ) -> HashMap<u32, usize> {
-    let mut oldest_ready = HashMap::new();
+    let mut prefix_end = HashMap::new();
     for (index, surface_id, ready) in commits {
         if ready {
-            oldest_ready.entry(surface_id).or_insert(index);
+            prefix_end.insert(surface_id, index);
         }
     }
-    oldest_ready
+    prefix_end
 }
 
 pub(in crate::compositor) fn explicit_sync_overflow_unready_index(
@@ -140,16 +140,36 @@ mod explicit_sync_commit_accounting_tests {
 
     #[test]
     fn ready_commits_publish_in_sequence() {
-        let oldest = oldest_ready_explicit_sync_commit_indices([(0, 7, true), (1, 7, true)]);
-        assert_eq!(oldest.get(&7), Some(&0));
-        let next = oldest_ready_explicit_sync_commit_indices([(1, 7, true)]);
-        assert_eq!(next.get(&7), Some(&1));
+        let prefix = ready_explicit_sync_prefix_end_indices([
+            (0, 7, true),
+            (1, 7, true),
+            (2, 7, true),
+            (3, 7, false),
+        ]);
+        assert_eq!(prefix.get(&7), Some(&2));
+    }
+
+    #[test]
+    fn ready_prefix_end_covers_ready_and_unready_combinations() {
+        assert_eq!(
+            ready_explicit_sync_prefix_end_indices([(0, 7, true), (1, 7, false)]).get(&7),
+            Some(&0)
+        );
+        assert_eq!(
+            ready_explicit_sync_prefix_end_indices([(0, 7, false), (1, 7, true)]).get(&7),
+            Some(&1)
+        );
+        assert_eq!(
+            ready_explicit_sync_prefix_end_indices([(0, 7, true), (1, 7, true), (2, 7, false),])
+                .get(&7),
+            Some(&1)
+        );
     }
 
     #[test]
     fn unready_explicit_sync_commit_can_be_superseded_by_newer_state() {
-        let oldest = oldest_ready_explicit_sync_commit_indices([(0, 7, false), (1, 7, true)]);
-        assert_eq!(oldest.get(&7), Some(&1));
+        let prefix = ready_explicit_sync_prefix_end_indices([(0, 7, false), (1, 7, true)]);
+        assert_eq!(prefix.get(&7), Some(&1));
 
         let mut metrics = ExplicitSyncCommitMetrics::default();
         let disposition = metrics.note_superseded(PendingAcquireState::RegistrationPending);

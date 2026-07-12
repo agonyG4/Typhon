@@ -331,12 +331,6 @@ impl SurfaceData {
             .unwrap_or_default()
     }
 
-    pub(super) fn has_frame_callbacks(&self) -> bool {
-        self.frame_callbacks
-            .lock()
-            .is_ok_and(|callbacks| !callbacks.is_empty())
-    }
-
     pub(super) fn attach_explicit_sync(&self, state: Arc<SyncobjSurfaceState>) -> bool {
         let Ok(mut explicit_sync) = self.explicit_sync.lock() else {
             return false;

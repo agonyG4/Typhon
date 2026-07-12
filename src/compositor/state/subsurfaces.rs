@@ -421,6 +421,11 @@ impl CompositorState {
             .subsurface_transaction_metrics
             .maximum_waiting_slots_per_root
             .max(waiting);
+        self.subsurface_transaction_metrics
+            .maximum_explicit_sync_queue_depth = self
+            .subsurface_transaction_metrics
+            .maximum_explicit_sync_queue_depth
+            .max(ready.saturating_add(waiting));
     }
 
     pub(in crate::compositor) fn prepare_surface_tree_surface_state(
@@ -558,6 +563,10 @@ impl CompositorState {
             matching.len() >= 3 && matching.iter().all(|transaction| transaction.is_ready())
         };
         if at_capacity_with_only_ready {
+            self.subsurface_transaction_metrics.all_ready_queue_pressure = self
+                .subsurface_transaction_metrics
+                .all_ready_queue_pressure
+                .saturating_add(1);
             self.commit_ready_surface_tree_transactions();
         }
         let matching = self
@@ -641,6 +650,13 @@ impl CompositorState {
                 dependencies,
                 received_at: Instant::now(),
             });
+        debug_assert!(
+            self.pending_surface_tree_transactions
+                .iter()
+                .filter(|transaction| transaction.root_surface_id == root_surface_id)
+                .count()
+                <= 3
+        );
         self.update_surface_tree_slot_metrics(root_surface_id);
         let pending_acquires = self.pending_explicit_sync_commits.len().saturating_add(
             self.pending_surface_tree_transactions
@@ -663,7 +679,11 @@ impl CompositorState {
             if commit.attachment.is_none() {
                 return None;
             }
-            let decision = self.surface_publication_decision(*surface_id, commit.commit_sequence);
+            let decision = self.surface_publication_decision(
+                *surface_id,
+                commit.commit_sequence,
+                SurfacePublicationContext::OrderedExplicitSyncQueue,
+            );
             (decision != SurfacePublicationDecision::Publish).then_some((
                 *surface_id,
                 commit.commit_sequence,
@@ -1048,14 +1068,14 @@ impl CompositorState {
                     return;
                 }
                 if self.is_cursor_surface(surface_id) {
-                    self.commit_cursor_surface_removal_request(surface_id, data, None);
+                    self.commit_cursor_surface_removal_request(surface_id, None);
                     self.complete_frame_callbacks(frame_callbacks);
                 } else {
                     self.commit_surface_remove_content(
                         surface_id,
                         commit_sequence,
                         frame_callbacks,
-                        SurfacePublicationSource::RemoveContent,
+                        SurfacePublicationSource::SurfaceTree,
                     );
                 }
             }
@@ -1075,7 +1095,6 @@ impl CompositorState {
                 };
                 self.commit_surface_without_buffer(
                     surface_id,
-                    data,
                     BufferlessSurfaceCommitState {
                         commit_sequence,
                         damage,

@@ -499,11 +499,7 @@ impl super::CompositorState {
             self.subsurface_transaction_metrics
                 .explicit_sync_queue_overflow,
             self.subsurface_transaction_metrics
-                .maximum_ready_slots_per_root
-                .saturating_add(
-                    self.subsurface_transaction_metrics
-                        .maximum_waiting_slots_per_root
-                ),
+                .maximum_explicit_sync_queue_depth,
             self.subsurface_transaction_metrics.all_ready_queue_pressure,
             m.unready_commits_superseded,
             self.commit_debug.live.len(),

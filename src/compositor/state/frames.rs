@@ -1,11 +1,6 @@
 use super::*;
 
 impl CompositorState {
-    pub(in crate::compositor) fn complete_frame_callbacks_now(&mut self, data: &SurfaceData) {
-        let callbacks = data.take_frame_callbacks();
-        self.complete_frame_callbacks(callbacks);
-    }
-
     pub(in crate::compositor) fn complete_pending_frame_callbacks(&mut self) {
         let callbacks = if self.submitted_frame_callback_batch {
             self.submitted_frame_callback_batch = false;
@@ -19,12 +14,6 @@ impl CompositorState {
     pub(in crate::compositor) fn capture_frame_callbacks_for_render(&mut self) {
         self.prepared_frame_callbacks
             .append(&mut self.pending_frame_callbacks);
-        for surface in self.surface_resources.values() {
-            if let Some(data) = surface.data::<SurfaceData>() {
-                self.prepared_frame_callbacks
-                    .extend(data.take_frame_callbacks());
-            }
-        }
         self.prepared_presentation_feedbacks
             .append(&mut self.pending_presentation_feedbacks);
     }
@@ -57,30 +46,10 @@ impl CompositorState {
                 .iter()
                 .flat_map(|transaction| &transaction.nodes)
                 .any(|(_, commit)| !commit.frame_callbacks.is_empty())
-            || self
-                .surface_resources
-                .values()
-                .filter_map(Resource::data::<SurfaceData>)
-                .any(SurfaceData::has_frame_callbacks)
     }
 
     pub(in crate::compositor) fn has_only_pending_surface_frame_callbacks(&self) -> bool {
-        !self.pending_resize_configure_is_flushable()
-            && self.pending_frame_callbacks.is_empty()
-            && self.prepared_frame_callbacks.is_empty()
-            && self.submitted_frame_callbacks.is_empty()
-            && !self.submitted_frame_callback_batch
-            && self.pending_explicit_sync_commits.is_empty()
-            && self.pending_surface_tree_transactions.is_empty()
-            && self.pending_presentation_feedbacks.is_empty()
-            && self.prepared_presentation_feedbacks.is_empty()
-            && self.submitted_presentation_feedbacks.is_empty()
-            && !self.submitted_presentation_feedback_batch
-            && self
-                .surface_resources
-                .values()
-                .filter_map(Resource::data::<SurfaceData>)
-                .any(SurfaceData::has_frame_callbacks)
+        false
     }
 
     pub(in crate::compositor) fn has_pending_frame_prepare_work(&self) -> bool {
@@ -589,38 +558,53 @@ impl CompositorState {
         for commit_id in newly_ready {
             self.note_explicit_commit_ready(commit_id);
         }
-        let oldest_ready = oldest_ready_explicit_sync_commit_indices(
-            commits.iter().enumerate().map(|(index, commit)| {
+        let prefix_end = ready_explicit_sync_prefix_end_indices(commits.iter().enumerate().map(
+            |(index, commit)| {
                 (
                     index,
                     commit.surface_id,
                     commit.acquire_state == PendingAcquireState::Ready,
                 )
-            }),
-        );
-        let replacements = oldest_ready
+            },
+        ));
+        let replacements = commits
             .iter()
-            .map(|(surface, index)| (*surface, commits[*index].surface_commit_id))
+            .enumerate()
+            .filter_map(|(index, commit)| {
+                let end = *prefix_end.get(&commit.surface_id)?;
+                (index <= end && commit.acquire_state != PendingAcquireState::Ready).then(|| {
+                    let replacement = commits[index + 1..=end]
+                        .iter()
+                        .find(|candidate| {
+                            candidate.surface_id == commit.surface_id
+                                && candidate.acquire_state == PendingAcquireState::Ready
+                        })
+                        .expect("ready prefix end guarantees an ordered ready successor")
+                        .surface_commit_id;
+                    (index, replacement)
+                })
+            })
             .collect::<HashMap<_, _>>();
-
         let mut waiting = Vec::new();
         let mut ready = Vec::new();
-        let mut superseded_callbacks: HashMap<u32, Vec<wl_callback::WlCallback>> = HashMap::new();
+        let mut carried_callbacks: HashMap<u32, Vec<wl_callback::WlCallback>> = HashMap::new();
         let mut released_captures = Vec::new();
         for (index, commit) in commits.into_iter().enumerate() {
-            let Some(&ready_index) = oldest_ready.get(&commit.surface_id) else {
+            let Some(&end_index) = prefix_end.get(&commit.surface_id) else {
                 waiting.push(commit);
                 continue;
             };
-            if index < ready_index {
+            if index > end_index {
+                waiting.push(commit);
+            } else if commit.acquire_state != PendingAcquireState::Ready {
                 self.note_explicit_commit_superseded(
                     commit.surface_commit_id,
                     commit.acquire_state,
                     commit.frame_callbacks.len(),
-                    replacements[&commit.surface_id],
+                    replacements[&index],
                     "unready_head_superseded",
                 );
-                superseded_callbacks
+                carried_callbacks
                     .entry(commit.surface_id)
                     .or_default()
                     .extend(commit.frame_callbacks);
@@ -634,10 +618,14 @@ impl CompositorState {
                             reason: AcquireWatchCancelReason::Superseded,
                         });
                 }
-            } else if index == ready_index {
-                ready.push(commit);
             } else {
-                waiting.push(commit);
+                let mut commit = commit;
+                let mut callbacks = carried_callbacks
+                    .remove(&commit.surface_id)
+                    .unwrap_or_default();
+                callbacks.append(&mut commit.frame_callbacks);
+                commit.frame_callbacks = callbacks;
+                ready.push(commit);
             }
         }
         self.pending_explicit_sync_commits = waiting;
@@ -645,8 +633,11 @@ impl CompositorState {
             self.release_resize_capture(surface_id, commit_sequence);
         }
         for mut commit in ready {
-            let decision =
-                self.surface_publication_decision(commit.surface_id, commit.commit_sequence);
+            let decision = self.surface_publication_decision(
+                commit.surface_id,
+                commit.commit_sequence,
+                SurfacePublicationContext::OrderedExplicitSyncQueue,
+            );
             if decision != SurfacePublicationDecision::Publish {
                 self.record_surface_publication_rejection(
                     commit.surface_id,
@@ -662,10 +653,7 @@ impl CompositorState {
                 self.complete_frame_callbacks(commit.frame_callbacks);
                 continue;
             }
-            let mut callbacks = superseded_callbacks
-                .remove(&commit.surface_id)
-                .unwrap_or_default();
-            callbacks.extend(commit.frame_callbacks);
+            let callbacks = commit.frame_callbacks;
             if commit.pending.resize_commit.is_none() {
                 commit.pending.resize_commit = self
                     .capture_acked_resize_for_surface_commit(commit.surface_id)
@@ -706,17 +694,28 @@ impl CompositorState {
         for commit_id in newly_ready {
             self.note_explicit_commit_ready(commit_id);
         }
-        let oldest_ready =
-            oldest_ready_explicit_sync_commit_indices(transactions.iter().enumerate().map(
+        let prefix_end =
+            ready_explicit_sync_prefix_end_indices(transactions.iter().enumerate().map(
                 |(index, transaction)| (index, transaction.root_surface_id, transaction.is_ready()),
             ));
-        let replacements = oldest_ready
+        let replacements = transactions
             .iter()
-            .filter_map(|(root, index)| {
-                transactions[*index]
-                    .nodes
-                    .first()
-                    .map(|(_, commit)| (*root, commit.commit_id))
+            .enumerate()
+            .filter_map(|(index, transaction)| {
+                let end = *prefix_end.get(&transaction.root_surface_id)?;
+                (index <= end && !transaction.is_ready()).then(|| {
+                    let replacement = transactions[index + 1..=end]
+                        .iter()
+                        .find(|candidate| {
+                            candidate.root_surface_id == transaction.root_surface_id
+                                && candidate.is_ready()
+                        })
+                        .and_then(|candidate| candidate.nodes.first())
+                        .expect("ready tree prefix guarantees an ordered ready successor")
+                        .1
+                        .commit_id;
+                    (index, replacement)
+                })
             })
             .collect::<HashMap<_, _>>();
         let mut waiting = Vec::new();
@@ -724,18 +723,20 @@ impl CompositorState {
         let mut superseded_callbacks: HashMap<u32, Vec<wl_callback::WlCallback>> = HashMap::new();
         let mut superseded_resize_commits: HashMap<u32, ResizeCommitSnapshot> = HashMap::new();
         for (index, transaction) in transactions.into_iter().enumerate() {
-            let Some(&ready_index) = oldest_ready.get(&transaction.root_surface_id) else {
+            let Some(&end_index) = prefix_end.get(&transaction.root_surface_id) else {
                 waiting.push(transaction);
                 continue;
             };
-            if index < ready_index {
+            if index > end_index {
+                waiting.push(transaction);
+            } else if !transaction.is_ready() {
                 let root_id = transaction.root_surface_id;
                 let acquire_state = if transaction.is_ready() {
                     PendingAcquireState::Ready
                 } else {
                     PendingAcquireState::RegistrationPending
                 };
-                let replacement = replacements[&root_id];
+                let replacement = replacements[&index];
                 for (_, commit) in &transaction.nodes {
                     if commit.attachment.is_some() {
                         self.note_explicit_commit_superseded(
@@ -765,30 +766,29 @@ impl CompositorState {
                     .subsurface_transaction_metrics
                     .tree_transactions_superseded
                     .saturating_add(1);
-            } else if index == ready_index {
-                ready.push(transaction);
             } else {
-                waiting.push(transaction);
+                let mut transaction = transaction;
+                if let Some((_, root)) = transaction.nodes.first_mut() {
+                    let mut callbacks = superseded_callbacks
+                        .remove(&transaction.root_surface_id)
+                        .unwrap_or_default();
+                    callbacks.append(&mut root.frame_callbacks);
+                    root.frame_callbacks = callbacks;
+                }
+                if let Some(resize_commit) =
+                    superseded_resize_commits.remove(&transaction.root_surface_id)
+                {
+                    self.install_tree_resize_commit(
+                        transaction.root_surface_id,
+                        &mut transaction.nodes,
+                        resize_commit,
+                    );
+                }
+                ready.push(transaction);
             }
         }
         self.pending_surface_tree_transactions = waiting;
-        for mut transaction in ready {
-            if let Some((_, root)) = transaction.nodes.first_mut() {
-                root.frame_callbacks.extend(
-                    superseded_callbacks
-                        .remove(&transaction.root_surface_id)
-                        .unwrap_or_default(),
-                );
-            }
-            if let Some(resize_commit) =
-                superseded_resize_commits.remove(&transaction.root_surface_id)
-            {
-                self.install_tree_resize_commit(
-                    transaction.root_surface_id,
-                    &mut transaction.nodes,
-                    resize_commit,
-                );
-            }
+        for transaction in ready {
             let wait_ms =
                 u64::try_from(transaction.received_at.elapsed().as_millis()).unwrap_or(u64::MAX);
             self.subsurface_transaction_metrics

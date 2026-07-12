@@ -67,7 +67,36 @@ fn finish_frame_completes_frame_callbacks_after_prepare_frame_only_flushes() {
 }
 
 #[test]
-fn visible_frame_callback_without_damage_is_protocol_only_frame_work() {
+fn frame_callback_request_without_commit_is_not_captured_by_unrelated_render() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (before_commit, after_commit) =
+        exercise_uncommitted_frame_callback_ownership(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(!before_commit);
+    assert!(after_commit);
+}
+
+#[test]
+fn frame_callbacks_keep_request_order_within_and_across_commits() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (expected, completed) =
+        exercise_committed_frame_callback_order(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(completed, expected);
+}
+
+#[test]
+fn uncommitted_frame_callback_is_not_protocol_frame_work() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -80,18 +109,17 @@ fn visible_frame_callback_without_damage_is_protocol_only_frame_work() {
         );
     let _server = stop_controllable_test_server(commands, server_thread);
 
-    assert!(protocol_only.unwrap());
+    assert!(!protocol_only.unwrap());
 }
 
 #[test]
-fn present_frame_completes_frame_callback_requested_after_visible_commit() {
+fn present_frame_completes_frame_callback_after_its_followup_commit() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
-    let state =
-        create_visible_surface_frame_callback_without_commit_and_present(&socket_path, &commands);
+    let state = create_visible_surface_frame_callback_commit_and_present(&socket_path, &commands);
     let _server = stop_controllable_test_server(commands, server_thread);
 
     assert!(state.unwrap().frame_done);

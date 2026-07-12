@@ -8,6 +8,7 @@ use super::{
 pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) frame_done: bool,
     pub(in crate::compositor::tests) frame_done_time: Option<u32>,
+    pub(in crate::compositor::tests) frame_done_callbacks: Vec<u32>,
     pub(in crate::compositor::tests) keyboard_key: bool,
     pub(in crate::compositor::tests) keyboard_key_serial: Option<u32>,
     pub(in crate::compositor::tests) keyboard_keys: Vec<u32>,
@@ -562,7 +563,7 @@ impl Dispatch<client_wl_data_source::WlDataSource, ()> for RegistryTestState {
 impl Dispatch<client_wl_callback::WlCallback, ()> for RegistryTestState {
     fn event(
         state: &mut Self,
-        _proxy: &client_wl_callback::WlCallback,
+        proxy: &client_wl_callback::WlCallback,
         event: client_wl_callback::Event,
         _data: &(),
         _conn: &Connection,
@@ -571,6 +572,7 @@ impl Dispatch<client_wl_callback::WlCallback, ()> for RegistryTestState {
         if let client_wl_callback::Event::Done { callback_data } = event {
             state.frame_done = true;
             state.frame_done_time = Some(callback_data);
+            state.frame_done_callbacks.push(proxy.id().protocol_id());
         }
     }
 }
