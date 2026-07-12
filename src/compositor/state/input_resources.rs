@@ -381,6 +381,94 @@ impl CompositorState {
         }
     }
 
+    pub(in crate::compositor) fn send_window_interaction_pointer_motion(
+        &mut self,
+        timestamp_usec: u64,
+        x: f64,
+        y: f64,
+    ) -> usize {
+        let Some((interaction_id, root_surface_id, pointer_motion_surface_id)) =
+            self.window_interaction.map(|interaction| {
+                (
+                    interaction.id,
+                    interaction.root_surface_id,
+                    interaction.pointer_motion_surface_id,
+                )
+            })
+        else {
+            return 0;
+        };
+        let Some(surface_id) = pointer_motion_surface_id else {
+            pointer_debug_log(format!(
+                "pointer.interaction_motion interaction={} target=none dispatched=0 relative_suppressed=true",
+                interaction_id.get(),
+            ));
+            return 0;
+        };
+        let Some(surface) = self.surface_resource_by_id(surface_id) else {
+            pointer_debug_log(format!(
+                "pointer.interaction_motion interaction={} target={} dispatched=0 reason=surface-missing relative_suppressed=true",
+                interaction_id.get(),
+                surface_id,
+            ));
+            return 0;
+        };
+        if !surface.is_alive()
+            || self.root_surface_id_for_surface(surface_id) != root_surface_id
+            || !self
+                .pointer_surface
+                .as_ref()
+                .is_some_and(|focused| same_surface_resource(focused, &surface))
+        {
+            pointer_debug_log(format!(
+                "pointer.interaction_motion interaction={} target={} dispatched=0 reason=target-not-focused-or-owned relative_suppressed=true",
+                interaction_id.get(),
+                surface_id,
+            ));
+            return 0;
+        }
+        let Some(target) = self.pointer_target_for_grabbed_surface_at_output(&surface, x, y) else {
+            pointer_debug_log(format!(
+                "pointer.interaction_motion interaction={} target={} dispatched=0 reason=surface-not-renderable relative_suppressed=true",
+                interaction_id.get(),
+                surface_id,
+            ));
+            return 0;
+        };
+
+        self.last_pointer_motion_usec = Some(timestamp_usec);
+        let time = wayland_event_time();
+        self.pointer_resources.retain(Resource::is_alive);
+        let pointers = self
+            .pointer_resources
+            .iter()
+            .filter(|pointer| {
+                resource_belongs_to_surface_client(*pointer, &target.surface)
+                    && self.pointer_resource_entered_surface(pointer, &target.surface)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let dispatched = pointers.len();
+        for pointer in pointers {
+            let _ = pointer.send_event(wl_pointer::Event::Motion {
+                time,
+                surface_x: target.surface_x,
+                surface_y: target.surface_y,
+            });
+            send_pointer_frame_if_supported(&pointer);
+        }
+        pointer_debug_log(format!(
+            "pointer.interaction_motion interaction={} root={} target={} output=({x},{y}) local=({},{}) dispatched={} relative_suppressed=true",
+            interaction_id.get(),
+            root_surface_id,
+            surface_id,
+            target.surface_x,
+            target.surface_y,
+            dispatched,
+        ));
+        dispatched
+    }
+
     pub(in crate::compositor) fn update_pointer_position(&mut self, x: f64, y: f64) {
         let changed = self.last_pointer_x != x || self.last_pointer_y != y;
         let moves_visible_cursor = changed

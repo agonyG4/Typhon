@@ -438,6 +438,19 @@ impl OwnCompositorServer {
         let _ = self.display.flush_clients();
     }
 
+    pub fn send_window_interaction_pointer_motion(
+        &mut self,
+        timestamp_usec: u64,
+        x: f64,
+        y: f64,
+    ) -> usize {
+        let dispatched = self
+            .state
+            .send_window_interaction_pointer_motion(timestamp_usec, x, y);
+        let _ = self.display.flush_clients();
+        dispatched
+    }
+
     pub fn send_pointer_button(&mut self, button: u32, pressed: bool) {
         self.state.send_pointer_button(button, pressed);
         let _ = self.display.flush_clients();

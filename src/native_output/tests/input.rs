@@ -1417,7 +1417,7 @@ fn native_input_window_interaction_motion_routes_through_compositor_owner() {
 }
 
 #[test]
-fn native_input_active_resize_updates_real_compositor_without_client_motion() {
+fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion() {
     let socket_name = format!("typhon-native-input-interaction-{}", std::process::id());
     let socket_path =
         PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(&socket_name);
@@ -1434,12 +1434,19 @@ fn native_input_active_resize_updates_real_compositor_without_client_motion() {
     assert!(server.cursor_visibility_requested());
     server.send_pointer_motion(92.0, 86.0);
     client_commands.send(ClientCommand::SetCursor).unwrap();
-    let pointer_motion_count = match pump_native_input_server_until(&mut server, &client_events) {
-        ClientEvent::CursorReady {
-            pointer_motion_count,
-        } => pointer_motion_count,
-        event => panic!("expected client cursor, got {event:?}"),
-    };
+    let (pointer_motion_count, pointer_enter_count, pointer_leave_count) =
+        match pump_native_input_server_until(&mut server, &client_events) {
+            ClientEvent::CursorReady {
+                pointer_motion_count,
+                pointer_enter_count,
+                pointer_leave_count,
+            } => (
+                pointer_motion_count,
+                pointer_enter_count,
+                pointer_leave_count,
+            ),
+            event => panic!("expected client cursor, got {event:?}"),
+        };
     pump_native_input_server_until_cursor(&mut server);
     let updates_before = server.resize_flow_metrics().resize_updates_applied;
     let raw_updates_before = server.resize_flow_metrics().raw_pointer_resize_updates;
@@ -1475,6 +1482,18 @@ fn native_input_active_resize_updates_real_compositor_without_client_motion() {
     assert!(application.redraw_requested);
     assert!(server.client_cursor_request_active());
     assert!(server.client_cursor_render_state().is_none());
+    client_commands.send(ClientCommand::CaptureActive).unwrap();
+    let active = pump_native_input_server_until(&mut server, &client_events);
+    assert_eq!(
+        active,
+        ClientEvent::Active {
+            pointer_motion_count: pointer_motion_count + 1,
+            pointer_surface_x: Some(60.0),
+            pointer_surface_y: Some(40.0),
+            pointer_enter_count,
+            pointer_leave_count,
+        }
+    );
     server.prepare_frame();
     assert_eq!(
         server.resize_flow_metrics().resize_updates_applied,
@@ -1554,21 +1573,43 @@ fn native_input_active_resize_updates_real_compositor_without_client_motion() {
     assert_eq!(
         finished,
         ClientEvent::Finished {
-            pointer_motion_count: pointer_motion_count + 1,
+            pointer_motion_count: pointer_motion_count + 2,
+            pointer_surface_x: Some(61.0),
+            pointer_surface_y: Some(42.0),
+            pointer_enter_count,
+            pointer_leave_count,
         }
     );
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 enum ClientEvent {
     ReadyForPointer,
-    CursorReady { pointer_motion_count: usize },
-    Finished { pointer_motion_count: usize },
+    Active {
+        pointer_motion_count: usize,
+        pointer_surface_x: Option<f64>,
+        pointer_surface_y: Option<f64>,
+        pointer_enter_count: usize,
+        pointer_leave_count: usize,
+    },
+    CursorReady {
+        pointer_motion_count: usize,
+        pointer_enter_count: usize,
+        pointer_leave_count: usize,
+    },
+    Finished {
+        pointer_motion_count: usize,
+        pointer_surface_x: Option<f64>,
+        pointer_surface_y: Option<f64>,
+        pointer_enter_count: usize,
+        pointer_leave_count: usize,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum ClientCommand {
     SetCursor,
+    CaptureActive,
     Finish,
 }
 
@@ -1576,6 +1617,10 @@ enum ClientCommand {
 struct NativeInputClientState {
     pointer_enter_serial: Option<u32>,
     pointer_motion_count: usize,
+    pointer_enter_count: usize,
+    pointer_leave_count: usize,
+    pointer_surface_x: Option<f64>,
+    pointer_surface_y: Option<f64>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for NativeInputClientState {
@@ -1625,9 +1670,19 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for NativeInputClientState {
     ) {
         match event {
             client_wl_pointer::Event::Enter { serial, .. } => {
-                state.pointer_enter_serial = Some(serial)
+                state.pointer_enter_serial = Some(serial);
+                state.pointer_enter_count += 1;
             }
-            client_wl_pointer::Event::Motion { .. } => state.pointer_motion_count += 1,
+            client_wl_pointer::Event::Leave { .. } => state.pointer_leave_count += 1,
+            client_wl_pointer::Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                state.pointer_motion_count += 1;
+                state.pointer_surface_x = Some(surface_x);
+                state.pointer_surface_y = Some(surface_y);
+            }
             _ => {}
         }
     }
@@ -1698,15 +1753,48 @@ fn spawn_native_input_resize_client(
         events_sender
             .send(ClientEvent::CursorReady {
                 pointer_motion_count: state.pointer_motion_count,
+                pointer_enter_count: state.pointer_enter_count,
+                pointer_leave_count: state.pointer_leave_count,
             })
             .unwrap();
-        assert_eq!(commands_receiver.recv().unwrap(), ClientCommand::Finish);
-        queue.roundtrip(&mut state).unwrap();
-        events_sender
-            .send(ClientEvent::Finished {
-                pointer_motion_count: state.pointer_motion_count,
-            })
-            .unwrap();
+        match commands_receiver.recv().unwrap() {
+            ClientCommand::CaptureActive => {
+                queue.roundtrip(&mut state).unwrap();
+                events_sender
+                    .send(ClientEvent::Active {
+                        pointer_motion_count: state.pointer_motion_count,
+                        pointer_surface_x: state.pointer_surface_x,
+                        pointer_surface_y: state.pointer_surface_y,
+                        pointer_enter_count: state.pointer_enter_count,
+                        pointer_leave_count: state.pointer_leave_count,
+                    })
+                    .unwrap();
+                assert_eq!(commands_receiver.recv().unwrap(), ClientCommand::Finish);
+                queue.roundtrip(&mut state).unwrap();
+                events_sender
+                    .send(ClientEvent::Finished {
+                        pointer_motion_count: state.pointer_motion_count,
+                        pointer_surface_x: state.pointer_surface_x,
+                        pointer_surface_y: state.pointer_surface_y,
+                        pointer_enter_count: state.pointer_enter_count,
+                        pointer_leave_count: state.pointer_leave_count,
+                    })
+                    .unwrap();
+            }
+            ClientCommand::Finish => {
+                queue.roundtrip(&mut state).unwrap();
+                events_sender
+                    .send(ClientEvent::Finished {
+                        pointer_motion_count: state.pointer_motion_count,
+                        pointer_surface_x: state.pointer_surface_x,
+                        pointer_surface_y: state.pointer_surface_y,
+                        pointer_enter_count: state.pointer_enter_count,
+                        pointer_leave_count: state.pointer_leave_count,
+                    })
+                    .unwrap();
+            }
+            ClientCommand::SetCursor => panic!("cursor was already set"),
+        }
     });
     (commands_sender, events_receiver)
 }
@@ -1807,14 +1895,14 @@ fn active_window_interaction_motion_updates_pointer_before_interaction() {
 }
 
 #[test]
-fn active_window_interaction_motion_route_skips_client_dispatch() {
+fn active_window_interaction_motion_updates_geometry_before_exact_client_dispatch() {
     let routing = include_str!("../input/routing.rs");
     let apply = routing
         .split_once("pub(crate) fn apply_native_input_effect")
         .expect("native input application routing")
         .1;
     let interaction_route = apply
-        .split_once("if let Some((x, y)) = effect.pointer_motion")
+        .split_once("if context.server.window_interaction_active()")
         .expect("active interaction route")
         .1
         .split_once("} else if effect.pointer_motion.is_some()")
@@ -1827,8 +1915,13 @@ fn active_window_interaction_motion_route_skips_client_dispatch() {
     let interaction_update = interaction_route
         .find("NativeWindowAction::UpdateInteraction")
         .expect("active route should update window interaction");
+    let client_dispatch = interaction_route
+        .find("send_window_interaction_pointer_motion")
+        .expect("active route should dispatch exact-target absolute motion");
     assert!(pointer_update < interaction_update);
+    assert!(interaction_update < client_dispatch);
     assert!(!interaction_route.contains("send_pointer_motion_sample"));
+    assert!(!interaction_route.contains("send_relative_pointer_motion"));
 }
 
 #[test]

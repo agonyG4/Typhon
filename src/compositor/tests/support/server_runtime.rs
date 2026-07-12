@@ -86,6 +86,12 @@ pub(in crate::compositor::tests) enum ServerCommand {
         y: f64,
         reply: Sender<bool>,
     },
+    SendWindowInteractionPointerMotion {
+        timestamp_usec: u64,
+        x: f64,
+        y: f64,
+        reply: Sender<usize>,
+    },
     EndInteraction,
     ResizeFocusedTo {
         width: u32,
@@ -211,6 +217,18 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::UpdateInteractionResult { x, y, reply } => {
                         let _ = reply.send(server.update_window_interaction(x, y));
+                    }
+                    ServerCommand::SendWindowInteractionPointerMotion {
+                        timestamp_usec,
+                        x,
+                        y,
+                        reply,
+                    } => {
+                        let _ = reply.send(server.send_window_interaction_pointer_motion(
+                            timestamp_usec,
+                            x,
+                            y,
+                        ));
                     }
                     ServerCommand::EndInteraction => {
                         server.end_window_interaction();

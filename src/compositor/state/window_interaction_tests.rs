@@ -153,6 +153,24 @@ fn server_decoration_construction_has_no_motion_target() {
 }
 
 #[test]
+fn window_interaction_without_target_dispatches_nothing() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Move,
+            None,
+        )),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        state.send_window_interaction_pointer_motion(42_000, 120.0, 130.0),
+        0
+    );
+    assert_eq!(state.last_pointer_motion_usec, None);
+}
+
+#[test]
 fn failed_begin_with_invalid_motion_target_does_not_capture_interaction() {
     let mut state = CompositorState::default();
 
