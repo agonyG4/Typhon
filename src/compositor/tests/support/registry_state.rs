@@ -303,7 +303,10 @@ pub(in crate::compositor::tests) struct CursorMotionStateSnapshot {
 pub(in crate::compositor::tests) struct CompositorOnlyCursorSynchronizationSnapshots {
     pub(in crate::compositor::tests) initial: CursorMotionStateSnapshot,
     pub(in crate::compositor::tests) compositor_only: CursorMotionStateSnapshot,
+    pub(in crate::compositor::tests) interaction: CursorMotionStateSnapshot,
     pub(in crate::compositor::tests) normal_motion: CursorMotionStateSnapshot,
+    pub(in crate::compositor::tests) interaction_update_applied: bool,
+    pub(in crate::compositor::tests) resize_visual_active: bool,
 }
 
 impl RegistryTestState {

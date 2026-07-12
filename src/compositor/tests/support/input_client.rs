@@ -918,7 +918,21 @@ pub(in crate::compositor::tests) fn create_client_cursor_then_synchronize_compos
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
 
-    _toplevel.resize(&seat, serial, client_xdg_toplevel::ResizeEdge::BottomRight);
+    commands.send(ServerCommand::PointerButton {
+        button: 0x110,
+        pressed: true,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let button_serial = state
+        .pointer_button_serial
+        .ok_or_else(|| io::Error::other("pointer button serial was not delivered"))?;
+
+    _toplevel.resize(
+        &seat,
+        button_serial,
+        client_xdg_toplevel::ResizeEdge::BottomRight,
+    );
     connection.flush()?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
@@ -931,9 +945,16 @@ pub(in crate::compositor::tests) fn create_client_cursor_then_synchronize_compos
     queue.roundtrip(&mut state)?;
     let compositor_only = capture_cursor_motion_state(&state, commands, visual_changed);
 
-    commands.send(ServerCommand::UpdateInteraction { x, y })?;
+    let (reply, receiver) = mpsc::channel();
+    commands.send(ServerCommand::UpdateInteractionResult { x, y, reply })?;
+    let interaction_update_applied = receiver.recv_timeout(Duration::from_secs(1))?;
+    wait_for_server_commands(commands);
+    commands.send(ServerCommand::PrepareFrame)?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
+    let interaction = capture_cursor_motion_state(&state, commands, false);
+    let resize_visual_active =
+        capture_toplevel_visual_geometry(commands).is_some_and(|visual| visual.active_resize);
 
     commands.send(ServerCommand::PointerMotion { x, y })?;
     wait_for_server_commands(commands);
@@ -943,7 +964,10 @@ pub(in crate::compositor::tests) fn create_client_cursor_then_synchronize_compos
     Ok(CompositorOnlyCursorSynchronizationSnapshots {
         initial,
         compositor_only,
+        interaction,
         normal_motion,
+        interaction_update_applied,
+        resize_visual_active,
     })
 }
 

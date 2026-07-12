@@ -605,10 +605,12 @@ fn compositor_only_interaction_motion_prevents_post_grab_cursor_teleport() {
         snapshots.compositor_only.pointer_focus_surface,
         snapshots.initial.pointer_focus_surface
     );
-    assert_eq!(normal_motion_cursor, compositor_only_cursor);
+    assert!(snapshots.interaction_update_applied);
+    assert!(snapshots.resize_visual_active);
+    assert_eq!(normal_motion_cursor, snapshots.interaction.cursor.unwrap());
     assert_eq!(
         snapshots.normal_motion.render_generation,
-        snapshots.compositor_only.render_generation
+        snapshots.interaction.render_generation
     );
 }
 
