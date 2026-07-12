@@ -1396,6 +1396,33 @@ fn native_input_window_interaction_motion_routes_through_compositor_owner() {
 }
 
 #[test]
+fn active_window_interaction_motion_updates_pointer_before_interaction() {
+    for (pointer_changed, interaction_changed, expected_changed) in [
+        (true, false, true),
+        (false, true, true),
+        (true, true, true),
+        (false, false, false),
+    ] {
+        let order = std::cell::RefCell::new(Vec::new());
+        let changed = apply_active_window_interaction_motion(
+            12.0,
+            34.0,
+            |_, _| {
+                order.borrow_mut().push("pointer");
+                pointer_changed
+            },
+            |_, _| {
+                order.borrow_mut().push("interaction");
+                interaction_changed
+            },
+        );
+
+        assert_eq!(changed, expected_changed);
+        assert_eq!(*order.borrow(), ["pointer", "interaction"]);
+    }
+}
+
+#[test]
 fn native_libinput_scroll_axis_value_skips_absent_axis_reader() {
     let value = libinput_scroll_axis_value(false, || panic!("axis value should not be read"));
 

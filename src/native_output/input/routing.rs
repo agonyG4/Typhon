@@ -809,6 +809,15 @@ pub(crate) fn read_linux_input_event(device: &mut NativeInputDevice) -> Option<L
     None
 }
 
+pub(crate) fn apply_active_window_interaction_motion(
+    x: f64,
+    y: f64,
+    update_pointer_position: impl FnOnce(f64, f64) -> bool,
+    update_interaction: impl FnOnce(f64, f64) -> bool,
+) -> bool {
+    update_pointer_position(x, y) | update_interaction(x, y)
+}
+
 pub(crate) fn apply_native_input_effect(
     mut effect: NativeInputEffect,
     context: NativeInputApplyContext<'_>,
