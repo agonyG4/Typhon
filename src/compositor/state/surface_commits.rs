@@ -18,6 +18,10 @@ impl CompositorState {
         }
 
         let generation = self.next_render_generation_value();
+        self.note_explicit_commit_visual_generation(
+            SurfaceCommitId::from_sequence(commit_sequence),
+            generation,
+        );
         self.apply_committed_window_geometry(surface_id, window_geometry);
         let resize_placement = match self.take_pending_resize_commit_placement(surface_id, &pending)
         {
@@ -478,6 +482,7 @@ impl CompositorState {
     pub(in crate::compositor) fn commit_surface_request_with_captured_sync(
         &mut self,
         surface_id: u32,
+        surface_commit_id: SurfaceCommitId,
         commit_sequence: SurfaceCommitSequence,
         source: SurfacePublicationSource,
         mut pending: PendingSurfaceBuffer,
@@ -557,6 +562,7 @@ impl CompositorState {
         pending.explicit_release = Some(release);
         let acquire_ready = acquire.is_signaled();
         if acquire_ready {
+            self.note_explicit_commit_ready(surface_commit_id);
             let mut callbacks =
                 self.supersede_older_pending_attachments_for_surface(surface_id, commit_sequence);
             callbacks.extend(self.cancel_pending_acquire_commits_for_surface(
@@ -583,7 +589,8 @@ impl CompositorState {
             );
             return;
         };
-        let mut callbacks = self.retain_oldest_pending_acquire_for_surface(surface_id);
+        let mut callbacks =
+            self.retain_oldest_pending_acquire_for_surface(surface_id, surface_commit_id);
         callbacks.extend(frame_callbacks);
         self.finalize_pending_buffer_resize_capture(surface_id, &mut pending, window_geometry);
         let buffer_id = pending.resource.id().protocol_id();
@@ -605,8 +612,10 @@ impl CompositorState {
                 ("buffer", buffer_id.to_string()),
             ],
         );
+        let callback_count = callbacks.len();
         self.pending_explicit_sync_commits
             .push(PendingExplicitSyncCommit {
+                surface_commit_id,
                 commit_id,
                 surface_id,
                 commit_sequence,
@@ -617,6 +626,7 @@ impl CompositorState {
                 acquire: acquire.clone(),
                 acquire_state: PendingAcquireState::RegistrationPending,
             });
+        self.note_explicit_commit_acquire_wait(surface_commit_id, callback_count);
         self.resize_flow_metrics.commits_delayed_by_explicit_sync = self
             .resize_flow_metrics
             .commits_delayed_by_explicit_sync

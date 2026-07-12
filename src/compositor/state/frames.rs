@@ -186,6 +186,7 @@ impl CompositorState {
         callbacks: Vec<wl_callback::WlCallback>,
     ) {
         let time = self.frame_callback_time_ms();
+        self.note_callbacks_completed(&callbacks);
         for callback in callbacks {
             client_pacing_log(
                 "frame_callback_sent",
@@ -210,6 +211,20 @@ impl CompositorState {
         let mut canceled_resize_captures = Vec::new();
         for commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
             if commit.surface_id == surface_id {
+                match reason {
+                    AcquireWatchCancelReason::Superseded => self.note_explicit_commit_destroyed(
+                        commit.surface_commit_id,
+                        "superseded_without_replacement_identity",
+                    ),
+                    AcquireWatchCancelReason::Rejected => self.note_explicit_commit_rejected(
+                        commit.surface_commit_id,
+                        "acquire_commit_rejected",
+                    ),
+                    _ => self.note_explicit_commit_destroyed(
+                        commit.surface_commit_id,
+                        "surface_or_sync_owner_destroyed",
+                    ),
+                }
                 canceled_callbacks.extend(commit.frame_callbacks);
                 if let Some(resize) = commit.pending.resize_commit.as_deref() {
                     canceled_resize_captures.push(resize.commit_sequence);
@@ -235,6 +250,7 @@ impl CompositorState {
     pub(in crate::compositor) fn retain_oldest_pending_acquire_for_surface(
         &mut self,
         surface_id: u32,
+        replacement: SurfaceCommitId,
     ) -> Vec<wl_callback::WlCallback> {
         let mut retained = Vec::with_capacity(self.pending_explicit_sync_commits.len());
         let mut kept_oldest = false;
@@ -246,6 +262,13 @@ impl CompositorState {
                 retained.push(commit);
                 continue;
             }
+            self.note_explicit_commit_superseded(
+                commit.surface_commit_id,
+                commit.acquire_state,
+                commit.frame_callbacks.len(),
+                replacement,
+                "bounded_pending_acquire_retention",
+            );
             superseded_callbacks.extend(commit.frame_callbacks);
             if let Some(resize) = commit.pending.resize_commit.as_deref() {
                 released_captures.push(resize.commit_sequence);
@@ -439,6 +462,18 @@ impl CompositorState {
         surface_id: u32,
         acquire: &ExplicitSyncPoint,
     ) -> bool {
+        let surface_commit_id = self
+            .pending_explicit_sync_commits
+            .iter()
+            .find(|commit| commit.commit_id == commit_id)
+            .map(|commit| commit.surface_commit_id);
+        let surface_commit_id = surface_commit_id.or_else(|| {
+            self.pending_surface_tree_transactions
+                .iter()
+                .flat_map(|transaction| &transaction.dependencies)
+                .find(|dependency| dependency.commit_id == commit_id)
+                .map(|dependency| dependency.surface_commit_id)
+        });
         let ready = if self
             .pending_explicit_sync_commits
             .iter_mut()
@@ -462,6 +497,9 @@ impl CompositorState {
                 .is_some_and(|dependency| dependency.state.mark_ready())
         };
         if ready {
+            if let Some(surface_commit_id) = surface_commit_id {
+                self.note_explicit_commit_ready(surface_commit_id);
+            }
             client_pacing_log(
                 "acquire_ready",
                 &[
@@ -483,10 +521,17 @@ impl CompositorState {
 
     pub(in crate::compositor) fn commit_ready_explicit_sync_buffers(&mut self) {
         let mut commits = std::mem::take(&mut self.pending_explicit_sync_commits);
+        let mut newly_ready = Vec::new();
         for commit in &mut commits {
-            if !self.external_acquire_readiness && commit.acquire.is_signaled() {
-                commit.acquire_state.mark_ready();
+            if !self.external_acquire_readiness
+                && commit.acquire.is_signaled()
+                && commit.acquire_state.mark_ready()
+            {
+                newly_ready.push(commit.surface_commit_id);
             }
+        }
+        for commit_id in newly_ready {
+            self.note_explicit_commit_ready(commit_id);
         }
         let newest_ready = newest_ready_explicit_sync_commit_indices(
             commits.iter().enumerate().map(|(index, commit)| {
@@ -497,6 +542,10 @@ impl CompositorState {
                 )
             }),
         );
+        let replacements = newest_ready
+            .iter()
+            .map(|(surface, index)| (*surface, commits[*index].surface_commit_id))
+            .collect::<HashMap<_, _>>();
 
         let mut waiting = Vec::new();
         let mut ready = Vec::new();
@@ -508,6 +557,13 @@ impl CompositorState {
                 continue;
             };
             if index < ready_index {
+                self.note_explicit_commit_superseded(
+                    commit.surface_commit_id,
+                    commit.acquire_state,
+                    commit.frame_callbacks.len(),
+                    replacements[&commit.surface_id],
+                    "newest_ready_selected",
+                );
                 superseded_callbacks
                     .entry(commit.surface_id)
                     .or_default()
@@ -581,19 +637,32 @@ impl CompositorState {
 
     pub(in crate::compositor) fn commit_ready_surface_tree_transactions(&mut self) {
         let mut transactions = std::mem::take(&mut self.pending_surface_tree_transactions);
+        let mut newly_ready = Vec::new();
         if !self.external_acquire_readiness {
             for transaction in &mut transactions {
                 for dependency in &mut transaction.dependencies {
-                    if dependency.acquire.is_signaled() {
-                        dependency.state.mark_ready();
+                    if dependency.acquire.is_signaled() && dependency.state.mark_ready() {
+                        newly_ready.push(dependency.surface_commit_id);
                     }
                 }
             }
+        }
+        for commit_id in newly_ready {
+            self.note_explicit_commit_ready(commit_id);
         }
         let newest_ready =
             newest_ready_explicit_sync_commit_indices(transactions.iter().enumerate().map(
                 |(index, transaction)| (index, transaction.root_surface_id, transaction.is_ready()),
             ));
+        let replacements = newest_ready
+            .iter()
+            .filter_map(|(root, index)| {
+                transactions[*index]
+                    .nodes
+                    .first()
+                    .map(|(_, commit)| (*root, commit.commit_id))
+            })
+            .collect::<HashMap<_, _>>();
         let mut waiting = Vec::new();
         let mut ready = Vec::new();
         let mut superseded_callbacks: HashMap<u32, Vec<wl_callback::WlCallback>> = HashMap::new();
@@ -605,6 +674,23 @@ impl CompositorState {
             };
             if index < ready_index {
                 let root_id = transaction.root_surface_id;
+                let acquire_state = if transaction.is_ready() {
+                    PendingAcquireState::Ready
+                } else {
+                    PendingAcquireState::RegistrationPending
+                };
+                let replacement = replacements[&root_id];
+                for (_, commit) in &transaction.nodes {
+                    if commit.attachment.is_some() {
+                        self.note_explicit_commit_superseded(
+                            commit.commit_id,
+                            acquire_state,
+                            commit.frame_callbacks.len(),
+                            replacement,
+                            "newest_ready_surface_tree_selected",
+                        );
+                    }
+                }
                 let released = self.release_pending_surface_tree_transaction(
                     transaction,
                     AcquireWatchCancelReason::Superseded,

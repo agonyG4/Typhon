@@ -24,6 +24,8 @@ impl NativeRuntime {
 
     fn run_cycle(&mut self) -> NativeResult<()> {
         let mut cycle = self.wait_for_events_and_pageflips()?;
+        self.server
+            .set_commit_debug_pageflip_pending(self.scanout.page_flip_pending());
         self.reap_supervised_children(&cycle)?;
         self.advance_shutdown_lifecycle(&cycle)?;
         if !self.session.permits_output() {

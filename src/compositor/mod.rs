@@ -67,6 +67,7 @@ use crate::wayland_drm::server::wl_drm;
 
 mod clipboard_bridge;
 mod color;
+mod commit_debug;
 mod dmabuf;
 mod explicit_sync;
 mod fullscreen;
@@ -90,6 +91,7 @@ mod subsurface;
 mod surface;
 mod window_state;
 
+use commit_debug::*;
 use pacing::*;
 
 use dmabuf::{
@@ -308,6 +310,7 @@ struct XdgConfigureSerialState {
 
 #[derive(Debug)]
 struct SurfaceTreeAcquireDependency {
+    surface_commit_id: SurfaceCommitId,
     commit_id: AcquireCommitId,
     surface_id: u32,
     buffer_id: u32,
@@ -541,6 +544,8 @@ pub struct CompositorState {
     next_resize_interaction_id: u64,
     next_resize_configure_sequence: u64,
     next_surface_commit_sequence: u64,
+    surface_commit_ids: SurfaceCommitIdAllocator,
+    commit_debug: CommitDebugState,
     resize_flow_metrics: ResizeFlowMetrics,
     xdg_configure_serials: HashMap<u32, XdgConfigureSerialState>,
     last_pointer_x: f64,

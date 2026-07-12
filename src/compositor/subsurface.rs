@@ -3,7 +3,7 @@ use std::{collections::HashMap, time::Instant};
 use wayland_server::protocol::wl_callback;
 
 use super::{
-    RenderableSurfaceDamage, SurfaceCommitSequence, SurfaceInputRegion,
+    RenderableSurfaceDamage, SurfaceCommitId, SurfaceCommitSequence, SurfaceInputRegion,
     explicit_sync::{CapturedExplicitSyncState, PendingPresentationFeedback},
     state_data::{PendingSurfaceAttachment, PendingViewportChange, SurfaceBufferRelease},
 };
@@ -17,6 +17,7 @@ pub(super) enum SubsurfaceSyncMode {
 
 #[derive(Debug)]
 pub(super) struct CachedSubsurfaceCommit {
+    pub(super) commit_id: SurfaceCommitId,
     pub(super) commit_sequence: SurfaceCommitSequence,
     pub(super) attachment: Option<PendingSurfaceAttachment>,
     pub(super) damage: Option<RenderableSurfaceDamage>,
@@ -36,6 +37,7 @@ pub(super) struct CachedSubsurfaceCommit {
 impl CachedSubsurfaceCommit {
     pub(super) fn merge(&mut self, newer: Self) -> Option<SurfaceBufferRelease> {
         let Self {
+            commit_id,
             commit_sequence,
             attachment,
             damage,
@@ -51,6 +53,7 @@ impl CachedSubsurfaceCommit {
             window_geometry,
             cached_at: _,
         } = newer;
+        self.commit_id = commit_id;
         self.commit_sequence = commit_sequence;
         let attachment_changed = attachment.is_some();
         let superseded = attachment.and_then(|attachment| {
@@ -122,6 +125,7 @@ mod window_geometry_tests {
         window_geometry: XdgWindowGeometry,
     ) -> CachedSubsurfaceCommit {
         CachedSubsurfaceCommit {
+            commit_id: SurfaceCommitId::for_tests(sequence),
             commit_sequence: SurfaceCommitSequence(sequence),
             attachment: None,
             damage: None,

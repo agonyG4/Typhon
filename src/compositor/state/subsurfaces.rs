@@ -494,6 +494,7 @@ impl CompositorState {
             }
             pending.explicit_release = Some(release);
             if acquire.is_signaled() {
+                self.note_explicit_commit_ready(commit.commit_id);
                 continue;
             }
             let Some(commit_id) = self.acquire_commit_ids.allocate() else {
@@ -521,12 +522,14 @@ impl CompositorState {
                 ],
             );
             dependencies.push(SurfaceTreeAcquireDependency {
+                surface_commit_id: commit.commit_id,
                 commit_id,
                 surface_id: *surface_id,
                 buffer_id: pending.resource.id().protocol_id(),
                 acquire,
                 state: PendingAcquireState::RegistrationPending,
             });
+            self.note_explicit_commit_acquire_wait(commit.commit_id, commit.frame_callbacks.len());
         }
         Some(dependencies)
     }
@@ -951,6 +954,7 @@ impl CompositorState {
         commit: CachedSubsurfaceCommit,
     ) {
         let CachedSubsurfaceCommit {
+            commit_id,
             commit_sequence,
             attachment,
             damage,
@@ -990,6 +994,7 @@ impl CompositorState {
                 debug_assert!(pending.surface_size.is_some());
                 self.commit_surface_request_with_captured_sync(
                     surface_id,
+                    commit_id,
                     commit_sequence,
                     SurfacePublicationSource::SurfaceTree,
                     pending,

@@ -1,0 +1,559 @@
+use std::collections::HashMap;
+use std::num::NonZeroU64;
+use wayland_server::{Resource, backend::ObjectId, protocol::wl_callback};
+
+use super::PendingAcquireState;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SurfaceCommitId(NonZeroU64);
+
+impl SurfaceCommitId {
+    pub(crate) const fn get(self) -> u64 {
+        self.0.get()
+    }
+    pub(crate) fn for_tests(value: u64) -> Self {
+        Self(NonZeroU64::new(value).unwrap())
+    }
+    pub(crate) fn from_sequence(sequence: super::SurfaceCommitSequence) -> Self {
+        Self(NonZeroU64::new(sequence.get()).expect("live surface commit sequence must be nonzero"))
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SurfaceCommitIdAllocator {
+    next: u64,
+}
+
+impl SurfaceCommitIdAllocator {
+    pub(crate) fn allocate(&mut self) -> Option<SurfaceCommitId> {
+        self.next = self.next.checked_add(1)?;
+        Some(SurfaceCommitId(NonZeroU64::new(self.next)?))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SurfaceCommitDisposition {
+    Published,
+    SupersededWhileUnready,
+    SupersededWhileReady,
+    Rejected,
+    SurfaceDestroyed,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExplicitSyncCommitMetrics {
+    pub(crate) explicit_sync_commits_captured: u64,
+    pub(crate) explicit_sync_commits_became_ready: u64,
+    pub(crate) explicit_sync_commits_published: u64,
+    pub(crate) ready_commits_superseded: u64,
+    pub(crate) unready_commits_superseded: u64,
+    pub(crate) callbacks_merged_from_superseded: u64,
+    pub(crate) callbacks_completed_from_published: u64,
+    pub(crate) callbacks_completed_from_unpublished: u64,
+    pub(crate) published_commits_without_visual_generation: u64,
+    pub(crate) visual_generations_from_explicit_sync: u64,
+}
+
+impl ExplicitSyncCommitMetrics {
+    pub(in crate::compositor) fn note_superseded(
+        &mut self,
+        state: PendingAcquireState,
+    ) -> SurfaceCommitDisposition {
+        if state == PendingAcquireState::Ready {
+            self.ready_commits_superseded = self.ready_commits_superseded.saturating_add(1);
+            SurfaceCommitDisposition::SupersededWhileReady
+        } else {
+            self.unready_commits_superseded = self.unready_commits_superseded.saturating_add(1);
+            SurfaceCommitDisposition::SupersededWhileUnready
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LiveCommit {
+    surface: u32,
+    root: u32,
+    sequence: u64,
+    acquire_state: PendingAcquireState,
+    visual_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CallbackOwner {
+    commit_id: SurfaceCommitId,
+    surface: u32,
+    published: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CommitDebugState {
+    enabled: bool,
+    initialized: bool,
+    pageflip_pending: bool,
+    live: HashMap<SurfaceCommitId, LiveCommit>,
+    callbacks: HashMap<ObjectId, CallbackOwner>,
+    metrics: ExplicitSyncCommitMetrics,
+}
+
+impl CommitDebugState {
+    fn ensure_initialized(&mut self) {
+        if !self.initialized {
+            self.enabled = std::env::var("TYPHON_COMMIT_DEBUG").ok().is_some_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on" | "debug" | "trace"
+                )
+            });
+            self.initialized = true;
+        }
+    }
+}
+
+impl super::CompositorState {
+    pub(in crate::compositor) fn note_explicit_commit_captured(
+        &mut self,
+        id: SurfaceCommitId,
+        surface: u32,
+        sequence: u64,
+        buffer_id: Option<u64>,
+        callbacks: &[wl_callback::WlCallback],
+    ) {
+        self.commit_debug.ensure_initialized();
+        let root = self.root_surface_id_for_surface(surface);
+        self.commit_debug.metrics.explicit_sync_commits_captured = self
+            .commit_debug
+            .metrics
+            .explicit_sync_commits_captured
+            .saturating_add(1);
+        let previous = self.commit_debug.live.insert(
+            id,
+            LiveCommit {
+                surface,
+                root,
+                sequence,
+                acquire_state: PendingAcquireState::RegistrationPending,
+                visual_generation: None,
+            },
+        );
+        debug_assert!(previous.is_none());
+        for callback in callbacks {
+            self.commit_debug.callbacks.insert(
+                callback.id(),
+                CallbackOwner {
+                    commit_id: id,
+                    surface,
+                    published: false,
+                },
+            );
+        }
+        self.commit_log(
+            "captured",
+            id,
+            surface,
+            sequence,
+            buffer_id,
+            "captured",
+            callbacks.len(),
+            "wl_surface_commit",
+        );
+        for callback in callbacks {
+            self.commit_log_callback("callback_requested", id, surface, callback, "captured");
+        }
+    }
+
+    pub(in crate::compositor) fn note_explicit_commit_acquire_wait(
+        &mut self,
+        id: SurfaceCommitId,
+        callback_count: usize,
+    ) {
+        let Some(live) = self.commit_debug.live.get(&id).cloned() else {
+            return;
+        };
+        self.commit_log(
+            "acquire_wait",
+            id,
+            live.surface,
+            live.sequence,
+            None,
+            "pending",
+            callback_count,
+            "fence_unsignaled",
+        );
+    }
+
+    pub(in crate::compositor) fn note_explicit_commit_ready(&mut self, id: SurfaceCommitId) {
+        let Some(live) = self.commit_debug.live.get_mut(&id) else {
+            return;
+        };
+        if live.acquire_state != PendingAcquireState::Ready {
+            live.acquire_state = PendingAcquireState::Ready;
+            self.commit_debug.metrics.explicit_sync_commits_became_ready = self
+                .commit_debug
+                .metrics
+                .explicit_sync_commits_became_ready
+                .saturating_add(1);
+        }
+        let live = live.clone();
+        self.commit_log(
+            "acquire_ready",
+            id,
+            live.surface,
+            live.sequence,
+            None,
+            "ready",
+            0,
+            "fence_signaled",
+        );
+    }
+
+    pub(in crate::compositor) fn note_explicit_commit_superseded(
+        &mut self,
+        id: SurfaceCommitId,
+        state: PendingAcquireState,
+        callback_count: usize,
+        replacement: SurfaceCommitId,
+        reason: &str,
+    ) {
+        let Some(live) = self.commit_debug.live.remove(&id) else {
+            return;
+        };
+        let disposition = self.commit_debug.metrics.note_superseded(state);
+        self.commit_debug.metrics.callbacks_merged_from_superseded = self
+            .commit_debug
+            .metrics
+            .callbacks_merged_from_superseded
+            .saturating_add(callback_count as u64);
+        let moved = self
+            .commit_debug
+            .callbacks
+            .iter()
+            .filter_map(|(callback, owner)| {
+                (owner.commit_id == id).then_some((callback.clone(), owner.surface))
+            })
+            .collect::<Vec<_>>();
+        for (callback, surface) in moved {
+            if let Some(owner) = self.commit_debug.callbacks.get_mut(&callback) {
+                owner.commit_id = replacement;
+            }
+            if self.commit_debug.enabled {
+                println!(
+                    "typhon commit: event=callback_moved commit_id={} replacement_commit_id={} surface={surface} callback={callback:?} reason={reason}",
+                    id.get(),
+                    replacement.get()
+                );
+            }
+        }
+        self.commit_log(
+            match disposition {
+                SurfaceCommitDisposition::SupersededWhileReady => "superseded_ready",
+                _ => "superseded_unready",
+            },
+            id,
+            live.surface,
+            live.sequence,
+            None,
+            if state == PendingAcquireState::Ready {
+                "ready"
+            } else {
+                "unready"
+            },
+            callback_count,
+            reason,
+        );
+    }
+
+    pub(in crate::compositor) fn note_explicit_commit_visual_generation(
+        &mut self,
+        id: SurfaceCommitId,
+        generation: u64,
+    ) {
+        let Some(live) = self.commit_debug.live.get_mut(&id) else {
+            return;
+        };
+        live.visual_generation = Some(generation);
+        self.commit_debug
+            .metrics
+            .visual_generations_from_explicit_sync = self
+            .commit_debug
+            .metrics
+            .visual_generations_from_explicit_sync
+            .saturating_add(1);
+        let Some(live) = self.commit_debug.live.get(&id).cloned() else {
+            return;
+        };
+        self.commit_log(
+            "visual_generation",
+            id,
+            live.surface,
+            live.sequence,
+            None,
+            "published",
+            0,
+            &generation.to_string(),
+        );
+    }
+
+    pub(in crate::compositor) fn note_explicit_commit_published(&mut self, id: SurfaceCommitId) {
+        let _disposition = SurfaceCommitDisposition::Published;
+        for owner in self
+            .commit_debug
+            .callbacks
+            .values_mut()
+            .filter(|owner| owner.commit_id == id)
+        {
+            owner.published = true;
+        }
+        let Some(live) = self.commit_debug.live.remove(&id) else {
+            return;
+        };
+        self.commit_debug.metrics.explicit_sync_commits_published = self
+            .commit_debug
+            .metrics
+            .explicit_sync_commits_published
+            .saturating_add(1);
+        if live.visual_generation.is_none() {
+            self.commit_debug
+                .metrics
+                .published_commits_without_visual_generation = self
+                .commit_debug
+                .metrics
+                .published_commits_without_visual_generation
+                .saturating_add(1);
+        }
+        self.commit_log(
+            "published",
+            id,
+            live.surface,
+            live.sequence,
+            None,
+            "ready",
+            0,
+            "surface_state_published",
+        );
+    }
+
+    pub(in crate::compositor) fn note_explicit_commit_rejected(
+        &mut self,
+        id: SurfaceCommitId,
+        reason: &str,
+    ) {
+        let _disposition = SurfaceCommitDisposition::Rejected;
+        let Some(live) = self.commit_debug.live.remove(&id) else {
+            return;
+        };
+        self.commit_log(
+            "destroyed",
+            id,
+            live.surface,
+            live.sequence,
+            None,
+            "rejected",
+            0,
+            reason,
+        );
+    }
+
+    pub(in crate::compositor) fn note_explicit_commit_destroyed(
+        &mut self,
+        id: SurfaceCommitId,
+        reason: &str,
+    ) {
+        let _disposition = SurfaceCommitDisposition::SurfaceDestroyed;
+        let Some(live) = self.commit_debug.live.remove(&id) else {
+            return;
+        };
+        self.commit_log(
+            "destroyed",
+            id,
+            live.surface,
+            live.sequence,
+            None,
+            "destroyed",
+            0,
+            reason,
+        );
+    }
+
+    pub(in crate::compositor) fn note_callbacks_completed(
+        &mut self,
+        callbacks: &[wl_callback::WlCallback],
+    ) {
+        for callback in callbacks {
+            let Some(owner) = self.commit_debug.callbacks.remove(&callback.id()) else {
+                continue;
+            };
+            if owner.published {
+                self.commit_debug.metrics.callbacks_completed_from_published = self
+                    .commit_debug
+                    .metrics
+                    .callbacks_completed_from_published
+                    .saturating_add(1);
+            } else {
+                self.commit_debug
+                    .metrics
+                    .callbacks_completed_from_unpublished = self
+                    .commit_debug
+                    .metrics
+                    .callbacks_completed_from_unpublished
+                    .saturating_add(1);
+            }
+            self.commit_log_callback(
+                "callback_completed",
+                owner.commit_id,
+                owner.surface,
+                callback,
+                if owner.published {
+                    "published"
+                } else {
+                    "unpublished"
+                },
+            );
+        }
+    }
+
+    pub(in crate::compositor) fn set_commit_debug_pageflip_pending(&mut self, pending: bool) {
+        self.commit_debug.pageflip_pending = pending;
+    }
+    pub(in crate::compositor) fn log_commit_debug_summary(&mut self) {
+        self.commit_debug.ensure_initialized();
+        if !self.commit_debug.enabled {
+            return;
+        }
+        let m = self.commit_debug.metrics;
+        println!(
+            "typhon commit: event=summary captured={} became_ready={} published={} ready_superseded={} unready_superseded={} callbacks_moved={} callbacks_completed_from_published={} callbacks_completed_from_unpublished={} published_without_visual_generation={} visual_generations={} live_commits={} live_callbacks={}",
+            m.explicit_sync_commits_captured,
+            m.explicit_sync_commits_became_ready,
+            m.explicit_sync_commits_published,
+            m.ready_commits_superseded,
+            m.unready_commits_superseded,
+            m.callbacks_merged_from_superseded,
+            m.callbacks_completed_from_published,
+            m.callbacks_completed_from_unpublished,
+            m.published_commits_without_visual_generation,
+            m.visual_generations_from_explicit_sync,
+            self.commit_debug.live.len(),
+            self.commit_debug.callbacks.len()
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_log(
+        &self,
+        event: &str,
+        id: SurfaceCommitId,
+        surface: u32,
+        sequence: u64,
+        buffer: Option<u64>,
+        acquire: &str,
+        callbacks: usize,
+        reason: &str,
+    ) {
+        if !self.commit_debug.enabled {
+            return;
+        }
+        let live = self.commit_debug.live.get(&id);
+        println!(
+            "typhon commit: event={event} commit_id={} surface={surface} root={} sequence={sequence} buffer_id={} acquire_state={acquire} callback_count={callbacks} pageflip_pending={} pending_queue_depth={} ready_queue_depth={} visual_generation={} reason={reason}",
+            id.get(),
+            live.map_or_else(|| self.root_surface_id_for_surface(surface), |l| l.root),
+            buffer.map_or_else(|| "none".to_string(), |b| b.to_string()),
+            self.commit_debug.pageflip_pending,
+            self.pending_explicit_sync_commits.len(),
+            self.pending_explicit_sync_commits
+                .iter()
+                .filter(|c| c.acquire_state == PendingAcquireState::Ready)
+                .count(),
+            live.and_then(|l| l.visual_generation)
+                .map_or_else(|| "none".to_string(), |g| g.to_string())
+        );
+    }
+    fn commit_log_callback(
+        &self,
+        event: &str,
+        id: SurfaceCommitId,
+        surface: u32,
+        callback: &wl_callback::WlCallback,
+        reason: &str,
+    ) {
+        if self.commit_debug.enabled {
+            println!(
+                "typhon commit: event={event} commit_id={} surface={surface} root={} sequence={} buffer_id=none acquire_state=none callback_count=1 callback={:?} pageflip_pending={} pending_queue_depth={} ready_queue_depth={} visual_generation=none reason={reason}",
+                id.get(),
+                self.root_surface_id_for_surface(surface),
+                self.commit_debug.live.get(&id).map_or(0, |l| l.sequence),
+                callback.id(),
+                self.commit_debug.pageflip_pending,
+                self.pending_explicit_sync_commits.len(),
+                self.pending_explicit_sync_commits
+                    .iter()
+                    .filter(|c| c.acquire_state == PendingAcquireState::Ready)
+                    .count()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn surface_commits_receive_unique_ids() {
+        let mut allocator = SurfaceCommitIdAllocator::default();
+        let first = allocator.allocate().unwrap();
+        let second = allocator.allocate().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(second.get(), first.get() + 1);
+    }
+
+    #[test]
+    fn ready_and_unready_supersede_accounting_is_separate() {
+        let mut metrics = ExplicitSyncCommitMetrics::default();
+        metrics.note_superseded(PendingAcquireState::Ready);
+        metrics.note_superseded(PendingAcquireState::RegistrationPending);
+        assert_eq!(metrics.ready_commits_superseded, 1);
+        assert_eq!(metrics.unready_commits_superseded, 1);
+    }
+
+    #[test]
+    fn commit_id_survives_ready_visual_and_publication_transitions() {
+        let mut state = super::super::CompositorState::default();
+        let id = state.allocate_surface_commit_id();
+        state.note_explicit_commit_captured(id, 7, 11, Some(19), &[]);
+        state.note_explicit_commit_ready(id);
+        state.note_explicit_commit_visual_generation(id, 23);
+        state.note_explicit_commit_published(id);
+        assert_eq!(state.commit_debug.metrics.explicit_sync_commits_captured, 1);
+        assert_eq!(
+            state
+                .commit_debug
+                .metrics
+                .explicit_sync_commits_became_ready,
+            1
+        );
+        assert_eq!(
+            state
+                .commit_debug
+                .metrics
+                .visual_generations_from_explicit_sync,
+            1
+        );
+        assert_eq!(
+            state.commit_debug.metrics.explicit_sync_commits_published,
+            1
+        );
+        assert!(!state.commit_debug.live.contains_key(&id));
+    }
+
+    #[test]
+    fn surface_destruction_retires_live_commit_id_without_reuse() {
+        let mut state = super::super::CompositorState::default();
+        let id = state.allocate_surface_commit_id();
+        state.note_explicit_commit_captured(id, 7, 11, None, &[]);
+        state.note_explicit_commit_destroyed(id, "surface_destroyed");
+        let next = state.allocate_surface_commit_id();
+        assert!(next.get() > id.get());
+        assert!(!state.commit_debug.live.contains_key(&id));
+    }
+}

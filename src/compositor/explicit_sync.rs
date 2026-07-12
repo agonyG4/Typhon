@@ -12,7 +12,9 @@ use wayland_server::{
 
 use crate::syncobj::DrmSyncobjTimeline;
 
-use super::{PendingSurfaceBuffer, RenderableSurfaceDamage, SurfaceCommitSequence};
+use super::{
+    PendingSurfaceBuffer, RenderableSurfaceDamage, SurfaceCommitId, SurfaceCommitSequence,
+};
 
 pub(super) const SYNCOBJ_MANAGER_ERROR_SURFACE_EXISTS: u32 = 0;
 pub(super) const SYNCOBJ_MANAGER_ERROR_INVALID_TIMELINE: u32 = 1;
@@ -158,6 +160,7 @@ impl Eq for ExplicitSyncPoint {}
 
 #[derive(Debug)]
 pub(super) struct PendingExplicitSyncCommit {
+    pub(super) surface_commit_id: SurfaceCommitId,
     pub(super) commit_id: AcquireCommitId,
     pub(super) surface_id: u32,
     pub(super) commit_sequence: SurfaceCommitSequence,

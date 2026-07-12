@@ -7,6 +7,9 @@ impl CompositorState {
             cached.extend(transaction.nodes.into_iter().map(|(_, commit)| commit));
         }
         for commit in cached {
+            if commit.explicit_sync.is_some() {
+                self.note_explicit_commit_destroyed(commit.commit_id, "compositor_shutdown");
+            }
             for feedback in commit.presentation_feedbacks {
                 feedback.feedback.discarded();
             }
@@ -14,7 +17,8 @@ impl CompositorState {
                 buffer.release_target().release();
             }
         }
-        for commit in self.pending_explicit_sync_commits.drain(..) {
+        for commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
+            self.note_explicit_commit_destroyed(commit.surface_commit_id, "compositor_shutdown");
             commit.pending.release_target().release();
         }
     }
@@ -22,6 +26,7 @@ impl CompositorState {
 
 pub(in crate::compositor) fn empty_cached_subsurface_commit() -> CachedSubsurfaceCommit {
     CachedSubsurfaceCommit {
+        commit_id: SurfaceCommitId::for_tests(1),
         commit_sequence: SurfaceCommitSequence::initial(),
         attachment: None,
         damage: None,
@@ -119,4 +124,35 @@ where
     R: Resource,
 {
     left.id().protocol_id() == right.id().protocol_id() && left.id().same_client_as(&right.id())
+}
+
+#[cfg(test)]
+mod explicit_sync_commit_accounting_tests {
+    use super::*;
+
+    #[test]
+    fn ready_explicit_sync_commit_is_superseded_before_publication() {
+        let newest = newest_ready_explicit_sync_commit_indices([(0, 7, true), (1, 7, true)]);
+        assert_eq!(newest.get(&7), Some(&1));
+
+        let mut metrics = ExplicitSyncCommitMetrics::default();
+        let disposition = metrics.note_superseded(PendingAcquireState::Ready);
+        assert_eq!(disposition, SurfaceCommitDisposition::SupersededWhileReady);
+        assert_eq!(metrics.ready_commits_superseded, 1);
+    }
+
+    #[test]
+    fn unready_explicit_sync_commit_can_be_superseded_by_newer_state() {
+        let newest = newest_ready_explicit_sync_commit_indices([(0, 7, false), (1, 7, true)]);
+        assert_eq!(newest.get(&7), Some(&1));
+
+        let mut metrics = ExplicitSyncCommitMetrics::default();
+        let disposition = metrics.note_superseded(PendingAcquireState::RegistrationPending);
+        assert_eq!(
+            disposition,
+            SurfaceCommitDisposition::SupersededWhileUnready
+        );
+        assert_eq!(metrics.unready_commits_superseded, 1);
+        assert_eq!(metrics.ready_commits_superseded, 0);
+    }
 }

@@ -86,6 +86,7 @@ impl ClientData for TyphonClientData {
 impl Drop for OwnCompositorServer {
     fn drop(&mut self) {
         self.state.release_cached_resources_for_shutdown();
+        self.state.log_commit_debug_summary();
     }
 }
 
@@ -264,6 +265,11 @@ impl OwnCompositorServer {
     ) -> bool {
         self.state
             .mark_acquire_commit_ready(commit_id, surface_id, acquire)
+    }
+
+    #[doc(hidden)]
+    pub fn set_commit_debug_pageflip_pending(&mut self, pending: bool) {
+        self.state.set_commit_debug_pageflip_pending(pending);
     }
 
     pub const fn gpu_buffer_protocols_enabled(&self) -> bool {

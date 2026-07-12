@@ -8,6 +8,12 @@ impl CompositorState {
         SurfaceCommitSequence(self.next_surface_commit_sequence)
     }
 
+    pub(in crate::compositor) fn allocate_surface_commit_id(&mut self) -> SurfaceCommitId {
+        self.surface_commit_ids
+            .allocate()
+            .expect("surface commit identity space exhausted")
+    }
+
     pub(in crate::compositor) fn record_surface_commit_received(
         &mut self,
         surface_id: u32,
@@ -69,6 +75,7 @@ impl CompositorState {
         }
         state.latest_published = Some(commit_sequence);
         state.latest_published_buffer_id = buffer_id;
+        self.note_explicit_commit_published(SurfaceCommitId::from_sequence(commit_sequence));
         self.resize_flow_metrics.surface_content_publishes = self
             .resize_flow_metrics
             .surface_content_publishes
@@ -105,6 +112,10 @@ impl CompositorState {
         source: SurfacePublicationSource,
         decision: SurfacePublicationDecision,
     ) {
+        self.note_explicit_commit_rejected(
+            SurfaceCommitId::from_sequence(commit_sequence),
+            "surface_publication_rejected",
+        );
         self.resize_flow_metrics.surface_content_stale_rejections = self
             .resize_flow_metrics
             .surface_content_stale_rejections
@@ -152,6 +163,13 @@ impl CompositorState {
         let mut retained_explicit = Vec::new();
         for commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
             if commit.surface_id == surface_id && commit.commit_sequence < new_sequence {
+                self.note_explicit_commit_superseded(
+                    commit.surface_commit_id,
+                    commit.acquire_state,
+                    commit.frame_callbacks.len(),
+                    SurfaceCommitId::from_sequence(new_sequence),
+                    "newer_attachment_arrived",
+                );
                 if self.external_acquire_readiness {
                     self.pending_acquire_watch_changes
                         .push(AcquireWatchChange::Cancel {
@@ -198,6 +216,23 @@ impl CompositorState {
             });
             if supersedes {
                 let root_surface_id = transaction.root_surface_id;
+                let replacement = SurfaceCommitId::from_sequence(new_sequence);
+                let acquire_state = if transaction.is_ready() {
+                    PendingAcquireState::Ready
+                } else {
+                    PendingAcquireState::RegistrationPending
+                };
+                for (_, commit) in &transaction.nodes {
+                    if commit.attachment.is_some() {
+                        self.note_explicit_commit_superseded(
+                            commit.commit_id,
+                            acquire_state,
+                            commit.frame_callbacks.len(),
+                            replacement,
+                            "newer_surface_tree_attachment_arrived",
+                        );
+                    }
+                }
                 let released = self.release_pending_surface_tree_transaction(
                     transaction,
                     AcquireWatchCancelReason::Superseded,

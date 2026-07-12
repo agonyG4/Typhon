@@ -64,6 +64,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
             wl_surface::Request::Commit => {
                 let surface_id = data.surface_id();
                 let commit_sequence = state.allocate_surface_commit_sequence();
+                let commit_id = state.allocate_surface_commit_id();
                 let window_geometry = state.pending_surface_window_geometries.remove(&surface_id);
                 let explicit_sync = data.explicit_sync();
                 let offset = data.take_pending_offset();
@@ -113,6 +114,21 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     _ => damage.explicit(),
                 };
                 let frame_callbacks = data.take_frame_callbacks();
+                if explicit_sync.is_some() {
+                    let buffer_id = attachment.as_ref().and_then(|attachment| match attachment {
+                        PendingSurfaceAttachment::Buffer(buffer) => {
+                            Some(buffer.data.buffer_id().get())
+                        }
+                        PendingSurfaceAttachment::RemoveContent => None,
+                    });
+                    state.note_explicit_commit_captured(
+                        commit_id,
+                        surface_id,
+                        commit_sequence.get(),
+                        buffer_id,
+                        &frame_callbacks,
+                    );
+                }
                 let attachment_kind = match attachment.as_ref() {
                     Some(PendingSurfaceAttachment::Buffer(_)) => "buffer",
                     Some(PendingSurfaceAttachment::RemoveContent) => "remove",
@@ -157,6 +173,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     ],
                 );
                 let commit = CachedSubsurfaceCommit {
+                    commit_id,
                     commit_sequence,
                     attachment,
                     damage,
