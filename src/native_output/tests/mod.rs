@@ -21,6 +21,7 @@ fn test_buffer_identity() -> BufferIdentity {
 
 mod frame;
 mod input;
+mod input_interaction_liveness;
 mod output;
 mod scanout;
 mod shell_control;

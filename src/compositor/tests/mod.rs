@@ -113,4 +113,5 @@ mod protocol_buffers;
 mod subsurface;
 mod surface_frames;
 mod windows;
+mod windows_resize_liveness;
 mod xdg;
