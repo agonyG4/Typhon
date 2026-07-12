@@ -809,6 +809,7 @@ pub(crate) fn read_linux_input_event(device: &mut NativeInputDevice) -> Option<L
     None
 }
 
+#[cfg(test)]
 pub(crate) fn apply_active_window_interaction_motion(
     x: f64,
     y: f64,
