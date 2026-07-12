@@ -971,6 +971,151 @@ pub(in crate::compositor::tests) fn create_client_cursor_then_synchronize_compos
     })
 }
 
+pub(in crate::compositor::tests) fn create_client_cursor_then_window_interaction(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    hidden: bool,
+    resize: bool,
+) -> Result<WindowInteractionCursorSnapshots, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let pointer = seat.get_pointer(&qh, ());
+    let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+    let _relative_pointer = relative_manager.get_relative_pointer(&pointer, &qh, ());
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120)?;
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    let start_x = f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0;
+    let start_y = f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0;
+    commands.send(ServerCommand::PointerMotion {
+        x: start_x,
+        y: start_y,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let serial = state
+        .pointer_enter_serial
+        .ok_or("missing pointer enter serial")?;
+
+    let _cursor_surface = if hidden {
+        pointer.set_cursor(serial, None, 0, 0);
+        None
+    } else {
+        let cursor_surface = compositor.create_surface(&qh, ());
+        pointer.set_cursor(serial, Some(&cursor_surface), 3, 4);
+        commit_test_buffered_surface(&cursor_surface, &shm, &qh, 24, 24)?;
+        Some(cursor_surface)
+    };
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let before_cursor = capture_client_cursor_snapshot(commands);
+    let before_state = capture_interaction_cursor_state(commands);
+    let pointer_motion_count_before = state
+        .pointer_event_log
+        .iter()
+        .filter(|event| **event == "motion")
+        .count();
+    let relative_motion_count_before = state.relative_motion_count;
+
+    let begin_x = if resize {
+        f64::from(render::FIRST_SURFACE_OFFSET.0) + 158.0
+    } else {
+        start_x
+    };
+    let begin_y = if resize {
+        f64::from(render::FIRST_SURFACE_OFFSET.1) + 118.0
+    } else {
+        start_y
+    };
+    commands.send(if resize {
+        ServerCommand::BeginResize {
+            x: begin_x,
+            y: begin_y,
+        }
+    } else {
+        ServerCommand::BeginMove {
+            x: begin_x,
+            y: begin_y,
+        }
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let update_x = f64::from(render::FIRST_SURFACE_OFFSET.0) + if resize { 300.0 } else { 80.0 };
+    let update_y = f64::from(render::FIRST_SURFACE_OFFSET.1) + if resize { 250.0 } else { 60.0 };
+    let (reply, receiver) = std::sync::mpsc::channel();
+    commands.send(ServerCommand::UpdatePointerPositionWithoutClientDispatch {
+        x: update_x,
+        y: update_y,
+        reply,
+    })?;
+    receiver.recv_timeout(Duration::from_secs(1))?;
+    wait_for_server_commands(commands);
+    commands.send(ServerCommand::UpdateInteraction {
+        x: update_x,
+        y: update_y,
+    })?;
+    commands.send(ServerCommand::PrepareFrame)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let during_cursor = capture_client_cursor_snapshot(commands);
+    let during_state = capture_interaction_cursor_state(commands);
+    let pointer_motion_count_during = state
+        .pointer_event_log
+        .iter()
+        .filter(|event| **event == "motion")
+        .count();
+    let relative_motion_count_during = state.relative_motion_count;
+    let resize_geometry_during = capture_toplevel_visual_geometry(commands);
+    let moved_root_origin_during = capture_renderable_surface_snapshot(commands)
+        .into_iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .map(|surface| (surface.origin_x, surface.origin_y));
+
+    commands.send(ServerCommand::EndInteraction)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let after_cursor = capture_client_cursor_snapshot(commands);
+    let after_state = capture_interaction_cursor_state(commands);
+    let pointer_motion_count_after = state
+        .pointer_event_log
+        .iter()
+        .filter(|event| **event == "motion")
+        .count();
+    let relative_motion_count_after = state.relative_motion_count;
+
+    Ok(WindowInteractionCursorSnapshots {
+        before_cursor,
+        during_cursor,
+        after_cursor,
+        before_state,
+        during_state,
+        after_state,
+        pointer_motion_count_before,
+        pointer_motion_count_during,
+        pointer_motion_count_after,
+        relative_motion_count_before,
+        relative_motion_count_during,
+        relative_motion_count_after,
+        resize_geometry_during,
+        moved_root_origin_during,
+    })
+}
+
 fn capture_cursor_motion_state(
     state: &RegistryTestState,
     commands: &Sender<ServerCommand>,

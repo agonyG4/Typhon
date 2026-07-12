@@ -48,6 +48,39 @@ pub(super) enum WindowInteractionKind {
     Resize(ResizeEdges),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InteractionCursorShape {
+    Move,
+    ResizeHorizontal,
+    ResizeVertical,
+    ResizeDiagonalNwSe,
+    ResizeDiagonalNeSw,
+}
+
+impl InteractionCursorShape {
+    pub(super) const fn for_window_interaction(kind: WindowInteractionKind) -> Self {
+        match kind {
+            WindowInteractionKind::Move => Self::Move,
+            WindowInteractionKind::Resize(edges) => {
+                if (edges.top && edges.left) || (edges.bottom && edges.right) {
+                    Self::ResizeDiagonalNwSe
+                } else if (edges.top && edges.right) || (edges.bottom && edges.left) {
+                    Self::ResizeDiagonalNeSw
+                } else if edges.left || edges.right {
+                    Self::ResizeHorizontal
+                } else {
+                    Self::ResizeVertical
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct InteractionCursorOverride {
+    pub(super) shape: InteractionCursorShape,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WindowInteractionId(u64);
 

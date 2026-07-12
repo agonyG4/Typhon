@@ -189,6 +189,9 @@ impl CompositorState {
     pub(in crate::compositor) fn client_cursor_render_state(
         &self,
     ) -> Option<ClientCursorRenderState<'_>> {
+        if self.interaction_cursor_override.is_some() {
+            return None;
+        }
         if self.cursor_visibility.lock_hidden_constraint_id.is_some() {
             return None;
         }
@@ -380,10 +383,12 @@ impl CompositorState {
 
     pub(in crate::compositor) fn update_pointer_position(&mut self, x: f64, y: f64) {
         let changed = self.last_pointer_x != x || self.last_pointer_y != y;
-        let moves_client_cursor = changed && self.client_cursor_render_state().is_some();
+        let moves_visible_cursor = changed
+            && (self.interaction_cursor_override.is_some()
+                || self.client_cursor_render_state().is_some());
         self.last_pointer_x = x;
         self.last_pointer_y = y;
-        if moves_client_cursor {
+        if moves_visible_cursor {
             self.advance_render_generation(RenderGenerationCause::CursorMotion);
         }
     }

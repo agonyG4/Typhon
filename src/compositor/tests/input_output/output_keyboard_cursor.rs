@@ -573,12 +573,10 @@ fn compositor_only_interaction_motion_prevents_post_grab_cursor_teleport() {
         .unwrap();
     let _server = stop_controllable_test_server(commands, server_thread);
 
-    let initial_cursor = snapshots.initial.cursor.unwrap();
-    let compositor_only_cursor = snapshots.compositor_only.cursor.unwrap();
-    let normal_motion_cursor = snapshots.normal_motion.cursor.unwrap();
-    assert_ne!(compositor_only_cursor, initial_cursor);
-    assert_eq!(compositor_only_cursor.logical_x, x.round() as i32 - 3);
-    assert_eq!(compositor_only_cursor.logical_y, y.round() as i32 - 4);
+    let compositor_only_cursor = snapshots.compositor_only.cursor;
+    let normal_motion_cursor = snapshots.normal_motion.cursor;
+    assert!(compositor_only_cursor.is_none());
+    assert!(normal_motion_cursor.is_none());
     assert!(snapshots.compositor_only.visual_changed);
     assert!(snapshots.compositor_only.render_generation > snapshots.initial.render_generation);
     assert_eq!(
@@ -607,7 +605,7 @@ fn compositor_only_interaction_motion_prevents_post_grab_cursor_teleport() {
     );
     assert!(snapshots.interaction_update_applied);
     assert!(snapshots.resize_visual_active);
-    assert_eq!(normal_motion_cursor, snapshots.interaction.cursor.unwrap());
+    assert_eq!(normal_motion_cursor, snapshots.interaction.cursor);
     assert_eq!(
         snapshots.normal_motion.render_generation,
         snapshots.interaction.render_generation
@@ -630,6 +628,161 @@ fn compositor_only_pointer_motion_without_client_cursor_does_not_advance_generat
         (server.state.last_pointer_x, server.state.last_pointer_y),
         (100.0, 120.0)
     );
+}
+
+#[test]
+fn hidden_client_cursor_is_overridden_during_resize() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_with_input_capabilities(
+        &socket_name,
+        InputProtocolCapabilities {
+            relative_pointer: true,
+            ..InputProtocolCapabilities::desktop_baseline()
+        },
+    )
+    .unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots =
+        create_client_cursor_then_window_interaction(&socket_path, &commands, true, true).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(snapshots.before_cursor, None);
+    assert_eq!(snapshots.during_cursor, None);
+    assert_eq!(snapshots.after_cursor, None);
+    assert!(!snapshots.before_state.override_active);
+    assert!(snapshots.during_state.override_active);
+    assert!(snapshots.during_state.visible);
+    assert!(!snapshots.after_state.override_active);
+    assert!(!snapshots.after_state.visible);
+    assert_eq!(
+        (
+            snapshots.during_state.pointer_x,
+            snapshots.during_state.pointer_y
+        ),
+        (
+            f64::from(render::FIRST_SURFACE_OFFSET.0) + 300.0,
+            f64::from(render::FIRST_SURFACE_OFFSET.1) + 250.0
+        )
+    );
+    assert!(
+        snapshots
+            .resize_geometry_during
+            .is_some_and(|geometry| geometry.active_resize && geometry.width > 160)
+    );
+    assert_eq!(
+        snapshots.pointer_motion_count_during,
+        snapshots.pointer_motion_count_before
+    );
+    assert_eq!(
+        snapshots.pointer_motion_count_after,
+        snapshots.pointer_motion_count_before
+    );
+    assert_eq!(
+        snapshots.relative_motion_count_during,
+        snapshots.relative_motion_count_before
+    );
+    assert_eq!(
+        snapshots.relative_motion_count_after,
+        snapshots.relative_motion_count_before
+    );
+}
+
+#[test]
+fn hidden_client_cursor_is_overridden_during_move() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_with_input_capabilities(
+        &socket_name,
+        InputProtocolCapabilities {
+            relative_pointer: true,
+            ..InputProtocolCapabilities::desktop_baseline()
+        },
+    )
+    .unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots =
+        create_client_cursor_then_window_interaction(&socket_path, &commands, true, false).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(snapshots.before_cursor, None);
+    assert_eq!(snapshots.during_cursor, None);
+    assert_eq!(snapshots.after_cursor, None);
+    assert!(snapshots.during_state.override_active);
+    assert!(snapshots.during_state.visible);
+    assert!(!snapshots.after_state.override_active);
+    assert!(!snapshots.after_state.visible);
+    assert_eq!(snapshots.moved_root_origin_during, Some((132, 118)));
+    assert_eq!(
+        snapshots.pointer_motion_count_during,
+        snapshots.pointer_motion_count_before
+    );
+    assert_eq!(
+        snapshots.relative_motion_count_during,
+        snapshots.relative_motion_count_before
+    );
+}
+
+#[test]
+fn custom_client_cursor_is_restored_after_resize() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_with_input_capabilities(
+        &socket_name,
+        InputProtocolCapabilities {
+            relative_pointer: true,
+            ..InputProtocolCapabilities::desktop_baseline()
+        },
+    )
+    .unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots =
+        create_client_cursor_then_window_interaction(&socket_path, &commands, false, true).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let before = snapshots
+        .before_cursor
+        .expect("custom cursor should be active before resize");
+    assert_eq!(snapshots.during_cursor, None);
+    let after = snapshots
+        .after_cursor
+        .expect("custom cursor should be restored after resize");
+    assert_eq!(after.surface_id, before.surface_id);
+    assert_eq!((after.width, after.height), (before.width, before.height));
+    assert_eq!((after.logical_x, after.logical_y), (369, 318));
+    assert_eq!((before.logical_x, before.logical_y), (89, 82));
+    assert!(snapshots.during_state.override_active);
+    assert!(snapshots.during_state.visible);
+    assert!(!snapshots.after_state.override_active);
+    assert!(!snapshots.after_state.visible);
+}
+
+#[test]
+fn hidden_client_cursor_state_is_restored_after_resize() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_with_input_capabilities(
+        &socket_name,
+        InputProtocolCapabilities {
+            relative_pointer: true,
+            ..InputProtocolCapabilities::desktop_baseline()
+        },
+    )
+    .unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let snapshots =
+        create_client_cursor_then_window_interaction(&socket_path, &commands, true, true).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(snapshots.before_cursor, None);
+    assert_eq!(snapshots.during_cursor, None);
+    assert_eq!(snapshots.after_cursor, None);
+    assert!(!snapshots.after_state.override_active);
+    assert!(!snapshots.after_state.visible);
 }
 
 #[test]

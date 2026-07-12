@@ -218,10 +218,275 @@ fn destroyed_target_cancels_active_interaction() {
             WindowInteractionKind::Move,
             Some(0x110),
         )),
+        interaction_cursor_override: Some(InteractionCursorOverride {
+            shape: InteractionCursorShape::Move,
+        }),
         ..Default::default()
     };
 
     state.clear_resize_state_for_surfaces(&[42]);
 
     assert!(!state.window_interaction_active());
+    assert!(state.interaction_cursor_override.is_none());
+}
+
+#[test]
+fn interaction_cursor_shape_maps_every_window_resize_edge() {
+    assert_eq!(
+        InteractionCursorShape::for_window_interaction(WindowInteractionKind::Move),
+        InteractionCursorShape::Move
+    );
+    assert_eq!(
+        InteractionCursorShape::for_window_interaction(WindowInteractionKind::Resize(
+            ResizeEdges::new(false, false, true, false),
+        )),
+        InteractionCursorShape::ResizeHorizontal
+    );
+    assert_eq!(
+        InteractionCursorShape::for_window_interaction(WindowInteractionKind::Resize(
+            ResizeEdges::new(false, false, false, true),
+        )),
+        InteractionCursorShape::ResizeHorizontal
+    );
+    assert_eq!(
+        InteractionCursorShape::for_window_interaction(WindowInteractionKind::Resize(
+            ResizeEdges::new(true, false, false, false),
+        )),
+        InteractionCursorShape::ResizeVertical
+    );
+    assert_eq!(
+        InteractionCursorShape::for_window_interaction(WindowInteractionKind::Resize(
+            ResizeEdges::new(false, true, false, false),
+        )),
+        InteractionCursorShape::ResizeVertical
+    );
+    assert_eq!(
+        InteractionCursorShape::for_window_interaction(WindowInteractionKind::Resize(
+            ResizeEdges::new(true, false, true, false),
+        )),
+        InteractionCursorShape::ResizeDiagonalNwSe
+    );
+    assert_eq!(
+        InteractionCursorShape::for_window_interaction(WindowInteractionKind::Resize(
+            ResizeEdges::BOTTOM_RIGHT,
+        )),
+        InteractionCursorShape::ResizeDiagonalNwSe
+    );
+    assert_eq!(
+        InteractionCursorShape::for_window_interaction(WindowInteractionKind::Resize(
+            ResizeEdges::new(true, false, false, true),
+        )),
+        InteractionCursorShape::ResizeDiagonalNeSw
+    );
+    assert_eq!(
+        InteractionCursorShape::for_window_interaction(WindowInteractionKind::Resize(
+            ResizeEdges::new(false, true, true, false),
+        )),
+        InteractionCursorShape::ResizeDiagonalNeSw
+    );
+}
+
+#[test]
+fn failed_interaction_begin_does_not_activate_cursor_override() {
+    let mut state = CompositorState::default();
+
+    assert!(!state.begin_window_resize_at_with_trigger(100.0, 100.0, 0x111));
+
+    assert!(state.interaction_cursor_override.is_none());
+}
+
+#[test]
+fn locked_client_rejects_window_interaction_begin_without_cursor_override() {
+    let mut state = CompositorState::default();
+    state
+        .pointer_constraint
+        .activate(PointerConstraintMode::Locked, 42);
+
+    assert!(!state.begin_window_interaction_at(
+        100.0,
+        100.0,
+        WindowInteractionKind::Move,
+        WindowInteractionSource::NativeBinding,
+        Some(0x110),
+        None,
+    ));
+    assert!(state.interaction_cursor_override.is_none());
+}
+
+#[test]
+fn ending_window_interaction_clears_cursor_override_and_only_advances_cursor_generation() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Move,
+            Some(0x110),
+        )),
+        interaction_cursor_override: Some(InteractionCursorOverride {
+            shape: InteractionCursorShape::Move,
+        }),
+        ..Default::default()
+    };
+    let before_render_generation = state.render_generation;
+    let before_scene_generation = state.scene_render_generation;
+
+    assert!(state.end_window_interaction_for_button(0x110));
+
+    assert!(state.interaction_cursor_override.is_none());
+    assert!(state.render_generation > before_render_generation);
+    assert_eq!(state.scene_render_generation, before_scene_generation);
+    assert_eq!(
+        state.render_generation_cause,
+        RenderGenerationCause::CursorState
+    );
+}
+
+#[test]
+fn interaction_cursor_motion_advances_cursor_generation_only() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Move,
+            Some(0x110),
+        )),
+        interaction_cursor_override: Some(InteractionCursorOverride {
+            shape: InteractionCursorShape::Move,
+        }),
+        ..Default::default()
+    };
+    let before_render_generation = state.render_generation;
+    let before_scene_generation = state.scene_render_generation;
+
+    assert!(state.update_pointer_position_without_client_dispatch(150.0, 125.0));
+
+    assert!(state.render_generation > before_render_generation);
+    assert_eq!(state.scene_render_generation, before_scene_generation);
+    assert_eq!(
+        state.render_generation_cause,
+        RenderGenerationCause::CursorMotion
+    );
+}
+
+#[test]
+fn fullscreen_transition_clears_interaction_cursor_override() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+            Some(0x110),
+        )),
+        interaction_cursor_override: Some(InteractionCursorOverride {
+            shape: InteractionCursorShape::ResizeDiagonalNwSe,
+        }),
+        ..Default::default()
+    };
+
+    state.clear_resize_state_for_surfaces(&[42]);
+
+    assert!(!state.window_interaction_active());
+    assert!(state.interaction_cursor_override.is_none());
+}
+
+#[test]
+fn maximize_transition_clears_interaction_cursor_override() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+            Some(0x110),
+        )),
+        interaction_cursor_override: Some(InteractionCursorOverride {
+            shape: InteractionCursorShape::ResizeDiagonalNwSe,
+        }),
+        ..Default::default()
+    };
+
+    state.clear_resize_state_for_surfaces(&[42]);
+
+    assert!(!state.window_interaction_active());
+    assert!(state.interaction_cursor_override.is_none());
+}
+
+#[test]
+fn client_disconnect_cleanup_path_clears_interaction_cursor_override() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Move,
+            Some(0x110),
+        )),
+        interaction_cursor_override: Some(InteractionCursorOverride {
+            shape: InteractionCursorShape::Move,
+        }),
+        ..Default::default()
+    };
+
+    state.clear_resize_state_for_surfaces(&[42]);
+
+    assert!(!state.window_interaction_active());
+    assert!(state.interaction_cursor_override.is_none());
+}
+
+#[test]
+fn explicit_interaction_cancel_clears_interaction_cursor_override() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Move,
+            Some(0x110),
+        )),
+        interaction_cursor_override: Some(InteractionCursorOverride {
+            shape: InteractionCursorShape::Move,
+        }),
+        ..Default::default()
+    };
+
+    assert!(state.clear_window_interaction_state());
+    assert!(!state.window_interaction_active());
+    assert!(state.interaction_cursor_override.is_none());
+}
+
+#[test]
+fn focus_loss_clears_interaction_cursor_override() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Move,
+            Some(0x110),
+        )),
+        interaction_cursor_override: Some(InteractionCursorOverride {
+            shape: InteractionCursorShape::Move,
+        }),
+        ..Default::default()
+    };
+
+    state.clear_pointer_focus();
+
+    assert!(!state.window_interaction_active());
+    assert!(state.interaction_cursor_override.is_none());
+}
+
+#[test]
+fn interaction_cancel_with_pointer_constraint_clears_override_without_clearing_confinement() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Move,
+            Some(0x110),
+        )),
+        interaction_cursor_override: Some(InteractionCursorOverride {
+            shape: InteractionCursorShape::Move,
+        }),
+        ..Default::default()
+    };
+    state
+        .pointer_constraint
+        .activate(PointerConstraintMode::Confined, 42);
+
+    assert!(state.clear_window_interaction_state());
+
+    assert!(state.interaction_cursor_override.is_none());
+    assert_eq!(
+        state.pointer_constraint.mode(),
+        PointerConstraintMode::Confined
+    );
 }

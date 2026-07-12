@@ -164,7 +164,7 @@ impl CompositorState {
         &mut self,
         begin: BeginWindowInteraction,
     ) -> bool {
-        if self.window_interaction.is_some() {
+        if self.window_interaction.is_some() || self.window_interaction_blocked_by_pointer_lock() {
             return false;
         }
         let BeginWindowInteraction {
@@ -270,6 +270,7 @@ impl CompositorState {
             drag_committed: false,
             resize_interaction_id,
         });
+        self.set_interaction_cursor_override(kind);
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
                 "oblivion-one compositor: window_interaction begin id={} root={} source={:?} kind={:?} trigger_button={:?} trigger_serial={:?}",
@@ -282,6 +283,33 @@ impl CompositorState {
             );
         }
         true
+    }
+
+    fn set_interaction_cursor_override(&mut self, kind: WindowInteractionKind) {
+        let next = Some(InteractionCursorOverride {
+            shape: InteractionCursorShape::for_window_interaction(kind),
+        });
+        if self.interaction_cursor_override == next {
+            return;
+        }
+        self.interaction_cursor_override = next;
+        self.advance_render_generation(RenderGenerationCause::CursorState);
+        self.sync_cursor_visibility_request();
+    }
+
+    pub(in crate::compositor) fn clear_window_interaction_state(&mut self) -> bool {
+        let had_interaction = self.window_interaction.take().is_some();
+        let had_cursor_override = self.interaction_cursor_override.take().is_some();
+        if had_cursor_override {
+            self.advance_render_generation(RenderGenerationCause::CursorState);
+            self.sync_cursor_visibility_request();
+            self.resume_pending_pointer_constraint_activation();
+        }
+        had_interaction || had_cursor_override
+    }
+
+    pub(in crate::compositor) fn interaction_cursor_override_active(&self) -> bool {
+        self.interaction_cursor_override.is_some()
     }
 
     pub(in crate::compositor) fn allocate_window_interaction_id(&mut self) -> WindowInteractionId {
@@ -446,7 +474,7 @@ impl CompositorState {
                 interaction.trigger_serial,
             );
         }
-        self.window_interaction = None;
+        self.clear_window_interaction_state();
         true
     }
 

@@ -122,11 +122,11 @@ pub use input::{
     PointerMotionSample, RelativePointerMotion,
 };
 use interaction::{
-    PendingResizeConfigure, PointerPress, PointerTarget, ResizeAckDecision, ResizeCommitSnapshot,
-    ResizeConfigureFlow, ResizeEdges, RootSurfaceHit, WindowFrameHit, WindowInteraction,
-    WindowInteractionKind, WindowInteractionSource, interactive_resize_geometry,
-    resize_drag_threshold_reached, resize_edges_for_window_point, resize_edges_from_xdg,
-    window_frame_action_for_local_point,
+    InteractionCursorOverride, InteractionCursorShape, PendingResizeConfigure, PointerPress,
+    PointerTarget, ResizeAckDecision, ResizeCommitSnapshot, ResizeConfigureFlow, ResizeEdges,
+    RootSurfaceHit, WindowFrameHit, WindowInteraction, WindowInteractionKind,
+    WindowInteractionSource, interactive_resize_geometry, resize_drag_threshold_reached,
+    resize_edges_for_window_point, resize_edges_from_xdg, window_frame_action_for_local_point,
 };
 pub use interaction::{ResizeInteractionId, WindowInteractionId};
 use layer_shell::{Layer, LayerSurfaceRole};
@@ -526,6 +526,7 @@ pub struct CompositorState {
     last_application_keyboard_focus: Option<wl_surface::WlSurface>,
     configured_xdg_surfaces: HashSet<u32>,
     window_interaction: Option<WindowInteraction>,
+    interaction_cursor_override: Option<InteractionCursorOverride>,
     fullscreen_presentation: Option<FullscreenPresentationState>,
     pending_interactive_resize_update: Option<PendingInteractiveResizeUpdate>,
     resize_configure_flows: HashMap<u32, ResizeConfigureFlow>,

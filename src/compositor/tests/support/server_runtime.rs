@@ -121,6 +121,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureToplevelVisualGeometry(Sender<Option<ToplevelVisualGeometrySnapshot>>),
     CaptureFullscreenPresentationEligibility(Sender<FullscreenPresentationEligibility>),
     CaptureClientCursorSnapshot(Sender<Option<ClientCursorSnapshot>>),
+    CaptureInteractionCursorState(Sender<InteractionCursorStateSnapshot>),
     CaptureClipboardState(Sender<ClipboardStateSnapshot>),
     CaptureXdgRoleSnapshot {
         surface_id: u32,
@@ -374,6 +375,15 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             }
                         });
                         let _ = reply.send(snapshot);
+                    }
+                    ServerCommand::CaptureInteractionCursorState(reply) => {
+                        let (pointer_x, pointer_y) = server.last_pointer_position();
+                        let _ = reply.send(InteractionCursorStateSnapshot {
+                            override_active: server.interaction_cursor_override_active(),
+                            visible: server.cursor_visibility_requested(),
+                            pointer_x,
+                            pointer_y,
+                        });
                     }
                     ServerCommand::CaptureClipboardState(reply) => {
                         let _ = reply.send(ClipboardStateSnapshot {
@@ -732,6 +742,18 @@ pub(in crate::compositor::tests) fn capture_client_cursor_snapshot(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report client cursor snapshot")
+}
+
+pub(in crate::compositor::tests) fn capture_interaction_cursor_state(
+    commands: &Sender<ServerCommand>,
+) -> InteractionCursorStateSnapshot {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureInteractionCursorState(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report interaction cursor state")
 }
 
 pub(in crate::compositor::tests) fn capture_xdg_role_snapshot(

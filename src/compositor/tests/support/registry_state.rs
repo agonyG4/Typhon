@@ -260,6 +260,32 @@ pub(in crate::compositor::tests) struct ClientCursorSnapshot {
     pub(in crate::compositor::tests) height: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::compositor::tests) struct InteractionCursorStateSnapshot {
+    pub(in crate::compositor::tests) override_active: bool,
+    pub(in crate::compositor::tests) visible: bool,
+    pub(in crate::compositor::tests) pointer_x: f64,
+    pub(in crate::compositor::tests) pointer_y: f64,
+}
+
+#[derive(Debug)]
+pub(in crate::compositor::tests) struct WindowInteractionCursorSnapshots {
+    pub(in crate::compositor::tests) before_cursor: Option<ClientCursorSnapshot>,
+    pub(in crate::compositor::tests) during_cursor: Option<ClientCursorSnapshot>,
+    pub(in crate::compositor::tests) after_cursor: Option<ClientCursorSnapshot>,
+    pub(in crate::compositor::tests) before_state: InteractionCursorStateSnapshot,
+    pub(in crate::compositor::tests) during_state: InteractionCursorStateSnapshot,
+    pub(in crate::compositor::tests) after_state: InteractionCursorStateSnapshot,
+    pub(in crate::compositor::tests) pointer_motion_count_before: usize,
+    pub(in crate::compositor::tests) pointer_motion_count_during: usize,
+    pub(in crate::compositor::tests) pointer_motion_count_after: usize,
+    pub(in crate::compositor::tests) relative_motion_count_before: usize,
+    pub(in crate::compositor::tests) relative_motion_count_during: usize,
+    pub(in crate::compositor::tests) relative_motion_count_after: usize,
+    pub(in crate::compositor::tests) resize_geometry_during: Option<ToplevelVisualGeometrySnapshot>,
+    pub(in crate::compositor::tests) moved_root_origin_during: Option<(i32, i32)>,
+}
+
 #[derive(Debug)]
 pub(in crate::compositor::tests) struct CursorSurfaceCommitSnapshot {
     pub(in crate::compositor::tests) renderable_count: usize,

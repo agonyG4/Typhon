@@ -974,8 +974,11 @@ impl CompositorState {
             .window_interaction
             .is_some_and(|interaction| surface_ids.contains(&interaction.root_surface_id))
         {
-            self.window_interaction = None;
+            self.clear_window_interaction_state();
         }
+        debug_assert!(
+            self.window_interaction.is_some() || self.interaction_cursor_override.is_none()
+        );
         if removed_flows > 0 || removed_previews > 0 {
             self.resize_flow_metrics.resize_interactions_canceled = self
                 .resize_flow_metrics

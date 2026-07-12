@@ -83,14 +83,14 @@ fn window_drag_moves_root_surface_without_moving_children_independently() {
     wait_for_server_commands(&commands);
     assert_eq!(
         capture_render_generation_cause(&commands),
-        RenderGenerationCause::WindowMove
+        RenderGenerationCause::CursorState
     );
     let server = stop_controllable_test_server(commands, server_thread);
 
     let origins = render::surface_origins(server.renderable_surfaces());
     assert_eq!(
         server.render_generation_cause(),
-        RenderGenerationCause::WindowMove
+        RenderGenerationCause::CursorState
     );
     let parent_index = server
         .renderable_surfaces()

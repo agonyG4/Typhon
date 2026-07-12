@@ -317,6 +317,22 @@ impl OwnCompositorServer {
         self.state.client_cursor_render_state()
     }
 
+    pub fn interaction_cursor_override_active(&self) -> bool {
+        self.state.interaction_cursor_override_active()
+    }
+
+    pub fn client_cursor_request_active(&self) -> bool {
+        self.state.active_client_cursor.is_some()
+    }
+
+    pub fn cursor_visibility_requested(&self) -> bool {
+        self.state.cursor_visibility.visible
+    }
+
+    pub fn last_pointer_position(&self) -> (f64, f64) {
+        (self.state.last_pointer_x, self.state.last_pointer_y)
+    }
+
     pub fn render_generation(&self) -> u64 {
         self.state.render_generation
     }

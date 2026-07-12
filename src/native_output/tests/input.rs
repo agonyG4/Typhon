@@ -1431,6 +1431,7 @@ fn native_input_active_resize_updates_real_compositor_without_client_motion() {
     assert_eq!(server.renderable_surfaces().len(), 1);
     assert!(server.begin_window_resize_at_with_trigger(92.0, 86.0, u32::from(BTN_LEFT),));
     assert!(server.window_interaction_active());
+    assert!(server.cursor_visibility_requested());
     server.send_pointer_motion(92.0, 86.0);
     client_commands.send(ClientCommand::SetCursor).unwrap();
     let pointer_motion_count = match pump_native_input_server_until(&mut server, &client_events) {
@@ -1472,11 +1473,8 @@ fn native_input_active_resize_updates_real_compositor_without_client_motion() {
         raw_updates_before + 1
     );
     assert!(application.redraw_requested);
-    let cursor = server.client_cursor_render_state().unwrap();
-    assert_eq!(
-        (cursor.logical_x + 3, cursor.logical_y + 4),
-        (x as i32, y as i32)
-    );
+    assert!(server.client_cursor_request_active());
+    assert!(server.client_cursor_render_state().is_none());
     server.prepare_frame();
     assert_eq!(
         server.resize_flow_metrics().resize_updates_applied,
@@ -1509,6 +1507,7 @@ fn native_input_active_resize_updates_real_compositor_without_client_motion() {
 
     assert!(release_application.redraw_requested);
     assert!(!server.window_interaction_active());
+    assert!(!server.cursor_visibility_requested());
     let cursor_after_release = server
         .client_cursor_render_state()
         .expect("client cursor remains rendered after resize release");
@@ -1770,7 +1769,7 @@ fn pump_native_input_server_until(
 
 fn pump_native_input_server_until_cursor(server: &mut OwnCompositorServer) {
     let deadline = Instant::now() + Duration::from_secs(2);
-    while server.client_cursor_render_state().is_none() {
+    while !server.client_cursor_request_active() {
         let _ = server.tick();
         assert!(
             Instant::now() < deadline,

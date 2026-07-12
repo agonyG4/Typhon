@@ -19,7 +19,8 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn sync_cursor_visibility_request(&mut self) {
-        let desired_visible = self.cursor_visibility.desired_visible();
+        let desired_visible =
+            self.interaction_cursor_override.is_some() || self.cursor_visibility.desired_visible();
         if self.cursor_visibility.visible == desired_visible {
             return;
         }
@@ -39,6 +40,34 @@ impl CompositorState {
                 visible: desired_visible,
             },
         );
+    }
+
+    pub(in crate::compositor) fn window_interaction_blocked_by_pointer_lock(&self) -> bool {
+        if self.pointer_constraint.mode() == PointerConstraintMode::Locked
+            || self.active_locked_pointer_binding().is_some()
+        {
+            return true;
+        }
+        self.pending_backend_constraint
+            .and_then(|id| self.pointer_constraints.get(&id.constraint_id))
+            .is_some_and(|constraint| constraint.mode == PointerConstraintMode::Locked)
+    }
+
+    pub(in crate::compositor) fn resume_pending_pointer_constraint_activation(&mut self) {
+        if self.window_interaction.is_some() {
+            return;
+        }
+        let ids = self
+            .pointer_constraints
+            .values()
+            .filter(|constraint| {
+                !constraint.active && !constraint.backend_pending && !constraint.defunct
+            })
+            .map(|constraint| constraint.id)
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.maybe_request_pointer_constraint_activation(id);
+        }
     }
 
     pub(in crate::compositor) fn begin_client_dispatch_cycle(&mut self) {
@@ -358,6 +387,17 @@ impl CompositorState {
         &mut self,
         constraint_id: u64,
     ) {
+        let locked = self
+            .pointer_constraints
+            .get(&constraint_id)
+            .is_some_and(|constraint| constraint.mode == PointerConstraintMode::Locked);
+        if self.window_interaction.is_some() && locked {
+            pointer_debug_log(format!(
+                "constraint activation deferred id={} reason=window_interaction",
+                constraint_id
+            ));
+            return;
+        }
         let Some((pointer, surface)) =
             self.pointer_constraints
                 .get(&constraint_id)

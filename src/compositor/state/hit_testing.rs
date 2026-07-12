@@ -366,7 +366,9 @@ impl CompositorState {
             return;
         }
 
-        self.clear_pointer_focus();
+        if self.pointer_surface.is_some() {
+            self.clear_pointer_focus();
+        }
         self.pointer_surface = Some(surface.clone());
     }
 
@@ -604,6 +606,9 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn clear_pointer_focus(&mut self) {
+        if self.window_interaction.is_some() {
+            self.clear_window_interaction_state();
+        }
         if let Some(active) = self.active_locked_pointer_binding() {
             pointer_debug_log(format!(
                 "pointer focus clear suppressed by locked route id={} surface={}",
