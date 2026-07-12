@@ -10,7 +10,10 @@ use std::{
         unix::net::UnixStream,
     },
     path::PathBuf,
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -1925,11 +1928,14 @@ fn attach_native_input_test_buffer(
     width: usize,
     height: usize,
 ) {
+    static NEXT_TEST_SHM_FILE: AtomicU64 = AtomicU64::new(0);
     let pixels = vec![0xff20_3040_u32; width * height];
+    let file_sequence = NEXT_TEST_SHM_FILE.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "typhon-native-input-test-{}-{}",
+        "typhon-native-input-test-{}-{}-{}",
         std::process::id(),
-        width * height
+        width * height,
+        file_sequence,
     ));
     let mut file = OpenOptions::new()
         .read(true)
