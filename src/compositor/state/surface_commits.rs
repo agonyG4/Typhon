@@ -834,7 +834,10 @@ impl CompositorState {
                 self.queue_dmabuf_buffer_release(buffer);
             }
         }
-        self.clear_resize_state_for_surfaces(&removed_surface_ids);
+        self.clear_resize_state_for_surfaces_with_reason(
+            &removed_surface_ids,
+            WindowInteractionEndReason::SurfaceUnmapped,
+        );
         self.renderable_surfaces
             .retain(|surface| !removed_surface_ids.contains(&surface.surface_id));
         self.clear_popup_grab_for_surface_ids(&removed_surface_ids);
@@ -894,7 +897,10 @@ impl CompositorState {
             .retain(|surface_id| !removed_surface_ids.contains(surface_id));
         self.recent_input_serials
             .retain(|input| !removed_surface_ids.contains(&compositor_surface_id(&input.surface)));
-        self.clear_resize_state_for_surfaces(&removed_surface_ids);
+        self.clear_resize_state_for_surfaces_with_reason(
+            &removed_surface_ids,
+            WindowInteractionEndReason::SurfaceUnmapped,
+        );
         self.clear_pointer_button_state_for_removed_surfaces(
             &removed_surface_ids,
             "surface-destroyed",
@@ -930,6 +936,17 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn clear_resize_state_for_surfaces(&mut self, surface_ids: &[u32]) {
+        self.clear_resize_state_for_surfaces_with_reason(
+            surface_ids,
+            WindowInteractionEndReason::SurfaceDestroyed,
+        );
+    }
+
+    pub(in crate::compositor) fn clear_resize_state_for_surfaces_with_reason(
+        &mut self,
+        surface_ids: &[u32],
+        reason: WindowInteractionEndReason,
+    ) {
         let before_flows = self.resize_configure_flows.len();
         self.resize_configure_flows
             .retain(|surface_id, _| !surface_ids.contains(surface_id));
@@ -974,7 +991,7 @@ impl CompositorState {
             .window_interaction
             .is_some_and(|interaction| surface_ids.contains(&interaction.root_surface_id))
         {
-            self.clear_window_interaction_state();
+            self.clear_window_interaction_state(reason);
         }
         debug_assert!(
             self.window_interaction.is_some() || self.interaction_cursor_override.is_none()

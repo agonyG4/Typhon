@@ -43,7 +43,7 @@ pub(super) struct WindowFrameHit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum WindowInteractionKind {
+pub enum WindowInteractionKind {
     Move,
     Resize(ResizeEdges),
 }
@@ -95,14 +95,31 @@ impl WindowInteractionId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum WindowInteractionSource {
+pub enum WindowInteractionSource {
     NativeBinding,
     XdgToplevelMove,
     XdgToplevelResize,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ResizeEdges {
+pub(in crate::compositor) enum WindowInteractionEndReason {
+    TriggerButtonRelease,
+    TriggerButtonNoLongerHeld,
+    ExplicitEnd,
+    ExplicitCancel,
+    ModeTransition,
+    FocusLoss,
+    SurfaceDestroyed,
+    SurfaceUnmapped,
+    ClientDisconnected,
+    PointerConstraintTransition,
+    SessionSuspended,
+    StateTeardown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResizeEdges {
     pub(super) top: bool,
     pub(super) bottom: bool,
     pub(super) left: bool,
@@ -156,6 +173,42 @@ pub(super) struct WindowInteraction {
     pub(super) start_height: u32,
     pub(super) drag_committed: bool,
     pub(super) resize_interaction_id: Option<ResizeInteractionId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowInteractionDebugSnapshot {
+    pub interaction_id: u64,
+    pub resize_interaction_id: Option<u64>,
+    pub root_surface_id: u32,
+    pub pointer_motion_surface_id: Option<u32>,
+    pub kind: WindowInteractionKind,
+    pub source: WindowInteractionSource,
+    pub trigger_button: Option<u32>,
+    pub trigger_serial: Option<u32>,
+    pub drag_committed: bool,
+    pub start_pointer_x: f64,
+    pub start_pointer_y: f64,
+}
+
+impl WindowInteraction {
+    pub(super) const fn debug_snapshot(self) -> WindowInteractionDebugSnapshot {
+        WindowInteractionDebugSnapshot {
+            interaction_id: self.id.get(),
+            resize_interaction_id: match self.resize_interaction_id {
+                Some(id) => Some(id.get()),
+                None => None,
+            },
+            root_surface_id: self.root_surface_id,
+            pointer_motion_surface_id: self.pointer_motion_surface_id,
+            kind: self.kind,
+            source: self.source,
+            trigger_button: self.trigger_button,
+            trigger_serial: self.trigger_serial,
+            drag_committed: self.drag_committed,
+            start_pointer_x: self.start_pointer_x,
+            start_pointer_y: self.start_pointer_y,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -486,9 +539,12 @@ impl ResizeConfigureFlow {
             })
     }
 
-    #[cfg(test)]
     pub(super) fn queued_latest(&self) -> Option<PendingResizeConfigure> {
         self.queued_latest
+    }
+
+    pub(super) fn final_pending(&self) -> Option<PendingResizeConfigure> {
+        self.final_pending
     }
 
     #[cfg(test)]
@@ -506,6 +562,14 @@ impl ResizeConfigureFlow {
 
     pub(super) fn captured_count(&self) -> usize {
         self.captured.len()
+    }
+
+    pub(super) fn outstanding_count(&self) -> usize {
+        self.outstanding.len()
+    }
+
+    pub(super) fn acked_uncaptured_count(&self) -> usize {
+        usize::from(self.acked_uncaptured.is_some())
     }
 
     pub(super) fn in_flight_configure_count(&self) -> usize {
@@ -534,6 +598,10 @@ impl ResizeConfigureFlow {
             .back()
             .map(|sent| sent.sequence)
             .or_else(|| self.acked_uncaptured.as_ref().map(|sent| sent.sequence))
+    }
+
+    pub(super) fn active_interaction_id(&self) -> Option<ResizeInteractionId> {
+        self.active_interaction
     }
 
     pub(super) fn retained_configure_count(&self) -> usize {

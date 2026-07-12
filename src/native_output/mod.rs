@@ -37,7 +37,7 @@ use oblivion_one::compositor::{
     PointerConstraintMode, PointerMotionSample as CompositorPointerMotionSample, PresentationClock,
     RelativePointerMotion as CompositorRelativePointerMotion, RenderGenerationCause,
     RenderSceneElement, RenderSceneElementId, RenderableSurface, cursor_texture_pixels,
-    cursor_texture_size, render_scene_elements_for_surfaces,
+    cursor_texture_size, render_scene_elements_for_surfaces, resize_debug_log,
 };
 #[cfg(test)]
 use oblivion_one::native::kms::KmsBackendKind;

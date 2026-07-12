@@ -121,3 +121,54 @@ pub(in crate::compositor) fn wayland_resource_client_label(resource: &impl Resou
         .map(|client| format!("{:?}", client.id()))
         .unwrap_or_else(|| "unknown".to_string())
 }
+
+impl CompositorState {
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::compositor) fn resize_flow_debug_event(
+        &self,
+        event: &str,
+        surface_id: u32,
+        interaction_id: Option<WindowInteractionId>,
+        serial: Option<u32>,
+        sequence: Option<u64>,
+        resizing: bool,
+        geometry: Option<WindowGeometry>,
+    ) {
+        let flow = self.resize_configure_flows.get(&surface_id);
+        let active_window = self
+            .window_interaction_debug_snapshot()
+            .filter(|snapshot| snapshot.root_surface_id == surface_id);
+        let flow_state = flow.map(|flow| {
+            (
+                flow.active_interaction_id(),
+                flow.outstanding_count(),
+                flow.acked_uncaptured_count(),
+                flow.captured_count(),
+                flow.queued_latest(),
+                flow.final_pending(),
+            )
+        });
+        let interaction_id = interaction_id.or_else(|| {
+            active_window.map(|snapshot| WindowInteractionId::new(snapshot.interaction_id))
+        });
+        resize_debug_log(|| {
+            format!(
+                "event={event} interaction_id={} resize_interaction_id={} root={} serial={} sequence={} resizing={} geometry={geometry:?} outstanding_count={} acked_uncaptured_count={} queued_latest={:?} final_pending={:?} captured_count={} preview_active={}",
+                interaction_id.map_or_else(|| "none".to_string(), |id| id.get().to_string()),
+                flow_state
+                    .and_then(|state| state.0)
+                    .map_or_else(|| "none".to_string(), |id| id.get().to_string()),
+                surface_id,
+                serial.map_or_else(|| "none".to_string(), |serial| serial.to_string()),
+                sequence.map_or_else(|| "none".to_string(), |sequence| sequence.to_string()),
+                resizing,
+                flow_state.map_or(0, |state| state.1),
+                flow_state.map_or(0, |state| state.2),
+                flow_state.and_then(|state| state.4),
+                flow_state.and_then(|state| state.5),
+                flow_state.map_or(0, |state| state.3),
+                self.active_toplevel_resizes.contains_key(&surface_id),
+            )
+        });
+    }
+}

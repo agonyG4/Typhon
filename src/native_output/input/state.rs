@@ -18,6 +18,7 @@ pub(crate) struct NativeInputState {
     pub(crate) pressed_deferred_modifier_keys: Vec<u16>,
     pub(crate) forwarded_deferred_modifier_keys: Vec<u16>,
     pub(crate) suppressed_vt_switch_keys: Vec<u16>,
+    pressed_pointer_buttons: Vec<u32>,
 }
 
 impl NativeInputState {
@@ -39,6 +40,7 @@ impl NativeInputState {
             pressed_deferred_modifier_keys: Vec::new(),
             forwarded_deferred_modifier_keys: Vec::new(),
             suppressed_vt_switch_keys: Vec::new(),
+            pressed_pointer_buttons: Vec::new(),
         }
     }
 
@@ -280,32 +282,81 @@ impl NativeInputState {
         pressed: bool,
     ) -> NativeInputEffect {
         let mut effect = NativeInputEffect::default();
+        self.set_pointer_button_pressed(button, pressed);
 
-        match self.binding_manager.handle_pointer_button(
+        let binding_match = self.binding_manager.handle_pointer_button(
             self.active_modifier_mask(),
             button,
             pressed,
             self.keyboard_shortcuts_inhibited,
-        ) {
+        );
+        resize_debug_log(|| {
+            format!(
+                "event=hardware_button button={} pressed={} modifiers={:?} binding_result={} binding_action={}",
+                button,
+                pressed,
+                self.active_modifier_mask(),
+                match &binding_match {
+                    AstreaBindingMatch::Consumed { .. } => "consumed",
+                    AstreaBindingMatch::Pass => "pass",
+                },
+                match &binding_match {
+                    AstreaBindingMatch::Consumed { action, .. } => format!("{action:?}"),
+                    AstreaBindingMatch::Pass => "none".to_string(),
+                },
+            )
+        });
+        let binding_consumed = matches!(binding_match, AstreaBindingMatch::Consumed { .. });
+        match binding_match {
             AstreaBindingMatch::Consumed { action, phase } => {
                 self.apply_binding_action(action, phase, Some(button), &mut effect);
-                return effect;
             }
             AstreaBindingMatch::Pass => {}
         }
 
+        if !binding_consumed {
+            effect
+                .pointer_buttons
+                .push(NativePointerButtonEvent::new_at(
+                    button,
+                    pressed,
+                    self.cursor_x,
+                    self.cursor_y,
+                    self.output_width,
+                    self.output_height,
+                ));
+            effect.request_redraw();
+        }
+        resize_debug_log(|| {
+            format!(
+                "event=effect_button button={} pressed={} forwarded_to_apply={} window_actions={:?}",
+                button, pressed, !binding_consumed, effect.window_actions,
+            )
+        });
         effect
-            .pointer_buttons
-            .push(NativePointerButtonEvent::new_at(
-                button,
-                pressed,
-                self.cursor_x,
-                self.cursor_y,
-                self.output_width,
-                self.output_height,
-            ));
-        effect.request_redraw();
-        effect
+    }
+
+    fn set_pointer_button_pressed(&mut self, button: u32, pressed: bool) {
+        if pressed {
+            if !self.pressed_pointer_buttons.contains(&button) {
+                self.pressed_pointer_buttons.push(button);
+            }
+        } else {
+            self.pressed_pointer_buttons
+                .retain(|pressed_button| *pressed_button != button);
+        }
+    }
+
+    pub(crate) fn is_pointer_button_pressed(&self, button: u32) -> bool {
+        self.pressed_pointer_buttons.contains(&button)
+    }
+
+    pub(crate) fn pressed_pointer_buttons_snapshot(&self) -> Vec<u32> {
+        self.pressed_pointer_buttons.clone()
+    }
+
+    pub(crate) fn clear_pressed_pointer_buttons(&mut self) {
+        self.pressed_pointer_buttons.clear();
     }
 
     pub(crate) fn handle_pointer_motion(
@@ -538,6 +589,7 @@ impl NativeInputState {
         self.forwarded_control_keys.clear();
         self.pressed_deferred_modifier_keys.clear();
         self.forwarded_deferred_modifier_keys.clear();
+        self.clear_pressed_pointer_buttons();
         self.pointer_constraint = NativePointerConstraintState::None;
     }
 }

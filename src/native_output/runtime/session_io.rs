@@ -148,6 +148,7 @@ impl NativeSessionIo for NativeRuntime {
     }
 
     fn suspend_input(&mut self) -> NativeResult<()> {
+        self.server.cancel_window_interaction_for_session_suspend();
         self.input_devices.suspend_for_session();
         self.input_state.clear_pressed_state_for_session_switch();
         Ok(())
@@ -254,6 +255,7 @@ impl NativeSessionIo for NativeRuntime {
 
     fn resume_input(&mut self) -> NativeResult<()> {
         self.input_devices.resume_after_session()?;
+        self.server.reconcile_window_interaction_trigger(false);
         Ok(())
     }
 
@@ -264,6 +266,7 @@ impl NativeSessionIo for NativeRuntime {
 
     fn discard_input(&mut self) -> NativeResult<()> {
         self.input_devices.discard_suspended_events();
+        self.server.reconcile_window_interaction_trigger(false);
         Ok(())
     }
 

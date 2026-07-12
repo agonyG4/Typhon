@@ -106,6 +106,26 @@ fn root_native_interaction_construction_records_root_motion_target() {
 }
 
 #[test]
+fn interaction_debug_snapshot_is_read_only_and_authoritative() {
+    let interaction = test_window_interaction_with_target(
+        7,
+        WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+        WindowInteractionSource::NativeBinding,
+        Some(0x111),
+        Some(84),
+    );
+    let snapshot = interaction.debug_snapshot();
+
+    assert_eq!(snapshot.interaction_id, 7);
+    assert_eq!(snapshot.resize_interaction_id, Some(7));
+    assert_eq!(snapshot.root_surface_id, 42);
+    assert_eq!(snapshot.pointer_motion_surface_id, Some(84));
+    assert_eq!(snapshot.trigger_button, Some(0x111));
+    assert_eq!(snapshot.start_pointer_x, 100.0);
+    assert_eq!(snapshot.start_pointer_y, 100.0);
+}
+
+#[test]
 fn subsurface_native_interaction_construction_records_exact_motion_target() {
     let interaction = test_window_interaction_with_target(
         1,
@@ -247,6 +267,33 @@ fn active_resize_rejects_begin_move() {
 }
 
 #[test]
+fn second_begin_rejection_logs_active_interaction_snapshot() {
+    let active = test_window_interaction(
+        7,
+        WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+        Some(0x111),
+    );
+    let begin = test_begin_window_interaction(
+        42,
+        None,
+        WindowInteractionKind::Move,
+        WindowInteractionSource::NativeBinding,
+    );
+    let line = format_begin_rejection(
+        "interaction_already_active",
+        begin,
+        Some(active.debug_snapshot()),
+    );
+
+    assert!(line.contains("event=begin reason=interaction_already_active"));
+    assert!(line.contains("active_interaction_id=7"));
+    assert!(line.contains("active_root=42"));
+    assert!(line.contains("active_kind=Resize"));
+    assert!(line.contains("active_trigger_button=273"));
+    assert!(line.contains("active_drag_committed=false"));
+}
+
+#[test]
 fn active_move_rejects_begin_resize() {
     let mut state = CompositorState {
         window_interaction: Some(test_window_interaction(
@@ -299,7 +346,10 @@ fn stale_interaction_end_is_ignored() {
         ..Default::default()
     };
 
-    assert!(!state.end_window_interaction_by_id(WindowInteractionId::new(1)));
+    assert!(!state.end_window_interaction_by_id_with_reason(
+        WindowInteractionId::new(1),
+        WindowInteractionEndReason::ExplicitEnd,
+    ));
 
     assert_eq!(
         state.active_window_interaction_id(),
@@ -324,6 +374,120 @@ fn non_trigger_button_release_does_not_end_resize() {
 }
 
 #[test]
+fn normal_trigger_release_ends_interaction_once() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Move,
+            Some(0x110),
+        )),
+        ..Default::default()
+    };
+
+    assert!(state.end_window_interaction_for_button(0x110));
+    assert!(!state.end_window_interaction_for_button(0x110));
+    assert!(!state.window_interaction_active());
+}
+
+#[test]
+fn interaction_end_does_not_wait_for_resize_ack() {
+    let mut flow = ResizeConfigureFlow::default();
+    flow.mark_sent(
+        PendingResizeConfigure {
+            surface_id: 42,
+            width: 640,
+            height: 480,
+            placement: SurfacePlacement::root_at(20, 30),
+            edges: ResizeEdges::BOTTOM_RIGHT,
+            resizing: true,
+            interaction_id: ResizeInteractionId::new(1),
+        },
+        10,
+        1,
+    );
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+            Some(0x111),
+        )),
+        resize_configure_flows: [(42, flow)].into_iter().collect(),
+        ..Default::default()
+    };
+
+    assert!(state.end_window_interaction_for_button(0x111));
+    assert!(!state.window_interaction_active());
+    assert_eq!(
+        state.resize_configure_flows[&42].in_flight_configure_count(),
+        1
+    );
+}
+
+#[test]
+fn interaction_end_does_not_wait_for_resize_commit() {
+    let mut flow = ResizeConfigureFlow::default();
+    flow.mark_sent(
+        PendingResizeConfigure {
+            surface_id: 42,
+            width: 640,
+            height: 480,
+            placement: SurfacePlacement::root_at(20, 30),
+            edges: ResizeEdges::BOTTOM_RIGHT,
+            resizing: true,
+            interaction_id: ResizeInteractionId::new(1),
+        },
+        10,
+        1,
+    );
+    assert_eq!(flow.ack(10), ResizeAckDecision::Matched);
+    assert!(flow.capture(1).is_some());
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+            Some(0x111),
+        )),
+        resize_configure_flows: [(42, flow)].into_iter().collect(),
+        ..Default::default()
+    };
+
+    assert!(state.end_window_interaction_for_button(0x111));
+    assert!(!state.window_interaction_active());
+    assert_eq!(state.resize_configure_flows[&42].captured_count(), 1);
+}
+
+#[test]
+fn new_move_can_begin_after_resize_release_with_outstanding_protocol_work() {
+    let mut flow = ResizeConfigureFlow::default();
+    flow.mark_sent(
+        PendingResizeConfigure {
+            surface_id: 42,
+            width: 640,
+            height: 480,
+            placement: SurfacePlacement::root_at(20, 30),
+            edges: ResizeEdges::BOTTOM_RIGHT,
+            resizing: true,
+            interaction_id: ResizeInteractionId::new(1),
+        },
+        10,
+        1,
+    );
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+            Some(0x111),
+        )),
+        resize_configure_flows: [(42, flow)].into_iter().collect(),
+        ..Default::default()
+    };
+
+    assert!(state.end_window_interaction_for_button(0x111));
+    assert!(state.resize_configure_flows[&42].has_in_flight());
+    assert!(!state.window_interaction_active());
+}
+
+#[test]
 fn xdg_resize_trigger_button_release_ends_interaction() {
     let mut state = CompositorState {
         window_interaction: Some(test_window_interaction(
@@ -340,7 +504,56 @@ fn xdg_resize_trigger_button_release_ends_interaction() {
 }
 
 #[test]
-fn destroyed_target_cancels_active_interaction() {
+fn consumed_trigger_release_is_detected_by_reconciliation() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+            Some(0x111),
+        )),
+        ..Default::default()
+    };
+
+    assert!(state.reconcile_window_interaction_trigger(false));
+    assert!(!state.window_interaction_active());
+}
+
+#[test]
+fn trigger_reconciliation_keeps_valid_held_interaction() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+            Some(0x111),
+        )),
+        ..Default::default()
+    };
+
+    assert!(!state.reconcile_window_interaction_trigger(true));
+    assert!(state.window_interaction_active());
+}
+
+#[test]
+fn session_suspend_cancels_active_window_interaction() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+            Some(0x111),
+        )),
+        interaction_cursor_override: Some(InteractionCursorOverride {
+            shape: InteractionCursorShape::ResizeDiagonalNwSe,
+        }),
+        ..Default::default()
+    };
+
+    assert!(state.clear_window_interaction_state(WindowInteractionEndReason::SessionSuspended));
+    assert!(!state.window_interaction_active());
+    assert!(state.interaction_cursor_override.is_none());
+}
+
+#[test]
+fn surface_destroy_cancels_active_window_interaction() {
     let mut state = CompositorState {
         window_interaction: Some(test_window_interaction_with_target(
             1,
@@ -579,7 +792,7 @@ fn explicit_interaction_cancel_clears_interaction_cursor_override() {
         ..Default::default()
     };
 
-    assert!(state.clear_window_interaction_state());
+    assert!(state.clear_window_interaction_state(WindowInteractionEndReason::ExplicitCancel));
     assert!(!state.window_interaction_active());
     assert!(state.interaction_cursor_override.is_none());
 }
@@ -605,7 +818,7 @@ fn focus_loss_clears_interaction_cursor_override() {
 }
 
 #[test]
-fn interaction_cancel_with_pointer_constraint_clears_override_without_clearing_confinement() {
+fn pointer_constraint_cleanup_remains_correct() {
     let mut state = CompositorState {
         window_interaction: Some(test_window_interaction(
             1,
@@ -621,7 +834,7 @@ fn interaction_cancel_with_pointer_constraint_clears_override_without_clearing_c
         .pointer_constraint
         .activate(PointerConstraintMode::Confined, 42);
 
-    assert!(state.clear_window_interaction_state());
+    assert!(state.clear_window_interaction_state(WindowInteractionEndReason::ExplicitCancel));
 
     assert!(state.interaction_cursor_override.is_none());
     assert_eq!(

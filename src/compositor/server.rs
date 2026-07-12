@@ -42,7 +42,8 @@ use super::{
     CompositorState, ExplicitSyncPoint, FramePresentation, FullscreenRenderPlanMetrics,
     InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PresentationClock,
     RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
-    SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, color,
+    SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, WindowInteractionDebugSnapshot,
+    WindowInteractionEndReason, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 
@@ -554,6 +555,14 @@ impl OwnCompositorServer {
         let _ = self.display.flush_clients();
     }
 
+    pub fn cancel_window_interaction_for_session_suspend(&mut self) -> bool {
+        let cancelled = self
+            .state
+            .cancel_window_interaction(WindowInteractionEndReason::SessionSuspended);
+        let _ = self.display.flush_clients();
+        cancelled
+    }
+
     pub fn end_window_interaction_for_button(&mut self, button: u32) -> bool {
         let ended = self.state.end_window_interaction_for_button(button);
         let _ = self.display.flush_clients();
@@ -566,6 +575,18 @@ impl OwnCompositorServer {
 
     pub fn active_window_interaction_trigger_button(&self) -> Option<u32> {
         self.state.active_window_interaction_trigger_button()
+    }
+
+    pub fn reconcile_window_interaction_trigger(&mut self, trigger_pressed: bool) -> bool {
+        let reconciled = self
+            .state
+            .reconcile_window_interaction_trigger(trigger_pressed);
+        let _ = self.display.flush_clients();
+        reconciled
+    }
+
+    pub fn window_interaction_debug_snapshot(&self) -> Option<WindowInteractionDebugSnapshot> {
+        self.state.window_interaction_debug_snapshot()
     }
 
     pub fn emit_astrea_shortcut(

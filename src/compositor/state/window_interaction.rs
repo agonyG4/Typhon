@@ -51,6 +51,14 @@ impl CompositorState {
         trigger_button: u32,
     ) -> bool {
         let Some(surface_id) = self.surface_id_at(x, y) else {
+            log_begin_rejection_without_target(
+                "no_surface_at_pointer",
+                x,
+                y,
+                WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+                WindowInteractionSource::NativeBinding,
+                trigger_button,
+            );
             return false;
         };
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
@@ -83,6 +91,14 @@ impl CompositorState {
 
     pub(in crate::compositor) fn begin_window_frame_action_at(&mut self, x: f64, y: f64) -> bool {
         let Some(hit) = self.window_frame_hit_at(x, y) else {
+            log_begin_rejection_without_target(
+                "no_surface_at_pointer",
+                x,
+                y,
+                WindowInteractionKind::Move,
+                WindowInteractionSource::NativeBinding,
+                0,
+            );
             return false;
         };
         self.begin_window_interaction_for_root(BeginWindowInteraction {
@@ -107,6 +123,14 @@ impl CompositorState {
         trigger_serial: Option<u32>,
     ) -> bool {
         let Some(surface_id) = self.surface_id_at(x, y) else {
+            log_begin_rejection_without_target(
+                "no_surface_at_pointer",
+                x,
+                y,
+                kind,
+                source,
+                trigger_button.unwrap_or_default(),
+            );
             return false;
         };
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
@@ -130,6 +154,14 @@ impl CompositorState {
         let root_surface_id = self.root_surface_id_for_surface(compositor_surface_id(surface));
         let Some(press) = self.valid_pointer_press_for_surface(root_surface_id, surface, serial)
         else {
+            log_begin_rejection_without_target(
+                "invalid_press_serial",
+                0.0,
+                0.0,
+                WindowInteractionKind::Move,
+                WindowInteractionSource::XdgToplevelMove,
+                0,
+            );
             return false;
         };
         self.begin_window_interaction_for_root(BeginWindowInteraction {
@@ -153,6 +185,14 @@ impl CompositorState {
         let root_surface_id = self.root_surface_id_for_surface(compositor_surface_id(surface));
         let Some(press) = self.valid_pointer_press_for_surface(root_surface_id, surface, serial)
         else {
+            log_begin_rejection_without_target(
+                "invalid_press_serial",
+                0.0,
+                0.0,
+                WindowInteractionKind::Resize(edges),
+                WindowInteractionSource::XdgToplevelResize,
+                0,
+            );
             return false;
         };
         self.begin_window_interaction_for_root(BeginWindowInteraction {
@@ -171,7 +211,12 @@ impl CompositorState {
         &mut self,
         begin: BeginWindowInteraction,
     ) -> bool {
-        if self.window_interaction.is_some() || self.window_interaction_blocked_by_pointer_lock() {
+        if self.window_interaction.is_some() {
+            log_begin_rejection(self, begin, "interaction_already_active");
+            return false;
+        }
+        if self.window_interaction_blocked_by_pointer_lock() {
+            log_begin_rejection(self, begin, "pointer_lock_active_or_pending");
             return false;
         }
         let BeginWindowInteraction {
@@ -189,15 +234,21 @@ impl CompositorState {
             .iter()
             .find(|surface| surface.surface_id == root_surface_id)
         else {
+            log_begin_rejection(self, begin, "root_missing");
             return false;
         };
-        if let Some(pointer_motion_surface_id) = pointer_motion_surface_id
-            && (self
+        if let Some(pointer_motion_surface_id) = pointer_motion_surface_id {
+            if self
                 .surface_resource_by_id(pointer_motion_surface_id)
                 .is_none()
-                || self.root_surface_id_for_surface(pointer_motion_surface_id) != root_surface_id)
-        {
-            return false;
+            {
+                log_begin_rejection(self, begin, "motion_target_missing");
+                return false;
+            }
+            if self.root_surface_id_for_surface(pointer_motion_surface_id) != root_surface_id {
+                log_begin_rejection(self, begin, "motion_target_wrong_root");
+                return false;
+            }
         }
         let fallback_geometry = WindowGeometry::new(
             root_surface.placement,
@@ -213,6 +264,7 @@ impl CompositorState {
                 .unwrap_or(fallback_geometry),
         };
         let Some(root_resource) = self.surface_resource_by_id(root_surface_id) else {
+            log_begin_rejection(self, begin, "root_resource_missing");
             return false;
         };
         let resize_interaction_id = match kind {
@@ -288,6 +340,39 @@ impl CompositorState {
             resize_interaction_id,
         });
         self.set_interaction_cursor_override(kind);
+        let snapshot = self
+            .window_interaction
+            .expect("window interaction was just installed")
+            .debug_snapshot();
+        resize_debug_log(|| {
+            format!(
+                "event=begin interaction_id={} resize_interaction_id={} root={} motion_target={} source={:?} kind={:?} trigger_button={} trigger_serial={} pointer=({},{}) start_geometry=({},{},{},{},{:?}) cursor_override={:?} pointer_lock_blocked=false",
+                snapshot.interaction_id,
+                snapshot
+                    .resize_interaction_id
+                    .map_or_else(|| "none".to_string(), |id| id.to_string()),
+                snapshot.root_surface_id,
+                snapshot
+                    .pointer_motion_surface_id
+                    .map_or_else(|| "none".to_string(), |id| id.to_string()),
+                snapshot.source,
+                snapshot.kind,
+                snapshot
+                    .trigger_button
+                    .map_or_else(|| "none".to_string(), |button| button.to_string()),
+                snapshot
+                    .trigger_serial
+                    .map_or_else(|| "none".to_string(), |serial| serial.to_string()),
+                snapshot.start_pointer_x,
+                snapshot.start_pointer_y,
+                start_width,
+                start_height,
+                start_placement.local_x,
+                start_placement.local_y,
+                start_placement.root_mode,
+                self.interaction_cursor_override,
+            )
+        });
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
                 "oblivion-one compositor: window_interaction begin id={} root={} source={:?} kind={:?} trigger_button={:?} trigger_serial={:?}",
@@ -314,7 +399,53 @@ impl CompositorState {
         self.sync_cursor_visibility_request();
     }
 
-    pub(in crate::compositor) fn clear_window_interaction_state(&mut self) -> bool {
+    pub(in crate::compositor) fn clear_window_interaction_state(
+        &mut self,
+        reason: WindowInteractionEndReason,
+    ) -> bool {
+        let interaction = self.window_interaction;
+        let snapshot = interaction.map(WindowInteraction::debug_snapshot);
+        let root_surface_id = snapshot.map(|snapshot| snapshot.root_surface_id);
+        let pending_resize = root_surface_id.and_then(|surface_id| {
+            self.resize_configure_flows.get(&surface_id).map(|flow| {
+                (
+                    flow.outstanding_count(),
+                    flow.acked_uncaptured_count(),
+                    flow.captured_count(),
+                    flow.queued_latest(),
+                    flow.final_pending(),
+                )
+            })
+        });
+        let visual_geometry = root_surface_id
+            .and_then(|surface_id| self.current_visual_root_window_geometry(surface_id));
+        let committed_geometry =
+            root_surface_id.and_then(|surface_id| self.current_root_window_geometry(surface_id));
+        resize_debug_log(|| {
+            format!(
+                "event=end reason={reason:?} interaction_id={} resize_interaction_id={} root={} kind={:?} source={:?} trigger_button={} trigger_serial={} drag_committed={} pending_resize={pending_resize:?} visual_geometry={visual_geometry:?} committed_geometry={committed_geometry:?}",
+                snapshot.map_or_else(
+                    || "none".to_string(),
+                    |snapshot| snapshot.interaction_id.to_string()
+                ),
+                snapshot
+                    .and_then(|snapshot| snapshot.resize_interaction_id)
+                    .map_or_else(|| "none".to_string(), |id| id.to_string()),
+                snapshot.map_or_else(
+                    || "none".to_string(),
+                    |snapshot| snapshot.root_surface_id.to_string()
+                ),
+                snapshot.map(|snapshot| snapshot.kind),
+                snapshot.map(|snapshot| snapshot.source),
+                snapshot
+                    .and_then(|snapshot| snapshot.trigger_button)
+                    .map_or_else(|| "none".to_string(), |button| button.to_string()),
+                snapshot
+                    .and_then(|snapshot| snapshot.trigger_serial)
+                    .map_or_else(|| "none".to_string(), |serial| serial.to_string()),
+                snapshot.is_some_and(|snapshot| snapshot.drag_committed),
+            )
+        });
         let had_interaction = self.window_interaction.take().is_some();
         let had_cursor_override = self.interaction_cursor_override.take().is_some();
         if had_cursor_override {
@@ -435,16 +566,30 @@ impl CompositorState {
                         .saturating_add(1);
                     return false;
                 }
-                if self
+                let pending_update_replaced = self
                     .pending_interactive_resize_update
                     .replace(update)
-                    .is_some()
-                {
+                    .is_some();
+                if pending_update_replaced {
                     self.resize_flow_metrics.pending_resize_updates_replaced = self
                         .resize_flow_metrics
                         .pending_resize_updates_replaced
                         .saturating_add(1);
                 }
+                resize_debug_log(|| {
+                    format!(
+                        "event=update interaction_id={} root={} pointer=({x},{y}) delta=({dx},{dy}) drag_committed={} pending_update_replaced={} target_geometry=({},{},{},{},{:?})",
+                        interaction.id.get(),
+                        interaction.root_surface_id,
+                        interaction.drag_committed,
+                        pending_update_replaced,
+                        update.placement.local_x,
+                        update.placement.local_y,
+                        update.width,
+                        update.height,
+                        update.placement.root_mode,
+                    )
+                });
                 true
             }
         }
@@ -454,12 +599,26 @@ impl CompositorState {
         let Some(interaction_id) = self.active_window_interaction_id() else {
             return;
         };
-        self.end_window_interaction_by_id(interaction_id);
+        self.end_window_interaction_by_id_with_reason(
+            interaction_id,
+            WindowInteractionEndReason::ExplicitEnd,
+        );
     }
 
-    pub(in crate::compositor) fn end_window_interaction_by_id(
+    pub(in crate::compositor) fn cancel_window_interaction(
+        &mut self,
+        reason: WindowInteractionEndReason,
+    ) -> bool {
+        if self.window_interaction.is_none() && self.interaction_cursor_override.is_none() {
+            return false;
+        }
+        self.clear_window_interaction_state(reason)
+    }
+
+    pub(in crate::compositor) fn end_window_interaction_by_id_with_reason(
         &mut self,
         interaction_id: WindowInteractionId,
+        reason: WindowInteractionEndReason,
     ) -> bool {
         let interaction = self.window_interaction;
         if interaction.is_none_or(|interaction| interaction.id != interaction_id) {
@@ -491,7 +650,7 @@ impl CompositorState {
                 interaction.trigger_serial,
             );
         }
-        self.clear_window_interaction_state();
+        self.clear_window_interaction_state(reason);
         true
     }
 
@@ -502,7 +661,10 @@ impl CompositorState {
         if interaction.trigger_button != Some(button) {
             return false;
         }
-        self.end_window_interaction_by_id(interaction.id)
+        self.end_window_interaction_by_id_with_reason(
+            interaction.id,
+            WindowInteractionEndReason::TriggerButtonRelease,
+        )
     }
 
     pub(in crate::compositor) fn apply_pending_interactive_resize_update(&mut self) -> bool {
@@ -545,4 +707,100 @@ impl CompositorState {
         self.window_interaction
             .and_then(|interaction| interaction.trigger_button)
     }
+
+    pub(in crate::compositor) fn reconcile_window_interaction_trigger(
+        &mut self,
+        trigger_pressed: bool,
+    ) -> bool {
+        let Some(interaction) = self.window_interaction else {
+            return false;
+        };
+        if interaction.trigger_button.is_none() || trigger_pressed {
+            return false;
+        }
+        resize_debug_log(|| {
+            format!(
+                "event=invariant_violation type=trigger_not_held interaction_id={} trigger_button={}",
+                interaction.id.get(),
+                interaction.trigger_button.unwrap_or_default(),
+            )
+        });
+        self.end_window_interaction_by_id_with_reason(
+            interaction.id,
+            WindowInteractionEndReason::TriggerButtonNoLongerHeld,
+        )
+    }
+
+    pub(in crate::compositor) fn window_interaction_debug_snapshot(
+        &self,
+    ) -> Option<WindowInteractionDebugSnapshot> {
+        self.window_interaction
+            .map(WindowInteraction::debug_snapshot)
+    }
+}
+
+fn log_begin_rejection(state: &CompositorState, begin: BeginWindowInteraction, reason: &str) {
+    let active = state.window_interaction_debug_snapshot();
+    resize_debug_log(|| format_begin_rejection(reason, begin, active));
+}
+
+pub(in crate::compositor) fn format_begin_rejection(
+    reason: &str,
+    begin: BeginWindowInteraction,
+    active: Option<WindowInteractionDebugSnapshot>,
+) -> String {
+    let active_fields = active.map_or_else(
+        || {
+            "active_interaction_id=none active_root=none active_kind=none active_trigger_button=none active_drag_committed=false".to_string()
+        },
+        |active| {
+            format!(
+                "active_interaction_id={} active_root={} active_kind={:?} active_trigger_button={} active_drag_committed={}",
+                active.interaction_id,
+                active.root_surface_id,
+                active.kind,
+                active
+                    .trigger_button
+                    .map_or_else(|| "none".to_string(), |button| button.to_string()),
+                active.drag_committed,
+            )
+        },
+    );
+    format!(
+        "event=begin reason={reason} root={} motion_target={} source={:?} kind={:?} trigger_button={} trigger_serial={} pointer=({},{}) {active_fields}",
+        begin.root_surface_id,
+        begin
+            .pointer_motion_surface_id
+            .map_or_else(|| "none".to_string(), |id| id.to_string()),
+        begin.source,
+        begin.kind,
+        begin
+            .trigger_button
+            .map_or_else(|| "none".to_string(), |button| button.to_string()),
+        begin
+            .trigger_serial
+            .map_or_else(|| "none".to_string(), |serial| serial.to_string()),
+        begin.x,
+        begin.y,
+    )
+}
+
+fn log_begin_rejection_without_target(
+    reason: &str,
+    x: f64,
+    y: f64,
+    kind: WindowInteractionKind,
+    source: WindowInteractionSource,
+    trigger_button: u32,
+) {
+    resize_debug_log(|| {
+        format!(
+            "event=begin reason={reason} root=none motion_target=none source={source:?} kind={kind:?} trigger_button={} trigger_serial=none pointer=({x},{y}) active_interaction_id=none active_root=none active_kind=none active_trigger_button=none active_drag_committed=false",
+            if trigger_button == 0 {
+                "none".to_string()
+            } else {
+                trigger_button.to_string()
+            },
+        )
+    });
 }

@@ -124,11 +124,12 @@ pub use input::{
 use interaction::{
     InteractionCursorOverride, InteractionCursorShape, PendingResizeConfigure, PointerPress,
     PointerTarget, ResizeAckDecision, ResizeCommitSnapshot, ResizeConfigureFlow, ResizeEdges,
-    RootSurfaceHit, WindowFrameHit, WindowInteraction, WindowInteractionKind,
-    WindowInteractionSource, interactive_resize_geometry, resize_drag_threshold_reached,
-    resize_edges_for_window_point, resize_edges_from_xdg, window_frame_action_for_local_point,
+    RootSurfaceHit, WindowFrameHit, WindowInteraction, WindowInteractionEndReason,
+    WindowInteractionKind, WindowInteractionSource, interactive_resize_geometry,
+    resize_drag_threshold_reached, resize_edges_for_window_point, resize_edges_from_xdg,
+    window_frame_action_for_local_point,
 };
-pub use interaction::{ResizeInteractionId, WindowInteractionId};
+pub use interaction::{ResizeInteractionId, WindowInteractionDebugSnapshot, WindowInteractionId};
 use layer_shell::{Layer, LayerSurfaceRole};
 use output::{
     OutputRefreshRate, OutputScale, OutputSize, send_output_description,
@@ -157,6 +158,7 @@ pub use render::{
     surface_render_plan_with_clip, surface_render_space_assignments,
 };
 use runtime_files::{compositor_debug_surface_logging_enabled, unique_runtime_file_path};
+pub use runtime_files::{resize_debug_log, resize_debug_logging_enabled};
 pub use selection::{SelectionOfferRecord, SelectionState};
 pub use server::{CompositorError, OwnCompositorServer};
 use shm::{

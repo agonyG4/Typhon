@@ -112,6 +112,20 @@ impl CompositorState {
                 }
             }
         }
+        let sequence = self
+            .resize_configure_flows
+            .get(&surface_id)
+            .and_then(ResizeConfigureFlow::in_flight_sequence);
+        self.resize_flow_debug_event(
+            "configure_acked",
+            surface_id,
+            None,
+            Some(serial),
+            sequence,
+            self.active_toplevel_resizes.contains_key(&surface_id),
+            self.current_visual_root_window_geometry(surface_id)
+                .or_else(|| self.current_root_window_geometry(surface_id)),
+        );
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
                 "oblivion-one compositor: resize_flow surface={surface_id} acked_serial={serial} decision={} reason={decision}",
@@ -141,6 +155,19 @@ impl CompositorState {
             self.resize_flow_metrics.commits_captured =
                 self.resize_flow_metrics.commits_captured.saturating_add(1);
             self.update_resize_captures_pending_metrics(surface_id);
+            self.resize_flow_debug_event(
+                "commit_captured",
+                surface_id,
+                None,
+                Some(snapshot.serial),
+                Some(snapshot.sequence),
+                snapshot.resizing,
+                Some(WindowGeometry::new(
+                    snapshot.placement,
+                    snapshot.width,
+                    snapshot.height,
+                )),
+            );
             if compositor_debug_surface_logging_enabled() {
                 eprintln!(
                     "oblivion-one compositor: resize_capture surface={surface_id} serial={} sequence={} commit_sequence={} content_size={:?} size_source=pending xdg_geometry={:?} captured_pending={}",
@@ -332,6 +359,20 @@ impl CompositorState {
                 preview_active,
             )
         };
+        if !snapshot.resizing {
+            let (width, height) = snapshot
+                .committed_size
+                .unwrap_or((snapshot.width, snapshot.height));
+            self.resize_flow_debug_event(
+                "final_committed",
+                surface_id,
+                None,
+                Some(snapshot.serial),
+                Some(snapshot.sequence),
+                false,
+                Some(WindowGeometry::new(snapshot.placement, width, height)),
+            );
+        }
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
                 "oblivion-one compositor: resize_flow surface={surface_id} decision=applied serial={} sequence={} commit_generation={} interaction_id={} buffer_id={:?} preview_sequence={preview_sequence:?} preview_active={preview_active} preview_age_ms={preview_age_ms}",

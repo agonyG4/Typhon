@@ -773,7 +773,7 @@ impl NativeRuntime {
         .flatten();
         let coalesced_events = coalesce_pointer_motion_events(raw_events);
         let coalesced_input_events = coalesced_events.len();
-        for event in coalesced_events {
+        for (event_index, event) in coalesced_events.into_iter().enumerate() {
             let may_change_pointer_constraints = event.may_change_pointer_constraints();
             let effect = input_state.handle_hardware_input_event(event);
             let effect_requested_redraw = effect.redraw_requested;
@@ -821,6 +821,12 @@ impl NativeRuntime {
                 skipped_input_repaints = skipped_input_repaints.saturating_add(1);
             }
             redraw_requested |= application.redraw_requested;
+            let interaction_reconciled = reconcile_trigger_liveness(
+                server,
+                input_state,
+                &format!("event_index={event_index}"),
+            );
+            redraw_requested |= interaction_reconciled;
             if may_change_pointer_constraints {
                 let _ = server.tick()?;
                 redraw_requested |= process_native_pointer_constraint_backend_requests(
@@ -832,6 +838,8 @@ impl NativeRuntime {
                 )?;
             }
         }
+        let interaction_reconciled = reconcile_trigger_liveness(server, input_state, "batch_end");
+        redraw_requested |= interaction_reconciled;
         redraw_requested |= process_native_pointer_constraint_backend_requests(
             server,
             pointer_constraint_backend,
@@ -1235,4 +1243,30 @@ impl NativeRuntime {
         }
         Ok(())
     }
+}
+
+fn reconcile_trigger_liveness(
+    server: &mut OwnCompositorServer,
+    input_state: &NativeInputState,
+    after_event: &str,
+) -> bool {
+    let Some(snapshot) = server.window_interaction_debug_snapshot() else {
+        return false;
+    };
+    let trigger_pressed = snapshot
+        .trigger_button
+        .is_none_or(|button| input_state.is_pointer_button_pressed(button));
+    if let Some(trigger_button) = snapshot.trigger_button
+        && !trigger_pressed
+    {
+        resize_debug_log(|| {
+            format!(
+                "event=trigger_mismatch interaction_id={} trigger_button={} physical_pressed=false pressed_buttons={:?} after_event={after_event}",
+                snapshot.interaction_id,
+                trigger_button,
+                input_state.pressed_pointer_buttons_snapshot(),
+            )
+        });
+    };
+    server.reconcile_window_interaction_trigger(trigger_pressed)
 }

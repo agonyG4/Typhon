@@ -200,6 +200,15 @@ impl CompositorState {
                 .saturating_add(1);
         }
         self.advance_render_generation(RenderGenerationCause::WindowResize);
+        self.resize_flow_debug_event(
+            "preview_applied",
+            surface_id,
+            None,
+            None,
+            Some(flow_sequence),
+            true,
+            Some(WindowGeometry::new(placement, width, height)),
+        );
         true
     }
 
@@ -352,11 +361,27 @@ impl CompositorState {
             .resize_flow_metrics
             .configures_requested
             .saturating_add(1);
-        self.resize_configure_flows
+        let queued = self
+            .resize_configure_flows
             .entry(surface_id)
             .or_default()
             .queue_final(desired);
         self.update_resize_retained_configure_peak(surface_id);
+        if queued {
+            self.resize_flow_debug_event(
+                "final_queued",
+                surface_id,
+                None,
+                None,
+                None,
+                false,
+                Some(WindowGeometry::new(
+                    desired.placement,
+                    desired.width,
+                    desired.height,
+                )),
+            );
+        }
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
                 "oblivion-one compositor: resize_flow surface={surface_id} decision=coalesced queued_serial=not-sent queued_size={}x{} final_pending=true preview_active={}",
@@ -427,6 +452,19 @@ impl CompositorState {
                     .get(&surface_id)
                     .map_or(0, ResizeConfigureFlow::in_flight_configure_count),
             );
+        self.resize_flow_debug_event(
+            if resize.resizing {
+                "configure_sent"
+            } else {
+                "final_sent"
+            },
+            surface_id,
+            None,
+            Some(serial),
+            Some(sequence),
+            resize.resizing,
+            Some(WindowGeometry::new(placement, width, height)),
+        );
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
                 "oblivion-one compositor: resize_flow surface={surface_id} decision=sent serial={serial} sequence={sequence} size={}x{} placement={},{} edges={:?} resizing={} in_flight_serial={serial}",

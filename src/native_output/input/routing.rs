@@ -868,11 +868,31 @@ pub(crate) fn apply_native_input_effect(
             });
     }
     for event in effect.pointer_buttons {
-        if !event.pressed
+        let active = context.server.window_interaction_debug_snapshot();
+        let end_attempt = !event.pressed;
+        let end_result = end_attempt
             && context
                 .server
-                .end_window_interaction_for_button(event.button)
-        {
+                .end_window_interaction_for_button(event.button);
+        let client_dispatch = !end_result;
+        resize_debug_log(|| {
+            format!(
+                "event=apply_button button={} pressed={} active_interaction_id={} active_trigger_button={} end_attempt={} end_result={} client_dispatch={}",
+                event.button,
+                event.pressed,
+                active.map_or_else(
+                    || "none".to_string(),
+                    |snapshot| snapshot.interaction_id.to_string()
+                ),
+                active
+                    .and_then(|snapshot| snapshot.trigger_button)
+                    .map_or_else(|| "none".to_string(), |button| button.to_string()),
+                end_attempt,
+                end_result,
+                client_dispatch,
+            )
+        });
+        if end_result {
             context.resize_perf.observe_action(
                 NativeWindowAction::EndInteraction,
                 true,

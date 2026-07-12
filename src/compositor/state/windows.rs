@@ -16,7 +16,10 @@ impl CompositorState {
             return;
         }
         self.configured_xdg_surfaces.remove(&surface_id);
-        self.clear_resize_state_for_surfaces(&[surface_id]);
+        self.clear_resize_state_for_surfaces_with_reason(
+            &[surface_id],
+            WindowInteractionEndReason::ExplicitCancel,
+        );
         self.toplevel_surfaces.insert(
             surface_id,
             ToplevelSurface {
@@ -901,7 +904,14 @@ impl CompositorState {
         if !self.toplevel_surfaces.contains_key(&surface_id) {
             return false;
         }
-        self.clear_resize_state_for_surfaces(&[surface_id]);
+        let restore_geometry = self
+            .current_visual_root_window_geometry(surface_id)
+            .or_else(|| self.current_root_window_geometry(surface_id))
+            .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(surface_id), 0, 0));
+        self.clear_resize_state_for_surfaces_with_reason(
+            &[surface_id],
+            WindowInteractionEndReason::ModeTransition,
+        );
         if self
             .toplevel_surfaces
             .get(&surface_id)
@@ -910,9 +920,6 @@ impl CompositorState {
             self.restore_minimized_root_window(surface_id);
         }
 
-        let restore_geometry = self
-            .current_root_window_geometry(surface_id)
-            .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(surface_id), 0, 0));
         if let Some(toplevel) = self.toplevel_surfaces.get_mut(&surface_id) {
             toplevel.window.capture_restore_geometry(restore_geometry);
             toplevel.window.set_mode(mode);
@@ -937,7 +944,10 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn restore_floating_root_window(&mut self, surface_id: u32) -> bool {
-        self.clear_resize_state_for_surfaces(&[surface_id]);
+        self.clear_resize_state_for_surfaces_with_reason(
+            &[surface_id],
+            WindowInteractionEndReason::ModeTransition,
+        );
         self.clear_fullscreen_presentation_owner(surface_id);
         let Some(restore_geometry) = self.toplevel_surfaces.get_mut(&surface_id).map(|toplevel| {
             toplevel.window.set_mode(ToplevelMode::Floating);
