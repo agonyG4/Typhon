@@ -90,6 +90,14 @@ impl CompositorState {
         };
         for pending in feedbacks {
             if !pending.surface.is_alive() || presentation.clock != self.presentation_clock {
+                client_pacing_log(
+                    "presentation_feedback_completed",
+                    &[
+                        ("surface", pending.surface_id.to_string()),
+                        ("feedback", format!("{:?}", pending.feedback.id())),
+                        ("outcome", "discarded".to_string()),
+                    ],
+                );
                 pending.feedback.discarded();
                 continue;
             }
@@ -108,6 +116,24 @@ impl CompositorState {
                 (sequence >> 32) as u32,
                 sequence as u32,
                 flags,
+            );
+            client_pacing_log(
+                "presentation_feedback_completed",
+                &[
+                    ("surface", pending.surface_id.to_string()),
+                    (
+                        "root",
+                        self.root_surface_id_for_surface(pending.surface_id)
+                            .to_string(),
+                    ),
+                    (
+                        "client",
+                        format!("{:?}", self.surface_client_ids.get(&pending.surface_id)),
+                    ),
+                    ("feedback", format!("{:?}", pending.feedback.id())),
+                    ("outcome", "presented".to_string()),
+                    ("sequence", sequence.to_string()),
+                ],
             );
         }
     }
@@ -161,6 +187,13 @@ impl CompositorState {
     ) {
         let time = self.frame_callback_time_ms();
         for callback in callbacks {
+            client_pacing_log(
+                "frame_callback_sent",
+                &[
+                    ("callback", format!("{:?}", callback.id())),
+                    ("callback_data_ms", time.to_string()),
+                ],
+            );
             let _ = callback.send_event(wl_callback::Event::Done {
                 callback_data: time,
             });
@@ -406,7 +439,7 @@ impl CompositorState {
         surface_id: u32,
         acquire: &ExplicitSyncPoint,
     ) -> bool {
-        if self
+        let ready = if self
             .pending_explicit_sync_commits
             .iter_mut()
             .find(|commit| {
@@ -416,17 +449,36 @@ impl CompositorState {
             })
             .is_some_and(|commit| commit.acquire_state.mark_ready())
         {
-            return true;
+            true
+        } else {
+            self.pending_surface_tree_transactions
+                .iter_mut()
+                .flat_map(|transaction| &mut transaction.dependencies)
+                .find(|dependency| {
+                    dependency.commit_id == commit_id
+                        && dependency.surface_id == surface_id
+                        && dependency.acquire == *acquire
+                })
+                .is_some_and(|dependency| dependency.state.mark_ready())
+        };
+        if ready {
+            client_pacing_log(
+                "acquire_ready",
+                &[
+                    ("surface", surface_id.to_string()),
+                    (
+                        "root",
+                        self.root_surface_id_for_surface(surface_id).to_string(),
+                    ),
+                    (
+                        "client",
+                        format!("{:?}", self.surface_client_ids.get(&surface_id)),
+                    ),
+                    ("acquire_commit_id", commit_id.get().to_string()),
+                ],
+            );
         }
-        self.pending_surface_tree_transactions
-            .iter_mut()
-            .flat_map(|transaction| &mut transaction.dependencies)
-            .find(|dependency| {
-                dependency.commit_id == commit_id
-                    && dependency.surface_id == surface_id
-                    && dependency.acquire == *acquire
-            })
-            .is_some_and(|dependency| dependency.state.mark_ready())
+        ready
     }
 
     pub(in crate::compositor) fn commit_ready_explicit_sync_buffers(&mut self) {

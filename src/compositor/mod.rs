@@ -75,6 +75,7 @@ mod input;
 mod interaction;
 mod layer_shell;
 mod output;
+mod pacing;
 mod plan;
 mod popup;
 mod presentation;
@@ -88,6 +89,8 @@ mod state_data;
 mod subsurface;
 mod surface;
 mod window_state;
+
+use pacing::*;
 
 use dmabuf::{
     DmabufBufferData, DmabufFeedbackData, DmabufParamsData, PendingDmabufPlane,

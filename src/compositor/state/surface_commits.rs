@@ -26,6 +26,23 @@ impl CompositorState {
         };
         let mut placement = resize_placement.unwrap_or_else(|| self.surface_placement(surface_id));
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
+        client_pacing_log(
+            "visual_generation_queued",
+            &[
+                ("surface", surface_id.to_string()),
+                ("root", root_surface_id.to_string()),
+                (
+                    "client",
+                    format!("{:?}", self.surface_client_ids.get(&surface_id)),
+                ),
+                ("commit_sequence", commit_sequence.0.to_string()),
+                ("buffer", format!("{:?}", pending.resource.id())),
+                ("buffer_id", pending.data.buffer_id().get().to_string()),
+                ("damage", (!damage.is_empty()).to_string()),
+                ("render_generation", generation.to_string()),
+                ("source", format!("{source:?}")),
+            ],
+        );
         if let Some(resize) = resize_commit
             && resize.resizing
             && self
@@ -286,6 +303,7 @@ impl CompositorState {
     pub(in crate::compositor) fn commit_surface_damage_only(
         &mut self,
         surface_id: u32,
+        commit_sequence: SurfaceCommitSequence,
         damage: RenderableSurfaceDamage,
         surface_size: Option<BufferSize>,
         buffer_scale: u32,
@@ -304,6 +322,26 @@ impl CompositorState {
             return false;
         };
         let generation = self.next_render_generation_value();
+        client_pacing_log(
+            "visual_generation_queued",
+            &[
+                ("surface", surface_id.to_string()),
+                (
+                    "root",
+                    self.root_surface_id_for_surface(surface_id).to_string(),
+                ),
+                (
+                    "client",
+                    format!("{:?}", self.surface_client_ids.get(&surface_id)),
+                ),
+                ("commit_sequence", commit_sequence.0.to_string()),
+                ("buffer", format!("{:?}", current.resource.id())),
+                ("buffer_id", current.data.buffer_id().get().to_string()),
+                ("damage", (!damage.is_empty()).to_string()),
+                ("render_generation", generation.to_string()),
+                ("source", "damage_only".to_string()),
+            ],
+        );
         self.apply_committed_window_geometry(surface_id, window_geometry);
         let Some(existing) = self
             .renderable_surfaces
@@ -550,6 +588,23 @@ impl CompositorState {
         self.finalize_pending_buffer_resize_capture(surface_id, &mut pending, window_geometry);
         let buffer_id = pending.resource.id().protocol_id();
         let received_at = Instant::now();
+        client_pacing_log(
+            "acquire_wait_queued",
+            &[
+                ("surface", surface_id.to_string()),
+                (
+                    "root",
+                    self.root_surface_id_for_surface(surface_id).to_string(),
+                ),
+                (
+                    "client",
+                    format!("{:?}", self.surface_client_ids.get(&surface_id)),
+                ),
+                ("commit_sequence", commit_sequence.0.to_string()),
+                ("acquire_commit_id", commit_id.get().to_string()),
+                ("buffer", buffer_id.to_string()),
+            ],
+        );
         self.pending_explicit_sync_commits
             .push(PendingExplicitSyncCommit {
                 commit_id,
@@ -694,6 +749,7 @@ impl CompositorState {
         {
             self.commit_surface_damage_only(
                 surface_id,
+                commit_sequence,
                 damage,
                 surface_size,
                 buffer_scale,

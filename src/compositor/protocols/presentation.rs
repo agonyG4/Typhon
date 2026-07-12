@@ -14,12 +14,28 @@ impl Dispatch<wp_presentation::WpPresentation, ()> for CompositorState {
             wp_presentation::Request::Destroy => {}
             wp_presentation::Request::Feedback { surface, callback } => {
                 let feedback = data_init.init(callback, ());
+                let surface_id = compositor_surface_id(&surface);
+                client_pacing_log(
+                    "presentation_feedback_requested",
+                    &[
+                        ("surface", surface_id.to_string()),
+                        (
+                            "root",
+                            state.root_surface_id_for_surface(surface_id).to_string(),
+                        ),
+                        (
+                            "client",
+                            format!("{:?}", state.surface_client_ids.get(&surface_id)),
+                        ),
+                        ("feedback", format!("{:?}", feedback.id())),
+                    ],
+                );
                 state
                     .pending_surface_presentation_feedbacks
-                    .entry(compositor_surface_id(&surface))
+                    .entry(surface_id)
                     .or_default()
                     .push(PendingPresentationFeedback {
-                        surface_id: compositor_surface_id(&surface),
+                        surface_id,
                         surface,
                         feedback,
                     });

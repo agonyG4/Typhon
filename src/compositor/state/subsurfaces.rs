@@ -503,6 +503,23 @@ impl CompositorState {
                 );
                 return None;
             };
+            client_pacing_log(
+                "acquire_wait_queued",
+                &[
+                    ("surface", surface_id.to_string()),
+                    (
+                        "root",
+                        self.root_surface_id_for_surface(*surface_id).to_string(),
+                    ),
+                    (
+                        "client",
+                        format!("{:?}", self.surface_client_ids.get(surface_id)),
+                    ),
+                    ("commit_sequence", commit.commit_sequence.0.to_string()),
+                    ("acquire_commit_id", commit_id.get().to_string()),
+                    ("buffer", pending.resource.id().protocol_id().to_string()),
+                ],
+            );
             dependencies.push(SurfaceTreeAcquireDependency {
                 commit_id,
                 surface_id: *surface_id,

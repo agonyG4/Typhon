@@ -39,6 +39,23 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
         match request {
             wl_surface::Request::Frame { callback } => {
                 let callback = data_init.init(callback, ());
+                client_pacing_log(
+                    "frame_callback_requested",
+                    &[
+                        ("surface", data.surface_id().to_string()),
+                        (
+                            "root",
+                            state
+                                .root_surface_id_for_surface(data.surface_id())
+                                .to_string(),
+                        ),
+                        (
+                            "client",
+                            format!("{:?}", state.surface_client_ids.get(&data.surface_id())),
+                        ),
+                        ("callback", format!("{:?}", callback.id())),
+                    ],
+                );
                 data.push_frame_callback(callback);
             }
             wl_surface::Request::Attach { buffer, x, y } => {
@@ -95,11 +112,55 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     Some(PendingSurfaceAttachment::Buffer(_)) => Some(damage.damage),
                     _ => damage.explicit(),
                 };
+                let frame_callbacks = data.take_frame_callbacks();
+                let attachment_kind = match attachment.as_ref() {
+                    Some(PendingSurfaceAttachment::Buffer(_)) => "buffer",
+                    Some(PendingSurfaceAttachment::RemoveContent) => "remove",
+                    None => "unchanged",
+                };
+                let buffer = match attachment.as_ref() {
+                    Some(PendingSurfaceAttachment::Buffer(buffer)) => {
+                        format!("{:?}", buffer.resource.id())
+                    }
+                    _ => "none".to_string(),
+                };
+                client_pacing_log(
+                    "surface_commit",
+                    &[
+                        ("surface", surface_id.to_string()),
+                        (
+                            "root",
+                            state.root_surface_id_for_surface(surface_id).to_string(),
+                        ),
+                        (
+                            "client",
+                            format!("{:?}", state.surface_client_ids.get(&surface_id)),
+                        ),
+                        ("commit_sequence", commit_sequence.0.to_string()),
+                        ("attachment", attachment_kind.to_string()),
+                        ("buffer", buffer),
+                        ("damage", damage.is_some().to_string()),
+                        (
+                            "frame_callback_requested",
+                            (!frame_callbacks.is_empty()).to_string(),
+                        ),
+                        ("frame_callback_count", frame_callbacks.len().to_string()),
+                        (
+                            "presentation_feedback_requested",
+                            (!presentation_feedbacks.is_empty()).to_string(),
+                        ),
+                        (
+                            "presentation_feedback_count",
+                            presentation_feedbacks.len().to_string(),
+                        ),
+                        ("explicit_sync", explicit_sync.is_some().to_string()),
+                    ],
+                );
                 let commit = CachedSubsurfaceCommit {
                     commit_sequence,
                     attachment,
                     damage,
-                    frame_callbacks: data.take_frame_callbacks(),
+                    frame_callbacks,
                     explicit_sync: explicit_sync.map(CapturedExplicitSyncState::capture),
                     offset,
                     viewport_destination: viewport_change,
