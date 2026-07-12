@@ -1429,7 +1429,7 @@ fn native_input_active_resize_updates_real_compositor_without_client_motion() {
         ClientEvent::ReadyForPointer
     ));
     assert_eq!(server.renderable_surfaces().len(), 1);
-    assert!(server.begin_window_resize_at(92.0, 86.0));
+    assert!(server.begin_window_resize_at_with_trigger(92.0, 86.0, u32::from(BTN_LEFT),));
     assert!(server.window_interaction_active());
     server.send_pointer_motion(92.0, 86.0);
     client_commands.send(ClientCommand::SetCursor).unwrap();
@@ -1482,12 +1482,80 @@ fn native_input_active_resize_updates_real_compositor_without_client_motion() {
         server.resize_flow_metrics().resize_updates_applied,
         updates_before + 1
     );
+
+    let release_application = apply_native_input_effect(
+        NativeInputEffect {
+            pointer_buttons: vec![NativePointerButtonEvent::new_at(
+                u32::from(BTN_LEFT),
+                false,
+                x,
+                y,
+                320,
+                200,
+            )],
+            ..NativeInputEffect::default()
+        },
+        NativeInputApplyContext {
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            seat_session: None,
+            process_supervisor: &mut process_supervisor,
+        },
+    )
+    .unwrap();
+
+    assert!(release_application.redraw_requested);
+    assert!(!server.window_interaction_active());
+    let cursor_after_release = server
+        .client_cursor_render_state()
+        .expect("client cursor remains rendered after resize release");
+    assert_eq!(
+        (
+            cursor_after_release.logical_x + 3,
+            cursor_after_release.logical_y + 4
+        ),
+        (x as i32, y as i32)
+    );
+
+    let next_x = x + 1.0;
+    let next_y = y + 2.0;
+    apply_native_input_effect(
+        NativeInputEffect {
+            pointer_motion: Some((next_x, next_y)),
+            pointer_motion_usec: Some(43_000),
+            ..NativeInputEffect::default()
+        },
+        NativeInputApplyContext {
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            seat_session: None,
+            process_supervisor: &mut process_supervisor,
+        },
+    )
+    .unwrap();
+
+    let cursor_after_next_motion = server
+        .client_cursor_render_state()
+        .expect("client cursor remains rendered after normal motion");
+    assert_eq!(
+        (
+            cursor_after_next_motion.logical_x + 3,
+            cursor_after_next_motion.logical_y + 4
+        ),
+        (next_x as i32, next_y as i32)
+    );
     client_commands.send(ClientCommand::Finish).unwrap();
     let finished = pump_native_input_server_until(&mut server, &client_events);
     assert_eq!(
         finished,
         ClientEvent::Finished {
-            pointer_motion_count
+            pointer_motion_count: pointer_motion_count + 1,
         }
     );
 }
