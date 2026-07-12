@@ -1822,7 +1822,13 @@ fn active_window_interaction_motion_route_skips_client_dispatch() {
         .expect("ordinary motion route")
         .0;
 
-    assert!(interaction_route.contains("apply_active_window_interaction_motion"));
+    let pointer_update = interaction_route
+        .find("update_pointer_position_without_client_dispatch")
+        .expect("active route should update compositor pointer position");
+    let interaction_update = interaction_route
+        .find("NativeWindowAction::UpdateInteraction")
+        .expect("active route should update window interaction");
+    assert!(pointer_update < interaction_update);
     assert!(!interaction_route.contains("send_pointer_motion_sample"));
 }
 
