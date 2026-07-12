@@ -3,9 +3,30 @@ use crate::native_output::runtime::{
     NativePointerConstraint, NativePointerConstraintBackendAction,
 };
 use std::{
-    fs,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    fs::{self, OpenOptions},
+    io::Write,
+    os::{
+        fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+        unix::net::UnixStream,
+    },
     path::PathBuf,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
+use wayland_client::{
+    Connection, Dispatch, QueueHandle,
+    globals::{GlobalListContents, registry_queue_init},
+    protocol::{
+        wl_buffer as client_wl_buffer, wl_compositor as client_wl_compositor,
+        wl_pointer as client_wl_pointer, wl_registry, wl_seat as client_wl_seat,
+        wl_shm as client_wl_shm, wl_shm_pool as client_wl_shm_pool,
+        wl_surface as client_wl_surface,
+    },
+};
+use wayland_protocols::xdg::shell::client::{
+    xdg_surface as client_xdg_surface, xdg_toplevel as client_xdg_toplevel,
+    xdg_wm_base as client_xdg_wm_base,
 };
 
 #[test]
@@ -1393,6 +1414,302 @@ fn native_input_window_interaction_motion_routes_through_compositor_owner() {
     assert!(effect.window_actions.is_empty());
     assert_eq!(effect.pointer_motion, Some((172.0, 96.0)));
     assert!(!effect.requires_frame_repaint(NativeCursorRenderMode::Hardware));
+}
+
+#[test]
+fn native_input_active_resize_updates_real_compositor_without_client_motion() {
+    let socket_name = format!("typhon-native-input-interaction-{}", std::process::id());
+    let socket_path =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(&socket_name);
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (client_commands, client_events) = spawn_native_input_resize_client(socket_path);
+
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::ReadyForPointer
+    ));
+    assert_eq!(server.renderable_surfaces().len(), 1);
+    assert!(server.begin_window_resize_at(92.0, 86.0));
+    assert!(server.window_interaction_active());
+    server.send_pointer_motion(92.0, 86.0);
+    client_commands.send(ClientCommand::SetCursor).unwrap();
+    let pointer_motion_count = match pump_native_input_server_until(&mut server, &client_events) {
+        ClientEvent::CursorReady {
+            pointer_motion_count,
+        } => pointer_motion_count,
+        event => panic!("expected client cursor, got {event:?}"),
+    };
+    pump_native_input_server_until_cursor(&mut server);
+    let updates_before = server.resize_flow_metrics().resize_updates_applied;
+    let raw_updates_before = server.resize_flow_metrics().raw_pointer_resize_updates;
+    let x = 132.0;
+    let y = 112.0;
+    let mut process_supervisor = ChildSupervisor::new();
+    let mut resize_perf = NativeResizePerfState::default();
+
+    let application = apply_native_input_effect(
+        NativeInputEffect {
+            pointer_motion: Some((x, y)),
+            pointer_motion_usec: Some(42_000),
+            relative_motion: Some(RelativeMotion::accelerated_only(7.0, -5.0)),
+            ..NativeInputEffect::default()
+        },
+        NativeInputApplyContext {
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            seat_session: None,
+            process_supervisor: &mut process_supervisor,
+        },
+    )
+    .unwrap();
+
+    assert!(server.window_interaction_active());
+    assert_eq!(
+        server.resize_flow_metrics().raw_pointer_resize_updates,
+        raw_updates_before + 1
+    );
+    assert!(application.redraw_requested);
+    let cursor = server.client_cursor_render_state().unwrap();
+    assert_eq!(
+        (cursor.logical_x + 3, cursor.logical_y + 4),
+        (x as i32, y as i32)
+    );
+    server.prepare_frame();
+    assert_eq!(
+        server.resize_flow_metrics().resize_updates_applied,
+        updates_before + 1
+    );
+    client_commands.send(ClientCommand::Finish).unwrap();
+    let finished = pump_native_input_server_until(&mut server, &client_events);
+    assert_eq!(
+        finished,
+        ClientEvent::Finished {
+            pointer_motion_count
+        }
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClientEvent {
+    ReadyForPointer,
+    CursorReady { pointer_motion_count: usize },
+    Finished { pointer_motion_count: usize },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClientCommand {
+    SetCursor,
+    Finish,
+}
+
+#[derive(Default)]
+struct NativeInputClientState {
+    pointer_enter_serial: Option<u32>,
+    pointer_motion_count: usize,
+}
+
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for NativeInputClientState {
+    fn event(
+        _: &mut Self,
+        _: &wl_registry::WlRegistry,
+        _: wl_registry::Event,
+        _: &GlobalListContents,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+macro_rules! native_input_noop_dispatch {
+    ($interface:path) => {
+        impl Dispatch<$interface, ()> for NativeInputClientState {
+            fn event(
+                _: &mut Self,
+                _: &$interface,
+                _: <$interface as wayland_client::Proxy>::Event,
+                _: &(),
+                _: &Connection,
+                _: &QueueHandle<Self>,
+            ) {
+            }
+        }
+    };
+}
+
+native_input_noop_dispatch!(client_wl_compositor::WlCompositor);
+native_input_noop_dispatch!(client_wl_surface::WlSurface);
+native_input_noop_dispatch!(client_wl_seat::WlSeat);
+native_input_noop_dispatch!(client_wl_shm::WlShm);
+native_input_noop_dispatch!(client_wl_shm_pool::WlShmPool);
+native_input_noop_dispatch!(client_wl_buffer::WlBuffer);
+native_input_noop_dispatch!(client_xdg_toplevel::XdgToplevel);
+
+impl Dispatch<client_wl_pointer::WlPointer, ()> for NativeInputClientState {
+    fn event(
+        state: &mut Self,
+        _: &client_wl_pointer::WlPointer,
+        event: client_wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_wl_pointer::Event::Enter { serial, .. } => {
+                state.pointer_enter_serial = Some(serial)
+            }
+            client_wl_pointer::Event::Motion { .. } => state.pointer_motion_count += 1,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<client_xdg_wm_base::XdgWmBase, ()> for NativeInputClientState {
+    fn event(
+        _: &mut Self,
+        proxy: &client_xdg_wm_base::XdgWmBase,
+        event: client_xdg_wm_base::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let client_xdg_wm_base::Event::Ping { serial } = event {
+            proxy.pong(serial);
+        }
+    }
+}
+
+impl Dispatch<client_xdg_surface::XdgSurface, ()> for NativeInputClientState {
+    fn event(
+        _: &mut Self,
+        proxy: &client_xdg_surface::XdgSurface,
+        event: client_xdg_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let client_xdg_surface::Event::Configure { serial } = event {
+            proxy.ack_configure(serial);
+        }
+    }
+}
+
+fn spawn_native_input_resize_client(
+    socket_path: PathBuf,
+) -> (mpsc::Sender<ClientCommand>, mpsc::Receiver<ClientEvent>) {
+    let (commands_sender, commands_receiver) = mpsc::channel();
+    let (events_sender, events_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let stream = UnixStream::connect(socket_path).unwrap();
+        let connection = Connection::from_socket(stream).unwrap();
+        let (globals, mut queue) =
+            registry_queue_init::<NativeInputClientState>(&connection).unwrap();
+        let qh = queue.handle();
+        let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+        let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+        let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+        let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+        let pointer = seat.get_pointer(&qh, ());
+        let surface = compositor.create_surface(&qh, ());
+        let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+        let _toplevel = xdg_surface.get_toplevel(&qh, ());
+        let mut state = NativeInputClientState::default();
+        attach_native_input_test_buffer(&surface, &shm, &qh, 160, 120);
+        surface.commit();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+        events_sender.send(ClientEvent::ReadyForPointer).unwrap();
+        assert_eq!(commands_receiver.recv().unwrap(), ClientCommand::SetCursor);
+        queue.roundtrip(&mut state).unwrap();
+        let cursor = compositor.create_surface(&qh, ());
+        pointer.set_cursor(state.pointer_enter_serial.unwrap(), Some(&cursor), 3, 4);
+        attach_native_input_test_buffer(&cursor, &shm, &qh, 24, 24);
+        cursor.commit();
+        connection.flush().unwrap();
+        events_sender
+            .send(ClientEvent::CursorReady {
+                pointer_motion_count: state.pointer_motion_count,
+            })
+            .unwrap();
+        assert_eq!(commands_receiver.recv().unwrap(), ClientCommand::Finish);
+        queue.roundtrip(&mut state).unwrap();
+        events_sender
+            .send(ClientEvent::Finished {
+                pointer_motion_count: state.pointer_motion_count,
+            })
+            .unwrap();
+    });
+    (commands_sender, events_receiver)
+}
+
+fn attach_native_input_test_buffer(
+    surface: &client_wl_surface::WlSurface,
+    shm: &client_wl_shm::WlShm,
+    qh: &QueueHandle<NativeInputClientState>,
+    width: usize,
+    height: usize,
+) {
+    let pixels = vec![0xff20_3040_u32; width * height];
+    let path = std::env::temp_dir().join(format!(
+        "typhon-native-input-test-{}-{}",
+        std::process::id(),
+        width * height
+    ));
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    fs::remove_file(path).unwrap();
+    for pixel in pixels {
+        file.write_all(&pixel.to_ne_bytes()).unwrap();
+    }
+    file.flush().unwrap();
+    let pool = shm.create_pool(file.as_fd(), (width * height * 4) as i32, qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        width as i32,
+        height as i32,
+        (width * 4) as i32,
+        client_wl_shm::Format::Argb8888,
+        qh,
+        (),
+    );
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage_buffer(0, 0, width as i32, height as i32);
+}
+
+fn pump_native_input_server_until(
+    server: &mut OwnCompositorServer,
+    events: &mpsc::Receiver<ClientEvent>,
+) -> ClientEvent {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let _ = server.tick();
+        if let Ok(event) = events.try_recv() {
+            return event;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "native input client did not progress"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn pump_native_input_server_until_cursor(server: &mut OwnCompositorServer) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while server.client_cursor_render_state().is_none() {
+        let _ = server.tick();
+        assert!(
+            Instant::now() < deadline,
+            "native input client cursor did not commit"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]
