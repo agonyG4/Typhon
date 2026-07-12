@@ -113,6 +113,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureCommittedWindowGeometry(Sender<Option<XdgWindowGeometry>>),
     CaptureToplevelVisualGeometry(Sender<Option<ToplevelVisualGeometrySnapshot>>),
     CaptureClientCursorSnapshot(Sender<Option<ClientCursorSnapshot>>),
+    CaptureClipboardState(Sender<ClipboardStateSnapshot>),
     CaptureXdgRoleSnapshot {
         surface_id: u32,
         reply: Sender<XdgRoleSnapshot>,
@@ -161,6 +162,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
     let server_thread = thread::spawn(move || {
         let mut running = true;
         while running {
+            let mut barriers = Vec::new();
             while let Ok(command) = receiver.try_recv() {
                 match command {
                     ServerCommand::KeyboardKey { key, pressed } => {
@@ -315,6 +317,13 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                         });
                         let _ = reply.send(snapshot);
                     }
+                    ServerCommand::CaptureClipboardState(reply) => {
+                        let _ = reply.send(ClipboardStateSnapshot {
+                            active_source: server.state.active_clipboard.is_some(),
+                            source_count: server.state.data_sources.len(),
+                            offer_count: server.state.data_offers.len(),
+                        });
+                    }
                     ServerCommand::CaptureXdgRoleSnapshot { surface_id, reply } => {
                         let tracked_surface_id = if server.state.toplevel_surfaces.len() == 1 {
                             *server.state.toplevel_surfaces.keys().next().unwrap()
@@ -429,9 +438,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::ClearPointerEnterTracking => {
                         server.state.pointer_entered_surfaces.clear();
                     }
-                    ServerCommand::Barrier(reply) => {
-                        let _ = reply.send(());
-                    }
+                    ServerCommand::Barrier(reply) => barriers.push(reply),
                     ServerCommand::PrepareFrame => {
                         server.prepare_frame();
                     }
@@ -448,6 +455,9 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                 }
             }
             let _ = server.tick();
+            for barrier in barriers {
+                let _ = barrier.send(());
+            }
             thread::sleep(Duration::from_millis(2));
         }
         server
@@ -470,6 +480,18 @@ pub(in crate::compositor::tests) fn wait_for_server_commands(commands: &Sender<S
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should process command barrier");
+}
+
+pub(in crate::compositor::tests) fn capture_clipboard_state(
+    commands: &Sender<ServerCommand>,
+) -> ClipboardStateSnapshot {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureClipboardState(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report clipboard state")
 }
 
 pub(in crate::compositor::tests) fn capture_render_generation(

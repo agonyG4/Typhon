@@ -4,6 +4,12 @@ use super::{
     client_setup::*, frame_buffer_client::*, input_client::*, locked_relative::*,
     output_bindings::*, registry_state::*, server_runtime::*, subsurface_client::*, window_ops::*,
 };
+
+pub(in crate::compositor::tests) struct ClipboardDisconnectResult {
+    pub(in crate::compositor::tests) target_state: RegistryTestState,
+    pub(in crate::compositor::tests) clipboard_state: ClipboardStateSnapshot,
+}
+
 pub(in crate::compositor::tests) fn forward_clipboard_between_two_clients(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
@@ -93,7 +99,7 @@ pub(in crate::compositor::tests) fn forward_clipboard_between_two_clients(
 pub(in crate::compositor::tests) fn disconnect_clipboard_source_after_target_offer(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
-) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+) -> Result<ClipboardDisconnectResult, Box<dyn std::error::Error>> {
     let source_stream = UnixStream::connect(socket_path)?;
     let source_connection = Connection::from_socket(source_stream)?;
     let (source_globals, mut source_queue) =
@@ -180,7 +186,11 @@ pub(in crate::compositor::tests) fn disconnect_clipboard_source_after_target_off
     wait_for_server_commands(commands);
     target_queue.roundtrip(&mut target_state)?;
     target_queue.roundtrip(&mut target_state)?;
-    Ok(target_state)
+    let clipboard_state = capture_clipboard_state(commands);
+    Ok(ClipboardDisconnectResult {
+        target_state,
+        clipboard_state,
+    })
 }
 
 pub(in crate::compositor::tests) fn receive_host_clipboard_from_bridge(

@@ -68,10 +68,27 @@ fn clipboard_source_disconnect_clears_focused_target_selection() {
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();
 
-    let target_state = result.unwrap();
+    let ClipboardDisconnectResult {
+        target_state,
+        clipboard_state,
+    } = result.unwrap();
+    assert_eq!(
+        target_state.data_device_selection_events,
+        vec![true, false],
+        "target should receive its offer followed by exactly one selection clear"
+    );
     assert!(
         target_state.data_device_selection_offer.is_none(),
         "target should receive selection(None) when the source client disconnects"
+    );
+    assert_eq!(
+        clipboard_state,
+        ClipboardStateSnapshot {
+            active_source: false,
+            source_count: 0,
+            offer_count: 0,
+        },
+        "disconnect should leave no active clipboard source or offer state"
     );
 }
 

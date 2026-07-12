@@ -118,6 +118,7 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) fractional_preferred_scales: Vec<u32>,
     pub(in crate::compositor::tests) data_device_selection_offer:
         Option<client_wl_data_offer::WlDataOffer>,
+    pub(in crate::compositor::tests) data_device_selection_events: Vec<bool>,
     pub(in crate::compositor::tests) data_offer_mime_types: Vec<String>,
     pub(in crate::compositor::tests) data_source_send_mime_types: Vec<String>,
     pub(in crate::compositor::tests) data_source_cancelled: bool,
@@ -128,6 +129,13 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) astrea_shortcut_cancelled_count: usize,
     pub(in crate::compositor::tests) astrea_shortcut_cancelled_serials: Vec<u32>,
     pub(in crate::compositor::tests) astrea_shortcut_events: Vec<AstreaShortcutEventRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct ClipboardStateSnapshot {
+    pub(in crate::compositor::tests) active_source: bool,
+    pub(in crate::compositor::tests) source_count: usize,
+    pub(in crate::compositor::tests) offer_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,6 +481,7 @@ impl Dispatch<client_wl_data_device::WlDataDevice, ()> for RegistryTestState {
         match event {
             client_wl_data_device::Event::DataOffer { .. } => {}
             client_wl_data_device::Event::Selection { id } => {
+                state.data_device_selection_events.push(id.is_some());
                 state.data_device_selection_offer = id;
             }
             _ => {}
