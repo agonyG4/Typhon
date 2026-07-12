@@ -103,8 +103,15 @@ pub(in crate::compositor::tests) enum ServerCommand {
     },
     MinimizeFocused,
     RestoreNextMinimized,
+    FocusRootWindow(u32),
+    RaiseRootWindow(u32),
     ToggleMaximizeFocused,
     ToggleFullscreenFocused,
+    SetFocusedRootVisualGeometry {
+        placement: SurfacePlacement,
+        width: u32,
+        height: u32,
+    },
     CaptureRenderGeneration(Sender<u64>),
     CaptureSceneRenderGeneration(Sender<u64>),
     CaptureRenderGenerationCause(Sender<RenderGenerationCause>),
@@ -112,6 +119,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureRenderableSurfaceSnapshot(Sender<Vec<RenderableSurfaceSnapshot>>),
     CaptureCommittedWindowGeometry(Sender<Option<XdgWindowGeometry>>),
     CaptureToplevelVisualGeometry(Sender<Option<ToplevelVisualGeometrySnapshot>>),
+    CaptureFullscreenPresentationEligibility(Sender<FullscreenPresentationEligibility>),
     CaptureClientCursorSnapshot(Sender<Option<ClientCursorSnapshot>>),
     CaptureClipboardState(Sender<ClipboardStateSnapshot>),
     CaptureXdgRoleSnapshot {
@@ -224,11 +232,58 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::RestoreNextMinimized => {
                         server.restore_next_minimized_window();
                     }
+                    ServerCommand::FocusRootWindow(surface_id) => {
+                        if let Some(surface) = server.state.surface_resource_by_id(surface_id) {
+                            server.state.focus_surface(surface);
+                        }
+                    }
+                    ServerCommand::RaiseRootWindow(surface_id) => {
+                        server.state.raise_root_window(surface_id);
+                    }
                     ServerCommand::ToggleMaximizeFocused => {
                         server.toggle_maximize_focused_window();
                     }
                     ServerCommand::ToggleFullscreenFocused => {
                         server.toggle_fullscreen_focused_window();
+                    }
+                    ServerCommand::SetFocusedRootVisualGeometry {
+                        placement,
+                        width,
+                        height,
+                    } => {
+                        if let Some(surface_id) = server.state.focused_root_surface_id() {
+                            server.state.set_surface_placement(surface_id, placement);
+                            let has_visual = if let Some(visual) =
+                                server.state.toplevel_visual_geometries.get_mut(&surface_id)
+                            {
+                                visual.placement = placement;
+                                visual.width = width;
+                                visual.height = height;
+                                true
+                            } else {
+                                false
+                            };
+                            if !has_visual {
+                                if let Some(surface) = server
+                                    .state
+                                    .renderable_surfaces
+                                    .iter_mut()
+                                    .find(|surface| surface.surface_id == surface_id)
+                                {
+                                    surface.width = width;
+                                    surface.height = height;
+                                }
+                                if let Some(geometry) =
+                                    server.state.surface_window_geometries.get_mut(&surface_id)
+                                {
+                                    geometry.width = width as i32;
+                                    geometry.height = height as i32;
+                                }
+                            }
+                            server
+                                .state
+                                .update_toplevel_visual_render_assignment(surface_id);
+                        }
                     }
                     ServerCommand::CaptureRenderGeneration(reply) => {
                         let _ = reply.send(server.render_generation());
@@ -304,6 +359,9 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 None
                             };
                         let _ = reply.send(visual);
+                    }
+                    ServerCommand::CaptureFullscreenPresentationEligibility(reply) => {
+                        let _ = reply.send(server.state.fullscreen_presentation_eligibility());
                     }
                     ServerCommand::CaptureClientCursorSnapshot(reply) => {
                         let snapshot = server.client_cursor_render_state().map(|cursor| {
@@ -612,6 +670,56 @@ pub(in crate::compositor::tests) fn capture_toplevel_visual_geometry(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report toplevel visual geometry")
+}
+
+pub(in crate::compositor::tests) fn capture_fullscreen_presentation_eligibility(
+    commands: &Sender<ServerCommand>,
+) -> FullscreenPresentationEligibility {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFullscreenPresentationEligibility(
+            reply,
+        ))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report fullscreen presentation eligibility")
+}
+
+pub(in crate::compositor::tests) fn focus_root_window(
+    commands: &Sender<ServerCommand>,
+    surface_id: u32,
+) {
+    commands
+        .send(ServerCommand::FocusRootWindow(surface_id))
+        .unwrap();
+    wait_for_server_commands(commands);
+}
+
+pub(in crate::compositor::tests) fn raise_root_window(
+    commands: &Sender<ServerCommand>,
+    surface_id: u32,
+) {
+    commands
+        .send(ServerCommand::RaiseRootWindow(surface_id))
+        .unwrap();
+    wait_for_server_commands(commands);
+}
+
+pub(in crate::compositor::tests) fn set_focused_root_visual_geometry(
+    commands: &Sender<ServerCommand>,
+    placement: SurfacePlacement,
+    width: u32,
+    height: u32,
+) {
+    commands
+        .send(ServerCommand::SetFocusedRootVisualGeometry {
+            placement,
+            width,
+            height,
+        })
+        .unwrap();
+    wait_for_server_commands(commands);
 }
 
 pub(in crate::compositor::tests) fn capture_client_cursor_snapshot(

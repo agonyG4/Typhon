@@ -277,6 +277,505 @@ fn fullscreen_ignores_layer_shell_exclusive_zone_for_main_geometry() {
 }
 
 #[test]
+fn fullscreen_later_root_uses_absolute_output_origin() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (state, surface_ids) = create_three_buffered_toplevels_then_toggle_mode(
+        &socket_path,
+        &commands,
+        ServerCommand::ToggleFullscreenFocused,
+        false,
+    )
+    .unwrap();
+    let snapshots = capture_renderable_surface_snapshot(&commands);
+    let fullscreen = snapshots
+        .iter()
+        .find(|surface| surface.surface_id == surface_ids[2])
+        .expect("fullscreen root should be renderable");
+    let role = capture_xdg_role_snapshot(&commands, surface_ids[2]);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+    assert_eq!((fullscreen.origin_x, fullscreen.origin_y), (0, 0));
+    assert_eq!((fullscreen.width, fullscreen.height), (1280, 800));
+    assert_eq!(
+        role.placement.expect("fullscreen placement").root_mode,
+        RootPlacementMode::Absolute
+    );
+}
+
+#[test]
+fn fullscreen_origin_is_independent_of_raise_and_focus_order() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (state, surface_ids) = create_three_buffered_toplevels_then_toggle_mode(
+        &socket_path,
+        &commands,
+        ServerCommand::ToggleFullscreenFocused,
+        true,
+    )
+    .unwrap();
+    let snapshots = capture_renderable_surface_snapshot(&commands);
+    let fullscreen = snapshots
+        .iter()
+        .find(|surface| surface.surface_id == surface_ids[2])
+        .expect("fullscreen root should be renderable");
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+    assert_eq!((fullscreen.origin_x, fullscreen.origin_y), (0, 0));
+}
+
+#[test]
+fn fullscreen_client_request_uses_absolute_output_origin() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (state, surface_ids) =
+        create_three_buffered_toplevels_then_client_fullscreen(&socket_path, &commands).unwrap();
+    let snapshots = capture_renderable_surface_snapshot(&commands);
+    let fullscreen = snapshots
+        .iter()
+        .find(|surface| surface.surface_id == surface_ids[2])
+        .expect("fullscreen root should be renderable");
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+    assert_eq!((fullscreen.origin_x, fullscreen.origin_y), (0, 0));
+    assert_eq!((fullscreen.width, fullscreen.height), (1280, 800));
+}
+
+#[test]
+fn fullscreen_csd_window_geometry_aligns_to_output() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_csd_toplevel_then_client_fullscreen(&socket_path, &commands).unwrap();
+    let snapshots = capture_renderable_surface_snapshot(&commands);
+    let root = snapshots
+        .iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("fullscreen CSD root should be renderable");
+    let geometry = capture_committed_window_geometry(&commands);
+    let role = capture_xdg_role_snapshot(&commands, root.surface_id);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+    assert_eq!((state.toplevel_width, state.toplevel_height), (1280, 800));
+    assert_eq!(geometry, Some(XdgWindowGeometry::new(20, 20, 1280, 800)));
+    assert_eq!((root.origin_x + 20, root.origin_y + 20), (0, 0));
+    assert_eq!((root.width, root.height), (1320, 840));
+    assert_eq!(
+        role.placement.expect("fullscreen CSD placement").root_mode,
+        RootPlacementMode::Absolute
+    );
+}
+
+#[test]
+fn unfullscreen_csd_clears_absolute_render_assignment() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let _state = create_csd_toplevel_then_client_fullscreen(&socket_path, &commands).unwrap();
+    commands
+        .send(ServerCommand::ToggleFullscreenFocused)
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let snapshots = capture_renderable_surface_snapshot(&commands);
+    let root = snapshots
+        .iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("restored CSD root should be renderable");
+    let role = capture_xdg_role_snapshot(&commands, root.surface_id);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!((root.origin_x, root.origin_y), (72, 72));
+    assert_eq!(
+        role.placement.unwrap_or_default().root_mode,
+        RootPlacementMode::CascadedWindow
+    );
+}
+
+#[test]
+fn maximized_later_root_uses_absolute_usable_output_origin() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (state, surface_ids) = create_three_buffered_toplevels_then_toggle_mode(
+        &socket_path,
+        &commands,
+        ServerCommand::ToggleMaximizeFocused,
+        false,
+    )
+    .unwrap();
+    let usable = capture_usable_output_geometry(&commands);
+    let snapshots = capture_renderable_surface_snapshot(&commands);
+    let maximized = snapshots
+        .iter()
+        .find(|surface| surface.surface_id == surface_ids[2])
+        .expect("maximized root should be renderable");
+    let role = capture_xdg_role_snapshot(&commands, surface_ids[2]);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    assert_eq!(
+        (maximized.origin_x, maximized.origin_y),
+        (usable.x as i32, usable.y as i32)
+    );
+    assert_eq!(
+        (maximized.width, maximized.height),
+        (usable.width as u32, usable.height as u32)
+    );
+    assert_eq!(
+        role.placement.expect("maximized placement").root_mode,
+        RootPlacementMode::Absolute
+    );
+}
+
+#[test]
+fn maximized_later_root_respects_reserved_usable_geometry_without_cascade() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let _panel = map_exclusive_top_panel(&socket_path);
+
+    let (state, surface_ids) = create_three_buffered_toplevels_then_toggle_mode(
+        &socket_path,
+        &commands,
+        ServerCommand::ToggleMaximizeFocused,
+        false,
+    )
+    .unwrap();
+    let usable = capture_usable_output_geometry(&commands);
+    let snapshots = capture_renderable_surface_snapshot(&commands);
+    let maximized = snapshots
+        .iter()
+        .find(|surface| surface.surface_id == surface_ids[2])
+        .expect("maximized root should be renderable");
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    assert_eq!(
+        (maximized.origin_x, maximized.origin_y),
+        (usable.x as i32, usable.y as i32)
+    );
+    assert_eq!(
+        (maximized.width, maximized.height),
+        (usable.width as u32, usable.height as u32)
+    );
+}
+
+#[test]
+fn fullscreen_exact_cover_requires_absolute_zero_origin() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let _state = create_buffered_toplevel_then_shortcut_fullscreen_with_committed_geometry(
+        &socket_path,
+        &commands,
+    )
+    .unwrap();
+    let exact = capture_fullscreen_presentation_eligibility(&commands);
+    assert!(exact.exactly_covers_output);
+
+    set_focused_root_visual_geometry(
+        &commands,
+        SurfacePlacement::root_at(
+            -render::FIRST_SURFACE_OFFSET.0,
+            -render::FIRST_SURFACE_OFFSET.1,
+        ),
+        1280,
+        800,
+    );
+    assert!(!capture_fullscreen_presentation_eligibility(&commands).exactly_covers_output);
+
+    set_focused_root_visual_geometry(
+        &commands,
+        SurfacePlacement::absolute_root_at(1, 0),
+        1280,
+        800,
+    );
+    assert!(!capture_fullscreen_presentation_eligibility(&commands).exactly_covers_output);
+
+    set_focused_root_visual_geometry(
+        &commands,
+        SurfacePlacement::absolute_root_at(0, 0),
+        1279,
+        800,
+    );
+    let wrong_size = capture_fullscreen_presentation_eligibility(&commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(!wrong_size.exactly_covers_output);
+}
+
+#[test]
+fn unfullscreen_restores_exact_previous_floating_placement() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let custom_x = 215;
+    let custom_y = 137;
+
+    let state = create_buffered_toplevel_then_window_commands(
+        &socket_path,
+        &commands,
+        &[
+            ServerCommand::BeginMove {
+                x: f64::from(render::FIRST_SURFACE_OFFSET.0 + 1),
+                y: f64::from(render::FIRST_SURFACE_OFFSET.1 + 1),
+            },
+            ServerCommand::UpdateInteraction {
+                x: f64::from(render::FIRST_SURFACE_OFFSET.0 + custom_x + 1),
+                y: f64::from(render::FIRST_SURFACE_OFFSET.1 + custom_y + 1),
+            },
+            ServerCommand::EndInteraction,
+            ServerCommand::ToggleFullscreenFocused,
+            ServerCommand::ToggleFullscreenFocused,
+        ],
+    )
+    .unwrap();
+    let snapshots = capture_renderable_surface_snapshot(&commands);
+    let root = snapshots
+        .iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("restored root should be renderable");
+    let role = capture_xdg_role_snapshot(&commands, root.surface_id);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!((root.local_x, root.local_y), (custom_x, custom_y));
+    assert_eq!((root.width, root.height), (300, 200));
+    assert_eq!(
+        role.placement.expect("restored placement").root_mode,
+        RootPlacementMode::CascadedWindow
+    );
+    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+}
+
+#[test]
+fn unmaximize_restores_exact_previous_floating_placement() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let custom_x = 215;
+    let custom_y = 137;
+
+    let state = create_buffered_toplevel_then_window_commands(
+        &socket_path,
+        &commands,
+        &[
+            ServerCommand::BeginMove {
+                x: f64::from(render::FIRST_SURFACE_OFFSET.0 + 1),
+                y: f64::from(render::FIRST_SURFACE_OFFSET.1 + 1),
+            },
+            ServerCommand::UpdateInteraction {
+                x: f64::from(render::FIRST_SURFACE_OFFSET.0 + custom_x + 1),
+                y: f64::from(render::FIRST_SURFACE_OFFSET.1 + custom_y + 1),
+            },
+            ServerCommand::EndInteraction,
+            ServerCommand::ToggleMaximizeFocused,
+            ServerCommand::ToggleMaximizeFocused,
+        ],
+    )
+    .unwrap();
+    let snapshots = capture_renderable_surface_snapshot(&commands);
+    let root = snapshots
+        .iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("restored root should be renderable");
+    let role = capture_xdg_role_snapshot(&commands, root.surface_id);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!((root.local_x, root.local_y), (custom_x, custom_y));
+    assert_eq!((root.width, root.height), (300, 200));
+    assert_eq!(
+        role.placement.expect("restored placement").root_mode,
+        RootPlacementMode::CascadedWindow
+    );
+    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+}
+
+#[test]
+fn fullscreen_output_resize_preserves_absolute_origin() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_buffered_toplevel_then_mode_and_output_resize(
+        &socket_path,
+        &commands,
+        ServerCommand::ToggleFullscreenFocused,
+        1600,
+        900,
+    )
+    .unwrap();
+    let snapshots = capture_renderable_surface_snapshot(&commands);
+    let root = snapshots
+        .iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("fullscreen root should be renderable");
+    let role = capture_xdg_role_snapshot(&commands, root.surface_id);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+    assert_eq!((state.toplevel_width, state.toplevel_height), (1600, 900));
+    assert_eq!((root.origin_x, root.origin_y), (0, 0));
+    assert_eq!((root.width, root.height), (1600, 900));
+    assert_eq!(
+        role.placement.expect("fullscreen placement").root_mode,
+        RootPlacementMode::Absolute
+    );
+}
+
+#[test]
+fn maximized_output_resize_preserves_absolute_usable_origin() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_buffered_toplevel_then_mode_and_output_resize(
+        &socket_path,
+        &commands,
+        ServerCommand::ToggleMaximizeFocused,
+        1600,
+        900,
+    )
+    .unwrap();
+    let usable = capture_usable_output_geometry(&commands);
+    let snapshots = capture_renderable_surface_snapshot(&commands);
+    let root = snapshots
+        .iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("maximized root should be renderable");
+    let role = capture_xdg_role_snapshot(&commands, root.surface_id);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    assert_eq!((state.toplevel_width, state.toplevel_height), (1600, 900));
+    assert_eq!(
+        (root.origin_x, root.origin_y),
+        (usable.x as i32, usable.y as i32)
+    );
+    assert_eq!(
+        (root.width, root.height),
+        (usable.width as u32, usable.height as u32)
+    );
+    assert_eq!(
+        role.placement.expect("maximized placement").root_mode,
+        RootPlacementMode::Absolute
+    );
+}
+
+#[test]
+fn maximized_geometry_updates_when_exclusive_panel_maps() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_buffered_toplevel_then_toggle_maximize(&socket_path, &commands).unwrap();
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    let _panel = map_exclusive_top_panel(&socket_path);
+    let usable = capture_usable_output_geometry(&commands);
+    let snapshots = capture_renderable_surface_snapshot(&commands);
+    let root = snapshots
+        .iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("maximized root should be renderable");
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(
+        (root.origin_x, root.origin_y),
+        (usable.x as i32, usable.y as i32)
+    );
+}
+
+#[test]
+fn maximized_geometry_updates_when_exclusive_panel_unmaps() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_buffered_toplevel_then_toggle_maximize(&socket_path, &commands).unwrap();
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    let (panel_connection, mut panel_queue, panel_surface, _panel) =
+        map_exclusive_top_panel(&socket_path);
+    panel_surface.attach(None, 0, 0);
+    panel_surface.commit();
+    panel_connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    panel_queue
+        .roundtrip(&mut RegistryTestState::default())
+        .unwrap();
+    let usable = capture_usable_output_geometry(&commands);
+    let snapshots = capture_renderable_surface_snapshot(&commands);
+    let root = snapshots
+        .iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("maximized root should be renderable");
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!((usable.x, usable.y), (0.0, 0.0));
+    assert_eq!((root.origin_x, root.origin_y), (0, 0));
+}
+
+#[test]
+fn fullscreen_subsurface_remains_relative_to_absolute_root() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    create_client_toplevel_with_positioned_subsurface_buffer(&socket_path).unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::ToggleFullscreenFocused)
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let snapshots = capture_renderable_surface_snapshot(&commands);
+    let root = snapshots
+        .iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("fullscreen root should be renderable");
+    let child = snapshots
+        .iter()
+        .find(|surface| surface.parent_surface_id == Some(root.surface_id))
+        .expect("fullscreen child should be renderable");
+    let role = capture_xdg_role_snapshot(&commands, root.surface_id);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!((root.origin_x, root.origin_y), (0, 0));
+    assert_eq!(
+        role.placement.expect("fullscreen root placement").root_mode,
+        RootPlacementMode::Absolute
+    );
+    assert_eq!((child.local_x, child.local_y), (10, 12));
+    assert_eq!((child.origin_x, child.origin_y), (10, 12));
+}
+
+#[test]
 fn window_resize_drag_sends_configure_for_root_surface() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

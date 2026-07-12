@@ -408,6 +408,9 @@ impl CompositorState {
             .surface_window_geometries
             .insert(surface_id, window_geometry)
             != Some(window_geometry);
+        if self.toplevel_surfaces.contains_key(&surface_id) {
+            self.update_toplevel_visual_render_assignment(surface_id);
+        }
         self.update_popup_surface_placement_from_committed_state(surface_id);
         if let Some(positioner) = self
             .popup_surfaces

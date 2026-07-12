@@ -276,6 +276,7 @@ impl CompositorState {
         if !self.layer_surfaces.contains_key(&surface_id) {
             return true;
         }
+        let previous_usable = self.reserved_usable_geometry();
         let committed_change = match self.commit_pending_layer_surface_state(surface_id) {
             Some(committed_change) => committed_change,
             None => {
@@ -283,7 +284,7 @@ impl CompositorState {
             }
         };
         if committed_change {
-            self.arrange_layer_surfaces();
+            self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(previous_usable);
             self.reorder_renderable_surfaces_by_committed_stack();
         }
         if self
@@ -304,6 +305,7 @@ impl CompositorState {
         if !self.layer_surfaces.contains_key(&surface_id) {
             return true;
         }
+        let previous_usable = self.reserved_usable_geometry();
         if self
             .commit_pending_layer_surface_state(surface_id)
             .is_none()
@@ -315,7 +317,7 @@ impl CompositorState {
             .get(&surface_id)
             .is_some_and(|role| role.mapped)
         {
-            self.arrange_layer_surfaces();
+            self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(previous_usable);
             self.reorder_renderable_surfaces_by_committed_stack();
         }
         let Some(role) = self.layer_surfaces.get(&surface_id) else {
@@ -362,6 +364,7 @@ impl CompositorState {
         if !self.layer_surfaces.contains_key(&surface_id) {
             return;
         }
+        let previous_usable = self.reserved_usable_geometry();
         let should_focus = self.layer_surfaces.get(&surface_id).is_some_and(|role| {
             role.committed.keyboard_interactivity == KeyboardInteractivity::Exclusive
         });
@@ -371,7 +374,7 @@ impl CompositorState {
             role.mapped = true;
             role.order = activation_order;
         }
-        self.arrange_layer_surfaces();
+        self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(previous_usable);
         if should_focus {
             self.recompute_layer_keyboard_focus();
         }
@@ -380,6 +383,7 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn note_layer_surface_unmapped(&mut self, surface_id: u32) {
+        let previous_usable = self.reserved_usable_geometry();
         let Some(role) = self.layer_surfaces.get_mut(&surface_id) else {
             return;
         };
@@ -391,7 +395,7 @@ impl CompositorState {
         role.initial_configure_sent = false;
         if was_mapped {
             self.unregister_layer_surface_popups(surface_id);
-            self.arrange_layer_surfaces();
+            self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(previous_usable);
             self.reorder_renderable_surfaces_by_committed_stack();
         }
         self.recompute_layer_keyboard_focus();
@@ -443,6 +447,7 @@ impl CompositorState {
         if !self.layer_surfaces.contains_key(&surface_id) {
             return;
         }
+        let previous_usable = self.reserved_usable_geometry();
         self.unregister_layer_surface_popups(surface_id);
         if let Some(role) = self.layer_surfaces.get_mut(&surface_id) {
             role.mapped = false;
@@ -454,7 +459,7 @@ impl CompositorState {
         self.layer_surfaces.remove(&surface_id);
         self.clear_surface_role_if(surface_id, SurfaceRole::LayerSurface);
         self.unmap_surface_content(surface_id);
-        self.arrange_layer_surfaces();
+        self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(previous_usable);
         self.reorder_renderable_surfaces_by_committed_stack();
         self.recompute_layer_keyboard_focus();
     }
@@ -745,6 +750,16 @@ impl CompositorState {
                 usable.x, usable.y, usable.width, usable.height
             )
         });
+    }
+
+    fn arrange_layer_surfaces_and_reconfigure_stateful_windows_from(
+        &mut self,
+        previous_usable: LayerLayoutRect,
+    ) {
+        self.arrange_layer_surfaces();
+        if self.reserved_usable_geometry() != previous_usable {
+            self.reconfigure_stateful_windows_for_output_size();
+        }
     }
 
     fn layer_surface_needs_size_configure(&self, surface_id: u32, geometry: LayerGeometry) -> bool {

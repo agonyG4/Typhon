@@ -207,30 +207,67 @@ impl CompositorState {
         &mut self,
         root_surface_id: u32,
     ) {
-        let Some(visual) = self
-            .toplevel_visual_geometries
-            .get(&root_surface_id)
-            .copied()
-        else {
-            return;
-        };
         let geometry = self
             .surface_window_geometries
             .get(&root_surface_id)
             .copied();
         let geometry_x = geometry.map_or(0, |geometry| geometry.x);
         let geometry_y = geometry.map_or(0, |geometry| geometry.y);
-        let root_render_placement = SurfacePlacement::root_at(
-            visual.placement.local_x.saturating_sub(geometry_x),
-            visual.placement.local_y.saturating_sub(geometry_y),
-        );
+        let authoritative = self.surface_placement(root_surface_id);
+        let visual = self
+            .toplevel_visual_geometries
+            .get(&root_surface_id)
+            .copied()
+            .map(|visual| {
+                (
+                    visual.placement,
+                    visual.width,
+                    visual.height,
+                    visual.active_resize,
+                )
+            })
+            .or_else(|| {
+                (authoritative.root_mode == RootPlacementMode::Absolute).then(|| {
+                    let surface = self
+                        .renderable_surfaces
+                        .iter()
+                        .find(|surface| surface.surface_id == root_surface_id);
+                    let (width, height) = self
+                        .xdg_window_geometry_size(root_surface_id)
+                        .or_else(|| surface.map(|surface| (surface.width, surface.height)))
+                        .unwrap_or_default();
+                    (authoritative, width, height, None)
+                })
+            });
+        let Some((visual_placement, visual_width, visual_height, active_resize)) = visual else {
+            let placements = &self.surface_placements;
+            for surface in &mut self.renderable_surfaces {
+                if root_surface_id_for_surface_in_placements(placements, surface.surface_id)
+                    == root_surface_id
+                {
+                    surface.render_placement = None;
+                    surface.visual_clip = None;
+                }
+            }
+            self.invalidate_surface_origin_cache();
+            return;
+        };
+        if visual_width == 0 || visual_height == 0 {
+            return;
+        }
+        let root_render_placement = SurfacePlacement {
+            parent_surface_id: None,
+            local_x: visual_placement.local_x.saturating_sub(geometry_x),
+            local_y: visual_placement.local_y.saturating_sub(geometry_y),
+            root_mode: visual_placement.root_mode,
+        };
         let clip = render::SurfaceTargetRect::new(
-            visual.placement.local_x,
-            visual.placement.local_y,
-            visual.width,
-            visual.height,
+            visual_placement.local_x,
+            visual_placement.local_y,
+            visual_width,
+            visual_height,
         );
-        let visual_clip = visual.active_resize.is_some().then_some(clip);
+        let visual_clip = active_resize.is_some().then_some(clip);
         let placements = &self.surface_placements;
         for surface in &mut self.renderable_surfaces {
             if root_surface_id_for_surface_in_placements(placements, surface.surface_id)

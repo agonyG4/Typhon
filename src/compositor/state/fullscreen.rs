@@ -20,10 +20,7 @@ impl CompositorState {
     pub(in crate::compositor) fn maximized_window_geometry(&self) -> WindowGeometry {
         let usable = self.usable_output_geometry();
         WindowGeometry::new(
-            SurfacePlacement::root_at(
-                usable.x as i32 - render::FIRST_SURFACE_OFFSET.0,
-                usable.y as i32 - render::FIRST_SURFACE_OFFSET.1,
-            ),
+            SurfacePlacement::absolute_root_at(usable.x as i32, usable.y as i32),
             usable.width as u32,
             usable.height as u32,
         )
@@ -31,10 +28,7 @@ impl CompositorState {
 
     pub(in crate::compositor) fn fullscreen_window_geometry(&self) -> WindowGeometry {
         WindowGeometry::new(
-            SurfacePlacement::root_at(
-                -render::FIRST_SURFACE_OFFSET.0,
-                -render::FIRST_SURFACE_OFFSET.1,
-            ),
+            SurfacePlacement::absolute_root_at(0, 0),
             self.output_size.width,
             self.output_size.height,
         )
@@ -107,8 +101,9 @@ impl CompositorState {
             .unwrap_or_else(|| self.fullscreen_window_geometry());
         let exactly_covers_output = geometry.width == self.output_size.width
             && geometry.height == self.output_size.height
-            && geometry.placement.local_x == -render::FIRST_SURFACE_OFFSET.0
-            && geometry.placement.local_y == -render::FIRST_SURFACE_OFFSET.1;
+            && geometry.placement.root_mode == RootPlacementMode::Absolute
+            && geometry.placement.local_x == 0
+            && geometry.placement.local_y == 0;
         let overlays_visible = self.visible_fullscreen_overlay_count() > 0;
         let fully_opaque = false;
         let software_cursor_visible = false;

@@ -1370,6 +1370,7 @@ impl CompositorState {
             if self
                 .toplevel_visual_geometries
                 .contains_key(&root_surface_id)
+                || self.toplevel_surfaces.contains_key(&root_surface_id)
             {
                 self.update_toplevel_visual_render_assignment(root_surface_id);
             }

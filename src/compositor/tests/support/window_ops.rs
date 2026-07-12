@@ -205,6 +205,247 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_toggle_fullscr
     )
 }
 
+pub(in crate::compositor::tests) fn create_three_buffered_toplevels_then_toggle_mode(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    mode_command: ServerCommand,
+    reorder_before_mode: bool,
+) -> Result<(RegistryTestState, [u32; 3]), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let mut surfaces = Vec::new();
+    for _ in 0..3 {
+        let (surface, _xdg_surface, _toplevel) =
+            create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 300, 200)?;
+        surface.commit();
+        surfaces.push(surface);
+    }
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    let surface_ids: [u32; 3] = capture_renderable_surface_snapshot(commands)
+        .into_iter()
+        .filter(|surface| surface.parent_surface_id.is_none())
+        .filter(|surface| {
+            capture_xdg_role_snapshot(commands, surface.surface_id).toplevel_registered
+        })
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>()
+        .try_into()
+        .expect("expected three root surface ids");
+
+    if reorder_before_mode {
+        commands.send(ServerCommand::FocusRootWindow(surface_ids[0]))?;
+        wait_for_server_commands(commands);
+        commands.send(ServerCommand::RaiseRootWindow(surface_ids[0]))?;
+        wait_for_server_commands(commands);
+        commands.send(ServerCommand::FocusRootWindow(surface_ids[2]))?;
+        wait_for_server_commands(commands);
+    }
+
+    commands.send(mode_command)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let configured_width = usize::try_from(state.toplevel_width)?;
+    let configured_height = usize::try_from(state.toplevel_height)?;
+    commit_test_buffered_surface(&surfaces[2], &shm, &qh, configured_width, configured_height)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    retain_live_test_connection(connection);
+
+    Ok((state, surface_ids))
+}
+
+pub(in crate::compositor::tests) fn create_three_buffered_toplevels_then_client_fullscreen(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<(RegistryTestState, [u32; 3]), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let mut surfaces = Vec::new();
+    let mut toplevels = Vec::new();
+    for _ in 0..3 {
+        let (surface, _xdg_surface, toplevel) =
+            create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 300, 200)?;
+        surface.commit();
+        surfaces.push(surface);
+        toplevels.push(toplevel);
+    }
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    let surface_ids: [u32; 3] = capture_renderable_surface_snapshot(commands)
+        .into_iter()
+        .filter(|surface| surface.parent_surface_id.is_none())
+        .filter(|surface| {
+            capture_xdg_role_snapshot(commands, surface.surface_id).toplevel_registered
+        })
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>()
+        .try_into()
+        .expect("expected three root surface ids");
+
+    toplevels[2].set_fullscreen(None);
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commit_test_buffered_surface(
+        &surfaces[2],
+        &shm,
+        &qh,
+        usize::try_from(state.toplevel_width)?,
+        usize::try_from(state.toplevel_height)?,
+    )?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    retain_live_test_connection(connection);
+    Ok((state, surface_ids))
+}
+
+pub(in crate::compositor::tests) fn create_buffered_toplevel_then_shortcut_fullscreen_with_committed_geometry(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 300, 200)?;
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::ToggleFullscreenFocused)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    commit_test_buffered_surface(
+        &surface,
+        &shm,
+        &qh,
+        usize::try_from(state.toplevel_width)?,
+        usize::try_from(state.toplevel_height)?,
+    )?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    retain_live_test_connection(connection);
+    Ok(state)
+}
+
+pub(in crate::compositor::tests) fn create_buffered_toplevel_then_mode_and_output_resize(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    mode_command: ServerCommand,
+    output_width: u32,
+    output_height: u32,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 300, 200)?;
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(mode_command)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commit_test_buffered_surface(
+        &surface,
+        &shm,
+        &qh,
+        usize::try_from(state.toplevel_width)?,
+        usize::try_from(state.toplevel_height)?,
+    )?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    commands.send(ServerCommand::SetOutputSize {
+        width: output_width,
+        height: output_height,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commit_test_buffered_surface(
+        &surface,
+        &shm,
+        &qh,
+        usize::try_from(state.toplevel_width)?,
+        usize::try_from(state.toplevel_height)?,
+    )?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    retain_live_test_connection(connection);
+    Ok(state)
+}
+
+pub(in crate::compositor::tests) fn create_csd_toplevel_then_client_fullscreen(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let (surface, xdg_surface, toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 1320, 840)?;
+    xdg_surface.set_window_geometry(20, 20, 1280, 800);
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    toplevel.set_fullscreen(None);
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    xdg_surface.set_window_geometry(20, 20, 1280, 800);
+    commit_test_buffered_surface(&surface, &shm, &qh, 1320, 840)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    retain_live_test_connection(connection);
+    Ok(state)
+}
+
 pub(in crate::compositor::tests) fn create_buffered_toplevel_then_window_commands(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
