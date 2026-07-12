@@ -891,6 +891,9 @@ pub(in crate::compositor::tests) fn create_client_cursor_then_synchronize_compos
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let pointer = seat.get_pointer(&qh, ());
+    let relative_manager: client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1 =
+        globals.bind(&qh, 1..=1, ())?;
+    let _relative_pointer = relative_manager.get_relative_pointer(&pointer, &qh, ());
     let (surface, _xdg_surface, _toplevel) =
         create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120)?;
     surface.commit();
@@ -915,6 +918,11 @@ pub(in crate::compositor::tests) fn create_client_cursor_then_synchronize_compos
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
 
+    _toplevel.resize(&seat, serial, client_xdg_toplevel::ResizeEdge::BottomRight);
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
     let initial = capture_cursor_motion_state(&state, commands, false);
     let (reply, receiver) = mpsc::channel();
     commands.send(ServerCommand::UpdatePointerPositionWithoutClientDispatch { x, y, reply })?;
@@ -922,6 +930,10 @@ pub(in crate::compositor::tests) fn create_client_cursor_then_synchronize_compos
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     let compositor_only = capture_cursor_motion_state(&state, commands, visual_changed);
+
+    commands.send(ServerCommand::UpdateInteraction { x, y })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
 
     commands.send(ServerCommand::PointerMotion { x, y })?;
     wait_for_server_commands(commands);

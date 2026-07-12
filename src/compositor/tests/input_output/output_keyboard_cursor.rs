@@ -550,7 +550,14 @@ fn compositor_only_pointer_motion_preserves_client_dispatch_state() {
 #[test]
 fn compositor_only_interaction_motion_prevents_post_grab_cursor_teleport() {
     let socket_name = unique_socket_name();
-    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let server = OwnCompositorServer::bind_with_input_capabilities(
+        &socket_name,
+        InputProtocolCapabilities {
+            relative_pointer: true,
+            ..InputProtocolCapabilities::desktop_baseline()
+        },
+    )
+    .unwrap();
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
     let x = f64::from(render::FIRST_SURFACE_OFFSET.0) + 60.0;
