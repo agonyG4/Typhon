@@ -2,13 +2,14 @@ use super::*;
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::compositor) struct BeginWindowInteraction {
-    root_surface_id: u32,
-    x: f64,
-    y: f64,
-    kind: WindowInteractionKind,
-    source: WindowInteractionSource,
-    trigger_button: Option<u32>,
-    trigger_serial: Option<u32>,
+    pub(super) root_surface_id: u32,
+    pub(super) x: f64,
+    pub(super) y: f64,
+    pub(super) kind: WindowInteractionKind,
+    pub(super) source: WindowInteractionSource,
+    pub(super) trigger_button: Option<u32>,
+    pub(super) trigger_serial: Option<u32>,
+    pub(super) pointer_motion_surface_id: Option<u32>,
 }
 
 impl CompositorState {
@@ -64,6 +65,7 @@ impl CompositorState {
                 source: WindowInteractionSource::NativeBinding,
                 trigger_button: (trigger_button != 0).then_some(trigger_button),
                 trigger_serial: None,
+                pointer_motion_surface_id: Some(surface_id),
             });
         };
         let edges = resize_edges_for_window_point(local_x, local_y, width, height);
@@ -75,6 +77,7 @@ impl CompositorState {
             source: WindowInteractionSource::NativeBinding,
             trigger_button: (trigger_button != 0).then_some(trigger_button),
             trigger_serial: None,
+            pointer_motion_surface_id: Some(surface_id),
         })
     }
 
@@ -90,6 +93,7 @@ impl CompositorState {
             source: WindowInteractionSource::NativeBinding,
             trigger_button: None,
             trigger_serial: None,
+            pointer_motion_surface_id: None,
         })
     }
 
@@ -114,6 +118,7 @@ impl CompositorState {
             source,
             trigger_button,
             trigger_serial,
+            pointer_motion_surface_id: Some(surface_id),
         })
     }
 
@@ -135,6 +140,7 @@ impl CompositorState {
             source: WindowInteractionSource::XdgToplevelMove,
             trigger_button: Some(press.button),
             trigger_serial: Some(press.serial),
+            pointer_motion_surface_id: Some(compositor_surface_id(&press.surface)),
         })
     }
 
@@ -157,6 +163,7 @@ impl CompositorState {
             source: WindowInteractionSource::XdgToplevelResize,
             trigger_button: Some(press.button),
             trigger_serial: Some(press.serial),
+            pointer_motion_surface_id: Some(compositor_surface_id(&press.surface)),
         })
     }
 
@@ -175,6 +182,7 @@ impl CompositorState {
             source,
             trigger_button,
             trigger_serial,
+            pointer_motion_surface_id,
         } = begin;
         let Some(root_surface) = self
             .renderable_surfaces
@@ -183,6 +191,14 @@ impl CompositorState {
         else {
             return false;
         };
+        if let Some(pointer_motion_surface_id) = pointer_motion_surface_id
+            && (self
+                .surface_resource_by_id(pointer_motion_surface_id)
+                .is_none()
+                || self.root_surface_id_for_surface(pointer_motion_surface_id) != root_surface_id)
+        {
+            return false;
+        }
         let fallback_geometry = WindowGeometry::new(
             root_surface.placement,
             root_surface.width,
@@ -262,6 +278,7 @@ impl CompositorState {
             source,
             trigger_button,
             trigger_serial,
+            pointer_motion_surface_id,
             start_pointer_x: x,
             start_pointer_y: y,
             start_placement,
