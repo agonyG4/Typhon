@@ -841,8 +841,20 @@ pub(crate) fn apply_native_input_effect(
         && context.server.window_interaction_active()
     {
         let action = NativeWindowAction::UpdateInteraction { x, y };
-        let changed =
-            apply_native_window_action(action, context.server, context.perf, context.resize_perf);
+        let server = std::cell::RefCell::new(&mut *context.server);
+        let changed = apply_active_window_interaction_motion(
+            x,
+            y,
+            |x, y| {
+                server
+                    .borrow_mut()
+                    .update_pointer_position_without_client_dispatch(x, y)
+            },
+            |_, _| {
+                let mut server = server.borrow_mut();
+                apply_native_window_action(action, &mut server, context.perf, context.resize_perf)
+            },
+        );
         application.redraw_requested |= changed;
     } else if effect.pointer_motion.is_some() || effect.relative_motion.is_some() {
         context

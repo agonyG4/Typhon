@@ -1423,6 +1423,25 @@ fn active_window_interaction_motion_updates_pointer_before_interaction() {
 }
 
 #[test]
+fn active_window_interaction_motion_route_skips_client_dispatch() {
+    let routing = include_str!("../input/routing.rs");
+    let apply = routing
+        .split_once("pub(crate) fn apply_native_input_effect")
+        .expect("native input application routing")
+        .1;
+    let interaction_route = apply
+        .split_once("if let Some((x, y)) = effect.pointer_motion")
+        .expect("active interaction route")
+        .1
+        .split_once("} else if effect.pointer_motion.is_some()")
+        .expect("ordinary motion route")
+        .0;
+
+    assert!(interaction_route.contains("apply_active_window_interaction_motion"));
+    assert!(!interaction_route.contains("send_pointer_motion_sample"));
+}
+
+#[test]
 fn native_libinput_scroll_axis_value_skips_absent_axis_reader() {
     let value = libinput_scroll_axis_value(false, || panic!("axis value should not be read"));
 
