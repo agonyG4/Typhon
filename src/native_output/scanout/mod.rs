@@ -4,12 +4,14 @@ mod backend;
 mod dumb;
 mod egl_gbm;
 mod gbm_cpu;
+#[allow(dead_code)] // Ownership primitives are wired into the explicit backend in Tasks 4 and 8.
 mod output_swapchain;
 
 pub(crate) use backend::*;
 pub(crate) use dumb::*;
 pub(crate) use egl_gbm::*;
 pub(crate) use gbm_cpu::*;
+#[allow(unused_imports)]
 pub(crate) use output_swapchain::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
