@@ -10,6 +10,7 @@ use khronos_egl as egl;
 use oblivion_one::native::kms::{AtomicDiscovery, DrmFormatModifierPair};
 
 use crate::egl_renderer::dmabuf::query_egl_renderable_dmabuf_formats;
+use crate::egl_renderer::native_fence::{NativeFenceFunctions, NativeRenderFence};
 use crate::egl_renderer::{
     EglInstance, choose_native_egl_config, create_gles_context, load_egl_image_target_texture_2d,
 };
@@ -22,6 +23,7 @@ pub(crate) struct AtomicEglGbmScanout {
     egl_display: egl::Display,
     egl_context: egl::Context,
     gl: glow::Context,
+    native_fence_functions: NativeFenceFunctions,
     pool: Option<AtomicOutputPool>,
     pub(crate) format_modifier: DrmFormatModifierPair,
     drm_cleanup_armed: bool,
@@ -117,6 +119,12 @@ impl AtomicEglGbmScanout {
             let image_target = load_egl_image_target_texture_2d(&egl).ok_or_else(|| {
                 io::Error::other("explicit Atomic EGL/GBM requires GL_OES_EGL_image")
             })?;
+            let native_fence_functions =
+                NativeFenceFunctions::load(&egl, egl_display).map_err(|error| {
+                    io::Error::other(format!(
+                        "native output fence initialization failed: {error}"
+                    ))
+                })?;
             let gl = unsafe {
                 glow::Context::from_loader_function(|name| {
                     egl.get_proc_address(name)
@@ -177,16 +185,23 @@ impl AtomicEglGbmScanout {
                 }
             };
             let pool = AtomicOutputPool::from_validated_slots(slots, pool_generation);
-            Ok((egl_context, gl, pool, format_modifier))
+            Ok((
+                egl_context,
+                gl,
+                native_fence_functions,
+                pool,
+                format_modifier,
+            ))
         })();
 
         match result {
-            Ok((egl_context, gl, pool, format_modifier)) => Ok(Self {
+            Ok((egl_context, gl, native_fence_functions, pool, format_modifier)) => Ok(Self {
                 _device: device,
                 egl,
                 egl_display,
                 egl_context,
                 gl,
+                native_fence_functions,
                 pool: Some(pool),
                 format_modifier,
                 drm_cleanup_armed: true,
@@ -200,6 +215,16 @@ impl AtomicEglGbmScanout {
                 Err(error)
             }
         }
+    }
+
+    pub(crate) fn create_render_fence(&self) -> io::Result<NativeRenderFence> {
+        NativeRenderFence::create(
+            &self.egl,
+            self.egl_display,
+            &self.gl,
+            self.native_fence_functions,
+        )
+        .map_err(|error| io::Error::other(format!("native render fence export failed: {error}")))
     }
 }
 

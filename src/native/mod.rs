@@ -6,3 +6,5 @@ pub mod event_loop;
 pub mod explicit_sync;
 pub mod kms;
 pub mod scheduler;
+#[doc(hidden)]
+pub mod sync_file;

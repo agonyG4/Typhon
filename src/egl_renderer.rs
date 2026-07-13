@@ -16,6 +16,7 @@ use oblivion_one::{
 mod damage;
 pub(crate) mod dmabuf;
 mod geometry;
+pub(crate) mod native_fence;
 mod program;
 
 pub(crate) use damage::{BufferAge, OutputDamage, OutputRect, RepaintMode, software_buffer_age};
