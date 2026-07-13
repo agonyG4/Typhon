@@ -1152,6 +1152,7 @@ impl CompositorState {
         _damage: RenderableSurfaceDamage,
         frame_callbacks: Vec<wl_callback::WlCallback>,
     ) {
+        let commit_id = SurfaceCommitId::from_sequence(pending.commit_sequence);
         self.unmap_surface_content(surface_id);
         let generation = self.next_render_generation_value();
         let damage = RenderableSurfaceDamage::Full;
@@ -1161,6 +1162,7 @@ impl CompositorState {
             return;
         };
         let buffer_size = surface.buffer_size();
+        self.note_explicit_commit_published(commit_id);
         self.track_committed_buffer_lifetime(surface_id, &pending);
         self.current_surface_buffers.insert(surface_id, pending);
         self.client_cursor_surfaces.insert(surface_id, surface);

@@ -1019,6 +1019,7 @@ impl CompositorState {
                 }
                 if self.is_cursor_surface(surface_id) {
                     self.commit_cursor_surface_removal_request(surface_id, None);
+                    self.note_explicit_commit_published(commit_id);
                     self.complete_frame_callbacks(frame_callbacks);
                 } else {
                     self.commit_surface_remove_content(
@@ -1056,6 +1057,7 @@ impl CompositorState {
                         window_geometry,
                     },
                 );
+                self.note_explicit_commit_published(commit_id);
                 if self
                     .renderable_surfaces
                     .iter()
