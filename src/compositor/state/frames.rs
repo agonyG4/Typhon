@@ -53,43 +53,40 @@ impl CompositorState {
             .saturating_add(stats.resize_snapshots_replaced as u64);
     }
 
-    pub(in crate::compositor) fn complete_pending_frame_callbacks(&mut self) {
-        let callbacks = if self.submitted_frame_callback_batch {
-            self.submitted_frame_callback_batch = false;
-            std::mem::take(&mut self.submitted_frame_callbacks)
-        } else {
-            std::mem::take(&mut self.prepared_frame_callbacks)
-        };
-        self.complete_frame_callbacks(callbacks);
-    }
-
     pub(in crate::compositor) fn capture_frame_callbacks_for_render(&mut self) {
-        self.prepared_frame_callbacks
-            .append(&mut self.pending_frame_callbacks);
-        self.prepared_presentation_feedbacks
-            .append(&mut self.pending_presentation_feedbacks);
+        if self.legacy_prepared_frame_batch.is_some() {
+            return;
+        }
+        self.next_legacy_output_frame_id = self
+            .next_legacy_output_frame_id
+            .checked_add(1)
+            .expect("legacy output frame ID overflow");
+        let frame_id = self.next_legacy_output_frame_id;
+        self.legacy_prepared_frame_batch = Some(self.take_frame_batch_for_render(frame_id));
     }
 
     pub(in crate::compositor) fn mark_prepared_frame_submitted(&mut self) {
-        debug_assert!(!self.submitted_frame_callback_batch);
-        self.submitted_frame_callback_batch = true;
-        self.submitted_frame_callbacks
-            .append(&mut self.prepared_frame_callbacks);
-        debug_assert!(!self.submitted_presentation_feedback_batch);
-        self.submitted_presentation_feedback_batch = true;
-        self.submitted_presentation_feedbacks
-            .append(&mut self.prepared_presentation_feedbacks);
+        assert!(
+            self.legacy_submitted_frame_batch.is_none(),
+            "a compositor output frame batch is already submitted"
+        );
+        self.legacy_submitted_frame_batch = Some(
+            self.legacy_prepared_frame_batch
+                .take()
+                .expect("no prepared compositor frame batch exists"),
+        );
     }
 
     pub(in crate::compositor) fn has_submitted_frame_batch(&self) -> bool {
-        self.submitted_frame_callback_batch || self.submitted_presentation_feedback_batch
+        self.legacy_submitted_frame_batch.is_some()
     }
 
     pub(in crate::compositor) fn has_pending_frame_callbacks(&self) -> bool {
         !self.pending_frame_callbacks.is_empty()
-            || !self.prepared_frame_callbacks.is_empty()
-            || !self.submitted_frame_callbacks.is_empty()
-            || self.submitted_frame_callback_batch
+            || self
+                .frame_batches
+                .values()
+                .any(|batch| !batch.callbacks.is_empty())
             || self.pending_explicit_sync_commits.iter().any(|commit| {
                 !self.external_acquire_readiness && !commit.frame_callbacks.is_empty()
             })
@@ -128,21 +125,34 @@ impl CompositorState {
             || self.pending_resize_configure_is_flushable()
             || self.has_pending_frame_callbacks()
             || !self.pending_presentation_feedbacks.is_empty()
-            || !self.prepared_presentation_feedbacks.is_empty()
-            || !self.submitted_presentation_feedbacks.is_empty()
-            || self.submitted_presentation_feedback_batch
+            || self
+                .frame_batches
+                .values()
+                .any(|batch| !batch.presentation_feedbacks.is_empty())
     }
 
     pub(in crate::compositor) fn complete_pending_presentation_feedbacks(
         &mut self,
         presentation: FramePresentation,
     ) {
-        let feedbacks = if self.submitted_presentation_feedback_batch {
-            self.submitted_presentation_feedback_batch = false;
-            std::mem::take(&mut self.submitted_presentation_feedbacks)
-        } else {
-            std::mem::take(&mut self.prepared_presentation_feedbacks)
-        };
+        let batch_id = self
+            .legacy_submitted_frame_batch
+            .take()
+            .or_else(|| self.legacy_prepared_frame_batch.take())
+            .expect("no compositor frame batch exists for presentation");
+        let frame_id = self
+            .frame_batches
+            .get(&batch_id)
+            .expect("compositor frame batch registry lost an owned batch")
+            .frame_id;
+        self.complete_presented_frame_batch(frame_id, batch_id, presentation);
+    }
+
+    fn complete_presentation_feedbacks(
+        &mut self,
+        feedbacks: Vec<PendingPresentationFeedback>,
+        presentation: FramePresentation,
+    ) {
         if feedbacks.is_empty() {
             return;
         }
@@ -204,6 +214,101 @@ impl CompositorState {
         }
     }
 
+    pub(in crate::compositor) fn take_frame_batch_for_render(
+        &mut self,
+        frame_id: u64,
+    ) -> CompositorFrameBatchId {
+        assert!(
+            self.frame_batches.len() < 2,
+            "compositor frame batch registry exceeds pending plus ready capacity"
+        );
+        self.next_frame_batch_id = self
+            .next_frame_batch_id
+            .checked_add(1)
+            .expect("compositor frame batch ID overflow");
+        let batch_id = CompositorFrameBatchId(
+            NonZeroU64::new(self.next_frame_batch_id)
+                .expect("compositor frame batch IDs start at one"),
+        );
+        let previous = self.frame_batches.insert(
+            batch_id,
+            CompositorFrameBatch {
+                frame_id,
+                callbacks: std::mem::take(&mut self.pending_frame_callbacks),
+                presentation_feedbacks: std::mem::take(&mut self.pending_presentation_feedbacks),
+            },
+        );
+        assert!(previous.is_none(), "compositor frame batch ID was reused");
+        batch_id
+    }
+
+    #[allow(dead_code)] // Called through the explicit output server API after runtime integration.
+    pub(in crate::compositor) fn restore_frame_batch_after_render_failure(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+    ) {
+        let mut batch = self
+            .frame_batches
+            .remove(&batch_id)
+            .expect("missing compositor frame batch on render failure");
+        batch.callbacks.append(&mut self.pending_frame_callbacks);
+        self.pending_frame_callbacks = batch.callbacks;
+        batch
+            .presentation_feedbacks
+            .append(&mut self.pending_presentation_feedbacks);
+        self.pending_presentation_feedbacks = batch.presentation_feedbacks;
+        self.clear_legacy_batch_reference(batch_id);
+    }
+
+    pub(in crate::compositor) fn discard_frame_batch(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+        _reason: FrameBatchDiscardReason,
+    ) {
+        let batch = self
+            .frame_batches
+            .remove(&batch_id)
+            .expect("missing compositor frame batch on discard");
+        for pending in batch.presentation_feedbacks {
+            pending.feedback.discarded();
+        }
+        self.complete_frame_callbacks(batch.callbacks);
+        self.clear_legacy_batch_reference(batch_id);
+    }
+
+    pub(in crate::compositor) fn complete_presented_frame_batch(
+        &mut self,
+        frame_id: u64,
+        batch_id: CompositorFrameBatchId,
+        presentation: FramePresentation,
+    ) {
+        let registered_frame_id = self
+            .frame_batches
+            .get(&batch_id)
+            .expect("missing compositor frame batch on presentation")
+            .frame_id;
+        assert_eq!(
+            registered_frame_id, frame_id,
+            "pageflip frame ID does not own the compositor frame batch"
+        );
+        let batch = self
+            .frame_batches
+            .remove(&batch_id)
+            .expect("compositor frame batch disappeared during completion");
+        self.clear_legacy_batch_reference(batch_id);
+        self.complete_frame_callbacks(batch.callbacks);
+        self.complete_presentation_feedbacks(batch.presentation_feedbacks, presentation);
+    }
+
+    fn clear_legacy_batch_reference(&mut self, batch_id: CompositorFrameBatchId) {
+        if self.legacy_prepared_frame_batch == Some(batch_id) {
+            self.legacy_prepared_frame_batch = None;
+        }
+        if self.legacy_submitted_frame_batch == Some(batch_id) {
+            self.legacy_submitted_frame_batch = None;
+        }
+    }
+
     pub(in crate::compositor) fn discard_pending_presentation_feedbacks_for_surface(
         &mut self,
         surface_id: u32,
@@ -219,21 +324,20 @@ impl CompositorState {
             });
         }
         discard_surface(&mut self.pending_presentation_feedbacks, surface_id);
-        discard_surface(&mut self.prepared_presentation_feedbacks, surface_id);
-        discard_surface(&mut self.submitted_presentation_feedbacks, surface_id);
+        for batch in self.frame_batches.values_mut() {
+            discard_surface(&mut batch.presentation_feedbacks, surface_id);
+        }
     }
 
     pub(in crate::compositor) fn discard_all_pending_presentation_feedbacks(&mut self) {
-        for feedbacks in [
-            &mut self.pending_presentation_feedbacks,
-            &mut self.prepared_presentation_feedbacks,
-            &mut self.submitted_presentation_feedbacks,
-        ] {
-            for pending in std::mem::take(feedbacks) {
+        for pending in std::mem::take(&mut self.pending_presentation_feedbacks) {
+            pending.feedback.discarded();
+        }
+        for batch in self.frame_batches.values_mut() {
+            for pending in std::mem::take(&mut batch.presentation_feedbacks) {
                 pending.feedback.discarded();
             }
         }
-        self.submitted_presentation_feedback_batch = false;
         for feedbacks in
             std::mem::take(&mut self.pending_surface_presentation_feedbacks).into_values()
         {
@@ -262,6 +366,10 @@ impl CompositorState {
         &mut self,
         callbacks: Vec<wl_callback::WlCallback>,
     ) {
+        let callbacks: Vec<_> = callbacks
+            .into_iter()
+            .filter(|callback| callback.is_alive())
+            .collect();
         let time = self.frame_callback_time_ms();
         self.note_callbacks_completed(&callbacks);
         for callback in callbacks {
@@ -872,12 +980,11 @@ mod frame_consumption_tests {
         state.mark_prepared_frame_submitted();
 
         assert!(state.has_submitted_frame_batch());
-        state.complete_pending_frame_callbacks();
-        assert!(state.submitted_presentation_feedback_batch);
         state.complete_pending_presentation_feedbacks(
             FramePresentation::software_now(state.presentation_clock).unwrap(),
         );
         assert!(!state.has_submitted_frame_batch());
+        assert!(state.frame_batches.is_empty());
     }
 
     #[test]
@@ -885,5 +992,54 @@ mod frame_consumption_tests {
         let mut state = CompositorState::default();
         state.commit_ready_explicit_sync_buffers();
         assert!(!state.has_submitted_frame_batch());
+    }
+
+    #[test]
+    fn empty_frame_batch_is_explicit_and_registry_is_bounded_to_two() {
+        let mut state = CompositorState::default();
+        let first = state.take_frame_batch_for_render(10);
+        let second = state.take_frame_batch_for_render(11);
+        assert_eq!(state.frame_batches.len(), 2);
+        assert!(state.frame_batches[&first].callbacks.is_empty());
+        assert!(
+            state.frame_batches[&second]
+                .presentation_feedbacks
+                .is_empty()
+        );
+
+        let overflow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.take_frame_batch_for_render(12)
+        }));
+        assert!(overflow.is_err());
+        assert_eq!(state.frame_batches.len(), 2);
+    }
+
+    #[test]
+    fn unrelated_completion_cannot_consume_ready_frame_batch() {
+        let mut state = CompositorState::default();
+        let submitted = state.take_frame_batch_for_render(20);
+        let ready = state.take_frame_batch_for_render(21);
+        let presentation = FramePresentation::software_now(state.presentation_clock).unwrap();
+
+        state.complete_presented_frame_batch(20, submitted, presentation);
+
+        assert!(!state.frame_batches.contains_key(&submitted));
+        assert!(state.frame_batches.contains_key(&ready));
+        state.restore_frame_batch_after_render_failure(ready);
+        assert!(state.frame_batches.is_empty());
+    }
+
+    #[test]
+    fn mismatched_frame_and_batch_identity_completes_nothing() {
+        let mut state = CompositorState::default();
+        let batch = state.take_frame_batch_for_render(30);
+        let presentation = FramePresentation::software_now(state.presentation_clock).unwrap();
+
+        let mismatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.complete_presented_frame_batch(31, batch, presentation)
+        }));
+
+        assert!(mismatch.is_err());
+        assert!(state.frame_batches.contains_key(&batch));
     }
 }

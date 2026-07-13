@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::File,
     io,
+    num::NonZeroU64,
     os::fd::{AsFd, OwnedFd},
     sync::{Arc, Mutex},
     time::Instant,
@@ -586,13 +587,12 @@ pub struct CompositorState {
     pending_acquire_watch_changes: Vec<AcquireWatchChange>,
     external_acquire_readiness: bool,
     pending_frame_callbacks: Vec<wl_callback::WlCallback>,
-    prepared_frame_callbacks: Vec<wl_callback::WlCallback>,
-    submitted_frame_callbacks: Vec<wl_callback::WlCallback>,
-    submitted_frame_callback_batch: bool,
     pending_presentation_feedbacks: Vec<PendingPresentationFeedback>,
-    prepared_presentation_feedbacks: Vec<PendingPresentationFeedback>,
-    submitted_presentation_feedbacks: Vec<PendingPresentationFeedback>,
-    submitted_presentation_feedback_batch: bool,
+    frame_batches: HashMap<CompositorFrameBatchId, CompositorFrameBatch>,
+    next_frame_batch_id: u64,
+    next_legacy_output_frame_id: u64,
+    legacy_prepared_frame_batch: Option<CompositorFrameBatchId>,
+    legacy_submitted_frame_batch: Option<CompositorFrameBatchId>,
     pending_surface_presentation_feedbacks: HashMap<u32, Vec<PendingPresentationFeedback>>,
     frame_clock_start: Option<Instant>,
     next_configure_serial: u32,
@@ -627,6 +627,25 @@ pub struct CompositorState {
     astrea_shell_client_uids: HashSet<u32>,
     typhon_socket_name: Option<String>,
     pending_process_launches: VecDeque<PendingProcessLaunch>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CompositorFrameBatchId(NonZeroU64);
+
+#[derive(Debug)]
+pub(crate) struct CompositorFrameBatch {
+    frame_id: u64,
+    callbacks: Vec<wl_callback::WlCallback>,
+    presentation_feedbacks: Vec<PendingPresentationFeedback>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Failure dispositions are wired by the explicit output runtime.
+pub(crate) enum FrameBatchDiscardReason {
+    RenderFailure,
+    FatalOutputFailure,
+    SuspendAbandonment,
+    OutputDestroyed,
 }
 
 #[derive(Debug, Clone)]

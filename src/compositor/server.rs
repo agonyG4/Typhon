@@ -39,11 +39,12 @@ use crate::wayland_drm::server::wl_drm;
 
 use super::{
     AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, ClientCursorRenderState,
-    CompositorState, ExplicitSyncPoint, FramePresentation, FullscreenRenderPlanMetrics,
-    InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PresentationClock,
-    RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
-    SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, WindowInteractionDebugSnapshot,
-    WindowInteractionEndReason, color,
+    CompositorFrameBatchId, CompositorState, ExplicitSyncPoint, FrameBatchDiscardReason,
+    FramePresentation, FullscreenRenderPlanMetrics, InputProtocolCapabilities, OutputRect,
+    PendingProcessLaunch, PresentationClock, RenderGenerationCause, RenderableSurface,
+    RendererProtocolCapabilities, ResizeFlowMetrics, SelectionProtocolCapabilities,
+    SubsurfaceTransactionMetrics, WindowInteractionDebugSnapshot, WindowInteractionEndReason,
+    color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 
@@ -672,6 +673,41 @@ impl OwnCompositorServer {
         self.state.capture_frame_callbacks_for_render();
     }
 
+    #[allow(dead_code)] // Consumed by the explicit Atomic output runtime integration.
+    pub(crate) fn take_frame_batch_for_render(&mut self, frame_id: u64) -> CompositorFrameBatchId {
+        self.state.take_frame_batch_for_render(frame_id)
+    }
+
+    #[allow(dead_code)] // Consumed by the explicit Atomic output runtime integration.
+    pub(crate) fn restore_frame_batch_after_render_failure(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+    ) {
+        self.state
+            .restore_frame_batch_after_render_failure(batch_id);
+    }
+
+    #[allow(dead_code)] // Consumed by the explicit Atomic output runtime integration.
+    pub(crate) fn discard_frame_batch(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+        reason: FrameBatchDiscardReason,
+    ) {
+        self.state.discard_frame_batch(batch_id, reason);
+    }
+
+    #[allow(dead_code)] // Consumed by the explicit Atomic output runtime integration.
+    pub(crate) fn complete_presented_frame_batch(
+        &mut self,
+        frame_id: u64,
+        batch_id: CompositorFrameBatchId,
+        presentation: FramePresentation,
+    ) {
+        self.state
+            .complete_presented_frame_batch(frame_id, batch_id, presentation);
+        let _ = self.display.flush_clients();
+    }
+
     pub fn mark_prepared_frame_submitted(&mut self) {
         self.state.mark_prepared_frame_submitted();
     }
@@ -682,7 +718,12 @@ impl OwnCompositorServer {
         else {
             self.state.discard_all_pending_presentation_feedbacks();
             self.state.release_pending_buffers();
-            self.state.complete_pending_frame_callbacks();
+            let batch_id = self
+                .state
+                .legacy_prepared_frame_batch
+                .expect("software frame capture did not create a frame batch");
+            self.state
+                .discard_frame_batch(batch_id, FrameBatchDiscardReason::OutputDestroyed);
             let _ = self.display.flush_clients();
             return;
         };
@@ -694,7 +735,6 @@ impl OwnCompositorServer {
             self.state.capture_frame_callbacks_for_render();
         }
         self.state.release_pending_buffers();
-        self.state.complete_pending_frame_callbacks();
         self.state
             .complete_pending_presentation_feedbacks(presentation);
         let _ = self.display.flush_clients();
