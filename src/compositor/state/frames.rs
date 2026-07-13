@@ -1,6 +1,58 @@
 use super::*;
 
 impl CompositorState {
+    pub(in crate::compositor) fn record_surface_tree_merge_metrics(
+        &mut self,
+        stats: &SurfaceTreeMergeStats,
+    ) {
+        self.subsurface_transaction_metrics
+            .bufferless_tree_commits_merged = self
+            .subsurface_transaction_metrics
+            .bufferless_tree_commits_merged
+            .saturating_add((stats.bufferless_nodes == stats.incoming_nodes) as u64);
+        self.subsurface_transaction_metrics
+            .metadata_only_nodes_merged = self
+            .subsurface_transaction_metrics
+            .metadata_only_nodes_merged
+            .saturating_add(stats.bufferless_nodes as u64);
+        self.subsurface_transaction_metrics.attachments_replaced = self
+            .subsurface_transaction_metrics
+            .attachments_replaced
+            .saturating_add(stats.attachments_replaced as u64);
+        self.subsurface_transaction_metrics.explicit_detaches = self
+            .subsurface_transaction_metrics
+            .explicit_detaches
+            .saturating_add(stats.explicit_detaches as u64);
+        self.subsurface_transaction_metrics
+            .acquire_dependencies_preserved = self
+            .subsurface_transaction_metrics
+            .acquire_dependencies_preserved
+            .saturating_add(stats.dependencies_preserved as u64);
+        self.subsurface_transaction_metrics
+            .acquire_dependencies_replaced = self
+            .subsurface_transaction_metrics
+            .acquire_dependencies_replaced
+            .saturating_add(stats.dependencies_replaced as u64);
+        self.subsurface_transaction_metrics.callbacks_merged = self
+            .subsurface_transaction_metrics
+            .callbacks_merged
+            .saturating_add(stats.callbacks_merged as u64);
+        self.subsurface_transaction_metrics.feedbacks_merged = self
+            .subsurface_transaction_metrics
+            .feedbacks_merged
+            .saturating_add(stats.feedbacks_merged as u64);
+        self.subsurface_transaction_metrics
+            .resize_snapshots_preserved = self
+            .subsurface_transaction_metrics
+            .resize_snapshots_preserved
+            .saturating_add(stats.resize_snapshots_preserved as u64);
+        self.subsurface_transaction_metrics
+            .resize_snapshots_replaced = self
+            .subsurface_transaction_metrics
+            .resize_snapshots_replaced
+            .saturating_add(stats.resize_snapshots_replaced as u64);
+    }
+
     pub(in crate::compositor) fn complete_pending_frame_callbacks(&mut self) {
         let callbacks = if self.submitted_frame_callback_batch {
             self.submitted_frame_callback_batch = false;

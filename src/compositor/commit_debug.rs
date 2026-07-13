@@ -26,6 +26,7 @@ pub(crate) enum SurfaceCommitDisposition {
     SupersededWhileReady,
     Rejected,
     SurfaceDestroyed,
+    MergedIntoNewer,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -280,6 +281,58 @@ impl super::CompositorState {
             callback_count,
             reason,
         );
+    }
+
+    pub(in crate::compositor) fn note_explicit_commit_merged(
+        &mut self,
+        id: SurfaceCommitId,
+        replacement: SurfaceCommitId,
+        callback_count: usize,
+    ) {
+        let _disposition = SurfaceCommitDisposition::MergedIntoNewer;
+        let live = self.commit_debug.live.remove(&id);
+        self.commit_debug.metrics.callbacks_merged_from_superseded = self
+            .commit_debug
+            .metrics
+            .callbacks_merged_from_superseded
+            .saturating_add(callback_count as u64);
+        let moved = self
+            .commit_debug
+            .callbacks
+            .iter()
+            .filter_map(|(callback, owner)| {
+                (owner.commit_id == id).then_some((callback.clone(), owner.surface))
+            })
+            .collect::<Vec<_>>();
+        for (callback, surface) in moved {
+            if let Some(owner) = self.commit_debug.callbacks.get_mut(&callback) {
+                owner.commit_id = replacement;
+            }
+            if self.commit_debug.enabled {
+                println!(
+                    "typhon commit: event=callback_moved commit_id={} replacement_commit_id={} surface={} callback={callback:?} reason=surface_tree_commit_merged",
+                    id.get(),
+                    replacement.get(),
+                    surface,
+                );
+            }
+        }
+        if let Some(live) = live {
+            self.commit_log(
+                "merged",
+                id,
+                live.surface,
+                live.sequence,
+                None,
+                if live.acquire_state == PendingAcquireState::Ready {
+                    "ready"
+                } else {
+                    "unready"
+                },
+                callback_count,
+                "surface_tree_commit_merged",
+            );
+        }
     }
 
     pub(in crate::compositor) fn note_explicit_commit_visual_generation(
@@ -636,5 +689,24 @@ mod tests {
 
         assert_eq!(metrics.ready_commits_rejected_newer_attachment, 1);
         assert_eq!(metrics.ready_commits_rejected_stale, 0);
+    }
+
+    #[test]
+    fn merged_commit_identity_retires_predecessor_before_successor_publication() {
+        let mut state = super::super::CompositorState::default();
+        let predecessor = SurfaceCommitId::for_tests(11);
+        let successor = SurfaceCommitId::for_tests(13);
+        state.note_explicit_commit_captured(predecessor, 7, 11, None, &[]);
+        state.note_explicit_commit_captured(successor, 7, 13, None, &[]);
+
+        state.note_explicit_commit_merged(predecessor, successor, 0);
+        state.note_explicit_commit_published(successor);
+
+        assert!(!state.commit_debug.live.contains_key(&predecessor));
+        assert!(!state.commit_debug.live.contains_key(&successor));
+        assert_eq!(
+            state.commit_debug.metrics.explicit_sync_commits_published,
+            1
+        );
     }
 }

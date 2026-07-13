@@ -307,9 +307,19 @@ impl CompositorState {
                 );
             }
             let existing = &mut transaction.nodes[existing_index].1;
+            let previous_commit_id = existing.commit_id;
+            let previous_callback_count = existing.frame_callbacks.len();
+            let replacement_commit_id = incoming.commit_id;
             if let Some(release) = existing.merge(incoming) {
                 stats.attachments_replaced = stats.attachments_replaced.saturating_add(1);
                 release.release();
+            }
+            if previous_commit_id != replacement_commit_id {
+                self.note_explicit_commit_merged(
+                    previous_commit_id,
+                    replacement_commit_id,
+                    previous_callback_count,
+                );
             }
             if let Some(resize_commit) = old_resize_commit {
                 self.release_detached_resize_capture(surface_id, resize_commit);
@@ -338,58 +348,6 @@ impl CompositorState {
         }
         transaction.dependencies.extend(dependencies);
         stats
-    }
-
-    pub(in crate::compositor) fn record_surface_tree_merge_metrics(
-        &mut self,
-        stats: &SurfaceTreeMergeStats,
-    ) {
-        self.subsurface_transaction_metrics
-            .bufferless_tree_commits_merged = self
-            .subsurface_transaction_metrics
-            .bufferless_tree_commits_merged
-            .saturating_add((stats.bufferless_nodes == stats.incoming_nodes) as u64);
-        self.subsurface_transaction_metrics
-            .metadata_only_nodes_merged = self
-            .subsurface_transaction_metrics
-            .metadata_only_nodes_merged
-            .saturating_add(stats.bufferless_nodes as u64);
-        self.subsurface_transaction_metrics.attachments_replaced = self
-            .subsurface_transaction_metrics
-            .attachments_replaced
-            .saturating_add(stats.attachments_replaced as u64);
-        self.subsurface_transaction_metrics.explicit_detaches = self
-            .subsurface_transaction_metrics
-            .explicit_detaches
-            .saturating_add(stats.explicit_detaches as u64);
-        self.subsurface_transaction_metrics
-            .acquire_dependencies_preserved = self
-            .subsurface_transaction_metrics
-            .acquire_dependencies_preserved
-            .saturating_add(stats.dependencies_preserved as u64);
-        self.subsurface_transaction_metrics
-            .acquire_dependencies_replaced = self
-            .subsurface_transaction_metrics
-            .acquire_dependencies_replaced
-            .saturating_add(stats.dependencies_replaced as u64);
-        self.subsurface_transaction_metrics.callbacks_merged = self
-            .subsurface_transaction_metrics
-            .callbacks_merged
-            .saturating_add(stats.callbacks_merged as u64);
-        self.subsurface_transaction_metrics.feedbacks_merged = self
-            .subsurface_transaction_metrics
-            .feedbacks_merged
-            .saturating_add(stats.feedbacks_merged as u64);
-        self.subsurface_transaction_metrics
-            .resize_snapshots_preserved = self
-            .subsurface_transaction_metrics
-            .resize_snapshots_preserved
-            .saturating_add(stats.resize_snapshots_preserved as u64);
-        self.subsurface_transaction_metrics
-            .resize_snapshots_replaced = self
-            .subsurface_transaction_metrics
-            .resize_snapshots_replaced
-            .saturating_add(stats.resize_snapshots_replaced as u64);
     }
 
     pub(in crate::compositor) fn update_surface_tree_slot_metrics(&mut self, root_surface_id: u32) {
