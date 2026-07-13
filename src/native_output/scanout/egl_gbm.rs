@@ -531,7 +531,7 @@ impl NativeEglGbmScanout {
             .map_err(native_egl_io_error)?;
         let draw_us = elapsed_micros(draw_start);
         let EglFrameOutcome::Rendered {
-            plan: output_damage,
+            commit: scene_commit,
             ..
         } = outcome
         else {
@@ -549,25 +549,26 @@ impl NativeEglGbmScanout {
                 false,
             )));
         };
+        let output_damage = scene_commit.repaint_plan();
         let swap_with_damage_used = self.swap_buffers_with_damage.is_some()
             && output_damage
                 .swap_damage()
                 .to_egl_rects(self.width, self.height)
                 .is_some();
         let swap_start = Instant::now();
-        egl_swap_buffers_with_damage(
+        if let Err(error) = egl_swap_buffers_with_damage(
             &self.egl,
             self.egl_display,
             self.egl_surface,
             self.swap_buffers_with_damage,
             output_damage.swap_damage(),
             (self.width, self.height),
-        )
-        .map_err(|error| {
+        ) {
+            self.scene.discard_rendered(scene_commit);
             self.scene.frame_swap_failed();
-            native_egl_io_error(error)
-        })?;
-        self.scene.frame_presented(&output_damage);
+            return Err(native_egl_io_error(error));
+        }
+        self.scene.commit_presented(scene_commit);
         let scene_stats = self.scene.last_frame_stats();
         let swap_us = elapsed_micros(swap_start);
         let bo = unsafe { self.surface.lock_front_buffer() }.map_err(|error| {

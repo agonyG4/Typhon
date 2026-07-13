@@ -13,7 +13,9 @@ use oblivion_one::{
     },
 };
 
-use crate::egl_renderer::{EglInstance, GlEglImageTargetTexture2DOes};
+use crate::egl_renderer::{
+    BufferAge, EglInstance, GlEglImageTargetTexture2DOes, software_buffer_age,
+};
 
 use super::{
     EXPLICIT_OUTPUT_SLOT_CAPACITY, ExplicitFramebufferDescriptor, ExplicitFramebufferPlane,
@@ -34,6 +36,10 @@ pub(crate) struct AtomicOutputSlot {
 }
 
 impl AtomicOutputSlot {
+    pub(crate) fn buffer_age(&self, presentation_serial: u64) -> BufferAge {
+        software_buffer_age(presentation_serial, self.last_presented_serial)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn import(
         id: OutputSlotId,

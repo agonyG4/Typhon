@@ -5,6 +5,7 @@ use oblivion_one::compositor::{DesktopVisualState, SurfaceDamageRect, cursor_tex
 
 pub(crate) const MAX_PARTIAL_REPAINT_RECTS: usize = 8;
 pub(crate) const MAX_DAMAGE_HISTORY_FRAMES: usize = 8;
+const MAX_EXPLICIT_OUTPUT_BUFFER_AGE: u32 = 3;
 const MAX_PARTIAL_REPAINT_PERCENT: u64 = 75;
 
 /// A half-open rectangle in output physical pixels with a top-left origin.
@@ -255,6 +256,23 @@ pub(crate) enum BufferAge {
     Value(i32),
 }
 
+pub(crate) fn software_buffer_age(
+    presentation_serial: u64,
+    last_presented_serial: Option<u64>,
+) -> BufferAge {
+    let Some(last_presented_serial) = last_presented_serial else {
+        return BufferAge::Value(0);
+    };
+    let Some(age) = presentation_serial
+        .checked_sub(last_presented_serial)
+        .and_then(|distance| distance.checked_add(1))
+        .and_then(|age| i32::try_from(age).ok())
+    else {
+        return BufferAge::Value(-1);
+    };
+    BufferAge::Value(age)
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RepaintMode {
     Skip,
@@ -451,6 +469,13 @@ impl PartialRepaintPlanner {
             }
             BufferAge::Value(value) => value as u32,
         };
+        if age > MAX_EXPLICIT_OUTPUT_BUFFER_AGE {
+            return self.full_plan(
+                current_damage,
+                Some(age),
+                FullRepaintReason::InsufficientHistory,
+            );
+        }
         let prior_count = usize::try_from(age.saturating_sub(1)).unwrap_or(usize::MAX);
         if prior_count > self.history.len() {
             self.invalidate();
@@ -543,6 +568,12 @@ impl PartialRepaintPlanner {
         self.history.push_front(plan.current_damage.clone());
         self.history.truncate(MAX_DAMAGE_HISTORY_FRAMES);
         self.history_valid = true;
+    }
+
+    pub(crate) fn discard_rendered(&mut self, _plan: &RepaintPlan) {
+        // A rendered candidate has no presentation authority. Keeping this an
+        // explicit operation makes discard paths consume their token without
+        // mutating the last-presented damage journal.
     }
 
     pub(crate) fn swap_failed(&mut self) {
@@ -870,6 +901,38 @@ mod partial_repaint_tests {
     }
 
     #[test]
+    fn software_buffer_age_uses_output_presentation_serials() {
+        assert_eq!(software_buffer_age(10, None), BufferAge::Value(0));
+        assert_eq!(software_buffer_age(10, Some(9)), BufferAge::Value(2));
+        assert_eq!(software_buffer_age(10, Some(8)), BufferAge::Value(3));
+        assert_eq!(software_buffer_age(10, Some(10)), BufferAge::Value(1));
+        assert_eq!(software_buffer_age(10, Some(11)), BufferAge::Value(-1));
+    }
+
+    #[test]
+    fn buffer_age_beyond_three_slot_history_forces_full_repaint() {
+        let mut planner = partial_planner((100, 80), partial_capabilities());
+        for x in [1, 10, 20] {
+            let plan = planner.plan(
+                OutputDamage::rects(100, 80, [rect(x, 1, 2, 2)]),
+                BufferAge::Value(1),
+            );
+            planner.commit_presented(&plan);
+        }
+
+        let unsupported = planner.plan(
+            OutputDamage::rects(100, 80, [rect(30, 1, 2, 2)]),
+            BufferAge::Value(4),
+        );
+
+        assert_eq!(unsupported.mode, RepaintMode::Full);
+        assert_eq!(
+            unsupported.fallback_reason,
+            Some(FullRepaintReason::InsufficientHistory)
+        );
+    }
+
+    #[test]
     fn empty_logical_damage_skips_even_when_history_is_invalid() {
         let mut planner = partial_planner((100, 80), partial_capabilities());
 
@@ -944,6 +1007,59 @@ mod partial_repaint_tests {
             OutputDamage::Empty
         );
         assert_eq!(failed.current_damage.rect_count(), 1);
+    }
+
+    #[test]
+    fn rendered_candidate_does_not_advance_history_until_matching_commit() {
+        let mut planner = partial_planner((100, 80), partial_capabilities());
+        let candidate = planner.plan(OutputDamage::Full, BufferAge::Value(0));
+
+        assert_eq!(planner.history_depth(), 0);
+        planner.commit_presented(&candidate);
+        assert_eq!(planner.history_depth(), 1);
+    }
+
+    #[test]
+    fn discarded_rendered_candidate_does_not_advance_or_invalidate_history() {
+        let mut planner = partial_planner((100, 80), partial_capabilities());
+        let presented = planner.plan(
+            OutputDamage::rects(100, 80, [rect(1, 2, 2, 2)]),
+            BufferAge::Value(0),
+        );
+        planner.commit_presented(&presented);
+        let discarded = planner.plan(
+            OutputDamage::rects(100, 80, [rect(4, 5, 6, 7)]),
+            BufferAge::Value(2),
+        );
+
+        planner.discard_rendered(&discarded);
+
+        assert_eq!(planner.history_depth(), 1);
+        assert_eq!(
+            planner
+                .plan(
+                    OutputDamage::rects(100, 80, [rect(20, 21, 2, 2)]),
+                    BufferAge::Value(2),
+                )
+                .repair_damage
+                .rect_count(),
+            2
+        );
+    }
+
+    #[test]
+    fn two_rendered_candidates_can_coexist_before_one_is_committed() {
+        let mut planner = partial_planner((100, 80), partial_capabilities());
+        let first = planner.plan(OutputDamage::Full, BufferAge::Value(0));
+        let second = planner.plan(
+            OutputDamage::rects(100, 80, [rect(8, 9, 3, 3)]),
+            BufferAge::Value(0),
+        );
+
+        assert_eq!(planner.history_depth(), 0);
+        planner.discard_rendered(&first);
+        planner.commit_presented(&second);
+        assert_eq!(planner.history_depth(), 1);
     }
 
     #[test]

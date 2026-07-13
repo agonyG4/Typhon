@@ -18,12 +18,12 @@ pub(crate) mod dmabuf;
 mod geometry;
 mod program;
 
+pub(crate) use damage::{BufferAge, OutputDamage, OutputRect, RepaintMode, software_buffer_age};
 use damage::{
-    BufferAge, ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker,
+    ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker,
     EglPartialRepaintCapabilities, EglPresentedDamageState, FullRepaintReason,
     PartialRepaintPlanner, RenderExecution, RepaintPlan,
 };
-pub(crate) use damage::{OutputDamage, OutputRect, RepaintMode};
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglRect, EglTexturedVertex, EglUvRect, MIN_VERTEX_BUFFER_BYTES,
     SurfaceSampling, VERTEX_STRIDE, push_draw_command, push_draw_command_with_uv,
@@ -95,9 +95,31 @@ pub(crate) enum EglFrameOutcome {
         stats: GlesSceneFrameStats,
     },
     Rendered {
-        plan: RepaintPlan,
+        commit: EglSceneFrameCommit,
         stats: GlesSceneFrameStats,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // The explicit Atomic runtime consumes this after bootstrap reordering.
+pub(crate) struct EglOutputRenderTarget {
+    pub(crate) framebuffer: glow::Framebuffer,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) buffer_age: BufferAge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EglSceneFrameCommit {
+    repaint_plan: RepaintPlan,
+    damage_state: EglPresentedDamageState,
+    scene_key: EglSceneCacheKey,
+}
+
+impl EglSceneFrameCommit {
+    pub(crate) const fn repaint_plan(&self) -> &RepaintPlan {
+        &self.repaint_plan
+    }
 }
 
 pub struct EglSceneDrawRequest<'a> {
@@ -126,7 +148,6 @@ pub(crate) struct GlesSceneRenderer {
     cursor_commands: Vec<EglDrawCommand>,
     scene_cache_key: Option<EglSceneCacheKey>,
     presented_scene_key: Option<EglSceneCacheKey>,
-    pending_scene_key: Option<EglSceneCacheKey>,
     wallpaper_resource: Option<EglImageResource>,
     cursor_resource: Option<EglImageResource>,
     surface_resources: HashMap<u32, EglSurfaceResource>,
@@ -137,7 +158,6 @@ pub(crate) struct GlesSceneRenderer {
     frame_resources: HashMap<compositor::ServerFrameColor, EglImageResource>,
     egl_image_target_texture_2d: Option<GlEglImageTargetTexture2DOes>,
     damage_tracker: EglOutputDamageTracker,
-    pending_damage_state: Option<EglPresentedDamageState>,
     repaint_planner: PartialRepaintPlanner,
     frame_stats: GlesSceneFrameStats,
 }
@@ -210,7 +230,6 @@ impl GlesSceneRenderer {
             cursor_commands: Vec::new(),
             scene_cache_key: None,
             presented_scene_key: None,
-            pending_scene_key: None,
             wallpaper_resource: None,
             cursor_resource: None,
             surface_resources: HashMap::new(),
@@ -221,7 +240,6 @@ impl GlesSceneRenderer {
             frame_resources: HashMap::new(),
             egl_image_target_texture_2d,
             damage_tracker: EglOutputDamageTracker::default(),
-            pending_damage_state: None,
             repaint_planner: PartialRepaintPlanner::new(
                 (width, height),
                 partial_repaint_capabilities,
@@ -248,6 +266,45 @@ impl GlesSceneRenderer {
         egl_display: egl::Display,
         egl_surface: egl::Surface,
         request: EglSceneDrawRequest<'_>,
+    ) -> RendererResult<EglFrameOutcome> {
+        let buffer_age = query_egl_buffer_age(
+            egl,
+            egl_display,
+            egl_surface,
+            self.repaint_planner.capabilities().buffer_age,
+        );
+        self.draw_scene_with_buffer_age(egl, egl_display, request, buffer_age)
+    }
+
+    #[allow(dead_code)] // Wired by the explicit Atomic runtime integration task.
+    pub(crate) fn draw_scene_to_target(
+        &mut self,
+        egl: &EglInstance,
+        egl_display: egl::Display,
+        target: EglOutputRenderTarget,
+        mut request: EglSceneDrawRequest<'_>,
+    ) -> RendererResult<EglFrameOutcome> {
+        request.width = target.width;
+        request.height = target.height;
+        unsafe {
+            self.gl
+                .bind_framebuffer(glow::FRAMEBUFFER, Some(target.framebuffer));
+            self.gl
+                .viewport(0, 0, target.width as i32, target.height as i32);
+        }
+        let result = self.draw_scene_with_buffer_age(egl, egl_display, request, target.buffer_age);
+        unsafe {
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+        result
+    }
+
+    fn draw_scene_with_buffer_age(
+        &mut self,
+        egl: &EglInstance,
+        egl_display: egl::Display,
+        request: EglSceneDrawRequest<'_>,
+        buffer_age: BufferAge,
     ) -> RendererResult<EglFrameOutcome> {
         let EglSceneDrawRequest {
             width,
@@ -334,12 +391,12 @@ impl GlesSceneRenderer {
             self.frame_stats.contradictory_empty_damage = true;
             output_damage = OutputDamage::Full;
         }
-        self.pending_damage_state = Some(EglOutputDamageTracker::candidate_state(
+        let damage_state = EglOutputDamageTracker::candidate_state(
             width,
             height,
             scaled_visual_state,
             client_cursor_damage,
-        ));
+        );
 
         if commands_changed {
             self.frame_stats.scene_rebuilt = true;
@@ -361,48 +418,42 @@ impl GlesSceneRenderer {
             client_cursor,
             output_scale,
         );
-        let buffer_age = query_egl_buffer_age(
-            egl,
-            egl_display,
-            egl_surface,
-            self.repaint_planner.capabilities().buffer_age,
-        );
         let plan = self.repaint_planner.plan(output_damage, buffer_age);
         if plan.mode == RepaintMode::Skip {
-            self.pending_damage_state = None;
-            self.pending_scene_key = None;
             self.record_repaint_stats(&plan);
             return Ok(EglFrameOutcome::Skipped {
                 reason: FrameSkipReason::NoLogicalDamage,
                 stats: self.frame_stats,
             });
         }
-        self.pending_scene_key = Some(candidate_scene_key);
         if let Err(error) = self.draw_textured_layers(&plan) {
             self.repaint_planner.invalidate();
-            self.pending_scene_key = None;
             return Err(error);
         }
         self.record_repaint_stats(&plan);
         Ok(EglFrameOutcome::Rendered {
-            plan,
+            commit: EglSceneFrameCommit {
+                repaint_plan: plan,
+                damage_state,
+                scene_key: candidate_scene_key,
+            },
             stats: self.frame_stats,
         })
     }
 
-    pub(crate) fn frame_presented(&mut self, plan: &RepaintPlan) {
-        self.repaint_planner.commit_presented(plan);
-        if let Some(state) = self.pending_damage_state.take() {
-            self.damage_tracker.commit_presented(state);
-        }
-        self.presented_scene_key = self.pending_scene_key.take();
+    pub(crate) fn commit_presented(&mut self, frame: EglSceneFrameCommit) {
+        self.repaint_planner.commit_presented(&frame.repaint_plan);
+        self.damage_tracker.commit_presented(frame.damage_state);
+        self.presented_scene_key = Some(frame.scene_key);
         self.frame_stats.history_depth = self.repaint_planner.history_depth();
+    }
+
+    pub(crate) fn discard_rendered(&mut self, frame: EglSceneFrameCommit) {
+        self.repaint_planner.discard_rendered(&frame.repaint_plan);
     }
 
     pub(crate) fn frame_swap_failed(&mut self) {
         self.repaint_planner.swap_failed();
-        self.pending_damage_state = None;
-        self.pending_scene_key = None;
         self.frame_stats.history_depth = 0;
     }
 
