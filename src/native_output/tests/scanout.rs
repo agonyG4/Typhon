@@ -5,6 +5,7 @@ use oblivion_one::render_backend::{
     egl_gles::EglGlesDmabufFormat,
 };
 use std::io;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::{cell::RefCell, rc::Rc};
 
 struct TestGbmAllocationProbe {
@@ -250,6 +251,178 @@ fn current_pending_ready_slots_never_alias() {
     assert!(ownership.set_ready(OutputSlotId::new(1).unwrap()).is_err());
     assert!(ownership.set_ready(OutputSlotId::new(2).unwrap()).is_ok());
     assert!(ownership.set_ready(OutputSlotId::new(0).unwrap()).is_err());
+}
+
+fn explicit_slot_set() -> OutputSlotSet {
+    OutputSlotSet::new([
+        OutputSlotId::new(0).unwrap(),
+        OutputSlotId::new(1).unwrap(),
+        OutputSlotId::new(2).unwrap(),
+    ])
+    .unwrap()
+}
+
+fn test_sync_fd() -> OwnedFd {
+    let mut pipe = [-1; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    unsafe { libc::close(pipe[1]) };
+    unsafe { OwnedFd::from_raw_fd(pipe[0]) }
+}
+
+fn test_render_fence() -> crate::egl_renderer::native_fence::NativeRenderFence {
+    crate::egl_renderer::native_fence::NativeRenderFence::from_submission_fd(test_sync_fd())
+}
+
+#[test]
+fn explicit_output_swapchain_valid_current_pending_ready_transition() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        7,
+    )
+    .unwrap();
+    let slot_one = swapchain.acquire_render_slot().unwrap();
+    assert_eq!(slot_one, OutputSlotId::new(1).unwrap());
+    swapchain
+        .finish_render(slot_one, 10, test_render_fence())
+        .unwrap();
+    let token_one = PageFlipToken::new(101).unwrap();
+    swapchain.submit_ready(token_one, None).unwrap();
+
+    let slot_two = swapchain.acquire_render_slot().unwrap();
+    assert_eq!(slot_two, OutputSlotId::new(2).unwrap());
+    swapchain
+        .finish_render(slot_two, 11, test_render_fence())
+        .unwrap();
+    assert_eq!(swapchain.pending_slot(), Some(slot_one));
+    assert_eq!(swapchain.ready_slot(), Some(slot_two));
+
+    let completed = swapchain.complete_pageflip(token_one, 7).unwrap();
+    assert_eq!(completed.old_current, OutputSlotId::new(0).unwrap());
+    assert_eq!(completed.new_current, slot_one);
+    assert_eq!(swapchain.current(), slot_one);
+    assert_eq!(swapchain.ready_slot(), Some(slot_two));
+    swapchain
+        .submit_ready(PageFlipToken::new(102).unwrap(), None)
+        .unwrap();
+    assert_eq!(swapchain.pending_slot(), Some(slot_two));
+    swapchain.validate_invariants().unwrap();
+}
+
+#[test]
+fn explicit_output_swapchain_rejects_invalid_transitions_without_mutation() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        9,
+    )
+    .unwrap();
+    assert!(
+        swapchain
+            .submit_ready(PageFlipToken::new(1).unwrap(), None)
+            .is_err()
+    );
+    let rendering = swapchain.acquire_render_slot().unwrap();
+    assert!(swapchain.acquire_render_slot().is_err());
+    assert!(
+        swapchain
+            .finish_render(OutputSlotId::new(2).unwrap(), 1, test_render_fence())
+            .is_err()
+    );
+    swapchain
+        .finish_render(rendering, 1, test_render_fence())
+        .unwrap();
+    assert!(swapchain.acquire_render_slot().is_err());
+    let token = PageFlipToken::new(10).unwrap();
+    swapchain.submit_ready(token, None).unwrap();
+    assert!(
+        swapchain
+            .submit_ready(PageFlipToken::new(11).unwrap(), None)
+            .is_err()
+    );
+    assert!(
+        swapchain
+            .complete_pageflip(PageFlipToken::new(11).unwrap(), 9)
+            .is_err()
+    );
+    assert_eq!(swapchain.pending_slot(), Some(rendering));
+    assert!(swapchain.complete_pageflip(token, 8).is_err());
+    assert_eq!(swapchain.pending_slot(), Some(rendering));
+    swapchain.validate_invariants().unwrap();
+}
+
+#[test]
+fn atomic_submit_failure_quarantines_ready_slot_and_poison_rejects_operations() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        4,
+    )
+    .unwrap();
+    let slot = swapchain.acquire_render_slot().unwrap();
+    swapchain
+        .finish_render(slot, 1, test_render_fence())
+        .unwrap();
+
+    assert_eq!(swapchain.atomic_submit_failed().unwrap(), slot);
+    assert_eq!(swapchain.quarantine_slot_id(), Some(slot));
+    assert!(swapchain.is_poisoned());
+    assert!(swapchain.acquire_render_slot().is_err());
+    assert!(
+        swapchain
+            .submit_ready(PageFlipToken::new(1).unwrap(), None)
+            .is_err()
+    );
+    swapchain.validate_invariants().unwrap();
+}
+
+#[test]
+fn post_draw_failure_quarantines_rendering_slot_without_freeing_it() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        4,
+    )
+    .unwrap();
+    let slot = swapchain.acquire_render_slot().unwrap();
+
+    assert_eq!(
+        swapchain
+            .quarantine_rendering(None, OutputQuarantineReason::RenderFenceExportFailure)
+            .unwrap(),
+        slot
+    );
+    assert_eq!(swapchain.rendering_slot(), None);
+    assert_eq!(swapchain.quarantine_slot_id(), Some(slot));
+    assert!(swapchain.acquire_render_slot().is_err());
+    swapchain.validate_invariants().unwrap();
+}
+
+#[test]
+fn suspended_ready_slot_cannot_be_reused_before_fence_proof() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        12,
+    )
+    .unwrap();
+    let slot = swapchain.acquire_render_slot().unwrap();
+    swapchain
+        .finish_render(slot, 1, test_render_fence())
+        .unwrap();
+    assert_eq!(swapchain.suspend_abandon_ready().unwrap(), Some(slot));
+
+    assert!(!swapchain.is_poisoned());
+    assert!(swapchain.acquire_render_slot().is_err());
+    assert!(swapchain.recover_suspended_slot(false).is_err());
+    assert_eq!(swapchain.quarantine_slot_id(), Some(slot));
+    swapchain.recover_suspended_slot(true).unwrap();
+    assert_eq!(swapchain.quarantine_slot_id(), None);
+    assert_eq!(swapchain.acquire_render_slot().unwrap(), slot);
+    swapchain.validate_invariants().unwrap();
 }
 
 #[test]
