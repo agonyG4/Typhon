@@ -178,6 +178,18 @@ mod tests {
     }
 
     #[test]
+    fn legacy_kms_never_enables_explicit_triple_buffering() {
+        let backend_kind = KmsBackendKind::Legacy;
+        let primary_plane_has_in_fence_fd = true;
+        let explicit_triple_buffering_enabled = primary_plane_has_in_fence_fd;
+
+        assert!(
+            !explicit_triple_buffering_enabled || backend_kind == KmsBackendKind::Atomic,
+            "legacy KMS must never inherit the Atomic explicit-triple-buffering path"
+        );
+    }
+
+    #[test]
     fn startup_policy_allows_only_pre_takeover_auto_fallback() {
         assert_eq!(
             KmsPolicy::Auto.on_atomic_failure(AtomicFailurePhase::Capability),

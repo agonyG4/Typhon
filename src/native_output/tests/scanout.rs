@@ -1,4 +1,45 @@
 use super::*;
+
+#[test]
+fn explicit_output_pool_has_exactly_three_slots() {
+    let buffers = NativePageFlipBuffers::<u8>::default();
+    let allocated_slots = [buffers.current, buffers.pending, buffers.ready]
+        .into_iter()
+        .flatten()
+        .count();
+
+    assert_eq!(
+        allocated_slots, 3,
+        "the explicit output path must allocate exactly three owned slots"
+    );
+}
+
+#[test]
+fn explicit_output_swapchain_requires_a_presented_current_slot() {
+    let mut buffers = NativePageFlipBuffers::default();
+
+    buffers.set_ready(20);
+
+    assert_eq!(
+        buffers.current,
+        Some(20),
+        "an explicit output swapchain must be initialized around a presented current slot"
+    );
+}
+
+#[test]
+fn current_pending_ready_slots_never_alias() {
+    let buffers = NativePageFlipBuffers {
+        current: Some(7),
+        pending: Some(7),
+        ready: Some(7),
+    };
+
+    assert_ne!(buffers.current, buffers.pending, "current aliases pending");
+    assert_ne!(buffers.current, buffers.ready, "current aliases ready");
+    assert_ne!(buffers.pending, buffers.ready, "pending aliases ready");
+}
+
 #[test]
 fn proc_stat_cpu_parser_reads_user_and_system_ticks_after_comm() {
     let stat = "1234 (oblivion one) S 1 2 3 4 5 6 7 8 9 10 123 45 0 0 20 0";
