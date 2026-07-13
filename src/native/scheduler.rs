@@ -1,5 +1,7 @@
 //! Absolute-deadline frame scheduling for the native compositor runtime.
 
+use crate::native::kms::KmsBackendKind;
+
 const DEFAULT_PAGE_FLIP_WATCHDOG_NS: u64 = 1_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +25,52 @@ pub enum SchedulerState {
     RefreshDeadlineArmed,
     PageFlipPending,
     ReadyFrameQueued,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedulerCapabilities {
+    kms_backend: KmsBackendKind,
+    primary_plane_in_fence: bool,
+    explicit_output_swapchain: bool,
+}
+
+impl SchedulerCapabilities {
+    pub const fn for_backend(kms_backend: KmsBackendKind) -> Self {
+        Self {
+            kms_backend,
+            primary_plane_in_fence: false,
+            explicit_output_swapchain: false,
+        }
+    }
+
+    pub const fn explicit_atomic(
+        primary_plane_in_fence: bool,
+        explicit_output_swapchain: bool,
+    ) -> Self {
+        Self::for_backend(KmsBackendKind::Atomic)
+            .with_primary_plane_in_fence(primary_plane_in_fence)
+            .with_explicit_output_swapchain(explicit_output_swapchain)
+    }
+
+    pub const fn legacy() -> Self {
+        Self::for_backend(KmsBackendKind::Legacy)
+    }
+
+    pub const fn with_primary_plane_in_fence(mut self, available: bool) -> Self {
+        self.primary_plane_in_fence = available;
+        self
+    }
+
+    pub const fn with_explicit_output_swapchain(mut self, available: bool) -> Self {
+        self.explicit_output_swapchain = available;
+        self
+    }
+
+    pub const fn render_ahead_allowed(self) -> bool {
+        matches!(self.kms_backend, KmsBackendKind::Atomic)
+            && self.primary_plane_in_fence
+            && self.explicit_output_swapchain
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

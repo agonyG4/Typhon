@@ -4,11 +4,13 @@ mod backend;
 mod dumb;
 mod egl_gbm;
 mod gbm_cpu;
+mod output_swapchain;
 
 pub(crate) use backend::*;
 pub(crate) use dumb::*;
 pub(crate) use egl_gbm::*;
 pub(crate) use gbm_cpu::*;
+pub(crate) use output_swapchain::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeScanoutPreference {

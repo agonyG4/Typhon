@@ -179,14 +179,12 @@ mod tests {
 
     #[test]
     fn legacy_kms_never_enables_explicit_triple_buffering() {
-        let backend_kind = KmsBackendKind::Legacy;
-        let primary_plane_has_in_fence_fd = true;
-        let explicit_triple_buffering_enabled = primary_plane_has_in_fence_fd;
+        let capabilities =
+            crate::native::scheduler::SchedulerCapabilities::for_backend(KmsBackendKind::Legacy)
+                .with_primary_plane_in_fence(true)
+                .with_explicit_output_swapchain(true);
 
-        assert!(
-            !explicit_triple_buffering_enabled || backend_kind == KmsBackendKind::Atomic,
-            "legacy KMS must never inherit the Atomic explicit-triple-buffering path"
-        );
+        assert!(!capabilities.render_ahead_allowed());
     }
 
     #[test]

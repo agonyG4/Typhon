@@ -3,25 +3,19 @@ use super::*;
 use crate::native_output::runtime::{
     NativeRepaintDecision, NativeRepaintInputs, native_repaint_decision,
 };
+use oblivion_one::native::scheduler::SchedulerCapabilities;
 
 #[test]
 fn render_ahead_requires_atomic_in_fence_support() {
-    let atomic_kms = true;
-    let primary_plane_has_in_fence_fd = true;
-    let decision = native_repaint_decision(NativeRepaintInputs {
-        accepted_clients: false,
-        render_generation_changed: true,
-        pending_frame_work: true,
-        only_pending_surface_frame_callbacks: false,
-        redraw_requested: true,
-        page_flip_pending: true,
-    });
+    let eligible = SchedulerCapabilities::explicit_atomic(true, true);
+    let missing_in_fence = SchedulerCapabilities::explicit_atomic(false, true);
+    let opaque_output = SchedulerCapabilities::explicit_atomic(true, false);
+    let legacy = SchedulerCapabilities::legacy();
 
-    assert_eq!(
-        decision.repaint,
-        atomic_kms && primary_plane_has_in_fence_fd,
-        "render-ahead must be admitted only by an Atomic KMS IN_FENCE_FD capability gate"
-    );
+    assert!(eligible.render_ahead_allowed());
+    assert!(!missing_in_fence.render_ahead_allowed());
+    assert!(!opaque_output.render_ahead_allowed());
+    assert!(!legacy.render_ahead_allowed());
 }
 
 #[test]
