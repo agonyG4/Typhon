@@ -235,10 +235,10 @@ impl super::CompositorState {
         replacement: SurfaceCommitId,
         reason: &str,
     ) {
-        let Some(live) = self.commit_debug.live.remove(&id) else {
-            return;
-        };
-        let disposition = self.commit_debug.metrics.note_superseded(state);
+        let live = self.commit_debug.live.remove(&id);
+        let disposition = live
+            .as_ref()
+            .map(|_| self.commit_debug.metrics.note_superseded(state));
         self.commit_debug.metrics.callbacks_merged_from_superseded = self
             .commit_debug
             .metrics
@@ -264,23 +264,25 @@ impl super::CompositorState {
                 );
             }
         }
-        self.commit_log(
-            match disposition {
-                SurfaceCommitDisposition::SupersededWhileReady => "superseded_ready",
-                _ => "superseded_unready",
-            },
-            id,
-            live.surface,
-            live.sequence,
-            None,
-            if state == PendingAcquireState::Ready {
-                "ready"
-            } else {
-                "unready"
-            },
-            callback_count,
-            reason,
-        );
+        if let (Some(live), Some(disposition)) = (live, disposition) {
+            self.commit_log(
+                match disposition {
+                    SurfaceCommitDisposition::SupersededWhileReady => "superseded_ready",
+                    _ => "superseded_unready",
+                },
+                id,
+                live.surface,
+                live.sequence,
+                None,
+                if state == PendingAcquireState::Ready {
+                    "ready"
+                } else {
+                    "unready"
+                },
+                callback_count,
+                reason,
+            );
+        }
     }
 
     pub(in crate::compositor) fn note_explicit_commit_merged(
