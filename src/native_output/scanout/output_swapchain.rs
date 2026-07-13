@@ -442,7 +442,7 @@ impl AtomicOutputSwapchain {
         Ok(slot)
     }
 
-    pub(crate) fn suspend_abandon_ready(&mut self) -> io::Result<Option<OutputSlotId>> {
+    pub(crate) fn suspend_abandon_ready(&mut self) -> io::Result<Option<RenderedOutputFrame>> {
         if self.quarantine.is_some() {
             return Err(io::Error::other("an output slot is already quarantined"));
         }
@@ -456,7 +456,54 @@ impl AtomicOutputSwapchain {
             timing_fence,
             OutputQuarantineReason::SuspendAbandonment,
         )?;
-        Ok(Some(slot))
+        Ok(Some(frame))
+    }
+
+    pub(crate) fn suspended_ready_fence_signaled(&self) -> io::Result<bool> {
+        let Some(quarantine) = self.quarantine.as_ref() else {
+            return Ok(true);
+        };
+        if quarantine.reason != OutputQuarantineReason::SuspendAbandonment {
+            return Err(io::Error::other(
+                "fatal output quarantine cannot recover to normal operation",
+            ));
+        }
+        let Some(fence) = quarantine.timing_fence.as_ref() else {
+            return Ok(false);
+        };
+        let mut pollfd = libc::pollfd {
+            fd: fence.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        if ready < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(io::Error::other(
+                "suspended output render fence reported poll failure",
+            ));
+        }
+        Ok(ready > 0 && pollfd.revents & libc::POLLIN != 0)
+    }
+
+    pub(crate) fn retire_pending_after_recovery(&mut self) -> Option<RenderedOutputFrame> {
+        self.pending.take().map(|submitted| submitted.frame)
+    }
+
+    pub(crate) fn rebind_pool_generation(&mut self, pool_generation: u64) -> io::Result<()> {
+        if self.pending.is_some()
+            || self.ready.is_some()
+            || self.rendering.is_some()
+            || self.quarantine.is_some()
+        {
+            return Err(io::Error::other(
+                "output pool generation cannot change while a non-current slot is owned",
+            ));
+        }
+        self.pool_generation = pool_generation;
+        Ok(())
     }
 
     pub(crate) fn recover_suspended_slot(&mut self, fence_signaled: bool) -> io::Result<()> {

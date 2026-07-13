@@ -164,7 +164,10 @@ impl NativeSessionIo for NativeRuntime {
 
     fn quarantine_pageflip(&mut self) -> NativeResult<()> {
         self.frame_scheduler.abandon_for_session_suspend();
-        self.scanout.suspend_page_flip();
+        if let Some(token) = self.output_render_fence_token.take() {
+            self.event_loop.unregister(token)?;
+        }
+        self.scanout.suspend_page_flip(&mut self.server)?;
         Ok(())
     }
 
@@ -201,7 +204,8 @@ impl NativeSessionIo for NativeRuntime {
         let recovery = self.pending_session_recovery.as_ref().ok_or_else(|| {
             io::Error::other("session recovery completion has no prepared framebuffer")
         })?;
-        self.scanout.complete_session_recovery(*recovery)?;
+        self.scanout
+            .complete_session_recovery(*recovery, &mut self.server)?;
         self.pending_session_recovery = None;
         Ok(())
     }
@@ -246,6 +250,14 @@ impl NativeSessionIo for NativeRuntime {
     }
 
     fn rearm_scheduler(&mut self) -> NativeResult<()> {
+        let refresh_interval =
+            Duration::from_nanos(1_000_000_000u64 / u64::from(self.refresh_hz.max(1)));
+        self.presentation_deadline.invalidate(refresh_interval);
+        self.scheduled_presentation_target = None;
+        self.render_journal.reset();
+        self.adaptive_buffering.reset();
+        self.pending_proven_deadline_miss = None;
+        self.queued_redraw_requested = true;
         self.event_loop.arm_deadline(earliest_native_deadline(
             self.frame_scheduler.next_deadline_ns(),
             self.acquire_watches.next_fallback_deadline_ns(),

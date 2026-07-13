@@ -192,6 +192,11 @@ pub(crate) struct GlesRendererInfo {
 }
 
 impl GlesSceneRenderer {
+    pub(crate) fn invalidate_presented_damage_history(&mut self) {
+        self.repaint_planner.invalidate();
+        self.presented_scene_key = None;
+    }
+
     pub(crate) fn new_current(
         egl: &EglInstance,
         width: u32,

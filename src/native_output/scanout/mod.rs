@@ -210,6 +210,7 @@ pub(crate) enum NativeScanoutBackend {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeScanoutRecovery {
+    AtomicEglGbm(AtomicExplicitRecovery),
     NativeEglGbm(NativePageFlipRecovery),
     Gbm(NativeIndexedScanoutRecovery),
     Dumb(FramebufferId),
@@ -218,6 +219,7 @@ pub(crate) enum NativeScanoutRecovery {
 impl NativeScanoutRecovery {
     pub(crate) fn framebuffer_id(self) -> FramebufferId {
         match self {
+            Self::AtomicEglGbm(recovery) => recovery.framebuffer,
             Self::NativeEglGbm(recovery) => {
                 // A recovery token cannot be created with a zero framebuffer ID.
                 FramebufferId::new(recovery.framebuffer_id).expect("validated recovery framebuffer")
@@ -228,6 +230,13 @@ impl NativeScanoutRecovery {
             Self::Dumb(framebuffer) => framebuffer,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AtomicExplicitRecovery {
+    framebuffer: FramebufferId,
+    current: OutputSlotId,
+    pool_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -365,9 +374,9 @@ impl NativeScanoutBackend {
 
     pub(crate) fn prepare_session_recovery(&self) -> io::Result<NativeScanoutRecovery> {
         match self {
-            Self::AtomicEglGbm(_) => Err(io::Error::other(
-                "explicit Atomic recovery uses generation-checked swapchain recovery",
-            )),
+            Self::AtomicEglGbm(scanout) => scanout
+                .prepare_session_recovery()
+                .map(NativeScanoutRecovery::AtomicEglGbm),
             Self::NativeEglGbm(scanout) => scanout
                 .prepare_session_recovery()
                 .map(NativeScanoutRecovery::NativeEglGbm),
@@ -383,11 +392,12 @@ impl NativeScanoutBackend {
     pub(crate) fn complete_session_recovery(
         &mut self,
         recovery: NativeScanoutRecovery,
+        server: &mut OwnCompositorServer,
     ) -> io::Result<()> {
         match (self, recovery) {
-            (Self::AtomicEglGbm(_), _) => Err(io::Error::other(
-                "explicit Atomic recovery token is invalid for the opaque recovery API",
-            )),
+            (Self::AtomicEglGbm(scanout), NativeScanoutRecovery::AtomicEglGbm(recovery)) => {
+                scanout.complete_session_recovery(recovery, server)
+            }
             (Self::NativeEglGbm(scanout), NativeScanoutRecovery::NativeEglGbm(recovery)) => {
                 scanout.complete_session_recovery(recovery)
             }
@@ -465,18 +475,19 @@ impl NativeScanoutBackend {
         }
     }
 
-    pub(crate) fn suspend_page_flip(&mut self) {
+    pub(crate) fn suspend_page_flip(&mut self, server: &mut OwnCompositorServer) -> io::Result<()> {
         match self {
-            Self::AtomicEglGbm(_) => {}
+            Self::AtomicEglGbm(scanout) => scanout.suspend_for_session(server)?,
             Self::NativeEglGbm(scanout) => scanout.suspend_page_flip(),
             Self::Gbm(scanout) => scanout.suspend_page_flip(),
             Self::Dumb(_) => {}
         }
+        Ok(())
     }
 
     pub(crate) fn rebind_session_generation(&mut self, generation: u64) {
         match self {
-            Self::AtomicEglGbm(_) => {}
+            Self::AtomicEglGbm(scanout) => scanout.rebind_session_generation(generation),
             Self::NativeEglGbm(scanout) => scanout.rebind_session_generation(generation),
             Self::Gbm(scanout) => scanout.rebind_session_generation(generation),
             Self::Dumb(_) => {}

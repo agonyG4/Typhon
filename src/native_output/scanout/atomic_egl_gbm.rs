@@ -66,6 +66,79 @@ impl GbmAllocationProbe for DeviceAllocationProbe<'_> {
 }
 
 impl AtomicEglGbmScanout {
+    pub(crate) fn prepare_session_recovery(&self) -> io::Result<AtomicExplicitRecovery> {
+        let swapchain = self.swapchain()?;
+        let current = swapchain.current();
+        Ok(AtomicExplicitRecovery {
+            framebuffer: self.framebuffer(current)?,
+            current,
+            pool_generation: swapchain.pool_generation(),
+        })
+    }
+
+    pub(crate) fn suspend_for_session(
+        &mut self,
+        server: &mut OwnCompositorServer,
+    ) -> io::Result<()> {
+        if let Some(frame) = self.swapchain_mut()?.suspend_abandon_ready()? {
+            server.discard_frame_batch(
+                frame.protocol_batch_id,
+                FrameBatchDiscardReason::SuspendAbandonment,
+            );
+            self.scene.discard_rendered(frame.scene_commit);
+            drop(frame.surface_damage);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_session_recovery(
+        &mut self,
+        recovery: AtomicExplicitRecovery,
+        server: &mut OwnCompositorServer,
+    ) -> io::Result<()> {
+        let swapchain = self.swapchain()?;
+        if swapchain.pool_generation() != recovery.pool_generation
+            || swapchain.current() != recovery.current
+            || self.framebuffer(recovery.current)? != recovery.framebuffer
+        {
+            return Err(io::Error::other(
+                "explicit output recovery token no longer matches the active pool",
+            ));
+        }
+        let fence_signaled = swapchain.suspended_ready_fence_signaled()?;
+        if !fence_signaled {
+            return Err(io::Error::other(
+                "suspended-ready output fence is not signaled after recovery modeset",
+            ));
+        }
+        self.swapchain_mut()?.recover_suspended_slot(true)?;
+        if let Some(frame) = self.swapchain_mut()?.retire_pending_after_recovery() {
+            server.discard_frame_batch(
+                frame.protocol_batch_id,
+                FrameBatchDiscardReason::SuspendAbandonment,
+            );
+            self.scene.discard_rendered(frame.scene_commit);
+            drop(frame.surface_damage);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rebind_session_generation(&mut self, generation: u64) {
+        let Some(pool) = self.pool.as_mut() else {
+            return;
+        };
+        if let Some(swapchain) = self.swapchain.as_mut() {
+            swapchain
+                .rebind_pool_generation(generation)
+                .expect("recovery retires all non-current explicit output ownership");
+        }
+        pool.pool_generation = generation;
+        for slot in &mut pool.slots {
+            slot.pool_generation = generation;
+        }
+        self.scene.invalidate_presented_damage_history();
+    }
+
     pub(crate) fn create_unattached_pool(
         kms: &fs::File,
         discovery: &AtomicDiscovery,
