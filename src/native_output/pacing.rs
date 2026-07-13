@@ -61,6 +61,9 @@ mod tests {
     }
 }
 use super::scanout::NativeScanoutBufferSnapshot;
+use oblivion_one::native::adaptive_buffering::{
+    AdaptiveBufferingMode, FenceTimestampQuality, ProvenDeadlineMiss,
+};
 use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -238,6 +241,17 @@ pub(crate) struct NativeFramePacing {
     pub(crate) render_ahead_successes: u64,
     pub(crate) wait_for_buffer_count: u64,
     pub(crate) ready_submit_count: u64,
+    pub(crate) adaptive_triple_entries_predicted: u64,
+    pub(crate) adaptive_triple_entries_proven_render_miss: u64,
+    pub(crate) adaptive_triple_entries_proven_submit_miss: u64,
+    pub(crate) adaptive_triple_exits: u64,
+    pub(crate) sync_file_info_exact: u64,
+    pub(crate) sync_file_info_approximate: u64,
+    wake_lateness: BoundedSamples<PACING_SAMPLE_CAPACITY>,
+    slot_hold: BoundedSamples<PACING_SAMPLE_CAPACITY>,
+    ready_age: BoundedSamples<PACING_SAMPLE_CAPACITY>,
+    target_error: BoundedSamples<PACING_SAMPLE_CAPACITY>,
+    atomic_submit: BoundedSamples<PACING_SAMPLE_CAPACITY>,
     pageflip_intervals: BoundedSamples<PACING_SAMPLE_CAPACITY>,
     commit_to_present: BoundedSamples<PACING_SAMPLE_CAPACITY>,
     misses: RefreshMissBuckets,
@@ -259,6 +273,17 @@ impl NativeFramePacing {
             render_ahead_successes: 0,
             wait_for_buffer_count: 0,
             ready_submit_count: 0,
+            adaptive_triple_entries_predicted: 0,
+            adaptive_triple_entries_proven_render_miss: 0,
+            adaptive_triple_entries_proven_submit_miss: 0,
+            adaptive_triple_exits: 0,
+            sync_file_info_exact: 0,
+            sync_file_info_approximate: 0,
+            wake_lateness: BoundedSamples::default(),
+            slot_hold: BoundedSamples::default(),
+            ready_age: BoundedSamples::default(),
+            target_error: BoundedSamples::default(),
+            atomic_submit: BoundedSamples::default(),
             pageflip_intervals: BoundedSamples::default(),
             commit_to_present: BoundedSamples::default(),
             misses: RefreshMissBuckets::default(),
@@ -363,9 +388,76 @@ impl NativeFramePacing {
     pub(crate) fn last_pageflip_ns(&self) -> Option<u64> {
         self.last_pageflip_ns
     }
+    pub(crate) fn note_wake_lateness(&mut self, lateness_ns: u64) {
+        if self.enabled {
+            self.wake_lateness.record(lateness_ns / 1_000);
+        }
+    }
+    pub(crate) fn note_explicit_present(
+        &mut self,
+        target_ns: u64,
+        presented_ns: u64,
+        composite_started_ns: u64,
+        rendered_ns: u64,
+        submit_started_ns: u64,
+        submit_returned_ns: u64,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.target_error
+            .record(presented_ns.abs_diff(target_ns) / 1_000);
+        self.slot_hold
+            .record(submit_returned_ns.saturating_sub(composite_started_ns) / 1_000);
+        self.ready_age
+            .record(submit_started_ns.saturating_sub(rendered_ns) / 1_000);
+        self.atomic_submit
+            .record(submit_returned_ns.saturating_sub(submit_started_ns) / 1_000);
+    }
+    pub(crate) fn note_adaptive_transition(
+        &mut self,
+        before: AdaptiveBufferingMode,
+        after: AdaptiveBufferingMode,
+        miss: Option<ProvenDeadlineMiss>,
+    ) {
+        if !self.enabled || before == after {
+            return;
+        }
+        match (before, after, miss) {
+            (AdaptiveBufferingMode::Double, AdaptiveBufferingMode::Triple, None) => {
+                self.adaptive_triple_entries_predicted += 1;
+            }
+            (
+                AdaptiveBufferingMode::Double,
+                AdaptiveBufferingMode::Triple,
+                Some(ProvenDeadlineMiss::AtomicSubmit),
+            ) => self.adaptive_triple_entries_proven_submit_miss += 1,
+            (AdaptiveBufferingMode::Double, AdaptiveBufferingMode::Triple, Some(_)) => {
+                self.adaptive_triple_entries_proven_render_miss += 1;
+            }
+            (AdaptiveBufferingMode::Triple, AdaptiveBufferingMode::Double, _) => {
+                self.adaptive_triple_exits += 1;
+            }
+            _ => {}
+        }
+    }
+    pub(crate) fn note_fence_timestamp_quality(&mut self, quality: FenceTimestampQuality) {
+        if !self.enabled {
+            return;
+        }
+        match quality {
+            FenceTimestampQuality::ExactSyncFile => self.sync_file_info_exact += 1,
+            FenceTimestampQuality::ObservedApproximate => self.sync_file_info_approximate += 1,
+        }
+    }
     pub(crate) fn summary_line(&self) -> String {
         let (pf50, pf95, pf99) = self.pageflip_intervals.percentiles();
         let (cp50, cp95, cp99) = self.commit_to_present.percentiles();
+        let (wake50, wake95, wake99) = self.wake_lateness.percentiles();
+        let (slot50, slot95, slot99) = self.slot_hold.percentiles();
+        let (ready50, ready95, ready99) = self.ready_age.percentiles();
+        let (target50, target95, target99) = self.target_error.percentiles();
+        let (submit50, submit95, submit99) = self.atomic_submit.percentiles();
         pacing_line(
             "summary",
             &[
@@ -373,6 +465,40 @@ impl NativeFramePacing {
                 PacingField::u64("render_ahead_successes", self.render_ahead_successes),
                 PacingField::u64("wait_for_buffer_count", self.wait_for_buffer_count),
                 PacingField::u64("ready_submit_count", self.ready_submit_count),
+                PacingField::u64(
+                    "adaptive_triple_entries_predicted",
+                    self.adaptive_triple_entries_predicted,
+                ),
+                PacingField::u64(
+                    "adaptive_triple_entries_proven_render_miss",
+                    self.adaptive_triple_entries_proven_render_miss,
+                ),
+                PacingField::u64(
+                    "adaptive_triple_entries_proven_submit_miss",
+                    self.adaptive_triple_entries_proven_submit_miss,
+                ),
+                PacingField::u64("adaptive_triple_exits", self.adaptive_triple_exits),
+                PacingField::u64("sync_file_info_exact", self.sync_file_info_exact),
+                PacingField::u64(
+                    "sync_file_info_approximate",
+                    self.sync_file_info_approximate,
+                ),
+                PacingField::u64("presentation_target_sequence_mutations", 0),
+                PacingField::u64("scheduler_wakeup_lateness_p50_us", wake50),
+                PacingField::u64("scheduler_wakeup_lateness_p95_us", wake95),
+                PacingField::u64("scheduler_wakeup_lateness_p99_us", wake99),
+                PacingField::u64("slot_hold_p50_us", slot50),
+                PacingField::u64("slot_hold_p95_us", slot95),
+                PacingField::u64("slot_hold_p99_us", slot99),
+                PacingField::u64("ready_age_p50_us", ready50),
+                PacingField::u64("ready_age_p95_us", ready95),
+                PacingField::u64("ready_age_p99_us", ready99),
+                PacingField::u64("target_error_p50_us", target50),
+                PacingField::u64("target_error_p95_us", target95),
+                PacingField::u64("target_error_p99_us", target99),
+                PacingField::u64("atomic_submit_p50_us", submit50),
+                PacingField::u64("atomic_submit_p95_us", submit95),
+                PacingField::u64("atomic_submit_p99_us", submit99),
                 PacingField::u64("pageflip_interval_p50_us", pf50),
                 PacingField::u64("pageflip_interval_p95_us", pf95),
                 PacingField::u64("pageflip_interval_p99_us", pf99),

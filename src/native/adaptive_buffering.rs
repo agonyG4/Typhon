@@ -18,6 +18,14 @@ pub enum AdaptiveTripleBufferPolicy {
 }
 
 impl AdaptiveTripleBufferPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+            Self::Force => "force",
+        }
+    }
+
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
             "auto" => Ok(Self::Auto),

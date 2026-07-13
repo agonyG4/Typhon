@@ -256,6 +256,12 @@ pub(crate) struct NativePageFlipDrain {
 }
 
 impl NativeScanoutBackend {
+    pub(crate) fn explicit_output_counters(&self) -> Option<ExplicitOutputCounters> {
+        match self {
+            Self::AtomicEglGbm(scanout) => Some(scanout.counters()),
+            _ => None,
+        }
+    }
     pub(crate) fn from_atomic_explicit(scanout: AtomicEglGbmScanout) -> Self {
         Self::AtomicEglGbm(Box::new(scanout))
     }

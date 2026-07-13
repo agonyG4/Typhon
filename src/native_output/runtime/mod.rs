@@ -128,6 +128,17 @@ impl Drop for NativeRuntime {
         self.server.finish_commit_debug_for_shutdown();
         if self.frame_pacing.enabled() {
             println!("{}", self.frame_pacing.summary_line());
+            if let Some(counters) = self.scanout.explicit_output_counters() {
+                println!(
+                    "typhon pacing: event=explicit_output_summary sync_file_deadline_hints_applied={} sync_file_deadline_hints_unsupported={} sync_file_deadline_hints_failed={} atomic_in_fence_submissions={} atomic_out_fences_received={} atomic_out_fence_missing={}",
+                    counters.sync_file_deadline_hints_applied,
+                    counters.sync_file_deadline_hints_unsupported,
+                    counters.sync_file_deadline_hints_failed,
+                    counters.atomic_in_fence_submissions,
+                    counters.atomic_out_fences_received,
+                    counters.atomic_out_fence_missing,
+                );
+            }
         }
         if !self.session.permits_output() {
             self.scanout.disarm_drm_cleanup();

@@ -304,6 +304,34 @@ impl NativeRuntime {
         let scheduled_presentation_target = None;
         let render_journal = AdaptiveRenderJournal::default();
         let adaptive_buffering = AdaptiveBufferingController::new(triple_buffer_policy);
+        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &scanout {
+            perf.log("native.explicit_output", || {
+                vec![
+                    NativePerfField::str("scanout_backend", "atomic-egl-gbm-explicit"),
+                    NativePerfField::str("output_swapchain", "explicit-atomic-egl-gbm"),
+                    NativePerfField::u64("slot_capacity", 3),
+                    NativePerfField::str("kms_backend", "atomic"),
+                    NativePerfField::bool("surfaceless", true),
+                    NativePerfField::str(
+                        "format",
+                        String::from_utf8_lossy(&explicit.format_modifier.fourcc.to_le_bytes())
+                            .to_string(),
+                    ),
+                    NativePerfField::str(
+                        "modifier",
+                        format!("{:#x}", explicit.format_modifier.modifier),
+                    ),
+                    NativePerfField::u64(
+                        "plane_count",
+                        u64::from(explicit.plane_count().unwrap_or(0)),
+                    ),
+                    NativePerfField::str("triple_policy", triple_buffer_policy.as_str()),
+                    NativePerfField::str("pacing_policy", "deadline-driven"),
+                    NativePerfField::str("presentation_clock", "clock-monotonic"),
+                    NativePerfField::str("render_journal", "ewma+upper-deviation+p90"),
+                ]
+            });
+        }
         if let Some(token) = scanout.pending_page_flip_token() {
             frame_scheduler
                 .note_async_submission(token, scheduler_anchor_ns)

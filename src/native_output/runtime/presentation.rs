@@ -113,6 +113,7 @@ impl NativeRuntime {
                 _ => None,
             };
             if let Some(pending_target) = pending_target {
+                let buffering_mode_before = adaptive_buffering.mode();
                 adaptive_buffering.observe(
                     prediction.total_cost_ns,
                     refresh_interval,
@@ -120,6 +121,11 @@ impl NativeRuntime {
                     pending_target.sequence,
                     scheduler_now,
                     true,
+                );
+                frame_pacing.note_adaptive_transition(
+                    buffering_mode_before,
+                    adaptive_buffering.mode(),
+                    Some(miss),
                 );
             }
         }
@@ -309,6 +315,18 @@ impl NativeRuntime {
                 PacingField::u64("render_generation", render_generation),
                 PacingField::u64("render_begin_ns", render_begin_ns),
                 PacingField::bool("render_ahead", render_ahead),
+                PacingField::str("buffering_mode", format!("{:?}", adaptive_buffering.mode())),
+                PacingField::u64("prediction_ewma_ns", prediction.ewma_render_ns),
+                PacingField::u64(
+                    "prediction_upper_deviation_ns",
+                    prediction.upper_render_deviation_ns,
+                ),
+                PacingField::u64("prediction_p90_ns", prediction.p90_recent_render_ns),
+                PacingField::u64("prediction_render_risk_ns", prediction.render_risk_ns),
+                PacingField::u64("dynamic_safety_margin_ns", prediction.safety_margin_ns),
+                PacingField::u64("predicted_total_cost_ns", prediction.total_cost_ns),
+                PacingField::u64("refresh_interval_ns", refresh_interval.as_nanos() as u64),
+                PacingField::bool("idle_wake_guard", prediction.idle_wake_guard),
             ];
             render_begin_fields.extend(snapshot_fields(scanout.buffer_snapshot()));
             frame_pacing.log("render_begin", render_begin_fields);

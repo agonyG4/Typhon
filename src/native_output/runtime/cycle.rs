@@ -357,12 +357,13 @@ impl NativeRuntime {
             ]
         });
         if wakeup.reasons.timer() {
+            let wake_lateness_ns = wakeup.timer_lateness_ns.unwrap_or(0);
+            render_journal.record_wake_lateness(wake_lateness_ns);
+            frame_pacing.note_wake_lateness(wake_lateness_ns);
             perf.log("native.deadline", || {
                 vec![
-                    NativePerfField::u64(
-                        "lateness_us",
-                        wakeup.timer_lateness_ns.unwrap_or(0) / 1_000,
-                    ),
+                    NativePerfField::u64("lateness_us", wake_lateness_ns / 1_000),
+                    NativePerfField::u64("scheduler_wakeup_lateness_ns", wake_lateness_ns),
                     NativePerfField::str("scheduler_state", format!("{scheduler_state_before:?}")),
                     NativePerfField::bool("pageflip_watchdog", frame_scheduler.page_flip_pending()),
                 ]
@@ -376,6 +377,7 @@ impl NativeRuntime {
                 && let Some(timing) = explicit
                     .sample_pending_timing(MonotonicTimestampNs::new(monotonic_now_ns()?))?
             {
+                frame_pacing.note_fence_timestamp_quality(timing.quality);
                 render_journal.record_render_sample(
                     timing
                         .signaled_at
@@ -406,6 +408,13 @@ impl NativeRuntime {
                         NativePerfField::u64("frame_id", timing.frame_id),
                         NativePerfField::u64("signal_ns", timing.signaled_at.get()),
                         NativePerfField::u64("target_ns", timing.target.presentation_time.get()),
+                        NativePerfField::u64(
+                            "render_fence_signal_latency_ns",
+                            timing
+                                .signaled_at
+                                .get()
+                                .saturating_sub(timing.composite_started_at.get()),
+                        ),
                         NativePerfField::str("quality", format!("{:?}", timing.quality)),
                     ]
                 });
@@ -528,6 +537,7 @@ impl NativeRuntime {
                     let before_sample = render_journal.prediction(refresh);
                     let mut proven_miss = None;
                     if let Some((signaled_at, quality)) = completed.fence_signal {
+                        frame_pacing.note_fence_timestamp_quality(quality);
                         render_journal.record_render_sample(
                             signaled_at
                                 .get()
@@ -558,6 +568,7 @@ impl NativeRuntime {
                         proven_miss = Some(ProvenDeadlineMiss::AtomicSubmit);
                     }
                     let prediction = render_journal.prediction(refresh);
+                    let buffering_mode_before = adaptive_buffering.mode();
                     adaptive_buffering.observe(
                         prediction.total_cost_ns,
                         refresh,
@@ -565,6 +576,19 @@ impl NativeRuntime {
                         completed.target.sequence,
                         presented_at,
                         server.has_pending_frame_work() || frame_scheduler.visual_work_queued(),
+                    );
+                    frame_pacing.note_adaptive_transition(
+                        buffering_mode_before,
+                        adaptive_buffering.mode(),
+                        proven_miss,
+                    );
+                    frame_pacing.note_explicit_present(
+                        completed.target.presentation_time.get(),
+                        presented_at_ns,
+                        completed.composite_started_at.get(),
+                        completed.rendered_at.get(),
+                        completed.submit_started_at.get(),
+                        completed.submit_returned_at.get(),
                     );
                     *pending_proven_deadline_miss = None;
                     *scheduled_presentation_target = None;

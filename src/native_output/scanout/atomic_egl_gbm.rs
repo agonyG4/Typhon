@@ -40,6 +40,17 @@ pub(crate) struct AtomicEglGbmScanout {
     pub(crate) format_modifier: DrmFormatModifierPair,
     drm_cleanup_armed: bool,
     deadline_hints_enabled: bool,
+    counters: ExplicitOutputCounters,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ExplicitOutputCounters {
+    pub(crate) sync_file_deadline_hints_applied: u64,
+    pub(crate) sync_file_deadline_hints_unsupported: u64,
+    pub(crate) sync_file_deadline_hints_failed: u64,
+    pub(crate) atomic_in_fence_submissions: u64,
+    pub(crate) atomic_out_fences_received: u64,
+    pub(crate) atomic_out_fence_missing: u64,
 }
 
 struct DeviceAllocationProbe<'a> {
@@ -325,6 +336,7 @@ impl AtomicEglGbmScanout {
                 format_modifier,
                 drm_cleanup_armed: true,
                 deadline_hints_enabled: true,
+                counters: ExplicitOutputCounters::default(),
             }),
             Err(error) => {
                 let _ = egl.make_current(egl_display, None, None, None);
@@ -353,6 +365,13 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn framebuffer(&self, slot: OutputSlotId) -> io::Result<FramebufferId> {
         Ok(self.slot(slot)?.framebuffer)
+    }
+
+    pub(crate) fn plane_count(&self) -> io::Result<u32> {
+        self.pool
+            .as_ref()
+            .map(|pool| pool.slots[0].bo.plane_count())
+            .ok_or_else(|| io::Error::other("explicit output pool is unavailable"))
     }
 
     pub(crate) fn render_to_slot(
@@ -480,8 +499,12 @@ impl AtomicEglGbmScanout {
                 .render_fence
                 .apply_deadline_hint(frame.target.presentation_time.get(), monotonic_now_ns()?)
             {
-                Ok(Some(SyncFileDeadlineHint::Applied)) | Ok(None) => {}
+                Ok(Some(SyncFileDeadlineHint::Applied)) => {
+                    self.counters.sync_file_deadline_hints_applied += 1;
+                }
+                Ok(None) => {}
                 Ok(Some(SyncFileDeadlineHint::Unsupported)) => {
+                    self.counters.sync_file_deadline_hints_unsupported += 1;
                     self.deadline_hints_enabled = false;
                 }
                 Err(error)
@@ -494,6 +517,7 @@ impl AtomicEglGbmScanout {
                     )));
                 }
                 Err(error) => {
+                    self.counters.sync_file_deadline_hints_failed += 1;
                     eprintln!("native sync-file deadline hints disabled: {error}");
                     self.deadline_hints_enabled = false;
                 }
@@ -516,6 +540,12 @@ impl AtomicEglGbmScanout {
         let submit_returned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         match submission {
             Ok(submission) => {
+                self.counters.atomic_in_fence_submissions += 1;
+                if submission.out_fence.is_some() {
+                    self.counters.atomic_out_fences_received += 1;
+                } else {
+                    self.counters.atomic_out_fence_missing += 1;
+                }
                 self.swapchain_mut()?.submission_succeeded(
                     frame,
                     token,
@@ -555,6 +585,7 @@ impl AtomicEglGbmScanout {
             surface_damage,
             protocol_batch_id,
             composite_started_at,
+            rendered_at,
             ..
         } = completed.frame;
         self.scene.commit_presented(scene_commit);
@@ -568,6 +599,7 @@ impl AtomicEglGbmScanout {
             frame_id: id,
             target,
             composite_started_at,
+            rendered_at,
             submit_started_at: completed.submit_started_at,
             submit_returned_at: completed.submit_returned_at,
             fence_signal,
@@ -576,6 +608,10 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn pending_timing_fd(&self) -> Option<RawFd> {
         self.swapchain.as_ref()?.pending_timing_fd()
+    }
+
+    pub(crate) const fn counters(&self) -> ExplicitOutputCounters {
+        self.counters
     }
 
     pub(crate) fn sample_pending_timing(
@@ -701,6 +737,7 @@ pub(crate) struct PresentedOutputFrame {
     pub(crate) frame_id: u64,
     pub(crate) target: PresentationTarget,
     pub(crate) composite_started_at: MonotonicTimestampNs,
+    pub(crate) rendered_at: MonotonicTimestampNs,
     pub(crate) submit_started_at: MonotonicTimestampNs,
     pub(crate) submit_returned_at: MonotonicTimestampNs,
     pub(crate) fence_signal: Option<(MonotonicTimestampNs, FenceTimestampQuality)>,
