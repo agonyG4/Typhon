@@ -579,8 +579,9 @@ impl NativeRuntime {
     ) {
         Ok(paint) => paint,
         Err(error)
-            if scanout.kind() == NativeScanoutKind::NativeEglGbm
-                && scanout_preference != NativeScanoutPreference::NativeEglGbm
+            if scanout.kind() == NativeScanoutKind::NativeEglGbmOpaqueCompatibility
+                && scanout_preference
+                    != NativeScanoutPreference::NativeEglGbmOpaqueCompatibility
                 && app_gpu_preference != CompositorAppGpuPreference::Accelerated =>
         {
             let fallback_plan = scanout_plan.after_failed(scanout.kind());
@@ -593,7 +594,10 @@ impl NativeRuntime {
             );
             perf.log("native.backend_fallback", || {
                 vec![
-                    NativePerfField::str("failed", NativeScanoutKind::NativeEglGbm.as_str()),
+                    NativePerfField::str(
+                        "failed",
+                        NativeScanoutKind::NativeEglGbmOpaqueCompatibility.as_str(),
+                    ),
                     NativePerfField::str("fallback", fallback_plan.primary.as_str()),
                     NativePerfField::str("error", error.to_string()),
                 ]

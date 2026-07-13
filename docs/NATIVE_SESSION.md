@@ -36,7 +36,11 @@ the compositor launch environment.
 
 - `OBLIVION_ONE_MODE=auto|preferred|highres|highrr|WIDTHxHEIGHT[@HZ]`
 - `OBLIVION_ONE_KMS_MODE=auto|atomic|legacy`
-- `OBLIVION_ONE_SCANOUT_BACKEND=auto|native-egl-gbm|gbm-cpu-write|cpu|dumb`
+- `OBLIVION_ONE_SCANOUT_BACKEND=auto|gpu|native-egl-gbm|native-egl-gbm-opaque|gbm-cpu-write|cpu|dumb`
+
+`auto`, `gpu`, and `native-egl-gbm` select the explicit Atomic EGL/GBM path.
+The exact `native-egl-gbm-opaque` value is the rollback-only opaque window
+surface implementation and is never selected by `auto`.
 - `OBLIVION_ONE_CURSOR=auto|hardware|software`
 - `OBLIVION_ONE_NATIVE_APP_GPU=auto|gpu|cpu`
 - `OBLIVION_ONE_SHELL_COMMAND='...'`

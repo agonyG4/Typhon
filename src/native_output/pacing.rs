@@ -46,7 +46,7 @@ mod tests {
     #[test]
     fn snapshot_fields_use_stable_slot_values_only() {
         let fields = snapshot_fields(NativeScanoutBufferSnapshot {
-            backend: super::super::scanout::NativeScanoutKind::NativeEglGbm,
+            backend: super::super::scanout::NativeScanoutKind::AtomicEglGbmExplicit,
             capacity: None,
             current: None,
             pending: None,
@@ -56,7 +56,7 @@ mod tests {
         });
         assert_eq!(
             pacing_line("decision", &fields),
-            "typhon pacing: event=decision backend=native-egl-gbm capacity=none current=none pending=none ready=none free_count=none gbm_surface_has_free_buffers=false"
+            "typhon pacing: event=decision backend=atomic-egl-gbm-explicit capacity=none current=none pending=none ready=none free_count=none gbm_surface_has_free_buffers=false"
         );
     }
 }

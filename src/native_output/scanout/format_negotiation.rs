@@ -89,12 +89,28 @@ impl ExplicitFramebufferDescriptor {
         self.plane_count
     }
 
+    pub(crate) const fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub(crate) const fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub(crate) const fn format(&self) -> u32 {
+        self.format
+    }
+
     pub(crate) const fn handles(&self) -> &[u32; 4] {
         &self.handles
     }
 
     pub(crate) const fn pitches(&self) -> &[u32; 4] {
         &self.pitches
+    }
+
+    pub(crate) const fn offsets(&self) -> &[u32; 4] {
+        &self.offsets
     }
 
     pub(crate) const fn modifiers(&self) -> &[u64; 4] {

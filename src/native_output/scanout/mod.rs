@@ -1,14 +1,20 @@
 use super::*;
 
+#[allow(dead_code)] // Runtime attachment is completed after frame-owned rendering is available.
+mod atomic_egl_gbm;
 mod backend;
 mod dumb;
 mod egl_gbm;
 #[allow(dead_code)] // Negotiation is wired into explicit slot allocation in Task 4.
 mod format_negotiation;
 mod gbm_cpu;
+#[allow(dead_code)] // Concrete slots are attached to runtime ownership after initial modeset.
+mod output_slot;
 #[allow(dead_code)] // Ownership primitives are wired into the explicit backend in Tasks 4 and 8.
 mod output_swapchain;
 
+#[allow(unused_imports)]
+pub(crate) use atomic_egl_gbm::*;
 pub(crate) use backend::*;
 pub(crate) use dumb::*;
 pub(crate) use egl_gbm::*;
@@ -16,12 +22,15 @@ pub(crate) use egl_gbm::*;
 pub(crate) use format_negotiation::*;
 pub(crate) use gbm_cpu::*;
 #[allow(unused_imports)]
+pub(crate) use output_slot::*;
+#[allow(unused_imports)]
 pub(crate) use output_swapchain::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeScanoutPreference {
     Auto,
-    NativeEglGbm,
+    AtomicEglGbmExplicit,
+    NativeEglGbmOpaqueCompatibility,
     GbmCpuWritePageFlip,
     DumbFramebuffer,
 }
@@ -43,8 +52,9 @@ impl NativeScanoutPreference {
     pub(crate) fn parse(value: &str) -> Self {
         match value {
             "auto" => Self::Auto,
+            "native-egl-gbm-opaque" => Self::NativeEglGbmOpaqueCompatibility,
             "gpu" | "native" | "native-gpu" | "native-egl-gbm" | "egl-gbm" | "gles-gbm"
-            | "egl-gles-gbm" => Self::NativeEglGbm,
+            | "egl-gles-gbm" => Self::AtomicEglGbmExplicit,
             "gbm-cpu-write"
             | "gbm-cpu-write-pageflip"
             | "cpu-gbm-write"
@@ -72,6 +82,7 @@ impl NativeScanoutPreference {
                 | "egl-gbm"
                 | "gles-gbm"
                 | "egl-gles-gbm"
+                | "native-egl-gbm-opaque"
                 | "gbm-cpu-write"
                 | "gbm-cpu-write-pageflip"
                 | "cpu-gbm-write"
@@ -107,15 +118,24 @@ pub(crate) struct NativeScanoutPlan {
 impl NativeScanoutPlan {
     pub(crate) fn choose(choice: NativeScanoutChoice) -> Self {
         match choice.preference {
-            NativeScanoutPreference::NativeEglGbm
+            NativeScanoutPreference::AtomicEglGbmExplicit
                 if choice.gbm_available && choice.egl_available && choice.page_flip_available =>
             {
                 Self {
-                    primary: NativeScanoutKind::NativeEglGbm,
+                    primary: NativeScanoutKind::AtomicEglGbmExplicit,
                     fallbacks: Vec::new(),
                 }
             }
-            NativeScanoutPreference::NativeEglGbm => Self::unavailable(),
+            NativeScanoutPreference::AtomicEglGbmExplicit => Self::unavailable(),
+            NativeScanoutPreference::NativeEglGbmOpaqueCompatibility
+                if choice.gbm_available && choice.egl_available && choice.page_flip_available =>
+            {
+                Self {
+                    primary: NativeScanoutKind::NativeEglGbmOpaqueCompatibility,
+                    fallbacks: Vec::new(),
+                }
+            }
+            NativeScanoutPreference::NativeEglGbmOpaqueCompatibility => Self::unavailable(),
             NativeScanoutPreference::GbmCpuWritePageFlip
                 if choice.gbm_available && choice.page_flip_available =>
             {
@@ -133,7 +153,7 @@ impl NativeScanoutPlan {
                 if choice.gbm_available && choice.egl_available && choice.page_flip_available =>
             {
                 Self {
-                    primary: NativeScanoutKind::NativeEglGbm,
+                    primary: NativeScanoutKind::AtomicEglGbmExplicit,
                     fallbacks: vec![
                         NativeScanoutKind::GbmCpuWritePageFlip,
                         NativeScanoutKind::DumbFramebuffer,
@@ -257,7 +277,10 @@ impl NativeScanoutBackend {
         backend_generation: u64,
     ) -> io::Result<Self> {
         match kind {
-            NativeScanoutKind::NativeEglGbm => {
+            NativeScanoutKind::AtomicEglGbmExplicit => Err(io::Error::other(
+                "explicit Atomic EGL/GBM requires pre-discovered Atomic plane capabilities",
+            )),
+            NativeScanoutKind::NativeEglGbmOpaqueCompatibility => {
                 if native_test_fail_native_egl_gbm_enabled() {
                     return Err(io::Error::other(
                         "native EGL/GBM failure injected by OBLIVION_ONE_TEST_FAIL_NATIVE_EGL_GBM",
@@ -287,7 +310,7 @@ impl NativeScanoutBackend {
 
     pub(crate) const fn kind(&self) -> NativeScanoutKind {
         match self {
-            Self::NativeEglGbm(_) => NativeScanoutKind::NativeEglGbm,
+            Self::NativeEglGbm(_) => NativeScanoutKind::NativeEglGbmOpaqueCompatibility,
             Self::Gbm(_) => NativeScanoutKind::GbmCpuWritePageFlip,
             Self::Dumb(_) => NativeScanoutKind::DumbFramebuffer,
         }
@@ -448,7 +471,7 @@ impl NativeScanoutBackend {
     pub(crate) fn buffer_snapshot(&self) -> NativeScanoutBufferSnapshot {
         match self {
             Self::NativeEglGbm(scanout) => NativeScanoutBufferSnapshot {
-                backend: NativeScanoutKind::NativeEglGbm,
+                backend: NativeScanoutKind::NativeEglGbmOpaqueCompatibility,
                 capacity: None,
                 current: None,
                 pending: None,

@@ -161,9 +161,11 @@ pub(crate) fn resolve_native_app_gpu_policy(
 ) -> io::Result<EffectiveCompositorAppGpuPolicy> {
     match (preference, scanout) {
         (CompositorAppGpuPreference::CpuOnly, _) => Ok(EffectiveCompositorAppGpuPolicy::CpuOnly),
-        (CompositorAppGpuPreference::Accelerated, NativeScanoutKind::NativeEglGbm) => {
-            Ok(EffectiveCompositorAppGpuPolicy::Accelerated)
-        }
+        (
+            CompositorAppGpuPreference::Accelerated,
+            NativeScanoutKind::AtomicEglGbmExplicit
+            | NativeScanoutKind::NativeEglGbmOpaqueCompatibility,
+        ) => Ok(EffectiveCompositorAppGpuPolicy::Accelerated),
         (CompositorAppGpuPreference::Accelerated, scanout) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -171,9 +173,11 @@ pub(crate) fn resolve_native_app_gpu_policy(
                 scanout.metric_name()
             ),
         )),
-        (CompositorAppGpuPreference::Auto, NativeScanoutKind::NativeEglGbm) => {
-            Ok(EffectiveCompositorAppGpuPolicy::Accelerated)
-        }
+        (
+            CompositorAppGpuPreference::Auto,
+            NativeScanoutKind::AtomicEglGbmExplicit
+            | NativeScanoutKind::NativeEglGbmOpaqueCompatibility,
+        ) => Ok(EffectiveCompositorAppGpuPolicy::Accelerated),
         (CompositorAppGpuPreference::Auto, _) => Ok(EffectiveCompositorAppGpuPolicy::CpuOnly),
     }
 }

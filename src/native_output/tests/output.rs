@@ -164,7 +164,7 @@ fn native_app_gpu_policy_resolves_from_active_scanout_backend() {
     assert_eq!(
         resolve_native_app_gpu_policy(
             CompositorAppGpuPreference::Auto,
-            NativeScanoutKind::NativeEglGbm,
+            NativeScanoutKind::AtomicEglGbmExplicit,
         )
         .unwrap(),
         EffectiveCompositorAppGpuPolicy::Accelerated
@@ -180,7 +180,7 @@ fn native_app_gpu_policy_resolves_from_active_scanout_backend() {
     assert_eq!(
         resolve_native_app_gpu_policy(
             CompositorAppGpuPreference::CpuOnly,
-            NativeScanoutKind::NativeEglGbm,
+            NativeScanoutKind::AtomicEglGbmExplicit,
         )
         .unwrap(),
         EffectiveCompositorAppGpuPolicy::CpuOnly
@@ -233,7 +233,7 @@ fn native_launch_request_preserves_args_policy_and_source() {
 fn native_runtime_error_includes_stage_backend_frame_and_recovery_command() {
     let error = native_runtime_error(
         NativeRuntimeStage::Present,
-        NativeScanoutKind::NativeEglGbm,
+        NativeScanoutKind::AtomicEglGbmExplicit,
         42,
         1842,
         io::Error::other("page flip failed"),

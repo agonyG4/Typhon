@@ -5,6 +5,7 @@ use oblivion_one::render_backend::{
     egl_gles::EglGlesDmabufFormat,
 };
 use std::io;
+use std::{cell::RefCell, rc::Rc};
 
 struct TestGbmAllocationProbe {
     rejected: Vec<DrmFormatModifierPair>,
@@ -164,6 +165,45 @@ fn explicit_addfb2_partial_creation_cleans_up_created_framebuffers() {
     assert!(register_explicit_framebuffers(&mut registration, &descriptors).is_err());
     assert_eq!(registration.added, vec![100, 101]);
     assert_eq!(registration.removed, vec![101, 100]);
+}
+
+struct DropOrderProbe {
+    id: u8,
+    log: Rc<RefCell<Vec<String>>>,
+}
+
+impl Drop for DropOrderProbe {
+    fn drop(&mut self) {
+        self.log.borrow_mut().push(format!("bo{}", self.id));
+    }
+}
+
+#[test]
+fn output_slot_two_construction_failure_tears_down_resources_in_safe_order() {
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let slots = vec![
+        DropOrderProbe {
+            id: 0,
+            log: Rc::clone(&log),
+        },
+        DropOrderProbe {
+            id: 1,
+            log: Rc::clone(&log),
+        },
+    ];
+
+    teardown_slot_resources(
+        &slots,
+        |slot| log.borrow_mut().push(format!("gl{}", slot.id)),
+        |slot| log.borrow_mut().push(format!("image{}", slot.id)),
+        |slot| log.borrow_mut().push(format!("fb{}", slot.id)),
+    );
+    drop(slots);
+
+    assert_eq!(
+        *log.borrow(),
+        ["gl0", "gl1", "image0", "image1", "fb0", "fb1", "bo0", "bo1"]
+    );
 }
 
 #[test]
@@ -394,7 +434,7 @@ fn native_scanout_plan_prefers_native_egl_gbm_when_ready() {
         page_flip_available: true,
     });
 
-    assert_eq!(plan.primary, NativeScanoutKind::NativeEglGbm);
+    assert_eq!(plan.primary, NativeScanoutKind::AtomicEglGbmExplicit);
     assert_eq!(
         plan.fallbacks,
         vec![
@@ -405,22 +445,46 @@ fn native_scanout_plan_prefers_native_egl_gbm_when_ready() {
 }
 
 #[test]
+fn native_scanout_parser_keeps_opaque_egl_gbm_explicit_only() {
+    assert_eq!(
+        NativeScanoutPreference::parse("native-egl-gbm-opaque"),
+        NativeScanoutPreference::NativeEglGbmOpaqueCompatibility
+    );
+    assert_eq!(
+        NativeScanoutPreference::parse("native-egl-gbm"),
+        NativeScanoutPreference::AtomicEglGbmExplicit
+    );
+    assert_eq!(
+        NativeScanoutPreference::parse("gpu"),
+        NativeScanoutPreference::AtomicEglGbmExplicit
+    );
+    assert_eq!(
+        NativeScanoutKind::AtomicEglGbmExplicit.metric_name(),
+        "atomic-egl-gbm-explicit"
+    );
+    assert_eq!(
+        NativeScanoutKind::NativeEglGbmOpaqueCompatibility.metric_name(),
+        "native-egl-gbm-opaque"
+    );
+}
+
+#[test]
 fn native_scanout_plan_can_force_gpu_without_cpu_fallback() {
     let plan = NativeScanoutPlan::choose(NativeScanoutChoice {
-        preference: NativeScanoutPreference::NativeEglGbm,
+        preference: NativeScanoutPreference::AtomicEglGbmExplicit,
         gbm_available: true,
         egl_available: true,
         page_flip_available: true,
     });
 
-    assert_eq!(plan.primary, NativeScanoutKind::NativeEglGbm);
+    assert_eq!(plan.primary, NativeScanoutKind::AtomicEglGbmExplicit);
     assert!(plan.fallbacks.is_empty());
 }
 
 #[test]
 fn native_scanout_plan_rejects_forced_gpu_without_egl() {
     let plan = NativeScanoutPlan::choose(NativeScanoutChoice {
-        preference: NativeScanoutPreference::NativeEglGbm,
+        preference: NativeScanoutPreference::AtomicEglGbmExplicit,
         gbm_available: true,
         egl_available: false,
         page_flip_available: true,
@@ -438,7 +502,7 @@ fn native_scanout_plan_fallback_after_gpu_failure_preserves_remaining_candidates
         egl_available: true,
         page_flip_available: true,
     })
-    .after_failed(NativeScanoutKind::NativeEglGbm);
+    .after_failed(NativeScanoutKind::AtomicEglGbmExplicit);
 
     assert_eq!(plan.primary, NativeScanoutKind::GbmCpuWritePageFlip);
     assert_eq!(plan.fallbacks, vec![NativeScanoutKind::DumbFramebuffer]);
@@ -460,11 +524,16 @@ fn injected_native_egl_gbm_open_failure_returns_clear_error_before_kms_use() {
     }
     let file = fs::File::open("Cargo.toml").unwrap();
 
-    let error =
-        match NativeScanoutBackend::open_kind(NativeScanoutKind::NativeEglGbm, &file, 1, 1, 1) {
-            Ok(_) => panic!("injected native EGL/GBM failure should fail before KMS use"),
-            Err(error) => error,
-        };
+    let error = match NativeScanoutBackend::open_kind(
+        NativeScanoutKind::NativeEglGbmOpaqueCompatibility,
+        &file,
+        1,
+        1,
+        1,
+    ) {
+        Ok(_) => panic!("injected native EGL/GBM failure should fail before KMS use"),
+        Err(error) => error,
+    };
 
     match previous {
         Some(value) => unsafe {
@@ -490,7 +559,7 @@ fn auto_gpu_open_failure_next_cpu_candidate_resolves_apps_to_cpu() {
         page_flip_available: true,
     });
 
-    let fallback = plan.after_failed(NativeScanoutKind::NativeEglGbm);
+    let fallback = plan.after_failed(NativeScanoutKind::AtomicEglGbmExplicit);
 
     assert_eq!(fallback.primary, NativeScanoutKind::GbmCpuWritePageFlip);
     assert_eq!(
@@ -519,11 +588,11 @@ fn native_scanout_preference_accepts_canonical_cpu_write_backend_name() {
 fn native_scanout_preference_accepts_canonical_gpu_backend_name() {
     assert_eq!(
         NativeScanoutPreference::parse("native-egl-gbm"),
-        NativeScanoutPreference::NativeEglGbm
+        NativeScanoutPreference::AtomicEglGbmExplicit
     );
     assert_eq!(
         NativeScanoutPreference::parse("gpu"),
-        NativeScanoutPreference::NativeEglGbm
+        NativeScanoutPreference::AtomicEglGbmExplicit
     );
 }
 

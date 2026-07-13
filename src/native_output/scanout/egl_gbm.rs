@@ -732,7 +732,7 @@ pub(crate) fn native_egl_gbm_paint_stats(
     swap_with_damage_used: bool,
 ) -> NativePaintStats {
     NativePaintStats {
-        backend: NativeScanoutKind::NativeEglGbm,
+        backend: NativeScanoutKind::NativeEglGbmOpaqueCompatibility,
         scanout_format: Some(scanout_format),
         width,
         height,

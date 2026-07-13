@@ -106,6 +106,18 @@ pub(crate) fn query_egl_dmabuf_feedback(
     }
 }
 
+pub(crate) fn query_egl_renderable_dmabuf_formats(
+    egl: &EglInstance,
+    display: egl::Display,
+) -> Vec<EglGlesDmabufFormat> {
+    query_egl_dmabuf_feedback(egl, display)
+        .formats()
+        .iter()
+        .copied()
+        .filter(|format| format.modifier != DrmModifier::INVALID)
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy)]
 struct EglQueriedModifier {
     modifier: DrmModifier,

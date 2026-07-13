@@ -35,8 +35,9 @@ Current native controls are environment-based:
 
 - `OBLIVION_ONE_MODE` selects the KMS mode.
 - `OBLIVION_ONE_KMS_MODE` selects atomic or legacy KMS policy.
-- `OBLIVION_ONE_SCANOUT_BACKEND` selects native EGL/GBM, CPU GBM, or dumb
-  framebuffer policy.
+- `OBLIVION_ONE_SCANOUT_BACKEND=auto|gpu|native-egl-gbm` selects the explicit
+  Atomic EGL/GBM path. The old opaque path is rollback-only under the exact
+  value `native-egl-gbm-opaque`; CPU GBM and dumb remain separate fallbacks.
 - `OBLIVION_ONE_CURSOR` selects hardware or software cursor policy.
 - `OBLIVION_ONE_NATIVE_APP_GPU` selects the GPU policy for launched clients.
 - `OBLIVION_ONE_SHELL_COMMAND` starts the session shell.

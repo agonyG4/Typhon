@@ -2,7 +2,8 @@ use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeScanoutKind {
-    NativeEglGbm,
+    AtomicEglGbmExplicit,
+    NativeEglGbmOpaqueCompatibility,
     GbmCpuWritePageFlip,
     DumbFramebuffer,
     Unavailable,
@@ -22,7 +23,8 @@ pub(crate) struct NativeScanoutBufferSnapshot {
 impl NativeScanoutKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::NativeEglGbm => "native EGL/GLES GBM pageflip",
+            Self::AtomicEglGbmExplicit => "explicit Atomic EGL/GLES GBM",
+            Self::NativeEglGbmOpaqueCompatibility => "opaque EGL/GLES GBM compatibility",
             Self::GbmCpuWritePageFlip => "GBM CPU-write pageflip",
             Self::DumbFramebuffer => "KMS dumb framebuffer",
             Self::Unavailable => "unavailable",
@@ -31,7 +33,8 @@ impl NativeScanoutKind {
 
     pub(crate) const fn metric_name(self) -> &'static str {
         match self {
-            Self::NativeEglGbm => "native-egl-gbm",
+            Self::AtomicEglGbmExplicit => "atomic-egl-gbm-explicit",
+            Self::NativeEglGbmOpaqueCompatibility => "native-egl-gbm-opaque",
             Self::GbmCpuWritePageFlip => "gbm-cpu-write-pageflip",
             Self::DumbFramebuffer => "dumb-framebuffer",
             Self::Unavailable => "unavailable",
