@@ -539,6 +539,8 @@ pub struct CompositorState {
     client_cursor_surfaces: HashMap<u32, RenderableSurface>,
     surface_damage_journals: HashMap<u32, SurfaceDamageJournal>,
     presented_surface_commits: HashMap<u32, SurfaceCommitCounter>,
+    surface_presentation_generations: HashMap<u32, u64>,
+    next_surface_presentation_generation: u64,
     surface_publications: HashMap<u32, SurfacePublicationState>,
     surface_placements: HashMap<u32, SurfacePlacement>,
     committed_subsurface_stacks: HashMap<u32, Vec<u32>>,
@@ -646,6 +648,17 @@ pub(crate) enum FrameBatchDiscardReason {
     FatalOutputFailure,
     SuspendAbandonment,
     OutputDestroyed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SurfacePresentationKey {
+    surface_id: u32,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SurfaceDamagePresentation {
+    sampled_commits: Vec<(SurfacePresentationKey, SurfaceCommitCounter)>,
 }
 
 #[derive(Debug, Clone)]

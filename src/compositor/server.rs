@@ -43,8 +43,8 @@ use super::{
     FramePresentation, FullscreenRenderPlanMetrics, InputProtocolCapabilities, OutputRect,
     PendingProcessLaunch, PresentationClock, RenderGenerationCause, RenderableSurface,
     RendererProtocolCapabilities, ResizeFlowMetrics, SelectionProtocolCapabilities,
-    SubsurfaceTransactionMetrics, WindowInteractionDebugSnapshot, WindowInteractionEndReason,
-    color,
+    SubsurfaceTransactionMetrics, SurfaceDamagePresentation, WindowInteractionDebugSnapshot,
+    WindowInteractionEndReason, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 
@@ -325,6 +325,16 @@ impl OwnCompositorServer {
 
     pub fn mark_render_damage_presented(&mut self) {
         self.state.mark_render_damage_presented();
+    }
+
+    #[allow(dead_code)] // Consumed by the explicit Atomic output runtime integration.
+    pub(crate) fn capture_surface_damage_presentation(&self) -> SurfaceDamagePresentation {
+        self.state.capture_surface_damage_presentation()
+    }
+
+    #[allow(dead_code)] // Consumed by the explicit Atomic output runtime integration.
+    pub(crate) fn commit_surface_damage_presented(&mut self, token: SurfaceDamagePresentation) {
+        self.state.commit_surface_damage_presented(token);
     }
 
     pub fn client_cursor_render_state(&self) -> Option<ClientCursorRenderState<'_>> {

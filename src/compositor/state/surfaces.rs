@@ -269,31 +269,85 @@ impl CompositorState {
         callbacks
     }
 
-    pub(in crate::compositor) fn mark_render_damage_presented(&mut self) {
-        for surface in &mut self.renderable_surfaces {
-            if let Some(journal) = self.surface_damage_journals.get(&surface.surface_id) {
-                let last_seen = self
-                    .presented_surface_commits
-                    .get(&surface.surface_id)
-                    .copied()
-                    .unwrap_or_default();
-                let _ = journal.damage_since(
-                    last_seen,
+    pub(in crate::compositor) fn capture_surface_damage_presentation(
+        &self,
+    ) -> SurfaceDamagePresentation {
+        let mut sampled_commits = Vec::new();
+        for surface_id in self
+            .renderable_surfaces
+            .iter()
+            .map(|surface| surface.surface_id)
+            .chain(self.client_cursor_surfaces.keys().copied())
+        {
+            let Some(generation) = self
+                .surface_presentation_generations
+                .get(&surface_id)
+                .copied()
+            else {
+                continue;
+            };
+            let Some(commit) = self
+                .surface_damage_journals
+                .get(&surface_id)
+                .map(SurfaceDamageJournal::current_commit)
+            else {
+                continue;
+            };
+            let key = SurfacePresentationKey {
+                surface_id,
+                generation,
+            };
+            if !sampled_commits.iter().any(|(sampled, _)| *sampled == key) {
+                sampled_commits.push((key, commit));
+            }
+        }
+        SurfaceDamagePresentation { sampled_commits }
+    }
+
+    pub(in crate::compositor) fn commit_surface_damage_presented(
+        &mut self,
+        token: SurfaceDamagePresentation,
+    ) {
+        for (key, sampled_commit) in token.sampled_commits {
+            if self
+                .surface_presentation_generations
+                .get(&key.surface_id)
+                .copied()
+                != Some(key.generation)
+            {
+                continue;
+            }
+            self.presented_surface_commits
+                .insert(key.surface_id, sampled_commit);
+            let Some(journal) = self.surface_damage_journals.get(&key.surface_id) else {
+                continue;
+            };
+            for surface in self
+                .renderable_surfaces
+                .iter_mut()
+                .filter(|surface| surface.surface_id == key.surface_id)
+                .chain(
+                    self.client_cursor_surfaces
+                        .values_mut()
+                        .filter(|surface| surface.surface_id == key.surface_id),
+                )
+            {
+                surface.damage = match journal.damage_since(
+                    sampled_commit,
                     surface.buffer_size().width,
                     surface.buffer_size().height,
-                );
-                self.presented_surface_commits
-                    .insert(surface.surface_id, journal.current_commit());
+                ) {
+                    DamageSince::Empty => RenderableSurfaceDamage::Empty,
+                    DamageSince::Known(damage) => damage,
+                    DamageSince::HistoryLost => RenderableSurfaceDamage::Full,
+                };
             }
-            surface.damage = RenderableSurfaceDamage::Empty;
         }
-        for surface in self.client_cursor_surfaces.values_mut() {
-            if let Some(journal) = self.surface_damage_journals.get(&surface.surface_id) {
-                self.presented_surface_commits
-                    .insert(surface.surface_id, journal.current_commit());
-            }
-            surface.damage = RenderableSurfaceDamage::Empty;
-        }
+    }
+
+    pub(in crate::compositor) fn mark_render_damage_presented(&mut self) {
+        let token = self.capture_surface_damage_presentation();
+        self.commit_surface_damage_presented(token);
     }
 
     pub(in crate::compositor) fn record_surface_damage_commit(
@@ -438,6 +492,14 @@ impl CompositorState {
 
     pub(in crate::compositor) fn allocate_surface_id(&mut self) -> u32 {
         self.next_surface_id = self.next_surface_id.saturating_add(1).max(1);
+        self.next_surface_presentation_generation = self
+            .next_surface_presentation_generation
+            .checked_add(1)
+            .expect("surface presentation generation overflow");
+        self.surface_presentation_generations.insert(
+            self.next_surface_id,
+            self.next_surface_presentation_generation,
+        );
         self.next_surface_id
     }
 
@@ -1066,6 +1128,7 @@ impl CompositorState {
     pub(in crate::compositor) fn unregister_surface_resource(&mut self, surface_id: u32) {
         self.surface_damage_journals.remove(&surface_id);
         self.presented_surface_commits.remove(&surface_id);
+        self.surface_presentation_generations.remove(&surface_id);
         self.cancel_pending_surface_trees_for_surface(
             surface_id,
             AcquireWatchCancelReason::SurfaceDestroyed,
@@ -1253,5 +1316,84 @@ mod ordered_publication_tests {
             ),
             SurfacePublicationDecision::StaleAlreadyPublished
         );
+    }
+
+    #[test]
+    fn old_frame_completion_advances_only_its_sampled_damage_commit() {
+        let mut state = CompositorState::default();
+        state.surface_presentation_generations.insert(7, 1);
+        let journal = state
+            .surface_damage_journals
+            .entry(7)
+            .or_insert_with(|| SurfaceDamageJournal::new(64));
+        let mut sampled = SurfaceCommitCounter::default();
+        for _ in 0..10 {
+            sampled = journal.record(RenderableSurfaceDamage::Full, 100, 80);
+        }
+        let token = SurfaceDamagePresentation {
+            sampled_commits: vec![(
+                SurfacePresentationKey {
+                    surface_id: 7,
+                    generation: 1,
+                },
+                sampled,
+            )],
+        };
+        let newer = journal.record(RenderableSurfaceDamage::Full, 100, 80);
+
+        state.commit_surface_damage_presented(token);
+
+        assert_eq!(sampled, SurfaceCommitCounter(10));
+        assert_eq!(newer, SurfaceCommitCounter(11));
+        assert_eq!(state.presented_surface_commits.get(&7), Some(&sampled));
+        assert!(matches!(
+            state.surface_damage_journals[&7].damage_since(sampled, 100, 80),
+            DamageSince::Known(RenderableSurfaceDamage::Full)
+        ));
+    }
+
+    #[test]
+    fn stale_surface_generation_cannot_advance_reused_surface_identity() {
+        let mut state = CompositorState::default();
+        state.surface_presentation_generations.insert(7, 2);
+        state.surface_damage_journals.insert(7, {
+            let mut journal = SurfaceDamageJournal::new(4);
+            journal.record(RenderableSurfaceDamage::Full, 10, 10);
+            journal
+        });
+        let stale = SurfaceDamagePresentation {
+            sampled_commits: vec![(
+                SurfacePresentationKey {
+                    surface_id: 7,
+                    generation: 1,
+                },
+                SurfaceCommitCounter(1),
+            )],
+        };
+
+        state.commit_surface_damage_presented(stale);
+
+        assert!(!state.presented_surface_commits.contains_key(&7));
+    }
+
+    #[test]
+    fn compositor_owned_surface_keys_do_not_collide_across_clients() {
+        let first = SurfacePresentationKey {
+            surface_id: 7,
+            generation: 11,
+        };
+        let second = SurfacePresentationKey {
+            surface_id: 8,
+            generation: 12,
+        };
+        let token = SurfaceDamagePresentation {
+            sampled_commits: vec![
+                (first, SurfaceCommitCounter(3)),
+                (second, SurfaceCommitCounter(4)),
+            ],
+        };
+
+        assert_ne!(first, second);
+        assert_eq!(token.sampled_commits.len(), 2);
     }
 }
