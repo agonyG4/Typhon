@@ -116,6 +116,9 @@ impl NativeRuntime {
 
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
+        // Emit the commit summary while the native runtime's output stream is
+        // still known to be live. The server drop repeats this idempotently.
+        self.server.finish_commit_debug_for_shutdown();
         if self.frame_pacing.enabled() {
             println!("{}", self.frame_pacing.summary_line());
         }

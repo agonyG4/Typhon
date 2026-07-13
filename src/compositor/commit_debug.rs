@@ -110,6 +110,7 @@ struct CallbackOwner {
 pub(crate) struct CommitDebugState {
     enabled: bool,
     initialized: bool,
+    summary_emitted: bool,
     pageflip_pending: bool,
     live: HashMap<SurfaceCommitId, LiveCommit>,
     callbacks: HashMap<ObjectId, CallbackOwner>,
@@ -529,13 +530,14 @@ impl super::CompositorState {
     pub(in crate::compositor) fn set_commit_debug_pageflip_pending(&mut self, pending: bool) {
         self.commit_debug.pageflip_pending = pending;
     }
-    pub(in crate::compositor) fn log_commit_debug_summary(&mut self) {
+    pub(in crate::compositor) fn take_commit_debug_summary_line(&mut self) -> Option<String> {
         self.commit_debug.ensure_initialized();
-        if !self.commit_debug.enabled {
-            return;
+        if !self.commit_debug.enabled || self.commit_debug.summary_emitted {
+            return None;
         }
+        self.commit_debug.summary_emitted = true;
         let m = self.commit_debug.metrics;
-        println!(
+        Some(format!(
             "typhon commit: event=summary captured={} became_ready={} published={} ready_superseded={} unready_superseded={} ready_rejected_stale={} ready_rejected_newer_attachment={} unready_rejected_stale={} unready_rejected_newer_attachment={} callbacks_moved={} callbacks_completed_from_published={} callbacks_completed_from_unpublished={} published_without_visual_generation={} visual_generations={} queue_overflow={} max_queue_depth={} all_ready_pressure={} unready_retirements={} live_commits={} live_callbacks={}",
             m.explicit_sync_commits_captured,
             m.explicit_sync_commits_became_ready,
@@ -559,7 +561,7 @@ impl super::CompositorState {
             m.unready_commits_superseded,
             self.commit_debug.live.len(),
             self.commit_debug.callbacks.len()
-        );
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -638,6 +640,16 @@ mod tests {
         metrics.note_superseded(PendingAcquireState::RegistrationPending);
         assert_eq!(metrics.ready_commits_superseded, 1);
         assert_eq!(metrics.unready_commits_superseded, 1);
+    }
+
+    #[test]
+    fn commit_debug_summary_is_emitted_once() {
+        let mut state = super::super::CompositorState::default();
+        state.commit_debug.initialized = true;
+        state.commit_debug.enabled = true;
+
+        assert!(state.take_commit_debug_summary_line().is_some());
+        assert!(state.take_commit_debug_summary_line().is_none());
     }
 
     #[test]

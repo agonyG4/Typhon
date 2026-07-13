@@ -85,12 +85,18 @@ impl ClientData for TyphonClientData {
 
 impl Drop for OwnCompositorServer {
     fn drop(&mut self) {
-        self.state.release_cached_resources_for_shutdown();
-        self.state.log_commit_debug_summary();
+        self.finish_commit_debug_for_shutdown();
     }
 }
 
 impl OwnCompositorServer {
+    pub fn finish_commit_debug_for_shutdown(&mut self) {
+        self.state.release_cached_resources_for_shutdown();
+        if let Some(summary) = self.state.take_commit_debug_summary_line() {
+            println!("{summary}");
+        }
+    }
+
     pub fn bind(socket_name: impl Into<String>) -> Result<Self, CompositorError> {
         Self::bind_with_gpu_buffers(socket_name, true)
     }
