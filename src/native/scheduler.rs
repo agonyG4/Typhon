@@ -1,6 +1,8 @@
 //! Absolute-deadline frame scheduling for the native compositor runtime.
 
 use crate::native::kms::KmsBackendKind;
+use crate::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
+use std::time::Duration;
 
 const DEFAULT_PAGE_FLIP_WATCHDOG_NS: u64 = 1_000_000_000;
 
@@ -32,6 +34,17 @@ pub struct SchedulerCapabilities {
     kms_backend: KmsBackendKind,
     primary_plane_in_fence: bool,
     explicit_output_swapchain: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SchedulerFrameContext {
+    pub(crate) capabilities: SchedulerCapabilities,
+    pub(crate) presentation_target: Option<PresentationTarget>,
+    pub(crate) predicted_total_cost: Duration,
+    pub(crate) now: MonotonicTimestampNs,
+    pub(crate) render_target_available: bool,
+    pub(crate) render_ahead_allowed: bool,
+    pub(crate) ready_frame_present: bool,
 }
 
 impl SchedulerCapabilities {
@@ -208,10 +221,42 @@ impl NativeFrameScheduler {
         now_ns: u64,
         render_target_available: bool,
     ) -> SchedulerDecision {
+        self.decision_with_context(SchedulerFrameContext {
+            capabilities: SchedulerCapabilities::legacy(),
+            presentation_target: None,
+            predicted_total_cost: Duration::ZERO,
+            now: MonotonicTimestampNs::new(now_ns),
+            render_target_available,
+            render_ahead_allowed: false,
+            ready_frame_present: self.ready_frame_queued,
+        })
+    }
+
+    pub(crate) fn decision_with_context(
+        &mut self,
+        context: SchedulerFrameContext,
+    ) -> SchedulerDecision {
+        let now_ns = context.now.get();
+        let _predicted_total_cost = context.predicted_total_cost;
         if self.pending_page_flip_token.is_some() {
             if self.visual_work_queued {
-                if !render_target_available {
+                if context.ready_frame_present || self.ready_frame_queued {
+                    return SchedulerDecision::WaitForPageFlip;
+                }
+                if !context.render_target_available {
                     return SchedulerDecision::WaitForBuffer;
+                }
+                if !context.render_ahead_allowed
+                    || !context.capabilities.render_ahead_allowed()
+                    || context.presentation_target.is_none()
+                {
+                    return SchedulerDecision::WaitForPageFlip;
+                }
+                if context
+                    .presentation_target
+                    .is_some_and(|target| now_ns < target.render_start_deadline.get())
+                {
+                    return SchedulerDecision::WaitForRefresh;
                 }
                 return SchedulerDecision::RenderAhead;
             }
@@ -228,6 +273,12 @@ impl NativeFrameScheduler {
             return SchedulerDecision::WaitForPageFlip;
         }
         if self.visual_work_queued {
+            if context
+                .presentation_target
+                .is_some_and(|target| now_ns < target.render_start_deadline.get())
+            {
+                return SchedulerDecision::WaitForRefresh;
+            }
             return SchedulerDecision::Render;
         }
         if self.ready_frame_queued {
@@ -391,6 +442,32 @@ impl NativeFrameScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::presentation_deadline::PresentationTargetReason;
+
+    fn render_ahead_context(
+        now_ns: u64,
+        render_target_available: bool,
+        ready_frame_present: bool,
+    ) -> SchedulerFrameContext {
+        SchedulerFrameContext {
+            capabilities: SchedulerCapabilities::explicit_atomic(true, true),
+            presentation_target: Some(PresentationTarget {
+                sequence: 2,
+                presentation_time: MonotonicTimestampNs::new(now_ns.saturating_add(1_000_000)),
+                render_start_deadline: MonotonicTimestampNs::new(now_ns),
+                refresh_interval: Duration::from_millis(10),
+                reason: PresentationTargetReason::PredictedPressure,
+                clock_generation: 1,
+                estimated: false,
+                predicted_unreachable: false,
+            }),
+            predicted_total_cost: Duration::from_millis(10),
+            now: MonotonicTimestampNs::new(now_ns),
+            render_target_available,
+            render_ahead_allowed: true,
+            ready_frame_present,
+        }
+    }
 
     fn assert_deadlines_do_not_drift(refresh_hz: u32) {
         let mut scheduler = NativeFrameScheduler::new(refresh_hz, 1_000);
@@ -479,7 +556,10 @@ mod tests {
         scheduler.note_async_submission(41, 10).unwrap();
         scheduler.queue_visual_work();
 
-        assert_eq!(scheduler.decision(20), SchedulerDecision::RenderAhead);
+        assert_eq!(
+            scheduler.decision_with_context(render_ahead_context(20, true, false)),
+            SchedulerDecision::RenderAhead
+        );
         assert!(scheduler.visual_work_queued());
     }
 
@@ -490,7 +570,10 @@ mod tests {
         scheduler.note_async_submission(41, 10).unwrap();
         scheduler.queue_visual_work();
 
-        assert_eq!(scheduler.decision(11), SchedulerDecision::RenderAhead);
+        assert_eq!(
+            scheduler.decision_with_context(render_ahead_context(11, true, false)),
+            SchedulerDecision::RenderAhead
+        );
     }
 
     #[test]
@@ -525,7 +608,10 @@ mod tests {
         scheduler.queue_visual_work();
         scheduler.note_async_submission(41, 10).unwrap();
         scheduler.queue_visual_work();
-        assert_eq!(scheduler.decision(11), SchedulerDecision::RenderAhead);
+        assert_eq!(
+            scheduler.decision_with_context(render_ahead_context(11, true, false)),
+            SchedulerDecision::RenderAhead
+        );
         scheduler.note_render_ahead_ready();
         assert!(scheduler.ready_frame_queued());
 
@@ -543,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_frame_is_latest_frame_wins() {
+    fn ready_frame_is_never_replaced_by_newer_visual_work() {
         let mut scheduler = NativeFrameScheduler::new(165, 0);
         scheduler.queue_visual_work();
         scheduler.note_async_submission(41, 10).unwrap();
@@ -551,11 +637,13 @@ mod tests {
         scheduler.note_render_ahead_ready();
         scheduler.queue_visual_work();
 
-        assert_eq!(scheduler.decision(12), SchedulerDecision::RenderAhead);
-        scheduler.note_render_ahead_ready();
+        assert_eq!(
+            scheduler.decision_with_context(render_ahead_context(12, true, true)),
+            SchedulerDecision::WaitForPageFlip
+        );
 
         assert!(scheduler.ready_frame_queued());
-        assert!(!scheduler.visual_work_queued());
+        assert!(scheduler.visual_work_queued());
     }
 
     #[test]
@@ -564,10 +652,18 @@ mod tests {
         scheduler.queue_visual_work();
         scheduler.note_async_submission(41, 10).unwrap();
 
-        for now in 11..100 {
+        scheduler.queue_visual_work();
+        assert_eq!(
+            scheduler.decision_with_context(render_ahead_context(11, true, false)),
+            SchedulerDecision::RenderAhead
+        );
+        scheduler.note_render_ahead_ready();
+        for now in 12..100 {
             scheduler.queue_visual_work();
-            assert_eq!(scheduler.decision(now), SchedulerDecision::RenderAhead);
-            scheduler.note_render_ahead_ready();
+            assert_eq!(
+                scheduler.decision_with_context(render_ahead_context(now, true, true)),
+                SchedulerDecision::WaitForPageFlip
+            );
             assert!(scheduler.ready_frame_queued());
         }
     }
@@ -580,10 +676,54 @@ mod tests {
         scheduler.queue_visual_work();
 
         assert_eq!(
-            scheduler.decision_with_render_target(11, false),
+            scheduler.decision_with_context(render_ahead_context(11, false, false)),
             SchedulerDecision::WaitForBuffer
         );
         assert!(scheduler.visual_work_queued());
+    }
+
+    #[test]
+    fn pending_render_ahead_requires_policy_capability_and_target() {
+        let mut scheduler = NativeFrameScheduler::new(60, 0);
+        scheduler.note_async_submission(41, 1).unwrap();
+        scheduler.queue_visual_work();
+        let mut context = render_ahead_context(2, true, false);
+
+        context.render_ahead_allowed = false;
+        assert_eq!(
+            scheduler.decision_with_context(context),
+            SchedulerDecision::WaitForPageFlip
+        );
+        context.render_ahead_allowed = true;
+        context.capabilities = SchedulerCapabilities::legacy();
+        assert_eq!(
+            scheduler.decision_with_context(context),
+            SchedulerDecision::WaitForPageFlip
+        );
+        context.capabilities = SchedulerCapabilities::explicit_atomic(true, true);
+        context.presentation_target = None;
+        assert_eq!(
+            scheduler.decision_with_context(context),
+            SchedulerDecision::WaitForPageFlip
+        );
+    }
+
+    #[test]
+    fn target_deadline_arms_without_busy_rendering() {
+        let mut scheduler = NativeFrameScheduler::new(60, 0);
+        scheduler.note_async_submission(41, 1).unwrap();
+        scheduler.queue_visual_work();
+        let mut context = render_ahead_context(2, true, false);
+        context
+            .presentation_target
+            .as_mut()
+            .unwrap()
+            .render_start_deadline = MonotonicTimestampNs::new(3);
+
+        assert_eq!(
+            scheduler.decision_with_context(context),
+            SchedulerDecision::WaitForRefresh
+        );
     }
 
     #[test]
