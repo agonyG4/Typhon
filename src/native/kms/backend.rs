@@ -30,6 +30,48 @@ pub struct AtomicDiscovery {
     pub plane_formats: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtomicDiscoveryRequest {
+    connector: ConnectorId,
+    crtc: CrtcId,
+    framebuffer_format: u32,
+}
+
+impl AtomicDiscoveryRequest {
+    pub const fn new(connector: ConnectorId, crtc: CrtcId, framebuffer_format: u32) -> Self {
+        Self {
+            connector,
+            crtc,
+            framebuffer_format,
+        }
+    }
+
+    pub const fn connector(self) -> ConnectorId {
+        self.connector
+    }
+
+    pub const fn crtc(self) -> CrtcId {
+        self.crtc
+    }
+
+    pub const fn framebuffer_format(self) -> u32 {
+        self.framebuffer_format
+    }
+}
+
+pub fn discover_atomic_pipeline(
+    fd: BorrowedFd<'_>,
+    request: AtomicDiscoveryRequest,
+) -> Result<AtomicDiscovery, AtomicKmsError> {
+    enable_atomic_client_capability(fd)?;
+    AtomicDiscovery::discover(
+        fd,
+        request.connector,
+        request.crtc,
+        request.framebuffer_format,
+    )
+}
+
 fn mode_matches(
     candidate: &drm_sys::drm_mode_modeinfo,
     expected: &drm_sys::drm_mode_modeinfo,
@@ -299,28 +341,18 @@ pub struct DrmAtomicBackend {
 }
 
 impl DrmAtomicBackend {
-    #[allow(clippy::too_many_arguments)]
-    pub fn initialize(
+    pub fn initialize_from_discovery(
         fd: BorrowedFd<'_>,
-        connector: ConnectorId,
-        crtc: CrtcId,
+        discovery: AtomicDiscovery,
         mode: drm_sys::drm_mode_modeinfo,
         width: u32,
         height: u32,
-        framebuffer_format: u32,
         framebuffer: FramebufferId,
     ) -> Result<Self, AtomicKmsError> {
-        enable_atomic_client_capability(fd)?;
-        let discovery = AtomicDiscovery::discover(fd, connector, crtc, framebuffer_format)?;
         let mode_blob = ModeBlob::create(DrmModeBlobIo::new(fd.as_raw_fd()), &mode)?;
         let geometry = AtomicPlaneGeometry::fullscreen(width, height)?;
-        let request = AtomicRequest::initial_modeset(
-            connector,
-            crtc,
-            discovery.pipeline.plane,
-            &discovery.pipeline.connector_props,
-            &discovery.pipeline.crtc_props,
-            &discovery.pipeline.plane_props,
+        let request = initial_modeset_request_from_discovery(
+            &discovery,
             mode_blob.id(),
             framebuffer,
             geometry,
@@ -450,6 +482,26 @@ impl DrmAtomicBackend {
     }
 }
 
+pub fn initial_modeset_request_from_discovery(
+    discovery: &AtomicDiscovery,
+    mode_blob: BlobId,
+    framebuffer: FramebufferId,
+    geometry: AtomicPlaneGeometry,
+) -> Result<AtomicRequest, AtomicKmsError> {
+    let pipeline = &discovery.pipeline;
+    AtomicRequest::initial_modeset(
+        pipeline.connector,
+        pipeline.crtc,
+        pipeline.plane,
+        &pipeline.connector_props,
+        &pipeline.crtc_props,
+        &pipeline.plane_props,
+        mode_blob,
+        framebuffer,
+        geometry,
+    )
+}
+
 fn elapsed_micros(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
@@ -545,6 +597,42 @@ pub struct KmsBackendSelection {
 }
 
 impl KmsBackendSelection {
+    pub fn discover_atomic_pipeline(
+        fd: BorrowedFd<'_>,
+        connector: ConnectorId,
+        crtc: CrtcId,
+        framebuffer_format: u32,
+    ) -> Result<AtomicDiscovery, AtomicKmsError> {
+        discover_atomic_pipeline(
+            fd,
+            AtomicDiscoveryRequest::new(connector, crtc, framebuffer_format),
+        )
+    }
+
+    pub fn initialize_atomic_from_discovery(
+        fd: BorrowedFd<'_>,
+        policy: KmsPolicy,
+        discovery: AtomicDiscovery,
+        mode: drm_sys::drm_mode_modeinfo,
+        width: u32,
+        height: u32,
+        framebuffer: FramebufferId,
+    ) -> Result<Self, AtomicKmsError> {
+        let backend = DrmAtomicBackend::initialize_from_discovery(
+            fd,
+            discovery,
+            mode,
+            width,
+            height,
+            framebuffer,
+        )?;
+        Ok(Self {
+            requested: policy,
+            fallback_reason: None,
+            backend: KmsDisplayBackend::Atomic(backend),
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn initialize(
         fd: BorrowedFd<'_>,
@@ -570,21 +658,26 @@ impl KmsBackendSelection {
                 )?),
             });
         }
-        match DrmAtomicBackend::initialize(
-            fd,
-            connector,
-            crtc,
-            mode,
-            width,
-            height,
-            framebuffer_format,
-            framebuffer,
-        ) {
-            Ok(backend) => Ok(Self {
-                requested: policy,
-                fallback_reason: None,
-                backend: KmsDisplayBackend::Atomic(backend),
-            }),
+        match Self::discover_atomic_pipeline(fd, connector, crtc, framebuffer_format) {
+            Ok(discovery) => {
+                match Self::initialize_atomic_from_discovery(
+                    fd,
+                    policy,
+                    discovery,
+                    mode,
+                    width,
+                    height,
+                    framebuffer,
+                ) {
+                    Ok(selection) => Ok(selection),
+                    Err(error) => match atomic_failure_action_after_discovery(policy) {
+                        AtomicFailureAction::Fail => Err(error),
+                        AtomicFailureAction::UseLegacy => unreachable!(
+                            "successful Atomic discovery cannot fall back during initialization"
+                        ),
+                    },
+                }
+            }
             Err(error) => {
                 let phase = error_phase(error.kind);
                 if policy.on_atomic_failure(phase) == AtomicFailureAction::UseLegacy {
@@ -652,6 +745,10 @@ impl KmsBackendSelection {
             KmsDisplayBackend::Legacy(_) => None,
         }
     }
+}
+
+pub const fn atomic_failure_action_after_discovery(_policy: KmsPolicy) -> AtomicFailureAction {
+    AtomicFailureAction::Fail
 }
 
 fn error_phase(kind: AtomicKmsErrorKind) -> AtomicFailurePhase {

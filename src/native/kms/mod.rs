@@ -370,6 +370,85 @@ mod tests {
         )
     }
 
+    fn discovery() -> AtomicDiscovery {
+        let (connector, crtc, plane, connector_props, crtc_props, plane_props) = ids();
+        AtomicDiscovery {
+            pipeline: AtomicPipelineProperties {
+                connector,
+                crtc,
+                plane,
+                connector_props,
+                crtc_props,
+                plane_props,
+            },
+            snapshot: AtomicPipelineSnapshot {
+                connector_crtc_id: 0,
+                crtc_active: 0,
+                crtc_mode_id: 0,
+                plane_fb_id: 0,
+                plane_crtc_id: 0,
+                src_x: 0,
+                src_y: 0,
+                src_w: 0,
+                src_h: 0,
+                crtc_x: 0,
+                crtc_y: 0,
+                crtc_w: 0,
+                crtc_h: 0,
+            },
+            optional: AtomicOptionalCapabilities {
+                vrr_enabled: false,
+                in_fence_fd: true,
+                out_fence_ptr: false,
+                framebuffer_damage_clips: false,
+            },
+            plane_possible_crtcs: 1,
+            plane_formats: vec![u32::from_le_bytes(*b"XR24")],
+        }
+    }
+
+    #[test]
+    fn atomic_discovery_does_not_require_an_initial_framebuffer() {
+        let request = AtomicDiscoveryRequest::new(
+            ConnectorId::new(1).unwrap(),
+            CrtcId::new(2).unwrap(),
+            u32::from_le_bytes(*b"XR24"),
+        );
+
+        assert_eq!(request.connector(), ConnectorId::new(1).unwrap());
+        assert_eq!(request.crtc(), CrtcId::new(2).unwrap());
+        assert_eq!(request.framebuffer_format(), u32::from_le_bytes(*b"XR24"));
+    }
+
+    #[test]
+    fn atomic_initialization_reuses_exactly_the_supplied_discovery() {
+        let discovery = discovery();
+        let request = initial_modeset_request_from_discovery(
+            &discovery,
+            BlobId::new(90).unwrap(),
+            FramebufferId::new(80).unwrap(),
+            AtomicPlaneGeometry::fullscreen(1920, 1080).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            request.serialize().objects,
+            vec![
+                discovery.pipeline.connector.get(),
+                discovery.pipeline.crtc.get(),
+                discovery.pipeline.plane.get(),
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_fallback_is_not_entered_after_successful_atomic_discovery() {
+        assert_eq!(
+            atomic_failure_action_after_discovery(KmsPolicy::Auto),
+            AtomicFailureAction::Fail
+        );
+    }
+
     #[test]
     fn initial_request_contains_exact_connector_crtc_and_primary_plane_state() {
         let (connector, crtc, plane, connector_props, crtc_props, plane_props) = ids();
