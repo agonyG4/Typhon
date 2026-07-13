@@ -32,6 +32,12 @@ id_type!(FramebufferId);
 id_type!(BlobId);
 id_type!(PropertyId);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DrmFormatModifierPair {
+    pub fourcc: u32,
+    pub modifier: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PageFlipToken(NonZeroU64);
 
@@ -192,6 +198,7 @@ pub struct AtomicPlaneProperties {
     pub crtc_h: PlanePropertyId,
     pub plane_type: PlanePropertyId,
     pub in_fence_fd: Option<PlanePropertyId>,
+    pub in_formats: Option<PlanePropertyId>,
     pub damage_clips: Option<PlanePropertyId>,
     pub rotation: Option<PlanePropertyId>,
     pub alpha: Option<PlanePropertyId>,
@@ -216,6 +223,7 @@ impl AtomicPlaneProperties {
             crtc_h: PlanePropertyId(set.required("CRTC_H")?),
             plane_type: PlanePropertyId(set.required("type")?),
             in_fence_fd: set.optional("IN_FENCE_FD").map(PlanePropertyId),
+            in_formats: set.optional("IN_FORMATS").map(PlanePropertyId),
             damage_clips: set.optional("FB_DAMAGE_CLIPS").map(PlanePropertyId),
             rotation: set.optional("rotation").map(PlanePropertyId),
             alpha: set.optional("alpha").map(PlanePropertyId),
@@ -224,4 +232,100 @@ impl AtomicPlaneProperties {
             color_range: set.optional("COLOR_RANGE").map(PlanePropertyId),
         })
     }
+}
+
+pub fn parse_in_formats_blob(bytes: &[u8]) -> Result<Vec<DrmFormatModifierPair>, AtomicKmsError> {
+    const HEADER_SIZE: usize = 24;
+    const MODIFIER_SIZE: usize = 24;
+    if bytes.len() < HEADER_SIZE {
+        return Err(malformed_blob(
+            "blob is smaller than drm_format_modifier_blob",
+        ));
+    }
+
+    let count_formats = read_u32(bytes, 8)? as usize;
+    let formats_offset = read_u32(bytes, 12)? as usize;
+    let count_modifiers = read_u32(bytes, 16)? as usize;
+    let modifiers_offset = read_u32(bytes, 20)? as usize;
+    if formats_offset < HEADER_SIZE || modifiers_offset < HEADER_SIZE {
+        return Err(malformed_blob(
+            "format/modifier data overlaps the blob header",
+        ));
+    }
+    let formats_range = checked_blob_range(bytes, formats_offset, count_formats, 4, "formats")?;
+    let modifiers_range = checked_blob_range(
+        bytes,
+        modifiers_offset,
+        count_modifiers,
+        MODIFIER_SIZE,
+        "modifiers",
+    )?;
+
+    let formats = formats_range
+        .step_by(4)
+        .map(|offset| read_u32(bytes, offset))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut pairs = Vec::new();
+    for offset in modifiers_range.step_by(MODIFIER_SIZE) {
+        let mask = read_u64(bytes, offset)?;
+        let format_offset = read_u32(bytes, offset + 8)? as usize;
+        let modifier = read_u64(bytes, offset + 16)?;
+        for bit in 0..64usize {
+            if mask & (1u64 << bit) == 0 {
+                continue;
+            }
+            let index = format_offset
+                .checked_add(bit)
+                .ok_or_else(|| malformed_blob("modifier format index overflow"))?;
+            let fourcc = formats.get(index).copied().ok_or_else(|| {
+                malformed_blob("modifier bit selects a format outside count_formats")
+            })?;
+            pairs.push(DrmFormatModifierPair { fourcc, modifier });
+        }
+    }
+    pairs.sort_unstable();
+    pairs.dedup();
+    Ok(pairs)
+}
+
+fn checked_blob_range(
+    bytes: &[u8],
+    offset: usize,
+    count: usize,
+    stride: usize,
+    label: &str,
+) -> Result<std::ops::Range<usize>, AtomicKmsError> {
+    let byte_count = count
+        .checked_mul(stride)
+        .ok_or_else(|| malformed_blob(format!("{label} byte count overflow")))?;
+    let end = offset
+        .checked_add(byte_count)
+        .ok_or_else(|| malformed_blob(format!("{label} end offset overflow")))?;
+    if end > bytes.len() {
+        return Err(malformed_blob(format!(
+            "{label} range {offset}..{end} exceeds blob size {}",
+            bytes.len()
+        )));
+    }
+    Ok(offset..end)
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, AtomicKmsError> {
+    let value = bytes
+        .get(offset..offset.saturating_add(4))
+        .and_then(|slice| <[u8; 4]>::try_from(slice).ok())
+        .ok_or_else(|| malformed_blob("truncated u32 in format-modifier blob"))?;
+    Ok(u32::from_ne_bytes(value))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, AtomicKmsError> {
+    let value = bytes
+        .get(offset..offset.saturating_add(8))
+        .and_then(|slice| <[u8; 8]>::try_from(slice).ok())
+        .ok_or_else(|| malformed_blob("truncated u64 in format-modifier blob"))?;
+    Ok(u64::from_ne_bytes(value))
+}
+
+fn malformed_blob(detail: impl Into<String>) -> AtomicKmsError {
+    AtomicKmsError::new(AtomicKmsErrorKind::MalformedPropertyBlob, detail)
 }

@@ -97,6 +97,7 @@ pub enum AtomicKmsErrorKind {
     MissingObject,
     MissingProperty,
     DuplicateProperty,
+    MalformedPropertyBlob,
     NoCompatiblePrimaryPlane,
     InvalidGeometry,
     DuplicateAssignment,
@@ -404,7 +405,92 @@ mod tests {
             },
             plane_possible_crtcs: 1,
             plane_formats: vec![u32::from_le_bytes(*b"XR24")],
+            plane_scanout_formats: Vec::new(),
         }
+    }
+
+    fn in_formats_blob(formats: &[u32], modifiers: &[(u64, u32, u64)]) -> Vec<u8> {
+        let formats_offset = 24u32;
+        let modifiers_offset = formats_offset + u32::try_from(formats.len() * 4).unwrap();
+        let mut bytes = Vec::new();
+        for value in [
+            1,
+            0,
+            u32::try_from(formats.len()).unwrap(),
+            formats_offset,
+            u32::try_from(modifiers.len()).unwrap(),
+            modifiers_offset,
+        ] {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        for format in formats {
+            bytes.extend_from_slice(&format.to_ne_bytes());
+        }
+        for (mask, offset, modifier) in modifiers {
+            bytes.extend_from_slice(&mask.to_ne_bytes());
+            bytes.extend_from_slice(&offset.to_ne_bytes());
+            bytes.extend_from_slice(&0u32.to_ne_bytes());
+            bytes.extend_from_slice(&modifier.to_ne_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn in_formats_blob_parses_one_format_with_one_modifier() {
+        let xr24 = u32::from_le_bytes(*b"XR24");
+        let parsed = parse_in_formats_blob(&in_formats_blob(&[xr24], &[(1, 0, 7)])).unwrap();
+
+        assert_eq!(
+            parsed,
+            vec![DrmFormatModifierPair {
+                fourcc: xr24,
+                modifier: 7,
+            }]
+        );
+    }
+
+    #[test]
+    fn in_formats_blob_parses_shared_and_offset_modifier_masks() {
+        let formats = [11, 22, 33];
+        let parsed =
+            parse_in_formats_blob(&in_formats_blob(&formats, &[(0b11, 0, 7), (0b11, 1, 9)]))
+                .unwrap();
+
+        assert_eq!(
+            parsed,
+            vec![
+                DrmFormatModifierPair {
+                    fourcc: 11,
+                    modifier: 7,
+                },
+                DrmFormatModifierPair {
+                    fourcc: 22,
+                    modifier: 7,
+                },
+                DrmFormatModifierPair {
+                    fourcc: 22,
+                    modifier: 9,
+                },
+                DrmFormatModifierPair {
+                    fourcc: 33,
+                    modifier: 9,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn in_formats_blob_rejects_malformed_offsets_counts_and_format_bits() {
+        let mut bad_offset = in_formats_blob(&[11], &[(1, 0, 7)]);
+        bad_offset[12..16].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert!(parse_in_formats_blob(&bad_offset).is_err());
+
+        let mut bad_count = in_formats_blob(&[11], &[(1, 0, 7)]);
+        bad_count[8..12].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert!(parse_in_formats_blob(&bad_count).is_err());
+
+        let out_of_range_bit = in_formats_blob(&[11], &[(0b10, 0, 7)]);
+        assert!(parse_in_formats_blob(&out_of_range_bit).is_err());
     }
 
     #[test]

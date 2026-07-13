@@ -1,4 +1,170 @@
 use super::*;
+use oblivion_one::native::kms::DrmFormatModifierPair;
+use oblivion_one::render_backend::{
+    buffer::{DrmFormat, DrmModifier},
+    egl_gles::EglGlesDmabufFormat,
+};
+use std::io;
+
+struct TestGbmAllocationProbe {
+    rejected: Vec<DrmFormatModifierPair>,
+}
+
+impl GbmAllocationProbe for TestGbmAllocationProbe {
+    fn supports(&mut self, candidate: DrmFormatModifierPair) -> bool {
+        !self.rejected.contains(&candidate)
+    }
+}
+
+#[test]
+fn explicit_output_modifier_intersection_uses_exact_preference_order() {
+    let xrgb_linear = DrmFormatModifierPair {
+        fourcc: DrmFormat::XRGB8888_FOURCC,
+        modifier: DrmModifier::LINEAR.0,
+    };
+    let argb_tiled = DrmFormatModifierPair {
+        fourcc: DrmFormat::ARGB8888_FOURCC,
+        modifier: 9,
+    };
+    let xrgb_tiled = DrmFormatModifierPair {
+        fourcc: DrmFormat::XRGB8888_FOURCC,
+        modifier: 11,
+    };
+    let drm = [xrgb_linear, argb_tiled, xrgb_tiled];
+    let egl = [
+        EglGlesDmabufFormat::new(DrmFormat::Xrgb8888, DrmModifier::LINEAR),
+        EglGlesDmabufFormat::new(DrmFormat::Argb8888, DrmModifier(9)),
+        EglGlesDmabufFormat::new(DrmFormat::Xrgb8888, DrmModifier(11)),
+    ];
+
+    let selected =
+        select_output_format_modifier(&drm, &egl, &mut TestGbmAllocationProbe { rejected: vec![] })
+            .unwrap();
+
+    assert_eq!(selected, xrgb_tiled);
+}
+
+#[test]
+fn explicit_output_modifier_intersection_probes_gbm_and_rejects_invalid_modifier() {
+    let xrgb_tiled = DrmFormatModifierPair {
+        fourcc: DrmFormat::XRGB8888_FOURCC,
+        modifier: 11,
+    };
+    let argb_linear = DrmFormatModifierPair {
+        fourcc: DrmFormat::ARGB8888_FOURCC,
+        modifier: DrmModifier::LINEAR.0,
+    };
+    let invalid = DrmFormatModifierPair {
+        fourcc: DrmFormat::XRGB8888_FOURCC,
+        modifier: DrmModifier::INVALID.0,
+    };
+    let drm = [invalid, xrgb_tiled, argb_linear];
+    let egl = [
+        EglGlesDmabufFormat::new(DrmFormat::Xrgb8888, DrmModifier::INVALID),
+        EglGlesDmabufFormat::new(DrmFormat::Xrgb8888, DrmModifier(11)),
+        EglGlesDmabufFormat::new(DrmFormat::Argb8888, DrmModifier::LINEAR),
+    ];
+
+    let selected = select_output_format_modifier(
+        &drm,
+        &egl,
+        &mut TestGbmAllocationProbe {
+            rejected: vec![xrgb_tiled],
+        },
+    )
+    .unwrap();
+
+    assert_eq!(selected, argb_linear);
+}
+
+#[test]
+fn explicit_addfb2_metadata_preserves_multiple_planes_and_modifier_flag() {
+    let descriptor = ExplicitFramebufferDescriptor::new(
+        1920,
+        1080,
+        DrmFormat::XRGB8888_FOURCC,
+        &[
+            ExplicitFramebufferPlane {
+                handle: 10,
+                pitch: 7680,
+                offset: 0,
+                modifier: 9,
+            },
+            ExplicitFramebufferPlane {
+                handle: 11,
+                pitch: 3840,
+                offset: 8_294_400,
+                modifier: 9,
+            },
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(descriptor.plane_count(), 2);
+    assert_eq!(descriptor.handles()[..2], [10, 11]);
+    assert_eq!(descriptor.pitches()[..2], [7680, 3840]);
+    assert_eq!(descriptor.modifiers()[..2], [9, 9]);
+    assert_eq!(descriptor.flags(), drm_sys::DRM_MODE_FB_MODIFIERS);
+}
+
+#[test]
+fn explicit_addfb2_metadata_rejects_invalid_plane_count() {
+    assert!(ExplicitFramebufferDescriptor::new(1, 1, DrmFormat::XRGB8888_FOURCC, &[]).is_err());
+    assert!(
+        ExplicitFramebufferDescriptor::new(
+            1,
+            1,
+            DrmFormat::XRGB8888_FOURCC,
+            &[ExplicitFramebufferPlane::default(); 5],
+        )
+        .is_err()
+    );
+}
+
+#[derive(Default)]
+struct TestFramebufferRegistration {
+    added: Vec<u32>,
+    removed: Vec<u32>,
+    fail_at: usize,
+}
+
+impl ExplicitFramebufferRegistration for TestFramebufferRegistration {
+    fn add(&mut self, _descriptor: &ExplicitFramebufferDescriptor) -> io::Result<u32> {
+        if self.added.len() == self.fail_at {
+            return Err(io::Error::other("injected AddFB2 failure"));
+        }
+        let id = 100 + u32::try_from(self.added.len()).unwrap();
+        self.added.push(id);
+        Ok(id)
+    }
+
+    fn remove(&mut self, framebuffer: u32) {
+        self.removed.push(framebuffer);
+    }
+}
+
+#[test]
+fn explicit_addfb2_partial_creation_cleans_up_created_framebuffers() {
+    let plane = ExplicitFramebufferPlane {
+        handle: 10,
+        pitch: 4,
+        offset: 0,
+        modifier: DrmModifier::LINEAR.0,
+    };
+    let descriptors = [
+        ExplicitFramebufferDescriptor::new(1, 1, DrmFormat::XRGB8888_FOURCC, &[plane]).unwrap(),
+        ExplicitFramebufferDescriptor::new(1, 1, DrmFormat::XRGB8888_FOURCC, &[plane]).unwrap(),
+        ExplicitFramebufferDescriptor::new(1, 1, DrmFormat::XRGB8888_FOURCC, &[plane]).unwrap(),
+    ];
+    let mut registration = TestFramebufferRegistration {
+        fail_at: 2,
+        ..Default::default()
+    };
+
+    assert!(register_explicit_framebuffers(&mut registration, &descriptors).is_err());
+    assert_eq!(registration.added, vec![100, 101]);
+    assert_eq!(registration.removed, vec![101, 100]);
+}
 
 #[test]
 fn explicit_output_pool_has_exactly_three_slots() {

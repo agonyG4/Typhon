@@ -81,6 +81,24 @@ pub fn object_properties(
         .collect()
 }
 
+pub fn property_blob(fd: BorrowedFd<'_>, blob_id: u32) -> Result<Vec<u8>, AtomicKmsError> {
+    if blob_id == 0 {
+        return Err(AtomicKmsError::new(
+            AtomicKmsErrorKind::MalformedPropertyBlob,
+            "DRM property blob ID is zero",
+        ));
+    }
+    let mut bytes = Vec::new();
+    drm_ffi::mode::get_property_blob(fd, blob_id, Some(&mut bytes)).map_err(|error| {
+        classify_io_error(
+            error,
+            AtomicKmsErrorKind::MalformedPropertyBlob,
+            "read DRM property blob",
+        )
+    })?;
+    Ok(bytes)
+}
+
 fn drm_property_name(name: &[libc::c_char]) -> String {
     let bytes = name
         .iter()

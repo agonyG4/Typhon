@@ -7,10 +7,11 @@ use super::{
     AtomicCommitFlags, AtomicConnectorProperties, AtomicCrtcProperties, AtomicFailureAction,
     AtomicFailurePhase, AtomicKmsError, AtomicKmsErrorKind, AtomicPipelineProperties,
     AtomicPipelineSnapshot, AtomicPlaneGeometry, AtomicPlaneProperties, AtomicRequest,
-    AtomicSubmission, BlobId, ConnectorId, CrtcId, DrmModeBlobIo, DrmObjectKind, DrmProperty,
-    FramebufferId, KmsBackendKind, KmsPolicy, LegacyKmsBackend, ModeBlob, PageFlipToken,
-    PlaneCandidate, PlaneId, PlaneType, RestorationOutcome, disable_atomic_client_capability,
-    enable_atomic_client_capability, object_properties, select_primary_plane, submit_atomic,
+    AtomicSubmission, BlobId, ConnectorId, CrtcId, DrmFormatModifierPair, DrmModeBlobIo,
+    DrmObjectKind, DrmProperty, FramebufferId, KmsBackendKind, KmsPolicy, LegacyKmsBackend,
+    ModeBlob, PageFlipToken, PlaneCandidate, PlaneId, PlaneType, RestorationOutcome,
+    disable_atomic_client_capability, enable_atomic_client_capability, object_properties,
+    parse_in_formats_blob, property_blob, select_primary_plane, submit_atomic,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +29,7 @@ pub struct AtomicDiscovery {
     pub optional: AtomicOptionalCapabilities,
     pub plane_possible_crtcs: u32,
     pub plane_formats: Vec<u32>,
+    pub plane_scanout_formats: Vec<DrmFormatModifierPair>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +162,18 @@ impl AtomicDiscovery {
                 )
             })?;
         let plane_props = AtomicPlaneProperties::discover(&plane_entries)?;
+        let plane_scanout_formats = match property_value(&plane_entries, "IN_FORMATS") {
+            Some(blob_id) if blob_id != 0 => {
+                let blob_id = u32::try_from(blob_id).map_err(|_| {
+                    AtomicKmsError::new(
+                        AtomicKmsErrorKind::MalformedPropertyBlob,
+                        "primary-plane IN_FORMATS blob ID exceeds u32",
+                    )
+                })?;
+                parse_in_formats_blob(&property_blob(fd, blob_id)?)?
+            }
+            _ => Vec::new(),
+        };
         let optional = AtomicOptionalCapabilities {
             vrr_enabled: crtc_props.vrr_enabled.is_some(),
             in_fence_fd: plane_props.in_fence_fd.is_some(),
@@ -198,6 +212,7 @@ impl AtomicDiscovery {
             optional,
             plane_possible_crtcs: selected_possible_crtcs,
             plane_formats: selected_formats,
+            plane_scanout_formats,
         })
     }
 
@@ -759,6 +774,7 @@ fn error_phase(kind: AtomicKmsErrorKind) -> AtomicFailurePhase {
         AtomicKmsErrorKind::MissingObject
         | AtomicKmsErrorKind::MissingProperty
         | AtomicKmsErrorKind::DuplicateProperty
+        | AtomicKmsErrorKind::MalformedPropertyBlob
         | AtomicKmsErrorKind::NoCompatiblePrimaryPlane
         | AtomicKmsErrorKind::InvalidGeometry
         | AtomicKmsErrorKind::BlobCreation => AtomicFailurePhase::Discovery,
