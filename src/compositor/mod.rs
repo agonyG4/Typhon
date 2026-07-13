@@ -790,38 +790,8 @@ struct ClipboardDataSource {
     mime_types: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-struct ClipboardDataDevice {
-    device: wl_data_device::WlDataDevice,
-    client_id: ClientId,
-    seat_id: ObjectId,
-}
-
-#[derive(Debug, Clone)]
-struct ClipboardDataOffer {
-    offer: wl_data_offer::WlDataOffer,
-    target_client_id: ClientId,
-    source_generation: u64,
-    mime_types: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ActiveClipboard {
-    generation: u64,
-    source: ClipboardSourceBackend,
-    mime_types: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-enum ClipboardSourceBackend {
-    InternalWayland {
-        source: wl_data_source::WlDataSource,
-        client_id: ClientId,
-    },
-    HostBridge {
-        offer_id: HostClipboardOfferId,
-    },
-}
+mod clipboard_state;
+use clipboard_state::*;
 
 mod state;
 use state::*;
