@@ -138,7 +138,12 @@ impl Error for AtomicKmsError {}
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc, time::Instant};
+    use std::{
+        cell::Cell,
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
+        rc::Rc,
+        time::Instant,
+    };
 
     use super::*;
 
@@ -371,6 +376,32 @@ mod tests {
         )
     }
 
+    fn explicit_fence_pipeline() -> AtomicPipelineProperties {
+        let (connector, crtc, plane, connector_props, _, _) = ids();
+        let mut crtc_properties = complete_crtc_properties();
+        crtc_properties.push(property(5, "OUT_FENCE_PTR", 0));
+        let mut plane_properties = complete_plane_properties();
+        plane_properties.push(property(30, "IN_FENCE_FD", 0));
+        AtomicPipelineProperties {
+            connector,
+            crtc,
+            plane,
+            connector_props,
+            crtc_props: AtomicCrtcProperties::discover(&crtc_properties).unwrap(),
+            plane_props: AtomicPlaneProperties::discover(&plane_properties).unwrap(),
+        }
+    }
+
+    fn pipe_read_end() -> OwnedFd {
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        unsafe { libc::close(pipe[1]) };
+        unsafe { OwnedFd::from_raw_fd(pipe[0]) }
+    }
+
     fn discovery() -> AtomicDiscovery {
         let (connector, crtc, plane, connector_props, crtc_props, plane_props) = ids();
         AtomicDiscovery {
@@ -581,6 +612,135 @@ mod tests {
     }
 
     #[test]
+    fn explicit_atomic_flip_serializes_fb_in_fence_and_out_fence_pointer() {
+        let pipeline = explicit_fence_pipeline();
+        let mut out_fence = -1i32;
+        let request = AtomicRequest::primary_flip_with_fences(
+            &pipeline,
+            FramebufferId::new(81).unwrap(),
+            17,
+            Some(std::ptr::addr_of_mut!(out_fence)),
+        )
+        .unwrap();
+        let serialized = request.serialize();
+
+        assert_eq!(request.assignment_count(), 3);
+        assert_eq!(
+            serialized.objects,
+            vec![pipeline.crtc.get(), pipeline.plane.get()]
+        );
+        assert_eq!(serialized.property_counts, vec![1, 2]);
+        assert_eq!(
+            serialized.properties,
+            vec![
+                pipeline.crtc_props.out_fence_ptr.unwrap().0.get(),
+                pipeline.plane_props.fb_id.0.get(),
+                pipeline.plane_props.in_fence_fd.unwrap().0.get(),
+            ]
+        );
+        assert_eq!(serialized.values[1], 81);
+        assert_eq!(serialized.values[2], 17);
+        assert_eq!(
+            serialized.values[0],
+            std::ptr::addr_of_mut!(out_fence) as u64
+        );
+    }
+
+    #[test]
+    fn explicit_atomic_flip_adopts_out_fence_and_closes_input_after_success() {
+        let pipeline = explicit_fence_pipeline();
+        let input = pipe_read_end();
+        let input_raw = input.as_raw_fd();
+        let returned_out = pipe_read_end();
+        let returned_out_raw = returned_out.as_raw_fd();
+        std::mem::forget(returned_out);
+        let out_property = pipeline.crtc_props.out_fence_ptr.unwrap().0.get();
+
+        let result = submit_atomic_flip_with(
+            &pipeline,
+            AtomicFlipRequest {
+                framebuffer: FramebufferId::new(81).unwrap(),
+                token: PageFlipToken::new(55).unwrap(),
+                in_fence: input,
+            },
+            |submission| {
+                let serialized = submission.request.serialize();
+                let index = serialized
+                    .properties
+                    .iter()
+                    .position(|property| *property == out_property)
+                    .unwrap();
+                unsafe { *(serialized.values[index] as *mut i32) = returned_out_raw };
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.out_fence.as_ref().unwrap().as_raw_fd(),
+            returned_out_raw
+        );
+        assert_eq!(unsafe { libc::fcntl(input_raw, libc::F_GETFD) }, -1);
+        drop(result);
+        assert_eq!(unsafe { libc::fcntl(returned_out_raw, libc::F_GETFD) }, -1);
+    }
+
+    #[test]
+    fn explicit_atomic_flip_closes_kernel_written_out_fence_on_ioctl_failure() {
+        let pipeline = explicit_fence_pipeline();
+        let input = pipe_read_end();
+        let input_raw = input.as_raw_fd();
+        let returned_out = pipe_read_end();
+        let returned_out_raw = returned_out.as_raw_fd();
+        std::mem::forget(returned_out);
+        let out_property = pipeline.crtc_props.out_fence_ptr.unwrap().0.get();
+
+        let error = submit_atomic_flip_with(
+            &pipeline,
+            AtomicFlipRequest {
+                framebuffer: FramebufferId::new(81).unwrap(),
+                token: PageFlipToken::new(55).unwrap(),
+                in_fence: input,
+            },
+            |submission| {
+                let serialized = submission.request.serialize();
+                let index = serialized
+                    .properties
+                    .iter()
+                    .position(|property| *property == out_property)
+                    .unwrap();
+                unsafe { *(serialized.values[index] as *mut i32) = returned_out_raw };
+                Err(AtomicKmsError::new(
+                    AtomicKmsErrorKind::FlipRejected,
+                    "injected failure",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind, AtomicKmsErrorKind::FlipRejected);
+        assert_eq!(unsafe { libc::fcntl(input_raw, libc::F_GETFD) }, -1);
+        assert_eq!(unsafe { libc::fcntl(returned_out_raw, libc::F_GETFD) }, -1);
+    }
+
+    #[test]
+    fn explicit_atomic_flip_ignores_negative_out_fence() {
+        let pipeline = explicit_fence_pipeline();
+        let result = submit_atomic_flip_with(
+            &pipeline,
+            AtomicFlipRequest {
+                framebuffer: FramebufferId::new(81).unwrap(),
+                token: PageFlipToken::new(55).unwrap(),
+                in_fence: pipe_read_end(),
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        assert!(result.out_fence.is_none());
+    }
+
+    #[test]
     fn resume_modeset_rebuilds_complete_pipeline_with_allow_modeset() {
         let (connector, crtc, plane, connector_props, crtc_props, plane_props) = ids();
         let request = AtomicRequest::resume_modeset(
@@ -599,6 +759,8 @@ mod tests {
 
         assert_eq!(submission.request.assignment_count(), 13);
         assert!(submission.flags.contains_allow_modeset());
+        assert!(!submission.flags.contains_nonblock());
+        assert!(!submission.flags.contains_pageflip_event());
         assert_eq!(submission.user_data, 0);
     }
 

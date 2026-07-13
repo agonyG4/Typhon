@@ -331,6 +331,37 @@ impl AtomicRequest {
         Ok(request)
     }
 
+    pub fn primary_flip_with_fences(
+        pipeline: &AtomicPipelineProperties,
+        framebuffer: FramebufferId,
+        in_fence_fd: i32,
+        out_fence_ptr: Option<*mut i32>,
+    ) -> Result<Self, AtomicKmsError> {
+        let in_fence_property = pipeline.plane_props.in_fence_fd.ok_or_else(|| {
+            AtomicKmsError::new(
+                AtomicKmsErrorKind::MissingProperty,
+                "primary plane is missing required IN_FENCE_FD",
+            )
+        })?;
+        let mut request =
+            Self::primary_flip(pipeline.plane, pipeline.plane_props.fb_id, framebuffer)?;
+        request.set_plane(
+            pipeline.plane,
+            in_fence_property,
+            u64::try_from(in_fence_fd).map_err(|_| {
+                AtomicKmsError::new(
+                    AtomicKmsErrorKind::MissingProperty,
+                    "Atomic input fence FD is negative",
+                )
+            })?,
+        )?;
+        if let (Some(property), Some(pointer)) = (pipeline.crtc_props.out_fence_ptr, out_fence_ptr)
+        {
+            request.set_crtc(pipeline.crtc, property, pointer as u64)?;
+        }
+        Ok(request)
+    }
+
     pub fn safe_disable(pipeline: &AtomicPipelineProperties) -> Result<Self, AtomicKmsError> {
         let mut request = Self::new();
         request.set_connector(pipeline.connector, pipeline.connector_props.crtc_id, 0)?;

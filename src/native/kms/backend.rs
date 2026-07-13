@@ -1,5 +1,5 @@
 use std::{
-    os::fd::{AsRawFd, BorrowedFd, RawFd},
+    os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
     time::Instant,
 };
 
@@ -37,6 +37,18 @@ pub struct AtomicDiscoveryRequest {
     connector: ConnectorId,
     crtc: CrtcId,
     framebuffer_format: u32,
+}
+
+#[derive(Debug)]
+pub struct AtomicFlipRequest {
+    pub framebuffer: FramebufferId,
+    pub token: PageFlipToken,
+    pub in_fence: OwnedFd,
+}
+
+#[derive(Debug)]
+pub struct AtomicFlipSubmission {
+    pub out_fence: Option<OwnedFd>,
 }
 
 impl AtomicDiscoveryRequest {
@@ -436,6 +448,21 @@ impl DrmAtomicBackend {
         )
     }
 
+    pub fn submit_atomic_flip(
+        &self,
+        request: AtomicFlipRequest,
+    ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
+        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        submit_atomic_flip_with(&self.discovery.pipeline, request, |submission| {
+            submit_atomic(
+                fd,
+                submission,
+                AtomicKmsErrorKind::FlipRejected,
+                "atomic primary-plane flip with explicit fence",
+            )
+        })
+    }
+
     pub fn recover(&self, framebuffer: FramebufferId) -> Result<(), AtomicKmsError> {
         let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
         self.discovery.validate_live_pipeline(fd, &self.mode)?;
@@ -495,6 +522,39 @@ impl DrmAtomicBackend {
     pub const fn initial_commit_us(&self) -> u64 {
         self.initial_commit_us
     }
+}
+
+pub(crate) fn submit_atomic_flip_with(
+    pipeline: &AtomicPipelineProperties,
+    request: AtomicFlipRequest,
+    submit: impl FnOnce(&AtomicSubmission) -> Result<(), AtomicKmsError>,
+) -> Result<AtomicFlipSubmission, AtomicKmsError> {
+    let mut out_fence_storage = -1i32;
+    let out_fence_ptr = pipeline
+        .crtc_props
+        .out_fence_ptr
+        .map(|_| std::ptr::addr_of_mut!(out_fence_storage));
+    let atomic_request = AtomicRequest::primary_flip_with_fences(
+        pipeline,
+        request.framebuffer,
+        request.in_fence.as_raw_fd(),
+        out_fence_ptr,
+    )?;
+    let submission = AtomicSubmission::page_flip(atomic_request, request.token);
+    let result = submit(&submission);
+    match result {
+        Ok(()) => Ok(AtomicFlipSubmission {
+            out_fence: adopt_out_fence(out_fence_storage),
+        }),
+        Err(error) => {
+            drop(adopt_out_fence(out_fence_storage));
+            Err(error)
+        }
+    }
+}
+
+fn adopt_out_fence(raw_fd: i32) -> Option<OwnedFd> {
+    (raw_fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(raw_fd) })
 }
 
 pub fn initial_modeset_request_from_discovery(
@@ -730,6 +790,19 @@ impl KmsBackendSelection {
         match &self.backend {
             KmsDisplayBackend::Atomic(backend) => backend.submit_flip(framebuffer, token),
             KmsDisplayBackend::Legacy(backend) => backend.submit_flip(framebuffer, token),
+        }
+    }
+
+    pub fn submit_atomic_flip(
+        &self,
+        request: AtomicFlipRequest,
+    ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
+        match &self.backend {
+            KmsDisplayBackend::Atomic(backend) => backend.submit_atomic_flip(request),
+            KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "legacy KMS cannot submit an explicit-fence Atomic flip",
+            )),
         }
     }
 
