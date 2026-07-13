@@ -3,13 +3,17 @@
 use std::{
     ffi::c_void,
     io,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
 };
 
 use glow::HasContext;
 use khronos_egl as egl;
 
 use super::{EglInstance, RendererResult};
+use oblivion_one::native::{
+    adaptive_buffering::FenceTimestampQuality,
+    sync_file::{SyncFileDeadlineHint, query_sync_file_info, set_sync_file_deadline},
+};
 
 const EGL_SYNC_NATIVE_FENCE_ANDROID: egl::Enum = 0x3144;
 
@@ -108,6 +112,65 @@ impl NativeRenderFence {
 
     pub(crate) fn take_timing_fd(&mut self) -> Option<OwnedFd> {
         self.timing_fd.take()
+    }
+
+    pub(crate) fn apply_deadline_hint(
+        &self,
+        deadline_ns: u64,
+        now_ns: u64,
+    ) -> io::Result<Option<SyncFileDeadlineHint>> {
+        if deadline_ns <= now_ns {
+            return Ok(None);
+        }
+        self.submission_fd
+            .as_ref()
+            .map(|fd| set_sync_file_deadline(fd.as_fd(), deadline_ns))
+            .transpose()
+    }
+
+    pub(crate) fn sample_timing_nonblocking(
+        &self,
+        observed_at_ns: u64,
+    ) -> io::Result<Option<(u64, FenceTimestampQuality)>> {
+        let Some(fd) = self.timing_fd.as_ref() else {
+            return Ok(None);
+        };
+        let mut pollfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        if ready < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if ready == 0 {
+            return Ok(None);
+        }
+        if pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(io::Error::other(
+                "native render timing fence reported poll failure",
+            ));
+        }
+        match query_sync_file_info(fd.as_fd()) {
+            Ok(info) => Ok(Some((
+                info.signal_timestamp_ns,
+                FenceTimestampQuality::ExactSyncFile,
+            ))),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOTTY) | Some(libc::EOPNOTSUPP) | Some(libc::EINVAL)
+                ) =>
+            {
+                Ok(Some((
+                    observed_at_ns,
+                    FenceTimestampQuality::ObservedApproximate,
+                )))
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 

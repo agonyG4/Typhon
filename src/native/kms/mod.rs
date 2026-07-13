@@ -647,6 +647,67 @@ mod tests {
     }
 
     #[test]
+    fn initial_real_modeset_can_attach_the_render_fence_without_runtime_flip_flags() {
+        let pipeline = explicit_fence_pipeline();
+        let mut request = AtomicRequest::initial_modeset(
+            pipeline.connector,
+            pipeline.crtc,
+            pipeline.plane,
+            &pipeline.connector_props,
+            &pipeline.crtc_props,
+            &pipeline.plane_props,
+            BlobId::new(90).unwrap(),
+            FramebufferId::new(80).unwrap(),
+            AtomicPlaneGeometry::fullscreen(1920, 1080).unwrap(),
+        )
+        .unwrap();
+
+        request.set_initial_input_fence(&pipeline, 23).unwrap();
+        let serialized = request.serialize();
+        let fence_property = pipeline.plane_props.in_fence_fd.unwrap().0.get();
+        let fence_index = serialized
+            .properties
+            .iter()
+            .position(|property| *property == fence_property)
+            .unwrap();
+
+        assert_eq!(serialized.values[fence_index], 23);
+        assert_eq!(
+            AtomicCommitFlags::initial_real(),
+            AtomicCommitFlags::allow_modeset()
+        );
+        assert!(!AtomicCommitFlags::initial_real().contains_nonblock());
+        assert!(!AtomicCommitFlags::initial_real().contains_pageflip_event());
+    }
+
+    #[test]
+    fn initial_test_only_modeset_uses_explicit_no_fence_value() {
+        let pipeline = explicit_fence_pipeline();
+        let mut request = AtomicRequest::initial_modeset(
+            pipeline.connector,
+            pipeline.crtc,
+            pipeline.plane,
+            &pipeline.connector_props,
+            &pipeline.crtc_props,
+            &pipeline.plane_props,
+            BlobId::new(90).unwrap(),
+            FramebufferId::new(80).unwrap(),
+            AtomicPlaneGeometry::fullscreen(1920, 1080).unwrap(),
+        )
+        .unwrap();
+        request.set_test_input_fence_none(&pipeline).unwrap();
+        let serialized = request.serialize();
+        let fence_property = pipeline.plane_props.in_fence_fd.unwrap().0.get();
+        let fence_index = serialized
+            .properties
+            .iter()
+            .position(|property| *property == fence_property)
+            .unwrap();
+
+        assert_eq!(serialized.values[fence_index], u64::MAX);
+    }
+
+    #[test]
     fn explicit_atomic_flip_adopts_out_fence_and_closes_input_after_success() {
         let pipeline = explicit_fence_pipeline();
         let input = pipe_read_end();

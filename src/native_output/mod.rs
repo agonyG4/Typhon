@@ -14,7 +14,7 @@ use std::{
     rc::Rc,
     slice,
     sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::egl_renderer::dmabuf::{query_egl_dmabuf_feedback, query_egl_main_device};
@@ -42,10 +42,15 @@ use oblivion_one::compositor::{
 #[cfg(test)]
 use oblivion_one::native::kms::KmsBackendKind;
 use oblivion_one::native::kms::{
-    AtomicCommitState, AtomicCompletion, ConnectorId, CrtcId, FramebufferId, KmsBackendSelection,
-    KmsPolicy, PageFlipToken,
+    AtomicCommitState, AtomicCompletion, AtomicKmsErrorKind, ConnectorId, CrtcId, FramebufferId,
+    KmsBackendSelection, KmsPolicy, PageFlipToken,
 };
 use oblivion_one::native::{
+    adaptive_buffering::{
+        AdaptiveBufferingController, AdaptiveBufferingMode, AdaptiveRenderJournal,
+        AdaptiveTripleBufferPolicy, FenceTimestampQuality, ProvenDeadlineMiss,
+        approximate_observation_is_late,
+    },
     drm::{
         DrmPresentationEvent, DrmTimestampClock, drain_drm_page_flip_events,
         query_drm_timestamp_clock, sample_clock_microseconds,
@@ -57,9 +62,13 @@ use oblivion_one::native::{
         AcquireReadyResult, AcquireRegistrationResult, DrmAcquirePointNotifier,
         ExplicitSyncWatchRegistry,
     },
+    presentation_deadline::{
+        MonotonicTimestampNs, PresentationDeadlinePlanner, PresentationTarget,
+        PresentationTargetReason,
+    },
     scheduler::{
         NativeFrameScheduler, PageFlipCompletionResult, PresentationCadenceMetrics,
-        SchedulerDecision,
+        SchedulerCapabilities, SchedulerDecision, SchedulerFrameContext,
     },
 };
 use oblivion_one::process::{ChildSupervisor, ProcessKind, ProcessOptions, RestartPolicy};

@@ -35,14 +35,16 @@ struct RawSyncSetDeadline {
     pad: u64,
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SyncFileInfo {
-    pub(crate) fence_count: u32,
-    pub(crate) signal_timestamp_ns: u64,
+pub struct SyncFileInfo {
+    pub fence_count: u32,
+    pub signal_timestamp_ns: u64,
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SyncFileDeadlineHint {
+pub enum SyncFileDeadlineHint {
     Applied,
     Unsupported,
 }
@@ -75,7 +77,8 @@ impl SyncFileIoctl for RealSyncFileIoctl {
     }
 }
 
-pub(crate) fn query_sync_file_info(fd: BorrowedFd<'_>) -> io::Result<SyncFileInfo> {
+#[doc(hidden)]
+pub fn query_sync_file_info(fd: BorrowedFd<'_>) -> io::Result<SyncFileInfo> {
     query_sync_file_info_with(&RealSyncFileIoctl, fd)
 }
 
@@ -132,7 +135,8 @@ fn validate_sync_file_status(status: i32) -> io::Result<()> {
     }
 }
 
-pub(crate) fn set_sync_file_deadline(
+#[doc(hidden)]
+pub fn set_sync_file_deadline(
     fd: BorrowedFd<'_>,
     deadline_ns: u64,
 ) -> io::Result<SyncFileDeadlineHint> {

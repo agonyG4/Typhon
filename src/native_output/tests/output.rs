@@ -242,7 +242,7 @@ fn native_runtime_error_includes_stage_backend_frame_and_recovery_command() {
 
     assert!(message.contains("fatal native GPU runtime error"));
     assert!(message.contains("stage=present"));
-    assert!(message.contains("backend=native-egl-gbm"));
+    assert!(message.contains("backend=atomic-egl-gbm-explicit"));
     assert!(message.contains("crtc=42"));
     assert!(message.contains("frame=1842"));
     assert!(message.contains("OBLIVION_ONE_SCANOUT_BACKEND=cpu"));

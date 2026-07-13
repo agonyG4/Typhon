@@ -3,15 +3,16 @@
 
 use std::time::Duration;
 
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct MonotonicTimestampNs(u64);
+pub struct MonotonicTimestampNs(u64);
 
 impl MonotonicTimestampNs {
-    pub(crate) const fn new(value: u64) -> Self {
+    pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
-    pub(crate) const fn get(self) -> u64 {
+    pub const fn get(self) -> u64 {
         self.0
     }
 
@@ -26,46 +27,49 @@ impl MonotonicTimestampNs {
     }
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PresentationTargetReason {
+pub enum PresentationTargetReason {
     Normal,
     PredictedPressure,
     ProvenReadinessMiss,
     ForcedValidation,
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PresentationTarget {
-    pub(crate) sequence: u64,
-    pub(crate) presentation_time: MonotonicTimestampNs,
-    pub(crate) render_start_deadline: MonotonicTimestampNs,
-    pub(crate) refresh_interval: Duration,
-    pub(crate) reason: PresentationTargetReason,
-    pub(crate) clock_generation: u64,
-    pub(crate) estimated: bool,
-    pub(crate) predicted_unreachable: bool,
+pub struct PresentationTarget {
+    pub sequence: u64,
+    pub presentation_time: MonotonicTimestampNs,
+    pub render_start_deadline: MonotonicTimestampNs,
+    pub refresh_interval: Duration,
+    pub reason: PresentationTargetReason,
+    pub clock_generation: u64,
+    pub estimated: bool,
+    pub predicted_unreachable: bool,
 }
 
 impl PresentationTarget {
-    pub(crate) const fn sequence(self) -> u64 {
+    pub const fn sequence(self) -> u64 {
         self.sequence
     }
 
-    pub(crate) const fn identity(self) -> (u64, u64) {
+    pub const fn identity(self) -> (u64, u64) {
         (self.clock_generation, self.sequence)
     }
 
-    pub(crate) const fn render_start_deadline(self) -> MonotonicTimestampNs {
+    pub const fn render_start_deadline(self) -> MonotonicTimestampNs {
         self.render_start_deadline
     }
 
-    pub(crate) const fn predicted_unreachable(self) -> bool {
+    pub const fn predicted_unreachable(self) -> bool {
         self.predicted_unreachable
     }
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct PresentationDeadlinePlanner {
+pub struct PresentationDeadlinePlanner {
     clock_generation: u64,
     last_presented_sequence: u64,
     last_presented_at: Option<MonotonicTimestampNs>,
@@ -74,7 +78,7 @@ pub(crate) struct PresentationDeadlinePlanner {
 }
 
 impl PresentationDeadlinePlanner {
-    pub(crate) fn new(refresh_interval: Duration) -> Self {
+    pub fn new(refresh_interval: Duration) -> Self {
         Self {
             clock_generation: 1,
             last_presented_sequence: 0,
@@ -84,17 +88,13 @@ impl PresentationDeadlinePlanner {
         }
     }
 
-    pub(crate) fn note_presented(
-        &mut self,
-        logical_sequence: u64,
-        presented_at: MonotonicTimestampNs,
-    ) {
+    pub fn note_presented(&mut self, logical_sequence: u64, presented_at: MonotonicTimestampNs) {
         self.last_presented_sequence = logical_sequence;
         self.last_presented_at = Some(presented_at);
         self.scheduled = None;
     }
 
-    pub(crate) fn plan_normal(
+    pub fn plan_normal(
         &mut self,
         now: MonotonicTimestampNs,
         predicted_total_cost: Duration,
@@ -113,7 +113,7 @@ impl PresentationDeadlinePlanner {
         Some(target)
     }
 
-    pub(crate) fn plan_render_ahead(
+    pub fn plan_render_ahead(
         &mut self,
         pending: PresentationTarget,
         now: MonotonicTimestampNs,
@@ -150,7 +150,7 @@ impl PresentationDeadlinePlanner {
         Some(target)
     }
 
-    pub(crate) fn reschedule_earlier(
+    pub fn reschedule_earlier(
         &mut self,
         target: PresentationTarget,
         predicted_total_cost: Duration,
@@ -169,7 +169,7 @@ impl PresentationDeadlinePlanner {
         updated
     }
 
-    pub(crate) fn invalidate(&mut self, refresh_interval: Duration) {
+    pub fn invalidate(&mut self, refresh_interval: Duration) {
         self.clock_generation = self.clock_generation.checked_add(1).unwrap_or(1);
         self.last_presented_sequence = 0;
         self.last_presented_at = None;
@@ -177,7 +177,7 @@ impl PresentationDeadlinePlanner {
         self.scheduled = None;
     }
 
-    pub(crate) const fn is_current(&self, target: PresentationTarget) -> bool {
+    pub const fn is_current(&self, target: PresentationTarget) -> bool {
         target.clock_generation == self.clock_generation
     }
 

@@ -202,6 +202,7 @@ impl NativeScanoutPlan {
 }
 
 pub(crate) enum NativeScanoutBackend {
+    AtomicEglGbm(Box<AtomicEglGbmScanout>),
     NativeEglGbm(Box<NativeEglGbmScanout>),
     Gbm(NativeGbmScanout),
     Dumb(DumbFramebuffer),
@@ -246,6 +247,10 @@ pub(crate) struct NativePageFlipDrain {
 }
 
 impl NativeScanoutBackend {
+    pub(crate) fn from_atomic_explicit(scanout: AtomicEglGbmScanout) -> Self {
+        Self::AtomicEglGbm(Box::new(scanout))
+    }
+
     pub(crate) fn open(
         plan: NativeScanoutPlan,
         kms: &fs::File,
@@ -310,6 +315,7 @@ impl NativeScanoutBackend {
 
     pub(crate) const fn kind(&self) -> NativeScanoutKind {
         match self {
+            Self::AtomicEglGbm(_) => NativeScanoutKind::AtomicEglGbmExplicit,
             Self::NativeEglGbm(_) => NativeScanoutKind::NativeEglGbmOpaqueCompatibility,
             Self::Gbm(_) => NativeScanoutKind::GbmCpuWritePageFlip,
             Self::Dumb(_) => NativeScanoutKind::DumbFramebuffer,
@@ -317,7 +323,7 @@ impl NativeScanoutBackend {
     }
 
     pub(crate) const fn supports_gpu_buffer_protocols(&self) -> bool {
-        matches!(self, Self::NativeEglGbm(_))
+        matches!(self, Self::AtomicEglGbm(_) | Self::NativeEglGbm(_))
     }
 
     pub(crate) fn paint_server_frame(
@@ -329,6 +335,9 @@ impl NativeScanoutBackend {
         damage: &NativeOutputDamage,
     ) -> io::Result<NativePaintOutcome> {
         match self {
+            Self::AtomicEglGbm(_) => Err(io::Error::other(
+                "explicit Atomic output requires a frame-owned render transaction",
+            )),
             Self::NativeEglGbm(scanout) => {
                 scanout.paint_server_frame(renderer, server, input_state, cursor_mode, damage)
             }
@@ -343,6 +352,11 @@ impl NativeScanoutBackend {
 
     pub(crate) fn fb_id(&self) -> u32 {
         match self {
+            Self::AtomicEglGbm(scanout) => scanout
+                .swapchain()
+                .and_then(|swapchain| scanout.framebuffer(swapchain.current()))
+                .map(FramebufferId::get)
+                .unwrap_or(0),
             Self::NativeEglGbm(scanout) => scanout.fb_id(),
             Self::Gbm(scanout) => scanout.fb_id(),
             Self::Dumb(framebuffer) => framebuffer.fb_id,
@@ -351,6 +365,9 @@ impl NativeScanoutBackend {
 
     pub(crate) fn prepare_session_recovery(&self) -> io::Result<NativeScanoutRecovery> {
         match self {
+            Self::AtomicEglGbm(_) => Err(io::Error::other(
+                "explicit Atomic recovery uses generation-checked swapchain recovery",
+            )),
             Self::NativeEglGbm(scanout) => scanout
                 .prepare_session_recovery()
                 .map(NativeScanoutRecovery::NativeEglGbm),
@@ -368,6 +385,9 @@ impl NativeScanoutBackend {
         recovery: NativeScanoutRecovery,
     ) -> io::Result<()> {
         match (self, recovery) {
+            (Self::AtomicEglGbm(_), _) => Err(io::Error::other(
+                "explicit Atomic recovery token is invalid for the opaque recovery API",
+            )),
             (Self::NativeEglGbm(scanout), NativeScanoutRecovery::NativeEglGbm(recovery)) => {
                 scanout.complete_session_recovery(recovery)
             }
@@ -387,6 +407,7 @@ impl NativeScanoutBackend {
 
     pub(crate) fn scanout_format(&self) -> u32 {
         match self {
+            Self::AtomicEglGbm(scanout) => scanout.format_modifier.fourcc,
             Self::NativeEglGbm(scanout) => scanout.format as u32,
             Self::Gbm(_) | Self::Dumb(_) => u32::from_le_bytes(*b"XR24"),
         }
@@ -394,6 +415,7 @@ impl NativeScanoutBackend {
 
     pub(crate) fn finish_initial_scanout(&mut self) {
         match self {
+            Self::AtomicEglGbm(_) => {}
             Self::NativeEglGbm(scanout) => scanout.finish_initial_scanout(),
             Self::Gbm(scanout) => scanout.finish_initial_scanout(),
             Self::Dumb(_) => {}
@@ -402,6 +424,11 @@ impl NativeScanoutBackend {
 
     pub(crate) fn present(&mut self, kms: &KmsBackendSelection) -> io::Result<NativePresentResult> {
         let submitted_token = match self {
+            Self::AtomicEglGbm(_) => {
+                return Err(io::Error::other(
+                    "explicit Atomic output requires IN_FENCE_FD submission",
+                ));
+            }
             Self::NativeEglGbm(scanout) => scanout.present(kms)?,
             Self::Gbm(scanout) => scanout.present(kms)?,
             Self::Dumb(_) => return Ok(NativePresentResult::Immediate),
@@ -414,6 +441,13 @@ impl NativeScanoutBackend {
 
     pub(crate) fn drain_page_flip_events(&mut self, fd: RawFd) -> io::Result<NativePageFlipDrain> {
         match self {
+            Self::AtomicEglGbm(_) => {
+                let events = drain_drm_page_flip_events(fd)?;
+                Ok(NativePageFlipDrain {
+                    completion: events.into_iter().next(),
+                    ..NativePageFlipDrain::default()
+                })
+            }
             Self::NativeEglGbm(scanout) => scanout.drain_page_flip_events(fd),
             Self::Gbm(scanout) => scanout.drain_page_flip_events(fd),
             Self::Dumb(_) => Ok(NativePageFlipDrain::default()),
@@ -422,6 +456,9 @@ impl NativeScanoutBackend {
 
     pub(crate) fn page_flip_pending(&self) -> bool {
         match self {
+            Self::AtomicEglGbm(scanout) => scanout
+                .swapchain()
+                .is_ok_and(|swapchain| swapchain.pending_slot().is_some()),
             Self::NativeEglGbm(scanout) => scanout.page_flip_pending(),
             Self::Gbm(scanout) => scanout.page_flip_pending(),
             Self::Dumb(_) => false,
@@ -430,6 +467,7 @@ impl NativeScanoutBackend {
 
     pub(crate) fn suspend_page_flip(&mut self) {
         match self {
+            Self::AtomicEglGbm(_) => {}
             Self::NativeEglGbm(scanout) => scanout.suspend_page_flip(),
             Self::Gbm(scanout) => scanout.suspend_page_flip(),
             Self::Dumb(_) => {}
@@ -438,6 +476,7 @@ impl NativeScanoutBackend {
 
     pub(crate) fn rebind_session_generation(&mut self, generation: u64) {
         match self {
+            Self::AtomicEglGbm(_) => {}
             Self::NativeEglGbm(scanout) => scanout.rebind_session_generation(generation),
             Self::Gbm(scanout) => scanout.rebind_session_generation(generation),
             Self::Dumb(_) => {}
@@ -446,6 +485,7 @@ impl NativeScanoutBackend {
 
     pub(crate) fn disarm_drm_cleanup(&mut self) {
         match self {
+            Self::AtomicEglGbm(scanout) => scanout.disarm_drm_cleanup(),
             Self::NativeEglGbm(scanout) => scanout.disarm_drm_cleanup(),
             Self::Gbm(scanout) => scanout.disarm_drm_cleanup(),
             Self::Dumb(framebuffer) => framebuffer.drm_cleanup_armed = false,
@@ -454,6 +494,9 @@ impl NativeScanoutBackend {
 
     pub(crate) fn ready_frame_queued(&self) -> bool {
         match self {
+            Self::AtomicEglGbm(scanout) => scanout
+                .swapchain()
+                .is_ok_and(|swapchain| swapchain.ready_slot().is_some()),
             Self::NativeEglGbm(scanout) => scanout.ready_frame_queued(),
             Self::Gbm(scanout) => scanout.ready_frame_queued(),
             Self::Dumb(_) => false,
@@ -462,6 +505,9 @@ impl NativeScanoutBackend {
 
     pub(crate) fn render_target_available(&self) -> bool {
         match self {
+            Self::AtomicEglGbm(scanout) => scanout
+                .swapchain()
+                .is_ok_and(|swapchain| swapchain.free_slot_count() > 0),
             Self::NativeEglGbm(scanout) => scanout.render_target_available(),
             Self::Gbm(scanout) => scanout.render_target_available(),
             Self::Dumb(_) => true,
@@ -470,6 +516,22 @@ impl NativeScanoutBackend {
 
     pub(crate) fn buffer_snapshot(&self) -> NativeScanoutBufferSnapshot {
         match self {
+            Self::AtomicEglGbm(scanout) => {
+                let swapchain = scanout.swapchain().ok();
+                NativeScanoutBufferSnapshot {
+                    backend: NativeScanoutKind::AtomicEglGbmExplicit,
+                    capacity: Some(EXPLICIT_OUTPUT_SLOT_CAPACITY),
+                    current: swapchain.map(|state| usize::from(state.current().get())),
+                    pending: swapchain
+                        .and_then(AtomicOutputSwapchain::pending_slot)
+                        .map(|slot| usize::from(slot.get())),
+                    ready: swapchain
+                        .and_then(AtomicOutputSwapchain::ready_slot)
+                        .map(|slot| usize::from(slot.get())),
+                    free_count: swapchain.map(AtomicOutputSwapchain::free_slot_count),
+                    gbm_surface_has_free_buffers: None,
+                }
+            }
             Self::NativeEglGbm(scanout) => NativeScanoutBufferSnapshot {
                 backend: NativeScanoutKind::NativeEglGbmOpaqueCompatibility,
                 capacity: None,
@@ -513,6 +575,11 @@ impl NativeScanoutBackend {
 
     pub(crate) fn pending_page_flip_token(&self) -> Option<u64> {
         match self {
+            Self::AtomicEglGbm(scanout) => scanout
+                .swapchain()
+                .ok()
+                .and_then(AtomicOutputSwapchain::pending_token)
+                .map(PageFlipToken::get),
             Self::NativeEglGbm(scanout) => {
                 scanout.page_flip.pending_token().map(PageFlipToken::get)
             }
@@ -523,6 +590,7 @@ impl NativeScanoutBackend {
 
     pub(crate) fn dmabuf_feedback(&self) -> EglGlesDmabufFeedback {
         match self {
+            Self::AtomicEglGbm(scanout) => scanout.dmabuf_feedback(),
             Self::NativeEglGbm(scanout) => scanout.dmabuf_feedback.clone(),
             Self::Gbm(_) | Self::Dumb(_) => EglGlesDmabufFeedback::new(Vec::new()),
         }
@@ -530,6 +598,7 @@ impl NativeScanoutBackend {
 
     pub(crate) fn dmabuf_main_device(&self) -> Option<u64> {
         match self {
+            Self::AtomicEglGbm(scanout) => scanout.dmabuf_main_device(),
             Self::NativeEglGbm(scanout) => scanout.dmabuf_main_device,
             Self::Gbm(_) | Self::Dumb(_) => None,
         }
@@ -537,6 +606,7 @@ impl NativeScanoutBackend {
 
     pub(crate) fn dmabuf_main_device_path(&self) -> Option<String> {
         match self {
+            Self::AtomicEglGbm(scanout) => scanout.dmabuf_main_device_path(),
             Self::NativeEglGbm(scanout) => scanout.dmabuf_main_device_path.clone(),
             Self::Gbm(_) | Self::Dumb(_) => None,
         }

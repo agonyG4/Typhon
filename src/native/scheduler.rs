@@ -36,15 +36,16 @@ pub struct SchedulerCapabilities {
     explicit_output_swapchain: bool,
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SchedulerFrameContext {
-    pub(crate) capabilities: SchedulerCapabilities,
-    pub(crate) presentation_target: Option<PresentationTarget>,
-    pub(crate) predicted_total_cost: Duration,
-    pub(crate) now: MonotonicTimestampNs,
-    pub(crate) render_target_available: bool,
-    pub(crate) render_ahead_allowed: bool,
-    pub(crate) ready_frame_present: bool,
+pub struct SchedulerFrameContext {
+    pub capabilities: SchedulerCapabilities,
+    pub presentation_target: Option<PresentationTarget>,
+    pub predicted_total_cost: Duration,
+    pub now: MonotonicTimestampNs,
+    pub render_target_available: bool,
+    pub render_ahead_allowed: bool,
+    pub ready_frame_present: bool,
 }
 
 impl SchedulerCapabilities {
@@ -232,10 +233,7 @@ impl NativeFrameScheduler {
         })
     }
 
-    pub(crate) fn decision_with_context(
-        &mut self,
-        context: SchedulerFrameContext,
-    ) -> SchedulerDecision {
+    pub fn decision_with_context(&mut self, context: SchedulerFrameContext) -> SchedulerDecision {
         let now_ns = context.now.get();
         let _predicted_total_cost = context.predicted_total_cost;
         if self.pending_page_flip_token.is_some() {
@@ -272,6 +270,9 @@ impl NativeFrameScheduler {
             }
             return SchedulerDecision::WaitForPageFlip;
         }
+        if self.ready_frame_queued {
+            return SchedulerDecision::SubmitReady;
+        }
         if self.visual_work_queued {
             if context
                 .presentation_target
@@ -280,9 +281,6 @@ impl NativeFrameScheduler {
                 return SchedulerDecision::WaitForRefresh;
             }
             return SchedulerDecision::Render;
-        }
-        if self.ready_frame_queued {
-            return SchedulerDecision::SubmitReady;
         }
         if self.protocol_work_queued {
             let deadline = match self.refresh_deadline_ns {

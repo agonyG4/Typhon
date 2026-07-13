@@ -362,6 +362,36 @@ impl AtomicRequest {
         Ok(request)
     }
 
+    pub fn set_initial_input_fence(
+        &mut self,
+        pipeline: &AtomicPipelineProperties,
+        in_fence_fd: i32,
+    ) -> Result<(), AtomicKmsError> {
+        let property = pipeline.plane_props.in_fence_fd.ok_or_else(|| {
+            AtomicKmsError::new(
+                AtomicKmsErrorKind::MissingProperty,
+                "primary plane is missing required IN_FENCE_FD",
+            )
+        })?;
+        let value = u64::try_from(in_fence_fd).map_err(|_| {
+            AtomicKmsError::new(
+                AtomicKmsErrorKind::MissingProperty,
+                "initial Atomic input fence FD is negative",
+            )
+        })?;
+        self.set_plane(pipeline.plane, property, value)
+    }
+
+    pub fn set_test_input_fence_none(
+        &mut self,
+        pipeline: &AtomicPipelineProperties,
+    ) -> Result<(), AtomicKmsError> {
+        if let Some(property) = pipeline.plane_props.in_fence_fd {
+            self.set_plane(pipeline.plane, property, u64::MAX)?;
+        }
+        Ok(())
+    }
+
     pub fn safe_disable(pipeline: &AtomicPipelineProperties) -> Result<Self, AtomicKmsError> {
         let mut request = Self::new();
         request.set_connector(pipeline.connector, pipeline.connector_props.crtc_id, 0)?;

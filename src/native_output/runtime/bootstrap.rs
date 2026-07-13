@@ -293,6 +293,17 @@ impl NativeRuntime {
         }
         let scheduler_anchor_ns = monotonic_now_ns()?;
         let mut frame_scheduler = NativeFrameScheduler::new(refresh_hz, scheduler_anchor_ns);
+        let refresh_interval = Duration::from_nanos(refresh_interval_ns);
+        let triple_buffer_policy = AdaptiveTripleBufferPolicy::parse(
+            std::env::var("OBLIVION_ONE_TRIPLE_BUFFERING")
+                .as_deref()
+                .unwrap_or("auto"),
+        )
+        .map_err(io::Error::other)?;
+        let presentation_deadline = PresentationDeadlinePlanner::new(refresh_interval);
+        let scheduled_presentation_target = None;
+        let render_journal = AdaptiveRenderJournal::default();
+        let adaptive_buffering = AdaptiveBufferingController::new(triple_buffer_policy);
         if let Some(token) = scanout.pending_page_flip_token() {
             frame_scheduler
                 .note_async_submission(token, scheduler_anchor_ns)
@@ -374,7 +385,14 @@ impl NativeRuntime {
             parked_acquire_watches: Vec::new(),
             event_loop,
             drm_reactor_token: Some(drm_reactor_token),
+            output_render_fence_token: None,
             frame_scheduler,
+            presentation_deadline,
+            scheduled_presentation_target,
+            render_journal,
+            adaptive_buffering,
+            triple_buffer_policy,
+            pending_proven_deadline_miss: None,
             effective_app_gpu_policy,
             last_render_generation,
             last_renderable_surfaces,
@@ -505,13 +523,59 @@ impl NativeRuntime {
             scanout_plan.primary.as_str()
         );
         let scanout_target = scanout_plan.primary.as_str();
-        let mut scanout = NativeScanoutBackend::open(
-            scanout_plan.clone(),
-            kms.file(),
-            target.width,
-            target.height,
-            drm_file_generation,
-        )?;
+        let connector_id = ConnectorId::new(target.connector_id)
+            .ok_or_else(|| io::Error::other("selected connector ID is zero"))?;
+        let crtc_id = CrtcId::new(target.crtc_id)
+            .ok_or_else(|| io::Error::other("selected CRTC ID is zero"))?;
+        let mut atomic_discovery = None;
+        let mut scanout = if scanout_plan.primary == NativeScanoutKind::AtomicEglGbmExplicit {
+            if kms_policy == KmsPolicy::Legacy {
+                return Err(io::Error::other(
+                    "explicit Atomic EGL/GBM output cannot run with OBLIVION_ONE_KMS_MODE=legacy",
+                )
+                .into());
+            }
+            let discovery = KmsBackendSelection::discover_atomic_pipeline(
+                kms.file().as_fd(),
+                connector_id,
+                crtc_id,
+                u32::from_le_bytes(*b"XR24"),
+            )
+            .or_else(|error| {
+                if error.kind != AtomicKmsErrorKind::NoCompatiblePrimaryPlane {
+                    return Err(error);
+                }
+                KmsBackendSelection::discover_atomic_pipeline(
+                    kms.file().as_fd(),
+                    connector_id,
+                    crtc_id,
+                    u32::from_le_bytes(*b"AR24"),
+                )
+            })?;
+            if !discovery.optional.in_fence_fd {
+                return Err(io::Error::other(
+                    "explicit Atomic EGL/GBM requires primary-plane IN_FENCE_FD",
+                )
+                .into());
+            }
+            let explicit = AtomicEglGbmScanout::create_unattached_pool(
+                kms.file(),
+                &discovery,
+                target.width,
+                target.height,
+                drm_file_generation,
+            )?;
+            atomic_discovery = Some(discovery);
+            NativeScanoutBackend::from_atomic_explicit(explicit)
+        } else {
+            NativeScanoutBackend::open(
+                scanout_plan.clone(),
+                kms.file(),
+                target.width,
+                target.height,
+                drm_file_generation,
+            )?
+        };
         perf.log("native.backend", || {
             vec![
                 NativePerfField::str("drm", kms.kind().as_str()),
@@ -570,7 +634,39 @@ impl NativeRuntime {
             input_plan.primary.as_str()
         );
         let initial_damage = NativeOutputDamage::full_output(target.width, target.height);
-        let initial_paint = match scanout.paint_server_frame(
+        let mut initial_atomic_parts = None;
+        let mut initial_surface_damage = None;
+        let initial_paint = if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut scanout {
+            let slot = explicit.initial_slot();
+            let framebuffer = explicit.framebuffer(slot)?;
+            KmsBackendSelection::test_atomic_modeset_from_discovery(
+                kms.file().as_fd(),
+                atomic_discovery
+                    .as_ref()
+                    .expect("explicit scanout retains Atomic discovery"),
+                target.mode,
+                target.width,
+                target.height,
+                framebuffer,
+            )?;
+            initial_surface_damage = Some(server.capture_surface_damage_presentation());
+            let parts = explicit.render_to_slot(
+                slot,
+                &mut frame_renderer,
+                &server,
+                &input_state,
+                cursor_render_mode,
+                &initial_damage,
+            )?;
+            let stats = parts.paint_stats(
+                explicit.format_modifier.fourcc,
+                target.width,
+                target.height,
+            );
+            initial_atomic_parts = Some(parts);
+            NativePaintOutcome::Rendered(stats)
+        } else {
+            match scanout.paint_server_frame(
         &mut frame_renderer,
         &server,
         &input_state,
@@ -618,8 +714,9 @@ impl NativeRuntime {
                 &initial_damage,
             )?
         }
-        Err(error) => return Err(error.into()),
-    }
+                Err(error) => return Err(error.into()),
+            }
+        }
     .require_rendered("initial native scanout")?;
         println!("native scanout backend active: {}", scanout.kind().as_str());
         let effective_app_gpu_policy =
@@ -661,23 +758,48 @@ impl NativeRuntime {
             ]);
             fields
         });
-        let connector_id = ConnectorId::new(target.connector_id)
-            .ok_or_else(|| io::Error::other("selected connector ID is zero"))?;
-        let crtc_id = CrtcId::new(target.crtc_id)
-            .ok_or_else(|| io::Error::other("selected CRTC ID is zero"))?;
-        let initial_framebuffer = FramebufferId::new(scanout.fb_id())
-            .ok_or_else(|| io::Error::other("initial scanout framebuffer ID is zero"))?;
-        let kms_backend = KmsBackendSelection::initialize(
-            kms.file().as_fd(),
-            kms_policy,
-            connector_id,
-            crtc_id,
-            target.mode,
-            target.width,
-            target.height,
-            scanout.scanout_format(),
-            initial_framebuffer,
-        )?;
+        let kms_backend = if let Some(discovery) = atomic_discovery.take() {
+            let mut parts = initial_atomic_parts
+                .take()
+                .expect("explicit initial render produced frame ownership");
+            let initial_framebuffer = match &scanout {
+                NativeScanoutBackend::AtomicEglGbm(explicit) => explicit.framebuffer(parts.slot)?,
+                _ => unreachable!("Atomic discovery belongs to explicit scanout"),
+            };
+            let submission_fence = parts.render_fence.take_submission_fd()?;
+            let backend = KmsBackendSelection::initialize_atomic_from_discovery_with_fence(
+                kms.file().as_fd(),
+                kms_policy,
+                discovery,
+                target.mode,
+                target.width,
+                target.height,
+                initial_framebuffer,
+                submission_fence,
+            )?;
+            let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut scanout else {
+                unreachable!("Atomic discovery belongs to explicit scanout");
+            };
+            explicit.promote_initial_presented(parts.slot, parts.scene_commit)?;
+            if let Some(surface_damage) = initial_surface_damage.take() {
+                server.commit_surface_damage_presented(surface_damage);
+            }
+            backend
+        } else {
+            let initial_framebuffer = FramebufferId::new(scanout.fb_id())
+                .ok_or_else(|| io::Error::other("initial scanout framebuffer ID is zero"))?;
+            KmsBackendSelection::initialize(
+                kms.file().as_fd(),
+                kms_policy,
+                connector_id,
+                crtc_id,
+                target.mode,
+                target.width,
+                target.height,
+                scanout.scanout_format(),
+                initial_framebuffer,
+            )?
+        };
         println!(
             "native KMS backend active: {}",
             kms_backend.effective_kind().as_str()

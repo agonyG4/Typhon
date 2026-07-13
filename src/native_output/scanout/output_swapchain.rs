@@ -1,8 +1,15 @@
-use std::{io, os::fd::OwnedFd};
+use std::{
+    io,
+    os::fd::{AsRawFd, OwnedFd, RawFd},
+};
 
+use oblivion_one::compositor::{CompositorFrameBatchId, SurfaceDamagePresentation};
 use oblivion_one::native::kms::PageFlipToken;
+#[cfg(test)]
+use oblivion_one::native::presentation_deadline::PresentationTargetReason;
+use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
 
-use crate::egl_renderer::native_fence::NativeRenderFence;
+use crate::egl_renderer::{EglSceneFrameCommit, native_fence::NativeRenderFence};
 
 pub(crate) const EXPLICIT_OUTPUT_SLOT_CAPACITY: usize = 3;
 
@@ -145,19 +152,32 @@ pub(crate) struct RenderedOutputFrame {
     pub(crate) slot: OutputSlotId,
     pub(crate) render_generation: u64,
     pub(crate) pool_generation: u64,
+    pub(crate) target: PresentationTarget,
     pub(crate) render_fence: NativeRenderFence,
+    pub(crate) scene_commit: EglSceneFrameCommit,
+    pub(crate) surface_damage: SurfaceDamagePresentation,
+    pub(crate) protocol_batch_id: CompositorFrameBatchId,
+    pub(crate) composite_started_at: MonotonicTimestampNs,
+    pub(crate) fence_exported_at: MonotonicTimestampNs,
+    pub(crate) rendered_at: MonotonicTimestampNs,
+    pub(crate) cpu_prepass_duration_ns: u64,
+    pub(crate) cpu_encode_duration_ns: u64,
 }
 
 #[derive(Debug)]
 pub(crate) struct SubmittedOutputFrame {
     pub(crate) frame: RenderedOutputFrame,
     pub(crate) token: PageFlipToken,
+    pub(crate) submit_started_at: MonotonicTimestampNs,
+    pub(crate) submit_returned_at: MonotonicTimestampNs,
     pub(crate) out_fence: Option<OwnedFd>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct CompletedOutputFrame {
-    pub(crate) frame_id: u64,
+    pub(crate) frame: RenderedOutputFrame,
+    pub(crate) submit_started_at: MonotonicTimestampNs,
+    pub(crate) submit_returned_at: MonotonicTimestampNs,
     pub(crate) old_current: OutputSlotId,
     pub(crate) new_current: OutputSlotId,
     pub(crate) presentation_serial: u64,
@@ -213,14 +233,74 @@ impl AtomicOutputSwapchain {
         Ok(slot)
     }
 
+    pub(crate) const fn next_frame_id(&self) -> u64 {
+        self.next_frame_id
+    }
+
+    pub(crate) const fn pool_generation(&self) -> u64 {
+        self.pool_generation
+    }
+
+    pub(crate) fn cancel_render_before_gpu(&mut self, slot: OutputSlotId) -> io::Result<()> {
+        if self.rendering != Some(slot) {
+            return Err(io::Error::other(
+                "cancelled output slot does not match active rendering ownership",
+            ));
+        }
+        self.rendering = None;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn finish_render(
         &mut self,
         slot: OutputSlotId,
         render_generation: u64,
         render_fence: NativeRenderFence,
     ) -> io::Result<u64> {
+        let now = MonotonicTimestampNs::new(0);
+        let target = PresentationTarget {
+            sequence: 1,
+            presentation_time: now,
+            render_start_deadline: now,
+            refresh_interval: std::time::Duration::from_nanos(1),
+            reason: PresentationTargetReason::ForcedValidation,
+            clock_generation: self.pool_generation,
+            estimated: true,
+            predicted_unreachable: false,
+        };
+        static NEXT_TEST_SERVER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let socket = format!(
+            "typhon-output-swapchain-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_SERVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let mut server = oblivion_one::compositor::OwnCompositorServer::bind(socket)
+            .expect("test frame ownership server should bind");
+        let protocol_batch_id = server.take_frame_batch_for_render(self.next_frame_id);
+        let surface_damage = server.capture_surface_damage_presentation();
+        self.finish_render_owned(RenderedOutputFrame {
+            id: self.next_frame_id,
+            slot,
+            render_generation,
+            pool_generation: self.pool_generation,
+            target,
+            render_fence,
+            scene_commit: EglSceneFrameCommit::empty_for_test(),
+            surface_damage,
+            protocol_batch_id,
+            composite_started_at: now,
+            fence_exported_at: now,
+            rendered_at: now,
+            cpu_prepass_duration_ns: 0,
+            cpu_encode_duration_ns: 0,
+        })
+    }
+
+    pub(crate) fn finish_render_owned(&mut self, frame: RenderedOutputFrame) -> io::Result<u64> {
         self.ensure_operational()?;
-        if self.rendering != Some(slot) {
+        if self.rendering != Some(frame.slot) {
             return Err(io::Error::other(
                 "finished output slot does not match active rendering ownership",
             ));
@@ -228,20 +308,19 @@ impl AtomicOutputSwapchain {
         if self.ready.is_some() {
             return Err(io::Error::other("an output frame is already ready"));
         }
-        let frame_id = self.next_frame_id;
+        if frame.id != self.next_frame_id || frame.pool_generation != self.pool_generation {
+            return Err(io::Error::other(
+                "rendered output frame identity does not match the swapchain",
+            ));
+        }
+        let frame_id = frame.id;
         let next_frame_id = self
             .next_frame_id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("output frame ID overflow"))?;
         self.next_frame_id = next_frame_id;
         self.rendering = None;
-        self.ready = Some(RenderedOutputFrame {
-            id: frame_id,
-            slot,
-            render_generation,
-            pool_generation: self.pool_generation,
-            render_fence,
-        });
+        self.ready = Some(frame);
         Ok(frame_id)
     }
 
@@ -250,20 +329,83 @@ impl AtomicOutputSwapchain {
         token: PageFlipToken,
         out_fence: Option<OwnedFd>,
     ) -> io::Result<()> {
+        self.submit_ready_timed(
+            token,
+            out_fence,
+            MonotonicTimestampNs::new(0),
+            MonotonicTimestampNs::new(0),
+        )
+    }
+
+    pub(crate) fn submit_ready_timed(
+        &mut self,
+        token: PageFlipToken,
+        out_fence: Option<OwnedFd>,
+        submit_started_at: MonotonicTimestampNs,
+        submit_returned_at: MonotonicTimestampNs,
+    ) -> io::Result<()> {
         self.ensure_operational()?;
         if self.pending.is_some() {
             return Err(io::Error::other("an output pageflip is already pending"));
         }
-        let frame = self
-            .ready
-            .take()
-            .ok_or_else(|| io::Error::other("no rendered output frame is ready"))?;
-        self.pending = Some(SubmittedOutputFrame {
+        let frame = self.take_ready_for_submission()?;
+        self.submission_succeeded(
             frame,
             token,
             out_fence,
+            submit_started_at,
+            submit_returned_at,
+        )
+    }
+
+    pub(crate) fn take_ready_for_submission(&mut self) -> io::Result<RenderedOutputFrame> {
+        self.ensure_operational()?;
+        if self.pending.is_some() {
+            return Err(io::Error::other("an output pageflip is already pending"));
+        }
+        self.ready
+            .take()
+            .ok_or_else(|| io::Error::other("no rendered output frame is ready"))
+    }
+
+    pub(crate) fn submission_succeeded(
+        &mut self,
+        frame: RenderedOutputFrame,
+        token: PageFlipToken,
+        out_fence: Option<OwnedFd>,
+        submit_started_at: MonotonicTimestampNs,
+        submit_returned_at: MonotonicTimestampNs,
+    ) -> io::Result<()> {
+        self.ensure_operational()?;
+        if self.pending.is_some() || frame.pool_generation != self.pool_generation {
+            return Err(io::Error::other(
+                "submitted output frame does not match available pending ownership",
+            ));
+        }
+        self.pending = Some(SubmittedOutputFrame {
+            frame,
+            token,
+            submit_started_at,
+            submit_returned_at,
+            out_fence,
         });
         Ok(())
+    }
+
+    pub(crate) fn submission_failed(
+        &mut self,
+        mut frame: RenderedOutputFrame,
+    ) -> io::Result<RenderedOutputFrame> {
+        if self.quarantine.is_some() {
+            return Err(io::Error::other("an output slot is already quarantined"));
+        }
+        let timing_fence = frame.render_fence.take_timing_fd();
+        self.quarantine_slot(
+            frame.slot,
+            timing_fence,
+            OutputQuarantineReason::AtomicSubmitFailure,
+        )?;
+        Ok(frame)
     }
 
     pub(crate) fn atomic_submit_failed(&mut self) -> io::Result<OutputSlotId> {
@@ -359,7 +501,9 @@ impl AtomicOutputSwapchain {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("output presentation serial overflow"))?;
         Ok(CompletedOutputFrame {
-            frame_id: pending.frame.id,
+            submit_started_at: pending.submit_started_at,
+            submit_returned_at: pending.submit_returned_at,
+            frame: pending.frame,
             old_current,
             new_current: self.current,
             presentation_serial: self.presentation_serial,
@@ -370,8 +514,33 @@ impl AtomicOutputSwapchain {
         self.current
     }
 
+    pub(crate) const fn presentation_serial(&self) -> u64 {
+        self.presentation_serial
+    }
+
     pub(crate) fn pending_slot(&self) -> Option<OutputSlotId> {
         self.pending.as_ref().map(|pending| pending.frame.slot)
+    }
+
+    pub(crate) fn pending_token(&self) -> Option<PageFlipToken> {
+        self.pending.as_ref().map(|pending| pending.token)
+    }
+
+    pub(crate) fn pending_target(&self) -> Option<PresentationTarget> {
+        self.pending.as_ref().map(|pending| pending.frame.target)
+    }
+
+    pub(crate) fn pending_frame_mut(&mut self) -> Option<&mut RenderedOutputFrame> {
+        self.pending.as_mut().map(|pending| &mut pending.frame)
+    }
+
+    pub(crate) fn pending_timing_fd(&self) -> Option<RawFd> {
+        self.pending
+            .as_ref()?
+            .frame
+            .render_fence
+            .timing_fd()
+            .map(AsRawFd::as_raw_fd)
     }
 
     pub(crate) fn ready_slot(&self) -> Option<OutputSlotId> {
@@ -390,6 +559,13 @@ impl AtomicOutputSwapchain {
         self.quarantine
             .as_ref()
             .is_some_and(|quarantine| quarantine.reason.is_fatal())
+    }
+
+    pub(crate) fn free_slot_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| self.slot_is_free(*slot))
+            .count()
     }
 
     pub(crate) fn validate_invariants(&self) -> io::Result<()> {

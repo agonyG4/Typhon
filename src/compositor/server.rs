@@ -327,13 +327,13 @@ impl OwnCompositorServer {
         self.state.mark_render_damage_presented();
     }
 
-    #[allow(dead_code)] // Consumed by the explicit Atomic output runtime integration.
-    pub(crate) fn capture_surface_damage_presentation(&self) -> SurfaceDamagePresentation {
+    #[doc(hidden)]
+    pub fn capture_surface_damage_presentation(&self) -> SurfaceDamagePresentation {
         self.state.capture_surface_damage_presentation()
     }
 
-    #[allow(dead_code)] // Consumed by the explicit Atomic output runtime integration.
-    pub(crate) fn commit_surface_damage_presented(&mut self, token: SurfaceDamagePresentation) {
+    #[doc(hidden)]
+    pub fn commit_surface_damage_presented(&mut self, token: SurfaceDamagePresentation) {
         self.state.commit_surface_damage_presented(token);
     }
 
@@ -683,22 +683,19 @@ impl OwnCompositorServer {
         self.state.capture_frame_callbacks_for_render();
     }
 
-    #[allow(dead_code)] // Consumed by the explicit Atomic output runtime integration.
-    pub(crate) fn take_frame_batch_for_render(&mut self, frame_id: u64) -> CompositorFrameBatchId {
+    #[doc(hidden)]
+    pub fn take_frame_batch_for_render(&mut self, frame_id: u64) -> CompositorFrameBatchId {
         self.state.take_frame_batch_for_render(frame_id)
     }
 
-    #[allow(dead_code)] // Consumed by the explicit Atomic output runtime integration.
-    pub(crate) fn restore_frame_batch_after_render_failure(
-        &mut self,
-        batch_id: CompositorFrameBatchId,
-    ) {
+    #[doc(hidden)]
+    pub fn restore_frame_batch_after_render_failure(&mut self, batch_id: CompositorFrameBatchId) {
         self.state
             .restore_frame_batch_after_render_failure(batch_id);
     }
 
-    #[allow(dead_code)] // Consumed by the explicit Atomic output runtime integration.
-    pub(crate) fn discard_frame_batch(
+    #[doc(hidden)]
+    pub fn discard_frame_batch(
         &mut self,
         batch_id: CompositorFrameBatchId,
         reason: FrameBatchDiscardReason,
@@ -706,8 +703,8 @@ impl OwnCompositorServer {
         self.state.discard_frame_batch(batch_id, reason);
     }
 
-    #[allow(dead_code)] // Consumed by the explicit Atomic output runtime integration.
-    pub(crate) fn complete_presented_frame_batch(
+    #[doc(hidden)]
+    pub fn complete_presented_frame_batch(
         &mut self,
         frame_id: u64,
         batch_id: CompositorFrameBatchId,

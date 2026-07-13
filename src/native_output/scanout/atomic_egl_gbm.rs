@@ -7,12 +7,17 @@ use std::{
 use gbm::AsRaw as _;
 use glow::HasContext;
 use khronos_egl as egl;
+use oblivion_one::compositor::FrameBatchDiscardReason;
+use oblivion_one::native::kms::AtomicFlipRequest;
 use oblivion_one::native::kms::{AtomicDiscovery, DrmFormatModifierPair};
+use oblivion_one::native::sync_file::SyncFileDeadlineHint;
 
 use crate::egl_renderer::dmabuf::query_egl_renderable_dmabuf_formats;
 use crate::egl_renderer::native_fence::{NativeFenceFunctions, NativeRenderFence};
 use crate::egl_renderer::{
-    EglInstance, choose_native_egl_config, create_gles_context, load_egl_image_target_texture_2d,
+    EglFrameOutcome, EglInstance, EglOutputRenderTarget, EglSceneFrameCommit, GlesSceneRenderer,
+    choose_surfaceless_egl_config, create_gles_context, detect_partial_repaint_capabilities,
+    load_egl_image_target_texture_2d,
 };
 
 use super::*;
@@ -23,10 +28,18 @@ pub(crate) struct AtomicEglGbmScanout {
     egl_display: egl::Display,
     egl_context: egl::Context,
     gl: glow::Context,
+    scene: GlesSceneRenderer,
     native_fence_functions: NativeFenceFunctions,
     pool: Option<AtomicOutputPool>,
+    swapchain: Option<AtomicOutputSwapchain>,
+    width: u32,
+    height: u32,
+    dmabuf_feedback: EglGlesDmabufFeedback,
+    dmabuf_main_device: Option<u64>,
+    dmabuf_main_device_path: Option<String>,
     pub(crate) format_modifier: DrmFormatModifierPair,
     drm_cleanup_armed: bool,
+    deadline_hints_enabled: bool,
 }
 
 struct DeviceAllocationProbe<'a> {
@@ -108,7 +121,7 @@ impl AtomicEglGbmScanout {
                 &egl_formats,
                 &mut probe,
             )?;
-            let config = choose_native_egl_config(&egl, egl_display, format_modifier.fourcc)
+            let config = choose_surfaceless_egl_config(&egl, egl_display, format_modifier.fourcc)
                 .map_err(native_egl_io_error)?;
             let egl_context =
                 create_gles_context(&egl, egl_display, config).map_err(native_egl_io_error)?;
@@ -132,6 +145,18 @@ impl AtomicEglGbmScanout {
                         .unwrap_or(ptr::null())
                 })
             };
+            let scene = GlesSceneRenderer::new_current(
+                &egl,
+                width,
+                height,
+                Some(image_target),
+                detect_partial_repaint_capabilities(&egl, egl_display, false),
+            )
+            .map_err(native_egl_io_error)?;
+            let dmabuf_feedback = query_egl_dmabuf_feedback(&egl, egl_display);
+            let (dmabuf_main_device_path, dmabuf_main_device) =
+                query_egl_main_device(&egl, egl_display)
+                    .map_or((None, None), |(path, device)| (Some(path), Some(device)));
             let format = gbm::Format::try_from(format_modifier.fourcc)
                 .map_err(|_| io::Error::other("selected output FourCC is unsupported by GBM"))?;
             let usage = gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING;
@@ -189,22 +214,44 @@ impl AtomicEglGbmScanout {
                 egl_context,
                 gl,
                 native_fence_functions,
+                scene,
                 pool,
                 format_modifier,
+                dmabuf_feedback,
+                dmabuf_main_device,
+                dmabuf_main_device_path,
             ))
         })();
 
         match result {
-            Ok((egl_context, gl, native_fence_functions, pool, format_modifier)) => Ok(Self {
+            Ok((
+                egl_context,
+                gl,
+                native_fence_functions,
+                scene,
+                pool,
+                format_modifier,
+                dmabuf_feedback,
+                dmabuf_main_device,
+                dmabuf_main_device_path,
+            )) => Ok(Self {
                 _device: device,
                 egl,
                 egl_display,
                 egl_context,
                 gl,
+                scene,
                 native_fence_functions,
                 pool: Some(pool),
+                swapchain: None,
+                width,
+                height,
+                dmabuf_feedback,
+                dmabuf_main_device,
+                dmabuf_main_device_path,
                 format_modifier,
                 drm_cleanup_armed: true,
+                deadline_hints_enabled: true,
             }),
             Err(error) => {
                 let _ = egl.make_current(egl_display, None, None, None);
@@ -225,6 +272,399 @@ impl AtomicEglGbmScanout {
             self.native_fence_functions,
         )
         .map_err(|error| io::Error::other(format!("native render fence export failed: {error}")))
+    }
+
+    pub(crate) fn initial_slot(&self) -> OutputSlotId {
+        OutputSlotId::new(0).expect("slot zero is valid")
+    }
+
+    pub(crate) fn framebuffer(&self, slot: OutputSlotId) -> io::Result<FramebufferId> {
+        Ok(self.slot(slot)?.framebuffer)
+    }
+
+    pub(crate) fn render_to_slot(
+        &mut self,
+        slot: OutputSlotId,
+        renderer: &mut NativeFrameRenderer,
+        server: &OwnCompositorServer,
+        input_state: &NativeInputState,
+        cursor_mode: NativeCursorRenderMode,
+        damage: &NativeOutputDamage,
+    ) -> io::Result<AtomicRenderedFrameParts> {
+        self.egl
+            .make_current(self.egl_display, None, None, Some(self.egl_context))
+            .map_err(native_egl_io_error)?;
+        let (framebuffer, buffer_age) = {
+            let slot = self.slot(slot)?;
+            let serial = self
+                .swapchain
+                .as_ref()
+                .map_or(0, AtomicOutputSwapchain::presentation_serial);
+            (slot.gl_framebuffer, slot.buffer_age(serial))
+        };
+        let request = renderer.egl_scene_draw_request(
+            self.width,
+            self.height,
+            server,
+            input_state,
+            cursor_mode,
+            Some(damage.as_renderer_damage(self.width, self.height)),
+        );
+        let started = Instant::now();
+        let outcome = self
+            .scene
+            .draw_scene_to_target(
+                &self.egl,
+                self.egl_display,
+                EglOutputRenderTarget {
+                    framebuffer,
+                    width: self.width,
+                    height: self.height,
+                    buffer_age,
+                },
+                request,
+            )
+            .map_err(native_egl_io_error)?;
+        let EglFrameOutcome::Rendered { commit, stats } = outcome else {
+            return Err(io::Error::other(
+                "explicit Atomic output render unexpectedly produced no frame",
+            ));
+        };
+        let fence = self.create_render_fence()?;
+        Ok(AtomicRenderedFrameParts {
+            slot,
+            scene_commit: commit,
+            render_fence: fence,
+            stats,
+            render_us: elapsed_micros(started),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_frame(
+        &mut self,
+        renderer: &mut NativeFrameRenderer,
+        server: &mut OwnCompositorServer,
+        input_state: &NativeInputState,
+        cursor_mode: NativeCursorRenderMode,
+        damage: &NativeOutputDamage,
+        render_generation: u64,
+        target: PresentationTarget,
+        composite_started_at: MonotonicTimestampNs,
+    ) -> io::Result<u64> {
+        let (slot, frame_id, pool_generation) = {
+            let swapchain = self.swapchain_mut()?;
+            let slot = swapchain.acquire_render_slot()?;
+            (slot, swapchain.next_frame_id(), swapchain.pool_generation())
+        };
+        let protocol_batch_id = server.take_frame_batch_for_render(frame_id);
+        let surface_damage = server.capture_surface_damage_presentation();
+        let parts =
+            match self.render_to_slot(slot, renderer, server, input_state, cursor_mode, damage) {
+                Ok(parts) => parts,
+                Err(error) => {
+                    server.discard_frame_batch(
+                        protocol_batch_id,
+                        FrameBatchDiscardReason::FatalOutputFailure,
+                    );
+                    let _ = self
+                        .swapchain_mut()?
+                        .quarantine_rendering(None, OutputQuarantineReason::PostDrawRenderFailure);
+                    return Err(error);
+                }
+            };
+        let rendered_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
+        let frame = RenderedOutputFrame {
+            id: frame_id,
+            slot,
+            render_generation,
+            pool_generation,
+            target,
+            render_fence: parts.render_fence,
+            scene_commit: parts.scene_commit,
+            surface_damage,
+            protocol_batch_id,
+            composite_started_at,
+            fence_exported_at: rendered_at,
+            rendered_at,
+            cpu_prepass_duration_ns: 0,
+            cpu_encode_duration_ns: parts.render_us.saturating_mul(1_000),
+        };
+        self.swapchain_mut()?.finish_render_owned(frame)
+    }
+
+    pub(crate) fn submit_ready_frame(
+        &mut self,
+        kms: &KmsBackendSelection,
+        server: &mut OwnCompositorServer,
+    ) -> io::Result<u64> {
+        let mut frame = self.swapchain_mut()?.take_ready_for_submission()?;
+        let framebuffer = self.framebuffer(frame.slot)?;
+        let token = PageFlipToken::new(allocate_native_page_flip_token())
+            .expect("allocated native pageflip token is nonzero");
+        if self.deadline_hints_enabled {
+            match frame
+                .render_fence
+                .apply_deadline_hint(frame.target.presentation_time.get(), monotonic_now_ns()?)
+            {
+                Ok(Some(SyncFileDeadlineHint::Applied)) | Ok(None) => {}
+                Ok(Some(SyncFileDeadlineHint::Unsupported)) => {
+                    self.deadline_hints_enabled = false;
+                }
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::EBADF) | Some(libc::EFAULT)) =>
+                {
+                    let frame = self.swapchain_mut()?.submission_failed(frame)?;
+                    self.discard_failed_frame(server, frame);
+                    return Err(io::Error::other(format!(
+                        "invalid native fence deadline-hint contract: {error}"
+                    )));
+                }
+                Err(error) => {
+                    eprintln!("native sync-file deadline hints disabled: {error}");
+                    self.deadline_hints_enabled = false;
+                }
+            }
+        }
+        let in_fence = match frame.render_fence.take_submission_fd() {
+            Ok(fence) => fence,
+            Err(error) => {
+                let frame = self.swapchain_mut()?.submission_failed(frame)?;
+                self.discard_failed_frame(server, frame);
+                return Err(error);
+            }
+        };
+        let submit_started_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
+        let submission = kms.submit_atomic_flip(AtomicFlipRequest {
+            framebuffer,
+            token,
+            in_fence,
+        });
+        let submit_returned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
+        match submission {
+            Ok(submission) => {
+                self.swapchain_mut()?.submission_succeeded(
+                    frame,
+                    token,
+                    submission.out_fence,
+                    submit_started_at,
+                    submit_returned_at,
+                )?;
+                Ok(token.get())
+            }
+            Err(error) => {
+                let frame = self.swapchain_mut()?.submission_failed(frame)?;
+                self.discard_failed_frame(server, frame);
+                Err(io::Error::other(format!(
+                    "explicit Atomic output submission failed: {error}"
+                )))
+            }
+        }
+    }
+
+    pub(crate) fn complete_pageflip(
+        &mut self,
+        token: PageFlipToken,
+        presentation: FramePresentation,
+        server: &mut OwnCompositorServer,
+    ) -> io::Result<PresentedOutputFrame> {
+        let generation = self.swapchain()?.pool_generation();
+        let completed = self.swapchain_mut()?.complete_pageflip(token, generation)?;
+        let fence_signal = completed
+            .frame
+            .render_fence
+            .sample_timing_nonblocking(monotonic_now_ns()?)?
+            .map(|(timestamp, quality)| (MonotonicTimestampNs::new(timestamp), quality));
+        let RenderedOutputFrame {
+            id,
+            target,
+            scene_commit,
+            surface_damage,
+            protocol_batch_id,
+            composite_started_at,
+            ..
+        } = completed.frame;
+        self.scene.commit_presented(scene_commit);
+        server.commit_surface_damage_presented(surface_damage);
+        server.complete_presented_frame_batch(id, protocol_batch_id, presentation);
+        if let Some(pool) = self.pool.as_mut() {
+            pool.slots[usize::from(completed.new_current.get())].last_presented_serial =
+                Some(completed.presentation_serial);
+        }
+        Ok(PresentedOutputFrame {
+            frame_id: id,
+            target,
+            composite_started_at,
+            submit_started_at: completed.submit_started_at,
+            submit_returned_at: completed.submit_returned_at,
+            fence_signal,
+        })
+    }
+
+    pub(crate) fn pending_timing_fd(&self) -> Option<RawFd> {
+        self.swapchain.as_ref()?.pending_timing_fd()
+    }
+
+    pub(crate) fn sample_pending_timing(
+        &mut self,
+        observed_at: MonotonicTimestampNs,
+    ) -> io::Result<Option<PendingFenceTiming>> {
+        let Some(frame) = self.swapchain_mut()?.pending_frame_mut() else {
+            return Ok(None);
+        };
+        let sample = frame
+            .render_fence
+            .sample_timing_nonblocking(observed_at.get())?;
+        let Some((signaled_at, quality)) = sample else {
+            return Ok(None);
+        };
+        let timing = PendingFenceTiming {
+            frame_id: frame.id,
+            target: frame.target,
+            composite_started_at: frame.composite_started_at,
+            signaled_at: MonotonicTimestampNs::new(signaled_at),
+            quality,
+        };
+        drop(frame.render_fence.take_timing_fd());
+        Ok(Some(timing))
+    }
+
+    fn discard_failed_frame(
+        &mut self,
+        server: &mut OwnCompositorServer,
+        frame: RenderedOutputFrame,
+    ) {
+        server.discard_frame_batch(
+            frame.protocol_batch_id,
+            FrameBatchDiscardReason::FatalOutputFailure,
+        );
+        self.scene.discard_rendered(frame.scene_commit);
+        drop(frame.surface_damage);
+    }
+
+    pub(crate) fn promote_initial_presented(
+        &mut self,
+        slot: OutputSlotId,
+        scene_commit: EglSceneFrameCommit,
+    ) -> io::Result<()> {
+        let pool = self
+            .pool
+            .as_mut()
+            .ok_or_else(|| io::Error::other("explicit output pool is unavailable"))?;
+        let slots = OutputSlotSet::new([
+            OutputSlotId::new(0).unwrap(),
+            OutputSlotId::new(1).unwrap(),
+            OutputSlotId::new(2).unwrap(),
+        ])?;
+        self.swapchain = Some(AtomicOutputSwapchain::from_presented_slots(
+            slots,
+            slot,
+            pool.pool_generation,
+        )?);
+        pool.slots[usize::from(slot.get())].last_presented_serial = Some(0);
+        self.scene.commit_presented(scene_commit);
+        Ok(())
+    }
+
+    pub(crate) fn swapchain(&self) -> io::Result<&AtomicOutputSwapchain> {
+        self.swapchain
+            .as_ref()
+            .ok_or_else(|| io::Error::other("explicit output swapchain is not presented"))
+    }
+
+    pub(crate) fn swapchain_mut(&mut self) -> io::Result<&mut AtomicOutputSwapchain> {
+        self.swapchain
+            .as_mut()
+            .ok_or_else(|| io::Error::other("explicit output swapchain is not presented"))
+    }
+
+    pub(crate) fn dmabuf_feedback(&self) -> EglGlesDmabufFeedback {
+        self.dmabuf_feedback.clone()
+    }
+
+    pub(crate) const fn dmabuf_main_device(&self) -> Option<u64> {
+        self.dmabuf_main_device
+    }
+
+    pub(crate) fn dmabuf_main_device_path(&self) -> Option<String> {
+        self.dmabuf_main_device_path.clone()
+    }
+
+    pub(crate) fn disarm_drm_cleanup(&mut self) {
+        self.drm_cleanup_armed = false;
+    }
+
+    fn slot(&self, slot: OutputSlotId) -> io::Result<&AtomicOutputSlot> {
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| io::Error::other("explicit output pool is unavailable"))?;
+        pool.slots
+            .get(usize::from(slot.get()))
+            .filter(|candidate| candidate.id == slot)
+            .ok_or_else(|| io::Error::other("explicit output slot is unavailable"))
+    }
+}
+
+pub(crate) struct AtomicRenderedFrameParts {
+    pub(crate) slot: OutputSlotId,
+    pub(crate) scene_commit: EglSceneFrameCommit,
+    pub(crate) render_fence: NativeRenderFence,
+    pub(crate) stats: GlesSceneFrameStats,
+    pub(crate) render_us: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingFenceTiming {
+    pub(crate) frame_id: u64,
+    pub(crate) target: PresentationTarget,
+    pub(crate) composite_started_at: MonotonicTimestampNs,
+    pub(crate) signaled_at: MonotonicTimestampNs,
+    pub(crate) quality: FenceTimestampQuality,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PresentedOutputFrame {
+    pub(crate) frame_id: u64,
+    pub(crate) target: PresentationTarget,
+    pub(crate) composite_started_at: MonotonicTimestampNs,
+    pub(crate) submit_started_at: MonotonicTimestampNs,
+    pub(crate) submit_returned_at: MonotonicTimestampNs,
+    pub(crate) fence_signal: Option<(MonotonicTimestampNs, FenceTimestampQuality)>,
+}
+
+impl AtomicRenderedFrameParts {
+    pub(crate) fn paint_stats(&self, format: u32, width: u32, height: u32) -> NativePaintStats {
+        NativePaintStats {
+            backend: NativeScanoutKind::AtomicEglGbmExplicit,
+            scanout_format: Some(format),
+            width,
+            height,
+            bytes: 0,
+            copy_bytes: 0,
+            write_bytes: 0,
+            gpu_draw_us: self.render_us,
+            egl_swap_us: 0,
+            shm_upload_bytes: self.stats.shm_upload_bytes,
+            dmabuf_imports: self.stats.dmabuf_imports,
+            dmabuf_reuses: self.stats.dmabuf_reuses,
+            dmabuf_import_failures: self.stats.dmabuf_import_failures,
+            dmabuf_cache_entries: self.stats.dmabuf_cache_entries,
+            dmabuf_cache_peak_entries: self.stats.dmabuf_cache_peak_entries,
+            dmabuf_cache_evictions: self.stats.dmabuf_cache_evictions,
+            scene_rebuild: if self.stats.scene_rebuilt {
+                DesktopSceneRebuildKind::Full
+            } else {
+                DesktopSceneRebuildKind::None
+            },
+            frame_copy: DesktopFrameCopyKind::None,
+            total_us: self.render_us,
+            render_us: self.render_us,
+            copy_us: 0,
+            write_us: 0,
+            gles_repaint: Some(self.stats),
+            swap_with_damage_used: false,
+        }
     }
 }
 

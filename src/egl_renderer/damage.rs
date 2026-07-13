@@ -666,6 +666,17 @@ pub(super) struct EglPresentedDamageState {
     client_cursor: Option<ClientCursorDamageState>,
 }
 
+#[cfg(test)]
+impl EglPresentedDamageState {
+    pub(super) const fn empty_for_test() -> Self {
+        Self {
+            output_size: (1, 1),
+            cursor_rect: None,
+            client_cursor: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ClientCursorDamageState {
     pub(super) rect: Option<SurfaceDamageRect>,

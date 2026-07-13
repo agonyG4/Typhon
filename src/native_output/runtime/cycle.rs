@@ -317,7 +317,13 @@ impl NativeRuntime {
             parked_acquire_watches: _,
             event_loop,
             drm_reactor_token: _,
+            output_render_fence_token,
             frame_scheduler,
+            presentation_deadline,
+            scheduled_presentation_target,
+            render_journal,
+            adaptive_buffering,
+            pending_proven_deadline_miss,
             effective_app_gpu_policy,
             last_render_generation,
             last_renderable_surfaces,
@@ -361,6 +367,49 @@ impl NativeRuntime {
                     NativePerfField::bool("pageflip_watchdog", frame_scheduler.page_flip_pending()),
                 ]
             });
+        }
+        if wakeup.reasons.output_render_fence() {
+            if let Some(token) = output_render_fence_token.take() {
+                event_loop.unregister(token)?;
+            }
+            if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout
+                && let Some(timing) = explicit
+                    .sample_pending_timing(MonotonicTimestampNs::new(monotonic_now_ns()?))?
+            {
+                render_journal.record_render_sample(
+                    timing
+                        .signaled_at
+                        .get()
+                        .saturating_sub(timing.composite_started_at.get()),
+                    timing.signaled_at,
+                );
+                let before = render_journal.prediction(timing.target.refresh_interval);
+                *pending_proven_deadline_miss = match timing.quality {
+                    FenceTimestampQuality::ExactSyncFile
+                        if timing.signaled_at > timing.target.presentation_time =>
+                    {
+                        Some(ProvenDeadlineMiss::ExactRender)
+                    }
+                    FenceTimestampQuality::ObservedApproximate
+                        if approximate_observation_is_late(
+                            timing.signaled_at.get(),
+                            timing.target.presentation_time.get(),
+                            before.p95_wake_lateness_ns,
+                        ) =>
+                    {
+                        Some(ProvenDeadlineMiss::GuardedApproximateRender)
+                    }
+                    _ => None,
+                };
+                perf.log("native.render_fence", || {
+                    vec![
+                        NativePerfField::u64("frame_id", timing.frame_id),
+                        NativePerfField::u64("signal_ns", timing.signaled_at.get()),
+                        NativePerfField::u64("target_ns", timing.target.presentation_time.get()),
+                        NativePerfField::str("quality", format!("{:?}", timing.quality)),
+                    ]
+                });
+            }
         }
 
         if !self.session.permits_output() {
@@ -456,6 +505,72 @@ impl NativeRuntime {
                 let receive_delay_us = compositor_receive_us.saturating_sub(kernel_timestamp_us);
                 let presented_at_ns =
                     compositor_receive_ns.saturating_sub(receive_delay_us.saturating_mul(1_000));
+                if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
+                    if let Some(token) = output_render_fence_token.take() {
+                        event_loop.unregister(token)?;
+                    }
+                    let completed = explicit.complete_pageflip(
+                        PageFlipToken::new(pageflip.user_data)
+                            .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
+                        presentation,
+                        server,
+                    )?;
+                    let presented_at = MonotonicTimestampNs::new(presented_at_ns);
+                    presentation_deadline.note_presented(completed.target.sequence, presented_at);
+                    render_journal.note_matching_presentation(presented_at);
+                    render_journal.record_atomic_submit(
+                        completed
+                            .submit_returned_at
+                            .get()
+                            .saturating_sub(completed.submit_started_at.get()),
+                    );
+                    let refresh = completed.target.refresh_interval;
+                    let before_sample = render_journal.prediction(refresh);
+                    let mut proven_miss = None;
+                    if let Some((signaled_at, quality)) = completed.fence_signal {
+                        render_journal.record_render_sample(
+                            signaled_at
+                                .get()
+                                .saturating_sub(completed.composite_started_at.get()),
+                            signaled_at,
+                        );
+                        let target_ns = completed.target.presentation_time.get();
+                        proven_miss = match quality {
+                            FenceTimestampQuality::ExactSyncFile
+                                if signaled_at.get() > target_ns =>
+                            {
+                                Some(ProvenDeadlineMiss::ExactRender)
+                            }
+                            FenceTimestampQuality::ObservedApproximate
+                                if approximate_observation_is_late(
+                                    signaled_at.get(),
+                                    target_ns,
+                                    before_sample.p95_wake_lateness_ns,
+                                ) =>
+                            {
+                                Some(ProvenDeadlineMiss::GuardedApproximateRender)
+                            }
+                            _ => None,
+                        };
+                    }
+                    if completed.submit_returned_at.get() > completed.target.presentation_time.get()
+                    {
+                        proven_miss = Some(ProvenDeadlineMiss::AtomicSubmit);
+                    }
+                    let prediction = render_journal.prediction(refresh);
+                    adaptive_buffering.observe(
+                        prediction.total_cost_ns,
+                        refresh,
+                        proven_miss,
+                        completed.target.sequence,
+                        presented_at,
+                        server.has_pending_frame_work() || frame_scheduler.visual_work_queued(),
+                    );
+                    *pending_proven_deadline_miss = None;
+                    *scheduled_presentation_target = None;
+                } else {
+                    server.finish_frame_with_presentation(presentation);
+                }
                 frame_pacing.note_pageflip(
                     presented_at_ns,
                     submitted_at_ns,
@@ -472,7 +587,6 @@ impl NativeRuntime {
                 frame_pacing.log("frame_complete", pacing_fields);
                 let cadence = presentation_cadence.record(pageflip.sequence, kernel_timestamp_us);
                 let finish_frame_start = Instant::now();
-                server.finish_frame_with_presentation(presentation);
                 if !server.has_pending_frame_work() {
                     frame_scheduler.complete_protocol_only();
                 }

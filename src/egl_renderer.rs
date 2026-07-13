@@ -121,6 +121,27 @@ impl EglSceneFrameCommit {
     pub(crate) const fn repaint_plan(&self) -> &RepaintPlan {
         &self.repaint_plan
     }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            repaint_plan: RepaintPlan {
+                current_damage: OutputDamage::Empty,
+                repair_damage: OutputDamage::Empty,
+                buffer_age: None,
+                mode: RepaintMode::Skip,
+                fallback_reason: None,
+            },
+            damage_state: EglPresentedDamageState::empty_for_test(),
+            scene_key: EglSceneCacheKey {
+                width: 1,
+                height: 1,
+                content_generation: 0,
+                output_scale_key: 0,
+                surface_signature_hash: 0,
+            },
+        }
+    }
 }
 
 pub struct EglSceneDrawRequest<'a> {
@@ -1914,6 +1935,34 @@ pub(crate) fn choose_native_egl_config(
         .ok_or_else(|| io::Error::other("selected EGL config index out of range").into())
 }
 
+pub(crate) fn choose_surfaceless_egl_config(
+    egl: &EglInstance,
+    display: egl::Display,
+    native_visual_id: u32,
+) -> RendererResult<egl::Config> {
+    let mut configs = Vec::with_capacity(egl.get_config_count(display)?);
+    egl.get_configs(display, &mut configs)?;
+    let candidates = configs
+        .iter()
+        .copied()
+        .map(|config| native_egl_config_candidate(egl, display, config))
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected = candidates
+        .iter()
+        .position(|candidate| {
+            native_egl_config_candidate_matches_common(candidate, native_visual_id)
+        })
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "EGL has no GLES3-capable surfaceless config for native visual {}",
+                native_visual_label(native_visual_id)
+            ))
+        })?;
+    configs.get(selected).copied().ok_or_else(|| {
+        io::Error::other("selected surfaceless EGL config index out of range").into()
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn select_native_egl_visual_format(
     formats: &[u32],
@@ -1956,8 +2005,15 @@ fn native_egl_config_candidate_matches(
     candidate: &NativeEglConfigCandidate,
     native_visual_id: u32,
 ) -> bool {
-    candidate.native_visual_id == native_visual_id
+    native_egl_config_candidate_matches_common(candidate, native_visual_id)
         && (candidate.surface_type & egl::WINDOW_BIT) != 0
+}
+
+fn native_egl_config_candidate_matches_common(
+    candidate: &NativeEglConfigCandidate,
+    native_visual_id: u32,
+) -> bool {
+    candidate.native_visual_id == native_visual_id
         && (candidate.renderable_type & egl::OPENGL_ES3_BIT) != 0
         && candidate.red_size >= 8
         && candidate.green_size >= 8
@@ -2217,6 +2273,15 @@ mod tests {
         let error = select_native_egl_config_candidate(&candidates, XR24).unwrap_err();
 
         assert!(error.to_string().contains("GLES3"));
+    }
+
+    #[test]
+    fn surfaceless_config_does_not_require_window_bit() {
+        let mut candidate = native_candidate(1, XR24);
+        candidate.surface_type = 0;
+
+        assert!(native_egl_config_candidate_matches_common(&candidate, XR24));
+        assert!(!native_egl_config_candidate_matches(&candidate, XR24));
     }
 
     #[test]

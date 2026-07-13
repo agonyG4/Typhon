@@ -9,15 +9,16 @@ const SAMPLE_CAPACITY: usize = 120;
 const MIN_HYSTERESIS_PRESENTATIONS: u64 = 10;
 const MIN_HYSTERESIS_NS: u64 = 100_000_000;
 
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AdaptiveTripleBufferPolicy {
+pub enum AdaptiveTripleBufferPolicy {
     Auto,
     Off,
     Force,
 }
 
 impl AdaptiveTripleBufferPolicy {
-    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+    pub fn parse(value: &str) -> Result<Self, String> {
         match value {
             "auto" => Ok(Self::Auto),
             "off" => Ok(Self::Off),
@@ -29,29 +30,33 @@ impl AdaptiveTripleBufferPolicy {
     }
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AdaptiveBufferingMode {
+pub enum AdaptiveBufferingMode {
     Double,
     Triple,
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TripleEntryReason {
+pub enum TripleEntryReason {
     PredictedDeadlinePressure,
     ProvenReadinessMiss,
     ProvenSubmitMiss,
     ForcedValidation,
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProvenDeadlineMiss {
+pub enum ProvenDeadlineMiss {
     ExactRender,
     GuardedApproximateRender,
     AtomicSubmit,
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FenceTimestampQuality {
+pub enum FenceTimestampQuality {
     ExactSyncFile,
     ObservedApproximate,
 }
@@ -67,22 +72,24 @@ pub(crate) struct FrameTimingObservation {
     pub(crate) submit_returned_at: Option<MonotonicTimestampNs>,
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RenderPrediction {
-    pub(crate) ewma_render_ns: u64,
-    pub(crate) upper_render_deviation_ns: u64,
-    pub(crate) p90_recent_render_ns: u64,
-    pub(crate) render_risk_ns: u64,
-    pub(crate) p95_wake_lateness_ns: u64,
-    pub(crate) p95_atomic_submit_ns: u64,
-    pub(crate) submit_allowance_ns: u64,
-    pub(crate) safety_margin_ns: u64,
-    pub(crate) total_cost_ns: u64,
-    pub(crate) idle_wake_guard: bool,
+pub struct RenderPrediction {
+    pub ewma_render_ns: u64,
+    pub upper_render_deviation_ns: u64,
+    pub p90_recent_render_ns: u64,
+    pub render_risk_ns: u64,
+    pub p95_wake_lateness_ns: u64,
+    pub p95_atomic_submit_ns: u64,
+    pub submit_allowance_ns: u64,
+    pub safety_margin_ns: u64,
+    pub total_cost_ns: u64,
+    pub idle_wake_guard: bool,
 }
 
+#[doc(hidden)]
 #[derive(Debug)]
-pub(crate) struct AdaptiveRenderJournal {
+pub struct AdaptiveRenderJournal {
     render_samples_ns: VecDeque<u64>,
     wake_lateness_samples_ns: VecDeque<u64>,
     atomic_submit_samples_ns: VecDeque<u64>,
@@ -111,7 +118,7 @@ impl Default for AdaptiveRenderJournal {
 }
 
 impl AdaptiveRenderJournal {
-    pub(crate) fn record_render_sample(&mut self, sample_ns: u64, at: MonotonicTimestampNs) {
+    pub fn record_render_sample(&mut self, sample_ns: u64, at: MonotonicTimestampNs) {
         if let Some(previous_at) = self.last_sample_at {
             let previous_mean = self.ewma_render_ns;
             let previous_deviation = self.upper_render_deviation_ns;
@@ -135,23 +142,23 @@ impl AdaptiveRenderJournal {
         self.last_sample_at = Some(at);
     }
 
-    pub(crate) fn record_wake_lateness(&mut self, sample_ns: u64) {
+    pub fn record_wake_lateness(&mut self, sample_ns: u64) {
         push_bounded(&mut self.wake_lateness_samples_ns, sample_ns);
     }
 
-    pub(crate) fn record_atomic_submit(&mut self, sample_ns: u64) {
+    pub fn record_atomic_submit(&mut self, sample_ns: u64) {
         push_bounded(&mut self.atomic_submit_samples_ns, sample_ns);
     }
 
-    pub(crate) fn note_matching_presentation(&mut self, at: MonotonicTimestampNs) {
+    pub fn note_matching_presentation(&mut self, at: MonotonicTimestampNs) {
         self.last_presented_at = Some(at);
     }
 
-    pub(crate) fn prediction(&self, refresh_interval: Duration) -> RenderPrediction {
+    pub fn prediction(&self, refresh_interval: Duration) -> RenderPrediction {
         self.base_prediction(refresh_interval, false)
     }
 
-    pub(crate) fn prediction_at(
+    pub fn prediction_at(
         &mut self,
         now: MonotonicTimestampNs,
         refresh_interval: Duration,
@@ -179,7 +186,7 @@ impl AdaptiveRenderJournal {
         nearest_rank(&self.render_samples_ns, 90)
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         *self = Self::default();
     }
 
@@ -236,8 +243,9 @@ impl AdaptiveRenderJournal {
     }
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct AdaptiveBufferingController {
+pub struct AdaptiveBufferingController {
     policy: AdaptiveTripleBufferPolicy,
     mode: AdaptiveBufferingMode,
     entry_reason: Option<TripleEntryReason>,
@@ -246,7 +254,7 @@ pub(crate) struct AdaptiveBufferingController {
 }
 
 impl AdaptiveBufferingController {
-    pub(crate) const fn new(policy: AdaptiveTripleBufferPolicy) -> Self {
+    pub const fn new(policy: AdaptiveTripleBufferPolicy) -> Self {
         Self {
             policy,
             mode: AdaptiveBufferingMode::Double,
@@ -256,7 +264,7 @@ impl AdaptiveBufferingController {
         }
     }
 
-    pub(crate) fn observe(
+    pub fn observe(
         &mut self,
         predicted_total_cost_ns: u64,
         refresh_interval: Duration,
@@ -325,20 +333,21 @@ impl AdaptiveBufferingController {
         }
     }
 
-    pub(crate) const fn mode(&self) -> AdaptiveBufferingMode {
+    pub const fn mode(&self) -> AdaptiveBufferingMode {
         self.mode
     }
 
-    pub(crate) const fn entry_reason(&self) -> Option<TripleEntryReason> {
+    pub const fn entry_reason(&self) -> Option<TripleEntryReason> {
         self.entry_reason
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         *self = Self::new(self.policy);
     }
 }
 
-pub(crate) fn approximate_observation_is_late(
+#[doc(hidden)]
+pub fn approximate_observation_is_late(
     observed_ns: u64,
     target_ns: u64,
     p95_wake_lateness_ns: u64,

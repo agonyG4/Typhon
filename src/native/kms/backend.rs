@@ -368,6 +368,35 @@ pub struct DrmAtomicBackend {
 }
 
 impl DrmAtomicBackend {
+    pub fn test_initial_from_discovery(
+        fd: BorrowedFd<'_>,
+        discovery: &AtomicDiscovery,
+        mode: drm_sys::drm_mode_modeinfo,
+        width: u32,
+        height: u32,
+        framebuffer: FramebufferId,
+    ) -> Result<(), AtomicKmsError> {
+        let mode_blob = ModeBlob::create(DrmModeBlobIo::new(fd.as_raw_fd()), &mode)?;
+        let geometry = AtomicPlaneGeometry::fullscreen(width, height)?;
+        let mut request = initial_modeset_request_from_discovery(
+            discovery,
+            mode_blob.id(),
+            framebuffer,
+            geometry,
+        )?;
+        request.set_test_input_fence_none(&discovery.pipeline)?;
+        submit_atomic(
+            fd,
+            &AtomicSubmission {
+                request,
+                flags: AtomicCommitFlags::initial_test(),
+                user_data: 0,
+            },
+            AtomicKmsErrorKind::TestOnlyRejected,
+            "pre-render atomic TEST_ONLY commit",
+        )
+    }
+
     pub fn initialize_from_discovery(
         fd: BorrowedFd<'_>,
         discovery: AtomicDiscovery,
@@ -376,16 +405,39 @@ impl DrmAtomicBackend {
         height: u32,
         framebuffer: FramebufferId,
     ) -> Result<Self, AtomicKmsError> {
+        Self::initialize_from_discovery_with_fence(
+            fd,
+            discovery,
+            mode,
+            width,
+            height,
+            framebuffer,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn initialize_from_discovery_with_fence(
+        fd: BorrowedFd<'_>,
+        discovery: AtomicDiscovery,
+        mode: drm_sys::drm_mode_modeinfo,
+        width: u32,
+        height: u32,
+        framebuffer: FramebufferId,
+        initial_in_fence: Option<OwnedFd>,
+    ) -> Result<Self, AtomicKmsError> {
         let mode_blob = ModeBlob::create(DrmModeBlobIo::new(fd.as_raw_fd()), &mode)?;
         let geometry = AtomicPlaneGeometry::fullscreen(width, height)?;
-        let request = initial_modeset_request_from_discovery(
+        let mut request = initial_modeset_request_from_discovery(
             &discovery,
             mode_blob.id(),
             framebuffer,
             geometry,
         )?;
+        let mut test_request = request.clone();
+        test_request.set_test_input_fence_none(&discovery.pipeline)?;
         let test = AtomicSubmission {
-            request: request.clone(),
+            request: test_request,
             flags: AtomicCommitFlags::initial_test(),
             user_data: 0,
         };
@@ -398,6 +450,9 @@ impl DrmAtomicBackend {
         )?;
         let test_only_us = elapsed_micros(test_started);
         let initial_property_count = request.assignment_count();
+        if let Some(in_fence) = initial_in_fence.as_ref() {
+            request.set_initial_input_fence(&discovery.pipeline, in_fence.as_raw_fd())?;
+        }
         let real = AtomicSubmission {
             request,
             flags: AtomicCommitFlags::initial_real(),
@@ -706,6 +761,51 @@ impl KmsBackendSelection {
             fallback_reason: None,
             backend: KmsDisplayBackend::Atomic(backend),
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn initialize_atomic_from_discovery_with_fence(
+        fd: BorrowedFd<'_>,
+        policy: KmsPolicy,
+        discovery: AtomicDiscovery,
+        mode: drm_sys::drm_mode_modeinfo,
+        width: u32,
+        height: u32,
+        framebuffer: FramebufferId,
+        initial_in_fence: OwnedFd,
+    ) -> Result<Self, AtomicKmsError> {
+        let backend = DrmAtomicBackend::initialize_from_discovery_with_fence(
+            fd,
+            discovery,
+            mode,
+            width,
+            height,
+            framebuffer,
+            Some(initial_in_fence),
+        )?;
+        Ok(Self {
+            requested: policy,
+            fallback_reason: None,
+            backend: KmsDisplayBackend::Atomic(backend),
+        })
+    }
+
+    pub fn test_atomic_modeset_from_discovery(
+        fd: BorrowedFd<'_>,
+        discovery: &AtomicDiscovery,
+        mode: drm_sys::drm_mode_modeinfo,
+        width: u32,
+        height: u32,
+        framebuffer: FramebufferId,
+    ) -> Result<(), AtomicKmsError> {
+        DrmAtomicBackend::test_initial_from_discovery(
+            fd,
+            discovery,
+            mode,
+            width,
+            height,
+            framebuffer,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

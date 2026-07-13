@@ -631,8 +631,9 @@ pub struct CompositorState {
     pending_process_launches: VecDeque<PendingProcessLaunch>,
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct CompositorFrameBatchId(NonZeroU64);
+pub struct CompositorFrameBatchId(NonZeroU64);
 
 #[derive(Debug)]
 pub(crate) struct CompositorFrameBatch {
@@ -641,9 +642,9 @@ pub(crate) struct CompositorFrameBatch {
     presentation_feedbacks: Vec<PendingPresentationFeedback>,
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Failure dispositions are wired by the explicit output runtime.
-pub(crate) enum FrameBatchDiscardReason {
+pub enum FrameBatchDiscardReason {
     RenderFailure,
     FatalOutputFailure,
     SuspendAbandonment,
@@ -656,8 +657,9 @@ pub(crate) struct SurfacePresentationKey {
     generation: u64,
 }
 
+#[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SurfaceDamagePresentation {
+pub struct SurfaceDamagePresentation {
     sampled_commits: Vec<(SurfacePresentationKey, SurfaceCommitCounter)>,
 }
 

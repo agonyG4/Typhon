@@ -16,6 +16,7 @@ pub enum NativeEventSource {
     Input(u16),
     Timer,
     ExplicitSyncAcquire,
+    OutputRenderFence,
     ChildSignal,
 }
 
@@ -66,6 +67,7 @@ impl WakeReasons {
     const TIMER: u32 = 1 << 4;
     const EXPLICIT_SYNC_ACQUIRE: u32 = 1 << 5;
     const CHILD_SIGNAL: u32 = 1 << 6;
+    const OUTPUT_RENDER_FENCE: u32 = 1 << 8;
 
     pub const fn drm(self) -> bool {
         self.0 & Self::DRM != 0
@@ -99,6 +101,10 @@ impl WakeReasons {
         self.0 & Self::CHILD_SIGNAL != 0
     }
 
+    pub const fn output_render_fence(self) -> bool {
+        self.0 & Self::OUTPUT_RENDER_FENCE != 0
+    }
+
     pub const fn bits(self) -> u32 {
         self.0
     }
@@ -112,6 +118,7 @@ impl WakeReasons {
             NativeEventSource::Input(_) => Self::INPUT,
             NativeEventSource::Timer => Self::TIMER,
             NativeEventSource::ExplicitSyncAcquire => Self::EXPLICIT_SYNC_ACQUIRE,
+            NativeEventSource::OutputRenderFence => Self::OUTPUT_RENDER_FENCE,
             NativeEventSource::ChildSignal => Self::CHILD_SIGNAL,
         };
     }
