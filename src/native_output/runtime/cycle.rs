@@ -525,7 +525,8 @@ impl NativeRuntime {
                         server,
                     )?;
                     let presented_at = MonotonicTimestampNs::new(presented_at_ns);
-                    presentation_deadline.note_presented(completed.target.sequence, presented_at);
+                    let actual_logical_sequence =
+                        presentation_deadline.note_presented(presented_at);
                     render_journal.note_matching_presentation(presented_at);
                     render_journal.record_atomic_submit(
                         completed
@@ -535,13 +536,11 @@ impl NativeRuntime {
                     );
                     let refresh = completed.target.refresh_interval;
                     let before_sample = render_journal.prediction(refresh);
-                    let mut proven_miss = None;
+                    let mut proven_miss = pending_proven_deadline_miss.take();
                     if let Some((signaled_at, quality)) = completed.fence_signal {
                         frame_pacing.note_fence_timestamp_quality(quality);
                         render_journal.record_render_sample(
-                            signaled_at
-                                .get()
-                                .saturating_sub(completed.composite_started_at.get()),
+                            render_sample_duration_ns(completed.composite_started_at, signaled_at),
                             signaled_at,
                         );
                         let target_ns = completed.target.presentation_time.get();
@@ -568,29 +567,34 @@ impl NativeRuntime {
                         proven_miss = Some(ProvenDeadlineMiss::AtomicSubmit);
                     }
                     let prediction = render_journal.prediction(refresh);
-                    let buffering_mode_before = adaptive_buffering.mode();
-                    adaptive_buffering.observe(
-                        prediction.total_cost_ns,
-                        refresh,
-                        proven_miss,
-                        completed.target.sequence,
-                        presented_at,
-                        server.has_pending_frame_work() || frame_scheduler.visual_work_queued(),
-                    );
-                    frame_pacing.note_adaptive_transition(
-                        buffering_mode_before,
-                        adaptive_buffering.mode(),
-                        proven_miss,
-                    );
-                    frame_pacing.note_explicit_present(
-                        completed.target.presentation_time.get(),
-                        presented_at_ns,
-                        completed.composite_started_at.get(),
-                        completed.rendered_at.get(),
-                        completed.submit_started_at.get(),
-                        completed.submit_returned_at.get(),
-                    );
-                    *pending_proven_deadline_miss = None;
+                    if !scanout.third_slot_owned() {
+                        let buffering_mode_before = adaptive_buffering.mode();
+                        adaptive_buffering.observe(
+                            prediction.total_cost_ns,
+                            refresh,
+                            proven_miss,
+                            completed.target.sequence,
+                            presented_at,
+                            server.has_pending_frame_work() || frame_scheduler.visual_work_queued(),
+                        );
+                        frame_pacing.note_adaptive_transition(
+                            buffering_mode_before,
+                            adaptive_buffering.mode(),
+                            proven_miss,
+                        );
+                    }
+                    frame_pacing.note_explicit_present(ExplicitPresentationObservation {
+                        planned_sequence: completed.target.sequence,
+                        actual_sequence: actual_logical_sequence,
+                        target_ns: completed.target.presentation_time.get(),
+                        presented_ns: presented_at_ns,
+                        composite_started_ns: completed.composite_started_at.get(),
+                        rendered_ns: completed.rendered_at.get(),
+                        submit_started_ns: completed.submit_started_at.get(),
+                        submit_returned_ns: completed.submit_returned_at.get(),
+                        reactive_double: completed.target.reason
+                            == PresentationTargetReason::ReactiveDouble,
+                    });
                     *scheduled_presentation_target = None;
                 } else {
                     server.finish_frame_with_presentation(presentation);
@@ -609,7 +613,12 @@ impl NativeRuntime {
                 ];
                 pacing_fields.extend(snapshot_fields(scanout.buffer_snapshot()));
                 frame_pacing.log("frame_complete", pacing_fields);
-                let cadence = presentation_cadence.record(pageflip.sequence, kernel_timestamp_us);
+                let refresh_interval_us = 1_000_000u64 / u64::from((*refresh_hz).max(1));
+                let cadence = presentation_cadence.record_with_refresh(
+                    pageflip.sequence,
+                    presented_at_ns / 1_000,
+                    refresh_interval_us,
+                );
                 let finish_frame_start = Instant::now();
                 if !server.has_pending_frame_work() {
                     frame_scheduler.complete_protocol_only();
@@ -634,6 +643,18 @@ impl NativeRuntime {
                         NativePerfField::u64(
                             "presentation_sequence_delta",
                             cadence.sequence_delta.map(u64::from).unwrap_or(0),
+                        ),
+                        NativePerfField::u64(
+                            "logical_presentation_sequence",
+                            cadence.logical_sequence,
+                        ),
+                        NativePerfField::u64(
+                            "logical_presentation_sequence_delta",
+                            cadence.logical_sequence_delta.unwrap_or(0),
+                        ),
+                        NativePerfField::bool(
+                            "timestamp_sequence_fallback",
+                            cadence.timestamp_sequence_fallback,
                         ),
                         NativePerfField::bool("presentation_sequence_gap", cadence.sequence_gap),
                         NativePerfField::u64(

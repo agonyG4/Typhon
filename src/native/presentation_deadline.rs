@@ -30,6 +30,7 @@ impl MonotonicTimestampNs {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentationTargetReason {
+    ReactiveDouble,
     Normal,
     PredictedPressure,
     ProvenReadinessMiss,
@@ -41,6 +42,7 @@ pub enum PresentationTargetReason {
 pub struct PresentationTarget {
     pub sequence: u64,
     pub presentation_time: MonotonicTimestampNs,
+    pub submit_not_before: MonotonicTimestampNs,
     pub render_start_deadline: MonotonicTimestampNs,
     pub refresh_interval: Duration,
     pub reason: PresentationTargetReason,
@@ -60,6 +62,10 @@ impl PresentationTarget {
 
     pub const fn render_start_deadline(self) -> MonotonicTimestampNs {
         self.render_start_deadline
+    }
+
+    pub const fn submit_not_before(self) -> MonotonicTimestampNs {
+        self.submit_not_before
     }
 
     pub const fn predicted_unreachable(self) -> bool {
@@ -88,10 +94,24 @@ impl PresentationDeadlinePlanner {
         }
     }
 
-    pub fn note_presented(&mut self, logical_sequence: u64, presented_at: MonotonicTimestampNs) {
+    pub fn note_presented(&mut self, presented_at: MonotonicTimestampNs) -> u64 {
+        let logical_sequence = self
+            .last_presented_at
+            .map(|previous| {
+                let elapsed = presented_at.get().saturating_sub(previous.get());
+                let refresh_ns = duration_ns(self.refresh_interval).max(1);
+                let intervals = elapsed
+                    .saturating_add(refresh_ns / 2)
+                    .checked_div(refresh_ns)
+                    .unwrap_or(1)
+                    .max(1);
+                self.last_presented_sequence.saturating_add(intervals)
+            })
+            .unwrap_or_else(|| self.last_presented_sequence.saturating_add(1));
         self.last_presented_sequence = logical_sequence;
         self.last_presented_at = Some(presented_at);
         self.scheduled = None;
+        logical_sequence
     }
 
     pub fn plan_normal(
@@ -108,9 +128,43 @@ impl PresentationDeadlinePlanner {
             PresentationTargetReason::Normal,
             estimated,
             false,
+            if estimated {
+                MonotonicTimestampNs::new(0)
+            } else {
+                submit_not_before(presentation_time, self.refresh_interval)
+            },
         );
         self.scheduled = Some(target);
         Some(target)
+    }
+
+    pub fn reactive_target(&self, now: MonotonicTimestampNs) -> Option<PresentationTarget> {
+        let sequence = self.last_presented_sequence.checked_add(1)?;
+        let (presentation_time, estimated) = match self.last_presented_at {
+            Some(last_presented_at) => {
+                (last_presented_at.checked_add(self.refresh_interval)?, false)
+            }
+            None => (now.checked_add(self.refresh_interval)?, true),
+        };
+        Some(PresentationTarget {
+            sequence,
+            presentation_time,
+            submit_not_before: now,
+            render_start_deadline: now,
+            refresh_interval: self.refresh_interval,
+            reason: PresentationTargetReason::ReactiveDouble,
+            clock_generation: self.clock_generation,
+            estimated,
+            predicted_unreachable: false,
+        })
+    }
+
+    pub const fn scheduled_target(&self) -> Option<PresentationTarget> {
+        self.scheduled
+    }
+
+    pub fn clear_scheduled_target(&mut self) {
+        self.scheduled = None;
     }
 
     pub fn plan_render_ahead(
@@ -145,6 +199,10 @@ impl PresentationDeadlinePlanner {
             reason,
             pending.estimated,
             unreachable,
+            pending
+                .presentation_time
+                .checked_add(SUBMIT_NOT_BEFORE_GUARD)
+                .unwrap_or(pending.presentation_time),
         );
         self.scheduled = Some(target);
         Some(target)
@@ -201,6 +259,7 @@ impl PresentationDeadlinePlanner {
         Some((sequence, presentation_time, false))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn make_target(
         &self,
         sequence: u64,
@@ -209,10 +268,12 @@ impl PresentationDeadlinePlanner {
         reason: PresentationTargetReason,
         estimated: bool,
         predicted_unreachable: bool,
+        submit_not_before: MonotonicTimestampNs,
     ) -> PresentationTarget {
         PresentationTarget {
             sequence,
             presentation_time,
+            submit_not_before,
             render_start_deadline: presentation_time.saturating_sub_duration(predicted_total_cost),
             refresh_interval: self.refresh_interval,
             reason,
@@ -221,6 +282,18 @@ impl PresentationDeadlinePlanner {
             predicted_unreachable,
         }
     }
+}
+
+const SUBMIT_NOT_BEFORE_GUARD: Duration = Duration::from_micros(100);
+
+fn submit_not_before(
+    presentation_time: MonotonicTimestampNs,
+    refresh_interval: Duration,
+) -> MonotonicTimestampNs {
+    presentation_time
+        .saturating_sub_duration(refresh_interval)
+        .checked_add(SUBMIT_NOT_BEFORE_GUARD)
+        .unwrap_or(presentation_time)
 }
 
 fn duration_ns(duration: Duration) -> u64 {
@@ -245,7 +318,10 @@ mod tests {
     #[test]
     fn pending_frame_targets_exactly_the_following_sequence() {
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
-        planner.note_presented(7, MonotonicTimestampNs::new(70_000_000));
+        assert_eq!(
+            planner.note_presented(MonotonicTimestampNs::new(70_000_000)),
+            1
+        );
         let pending = planner
             .plan_normal(
                 MonotonicTimestampNs::new(71_000_000),
@@ -269,7 +345,7 @@ mod tests {
     #[test]
     fn predictive_render_ahead_rejects_an_unreachable_next_target() {
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
-        planner.note_presented(7, MonotonicTimestampNs::new(70_000_000));
+        planner.note_presented(MonotonicTimestampNs::new(70_000_000));
         let pending = planner
             .plan_normal(
                 MonotonicTimestampNs::new(71_000_000),
@@ -292,7 +368,7 @@ mod tests {
     #[test]
     fn proven_miss_attempts_only_pending_plus_one_when_unreachable() {
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
-        planner.note_presented(7, MonotonicTimestampNs::new(70_000_000));
+        planner.note_presented(MonotonicTimestampNs::new(70_000_000));
         let pending = planner
             .plan_normal(
                 MonotonicTimestampNs::new(71_000_000),
@@ -315,7 +391,7 @@ mod tests {
     #[test]
     fn changed_estimate_only_moves_an_armed_deadline_earlier() {
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
-        planner.note_presented(7, MonotonicTimestampNs::new(70_000_000));
+        planner.note_presented(MonotonicTimestampNs::new(70_000_000));
         let original = planner
             .plan_normal(
                 MonotonicTimestampNs::new(71_000_000),
@@ -344,5 +420,97 @@ mod tests {
         planner.invalidate(Duration::from_nanos(REFRESH_NS));
 
         assert!(!planner.is_current(target));
+    }
+
+    #[test]
+    fn presented_sequence_is_derived_from_timestamp_intervals() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(6_060_606));
+
+        assert_eq!(
+            planner.note_presented(MonotonicTimestampNs::new(6_060_606)),
+            1
+        );
+        assert_eq!(
+            planner.note_presented(MonotonicTimestampNs::new(18_181_818)),
+            3
+        );
+        assert_eq!(
+            planner.note_presented(MonotonicTimestampNs::new(36_363_636)),
+            6
+        );
+    }
+
+    #[test]
+    fn normal_target_submission_boundary_is_immediate_for_n_plus_one_only() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(MonotonicTimestampNs::new(70_000_000));
+
+        let next = planner
+            .plan_normal(
+                MonotonicTimestampNs::new(71_000_000),
+                Duration::from_millis(2),
+            )
+            .unwrap();
+        assert_eq!(next.sequence, 2);
+        assert!(next.submit_not_before().get() < 71_000_000);
+
+        let later = planner
+            .plan_normal(
+                MonotonicTimestampNs::new(71_000_000),
+                Duration::from_millis(12),
+            )
+            .unwrap();
+        assert_eq!(later.sequence, 3);
+        assert!(later.submit_not_before().get() > 71_000_000);
+        assert_eq!(later.submit_not_before().get(), 80_100_000);
+    }
+
+    #[test]
+    fn reactive_target_is_non_gating_n_plus_one_metadata() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        assert_eq!(
+            planner.note_presented(MonotonicTimestampNs::new(70_000_000)),
+            1
+        );
+
+        let target = planner
+            .reactive_target(MonotonicTimestampNs::new(75_000_000))
+            .unwrap();
+
+        assert_eq!(target.sequence, 2);
+        assert_eq!(target.presentation_time.get(), 80_000_000);
+        assert_eq!(target.render_start_deadline.get(), 75_000_000);
+        assert_eq!(target.submit_not_before().get(), 75_000_000);
+        assert_eq!(target.reason, PresentationTargetReason::ReactiveDouble);
+        assert_eq!(planner.scheduled_target(), None);
+    }
+
+    #[test]
+    fn reactive_target_never_selects_n_plus_two_after_a_late_wake() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(MonotonicTimestampNs::new(70_000_000));
+
+        let target = planner
+            .reactive_target(MonotonicTimestampNs::new(95_000_000))
+            .unwrap();
+
+        assert_eq!(target.sequence, 2);
+        assert_eq!(target.presentation_time.get(), 80_000_000);
+        assert_eq!(target.submit_not_before().get(), 95_000_000);
+        assert_eq!(planner.scheduled_target(), None);
+    }
+
+    #[test]
+    fn one_thousand_reactive_frames_never_intentionally_target_n_plus_two() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(6_060_606));
+        let mut presented_at = MonotonicTimestampNs::new(0);
+        for expected_sequence in 1..=1_000 {
+            let target = planner.reactive_target(presented_at).unwrap();
+            assert_eq!(target.sequence, expected_sequence);
+            assert_eq!(target.reason, PresentationTargetReason::ReactiveDouble);
+            assert_eq!(planner.scheduled_target(), None);
+            presented_at = target.presentation_time;
+            assert_eq!(planner.note_presented(presented_at), expected_sequence);
+        }
     }
 }

@@ -38,13 +38,13 @@ use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
 
 use super::{
-    AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, ClientCursorRenderState,
-    CompositorFrameBatchId, CompositorState, ExplicitSyncPoint, FrameBatchDiscardReason,
-    FramePresentation, FullscreenRenderPlanMetrics, InputProtocolCapabilities, OutputRect,
-    PendingProcessLaunch, PresentationClock, RenderGenerationCause, RenderableSurface,
-    RendererProtocolCapabilities, ResizeFlowMetrics, SelectionProtocolCapabilities,
-    SubsurfaceTransactionMetrics, SurfaceDamagePresentation, WindowInteractionDebugSnapshot,
-    WindowInteractionEndReason, color,
+    AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, BufferReleaseMetrics,
+    ClientCursorRenderState, CompositorFrameBatchId, CompositorState, ExplicitSyncPoint,
+    FrameBatchDiscardReason, FramePresentation, FullscreenRenderPlanMetrics,
+    InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PresentationClock,
+    RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
+    SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
+    WindowInteractionDebugSnapshot, WindowInteractionEndReason, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 
@@ -93,6 +93,8 @@ impl Drop for OwnCompositorServer {
 impl OwnCompositorServer {
     pub fn finish_commit_debug_for_shutdown(&mut self) {
         self.state.release_cached_resources_for_shutdown();
+        self.state.discard_all_pending_presentation_feedbacks();
+        self.state.release_client_buffers_for_shutdown();
         if let Some(summary) = self.state.take_commit_debug_summary_line() {
             println!("{summary}");
         }
@@ -704,6 +706,17 @@ impl OwnCompositorServer {
     }
 
     #[doc(hidden)]
+    pub fn complete_frame_batch_after_safe_abandonment(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+        reason: FrameBatchDiscardReason,
+    ) {
+        self.state
+            .complete_frame_batch_after_safe_abandonment(batch_id, reason);
+        let _ = self.display.flush_clients();
+    }
+
+    #[doc(hidden)]
     pub fn complete_presented_frame_batch(
         &mut self,
         frame_id: u64,
@@ -724,13 +737,14 @@ impl OwnCompositorServer {
         let Ok(presentation) = FramePresentation::software_now(self.state.presentation_clock)
         else {
             self.state.discard_all_pending_presentation_feedbacks();
-            self.state.release_pending_buffers();
             let batch_id = self
                 .state
                 .legacy_prepared_frame_batch
                 .expect("software frame capture did not create a frame batch");
-            self.state
-                .discard_frame_batch(batch_id, FrameBatchDiscardReason::OutputDestroyed);
+            self.state.complete_frame_batch_after_safe_abandonment(
+                batch_id,
+                FrameBatchDiscardReason::OutputDestroyed,
+            );
             let _ = self.display.flush_clients();
             return;
         };
@@ -741,10 +755,19 @@ impl OwnCompositorServer {
         if !self.state.has_submitted_frame_batch() {
             self.state.capture_frame_callbacks_for_render();
         }
-        self.state.release_pending_buffers();
         self.state
             .complete_pending_presentation_feedbacks(presentation);
         let _ = self.display.flush_clients();
+    }
+
+    #[doc(hidden)]
+    pub fn buffer_release_metrics(&self) -> BufferReleaseMetrics {
+        self.state.buffer_release_metrics()
+    }
+
+    pub fn verbose_trace_dropped_entries(&self) -> u64 {
+        super::pacing::client_pacing_trace_dropped_entries()
+            .saturating_add(super::pacing::commit_debug_trace_dropped_entries())
     }
 
     pub fn present_frame(&mut self) {

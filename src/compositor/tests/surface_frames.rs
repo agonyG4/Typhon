@@ -158,7 +158,38 @@ fn wayland_client_buffer_release_for_buffer_commit_waits_for_present() {
 }
 
 #[test]
-fn wayland_client_dmabuf_release_is_not_sent_on_same_present_as_replacement() {
+fn explicit_frame_batch_does_not_release_a_late_commit() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let result = exercise_explicit_frame_batch_shm_release_late_commit(&socket_path, &commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let ((buffer_a, buffer_b, _buffer_c), after_frame_a, after_frame_b) = result.unwrap();
+    assert_eq!(after_frame_a, vec![buffer_a, buffer_b]);
+    assert_eq!(after_frame_b, vec![buffer_a, buffer_b, _buffer_c]);
+}
+
+#[test]
+fn destroyed_clients_scrub_pending_captured_and_retired_releases() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    exercise_destroyed_client_release_states(&socket_path, &commands).unwrap();
+    let server = stop_controllable_test_server(commands, server_thread);
+    let metrics = server.buffer_release_metrics();
+
+    assert_eq!(metrics.buffer_releases_completed, 0);
+    assert!(metrics.buffer_releases_discarded >= 3);
+    assert_eq!(metrics.buffer_release_duplicate_attempts, 0);
+}
+
+#[test]
+fn wayland_client_dmabuf_release_is_sent_on_matching_present_after_replacement() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -167,11 +198,16 @@ fn wayland_client_dmabuf_release_is_not_sent_on_same_present_as_replacement() {
     let state = create_dmabuf_surface_then_replace_buffer(&socket_path, &commands);
     let _server = stop_controllable_test_server(commands, server_thread);
 
-    assert_eq!(state.unwrap().buffer_release_count, 0);
+    let state = state.unwrap();
+    assert_eq!(state.buffer_release_count, 1);
+    assert_eq!(
+        state.frame_completion_event_log,
+        vec!["buffer_release", "frame_callback"]
+    );
 }
 
 #[test]
-fn wayland_client_dmabuf_release_is_deferred_for_one_present_after_replacement() {
+fn unrelated_extra_present_does_not_gate_or_duplicate_dmabuf_release() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);

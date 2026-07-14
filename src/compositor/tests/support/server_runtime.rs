@@ -166,6 +166,23 @@ pub(in crate::compositor::tests) enum ServerCommand {
     PrepareFrame,
     FinishFrame,
     FinishFrameWithPresentation(FramePresentation),
+    CaptureFrameBatch {
+        frame_id: u64,
+        reply: Sender<CompositorFrameBatchId>,
+    },
+    CompleteFrameBatch {
+        frame_id: u64,
+        batch_id: CompositorFrameBatchId,
+        presentation: FramePresentation,
+    },
+    CompleteFrameBatchNow {
+        frame_id: u64,
+        batch_id: CompositorFrameBatchId,
+    },
+    DiscardFrameBatch {
+        batch_id: CompositorFrameBatchId,
+        reason: FrameBatchDiscardReason,
+    },
     PresentFrame,
     Stop,
 }
@@ -533,6 +550,25 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::FinishFrameWithPresentation(presentation) => {
                         server.finish_frame_with_presentation(presentation);
+                    }
+                    ServerCommand::CaptureFrameBatch { frame_id, reply } => {
+                        let _ = reply.send(server.take_frame_batch_for_render(frame_id));
+                    }
+                    ServerCommand::CompleteFrameBatch {
+                        frame_id,
+                        batch_id,
+                        presentation,
+                    } => {
+                        server.complete_presented_frame_batch(frame_id, batch_id, presentation);
+                    }
+                    ServerCommand::CompleteFrameBatchNow { frame_id, batch_id } => {
+                        let presentation =
+                            FramePresentation::software_now(server.state.presentation_clock)
+                                .expect("test presentation clock should be usable");
+                        server.complete_presented_frame_batch(frame_id, batch_id, presentation);
+                    }
+                    ServerCommand::DiscardFrameBatch { batch_id, reason } => {
+                        server.discard_frame_batch(batch_id, reason);
                     }
                     ServerCommand::PresentFrame => {
                         server.present_frame();

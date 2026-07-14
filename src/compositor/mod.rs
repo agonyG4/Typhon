@@ -2,7 +2,6 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::File,
     io,
-    num::NonZeroU64,
     os::fd::{AsFd, OwnedFd},
     sync::{Arc, Mutex},
     time::Instant,
@@ -71,6 +70,7 @@ mod color;
 mod commit_debug;
 mod dmabuf;
 mod explicit_sync;
+mod frame_batch;
 mod fullscreen;
 mod idle;
 mod input;
@@ -113,6 +113,8 @@ use explicit_sync::{
     SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT, SYNCOBJ_SURFACE_ERROR_NO_SURFACE,
     SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER, SyncobjSurfaceState, SyncobjTimelineData,
 };
+pub(crate) use frame_batch::CompositorFrameBatch;
+pub use frame_batch::{BufferReleaseMetrics, CompositorFrameBatchId};
 pub use fullscreen::{
     FullscreenPresentationEligibility, FullscreenPresentationRejection,
     FullscreenPresentationState, FullscreenRenderPlanMetrics,
@@ -582,7 +584,7 @@ pub struct CompositorState {
     active_dmabuf_buffers: HashMap<u32, SurfaceBufferRelease>,
     pending_buffer_releases: Vec<wl_buffer::WlBuffer>,
     pending_dmabuf_buffer_releases: Vec<SurfaceBufferRelease>,
-    deferred_dmabuf_buffer_releases: Vec<SurfaceBufferRelease>,
+    buffer_release_metrics: BufferReleaseMetrics,
     pending_explicit_sync_commits: Vec<PendingExplicitSyncCommit>,
     pending_surface_tree_transactions: Vec<PendingSurfaceTreeTransaction>,
     acquire_commit_ids: AcquireCommitIdAllocator,
@@ -591,6 +593,7 @@ pub struct CompositorState {
     pending_frame_callbacks: Vec<wl_callback::WlCallback>,
     pending_presentation_feedbacks: Vec<PendingPresentationFeedback>,
     frame_batches: HashMap<CompositorFrameBatchId, CompositorFrameBatch>,
+    retired_frame_batches: HashMap<CompositorFrameBatchId, CompositorFrameBatch>,
     next_frame_batch_id: u64,
     next_legacy_output_frame_id: u64,
     legacy_prepared_frame_batch: Option<CompositorFrameBatchId>,
@@ -629,17 +632,6 @@ pub struct CompositorState {
     astrea_shell_client_uids: HashSet<u32>,
     typhon_socket_name: Option<String>,
     pending_process_launches: VecDeque<PendingProcessLaunch>,
-}
-
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CompositorFrameBatchId(NonZeroU64);
-
-#[derive(Debug)]
-pub(crate) struct CompositorFrameBatch {
-    frame_id: u64,
-    callbacks: Vec<wl_callback::WlCallback>,
-    presentation_feedbacks: Vec<PendingPresentationFeedback>,
 }
 
 #[doc(hidden)]

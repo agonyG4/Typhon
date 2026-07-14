@@ -108,6 +108,13 @@ pub(crate) struct EglOutputRenderTarget {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) buffer_age: BufferAge,
+    pub(crate) framebuffer_origin: OutputFramebufferOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputFramebufferOrigin {
+    BottomLeft,
+    TopLeftScanout,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +146,7 @@ impl EglSceneFrameCommit {
                 content_generation: 0,
                 output_scale_key: 0,
                 surface_signature_hash: 0,
+                framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
             },
         }
     }
@@ -300,7 +308,13 @@ impl GlesSceneRenderer {
             egl_surface,
             self.repaint_planner.capabilities().buffer_age,
         );
-        self.draw_scene_with_buffer_age(egl, egl_display, request, buffer_age)
+        self.draw_scene_with_buffer_age(
+            egl,
+            egl_display,
+            request,
+            buffer_age,
+            OutputFramebufferOrigin::BottomLeft,
+        )
     }
 
     #[allow(dead_code)] // Wired by the explicit Atomic runtime integration task.
@@ -319,7 +333,13 @@ impl GlesSceneRenderer {
             self.gl
                 .viewport(0, 0, target.width as i32, target.height as i32);
         }
-        let result = self.draw_scene_with_buffer_age(egl, egl_display, request, target.buffer_age);
+        let result = self.draw_scene_with_buffer_age(
+            egl,
+            egl_display,
+            request,
+            target.buffer_age,
+            target.framebuffer_origin,
+        );
         unsafe {
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
@@ -332,6 +352,7 @@ impl GlesSceneRenderer {
         egl_display: egl::Display,
         request: EglSceneDrawRequest<'_>,
         buffer_age: BufferAge,
+        framebuffer_origin: OutputFramebufferOrigin,
     ) -> RendererResult<EglFrameOutcome> {
         let EglSceneDrawRequest {
             width,
@@ -380,6 +401,7 @@ impl GlesSceneRenderer {
             content_generation,
             output_scale_key,
             &surface_signatures,
+            framebuffer_origin,
         );
         let scene_changed = self.presented_scene_key != Some(candidate_scene_key);
         let commands_changed = !self.scene_cache_is_current(
@@ -388,6 +410,7 @@ impl GlesSceneRenderer {
             content_generation,
             output_scale_key,
             &surface_signatures,
+            framebuffer_origin,
         );
         let client_cursor_damage = client_cursor.map(|cursor| {
             ClientCursorDamageState::new(
@@ -435,6 +458,7 @@ impl GlesSceneRenderer {
                 output_scale,
                 output_scale_key,
                 &surface_signatures,
+                framebuffer_origin,
             );
         }
         self.rebuild_overlay_commands(
@@ -444,6 +468,7 @@ impl GlesSceneRenderer {
             &overlay_surfaces,
             client_cursor,
             output_scale,
+            framebuffer_origin,
         );
         let plan = self.repaint_planner.plan(output_damage, buffer_age);
         if plan.mode == RepaintMode::Skip {
@@ -453,7 +478,7 @@ impl GlesSceneRenderer {
                 stats: self.frame_stats,
             });
         }
-        if let Err(error) = self.draw_textured_layers(&plan) {
+        if let Err(error) = self.draw_textured_layers(&plan, framebuffer_origin) {
             self.repaint_planner.invalidate();
             return Err(error);
         }
@@ -934,6 +959,7 @@ impl GlesSceneRenderer {
         content_generation: u64,
         output_scale_key: u32,
         surface_signatures: &[EglSceneSurfaceSignature],
+        framebuffer_origin: OutputFramebufferOrigin,
     ) -> bool {
         self.scene_cache_key.is_some_and(|key| {
             key.is_current(
@@ -942,6 +968,7 @@ impl GlesSceneRenderer {
                 content_generation,
                 output_scale_key,
                 surface_signatures,
+                framebuffer_origin,
             )
         })
     }
@@ -959,6 +986,7 @@ impl GlesSceneRenderer {
         output_scale: f64,
         output_scale_key: u32,
         surface_signatures: &[EglSceneSurfaceSignature],
+        framebuffer_origin: OutputFramebufferOrigin,
     ) {
         self.vertices.clear();
         self.commands.clear();
@@ -972,6 +1000,7 @@ impl GlesSceneRenderer {
             EglRect::new(0.0, 0.0, width as f32, height as f32),
             width,
             height,
+            framebuffer_origin,
         );
 
         let origins = compositor::surface_origins(surfaces);
@@ -999,6 +1028,7 @@ impl GlesSceneRenderer {
                     ),
                     width,
                     height,
+                    framebuffer_origin,
                 );
             }
             let render_plan = compositor::surface_render_plan_with_clip(
@@ -1035,6 +1065,7 @@ impl GlesSceneRenderer {
                 sampling,
                 width,
                 height,
+                framebuffer_origin,
             );
         }
 
@@ -1044,9 +1075,14 @@ impl GlesSceneRenderer {
             content_generation,
             output_scale_key,
             surface_signatures,
+            framebuffer_origin,
         ));
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "overlay command emission keeps target, overlay, cursor, scale, and origin state explicit"
+    )]
     fn rebuild_overlay_commands(
         &mut self,
         width: u32,
@@ -1055,6 +1091,7 @@ impl GlesSceneRenderer {
         overlay_surfaces: &[RenderableSurface],
         client_cursor: Option<compositor::ClientCursorRenderState<'_>>,
         output_scale: f64,
+        framebuffer_origin: OutputFramebufferOrigin,
     ) {
         self.cursor_vertices.clear();
         self.cursor_commands.clear();
@@ -1075,6 +1112,7 @@ impl GlesSceneRenderer {
                 origin_y,
                 render_assignment,
                 output_scale,
+                framebuffer_origin,
             );
         }
 
@@ -1093,6 +1131,7 @@ impl GlesSceneRenderer {
                 ),
                 width,
                 height,
+                framebuffer_origin,
             );
         }
 
@@ -1142,11 +1181,16 @@ impl GlesSceneRenderer {
                 ),
                 width,
                 height,
+                framebuffer_origin,
             );
         }
     }
 
-    fn draw_textured_layers(&mut self, plan: &RepaintPlan) -> RendererResult<()> {
+    fn draw_textured_layers(
+        &mut self,
+        plan: &RepaintPlan,
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> RendererResult<()> {
         let command_count = self
             .commands
             .len()
@@ -1159,7 +1203,7 @@ impl GlesSceneRenderer {
         }
 
         let execution = plan
-            .render_execution(self.current_size.0, self.current_size.1)
+            .render_execution(self.current_size.0, self.current_size.1, framebuffer_origin)
             .ok_or_else(|| io::Error::other("repaint execution conversion failed"))?;
         match execution {
             RenderExecution::Full => {
@@ -1393,6 +1437,7 @@ struct EglSceneCacheKey {
     content_generation: u64,
     output_scale_key: u32,
     surface_signature_hash: u64,
+    framebuffer_origin: OutputFramebufferOrigin,
 }
 
 impl EglSceneCacheKey {
@@ -1402,6 +1447,7 @@ impl EglSceneCacheKey {
         content_generation: u64,
         output_scale_key: u32,
         surface_signatures: &[EglSceneSurfaceSignature],
+        framebuffer_origin: OutputFramebufferOrigin,
     ) -> Self {
         Self {
             width,
@@ -1409,6 +1455,7 @@ impl EglSceneCacheKey {
             content_generation,
             output_scale_key,
             surface_signature_hash: egl_scene_surface_signature_hash(surface_signatures),
+            framebuffer_origin,
         }
     }
 
@@ -1419,12 +1466,14 @@ impl EglSceneCacheKey {
         content_generation: u64,
         output_scale_key: u32,
         surface_signatures: &[EglSceneSurfaceSignature],
+        framebuffer_origin: OutputFramebufferOrigin,
     ) -> bool {
         self.width == width
             && self.height == height
             && self.content_generation == content_generation
             && self.output_scale_key == output_scale_key
             && self.surface_signature_hash == egl_scene_surface_signature_hash(surface_signatures)
+            && self.framebuffer_origin == framebuffer_origin
     }
 }
 
@@ -1473,6 +1522,7 @@ fn push_egl_surface_commands(
     origin_y: i32,
     render_assignment: compositor::SurfaceRenderSpaceAssignment,
     output_scale: f64,
+    framebuffer_origin: OutputFramebufferOrigin,
 ) {
     for rect in compositor::server_frame_rects_for_surface(surface) {
         push_draw_command(
@@ -1489,6 +1539,7 @@ fn push_egl_surface_commands(
             ),
             width,
             height,
+            framebuffer_origin,
         );
     }
     let render_plan = compositor::surface_render_plan_with_clip(
@@ -1525,6 +1576,7 @@ fn push_egl_surface_commands(
         sampling,
         width,
         height,
+        framebuffer_origin,
     );
 }
 
@@ -2490,10 +2542,31 @@ mod tests {
             height: 320,
             ..initial_signature
         };
-        let key = EglSceneCacheKey::new(1280, 800, 9, 120, &[initial_signature]);
+        let key = EglSceneCacheKey::new(
+            1280,
+            800,
+            9,
+            120,
+            &[initial_signature],
+            OutputFramebufferOrigin::BottomLeft,
+        );
 
-        assert!(key.is_current(1280, 800, 9, 120, &[initial_signature]));
-        assert!(!key.is_current(1280, 800, 9, 120, &[resized_signature]));
+        assert!(key.is_current(
+            1280,
+            800,
+            9,
+            120,
+            &[initial_signature],
+            OutputFramebufferOrigin::BottomLeft,
+        ));
+        assert!(!key.is_current(
+            1280,
+            800,
+            9,
+            120,
+            &[resized_signature],
+            OutputFramebufferOrigin::BottomLeft,
+        ));
     }
 
     #[test]
@@ -2523,9 +2596,23 @@ mod tests {
             clip_height: 0,
             ..initial_signature
         };
-        let key = EglSceneCacheKey::new(1280, 800, 9, 120, &[initial_signature]);
+        let key = EglSceneCacheKey::new(
+            1280,
+            800,
+            9,
+            120,
+            &[initial_signature],
+            OutputFramebufferOrigin::BottomLeft,
+        );
 
-        assert!(!key.is_current(1280, 800, 9, 120, &[cropped_signature]));
+        assert!(!key.is_current(
+            1280,
+            800,
+            9,
+            120,
+            &[cropped_signature],
+            OutputFramebufferOrigin::BottomLeft,
+        ));
     }
 
     #[test]
@@ -2550,9 +2637,60 @@ mod tests {
             buffer_id: 12,
             ..initial
         };
-        let key = EglSceneCacheKey::new(1280, 800, 9, 120, &[initial]);
+        let key = EglSceneCacheKey::new(
+            1280,
+            800,
+            9,
+            120,
+            &[initial],
+            OutputFramebufferOrigin::BottomLeft,
+        );
 
-        assert!(!key.is_current(1280, 800, 9, 120, &[replacement]));
+        assert!(!key.is_current(
+            1280,
+            800,
+            9,
+            120,
+            &[replacement],
+            OutputFramebufferOrigin::BottomLeft,
+        ));
+    }
+
+    #[test]
+    fn scene_cache_key_invalidates_when_framebuffer_origin_changes() {
+        let signature = EglSceneSurfaceSignature {
+            surface_id: 7,
+            commit_sequence: 1,
+            buffer_id: 11,
+            x: 10,
+            y: 20,
+            width: 800,
+            height: 600,
+            render_x: 0,
+            render_y: 0,
+            clip_x: 0,
+            clip_y: 0,
+            clip_width: 0,
+            clip_height: 0,
+            generation: 1,
+        };
+        let key = EglSceneCacheKey::new(
+            1280,
+            800,
+            9,
+            120,
+            &[signature],
+            OutputFramebufferOrigin::BottomLeft,
+        );
+
+        assert!(!key.is_current(
+            1280,
+            800,
+            9,
+            120,
+            &[signature],
+            OutputFramebufferOrigin::TopLeftScanout,
+        ));
     }
 
     #[test]

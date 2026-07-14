@@ -1105,7 +1105,9 @@ pub(super) enum SurfaceBufferRelease {
 }
 
 impl SurfaceBufferRelease {
-    pub(super) fn same_buffer_resource(&self, other: &Self) -> bool {
+    /// Compares protocol completion identity, not the underlying client buffer allocation.
+    /// An explicit-sync reuse of one `wl_buffer` has a new token when its timeline point changes.
+    pub(super) fn same_release_token(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::WlBuffer(left), Self::WlBuffer(right)) => same_buffer_resource(left, right),
             (Self::ExplicitSync(left), Self::ExplicitSync(right)) => left == right,

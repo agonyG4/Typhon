@@ -1,9 +1,14 @@
-use std::sync::OnceLock;
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicU64, Ordering},
+    mpsc::{SyncSender, sync_channel},
+};
+use std::thread;
 
 pub(crate) fn client_pacing_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("TYPHON_FRAME_PACING_DEBUG")
+        std::env::var("TYPHON_FRAME_PACING_TRACE")
             .ok()
             .is_some_and(|value| {
                 matches!(
@@ -30,11 +35,89 @@ pub(crate) fn client_pacing_now_ns() -> u64 {
 
 pub(crate) fn client_pacing_log(event: &str, fields: &[(&str, String)]) {
     if client_pacing_enabled() {
-        println!(
-            "{}",
-            client_pacing_line(event, client_pacing_now_ns(), fields)
-        );
+        client_trace_sink().send(client_pacing_line(event, client_pacing_now_ns(), fields));
     }
+}
+
+pub(crate) fn commit_debug_log(line: String) {
+    if commit_debug_enabled() {
+        commit_trace_sink().send(line);
+    }
+}
+
+pub(crate) fn client_pacing_trace_dropped_entries() -> u64 {
+    if client_pacing_enabled() {
+        client_trace_sink().dropped_entries()
+    } else {
+        0
+    }
+}
+
+pub(crate) fn commit_debug_trace_dropped_entries() -> u64 {
+    if commit_debug_enabled() {
+        commit_trace_sink().dropped_entries()
+    } else {
+        0
+    }
+}
+
+fn commit_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_enabled("TYPHON_COMMIT_DEBUG"))
+}
+
+fn env_enabled(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "debug" | "trace"
+        )
+    })
+}
+
+const TRACE_QUEUE_CAPACITY: usize = 2_048;
+
+#[derive(Debug)]
+struct AsyncTraceSink {
+    sender: SyncSender<String>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl AsyncTraceSink {
+    fn new(thread_name: &'static str) -> Self {
+        let (sender, receiver) = sync_channel(TRACE_QUEUE_CAPACITY);
+        let _ = thread::Builder::new()
+            .name(thread_name.to_string())
+            .spawn(move || {
+                while let Ok(line) = receiver.recv() {
+                    println!("{line}");
+                }
+            });
+        Self {
+            sender,
+            dropped: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn send(&self, line: String) {
+        if self.sender.try_send(line).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn dropped_entries(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+fn client_trace_sink() -> &'static AsyncTraceSink {
+    static SINK: OnceLock<AsyncTraceSink> = OnceLock::new();
+    SINK.get_or_init(|| AsyncTraceSink::new("typhon-client-trace"))
+}
+
+fn commit_trace_sink() -> &'static AsyncTraceSink {
+    static SINK: OnceLock<AsyncTraceSink> = OnceLock::new();
+    SINK.get_or_init(|| AsyncTraceSink::new("typhon-commit-trace"))
 }
 
 pub(crate) fn client_pacing_line(event: &str, event_ns: u64, fields: &[(&str, String)]) -> String {

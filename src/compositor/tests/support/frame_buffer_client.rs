@@ -5,6 +5,8 @@ use super::{
     registry_state::*, server_runtime::*, subsurface_client::*, window_ops::*,
 };
 
+type ExplicitBatchReleaseTrace = ((u32, u32, u32), Vec<u32>, Vec<u32>);
+
 pub(in crate::compositor::tests) fn assign_test_toplevel(
     globals: &wayland_client::globals::GlobalList,
     qh: &QueueHandle<RegistryTestState>,
@@ -275,6 +277,138 @@ pub(in crate::compositor::tests) fn create_surface_with_buffer_release(
     Ok(state)
 }
 
+pub(in crate::compositor::tests) fn exercise_explicit_frame_batch_shm_release_late_commit(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<ExplicitBatchReleaseTrace, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let pixels = vec![0xff11_1111; 12];
+    let file = create_test_shm_file(&pixels)?;
+    let pool = shm.create_pool(file.as_fd(), 48, &qh, ());
+    let buffer_a = pool.create_buffer(0, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
+    let buffer_b = pool.create_buffer(16, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
+    let buffer_c = pool.create_buffer(32, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
+    let surface = compositor.create_surface(&qh, ());
+
+    surface.attach(Some(&buffer_a), 0, 0);
+    surface.damage_buffer(0, 0, 2, 2);
+    surface.commit();
+    connection.flush()?;
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PresentFrame)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    surface.attach(Some(&buffer_b), 0, 0);
+    surface.damage_buffer(0, 0, 2, 2);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+
+    let (batch_reply, batch_receiver) = mpsc::channel();
+    commands.send(ServerCommand::CaptureFrameBatch {
+        frame_id: 2,
+        reply: batch_reply,
+    })?;
+    let batch_id = batch_receiver.recv_timeout(Duration::from_secs(1))?;
+
+    surface.attach(Some(&buffer_c), 0, 0);
+    surface.damage_buffer(0, 0, 2, 2);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+
+    commands.send(ServerCommand::CompleteFrameBatchNow {
+        frame_id: 2,
+        batch_id,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let after_frame_a = state.buffer_release_ids.clone();
+
+    let (next_batch_reply, next_batch_receiver) = mpsc::channel();
+    commands.send(ServerCommand::CaptureFrameBatch {
+        frame_id: 3,
+        reply: next_batch_reply,
+    })?;
+    let next_batch_id = next_batch_receiver.recv_timeout(Duration::from_secs(1))?;
+    commands.send(ServerCommand::CompleteFrameBatchNow {
+        frame_id: 3,
+        batch_id: next_batch_id,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    Ok((
+        (
+            buffer_a.id().protocol_id(),
+            buffer_b.id().protocol_id(),
+            buffer_c.id().protocol_id(),
+        ),
+        after_frame_a,
+        state.buffer_release_ids,
+    ))
+}
+
+pub(in crate::compositor::tests) fn exercise_destroyed_client_release_states(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for state in ["pending", "captured", "retired"] {
+        let stream = UnixStream::connect(socket_path)?;
+        let connection = Connection::from_socket(stream)?;
+        let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+        let qh = queue.handle();
+        let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+        let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+        let file = create_test_shm_file(&[0xff11_1111; 8])?;
+        let pool = shm.create_pool(file.as_fd(), 32, &qh, ());
+        let buffer_a = pool.create_buffer(0, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
+        let buffer_b = pool.create_buffer(16, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
+        let surface = compositor.create_surface(&qh, ());
+
+        surface.attach(Some(&buffer_a), 0, 0);
+        surface.damage_buffer(0, 0, 2, 2);
+        surface.commit();
+        connection.flush()?;
+        let mut client_state = RegistryTestState::default();
+        queue.roundtrip(&mut client_state)?;
+        surface.attach(Some(&buffer_b), 0, 0);
+        surface.damage_buffer(0, 0, 2, 2);
+        surface.commit();
+        connection.flush()?;
+        queue.roundtrip(&mut client_state)?;
+
+        let batch_id = if state == "pending" {
+            None
+        } else {
+            let (reply, receiver) = mpsc::channel();
+            commands.send(ServerCommand::CaptureFrameBatch {
+                frame_id: state.len() as u64,
+                reply,
+            })?;
+            Some(receiver.recv_timeout(Duration::from_secs(1))?)
+        };
+        if state == "retired" {
+            commands.send(ServerCommand::DiscardFrameBatch {
+                batch_id: batch_id.expect("retired state captured a batch"),
+                reason: FrameBatchDiscardReason::FatalOutputFailure,
+            })?;
+            wait_for_server_commands(commands);
+        }
+
+        drop(connection);
+        wait_for_server_commands(commands);
+    }
+    Ok(())
+}
+
 pub(in crate::compositor::tests) fn create_dmabuf_surface_then_replace_buffer(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
@@ -305,6 +439,7 @@ pub(in crate::compositor::tests) fn create_dmabuf_surface_then_replace_buffer_in
     let second_buffer = create_test_dmabuf_buffer(&dmabuf, &qh, 0xff22_2222)?;
 
     let surface = compositor.create_surface(&qh, ());
+    assign_test_toplevel(&globals, &qh, &surface)?;
     surface.attach(Some(&first_buffer), 0, 0);
     surface.damage_buffer(0, 0, 2, 2);
     surface.commit();
@@ -318,15 +453,20 @@ pub(in crate::compositor::tests) fn create_dmabuf_surface_then_replace_buffer_in
 
     surface.attach(Some(&second_buffer), 0, 0);
     surface.damage_buffer(0, 0, 2, 2);
+    let _callback = surface.frame(&qh, ());
+    state.tracked_frame_callback_id = Some(_callback.id().protocol_id());
     surface.commit();
     connection.flush()?;
     queue.roundtrip(&mut state)?;
+    wait_for_server_commands(commands);
+    assert_eq!(state.frame_completion_event_log, Vec::<&'static str>::new());
     commands.send(ServerCommand::PresentFrame)?;
     queue.roundtrip(&mut state)?;
-    assert_eq!(state.buffer_release_count, 0);
+    assert_eq!(state.buffer_release_count, 1);
     if extra_present {
         commands.send(ServerCommand::PresentFrame)?;
         queue.roundtrip(&mut state)?;
+        assert_eq!(state.buffer_release_count, 1);
     }
     Ok(state)
 }
@@ -381,10 +521,7 @@ pub(in crate::compositor::tests) fn create_syncobj_dmabuf_surface_and_present(
     queue.roundtrip(&mut state)?;
     commands.send(ServerCommand::PresentFrame)?;
     queue.roundtrip(&mut state)?;
-    assert!(!release_timeline.point_signaled(2)?);
-
-    commands.send(ServerCommand::PresentFrame)?;
-    queue.roundtrip(&mut state)?;
+    assert!(release_timeline.point_signaled(2)?);
     Ok(state)
 }
 

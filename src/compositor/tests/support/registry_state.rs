@@ -9,6 +9,8 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) frame_done: bool,
     pub(in crate::compositor::tests) frame_done_time: Option<u32>,
     pub(in crate::compositor::tests) frame_done_callbacks: Vec<u32>,
+    pub(in crate::compositor::tests) tracked_frame_callback_id: Option<u32>,
+    pub(in crate::compositor::tests) frame_completion_event_log: Vec<&'static str>,
     pub(in crate::compositor::tests) keyboard_key: bool,
     pub(in crate::compositor::tests) keyboard_key_serial: Option<u32>,
     pub(in crate::compositor::tests) keyboard_keys: Vec<u32>,
@@ -109,6 +111,7 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) wl_drm_format: bool,
     pub(in crate::compositor::tests) wl_drm_authenticated: bool,
     pub(in crate::compositor::tests) buffer_release_count: usize,
+    pub(in crate::compositor::tests) buffer_release_ids: Vec<u32>,
     pub(in crate::compositor::tests) presentation_presented_count: usize,
     pub(in crate::compositor::tests) presentation_discarded_count: usize,
     pub(in crate::compositor::tests) presentation_kind:
@@ -573,6 +576,9 @@ impl Dispatch<client_wl_callback::WlCallback, ()> for RegistryTestState {
             state.frame_done = true;
             state.frame_done_time = Some(callback_data);
             state.frame_done_callbacks.push(proxy.id().protocol_id());
+            if state.tracked_frame_callback_id == Some(proxy.id().protocol_id()) {
+                state.frame_completion_event_log.push("frame_callback");
+            }
         }
     }
 }
@@ -949,7 +955,7 @@ impl Dispatch<client_wl_shm_pool::WlShmPool, ()> for RegistryTestState {
 impl Dispatch<client_wl_buffer::WlBuffer, ()> for RegistryTestState {
     fn event(
         state: &mut Self,
-        _proxy: &client_wl_buffer::WlBuffer,
+        proxy: &client_wl_buffer::WlBuffer,
         event: client_wl_buffer::Event,
         _data: &(),
         _conn: &Connection,
@@ -957,6 +963,8 @@ impl Dispatch<client_wl_buffer::WlBuffer, ()> for RegistryTestState {
     ) {
         if let client_wl_buffer::Event::Release = event {
             state.buffer_release_count += 1;
+            state.buffer_release_ids.push(proxy.id().protocol_id());
+            state.frame_completion_event_log.push("buffer_release");
         }
     }
 }

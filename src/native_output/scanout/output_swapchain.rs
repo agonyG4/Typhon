@@ -8,6 +8,7 @@ use oblivion_one::native::kms::PageFlipToken;
 #[cfg(test)]
 use oblivion_one::native::presentation_deadline::PresentationTargetReason;
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
+use oblivion_one::native::scheduler::NativeOutputPacingMode;
 
 use crate::egl_renderer::{EglSceneFrameCommit, native_fence::NativeRenderFence};
 
@@ -144,6 +145,7 @@ pub(crate) struct QuarantinedOutputSlot {
     pub(crate) pool_generation: u64,
     pub(crate) timing_fence: Option<OwnedFd>,
     pub(crate) reason: OutputQuarantineReason,
+    abandoned_frame: Option<RenderedOutputFrame>,
 }
 
 #[derive(Debug)]
@@ -217,12 +219,24 @@ impl AtomicOutputSwapchain {
     }
 
     pub(crate) fn acquire_render_slot(&mut self) -> io::Result<OutputSlotId> {
+        self.acquire_render_slot_for(NativeOutputPacingMode::PredictiveTriple)
+    }
+
+    pub(crate) fn acquire_render_slot_for(
+        &mut self,
+        pacing_mode: NativeOutputPacingMode,
+    ) -> io::Result<OutputSlotId> {
         self.ensure_operational()?;
         if self.rendering.is_some() {
             return Err(io::Error::other("an output slot is already rendering"));
         }
         if self.ready.is_some() {
             return Err(io::Error::other("an output frame is already ready"));
+        }
+        if pacing_mode == NativeOutputPacingMode::ReactiveDouble && self.pending.is_some() {
+            return Err(io::Error::other(
+                "ReactiveDouble cannot acquire a third output slot while pageflip is pending",
+            ));
         }
         let slot = self
             .slots
@@ -231,6 +245,14 @@ impl AtomicOutputSwapchain {
             .ok_or_else(|| io::Error::other("no explicit output slot is free"))?;
         self.rendering = Some(slot);
         Ok(slot)
+    }
+
+    pub(crate) fn render_target_available_for(&self, pacing_mode: NativeOutputPacingMode) -> bool {
+        !self.is_poisoned()
+            && self.rendering.is_none()
+            && self.ready.is_none()
+            && !(pacing_mode == NativeOutputPacingMode::ReactiveDouble && self.pending.is_some())
+            && self.free_slot_count() > 0
     }
 
     pub(crate) const fn next_frame_id(&self) -> u64 {
@@ -262,6 +284,7 @@ impl AtomicOutputSwapchain {
         let target = PresentationTarget {
             sequence: 1,
             presentation_time: now,
+            submit_not_before: now,
             render_start_deadline: now,
             refresh_interval: std::time::Duration::from_nanos(1),
             reason: PresentationTargetReason::ForcedValidation,
@@ -404,6 +427,7 @@ impl AtomicOutputSwapchain {
             frame.slot,
             timing_fence,
             OutputQuarantineReason::AtomicSubmitFailure,
+            None,
         )?;
         Ok(frame)
     }
@@ -422,6 +446,7 @@ impl AtomicOutputSwapchain {
             slot,
             timing_fence,
             OutputQuarantineReason::AtomicSubmitFailure,
+            None,
         )?;
         Ok(slot)
     }
@@ -438,16 +463,16 @@ impl AtomicOutputSwapchain {
             .rendering
             .take()
             .ok_or_else(|| io::Error::other("no rendering slot exists to quarantine"))?;
-        self.quarantine_slot(slot, timing_fence, reason)?;
+        self.quarantine_slot(slot, timing_fence, reason, None)?;
         Ok(slot)
     }
 
-    pub(crate) fn suspend_abandon_ready(&mut self) -> io::Result<Option<RenderedOutputFrame>> {
+    pub(crate) fn suspend_abandon_ready(&mut self) -> io::Result<bool> {
         if self.quarantine.is_some() {
             return Err(io::Error::other("an output slot is already quarantined"));
         }
         let Some(mut frame) = self.ready.take() else {
-            return Ok(None);
+            return Ok(false);
         };
         let slot = frame.slot;
         let timing_fence = frame.render_fence.take_timing_fd();
@@ -455,8 +480,9 @@ impl AtomicOutputSwapchain {
             slot,
             timing_fence,
             OutputQuarantineReason::SuspendAbandonment,
+            Some(frame),
         )?;
-        Ok(Some(frame))
+        Ok(true)
     }
 
     pub(crate) fn suspended_ready_fence_signaled(&self) -> io::Result<bool> {
@@ -492,6 +518,12 @@ impl AtomicOutputSwapchain {
         self.pending.take().map(|submitted| submitted.frame)
     }
 
+    pub(crate) fn take_suspended_ready_frame(&mut self) -> Option<RenderedOutputFrame> {
+        self.quarantine
+            .as_mut()
+            .and_then(|quarantine| quarantine.abandoned_frame.take())
+    }
+
     pub(crate) fn rebind_pool_generation(&mut self, pool_generation: u64) -> io::Result<()> {
         if self.pending.is_some()
             || self.ready.is_some()
@@ -518,6 +550,11 @@ impl AtomicOutputSwapchain {
         if !fence_signaled {
             return Err(io::Error::other(
                 "suspended output slot render fence is not signaled",
+            ));
+        }
+        if quarantine.abandoned_frame.is_some() {
+            return Err(io::Error::other(
+                "suspended ready frame release ownership has not been retired",
             ));
         }
         self.quarantine = None;
@@ -642,11 +679,28 @@ impl AtomicOutputSwapchain {
         Ok(())
     }
 
+    pub(crate) fn validate_invariants_for(
+        &self,
+        pacing_mode: NativeOutputPacingMode,
+    ) -> io::Result<()> {
+        self.validate_invariants()?;
+        if pacing_mode == NativeOutputPacingMode::ReactiveDouble
+            && self.pending.is_some()
+            && (self.ready.is_some() || self.rendering.is_some())
+        {
+            return Err(io::Error::other(
+                "ReactiveDouble cannot own a ready or rendering slot while pageflip is pending",
+            ));
+        }
+        Ok(())
+    }
+
     fn quarantine_slot(
         &mut self,
         slot: OutputSlotId,
         timing_fence: Option<OwnedFd>,
         reason: OutputQuarantineReason,
+        abandoned_frame: Option<RenderedOutputFrame>,
     ) -> io::Result<()> {
         if self.quarantine.is_some() {
             return Err(io::Error::other("an output slot is already quarantined"));
@@ -656,6 +710,7 @@ impl AtomicOutputSwapchain {
             pool_generation: self.pool_generation,
             timing_fence,
             reason,
+            abandoned_frame,
         });
         Ok(())
     }

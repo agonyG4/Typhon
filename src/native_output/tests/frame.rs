@@ -1,5 +1,51 @@
 use super::output::test_renderable_surface;
 use super::*;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReactiveHandoffOperation {
+    PageflipComplete,
+    Render,
+    AtomicSubmit,
+}
+
+#[test]
+fn matching_pageflip_and_queued_reactive_work_render_and_submit_in_one_cycle() {
+    let mut scheduler = NativeFrameScheduler::new(165, 0);
+    scheduler.note_async_submission(41, 1).unwrap();
+    scheduler.queue_visual_work();
+    let mut operations = Vec::new();
+
+    assert!(matches!(
+        scheduler.note_page_flip_completion(41, 6_060_606),
+        PageFlipCompletionResult::Completed { .. }
+    ));
+    operations.push(ReactiveHandoffOperation::PageflipComplete);
+    let decision = scheduler.decision_with_context(SchedulerFrameContext {
+        pacing_mode: NativeOutputPacingMode::ReactiveDouble,
+        capabilities: SchedulerCapabilities::explicit_atomic(true, true),
+        presentation_target: None,
+        predicted_total_cost: Duration::from_millis(100),
+        now: MonotonicTimestampNs::new(6_060_606),
+        render_target_available: true,
+        render_ahead_allowed: false,
+        ready_frame_present: false,
+        ready_target_current: true,
+    });
+    assert_eq!(decision, SchedulerDecision::Render);
+    operations.push(ReactiveHandoffOperation::Render);
+    scheduler.note_async_submission(42, 6_060_607).unwrap();
+    operations.push(ReactiveHandoffOperation::AtomicSubmit);
+
+    assert_eq!(
+        operations,
+        [
+            ReactiveHandoffOperation::PageflipComplete,
+            ReactiveHandoffOperation::Render,
+            ReactiveHandoffOperation::AtomicSubmit,
+        ]
+    );
+    assert!(scheduler.page_flip_pending());
+}
 use crate::native_output::runtime::{
     NativeRepaintDecision, NativeRepaintInputs, native_repaint_decision,
 };

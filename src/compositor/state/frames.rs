@@ -1,6 +1,12 @@
+use std::num::NonZeroU64;
+
 use super::*;
 
 impl CompositorState {
+    pub(in crate::compositor) const fn buffer_release_metrics(&self) -> BufferReleaseMetrics {
+        self.buffer_release_metrics
+    }
+
     pub(in crate::compositor) fn record_surface_tree_merge_metrics(
         &mut self,
         stats: &SurfaceTreeMergeStats,
@@ -226,9 +232,31 @@ impl CompositorState {
             .next_frame_batch_id
             .checked_add(1)
             .expect("compositor frame batch ID overflow");
-        let batch_id = CompositorFrameBatchId(
+        let batch_id = CompositorFrameBatchId::new(
             NonZeroU64::new(self.next_frame_batch_id)
                 .expect("compositor frame batch IDs start at one"),
+        );
+        let shm_buffer_releases = std::mem::take(&mut self.pending_buffer_releases);
+        let dmabuf_releases_to_complete_on_present =
+            std::mem::take(&mut self.pending_dmabuf_buffer_releases);
+        let captured_releases =
+            shm_buffer_releases.len() + dmabuf_releases_to_complete_on_present.len();
+        self.buffer_release_metrics.buffer_releases_captured = self
+            .buffer_release_metrics
+            .buffer_releases_captured
+            .saturating_add(captured_releases as u64);
+        client_pacing_log(
+            "buffer_releases_captured",
+            &[
+                ("frame_batch_id", batch_id.get().to_string()),
+                ("frame_id", frame_id.to_string()),
+                ("count", captured_releases.to_string()),
+                ("shm_count", shm_buffer_releases.len().to_string()),
+                (
+                    "dmabuf_count",
+                    dmabuf_releases_to_complete_on_present.len().to_string(),
+                ),
+            ],
         );
         let previous = self.frame_batches.insert(
             batch_id,
@@ -236,6 +264,8 @@ impl CompositorState {
                 frame_id,
                 callbacks: std::mem::take(&mut self.pending_frame_callbacks),
                 presentation_feedbacks: std::mem::take(&mut self.pending_presentation_feedbacks),
+                shm_buffer_releases,
+                dmabuf_releases_to_complete_on_present,
             },
         );
         assert!(previous.is_none(), "compositor frame batch ID was reused");
@@ -257,23 +287,75 @@ impl CompositorState {
             .presentation_feedbacks
             .append(&mut self.pending_presentation_feedbacks);
         self.pending_presentation_feedbacks = batch.presentation_feedbacks;
+        let restored_shm = batch.shm_buffer_releases.len();
+        batch
+            .shm_buffer_releases
+            .append(&mut self.pending_buffer_releases);
+        self.pending_buffer_releases = batch.shm_buffer_releases;
+        let restored_dmabuf = batch.dmabuf_releases_to_complete_on_present.len();
+        batch
+            .dmabuf_releases_to_complete_on_present
+            .append(&mut self.pending_dmabuf_buffer_releases);
+        self.pending_dmabuf_buffer_releases = batch.dmabuf_releases_to_complete_on_present;
+        self.note_buffer_releases_restored(batch_id, restored_shm + restored_dmabuf);
         self.clear_legacy_batch_reference(batch_id);
     }
 
     pub(in crate::compositor) fn discard_frame_batch(
         &mut self,
         batch_id: CompositorFrameBatchId,
-        _reason: FrameBatchDiscardReason,
+        reason: FrameBatchDiscardReason,
     ) {
         let batch = self
             .frame_batches
             .remove(&batch_id)
             .expect("missing compositor frame batch on discard");
+        let mut batch = batch;
+        for pending in std::mem::take(&mut batch.presentation_feedbacks) {
+            pending.feedback.discarded();
+        }
+        self.complete_frame_callbacks(std::mem::take(&mut batch.callbacks));
+        let frame_id = batch.frame_id;
+        let release_count =
+            batch.shm_buffer_releases.len() + batch.dmabuf_releases_to_complete_on_present.len();
+        self.retired_frame_batches.insert(batch_id, batch);
+        client_pacing_log(
+            "buffer_releases_retired",
+            &[
+                ("frame_batch_id", batch_id.get().to_string()),
+                ("frame_id", frame_id.to_string()),
+                ("count", release_count.to_string()),
+                ("reason", format!("{reason:?}")),
+            ],
+        );
+        self.clear_legacy_batch_reference(batch_id);
+    }
+
+    pub(in crate::compositor) fn complete_frame_batch_after_safe_abandonment(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+        reason: FrameBatchDiscardReason,
+    ) {
+        let batch = self
+            .frame_batches
+            .remove(&batch_id)
+            .or_else(|| self.retired_frame_batches.remove(&batch_id))
+            .expect("missing compositor frame batch after safe abandonment");
+        let frame_id = batch.frame_id;
+        let batch = self.complete_frame_batch_releases(batch_id, batch);
         for pending in batch.presentation_feedbacks {
             pending.feedback.discarded();
         }
         self.complete_frame_callbacks(batch.callbacks);
         self.clear_legacy_batch_reference(batch_id);
+        client_pacing_log(
+            "buffer_releases_completed_after_abandonment",
+            &[
+                ("frame_batch_id", batch_id.get().to_string()),
+                ("frame_id", frame_id.to_string()),
+                ("reason", format!("{reason:?}")),
+            ],
+        );
     }
 
     pub(in crate::compositor) fn complete_presented_frame_batch(
@@ -295,6 +377,7 @@ impl CompositorState {
             .frame_batches
             .remove(&batch_id)
             .expect("compositor frame batch disappeared during completion");
+        let batch = self.complete_frame_batch_releases(batch_id, batch);
         self.clear_legacy_batch_reference(batch_id);
         self.complete_frame_callbacks(batch.callbacks);
         self.complete_presentation_feedbacks(batch.presentation_feedbacks, presentation);
@@ -347,18 +430,283 @@ impl CompositorState {
         }
     }
 
-    pub(in crate::compositor) fn release_pending_buffers(&mut self) {
-        let buffers = std::mem::take(&mut self.pending_buffer_releases);
-        for buffer in buffers {
-            let _ = buffer.send_event(wl_buffer::Event::Release);
+    fn complete_frame_batch_releases(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+        mut batch: CompositorFrameBatch,
+    ) -> CompositorFrameBatch {
+        let frame_id = batch.frame_id;
+        for buffer in batch.shm_buffer_releases.drain(..) {
+            self.complete_wl_buffer_release(batch_id, frame_id, buffer);
         }
 
-        let dmabuf_releases = std::mem::replace(
-            &mut self.deferred_dmabuf_buffer_releases,
-            std::mem::take(&mut self.pending_dmabuf_buffer_releases),
+        let dmabuf_releases = std::mem::take(&mut batch.dmabuf_releases_to_complete_on_present);
+        client_pacing_log(
+            "buffer_releases_completed_on_present",
+            &[
+                ("frame_batch_id", batch_id.get().to_string()),
+                ("frame_id", frame_id.to_string()),
+                ("count", dmabuf_releases.len().to_string()),
+            ],
         );
         for release in dmabuf_releases {
-            release.release();
+            self.complete_dmabuf_release(batch_id, frame_id, release);
+        }
+        batch
+    }
+
+    fn complete_wl_buffer_release(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+        frame_id: u64,
+        buffer: wl_buffer::WlBuffer,
+    ) {
+        if !buffer.is_alive() {
+            self.buffer_release_metrics.buffer_releases_discarded = self
+                .buffer_release_metrics
+                .buffer_releases_discarded
+                .saturating_add(1);
+            client_pacing_log(
+                "buffer_release_scrubbed",
+                &[
+                    ("frame_batch_id", batch_id.get().to_string()),
+                    ("frame_id", frame_id.to_string()),
+                    ("buffer", format!("{:?}", buffer.id())),
+                    ("outcome", "dead_resource".to_string()),
+                ],
+            );
+            return;
+        }
+        match buffer.send_event(wl_buffer::Event::Release) {
+            Ok(()) => {
+                self.buffer_release_metrics.buffer_releases_completed = self
+                    .buffer_release_metrics
+                    .buffer_releases_completed
+                    .saturating_add(1);
+                client_pacing_log(
+                    "buffer_release_completed",
+                    &[
+                        ("frame_batch_id", batch_id.get().to_string()),
+                        ("frame_id", frame_id.to_string()),
+                        ("buffer", format!("{:?}", buffer.id())),
+                        ("kind", "shm".to_string()),
+                    ],
+                );
+            }
+            Err(_) => {
+                self.buffer_release_metrics.buffer_releases_discarded = self
+                    .buffer_release_metrics
+                    .buffer_releases_discarded
+                    .saturating_add(1);
+                client_pacing_log(
+                    "buffer_release_scrubbed",
+                    &[
+                        ("frame_batch_id", batch_id.get().to_string()),
+                        ("frame_id", frame_id.to_string()),
+                        ("buffer", format!("{:?}", buffer.id())),
+                        ("outcome", "send_failed".to_string()),
+                    ],
+                );
+            }
+        }
+    }
+
+    fn complete_dmabuf_release(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+        frame_id: u64,
+        release: SurfaceBufferRelease,
+    ) {
+        release.release();
+        self.buffer_release_metrics.buffer_releases_completed = self
+            .buffer_release_metrics
+            .buffer_releases_completed
+            .saturating_add(1);
+        client_pacing_log(
+            "buffer_release_completed",
+            &[
+                ("frame_batch_id", batch_id.get().to_string()),
+                ("frame_id", frame_id.to_string()),
+                ("kind", "dmabuf".to_string()),
+            ],
+        );
+    }
+
+    pub(in crate::compositor) fn release_client_buffers_for_shutdown(&mut self) {
+        for batch_id in self.frame_batches.keys().copied().collect::<Vec<_>>() {
+            let mut batch = self
+                .frame_batches
+                .remove(&batch_id)
+                .expect("frame batch disappeared during shutdown release");
+            for pending in std::mem::take(&mut batch.presentation_feedbacks) {
+                pending.feedback.discarded();
+            }
+            self.complete_frame_callbacks(std::mem::take(&mut batch.callbacks));
+            self.complete_frame_batch_releases(batch_id, batch);
+        }
+        for batch_id in self
+            .retired_frame_batches
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            let mut batch = self
+                .retired_frame_batches
+                .remove(&batch_id)
+                .expect("retired frame batch disappeared during shutdown release");
+            for pending in std::mem::take(&mut batch.presentation_feedbacks) {
+                pending.feedback.discarded();
+            }
+            self.complete_frame_callbacks(std::mem::take(&mut batch.callbacks));
+            self.complete_frame_batch_releases(batch_id, batch);
+        }
+        self.legacy_prepared_frame_batch = None;
+        self.legacy_submitted_frame_batch = None;
+
+        let pending_shm = std::mem::take(&mut self.pending_buffer_releases);
+        let pending_dmabuf = std::mem::take(&mut self.pending_dmabuf_buffer_releases);
+        for buffer in pending_shm {
+            self.complete_wl_buffer_release(CompositorFrameBatchId::for_shutdown(), 0, buffer);
+        }
+        for release in pending_dmabuf {
+            self.complete_dmabuf_release(CompositorFrameBatchId::for_shutdown(), 0, release);
+        }
+    }
+
+    pub(in crate::compositor) fn note_buffer_releases_restored(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+        count: usize,
+    ) {
+        self.buffer_release_metrics.buffer_releases_restored = self
+            .buffer_release_metrics
+            .buffer_releases_restored
+            .saturating_add(count as u64);
+        client_pacing_log(
+            "buffer_releases_restored",
+            &[
+                ("frame_batch_id", batch_id.get().to_string()),
+                ("count", count.to_string()),
+            ],
+        );
+    }
+
+    pub(in crate::compositor) fn buffer_release_is_owned(
+        &self,
+        candidate: &SurfaceBufferRelease,
+    ) -> bool {
+        let same = |release: &SurfaceBufferRelease| release.same_release_token(candidate);
+        (match candidate {
+            SurfaceBufferRelease::WlBuffer(_buffer) => self
+                .pending_buffer_releases
+                .iter()
+                .any(|existing| same(&SurfaceBufferRelease::WlBuffer(existing.clone()))),
+            SurfaceBufferRelease::ExplicitSync(_) => false,
+        }) || self.pending_dmabuf_buffer_releases.iter().any(same)
+            || self.frame_batches.values().any(|batch| {
+                batch
+                    .shm_buffer_releases
+                    .iter()
+                    .any(|buffer| same(&SurfaceBufferRelease::WlBuffer(buffer.clone())))
+                    || batch
+                        .dmabuf_releases_to_complete_on_present
+                        .iter()
+                        .any(same)
+            })
+            || self.retired_frame_batches.values().any(|batch| {
+                batch
+                    .shm_buffer_releases
+                    .iter()
+                    .any(|buffer| same(&SurfaceBufferRelease::WlBuffer(buffer.clone())))
+                    || batch
+                        .dmabuf_releases_to_complete_on_present
+                        .iter()
+                        .any(same)
+            })
+    }
+
+    pub(in crate::compositor) fn note_buffer_release_duplicate_attempt(&mut self) {
+        self.buffer_release_metrics
+            .buffer_release_duplicate_attempts = self
+            .buffer_release_metrics
+            .buffer_release_duplicate_attempts
+            .saturating_add(1);
+        client_pacing_log(
+            "buffer_release_duplicate_attempt",
+            &[("count", "1".to_string())],
+        );
+    }
+
+    pub(in crate::compositor) fn scrub_dead_buffer_releases(&mut self) {
+        let mut discarded = 0u64;
+        self.pending_buffer_releases.retain(|buffer| {
+            let alive = buffer.is_alive();
+            if !alive {
+                discarded = discarded.saturating_add(1);
+            }
+            alive
+        });
+        self.pending_dmabuf_buffer_releases.retain(|release| {
+            let alive = match release {
+                SurfaceBufferRelease::WlBuffer(buffer) => buffer.is_alive(),
+                SurfaceBufferRelease::ExplicitSync(_) => true,
+            };
+            if !alive {
+                discarded = discarded.saturating_add(1);
+            }
+            alive
+        });
+        for batch in self.frame_batches.values_mut() {
+            batch.shm_buffer_releases.retain(|buffer| {
+                let alive = buffer.is_alive();
+                if !alive {
+                    discarded = discarded.saturating_add(1);
+                }
+                alive
+            });
+            batch
+                .dmabuf_releases_to_complete_on_present
+                .retain(|release| {
+                    let alive = match release {
+                        SurfaceBufferRelease::WlBuffer(buffer) => buffer.is_alive(),
+                        SurfaceBufferRelease::ExplicitSync(_) => true,
+                    };
+                    if !alive {
+                        discarded = discarded.saturating_add(1);
+                    }
+                    alive
+                });
+        }
+        for batch in self.retired_frame_batches.values_mut() {
+            batch.shm_buffer_releases.retain(|buffer| {
+                let alive = buffer.is_alive();
+                if !alive {
+                    discarded = discarded.saturating_add(1);
+                }
+                alive
+            });
+            batch
+                .dmabuf_releases_to_complete_on_present
+                .retain(|release| {
+                    let alive = match release {
+                        SurfaceBufferRelease::WlBuffer(buffer) => buffer.is_alive(),
+                        SurfaceBufferRelease::ExplicitSync(_) => true,
+                    };
+                    if !alive {
+                        discarded = discarded.saturating_add(1);
+                    }
+                    alive
+                });
+        }
+        self.buffer_release_metrics.buffer_releases_discarded = self
+            .buffer_release_metrics
+            .buffer_releases_discarded
+            .saturating_add(discarded);
+        if discarded > 0 {
+            client_pacing_log(
+                "buffer_releases_scrubbed",
+                &[("count", discarded.to_string())],
+            );
         }
     }
 
@@ -966,80 +1314,5 @@ impl CompositorState {
         for (root_surface_id, resize_commit) in superseded_resize_commits {
             self.release_detached_resize_capture(root_surface_id, resize_commit);
         }
-    }
-}
-
-#[cfg(test)]
-mod frame_consumption_tests {
-    use super::*;
-
-    #[test]
-    fn empty_submitted_frame_batch_is_still_owned_until_completion() {
-        let mut state = CompositorState::default();
-        state.capture_frame_callbacks_for_render();
-        state.mark_prepared_frame_submitted();
-
-        assert!(state.has_submitted_frame_batch());
-        state.complete_pending_presentation_feedbacks(
-            FramePresentation::software_now(state.presentation_clock).unwrap(),
-        );
-        assert!(!state.has_submitted_frame_batch());
-        assert!(state.frame_batches.is_empty());
-    }
-
-    #[test]
-    fn prepare_publication_does_not_create_a_submitted_frame_batch() {
-        let mut state = CompositorState::default();
-        state.commit_ready_explicit_sync_buffers();
-        assert!(!state.has_submitted_frame_batch());
-    }
-
-    #[test]
-    fn empty_frame_batch_is_explicit_and_registry_is_bounded_to_two() {
-        let mut state = CompositorState::default();
-        let first = state.take_frame_batch_for_render(10);
-        let second = state.take_frame_batch_for_render(11);
-        assert_eq!(state.frame_batches.len(), 2);
-        assert!(state.frame_batches[&first].callbacks.is_empty());
-        assert!(
-            state.frame_batches[&second]
-                .presentation_feedbacks
-                .is_empty()
-        );
-
-        let overflow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            state.take_frame_batch_for_render(12)
-        }));
-        assert!(overflow.is_err());
-        assert_eq!(state.frame_batches.len(), 2);
-    }
-
-    #[test]
-    fn unrelated_completion_cannot_consume_ready_frame_batch() {
-        let mut state = CompositorState::default();
-        let submitted = state.take_frame_batch_for_render(20);
-        let ready = state.take_frame_batch_for_render(21);
-        let presentation = FramePresentation::software_now(state.presentation_clock).unwrap();
-
-        state.complete_presented_frame_batch(20, submitted, presentation);
-
-        assert!(!state.frame_batches.contains_key(&submitted));
-        assert!(state.frame_batches.contains_key(&ready));
-        state.restore_frame_batch_after_render_failure(ready);
-        assert!(state.frame_batches.is_empty());
-    }
-
-    #[test]
-    fn mismatched_frame_and_batch_identity_completes_nothing() {
-        let mut state = CompositorState::default();
-        let batch = state.take_frame_batch_for_render(30);
-        let presentation = FramePresentation::software_now(state.presentation_clock).unwrap();
-
-        let mismatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            state.complete_presented_frame_batch(31, batch, presentation)
-        }));
-
-        assert!(mismatch.is_err());
-        assert!(state.frame_batches.contains_key(&batch));
     }
 }

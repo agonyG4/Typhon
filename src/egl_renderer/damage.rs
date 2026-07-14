@@ -3,6 +3,8 @@ use std::collections::VecDeque;
 use khronos_egl as egl;
 use oblivion_one::compositor::{DesktopVisualState, SurfaceDamageRect, cursor_texture_size};
 
+use super::OutputFramebufferOrigin;
+
 pub(crate) const MAX_PARTIAL_REPAINT_RECTS: usize = 8;
 pub(crate) const MAX_DAMAGE_HISTORY_FRAMES: usize = 8;
 const MAX_EXPLICIT_OUTPUT_BUFFER_AGE: u32 = 3;
@@ -168,8 +170,9 @@ impl OutputDamage {
         &self,
         output_width: u32,
         output_height: u32,
+        framebuffer_origin: OutputFramebufferOrigin,
     ) -> Option<Vec<[i32; 4]>> {
-        self.convert_bottom_left_rects(output_width, output_height)
+        self.convert_rects(output_width, output_height, framebuffer_origin)
     }
 
     pub(crate) fn to_egl_rects(
@@ -190,6 +193,19 @@ impl OutputDamage {
         output_width: u32,
         output_height: u32,
     ) -> Option<Vec<[i32; 4]>> {
+        self.convert_rects(
+            output_width,
+            output_height,
+            OutputFramebufferOrigin::BottomLeft,
+        )
+    }
+
+    fn convert_rects(
+        &self,
+        output_width: u32,
+        output_height: u32,
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> Option<Vec<[i32; 4]>> {
         let full;
         let rects = match self {
             Self::Empty => return Some(Vec::new()),
@@ -203,8 +219,13 @@ impl OutputDamage {
             .iter()
             .map(|rect| {
                 let rect = rect.clipped(output_width, output_height)?;
-                let bottom = output_height.checked_sub(rect.y.try_into().ok()?)?;
-                let gl_y = bottom.checked_sub(rect.height)?;
+                let gl_y = match framebuffer_origin {
+                    OutputFramebufferOrigin::BottomLeft => {
+                        let bottom = output_height.checked_sub(rect.y.try_into().ok()?)?;
+                        bottom.checked_sub(rect.height)?
+                    }
+                    OutputFramebufferOrigin::TopLeftScanout => rect.y.try_into().ok()?,
+                };
                 Some([
                     rect.x,
                     i32::try_from(gl_y).ok()?,
@@ -349,14 +370,17 @@ impl RepaintPlan {
         &self,
         output_width: u32,
         output_height: u32,
+        framebuffer_origin: OutputFramebufferOrigin,
     ) -> Option<RenderExecution> {
         match self.mode {
             RepaintMode::Skip => None,
             RepaintMode::Full => Some(RenderExecution::Full),
             RepaintMode::Partial => Some(RenderExecution::Scissored {
-                scissors: self
-                    .repair_damage
-                    .to_gl_scissors(output_width, output_height)?,
+                scissors: self.repair_damage.to_gl_scissors(
+                    output_width,
+                    output_height,
+                    framebuffer_origin,
+                )?,
                 disable_scissor_after: true,
             }),
         }
@@ -863,7 +887,9 @@ mod partial_repaint_tests {
     fn output_damage_converts_top_left_rectangles_for_gl_and_egl() {
         let damage = OutputDamage::rects(100, 80, [rect(4, 7, 9, 11)]);
         assert_eq!(
-            damage.to_gl_scissors(100, 80).unwrap(),
+            damage
+                .to_gl_scissors(100, 80, OutputFramebufferOrigin::BottomLeft)
+                .unwrap(),
             vec![[4, 62, 9, 11]]
         );
         assert_eq!(
@@ -885,7 +911,9 @@ mod partial_repaint_tests {
             ],
         );
         assert_eq!(
-            damage.to_gl_scissors(8, 6).unwrap(),
+            damage
+                .to_gl_scissors(8, 6, OutputFramebufferOrigin::BottomLeft)
+                .unwrap(),
             vec![[0, 5, 1, 1], [0, 0, 1, 1], [7, 3, 1, 1], [3, 5, 1, 1]]
         );
     }
@@ -1119,7 +1147,8 @@ mod partial_repaint_tests {
         };
 
         assert_eq!(
-            plan.render_execution(100, 80).unwrap(),
+            plan.render_execution(100, 80, OutputFramebufferOrigin::BottomLeft)
+                .unwrap(),
             RenderExecution::Scissored {
                 scissors: vec![[4, 62, 9, 11], [30, 34, 5, 6]],
                 disable_scissor_after: true,
@@ -1138,7 +1167,10 @@ mod partial_repaint_tests {
             fallback_reason: None,
         };
 
-        assert_eq!(plan.render_execution(100, 80), None);
+        assert_eq!(
+            plan.render_execution(100, 80, OutputFramebufferOrigin::BottomLeft),
+            None
+        );
     }
 
     #[test]
@@ -1171,7 +1203,9 @@ mod partial_repaint_tests {
     #[test]
     fn full_damage_conversion_and_checked_area_are_explicit() {
         assert_eq!(
-            OutputDamage::Full.to_gl_scissors(8, 6).unwrap(),
+            OutputDamage::Full
+                .to_gl_scissors(8, 6, OutputFramebufferOrigin::BottomLeft)
+                .unwrap(),
             vec![[0, 0, 8, 6]]
         );
         let overflowing = OutputDamage::Rects(vec![
@@ -1320,5 +1354,81 @@ mod partial_repaint_tests {
         resized_buffer.copy_from_slice(&resized_reference);
         assert_eq!(resized_buffer, resized_reference);
         planner.commit_presented(&resized);
+    }
+
+    #[test]
+    fn logical_top_damage_maps_to_origin_specific_gl_rows() {
+        let damage = OutputDamage::rects(100, 80, [rect(4, 0, 9, 11)]);
+
+        assert_eq!(
+            damage
+                .to_gl_scissors(
+                    100,
+                    80,
+                    crate::egl_renderer::OutputFramebufferOrigin::BottomLeft
+                )
+                .unwrap(),
+            vec![[4, 69, 9, 11]]
+        );
+        assert_eq!(
+            damage
+                .to_gl_scissors(
+                    100,
+                    80,
+                    crate::egl_renderer::OutputFramebufferOrigin::TopLeftScanout,
+                )
+                .unwrap(),
+            vec![[4, 0, 9, 11]]
+        );
+    }
+
+    #[test]
+    fn logical_bottom_damage_maps_to_origin_specific_gl_rows() {
+        let damage = OutputDamage::rects(100, 80, [rect(4, 69, 9, 11)]);
+
+        assert_eq!(
+            damage
+                .to_gl_scissors(
+                    100,
+                    80,
+                    crate::egl_renderer::OutputFramebufferOrigin::BottomLeft
+                )
+                .unwrap(),
+            vec![[4, 0, 9, 11]]
+        );
+        assert_eq!(
+            damage
+                .to_gl_scissors(
+                    100,
+                    80,
+                    crate::egl_renderer::OutputFramebufferOrigin::TopLeftScanout,
+                )
+                .unwrap(),
+            vec![[4, 69, 9, 11]]
+        );
+    }
+
+    #[test]
+    fn partial_render_execution_uses_scanout_damage_rows() {
+        let plan = RepaintPlan {
+            current_damage: OutputDamage::rects(100, 80, [rect(4, 0, 9, 11)]),
+            repair_damage: OutputDamage::rects(100, 80, [rect(4, 0, 9, 11)]),
+            buffer_age: Some(2),
+            mode: RepaintMode::Partial,
+            fallback_reason: None,
+        };
+
+        assert_eq!(
+            plan.render_execution(
+                100,
+                80,
+                crate::egl_renderer::OutputFramebufferOrigin::TopLeftScanout,
+            )
+            .unwrap(),
+            RenderExecution::Scissored {
+                scissors: vec![[4, 0, 9, 11]],
+                disable_scissor_after: true,
+            }
+        );
     }
 }

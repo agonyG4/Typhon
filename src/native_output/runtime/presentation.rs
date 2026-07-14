@@ -1,6 +1,29 @@
 use super::frame::{NativeRepaintInputs, native_repaint_decision};
 use super::*;
 
+fn plan_scheduled_target_for_mode(
+    planner: &mut PresentationDeadlinePlanner,
+    pacing_mode: NativeOutputPacingMode,
+    pending_target: Option<PresentationTarget>,
+    now: MonotonicTimestampNs,
+    predicted_total_cost: Duration,
+    reason: PresentationTargetReason,
+) -> Option<PresentationTarget> {
+    if pacing_mode != NativeOutputPacingMode::PredictiveTriple {
+        return None;
+    }
+    planner.plan_render_ahead(pending_target?, now, predicted_total_cost, reason)
+}
+
+fn visual_target_deadline_for_mode(
+    pacing_mode: NativeOutputPacingMode,
+    scheduled_target: Option<PresentationTarget>,
+) -> Option<u64> {
+    (pacing_mode == NativeOutputPacingMode::PredictiveTriple)
+        .then(|| scheduled_target.map(|target| target.render_start_deadline.get()))
+        .flatten()
+}
+
 impl NativeRuntime {
     #[allow(unused_variables)]
     pub(super) fn render_present_and_update_metrics(
@@ -101,34 +124,6 @@ impl NativeRuntime {
             Duration::from_nanos(1_000_000_000 / u64::from((*refresh_hz).max(1)));
         let prediction = render_journal.prediction_at(scheduler_now, refresh_interval);
         let explicit_output = matches!(&**scanout, NativeScanoutBackend::AtomicEglGbm(_));
-        if explicit_output
-            && scanout.page_flip_pending()
-            && frame_scheduler.visual_work_queued()
-            && let Some(miss) = pending_proven_deadline_miss.take()
-        {
-            let pending_target = match &**scanout {
-                NativeScanoutBackend::AtomicEglGbm(explicit) => {
-                    explicit.swapchain()?.pending_target()
-                }
-                _ => None,
-            };
-            if let Some(pending_target) = pending_target {
-                let buffering_mode_before = adaptive_buffering.mode();
-                adaptive_buffering.observe(
-                    prediction.total_cost_ns,
-                    refresh_interval,
-                    Some(miss),
-                    pending_target.sequence,
-                    scheduler_now,
-                    true,
-                );
-                frame_pacing.note_adaptive_transition(
-                    buffering_mode_before,
-                    adaptive_buffering.mode(),
-                    Some(miss),
-                );
-            }
-        }
         let render_ahead_allowed = match triple_buffer_policy {
             AdaptiveTripleBufferPolicy::Off => false,
             AdaptiveTripleBufferPolicy::Force => true,
@@ -136,6 +131,11 @@ impl NativeRuntime {
                 adaptive_buffering.mode() == AdaptiveBufferingMode::Triple
             }
         };
+        let pacing_mode = adaptive_buffering.pacing_mode();
+        if pacing_mode == NativeOutputPacingMode::ReactiveDouble {
+            *scheduled_presentation_target = None;
+            presentation_deadline.clear_scheduled_target();
+        }
         if explicit_output
             && frame_scheduler.visual_work_queued()
             && scheduled_presentation_target.is_none()
@@ -146,41 +146,41 @@ impl NativeRuntime {
                 }
                 _ => None,
             };
-            *scheduled_presentation_target = if let Some(pending_target) = pending_target {
-                if render_ahead_allowed {
-                    let reason = if *triple_buffer_policy == AdaptiveTripleBufferPolicy::Force {
-                        PresentationTargetReason::ForcedValidation
-                    } else {
-                        PresentationTargetReason::PredictedPressure
-                    };
-                    presentation_deadline.plan_render_ahead(
-                        pending_target,
-                        scheduler_now,
-                        Duration::from_nanos(prediction.total_cost_ns),
-                        reason,
-                    )
-                } else {
-                    None
-                }
+            let reason = if *triple_buffer_policy == AdaptiveTripleBufferPolicy::Force {
+                PresentationTargetReason::ForcedValidation
             } else {
-                presentation_deadline.plan_normal(
-                    scheduler_now,
-                    Duration::from_nanos(prediction.total_cost_ns),
-                )
+                PresentationTargetReason::PredictedPressure
             };
+            *scheduled_presentation_target = plan_scheduled_target_for_mode(
+                presentation_deadline,
+                pacing_mode,
+                pending_target,
+                scheduler_now,
+                Duration::from_nanos(prediction.total_cost_ns),
+                reason,
+            );
         }
+        let effective_render_target_available = if explicit_output {
+            scanout.render_target_available_for(pacing_mode)
+        } else {
+            scanout.render_target_available()
+        };
         let scheduler_decision = if explicit_output {
             let in_fence = kms_backend
                 .atomic()
                 .is_some_and(|atomic| atomic.discovery().optional.in_fence_fd);
             frame_scheduler.decision_with_context(SchedulerFrameContext {
+                pacing_mode,
                 capabilities: SchedulerCapabilities::explicit_atomic(in_fence, true),
                 presentation_target: *scheduled_presentation_target,
                 predicted_total_cost: Duration::from_nanos(prediction.total_cost_ns),
                 now: scheduler_now,
-                render_target_available: scanout.render_target_available(),
+                render_target_available: effective_render_target_available,
                 render_ahead_allowed,
                 ready_frame_present: scanout.ready_frame_queued(),
+                ready_target_current: frame_scheduler
+                    .ready_target()
+                    .is_none_or(|target| presentation_deadline.is_current(target)),
             })
         } else {
             frame_scheduler
@@ -190,7 +190,7 @@ impl NativeRuntime {
             frame_id_field(frame_pacing.active),
             PacingField::u64("render_generation", render_generation),
             PacingField::str("scheduler_decision", format!("{scheduler_decision:?}")),
-            PacingField::bool("render_target_available", scanout.render_target_available()),
+            PacingField::bool("render_target_available", effective_render_target_available),
             PacingField::u64(
                 "pageflip_token",
                 scanout.pending_page_flip_token().unwrap_or(0),
@@ -224,7 +224,16 @@ impl NativeRuntime {
             ))
             .into());
         }
-        if scheduler_decision == SchedulerDecision::SubmitReady {
+        if scheduler_decision == SchedulerDecision::ReadyTargetInvalidated {
+            return Err(io::Error::other(
+                "explicit Atomic ready frame belongs to an invalidated presentation target",
+            )
+            .into());
+        }
+        if matches!(
+            scheduler_decision,
+            SchedulerDecision::SubmitReady | SchedulerDecision::SubmitReadyLate
+        ) {
             let repaint_present_start = Instant::now();
             let explicit_submission = matches!(&**scanout, NativeScanoutBackend::AtomicEglGbm(_));
             let present_result =
@@ -261,7 +270,7 @@ impl NativeRuntime {
                     frame_scheduler
                         .note_ready_submission(token, monotonic_now_ns()?)
                         .map_err(io::Error::other)?;
-                    frame_pacing.note_submit(token, monotonic_now_ns()?, true);
+                    frame_pacing.note_submit(token, monotonic_now_ns()?, true, pacing_mode);
                     if explicit_submission
                         && output_render_fence_token.is_none()
                         && let NativeScanoutBackend::AtomicEglGbm(explicit) = &**scanout
@@ -284,7 +293,10 @@ impl NativeRuntime {
                             NativePerfField::u64("refresh_hz", u64::from(*refresh_hz)),
                             NativePerfField::u64("repaint_present_us", repaint_present_us),
                             NativePerfField::u64("pageflip_token", token),
-                            NativePerfField::bool("render_ahead_ready", true),
+                            NativePerfField::bool(
+                                "render_ahead_ready",
+                                scheduler_decision == SchedulerDecision::SubmitReady,
+                            ),
                         ]
                     });
                 }
@@ -306,14 +318,12 @@ impl NativeRuntime {
             SchedulerDecision::Render | SchedulerDecision::RenderAhead
         ) {
             let render_ahead = scheduler_decision == SchedulerDecision::RenderAhead;
-            if render_ahead {
-                frame_pacing.render_ahead_attempts += 1;
-            }
-            let render_begin_ns = monotonic_now_ns()?;
+            frame_pacing.note_render_started(pacing_mode, render_ahead);
+            let render_observed_at_ns = monotonic_now_ns()?;
             let mut render_begin_fields = vec![
                 frame_id_field(frame_pacing.active),
                 PacingField::u64("render_generation", render_generation),
-                PacingField::u64("render_begin_ns", render_begin_ns),
+                PacingField::u64("render_observed_at_ns", render_observed_at_ns),
                 PacingField::bool("render_ahead", render_ahead),
                 PacingField::str("buffering_mode", format!("{:?}", adaptive_buffering.mode())),
                 PacingField::u64("prediction_ewma_ns", prediction.ewma_render_ns),
@@ -394,11 +404,23 @@ impl NativeRuntime {
                 *last_renderable_surfaces = server.renderable_surfaces().to_vec();
             } else {
                 if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
-                    let frame_target = scheduled_presentation_target.take().ok_or_else(|| {
+                    let frame_target = match pacing_mode {
+                        NativeOutputPacingMode::ReactiveDouble => presentation_deadline
+                            .reactive_target(MonotonicTimestampNs::new(monotonic_now_ns()?)),
+                        NativeOutputPacingMode::PredictiveTriple => {
+                            scheduled_presentation_target.take().or_else(|| {
+                                presentation_deadline.reactive_target(MonotonicTimestampNs::new(
+                                    monotonic_now_ns().ok()?,
+                                ))
+                            })
+                        }
+                    }
+                    .ok_or_else(|| {
                         io::Error::other(
                             "explicit Atomic render started without a presentation target",
                         )
                     })?;
+                    presentation_deadline.clear_scheduled_target();
                     let frame_id = explicit.render_frame(
                         frame_renderer,
                         server,
@@ -407,18 +429,20 @@ impl NativeRuntime {
                         &output_damage,
                         render_generation,
                         frame_target,
-                        MonotonicTimestampNs::new(render_begin_ns),
+                        pacing_mode,
                     )?;
                     frame_rendered = true;
-                    if render_ahead {
-                        frame_scheduler.note_render_ahead_ready();
-                        frame_pacing.note_render_ahead_ready(monotonic_now_ns()?);
+                    let ready_at_ns = monotonic_now_ns()?;
+                    let waits_for_target = render_ahead;
+                    if waits_for_target {
+                        frame_scheduler.note_ready_frame(Some(frame_target));
+                        frame_pacing.note_ready_frame(ready_at_ns, render_ahead);
                     } else {
                         let token = explicit.submit_ready_frame(kms_backend, server)?;
                         frame_scheduler
                             .note_async_submission(token, monotonic_now_ns()?)
                             .map_err(io::Error::other)?;
-                        frame_pacing.note_submit(token, monotonic_now_ns()?, false);
+                        frame_pacing.note_submit(token, monotonic_now_ns()?, false, pacing_mode);
                         if output_render_fence_token.is_none()
                             && let Some(fd) = explicit.pending_timing_fd()
                         {
@@ -434,8 +458,8 @@ impl NativeRuntime {
                         vec![
                             PacingField::u64("frame_id", frame_id),
                             PacingField::u64("render_generation", render_generation),
-                            PacingField::u64("render_begin_ns", render_begin_ns),
-                            PacingField::u64("render_end_ns", monotonic_now_ns()?),
+                            PacingField::u64("render_observed_at_ns", render_observed_at_ns),
+                            PacingField::u64("render_end_ns", ready_at_ns),
                             PacingField::u64("target_vblank_sequence", frame_target.sequence),
                             PacingField::u64(
                                 "target_presentation_ns",
@@ -466,7 +490,7 @@ impl NativeRuntime {
                         vec![
                             frame_id_field(frame_pacing.active),
                             PacingField::u64("render_generation", render_generation),
-                            PacingField::u64("render_begin_ns", render_begin_ns),
+                            PacingField::u64("render_observed_at_ns", render_observed_at_ns),
                             PacingField::u64("render_end_ns", monotonic_now_ns()?),
                             PacingField::u64("gpu_draw_us", paint_stats.gpu_draw_us),
                             PacingField::u64("egl_swap_us", paint_stats.egl_swap_us),
@@ -548,7 +572,12 @@ impl NativeRuntime {
                                 frame_scheduler
                                     .note_async_submission(token, monotonic_now_ns()?)
                                     .map_err(io::Error::other)?;
-                                frame_pacing.note_submit(token, monotonic_now_ns()?, false);
+                                frame_pacing.note_submit(
+                                    token,
+                                    monotonic_now_ns()?,
+                                    false,
+                                    pacing_mode,
+                                );
                                 frame_submitted = true;
                             }
                             NativePresentResult::Immediate => {
@@ -733,7 +762,7 @@ impl NativeRuntime {
                     NativePerfField::bool("pageflip_pending_at_tick", pageflip_pending_at_tick),
                     NativePerfField::bool(
                         "render_target_available",
-                        scanout.render_target_available(),
+                        effective_render_target_available,
                     ),
                     NativePerfField::u64("input_drain_us", input_drain_us),
                     NativePerfField::usize("raw_input_events", raw_input_events),
@@ -840,14 +869,101 @@ impl NativeRuntime {
                 ),
             ]
         });
+        let scheduler_deadline = self.frame_scheduler.next_deadline_ns();
+        let visual_deadline = visual_target_deadline_for_mode(
+            self.adaptive_buffering.pacing_mode(),
+            self.scheduled_presentation_target,
+        );
+        self.frame_pacing.note_deadline_state(
+            scheduler_decision,
+            monotonic_now_ns()?,
+            scheduler_deadline,
+            visual_deadline,
+            self.frame_scheduler.ready_frame_queued() || self.scanout.ready_frame_queued(),
+            cycle.wakeup.reasons.timer(),
+        );
         self.event_loop.arm_deadline(earliest_native_deadline(
-            earliest_native_deadline(
-                self.frame_scheduler.next_deadline_ns(),
-                self.scheduled_presentation_target
-                    .map(|target| target.render_start_deadline.get()),
-            ),
+            earliest_native_deadline(scheduler_deadline, visual_deadline),
             self.acquire_watches.next_fallback_deadline_ns(),
         ))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pacing_mode_tests {
+    use super::*;
+
+    #[test]
+    fn reactive_double_never_schedules_a_normal_visual_target() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(6_060_606));
+        planner.note_presented(MonotonicTimestampNs::new(6_060_606));
+
+        let target = plan_scheduled_target_for_mode(
+            &mut planner,
+            NativeOutputPacingMode::ReactiveDouble,
+            None,
+            MonotonicTimestampNs::new(7_000_000),
+            Duration::from_millis(100),
+            PresentationTargetReason::PredictedPressure,
+        );
+
+        assert_eq!(target, None);
+        assert_eq!(planner.scheduled_target(), None);
+    }
+
+    #[test]
+    fn predictive_triple_only_schedules_pending_plus_one() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_millis(10));
+        planner.note_presented(MonotonicTimestampNs::new(10_000_000));
+        let pending = planner
+            .reactive_target(MonotonicTimestampNs::new(11_000_000))
+            .unwrap();
+
+        assert_eq!(
+            plan_scheduled_target_for_mode(
+                &mut planner,
+                NativeOutputPacingMode::PredictiveTriple,
+                None,
+                MonotonicTimestampNs::new(12_000_000),
+                Duration::from_millis(2),
+                PresentationTargetReason::PredictedPressure,
+            ),
+            None
+        );
+        let ready = plan_scheduled_target_for_mode(
+            &mut planner,
+            NativeOutputPacingMode::PredictiveTriple,
+            Some(pending),
+            MonotonicTimestampNs::new(12_000_000),
+            Duration::from_millis(2),
+            PresentationTargetReason::PredictedPressure,
+        )
+        .unwrap();
+        assert_eq!(ready.sequence, pending.sequence + 1);
+    }
+
+    #[test]
+    fn reactive_double_visual_target_never_owns_an_event_loop_deadline() {
+        let target = PresentationTarget {
+            sequence: 1,
+            presentation_time: MonotonicTimestampNs::new(10),
+            submit_not_before: MonotonicTimestampNs::new(9),
+            render_start_deadline: MonotonicTimestampNs::new(8),
+            refresh_interval: Duration::from_millis(1),
+            reason: PresentationTargetReason::ReactiveDouble,
+            clock_generation: 1,
+            estimated: false,
+            predicted_unreachable: false,
+        };
+
+        assert_eq!(
+            visual_target_deadline_for_mode(NativeOutputPacingMode::ReactiveDouble, Some(target)),
+            None
+        );
+        assert_eq!(
+            visual_target_deadline_for_mode(NativeOutputPacingMode::PredictiveTriple, Some(target)),
+            Some(8)
+        );
     }
 }

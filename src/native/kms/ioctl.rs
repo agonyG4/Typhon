@@ -59,17 +59,25 @@ pub fn object_properties(
     ids.into_iter()
         .zip(values)
         .map(|(id, value)| {
-            let property = drm_ffi::mode::get_property(fd, id, None, None).map_err(|error| {
-                classify_io_error(
-                    error,
-                    AtomicKmsErrorKind::MissingProperty,
-                    "query property metadata",
-                )
-            })?;
+            let property = query_property_for_object_with(
+                object_id,
+                object_type,
+                id,
+                |property_id, property_values, property_enums| {
+                    drm_ffi::mode::get_property(
+                        fd,
+                        property_id,
+                        Some(property_values),
+                        Some(property_enums),
+                    )
+                },
+            )?;
             let id = PropertyId::new(id).ok_or_else(|| {
                 AtomicKmsError::new(
                     AtomicKmsErrorKind::MissingProperty,
-                    "DRM returned property ID zero",
+                    format!(
+                        "DRM returned property ID zero; object_id={object_id} object_type={object_type} property_id=0"
+                    ),
                 )
             })?;
             Ok(DrmProperty::new(
@@ -79,6 +87,31 @@ pub fn object_properties(
             ))
         })
         .collect()
+}
+
+fn query_property_for_object_with(
+    object_id: u32,
+    object_type: u32,
+    property_id: u32,
+    query: impl FnOnce(
+        u32,
+        &mut Vec<u64>,
+        &mut Vec<drm_sys::drm_mode_property_enum>,
+    ) -> io::Result<drm_sys::drm_mode_get_property>,
+) -> Result<drm_sys::drm_mode_get_property, AtomicKmsError> {
+    let mut property_values = Vec::new();
+    let mut property_enums = Vec::new();
+    query(property_id, &mut property_values, &mut property_enums).map_err(|error| {
+        let mut error = classify_io_error(
+            error,
+            AtomicKmsErrorKind::MissingProperty,
+            "query property metadata",
+        );
+        error.detail.push_str(&format!(
+            "; object_id={object_id} object_type={object_type} property_id={property_id}"
+        ));
+        error
+    })
 }
 
 pub fn property_blob(fd: BorrowedFd<'_>, blob_id: u32) -> Result<Vec<u8>, AtomicKmsError> {
@@ -262,6 +295,56 @@ const fn drm_iowr<T>(number: u8) -> libc::c_ulong {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn property_metadata_query_supplies_storage_for_values_and_enums() {
+        let property = query_property_for_object_with(
+            41,
+            drm_sys::DRM_MODE_OBJECT_PLANE,
+            73,
+            |property_id,
+             values: &mut Vec<u64>,
+             enums: &mut Vec<drm_sys::drm_mode_property_enum>| {
+                assert_eq!(property_id, 73);
+                values.extend([0, 1]);
+                enums.push(drm_sys::drm_mode_property_enum::default());
+                Ok(drm_sys::drm_mode_get_property {
+                    prop_id: property_id,
+                    count_values: 2,
+                    count_enum_blobs: 1,
+                    ..Default::default()
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(property.count_values, 2);
+        assert_eq!(property.count_enum_blobs, 1);
+    }
+
+    #[test]
+    fn property_metadata_error_keeps_classification_and_object_identity() {
+        let error = query_property_for_object_with(
+            41,
+            drm_sys::DRM_MODE_OBJECT_PLANE,
+            73,
+            |_property_id,
+             _values: &mut Vec<u64>,
+             _enums: &mut Vec<drm_sys::drm_mode_property_enum>| {
+                Err(io::Error::from_raw_os_error(libc::EACCES))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind, AtomicKmsErrorKind::PermissionOrSession);
+        assert!(error.detail.contains("object_id=41"));
+        assert!(
+            error
+                .detail
+                .contains(&format!("object_type={}", drm_sys::DRM_MODE_OBJECT_PLANE))
+        );
+        assert!(error.detail.contains("property_id=73"));
+    }
 
     #[test]
     fn errno_classification_distinguishes_busy_permission_and_device_loss() {

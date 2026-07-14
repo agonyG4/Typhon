@@ -60,6 +60,8 @@ pub(in crate::compositor) use window_resize::*;
 pub(in crate::compositor) use windows::*;
 
 #[cfg(test)]
+mod frame_tests;
+#[cfg(test)]
 mod task_05_8_tests;
 #[cfg(test)]
 mod window_interaction_tests;

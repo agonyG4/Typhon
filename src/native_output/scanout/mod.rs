@@ -520,11 +520,24 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn third_slot_owned(&self) -> bool {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.swapchain().is_ok_and(|swapchain| {
+                swapchain.ready_slot().is_some() || swapchain.rendering_slot().is_some()
+            }),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => false,
+        }
+    }
+
     pub(crate) fn render_target_available(&self) -> bool {
+        self.render_target_available_for(NativeOutputPacingMode::PredictiveTriple)
+    }
+
+    pub(crate) fn render_target_available_for(&self, pacing_mode: NativeOutputPacingMode) -> bool {
         match self {
             Self::AtomicEglGbm(scanout) => scanout
                 .swapchain()
-                .is_ok_and(|swapchain| swapchain.free_slot_count() > 0),
+                .is_ok_and(|swapchain| swapchain.render_target_available_for(pacing_mode)),
             Self::NativeEglGbm(scanout) => scanout.render_target_available(),
             Self::Gbm(scanout) => scanout.render_target_available(),
             Self::Dumb(_) => true,

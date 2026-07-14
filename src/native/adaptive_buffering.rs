@@ -2,6 +2,7 @@
 #![allow(dead_code)] // Wired into the native runtime in Task 12.
 
 use crate::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
+use crate::native::scheduler::NativeOutputPacingMode;
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -78,6 +79,15 @@ pub(crate) struct FrameTimingObservation {
     pub(crate) fence_signaled_at: Option<(MonotonicTimestampNs, FenceTimestampQuality)>,
     pub(crate) submit_started_at: Option<MonotonicTimestampNs>,
     pub(crate) submit_returned_at: Option<MonotonicTimestampNs>,
+}
+
+pub fn render_sample_duration_ns(
+    composite_started_at: MonotonicTimestampNs,
+    fence_signaled_at: MonotonicTimestampNs,
+) -> u64 {
+    fence_signaled_at
+        .get()
+        .saturating_sub(composite_started_at.get())
 }
 
 #[doc(hidden)]
@@ -345,6 +355,17 @@ impl AdaptiveBufferingController {
         self.mode
     }
 
+    pub const fn pacing_mode(&self) -> NativeOutputPacingMode {
+        match self.policy {
+            AdaptiveTripleBufferPolicy::Off => NativeOutputPacingMode::ReactiveDouble,
+            AdaptiveTripleBufferPolicy::Force => NativeOutputPacingMode::PredictiveTriple,
+            AdaptiveTripleBufferPolicy::Auto => match self.mode {
+                AdaptiveBufferingMode::Double => NativeOutputPacingMode::ReactiveDouble,
+                AdaptiveBufferingMode::Triple => NativeOutputPacingMode::PredictiveTriple,
+            },
+        }
+    }
+
     pub const fn entry_reason(&self) -> Option<TripleEntryReason> {
         self.entry_reason
     }
@@ -433,6 +454,31 @@ mod tests {
         journal.record_render_sample(3_000_000, MonotonicTimestampNs::new(10_000_000));
         assert_eq!(journal.ewma_render_ns(), 3_000_000);
         assert_eq!(journal.upper_render_deviation_ns(), 0);
+    }
+
+    #[test]
+    fn debug_log_delay_before_backend_start_does_not_change_render_sample() {
+        let baseline = render_sample_duration_ns(
+            MonotonicTimestampNs::new(100),
+            MonotonicTimestampNs::new(700),
+        );
+        let delayed_debug_start = render_sample_duration_ns(
+            MonotonicTimestampNs::new(1_000_100),
+            MonotonicTimestampNs::new(1_000_700),
+        );
+
+        assert_eq!(baseline, 600);
+        assert_eq!(delayed_debug_start, baseline);
+
+        let mut baseline_journal = AdaptiveRenderJournal::default();
+        baseline_journal.record_render_sample(baseline, MonotonicTimestampNs::new(700));
+        let mut delayed_journal = AdaptiveRenderJournal::default();
+        delayed_journal
+            .record_render_sample(delayed_debug_start, MonotonicTimestampNs::new(1_000_700));
+        assert_eq!(
+            baseline_journal.prediction(Duration::from_millis(10)),
+            delayed_journal.prediction(Duration::from_millis(10))
+        );
     }
 
     #[test]
@@ -548,6 +594,36 @@ mod tests {
             force.entry_reason(),
             Some(TripleEntryReason::ForcedValidation)
         );
+    }
+
+    #[test]
+    fn pacing_mode_maps_off_and_auto_double_to_reactive_double() {
+        let off = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Off);
+        let auto = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+
+        assert_eq!(off.pacing_mode(), NativeOutputPacingMode::ReactiveDouble);
+        assert_eq!(auto.pacing_mode(), NativeOutputPacingMode::ReactiveDouble);
+    }
+
+    #[test]
+    fn pacing_mode_maps_force_and_auto_triple_to_predictive_triple() {
+        let refresh = Duration::from_millis(10);
+        let force = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Force);
+        let mut auto = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+        auto.observe(
+            10_000_000,
+            refresh,
+            None,
+            1,
+            MonotonicTimestampNs::new(10_000_000),
+            true,
+        );
+
+        assert_eq!(
+            force.pacing_mode(),
+            NativeOutputPacingMode::PredictiveTriple
+        );
+        assert_eq!(auto.pacing_mode(), NativeOutputPacingMode::PredictiveTriple);
     }
 
     #[test]

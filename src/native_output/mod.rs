@@ -49,7 +49,7 @@ use oblivion_one::native::{
     adaptive_buffering::{
         AdaptiveBufferingController, AdaptiveBufferingMode, AdaptiveRenderJournal,
         AdaptiveTripleBufferPolicy, FenceTimestampQuality, ProvenDeadlineMiss,
-        approximate_observation_is_late,
+        approximate_observation_is_late, render_sample_duration_ns,
     },
     drm::{
         DrmPresentationEvent, DrmTimestampClock, drain_drm_page_flip_events,
@@ -67,8 +67,9 @@ use oblivion_one::native::{
         PresentationTargetReason,
     },
     scheduler::{
-        NativeFrameScheduler, PageFlipCompletionResult, PresentationCadenceMetrics,
-        SchedulerCapabilities, SchedulerDecision, SchedulerFrameContext,
+        NativeFrameScheduler, NativeOutputPacingMode, PageFlipCompletionResult,
+        PresentationCadenceMetrics, SchedulerCapabilities, SchedulerDecision,
+        SchedulerFrameContext,
     },
 };
 use oblivion_one::process::{ChildSupervisor, ProcessKind, ProcessOptions, RestartPolicy};

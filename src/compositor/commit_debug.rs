@@ -4,6 +4,12 @@ use wayland_server::{Resource, backend::ObjectId, protocol::wl_callback};
 
 use super::PendingAcquireState;
 
+macro_rules! commit_debug_println {
+    ($($arg:tt)*) => {
+        super::pacing::commit_debug_log(format!($($arg)*));
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SurfaceCommitId(NonZeroU64);
 
@@ -258,7 +264,7 @@ impl super::CompositorState {
                 owner.commit_id = replacement;
             }
             if self.commit_debug.enabled {
-                println!(
+                commit_debug_println!(
                     "typhon commit: event=callback_moved commit_id={} replacement_commit_id={} surface={surface} callback={callback:?} reason={reason}",
                     id.get(),
                     replacement.get()
@@ -312,7 +318,7 @@ impl super::CompositorState {
                 owner.commit_id = replacement;
             }
             if self.commit_debug.enabled {
-                println!(
+                commit_debug_println!(
                     "typhon commit: event=callback_moved commit_id={} replacement_commit_id={} surface={} callback={callback:?} reason=surface_tree_commit_merged",
                     id.get(),
                     replacement.get(),
@@ -423,7 +429,7 @@ impl super::CompositorState {
             .metrics
             .note_publication_rejected(live.acquire_state, decision);
         if self.commit_debug.enabled {
-            println!(
+            commit_debug_println!(
                 "typhon commit: event=publication_rejected commit_id={} surface={} root={} sequence={} acquire_state={} decision={} latest_published={} latest_attachment_received={}",
                 id.get(),
                 live.surface,
@@ -580,7 +586,7 @@ impl super::CompositorState {
             return;
         }
         let live = self.commit_debug.live.get(&id);
-        println!(
+        commit_debug_println!(
             "typhon commit: event={event} commit_id={} surface={surface} root={} sequence={sequence} buffer_id={} acquire_state={acquire} callback_count={callbacks} pageflip_pending={} pending_queue_depth={} ready_queue_depth={} visual_generation={} reason={reason}",
             id.get(),
             live.map_or_else(|| self.root_surface_id_for_surface(surface), |l| l.root),
@@ -604,7 +610,7 @@ impl super::CompositorState {
         reason: &str,
     ) {
         if self.commit_debug.enabled {
-            println!(
+            commit_debug_println!(
                 "typhon commit: event={event} commit_id={} surface={surface} root={} sequence={} buffer_id=none acquire_state=none callback_count=1 callback={:?} pageflip_pending={} pending_queue_depth={} ready_queue_depth={} visual_generation=none reason={reason}",
                 id.get(),
                 self.root_surface_id_for_surface(surface),

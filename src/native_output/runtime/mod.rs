@@ -123,20 +123,22 @@ impl NativeRuntime {
 
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
-        // Emit the commit summary while the native runtime's output stream is
-        // still known to be live. The server drop repeats this idempotently.
-        self.server.finish_commit_debug_for_shutdown();
         if self.frame_pacing.enabled() {
-            println!("{}", self.frame_pacing.summary_line());
+            println!(
+                "{}",
+                self.frame_pacing
+                    .summary_line(self.server.verbose_trace_dropped_entries())
+            );
             if let Some(counters) = self.scanout.explicit_output_counters() {
                 println!(
-                    "typhon pacing: event=explicit_output_summary sync_file_deadline_hints_applied={} sync_file_deadline_hints_unsupported={} sync_file_deadline_hints_failed={} atomic_in_fence_submissions={} atomic_out_fences_received={} atomic_out_fence_missing={}",
+                    "typhon pacing: event=explicit_output_summary sync_file_deadline_hints_applied={} sync_file_deadline_hints_unsupported={} sync_file_deadline_hints_failed={} atomic_in_fence_submissions={} atomic_out_fences_received={} atomic_out_fence_missing={} render_fence_timing_unavailable={}",
                     counters.sync_file_deadline_hints_applied,
                     counters.sync_file_deadline_hints_unsupported,
                     counters.sync_file_deadline_hints_failed,
                     counters.atomic_in_fence_submissions,
                     counters.atomic_out_fences_received,
                     counters.atomic_out_fence_missing,
+                    counters.render_fence_timing_unavailable,
                 );
             }
         }
@@ -146,10 +148,29 @@ impl Drop for NativeRuntime {
             if let Some(cursor) = self.hardware_cursor.as_mut() {
                 cursor.disarm_drm_cleanup();
             }
+        } else if let Err(error) = self.kms_backend.restore() {
+            eprintln!("native KMS restore before client-buffer drain failed: {error}");
         }
         // SAFETY: scanout is wrapped solely so inactive managed-session
         // teardown can disarm DRM cleanup before its normal resource drop.
-        // It is dropped exactly once here, while `kms` is still alive.
+        // Active KMS ownership was restored above; it is dropped exactly once
+        // here, while `kms` is still alive.
         unsafe { mem::ManuallyDrop::drop(&mut self.scanout) };
+
+        // Client buffers are released only after KMS ownership has ended and
+        // the EGL/GBM renderer has been torn down, so shutdown cannot reuse a
+        // buffer while KMS or GLES still owns it. The server drop repeats this
+        // idempotently.
+        self.server.finish_commit_debug_for_shutdown();
+        let buffer_release_metrics = self.server.buffer_release_metrics();
+        println!(
+            "typhon pacing: event=buffer_release_summary buffer_releases_captured={} buffer_releases_completed={} buffer_releases_deferred={} buffer_releases_restored={} buffer_releases_discarded={} buffer_release_duplicate_attempts={}",
+            buffer_release_metrics.buffer_releases_captured,
+            buffer_release_metrics.buffer_releases_completed,
+            buffer_release_metrics.buffer_releases_deferred,
+            buffer_release_metrics.buffer_releases_restored,
+            buffer_release_metrics.buffer_releases_discarded,
+            buffer_release_metrics.buffer_release_duplicate_attempts,
+        );
     }
 }

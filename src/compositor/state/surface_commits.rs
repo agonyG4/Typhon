@@ -1128,13 +1128,18 @@ impl CompositorState {
         if let Some(previous) = self
             .active_dmabuf_buffers
             .insert(surface_id, new_release.clone())
-            && !previous.same_buffer_resource(&new_release)
+            && !previous.same_release_token(&new_release)
         {
             self.queue_dmabuf_buffer_release(previous);
         }
     }
 
     pub(in crate::compositor) fn queue_buffer_release(&mut self, buffer: wl_buffer::WlBuffer) {
+        let candidate = SurfaceBufferRelease::WlBuffer(buffer.clone());
+        if self.buffer_release_is_owned(&candidate) {
+            self.note_buffer_release_duplicate_attempt();
+            return;
+        }
         self.pending_buffer_releases.push(buffer);
     }
 
@@ -1142,6 +1147,13 @@ impl CompositorState {
         &mut self,
         release: SurfaceBufferRelease,
     ) {
+        // Published-buffer replacement and surface removal/destruction both converge here. Only
+        // the exact same completion token is a duplicate; a reused wl_buffer with a newer
+        // explicit-sync timeline point is a distinct use.
+        if self.buffer_release_is_owned(&release) {
+            self.note_buffer_release_duplicate_attempt();
+            return;
+        }
         self.pending_dmabuf_buffer_releases.push(release);
     }
 

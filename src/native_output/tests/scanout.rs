@@ -330,6 +330,66 @@ fn explicit_output_swapchain_valid_current_pending_ready_transition() {
 }
 
 #[test]
+fn reactive_double_exposes_no_third_render_slot_while_pageflip_is_pending() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        70,
+    )
+    .unwrap();
+    let pending = swapchain
+        .acquire_render_slot_for(NativeOutputPacingMode::ReactiveDouble)
+        .unwrap();
+    swapchain
+        .finish_render(pending, 1, test_render_fence())
+        .unwrap();
+    swapchain
+        .submit_ready(PageFlipToken::new(700).unwrap(), None)
+        .unwrap();
+
+    assert!(!swapchain.render_target_available_for(NativeOutputPacingMode::ReactiveDouble));
+    assert!(
+        swapchain
+            .acquire_render_slot_for(NativeOutputPacingMode::ReactiveDouble)
+            .is_err()
+    );
+    swapchain
+        .validate_invariants_for(NativeOutputPacingMode::ReactiveDouble)
+        .unwrap();
+}
+
+#[test]
+fn predictive_triple_can_acquire_exactly_one_slot_behind_pending() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        71,
+    )
+    .unwrap();
+    let pending = swapchain
+        .acquire_render_slot_for(NativeOutputPacingMode::PredictiveTriple)
+        .unwrap();
+    swapchain
+        .finish_render(pending, 1, test_render_fence())
+        .unwrap();
+    swapchain
+        .submit_ready(PageFlipToken::new(710).unwrap(), None)
+        .unwrap();
+
+    assert!(swapchain.render_target_available_for(NativeOutputPacingMode::PredictiveTriple));
+    let third = swapchain
+        .acquire_render_slot_for(NativeOutputPacingMode::PredictiveTriple)
+        .unwrap();
+    assert_ne!(third, swapchain.current());
+    assert_ne!(Some(third), swapchain.pending_slot());
+    assert!(
+        swapchain
+            .acquire_render_slot_for(NativeOutputPacingMode::PredictiveTriple)
+            .is_err()
+    );
+}
+
+#[test]
 fn explicit_output_swapchain_rejects_invalid_transitions_without_mutation() {
     let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
         explicit_slot_set(),
@@ -419,6 +479,25 @@ fn post_draw_failure_quarantines_rendering_slot_without_freeing_it() {
 }
 
 #[test]
+fn suspend_while_rendering_retains_slot_ownership() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        11,
+    )
+    .unwrap();
+    let slot = swapchain.acquire_render_slot().unwrap();
+
+    assert!(!swapchain.suspend_abandon_ready().unwrap());
+    assert_eq!(swapchain.rendering_slot(), Some(slot));
+    assert_eq!(swapchain.quarantine_slot_id(), None);
+
+    swapchain.cancel_render_before_gpu(slot).unwrap();
+    assert_eq!(swapchain.rendering_slot(), None);
+    swapchain.validate_invariants().unwrap();
+}
+
+#[test]
 fn suspended_ready_slot_cannot_be_reused_before_fence_proof() {
     let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
         explicit_slot_set(),
@@ -430,16 +509,14 @@ fn suspended_ready_slot_cannot_be_reused_before_fence_proof() {
     swapchain
         .finish_render(slot, 1, test_render_fence())
         .unwrap();
-    let abandoned = swapchain
-        .suspend_abandon_ready()
-        .unwrap()
-        .expect("ready frame should be returned for protocol disposition");
-    assert_eq!(abandoned.slot, slot);
+    assert!(swapchain.suspend_abandon_ready().unwrap());
+    assert_eq!(swapchain.quarantine_slot_id(), Some(slot));
 
     assert!(!swapchain.is_poisoned());
     assert!(swapchain.acquire_render_slot().is_err());
     assert!(swapchain.recover_suspended_slot(false).is_err());
     assert_eq!(swapchain.quarantine_slot_id(), Some(slot));
+    let _abandoned = swapchain.take_suspended_ready_frame();
     swapchain.recover_suspended_slot(true).unwrap();
     assert_eq!(swapchain.quarantine_slot_id(), None);
     assert_eq!(swapchain.acquire_render_slot().unwrap(), slot);
@@ -480,7 +557,7 @@ fn suspended_ready_fence_requires_an_observed_signal_before_recovery() {
     let slot = swapchain.acquire_render_slot().unwrap();
     let (fence, signal) = controllable_render_fence();
     swapchain.finish_render(slot, 1, fence).unwrap();
-    let _abandoned = swapchain.suspend_abandon_ready().unwrap().unwrap();
+    assert!(swapchain.suspend_abandon_ready().unwrap());
 
     assert!(!swapchain.suspended_ready_fence_signaled().unwrap());
     let value = 1u64.to_ne_bytes();
@@ -489,6 +566,7 @@ fn suspended_ready_fence_requires_an_observed_signal_before_recovery() {
         value.len() as isize
     );
     assert!(swapchain.suspended_ready_fence_signaled().unwrap());
+    let _abandoned = swapchain.take_suspended_ready_frame();
     swapchain.recover_suspended_slot(true).unwrap();
     assert_eq!(swapchain.acquire_render_slot().unwrap(), slot);
 }
@@ -506,7 +584,8 @@ fn pool_generation_changes_only_after_recovery_ownership_is_retired() {
         .finish_render(slot, 1, test_render_fence())
         .unwrap();
     assert!(swapchain.rebind_pool_generation(21).is_err());
-    let _abandoned = swapchain.suspend_abandon_ready().unwrap().unwrap();
+    assert!(swapchain.suspend_abandon_ready().unwrap());
+    let _abandoned = swapchain.take_suspended_ready_frame();
     swapchain.recover_suspended_slot(true).unwrap();
 
     swapchain.rebind_pool_generation(21).unwrap();

@@ -678,6 +678,7 @@ impl NativeRuntime {
                 framebuffer,
             )?;
             initial_surface_damage = Some(server.capture_surface_damage_presentation());
+            let mut initial_gpu_sampling_started = false;
             let parts = explicit.render_to_slot(
                 slot,
                 &mut frame_renderer,
@@ -685,6 +686,7 @@ impl NativeRuntime {
                 &input_state,
                 cursor_render_mode,
                 &initial_damage,
+                &mut initial_gpu_sampling_started,
             )?;
             let stats = parts.paint_stats(
                 explicit.format_modifier.fourcc,

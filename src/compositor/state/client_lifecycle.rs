@@ -15,6 +15,7 @@ impl CompositorState {
         let renderables_before = self.renderable_surfaces.len();
         let surfaces_removed = self.teardown_surfaces_for_client(client_id);
         self.teardown_non_surface_resources_for_client(client_id);
+        self.scrub_dead_buffer_releases();
         let renderables_removed = renderables_before.saturating_sub(self.renderable_surfaces.len());
 
         ClientTeardownSummary {
