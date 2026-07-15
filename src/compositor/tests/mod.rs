@@ -34,7 +34,7 @@ use wayland_client::{
         wl_pointer as client_wl_pointer, wl_region as client_wl_region, wl_registry,
         wl_seat as client_wl_seat, wl_shm as client_wl_shm, wl_shm_pool as client_wl_shm_pool,
         wl_subcompositor as client_wl_subcompositor, wl_subsurface as client_wl_subsurface,
-        wl_surface as client_wl_surface,
+        wl_surface as client_wl_surface, wl_touch as client_wl_touch,
     },
 };
 use wayland_protocols::wp::fractional_scale::v1::client::{
@@ -91,6 +91,7 @@ use crate::astrea_shortcuts::client::{
     astrea_shortcuts_manager_v1 as client_astrea_shortcuts_manager_v1,
 };
 
+mod output_model;
 mod support;
 
 use support::client_setup::*;
@@ -99,17 +100,21 @@ use support::frame_buffer_client::*;
 use support::input_client::*;
 use support::locked_relative::*;
 use support::output_bindings::*;
+use support::protocol_errors::*;
 use support::registry_state::*;
 use support::server_runtime::*;
 use support::subsurface_client::*;
 use support::window_ops::*;
 
 mod astrea_shortcuts;
+mod data_device;
 mod input_output;
 mod layer_shell;
 mod lifecycle;
 mod plan;
 mod protocol_buffers;
+mod protocol_contract;
+mod protocol_error;
 mod subsurface;
 mod surface_frames;
 mod windows;

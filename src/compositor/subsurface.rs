@@ -1,6 +1,7 @@
 use std::{collections::HashMap, time::Instant};
 
 use wayland_server::protocol::wl_callback;
+use wayland_server::protocol::wl_output;
 
 use super::{
     RenderableSurfaceDamage, SurfaceCommitId, SurfaceCommitSequence, SurfaceInputRegion,
@@ -26,6 +27,8 @@ pub(super) struct CachedSubsurfaceCommit {
     pub(super) offset: Option<(i32, i32)>,
     pub(super) viewport_destination: PendingViewportChange,
     pub(super) buffer_scale: Option<u32>,
+    pub(super) buffer_transform: Option<wl_output::Transform>,
+    pub(super) opaque_region: Option<SurfaceInputRegion>,
     pub(super) input_region: Option<SurfaceInputRegion>,
     pub(super) presentation_feedbacks: Vec<PendingPresentationFeedback>,
     pub(super) resize_commit: Option<super::ResizeCommitSnapshot>,
@@ -46,6 +49,8 @@ impl CachedSubsurfaceCommit {
             offset,
             viewport_destination,
             buffer_scale,
+            buffer_transform,
+            opaque_region,
             input_region,
             presentation_feedbacks,
             resize_commit,
@@ -77,6 +82,12 @@ impl CachedSubsurfaceCommit {
         }
         if buffer_scale.is_some() {
             self.buffer_scale = buffer_scale;
+        }
+        if buffer_transform.is_some() {
+            self.buffer_transform = buffer_transform;
+        }
+        if opaque_region.is_some() {
+            self.opaque_region = opaque_region;
         }
         if input_region.is_some() {
             self.input_region = input_region;
@@ -134,6 +145,8 @@ mod window_geometry_tests {
             offset: None,
             viewport_destination: PendingViewportChange::default(),
             buffer_scale: None,
+            buffer_transform: None,
+            opaque_region: None,
             input_region: None,
             presentation_feedbacks: Vec::new(),
             resize_commit: None,

@@ -259,6 +259,7 @@ impl CompositorState {
                 }
             }
             self.invalidate_surface_origin_cache();
+            self.reconcile_all_surface_output_memberships();
             return;
         };
         if visual_width == 0 || visual_height == 0 {
@@ -290,6 +291,7 @@ impl CompositorState {
             }
         }
         self.invalidate_surface_origin_cache();
+        self.reconcile_all_surface_output_memberships();
     }
 
     pub(in crate::compositor) fn clear_toplevel_visual_render_assignment(

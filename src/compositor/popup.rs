@@ -52,23 +52,12 @@ impl PopupRect {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct PopupAnchorRect {
     pub(super) x: i32,
     pub(super) y: i32,
     pub(super) width: i32,
     pub(super) height: i32,
-}
-
-impl Default for PopupAnchorRect {
-    fn default() -> Self {
-        Self {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,10 +200,18 @@ pub(super) struct XdgPositionerState {
     pub(super) offset_y: i32,
     pub(super) constraint_adjustment: PopupConstraintAdjustment,
     pub(super) parent_size: Option<(i32, i32)>,
+    pub(super) parent_configure: Option<u32>,
     pub(super) reactive: bool,
 }
 
 impl XdgPositionerState {
+    pub(super) fn is_complete(self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.anchor_rect.width > 0
+            && self.anchor_rect.height > 0
+    }
+
     fn geometry(self) -> PopupRect {
         PopupRect::new(
             self.geometry_x(),
@@ -340,8 +337,10 @@ impl XdgPositionerState {
 impl Default for XdgPositionerState {
     fn default() -> Self {
         Self {
-            width: 1,
-            height: 1,
+            // xdg_positioner is incomplete until both set_size and
+            // set_anchor_rect have supplied non-zero dimensions.
+            width: 0,
+            height: 0,
             anchor_rect: PopupAnchorRect::default(),
             anchor: PopupEdges::CENTER,
             gravity: PopupEdges::CENTER,
@@ -349,7 +348,29 @@ impl Default for XdgPositionerState {
             offset_y: 0,
             constraint_adjustment: PopupConstraintAdjustment::default(),
             parent_size: None,
+            parent_configure: None,
             reactive: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_positioner_is_not_usable_for_reposition() {
+        assert!(!XdgPositionerState::default().is_complete());
+
+        let mut positioner = XdgPositionerState {
+            width: 80,
+            height: 40,
+            ..XdgPositionerState::default()
+        };
+        assert!(!positioner.is_complete());
+
+        positioner.anchor_rect.width = 1;
+        positioner.anchor_rect.height = 1;
+        assert!(positioner.is_complete());
     }
 }

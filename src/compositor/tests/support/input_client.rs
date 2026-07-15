@@ -615,10 +615,52 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_pointer_
     commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
-    commands.send(ServerCommand::PointerAxis {
-        horizontal: 0.0,
-        vertical: 15.0,
-    })?;
+    commands.send(ServerCommand::PointerAxisFrame(PointerAxisFrame {
+        timestamp_usec: 123_456_000,
+        source: PointerAxisSource::Wheel,
+        horizontal: PointerAxisComponent::absent(),
+        vertical: PointerAxisComponent {
+            continuous: Some(15.0),
+            discrete: Some(1),
+            stopped: false,
+        },
+    }))?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    Ok(state)
+}
+
+pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_pointer_axis_at_version(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    pointer_version: u32,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, pointer_version..=pointer_version, ())?;
+    let _pointer = seat.get_pointer(&qh, ());
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion { x: 42.0, y: 48.0 })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerAxisFrame(PointerAxisFrame {
+        timestamp_usec: 123_456_000,
+        source: PointerAxisSource::Wheel,
+        horizontal: PointerAxisComponent::absent(),
+        vertical: PointerAxisComponent::continuous(15.0),
+    }))?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
     Ok(state)
@@ -1171,6 +1213,9 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_and_receive_surface
     let surface = compositor.create_surface(&qh, ());
     let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
     let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
     surface.attach(Some(&buffer), 0, 0);
     surface.damage_buffer(0, 0, width as i32, height as i32);
     surface.commit();

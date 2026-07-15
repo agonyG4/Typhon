@@ -79,6 +79,39 @@ impl CompositorState {
             superseded_callbacks.extend(commit.frame_callbacks);
             commit.frame_callbacks = superseded_callbacks;
         }
+        if self.xdg_surface_is_constructed(surface_id) {
+            match commit.attachment.as_ref() {
+                Some(PendingSurfaceAttachment::Buffer(_))
+                    if !self.xdg_surface_is_configured(surface_id) =>
+                {
+                    if let Some(surface) = self.surface_resource_by_id(surface_id)
+                        && let Some(client) = surface.client()
+                        && let Some(xdg_surface) =
+                            self.xdg_surface_resources.get(&surface_id).cloned()
+                    {
+                        self.post_protocol_error(
+                            &client,
+                            &xdg_surface,
+                            xdg_surface::Error::UnconfiguredBuffer,
+                            "xdg_surface buffer commit was not preceded by an acknowledged configure"
+                                .to_string(),
+                        );
+                    }
+                    self.release_unpublished_surface_tree_nodes(vec![(surface_id, commit)]);
+                    return;
+                }
+                Some(PendingSurfaceAttachment::RemoveContent) => {
+                    self.begin_xdg_empty_or_unmap_commit(surface_id);
+                    self.configure_xdg_surface_if_needed(surface_id);
+                }
+                None => {
+                    if self.mark_xdg_empty_commit(surface_id) {
+                        self.configure_xdg_surface_if_needed(surface_id);
+                    }
+                }
+                _ => {}
+            }
+        }
         if self.is_effectively_synchronized_subsurface(surface_id) {
             self.cache_synchronized_subsurface_commit(surface_id, commit);
             return;
@@ -90,10 +123,23 @@ impl CompositorState {
                 {
                     let viewport = data.viewport_for_change(commit.viewport_destination);
                     let buffer_scale = data.buffer_scale_for_change(commit.buffer_scale);
+                    let buffer_transform =
+                        data.buffer_transform_for_change(commit.buffer_transform);
                     if pending
-                        .apply_committed_surface_state(viewport, buffer_scale)
+                        .apply_committed_surface_state(viewport, buffer_scale, buffer_transform)
                         .is_err()
                     {
+                        if let Some(client) = surface.client() {
+                            self.post_protocol_error(
+                                &client,
+                                &surface,
+                                wl_surface::Error::InvalidSize,
+                                "buffer dimensions are not integral after transform and scale"
+                                    .to_string(),
+                            );
+                        }
+                        pending.release_target().release();
+                        self.complete_frame_callbacks(std::mem::take(&mut commit.frame_callbacks));
                         return;
                     }
                 }
@@ -129,6 +175,21 @@ impl CompositorState {
         mut nodes: Vec<(u32, CachedSubsurfaceCommit)>,
     ) {
         if !self.prepare_surface_tree_surface_state(&mut nodes) {
+            if compositor_debug_surface_logging_enabled() {
+                eprintln!(
+                    "oblivion-one compositor: surface_commit validation failed surface={surface_id}"
+                );
+            }
+            if let Some(surface) = self.surface_resource_by_id(surface_id)
+                && let Some(client) = surface.client()
+            {
+                self.post_protocol_error(
+                    &client,
+                    &surface,
+                    wl_surface::Error::InvalidSize,
+                    "buffer dimensions are not integral after transform and scale".to_string(),
+                );
+            }
             self.release_unpublished_surface_tree_nodes(nodes);
             return;
         }
@@ -397,8 +458,9 @@ impl CompositorState {
             };
             let viewport = data.viewport_for_change(commit.viewport_destination);
             let buffer_scale = data.buffer_scale_for_change(commit.buffer_scale);
+            let buffer_transform = data.buffer_transform_for_change(commit.buffer_transform);
             if pending
-                .apply_committed_surface_state(viewport, buffer_scale)
+                .apply_committed_surface_state(viewport, buffer_scale, buffer_transform)
                 .is_err()
             {
                 return false;
@@ -423,7 +485,8 @@ impl CompositorState {
             } = explicit_sync;
             let Some(PendingSurfaceAttachment::Buffer(pending)) = commit.attachment.as_mut() else {
                 if acquire.is_some() || release.is_some() {
-                    state.post_error(
+                    state.post_error_with_metrics(
+                        &mut self.compliance_metrics,
                         SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
                         "explicit sync points were set without an attached buffer",
                     );
@@ -432,28 +495,32 @@ impl CompositorState {
                 continue;
             };
             if !pending.data.is_dmabuf() {
-                state.post_error(
+                state.post_error_with_metrics(
+                    &mut self.compliance_metrics,
                     SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER,
                     "explicit sync is only supported for linux-dmabuf buffers",
                 );
                 return None;
             }
             let Some(acquire) = acquire else {
-                state.post_error(
+                state.post_error_with_metrics(
+                    &mut self.compliance_metrics,
                     SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
                     "dmabuf commit is missing an acquire timeline point",
                 );
                 return None;
             };
             let Some(release) = release else {
-                state.post_error(
+                state.post_error_with_metrics(
+                    &mut self.compliance_metrics,
                     SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT,
                     "dmabuf commit is missing a release timeline point",
                 );
                 return None;
             };
             if acquire.timeline.same_timeline(&release.timeline) && acquire.point >= release.point {
-                state.post_error(
+                state.post_error_with_metrics(
+                    &mut self.compliance_metrics,
                     SYNCOBJ_SURFACE_ERROR_CONFLICTING_POINTS,
                     "acquire timeline point must be lower than release point on the same timeline",
                 );
@@ -465,7 +532,8 @@ impl CompositorState {
                 continue;
             }
             let Some(commit_id) = self.acquire_commit_ids.allocate() else {
-                state.post_error(
+                state.post_error_with_metrics(
+                    &mut self.compliance_metrics,
                     SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
                     "explicit sync commit identity space exhausted",
                 );
@@ -951,131 +1019,6 @@ impl CompositorState {
         }
     }
 
-    pub(in crate::compositor) fn apply_cached_subsurface_commit(
-        &mut self,
-        surface_id: u32,
-        commit: CachedSubsurfaceCommit,
-    ) {
-        let CachedSubsurfaceCommit {
-            commit_id,
-            commit_sequence,
-            attachment,
-            damage,
-            frame_callbacks,
-            explicit_sync,
-            offset,
-            viewport_destination,
-            buffer_scale,
-            input_region,
-            presentation_feedbacks,
-            resize_commit,
-            resize_capture_finalized,
-            window_geometry,
-            cached_at: _,
-        } = commit;
-        let Some(surface) = self.surface_resource_by_id(surface_id) else {
-            return;
-        };
-        let Some(data) = surface.data::<SurfaceData>() else {
-            return;
-        };
-        let viewport = data.apply_viewport_change(viewport_destination);
-        let surface_size = viewport
-            .destination
-            .or_else(|| viewport.source.and_then(ViewportSourceRect::logical_size));
-        let committed_buffer_scale = data.apply_buffer_scale_change(buffer_scale);
-        let input_region_changed = data.apply_input_region_change(input_region);
-        let damage = damage.or(window_geometry
-            .is_some()
-            .then_some(RenderableSurfaceDamage::Full));
-        match attachment {
-            Some(PendingSurfaceAttachment::Buffer(mut pending)) => {
-                if let Some((x, y)) = offset {
-                    pending.x = x;
-                    pending.y = y;
-                }
-                debug_assert!(pending.surface_size.is_some());
-                self.commit_surface_request_with_captured_sync(
-                    surface_id,
-                    commit_id,
-                    commit_sequence,
-                    SurfacePublicationSource::SurfaceTree,
-                    pending,
-                    damage.unwrap_or_else(RenderableSurfaceDamage::full),
-                    frame_callbacks,
-                    explicit_sync,
-                    window_geometry,
-                );
-            }
-            Some(PendingSurfaceAttachment::RemoveContent) => {
-                if let Some(explicit_sync) = explicit_sync
-                    && (explicit_sync.acquire.is_some() || explicit_sync.release.is_some())
-                {
-                    explicit_sync.state.post_error(
-                        SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
-                        "explicit sync points were set without an attached buffer",
-                    );
-                    return;
-                }
-                if self.is_cursor_surface(surface_id) {
-                    self.commit_cursor_surface_removal_request(surface_id, None);
-                    self.note_explicit_commit_published(commit_id);
-                    self.complete_frame_callbacks(frame_callbacks);
-                } else {
-                    self.commit_surface_remove_content(
-                        surface_id,
-                        commit_sequence,
-                        frame_callbacks,
-                        SurfacePublicationSource::SurfaceTree,
-                    );
-                }
-            }
-            None => {
-                let explicit_sync = match explicit_sync {
-                    Some(explicit_sync)
-                        if explicit_sync.acquire.is_some() || explicit_sync.release.is_some() =>
-                    {
-                        explicit_sync.state.post_error(
-                            SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
-                            "explicit sync points were set without an attached buffer",
-                        );
-                        return;
-                    }
-                    Some(explicit_sync) => Some(explicit_sync.state),
-                    None => None,
-                };
-                self.commit_surface_without_buffer(
-                    surface_id,
-                    BufferlessSurfaceCommitState {
-                        commit_sequence,
-                        damage,
-                        explicit_sync,
-                        surface_size,
-                        buffer_scale: committed_buffer_scale,
-                        resize_commit,
-                        resize_capture_finalized,
-                        window_geometry,
-                    },
-                );
-                self.note_explicit_commit_published(commit_id);
-                if self
-                    .renderable_surfaces
-                    .iter()
-                    .any(|surface| surface.surface_id == surface_id)
-                {
-                    self.pending_frame_callbacks.extend(frame_callbacks);
-                } else {
-                    self.complete_frame_callbacks(frame_callbacks);
-                }
-            }
-        }
-        if input_region_changed {
-            self.refresh_pointer_focus_at_last_position();
-        }
-        self.pending_presentation_feedbacks
-            .extend(presentation_feedbacks);
-    }
-
     pub(in crate::compositor) fn pending_stack_for_parent(
         &mut self,
         parent_id: u32,
@@ -1185,11 +1128,7 @@ impl CompositorState {
             self.release_cached_subsurface_commits(vec![commit]);
         }
         self.unmap_surface_content(surface_id);
-        if let Some(parent_id) = parent_id {
-            self.clear_surface_role_if(surface_id, SurfaceRole::Subsurface { parent_id });
-        } else {
-            self.clear_surface_role(surface_id);
-        }
+        self.deactivate_role_instance(surface_id);
         self.set_surface_placement(surface_id, SurfacePlacement::root());
         for stack in self.committed_subsurface_stacks.values_mut() {
             stack.retain(|id| *id != surface_id);

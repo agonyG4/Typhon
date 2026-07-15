@@ -21,10 +21,10 @@ pub(super) const WL_SHM_FORMAT_XRGB2101010: u32 = 0x3033_5258;
 pub(super) const WL_SHM_FORMAT_ABGR2101010: u32 = 0x3033_4241;
 pub(super) const WL_SHM_FORMAT_XBGR2101010: u32 = 0x3033_4258;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct ShmPoolData {
     pub(super) file: Arc<File>,
-    size: AtomicI32,
+    size: Arc<AtomicI32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,12 +36,18 @@ impl ShmPoolData {
     pub(super) fn new(file: Arc<File>, size: i32) -> Self {
         Self {
             file,
-            size: AtomicI32::new(size),
+            size: Arc::new(AtomicI32::new(size)),
         }
     }
 
     pub(super) fn size(&self) -> i32 {
         self.size.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn has_backing_range(&self, end: u64) -> bool {
+        self.file
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() >= end)
     }
 
     pub(super) fn grow_to(&self, new_size: i32) -> Result<(), ShmPoolResizeError> {
@@ -72,8 +78,7 @@ impl ShmPoolData {
 #[derive(Debug, Clone)]
 pub(super) struct ShmBufferData {
     pub(super) identity: BufferIdentity,
-    pub(super) pool_size: i32,
-    pub(super) file: Arc<File>,
+    pub(super) pool: Arc<ShmPoolData>,
     pub(super) offset: i32,
     pub(super) width: i32,
     pub(super) height: i32,
@@ -83,18 +88,30 @@ pub(super) struct ShmBufferData {
 
 impl ShmBufferData {
     pub(super) fn fits_in_pool(&self) -> bool {
-        let _ = &self.format;
+        let Some(format) = shm_format_descriptor(self.format) else {
+            return false;
+        };
         if self.offset < 0 || self.width <= 0 || self.height <= 0 || self.stride <= 0 {
             return false;
         }
-        let Some(bytes) = self.height.checked_mul(self.stride) else {
+        let Some(row_bytes) = self
+            .width
+            .checked_mul(format.bytes_per_pixel)
+            .filter(|row_bytes| *row_bytes <= self.stride)
+        else {
             return false;
         };
-        let Some(end) = self.offset.checked_add(bytes) else {
+        let Some(end) = self
+            .height
+            .checked_sub(1)
+            .and_then(|rows| rows.checked_mul(self.stride))
+            .and_then(|last_row| self.offset.checked_add(last_row))
+            .and_then(|last_row_offset| last_row_offset.checked_add(row_bytes))
+        else {
             return false;
         };
 
-        end <= self.pool_size
+        end <= self.pool.size()
     }
 
     pub(super) fn width(&self) -> io::Result<u32> {
@@ -120,7 +137,12 @@ impl ShmBufferData {
         let width = usize::try_from(self.width).map_err(|_| invalid_shm_buffer())?;
         let height = usize::try_from(self.height).map_err(|_| invalid_shm_buffer())?;
         let stride = usize::try_from(self.stride).map_err(|_| invalid_shm_buffer())?;
-        let row_pixels_bytes = width.checked_mul(4).ok_or_else(invalid_shm_buffer)?;
+        let format = shm_format_descriptor(self.format).ok_or_else(invalid_shm_buffer)?;
+        let bytes_per_pixel =
+            usize::try_from(format.bytes_per_pixel).map_err(|_| invalid_shm_buffer())?;
+        let row_pixels_bytes = width
+            .checked_mul(bytes_per_pixel)
+            .ok_or_else(invalid_shm_buffer)?;
         if row_pixels_bytes > stride {
             return Err(invalid_shm_buffer());
         }
@@ -128,7 +150,7 @@ impl ShmBufferData {
         let pixel_count = self.pixel_count()?;
         pixels.resize(pixel_count, 0);
         if row_pixels_bytes == stride {
-            self.file.read_exact_at(
+            self.pool.file.read_exact_at(
                 bytemuck::cast_slice_mut(pixels.as_mut_slice()),
                 self.offset as u64,
             )?;
@@ -137,7 +159,7 @@ impl ShmBufferData {
                 let source_offset = self.offset as u64 + (row_index * stride) as u64;
                 let target_start = row_index * width;
                 let target_end = target_start + width;
-                self.file.read_exact_at(
+                self.pool.file.read_exact_at(
                     bytemuck::cast_slice_mut(&mut pixels[target_start..target_end]),
                     source_offset,
                 )?;
@@ -164,6 +186,9 @@ impl ShmBufferData {
 
         let stride = usize::try_from(self.stride).map_err(|_| invalid_shm_buffer())?;
         let surface_width = usize::try_from(width).map_err(|_| invalid_shm_buffer())?;
+        let format = shm_format_descriptor(self.format).ok_or_else(invalid_shm_buffer)?;
+        let bytes_per_pixel =
+            usize::try_from(format.bytes_per_pixel).map_err(|_| invalid_shm_buffer())?;
         let rects = damage.clipped_rects(width, height);
         if rects.is_empty() {
             return Ok(());
@@ -174,19 +199,22 @@ impl ShmBufferData {
             let rect_y = usize::try_from(rect.y).map_err(|_| invalid_shm_buffer())?;
             let rect_width = usize::try_from(rect.width).map_err(|_| invalid_shm_buffer())?;
             let rect_height = usize::try_from(rect.height).map_err(|_| invalid_shm_buffer())?;
-            let row_bytes = rect_width.checked_mul(4).ok_or_else(invalid_shm_buffer)?;
+            let row_bytes = rect_width
+                .checked_mul(bytes_per_pixel)
+                .ok_or_else(invalid_shm_buffer)?;
             for row_index in 0..rect_height {
                 let source_offset = self.offset as u64
                     + ((rect_y + row_index) * stride) as u64
-                    + (rect_x * 4) as u64;
+                    + (rect_x * bytes_per_pixel) as u64;
                 let target_start = (rect_y + row_index) * surface_width + rect_x;
                 let target_end = target_start + rect_width;
                 let Some(target_row) = pixels.get_mut(target_start..target_end) else {
                     return Err(invalid_shm_buffer());
                 };
-                self.file
+                self.pool
+                    .file
                     .read_exact_at(bytemuck::cast_slice_mut(target_row), source_offset)?;
-                debug_assert_eq!(row_bytes, target_row.len() * 4);
+                debug_assert_eq!(row_bytes, target_row.len() * bytes_per_pixel);
             }
         }
 
@@ -213,6 +241,27 @@ impl ShmBufferData {
         let height = usize::try_from(self.height).map_err(|_| invalid_shm_buffer())?;
         width.checked_mul(height).ok_or_else(invalid_shm_buffer)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ShmFormatDescriptor {
+    pub(super) bytes_per_pixel: i32,
+}
+
+pub(super) fn shm_format_descriptor(format: WEnum<wl_shm::Format>) -> Option<ShmFormatDescriptor> {
+    let supported = matches!(
+        format,
+        WEnum::Value(wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888)
+            | WEnum::Unknown(
+                WL_SHM_FORMAT_ABGR8888
+                    | WL_SHM_FORMAT_XBGR8888
+                    | WL_SHM_FORMAT_ARGB2101010
+                    | WL_SHM_FORMAT_XRGB2101010
+                    | WL_SHM_FORMAT_ABGR2101010
+                    | WL_SHM_FORMAT_XBGR2101010,
+            )
+    );
+    supported.then_some(ShmFormatDescriptor { bytes_per_pixel: 4 })
 }
 
 fn normalize_shm_argb_pixels<'a>(

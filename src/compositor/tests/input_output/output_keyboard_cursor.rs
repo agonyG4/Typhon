@@ -34,6 +34,32 @@ fn wayland_client_surface_commit_sends_output_enter() {
 }
 
 #[test]
+fn output_membership_reconciles_leave_and_remap_enter() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+    let state = create_mapped_surface_then_unmap_and_remap(&socket_path);
+    let _server = stop_test_server(running, server_thread);
+    let state = state.unwrap();
+    assert_eq!(state.surface_leave_count, 1);
+    assert_eq!(state.surface_enter_count, 2);
+}
+
+#[test]
+fn output_membership_reconciles_move_outside_without_duplicate_enter() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let state = create_mapped_surface_then_move_outside_output(&socket_path, &commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+    let state = state.unwrap();
+    assert_eq!(state.surface_enter_count, 1);
+    assert_eq!(state.surface_leave_count, 1);
+}
+
+#[test]
 fn wayland_surface_offset_request_updates_rendered_surface_offset() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -163,6 +189,56 @@ fn wayland_client_receives_fractional_scale_updates_after_output_scale_change() 
 
     let state = state.unwrap();
     assert_eq!(state.fractional_preferred_scales, vec![120, 180]);
+}
+
+#[test]
+fn preferred_buffer_events_are_version_gated_and_deduplicated() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_mapped_surface_then_set_output_preferences(
+        &socket_path,
+        &commands,
+        5,
+        1.5,
+        Some(1),
+        false,
+    )
+    .unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(state.preferred_buffer_scales.is_empty());
+    assert!(state.preferred_buffer_transforms.is_empty());
+}
+
+#[test]
+fn preferred_buffer_events_emit_changed_values_and_default_returns_once() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_mapped_surface_then_set_output_preferences(
+        &socket_path,
+        &commands,
+        6,
+        1.5,
+        Some(1),
+        true,
+    )
+    .unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(state.preferred_buffer_scales, vec![2, 1]);
+    assert_eq!(
+        state.preferred_buffer_transforms,
+        vec![
+            client_wl_output::Transform::_90,
+            client_wl_output::Transform::Normal
+        ]
+    );
 }
 
 #[test]
@@ -342,8 +418,29 @@ fn wayland_client_receives_pointer_axis_from_native_input_bridge() {
     let state = state.unwrap();
     assert!(state.pointer_enter);
     assert_eq!(state.pointer_vertical_axis, Some(15.0));
+    assert_eq!(state.pointer_axis_sources, vec![0]);
+    assert_eq!(state.pointer_axis_discrete, vec![(0, 1)]);
+    assert_eq!(state.pointer_axis_times, vec![123_456]);
     assert_eq!(state.pointer_enter_frame_count, 1);
     assert_eq!(state.pointer_frame_count, 3);
+}
+
+#[test]
+fn wl_pointer_v4_receives_only_legacy_axis_events() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state =
+        create_focused_toplevel_and_receive_pointer_axis_at_version(&socket_path, &commands, 4);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let state = state.unwrap();
+    assert_eq!(state.pointer_vertical_axis, Some(15.0));
+    assert!(state.pointer_axis_sources.is_empty());
+    assert!(state.pointer_axis_discrete.is_empty());
+    assert_eq!(state.pointer_frame_count, 0);
 }
 
 #[test]

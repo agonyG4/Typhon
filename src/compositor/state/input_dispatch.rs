@@ -412,6 +412,13 @@ impl CompositorState {
             compositor_surface_id(&grab.surface),
             reason
         ));
+        if self.active_drag.is_some() {
+            if reason == "last-release" {
+                self.drop_active_drag();
+            } else {
+                self.cancel_drag_session(reason);
+            }
+        }
     }
 
     pub(in crate::compositor) fn cancel_implicit_pointer_grab_for_surface_ids(
@@ -533,7 +540,13 @@ impl CompositorState {
             };
             let serial = self.next_configure_serial();
             let time = wayland_event_time();
-            self.remember_input_serial(serial, surface.clone());
+            if pressed {
+                self.remember_input_serial(
+                    serial,
+                    surface.clone(),
+                    InputSerialKind::PointerButtonPress { button },
+                );
+            }
             if pressed {
                 let surface_id = compositor_surface_id(&surface);
                 let root_surface_id = self.root_surface_id_for_surface(surface_id);
@@ -631,7 +644,13 @@ impl CompositorState {
         };
         let serial = self.next_configure_serial();
         let time = wayland_event_time();
-        self.remember_input_serial(serial, surface.clone());
+        if pressed {
+            self.remember_input_serial(
+                serial,
+                surface.clone(),
+                InputSerialKind::PointerButtonPress { button },
+            );
+        }
 
         if pressed {
             let surface_id = compositor_surface_id(&surface);
@@ -708,62 +727,48 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn send_pointer_axis(&mut self, horizontal: f64, vertical: f64) {
-        if horizontal == 0.0 && vertical == 0.0 {
+        self.send_pointer_axis_frame(PointerAxisFrame::unknown(
+            u64::from(wayland_event_time()) * 1_000,
+            horizontal,
+            vertical,
+        ));
+    }
+
+    pub(in crate::compositor) fn send_pointer_axis_frame(&mut self, frame: PointerAxisFrame) {
+        if frame.horizontal.continuous == Some(0.0)
+            && frame.vertical.continuous == Some(0.0)
+            && !frame.horizontal.stopped
+            && !frame.vertical.stopped
+        {
             return;
         }
+        self.compliance_metrics.pointer_axis_frames = self
+            .compliance_metrics
+            .pointer_axis_frames
+            .saturating_add(1);
 
         if let Some(surface) = self.locked_pointer_input_surface() {
             if let Some(active) = self.active_locked_pointer_binding() {
                 self.pin_locked_pointer_focus(&active);
             }
             self.ensure_pointer_focus(&surface);
-            let time = wayland_event_time();
             for pointer in self
                 .pointer_resources
                 .iter()
                 .filter(|pointer| resource_belongs_to_surface_client(*pointer, &surface))
             {
-                if horizontal != 0.0 {
-                    let _ = pointer.send_event(wl_pointer::Event::Axis {
-                        time,
-                        axis: WEnum::Value(wl_pointer::Axis::HorizontalScroll),
-                        value: horizontal,
-                    });
-                }
-                if vertical != 0.0 {
-                    let _ = pointer.send_event(wl_pointer::Event::Axis {
-                        time,
-                        axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
-                        value: vertical,
-                    });
-                }
-                send_pointer_frame_if_supported(pointer);
+                send_pointer_axis_frame_to_resource(pointer, frame);
             }
             return;
         }
 
         if let Some(surface) = self.implicit_pointer_grab_surface("surface-destroyed") {
-            let time = wayland_event_time();
             for pointer in self
                 .pointer_resources
                 .iter()
                 .filter(|pointer| resource_belongs_to_surface_client(*pointer, &surface))
             {
-                if horizontal != 0.0 {
-                    let _ = pointer.send_event(wl_pointer::Event::Axis {
-                        time,
-                        axis: WEnum::Value(wl_pointer::Axis::HorizontalScroll),
-                        value: horizontal,
-                    });
-                }
-                if vertical != 0.0 {
-                    let _ = pointer.send_event(wl_pointer::Event::Axis {
-                        time,
-                        axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
-                        value: vertical,
-                    });
-                }
-                send_pointer_frame_if_supported(pointer);
+                send_pointer_axis_frame_to_resource(pointer, frame);
             }
             return;
         }
@@ -776,7 +781,6 @@ impl CompositorState {
             self.clear_pointer_focus();
             return;
         }
-        let time = wayland_event_time();
         self.ensure_pointer_focus(&target.surface);
         self.send_pointer_enter_if_needed(&target);
 
@@ -785,21 +789,62 @@ impl CompositorState {
             .iter()
             .filter(|pointer| resource_belongs_to_surface_client(*pointer, &target.surface))
         {
-            if horizontal != 0.0 {
-                let _ = pointer.send_event(wl_pointer::Event::Axis {
-                    time,
-                    axis: WEnum::Value(wl_pointer::Axis::HorizontalScroll),
-                    value: horizontal,
-                });
-            }
-            if vertical != 0.0 {
-                let _ = pointer.send_event(wl_pointer::Event::Axis {
-                    time,
-                    axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
-                    value: vertical,
-                });
-            }
-            send_pointer_frame_if_supported(pointer);
+            send_pointer_axis_frame_to_resource(pointer, frame);
         }
     }
+}
+
+fn send_pointer_axis_frame_to_resource(pointer: &wl_pointer::WlPointer, frame: PointerAxisFrame) {
+    let time = wayland_event_time_from_usec(frame.timestamp_usec);
+    if pointer.version() >= 5 {
+        let source = match frame.source {
+            PointerAxisSource::Wheel => Some(wl_pointer::AxisSource::Wheel),
+            PointerAxisSource::Finger => Some(wl_pointer::AxisSource::Finger),
+            PointerAxisSource::Continuous => Some(wl_pointer::AxisSource::Continuous),
+            PointerAxisSource::WheelTilt if pointer.version() >= 6 => {
+                Some(wl_pointer::AxisSource::WheelTilt)
+            }
+            PointerAxisSource::WheelTilt | PointerAxisSource::Unknown => None,
+        };
+        if let Some(source) = source {
+            let _ = pointer.send_event(wl_pointer::Event::AxisSource {
+                axis_source: WEnum::Value(source),
+            });
+        }
+    }
+
+    let axes = [
+        (wl_pointer::Axis::HorizontalScroll, frame.horizontal),
+        (wl_pointer::Axis::VerticalScroll, frame.vertical),
+    ];
+    for (axis, component) in axes {
+        if pointer.version() >= 5
+            && let Some(discrete) = component.discrete
+        {
+            let _ = pointer.send_event(wl_pointer::Event::AxisDiscrete {
+                axis: WEnum::Value(axis),
+                discrete,
+            });
+        }
+    }
+    for (axis, component) in axes {
+        if let Some(value) = component.continuous
+            && value != 0.0
+        {
+            let _ = pointer.send_event(wl_pointer::Event::Axis {
+                time,
+                axis: WEnum::Value(axis),
+                value,
+            });
+        }
+    }
+    for (axis, component) in axes {
+        if pointer.version() >= 5 && component.stopped {
+            let _ = pointer.send_event(wl_pointer::Event::AxisStop {
+                time,
+                axis: WEnum::Value(axis),
+            });
+        }
+    }
+    send_pointer_frame_if_supported(pointer);
 }

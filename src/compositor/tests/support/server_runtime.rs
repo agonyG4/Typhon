@@ -65,6 +65,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
         horizontal: f64,
         vertical: f64,
     },
+    PointerAxisFrame(PointerAxisFrame),
     BeginFrameAction {
         x: f64,
         y: f64,
@@ -107,6 +108,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     SetOutputScale {
         scale_factor: f64,
     },
+    SetOutputPreferredTransform(u32),
     MinimizeFocused,
     RestoreNextMinimized,
     FocusRootWindow(u32),
@@ -122,6 +124,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureSceneRenderGeneration(Sender<u64>),
     CaptureRenderGenerationCause(Sender<RenderGenerationCause>),
     CaptureRenderableSurfaceCount(Sender<usize>),
+    CaptureSurfaceResourceCount(Sender<usize>),
     CaptureRenderableSurfaceSnapshot(Sender<Vec<RenderableSurfaceSnapshot>>),
     CaptureCommittedWindowGeometry(Sender<Option<XdgWindowGeometry>>),
     CaptureToplevelVisualGeometry(Sender<Option<ToplevelVisualGeometrySnapshot>>),
@@ -220,6 +223,9 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     } => {
                         server.send_pointer_axis(horizontal, vertical);
                     }
+                    ServerCommand::PointerAxisFrame(frame) => {
+                        server.send_pointer_axis_frame(frame);
+                    }
                     ServerCommand::BeginFrameAction { x, y } => {
                         server.begin_window_frame_action_at(x, y);
                     }
@@ -261,6 +267,20 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::SetOutputScale { scale_factor } => {
                         server.set_output_scale_factor(scale_factor);
+                    }
+                    ServerCommand::SetOutputPreferredTransform(transform) => {
+                        let transform = match transform {
+                            0 => wayland_server::protocol::wl_output::Transform::Normal,
+                            1 => wayland_server::protocol::wl_output::Transform::_90,
+                            2 => wayland_server::protocol::wl_output::Transform::_180,
+                            3 => wayland_server::protocol::wl_output::Transform::_270,
+                            4 => wayland_server::protocol::wl_output::Transform::Flipped,
+                            5 => wayland_server::protocol::wl_output::Transform::Flipped90,
+                            6 => wayland_server::protocol::wl_output::Transform::Flipped180,
+                            7 => wayland_server::protocol::wl_output::Transform::Flipped270,
+                            _ => continue,
+                        };
+                        server.set_output_preferred_transform(transform);
                     }
                     ServerCommand::MinimizeFocused => {
                         server.minimize_focused_window();
@@ -316,6 +336,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                     geometry.height = height as i32;
                                 }
                             }
+                            server.state.reconcile_all_surface_output_memberships();
                             server
                                 .state
                                 .update_toplevel_visual_render_assignment(surface_id);
@@ -332,6 +353,9 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureRenderableSurfaceCount(reply) => {
                         let _ = reply.send(server.renderable_surfaces().len());
+                    }
+                    ServerCommand::CaptureSurfaceResourceCount(reply) => {
+                        let _ = reply.send(server.state.surface_resources.len());
                     }
                     ServerCommand::CaptureRenderableSurfaceSnapshot(reply) => {
                         let surfaces = server.renderable_surfaces();
@@ -428,24 +452,30 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                         });
                     }
                     ServerCommand::CaptureXdgRoleSnapshot { surface_id, reply } => {
-                        let tracked_surface_id = if server.state.toplevel_surfaces.len() == 1 {
+                        let tracked_surface_id = if let Some((tracked_id, _)) = server
+                            .state
+                            .surface_resources
+                            .iter()
+                            .find(|(_, surface)| surface.id().protocol_id() == surface_id)
+                        {
+                            *tracked_id
+                        } else if server.state.popup_surfaces.len() == 1 {
+                            *server.state.popup_surfaces.keys().next().unwrap()
+                        } else if server.state.toplevel_surfaces.len() == 1 {
                             *server.state.toplevel_surfaces.keys().next().unwrap()
-                        } else if server.state.surface_resources.contains_key(&surface_id) {
-                            surface_id
                         } else if server.state.surface_resources.len() == 1 {
                             *server.state.surface_resources.keys().next().unwrap()
                         } else {
                             surface_id
                         };
+                        let toplevel = server.state.toplevel_surfaces.get(&tracked_surface_id);
                         let _ = reply.send(XdgRoleSnapshot {
+                            surface_id: tracked_surface_id,
                             surface_registered: server
                                 .state
                                 .surface_resources
                                 .contains_key(&tracked_surface_id),
-                            configured: server
-                                .state
-                                .configured_xdg_surfaces
-                                .contains(&tracked_surface_id),
+                            configured: server.state.xdg_surface_is_configured(tracked_surface_id),
                             toplevel_count: server.state.toplevel_surfaces.len(),
                             toplevel_registered: server
                                 .state
@@ -463,6 +493,68 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .surface_placements
                                 .get(&tracked_surface_id)
                                 .copied(),
+                            permanent_role: server.state.permanent_surface_role(tracked_surface_id),
+                            xdg_association: server
+                                .state
+                                .xdg_association_exists(tracked_surface_id),
+                            toplevel_has_app_id: toplevel
+                                .is_some_and(|toplevel| toplevel.app_id.is_some()),
+                            toplevel_has_title: toplevel
+                                .is_some_and(|toplevel| toplevel.title.is_some()),
+                            toplevel_has_non_default_constraints: toplevel.is_some_and(
+                                |toplevel| {
+                                    toplevel.constraints != ToplevelSizeConstraints::default()
+                                        || toplevel.pending_constraints.is_some()
+                                },
+                            ),
+                            toplevel_mode: toplevel.map(|toplevel| toplevel.window.mode()),
+                            popup_parent_surface_id: server
+                                .state
+                                .popup_surfaces
+                                .get(&tracked_surface_id)
+                                .and_then(|popup| popup.parent_surface_id),
+                            pending_explicit_sync_commits: server
+                                .state
+                                .pending_explicit_sync_commits
+                                .iter()
+                                .filter(|commit| commit.surface_id == tracked_surface_id)
+                                .count(),
+                            pending_surface_tree_transactions: server
+                                .state
+                                .pending_surface_tree_transactions
+                                .iter()
+                                .filter(|transaction| {
+                                    transaction
+                                        .nodes
+                                        .iter()
+                                        .any(|(surface_id, _)| *surface_id == tracked_surface_id)
+                                })
+                                .count(),
+                            current_surface_buffer: server
+                                .state
+                                .current_surface_buffers
+                                .contains_key(&tracked_surface_id),
+                            renderable_surface: server
+                                .state
+                                .renderable_surfaces
+                                .iter()
+                                .any(|surface| surface.surface_id == tracked_surface_id),
+                            role_destroyed_pending_commits_retired: server
+                                .state
+                                .compliance_metrics
+                                .xdg_role_destroyed_pending_commits_retired,
+                            role_destroyed_pending_trees_retired: server
+                                .state
+                                .compliance_metrics
+                                .xdg_role_destroyed_pending_trees_retired,
+                            role_destroyed_acquire_watches_cancelled: server
+                                .state
+                                .compliance_metrics
+                                .xdg_role_destroyed_acquire_watches_cancelled,
+                            reassociation_blocked_stale_work: server
+                                .state
+                                .compliance_metrics
+                                .xdg_reassociation_blocked_stale_unpublished_work,
                         });
                     }
                     ServerCommand::CapturePendingFrameCallbacks(reply) => {
@@ -674,6 +766,18 @@ pub(in crate::compositor::tests) fn capture_renderable_surface_count(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report renderable surface count")
+}
+
+pub(in crate::compositor::tests) fn capture_surface_resource_count(
+    commands: &Sender<ServerCommand>,
+) -> usize {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureSurfaceResourceCount(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report surface resource count")
 }
 
 pub(in crate::compositor::tests) fn capture_renderable_surface_snapshot(

@@ -149,6 +149,136 @@ pub(in crate::compositor::tests) fn create_fractional_scale_surface_then_set_out
     Ok(state)
 }
 
+pub(in crate::compositor::tests) fn create_mapped_surface_then_set_output_preferences(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    compositor_version: u32,
+    scale_factor: f64,
+    transform: Option<u32>,
+    restore_defaults: bool,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor =
+        globals.bind(&qh, compositor_version..=compositor_version, ())?;
+    let _output: client_wl_output::WlOutput = globals.bind(&qh, 1..=4, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let surface = compositor.create_surface(&qh, ());
+    assign_test_toplevel(&globals, &qh, &surface)?;
+    let mut state = RegistryTestState::default();
+    commit_test_buffered_surface_after_initial_configure(
+        &surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        40,
+        30,
+    )?;
+    commands.send(ServerCommand::SetOutputScale { scale_factor })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    if let Some(transform) = transform {
+        commands.send(ServerCommand::SetOutputPreferredTransform(transform))?;
+        wait_for_server_commands(commands);
+        queue.roundtrip(&mut state)?;
+        if restore_defaults {
+            commands.send(ServerCommand::SetOutputScale { scale_factor })?;
+            wait_for_server_commands(commands);
+            queue.roundtrip(&mut state)?;
+            commands.send(ServerCommand::SetOutputPreferredTransform(0))?;
+            wait_for_server_commands(commands);
+            queue.roundtrip(&mut state)?;
+            commands.send(ServerCommand::SetOutputScale { scale_factor: 1.0 })?;
+            wait_for_server_commands(commands);
+            queue.roundtrip(&mut state)?;
+        }
+    }
+    Ok(state)
+}
+
+pub(in crate::compositor::tests) fn create_mapped_surface_then_move_outside_output(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let _output: client_wl_output::WlOutput = globals.bind(&qh, 1..=4, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let surface = compositor.create_surface(&qh, ());
+    assign_test_toplevel(&globals, &qh, &surface)?;
+    let mut state = RegistryTestState::default();
+    commit_test_buffered_surface_after_initial_configure(
+        &surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        40,
+        30,
+    )?;
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::SetFocusedRootVisualGeometry {
+        placement: SurfacePlacement::absolute_root_at(-500, -500),
+        width: 40,
+        height: 30,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    Ok(state)
+}
+
+pub(in crate::compositor::tests) fn create_mapped_surface_then_unmap_and_remap(
+    socket_path: &PathBuf,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let _output: client_wl_output::WlOutput = globals.bind(&qh, 1..=4, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let surface = compositor.create_surface(&qh, ());
+    assign_test_toplevel(&globals, &qh, &surface)?;
+    let mut state = RegistryTestState::default();
+    commit_test_buffered_surface_after_initial_configure(
+        &surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        40,
+        30,
+    )?;
+    surface.attach(None, 0, 0);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    commit_test_buffered_surface_after_configure(
+        &surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        40,
+        30,
+    )?;
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    Ok(state)
+}
+
 pub(in crate::compositor::tests) fn create_duplicate_fractional_scale_surface(
     socket_path: &PathBuf,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
@@ -186,6 +316,9 @@ pub(in crate::compositor::tests) fn create_client_surface_with_buffer_scale(
     let surface = compositor.create_surface(&qh, ());
     assign_test_toplevel(&globals, &qh, &surface)?;
     surface.set_buffer_scale(buffer_scale);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
     commit_test_buffered_surface(
         &surface,
         &shm,

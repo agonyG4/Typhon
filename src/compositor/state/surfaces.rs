@@ -461,6 +461,20 @@ impl CompositorState {
         self.output_scale = output_scale;
         self.send_output_scale_to_bound_outputs();
         self.send_fractional_scale_to_bound_surfaces();
+        self.reconcile_all_surface_output_memberships();
+        self.advance_render_generation(RenderGenerationCause::OutputChange);
+        true
+    }
+
+    pub(in crate::compositor) fn set_output_preferred_transform(
+        &mut self,
+        transform: wl_output::Transform,
+    ) -> bool {
+        if self.preferred_output_transform == Some(transform) {
+            return false;
+        }
+        self.preferred_output_transform = Some(transform);
+        self.reconcile_all_surface_output_memberships();
         self.advance_render_generation(RenderGenerationCause::OutputChange);
         true
     }
@@ -524,6 +538,7 @@ impl CompositorState {
             .as_ref()
             .is_some_and(|current| same_surface_resource(current, &surface));
         if changed {
+            self.focus_generation = self.focus_generation.wrapping_add(1);
             pointer_debug_log(format!(
                 "focus change reason={} old={:?} new={}",
                 reason, old_surface_id, new_surface_id
@@ -560,11 +575,20 @@ impl CompositorState {
         &mut self,
         serial: u32,
         surface: wl_surface::WlSurface,
+        kind: InputSerialKind,
     ) {
+        let client_id = surface.client().map(|client| client.id());
+        let root_surface_id = self.root_surface_id_for_surface(compositor_surface_id(&surface));
         self.recent_input_serials
             .retain(|input| input.serial != serial);
-        self.recent_input_serials
-            .push(InputSerial { serial, surface });
+        self.recent_input_serials.push(InputSerial {
+            serial,
+            surface,
+            client_id,
+            root_surface_id,
+            kind,
+            focus_generation: self.focus_generation,
+        });
         const MAX_RECENT_INPUT_SERIALS: usize = 16;
         let excess = self
             .recent_input_serials
@@ -575,17 +599,7 @@ impl CompositorState {
         }
     }
 
-    pub(in crate::compositor) fn has_recent_input_serial_for_surface(
-        &self,
-        serial: u32,
-        surface: &wl_surface::WlSurface,
-    ) -> bool {
-        self.recent_input_serials
-            .iter()
-            .any(|input| input.serial == serial && input.surface.id().same_client_as(&surface.id()))
-    }
-
-    pub(in crate::compositor) fn client_has_recent_input_serial(
+    pub(in crate::compositor) fn validate_activation_token_serial(
         &self,
         client_id: &ClientId,
         serial: u32,
@@ -596,6 +610,73 @@ impl CompositorState {
                     .surface
                     .client()
                     .is_some_and(|client| client.id() == *client_id)
+                && matches!(
+                    input.kind,
+                    InputSerialKind::PointerEnter
+                        | InputSerialKind::PointerButtonPress { .. }
+                        | InputSerialKind::KeyboardKeyPress { .. }
+                        | InputSerialKind::TouchDown { .. }
+                )
+        })
+    }
+
+    pub(in crate::compositor) fn validate_set_cursor_serial(
+        &self,
+        serial: u32,
+        surface: &wl_surface::WlSurface,
+    ) -> bool {
+        self.recent_input_serials.iter().any(|input| {
+            input.serial == serial
+                && input.kind == InputSerialKind::PointerEnter
+                && input.surface.id().same_client_as(&surface.id())
+                && same_surface_resource(&input.surface, surface)
+                && input.focus_generation <= self.focus_generation
+        })
+    }
+
+    pub(in crate::compositor) fn validate_popup_grab_serial(
+        &self,
+        serial: u32,
+        surface: &wl_surface::WlSurface,
+    ) -> bool {
+        let surface_id = compositor_surface_id(surface);
+        let expected_root_surface_id = self
+            .popup_nodes
+            .get(&surface_id)
+            .map(|node| node.owner_root_id)
+            .unwrap_or_else(|| self.root_surface_id_for_surface(surface_id));
+        self.recent_input_serials.iter().any(|input| {
+            input.serial == serial
+                && matches!(input.kind, InputSerialKind::PointerButtonPress { .. })
+                && input.root_surface_id == expected_root_surface_id
+                && input.client_id == surface.client().map(|client| client.id())
+                && input.focus_generation <= self.focus_generation
+        })
+    }
+
+    pub(in crate::compositor) fn validate_start_drag_serial(
+        &self,
+        serial: u32,
+        surface: &wl_surface::WlSurface,
+    ) -> bool {
+        self.validate_popup_grab_serial(serial, surface)
+    }
+
+    pub(in crate::compositor) fn validate_set_selection_serial(
+        &self,
+        client_id: &ClientId,
+        serial: u32,
+    ) -> bool {
+        self.recent_input_serials.iter().any(|input| {
+            input.serial == serial
+                && input.client_id.as_ref() == Some(client_id)
+                && matches!(
+                    input.kind,
+                    InputSerialKind::PointerButtonPress { .. }
+                        | InputSerialKind::KeyboardKeyPress { .. }
+                        | InputSerialKind::TouchDown { .. }
+                )
+                && input.focus_generation <= self.focus_generation
         })
     }
 
@@ -611,6 +692,9 @@ impl CompositorState {
                 source,
                 client_id,
                 mime_types: Vec::new(),
+                use_state: DataSourceUse::Unused,
+                actions: 0,
+                actions_set: false,
             },
         );
     }
@@ -642,6 +726,10 @@ impl CompositorState {
         &mut self,
         source: &wl_data_source::WlDataSource,
     ) {
+        self.cancel_drag_for_source(source);
+        if let Some(binding) = self.data_sources.get_mut(&source.id()) {
+            binding.use_state = DataSourceUse::Retired;
+        }
         self.data_sources.remove(&source.id());
         self.selection_state
             .remove_source(source.id().protocol_id());
@@ -705,6 +793,14 @@ impl CompositorState {
         &mut self,
         device: &wl_data_device::WlDataDevice,
     ) {
+        if let Some(client_id) = device.client().map(|client| client.id())
+            && self
+                .active_drag
+                .as_ref()
+                .is_some_and(|drag| drag.target_client.as_ref() == Some(&client_id))
+        {
+            self.cancel_drag_session("data_device_destroyed");
+        }
         self.data_devices
             .retain(|binding| !same_wayland_resource(&binding.device, device));
         self.data_offers.retain(|_, offer| {
@@ -719,7 +815,7 @@ impl CompositorState {
         serial: u32,
     ) -> bool {
         if !self.client_has_focus(client_id)
-            || !self.client_has_recent_input_serial(client_id, serial)
+            || !self.validate_set_selection_serial(client_id, serial)
         {
             return false;
         }
@@ -742,6 +838,9 @@ impl CompositorState {
         if binding.client_id != *client_id || !source.is_alive() || binding.mime_types.is_empty() {
             return false;
         }
+        if binding.use_state != DataSourceUse::Unused {
+            return false;
+        }
 
         if let Some(previous) = self.active_clipboard.as_ref()
             && let ClipboardSourceBackend::InternalWayland {
@@ -755,6 +854,9 @@ impl CompositorState {
         }
 
         self.next_clipboard_generation = self.next_clipboard_generation.saturating_add(1);
+        if let Some(binding) = self.data_sources.get_mut(&source.id()) {
+            binding.use_state = DataSourceUse::Selection;
+        }
         let generation = self.next_clipboard_generation;
         self.selection_state
             .set_clipboard_selection_from_source(source.id().protocol_id());
@@ -883,6 +985,7 @@ impl CompositorState {
                 DataOfferData {
                     target_client_id: client.id(),
                     source_generation: selection.generation,
+                    kind: DataOfferKind::Selection,
                 },
             )
         else {
@@ -896,6 +999,13 @@ impl CompositorState {
                 target_client_id: client.id(),
                 source_generation: selection.generation,
                 mime_types: selection.mime_types.clone(),
+                kind: DataOfferKind::Selection,
+                accepted_mime: None,
+                selected_action: None,
+                drag_phase: None,
+                source_actions: 0,
+                destination_actions: None,
+                preferred_action: 0,
             },
         );
         let _ = device.send_event(wl_data_device::Event::DataOffer { id: offer.clone() });
@@ -916,6 +1026,31 @@ impl CompositorState {
         let Some(binding) = self.data_offers.get(&offer.id()) else {
             return;
         };
+        if binding.kind == DataOfferKind::DragAndDrop {
+            if binding.target_client_id != *client_id
+                || !binding.mime_types.iter().any(|mime| mime == &mime_type)
+            {
+                return;
+            }
+            let Some(active) = self.active_drag.as_ref() else {
+                return;
+            };
+            if active
+                .offer
+                .as_ref()
+                .is_none_or(|current| !same_wayland_resource(current, offer))
+            {
+                return;
+            }
+            let Some(source) = active.source.as_ref() else {
+                return;
+            };
+            let _ = source.send_event(wl_data_source::Event::Send {
+                mime_type,
+                fd: fd.as_fd(),
+            });
+            return;
+        }
         let Some(selection) = self.active_clipboard.as_ref() else {
             return;
         };
@@ -964,110 +1099,6 @@ impl CompositorState {
         self.surface_client_ids
             .entry(surface_id)
             .or_insert(client_id);
-    }
-
-    pub(in crate::compositor) fn register_output_resource(&mut self, output: wl_output::WlOutput) {
-        if self
-            .output_resources
-            .iter()
-            .any(|resource| same_wayland_resource(resource, &output))
-        {
-            return;
-        }
-
-        send_output_description(
-            &output,
-            self.output_size,
-            self.output_scale,
-            self.output_refresh,
-        );
-        self.output_resources.push(output);
-    }
-
-    pub(in crate::compositor) fn unregister_output_resource(
-        &mut self,
-        output: &wl_output::WlOutput,
-    ) {
-        let output_id = output.id().protocol_id();
-        self.output_resources
-            .retain(|resource| !same_wayland_resource(resource, output));
-        self.surface_entered_outputs
-            .retain(|(_, entered_output_id)| *entered_output_id != output_id);
-    }
-
-    pub(in crate::compositor) fn send_output_mode_to_bound_outputs(&self) {
-        for output in &self.output_resources {
-            send_output_mode(output, self.output_size, self.output_refresh);
-            send_output_done_if_supported(output);
-        }
-    }
-
-    pub(in crate::compositor) fn send_output_scale_to_bound_outputs(&self) {
-        for output in &self.output_resources {
-            send_output_scale(output, self.output_scale);
-            send_output_done_if_supported(output);
-        }
-    }
-
-    pub(in crate::compositor) fn register_fractional_scale_resource(
-        &mut self,
-        surface: &wl_surface::WlSurface,
-        fractional_scale: wp_fractional_scale_v1::WpFractionalScaleV1,
-    ) {
-        let surface_id = compositor_surface_id(surface);
-
-        fractional_scale.preferred_scale(self.output_scale.preferred_scale());
-        self.fractional_scale_resources
-            .entry(surface_id)
-            .or_default()
-            .push(fractional_scale);
-    }
-
-    pub(in crate::compositor) fn unregister_fractional_scale_resources_for_surface(
-        &mut self,
-        surface_id: u32,
-    ) {
-        self.fractional_scale_resources.remove(&surface_id);
-    }
-
-    pub(in crate::compositor) fn unregister_fractional_scale_resource(
-        &mut self,
-        surface_id: u32,
-        resource_id: u32,
-    ) {
-        if let Some(resources) = self.fractional_scale_resources.get_mut(&surface_id) {
-            resources.retain(|resource| resource.id().protocol_id() != resource_id);
-            if resources.is_empty() {
-                self.fractional_scale_resources.remove(&surface_id);
-            }
-        }
-    }
-
-    pub(in crate::compositor) fn send_fractional_scale_to_bound_surfaces(&self) {
-        for fractional_scales in self.fractional_scale_resources.values() {
-            for fractional_scale in fractional_scales {
-                fractional_scale.preferred_scale(self.output_scale.preferred_scale());
-            }
-        }
-    }
-
-    pub(in crate::compositor) fn ensure_surface_entered_outputs(
-        &mut self,
-        surface: &wl_surface::WlSurface,
-    ) {
-        let surface_id = compositor_surface_id(surface);
-        for output in &self.output_resources {
-            if !resource_belongs_to_surface_client(output, surface) {
-                continue;
-            }
-            let output_id = output.id().protocol_id();
-            if !self.surface_entered_outputs.insert((surface_id, output_id)) {
-                continue;
-            }
-            let _ = surface.send_event(wl_surface::Event::Enter {
-                output: output.clone(),
-            });
-        }
     }
 
     pub(in crate::compositor) fn reconfigure_stateful_windows_for_output_size(&mut self) {
@@ -1133,10 +1164,11 @@ impl CompositorState {
             surface_id,
             AcquireWatchCancelReason::SurfaceDestroyed,
         );
-        self.cancel_pending_acquire_commits_for_surface(
+        let callbacks = self.cancel_pending_acquire_commits_for_surface(
             surface_id,
             AcquireWatchCancelReason::SurfaceDestroyed,
         );
+        self.complete_frame_callbacks(callbacks);
         self.discard_pending_presentation_feedbacks_for_surface(surface_id);
         if let Some(feedbacks) = self
             .pending_surface_presentation_feedbacks
@@ -1152,7 +1184,7 @@ impl CompositorState {
         self.cleanup_subsurface_stack_state_for_surface(surface_id);
         self.surface_resources.remove(&surface_id);
         self.surface_client_ids.remove(&surface_id);
-        self.clear_surface_role(surface_id);
+        self.scrub_surface_lifecycle(surface_id);
         self.cursor_surface_ids.remove(&surface_id);
         let removed_cursor_content = self.client_cursor_surfaces.remove(&surface_id).is_some();
         let active_cursor_pointer = self
@@ -1181,9 +1213,10 @@ impl CompositorState {
         self.current_surface_buffers.remove(&surface_id);
         self.surface_window_geometries.remove(&surface_id);
         self.pending_surface_window_geometries.remove(&surface_id);
-        self.configured_xdg_surfaces.remove(&surface_id);
-        self.surface_entered_outputs
-            .retain(|(entered_surface_id, _)| *entered_surface_id != surface_id);
+        self.xdg_surface_resources.remove(&surface_id);
+        self.xdg_surface_wm_bases.remove(&surface_id);
+        self.xdg_surface_lifecycles.remove(&surface_id);
+        self.scrub_surface_output_membership(surface_id);
         self.unregister_toplevel_surface(surface_id);
         self.unregister_popup_surface(surface_id);
         self.teardown_layer_surface(surface_id);

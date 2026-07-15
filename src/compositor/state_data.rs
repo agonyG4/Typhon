@@ -7,12 +7,125 @@ use wayland_protocols::xdg::shell::server::{xdg_popup, xdg_surface, xdg_toplevel
 use wayland_server::{
     Resource,
     backend::ClientId,
-    protocol::{wl_buffer, wl_callback, wl_surface},
+    protocol::{wl_buffer, wl_callback, wl_output, wl_surface},
 };
 
+use crate::compositor::{DragSessionPhase, XdgAssociationReservation};
 use crate::render_backend::buffer::{
     BufferId, BufferSize, CommittedSurfaceBuffer, DmabufBufferHandle,
 };
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CoreComplianceMetrics {
+    pub protocol_errors_total: u64,
+    pub supported_request_unhandled_total: u64,
+    pub client_state_leaks_detected: u64,
+    pub xdg_same_role_reassociations_total: u64,
+    pub xdg_cross_role_reassociation_rejections: u64,
+    pub xdg_role_destroyed_pending_commits_retired: u64,
+    pub xdg_role_destroyed_pending_trees_retired: u64,
+    pub xdg_role_destroyed_acquire_watches_cancelled: u64,
+    pub xdg_reassociation_blocked_stale_unpublished_work: u64,
+    pub surface_enter_events: u64,
+    pub surface_leave_events: u64,
+    pub preferred_scale_events: u64,
+    pub preferred_transform_events: u64,
+    pub dnd_sessions_started: u64,
+    pub dnd_sessions_finished: u64,
+    pub dnd_sessions_cancelled: u64,
+    pub dnd_duplicate_terminal_attempts: u64,
+    pub dnd_orphaned_resources_detected: u64,
+    pub dnd_source_cancelled_events: u64,
+    pub dnd_source_finished_events: u64,
+    pub dnd_offer_action_events: u64,
+    pub dnd_source_action_events: u64,
+    pub(in crate::compositor) dnd_last_terminal_phase: Option<DragSessionPhase>,
+    pub pointer_axis_frames: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) enum UnhandledRequestClass {
+    FutureVersionOrGeneratedNonExhaustive,
+    SupportedButUnhandled,
+}
+
+impl CoreComplianceMetrics {
+    pub(in crate::compositor) fn note_protocol_error(&mut self) {
+        self.protocol_errors_total = self.protocol_errors_total.saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_unhandled_request(
+        &mut self,
+        interface: &str,
+        version: u32,
+        class: UnhandledRequestClass,
+    ) {
+        match class {
+            UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive => {}
+            UnhandledRequestClass::SupportedButUnhandled => {
+                eprintln!(
+                    "oblivion-one compliance: supported request unhandled interface={interface} version={version}"
+                );
+                self.note_unhandled_supported_request();
+            }
+        }
+    }
+
+    pub(in crate::compositor) fn note_unhandled_supported_request(&mut self) {
+        self.supported_request_unhandled_total =
+            self.supported_request_unhandled_total.saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_xdg_same_role_reassociation(&mut self) {
+        self.xdg_same_role_reassociations_total =
+            self.xdg_same_role_reassociations_total.saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_xdg_cross_role_reassociation_rejection(&mut self) {
+        self.xdg_cross_role_reassociation_rejections = self
+            .xdg_cross_role_reassociation_rejections
+            .saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_xdg_role_destroyed_pending_commits_retired(
+        &mut self,
+        count: usize,
+    ) {
+        self.xdg_role_destroyed_pending_commits_retired = self
+            .xdg_role_destroyed_pending_commits_retired
+            .saturating_add(count as u64);
+    }
+
+    pub(in crate::compositor) fn note_xdg_role_destroyed_pending_trees_retired(
+        &mut self,
+        count: usize,
+    ) {
+        self.xdg_role_destroyed_pending_trees_retired = self
+            .xdg_role_destroyed_pending_trees_retired
+            .saturating_add(count as u64);
+    }
+
+    pub(in crate::compositor) fn note_xdg_role_destroyed_acquire_watches_cancelled(
+        &mut self,
+        count: usize,
+    ) {
+        self.xdg_role_destroyed_acquire_watches_cancelled = self
+            .xdg_role_destroyed_acquire_watches_cancelled
+            .saturating_add(count as u64);
+    }
+
+    pub(in crate::compositor) fn note_xdg_reassociation_blocked_stale_unpublished_work(&mut self) {
+        self.xdg_reassociation_blocked_stale_unpublished_work = self
+            .xdg_reassociation_blocked_stale_unpublished_work
+            .saturating_add(1);
+    }
+
+    pub(in crate::compositor) fn note_dnd_duplicate_terminal_attempt(&mut self) {
+        self.dnd_duplicate_terminal_attempts =
+            self.dnd_duplicate_terminal_attempts.saturating_add(1);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ViewportSourceRect {
@@ -71,10 +184,14 @@ pub(super) struct ToplevelSizeConstraints {
 #[derive(Debug, Clone)]
 pub(super) struct ToplevelSurface {
     pub(super) app_id: Option<String>,
+    pub(super) title: Option<String>,
+    pub(super) parent_surface_id: Option<u32>,
     pub(super) xdg_surface: xdg_surface::XdgSurface,
     pub(super) toplevel: xdg_toplevel::XdgToplevel,
     pub(super) window: WindowState,
     pub(super) constraints: ToplevelSizeConstraints,
+    pub(super) pending_constraints: Option<ToplevelSizeConstraints>,
+    pub(super) wm_capabilities_sent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -165,7 +282,9 @@ pub(super) struct SurfaceData {
     explicit_sync: Mutex<Option<Arc<SyncobjSurfaceState>>>,
     viewport: Mutex<SurfaceViewportState>,
     buffer_scale: Mutex<SurfaceBufferScaleState>,
+    buffer_transform: Mutex<SurfaceBufferTransformState>,
     input_region: Mutex<SurfaceInputRegionState>,
+    opaque_region: Mutex<SurfaceInputRegionState>,
 }
 
 #[derive(Debug)]
@@ -234,6 +353,7 @@ impl SurfaceData {
                         commit_sequence: SurfaceCommitSequence::initial(),
                         resize_commit: None,
                         resize_capture_finalized: false,
+                        buffer_transform: wl_output::Transform::Normal,
                     }))
                 } else {
                     resource.data::<DmabufBufferData>().cloned().map(|data| {
@@ -248,6 +368,7 @@ impl SurfaceData {
                             commit_sequence: SurfaceCommitSequence::initial(),
                             resize_commit: None,
                             resize_capture_finalized: false,
+                            buffer_transform: wl_output::Transform::Normal,
                         })
                     })
                 }
@@ -258,6 +379,13 @@ impl SurfaceData {
         if let Ok(mut guard) = self.pending_buffer.lock() {
             *guard = pending;
         }
+    }
+
+    pub(super) fn has_pending_buffer(&self) -> bool {
+        self.pending_buffer
+            .lock()
+            .ok()
+            .is_some_and(|pending| pending.is_some())
     }
 
     pub(super) fn take_pending(&self) -> Option<PendingSurfaceAttachment> {
@@ -415,6 +543,46 @@ impl SurfaceData {
         }
     }
 
+    pub(super) fn set_pending_buffer_transform(&self, transform: wl_output::Transform) {
+        if let Ok(mut state) = self.buffer_transform.lock() {
+            state.pending = Some(transform);
+        }
+    }
+
+    pub(super) fn take_pending_buffer_transform(&self) -> Option<wl_output::Transform> {
+        self.buffer_transform
+            .lock()
+            .ok()
+            .and_then(|mut state| state.pending.take())
+    }
+
+    pub(super) fn buffer_transform_for_change(
+        &self,
+        transform: Option<wl_output::Transform>,
+    ) -> wl_output::Transform {
+        transform.unwrap_or_else(|| {
+            self.buffer_transform
+                .lock()
+                .map(|state| state.committed)
+                .unwrap_or(wl_output::Transform::Normal)
+        })
+    }
+
+    pub(super) fn apply_buffer_transform_change(
+        &self,
+        transform: Option<wl_output::Transform>,
+    ) -> wl_output::Transform {
+        self.buffer_transform
+            .lock()
+            .map(|mut state| {
+                if let Some(transform) = transform {
+                    state.committed = transform;
+                }
+                state.committed
+            })
+            .unwrap_or(wl_output::Transform::Normal)
+    }
+
     pub(super) fn take_pending_buffer_scale(&self) -> Option<u32> {
         self.buffer_scale
             .lock()
@@ -447,6 +615,31 @@ impl SurfaceData {
         if let Ok(mut state) = self.input_region.lock() {
             state.pending = Some(region);
         }
+    }
+
+    pub(super) fn set_pending_opaque_region(&self, region: SurfaceInputRegion) {
+        if let Ok(mut state) = self.opaque_region.lock() {
+            state.pending = Some(region);
+        }
+    }
+
+    pub(super) fn take_pending_opaque_region(&self) -> Option<SurfaceInputRegion> {
+        self.opaque_region
+            .lock()
+            .ok()
+            .and_then(|mut state| state.pending.take())
+    }
+
+    pub(super) fn apply_opaque_region_change(&self, pending: Option<SurfaceInputRegion>) -> bool {
+        let Ok(mut state) = self.opaque_region.lock() else {
+            return false;
+        };
+        let Some(pending) = pending else {
+            return false;
+        };
+        let changed = state.committed != pending;
+        state.committed = pending;
+        changed
     }
 
     pub(super) fn take_pending_input_region(&self) -> Option<SurfaceInputRegion> {
@@ -484,6 +677,10 @@ impl SurfaceData {
             })
             .unwrap_or(true)
     }
+}
+
+fn transform_swaps_dimensions(transform: wl_output::Transform) -> bool {
+    matches!(transform as i32, 1 | 3 | 5 | 7)
 }
 
 fn convert_pending_damage(
@@ -647,6 +844,21 @@ pub(super) struct PendingViewportChange {
 struct SurfaceBufferScaleState {
     committed: u32,
     pending: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SurfaceBufferTransformState {
+    committed: wl_output::Transform,
+    pending: Option<wl_output::Transform>,
+}
+
+impl Default for SurfaceBufferTransformState {
+    fn default() -> Self {
+        Self {
+            committed: wl_output::Transform::Normal,
+            pending: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -936,6 +1148,7 @@ pub(super) struct PendingSurfaceBuffer {
     pub(super) commit_sequence: SurfaceCommitSequence,
     pub(super) resize_commit: Option<Box<ResizeCommitSnapshot>>,
     pub(super) resize_capture_finalized: bool,
+    pub(super) buffer_transform: wl_output::Transform,
 }
 
 impl PendingSurfaceBuffer {
@@ -943,9 +1156,12 @@ impl PendingSurfaceBuffer {
         &mut self,
         viewport: SurfaceViewportCommit,
         buffer_scale: u32,
+        buffer_transform: wl_output::Transform,
     ) -> io::Result<()> {
         self.viewport_source = viewport.source;
-        self.surface_size = Some(self.surface_size_for_state(viewport, buffer_scale)?);
+        self.buffer_transform = buffer_transform;
+        self.surface_size =
+            Some(self.surface_size_for_state(viewport, buffer_scale, buffer_transform)?);
         Ok(())
     }
 
@@ -953,6 +1169,7 @@ impl PendingSurfaceBuffer {
         &self,
         viewport: SurfaceViewportCommit,
         buffer_scale: u32,
+        buffer_transform: wl_output::Transform,
     ) -> io::Result<BufferSize> {
         self.validate_viewport_source(viewport.source)?;
         if let Some(destination) = viewport.destination {
@@ -961,7 +1178,7 @@ impl PendingSurfaceBuffer {
         if let Some(source) = viewport.source.and_then(ViewportSourceRect::logical_size) {
             return Ok(source);
         }
-        self.surface_size_for_buffer_scale(buffer_scale)
+        self.surface_size_for_buffer_scale(buffer_scale, buffer_transform)
     }
 
     fn validate_viewport_source(&self, source: Option<ViewportSourceRect>) -> io::Result<()> {
@@ -982,10 +1199,19 @@ impl PendingSurfaceBuffer {
     pub(super) fn surface_size_for_buffer_scale(
         &self,
         buffer_scale: u32,
+        buffer_transform: wl_output::Transform,
     ) -> io::Result<BufferSize> {
         let buffer_scale = buffer_scale.max(1);
-        let width = self.data.width()?.div_ceil(buffer_scale);
-        let height = self.data.height()?.div_ceil(buffer_scale);
+        let (buffer_width, buffer_height) = if transform_swaps_dimensions(buffer_transform) {
+            (self.data.height()?, self.data.width()?)
+        } else {
+            (self.data.width()?, self.data.height()?)
+        };
+        if buffer_width % buffer_scale != 0 || buffer_height % buffer_scale != 0 {
+            return Err(invalid_shm_buffer());
+        }
+        let width = buffer_width / buffer_scale;
+        let height = buffer_height / buffer_scale;
         BufferSize::new(width, height).ok_or_else(invalid_shm_buffer)
     }
 
@@ -1130,6 +1356,7 @@ impl SurfaceBufferRelease {
 #[derive(Debug)]
 pub(super) struct XdgSurfaceData {
     pub(super) surface: wl_surface::WlSurface,
+    pub(super) reservation: XdgAssociationReservation,
 }
 
 #[derive(Debug)]
@@ -1185,5 +1412,55 @@ pub(super) fn compositor_surface_id(surface: &wl_surface::WlSurface) -> u32 {
 impl From<wl_surface::WlSurface> for FractionalScaleData {
     fn from(surface: wl_surface::WlSurface) -> Self {
         Self::new(surface)
+    }
+}
+
+#[cfg(test)]
+mod surface_region_tests {
+    use super::*;
+
+    #[test]
+    fn opaque_region_is_copied_and_double_buffered() {
+        let surface = SurfaceData::new(1);
+        let region = SurfaceInputRegion::Custom(vec![InputRegionOp::Add(
+            InputRegionRect::new(2, 3, 10, 11).unwrap(),
+        )]);
+        surface.set_pending_opaque_region(region.clone());
+        assert_eq!(surface.take_pending_opaque_region(), Some(region));
+    }
+
+    #[test]
+    fn null_input_region_resets_to_infinite_default() {
+        let surface = SurfaceData::new(1);
+        let region = SurfaceInputRegion::Custom(vec![InputRegionOp::Add(
+            InputRegionRect::new(0, 0, 4, 4).unwrap(),
+        )]);
+        surface.set_pending_input_region(region);
+        let pending = surface.take_pending_input_region();
+        assert!(surface.apply_input_region_change(pending));
+        assert!(surface.input_region_contains(1.0, 1.0, 10, 10));
+
+        surface.set_pending_input_region(SurfaceInputRegion::Default);
+        let pending = surface.take_pending_input_region();
+        assert!(surface.apply_input_region_change(pending));
+        assert!(surface.input_region_contains(9.0, 9.0, 10, 10));
+    }
+
+    #[test]
+    fn region_destroy_after_set_does_not_change_pending_copy() {
+        let region = RegionData::default();
+        region.push(InputRegionOp::Add(
+            InputRegionRect::new(0, 0, 4, 4).unwrap(),
+        ));
+        let snapshot = region.snapshot();
+        region.push(InputRegionOp::Add(
+            InputRegionRect::new(8, 8, 4, 4).unwrap(),
+        ));
+        assert_eq!(
+            snapshot,
+            SurfaceInputRegion::Custom(vec![InputRegionOp::Add(
+                InputRegionRect::new(0, 0, 4, 4).unwrap(),
+            )])
+        );
     }
 }

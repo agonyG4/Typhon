@@ -36,7 +36,7 @@ impl Dispatch<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1, ()>
     fn request(
         state: &mut Self,
         _client: &Client,
-        _resource: &zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
+        resource: &zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
         request: zwp_relative_pointer_manager_v1::Request,
         _data: &(),
         _dhandle: &DisplayHandle,
@@ -53,7 +53,14 @@ impl Dispatch<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1, ()>
                 );
                 state.add_relative_pointer_resource(relative_pointer, pointer);
             }
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "zwp_relative_pointer_manager_v1",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
@@ -93,7 +100,7 @@ impl GlobalDispatch<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1, ()> for
 impl Dispatch<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1, ()> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &zwp_pointer_constraints_v1::ZwpPointerConstraintsV1,
         request: zwp_pointer_constraints_v1::Request,
         _data: &(),
@@ -133,7 +140,9 @@ impl Dispatch<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1, ()> for Compo
                     confined_resource: None,
                     region,
                 }) {
-                    resource.post_error(
+                    state.post_protocol_error_deferred(
+                        client,
+                        resource,
                         zwp_pointer_constraints_v1::Error::AlreadyConstrained,
                         "surface and pointer already have a pointer constraint".to_string(),
                     );
@@ -170,13 +179,22 @@ impl Dispatch<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1, ()> for Compo
                     confined_resource: Some(confined_pointer.clone()),
                     region,
                 }) {
-                    resource.post_error(
+                    state.post_protocol_error_deferred(
+                        client,
+                        resource,
                         zwp_pointer_constraints_v1::Error::AlreadyConstrained,
                         "surface and pointer already have a pointer constraint".to_string(),
                     );
                 }
             }
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "zwp_pointer_constraints_v1",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
@@ -185,7 +203,7 @@ impl Dispatch<zwp_locked_pointer_v1::ZwpLockedPointerV1, LockedPointerData> for 
     fn request(
         state: &mut Self,
         _client: &Client,
-        _resource: &zwp_locked_pointer_v1::ZwpLockedPointerV1,
+        resource: &zwp_locked_pointer_v1::ZwpLockedPointerV1,
         request: zwp_locked_pointer_v1::Request,
         data: &LockedPointerData,
         _dhandle: &DisplayHandle,
@@ -217,7 +235,14 @@ impl Dispatch<zwp_locked_pointer_v1::ZwpLockedPointerV1, LockedPointerData> for 
                     surface_y,
                 );
             }
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "zwp_locked_pointer_v1",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
@@ -228,7 +253,7 @@ impl Dispatch<zwp_confined_pointer_v1::ZwpConfinedPointerV1, ConfinedPointerData
     fn request(
         state: &mut Self,
         _client: &Client,
-        _resource: &zwp_confined_pointer_v1::ZwpConfinedPointerV1,
+        resource: &zwp_confined_pointer_v1::ZwpConfinedPointerV1,
         request: zwp_confined_pointer_v1::Request,
         data: &ConfinedPointerData,
         _dhandle: &DisplayHandle,
@@ -246,7 +271,14 @@ impl Dispatch<zwp_confined_pointer_v1::ZwpConfinedPointerV1, ConfinedPointerData
                     .unwrap_or_default();
                 state.set_pointer_constraint_pending_region(data.constraint_id, region);
             }
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "zwp_confined_pointer_v1",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
@@ -268,7 +300,7 @@ impl Dispatch<wp_pointer_warp_v1::WpPointerWarpV1, ()> for CompositorState {
     fn request(
         state: &mut Self,
         _client: &Client,
-        _resource: &wp_pointer_warp_v1::WpPointerWarpV1,
+        resource: &wp_pointer_warp_v1::WpPointerWarpV1,
         request: wp_pointer_warp_v1::Request,
         _data: &(),
         _dhandle: &DisplayHandle,
@@ -285,7 +317,14 @@ impl Dispatch<wp_pointer_warp_v1::WpPointerWarpV1, ()> for CompositorState {
             } => {
                 state.warp_pointer_protocol_request(surface, pointer, x, y, serial);
             }
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "wp_pointer_warp_v1",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
@@ -318,7 +357,7 @@ impl Dispatch<zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1, ()> for Comp
     fn request(
         state: &mut Self,
         _client: &Client,
-        _resource: &zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
+        resource: &zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
         request: zwp_idle_inhibit_manager_v1::Request,
         _data: &(),
         _dhandle: &DisplayHandle,
@@ -330,7 +369,14 @@ impl Dispatch<zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1, ()> for Comp
                 let inhibitor = data_init.init(id, ());
                 state.add_idle_inhibitor(inhibitor);
             }
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "zwp_idle_inhibit_manager_v1",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
@@ -370,9 +416,9 @@ impl Dispatch<zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDevice
     for CompositorState
 {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
-        _resource: &zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
+        resource: &zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
         request: zwp_primary_selection_device_manager_v1::Request,
         _data: &(),
         _dhandle: &DisplayHandle,
@@ -386,7 +432,14 @@ impl Dispatch<zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDevice
                 data_init.init(id, ());
             }
             zwp_primary_selection_device_manager_v1::Request::Destroy => {}
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "zwp_primary_selection_device_manager_v1",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
@@ -449,9 +502,9 @@ impl GlobalDispatch<ext_data_control_manager_v1::ExtDataControlManagerV1, ()> fo
 
 impl Dispatch<ext_data_control_manager_v1::ExtDataControlManagerV1, ()> for CompositorState {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
-        _resource: &ext_data_control_manager_v1::ExtDataControlManagerV1,
+        resource: &ext_data_control_manager_v1::ExtDataControlManagerV1,
         request: ext_data_control_manager_v1::Request,
         _data: &(),
         _dhandle: &DisplayHandle,
@@ -465,7 +518,14 @@ impl Dispatch<ext_data_control_manager_v1::ExtDataControlManagerV1, ()> for Comp
                 data_init.init(id, ());
             }
             ext_data_control_manager_v1::Request::Destroy => {}
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "ext_data_control_manager_v1",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }

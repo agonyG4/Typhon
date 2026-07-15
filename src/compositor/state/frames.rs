@@ -758,6 +758,7 @@ impl CompositorState {
                         "surface_or_sync_owner_destroyed",
                     ),
                 }
+                commit.pending.release_target().release();
                 canceled_callbacks.extend(commit.frame_callbacks);
                 if let Some(resize) = commit.pending.resize_commit.as_deref() {
                     canceled_resize_captures.push(resize.commit_sequence);
@@ -826,6 +827,7 @@ impl CompositorState {
         buffer: &wl_buffer::WlBuffer,
         reason: AcquireWatchCancelReason,
     ) {
+        let mut callbacks = Vec::new();
         let ids = self
             .pending_explicit_sync_commits
             .iter()
@@ -833,7 +835,7 @@ impl CompositorState {
             .map(|commit| commit.surface_id)
             .collect::<Vec<_>>();
         for surface_id in ids {
-            self.cancel_pending_acquire_commits_for_surface(surface_id, reason);
+            callbacks.extend(self.cancel_pending_acquire_commits_for_surface(surface_id, reason));
         }
         let tree_roots = self
             .pending_surface_tree_transactions
@@ -852,8 +854,9 @@ impl CompositorState {
             if let Some(resize_commit) = released.resize_commit {
                 self.release_detached_resize_capture(root_surface_id, resize_commit);
             }
-            self.complete_frame_callbacks(released.callbacks);
+            callbacks.extend(released.callbacks);
         }
+        self.complete_frame_callbacks(callbacks);
     }
 
     pub(in crate::compositor) fn cancel_pending_acquire_commits_for_timeline(
@@ -863,6 +866,7 @@ impl CompositorState {
     ) {
         let mut retained = Vec::with_capacity(self.pending_explicit_sync_commits.len());
         let mut released_captures = Vec::new();
+        let mut callbacks = Vec::new();
         for commit in std::mem::take(&mut self.pending_explicit_sync_commits) {
             let uses_timeline = commit.acquire.timeline.same_timeline(timeline)
                 || commit
@@ -871,6 +875,8 @@ impl CompositorState {
                     .as_ref()
                     .is_some_and(|release| release.timeline.same_timeline(timeline));
             if uses_timeline {
+                commit.pending.release_target().release();
+                callbacks.extend(commit.frame_callbacks);
                 if let Some(resize) = commit.pending.resize_commit.as_deref() {
                     released_captures.push((commit.surface_id, resize.commit_sequence));
                 }
@@ -889,6 +895,7 @@ impl CompositorState {
         for (surface_id, commit_sequence) in released_captures {
             self.release_resize_capture(surface_id, commit_sequence);
         }
+        self.complete_frame_callbacks(callbacks);
         let tree_roots = self
             .pending_surface_tree_transactions
             .iter()

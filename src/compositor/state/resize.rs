@@ -103,7 +103,10 @@ impl CompositorState {
                     self.resize_flow_metrics.acks_stale.saturating_add(1);
             }
             ResizeAckDecision::Unknown => {
-                if !matched_other && serial > serial_state.latest_sent {
+                if !matched_other
+                    && serial_state.latest_sent != 0
+                    && serial > serial_state.latest_sent
+                {
                     self.resize_flow_metrics.acks_unknown =
                         self.resize_flow_metrics.acks_unknown.saturating_add(1);
                 } else if !matched_other {
@@ -460,6 +463,7 @@ impl CompositorState {
         let height = self.clamp_toplevel_height(surface_id, height);
         let toplevel = self.toplevel_surfaces.get(&surface_id).cloned()?;
 
+        self.send_wm_capabilities_if_needed(surface_id);
         let _ = toplevel
             .toplevel
             .send_event(xdg_toplevel::Event::Configure {
@@ -475,6 +479,7 @@ impl CompositorState {
             .entry(surface_id)
             .or_default()
             .latest_sent = serial;
+        self.record_xdg_configure(surface_id, serial);
         Some(serial)
     }
 }

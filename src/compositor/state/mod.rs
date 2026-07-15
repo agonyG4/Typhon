@@ -1,12 +1,14 @@
 use super::*;
 
 mod client_lifecycle;
+mod data_device;
 mod frames;
 mod fullscreen;
 mod helpers;
 mod hit_testing;
 mod input_dispatch;
 mod input_resources;
+mod output_membership;
 mod pointer_constraints;
 mod resize;
 mod roles;
@@ -15,13 +17,17 @@ mod shutdown;
 mod subsurfaces;
 mod support_types;
 mod surface_commits;
+mod surface_transactions;
 mod surfaces;
 mod window_interaction;
 mod window_resize;
 mod windows;
+mod xdg_lifecycle;
 
 #[allow(unused_imports)]
 pub(in crate::compositor) use client_lifecycle::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use data_device::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use frames::*;
 #[allow(unused_imports)]
@@ -34,6 +40,8 @@ pub(in crate::compositor) use hit_testing::*;
 pub(in crate::compositor) use input_dispatch::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use input_resources::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use output_membership::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use pointer_constraints::*;
 #[allow(unused_imports)]
@@ -51,6 +59,8 @@ pub(in crate::compositor) use support_types::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use surface_commits::*;
 #[allow(unused_imports)]
+pub(in crate::compositor) use surface_transactions::*;
+#[allow(unused_imports)]
 pub(in crate::compositor) use surfaces::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use window_interaction::*;
@@ -58,6 +68,8 @@ pub(in crate::compositor) use window_interaction::*;
 pub(in crate::compositor) use window_resize::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use windows::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use xdg_lifecycle::*;
 
 #[cfg(test)]
 mod frame_tests;

@@ -211,6 +211,11 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn send_keyboard_key(&mut self, key: u32, pressed: bool) {
+        if pressed {
+            self.pressed_keys.insert(key);
+        } else {
+            self.pressed_keys.remove(&key);
+        }
         let modifiers_changed = self.keyboard_modifiers.update_key(key, pressed);
         let Some(surface) = self.focused_surface.clone() else {
             return;
@@ -225,7 +230,11 @@ impl CompositorState {
         self.ensure_keyboard_focus(&surface);
 
         let serial = self.next_configure_serial();
-        self.remember_input_serial(serial, surface.clone());
+        self.remember_input_serial(
+            serial,
+            surface.clone(),
+            InputSerialKind::KeyboardKeyPress { key },
+        );
         for keyboard in self
             .keyboard_resources
             .iter()
@@ -269,7 +278,11 @@ impl CompositorState {
             let _ = keyboard.send_event(wl_keyboard::Event::Enter {
                 serial,
                 surface: surface.clone(),
-                keys: Vec::new(),
+                keys: self
+                    .pressed_keys
+                    .iter()
+                    .flat_map(|key| key.to_ne_bytes())
+                    .collect(),
             });
             let _ = keyboard.send_event(wl_keyboard::Event::Modifiers {
                 serial,
@@ -352,6 +365,7 @@ impl CompositorState {
             return;
         }
         self.update_pointer_position(x, y);
+        self.update_drag_target_at(x, y);
         if self.send_implicit_pointer_grab_motion(x, y) {
             return;
         }

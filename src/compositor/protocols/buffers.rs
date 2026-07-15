@@ -2,8 +2,8 @@ use super::super::*;
 
 impl Dispatch<wl_shm::WlShm, ()> for CompositorState {
     fn request(
-        _state: &mut Self,
-        _client: &Client,
+        state: &mut Self,
+        client: &Client,
         resource: &wl_shm::WlShm,
         request: wl_shm::Request,
         _data: &(),
@@ -12,14 +12,30 @@ impl Dispatch<wl_shm::WlShm, ()> for CompositorState {
     ) {
         if let wl_shm::Request::CreatePool { id, fd, size } = request {
             if size <= 0 {
-                resource.post_error(
+                state.post_protocol_error(
+                    client,
+                    resource,
                     wl_shm::Error::InvalidStride,
                     "wl_shm_pool size must be positive".to_string(),
                 );
                 return;
             }
 
-            data_init.init(id, ShmPoolData::new(Arc::new(File::from(fd)), size));
+            let file = Arc::new(File::from(fd));
+            if !file
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() >= u64::try_from(size).unwrap_or(u64::MAX))
+            {
+                state.post_protocol_error(
+                    client,
+                    resource,
+                    wl_shm::Error::InvalidFd,
+                    "wl_shm_pool backing file is not usable for its initial size".to_string(),
+                );
+                return;
+            }
+
+            data_init.init(id, ShmPoolData::new(file, size));
         }
     }
 }
@@ -27,7 +43,7 @@ impl Dispatch<wl_shm::WlShm, ()> for CompositorState {
 impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &wl_shm_pool::WlShmPool,
         request: wl_shm_pool::Request,
         data: &ShmPoolData,
@@ -43,6 +59,44 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for CompositorState {
                 stride,
                 format,
             } => {
+                let Some(format_descriptor) = shm_format_descriptor(format) else {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        wl_shm::Error::InvalidFormat,
+                        "wl_shm format was not advertised by Typhon".to_string(),
+                    );
+                    return;
+                };
+                let Some(row_bytes) = width.checked_mul(format_descriptor.bytes_per_pixel) else {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        wl_shm::Error::InvalidStride,
+                        "wl_shm row-byte calculation overflowed".to_string(),
+                    );
+                    return;
+                };
+                let valid_dimensions = offset >= 0 && width > 0 && height > 0;
+                let valid_stride = stride >= row_bytes;
+                let end = height
+                    .checked_sub(1)
+                    .and_then(|rows| rows.checked_mul(stride))
+                    .and_then(|last_row| offset.checked_add(last_row))
+                    .and_then(|last_row_offset| last_row_offset.checked_add(row_bytes));
+                let valid_pool_range = end.is_some_and(|end| end <= data.size());
+                let valid_backing_range = end.is_some_and(|end| {
+                    data.has_backing_range(u64::try_from(end).unwrap_or(u64::MAX))
+                });
+                if !valid_dimensions || !valid_stride || !valid_pool_range || !valid_backing_range {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        wl_shm::Error::InvalidStride,
+                        "wl_shm buffer metadata is outside the advertised pool".to_string(),
+                    );
+                    return;
+                }
                 let Some(identity) = state.allocate_buffer_identity() else {
                     return;
                 };
@@ -50,8 +104,7 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for CompositorState {
                     id,
                     ShmBufferData {
                         identity,
-                        pool_size: data.size(),
-                        file: Arc::clone(&data.file),
+                        pool: Arc::new(data.clone()),
                         offset,
                         width,
                         height,
@@ -61,15 +114,31 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for CompositorState {
                 );
             }
             wl_shm_pool::Request::Resize { size } => {
-                if data.grow_to(size).is_err() {
-                    resource.post_error(
-                        wl_shm::Error::InvalidFd,
+                if size <= 0 {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        wl_shm::Error::InvalidStride,
+                        "wl_shm_pool size must be positive".to_string(),
+                    );
+                } else if data.grow_to(size).is_err() {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        wl_shm::Error::InvalidStride,
                         "shrinking wl_shm_pool is invalid".to_string(),
                     );
                 }
             }
             wl_shm_pool::Request::Destroy => {}
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "wl_shm_pool",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
@@ -128,7 +197,7 @@ impl Dispatch<wl_buffer::WlBuffer, DmabufBufferData> for CompositorState {
 impl Dispatch<wl_drm::WlDrm, ()> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &wl_drm::WlDrm,
         request: wl_drm::Request,
         _data: &(),
@@ -158,13 +227,21 @@ impl Dispatch<wl_drm::WlDrm, ()> for CompositorState {
                     stride0,
                 };
                 if let Some(data) = state.allocate_buffer_identity().and_then(|identity| {
-                    wl_drm_prime_buffer_data(resource, request, &state.dmabuf_feedback, identity)
+                    wl_drm_prime_buffer_data(
+                        resource,
+                        request,
+                        &state.dmabuf_feedback,
+                        &mut state.compliance_metrics,
+                        identity,
+                    )
                 }) {
                     data_init.init(id, data);
                 }
             }
             wl_drm::Request::CreateBuffer { .. } | wl_drm::Request::CreatePlanarBuffer { .. } => {
-                resource.post_error(
+                state.post_protocol_error(
+                    client,
+                    resource,
                     wl_drm::Error::InvalidName,
                     "wl_drm flink buffers are not supported; use linux-dmabuf".to_string(),
                 );
@@ -186,9 +263,11 @@ fn wl_drm_prime_buffer_data(
     drm: &wl_drm::WlDrm,
     request: WlDrmPrimeBufferRequest,
     feedback: &EglGlesDmabufFeedback,
+    metrics: &mut CoreComplianceMetrics,
     identity: BufferIdentity,
 ) -> Option<DmabufBufferData> {
     if request.width <= 0 || request.height <= 0 || request.offset0 < 0 || request.stride0 <= 0 {
+        metrics.note_protocol_error();
         drm.post_error(
             wl_drm::Error::InvalidName,
             "wl_drm prime buffer dimensions are invalid".to_string(),
@@ -198,6 +277,7 @@ fn wl_drm_prime_buffer_data(
 
     let drm_format = DrmFormat::from_fourcc(request.format);
     if !matches!(drm_format, DrmFormat::Argb8888 | DrmFormat::Xrgb8888) {
+        metrics.note_protocol_error();
         drm.post_error(
             wl_drm::Error::InvalidFormat,
             "unsupported wl_drm prime buffer format".to_string(),
@@ -205,6 +285,7 @@ fn wl_drm_prime_buffer_data(
         return None;
     }
     if !feedback.supports(drm_format, DrmModifier::LINEAR) {
+        metrics.note_protocol_error();
         drm.post_error(
             wl_drm::Error::InvalidFormat,
             "wl_drm prime buffers require a linear advertised format".to_string(),
@@ -215,6 +296,7 @@ fn wl_drm_prime_buffer_data(
     let minimum_stride = (request.width as u32).saturating_mul(4);
     let stride = request.stride0 as u32;
     if stride < minimum_stride || request.offset0 % 4 != 0 {
+        metrics.note_protocol_error();
         drm.post_error(
             wl_drm::Error::InvalidName,
             "wl_drm prime buffer plane metadata is out of bounds".to_string(),
@@ -244,7 +326,7 @@ impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for CompositorState {
     fn request(
         state: &mut Self,
         _client: &Client,
-        _resource: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+        resource: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
         request: zwp_linux_dmabuf_v1::Request,
         _data: &(),
         _dhandle: &DisplayHandle,
@@ -269,7 +351,14 @@ impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for CompositorState {
                     }
                 }
             }
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "zwp_linux_dmabuf_v1",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
@@ -319,6 +408,7 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, DmabufParamsDa
                         stride,
                         modifier: ((modifier_hi as u64) << 32) | u64::from(modifier_lo),
                     },
+                    &mut state.compliance_metrics,
                 );
             }
             zwp_linux_buffer_params_v1::Request::Create {
@@ -337,6 +427,7 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, DmabufParamsDa
                     height,
                     format,
                     &state.dmabuf_feedback,
+                    &mut state.compliance_metrics,
                     identity,
                 ) else {
                     resource.failed();
@@ -367,13 +458,21 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, DmabufParamsDa
                     height,
                     format,
                     &state.dmabuf_feedback,
+                    &mut state.compliance_metrics,
                     identity,
                 ) {
                     _data_init.init(buffer_id, buffer_data);
                 }
             }
             zwp_linux_buffer_params_v1::Request::Destroy => {}
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "zwp_linux_buffer_params_v1",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }

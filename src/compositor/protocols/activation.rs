@@ -17,7 +17,7 @@ impl Dispatch<xdg_activation_v1::XdgActivationV1, ()> for CompositorState {
     fn request(
         state: &mut Self,
         client: &Client,
-        _resource: &xdg_activation_v1::XdgActivationV1,
+        resource: &xdg_activation_v1::XdgActivationV1,
         request: xdg_activation_v1::Request,
         _data: &(),
         _dhandle: &DisplayHandle,
@@ -47,7 +47,14 @@ impl Dispatch<xdg_activation_v1::XdgActivationV1, ()> for CompositorState {
                 state.activate_surface_with_token(client.id(), token, surface);
             }
             xdg_activation_v1::Request::Destroy => {}
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "xdg_activation_v1",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
@@ -85,7 +92,14 @@ impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for CompositorS
             xdg_activation_token_v1::Request::Destroy => {
                 state.pending_activation_tokens.remove(&resource_id);
             }
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "xdg_activation_token_v1",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
@@ -112,7 +126,7 @@ impl CompositorState {
             return;
         }
         if let Some(serial) = pending.serial
-            && !self.client_has_recent_input_serial(&client_id, serial)
+            && !self.validate_activation_token_serial(&client_id, serial)
         {
             activation_debug_log(|| {
                 format!(

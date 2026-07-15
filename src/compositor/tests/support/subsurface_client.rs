@@ -56,6 +56,9 @@ pub(in crate::compositor::tests) fn create_scaled_buffer_toplevel_then_right_edg
     let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
     let _toplevel = xdg_surface.get_toplevel(&qh, ());
     surface.set_buffer_scale(2);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
     attach_test_buffered_surface(&surface, &shm, &qh, 600, 400)?;
     surface.commit();
     connection.flush()?;
@@ -98,6 +101,9 @@ pub(in crate::compositor::tests) fn create_scaled_buffer_toplevel_then_left_edge
     let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
     let _toplevel = xdg_surface.get_toplevel(&qh, ());
     surface.set_buffer_scale(2);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
     attach_test_buffered_surface(&surface, &shm, &qh, 600, 400)?;
     surface.commit();
     connection.flush()?;
@@ -208,6 +214,9 @@ pub(in crate::compositor::tests) fn capture_gecko_pre_role_subsurface_adoption(
     let parent = compositor.create_surface(&qh, ());
     let xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
     let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    parent.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
     commit_test_buffered_surface(&parent, &shm, &qh, 1992, 1189)?;
 
     let viewport = viewporter.get_viewport(&child, &qh, ());

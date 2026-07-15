@@ -13,10 +13,6 @@ impl CompositorState {
     ) {
         let resize_commit = pending.resize_commit.as_deref().copied();
         let commit_sequence = pending.commit_sequence;
-        if let Some(surface) = self.surface_resource_by_id(surface_id) {
-            self.ensure_surface_entered_outputs(&surface);
-        }
-
         let generation = self.next_render_generation_value();
         self.note_explicit_commit_visual_generation(
             SurfaceCommitId::from_sequence(commit_sequence),
@@ -147,6 +143,9 @@ impl CompositorState {
             if let Some(resize_commit) = resize_commit {
                 self.complete_applied_resize_transaction(surface_id, resize_commit);
             }
+            if let Some(surface) = self.surface_resource_by_id(surface_id) {
+                self.reconcile_surface_output_membership(&surface);
+            }
             return;
         }
         if let Some(existing) = self
@@ -248,6 +247,9 @@ impl CompositorState {
         }
         if committed_popup {
             self.refresh_pointer_focus_at_last_position();
+        }
+        if let Some(surface) = self.surface_resource_by_id(surface_id) {
+            self.reconcile_surface_output_membership(&surface);
         }
     }
 
@@ -377,6 +379,7 @@ impl CompositorState {
                 destination: surface_size,
             },
             buffer_scale,
+            current.buffer_transform,
         ) {
             Ok(surface_size) => surface_size,
             Err(_) => buffer_size,
@@ -459,7 +462,7 @@ impl CompositorState {
             .get(&surface_id)
             .map(|popup| popup.positioner)
             && positioner.reactive
-            && self.configured_xdg_surfaces.contains(&surface_id)
+            && self.xdg_surface_is_configured(surface_id)
         {
             self.configure_popup_surface(surface_id, positioner, None);
         }
@@ -469,7 +472,7 @@ impl CompositorState {
             .filter_map(|(popup_surface_id, popup)| {
                 (popup.parent_surface_id == Some(surface_id)
                     && popup.positioner.reactive
-                    && self.configured_xdg_surfaces.contains(popup_surface_id))
+                    && self.xdg_surface_is_configured(*popup_surface_id))
                 .then_some((*popup_surface_id, popup.positioner))
             })
             .collect::<Vec<_>>();
@@ -501,7 +504,9 @@ impl CompositorState {
                 self.complete_frame_callbacks(frame_callbacks);
                 return;
             }
-            self.configure_xdg_surface_if_needed(surface_id);
+            if self.xdg_surface_is_configured(surface_id) {
+                self.mark_xdg_buffer_commit(surface_id);
+            }
         }
         let Some(CapturedExplicitSyncState {
             state: sync_state,
@@ -529,7 +534,8 @@ impl CompositorState {
         };
 
         if !pending.data.is_dmabuf() {
-            sync_state.post_error(
+            sync_state.post_error_with_metrics(
+                &mut self.compliance_metrics,
                 SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER,
                 "explicit sync is only supported for linux-dmabuf buffers",
             );
@@ -537,14 +543,16 @@ impl CompositorState {
         }
 
         let Some(acquire) = acquire else {
-            sync_state.post_error(
+            sync_state.post_error_with_metrics(
+                &mut self.compliance_metrics,
                 SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
                 "dmabuf commit is missing an acquire timeline point",
             );
             return;
         };
         let Some(release) = release else {
-            sync_state.post_error(
+            sync_state.post_error_with_metrics(
+                &mut self.compliance_metrics,
                 SYNCOBJ_SURFACE_ERROR_NO_RELEASE_POINT,
                 "dmabuf commit is missing a release timeline point",
             );
@@ -552,7 +560,8 @@ impl CompositorState {
         };
 
         if acquire.timeline.same_timeline(&release.timeline) && acquire.point >= release.point {
-            sync_state.post_error(
+            sync_state.post_error_with_metrics(
+                &mut self.compliance_metrics,
                 SYNCOBJ_SURFACE_ERROR_CONFLICTING_POINTS,
                 "acquire timeline point must be lower than release point on the same timeline",
             );
@@ -570,7 +579,8 @@ impl CompositorState {
             });
             if older_ready_is_queued {
                 let Some(commit_id) = self.acquire_commit_ids.allocate() else {
-                    sync_state.post_error(
+                    sync_state.post_error_with_metrics(
+                        &mut self.compliance_metrics,
                         SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
                         "explicit sync commit identity space exhausted",
                     );
@@ -624,7 +634,8 @@ impl CompositorState {
         }
 
         let Some(commit_id) = self.acquire_commit_ids.allocate() else {
-            sync_state.post_error(
+            sync_state.post_error_with_metrics(
+                &mut self.compliance_metrics,
                 SYNCOBJ_SURFACE_ERROR_NO_ACQUIRE_POINT,
                 "explicit sync commit identity space exhausted",
             );
@@ -734,7 +745,8 @@ impl CompositorState {
         if let Some(sync_state) = explicit_sync {
             let (acquire, release) = sync_state.take_points();
             if acquire.is_some() || release.is_some() {
-                sync_state.post_error(
+                sync_state.post_error_with_metrics(
+                    &mut self.compliance_metrics,
                     SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
                     "explicit sync points were set without an attached buffer",
                 );
@@ -757,7 +769,6 @@ impl CompositorState {
         if !self.apply_layer_surface_commit(surface_id) {
             return;
         }
-        self.configure_xdg_surface_if_needed(surface_id);
         let mut resize_commit = if resize_capture_finalized {
             captured_resize_commit
         } else {
@@ -789,6 +800,7 @@ impl CompositorState {
                     surface.width != surface_size.width || surface.height != surface_size.height
                 })
         });
+        self.apply_committed_window_geometry(surface_id, window_geometry);
         if let Some(damage) = damage
             .or(viewport_size_changed.then_some(RenderableSurfaceDamage::Full))
             .or(window_geometry
@@ -803,8 +815,6 @@ impl CompositorState {
                 buffer_scale,
                 window_geometry,
             );
-        } else {
-            self.apply_committed_window_geometry(surface_id, window_geometry);
         }
         if let Some(resize_commit) = resize_commit {
             self.complete_pending_resize_from_current_geometry(surface_id, resize_commit);
@@ -947,6 +957,11 @@ impl CompositorState {
         );
         self.renderable_surfaces
             .retain(|surface| !removed_surface_ids.contains(&surface.surface_id));
+        for removed_surface_id in &removed_surface_ids {
+            if let Some(surface) = self.surface_resource_by_id(*removed_surface_id) {
+                self.reconcile_surface_output_membership(&surface);
+            }
+        }
         self.clear_popup_grab_for_surface_ids(&removed_surface_ids);
         self.popup_grab_stack
             .retain(|surface_id| !removed_surface_ids.contains(surface_id));
@@ -996,9 +1011,20 @@ impl CompositorState {
         removed_surface_ids.sort_unstable();
         removed_surface_ids.dedup();
 
+        for removed_surface_id in &removed_surface_ids {
+            self.current_surface_buffers.remove(removed_surface_id);
+            if let Some(buffer) = self.active_dmabuf_buffers.remove(removed_surface_id) {
+                self.queue_dmabuf_buffer_release(buffer);
+            }
+        }
         let previous_renderable_count = self.renderable_surfaces.len();
         self.renderable_surfaces
             .retain(|surface| !removed_surface_ids.contains(&surface.surface_id));
+        for removed_surface_id in &removed_surface_ids {
+            if let Some(surface) = self.surface_resource_by_id(*removed_surface_id) {
+                self.reconcile_surface_output_membership(&surface);
+            }
+        }
         self.clear_popup_grab_for_surface_ids(&removed_surface_ids);
         self.popup_grab_stack
             .retain(|surface_id| !removed_surface_ids.contains(surface_id));
@@ -1301,7 +1327,7 @@ impl CompositorState {
             SurfaceRole::Cursor => {
                 self.commit_cursor_surface_buffer(surface_id, pending, damage, frame_callbacks);
             }
-            SurfaceRole::Unassigned => {
+            SurfaceRole::Unassigned | SurfaceRole::DragIcon => {
                 self.commit_unassigned_surface_buffer(surface_id, pending, frame_callbacks, source);
             }
             SurfaceRole::XdgToplevel
@@ -1386,6 +1412,7 @@ impl CompositorState {
                 destination: surface_size,
             },
             buffer_scale,
+            current.buffer_transform,
         ) {
             existing.width = size.width;
             existing.height = size.height;
@@ -1418,7 +1445,8 @@ impl CompositorState {
         if let Some(sync_state) = explicit_sync {
             let (acquire, release) = sync_state.take_points();
             if acquire.is_some() || release.is_some() {
-                sync_state.post_error(
+                sync_state.post_error_with_metrics(
+                    &mut self.compliance_metrics,
                     SYNCOBJ_SURFACE_ERROR_NO_BUFFER,
                     "explicit sync points were set without an attached buffer",
                 );

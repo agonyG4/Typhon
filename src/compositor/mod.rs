@@ -121,13 +121,14 @@ pub use fullscreen::{
 };
 pub use idle::{IdleManager, IdleState};
 use input::{
-    InputSerial, KeyboardModifierState, PointerConstraintLifetime, send_keyboard_initial_state,
-    send_pointer_frame_if_supported, wayland_event_time,
+    InputSerial, InputSerialKind, KeyboardModifierState, PointerConstraintLifetime,
+    send_keyboard_initial_state, send_pointer_frame_if_supported, wayland_event_time,
+    wayland_event_time_from_usec,
 };
 pub use input::{
-    OutputPosition, OutputRect, OutputRegion, PointerConstraintBackendId,
-    PointerConstraintBackendRequest, PointerConstraintMode, PointerConstraintState,
-    PointerMotionSample, RelativePointerMotion,
+    OutputPosition, OutputRect, OutputRegion, PointerAxisComponent, PointerAxisFrame,
+    PointerAxisSource, PointerConstraintBackendId, PointerConstraintBackendRequest,
+    PointerConstraintMode, PointerConstraintState, PointerMotionSample, RelativePointerMotion,
 };
 use interaction::{
     InteractionCursorOverride, InteractionCursorShape, PendingResizeConfigure, PointerPress,
@@ -172,7 +173,7 @@ pub use server::{CompositorError, OwnCompositorServer};
 use shm::{
     ShmBufferData, ShmPoolData, WL_SHM_FORMAT_ABGR8888, WL_SHM_FORMAT_ABGR2101010,
     WL_SHM_FORMAT_ARGB2101010, WL_SHM_FORMAT_XBGR8888, WL_SHM_FORMAT_XBGR2101010,
-    WL_SHM_FORMAT_XRGB2101010,
+    WL_SHM_FORMAT_XRGB2101010, shm_format_descriptor,
 };
 pub use state::AstreaShortcutPhase;
 use state_data::*;
@@ -515,8 +516,10 @@ pub struct CompositorState {
     output_refresh: OutputRefreshRate,
     presentation_clock: PresentationClock,
     focused_surface: Option<wl_surface::WlSurface>,
+    focus_generation: u64,
     keyboard_surface: Option<wl_surface::WlSurface>,
     keyboard_modifiers: KeyboardModifierState,
+    pressed_keys: HashSet<u32>,
     pointer_surface: Option<wl_surface::WlSurface>,
     pointer_constraint: PointerConstraintState,
     pointer_constraints: HashMap<u64, PointerConstraint>,
@@ -534,7 +537,7 @@ pub struct CompositorState {
     cursor_visibility: CursorVisibilityState,
     pointer_entered_surfaces: Vec<(wl_pointer::WlPointer, wl_surface::WlSurface)>,
     pointer_enter_serials: Vec<PointerEnterSerial>,
-    surface_roles: HashMap<u32, SurfaceRole>,
+    surface_role_lifecycles: HashMap<u32, SurfaceRoleLifecycle>,
     surface_client_ids: HashMap<u32, ClientId>,
     cursor_surface_ids: HashSet<u32>,
     active_client_cursor: Option<ActiveClientCursor>,
@@ -552,13 +555,16 @@ pub struct CompositorState {
     current_surface_buffers: HashMap<u32, PendingSurfaceBuffer>,
     surface_window_geometries: HashMap<u32, XdgWindowGeometry>,
     pending_surface_window_geometries: HashMap<u32, XdgWindowGeometry>,
-    surface_entered_outputs: HashSet<(u32, u32)>,
+    surface_output_memberships: HashMap<u32, SurfaceOutputMembership>,
+    preferred_output_transform: Option<wl_output::Transform>,
+    xdg_surface_resources: HashMap<u32, xdg_surface::XdgSurface>,
+    xdg_surface_wm_bases: HashMap<u32, xdg_wm_base::XdgWmBase>,
+    xdg_surface_lifecycles: HashMap<u32, XdgSurfaceLifecycle>,
     toplevel_surfaces: HashMap<u32, ToplevelSurface>,
     layer_surfaces: HashMap<u32, LayerSurfaceRole>,
     layer_surface_order: u64,
     exclusive_keyboard_layer_surface: Option<u32>,
     last_application_keyboard_focus: Option<wl_surface::WlSurface>,
-    configured_xdg_surfaces: HashSet<u32>,
     window_interaction: Option<WindowInteraction>,
     interaction_cursor_override: Option<InteractionCursorOverride>,
     fullscreen_presentation: Option<FullscreenPresentationState>,
@@ -617,6 +623,7 @@ pub struct CompositorState {
     data_devices: Vec<ClipboardDataDevice>,
     data_offers: HashMap<ObjectId, ClipboardDataOffer>,
     active_clipboard: Option<ActiveClipboard>,
+    active_drag: Option<ActiveDrag>,
     next_clipboard_generation: u64,
     popup_surfaces: HashMap<u32, PopupSurface>,
     popup_grab_stack: Vec<u32>,
@@ -632,8 +639,8 @@ pub struct CompositorState {
     astrea_shell_client_uids: HashSet<u32>,
     typhon_socket_name: Option<String>,
     pending_process_launches: VecDeque<PendingProcessLaunch>,
+    compliance_metrics: CoreComplianceMetrics,
 }
-
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameBatchDiscardReason {
@@ -642,7 +649,6 @@ pub enum FrameBatchDiscardReason {
     SuspendAbandonment,
     OutputDestroyed,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SurfacePresentationKey {
     surface_id: u32,
@@ -773,6 +779,7 @@ struct DataDeviceData {
 struct DataOfferData {
     target_client_id: ClientId,
     source_generation: u64,
+    kind: DataOfferKind,
 }
 
 #[derive(Debug, Clone)]
@@ -780,13 +787,14 @@ struct ClipboardDataSource {
     source: wl_data_source::WlDataSource,
     client_id: ClientId,
     mime_types: Vec<String>,
+    use_state: DataSourceUse,
+    actions: u32,
+    actions_set: bool,
 }
 
 mod clipboard_state;
 use clipboard_state::*;
-
 mod state;
 use state::*;
-
 #[cfg(test)]
 mod tests;

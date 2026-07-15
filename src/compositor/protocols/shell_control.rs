@@ -43,7 +43,9 @@ impl Dispatch<astrea_shell_control_manager_v1::AstreaShellControlManagerV1, ()>
             } => {
                 let launch = data_init.init(request, AstreaLaunchRequestData);
                 if !state.astrea_shell_client_allowed(client, dhandle) {
-                    resource.post_error(
+                    state.post_protocol_error(
+                        client,
+                        resource,
                         astrea_shell_control_manager_v1::Error::Unauthorized,
                         "client is not an authorized Astrea shell descendant".to_string(),
                     );
@@ -63,7 +65,9 @@ impl Dispatch<astrea_shell_control_manager_v1::AstreaShellControlManagerV1, ()>
             astrea_shell_control_manager_v1::Request::LaunchArgvJson { request, argv_json } => {
                 let launch = data_init.init(request, AstreaLaunchRequestData);
                 if !state.astrea_shell_client_allowed(client, dhandle) {
-                    resource.post_error(
+                    state.post_protocol_error(
+                        client,
+                        resource,
                         astrea_shell_control_manager_v1::Error::Unauthorized,
                         "client is not an authorized Astrea shell descendant".to_string(),
                     );

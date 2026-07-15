@@ -150,7 +150,7 @@ fn minimized_toplevel_stays_hidden_when_client_commits_new_buffer() {
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
-    let client = LiveTestClient::connect(&socket_path).unwrap();
+    let mut client = LiveTestClient::connect(&socket_path).unwrap();
     let surface = client
         .create_toplevel_surface("oblivion.minimize-commit-test", 300, 200)
         .unwrap();

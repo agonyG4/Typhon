@@ -173,7 +173,7 @@ pub(crate) enum NativeHardwareInputEvent {
     Key { code: u16, value: i32 },
     PointerButton { button: u32, pressed: bool },
     PointerMotion(PointerMotionSample),
-    PointerAxis { horizontal: f64, vertical: f64 },
+    PointerAxis(PointerAxisFrame),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -223,7 +223,8 @@ impl NativeHardwareInputEvent {
     pub(crate) const fn timestamp_usec(self) -> Option<u64> {
         match self {
             Self::PointerMotion(sample) => Some(sample.timestamp_usec),
-            Self::Key { .. } | Self::PointerButton { .. } | Self::PointerAxis { .. } => None,
+            Self::Key { .. } | Self::PointerButton { .. } => None,
+            Self::PointerAxis(frame) => Some(frame.timestamp_usec),
         }
     }
 
@@ -248,14 +249,22 @@ impl NativeHardwareInputEvent {
                     linux_input_event_time_usec(event),
                     RelativeMotion::accelerated_only(0.0, f64::from(event.value)),
                 ))),
-                REL_WHEEL => Some(Self::PointerAxis {
-                    horizontal: 0.0,
-                    vertical: -f64::from(event.value) * WAYLAND_SCROLL_LINE_DISTANCE,
-                }),
-                REL_HWHEEL => Some(Self::PointerAxis {
-                    horizontal: f64::from(event.value) * WAYLAND_SCROLL_LINE_DISTANCE,
-                    vertical: 0.0,
-                }),
+                REL_WHEEL => Some(Self::PointerAxis(PointerAxisFrame {
+                    timestamp_usec: linux_input_event_time_usec(event),
+                    source: PointerAxisSource::Wheel,
+                    horizontal: PointerAxisComponent::absent(),
+                    vertical: PointerAxisComponent::continuous(
+                        -f64::from(event.value) * WAYLAND_SCROLL_LINE_DISTANCE,
+                    ),
+                })),
+                REL_HWHEEL => Some(Self::PointerAxis(PointerAxisFrame {
+                    timestamp_usec: linux_input_event_time_usec(event),
+                    source: PointerAxisSource::WheelTilt,
+                    horizontal: PointerAxisComponent::continuous(
+                        f64::from(event.value) * WAYLAND_SCROLL_LINE_DISTANCE,
+                    ),
+                    vertical: PointerAxisComponent::absent(),
+                })),
                 _ => None,
             },
             _ => None,
@@ -275,7 +284,7 @@ pub(crate) struct NativeInputEffect {
     pub(crate) pointer_motion_usec: Option<u64>,
     pub(crate) relative_motion: Option<RelativeMotion>,
     pub(crate) pointer_buttons: Vec<NativePointerButtonEvent>,
-    pub(crate) pointer_axis: Option<(f64, f64)>,
+    pub(crate) pointer_axis: Option<PointerAxisFrame>,
     pub(crate) window_actions: Vec<NativeWindowAction>,
     pub(crate) shortcut_events: Vec<AstreaShortcutEvent>,
     pub(crate) launch_command: Option<Vec<String>>,

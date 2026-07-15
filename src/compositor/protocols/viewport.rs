@@ -2,9 +2,9 @@ use super::super::*;
 
 impl Dispatch<wp_viewporter::WpViewporter, ()> for CompositorState {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
-        _resource: &wp_viewporter::WpViewporter,
+        resource: &wp_viewporter::WpViewporter,
         request: wp_viewporter::Request,
         _data: &(),
         _dhandle: &DisplayHandle,
@@ -15,16 +15,23 @@ impl Dispatch<wp_viewporter::WpViewporter, ()> for CompositorState {
             wp_viewporter::Request::GetViewport { id, surface } => {
                 data_init.init(id, ViewportData { surface });
             }
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "wp_viewporter",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
 
 impl Dispatch<wp_viewport::WpViewport, ViewportData> for CompositorState {
     fn request(
-        _state: &mut Self,
-        _client: &Client,
-        _resource: &wp_viewport::WpViewport,
+        state: &mut Self,
+        client: &Client,
+        resource: &wp_viewport::WpViewport,
         request: wp_viewport::Request,
         data: &ViewportData,
         _dhandle: &DisplayHandle,
@@ -44,7 +51,9 @@ impl Dispatch<wp_viewport::WpViewport, ViewportData> for CompositorState {
                 } else if width > 0 && height > 0 {
                     BufferSize::new(width as u32, height as u32)
                 } else {
-                    _resource.post_error(
+                    state.post_protocol_error(
+                        client,
+                        resource,
                         wp_viewport::Error::BadValue,
                         "viewport destination must be unset or positive".to_string(),
                     );
@@ -61,7 +70,9 @@ impl Dispatch<wp_viewport::WpViewport, ViewportData> for CompositorState {
                 let source = if x == -1.0 && y == -1.0 && width == -1.0 && height == -1.0 {
                     None
                 } else if x == -1.0 || y == -1.0 || width == -1.0 || height == -1.0 {
-                    _resource.post_error(
+                    state.post_protocol_error(
+                        client,
+                        resource,
                         wp_viewport::Error::BadValue,
                         "viewport source unset sentinel must use all -1 values".to_string(),
                     );
@@ -69,7 +80,9 @@ impl Dispatch<wp_viewport::WpViewport, ViewportData> for CompositorState {
                 } else if let Some(source) = ViewportSourceRect::new(x, y, width, height) {
                     Some(source)
                 } else {
-                    _resource.post_error(
+                    state.post_protocol_error(
+                        client,
+                        resource,
                         wp_viewport::Error::BadValue,
                         "viewport source must have a non-negative origin and positive size"
                             .to_string(),
@@ -78,7 +91,14 @@ impl Dispatch<wp_viewport::WpViewport, ViewportData> for CompositorState {
                 };
                 surface_data.set_pending_viewport_source(source);
             }
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "wp_viewport",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
@@ -87,7 +107,7 @@ impl Dispatch<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, ()> fo
     fn request(
         state: &mut Self,
         _client: &Client,
-        _resource: &wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+        resource: &wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
         request: wp_fractional_scale_manager_v1::Request,
         _data: &(),
         _dhandle: &DisplayHandle,
@@ -100,7 +120,14 @@ impl Dispatch<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, ()> fo
                     data_init.init(id, FractionalScaleData::new(surface.clone()));
                 state.register_fractional_scale_resource(&surface, fractional_scale);
             }
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "wp_fractional_scale_manager_v1",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }

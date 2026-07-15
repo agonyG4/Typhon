@@ -7,7 +7,7 @@ use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
 };
 
-use super::CompositorState;
+use super::{CompositorState, protocols::versions};
 
 pub(super) type PendingColorInfo = wp_image_description_info_v1::WpImageDescriptionInfoV1;
 
@@ -21,7 +21,10 @@ const ERROR_UNSUPPORTED_FEATURE: u32 = 0;
 const CAUSE_UNSUPPORTED: u32 = 1;
 
 pub(super) fn register_color_management_global(display: &DisplayHandle) {
-    display.create_global::<CompositorState, wp_color_manager_v1::WpColorManagerV1, _>(1, ());
+    display.create_global::<CompositorState, wp_color_manager_v1::WpColorManagerV1, _>(
+        versions::WP_COLOR_MANAGER_V1,
+        (),
+    );
 }
 
 impl GlobalDispatch<wp_color_manager_v1::WpColorManagerV1, ()> for CompositorState {
@@ -40,8 +43,8 @@ impl GlobalDispatch<wp_color_manager_v1::WpColorManagerV1, ()> for CompositorSta
 
 impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for CompositorState {
     fn request(
-        _state: &mut Self,
-        _client: &Client,
+        state: &mut Self,
+        client: &Client,
         resource: &wp_color_manager_v1::WpColorManagerV1,
         request: wp_color_manager_v1::Request,
         _data: &(),
@@ -65,13 +68,17 @@ impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for CompositorState {
             }
             wp_color_manager_v1::Request::CreateIccCreator { obj } => {
                 data_init.init(obj, ());
-                resource.post_error(
+                state.post_protocol_error(
+                    client,
+                    resource,
                     ERROR_UNSUPPORTED_FEATURE,
                     "ICC color descriptions are not supported yet".to_string(),
                 );
             }
             _ => {
-                resource.post_error(
+                state.post_protocol_error(
+                    client,
+                    resource,
                     ERROR_UNSUPPORTED_FEATURE,
                     "color management request is not supported yet".to_string(),
                 );

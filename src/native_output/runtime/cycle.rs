@@ -1226,6 +1226,10 @@ impl NativeRuntime {
                         "canceled_client_disconnected",
                         metrics.cancellations_by_reason[5],
                     ),
+                    NativePerfField::u64(
+                        "canceled_role_destroyed",
+                        metrics.cancellations_by_reason[8],
+                    ),
                 ]
             });
         }

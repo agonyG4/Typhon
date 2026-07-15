@@ -185,7 +185,7 @@ fn pointer_warp_rejects_stale_serial_and_out_of_surface_coordinates() {
 }
 
 #[test]
-fn pointer_warp_accepts_same_client_enter_serial_for_target_surface() {
+fn pointer_warp_rejects_a_stale_enter_serial_after_pointer_focus_moves() {
     let socket_name = unique_socket_name();
     let capabilities = InputProtocolCapabilities {
         pointer_warp: true,
@@ -257,11 +257,15 @@ fn pointer_warp_accepts_same_client_enter_serial_for_target_surface() {
         f64::from(render::FIRST_SURFACE_OFFSET.0 + render::SURFACE_CASCADE_STEP) + 30.0,
         f64::from(render::FIRST_SURFACE_OFFSET.1 + render::SURFACE_CASCADE_STEP) + 40.0,
     );
-    assert_eq!(position, expected);
-    assert!(state.pointer_motion);
-    assert_eq!(state.pointer_surface_x, Some(30.0));
-    assert_eq!(state.pointer_surface_y, Some(40.0));
-    assert!(requests.iter().any(|request| {
+    let original = (
+        f64::from(render::FIRST_SURFACE_OFFSET.0 + render::SURFACE_CASCADE_STEP) + 20.0,
+        f64::from(render::FIRST_SURFACE_OFFSET.1 + render::SURFACE_CASCADE_STEP) + 14.0,
+    );
+    assert_eq!(position, original);
+    assert!(!state.pointer_motion);
+    assert_eq!(state.pointer_surface_x, None);
+    assert_eq!(state.pointer_surface_y, None);
+    assert!(!requests.iter().any(|request| {
         matches!(
             request,
             PointerConstraintBackendRequest::WarpPointer {
@@ -750,7 +754,7 @@ fn implicit_pointer_grab_surface_destroy_clears_grab_without_stuck_button() {
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
     let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
     let _pointer = seat.get_pointer(&qh, ());
-    let (surface, xdg_surface, _toplevel) =
+    let (surface, xdg_surface, toplevel) =
         create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
     surface.commit();
     connection.flush().unwrap();
@@ -772,6 +776,7 @@ fn implicit_pointer_grab_surface_destroy_clears_grab_without_stuck_button() {
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
 
+    toplevel.destroy();
     xdg_surface.destroy();
     surface.destroy();
     connection.flush().unwrap();

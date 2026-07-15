@@ -37,14 +37,15 @@ use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
 
+use super::protocols::versions;
 use super::{
     AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, BufferReleaseMetrics,
-    ClientCursorRenderState, CompositorFrameBatchId, CompositorState, ExplicitSyncPoint,
-    FrameBatchDiscardReason, FramePresentation, FullscreenRenderPlanMetrics,
-    InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PresentationClock,
-    RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
-    SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
-    WindowInteractionDebugSnapshot, WindowInteractionEndReason, color,
+    ClientCursorRenderState, CompositorFrameBatchId, CompositorState, CoreComplianceMetrics,
+    ExplicitSyncPoint, FrameBatchDiscardReason, FramePresentation, FullscreenRenderPlanMetrics,
+    InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PointerAxisFrame,
+    PresentationClock, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
+    ResizeFlowMetrics, SelectionProtocolCapabilities, SubsurfaceTransactionMetrics,
+    SurfaceDamagePresentation, WindowInteractionDebugSnapshot, WindowInteractionEndReason, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 
@@ -91,10 +92,18 @@ impl Drop for OwnCompositorServer {
 }
 
 impl OwnCompositorServer {
+    pub fn core_compliance_metrics(&self) -> CoreComplianceMetrics {
+        self.state.compliance_metrics
+    }
+
     pub fn finish_commit_debug_for_shutdown(&mut self) {
         self.state.release_cached_resources_for_shutdown();
         self.state.discard_all_pending_presentation_feedbacks();
         self.state.release_client_buffers_for_shutdown();
+        println!(
+            "oblivion-one compliance: {:?}",
+            self.state.compliance_metrics
+        );
         if let Some(summary) = self.state.take_commit_debug_summary_line() {
             println!("{summary}");
         }
@@ -430,6 +439,12 @@ impl OwnCompositorServer {
         changed
     }
 
+    pub fn set_output_preferred_transform(&mut self, transform: wl_output::Transform) -> bool {
+        let changed = self.state.set_output_preferred_transform(transform);
+        let _ = self.display.flush_clients();
+        changed
+    }
+
     pub fn set_output_refresh_hz(&mut self, refresh_hz: u32) -> bool {
         let changed = self.state.set_output_refresh_hz(refresh_hz);
         let _ = self.display.flush_clients();
@@ -484,6 +499,11 @@ impl OwnCompositorServer {
 
     pub fn send_pointer_axis(&mut self, horizontal: f64, vertical: f64) {
         self.state.send_pointer_axis(horizontal, vertical);
+        let _ = self.display.flush_clients();
+    }
+
+    pub fn send_pointer_axis_frame(&mut self, frame: PointerAxisFrame) {
+        self.state.send_pointer_axis_frame(frame);
         let _ = self.display.flush_clients();
     }
 
@@ -797,12 +817,13 @@ impl OwnCompositorServer {
         self.state.accepted_clients += accepted;
         self.state.poll_clipboard_bridge();
         self.state.begin_client_dispatch_cycle();
-        self.display.dispatch_clients(&mut self.state)?;
+        let dispatch_result = self.display.dispatch_clients(&mut self.state);
         self.state.finish_client_dispatch_cycle();
         self.teardown_disconnected_clients();
         self.state.clear_dead_active_clipboard_source();
         self.state.poll_clipboard_bridge();
         self.display.flush_clients()?;
+        dispatch_result?;
         Ok(accepted)
     }
 
@@ -839,23 +860,43 @@ fn register_minimum_globals(
     selection_capabilities: SelectionProtocolCapabilities,
     renderer_capabilities: RendererProtocolCapabilities,
 ) {
-    display.create_global::<CompositorState, wl_compositor::WlCompositor, _>(6, ());
-    display.create_global::<CompositorState, wl_subcompositor::WlSubcompositor, _>(1, ());
+    debug_assert!(
+        versions::all_globals()
+            .iter()
+            .all(|global| global.version > 0 && !global.interface.is_empty())
+    );
+    display.create_global::<CompositorState, wl_compositor::WlCompositor, _>(
+        versions::WL_COMPOSITOR,
+        (),
+    );
+    display.create_global::<CompositorState, wl_subcompositor::WlSubcompositor, _>(
+        versions::WL_SUBCOMPOSITOR,
+        (),
+    );
     if selection_capabilities.clipboard {
         display.create_global::<CompositorState, wl_data_device_manager::WlDataDeviceManager, _>(
-            3,
+            versions::WL_DATA_DEVICE_MANAGER,
             (),
         );
     }
-    display.create_global::<CompositorState, wl_shm::WlShm, _>(2, ());
-    display.create_global::<CompositorState, wp_viewporter::WpViewporter, _>(1, ());
+    display.create_global::<CompositorState, wl_shm::WlShm, _>(versions::WL_SHM, ());
+    display.create_global::<CompositorState, wp_viewporter::WpViewporter, _>(
+        versions::WP_VIEWPORTER,
+        (),
+    );
     display.create_global::<
         CompositorState,
         wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
         _,
-    >(1, ());
-    display.create_global::<CompositorState, wp_presentation::WpPresentation, _>(2, ());
-    display.create_global::<CompositorState, zwlr_layer_shell_v1::ZwlrLayerShellV1, _>(4, ());
+    >(versions::WP_FRACTIONAL_SCALE_MANAGER_V1, ());
+    display.create_global::<CompositorState, wp_presentation::WpPresentation, _>(
+        versions::WP_PRESENTATION,
+        (),
+    );
+    display.create_global::<CompositorState, zwlr_layer_shell_v1::ZwlrLayerShellV1, _>(
+        versions::ZWLR_LAYER_SHELL_V1,
+        (),
+    );
     if renderer_capabilities.color_management {
         color::register_color_management_global(display);
     }
@@ -864,73 +905,82 @@ fn register_minimum_globals(
             CompositorState,
             zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
             _,
-        >(1, ());
+        >(versions::ZWP_RELATIVE_POINTER_MANAGER_V1, ());
     }
     if input_capabilities.pointer_constraints {
         display.create_global::<
             CompositorState,
             zwp_pointer_constraints_v1::ZwpPointerConstraintsV1,
             _,
-        >(1, ());
+        >(versions::ZWP_POINTER_CONSTRAINTS_V1, ());
     }
     if input_capabilities.pointer_warp {
-        display.create_global::<CompositorState, wp_pointer_warp_v1::WpPointerWarpV1, _>(1, ());
+        display.create_global::<CompositorState, wp_pointer_warp_v1::WpPointerWarpV1, _>(
+            versions::WP_POINTER_WARP_V1,
+            (),
+        );
     }
     if input_capabilities.idle_inhibit {
         display.create_global::<
             CompositorState,
             zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
             _,
-        >(1, ());
+        >(versions::ZWP_IDLE_INHIBIT_MANAGER_V1, ());
     }
     if selection_capabilities.primary_selection {
         display.create_global::<
             CompositorState,
             zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
             _,
-        >(1, ());
+        >(versions::ZWP_PRIMARY_SELECTION_DEVICE_MANAGER_V1, ());
     }
     if selection_capabilities.data_control {
         display.create_global::<
             CompositorState,
             ext_data_control_manager_v1::ExtDataControlManagerV1,
             _,
-        >(1, ());
+        >(versions::EXT_DATA_CONTROL_MANAGER_V1, ());
     }
     display
         .create_global::<CompositorState, zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _>(
-            1,
+            versions::ZXDG_DECORATION_MANAGER_V1,
             (),
         );
     if gpu_buffers_enabled {
         register_gpu_buffer_globals(display, syncobj_available);
     }
-    display.create_global::<CompositorState, xdg_activation_v1::XdgActivationV1, _>(1, ());
+    display.create_global::<CompositorState, xdg_activation_v1::XdgActivationV1, _>(
+        versions::XDG_ACTIVATION_V1,
+        (),
+    );
     display
         .create_global::<CompositorState, astrea_shortcuts_manager_v1::AstreaShortcutsManagerV1, _>(
-            1,
+            versions::ASTREA_SHORTCUTS_MANAGER_V1,
             (),
         );
     display.create_global::<
         CompositorState,
         astrea_shell_control_manager_v1::AstreaShellControlManagerV1,
         _,
-    >(1, ());
-    display.create_global::<CompositorState, xdg_wm_base::XdgWmBase, _>(6, ());
-    display.create_global::<CompositorState, wl_output::WlOutput, _>(4, ());
-    display.create_global::<CompositorState, wl_seat::WlSeat, _>(7, ());
+    >(versions::ASTREA_SHELL_CONTROL_MANAGER_V1, ());
+    display.create_global::<CompositorState, xdg_wm_base::XdgWmBase, _>(versions::XDG_WM_BASE, ());
+    display.create_global::<CompositorState, wl_output::WlOutput, _>(versions::WL_OUTPUT, ());
+    display.create_global::<CompositorState, wl_seat::WlSeat, _>(versions::WL_SEAT, ());
 }
 
 fn register_gpu_buffer_globals(display: &DisplayHandle, syncobj_available: bool) {
-    display.create_global::<CompositorState, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _>(4, ());
+    display.create_global::<CompositorState, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _>(
+        versions::ZWP_LINUX_DMABUF_V1,
+        (),
+    );
     if syncobj_available {
         display.create_global::<
             CompositorState,
             wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1,
             _,
-        >(1, ());
+        >(versions::WP_LINUX_DRM_SYNCOBJ_MANAGER_V1, ());
     }
-    display.create_global::<CompositorState, wl_drm::WlDrm, _>(2, ());
+    display.create_global::<CompositorState, wl_drm::WlDrm, _>(versions::WL_DRM, ());
 }
 
 #[derive(Debug)]

@@ -356,8 +356,7 @@ fn shm_read_pixels_into_reuses_existing_pixel_storage_for_same_size() {
         identity: BufferIdAllocator::default()
             .allocate()
             .expect("test buffer identity"),
-        pool_size: 16,
-        file,
+        pool: Arc::new(ShmPoolData::new(file, 16)),
         offset: 0,
         width: 2,
         height: 2,
@@ -385,8 +384,7 @@ fn shm_read_pixels_into_with_damage_updates_only_dirty_rect() {
         identity: BufferIdAllocator::default()
             .allocate()
             .expect("test buffer identity"),
-        pool_size: 16,
-        file,
+        pool: Arc::new(ShmPoolData::new(file, 16)),
         offset: 0,
         width: 2,
         height: 2,

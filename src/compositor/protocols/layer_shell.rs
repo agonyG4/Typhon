@@ -16,7 +16,7 @@ impl GlobalDispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for CompositorSta
 impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &zwlr_layer_shell_v1::ZwlrLayerShellV1,
         request: zwlr_layer_shell_v1::Request,
         _data: &(),
@@ -36,7 +36,9 @@ impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for CompositorState {
                     || state.popup_surfaces.contains_key(&surface_id)
                     || state.layer_surfaces.contains_key(&surface_id)
                 {
-                    resource.post_error(
+                    state.post_protocol_error(
+                        client,
+                        resource,
                         zwlr_layer_shell_v1::Error::Role,
                         "wl_surface already has an incompatible role".to_string(),
                     );
@@ -44,7 +46,12 @@ impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for CompositorState {
                 }
                 if let Err(error) = state.assign_surface_role(surface_id, SurfaceRole::LayerSurface)
                 {
-                    resource.post_error(zwlr_layer_shell_v1::Error::Role, error.message());
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        zwlr_layer_shell_v1::Error::Role,
+                        error.message(),
+                    );
                     return;
                 }
                 if state.current_surface_buffers.contains_key(&surface_id)
@@ -53,15 +60,19 @@ impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for CompositorState {
                         .iter()
                         .any(|renderable| renderable.surface_id == surface_id)
                 {
-                    state.clear_surface_role_if(surface_id, SurfaceRole::LayerSurface);
-                    resource.post_error(
+                    state.rollback_surface_role_reservation(surface_id, SurfaceRole::LayerSurface);
+                    state.post_protocol_error(
+                        client,
+                        resource,
                         zwlr_layer_shell_v1::Error::AlreadyConstructed,
                         "wl_surface already has committed content".to_string(),
                     );
                     return;
                 }
                 let Ok(layer) = crate::compositor::layer_shell::layer_from_protocol(layer) else {
-                    resource.post_error(
+                    state.post_protocol_error(
+                        client,
+                        resource,
                         zwlr_layer_shell_v1::Error::InvalidLayer,
                         "invalid layer".to_string(),
                     );
@@ -77,7 +88,14 @@ impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for CompositorState {
                 state.adopt_current_surface_content_for_role(surface_id);
             }
             zwlr_layer_shell_v1::Request::Destroy => {}
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "zwlr_layer_shell_v1",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
@@ -85,7 +103,7 @@ impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for CompositorState {
 impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, LayerSurfaceData> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
         request: zwlr_layer_surface_v1::Request,
         data: &LayerSurfaceData,
@@ -100,7 +118,9 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, LayerSurfaceData> for C
             zwlr_layer_surface_v1::Request::SetAnchor { anchor } => {
                 let Some(anchors) = crate::compositor::layer_shell::anchors_from_protocol(anchor)
                 else {
-                    resource.post_error(
+                    state.post_protocol_error(
+                        client,
+                        resource,
                         zwlr_layer_surface_v1::Error::InvalidSurfaceState,
                         "invalid anchors".to_string(),
                     );
@@ -137,7 +157,12 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, LayerSurfaceData> for C
                         state.set_layer_surface_pending_keyboard_interactivity(surface_id, mode)
                     }
                     Err(error) => {
-                        resource.post_error(error, "invalid keyboard interactivity".to_string());
+                        state.post_protocol_error(
+                            client,
+                            resource,
+                            error,
+                            "invalid keyboard interactivity".to_string(),
+                        );
                     }
                 }
             }
@@ -148,7 +173,9 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, LayerSurfaceData> for C
                         compositor_surface_id(&popup_data.surface),
                     )
                 {
-                    resource.post_error(
+                    state.post_protocol_error(
+                        client,
+                        resource,
                         zwlr_layer_surface_v1::Error::InvalidSurfaceState,
                         message.to_string(),
                     );
@@ -162,7 +189,9 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, LayerSurfaceData> for C
             }
             zwlr_layer_surface_v1::Request::SetLayer { layer } => {
                 let Ok(layer) = crate::compositor::layer_shell::layer_from_protocol(layer) else {
-                    resource.post_error(
+                    state.post_protocol_error(
+                        client,
+                        resource,
                         zwlr_layer_shell_v1::Error::InvalidLayer,
                         "invalid layer".to_string(),
                     );
@@ -170,7 +199,14 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, LayerSurfaceData> for C
                 };
                 state.set_layer_surface_pending_layer(surface_id, layer);
             }
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "zwlr_layer_surface_v1",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 

@@ -124,10 +124,7 @@ impl NativeInputState {
                 self.handle_pointer_button(button, pressed)
             }
             NativeHardwareInputEvent::PointerMotion(sample) => self.handle_pointer_motion(sample),
-            NativeHardwareInputEvent::PointerAxis {
-                horizontal,
-                vertical,
-            } => self.handle_pointer_axis(horizontal, vertical),
+            NativeHardwareInputEvent::PointerAxis(frame) => self.handle_pointer_axis_frame(frame),
         }
     }
 
@@ -417,13 +414,21 @@ impl NativeInputState {
         ))
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_pointer_axis(
         &mut self,
         horizontal: f64,
         vertical: f64,
     ) -> NativeInputEffect {
+        self.handle_pointer_axis_frame(PointerAxisFrame::unknown(0, horizontal, vertical))
+    }
+
+    pub(crate) fn handle_pointer_axis_frame(
+        &mut self,
+        frame: PointerAxisFrame,
+    ) -> NativeInputEffect {
         let mut effect = NativeInputEffect {
-            pointer_axis: Some((horizontal, vertical)),
+            pointer_axis: Some(frame),
             ..Default::default()
         };
         effect.request_redraw();

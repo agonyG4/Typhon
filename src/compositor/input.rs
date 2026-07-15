@@ -3,7 +3,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Seek, Write},
     os::fd::AsFd,
-    time::{SystemTime, UNIX_EPOCH},
+    time::Instant,
 };
 
 use wayland_server::{
@@ -21,10 +21,29 @@ const XKB_CONTROL_MASK: u32 = 1 << 2;
 const XKB_ALT_MASK: u32 = 1 << 3;
 const XKB_SUPER_MASK: u32 = 1 << 6;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InputSerialKind {
+    PointerEnter,
+    PointerButtonPress {
+        button: u32,
+    },
+    KeyboardKeyPress {
+        key: u32,
+    },
+    #[allow(dead_code)]
+    TouchDown {
+        touch_id: i32,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct InputSerial {
     pub(super) serial: u32,
     pub(super) surface: wl_surface::WlSurface,
+    pub(super) client_id: Option<wayland_server::backend::ClientId>,
+    pub(super) root_surface_id: u32,
+    pub(super) kind: InputSerialKind,
+    pub(super) focus_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -457,10 +476,72 @@ fn keymap_file() -> io::Result<(File, u32)> {
 }
 
 pub(super) fn wayland_event_time() -> u32 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u32)
-        .unwrap_or_default()
+    static CLOCK_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let elapsed = CLOCK_START.get_or_init(Instant::now).elapsed().as_millis();
+    u32::try_from(elapsed & u128::from(u32::MAX)).unwrap_or_default()
+}
+
+pub(super) fn wayland_event_time_from_usec(timestamp_usec: u64) -> u32 {
+    u32::try_from((timestamp_usec / 1_000) & u64::from(u32::MAX)).unwrap_or_default()
+}
+
+/// The metadata that accompanies one logical pointer scroll frame.
+///
+/// This lives at the compositor boundary so native input backends can preserve
+/// libinput's source, discrete-step, stop, and timestamp information all the
+/// way to wl_pointer dispatch.  A missing continuous value means that axis was
+/// not present in the native event.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PointerAxisComponent {
+    pub continuous: Option<f64>,
+    pub discrete: Option<i32>,
+    pub stopped: bool,
+}
+
+impl PointerAxisComponent {
+    pub const fn continuous(value: f64) -> Self {
+        Self {
+            continuous: Some(value),
+            discrete: None,
+            stopped: false,
+        }
+    }
+
+    pub const fn absent() -> Self {
+        Self {
+            continuous: None,
+            discrete: None,
+            stopped: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerAxisSource {
+    Wheel,
+    Finger,
+    Continuous,
+    WheelTilt,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PointerAxisFrame {
+    pub timestamp_usec: u64,
+    pub source: PointerAxisSource,
+    pub horizontal: PointerAxisComponent,
+    pub vertical: PointerAxisComponent,
+}
+
+impl PointerAxisFrame {
+    pub const fn unknown(timestamp_usec: u64, horizontal: f64, vertical: f64) -> Self {
+        Self {
+            timestamp_usec,
+            source: PointerAxisSource::Unknown,
+            horizontal: PointerAxisComponent::continuous(horizontal),
+            vertical: PointerAxisComponent::continuous(vertical),
+        }
+    }
 }
 
 #[cfg(test)]

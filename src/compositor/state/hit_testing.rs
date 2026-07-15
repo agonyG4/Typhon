@@ -405,7 +405,7 @@ impl CompositorState {
         surface: &wl_surface::WlSurface,
     ) -> bool {
         resource_belongs_to_surface_client(pointer, surface)
-            && self.has_recent_input_serial_for_surface(serial, surface)
+            && self.validate_set_cursor_serial(serial, surface)
     }
 
     pub(in crate::compositor) fn warp_pointer_protocol_request(
@@ -574,7 +574,11 @@ impl CompositorState {
             pointer.id().protocol_id(),
             compositor_surface_id(&target.surface)
         ));
-        self.remember_input_serial(serial, target.surface.clone());
+        self.remember_input_serial(
+            serial,
+            target.surface.clone(),
+            InputSerialKind::PointerEnter,
+        );
         self.remember_pointer_enter_serial(pointer, &target.surface, serial);
         send_pointer_frame_if_supported(pointer);
         self.pointer_entered_surfaces

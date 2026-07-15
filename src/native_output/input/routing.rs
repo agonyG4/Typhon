@@ -140,6 +140,39 @@ pub(crate) struct LibinputInputBackend {
     pub(crate) output_height: u32,
     pub(crate) device_count: usize,
     pub(crate) suspended: bool,
+    pub(crate) scroll_v120_remainders: HashMap<String, ScrollV120Remainder>,
+}
+
+/// Fractional wheel motion is kept per libinput device and per axis until it
+/// reaches one logical Wayland wheel step.  A v120 value is not itself a
+/// `wl_pointer.axis_discrete` value: 120 units represent one step.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct ScrollV120Remainder {
+    pub(crate) horizontal: f64,
+    pub(crate) vertical: f64,
+}
+
+impl ScrollV120Remainder {
+    pub(crate) fn take_steps(&mut self, horizontal: bool, v120: f64) -> Option<i32> {
+        if !v120.is_finite() {
+            return None;
+        }
+        let remainder = if horizontal {
+            &mut self.horizontal
+        } else {
+            &mut self.vertical
+        };
+        *remainder += v120;
+        let steps = (*remainder / 120.0).trunc();
+        if steps == 0.0 {
+            return None;
+        }
+        *remainder -= steps * 120.0;
+        if steps < f64::from(i32::MIN) || steps > f64::from(i32::MAX) {
+            return None;
+        }
+        Some(steps as i32)
+    }
 }
 
 impl LibinputInputBackend {
@@ -169,6 +202,7 @@ impl LibinputInputBackend {
             output_height,
             device_count,
             suspended: false,
+            scroll_v120_remainders: HashMap::new(),
         })
     }
 
@@ -191,6 +225,7 @@ impl LibinputInputBackend {
             output_height,
             device_count,
             suspended: false,
+            scroll_v120_remainders: HashMap::new(),
         })
     }
 
@@ -208,9 +243,16 @@ impl LibinputInputBackend {
             return events;
         }
         for event in &mut self.input {
-            if let Some(event) =
-                hardware_input_event_from_libinput(event, self.output_width, self.output_height)
-            {
+            let device_key = ::input::event::EventTrait::device(&event)
+                .sysname()
+                .to_owned();
+            if let Some(event) = hardware_input_event_from_libinput(
+                event,
+                self.output_width,
+                self.output_height,
+                &mut self.scroll_v120_remainders,
+                &device_key,
+            ) {
                 events.push(event);
                 if events.len() >= 256 {
                     break;
@@ -489,6 +531,8 @@ pub(crate) fn hardware_input_event_from_libinput(
     event: ::input::Event,
     output_width: u32,
     output_height: u32,
+    scroll_v120_remainders: &mut HashMap<String, ScrollV120Remainder>,
+    device_key: &str,
 ) -> Option<NativeHardwareInputEvent> {
     use ::input::event::keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait};
     #[allow(deprecated)]
@@ -537,10 +581,20 @@ pub(crate) fn hardware_input_event_from_libinput(
             let vertical = libinput_scroll_axis_value(event.has_axis(Axis::Vertical), || {
                 event.axis_value(Axis::Vertical)
             });
-            Some(NativeHardwareInputEvent::PointerAxis {
-                horizontal,
-                vertical,
-            })
+            Some(NativeHardwareInputEvent::PointerAxis(PointerAxisFrame {
+                timestamp_usec: event.time_usec(),
+                source: PointerAxisSource::Unknown,
+                horizontal: PointerAxisComponent {
+                    continuous: (event.has_axis(Axis::Horizontal)).then_some(horizontal),
+                    discrete: None,
+                    stopped: event.has_axis(Axis::Horizontal) && horizontal == 0.0,
+                },
+                vertical: PointerAxisComponent {
+                    continuous: (event.has_axis(Axis::Vertical)).then_some(vertical),
+                    discrete: None,
+                    stopped: event.has_axis(Axis::Vertical) && vertical == 0.0,
+                },
+            }))
         }
         ::input::Event::Pointer(PointerEvent::ScrollWheel(event)) => {
             let horizontal = libinput_scroll_axis_value(event.has_axis(Axis::Horizontal), || {
@@ -549,10 +603,28 @@ pub(crate) fn hardware_input_event_from_libinput(
             let vertical = libinput_scroll_axis_value(event.has_axis(Axis::Vertical), || {
                 event.scroll_value(Axis::Vertical)
             });
-            Some(NativeHardwareInputEvent::PointerAxis {
-                horizontal,
-                vertical,
-            })
+            Some(NativeHardwareInputEvent::PointerAxis(PointerAxisFrame {
+                timestamp_usec: event.time_usec(),
+                source: PointerAxisSource::Wheel,
+                horizontal: wheel_axis_component(
+                    event.has_axis(Axis::Horizontal),
+                    horizontal,
+                    || event.scroll_value_v120(Axis::Horizontal),
+                    scroll_v120_remainders
+                        .entry(device_key.to_owned())
+                        .or_default(),
+                    true,
+                ),
+                vertical: wheel_axis_component(
+                    event.has_axis(Axis::Vertical),
+                    vertical,
+                    || event.scroll_value_v120(Axis::Vertical),
+                    scroll_v120_remainders
+                        .entry(device_key.to_owned())
+                        .or_default(),
+                    false,
+                ),
+            }))
         }
         ::input::Event::Pointer(PointerEvent::ScrollFinger(event)) => {
             let horizontal = libinput_scroll_axis_value(event.has_axis(Axis::Horizontal), || {
@@ -561,10 +633,12 @@ pub(crate) fn hardware_input_event_from_libinput(
             let vertical = libinput_scroll_axis_value(event.has_axis(Axis::Vertical), || {
                 event.scroll_value(Axis::Vertical)
             });
-            Some(NativeHardwareInputEvent::PointerAxis {
-                horizontal,
-                vertical,
-            })
+            Some(NativeHardwareInputEvent::PointerAxis(PointerAxisFrame {
+                timestamp_usec: event.time_usec(),
+                source: PointerAxisSource::Finger,
+                horizontal: continuous_axis_component(event.has_axis(Axis::Horizontal), horizontal),
+                vertical: continuous_axis_component(event.has_axis(Axis::Vertical), vertical),
+            }))
         }
         ::input::Event::Pointer(PointerEvent::ScrollContinuous(event)) => {
             let horizontal = libinput_scroll_axis_value(event.has_axis(Axis::Horizontal), || {
@@ -573,10 +647,12 @@ pub(crate) fn hardware_input_event_from_libinput(
             let vertical = libinput_scroll_axis_value(event.has_axis(Axis::Vertical), || {
                 event.scroll_value(Axis::Vertical)
             });
-            Some(NativeHardwareInputEvent::PointerAxis {
-                horizontal,
-                vertical,
-            })
+            Some(NativeHardwareInputEvent::PointerAxis(PointerAxisFrame {
+                timestamp_usec: event.time_usec(),
+                source: PointerAxisSource::Continuous,
+                horizontal: continuous_axis_component(event.has_axis(Axis::Horizontal), horizontal),
+                vertical: continuous_axis_component(event.has_axis(Axis::Vertical), vertical),
+            }))
         }
         _ => None,
     }
@@ -587,6 +663,33 @@ where
     F: FnOnce() -> f64,
 {
     if has_axis { read_value() } else { 0.0 }
+}
+
+fn continuous_axis_component(has_axis: bool, value: f64) -> PointerAxisComponent {
+    PointerAxisComponent {
+        continuous: has_axis.then_some(value),
+        discrete: None,
+        stopped: has_axis && value == 0.0,
+    }
+}
+
+fn wheel_axis_component<F>(
+    has_axis: bool,
+    value: f64,
+    read_v120: F,
+    remainder: &mut ScrollV120Remainder,
+    horizontal: bool,
+) -> PointerAxisComponent
+where
+    F: FnOnce() -> f64,
+{
+    PointerAxisComponent {
+        continuous: has_axis.then_some(value),
+        discrete: has_axis
+            .then(|| remainder.take_steps(horizontal, read_v120()))
+            .flatten(),
+        stopped: has_axis && value == 0.0,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -905,8 +1008,8 @@ pub(crate) fn apply_native_input_effect(
             .server
             .send_pointer_button(event.button, event.pressed);
     }
-    if let Some((horizontal, vertical)) = effect.pointer_axis {
-        context.server.send_pointer_axis(horizontal, vertical);
+    if let Some(frame) = effect.pointer_axis {
+        context.server.send_pointer_axis_frame(frame);
     }
     for action in effect.window_actions {
         application.redraw_requested |=

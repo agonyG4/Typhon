@@ -10,5 +10,6 @@ mod presentation;
 mod shell_control;
 mod shortcuts;
 mod syncobj;
+pub(crate) mod versions;
 mod viewport;
 mod xdg;

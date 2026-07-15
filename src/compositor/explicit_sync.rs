@@ -13,7 +13,8 @@ use wayland_server::{
 use crate::syncobj::DrmSyncobjTimeline;
 
 use super::{
-    PendingSurfaceBuffer, RenderableSurfaceDamage, SurfaceCommitId, SurfaceCommitSequence,
+    CoreComplianceMetrics, PendingSurfaceBuffer, RenderableSurfaceDamage, SurfaceCommitId,
+    SurfaceCommitSequence,
 };
 
 pub(super) const SYNCOBJ_MANAGER_ERROR_SURFACE_EXISTS: u32 = 0;
@@ -139,6 +140,7 @@ pub enum AcquireWatchCancelReason {
     ClientDisconnected,
     BackendShutdown,
     Rejected,
+    RoleDestroyed,
 }
 
 #[derive(Debug, Clone)]
@@ -261,6 +263,16 @@ impl SyncobjSurfaceState {
         {
             resource.post_error(code, message);
         }
+    }
+
+    pub(super) fn post_error_with_metrics(
+        &self,
+        metrics: &mut CoreComplianceMetrics,
+        code: u32,
+        message: &str,
+    ) {
+        metrics.note_protocol_error();
+        self.post_error(code, message);
     }
 
     pub(super) fn set_pending_acquire(&self, point: ExplicitSyncPoint) {

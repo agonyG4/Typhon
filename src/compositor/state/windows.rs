@@ -15,16 +15,19 @@ impl CompositorState {
             ));
             return;
         }
-        self.configured_xdg_surfaces.remove(&surface_id);
         self.clear_resize_state_for_surfaces(&[surface_id]);
         self.toplevel_surfaces.insert(
             surface_id,
             ToplevelSurface {
                 app_id: None,
+                title: None,
+                parent_surface_id: None,
                 xdg_surface,
                 toplevel,
                 window: WindowState::default(),
                 constraints: Default::default(),
+                pending_constraints: None,
+                wm_capabilities_sent: false,
             },
         );
         self.set_surface_placement(surface_id, SurfacePlacement::root());
@@ -47,7 +50,6 @@ impl CompositorState {
             ));
             return;
         }
-        self.configured_xdg_surfaces.remove(&surface_id);
         self.clear_resize_state_for_surfaces(&[surface_id]);
         let parent_owner = parent
             .as_ref()
@@ -93,14 +95,57 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn unregister_toplevel_surface(&mut self, surface_id: u32) {
+        if self.toplevel_surfaces.contains_key(&surface_id)
+            || self
+                .surface_role_lifecycle(surface_id)
+                .live_instance
+                .is_some_and(|role| role == LiveRoleInstance::XdgToplevel)
+        {
+            self.retire_unpublished_work_for_xdg_role(
+                surface_id,
+                AcquireWatchCancelReason::RoleDestroyed,
+            );
+        }
         self.unmap_xdg_role_surfaces(surface_id);
         self.toplevel_surfaces.remove(&surface_id);
         self.clear_fullscreen_presentation_owner(surface_id);
-        self.clear_surface_role_if(surface_id, SurfaceRole::XdgToplevel);
+        self.deactivate_role_instance_if(surface_id, SurfaceRole::XdgToplevel);
         self.surface_placements.remove(&surface_id);
-        self.configured_xdg_surfaces.remove(&surface_id);
         self.xdg_configure_serials.remove(&surface_id);
         self.clear_resize_state_for_surfaces(&[surface_id]);
+    }
+
+    pub(in crate::compositor) fn apply_pending_toplevel_constraints(&mut self, surface_id: u32) {
+        if let Some(toplevel) = self.toplevel_surfaces.get_mut(&surface_id)
+            && let Some(pending) = toplevel.pending_constraints.take()
+        {
+            toplevel.constraints = pending;
+        }
+    }
+
+    pub(in crate::compositor) fn set_toplevel_parent(
+        &mut self,
+        surface_id: u32,
+        parent_surface_id: Option<u32>,
+    ) -> Result<(), ()> {
+        if parent_surface_id == Some(surface_id) {
+            return Err(());
+        }
+        let mut current = parent_surface_id;
+        while let Some(candidate) = current {
+            if candidate == surface_id {
+                return Err(());
+            }
+            current = self
+                .toplevel_surfaces
+                .get(&candidate)
+                .and_then(|toplevel| toplevel.parent_surface_id);
+        }
+        let Some(toplevel) = self.toplevel_surfaces.get_mut(&surface_id) else {
+            return Err(());
+        };
+        toplevel.parent_surface_id = parent_surface_id;
+        Ok(())
     }
 
     pub(in crate::compositor) fn unregister_xdg_surface_role(&mut self, surface_id: u32) {
@@ -110,13 +155,16 @@ impl CompositorState {
         self.unregister_popup_surface(surface_id);
         self.surface_window_geometries.remove(&surface_id);
         self.pending_surface_window_geometries.remove(&surface_id);
-        self.configured_xdg_surfaces.remove(&surface_id);
         self.surface_placements.remove(&surface_id);
         self.clear_popup_grab_for_surface_ids(&[surface_id]);
         self.popup_grab_stack.retain(|id| *id != surface_id);
         self.recent_input_serials
             .retain(|input| compositor_surface_id(&input.surface) != surface_id);
         self.clear_resize_state_for_surfaces(&[surface_id]);
+        self.xdg_surface_resources.remove(&surface_id);
+        self.xdg_surface_wm_bases.remove(&surface_id);
+        self.xdg_surface_lifecycles.remove(&surface_id);
+        self.destroy_xdg_association(surface_id);
     }
 
     pub(in crate::compositor) fn grab_popup_surface(
@@ -128,7 +176,7 @@ impl CompositorState {
         let surface_id = compositor_surface_id(surface);
         if !self.popup_node_is_alive(surface_id)
             || !resource_belongs_to_surface_client(seat, surface)
-            || !self.has_recent_input_serial_for_surface(serial, surface)
+            || !self.validate_popup_grab_serial(serial, surface)
         {
             self.dismiss_popup_surface(surface_id);
             return false;
@@ -177,7 +225,24 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn unregister_popup_surface(&mut self, surface_id: u32) {
+        if self.popup_surfaces.contains_key(&surface_id)
+            || self
+                .surface_role_lifecycle(surface_id)
+                .live_instance
+                .is_some_and(|role| role == LiveRoleInstance::XdgPopup)
+        {
+            self.retire_unpublished_work_for_xdg_role(
+                surface_id,
+                AcquireWatchCancelReason::RoleDestroyed,
+            );
+        }
         self.destroy_popup_role(surface_id);
+    }
+
+    pub(in crate::compositor) fn popup_destroy_is_topmost(&self, surface_id: u32) -> bool {
+        self.popup_grab_stack.last().is_none_or(|topmost| {
+            *topmost == surface_id || !self.popup_grab_stack.contains(&surface_id)
+        })
     }
 
     fn destroy_popup_role(&mut self, surface_id: u32) {
@@ -188,6 +253,17 @@ impl CompositorState {
             .unwrap_or_default();
         for child_surface_id in children {
             self.destroy_popup_role(child_surface_id);
+        }
+        if self.popup_surfaces.contains_key(&surface_id)
+            || self
+                .surface_role_lifecycle(surface_id)
+                .live_instance
+                .is_some_and(|role| role == LiveRoleInstance::XdgPopup)
+        {
+            self.retire_unpublished_work_for_xdg_role(
+                surface_id,
+                AcquireWatchCancelReason::RoleDestroyed,
+            );
         }
         let parent_surface_id = self
             .popup_surfaces
@@ -206,10 +282,9 @@ impl CompositorState {
         self.recent_input_serials
             .retain(|input| compositor_surface_id(&input.surface) != surface_id);
         self.popup_surfaces.remove(&surface_id);
-        self.clear_surface_role_if(surface_id, SurfaceRole::XdgPopup);
+        self.deactivate_role_instance_if(surface_id, SurfaceRole::XdgPopup);
         self.detach_popup_node(surface_id, PopupLifecycle::Destroyed);
         self.surface_placements.remove(&surface_id);
-        self.configured_xdg_surfaces.remove(&surface_id);
         self.surface_window_geometries.remove(&surface_id);
         self.pending_surface_window_geometries.remove(&surface_id);
         self.clear_resize_state_for_surfaces(&[surface_id]);
@@ -558,6 +633,7 @@ impl CompositorState {
                 "oblivion-one compositor: failed to send popup xdg_surface configure serial={serial}: {error:?}"
             );
         }
+        self.record_xdg_configure(surface_id, serial);
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
                 "oblivion-one compositor: popup surface {surface_id} configured xdg={}x{}+{},{} placement={},{} parent={:?}",
@@ -663,11 +739,15 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
     ) -> bool {
-        if self.configured_xdg_surfaces.contains(&surface_id) {
+        let Some(lifecycle) = self.xdg_surface_lifecycle(surface_id) else {
+            return false;
+        };
+        if !lifecycle.needs_configure() || lifecycle.has_outstanding_configure() {
             return false;
         }
 
         if let Some(toplevel) = self.toplevel_surfaces.get(&surface_id).cloned() {
+            self.send_wm_capabilities_if_needed(surface_id);
             if let Err(error) = toplevel
                 .toplevel
                 .send_event(xdg_toplevel::Event::Configure {
@@ -689,7 +769,7 @@ impl CompositorState {
                     "oblivion-one compositor: failed to send toplevel xdg_surface configure serial={serial}: {error:?}"
                 );
             }
-            self.configured_xdg_surfaces.insert(surface_id);
+            self.record_xdg_configure(surface_id, serial);
             return true;
         }
 
@@ -701,11 +781,31 @@ impl CompositorState {
             return false;
         };
         if self.configure_popup_surface(surface_id, positioner, None) {
-            self.configured_xdg_surfaces.insert(surface_id);
             return true;
         }
 
         false
+    }
+
+    pub(in crate::compositor) fn send_wm_capabilities_if_needed(&mut self, surface_id: u32) {
+        let Some(toplevel) = self.toplevel_surfaces.get_mut(&surface_id) else {
+            return;
+        };
+        if toplevel.toplevel.version() < 5 || toplevel.wm_capabilities_sent {
+            return;
+        }
+
+        let mut capabilities = Vec::with_capacity(2 * std::mem::size_of::<u32>());
+        for capability in [
+            xdg_toplevel::WmCapabilities::Maximize,
+            xdg_toplevel::WmCapabilities::Fullscreen,
+        ] {
+            capabilities.extend_from_slice(&(capability as u32).to_ne_bytes());
+        }
+        let _ = toplevel
+            .toplevel
+            .send_event(xdg_toplevel::Event::WmCapabilities { capabilities });
+        toplevel.wm_capabilities_sent = true;
     }
 
     pub(in crate::compositor) fn popup_constraint_target(

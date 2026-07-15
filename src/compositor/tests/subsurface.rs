@@ -126,7 +126,7 @@ fn default_synchronized_child_is_invisible_until_parent_commit() {
     assert_eq!(after_parent_generation, before_child_generation + 1);
     let metrics = server.subsurface_transaction_metrics();
     assert_eq!(metrics.synchronized_child_commits_cached, 1);
-    assert_eq!(metrics.tree_transactions_published, 1);
+    assert_eq!(metrics.tree_transactions_published, 2);
     assert_eq!(metrics.maximum_cached_nodes, 1);
     assert_eq!(metrics.synchronized_child_immediate_publish_attempts, 0);
 }

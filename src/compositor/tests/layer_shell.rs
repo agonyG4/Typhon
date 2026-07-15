@@ -601,6 +601,7 @@ fn direct_wl_surface_destroy_restores_focus_from_exclusive_overlay() {
     queue.roundtrip(&mut state).unwrap();
     assert_ne!(capture_focused_surface_id(&commands), Some(app_surface_id));
 
+    overlay.destroy();
     surface.destroy();
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();

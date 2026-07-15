@@ -82,7 +82,7 @@ pub struct ExplicitSyncWatchMetrics {
     pub leaked_watch_assertions: u64,
     pub last_registration_errno: i32,
     pub last_commit_to_ready_ns: u64,
-    pub cancellations_by_reason: [u64; 8],
+    pub cancellations_by_reason: [u64; 9],
 }
 
 #[derive(Debug)]
@@ -551,6 +551,7 @@ const fn cancellation_reason_index(reason: AcquireWatchCancelReason) -> usize {
         AcquireWatchCancelReason::ClientDisconnected => 5,
         AcquireWatchCancelReason::BackendShutdown => 6,
         AcquireWatchCancelReason::Rejected => 7,
+        AcquireWatchCancelReason::RoleDestroyed => 8,
     }
 }
 

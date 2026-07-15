@@ -1398,7 +1398,10 @@ fn native_forwarded_pointer_axis_skips_frame_repaint_without_local_visual_change
 
     let effect = input.handle_pointer_axis(0.0, 120.0);
 
-    assert_eq!(effect.pointer_axis, Some((0.0, 120.0)));
+    assert_eq!(
+        effect.pointer_axis,
+        Some(PointerAxisFrame::unknown(0, 0.0, 120.0))
+    );
     assert!(effect.redraw_requested);
     assert!(!effect.requires_frame_repaint(NativeCursorRenderMode::Hardware));
     assert!(!effect.requires_frame_repaint(NativeCursorRenderMode::Software));
@@ -1743,6 +1746,9 @@ pub(super) fn spawn_native_input_resize_client(
         let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
         let _toplevel = xdg_surface.get_toplevel(&qh, ());
         let mut state = NativeInputClientState::default();
+        surface.commit();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
         attach_native_input_test_buffer(&surface, &shm, &qh, 160, 120);
         surface.commit();
         connection.flush().unwrap();
@@ -1937,4 +1943,46 @@ fn native_libinput_scroll_axis_value_skips_absent_axis_reader() {
     let value = libinput_scroll_axis_value(false, || panic!("axis value should not be read"));
 
     assert_eq!(value, 0.0);
+}
+
+#[test]
+fn libinput_v120_conversion_uses_logical_steps_and_signed_remainders() {
+    let mut remainder = ScrollV120Remainder::default();
+    assert_eq!(remainder.take_steps(false, 120.0), Some(1));
+    assert_eq!(remainder.take_steps(false, -240.0), Some(-2));
+
+    assert_eq!(remainder.take_steps(false, 30.0), None);
+    assert_eq!(remainder.take_steps(false, 30.0), None);
+    assert_eq!(remainder.take_steps(false, 30.0), None);
+    assert_eq!(remainder.take_steps(false, 30.0), Some(1));
+}
+
+#[test]
+fn libinput_v120_conversion_keeps_devices_and_axes_independent() {
+    let mut first_device = ScrollV120Remainder::default();
+    let mut second_device = ScrollV120Remainder::default();
+
+    assert_eq!(first_device.take_steps(true, 90.0), None);
+    assert_eq!(first_device.take_steps(false, 90.0), None);
+    assert_eq!(second_device.take_steps(true, 30.0), None);
+    assert_eq!(first_device.take_steps(true, 30.0), Some(1));
+    assert_eq!(first_device.take_steps(false, 30.0), Some(1));
+    assert_eq!(second_device.take_steps(true, 90.0), Some(1));
+}
+
+#[test]
+fn libinput_v120_conversion_does_not_create_discrete_finger_or_continuous_steps() {
+    let finger = PointerAxisComponent {
+        continuous: Some(30.0),
+        discrete: None,
+        stopped: false,
+    };
+    let continuous = PointerAxisComponent {
+        continuous: Some(30.0),
+        discrete: None,
+        stopped: false,
+    };
+
+    assert_eq!(finger.discrete, None);
+    assert_eq!(continuous.discrete, None);
 }

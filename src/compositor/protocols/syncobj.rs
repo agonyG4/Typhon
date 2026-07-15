@@ -3,7 +3,7 @@ use super::super::*;
 impl Dispatch<wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1, ()> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1,
         request: wp_linux_drm_syncobj_manager_v1::Request,
         _data: &(),
@@ -14,7 +14,9 @@ impl Dispatch<wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1, ()> f
             wp_linux_drm_syncobj_manager_v1::Request::Destroy => {}
             wp_linux_drm_syncobj_manager_v1::Request::ImportTimeline { id, fd } => {
                 let Some(device) = state.syncobj_device.as_ref() else {
-                    resource.post_error(
+                    state.post_protocol_error(
+                        client,
+                        resource,
                         SYNCOBJ_MANAGER_ERROR_INVALID_TIMELINE,
                         "no DRM device supports timeline syncobj",
                     );
@@ -25,7 +27,9 @@ impl Dispatch<wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1, ()> f
                         data_init.init(id, SyncobjTimelineData { timeline });
                     }
                     Err(_) => {
-                        resource.post_error(
+                        state.post_protocol_error(
+                            client,
+                            resource,
                             SYNCOBJ_MANAGER_ERROR_INVALID_TIMELINE,
                             "failed to import DRM syncobj timeline",
                         );
@@ -34,21 +38,35 @@ impl Dispatch<wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1, ()> f
             }
             wp_linux_drm_syncobj_manager_v1::Request::GetSurface { id, surface } => {
                 let Some(surface_data) = surface.data::<SurfaceData>() else {
-                    resource.post_error(SYNCOBJ_MANAGER_ERROR_SURFACE_EXISTS, "invalid surface");
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        SYNCOBJ_MANAGER_ERROR_SURFACE_EXISTS,
+                        "invalid surface",
+                    );
                     return;
                 };
-                let state = Arc::new(SyncobjSurfaceState::new(surface.downgrade()));
-                if !surface_data.attach_explicit_sync(state.clone()) {
-                    resource.post_error(
+                let sync_state = Arc::new(SyncobjSurfaceState::new(surface.downgrade()));
+                if !surface_data.attach_explicit_sync(sync_state.clone()) {
+                    state.post_protocol_error(
+                        client,
+                        resource,
                         SYNCOBJ_MANAGER_ERROR_SURFACE_EXISTS,
                         "surface already has an explicit sync object",
                     );
                     return;
                 }
-                let sync_surface = data_init.init(id, state.clone());
-                state.set_resource(sync_surface);
+                let sync_surface = data_init.init(id, sync_state.clone());
+                sync_state.set_resource(sync_surface);
             }
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "wp_linux_drm_syncobj_manager_v1",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
@@ -59,17 +77,27 @@ impl Dispatch<wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1, Syn
     fn request(
         state: &mut Self,
         _client: &Client,
-        _resource: &wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1,
+        resource: &wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1,
         request: wp_linux_drm_syncobj_timeline_v1::Request,
         data: &SyncobjTimelineData,
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        if matches!(request, wp_linux_drm_syncobj_timeline_v1::Request::Destroy) {
-            state.cancel_pending_acquire_commits_for_timeline(
-                &data.timeline,
-                AcquireWatchCancelReason::TimelineDestroyed,
-            );
+        match request {
+            wp_linux_drm_syncobj_timeline_v1::Request::Destroy => {
+                state.cancel_pending_acquire_commits_for_timeline(
+                    &data.timeline,
+                    AcquireWatchCancelReason::TimelineDestroyed,
+                );
+            }
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "wp_linux_drm_syncobj_timeline_v1",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 
@@ -92,7 +120,7 @@ impl Dispatch<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1, Arc<S
     fn request(
         state: &mut Self,
         _client: &Client,
-        _resource: &wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1,
+        resource: &wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1,
         request: wp_linux_drm_syncobj_surface_v1::Request,
         data: &Arc<SyncobjSurfaceState>,
         _dhandle: &DisplayHandle,
@@ -106,10 +134,11 @@ impl Dispatch<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1, Arc<S
                         surface_id,
                         AcquireWatchCancelReason::SyncSurfaceDestroyed,
                     );
-                    state.cancel_pending_acquire_commits_for_surface(
+                    let callbacks = state.cancel_pending_acquire_commits_for_surface(
                         surface_id,
                         AcquireWatchCancelReason::SyncSurfaceDestroyed,
                     );
+                    state.complete_frame_callbacks(callbacks);
                 }
             }
             wp_linux_drm_syncobj_surface_v1::Request::SetAcquirePoint {
@@ -118,6 +147,7 @@ impl Dispatch<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1, Arc<S
                 point_lo,
             } => {
                 if !data.surface_is_alive() {
+                    state.note_protocol_error_metric();
                     data.post_error(
                         SYNCOBJ_SURFACE_ERROR_NO_SURFACE,
                         "associated wl_surface was destroyed",
@@ -138,6 +168,7 @@ impl Dispatch<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1, Arc<S
                 point_lo,
             } => {
                 if !data.surface_is_alive() {
+                    state.note_protocol_error_metric();
                     data.post_error(
                         SYNCOBJ_SURFACE_ERROR_NO_SURFACE,
                         "associated wl_surface was destroyed",
@@ -152,7 +183,14 @@ impl Dispatch<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1, Arc<S
                     ));
                 }
             }
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "wp_linux_drm_syncobj_surface_v1",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 
@@ -168,10 +206,11 @@ impl Dispatch<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1, Arc<S
                 surface_id,
                 AcquireWatchCancelReason::SyncSurfaceDestroyed,
             );
-            state.cancel_pending_acquire_commits_for_surface(
+            let callbacks = state.cancel_pending_acquire_commits_for_surface(
                 surface_id,
                 AcquireWatchCancelReason::SyncSurfaceDestroyed,
             );
+            state.complete_frame_callbacks(callbacks);
         }
     }
 }

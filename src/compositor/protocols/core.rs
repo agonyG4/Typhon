@@ -4,7 +4,7 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for CompositorState {
     fn request(
         state: &mut Self,
         client: &Client,
-        _resource: &wl_compositor::WlCompositor,
+        resource: &wl_compositor::WlCompositor,
         request: wl_compositor::Request,
         _data: &(),
         _dhandle: &DisplayHandle,
@@ -21,7 +21,18 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for CompositorState {
             wl_compositor::Request::CreateRegion { id } => {
                 data_init.init(id, RegionData::default());
             }
-            _ => {}
+            wl_compositor::Request::Release => {}
+            other => {
+                // The generated enum is non-exhaustive. Every request
+                // available through the advertised v6 object is explicit
+                // above; this hook records only an unsupported future request.
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "wl_compositor",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
@@ -29,7 +40,7 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for CompositorState {
 impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &wl_surface::WlSurface,
         request: wl_surface::Request,
         data: &SurfaceData,
@@ -59,18 +70,30 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                 data.push_frame_callback(callback);
             }
             wl_surface::Request::Attach { buffer, x, y } => {
+                if resource.version() >= 5 && (x != 0 || y != 0) {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        wl_surface::Error::InvalidOffset,
+                        "non-zero wl_surface.attach offsets are invalid from version 5".to_string(),
+                    );
+                    return;
+                }
                 data.set_pending(buffer, x, y);
             }
             wl_surface::Request::Commit => {
                 let surface_id = data.surface_id();
                 let commit_sequence = state.allocate_surface_commit_sequence();
                 let commit_id = SurfaceCommitId::from_sequence(commit_sequence);
+                state.apply_pending_toplevel_constraints(surface_id);
                 let window_geometry = state.pending_surface_window_geometries.remove(&surface_id);
                 let explicit_sync = data.explicit_sync();
                 let offset = data.take_pending_offset();
                 let viewport_change = data.take_pending_viewport();
                 let buffer_scale_change = data.take_pending_buffer_scale();
+                let buffer_transform_change = data.take_pending_buffer_transform();
                 let input_region_change = data.take_pending_input_region();
+                let opaque_region_change = data.take_pending_opaque_region();
                 let presentation_feedbacks = state.take_surface_presentation_feedbacks(surface_id);
                 let mut attachment = data.take_pending();
                 if let Some(PendingSurfaceAttachment::Buffer(buffer)) = attachment.as_mut() {
@@ -182,6 +205,8 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     offset,
                     viewport_destination: viewport_change,
                     buffer_scale: buffer_scale_change,
+                    buffer_transform: buffer_transform_change,
+                    opaque_region: opaque_region_change,
                     input_region: input_region_change,
                     presentation_feedbacks,
                     resize_commit: None,
@@ -192,6 +217,15 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                 state.commit_surface_tree_request(surface_id, commit);
             }
             wl_surface::Request::Destroy => {
+                if !state.validate_surface_destroy(data.surface_id()) {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        wl_surface::Error::DefunctRoleObject,
+                        "wl_surface destroyed before its role object".to_string(),
+                    );
+                    return;
+                }
                 state.teardown_surface_resource(
                     data.surface_id(),
                     SurfaceTeardownReason::ExplicitDestroy,
@@ -223,7 +257,9 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
             }
             wl_surface::Request::SetBufferScale { scale } => {
                 if scale <= 0 {
-                    resource.post_error(
+                    state.post_protocol_error(
+                        client,
+                        resource,
                         wl_surface::Error::InvalidScale,
                         "buffer scale must be greater than zero".to_string(),
                     );
@@ -231,12 +267,40 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                 }
                 data.set_pending_buffer_scale(scale as u32);
             }
-            wl_surface::Request::SetOpaqueRegion { .. }
-            | wl_surface::Request::SetBufferTransform { .. } => {}
+            wl_surface::Request::SetOpaqueRegion { region } => {
+                let opaque_region = region
+                    .as_ref()
+                    .and_then(|region| region.data::<RegionData>())
+                    .map(RegionData::snapshot)
+                    .unwrap_or_default();
+                data.set_pending_opaque_region(opaque_region);
+            }
+            wl_surface::Request::SetBufferTransform { transform } => {
+                let transform = match transform {
+                    WEnum::Value(transform) => transform,
+                    WEnum::Unknown(_) => {
+                        state.post_protocol_error(
+                            client,
+                            resource,
+                            wl_surface::Error::InvalidTransform,
+                            "buffer transform is not a wl_output.transform value".to_string(),
+                        );
+                        return;
+                    }
+                };
+                data.set_pending_buffer_transform(transform);
+            }
             wl_surface::Request::Offset { x, y } => {
                 data.set_pending_offset(x, y);
             }
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "wl_surface",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 
@@ -246,10 +310,11 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
         _resource: &wl_surface::WlSurface,
         data: &SurfaceData,
     ) {
-        let _ = state.cancel_pending_acquire_commits_for_surface(
+        let callbacks = state.cancel_pending_acquire_commits_for_surface(
             data.surface_id(),
             AcquireWatchCancelReason::ClientDisconnected,
         );
+        state.complete_frame_callbacks(callbacks);
     }
 }
 
@@ -268,9 +333,9 @@ impl Dispatch<wl_callback::WlCallback, ()> for CompositorState {
 
 impl Dispatch<wl_region::WlRegion, RegionData> for CompositorState {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
-        _resource: &wl_region::WlRegion,
+        resource: &wl_region::WlRegion,
         request: wl_region::Request,
         data: &RegionData,
         _dhandle: &DisplayHandle,
@@ -298,7 +363,14 @@ impl Dispatch<wl_region::WlRegion, RegionData> for CompositorState {
                 }
             }
             wl_region::Request::Destroy => {}
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "wl_region",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
@@ -306,8 +378,8 @@ impl Dispatch<wl_region::WlRegion, RegionData> for CompositorState {
 impl Dispatch<wl_subcompositor::WlSubcompositor, ()> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
-        _resource: &wl_subcompositor::WlSubcompositor,
+        client: &Client,
+        resource: &wl_subcompositor::WlSubcompositor,
         request: wl_subcompositor::Request,
         _data: &(),
         _dhandle: &DisplayHandle,
@@ -321,15 +393,40 @@ impl Dispatch<wl_subcompositor::WlSubcompositor, ()> for CompositorState {
             } => {
                 let surface_id = compositor_surface_id(&surface);
                 let parent_id = compositor_surface_id(&parent);
+                if surface_id == parent_id
+                    || !state.surface_resources.contains_key(&parent_id)
+                    || state.surface_client_ids.get(&surface_id)
+                        != state.surface_client_ids.get(&parent_id)
+                {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        wl_subcompositor::Error::BadParent,
+                        "subsurface parent must be a distinct surface from the same client"
+                            .to_string(),
+                    );
+                    return;
+                }
                 if let Err(error) =
                     state.assign_surface_role(surface_id, SurfaceRole::Subsurface { parent_id })
                 {
-                    _resource.post_error(wl_subcompositor::Error::BadSurface, error.message());
+                    let code = match error {
+                        SurfaceRoleError::MissingParent | SurfaceRoleError::Cycle => {
+                            wl_subcompositor::Error::BadParent
+                        }
+                        _ => wl_subcompositor::Error::BadSurface,
+                    };
+                    state.post_protocol_error(client, resource, code, error.message());
                     return;
                 }
                 if !state.register_subsurface_relationship(surface_id, parent_id) {
-                    state.clear_surface_role_if(surface_id, SurfaceRole::Subsurface { parent_id });
-                    _resource.post_error(
+                    state.rollback_surface_role_reservation(
+                        surface_id,
+                        SurfaceRole::Subsurface { parent_id },
+                    );
+                    state.post_protocol_error(
+                        client,
+                        resource,
                         wl_subcompositor::Error::BadSurface,
                         "surface has another role or would create a subsurface cycle".to_string(),
                     );
@@ -343,7 +440,14 @@ impl Dispatch<wl_subcompositor::WlSubcompositor, ()> for CompositorState {
                 data_init.init(id, SubsurfaceData { surface, parent });
             }
             wl_subcompositor::Request::Destroy => {}
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "wl_subcompositor",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
@@ -351,8 +455,8 @@ impl Dispatch<wl_subcompositor::WlSubcompositor, ()> for CompositorState {
 impl Dispatch<wl_subsurface::WlSubsurface, SubsurfaceData> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
-        _resource: &wl_subsurface::WlSubsurface,
+        client: &Client,
+        resource: &wl_subsurface::WlSubsurface,
         request: wl_subsurface::Request,
         data: &SubsurfaceData,
         _dhandle: &DisplayHandle,
@@ -371,7 +475,9 @@ impl Dispatch<wl_subsurface::WlSubsurface, SubsurfaceData> for CompositorState {
                 let parent_id = compositor_surface_id(&data.parent);
                 let sibling_id = compositor_surface_id(&sibling);
                 if !state.restack_subsurface(surface_id, parent_id, sibling_id, true) {
-                    _resource.post_error(
+                    state.post_protocol_error(
+                        client,
+                        resource,
                         wl_subsurface::Error::BadSurface,
                         "place_above reference must be the parent or a sibling".to_string(),
                     );
@@ -382,7 +488,9 @@ impl Dispatch<wl_subsurface::WlSubsurface, SubsurfaceData> for CompositorState {
                 let parent_id = compositor_surface_id(&data.parent);
                 let sibling_id = compositor_surface_id(&sibling);
                 if !state.restack_subsurface(surface_id, parent_id, sibling_id, false) {
-                    _resource.post_error(
+                    state.post_protocol_error(
+                        client,
+                        resource,
                         wl_subsurface::Error::BadSurface,
                         "place_below reference must be the parent or a sibling".to_string(),
                     );
@@ -400,7 +508,14 @@ impl Dispatch<wl_subsurface::WlSubsurface, SubsurfaceData> for CompositorState {
                     SubsurfaceSyncMode::Desynchronized,
                 );
             }
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "wl_subsurface",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }

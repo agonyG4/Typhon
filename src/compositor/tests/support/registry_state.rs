@@ -33,6 +33,10 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) pointer_axis: bool,
     pub(in crate::compositor::tests) pointer_vertical_axis: Option<f64>,
     pub(in crate::compositor::tests) pointer_horizontal_axis: Option<f64>,
+    pub(in crate::compositor::tests) pointer_axis_sources: Vec<u32>,
+    pub(in crate::compositor::tests) pointer_axis_discrete: Vec<(u32, i32)>,
+    pub(in crate::compositor::tests) pointer_axis_stops: Vec<(u32, u32)>,
+    pub(in crate::compositor::tests) pointer_axis_times: Vec<u32>,
     pub(in crate::compositor::tests) pointer_frame_count: usize,
     pub(in crate::compositor::tests) pointer_frame_resource_ids: Vec<u32>,
     pub(in crate::compositor::tests) pointer_enter_frame_count: usize,
@@ -61,6 +65,10 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) keyboard_leave_count: usize,
     pub(in crate::compositor::tests) keyboard_event_log: Vec<&'static str>,
     pub(in crate::compositor::tests) surface_enter_count: usize,
+    pub(in crate::compositor::tests) surface_leave_count: usize,
+    pub(in crate::compositor::tests) preferred_buffer_scales: Vec<i32>,
+    pub(in crate::compositor::tests) preferred_buffer_transforms: Vec<client_wl_output::Transform>,
+    pub(in crate::compositor::tests) surface_event_log: Vec<&'static str>,
     pub(in crate::compositor::tests) seat_has_keyboard: bool,
     pub(in crate::compositor::tests) output_done: bool,
     pub(in crate::compositor::tests) output_mode_count: usize,
@@ -95,6 +103,9 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) configured_after_initial_commit: bool,
     pub(in crate::compositor::tests) toplevel_configured: bool,
     pub(in crate::compositor::tests) toplevel_configure_count: usize,
+    pub(in crate::compositor::tests) toplevel_wm_capabilities_count: usize,
+    pub(in crate::compositor::tests) toplevel_wm_capabilities: Vec<u32>,
+    pub(in crate::compositor::tests) toplevel_event_log: Vec<&'static str>,
     pub(in crate::compositor::tests) toplevel_width: i32,
     pub(in crate::compositor::tests) toplevel_height: i32,
     pub(in crate::compositor::tests) toplevel_states: Vec<u8>,
@@ -123,8 +134,22 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) data_device_selection_offer:
         Option<client_wl_data_offer::WlDataOffer>,
     pub(in crate::compositor::tests) data_device_selection_events: Vec<bool>,
+    pub(in crate::compositor::tests) data_device_enter_count: usize,
+    pub(in crate::compositor::tests) data_device_leave_count: usize,
+    pub(in crate::compositor::tests) data_device_motion_count: usize,
+    pub(in crate::compositor::tests) data_device_drop_count: usize,
+    pub(in crate::compositor::tests) data_device_enter_serial: Option<u32>,
+    pub(in crate::compositor::tests) data_device_drag_offer:
+        Option<client_wl_data_offer::WlDataOffer>,
     pub(in crate::compositor::tests) data_offer_mime_types: Vec<String>,
+    pub(in crate::compositor::tests) data_offer_source_actions: Vec<u32>,
+    pub(in crate::compositor::tests) data_offer_actions: Vec<u32>,
     pub(in crate::compositor::tests) data_source_send_mime_types: Vec<String>,
+    pub(in crate::compositor::tests) data_source_target_mime_types: Vec<Option<String>>,
+    pub(in crate::compositor::tests) data_source_actions: Vec<u32>,
+    pub(in crate::compositor::tests) data_source_dnd_drop_performed_count: usize,
+    pub(in crate::compositor::tests) data_source_dnd_finished_count: usize,
+    pub(in crate::compositor::tests) data_source_cancelled_count: usize,
     pub(in crate::compositor::tests) data_source_cancelled: bool,
     pub(in crate::compositor::tests) activation_token_done: Option<String>,
     pub(in crate::compositor::tests) astrea_shortcut_pressed_count: usize,
@@ -152,6 +177,7 @@ pub(in crate::compositor::tests) enum AstreaShortcutEventRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::compositor::tests) struct XdgRoleSnapshot {
+    pub(in crate::compositor::tests) surface_id: u32,
     pub(in crate::compositor::tests) surface_registered: bool,
     pub(in crate::compositor::tests) configured: bool,
     pub(in crate::compositor::tests) toplevel_count: usize,
@@ -161,6 +187,21 @@ pub(in crate::compositor::tests) struct XdgRoleSnapshot {
     pub(in crate::compositor::tests) popup_grab_active: bool,
     pub(in crate::compositor::tests) window_geometry_present: bool,
     pub(in crate::compositor::tests) placement: Option<SurfacePlacement>,
+    pub(in crate::compositor::tests) permanent_role: Option<PermanentSurfaceRole>,
+    pub(in crate::compositor::tests) xdg_association: bool,
+    pub(in crate::compositor::tests) toplevel_has_app_id: bool,
+    pub(in crate::compositor::tests) toplevel_has_title: bool,
+    pub(in crate::compositor::tests) toplevel_has_non_default_constraints: bool,
+    pub(in crate::compositor::tests) toplevel_mode: Option<ToplevelMode>,
+    pub(in crate::compositor::tests) popup_parent_surface_id: Option<u32>,
+    pub(in crate::compositor::tests) pending_explicit_sync_commits: usize,
+    pub(in crate::compositor::tests) pending_surface_tree_transactions: usize,
+    pub(in crate::compositor::tests) current_surface_buffer: bool,
+    pub(in crate::compositor::tests) renderable_surface: bool,
+    pub(in crate::compositor::tests) role_destroyed_pending_commits_retired: u64,
+    pub(in crate::compositor::tests) role_destroyed_pending_trees_retired: u64,
+    pub(in crate::compositor::tests) role_destroyed_acquire_watches_cancelled: u64,
+    pub(in crate::compositor::tests) reassociation_blocked_stale_work: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,8 +486,28 @@ impl Dispatch<client_wl_surface::WlSurface, ()> for RegistryTestState {
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
-        if let client_wl_surface::Event::Enter { .. } = event {
-            state.surface_enter_count += 1;
+        match event {
+            client_wl_surface::Event::Enter { .. } => {
+                state.surface_enter_count += 1;
+                state.surface_event_log.push("enter");
+            }
+            client_wl_surface::Event::Leave { .. } => {
+                state.surface_leave_count += 1;
+                state.surface_event_log.push("leave");
+            }
+            client_wl_surface::Event::PreferredBufferScale { factor } => {
+                state.preferred_buffer_scales.push(factor);
+                state.surface_event_log.push("preferred_scale");
+            }
+            client_wl_surface::Event::PreferredBufferTransform { transform } => {
+                let transform = match transform {
+                    WEnum::Value(transform) => transform,
+                    WEnum::Unknown(_) => return,
+                };
+                state.preferred_buffer_transforms.push(transform);
+                state.surface_event_log.push("preferred_transform");
+            }
+            _ => {}
         }
     }
 }
@@ -510,6 +571,20 @@ impl Dispatch<client_wl_data_device::WlDataDevice, ()> for RegistryTestState {
     ) {
         match event {
             client_wl_data_device::Event::DataOffer { .. } => {}
+            client_wl_data_device::Event::Enter { serial, id, .. } => {
+                state.data_device_enter_count += 1;
+                state.data_device_enter_serial = Some(serial);
+                state.data_device_drag_offer = id;
+            }
+            client_wl_data_device::Event::Leave => {
+                state.data_device_leave_count += 1;
+            }
+            client_wl_data_device::Event::Motion { .. } => {
+                state.data_device_motion_count += 1;
+            }
+            client_wl_data_device::Event::Drop => {
+                state.data_device_drop_count += 1;
+            }
             client_wl_data_device::Event::Selection { id } => {
                 state.data_device_selection_events.push(id.is_some());
                 state.data_device_selection_offer = id;
@@ -534,9 +609,38 @@ impl Dispatch<client_wl_data_offer::WlDataOffer, ()> for RegistryTestState {
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
-        if let client_wl_data_offer::Event::Offer { mime_type } = event {
-            state.data_offer_mime_types.push(mime_type);
+        match event {
+            client_wl_data_offer::Event::Offer { mime_type } => {
+                state.data_offer_mime_types.push(mime_type);
+            }
+            client_wl_data_offer::Event::SourceActions { source_actions } => {
+                let actions = match source_actions {
+                    WEnum::Value(actions) => actions.bits(),
+                    WEnum::Unknown(actions) => actions,
+                };
+                state.data_offer_source_actions.push(actions);
+            }
+            client_wl_data_offer::Event::Action { dnd_action } => {
+                let action = match dnd_action {
+                    WEnum::Value(action) => action.bits(),
+                    WEnum::Unknown(action) => action,
+                };
+                state.data_offer_actions.push(action);
+            }
+            _ => {}
         }
+    }
+}
+
+impl Dispatch<client_wl_touch::WlTouch, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_wl_touch::WlTouch,
+        _event: client_wl_touch::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
     }
 }
 
@@ -556,7 +660,24 @@ impl Dispatch<client_wl_data_source::WlDataSource, ()> for RegistryTestState {
                 let _ = file.write_all(b"clipboard payload");
             }
             client_wl_data_source::Event::Cancelled => {
+                state.data_source_cancelled_count += 1;
                 state.data_source_cancelled = true;
+            }
+            client_wl_data_source::Event::Target { mime_type } => {
+                state.data_source_target_mime_types.push(mime_type);
+            }
+            client_wl_data_source::Event::Action { dnd_action } => {
+                let action = match dnd_action {
+                    WEnum::Value(action) => action.bits(),
+                    WEnum::Unknown(action) => action,
+                };
+                state.data_source_actions.push(action);
+            }
+            client_wl_data_source::Event::DndDropPerformed => {
+                state.data_source_dnd_drop_performed_count += 1;
+            }
+            client_wl_data_source::Event::DndFinished => {
+                state.data_source_dnd_finished_count += 1;
             }
             _ => {}
         }
@@ -747,8 +868,8 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
             }
             client_wl_pointer::Event::Axis {
                 axis: WEnum::Value(axis),
+                time,
                 value,
-                ..
             } => {
                 state.pointer_axis = true;
                 match axis {
@@ -760,7 +881,40 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for RegistryTestState {
                     }
                     _ => {}
                 }
+                state.pointer_axis_times.push(time);
                 state.pointer_event_log.push("axis");
+            }
+            client_wl_pointer::Event::AxisSource { axis_source } => {
+                let source = match axis_source {
+                    WEnum::Value(client_wl_pointer::AxisSource::Wheel) => 0,
+                    WEnum::Value(client_wl_pointer::AxisSource::Finger) => 1,
+                    WEnum::Value(client_wl_pointer::AxisSource::Continuous) => 2,
+                    WEnum::Value(client_wl_pointer::AxisSource::WheelTilt) => 3,
+                    WEnum::Value(_) => u32::MAX,
+                    WEnum::Unknown(source) => source,
+                };
+                state.pointer_axis_sources.push(source);
+                state.pointer_event_log.push("axis_source");
+            }
+            client_wl_pointer::Event::AxisDiscrete { axis, discrete } => {
+                let axis = match axis {
+                    WEnum::Value(client_wl_pointer::Axis::VerticalScroll) => 0,
+                    WEnum::Value(client_wl_pointer::Axis::HorizontalScroll) => 1,
+                    WEnum::Value(_) => u32::MAX,
+                    WEnum::Unknown(axis) => axis,
+                };
+                state.pointer_axis_discrete.push((axis, discrete));
+                state.pointer_event_log.push("axis_discrete");
+            }
+            client_wl_pointer::Event::AxisStop { time, axis } => {
+                let axis = match axis {
+                    WEnum::Value(client_wl_pointer::Axis::VerticalScroll) => 0,
+                    WEnum::Value(client_wl_pointer::Axis::HorizontalScroll) => 1,
+                    WEnum::Value(_) => u32::MAX,
+                    WEnum::Unknown(axis) => axis,
+                };
+                state.pointer_axis_stops.push((time, axis));
+                state.pointer_event_log.push("axis_stop");
             }
             client_wl_pointer::Event::Frame => {
                 state.pointer_frame_count += 1;
@@ -1318,14 +1472,17 @@ impl Dispatch<client_xdg_surface::XdgSurface, ()> for RegistryTestState {
         proxy: &client_xdg_surface::XdgSurface,
         event: client_xdg_surface::Event,
         _data: &(),
-        _conn: &Connection,
+        conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
         if let client_xdg_surface::Event::Configure { serial } = event {
             state.surface_configured = true;
             state.surface_configure_count += 1;
             state.surface_configure_serials.push(serial);
+            state.toplevel_event_log.push("xdg_surface_configure");
             proxy.ack_configure(serial);
+            commit_registered_initial_xdg_test_buffer(proxy);
+            let _ = conn.roundtrip();
         }
     }
 }
@@ -1339,17 +1496,28 @@ impl Dispatch<client_xdg_toplevel::XdgToplevel, ()> for RegistryTestState {
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
-        if let client_xdg_toplevel::Event::Configure {
-            width,
-            height,
-            states,
-        } = event
-        {
-            state.toplevel_configured = true;
-            state.toplevel_configure_count += 1;
-            state.toplevel_width = width;
-            state.toplevel_height = height;
-            state.toplevel_states = states;
+        match event {
+            client_xdg_toplevel::Event::WmCapabilities { capabilities } => {
+                state.toplevel_wm_capabilities_count += 1;
+                state.toplevel_wm_capabilities = capabilities
+                    .chunks_exact(4)
+                    .map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap()))
+                    .collect();
+                state.toplevel_event_log.push("wm_capabilities");
+            }
+            client_xdg_toplevel::Event::Configure {
+                width,
+                height,
+                states,
+            } => {
+                state.toplevel_configured = true;
+                state.toplevel_configure_count += 1;
+                state.toplevel_width = width;
+                state.toplevel_height = height;
+                state.toplevel_states = states;
+                state.toplevel_event_log.push("toplevel_configure");
+            }
+            _ => {}
         }
     }
 }

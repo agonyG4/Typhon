@@ -51,6 +51,9 @@ pub(in crate::compositor::tests) fn create_client_surface_with_viewport_destinat
     assign_test_toplevel(&globals, &qh, &surface)?;
     let viewport = viewporter.get_viewport(&surface, &qh, ());
     viewport.set_destination(destination_width as i32, destination_height as i32);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
     commit_test_buffered_surface(
         &surface,
         &shm,
@@ -77,7 +80,12 @@ pub(in crate::compositor::tests) fn create_client_surface_with_buffer_offset(
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let surface = compositor.create_surface(&qh, ());
-    assign_test_toplevel(&globals, &qh, &surface)?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
     attach_test_buffered_surface(&surface, &shm, &qh, 40, 30)?;
     surface.offset(5, 7);
     surface.commit();
@@ -148,6 +156,9 @@ pub(in crate::compositor::tests) fn create_buffered_toplevel_then_resize_drag(
     let surface = compositor.create_surface(&qh, ());
     let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
     let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
     surface.attach(Some(&buffer), 0, 0);
     surface.damage_buffer(0, 0, width as i32, height as i32);
     surface.commit();

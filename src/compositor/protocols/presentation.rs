@@ -4,7 +4,7 @@ impl Dispatch<wp_presentation::WpPresentation, ()> for CompositorState {
     fn request(
         state: &mut Self,
         _client: &Client,
-        _resource: &wp_presentation::WpPresentation,
+        resource: &wp_presentation::WpPresentation,
         request: wp_presentation::Request,
         _data: &(),
         _dhandle: &DisplayHandle,
@@ -40,7 +40,14 @@ impl Dispatch<wp_presentation::WpPresentation, ()> for CompositorState {
                         feedback,
                     });
             }
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "wp_presentation",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }

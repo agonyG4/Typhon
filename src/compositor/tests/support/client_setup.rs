@@ -124,13 +124,20 @@ pub(in crate::compositor::tests) fn create_client_toplevel(
 pub(in crate::compositor::tests) fn create_configured_client_toplevel(
     socket_path: &PathBuf,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    create_configured_client_toplevel_at_version(socket_path, 6)
+}
+
+pub(in crate::compositor::tests) fn create_configured_client_toplevel_at_version(
+    socket_path: &PathBuf,
+    version: u32,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
-    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
-    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=version, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=version, ())?;
     let surface = compositor.create_surface(&qh, ());
     let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
     let toplevel = xdg_surface.get_toplevel(&qh, ());
@@ -170,55 +177,6 @@ pub(in crate::compositor::tests) fn create_toplevel_and_check_initial_commit_con
     Ok(state)
 }
 
-pub(in crate::compositor::tests) fn recreate_toplevel_role_on_same_surface(
-    socket_path: &PathBuf,
-    commands: &Sender<ServerCommand>,
-) -> Result<(RegistryTestState, u32, XdgRoleSnapshot), Box<dyn std::error::Error>> {
-    let stream = UnixStream::connect(socket_path)?;
-    let connection = Connection::from_socket(stream)?;
-    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
-    let qh = queue.handle();
-
-    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
-    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
-    let surface = compositor.create_surface(&qh, ());
-    let surface_id = surface.id().protocol_id();
-
-    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
-    xdg_surface.set_window_geometry(5, 6, 111, 77);
-    let toplevel = xdg_surface.get_toplevel(&qh, ());
-    toplevel.set_app_id("oblivion.recreate-a".to_string());
-    surface.commit();
-    connection.flush()?;
-
-    let mut state = RegistryTestState::default();
-    queue.roundtrip(&mut state)?;
-    assert_eq!(state.surface_configure_count, 1);
-    assert_eq!(state.toplevel_configure_count, 1);
-
-    toplevel.destroy();
-    xdg_surface.destroy();
-    connection.flush()?;
-    queue.roundtrip(&mut state)?;
-
-    state.surface_configured = false;
-    state.toplevel_configured = false;
-    state.toplevel_configure_count = 0;
-
-    let recreated_xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
-    let recreated_toplevel = recreated_xdg_surface.get_toplevel(&qh, ());
-    recreated_toplevel.set_app_id("oblivion.recreate-b".to_string());
-    surface.commit();
-    connection.flush()?;
-    queue.roundtrip(&mut state)?;
-
-    Ok((
-        state,
-        surface_id,
-        capture_xdg_role_snapshot(commands, surface_id),
-    ))
-}
-
 pub(in crate::compositor::tests) fn create_popup_and_check_initial_commit_configure_order(
     socket_path: &PathBuf,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
@@ -231,6 +189,7 @@ pub(in crate::compositor::tests) fn create_popup_and_check_initial_commit_config
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
 
+    let mut state = RegistryTestState::default();
     let parent = compositor.create_surface(&qh, ());
     let parent_xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
     let parent_toplevel = parent_xdg_surface.get_toplevel(&qh, ());
@@ -238,9 +197,17 @@ pub(in crate::compositor::tests) fn create_popup_and_check_initial_commit_config
     parent.commit();
     connection.flush()?;
 
-    let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
-    commit_test_buffered_surface(&parent, &shm, &qh, 120, 90)?;
+    commit_test_buffered_surface_after_initial_configure(
+        &parent,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        120,
+        90,
+    )?;
     connection.flush()?;
     queue.roundtrip(&mut state)?;
 
@@ -279,14 +246,23 @@ pub(in crate::compositor::tests) fn create_client_toplevel_with_configured_popup
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
 
+    let mut state = RegistryTestState::default();
     let parent = compositor.create_surface(&qh, ());
     let parent_xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
     let parent_toplevel = parent_xdg_surface.get_toplevel(&qh, ());
     parent_toplevel.set_app_id("oblivion.popup-parent".to_string());
-    commit_test_buffered_surface(&parent, &shm, &qh, 120, 90)?;
+    commit_test_buffered_surface_after_initial_configure(
+        &parent,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        120,
+        90,
+    )?;
     connection.flush()?;
 
-    let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
 
     let popup_surface = compositor.create_surface(&qh, ());
@@ -298,7 +274,16 @@ pub(in crate::compositor::tests) fn create_client_toplevel_with_configured_popup
     positioner.set_gravity(client_xdg_positioner::Gravity::BottomRight);
     positioner.set_offset(3, 4);
     let _popup = popup_xdg_surface.get_popup(Some(&parent_xdg_surface), &positioner, &qh, ());
-    commit_test_buffered_surface(&popup_surface, &shm, &qh, 60, 40)?;
+    commit_test_buffered_surface_after_initial_configure(
+        &popup_surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        60,
+        40,
+    )?;
     connection.flush()?;
     queue.roundtrip(&mut state)?;
     Ok(state)
@@ -316,14 +301,23 @@ pub(in crate::compositor::tests) fn create_client_popup_with_constrained_positio
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
 
+    let mut state = RegistryTestState::default();
     let parent = compositor.create_surface(&qh, ());
     let parent_xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
     let parent_toplevel = parent_xdg_surface.get_toplevel(&qh, ());
     parent_toplevel.set_app_id("oblivion.popup-constraint-parent".to_string());
-    commit_test_buffered_surface(&parent, &shm, &qh, 120, 90)?;
+    commit_test_buffered_surface_after_initial_configure(
+        &parent,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        120,
+        90,
+    )?;
     connection.flush()?;
 
-    let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
 
     let popup_surface = compositor.create_surface(&qh, ());
@@ -339,7 +333,16 @@ pub(in crate::compositor::tests) fn create_client_popup_with_constrained_positio
             | client_xdg_positioner::ConstraintAdjustment::SlideY,
     );
     let _popup = popup_xdg_surface.get_popup(Some(&parent_xdg_surface), &positioner, &qh, ());
-    commit_test_buffered_surface(&popup_surface, &shm, &qh, 80, 50)?;
+    commit_test_buffered_surface_after_initial_configure(
+        &popup_surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        80,
+        50,
+    )?;
     connection.flush()?;
     queue.roundtrip(&mut state)?;
     Ok(state)
@@ -357,14 +360,23 @@ pub(in crate::compositor::tests) fn create_client_popup_then_reposition(
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
 
+    let mut state = RegistryTestState::default();
     let parent = compositor.create_surface(&qh, ());
     let parent_xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
     let parent_toplevel = parent_xdg_surface.get_toplevel(&qh, ());
     parent_toplevel.set_app_id("oblivion.popup-reposition-parent".to_string());
-    commit_test_buffered_surface(&parent, &shm, &qh, 120, 90)?;
+    commit_test_buffered_surface_after_initial_configure(
+        &parent,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        120,
+        90,
+    )?;
     connection.flush()?;
 
-    let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
 
     let popup_surface = compositor.create_surface(&qh, ());
@@ -376,7 +388,16 @@ pub(in crate::compositor::tests) fn create_client_popup_then_reposition(
     initial_positioner.set_gravity(client_xdg_positioner::Gravity::BottomRight);
     let popup =
         popup_xdg_surface.get_popup(Some(&parent_xdg_surface), &initial_positioner, &qh, ());
-    commit_test_buffered_surface(&popup_surface, &shm, &qh, 60, 40)?;
+    commit_test_buffered_surface_after_initial_configure(
+        &popup_surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        60,
+        40,
+    )?;
     connection.flush()?;
     queue.roundtrip(&mut state)?;
 
@@ -387,7 +408,16 @@ pub(in crate::compositor::tests) fn create_client_popup_then_reposition(
     repositioner.set_gravity(client_xdg_positioner::Gravity::BottomRight);
     repositioner.set_offset(1, 1);
     popup.reposition(&repositioner, 77);
-    commit_test_buffered_surface(&popup_surface, &shm, &qh, 50, 30)?;
+    commit_test_buffered_surface_after_configure(
+        &popup_surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        50,
+        30,
+    )?;
     connection.flush()?;
     queue.roundtrip(&mut state)?;
     Ok(state)
@@ -405,27 +435,45 @@ pub(in crate::compositor::tests) fn create_client_popup_with_window_geometry(
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
 
+    let mut state = RegistryTestState::default();
     let parent = compositor.create_surface(&qh, ());
     let parent_xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
     let parent_toplevel = parent_xdg_surface.get_toplevel(&qh, ());
     parent_toplevel.set_app_id("oblivion.popup-window-geometry-parent".to_string());
     parent_xdg_surface.set_window_geometry(8, 9, 100, 80);
-    commit_test_buffered_surface(&parent, &shm, &qh, 120, 90)?;
+    commit_test_buffered_surface_after_initial_configure(
+        &parent,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        120,
+        90,
+    )?;
     connection.flush()?;
 
-    let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
 
     let popup_surface = compositor.create_surface(&qh, ());
     let popup_xdg_surface = wm_base.get_xdg_surface(&popup_surface, &qh, ());
-    popup_xdg_surface.set_window_geometry(2, 3, 40, 30);
     let positioner = wm_base.create_positioner(&qh, ());
     positioner.set_size(40, 30);
     positioner.set_anchor_rect(10, 20, 1, 1);
     positioner.set_anchor(client_xdg_positioner::Anchor::TopLeft);
     positioner.set_gravity(client_xdg_positioner::Gravity::BottomRight);
     let _popup = popup_xdg_surface.get_popup(Some(&parent_xdg_surface), &positioner, &qh, ());
-    commit_test_buffered_surface(&popup_surface, &shm, &qh, 40, 30)?;
+    popup_xdg_surface.set_window_geometry(2, 3, 40, 30);
+    commit_test_buffered_surface_after_initial_configure(
+        &popup_surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        40,
+        30,
+    )?;
     connection.flush()?;
     queue.roundtrip(&mut state)?;
     Ok(state)
@@ -443,14 +491,23 @@ pub(in crate::compositor::tests) fn create_non_reactive_popup_then_set_window_ge
     let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
 
+    let mut state = RegistryTestState::default();
     let parent = compositor.create_surface(&qh, ());
     let parent_xdg_surface = wm_base.get_xdg_surface(&parent, &qh, ());
     let parent_toplevel = parent_xdg_surface.get_toplevel(&qh, ());
     parent_toplevel.set_app_id("oblivion.popup-gecko-parent".to_string());
-    commit_test_buffered_surface(&parent, &shm, &qh, 120, 90)?;
+    commit_test_buffered_surface_after_initial_configure(
+        &parent,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        120,
+        90,
+    )?;
     connection.flush()?;
 
-    let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
 
     let popup_surface = compositor.create_surface(&qh, ());
@@ -466,7 +523,16 @@ pub(in crate::compositor::tests) fn create_non_reactive_popup_then_set_window_ge
 
     state.popup_configure_count = 0;
     popup_xdg_surface.set_window_geometry(0, 0, 177, 493);
-    commit_test_buffered_surface(&popup_surface, &shm, &qh, 177, 493)?;
+    commit_test_buffered_surface_after_initial_configure(
+        &popup_surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        177,
+        493,
+    )?;
     connection.flush()?;
     queue.roundtrip(&mut state)?;
     Ok(state)
@@ -523,7 +589,16 @@ pub(in crate::compositor::tests) fn create_grabbed_popup_then_release_under_curs
     positioner.set_offset(3, 4);
     let popup = popup_xdg_surface.get_popup(Some(&parent_xdg_surface), &positioner, &qh, ());
     popup.grab(&seat, serial);
-    commit_test_buffered_surface(&popup_surface, &shm, &qh, 60, 40)?;
+    commit_test_buffered_surface_after_initial_configure(
+        &popup_surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        60,
+        40,
+    )?;
     connection.flush()?;
     queue.roundtrip(&mut state)?;
 
@@ -589,7 +664,16 @@ pub(in crate::compositor::tests) fn create_grabbed_popup_under_cursor(
     positioner.set_offset(3, 4);
     let popup = popup_xdg_surface.get_popup(Some(&parent_xdg_surface), &positioner, &qh, ());
     popup.grab(&seat, serial);
-    commit_test_buffered_surface(&popup_surface, &shm, &qh, 60, 40)?;
+    commit_test_buffered_surface_after_initial_configure(
+        &popup_surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        60,
+        40,
+    )?;
     connection.flush()?;
     queue.roundtrip(&mut state)?;
 
@@ -646,7 +730,16 @@ pub(in crate::compositor::tests) fn create_grabbed_popup_then_click_outside(
     positioner.set_offset(3, 4);
     let popup = popup_xdg_surface.get_popup(Some(&parent_xdg_surface), &positioner, &qh, ());
     popup.grab(&seat, serial);
-    commit_test_buffered_surface(&popup_surface, &shm, &qh, 60, 40)?;
+    commit_test_buffered_surface_after_initial_configure(
+        &popup_surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        60,
+        40,
+    )?;
     connection.flush()?;
     queue.roundtrip(&mut state)?;
 
@@ -724,7 +817,16 @@ pub(in crate::compositor::tests) fn create_grabbed_popup_then_axis_outside(
     positioner.set_offset(3, 4);
     let popup = popup_xdg_surface.get_popup(Some(&parent_xdg_surface), &positioner, &qh, ());
     popup.grab(&seat, serial);
-    commit_test_buffered_surface(&popup_surface, &shm, &qh, 60, 40)?;
+    commit_test_buffered_surface_after_initial_configure(
+        &popup_surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        60,
+        40,
+    )?;
     connection.flush()?;
     queue.roundtrip(&mut state)?;
 
@@ -761,10 +863,19 @@ pub(in crate::compositor::tests) fn create_client_surface_and_wait_for_enter(
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let surface = compositor.create_surface(&qh, ());
     assign_test_toplevel(&globals, &qh, &surface)?;
-    commit_test_buffered_surface(&surface, &shm, &qh, 40, 30)?;
+    let mut state = RegistryTestState::default();
+    commit_test_buffered_surface_after_initial_configure(
+        &surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        40,
+        30,
+    )?;
     connection.flush()?;
 
-    let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
     Ok(state)
 }

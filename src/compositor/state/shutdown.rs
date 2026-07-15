@@ -35,6 +35,8 @@ pub(in crate::compositor) fn empty_cached_subsurface_commit() -> CachedSubsurfac
         offset: None,
         viewport_destination: PendingViewportChange::default(),
         buffer_scale: None,
+        buffer_transform: None,
+        opaque_region: None,
         input_region: None,
         presentation_feedbacks: Vec::new(),
         resize_commit: None,

@@ -19,8 +19,8 @@ impl Dispatch<wl_output::WlOutput, ()> for CompositorState {
 impl Dispatch<wl_seat::WlSeat, ()> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
-        _resource: &wl_seat::WlSeat,
+        client: &Client,
+        resource: &wl_seat::WlSeat,
         request: wl_seat::Request,
         _data: &(),
         _dhandle: &DisplayHandle,
@@ -36,8 +36,23 @@ impl Dispatch<wl_seat::WlSeat, ()> for CompositorState {
                 send_keyboard_initial_state(&keyboard);
                 state.register_keyboard(keyboard);
             }
+            wl_seat::Request::GetTouch { .. } => {
+                state.post_protocol_error(
+                    client,
+                    resource,
+                    wl_seat::Error::MissingCapability,
+                    "Typhon does not advertise the wl_seat touch capability".to_string(),
+                );
+            }
             wl_seat::Request::Release => {}
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "wl_seat",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }
@@ -64,7 +79,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for CompositorState {
             wl_pointer::Request::Release => {
                 state.unregister_pointer(resource);
             }
-            _ => {}
+            other => {
+                let _ = other;
+                state.compliance_metrics.note_unhandled_request(
+                    "wl_pointer",
+                    resource.version(),
+                    UnhandledRequestClass::FutureVersionOrGeneratedNonExhaustive,
+                );
+            }
         }
     }
 }

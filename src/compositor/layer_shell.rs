@@ -325,7 +325,9 @@ impl CompositorState {
         };
         let requires_initial_ack = !role.mapped && role.acked_configure.is_none();
         if !role.initial_configure_sent || requires_initial_ack {
-            role.resource.post_error(
+            let resource = role.resource.clone();
+            self.note_protocol_error_metric();
+            resource.post_error(
                 zwlr_layer_surface_v1::Error::InvalidSurfaceState,
                 "layer surface buffer committed before configure was acknowledged".to_string(),
             );
@@ -344,7 +346,9 @@ impl CompositorState {
                 pending.width == size.0 && pending.height == size.1
             });
             if commits_unacked_configure_size {
-                role.resource.post_error(
+                let resource = role.resource.clone();
+                self.note_protocol_error_metric();
+                resource.post_error(
                     zwlr_layer_surface_v1::Error::InvalidSurfaceState,
                     "layer surface buffer committed before configure was acknowledged".to_string(),
                 );
@@ -457,7 +461,7 @@ impl CompositorState {
             role.initial_configure_sent = false;
         }
         self.layer_surfaces.remove(&surface_id);
-        self.clear_surface_role_if(surface_id, SurfaceRole::LayerSurface);
+        self.deactivate_role_instance_if(surface_id, SurfaceRole::LayerSurface);
         self.unmap_surface_content(surface_id);
         self.arrange_layer_surfaces_and_reconfigure_stateful_windows_from(previous_usable);
         self.reorder_renderable_surfaces_by_committed_stack();
@@ -564,9 +568,9 @@ impl CompositorState {
         };
         let pending = self.layer_surfaces[&surface_id].pending;
         if let Err(message) = validate_layer_surface_size(pending) {
-            let role = &self.layer_surfaces[&surface_id];
-            role.resource
-                .post_error(zwlr_layer_surface_v1::Error::InvalidSize, message);
+            let resource = self.layer_surfaces[&surface_id].resource.clone();
+            self.note_protocol_error_metric();
+            resource.post_error(zwlr_layer_surface_v1::Error::InvalidSize, message);
             return None;
         }
         let mut rerun_focus = false;

@@ -355,7 +355,7 @@ fn live_process_dead_wayland_client_removes_mapped_surfaces() {
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
-    let client = LiveTestClient::connect(&socket_path).unwrap();
+    let mut client = LiveTestClient::connect(&socket_path).unwrap();
     let surface = client
         .create_toplevel_surface("oblivion.disconnect-test", 64, 48)
         .unwrap();
@@ -412,6 +412,9 @@ fn disconnected_client_removes_toplevel_and_popup_state() {
         positioner.set_anchor(client_xdg_positioner::Anchor::BottomRight);
         positioner.set_gravity(client_xdg_positioner::Gravity::BottomRight);
         let _popup = popup_xdg_surface.get_popup(Some(&parent_xdg_surface), &positioner, &qh, ());
+        popup_surface.commit();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut RegistryTestState::default()).unwrap();
         commit_test_buffered_surface(&popup_surface, &shm, &qh, 60, 40).unwrap();
         connection.flush().unwrap();
         queue.roundtrip(&mut RegistryTestState::default()).unwrap();
@@ -447,7 +450,7 @@ fn client_reconnect_does_not_retain_old_surfaces() {
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
     let old_internal_surface_id = {
-        let client = LiveTestClient::connect(&socket_path).unwrap();
+        let mut client = LiveTestClient::connect(&socket_path).unwrap();
         client
             .create_toplevel_surface("oblivion.reconnect-old", 64, 48)
             .unwrap();
@@ -461,7 +464,7 @@ fn client_reconnect_does_not_retain_old_surfaces() {
     wait_for_server_commands(&commands);
     assert_eq!(capture_renderable_surface_count(&commands), 0);
 
-    let new_client = LiveTestClient::connect(&socket_path).unwrap();
+    let mut new_client = LiveTestClient::connect(&socket_path).unwrap();
     new_client
         .create_toplevel_surface("oblivion.reconnect-new", 80, 60)
         .unwrap();
@@ -483,7 +486,7 @@ fn disconnect_clears_focus_and_grabs_owned_by_client() {
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
     {
-        let client = LiveTestClient::connect(&socket_path).unwrap();
+        let mut client = LiveTestClient::connect(&socket_path).unwrap();
         client
             .create_toplevel_surface("oblivion.disconnect-focus", 100, 70)
             .unwrap();
@@ -572,7 +575,7 @@ fn disconnect_schedules_repaint_when_visible_surface_is_removed() {
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
     let before_disconnect_generation = {
-        let client = LiveTestClient::connect(&socket_path).unwrap();
+        let mut client = LiveTestClient::connect(&socket_path).unwrap();
         client
             .create_toplevel_surface("oblivion.disconnect-repaint", 64, 48)
             .unwrap();

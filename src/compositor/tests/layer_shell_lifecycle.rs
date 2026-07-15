@@ -485,14 +485,14 @@ fn layer_surface_explicit_sync_waits_then_publishes_and_destroy_pending_is_safe(
         globals.bind(&qh, 1..=1, ()).unwrap();
     let layer_shell: client_zwlr_layer_shell_v1::ZwlrLayerShellV1 =
         globals.bind(&qh, 4..=4, ()).unwrap();
-    let (surface, _layer_surface) = create_layer_surface(
+    let (surface, layer_surface) = create_layer_surface(
         &compositor,
         &layer_shell,
         &qh,
         client_zwlr_layer_shell_v1::Layer::Top,
         "layer-explicit-sync",
     );
-    _layer_surface.set_size(2, 2);
+    layer_surface.set_size(2, 2);
     let sync_surface = syncobj.get_surface(&surface, &qh, ());
     let acquire_timeline_fd = acquire_timeline.export_timeline_fd().unwrap();
     let release_timeline_fd = release_timeline.export_timeline_fd().unwrap();
@@ -536,6 +536,7 @@ fn layer_surface_explicit_sync_waits_then_publishes_and_destroy_pending_is_safe(
     surface.attach(Some(&first_buffer), 0, 0);
     surface.damage_buffer(0, 0, 2, 2);
     surface.commit();
+    layer_surface.destroy();
     surface.destroy();
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
