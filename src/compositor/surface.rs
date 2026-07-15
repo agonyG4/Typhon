@@ -122,7 +122,10 @@ pub struct RenderableSurface {
     pub generation: u64,
     pub commit_sequence: SurfaceCommitSequence,
     pub buffer: CommittedSurfaceBuffer,
+    pub buffer_scale: u32,
+    pub buffer_transform: wayland_server::protocol::wl_output::Transform,
     pub viewport_source: Option<ViewportSourceRect>,
+    pub viewport_destination: Option<BufferSize>,
     pub damage: RenderableSurfaceDamage,
 }
 

@@ -137,6 +137,7 @@ struct NativeRuntimeBootstrapTail {
     frame_renderer: NativeFrameRenderer,
     input_state: NativeInputState,
     cursor_preference: NativeCursorPreference,
+    direct_scanout_preference: NativeDirectScanoutPreference,
     pre_kms_hardware_cursor: Option<NativeHardwareCursor>,
     cursor_render_mode: NativeCursorRenderMode,
     input_plan: NativeInputBackendPlan,
@@ -163,6 +164,7 @@ impl NativeRuntime {
             mut frame_renderer,
             input_state,
             cursor_preference,
+            direct_scanout_preference,
             pre_kms_hardware_cursor,
             mut cursor_render_mode,
             input_plan,
@@ -400,6 +402,7 @@ impl NativeRuntime {
             frame_renderer,
             input_state,
             cursor_preference,
+            direct_scanout_preference,
             cursor_render_mode,
             hardware_cursor,
             input_devices,
@@ -617,6 +620,7 @@ impl NativeRuntime {
         let mut frame_renderer = NativeFrameRenderer::default();
         let input_state = NativeInputState::new(target.width, target.height);
         let cursor_preference = NativeCursorPreference::from_env();
+        let direct_scanout_preference = NativeDirectScanoutPreference::from_env();
         println!(
             "native cursor backend target: {}",
             cursor_preference.as_str()
@@ -903,6 +907,7 @@ impl NativeRuntime {
             frame_renderer,
             input_state,
             cursor_preference,
+            direct_scanout_preference,
             pre_kms_hardware_cursor,
             cursor_render_mode,
             input_plan,

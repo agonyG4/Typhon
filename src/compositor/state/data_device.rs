@@ -138,6 +138,9 @@ impl CompositorState {
                 vec![0; size.pixel_count().expect("test pixel count")],
             ),
             viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
             damage: RenderableSurfaceDamage::Full,
         });
         self.store_surface_placement(surface_id, placement);

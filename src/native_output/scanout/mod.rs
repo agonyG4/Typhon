@@ -3,6 +3,8 @@ use super::*;
 #[allow(dead_code)] // Runtime attachment is completed after frame-owned rendering is available.
 mod atomic_egl_gbm;
 mod backend;
+mod direct;
+mod direct_policy;
 mod dumb;
 mod egl_gbm;
 #[allow(dead_code)] // Negotiation is wired into explicit slot allocation in Task 4.
@@ -16,6 +18,8 @@ mod output_swapchain;
 #[allow(unused_imports)]
 pub(crate) use atomic_egl_gbm::*;
 pub(crate) use backend::*;
+pub(crate) use direct::*;
+pub(crate) use direct_policy::*;
 pub(crate) use dumb::*;
 pub(crate) use egl_gbm::*;
 #[allow(unused_imports)]
@@ -472,9 +476,14 @@ impl NativeScanoutBackend {
 
     pub(crate) fn page_flip_pending(&self) -> bool {
         match self {
-            Self::AtomicEglGbm(scanout) => scanout
-                .swapchain()
-                .is_ok_and(|swapchain| swapchain.pending_slot().is_some()),
+            Self::AtomicEglGbm(scanout) => {
+                let composited_pending = scanout
+                    .swapchain()
+                    .is_ok_and(|swapchain| swapchain.pending_slot().is_some());
+                let direct_pending = scanout.direct_scanout_pending();
+                debug_assert!(!(composited_pending && direct_pending));
+                composited_pending || direct_pending
+            }
             Self::NativeEglGbm(scanout) => scanout.page_flip_pending(),
             Self::Gbm(scanout) => scanout.page_flip_pending(),
             Self::Dumb(_) => false,
@@ -517,6 +526,15 @@ impl NativeScanoutBackend {
             Self::NativeEglGbm(scanout) => scanout.ready_frame_queued(),
             Self::Gbm(scanout) => scanout.ready_frame_queued(),
             Self::Dumb(_) => false,
+        }
+    }
+
+    pub(crate) fn output_render_in_progress(&self) -> bool {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout
+                .swapchain()
+                .is_ok_and(|swapchain| swapchain.rendering_slot().is_some()),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => false,
         }
     }
 
@@ -605,16 +623,86 @@ impl NativeScanoutBackend {
 
     pub(crate) fn pending_page_flip_token(&self) -> Option<u64> {
         match self {
-            Self::AtomicEglGbm(scanout) => scanout
-                .swapchain()
-                .ok()
-                .and_then(AtomicOutputSwapchain::pending_token)
-                .map(PageFlipToken::get),
+            Self::AtomicEglGbm(scanout) => {
+                let composited = scanout
+                    .swapchain()
+                    .ok()
+                    .and_then(AtomicOutputSwapchain::pending_token);
+                let direct = scanout.direct_scanout_pending_token();
+                debug_assert!(!(composited.is_some() && direct.is_some()));
+                composited.or(direct).map(PageFlipToken::get)
+            }
             Self::NativeEglGbm(scanout) => {
                 scanout.page_flip.pending_token().map(PageFlipToken::get)
             }
             Self::Gbm(scanout) => scanout.page_flip.pending_token().map(PageFlipToken::get),
             Self::Dumb(_) => None,
+        }
+    }
+
+    pub(crate) fn direct_scanout_active(&self) -> bool {
+        matches!(self, Self::AtomicEglGbm(scanout) if scanout.direct_scanout_active())
+    }
+
+    pub(crate) fn direct_scanout_pending(&self) -> bool {
+        matches!(self, Self::AtomicEglGbm(scanout) if scanout.direct_scanout_pending())
+    }
+
+    pub(crate) fn direct_scanout_surface(&self) -> Option<u32> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.direct_scanout_surface(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => None,
+        }
+    }
+
+    pub(crate) fn direct_scanout_info(&self) -> Option<(u64, u32, u32, u64)> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.direct_scanout_info(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => None,
+        }
+    }
+
+    pub(crate) fn direct_scanout_inhibited(&self) -> bool {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.direct_scanout_inhibited(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => true,
+        }
+    }
+
+    pub(crate) fn direct_scanout_counters(&self) -> Option<DirectScanoutCounters> {
+        match self {
+            Self::AtomicEglGbm(scanout) => Some(scanout.direct_scanout_counters()),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => None,
+        }
+    }
+
+    pub(crate) fn try_direct_scanout(
+        &mut self,
+        kms: &KmsBackendSelection,
+        server: &mut OwnCompositorServer,
+        target: oblivion_one::native::presentation_deadline::PresentationTarget,
+    ) -> io::Result<DirectScanoutAttempt> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.try_direct_scanout(kms, server, target),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
+                "direct scanout is unsupported by this backend",
+            )),
+        }
+    }
+
+    pub(crate) fn complete_direct_pageflip(
+        &mut self,
+        token: PageFlipToken,
+        presentation: FramePresentation,
+        server: &mut OwnCompositorServer,
+    ) -> io::Result<PresentedDirectFrame> {
+        match self {
+            Self::AtomicEglGbm(scanout) => {
+                scanout.complete_direct_pageflip(token, presentation, server)
+            }
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
+                "direct pageflip is unsupported by this backend",
+            )),
         }
     }
 

@@ -350,6 +350,8 @@ impl SurfaceData {
                         explicit_release: None,
                         surface_size: None,
                         viewport_source: None,
+                        viewport_destination: None,
+                        buffer_scale: 1,
                         commit_sequence: SurfaceCommitSequence::initial(),
                         resize_commit: None,
                         resize_capture_finalized: false,
@@ -365,6 +367,8 @@ impl SurfaceData {
                             explicit_release: None,
                             surface_size: None,
                             viewport_source: None,
+                            viewport_destination: None,
+                            buffer_scale: 1,
                             commit_sequence: SurfaceCommitSequence::initial(),
                             resize_commit: None,
                             resize_capture_finalized: false,
@@ -1145,6 +1149,8 @@ pub(super) struct PendingSurfaceBuffer {
     pub(super) explicit_release: Option<ExplicitSyncPoint>,
     pub(super) surface_size: Option<BufferSize>,
     pub(super) viewport_source: Option<ViewportSourceRect>,
+    pub(super) viewport_destination: Option<BufferSize>,
+    pub(super) buffer_scale: u32,
     pub(super) commit_sequence: SurfaceCommitSequence,
     pub(super) resize_commit: Option<Box<ResizeCommitSnapshot>>,
     pub(super) resize_capture_finalized: bool,
@@ -1159,6 +1165,8 @@ impl PendingSurfaceBuffer {
         buffer_transform: wl_output::Transform,
     ) -> io::Result<()> {
         self.viewport_source = viewport.source;
+        self.viewport_destination = viewport.destination;
+        self.buffer_scale = buffer_scale;
         self.buffer_transform = buffer_transform;
         self.surface_size =
             Some(self.surface_size_for_state(viewport, buffer_scale, buffer_transform)?);
@@ -1238,7 +1246,10 @@ impl PendingSurfaceBuffer {
             generation,
             commit_sequence: self.commit_sequence,
             buffer: self.data.to_committed_buffer_for_size(size)?,
+            buffer_scale: self.buffer_scale,
+            buffer_transform: self.buffer_transform,
             viewport_source: self.viewport_source,
+            viewport_destination: self.viewport_destination,
             damage,
         })
     }

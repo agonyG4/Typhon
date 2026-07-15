@@ -173,6 +173,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
         frame_id: u64,
         reply: Sender<CompositorFrameBatchId>,
     },
+    CaptureFrameBatchSurfaceIds {
+        batch_id: CompositorFrameBatchId,
+        reply: Sender<Vec<u32>>,
+    },
     CompleteFrameBatch {
         frame_id: u64,
         batch_id: CompositorFrameBatchId,
@@ -181,6 +185,12 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CompleteFrameBatchNow {
         frame_id: u64,
         batch_id: CompositorFrameBatchId,
+    },
+    CompleteDirectFrameBatch {
+        frame_id: u64,
+        batch_id: CompositorFrameBatchId,
+        direct_surface_id: u32,
+        presentation: FramePresentation,
     },
     DiscardFrameBatch {
         batch_id: CompositorFrameBatchId,
@@ -646,6 +656,10 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::CaptureFrameBatch { frame_id, reply } => {
                         let _ = reply.send(server.take_frame_batch_for_render(frame_id));
                     }
+                    ServerCommand::CaptureFrameBatchSurfaceIds { batch_id, reply } => {
+                        let _ =
+                            reply.send(server.test_frame_batch_presentation_surface_ids(batch_id));
+                    }
                     ServerCommand::CompleteFrameBatch {
                         frame_id,
                         batch_id,
@@ -658,6 +672,19 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             FramePresentation::software_now(server.state.presentation_clock)
                                 .expect("test presentation clock should be usable");
                         server.complete_presented_frame_batch(frame_id, batch_id, presentation);
+                    }
+                    ServerCommand::CompleteDirectFrameBatch {
+                        frame_id,
+                        batch_id,
+                        direct_surface_id,
+                        presentation,
+                    } => {
+                        server.complete_direct_presented_frame_batch(
+                            frame_id,
+                            batch_id,
+                            direct_surface_id,
+                            presentation,
+                        );
                     }
                     ServerCommand::DiscardFrameBatch { batch_id, reason } => {
                         server.discard_frame_batch(batch_id, reason);

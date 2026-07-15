@@ -1,3 +1,5 @@
+use crate::astrea_shell_control::server::astrea_launch_request_v1;
+use crate::astrea_shortcuts::server::astrea_shortcut_v1;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::File,
@@ -6,9 +8,6 @@ use std::{
     sync::{Arc, Mutex},
     time::Instant,
 };
-
-use crate::astrea_shell_control::server::astrea_launch_request_v1;
-use crate::astrea_shortcuts::server::astrea_shortcut_v1;
 
 pub use clipboard_bridge::{
     ClipboardBridge, ClipboardBridgeError, ClipboardBridgeEvent, HostClipboardOfferId,
@@ -115,9 +114,10 @@ use explicit_sync::{
 };
 pub(crate) use frame_batch::CompositorFrameBatch;
 pub use frame_batch::{BufferReleaseMetrics, CompositorFrameBatchId};
+pub(crate) use fullscreen::direct_scanout_scene_rejection_for_flags;
 pub use fullscreen::{
-    FullscreenPresentationEligibility, FullscreenPresentationRejection,
-    FullscreenPresentationState, FullscreenRenderPlanMetrics,
+    DirectScanoutSceneCandidate, DirectScanoutSceneRejection, FullscreenPresentationEligibility,
+    FullscreenPresentationRejection, FullscreenPresentationState, FullscreenRenderPlanMetrics,
 };
 pub use idle::{IdleManager, IdleState};
 use input::{

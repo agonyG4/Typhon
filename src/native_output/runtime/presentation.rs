@@ -46,6 +46,7 @@ impl NativeRuntime {
             frame_renderer,
             input_state,
             cursor_preference,
+            direct_scanout_preference,
             cursor_render_mode,
             hardware_cursor,
             input_devices,
@@ -238,9 +239,9 @@ impl NativeRuntime {
             let explicit_submission = matches!(&**scanout, NativeScanoutBackend::AtomicEglGbm(_));
             let present_result =
                 if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
-                    NativePresentResult::AsyncSubmitted {
-                        token: explicit.submit_ready_frame(kms_backend, server)?,
-                    }
+                    let token = explicit.submit_ready_frame(kms_backend, server)?;
+                    explicit.mark_composited_submission();
+                    NativePresentResult::AsyncSubmitted { token }
                 } else {
                     scanout.present(kms_backend).map_err(|error| {
                         native_runtime_error(
@@ -318,374 +319,487 @@ impl NativeRuntime {
             SchedulerDecision::Render | SchedulerDecision::RenderAhead
         ) {
             let render_ahead = scheduler_decision == SchedulerDecision::RenderAhead;
-            frame_pacing.note_render_started(pacing_mode, render_ahead);
-            let render_observed_at_ns = monotonic_now_ns()?;
-            let mut render_begin_fields = vec![
-                frame_id_field(frame_pacing.active),
-                PacingField::u64("render_generation", render_generation),
-                PacingField::u64("render_observed_at_ns", render_observed_at_ns),
-                PacingField::bool("render_ahead", render_ahead),
-                PacingField::str("buffering_mode", format!("{:?}", adaptive_buffering.mode())),
-                PacingField::u64("prediction_ewma_ns", prediction.ewma_render_ns),
-                PacingField::u64(
-                    "prediction_upper_deviation_ns",
-                    prediction.upper_render_deviation_ns,
-                ),
-                PacingField::u64("prediction_p90_ns", prediction.p90_recent_render_ns),
-                PacingField::u64("prediction_render_risk_ns", prediction.render_risk_ns),
-                PacingField::u64("dynamic_safety_margin_ns", prediction.safety_margin_ns),
-                PacingField::u64("predicted_total_cost_ns", prediction.total_cost_ns),
-                PacingField::u64("refresh_interval_ns", refresh_interval.as_nanos() as u64),
-                PacingField::bool("idle_wake_guard", prediction.idle_wake_guard),
-            ];
-            render_begin_fields.extend(snapshot_fields(scanout.buffer_snapshot()));
-            frame_pacing.log("render_begin", render_begin_fields);
-            let effective_redraw_requested = redraw_requested || *queued_redraw_requested;
-            let render_cause = native_repaint_cause_label(
-                render_generation_cause,
-                render_generation_changed,
-                accepted,
-                pending_frame_work,
-                effective_redraw_requested,
-            );
-            let output_damage = native_output_damage_for_repaint(
-                target.width,
-                target.height,
-                last_renderable_surfaces,
-                server.renderable_surfaces(),
-                render_generation_cause,
-                render_generation_changed,
-            );
-            let skip_empty_visible_damage = output_damage.is_empty()
-                && render_generation_changed
-                && accepted == 0
-                && !effective_redraw_requested;
-            if skip_empty_visible_damage {
-                perf.log("native.frame_skip", || {
-                    let mut fields = output_damage.fields().to_vec();
-                    fields.extend([
-                        NativePerfField::str("reason", "empty_visible_damage"),
-                        NativePerfField::usize("skipped_input_repaints", skipped_input_repaints),
-                        NativePerfField::u64("tick_us", tick_us),
-                        NativePerfField::bool("pageflip_pending_at_tick", pageflip_pending_at_tick),
-                        NativePerfField::u64("input_drain_us", input_drain_us),
-                        NativePerfField::usize("raw_input_events", raw_input_events),
-                        NativePerfField::usize("coalesced_input_events", coalesced_input_events),
-                        NativePerfField::u64("pageflip_drain_us", pageflip_drain_us),
-                        NativePerfField::bool("pageflip_completed", pageflip_completed),
-                        NativePerfField::u64("present_us", present_us),
-                        NativePerfField::str("kms_backend", kms_backend.effective_kind().as_str()),
-                        NativePerfField::u64(
-                            "pageflip_token",
-                            scanout.pending_page_flip_token().unwrap_or(0),
-                        ),
-                        NativePerfField::u64("backend_generation", *drm_file_generation),
-                        NativePerfField::u64("render_generation", render_generation),
-                        NativePerfField::str("render_cause", render_cause),
-                        NativePerfField::bool("pending_frame_work", pending_frame_work),
-                    ]);
-                    fields
-                });
-                if pending_frame_work {
-                    let finish_frame_start = Instant::now();
-                    server.finish_frame();
-                    perf.log("native.finish_frame", || {
-                        vec![
-                            NativePerfField::str("reason", "empty_visible_damage"),
-                            NativePerfField::u64("elapsed_us", elapsed_micros(finish_frame_start)),
-                            NativePerfField::usize("surfaces", server.renderable_surfaces().len()),
-                            NativePerfField::u64("render_generation", server.render_generation()),
-                        ]
-                    });
-                }
-                frame_scheduler.note_immediate_completion();
-                *queued_redraw_requested = false;
-                *last_render_generation = render_generation;
-                *last_renderable_surfaces = server.renderable_surfaces().to_vec();
-            } else {
-                if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
-                    let frame_target = match pacing_mode {
-                        NativeOutputPacingMode::ReactiveDouble => presentation_deadline
-                            .reactive_target(MonotonicTimestampNs::new(monotonic_now_ns()?)),
-                        NativeOutputPacingMode::PredictiveTriple => {
-                            scheduled_presentation_target.take().or_else(|| {
-                                presentation_deadline.reactive_target(MonotonicTimestampNs::new(
-                                    monotonic_now_ns().ok()?,
-                                ))
-                            })
-                        }
-                    }
-                    .ok_or_else(|| {
-                        io::Error::other(
-                            "explicit Atomic render started without a presentation target",
-                        )
-                    })?;
-                    presentation_deadline.clear_scheduled_target();
-                    let frame_id = explicit.render_frame(
-                        frame_renderer,
-                        server,
-                        input_state,
-                        *cursor_render_mode,
-                        &output_damage,
-                        render_generation,
-                        frame_target,
-                        pacing_mode,
-                    )?;
-                    frame_rendered = true;
-                    let ready_at_ns = monotonic_now_ns()?;
-                    let waits_for_target = render_ahead;
-                    if waits_for_target {
-                        frame_scheduler.note_ready_frame(Some(frame_target));
-                        frame_pacing.note_ready_frame(ready_at_ns, render_ahead);
-                    } else {
-                        let token = explicit.submit_ready_frame(kms_backend, server)?;
-                        frame_scheduler
-                            .note_async_submission(token, monotonic_now_ns()?)
-                            .map_err(io::Error::other)?;
-                        frame_pacing.note_submit(token, monotonic_now_ns()?, false, pacing_mode);
-                        if output_render_fence_token.is_none()
-                            && let Some(fd) = explicit.pending_timing_fd()
-                        {
-                            *output_render_fence_token = Some(
-                                event_loop.register(fd, NativeEventSource::OutputRenderFence)?,
+            let mut direct_submitted = false;
+            if !render_ahead
+                && direct_scanout_preference.enabled()
+                && hardware_cursor.is_some()
+                && !scanout.page_flip_pending()
+                && !scanout.ready_frame_queued()
+                && !scanout.output_render_in_progress()
+                && !scanout.direct_scanout_inhibited()
+                && (render_generation_changed || pending_frame_work || redraw_requested)
+            {
+                let direct_target = match pacing_mode {
+                    NativeOutputPacingMode::ReactiveDouble => presentation_deadline
+                        .reactive_target(MonotonicTimestampNs::new(monotonic_now_ns()?)),
+                    NativeOutputPacingMode::PredictiveTriple => scheduled_presentation_target
+                        .or_else(|| {
+                            presentation_deadline.reactive_target(MonotonicTimestampNs::new(
+                                monotonic_now_ns().ok()?,
+                            ))
+                        }),
+                };
+                if let Some(direct_target) = direct_target {
+                    match scanout.try_direct_scanout(kms_backend, server, direct_target)? {
+                        DirectScanoutAttempt::Submitted { token } => {
+                            frame_scheduler
+                                .note_async_submission(token, monotonic_now_ns()?)
+                                .map_err(io::Error::other)?;
+                            frame_pacing.note_submit(
+                                token,
+                                monotonic_now_ns()?,
+                                false,
+                                pacing_mode,
                             );
-                        }
-                        frame_submitted = true;
-                        *frame_index = frame_index.saturating_add(1);
-                    }
-                    frame_pacing.log(
-                        "render_complete",
-                        vec![
-                            PacingField::u64("frame_id", frame_id),
-                            PacingField::u64("render_generation", render_generation),
-                            PacingField::u64("render_observed_at_ns", render_observed_at_ns),
-                            PacingField::u64("render_end_ns", ready_at_ns),
-                            PacingField::u64("target_vblank_sequence", frame_target.sequence),
-                            PacingField::u64(
-                                "target_presentation_ns",
-                                frame_target.presentation_time.get(),
-                            ),
-                            PacingField::bool("render_ahead", render_ahead),
-                        ],
-                    );
-                    *queued_redraw_requested = false;
-                    *last_render_generation = render_generation;
-                    *last_renderable_surfaces = server.renderable_surfaces().to_vec();
-                } else {
-                    server.capture_frame_callbacks_for_render();
-                    let cpu_before = perf
-                        .enabled()
-                        .then(NativeProcessCpuSample::read_current)
-                        .flatten();
-                    let paint_outcome = scanout.paint_server_frame(
-                        frame_renderer,
-                        server,
-                        input_state,
-                        *cursor_render_mode,
-                        &output_damage,
-                    )?;
-                    let paint_stats = paint_outcome.stats();
-                    frame_pacing.log(
-                        "render_complete",
-                        vec![
-                            frame_id_field(frame_pacing.active),
-                            PacingField::u64("render_generation", render_generation),
-                            PacingField::u64("render_observed_at_ns", render_observed_at_ns),
-                            PacingField::u64("render_end_ns", monotonic_now_ns()?),
-                            PacingField::u64("gpu_draw_us", paint_stats.gpu_draw_us),
-                            PacingField::u64("egl_swap_us", paint_stats.egl_swap_us),
-                            PacingField::u64("render_total_us", paint_stats.total_us),
-                        ],
-                    );
-                    if matches!(paint_outcome, NativePaintOutcome::Skipped(_)) {
-                        frame_scheduler.note_immediate_completion();
-                        if server.has_pending_frame_work() {
-                            server.finish_frame();
-                            frame_completed = true;
-                        }
-                        perf.log("native.frame_skip", || {
-                            let mut fields = paint_stats.fields();
-                            fields.extend(output_damage.fields());
-                            fields.extend([
-                                NativePerfField::str("reason", "renderer_no_logical_damage"),
-                                NativePerfField::bool("egl_swap_attempted", false),
-                                NativePerfField::bool("gbm_front_buffer_locked", false),
-                                NativePerfField::bool("ready_frame_created", false),
-                                NativePerfField::u64("render_generation", render_generation),
-                            ]);
-                            fields
-                        });
-                        *queued_redraw_requested = false;
-                        *last_render_generation = render_generation;
-                        *last_renderable_surfaces = server.renderable_surfaces().to_vec();
-                    } else {
-                        frame_rendered = true;
-                        let mut ready_fields = vec![
-                            frame_id_field(frame_pacing.active),
-                            PacingField::u64("render_generation", render_generation),
-                        ];
-                        ready_fields.extend(snapshot_fields(scanout.buffer_snapshot()));
-                        frame_pacing.log("ready_queued", ready_fields);
-                        let cpu_after = perf
-                            .enabled()
-                            .then(NativeProcessCpuSample::read_current)
-                            .flatten();
-                        let (cpu_user_us, cpu_system_us) = cpu_before
-                            .zip(cpu_after)
-                            .map(|(before, after)| after.delta_us_since(before))
-                            .unwrap_or((0, 0));
-                        let repaint_present_start = Instant::now();
-                        let present_result = if render_ahead {
-                            NativePresentResult::Noop
-                        } else {
-                            scanout.present(kms_backend).map_err(|error| {
-                                native_runtime_error(
-                                    NativeRuntimeStage::Present,
-                                    scanout.kind(),
-                                    target.crtc_id,
-                                    *frame_index,
-                                    error,
-                                )
-                            })?
-                        };
-                        #[cfg(test)]
-                        if !render_ahead {
-                            native_io_recorder.record(NativeIoOperation::ScanoutPresent);
-                        }
-                        let repaint_present_us = elapsed_micros(repaint_present_start);
-                        let acquire_ready_to_render_submit_us = last_acquire_ready_at_ns
-                            .map(|ready_at| {
-                                monotonic_now_ns().map(|now| now.saturating_sub(ready_at) / 1_000)
-                            })
-                            .transpose()?
-                            .unwrap_or(0);
-                        match present_result {
-                            NativePresentResult::AsyncSubmitted { token } => {
-                                server.mark_prepared_frame_submitted();
-                                #[cfg(test)]
-                                native_io_recorder.record(NativeIoOperation::PageflipSubmit);
-                                #[cfg(test)]
-                                native_io_recorder.record(match kms_backend.effective_kind() {
-                                    KmsBackendKind::Atomic => NativeIoOperation::AtomicCommit,
-                                    KmsBackendKind::Legacy => NativeIoOperation::LegacyCommit,
-                                });
-                                frame_scheduler
-                                    .note_async_submission(token, monotonic_now_ns()?)
-                                    .map_err(io::Error::other)?;
-                                frame_pacing.note_submit(
-                                    token,
-                                    monotonic_now_ns()?,
-                                    false,
-                                    pacing_mode,
-                                );
-                                frame_submitted = true;
-                            }
-                            NativePresentResult::Immediate => {
-                                frame_scheduler.note_immediate_completion();
-                                if server.has_pending_frame_work() {
-                                    let finish_frame_start = Instant::now();
-                                    server.finish_frame();
-                                    frame_completed = true;
-                                    perf.log("native.finish_frame", || {
-                                        vec![
-                                            NativePerfField::str("reason", "immediate_scanout"),
-                                            NativePerfField::u64(
-                                                "elapsed_us",
-                                                elapsed_micros(finish_frame_start),
-                                            ),
-                                            NativePerfField::usize(
-                                                "surfaces",
-                                                server.renderable_surfaces().len(),
-                                            ),
-                                            NativePerfField::u64(
-                                                "render_generation",
-                                                server.render_generation(),
-                                            ),
-                                        ]
-                                    });
-                                }
-                            }
-                            NativePresentResult::Noop => {
-                                if render_ahead {
-                                    frame_scheduler.note_render_ahead_ready();
-                                    frame_pacing.note_render_ahead_ready(monotonic_now_ns()?);
-                                } else {
-                                    return Err(io::Error::other(
-                                    "native scanout rendered a frame but did not submit or complete it",
-                                )
-                                .into());
-                                }
-                            }
-                        }
-                        if !render_ahead {
-                            server.mark_render_damage_presented();
-                        }
-                        *last_acquire_ready_at_ns = None;
-                        if !render_ahead {
+                            presentation_deadline.clear_scheduled_target();
+                            *scheduled_presentation_target = None;
+                            *last_render_generation = render_generation;
+                            *last_renderable_surfaces = server.renderable_surfaces().to_vec();
                             *frame_index = frame_index.saturating_add(1);
+                            frame_submitted = true;
+                            direct_submitted = true;
+                            perf.log("native.direct_scanout", || {
+                                vec![
+                                    NativePerfField::str("transition", "submit"),
+                                    NativePerfField::u64("token", token),
+                                    NativePerfField::u64("gpu_draw_us", 0),
+                                ]
+                            });
                         }
-                        perf.log("native.frame", || {
-                            let mut fields = paint_stats.fields();
-                            fields.extend(output_damage.fields());
-                            fields.extend([
-                                NativePerfField::u64("index", *frame_index),
-                                NativePerfField::str(
-                                    "phase",
-                                    if render_ahead {
-                                        "render-ahead"
-                                    } else {
-                                        "repaint"
-                                    },
+                        DirectScanoutAttempt::Rejected(rejection) => {
+                            perf.log("native.direct_scanout", || {
+                                vec![
+                                    NativePerfField::str("transition", "fallback"),
+                                    NativePerfField::str("rejection", rejection.as_str()),
+                                ]
+                            });
+                        }
+                        DirectScanoutAttempt::Fallback(reason) => {
+                            perf.log("native.direct_scanout", || {
+                                vec![
+                                    NativePerfField::str("transition", "fallback"),
+                                    NativePerfField::str("reason", reason),
+                                ]
+                            });
+                        }
+                    }
+                }
+            }
+            if direct_submitted {
+                frame_pacing.log(
+                    "render_complete",
+                    vec![
+                        frame_id_field(frame_pacing.active),
+                        PacingField::u64("render_generation", render_generation),
+                        PacingField::u64("gpu_draw_us", 0),
+                        PacingField::bool("direct_scanout", true),
+                    ],
+                );
+            } else {
+                frame_pacing.note_render_started(pacing_mode, render_ahead);
+                let render_observed_at_ns = monotonic_now_ns()?;
+                let mut render_begin_fields = vec![
+                    frame_id_field(frame_pacing.active),
+                    PacingField::u64("render_generation", render_generation),
+                    PacingField::u64("render_observed_at_ns", render_observed_at_ns),
+                    PacingField::bool("render_ahead", render_ahead),
+                    PacingField::str("buffering_mode", format!("{:?}", adaptive_buffering.mode())),
+                    PacingField::u64("prediction_ewma_ns", prediction.ewma_render_ns),
+                    PacingField::u64(
+                        "prediction_upper_deviation_ns",
+                        prediction.upper_render_deviation_ns,
+                    ),
+                    PacingField::u64("prediction_p90_ns", prediction.p90_recent_render_ns),
+                    PacingField::u64("prediction_render_risk_ns", prediction.render_risk_ns),
+                    PacingField::u64("dynamic_safety_margin_ns", prediction.safety_margin_ns),
+                    PacingField::u64("predicted_total_cost_ns", prediction.total_cost_ns),
+                    PacingField::u64("refresh_interval_ns", refresh_interval.as_nanos() as u64),
+                    PacingField::bool("idle_wake_guard", prediction.idle_wake_guard),
+                ];
+                render_begin_fields.extend(snapshot_fields(scanout.buffer_snapshot()));
+                frame_pacing.log("render_begin", render_begin_fields);
+                let effective_redraw_requested = redraw_requested || *queued_redraw_requested;
+                let render_cause = native_repaint_cause_label(
+                    render_generation_cause,
+                    render_generation_changed,
+                    accepted,
+                    pending_frame_work,
+                    effective_redraw_requested,
+                );
+                let output_damage = if scanout.direct_scanout_active() {
+                    NativeOutputDamage::full_output(target.width, target.height)
+                } else {
+                    native_output_damage_for_repaint(
+                        target.width,
+                        target.height,
+                        last_renderable_surfaces,
+                        server.renderable_surfaces(),
+                        render_generation_cause,
+                        render_generation_changed,
+                    )
+                };
+                let skip_empty_visible_damage = output_damage.is_empty()
+                    && render_generation_changed
+                    && accepted == 0
+                    && !effective_redraw_requested;
+                if skip_empty_visible_damage {
+                    perf.log("native.frame_skip", || {
+                        let mut fields = output_damage.fields().to_vec();
+                        fields.extend([
+                            NativePerfField::str("reason", "empty_visible_damage"),
+                            NativePerfField::usize(
+                                "skipped_input_repaints",
+                                skipped_input_repaints,
+                            ),
+                            NativePerfField::u64("tick_us", tick_us),
+                            NativePerfField::bool(
+                                "pageflip_pending_at_tick",
+                                pageflip_pending_at_tick,
+                            ),
+                            NativePerfField::u64("input_drain_us", input_drain_us),
+                            NativePerfField::usize("raw_input_events", raw_input_events),
+                            NativePerfField::usize(
+                                "coalesced_input_events",
+                                coalesced_input_events,
+                            ),
+                            NativePerfField::u64("pageflip_drain_us", pageflip_drain_us),
+                            NativePerfField::bool("pageflip_completed", pageflip_completed),
+                            NativePerfField::u64("present_us", present_us),
+                            NativePerfField::str(
+                                "kms_backend",
+                                kms_backend.effective_kind().as_str(),
+                            ),
+                            NativePerfField::u64(
+                                "pageflip_token",
+                                scanout.pending_page_flip_token().unwrap_or(0),
+                            ),
+                            NativePerfField::u64("backend_generation", *drm_file_generation),
+                            NativePerfField::u64("render_generation", render_generation),
+                            NativePerfField::str("render_cause", render_cause),
+                            NativePerfField::bool("pending_frame_work", pending_frame_work),
+                        ]);
+                        fields
+                    });
+                    if pending_frame_work {
+                        let finish_frame_start = Instant::now();
+                        server.finish_frame();
+                        perf.log("native.finish_frame", || {
+                            vec![
+                                NativePerfField::str("reason", "empty_visible_damage"),
+                                NativePerfField::u64(
+                                    "elapsed_us",
+                                    elapsed_micros(finish_frame_start),
                                 ),
-                                NativePerfField::str("mode", mode_label.clone()),
-                                NativePerfField::str("cursor", cursor_render_mode.as_str()),
-                                NativePerfField::u64("refresh_hz", u64::from(*refresh_hz)),
                                 NativePerfField::usize(
                                     "surfaces",
                                     server.renderable_surfaces().len(),
                                 ),
-                                NativePerfField::u64("render_generation", render_generation),
-                                NativePerfField::bool("render_changed", render_generation_changed),
-                                NativePerfField::str("render_cause", render_cause),
-                                NativePerfField::u64("tick_us", tick_us),
-                                NativePerfField::bool(
-                                    "pageflip_pending_at_tick",
-                                    pageflip_pending_at_tick,
-                                ),
-                                NativePerfField::u64("input_drain_us", input_drain_us),
-                                NativePerfField::usize("raw_input_events", raw_input_events),
-                                NativePerfField::usize(
-                                    "coalesced_input_events",
-                                    coalesced_input_events,
-                                ),
-                                NativePerfField::u64("pageflip_drain_us", pageflip_drain_us),
-                                NativePerfField::bool("pageflip_completed", pageflip_completed),
-                                NativePerfField::u64("present_us", present_us),
-                                NativePerfField::u64("repaint_present_us", repaint_present_us),
-                                NativePerfField::bool("render_ahead", render_ahead),
-                                NativePerfField::bool(
-                                    "render_ahead_ready",
-                                    scanout.ready_frame_queued(),
-                                ),
                                 NativePerfField::u64(
-                                    "acquire_ready_to_render_submit_us",
-                                    acquire_ready_to_render_submit_us,
+                                    "render_generation",
+                                    server.render_generation(),
                                 ),
-                                NativePerfField::u64("cpu_user_us", cpu_user_us),
-                                NativePerfField::u64("cpu_system_us", cpu_system_us),
-                                NativePerfField::bool("pending_frame_work", pending_frame_work),
-                                NativePerfField::bool("redraw_requested", redraw_requested),
-                                NativePerfField::usize(
-                                    "skipped_input_repaints",
-                                    skipped_input_repaints,
-                                ),
-                                NativePerfField::usize("accepted_clients", accepted),
-                            ]);
-                            fields
+                            ]
                         });
+                    }
+                    frame_scheduler.note_immediate_completion();
+                    *queued_redraw_requested = false;
+                    *last_render_generation = render_generation;
+                    *last_renderable_surfaces = server.renderable_surfaces().to_vec();
+                } else {
+                    if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
+                        let frame_target = match pacing_mode {
+                            NativeOutputPacingMode::ReactiveDouble => presentation_deadline
+                                .reactive_target(MonotonicTimestampNs::new(monotonic_now_ns()?)),
+                            NativeOutputPacingMode::PredictiveTriple => {
+                                scheduled_presentation_target.take().or_else(|| {
+                                    presentation_deadline.reactive_target(
+                                        MonotonicTimestampNs::new(monotonic_now_ns().ok()?),
+                                    )
+                                })
+                            }
+                        }
+                        .ok_or_else(|| {
+                            io::Error::other(
+                                "explicit Atomic render started without a presentation target",
+                            )
+                        })?;
+                        presentation_deadline.clear_scheduled_target();
+                        let frame_id = explicit.render_frame(
+                            frame_renderer,
+                            server,
+                            input_state,
+                            *cursor_render_mode,
+                            &output_damage,
+                            render_generation,
+                            frame_target,
+                            pacing_mode,
+                        )?;
+                        frame_rendered = true;
+                        let ready_at_ns = monotonic_now_ns()?;
+                        let waits_for_target = render_ahead;
+                        if waits_for_target {
+                            frame_scheduler.note_ready_frame(Some(frame_target));
+                            frame_pacing.note_ready_frame(ready_at_ns, render_ahead);
+                        } else {
+                            let token = explicit.submit_ready_frame(kms_backend, server)?;
+                            frame_scheduler
+                                .note_async_submission(token, monotonic_now_ns()?)
+                                .map_err(io::Error::other)?;
+                            frame_pacing.note_submit(
+                                token,
+                                monotonic_now_ns()?,
+                                false,
+                                pacing_mode,
+                            );
+                            if output_render_fence_token.is_none()
+                                && let Some(fd) = explicit.pending_timing_fd()
+                            {
+                                *output_render_fence_token = Some(
+                                    event_loop
+                                        .register(fd, NativeEventSource::OutputRenderFence)?,
+                                );
+                            }
+                            frame_submitted = true;
+                            *frame_index = frame_index.saturating_add(1);
+                        }
+                        frame_pacing.log(
+                            "render_complete",
+                            vec![
+                                PacingField::u64("frame_id", frame_id),
+                                PacingField::u64("render_generation", render_generation),
+                                PacingField::u64("render_observed_at_ns", render_observed_at_ns),
+                                PacingField::u64("render_end_ns", ready_at_ns),
+                                PacingField::u64("target_vblank_sequence", frame_target.sequence),
+                                PacingField::u64(
+                                    "target_presentation_ns",
+                                    frame_target.presentation_time.get(),
+                                ),
+                                PacingField::bool("render_ahead", render_ahead),
+                            ],
+                        );
                         *queued_redraw_requested = false;
                         *last_render_generation = render_generation;
                         *last_renderable_surfaces = server.renderable_surfaces().to_vec();
+                    } else {
+                        server.capture_frame_callbacks_for_render();
+                        let cpu_before = perf
+                            .enabled()
+                            .then(NativeProcessCpuSample::read_current)
+                            .flatten();
+                        let paint_outcome = scanout.paint_server_frame(
+                            frame_renderer,
+                            server,
+                            input_state,
+                            *cursor_render_mode,
+                            &output_damage,
+                        )?;
+                        let paint_stats = paint_outcome.stats();
+                        frame_pacing.log(
+                            "render_complete",
+                            vec![
+                                frame_id_field(frame_pacing.active),
+                                PacingField::u64("render_generation", render_generation),
+                                PacingField::u64("render_observed_at_ns", render_observed_at_ns),
+                                PacingField::u64("render_end_ns", monotonic_now_ns()?),
+                                PacingField::u64("gpu_draw_us", paint_stats.gpu_draw_us),
+                                PacingField::u64("egl_swap_us", paint_stats.egl_swap_us),
+                                PacingField::u64("render_total_us", paint_stats.total_us),
+                            ],
+                        );
+                        if matches!(paint_outcome, NativePaintOutcome::Skipped(_)) {
+                            frame_scheduler.note_immediate_completion();
+                            if server.has_pending_frame_work() {
+                                server.finish_frame();
+                                frame_completed = true;
+                            }
+                            perf.log("native.frame_skip", || {
+                                let mut fields = paint_stats.fields();
+                                fields.extend(output_damage.fields());
+                                fields.extend([
+                                    NativePerfField::str("reason", "renderer_no_logical_damage"),
+                                    NativePerfField::bool("egl_swap_attempted", false),
+                                    NativePerfField::bool("gbm_front_buffer_locked", false),
+                                    NativePerfField::bool("ready_frame_created", false),
+                                    NativePerfField::u64("render_generation", render_generation),
+                                ]);
+                                fields
+                            });
+                            *queued_redraw_requested = false;
+                            *last_render_generation = render_generation;
+                            *last_renderable_surfaces = server.renderable_surfaces().to_vec();
+                        } else {
+                            frame_rendered = true;
+                            let mut ready_fields = vec![
+                                frame_id_field(frame_pacing.active),
+                                PacingField::u64("render_generation", render_generation),
+                            ];
+                            ready_fields.extend(snapshot_fields(scanout.buffer_snapshot()));
+                            frame_pacing.log("ready_queued", ready_fields);
+                            let cpu_after = perf
+                                .enabled()
+                                .then(NativeProcessCpuSample::read_current)
+                                .flatten();
+                            let (cpu_user_us, cpu_system_us) = cpu_before
+                                .zip(cpu_after)
+                                .map(|(before, after)| after.delta_us_since(before))
+                                .unwrap_or((0, 0));
+                            let repaint_present_start = Instant::now();
+                            let present_result = if render_ahead {
+                                NativePresentResult::Noop
+                            } else {
+                                scanout.present(kms_backend).map_err(|error| {
+                                    native_runtime_error(
+                                        NativeRuntimeStage::Present,
+                                        scanout.kind(),
+                                        target.crtc_id,
+                                        *frame_index,
+                                        error,
+                                    )
+                                })?
+                            };
+                            #[cfg(test)]
+                            if !render_ahead {
+                                native_io_recorder.record(NativeIoOperation::ScanoutPresent);
+                            }
+                            let repaint_present_us = elapsed_micros(repaint_present_start);
+                            let acquire_ready_to_render_submit_us = last_acquire_ready_at_ns
+                                .map(|ready_at| {
+                                    monotonic_now_ns()
+                                        .map(|now| now.saturating_sub(ready_at) / 1_000)
+                                })
+                                .transpose()?
+                                .unwrap_or(0);
+                            match present_result {
+                                NativePresentResult::AsyncSubmitted { token } => {
+                                    server.mark_prepared_frame_submitted();
+                                    #[cfg(test)]
+                                    native_io_recorder.record(NativeIoOperation::PageflipSubmit);
+                                    #[cfg(test)]
+                                    native_io_recorder.record(match kms_backend.effective_kind() {
+                                        KmsBackendKind::Atomic => NativeIoOperation::AtomicCommit,
+                                        KmsBackendKind::Legacy => NativeIoOperation::LegacyCommit,
+                                    });
+                                    frame_scheduler
+                                        .note_async_submission(token, monotonic_now_ns()?)
+                                        .map_err(io::Error::other)?;
+                                    frame_pacing.note_submit(
+                                        token,
+                                        monotonic_now_ns()?,
+                                        false,
+                                        pacing_mode,
+                                    );
+                                    frame_submitted = true;
+                                }
+                                NativePresentResult::Immediate => {
+                                    frame_scheduler.note_immediate_completion();
+                                    if server.has_pending_frame_work() {
+                                        let finish_frame_start = Instant::now();
+                                        server.finish_frame();
+                                        frame_completed = true;
+                                        perf.log("native.finish_frame", || {
+                                            vec![
+                                                NativePerfField::str("reason", "immediate_scanout"),
+                                                NativePerfField::u64(
+                                                    "elapsed_us",
+                                                    elapsed_micros(finish_frame_start),
+                                                ),
+                                                NativePerfField::usize(
+                                                    "surfaces",
+                                                    server.renderable_surfaces().len(),
+                                                ),
+                                                NativePerfField::u64(
+                                                    "render_generation",
+                                                    server.render_generation(),
+                                                ),
+                                            ]
+                                        });
+                                    }
+                                }
+                                NativePresentResult::Noop => {
+                                    if render_ahead {
+                                        frame_scheduler.note_render_ahead_ready();
+                                        frame_pacing.note_render_ahead_ready(monotonic_now_ns()?);
+                                    } else {
+                                        return Err(io::Error::other(
+                                    "native scanout rendered a frame but did not submit or complete it",
+                                )
+                                .into());
+                                    }
+                                }
+                            }
+                            if !render_ahead {
+                                server.mark_render_damage_presented();
+                            }
+                            *last_acquire_ready_at_ns = None;
+                            if !render_ahead {
+                                *frame_index = frame_index.saturating_add(1);
+                            }
+                            perf.log("native.frame", || {
+                                let mut fields = paint_stats.fields();
+                                fields.extend(output_damage.fields());
+                                fields.extend([
+                                    NativePerfField::u64("index", *frame_index),
+                                    NativePerfField::str(
+                                        "phase",
+                                        if render_ahead {
+                                            "render-ahead"
+                                        } else {
+                                            "repaint"
+                                        },
+                                    ),
+                                    NativePerfField::str("mode", mode_label.clone()),
+                                    NativePerfField::str("cursor", cursor_render_mode.as_str()),
+                                    NativePerfField::u64("refresh_hz", u64::from(*refresh_hz)),
+                                    NativePerfField::usize(
+                                        "surfaces",
+                                        server.renderable_surfaces().len(),
+                                    ),
+                                    NativePerfField::u64("render_generation", render_generation),
+                                    NativePerfField::bool(
+                                        "render_changed",
+                                        render_generation_changed,
+                                    ),
+                                    NativePerfField::str("render_cause", render_cause),
+                                    NativePerfField::u64("tick_us", tick_us),
+                                    NativePerfField::bool(
+                                        "pageflip_pending_at_tick",
+                                        pageflip_pending_at_tick,
+                                    ),
+                                    NativePerfField::u64("input_drain_us", input_drain_us),
+                                    NativePerfField::usize("raw_input_events", raw_input_events),
+                                    NativePerfField::usize(
+                                        "coalesced_input_events",
+                                        coalesced_input_events,
+                                    ),
+                                    NativePerfField::u64("pageflip_drain_us", pageflip_drain_us),
+                                    NativePerfField::bool("pageflip_completed", pageflip_completed),
+                                    NativePerfField::u64("present_us", present_us),
+                                    NativePerfField::u64("repaint_present_us", repaint_present_us),
+                                    NativePerfField::bool("render_ahead", render_ahead),
+                                    NativePerfField::bool(
+                                        "render_ahead_ready",
+                                        scanout.ready_frame_queued(),
+                                    ),
+                                    NativePerfField::u64(
+                                        "acquire_ready_to_render_submit_us",
+                                        acquire_ready_to_render_submit_us,
+                                    ),
+                                    NativePerfField::u64("cpu_user_us", cpu_user_us),
+                                    NativePerfField::u64("cpu_system_us", cpu_system_us),
+                                    NativePerfField::bool("pending_frame_work", pending_frame_work),
+                                    NativePerfField::bool("redraw_requested", redraw_requested),
+                                    NativePerfField::usize(
+                                        "skipped_input_repaints",
+                                        skipped_input_repaints,
+                                    ),
+                                    NativePerfField::usize("accepted_clients", accepted),
+                                ]);
+                                fields
+                            });
+                            *queued_redraw_requested = false;
+                            *last_render_generation = render_generation;
+                            *last_renderable_surfaces = server.renderable_surfaces().to_vec();
+                        }
                     }
                 }
             }
@@ -808,7 +922,7 @@ impl NativeRuntime {
         let perf = self.perf;
         perf.log("native.scheduler", || {
             let fullscreen = self.server.fullscreen_render_plan_metrics();
-            vec![
+            let mut fields = vec![
                 NativePerfField::str("decision", format!("{scheduler_decision:?}")),
                 NativePerfField::str("state_after", format!("{:?}", self.frame_scheduler.state())),
                 NativePerfField::bool("pageflip_pending", self.frame_scheduler.page_flip_pending()),
@@ -867,7 +981,84 @@ impl NativeRuntime {
                         .map(FullscreenPresentationRejection::as_str)
                         .unwrap_or("none"),
                 ),
-            ]
+            ];
+            fields.extend([
+                NativePerfField::bool(
+                    "direct_scanout_active",
+                    self.scanout.direct_scanout_active(),
+                ),
+                NativePerfField::bool(
+                    "direct_scanout_pending",
+                    self.scanout.direct_scanout_pending(),
+                ),
+                NativePerfField::u64(
+                    "direct_scanout_surface",
+                    u64::from(self.scanout.direct_scanout_surface().unwrap_or(0)),
+                ),
+            ]);
+            if let Some((buffer, framebuffer, format, modifier)) =
+                self.scanout.direct_scanout_info()
+            {
+                fields.extend([
+                    NativePerfField::u64("direct_scanout_buffer", buffer),
+                    NativePerfField::u64("direct_scanout_framebuffer", u64::from(framebuffer)),
+                    NativePerfField::u64("direct_scanout_format", u64::from(format)),
+                    NativePerfField::u64("direct_scanout_modifier", modifier),
+                ]);
+            }
+            if let Some(counters) = self.scanout.direct_scanout_counters() {
+                fields.extend([
+                    NativePerfField::u64(
+                        "direct_scanout_candidate_checks",
+                        counters.candidate_checks,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_candidates_accepted",
+                        counters.candidates_accepted,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_import_attempts",
+                        counters.import_attempts,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_import_cache_hits",
+                        counters.import_cache_hits,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_import_failures",
+                        counters.import_failures,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_test_only_attempts",
+                        counters.test_only_attempts,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_test_only_rejections",
+                        counters.test_only_rejections,
+                    ),
+                    NativePerfField::u64("direct_scanout_submissions", counters.submissions),
+                    NativePerfField::u64("direct_scanout_presentations", counters.presentations),
+                    NativePerfField::u64("direct_scanout_entries", counters.entries),
+                    NativePerfField::u64("direct_scanout_exits", counters.exits),
+                    NativePerfField::u64(
+                        "direct_scanout_same_buffer_resubmissions",
+                        counters.same_buffer_resubmissions,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_composited_fallbacks",
+                        counters.composited_fallbacks,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_stale_candidate_rejections",
+                        counters.stale_candidate_rejections,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_cleanup_failures",
+                        counters.cleanup_failures,
+                    ),
+                ]);
+            }
+            fields
         });
         let scheduler_deadline = self.frame_scheduler.next_deadline_ns();
         let visual_deadline = visual_target_deadline_for_mode(

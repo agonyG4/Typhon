@@ -259,6 +259,19 @@ impl AtomicOutputSwapchain {
         self.next_frame_id
     }
 
+    pub(crate) fn advance_external_frame_id(&mut self, frame_id: u64) -> io::Result<()> {
+        if frame_id != self.next_frame_id {
+            return Err(io::Error::other(
+                "external frame identity does not match the output sequence",
+            ));
+        }
+        self.next_frame_id = self
+            .next_frame_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("output frame ID overflow"))?;
+        Ok(())
+    }
+
     pub(crate) const fn pool_generation(&self) -> u64 {
         self.pool_generation
     }

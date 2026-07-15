@@ -420,7 +420,6 @@ impl NativeRuntime {
                 });
             }
         }
-
         if !self.session.permits_output() {
             return Ok(NativeCycleState {
                 wakeup,
@@ -488,25 +487,44 @@ impl NativeRuntime {
                 ]
             });
         }
-        let pageflip_completed = pageflip_drain.completion.is_some();
+        let wrong_crtc_pageflip = pageflip_drain
+            .completion
+            .is_some_and(|event| event.crtc_id != target.crtc_id);
+        if wrong_crtc_pageflip {
+            *mismatched_pageflip_events = mismatched_pageflip_events.saturating_add(1);
+        }
+        let pageflip_event = pageflip_drain
+            .completion
+            .filter(|event| event.crtc_id == target.crtc_id);
+        let pageflip_completed = pageflip_event.is_some();
         let mut completed_pageflip_token = None;
         let mut frame_completed = false;
         let frame_rendered = false;
         let frame_submitted = false;
-        if let Some(pageflip) = pageflip_drain.completion {
+        if let Some(pageflip) = pageflip_event {
             completed_pageflip_token = Some(pageflip.user_data);
             let compositor_receive_ns = monotonic_now_ns()?;
             let scheduler_state_at_completion = frame_scheduler.state();
+            let direct_pending = scanout.direct_scanout_pending();
             let completion = frame_scheduler
                 .note_page_flip_completion(pageflip.user_data, compositor_receive_ns);
             if let PageFlipCompletionResult::Completed { submitted_at_ns } = completion {
                 let completed_frame_id = frame_pacing.pending;
-                let presentation = FramePresentation::synchronized(
-                    *presentation_clock,
-                    pageflip.timestamp.seconds,
-                    pageflip.timestamp.microseconds,
-                    pageflip.sequence,
-                )?;
+                let presentation = if direct_pending {
+                    FramePresentation::synchronized_zero_copy(
+                        *presentation_clock,
+                        pageflip.timestamp.seconds,
+                        pageflip.timestamp.microseconds,
+                        pageflip.sequence,
+                    )?
+                } else {
+                    FramePresentation::synchronized(
+                        *presentation_clock,
+                        pageflip.timestamp.seconds,
+                        pageflip.timestamp.microseconds,
+                        pageflip.sequence,
+                    )?
+                };
                 let compositor_receive_us = sample_clock_microseconds(*drm_timestamp_clock)?;
                 let kernel_timestamp_us = u64::from(pageflip.timestamp.seconds)
                     .saturating_mul(1_000_000)
@@ -514,7 +532,31 @@ impl NativeRuntime {
                 let receive_delay_us = compositor_receive_us.saturating_sub(kernel_timestamp_us);
                 let presented_at_ns =
                     compositor_receive_ns.saturating_sub(receive_delay_us.saturating_mul(1_000));
-                if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
+                if direct_pending {
+                    let completed = scanout.complete_direct_pageflip(
+                        PageFlipToken::new(pageflip.user_data)
+                            .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
+                        presentation,
+                        server,
+                    )?;
+                    let presented_at = MonotonicTimestampNs::new(presented_at_ns);
+                    let actual_logical_sequence =
+                        presentation_deadline.note_presented(presented_at);
+                    render_journal.note_matching_presentation(presented_at);
+                    frame_pacing.note_explicit_present(ExplicitPresentationObservation {
+                        planned_sequence: completed.prepared.target.sequence,
+                        actual_sequence: actual_logical_sequence,
+                        target_ns: completed.prepared.target.presentation_time.get(),
+                        presented_ns: presented_at_ns,
+                        composite_started_ns: completed.submit_started_at.get(),
+                        rendered_ns: completed.submit_returned_at.get(),
+                        submit_started_ns: completed.submit_started_at.get(),
+                        submit_returned_ns: completed.submit_returned_at.get(),
+                        reactive_double: completed.prepared.target.reason
+                            == PresentationTargetReason::ReactiveDouble,
+                    });
+                    *scheduled_presentation_target = None;
+                } else if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
                     if let Some(token) = output_render_fence_token.take() {
                         event_loop.unregister(token)?;
                     }
@@ -699,7 +741,6 @@ impl NativeRuntime {
             shutdown_requested: false,
         })
     }
-
     fn dispatch_runtime_seat_events(&mut self, wakeup: &NativeWakeup) -> NativeResult<()> {
         if !wakeup.reasons.seat() {
             return Ok(());
@@ -730,7 +771,6 @@ impl NativeRuntime {
         }
         Ok(())
     }
-
     fn suspend_native_session(&mut self, seat: &NativeSeatSession) -> NativeResult<()> {
         self.log_session_transition("active", "suspending", "seat_disable");
         self.perf.log("native.session_suspend", || {
@@ -754,7 +794,6 @@ impl NativeRuntime {
             .arm_deadline(self.shutdown.suspended_reactor_deadline_ns())?;
         Ok(())
     }
-
     fn resume_native_session(&mut self) -> NativeResult<()> {
         self.log_session_transition("suspended", "resuming", "seat_enable");
         let result = recover_native_output(self);
@@ -781,7 +820,6 @@ impl NativeRuntime {
         self.log_session_transition("resuming", "active", "output_recovered");
         Ok(())
     }
-
     pub(super) fn rearm_parked_acquire_watches(&mut self) -> NativeResult<()> {
         let now_ns = monotonic_now_ns()?;
         let parked = std::mem::take(&mut self.parked_acquire_watches);
@@ -807,7 +845,6 @@ impl NativeRuntime {
         }
         Ok(())
     }
-
     fn dispatch_suspended_sources(&mut self, cycle: &NativeCycleState) -> NativeResult<()> {
         service_suspended_sources(
             self,
@@ -823,7 +860,6 @@ impl NativeRuntime {
             },
         )
     }
-
     fn log_session_transition(&self, from: &str, to: &str, reason: &str) {
         self.perf.log("native.session_transition", || {
             vec![
@@ -837,7 +873,6 @@ impl NativeRuntime {
             ]
         });
     }
-
     #[allow(unused_variables)]
     fn dispatch_wayland_and_input(&mut self, cycle: &mut NativeCycleState) -> NativeResult<()> {
         if cycle.wakeup.reasons.input() {

@@ -125,6 +125,7 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) buffer_release_ids: Vec<u32>,
     pub(in crate::compositor::tests) presentation_presented_count: usize,
     pub(in crate::compositor::tests) presentation_discarded_count: usize,
+    pub(in crate::compositor::tests) presentation_feedback_event_log: Vec<(u32, &'static str)>,
     pub(in crate::compositor::tests) presentation_kind:
         Option<client_wp_presentation_feedback::Kind>,
     pub(in crate::compositor::tests) presentation_clock_id: Option<u32>,
@@ -1312,6 +1313,9 @@ impl Dispatch<client_wp_presentation_feedback::WpPresentationFeedback, ()> for R
                 ..
             } => {
                 state.presentation_presented_count += 1;
+                state
+                    .presentation_feedback_event_log
+                    .push((_proxy.id().protocol_id(), "presented"));
                 state.presentation_timestamp = Some((tv_sec_hi, tv_sec_lo, tv_nsec));
                 state.presentation_sequence = Some((seq_hi, seq_lo));
                 if let WEnum::Value(flags) = flags {
@@ -1320,6 +1324,9 @@ impl Dispatch<client_wp_presentation_feedback::WpPresentationFeedback, ()> for R
             }
             client_wp_presentation_feedback::Event::Discarded => {
                 state.presentation_discarded_count += 1;
+                state
+                    .presentation_feedback_event_log
+                    .push((_proxy.id().protocol_id(), "discarded"));
             }
             _ => {}
         }

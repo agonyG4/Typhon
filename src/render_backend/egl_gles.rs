@@ -96,6 +96,7 @@ impl EglGlesImportPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EglGlesDmabufFeedback {
     formats: Vec<EglGlesDmabufFormat>,
+    scanout_formats: Vec<EglGlesDmabufFormat>,
     format_table_formats: Vec<EglGlesDmabufFormat>,
 }
 
@@ -110,6 +111,7 @@ impl EglGlesDmabufFeedback {
         Self {
             format_table_formats: Vec::new(),
             formats,
+            scanout_formats: Vec::new(),
         }
     }
 
@@ -136,6 +138,7 @@ impl EglGlesDmabufFeedback {
         Self {
             format_table_formats: formats.clone(),
             formats,
+            scanout_formats: Vec::new(),
         }
     }
 
@@ -152,6 +155,7 @@ impl EglGlesDmabufFeedback {
         Self {
             format_table_formats: unique_formats.clone(),
             formats: unique_formats,
+            scanout_formats: Vec::new(),
         }
     }
 
@@ -164,6 +168,26 @@ impl EglGlesDmabufFeedback {
         Self {
             format_table_formats,
             formats,
+            scanout_formats: Vec::new(),
+        }
+    }
+
+    pub fn with_scanout_tranche(
+        scanout_formats: impl IntoIterator<Item = EglGlesDmabufFormat>,
+        render_formats: impl IntoIterator<Item = EglGlesDmabufFormat>,
+    ) -> Self {
+        let scanout_formats = unique_dmabuf_formats(scanout_formats);
+        let formats = unique_dmabuf_formats(render_formats);
+        let format_table_formats = unique_dmabuf_formats(
+            scanout_formats
+                .iter()
+                .copied()
+                .chain(formats.iter().copied()),
+        );
+        Self {
+            formats,
+            scanout_formats,
+            format_table_formats,
         }
     }
 
@@ -181,6 +205,10 @@ impl EglGlesDmabufFeedback {
 
     pub fn formats(&self) -> &[EglGlesDmabufFormat] {
         &self.formats
+    }
+
+    pub fn scanout_formats(&self) -> &[EglGlesDmabufFormat] {
+        &self.scanout_formats
     }
 
     pub fn format_table_formats(&self) -> &[EglGlesDmabufFormat] {
@@ -452,6 +480,19 @@ mod tests {
                 EglGlesDmabufFormat::new(DrmFormat::Xrgb8888, DrmModifier::LINEAR),
             ]
         );
+    }
+
+    #[test]
+    fn dmabuf_feedback_keeps_scanout_tranche_before_render_tranche_and_unions_table() {
+        let scanout = EglGlesDmabufFormat::new(DrmFormat::Xrgb8888, DrmModifier(7));
+        let render = EglGlesDmabufFormat::new(DrmFormat::Argb8888, DrmModifier::LINEAR);
+        let feedback = EglGlesDmabufFeedback::with_scanout_tranche([scanout, scanout], [render]);
+
+        assert_eq!(feedback.scanout_formats(), &[scanout]);
+        assert_eq!(feedback.formats(), &[render]);
+        assert_eq!(feedback.format_table_formats(), &[scanout, render]);
+        assert!(!feedback.supports(DrmFormat::Xrgb8888, DrmModifier(7)));
+        assert!(feedback.advertises(DrmFormat::Xrgb8888, DrmModifier(7)));
     }
 
     fn dmabuf_handle(format: DrmFormat, modifier: DrmModifier) -> DmabufBufferHandle {

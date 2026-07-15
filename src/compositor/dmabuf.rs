@@ -43,7 +43,7 @@ fn wl_drm_formats(feedback: &EglGlesDmabufFeedback) -> Vec<u32> {
     ];
     formats.extend(
         feedback
-            .formats()
+            .format_table_formats()
             .iter()
             .map(|format| format.format.as_fourcc()),
     );
@@ -57,7 +57,7 @@ pub(super) fn send_dmabuf_format_modifiers(
     feedback: &EglGlesDmabufFeedback,
 ) {
     let mut announced_formats = Vec::new();
-    for format in feedback.formats() {
+    for format in feedback.format_table_formats() {
         let fourcc = format.format.as_fourcc();
         if !announced_formats.contains(&fourcc) {
             dmabuf.format(fourcc);
@@ -66,7 +66,7 @@ pub(super) fn send_dmabuf_format_modifiers(
     }
 
     if dmabuf.version() >= zwp_linux_dmabuf_v1::EVT_MODIFIER_SINCE {
-        for format in feedback.formats() {
+        for format in feedback.format_table_formats() {
             let modifier = format.modifier.0;
             dmabuf.modifier(
                 format.format.as_fourcc(),
@@ -86,20 +86,25 @@ pub(super) struct DmabufFeedbackData {
     format_table: File,
     format_table_size: u32,
     main_device: u64,
-    tranche_indices: Vec<u16>,
+    tranches: Vec<(Vec<u16>, bool)>,
 }
 
 impl DmabufFeedbackData {
     pub(super) fn new(feedback: &EglGlesDmabufFeedback, main_device: u64) -> io::Result<Self> {
         let format_table_formats = feedback.format_table_formats().to_vec();
-        let formats = feedback.formats().to_vec();
-        let tranche_indices = dmabuf_tranche_indices(&format_table_formats, &formats);
+        let scanout = dmabuf_tranche_indices(&format_table_formats, feedback.scanout_formats());
+        let render = dmabuf_tranche_indices(&format_table_formats, feedback.formats());
+        let tranches = if scanout.is_empty() {
+            vec![(render, false)]
+        } else {
+            vec![(scanout, true), (render, false)]
+        };
         let (format_table, format_table_size) = dmabuf_format_table_file(&format_table_formats)?;
         Ok(Self {
             format_table,
             format_table_size,
             main_device,
-            tranche_indices,
+            tranches,
         })
     }
 }
@@ -162,19 +167,23 @@ pub(super) fn send_dmabuf_feedback(
         return;
     };
     let device = data.main_device.to_ne_bytes().to_vec();
-    let indices = data
-        .tranche_indices
-        .iter()
-        .copied()
-        .flat_map(u16::to_ne_bytes)
-        .collect::<Vec<_>>();
-
     feedback.format_table(data.format_table.as_fd(), data.format_table_size);
     feedback.main_device(device.clone());
-    feedback.tranche_target_device(device);
-    feedback.tranche_flags(zwp_linux_dmabuf_feedback_v1::TrancheFlags::empty());
-    feedback.tranche_formats(indices);
-    feedback.tranche_done();
+    for (indices, scanout) in &data.tranches {
+        let tranche_indices = indices
+            .iter()
+            .copied()
+            .flat_map(u16::to_ne_bytes)
+            .collect::<Vec<_>>();
+        feedback.tranche_target_device(device.clone());
+        feedback.tranche_flags(if *scanout {
+            zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout
+        } else {
+            zwp_linux_dmabuf_feedback_v1::TrancheFlags::empty()
+        });
+        feedback.tranche_formats(tranche_indices);
+        feedback.tranche_done();
+    }
     feedback.done();
 }
 
@@ -379,4 +388,23 @@ pub(super) struct PendingDmabufPlane {
     pub(super) offset: u32,
     pub(super) stride: u32,
     pub(super) modifier: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scanout_tranche_is_preferred_and_render_tranche_is_not_scanout() {
+        let scanout = EglGlesDmabufFormat::new(DrmFormat::Xrgb8888, DrmModifier(7));
+        let render = EglGlesDmabufFormat::new(DrmFormat::Argb8888, DrmModifier::LINEAR);
+        let feedback = EglGlesDmabufFeedback::with_scanout_tranche([scanout], [render]);
+        let data = DmabufFeedbackData::new(&feedback, 0x1234).unwrap();
+
+        assert_eq!(data.tranches.len(), 2);
+        assert!(data.tranches[0].1);
+        assert!(!data.tranches[1].1);
+        assert_eq!(data.tranches[0].0, vec![0]);
+        assert_eq!(data.tranches[1].0, vec![1]);
+    }
 }

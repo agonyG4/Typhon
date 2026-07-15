@@ -70,6 +70,7 @@ pub(crate) struct NativeRuntime {
     frame_renderer: NativeFrameRenderer,
     input_state: NativeInputState,
     cursor_preference: NativeCursorPreference,
+    direct_scanout_preference: NativeDirectScanoutPreference,
     cursor_render_mode: NativeCursorRenderMode,
     hardware_cursor: Option<NativeHardwareCursor>,
     kms: NativeDrmDevice,

@@ -470,6 +470,27 @@ fn flip_request_changes_only_primary_fb_and_preserves_token_and_flags() {
 }
 
 #[test]
+fn direct_test_only_uses_primary_framebuffer_without_modeset_or_event() {
+    let pipeline = explicit_fence_pipeline();
+    let mut request = AtomicRequest::primary_flip(
+        pipeline.plane,
+        pipeline.plane_props.fb_id,
+        FramebufferId::new(81).unwrap(),
+    )
+    .unwrap();
+    request.set_test_input_fence_none(&pipeline).unwrap();
+    let submission = AtomicSubmission::test_only(request);
+
+    assert_eq!(submission.request.assignment_count(), 2);
+    assert!(submission.flags.contains_test_only());
+    assert!(!submission.flags.contains_allow_modeset());
+    assert!(!submission.flags.contains_pageflip_event());
+    assert_eq!(submission.user_data, 0);
+    assert_eq!(submission.request.serialize().values[0], 81);
+    assert_eq!(submission.request.serialize().values[1], u64::MAX);
+}
+
+#[test]
 fn explicit_atomic_flip_serializes_fb_in_fence_and_out_fence_pointer() {
     let pipeline = explicit_fence_pipeline();
     let mut out_fence = -1i32;

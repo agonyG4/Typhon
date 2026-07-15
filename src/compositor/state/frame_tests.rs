@@ -157,6 +157,25 @@ mod frame_consumption_tests {
     }
 
     #[test]
+    fn direct_frame_batch_completion_releases_once_and_rejects_duplicate_completion() {
+        let mut state = CompositorState::default();
+        state.queue_dmabuf_buffer_release(test_dmabuf_release(25));
+        let batch = state.take_frame_batch_for_render(65);
+        let presentation =
+            FramePresentation::synchronized(state.presentation_clock, 1, 0, 1).unwrap();
+
+        state.complete_direct_presented_frame_batch(65, batch, 7, presentation);
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 1);
+        assert!(state.frame_batches.is_empty());
+
+        let duplicate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.complete_direct_presented_frame_batch(65, batch, 7, presentation);
+        }));
+        assert!(duplicate.is_err());
+        assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 1);
+    }
+
+    #[test]
     fn failed_frame_retains_release_until_safe_teardown_without_duplication() {
         let mut state = CompositorState::default();
         state.queue_dmabuf_buffer_release(test_dmabuf_release(30));

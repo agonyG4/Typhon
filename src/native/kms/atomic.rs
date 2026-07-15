@@ -539,6 +539,10 @@ impl AtomicCommitFlags {
         Self(drm_sys::DRM_MODE_ATOMIC_NONBLOCK | drm_sys::DRM_MODE_PAGE_FLIP_EVENT)
     }
 
+    pub const fn test_only_no_modeset() -> Self {
+        Self(drm_sys::DRM_MODE_ATOMIC_TEST_ONLY)
+    }
+
     pub const fn bits(self) -> u32 {
         self.0
     }
@@ -553,6 +557,10 @@ impl AtomicCommitFlags {
 
     pub const fn contains_pageflip_event(self) -> bool {
         self.0 & drm_sys::DRM_MODE_PAGE_FLIP_EVENT != 0
+    }
+
+    pub const fn contains_test_only(self) -> bool {
+        self.0 & drm_sys::DRM_MODE_ATOMIC_TEST_ONLY != 0
     }
 }
 
@@ -576,6 +584,14 @@ impl AtomicSubmission {
         Self {
             request,
             flags: AtomicCommitFlags::allow_modeset(),
+            user_data: 0,
+        }
+    }
+
+    pub fn test_only(request: AtomicRequest) -> Self {
+        Self {
+            request,
+            flags: AtomicCommitFlags::test_only_no_modeset(),
             user_data: 0,
         }
     }

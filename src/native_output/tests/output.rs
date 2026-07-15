@@ -588,6 +588,9 @@ pub(super) fn test_renderable_surface(
             vec![0; width as usize * height as usize],
         ),
         viewport_source: None,
+        viewport_destination: None,
+        buffer_scale: 1,
+        buffer_transform: wayland_server::protocol::wl_output::Transform::Normal,
         damage,
     }
 }

@@ -293,6 +293,120 @@ fn presentation_feedback_uses_injected_kernel_metadata_once() {
 }
 
 #[test]
+fn direct_presentation_feedback_is_attributed_to_the_scanned_surface() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    server.set_presentation_clock(PresentationClock::Monotonic);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let presentation: client_wp_presentation::WpPresentation =
+        globals.bind(&qh, 1..=2, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let file = create_test_shm_file(&[0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff]).unwrap();
+    let pool = shm.create_pool(file.as_fd(), 16, &qh, ());
+    let buffer = pool.create_buffer(0, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
+    let direct_surface = compositor.create_surface(&qh, ());
+    let unrelated_surface = compositor.create_surface(&qh, ());
+    let direct_callback = direct_surface.frame(&qh, ());
+    let direct_feedback = presentation.feedback(&direct_surface, &qh, ());
+    let direct_feedback_secondary = presentation.feedback(&direct_surface, &qh, ());
+    let unrelated_feedback = presentation.feedback(&unrelated_surface, &qh, ());
+    direct_surface.attach(Some(&buffer), 0, 0);
+    direct_surface.damage_buffer(0, 0, 2, 2);
+    direct_surface.commit();
+    unrelated_surface.attach(Some(&buffer), 0, 0);
+    unrelated_surface.damage_buffer(0, 0, 2, 2);
+    unrelated_surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState {
+        tracked_frame_callback_id: Some(direct_callback.id().protocol_id()),
+        ..RegistryTestState::default()
+    };
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    commands.send(ServerCommand::PrepareFrame).unwrap();
+    wait_for_server_commands(&commands);
+
+    let (batch_reply, batch_receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFrameBatch {
+            frame_id: 91,
+            reply: batch_reply,
+        })
+        .unwrap();
+    let batch_id = batch_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+    let (surface_ids_reply, surface_ids_receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFrameBatchSurfaceIds {
+            batch_id,
+            reply: surface_ids_reply,
+        })
+        .unwrap();
+    let surface_ids = surface_ids_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(surface_ids.len(), 3);
+    commands
+        .send(ServerCommand::CompleteDirectFrameBatch {
+            frame_id: 91,
+            batch_id,
+            direct_surface_id: surface_ids[0],
+            presentation: FramePresentation::synchronized_zero_copy(
+                PresentationClock::Monotonic,
+                1,
+                0,
+                1,
+            )
+            .unwrap(),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(state.presentation_presented_count, 2);
+    assert_eq!(state.presentation_discarded_count, 1);
+    assert_eq!(
+        state
+            .frame_done_callbacks
+            .iter()
+            .filter(|id| **id == direct_callback.id().protocol_id())
+            .count(),
+        1
+    );
+    assert!(
+        state
+            .presentation_feedback_event_log
+            .contains(&(direct_feedback.id().protocol_id(), "presented"))
+    );
+    assert!(
+        state
+            .presentation_feedback_event_log
+            .contains(&(direct_feedback_secondary.id().protocol_id(), "presented"))
+    );
+    assert!(
+        state
+            .presentation_feedback_event_log
+            .contains(&(unrelated_feedback.id().protocol_id(), "discarded"))
+    );
+    assert_eq!(
+        state.presentation_kind,
+        Some(
+            client_wp_presentation_feedback::Kind::Vsync
+                | client_wp_presentation_feedback::Kind::ZeroCopy,
+        )
+    );
+}
+
+#[test]
 fn presentation_global_advertises_configured_realtime_clock() {
     let socket_name = unique_socket_name();
     let mut server = OwnCompositorServer::bind(&socket_name).unwrap();

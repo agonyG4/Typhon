@@ -166,10 +166,13 @@ impl CompositorState {
         let timestamp = presentation.timestamp;
         let (tv_sec_hi, tv_sec_lo) = timestamp.protocol_seconds();
         let sequence = presentation.sequence;
-        let flags = match presentation.kind {
+        let mut flags = match presentation.kind {
             PresentationKind::Synchronized => wp_presentation_feedback::Kind::Vsync,
             PresentationKind::Software => wp_presentation_feedback::Kind::empty(),
         };
+        if presentation.zero_copy {
+            flags |= wp_presentation_feedback::Kind::ZeroCopy;
+        }
         for pending in feedbacks {
             if !pending.surface.is_alive() || presentation.clock != self.presentation_clock {
                 client_pacing_log(
@@ -218,6 +221,23 @@ impl CompositorState {
                 ],
             );
         }
+    }
+
+    fn complete_direct_presentation_feedbacks(
+        &mut self,
+        feedbacks: Vec<PendingPresentationFeedback>,
+        direct_surface_id: u32,
+        presentation: FramePresentation,
+    ) {
+        let mut direct_feedbacks = Vec::new();
+        for pending in feedbacks {
+            if pending.surface_id == direct_surface_id {
+                direct_feedbacks.push(pending);
+            } else {
+                pending.feedback.discarded();
+            }
+        }
+        self.complete_presentation_feedbacks(direct_feedbacks, presentation);
     }
 
     pub(in crate::compositor) fn take_frame_batch_for_render(
@@ -364,6 +384,53 @@ impl CompositorState {
         batch_id: CompositorFrameBatchId,
         presentation: FramePresentation,
     ) {
+        let batch = self.take_presented_frame_batch(frame_id, batch_id);
+        let batch = self.complete_frame_batch_releases(batch_id, batch);
+        self.clear_legacy_batch_reference(batch_id);
+        self.complete_frame_callbacks(batch.callbacks);
+        self.complete_presentation_feedbacks(batch.presentation_feedbacks, presentation);
+    }
+
+    pub(in crate::compositor) fn complete_direct_presented_frame_batch(
+        &mut self,
+        frame_id: u64,
+        batch_id: CompositorFrameBatchId,
+        direct_surface_id: u32,
+        presentation: FramePresentation,
+    ) {
+        let batch = self.take_presented_frame_batch(frame_id, batch_id);
+        let batch = self.complete_frame_batch_releases(batch_id, batch);
+        self.clear_legacy_batch_reference(batch_id);
+        self.complete_frame_callbacks(batch.callbacks);
+        self.complete_direct_presentation_feedbacks(
+            batch.presentation_feedbacks,
+            direct_surface_id,
+            presentation,
+        );
+    }
+
+    #[cfg(test)]
+    pub(in crate::compositor) fn test_frame_batch_presentation_surface_ids(
+        &self,
+        batch_id: CompositorFrameBatchId,
+    ) -> Vec<u32> {
+        self.frame_batches
+            .get(&batch_id)
+            .map(|batch| {
+                batch
+                    .presentation_feedbacks
+                    .iter()
+                    .map(|feedback| feedback.surface_id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn take_presented_frame_batch(
+        &mut self,
+        frame_id: u64,
+        batch_id: CompositorFrameBatchId,
+    ) -> CompositorFrameBatch {
         let registered_frame_id = self
             .frame_batches
             .get(&batch_id)
@@ -373,14 +440,9 @@ impl CompositorState {
             registered_frame_id, frame_id,
             "pageflip frame ID does not own the compositor frame batch"
         );
-        let batch = self
-            .frame_batches
+        self.frame_batches
             .remove(&batch_id)
-            .expect("compositor frame batch disappeared during completion");
-        let batch = self.complete_frame_batch_releases(batch_id, batch);
-        self.clear_legacy_batch_reference(batch_id);
-        self.complete_frame_callbacks(batch.callbacks);
-        self.complete_presentation_feedbacks(batch.presentation_feedbacks, presentation);
+            .expect("compositor frame batch disappeared during completion")
     }
 
     fn clear_legacy_batch_reference(&mut self, batch_id: CompositorFrameBatchId) {

@@ -72,7 +72,10 @@ pub(in crate::compositor) fn update_renderable_surface_buffer(
     surface.placement = placement;
     surface.generation = generation;
     surface.commit_sequence = pending.commit_sequence;
+    surface.buffer_scale = pending.buffer_scale;
+    surface.buffer_transform = pending.buffer_transform;
     surface.viewport_source = pending.viewport_source;
+    surface.viewport_destination = pending.viewport_destination;
     surface.damage = surface
         .damage
         .clone()

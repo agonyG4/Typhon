@@ -41,7 +41,8 @@ use super::protocols::versions;
 use super::{
     AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, BufferReleaseMetrics,
     ClientCursorRenderState, CompositorFrameBatchId, CompositorState, CoreComplianceMetrics,
-    ExplicitSyncPoint, FrameBatchDiscardReason, FramePresentation, FullscreenRenderPlanMetrics,
+    DirectScanoutSceneCandidate, DirectScanoutSceneRejection, ExplicitSyncPoint,
+    FrameBatchDiscardReason, FramePresentation, FullscreenRenderPlanMetrics,
     InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PointerAxisFrame,
     PresentationClock, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
     ResizeFlowMetrics, SelectionProtocolCapabilities, SubsurfaceTransactionMetrics,
@@ -344,6 +345,15 @@ impl OwnCompositorServer {
     }
 
     #[doc(hidden)]
+    pub fn capture_surface_damage_presentation_for_surface(
+        &self,
+        surface_id: u32,
+    ) -> SurfaceDamagePresentation {
+        self.state
+            .capture_surface_damage_presentation_for_surface(surface_id)
+    }
+
+    #[doc(hidden)]
     pub fn commit_surface_damage_presented(&mut self, token: SurfaceDamagePresentation) {
         self.state.commit_surface_damage_presented(token);
     }
@@ -394,6 +404,12 @@ impl OwnCompositorServer {
 
     pub fn fullscreen_render_plan_metrics(&self) -> FullscreenRenderPlanMetrics {
         self.state.fullscreen_render_plan_metrics()
+    }
+
+    pub fn direct_scanout_scene_candidate(
+        &self,
+    ) -> Result<DirectScanoutSceneCandidate, DirectScanoutSceneRejection> {
+        self.state.direct_scanout_scene_candidate()
     }
 
     pub fn has_pending_frame_callbacks(&self) -> bool {
@@ -746,6 +762,32 @@ impl OwnCompositorServer {
         self.state
             .complete_presented_frame_batch(frame_id, batch_id, presentation);
         let _ = self.display.flush_clients();
+    }
+
+    #[doc(hidden)]
+    pub fn complete_direct_presented_frame_batch(
+        &mut self,
+        frame_id: u64,
+        batch_id: CompositorFrameBatchId,
+        direct_surface_id: u32,
+        presentation: FramePresentation,
+    ) {
+        self.state.complete_direct_presented_frame_batch(
+            frame_id,
+            batch_id,
+            direct_surface_id,
+            presentation,
+        );
+        let _ = self.display.flush_clients();
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_frame_batch_presentation_surface_ids(
+        &self,
+        batch_id: CompositorFrameBatchId,
+    ) -> Vec<u32> {
+        self.state
+            .test_frame_batch_presentation_surface_ids(batch_id)
     }
 
     pub fn mark_prepared_frame_submitted(&mut self) {

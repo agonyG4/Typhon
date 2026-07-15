@@ -2,6 +2,9 @@ pub mod buffer;
 pub mod egl_gles;
 pub mod native_egl_gbm;
 
+#[cfg(test)]
+use wayland_server::protocol::wl_output;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderBackendKind {
     EglGles,
@@ -369,6 +372,9 @@ mod tests {
                 vec![0xff00_0000; 4],
             ),
             viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
             damage: RenderableSurfaceDamage::full(),
         };
         let elements = render_scene_elements_for_surfaces(std::slice::from_ref(&surface), 1.0);

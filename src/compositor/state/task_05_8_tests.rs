@@ -31,6 +31,9 @@ mod task_05_8_tests {
                 vec![0; width as usize * height as usize],
             ),
             viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
             damage: RenderableSurfaceDamage::Full,
         }
     }

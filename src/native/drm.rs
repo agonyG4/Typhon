@@ -145,6 +145,26 @@ pub fn query_drm_timestamp_clock(fd: BorrowedFd<'_>) -> io::Result<DrmTimestampC
     DrmTimestampClock::from_capability_value(capability.value)
 }
 
+pub fn prime_fd_to_handle(drm: BorrowedFd<'_>, dma_buf: BorrowedFd<'_>) -> io::Result<u32> {
+    let imported = drm_ffi::gem::fd_to_handle(drm, dma_buf)?;
+    if imported.handle == 0 {
+        return Err(io::Error::other(
+            "DRM PRIME import returned GEM handle zero",
+        ));
+    }
+    Ok(imported.handle)
+}
+
+pub fn gem_close(drm: BorrowedFd<'_>, handle: u32) -> io::Result<()> {
+    if handle == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot close GEM handle zero",
+        ));
+    }
+    drm_ffi::gem::close(drm, handle).map(|_| ())
+}
+
 pub fn sample_clock_microseconds(clock: DrmTimestampClock) -> io::Result<u64> {
     let mut time = libc::timespec {
         tv_sec: 0,

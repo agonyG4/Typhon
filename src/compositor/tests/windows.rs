@@ -987,6 +987,9 @@ fn state_with_preview_resize(
             vec![0; 944 * 502],
         ),
         viewport_source: None,
+        viewport_destination: None,
+        buffer_scale: 1,
+        buffer_transform: wl_output::Transform::Normal,
         damage: RenderableSurfaceDamage::Full,
     });
     state

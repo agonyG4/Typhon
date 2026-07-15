@@ -304,6 +304,39 @@ impl CompositorState {
         SurfaceDamagePresentation { sampled_commits }
     }
 
+    pub(in crate::compositor) fn capture_surface_damage_presentation_for_surface(
+        &self,
+        surface_id: u32,
+    ) -> SurfaceDamagePresentation {
+        let Some(generation) = self
+            .surface_presentation_generations
+            .get(&surface_id)
+            .copied()
+        else {
+            return SurfaceDamagePresentation {
+                sampled_commits: Vec::new(),
+            };
+        };
+        let Some(commit) = self
+            .surface_damage_journals
+            .get(&surface_id)
+            .map(SurfaceDamageJournal::current_commit)
+        else {
+            return SurfaceDamagePresentation {
+                sampled_commits: Vec::new(),
+            };
+        };
+        SurfaceDamagePresentation {
+            sampled_commits: vec![(
+                SurfacePresentationKey {
+                    surface_id,
+                    generation,
+                },
+                commit,
+            )],
+        }
+    }
+
     pub(in crate::compositor) fn commit_surface_damage_presented(
         &mut self,
         token: SurfaceDamagePresentation,
@@ -1373,7 +1406,6 @@ mod ordered_publication_tests {
             )],
         };
         let newer = journal.record(RenderableSurfaceDamage::Full, 100, 80);
-
         state.commit_surface_damage_presented(token);
 
         assert_eq!(sampled, SurfaceCommitCounter(10));
@@ -1383,6 +1415,42 @@ mod ordered_publication_tests {
             state.surface_damage_journals[&7].damage_since(sampled, 100, 80),
             DamageSince::Known(RenderableSurfaceDamage::Full)
         ));
+    }
+
+    #[test]
+    fn filtered_surface_damage_capture_samples_only_the_requested_surface() {
+        let mut state = CompositorState::default();
+        state.surface_presentation_generations.insert(7, 1);
+        state.surface_presentation_generations.insert(8, 1);
+        let mut direct_journal = SurfaceDamageJournal::new(4);
+        let direct_commit = direct_journal.record(RenderableSurfaceDamage::Full, 100, 80);
+        state.surface_damage_journals.insert(7, direct_journal);
+        let mut unrelated_journal = SurfaceDamageJournal::new(4);
+        unrelated_journal.record(RenderableSurfaceDamage::Full, 100, 80);
+        state.surface_damage_journals.insert(8, unrelated_journal);
+        let token = state.capture_surface_damage_presentation_for_surface(7);
+        assert_eq!(
+            token.sampled_commits,
+            vec![(
+                SurfacePresentationKey {
+                    surface_id: 7,
+                    generation: 1,
+                },
+                direct_commit,
+            )]
+        );
+        assert!(
+            state
+                .capture_surface_damage_presentation_for_surface(99)
+                .sampled_commits
+                .is_empty()
+        );
+        state.commit_surface_damage_presented(token);
+        assert_eq!(
+            state.presented_surface_commits.get(&7),
+            Some(&direct_commit)
+        );
+        assert!(!state.presented_surface_commits.contains_key(&8));
     }
 
     #[test]

@@ -417,6 +417,11 @@ impl CompositorState {
         existing.width = surface_size.width;
         existing.height = surface_size.height;
         existing.generation = generation;
+        existing.commit_sequence = commit_sequence;
+        existing.buffer_scale = buffer_scale;
+        existing.buffer_transform = current.buffer_transform;
+        existing.viewport_source = current.viewport_source;
+        existing.viewport_destination = current.viewport_destination;
         existing.damage = existing.damage.clone().union(
             damage,
             existing.buffer_size().width,

@@ -92,6 +92,7 @@ pub struct FramePresentation {
     pub timestamp: PresentationTimestamp,
     pub sequence: u64,
     pub kind: PresentationKind,
+    pub zero_copy: bool,
 }
 
 impl FramePresentation {
@@ -106,7 +107,19 @@ impl FramePresentation {
             timestamp: PresentationTimestamp::from_microseconds(u64::from(seconds), microseconds)?,
             sequence: u64::from(sequence),
             kind: PresentationKind::Synchronized,
+            zero_copy: false,
         })
+    }
+
+    pub fn synchronized_zero_copy(
+        clock: PresentationClock,
+        seconds: u32,
+        microseconds: u32,
+        sequence: u32,
+    ) -> io::Result<Self> {
+        let mut presentation = Self::synchronized(clock, seconds, microseconds, sequence)?;
+        presentation.zero_copy = true;
+        Ok(presentation)
     }
 
     pub fn software_now(clock: PresentationClock) -> io::Result<Self> {
@@ -115,6 +128,7 @@ impl FramePresentation {
             timestamp: PresentationTimestamp::from_clock(clock)?,
             sequence: 0,
             kind: PresentationKind::Software,
+            zero_copy: false,
         })
     }
 }
@@ -154,6 +168,18 @@ mod tests {
         let timestamp = PresentationTimestamp::from_microseconds(u64::MAX, 0).unwrap();
 
         assert_eq!(timestamp.protocol_seconds(), (u32::MAX, u32::MAX));
+    }
+
+    #[test]
+    fn direct_presentation_is_zero_copy_but_composited_presentation_is_not() {
+        let direct =
+            FramePresentation::synchronized_zero_copy(PresentationClock::Monotonic, 1, 0, 1)
+                .unwrap();
+        let composited =
+            FramePresentation::synchronized(PresentationClock::Monotonic, 1, 0, 2).unwrap();
+
+        assert!(direct.zero_copy);
+        assert!(!composited.zero_copy);
     }
 
     #[test]
