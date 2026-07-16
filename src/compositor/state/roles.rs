@@ -467,7 +467,7 @@ impl CompositorState {
         lifecycle
             .live_instance
             .map(LiveRoleInstance::surface_role)
-            .or_else(|| match lifecycle.permanent {
+            .or(match lifecycle.permanent {
                 Some(PermanentSurfaceRole::DragIcon) => Some(SurfaceRole::DragIcon),
                 Some(PermanentSurfaceRole::Xwayland) => Some(SurfaceRole::Xwayland),
                 _ => None,
