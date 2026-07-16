@@ -269,6 +269,26 @@ fn ensure_socket_directory(path: &Path) -> io::Result<()> {
                 ),
             ));
         }
+        let uid = unsafe { libc::geteuid() } as u32;
+        if metadata.uid() != uid && metadata.uid() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "X11 socket directory has an unexpected owner: {}",
+                    path.display()
+                ),
+            ));
+        }
+        let mode = metadata.mode();
+        if mode & 0o002 != 0 && mode & 0o1000 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "X11 socket directory is world-writable without sticky bit: {}",
+                    path.display()
+                ),
+            ));
+        }
         return Ok(());
     }
     fs::create_dir_all(path)?;
@@ -386,9 +406,15 @@ fn abstract_socket_name(directory: &Path, display_number: u32) -> Vec<u8> {
 fn abstract_sockaddr(
     directory: &Path,
     display_number: u32,
-) -> (libc::sockaddr_un, libc::socklen_t) {
+) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
     let name = abstract_socket_name(directory, display_number);
     let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    if name.contains(&0) || name.len().saturating_add(1) >= address.sun_path.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "XWayland abstract socket name is too long or contains NUL",
+        ));
+    }
     address.sun_family = libc::AF_UNIX as libc::sa_family_t;
     address.sun_path[0] = 0;
     for (index, byte) in name.iter().enumerate() {
@@ -396,8 +422,13 @@ fn abstract_sockaddr(
     }
     let length = (std::mem::size_of::<libc::sa_family_t>() + 1 + name.len())
         .try_into()
-        .expect("abstract socket address fits socklen_t");
-    (address, length)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "abstract socket length overflow",
+            )
+        })?;
+    Ok((address, length))
 }
 
 fn bind_abstract_listener(directory: &Path, display_number: u32) -> io::Result<UnixListener> {
@@ -411,7 +442,7 @@ fn bind_abstract_listener(directory: &Path, display_number: u32) -> io::Result<U
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    let (address, length) = abstract_sockaddr(directory, display_number);
+    let (address, length) = abstract_sockaddr(directory, display_number)?;
     let result = unsafe { libc::bind(fd, (&address as *const libc::sockaddr_un).cast(), length) };
     if result < 0 {
         let error = io::Error::last_os_error();
@@ -435,7 +466,7 @@ pub(crate) fn connect_abstract_socket_for_tests(
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    let (address, length) = abstract_sockaddr(directory, display_number);
+    let (address, length) = abstract_sockaddr(directory, display_number)?;
     let result =
         unsafe { libc::connect(fd, (&address as *const libc::sockaddr_un).cast(), length) };
     let error = if result < 0 {

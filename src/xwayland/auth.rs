@@ -26,10 +26,18 @@ pub(crate) fn create_auth_file(directory: &Path, display_number: u32) -> io::Res
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .mode(0o600);
     let mut file = file.open(&path)?;
-    file.write_all(&authority_record(display_number, &cookie))?;
-    file.flush()?;
-    file.sync_all()?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    let result = (|| {
+        file.write_all(&authority_record(display_number, &cookie))?;
+        file.flush()?;
+        file.sync_all()?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        Ok::<(), io::Error>(())
+    })();
+    if let Err(error) = result {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
     Ok(AuthFile { path, cookie })
 }
 
