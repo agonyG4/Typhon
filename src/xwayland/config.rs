@@ -7,6 +7,19 @@ pub enum XwaylandMode {
     BaseEager,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XwaylandStartPolicy {
+    Off,
+    Lazy,
+    Eager,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XwaylandProfile {
+    Foundation,
+    Managed,
+}
+
 impl XwaylandMode {
     pub fn parse(value: Option<&str>) -> Self {
         match value {
@@ -27,11 +40,20 @@ impl XwaylandMode {
     pub const fn is_eager(self) -> bool {
         matches!(self, Self::BaseEager)
     }
+
+    pub const fn start_policy(self) -> XwaylandStartPolicy {
+        match self {
+            Self::Off => XwaylandStartPolicy::Off,
+            Self::BaseLazy => XwaylandStartPolicy::Lazy,
+            Self::BaseEager => XwaylandStartPolicy::Eager,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XwaylandConfig {
     pub mode: XwaylandMode,
+    pub profile: XwaylandProfile,
     pub binary: PathBuf,
     pub display_min: u32,
     pub display_max: u32,
@@ -43,6 +65,7 @@ impl XwaylandConfig {
     pub fn from_environment() -> Self {
         Self {
             mode: XwaylandMode::parse(env::var("TYPHON_XWAYLAND").ok().as_deref()),
+            profile: XwaylandProfile::Foundation,
             binary: env::var_os("TYPHON_XWAYLAND_BINARY")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("Xwayland")),
@@ -57,6 +80,7 @@ impl XwaylandConfig {
     pub fn for_tests(mode: XwaylandMode, binary: PathBuf) -> Self {
         Self {
             mode,
+            profile: XwaylandProfile::Foundation,
             binary,
             display_min: 0,
             display_max: 63,
@@ -68,6 +92,7 @@ impl XwaylandConfig {
     pub fn for_tests_at_root(mode: XwaylandMode, binary: PathBuf, root: PathBuf) -> Self {
         Self {
             mode,
+            profile: XwaylandProfile::Foundation,
             binary,
             display_min: 0,
             display_max: 63,

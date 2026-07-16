@@ -19,6 +19,7 @@ use super::{
     launch::{ChildFdTarget, build_command},
     metrics::XwaylandMetrics,
     next_nonzero,
+    xwm::Xwm,
 };
 
 const DISPLAYFD_MAX_BYTES: usize = 32;
@@ -32,6 +33,7 @@ pub enum XwaylandStateKind {
     Armed,
     Starting,
     RunningBase,
+    Running,
     Backoff,
     Failed,
 }
@@ -56,7 +58,7 @@ struct StartingResources {
     process: SpawnedProcess,
     displayfd: OwnedFd,
     private_wayland: Option<UnixStream>,
-    wm: UnixStream,
+    wm: Option<UnixStream>,
     display_ready: bool,
     shell_ready: bool,
     displayfd_bytes: Vec<u8>,
@@ -65,12 +67,19 @@ struct StartingResources {
 }
 
 #[derive(Debug)]
+struct RunningBaseResources {
+    generation: XwaylandGeneration,
+    process: SpawnedProcess,
+    private_wayland: Option<UnixStream>,
+    _wm: Option<UnixStream>,
+}
+
+#[derive(Debug)]
 struct RunningResources {
     generation: XwaylandGeneration,
     process: SpawnedProcess,
     private_wayland: Option<UnixStream>,
-    #[allow(dead_code)]
-    wm: UnixStream,
+    xwm: Xwm,
 }
 
 #[derive(Debug)]
@@ -78,7 +87,8 @@ enum ServiceState {
     Disabled,
     Armed,
     Starting(StartingResources),
-    RunningBase(RunningResources),
+    RunningBase(RunningBaseResources),
+    Running(Box<RunningResources>),
     Backoff { deadline_ns: u64 },
     Failed,
 }
@@ -161,6 +171,7 @@ impl XwaylandService {
             ServiceState::Armed => XwaylandStateKind::Armed,
             ServiceState::Starting(_) => XwaylandStateKind::Starting,
             ServiceState::RunningBase(_) => XwaylandStateKind::RunningBase,
+            ServiceState::Running(_) => XwaylandStateKind::Running,
             ServiceState::Backoff { .. } => XwaylandStateKind::Backoff,
             ServiceState::Failed => XwaylandStateKind::Failed,
         }
@@ -212,6 +223,7 @@ impl XwaylandService {
             ServiceState::Disabled
             | ServiceState::Armed
             | ServiceState::RunningBase(_)
+            | ServiceState::Running(_)
             | ServiceState::Failed => None,
         }
     }
@@ -220,10 +232,20 @@ impl XwaylandService {
         match self.state {
             ServiceState::Starting(ref resources) => Some(resources.generation),
             ServiceState::RunningBase(ref resources) => Some(resources.generation),
+            ServiceState::Running(ref resources) => Some(resources.generation),
             ServiceState::Disabled
             | ServiceState::Armed
             | ServiceState::Backoff { .. }
             | ServiceState::Failed => None,
+        }
+    }
+
+    pub fn managed_xwm_fd(&self, generation: XwaylandGeneration) -> Option<RawFd> {
+        match &self.state {
+            ServiceState::Running(resources) if resources.generation == generation => {
+                Some(resources.xwm.raw_fd())
+            }
+            _ => None,
         }
     }
 
@@ -240,6 +262,9 @@ impl XwaylandService {
                 resources.private_wayland.take()
             }
             ServiceState::RunningBase(resources) if resources.generation == generation => {
+                resources.private_wayland.take()
+            }
+            ServiceState::Running(resources) if resources.generation == generation => {
                 resources.private_wayland.take()
             }
             _ => None,
@@ -259,6 +284,7 @@ impl XwaylandService {
         let process_id = match &self.state {
             ServiceState::Starting(resources) => Some(resources.process.id),
             ServiceState::RunningBase(resources) => Some(resources.process.id),
+            ServiceState::Running(resources) => Some(resources.process.id),
             _ => None,
         };
         if let Some(process_id) = process_id {
@@ -350,7 +376,7 @@ impl XwaylandService {
             process,
             displayfd,
             private_wayland: Some(private_wayland),
-            wm,
+            wm: Some(wm),
             display_ready: false,
             shell_ready: false,
             displayfd_bytes: Vec::new(),
@@ -525,7 +551,7 @@ impl XwaylandService {
             &self.state,
             ServiceState::Starting(resources) if resources.display_ready && resources.shell_ready
         );
-        if !ready {
+        if !ready || self.config.profile == super::config::XwaylandProfile::Managed {
             return;
         }
         let ServiceState::Starting(resources) =
@@ -533,11 +559,11 @@ impl XwaylandService {
         else {
             unreachable!("readiness state changed while promoting XWayland")
         };
-        self.state = ServiceState::RunningBase(RunningResources {
+        self.state = ServiceState::RunningBase(RunningBaseResources {
             generation: resources.generation,
             process: resources.process,
             private_wayland: resources.private_wayland,
-            wm: resources.wm,
+            _wm: resources.wm,
         });
         self.metrics.startup_duration_ns = now_ns()
             .ok()
@@ -552,10 +578,76 @@ impl XwaylandService {
         self.log_state_transition();
     }
 
+    /// Complete the managed profile's XWM half of the readiness transaction.
+    ///
+    /// Foundation mode intentionally never calls this path.  The WM socket is
+    /// moved into `Xwm`; the service retains no duplicate endpoint.
+    pub fn initialize_managed_xwm(
+        &mut self,
+        generation: XwaylandGeneration,
+        supervisor: &mut ChildSupervisor,
+    ) -> io::Result<()> {
+        if self.config.profile != super::config::XwaylandProfile::Managed {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "managed XWM requested for foundation profile",
+            ));
+        }
+        let ServiceState::Starting(mut resources) =
+            std::mem::replace(&mut self.state, ServiceState::Disabled)
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "managed XWM requested outside XWayland startup",
+            ));
+        };
+        let ready = resources.generation == generation
+            && resources.display_ready
+            && resources.shell_ready
+            && self
+                .private_client
+                .as_ref()
+                .is_some_and(|(client_generation, _)| *client_generation == generation);
+        if !ready {
+            self.state = ServiceState::Starting(resources);
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "managed XWM readiness barrier is incomplete",
+            ));
+        }
+        let Some(wm_stream) = resources.wm.take() else {
+            let error = io::Error::other("managed XWM stream was already transferred");
+            self.state = ServiceState::Starting(resources);
+            return self.fail_generation(supervisor, error);
+        };
+        let process_id = resources.process.id;
+        match Xwm::connect(generation, wm_stream) {
+            Ok(xwm) => {
+                self.state = ServiceState::Running(Box::new(RunningResources {
+                    generation: resources.generation,
+                    process: resources.process,
+                    private_wayland: resources.private_wayland,
+                    xwm,
+                }));
+                self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
+                self.log_state_transition();
+                Ok(())
+            }
+            Err(error) => {
+                let error = io::Error::other(error);
+                self.state = ServiceState::Starting(resources);
+                self.kill_process_now(supervisor, process_id)?;
+                self.enter_backoff(now_ns()?);
+                Err(error)
+            }
+        }
+    }
+
     pub fn handle_process_exit(&mut self, exit: &ChildExit) -> io::Result<bool> {
         let process = match &self.state {
             ServiceState::Starting(resources) => resources.process,
             ServiceState::RunningBase(resources) => resources.process,
+            ServiceState::Running(resources) => resources.process,
             _ => return Ok(false),
         };
         if process.id != exit.id {
@@ -639,6 +731,7 @@ impl XwaylandService {
         let process_id = match &self.state {
             ServiceState::Starting(resources) => Some(resources.process.id),
             ServiceState::RunningBase(resources) => Some(resources.process.id),
+            ServiceState::Running(resources) => Some(resources.process.id),
             ServiceState::Disabled
             | ServiceState::Armed
             | ServiceState::Backoff { .. }

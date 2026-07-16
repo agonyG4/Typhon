@@ -1,5 +1,4 @@
 use super::*;
-
 impl CompositorState {
     pub(in crate::compositor) fn allocate_surface_commit_sequence(
         &mut self,
@@ -7,7 +6,6 @@ impl CompositorState {
         self.next_surface_commit_sequence = self.next_surface_commit_sequence.saturating_add(1);
         SurfaceCommitSequence(self.next_surface_commit_sequence)
     }
-
     pub(in crate::compositor) fn record_surface_commit_received(
         &mut self,
         surface_id: u32,
@@ -24,7 +22,6 @@ impl CompositorState {
             );
         }
     }
-
     pub(in crate::compositor) fn surface_publication_decision(
         &self,
         surface_id: u32,
@@ -49,7 +46,6 @@ impl CompositorState {
         }
         SurfacePublicationDecision::Publish
     }
-
     pub(in crate::compositor) fn record_surface_publication(
         &mut self,
         surface_id: u32,
@@ -99,7 +95,6 @@ impl CompositorState {
             );
         }
     }
-
     pub(in crate::compositor) fn record_surface_publication_rejection(
         &mut self,
         surface_id: u32,
@@ -156,7 +151,6 @@ impl CompositorState {
             );
         }
     }
-
     pub(in crate::compositor) fn supersede_older_pending_attachments_for_surface(
         &mut self,
         surface_id: u32,
@@ -268,7 +262,6 @@ impl CompositorState {
         self.pending_surface_tree_transactions = retained_trees;
         callbacks
     }
-
     pub(in crate::compositor) fn capture_surface_damage_presentation(
         &self,
     ) -> SurfaceDamagePresentation {
@@ -303,7 +296,6 @@ impl CompositorState {
         }
         SurfaceDamagePresentation { sampled_commits }
     }
-
     pub(in crate::compositor) fn capture_surface_damage_presentation_for_surface(
         &self,
         surface_id: u32,
@@ -336,7 +328,6 @@ impl CompositorState {
             )],
         }
     }
-
     pub(in crate::compositor) fn commit_surface_damage_presented(
         &mut self,
         token: SurfaceDamagePresentation,
@@ -377,7 +368,6 @@ impl CompositorState {
             }
         }
     }
-
     pub(in crate::compositor) fn mark_render_damage_presented(&mut self) {
         let token = self.capture_surface_damage_presentation();
         self.commit_surface_damage_presented(token);
