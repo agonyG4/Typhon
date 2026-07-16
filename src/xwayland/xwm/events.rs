@@ -7,7 +7,7 @@ use x11rb::{
 use super::{
     X11ConfigureRequest, X11Geometry, X11StackMode, X11StateAction, X11StateAtom, X11StateRequest,
     X11WindowHandle, Xwm, XwmDrain, XwmError, XwmEvent, atoms::XwmAtomName,
-    window::X11WindowLifecycle,
+    properties::PropertyKind, window::X11WindowLifecycle,
 };
 
 pub(crate) fn drain(xwm: &mut Xwm, budget: usize) -> Result<XwmDrain, XwmError> {
@@ -67,9 +67,11 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                     .map_err(XwmError::InvalidCommand)?;
                 return Ok(());
             }
-            if xwm.windows.get(handle).is_some_and(|record| {
-                record.snapshot.is_some() && record.lifecycle == X11WindowLifecycle::Mapped
-            }) {
+            if xwm
+                .windows
+                .confirm_external_map_notify(handle)
+                .map_err(XwmError::InvalidCommand)?
+            {
                 return Ok(());
             }
             xwm.cancel_window_properties(handle);
@@ -218,24 +220,16 @@ fn normalize_property_change(
     if !xwm.windows.contains(handle) {
         return Ok(());
     }
-    let known = [
-        XwmAtomName::NetWmName,
-        XwmAtomName::WmName,
-        XwmAtomName::WmClass,
-        XwmAtomName::NetWmPid,
-        XwmAtomName::NetWmWindowType,
-        XwmAtomName::WmTransientFor,
-        XwmAtomName::WmNormalHints,
-        XwmAtomName::WmHints,
-        XwmAtomName::WmProtocols,
-        XwmAtomName::NetWmSyncRequestCounter,
-        XwmAtomName::NetWmState,
-        XwmAtomName::MotifWmHints,
-    ];
-    if known.iter().any(|name| xwm.atoms.get(*name) == event.atom) {
-        xwm.refresh_window_properties(handle)?;
+    if let Some(kind) = property_kind_for_atom(xwm, event.atom) {
+        xwm.refresh_window_property(handle, kind)?;
     }
     Ok(())
+}
+
+fn property_kind_for_atom(xwm: &Xwm, atom: u32) -> Option<PropertyKind> {
+    PropertyKind::ALL
+        .into_iter()
+        .find(|kind| kind.atom(xwm) == atom)
 }
 
 #[allow(dead_code)]

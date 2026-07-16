@@ -28,8 +28,13 @@ pub(crate) struct X11WindowRecord {
     pub(crate) buffer_ready: bool,
     pub(crate) map_operation_pending: bool,
     pub(crate) properties: X11PropertySnapshot,
+    pub(crate) staging_properties: X11PropertySnapshot,
     pub(crate) properties_ready: bool,
     pub(crate) resolved_properties: u16,
+    pub(crate) pending_properties: u16,
+    pub(crate) dirty_properties: u16,
+    pub(crate) refresh_properties: u16,
+    pub(crate) refresh_all: bool,
     pub(crate) property_epoch: u64,
 }
 
@@ -86,8 +91,13 @@ impl X11WindowRegistry {
                 buffer_ready: false,
                 map_operation_pending: false,
                 properties: X11PropertySnapshot::default(),
+                staging_properties: X11PropertySnapshot::default(),
                 properties_ready: true,
                 resolved_properties: u16::MAX,
+                pending_properties: 0,
+                dirty_properties: 0,
+                refresh_properties: 0,
+                refresh_all: false,
                 property_epoch: 0,
             },
         );
@@ -115,8 +125,13 @@ impl X11WindowRegistry {
                 buffer_ready: false,
                 map_operation_pending: false,
                 properties: X11PropertySnapshot::default(),
+                staging_properties: X11PropertySnapshot::default(),
                 properties_ready: false,
                 resolved_properties: 0,
+                pending_properties: 0,
+                dirty_properties: 0,
+                refresh_properties: 0,
+                refresh_all: false,
                 property_epoch: 0,
             },
         );
@@ -129,6 +144,18 @@ impl X11WindowRegistry {
         }
         let kind = snapshot.kind;
         let geometry = snapshot.geometry;
+        let properties = X11PropertySnapshot {
+            title: snapshot.metadata.title.clone(),
+            app_id: snapshot.metadata.app_id.clone(),
+            pid: snapshot.metadata.pid,
+            constraints: snapshot.constraints,
+            state: snapshot.state,
+            transient_for: snapshot.transient_for,
+            supports_delete: snapshot.supports_delete,
+            supports_take_focus: snapshot.supports_take_focus,
+            sync_counter: snapshot.sync_counter,
+            ..X11PropertySnapshot::default()
+        };
         self.records.insert(
             snapshot.handle,
             X11WindowRecord {
@@ -140,20 +167,14 @@ impl X11WindowRegistry {
                 association: None,
                 buffer_ready: true,
                 map_operation_pending: false,
-                properties: X11PropertySnapshot {
-                    title: snapshot.metadata.title.clone(),
-                    app_id: snapshot.metadata.app_id.clone(),
-                    pid: snapshot.metadata.pid,
-                    constraints: snapshot.constraints,
-                    state: snapshot.state,
-                    transient_for: snapshot.transient_for,
-                    supports_delete: snapshot.supports_delete,
-                    supports_take_focus: snapshot.supports_take_focus,
-                    sync_counter: snapshot.sync_counter,
-                    ..X11PropertySnapshot::default()
-                },
+                properties: properties.clone(),
+                staging_properties: properties,
                 properties_ready: true,
                 resolved_properties: u16::MAX,
+                pending_properties: 0,
+                dirty_properties: 0,
+                refresh_properties: 0,
+                refresh_all: false,
                 property_epoch: 0,
             },
         );
@@ -300,6 +321,23 @@ impl X11WindowRegistry {
             return Err("map operation has no ready snapshot");
         }
         record.map_operation_pending = false;
+        record.lifecycle = X11WindowLifecycle::Mapped;
+        Ok(true)
+    }
+
+    pub(crate) fn confirm_external_map_notify(
+        &mut self,
+        handle: X11WindowHandle,
+    ) -> Result<bool, &'static str> {
+        let record = self.record_mut(handle)?;
+        if record.snapshot.is_none()
+            || !matches!(
+                record.lifecycle,
+                X11WindowLifecycle::Ready | X11WindowLifecycle::Mapped
+            )
+        {
+            return Ok(false);
+        }
         record.lifecycle = X11WindowLifecycle::Mapped;
         Ok(true)
     }

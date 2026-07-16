@@ -351,6 +351,14 @@ impl Xwm {
         properties::begin_refresh(self, handle, false)
     }
 
+    pub(crate) fn refresh_window_property(
+        &mut self,
+        handle: X11WindowHandle,
+        kind: properties::PropertyKind,
+    ) -> Result<(), XwmError> {
+        properties::refresh_property(self, handle, kind)
+    }
+
     pub(crate) fn cancel_window_properties(&mut self, handle: X11WindowHandle) {
         properties::cancel(self, handle);
     }
