@@ -1,13 +1,14 @@
 #![allow(dead_code)]
 
-use super::desktop_window::{WindowBackend, WindowId};
+use super::{ToplevelMode, WindowBackend, WindowGeometry, WindowId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowBackendCommand {
     Configure {
         window: WindowId,
-        width: u32,
-        height: u32,
+        geometry: WindowGeometry,
+        mode: ToplevelMode,
+        resizing: bool,
     },
     Close {
         window: WindowId,

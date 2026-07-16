@@ -582,6 +582,8 @@ impl CompositorState {
             });
         }
         self.focused_surface = Some(surface.clone());
+        self.focused_window_id =
+            self.window_id_for_surface(self.root_surface_id_for_surface(new_surface_id));
         self.ensure_keyboard_focus(&surface);
         self.apply_pending_pointer_constraint_state_for_surface(new_surface_id);
         if !self
@@ -1306,6 +1308,7 @@ impl CompositorState {
             .is_some_and(|surface| compositor_surface_id(surface) == surface_id)
         {
             self.focused_surface = None;
+            self.focused_window_id = None;
             focus_debug_log(|| format!("focus_leave reason=surface_destroyed old={surface_id}"));
         }
 

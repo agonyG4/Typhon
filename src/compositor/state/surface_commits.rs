@@ -993,6 +993,7 @@ impl CompositorState {
             .is_some_and(|surface| removed_surface_ids.contains(&compositor_surface_id(surface)))
         {
             self.focused_surface = None;
+            self.focused_window_id = None;
             if self.keyboard_surface.as_ref().is_some_and(|surface| {
                 removed_surface_ids.contains(&compositor_surface_id(surface))
             }) {
@@ -1060,6 +1061,7 @@ impl CompositorState {
             .is_some_and(|surface| removed_surface_ids.contains(&compositor_surface_id(surface)))
         {
             self.focused_surface = None;
+            self.focused_window_id = None;
             if self.keyboard_surface.as_ref().is_some_and(|surface| {
                 removed_surface_ids.contains(&compositor_surface_id(surface))
             }) {

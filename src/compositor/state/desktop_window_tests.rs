@@ -86,3 +86,21 @@ fn failed_role_creation_leaves_no_partial_desktop_window() {
     assert!(state.window(second).is_none());
     assert_eq!(state.window_id_for_surface(9), Some(first));
 }
+
+#[test]
+fn window_stacking_uses_stable_ids() {
+    let mut state = CompositorState::new(None);
+    let first = state.allocate_window_id().expect("first id");
+    let second = state.allocate_window_id().expect("second id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(first, 10))
+        .expect("insert first");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(second, 20))
+        .expect("insert second");
+
+    assert_eq!(state.window_stacking, vec![first, second]);
+    assert!(state.raise_window_id(first));
+    assert_eq!(state.window_stacking, vec![second, first]);
+    assert_eq!(state.window(first).expect("first").root_surface_id, 10);
+}

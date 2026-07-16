@@ -57,6 +57,7 @@ impl CompositorState {
         }
         self.window_by_root_surface
             .insert(window.root_surface_id, window.id);
+        self.window_stacking.push(window.id);
         self.desktop_windows.insert(window.id, window);
         Ok(())
     }
@@ -67,7 +68,17 @@ impl CompositorState {
     ) -> Option<DesktopWindow> {
         let window = self.desktop_windows.remove(&id)?;
         self.window_by_root_surface.remove(&window.root_surface_id);
+        self.window_stacking.retain(|window_id| *window_id != id);
         Some(window)
+    }
+
+    pub(in crate::compositor) fn raise_window_id(&mut self, id: WindowId) -> bool {
+        if !self.desktop_windows.contains_key(&id) {
+            return false;
+        }
+        self.window_stacking.retain(|window_id| *window_id != id);
+        self.window_stacking.push(id);
+        true
     }
 
     pub(in crate::compositor) fn window_id_for_surface(&self, surface_id: u32) -> Option<WindowId> {

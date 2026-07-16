@@ -335,6 +335,7 @@ impl CompositorState {
                 self.focus_surface(parent_surface);
             } else {
                 self.focused_surface = None;
+                self.focused_window_id = None;
                 if self
                     .keyboard_surface
                     .as_ref()
@@ -986,6 +987,7 @@ impl CompositorState {
         }
         if self.focused_root_surface_id() == Some(surface_id) {
             self.focused_surface = None;
+            self.focused_window_id = None;
             self.clear_keyboard_focus();
             if self.pointer_surface.as_ref().is_some_and(|surface| {
                 self.root_surface_id_for_surface(compositor_surface_id(surface)) == surface_id
@@ -1117,6 +1119,11 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn focused_root_surface_id(&self) -> Option<u32> {
+        if let Some(window_id) = self.focused_window_id
+            && let Some(window) = self.window(window_id)
+        {
+            return Some(window.root_surface_id);
+        }
         self.focused_surface
             .as_ref()
             .map(|surface| self.root_surface_id_for_surface(compositor_surface_id(surface)))
@@ -1178,10 +1185,11 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn focus_topmost_renderable_toplevel(&mut self) -> bool {
-        let Some(surface_id) = self.renderable_surfaces.iter().rev().find_map(|surface| {
-            let root_surface_id = self.root_surface_id_for_surface(surface.surface_id);
-            self.toplevel_surfaces
-                .contains_key(&root_surface_id)
+        let Some(surface_id) = self.window_stacking.iter().rev().find_map(|window_id| {
+            let root_surface_id = self.window(*window_id)?.root_surface_id;
+            self.renderable_surfaces
+                .iter()
+                .any(|surface| surface.surface_id == root_surface_id)
                 .then_some(root_surface_id)
         }) else {
             return false;
@@ -1194,6 +1202,9 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn raise_root_window(&mut self, surface_id: u32) -> bool {
+        if let Some(window_id) = self.window_id_for_surface(surface_id) {
+            let _ = self.raise_window_id(window_id);
+        }
         let surface_placements = &self.surface_placements;
         let mut raised_surfaces = Vec::new();
         let mut lower_surfaces = Vec::with_capacity(self.renderable_surfaces.len());
