@@ -4,8 +4,6 @@ use std::{
     num::NonZeroU64,
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
     os::unix::net::UnixStream,
-    path::PathBuf,
-    process::Command,
 };
 use wayland_server::backend::ClientId;
 
@@ -16,7 +14,11 @@ use crate::process::{
 
 use super::{
     XwaylandAppEnvironment, XwaylandAssociationEvent, XwaylandGeneration, XwaylandMode,
-    config::XwaylandConfig, display::DisplayLease, metrics::XwaylandMetrics, next_nonzero,
+    config::XwaylandConfig,
+    display::DisplayLease,
+    launch::{ChildFdTarget, build_command},
+    metrics::XwaylandMetrics,
+    next_nonzero,
 };
 
 const DISPLAYFD_MAX_BYTES: usize = 32;
@@ -683,56 +685,6 @@ impl XwaylandService {
         self.metrics.generations_started = self.metrics.generations_started.saturating_add(1);
         next_nonzero(&mut self.next_generation)
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ChildFdTarget {
-    WaylandSocket,
-    Wm,
-    DisplayFd,
-    FilesystemListen,
-    AbstractListen,
-}
-
-impl ChildFdTarget {
-    const fn raw_fd(self) -> RawFd {
-        match self {
-            Self::WaylandSocket => 3,
-            Self::Wm => 4,
-            Self::DisplayFd => 5,
-            Self::FilesystemListen => 6,
-            Self::AbstractListen => 7,
-        }
-    }
-}
-
-fn build_command(binary: &PathBuf, lease: &DisplayLease) -> Command {
-    let mut command = Command::new(binary);
-    command
-        .arg(lease.display())
-        .arg("-rootless")
-        .arg("-terminate")
-        .arg("-nolisten")
-        .arg("tcp")
-        .arg("-listenfd")
-        .arg(ChildFdTarget::FilesystemListen.raw_fd().to_string())
-        .arg("-listenfd")
-        .arg(ChildFdTarget::AbstractListen.raw_fd().to_string())
-        .arg("-displayfd")
-        .arg(ChildFdTarget::DisplayFd.raw_fd().to_string())
-        .arg("-wm")
-        .arg(ChildFdTarget::Wm.raw_fd().to_string())
-        .arg("-auth")
-        .arg(lease.xauthority_path())
-        .env_remove("WAYLAND_DISPLAY")
-        .env_remove("DISPLAY")
-        .env_remove("XAUTHORITY")
-        .env_remove("OBLIVION_ONE_XWAYLAND_DISPLAY")
-        .env(
-            "WAYLAND_SOCKET",
-            ChildFdTarget::WaylandSocket.raw_fd().to_string(),
-        );
-    command
 }
 
 fn pipe_pair() -> io::Result<(OwnedFd, OwnedFd)> {
