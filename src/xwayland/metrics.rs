@@ -21,4 +21,9 @@ pub(crate) struct XwaylandMetrics {
     pub(crate) resize_sync_presented: u64,
     pub(crate) resize_sync_timeouts: u64,
     pub(crate) resize_sync_command_failures: u64,
+    pub(crate) property_refresh_requested: u64,
+    pub(crate) property_refresh_completed: u64,
+    pub(crate) property_refresh_coalesced: u64,
+    pub(crate) property_refresh_rejected: u64,
+    pub(crate) property_refresh_stale: u64,
 }

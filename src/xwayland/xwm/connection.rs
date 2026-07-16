@@ -51,6 +51,8 @@ pub(crate) fn connect(
         sync_alarms: Default::default(),
         sync_handles_by_counter: Default::default(),
         next_resize_counter_values: Default::default(),
+        pending_properties: Default::default(),
+        property_metrics: Default::default(),
         buffer_ready_surfaces: Default::default(),
         supporting_wm_check,
         raw_fd,

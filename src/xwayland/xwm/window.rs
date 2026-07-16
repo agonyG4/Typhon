@@ -26,6 +26,40 @@ pub(crate) struct X11WindowRecord {
     pub(crate) map_requested: bool,
     pub(crate) association: Option<AssociatedSurface>,
     pub(crate) buffer_ready: bool,
+    pub(crate) properties: X11PropertySnapshot,
+    pub(crate) properties_ready: bool,
+    pub(crate) resolved_properties: u16,
+    pub(crate) property_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct X11PropertySnapshot {
+    pub(crate) title: Option<String>,
+    pub(crate) app_id: Option<String>,
+    pub(crate) pid: Option<u32>,
+    pub(crate) window_type: Option<X11WindowType>,
+    pub(crate) accepts_input: Option<bool>,
+    pub(crate) constraints: WindowConstraints,
+    pub(crate) state: X11PublishedState,
+    pub(crate) transient_for: Option<X11WindowHandle>,
+    pub(crate) supports_delete: bool,
+    pub(crate) supports_take_focus: bool,
+    pub(crate) sync_counter: Option<u64>,
+    pub(crate) net_wm_name: Option<String>,
+    pub(crate) wm_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum X11WindowType {
+    Normal,
+    Dialog,
+    Utility,
+    Menu,
+    PopupMenu,
+    DropdownMenu,
+    Tooltip,
+    Notification,
+    Other(u32),
 }
 
 #[derive(Debug, Default)]
@@ -49,6 +83,10 @@ impl X11WindowRegistry {
                 map_requested: false,
                 association: None,
                 buffer_ready: false,
+                properties: X11PropertySnapshot::default(),
+                properties_ready: true,
+                resolved_properties: u16::MAX,
+                property_epoch: 0,
             },
         );
         true
@@ -73,6 +111,10 @@ impl X11WindowRegistry {
                 map_requested: false,
                 association: None,
                 buffer_ready: false,
+                properties: X11PropertySnapshot::default(),
+                properties_ready: false,
+                resolved_properties: 0,
+                property_epoch: 0,
             },
         );
         true
@@ -88,12 +130,27 @@ impl X11WindowRegistry {
             snapshot.handle,
             X11WindowRecord {
                 lifecycle: X11WindowLifecycle::Ready,
-                snapshot: Some(snapshot),
+                snapshot: Some(snapshot.clone()),
                 kind,
                 geometry,
                 map_requested: true,
                 association: None,
                 buffer_ready: true,
+                properties: X11PropertySnapshot {
+                    title: snapshot.metadata.title.clone(),
+                    app_id: snapshot.metadata.app_id.clone(),
+                    pid: snapshot.metadata.pid,
+                    constraints: snapshot.constraints,
+                    state: snapshot.state,
+                    transient_for: snapshot.transient_for,
+                    supports_delete: snapshot.supports_delete,
+                    supports_take_focus: snapshot.supports_take_focus,
+                    sync_counter: snapshot.sync_counter,
+                    ..X11PropertySnapshot::default()
+                },
+                properties_ready: true,
+                resolved_properties: u16::MAX,
+                property_epoch: 0,
             },
         );
         true
@@ -139,6 +196,10 @@ impl X11WindowRegistry {
         }
         record.map_requested = true;
         record.snapshot = None;
+        record.buffer_ready = false;
+        record.properties = X11PropertySnapshot::default();
+        record.properties_ready = false;
+        record.resolved_properties = 0;
         self.update_pending_lifecycle(handle)
     }
 
@@ -195,13 +256,17 @@ impl X11WindowRegistry {
             surface_id: association.surface_id,
             kind: record.kind,
             geometry: record.geometry,
-            metadata: WindowMetadata::default(),
-            constraints: WindowConstraints::default(),
-            state: X11PublishedState::default(),
-            transient_for: None,
-            supports_delete: false,
-            supports_take_focus: false,
-            sync_counter: None,
+            metadata: WindowMetadata {
+                app_id: record.properties.app_id.clone(),
+                title: record.properties.title.clone(),
+                pid: record.properties.pid,
+            },
+            constraints: record.properties.constraints,
+            state: record.properties.state,
+            transient_for: record.properties.transient_for,
+            supports_delete: record.properties.supports_delete,
+            supports_take_focus: record.properties.supports_take_focus,
+            sync_counter: record.properties.sync_counter,
         };
         record.lifecycle = X11WindowLifecycle::Ready;
         record.snapshot = Some(snapshot.clone());
@@ -225,6 +290,10 @@ impl X11WindowRegistry {
         );
         record.lifecycle = X11WindowLifecycle::Withdrawn;
         record.map_requested = false;
+        record.buffer_ready = false;
+        record.snapshot = None;
+        record.properties_ready = false;
+        record.resolved_properties = 0;
         Ok(was_mapped)
     }
 
@@ -359,6 +428,29 @@ mod tests {
         assert_eq!(snapshot.handle, window);
         assert_eq!(registry.lifecycle(window), Some(X11WindowLifecycle::Ready));
         assert!(registry.try_ready(window).expect("known window").is_none());
+    }
+
+    #[test]
+    fn managed_unmap_requires_a_fresh_buffer_before_remap() {
+        let generation = generation(1);
+        let window = handle(generation, 19);
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::Managed,
+            X11Geometry::default(),
+        );
+        registry.mark_map_requested(window).expect("known window");
+        registry
+            .mark_associated(window, associated(generation, 1, 44))
+            .expect("association");
+        registry.mark_buffer_ready(window).expect("buffer");
+        assert!(registry.try_ready(window).unwrap().is_some());
+        registry.mark_unmapped(window).expect("unmap");
+        registry.mark_map_requested(window).expect("remap");
+        assert!(registry.try_ready(window).unwrap().is_none());
+        registry.mark_buffer_ready(window).expect("fresh buffer");
+        assert!(registry.try_ready(window).unwrap().is_some());
     }
 
     #[test]

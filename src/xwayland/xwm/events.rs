@@ -47,17 +47,21 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         }
         Event::MapRequest(event) => {
             let handle = ensure_window(xwm, event.window)?;
+            xwm.cancel_window_properties(handle);
             xwm.windows
                 .mark_map_requested(handle)
                 .map_err(XwmError::InvalidCommand)?;
+            xwm.refresh_window_properties(handle)?;
             xwm.emit_ready_if_complete(handle)?;
         }
         Event::MapNotify(event) => {
             let handle =
                 ensure_window_with_kind(xwm, event.window, window_kind(event.override_redirect))?;
+            xwm.cancel_window_properties(handle);
             xwm.windows
                 .mark_map_requested(handle)
                 .map_err(XwmError::InvalidCommand)?;
+            xwm.refresh_window_properties(handle)?;
             xwm.emit_ready_if_complete(handle)?;
         }
         Event::UnmapNotify(event) => {
@@ -70,6 +74,10 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                     record.lifecycle,
                     X11WindowLifecycle::Ready | X11WindowLifecycle::Mapped
                 );
+            if let Some(association) = record.association {
+                xwm.clear_surface_buffer_ready(association.surface_id);
+            }
+            xwm.cancel_window_properties(handle);
             xwm.windows
                 .mark_unmapped(handle)
                 .map_err(XwmError::InvalidCommand)?;
@@ -137,7 +145,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         Event::ClientMessage(event) if event.format == 32 => {
             normalize_client_message(xwm, event)?;
         }
-        Event::PropertyNotify(event) => normalize_property_change(xwm, event),
+        Event::PropertyNotify(event) => normalize_property_change(xwm, event)?,
         Event::SyncCounterNotify(event) => {
             xwm.note_sync_counter_notify(event.counter, int64_to_u64(event.counter_value));
         }
@@ -187,28 +195,32 @@ fn normalize_client_message(
     Ok(())
 }
 
-fn normalize_property_change(xwm: &mut Xwm, event: xproto::PropertyNotifyEvent) {
+fn normalize_property_change(
+    xwm: &mut Xwm,
+    event: xproto::PropertyNotifyEvent,
+) -> Result<(), XwmError> {
     let handle = X11WindowHandle::new(xwm.generation, event.window);
     if !xwm.windows.contains(handle) {
-        return;
+        return Ok(());
     }
-    let delta = if event.atom == xwm.atoms.get(XwmAtomName::NetWmName)
-        || event.atom == xwm.atoms.get(XwmAtomName::WmName)
-    {
-        Some(super::X11MetadataDelta::Title(None))
-    } else if event.atom == xwm.atoms.get(XwmAtomName::NetWmPid) {
-        Some(super::X11MetadataDelta::Pid(None))
-    } else if event.atom == xwm.atoms.get(XwmAtomName::WmClass) {
-        Some(super::X11MetadataDelta::AppId(None))
-    } else {
-        None
-    };
-    if let Some(delta) = delta {
-        xwm.outgoing_events.push_back(XwmEvent::MetadataChanged {
-            window: handle,
-            delta,
-        });
+    let known = [
+        XwmAtomName::NetWmName,
+        XwmAtomName::WmName,
+        XwmAtomName::WmClass,
+        XwmAtomName::NetWmPid,
+        XwmAtomName::NetWmWindowType,
+        XwmAtomName::WmTransientFor,
+        XwmAtomName::WmNormalHints,
+        XwmAtomName::WmHints,
+        XwmAtomName::WmProtocols,
+        XwmAtomName::NetWmSyncRequestCounter,
+        XwmAtomName::NetWmState,
+        XwmAtomName::MotifWmHints,
+    ];
+    if known.iter().any(|name| xwm.atoms.get(*name) == event.atom) {
+        xwm.refresh_window_properties(handle)?;
     }
+    Ok(())
 }
 
 #[allow(dead_code)]

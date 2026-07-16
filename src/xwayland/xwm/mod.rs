@@ -19,6 +19,7 @@ mod capabilities;
 mod commands;
 mod connection;
 mod events;
+mod properties;
 mod resize_sync;
 mod window;
 
@@ -257,6 +258,9 @@ pub struct Xwm {
     pub(crate) sync_alarms: HashMap<X11WindowHandle, u32>,
     pub(crate) sync_handles_by_counter: HashMap<u32, X11WindowHandle>,
     pub(crate) next_resize_counter_values: HashMap<X11WindowHandle, u64>,
+    pub(crate) pending_properties:
+        HashMap<x11rb::connection::SequenceNumber, properties::PendingProperty>,
+    pub(crate) property_metrics: properties::PropertyMetrics,
     buffer_ready_surfaces: HashSet<u32>,
     pub(crate) supporting_wm_check: u32,
     raw_fd: RawFd,
@@ -298,6 +302,10 @@ impl Xwm {
             && self.capabilities.sync
     }
 
+    pub(crate) fn property_metrics(&self) -> properties::PropertyMetrics {
+        self.property_metrics
+    }
+
     pub fn observe_window(&mut self, handle: X11WindowHandle) -> Result<bool, XwmError> {
         self.observe_window_with_kind(handle, DesktopWindowKind::Managed, X11Geometry::default())
     }
@@ -311,9 +319,13 @@ impl Xwm {
         if handle.generation() != self.generation {
             return Err(XwmError::StaleGeneration);
         }
-        Ok(self
+        let inserted = self
             .windows
-            .insert_observed_with_kind(handle, kind, geometry))
+            .insert_observed_with_kind(handle, kind, geometry);
+        if inserted {
+            properties::begin_initial(self, handle)?;
+        }
+        Ok(inserted)
     }
 
     pub fn register_snapshot(&mut self, snapshot: X11WindowSnapshot) -> Result<bool, XwmError> {
@@ -328,7 +340,19 @@ impl Xwm {
             return Err(XwmError::StaleGeneration);
         }
         self.clear_resize_sync(handle);
+        properties::cancel(self, handle);
         Ok(self.windows.remove(handle).is_some())
+    }
+
+    pub(crate) fn refresh_window_properties(
+        &mut self,
+        handle: X11WindowHandle,
+    ) -> Result<(), XwmError> {
+        properties::begin_refresh(self, handle, false)
+    }
+
+    pub(crate) fn cancel_window_properties(&mut self, handle: X11WindowHandle) {
+        properties::cancel(self, handle);
     }
 
     pub fn window_snapshot(&self, handle: X11WindowHandle) -> Option<&X11WindowSnapshot> {
@@ -339,6 +363,7 @@ impl Xwm {
         self.windows.clear_generation(generation);
         self.association.clear_generation(generation);
         self.clear_resize_sync_generation(generation);
+        properties::cancel_generation(self, generation);
         if generation == self.generation {
             self.buffer_ready_surfaces.clear();
         }
@@ -383,6 +408,10 @@ impl Xwm {
         Ok(())
     }
 
+    pub(crate) fn clear_surface_buffer_ready(&mut self, surface_id: u32) {
+        self.buffer_ready_surfaces.remove(&surface_id);
+    }
+
     pub(crate) fn note_sync_counter_notify(&mut self, counter: u32, value: u64) {
         let Some(handle) = self.sync_handles_by_counter.get(&counter).copied() else {
             return;
@@ -399,13 +428,17 @@ impl Xwm {
         self.resize_sync.next_deadline_ns()
     }
 
-    pub(crate) fn handle_resize_sync_deadline(&mut self, now_ns: u64) {
+    pub(crate) fn handle_resize_sync_deadline(&mut self, now_ns: u64) -> Result<(), XwmError> {
         for handle in self.resize_sync.expired_handles(now_ns) {
             if self.resize_sync.timeout(handle, now_ns) {
+                let allow_result = commands::set_allow_commits(self, handle, true);
+                self.clear_resize_sync(handle);
+                allow_result?;
                 self.outgoing_events
                     .push_back(XwmEvent::ResizeSyncTimedOut(handle));
             }
         }
+        Ok(())
     }
 
     pub(crate) fn complete_resize_sync(&mut self, handle: X11WindowHandle) -> Result<(), XwmError> {
@@ -526,7 +559,12 @@ impl Xwm {
     }
 
     pub fn drain_events(&mut self, budget: usize) -> Result<XwmDrain, XwmError> {
-        events::drain(self, budget.min(XWM_EVENT_BUDGET))
+        let property_input_ready = properties::socket_has_input(self.raw_fd);
+        let drain = events::drain(self, budget.min(XWM_EVENT_BUDGET))?;
+        if property_input_ready {
+            let _ = properties::poll_replies(self, budget.min(XWM_EVENT_BUDGET))?;
+        }
+        Ok(drain)
     }
 
     pub fn execute(&mut self, command: XwmCommand) -> Result<(), XwmError> {
@@ -573,6 +611,13 @@ impl Xwm {
     }
 
     fn emit_ready_if_complete(&mut self, handle: X11WindowHandle) -> Result<(), XwmError> {
+        if !self
+            .windows
+            .get(handle)
+            .is_some_and(|record| record.properties_ready)
+        {
+            return Ok(());
+        }
         let snapshot = self
             .windows
             .try_ready(handle)

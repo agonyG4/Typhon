@@ -14,6 +14,7 @@ pub(crate) enum XwmAtomName {
     WmProtocols,
     WmDeleteWindow,
     WmTakeFocus,
+    WmHints,
     WmClass,
     WmName,
     WmTransientFor,
@@ -45,6 +46,7 @@ pub(crate) enum XwmAtomName {
     NetWmSyncRequest,
     NetWmSyncRequestCounter,
     XwaylandAllowCommits,
+    MotifWmHints,
     NetWmNameTyphon,
 }
 
@@ -55,6 +57,7 @@ impl XwmAtomName {
         Self::WmProtocols,
         Self::WmDeleteWindow,
         Self::WmTakeFocus,
+        Self::WmHints,
         Self::WmClass,
         Self::WmName,
         Self::WmTransientFor,
@@ -86,6 +89,7 @@ impl XwmAtomName {
         Self::NetWmSyncRequest,
         Self::NetWmSyncRequestCounter,
         Self::XwaylandAllowCommits,
+        Self::MotifWmHints,
         Self::NetWmNameTyphon,
     ];
 
@@ -96,6 +100,7 @@ impl XwmAtomName {
             Self::WmProtocols => b"WM_PROTOCOLS",
             Self::WmDeleteWindow => b"WM_DELETE_WINDOW",
             Self::WmTakeFocus => b"WM_TAKE_FOCUS",
+            Self::WmHints => b"WM_HINTS",
             Self::WmClass => b"WM_CLASS",
             Self::WmName => b"WM_NAME",
             Self::WmTransientFor => b"WM_TRANSIENT_FOR",
@@ -127,6 +132,7 @@ impl XwmAtomName {
             Self::NetWmSyncRequest => b"_NET_WM_SYNC_REQUEST",
             Self::NetWmSyncRequestCounter => b"_NET_WM_SYNC_REQUEST_COUNTER",
             Self::XwaylandAllowCommits => b"_XWAYLAND_ALLOW_COMMITS",
+            Self::MotifWmHints => b"_MOTIF_WM_HINTS",
             Self::NetWmNameTyphon => b"Typhon",
         }
     }
@@ -164,9 +170,18 @@ impl XwmAtoms {
             XwmAtomName::NetSupported,
             XwmAtomName::NetSupportingWmCheck,
             XwmAtomName::NetWmName,
+            XwmAtomName::NetWmPid,
+            XwmAtomName::NetWmWindowType,
             XwmAtomName::NetActiveWindow,
             XwmAtomName::NetClientList,
             XwmAtomName::NetClientListStacking,
+            XwmAtomName::NetCloseWindow,
+            XwmAtomName::NetWmState,
+            XwmAtomName::NetWmStateFullscreen,
+            XwmAtomName::NetWmStateMaximizedVert,
+            XwmAtomName::NetWmStateMaximizedHorz,
+            XwmAtomName::NetWmStateHidden,
+            XwmAtomName::NetWmSyncRequest,
         ]
     }
 }
