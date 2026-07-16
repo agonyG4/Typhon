@@ -26,6 +26,7 @@ pub(crate) struct X11WindowRecord {
     pub(crate) map_requested: bool,
     pub(crate) association: Option<AssociatedSurface>,
     pub(crate) buffer_ready: bool,
+    pub(crate) map_operation_pending: bool,
     pub(crate) properties: X11PropertySnapshot,
     pub(crate) properties_ready: bool,
     pub(crate) resolved_properties: u16,
@@ -83,6 +84,7 @@ impl X11WindowRegistry {
                 map_requested: false,
                 association: None,
                 buffer_ready: false,
+                map_operation_pending: false,
                 properties: X11PropertySnapshot::default(),
                 properties_ready: true,
                 resolved_properties: u16::MAX,
@@ -111,6 +113,7 @@ impl X11WindowRegistry {
                 map_requested: false,
                 association: None,
                 buffer_ready: false,
+                map_operation_pending: false,
                 properties: X11PropertySnapshot::default(),
                 properties_ready: false,
                 resolved_properties: 0,
@@ -136,6 +139,7 @@ impl X11WindowRegistry {
                 map_requested: true,
                 association: None,
                 buffer_ready: true,
+                map_operation_pending: false,
                 properties: X11PropertySnapshot {
                     title: snapshot.metadata.title.clone(),
                     app_id: snapshot.metadata.app_id.clone(),
@@ -195,11 +199,10 @@ impl X11WindowRegistry {
             return Err("window was destroyed");
         }
         record.map_requested = true;
+        record.map_operation_pending = false;
         record.snapshot = None;
         record.buffer_ready = false;
-        record.properties = X11PropertySnapshot::default();
         record.properties_ready = false;
-        record.resolved_properties = 0;
         self.update_pending_lifecycle(handle)
     }
 
@@ -273,13 +276,32 @@ impl X11WindowRegistry {
         Ok(Some(snapshot))
     }
 
-    pub(crate) fn mark_mapped(&mut self, handle: X11WindowHandle) -> Result<(), &'static str> {
+    pub(crate) fn mark_map_commanded(
+        &mut self,
+        handle: X11WindowHandle,
+    ) -> Result<(), &'static str> {
         let record = self.record_mut(handle)?;
         if record.snapshot.is_none() {
             return Err("window is not ready");
         }
-        record.lifecycle = X11WindowLifecycle::Mapped;
+        record.map_operation_pending = true;
         Ok(())
+    }
+
+    pub(crate) fn confirm_map_notify(
+        &mut self,
+        handle: X11WindowHandle,
+    ) -> Result<bool, &'static str> {
+        let record = self.record_mut(handle)?;
+        if !record.map_operation_pending {
+            return Ok(false);
+        }
+        if record.snapshot.is_none() {
+            return Err("map operation has no ready snapshot");
+        }
+        record.map_operation_pending = false;
+        record.lifecycle = X11WindowLifecycle::Mapped;
+        Ok(true)
     }
 
     pub(crate) fn mark_unmapped(&mut self, handle: X11WindowHandle) -> Result<bool, &'static str> {
@@ -290,10 +312,10 @@ impl X11WindowRegistry {
         );
         record.lifecycle = X11WindowLifecycle::Withdrawn;
         record.map_requested = false;
+        record.map_operation_pending = false;
         record.buffer_ready = false;
         record.snapshot = None;
         record.properties_ready = false;
-        record.resolved_properties = 0;
         Ok(was_mapped)
     }
 
@@ -427,6 +449,52 @@ mod tests {
         assert_eq!(snapshot.surface_id, 43);
         assert_eq!(snapshot.handle, window);
         assert_eq!(registry.lifecycle(window), Some(X11WindowLifecycle::Ready));
+        assert!(registry.try_ready(window).expect("known window").is_none());
+    }
+
+    #[test]
+    fn map_command_then_notify_preserves_ready_snapshot() {
+        let generation = generation(1);
+        let window = handle(generation, 16);
+        let mut registry = X11WindowRegistry::default();
+
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::Managed,
+            X11Geometry::default(),
+        );
+        registry.mark_map_requested(window).expect("known window");
+        registry
+            .mark_associated(window, associated(generation, 1, 46))
+            .expect("association");
+        registry.mark_buffer_ready(window).expect("buffer");
+        let expected = registry
+            .try_ready(window)
+            .expect("known window")
+            .expect("mapping gate");
+
+        registry
+            .mark_map_commanded(window)
+            .expect("ready window can be mapped");
+        assert_eq!(registry.lifecycle(window), Some(X11WindowLifecycle::Ready));
+        assert!(registry.confirm_map_notify(window).expect("map notify"));
+        assert_eq!(registry.lifecycle(window), Some(X11WindowLifecycle::Mapped));
+        assert_eq!(
+            registry
+                .get(window)
+                .and_then(|record| record.snapshot.as_ref()),
+            Some(&expected)
+        );
+        assert!(
+            registry
+                .get(window)
+                .is_some_and(|record| record.buffer_ready)
+        );
+        assert!(
+            !registry
+                .confirm_map_notify(window)
+                .expect("duplicate map notify")
+        );
         assert!(registry.try_ready(window).expect("known window").is_none());
     }
 

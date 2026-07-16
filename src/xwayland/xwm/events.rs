@@ -57,6 +57,21 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         Event::MapNotify(event) => {
             let handle =
                 ensure_window_with_kind(xwm, event.window, window_kind(event.override_redirect))?;
+            if xwm
+                .windows
+                .get(handle)
+                .is_some_and(|record| record.map_operation_pending)
+            {
+                xwm.windows
+                    .confirm_map_notify(handle)
+                    .map_err(XwmError::InvalidCommand)?;
+                return Ok(());
+            }
+            if xwm.windows.get(handle).is_some_and(|record| {
+                record.snapshot.is_some() && record.lifecycle == X11WindowLifecycle::Mapped
+            }) {
+                return Ok(());
+            }
             xwm.cancel_window_properties(handle);
             xwm.windows
                 .mark_map_requested(handle)

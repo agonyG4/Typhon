@@ -32,7 +32,7 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             xwm.connection
                 .map_window(handle.xid())
                 .map_err(XwmError::Connection)?;
-            set_lifecycle_mapped(xwm, handle);
+            set_lifecycle_map_commanded(xwm, handle);
         }
         XwmCommand::Unmap(handle) => {
             xwm.connection
@@ -358,8 +358,8 @@ fn publish_state(
     Ok(())
 }
 
-fn set_lifecycle_mapped(xwm: &mut Xwm, handle: super::X11WindowHandle) {
-    let _ = xwm.windows.mark_mapped(handle);
+fn set_lifecycle_map_commanded(xwm: &mut Xwm, handle: super::X11WindowHandle) {
+    let _ = xwm.windows.mark_map_commanded(handle);
 }
 
 fn set_lifecycle_withdrawn(xwm: &mut Xwm, handle: super::X11WindowHandle) {
