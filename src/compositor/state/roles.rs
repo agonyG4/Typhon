@@ -1,4 +1,7 @@
 use super::*;
+use std::num::NonZeroU64;
+
+use crate::xwayland::{AssociationError, XwaylandAssociationEvent};
 
 /// A role is permanent for the lifetime of its wl_surface.  The associated
 /// protocol object is deliberately tracked separately because destroying that
@@ -11,6 +14,7 @@ pub(in crate::compositor) enum PermanentSurfaceRole {
     Subsurface,
     Cursor,
     DragIcon,
+    Xwayland,
 }
 
 impl PermanentSurfaceRole {
@@ -22,6 +26,7 @@ impl PermanentSurfaceRole {
             Self::Subsurface => "subsurface",
             Self::Cursor => "cursor",
             Self::DragIcon => "drag_icon",
+            Self::Xwayland => "xwayland",
         }
     }
 }
@@ -34,6 +39,7 @@ pub(in crate::compositor) enum LiveRoleInstance {
     Subsurface { parent_id: u32 },
     Cursor,
     DragIcon,
+    Xwayland,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -41,6 +47,24 @@ pub(in crate::compositor) struct SurfaceRoleLifecycle {
     pub(in crate::compositor) permanent: Option<PermanentSurfaceRole>,
     pub(in crate::compositor) live_instance: Option<LiveRoleInstance>,
     pub(in crate::compositor) xdg_association: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) struct XwaylandSurfaceState {
+    pub(in crate::compositor) generation: XwaylandGeneration,
+    pub(in crate::compositor) pending_serial: Option<NonZeroU64>,
+    pub(in crate::compositor) committed_serial: Option<NonZeroU64>,
+    pub(in crate::compositor) association_object_alive: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) enum XwaylandSurfaceCommit {
+    None,
+    Committed {
+        generation: XwaylandGeneration,
+        serial: NonZeroU64,
+    },
+    AlreadyAssociated,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +105,7 @@ fn validate_xdg_association_reservation(
                 PermanentSurfaceRole::Subsurface => SurfaceRole::Subsurface { parent_id: 0 },
                 PermanentSurfaceRole::Cursor => SurfaceRole::Cursor,
                 PermanentSurfaceRole::DragIcon => SurfaceRole::DragIcon,
+                PermanentSurfaceRole::Xwayland => SurfaceRole::Xwayland,
             },
             requested: SurfaceRole::XdgToplevel,
         });
@@ -120,6 +145,7 @@ fn activate_role_instance(
         SurfaceRole::Subsurface { parent_id } => LiveRoleInstance::Subsurface { parent_id },
         SurfaceRole::Cursor => LiveRoleInstance::Cursor,
         SurfaceRole::DragIcon => LiveRoleInstance::DragIcon,
+        SurfaceRole::Xwayland => LiveRoleInstance::Xwayland,
         SurfaceRole::Unassigned => unreachable!(),
     });
     Ok(())
@@ -134,6 +160,7 @@ pub(in crate::compositor) enum SurfaceRole {
     Subsurface { parent_id: u32 },
     Cursor,
     DragIcon,
+    Xwayland,
 }
 
 impl SurfaceRole {
@@ -146,6 +173,7 @@ impl SurfaceRole {
             Self::Subsurface { .. } => "subsurface",
             Self::Cursor => "cursor",
             Self::DragIcon => "drag_icon",
+            Self::Xwayland => "xwayland",
         }
     }
 
@@ -158,6 +186,7 @@ impl SurfaceRole {
             Self::Subsurface { .. } => Some(PermanentSurfaceRole::Subsurface),
             Self::Cursor => Some(PermanentSurfaceRole::Cursor),
             Self::DragIcon => Some(PermanentSurfaceRole::DragIcon),
+            Self::Xwayland => Some(PermanentSurfaceRole::Xwayland),
         }
     }
 }
@@ -171,6 +200,7 @@ impl LiveRoleInstance {
             Self::Subsurface { parent_id } => SurfaceRole::Subsurface { parent_id },
             Self::Cursor => SurfaceRole::Cursor,
             Self::DragIcon => SurfaceRole::DragIcon,
+            Self::Xwayland => SurfaceRole::Xwayland,
         }
     }
 }
@@ -314,6 +344,94 @@ impl SurfaceRoleError {
 }
 
 impl CompositorState {
+    pub(in crate::compositor) fn get_xwayland_surface(
+        &mut self,
+        surface_id: u32,
+        generation: XwaylandGeneration,
+    ) -> Result<(), SurfaceRoleError> {
+        self.assign_surface_role(surface_id, SurfaceRole::Xwayland)?;
+        self.xwayland_surface_states.insert(
+            surface_id,
+            XwaylandSurfaceState {
+                generation,
+                pending_serial: None,
+                committed_serial: None,
+                association_object_alive: true,
+            },
+        );
+        Ok(())
+    }
+
+    pub(in crate::compositor) fn register_xwayland_surface_resource(
+        &mut self,
+        surface_id: u32,
+        resource: xwayland_surface_v1::XwaylandSurfaceV1,
+    ) {
+        self.xwayland_surface_resources.insert(surface_id, resource);
+    }
+
+    pub(in crate::compositor) fn set_xwayland_pending_serial(
+        &mut self,
+        surface_id: u32,
+        generation: XwaylandGeneration,
+        serial: NonZeroU64,
+    ) -> Result<(), ()> {
+        let Some(state) = self.xwayland_surface_states.get_mut(&surface_id) else {
+            return Err(());
+        };
+        if state.generation != generation || !state.association_object_alive {
+            return Err(());
+        }
+        state.pending_serial = Some(serial);
+        Ok(())
+    }
+
+    pub(in crate::compositor) fn commit_xwayland_surface_serial(
+        &mut self,
+        surface_id: u32,
+    ) -> Result<XwaylandSurfaceCommit, AssociationError> {
+        let Some(state) = self.xwayland_surface_states.get_mut(&surface_id) else {
+            return Ok(XwaylandSurfaceCommit::None);
+        };
+        let Some(serial) = state.pending_serial.take() else {
+            return Ok(XwaylandSurfaceCommit::None);
+        };
+        if state.committed_serial.is_some() {
+            return Ok(XwaylandSurfaceCommit::AlreadyAssociated);
+        }
+        self.xwayland_associations
+            .commit_surface_serial(state.generation, serial, surface_id)?;
+        state.committed_serial = Some(serial);
+        Ok(XwaylandSurfaceCommit::Committed {
+            generation: state.generation,
+            serial,
+        })
+    }
+
+    pub(in crate::compositor) fn destroy_xwayland_surface_object(&mut self, surface_id: u32) {
+        if let Some(state) = self.xwayland_surface_states.get_mut(&surface_id) {
+            state.pending_serial = None;
+            state.association_object_alive = false;
+        }
+        self.xwayland_surface_resources.remove(&surface_id);
+        self.deactivate_role_instance_if(surface_id, SurfaceRole::Xwayland);
+    }
+
+    pub(in crate::compositor) fn take_xwayland_association_events(
+        &mut self,
+    ) -> Vec<XwaylandAssociationEvent> {
+        self.xwayland_associations.take_events()
+    }
+
+    pub(in crate::compositor) fn clear_xwayland_generation(
+        &mut self,
+        generation: XwaylandGeneration,
+    ) {
+        self.xwayland_associations.clear_generation(generation);
+        self.xwayland_surface_states
+            .retain(|_, state| state.generation != generation);
+    }
+
     pub(in crate::compositor) fn surface_role_lifecycle(
         &self,
         surface_id: u32,
@@ -337,8 +455,15 @@ impl CompositorState {
             .live_instance
             .map(LiveRoleInstance::surface_role)
             .or_else(|| {
-                matches!(lifecycle.permanent, Some(PermanentSurfaceRole::DragIcon))
-                    .then_some(SurfaceRole::DragIcon)
+                matches!(
+                    lifecycle.permanent,
+                    Some(PermanentSurfaceRole::DragIcon | PermanentSurfaceRole::Xwayland)
+                )
+                .then_some(match lifecycle.permanent {
+                    Some(PermanentSurfaceRole::DragIcon) => SurfaceRole::DragIcon,
+                    Some(PermanentSurfaceRole::Xwayland) => SurfaceRole::Xwayland,
+                    _ => unreachable!(),
+                })
             })
             .unwrap_or(SurfaceRole::Unassigned)
     }
@@ -511,6 +636,9 @@ impl CompositorState {
 
     pub(in crate::compositor) fn scrub_surface_lifecycle(&mut self, surface_id: u32) {
         self.surface_role_lifecycles.remove(&surface_id);
+        self.xwayland_surface_states.remove(&surface_id);
+        self.xwayland_surface_resources.remove(&surface_id);
+        self.xwayland_associations.remove_surface(surface_id);
     }
 
     fn surface_role_for_error(&self, surface_id: u32) -> SurfaceRole {
@@ -530,6 +658,7 @@ impl CompositorState {
             },
             Some(PermanentSurfaceRole::Cursor) => SurfaceRole::Cursor,
             Some(PermanentSurfaceRole::DragIcon) => SurfaceRole::DragIcon,
+            Some(PermanentSurfaceRole::Xwayland) => SurfaceRole::Xwayland,
             None => SurfaceRole::Unassigned,
         }
     }

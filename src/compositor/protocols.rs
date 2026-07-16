@@ -13,3 +13,4 @@ mod syncobj;
 pub(crate) mod versions;
 mod viewport;
 mod xdg;
+mod xwayland;

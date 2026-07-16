@@ -2,7 +2,9 @@ use super::super::protocols::versions::{self, GlobalAdvertisement};
 use super::super::state_data::{CoreComplianceMetrics, UnhandledRequestClass};
 use super::*;
 
+use crate::xwayland::XwaylandAssociationEvent;
 use wayland_client::Proxy;
+use wayland_protocols::xwayland::shell::v1::client::xwayland_shell_v1 as client_xwayland_shell_v1;
 
 #[test]
 fn advertised_global_versions_are_centralized() {
@@ -13,6 +15,7 @@ fn advertised_global_versions_are_centralized() {
     assert_eq!(versions::XDG_WM_BASE, 6);
     assert_eq!(versions::WL_OUTPUT, 4);
     assert_eq!(versions::WL_SEAT, 7);
+    assert_eq!(versions::XWAYLAND_SHELL_V1, 1);
 
     let globals = versions::all_globals();
     assert!(globals.contains(&GlobalAdvertisement::new("wl_compositor", 6)));
@@ -22,11 +25,56 @@ fn advertised_global_versions_are_centralized() {
     assert!(globals.contains(&GlobalAdvertisement::new("xdg_wm_base", 6)));
     assert!(globals.contains(&GlobalAdvertisement::new("wl_output", 4)));
     assert!(globals.contains(&GlobalAdvertisement::new("wl_seat", 7)));
+    assert!(globals.contains(&GlobalAdvertisement::new("xwayland_shell_v1", 1)));
 
     let mut sorted = globals.to_vec();
     sorted.sort_by_key(|global| global.interface);
     sorted.dedup_by_key(|global| global.interface);
     assert_eq!(sorted.len(), globals.len());
+}
+
+#[test]
+fn normal_clients_do_not_receive_private_xwayland_global() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let globals = read_registry_globals(&socket_path).unwrap();
+    assert!(!globals.iter().any(|name| name == "xwayland_shell_v1"));
+
+    let _ = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn active_private_xwayland_client_receives_shell_global() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    let generation = XwaylandGeneration::new(std::num::NonZeroU64::new(1).unwrap());
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    let _identity = server
+        .insert_xwayland_client(server_stream, generation)
+        .unwrap();
+    let (running, server_thread) = spawn_test_server(server);
+
+    let connection = Connection::from_socket(client_stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let shell: client_xwayland_shell_v1::XwaylandShellV1 = globals.bind(&qh, 1..=1, ()).unwrap();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let xwayland_surface = shell.get_xwayland_surface(&surface, &qh, ());
+    xwayland_surface.set_serial(0x0123_4567, 0x89ab_cdef);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+
+    let mut server = stop_test_server(running, server_thread);
+    assert_eq!(server.take_xwayland_shell_bind_events().len(), 1);
+    assert!(matches!(
+        server.take_xwayland_association_events().as_slice(),
+        [XwaylandAssociationEvent::Committed { .. }]
+    ));
 }
 
 #[test]
@@ -175,6 +223,7 @@ fn every_dispatch_fallback_has_an_explicit_unhandled_classification() {
         ("activation", include_str!("../protocols/activation.rs")),
         ("layer_shell", include_str!("../protocols/layer_shell.rs")),
         ("presentation", include_str!("../protocols/presentation.rs")),
+        ("xwayland", include_str!("../protocols/xwayland.rs")),
     ];
     for (name, source) in sources {
         let mut lines = source.lines();

@@ -22,6 +22,7 @@ use wayland_protocols::xdg::{
     activation::v1::server::xdg_activation_v1, decoration::zv1::server::zxdg_decoration_manager_v1,
     shell::server::xdg_wm_base,
 };
+use wayland_protocols::xwayland::shell::v1::server::xwayland_shell_v1;
 use wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_shell_v1;
 use wayland_server::{
     Display, DisplayHandle, ListeningSocket,
@@ -36,6 +37,7 @@ use crate::astrea_shortcuts::server::astrea_shortcuts_manager_v1;
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
+use crate::xwayland::{XwaylandAssociationEvent, XwaylandGeneration};
 
 use super::protocols::versions;
 use super::{
@@ -58,7 +60,20 @@ pub struct OwnCompositorServer {
     pub(super) state: CompositorState,
     disconnected_clients: Arc<Mutex<Vec<DisconnectedClient>>>,
     client_pids: Arc<Mutex<HashMap<ClientId, i32>>>,
+    xwayland_global_data: XwaylandShellGlobalData,
     gpu_buffer_protocols_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XwaylandClientIdentity {
+    pub client_id: ClientId,
+    pub generation: XwaylandGeneration,
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::compositor) struct XwaylandShellGlobalData {
+    pub(in crate::compositor) active: Arc<Mutex<Option<XwaylandClientIdentity>>>,
+    pub(in crate::compositor) bind_events: Arc<Mutex<Vec<XwaylandClientIdentity>>>,
 }
 
 #[derive(Debug)]
@@ -212,6 +227,10 @@ impl OwnCompositorServer {
         let display =
             Display::new().map_err(|error| CompositorError::DisplayInit(error.to_string()))?;
         let syncobj_device = DrmSyncobjDevice::open_available();
+        let xwayland_global_data = XwaylandShellGlobalData {
+            active: Arc::new(Mutex::new(None)),
+            bind_events: Arc::new(Mutex::new(Vec::new())),
+        };
         register_minimum_globals(
             &display.handle(),
             syncobj_device.is_some(),
@@ -219,6 +238,7 @@ impl OwnCompositorServer {
             input_capabilities,
             selection_capabilities,
             renderer_capabilities,
+            xwayland_global_data.clone(),
         );
         let socket = ListeningSocket::bind(&socket_name)
             .map_err(|error| CompositorError::Bind(error.to_string()))?;
@@ -234,6 +254,7 @@ impl OwnCompositorServer {
             state,
             disconnected_clients,
             client_pids,
+            xwayland_global_data,
             gpu_buffer_protocols_enabled: gpu_buffers_enabled,
         })
     }
@@ -305,6 +326,69 @@ impl OwnCompositorServer {
 
     pub fn client_dispatch_fd(&self) -> BorrowedFd<'_> {
         self.display.as_fd()
+    }
+
+    pub fn insert_xwayland_client(
+        &mut self,
+        stream: std::os::unix::net::UnixStream,
+        generation: XwaylandGeneration,
+    ) -> io::Result<XwaylandClientIdentity> {
+        let mut handle = self.display.handle();
+        let client = handle.insert_client(
+            stream,
+            Arc::new(TyphonClientData {
+                disconnected_clients: self.disconnected_clients.clone(),
+                client_pids: self.client_pids.clone(),
+            }),
+        )?;
+        let identity = XwaylandClientIdentity {
+            client_id: client.id(),
+            generation,
+        };
+        if let Ok(mut active) = self.xwayland_global_data.active.lock() {
+            *active = Some(identity.clone());
+        }
+        self.state.xwayland_client_identity = Some(identity.clone());
+        Ok(identity)
+    }
+
+    pub fn revoke_xwayland_generation(&mut self, generation: XwaylandGeneration) {
+        let revoke = self
+            .xwayland_global_data
+            .active
+            .lock()
+            .ok()
+            .is_some_and(|active| {
+                active
+                    .as_ref()
+                    .is_some_and(|identity| identity.generation == generation)
+            });
+        if revoke {
+            if let Ok(mut active) = self.xwayland_global_data.active.lock() {
+                *active = None;
+            }
+            if self
+                .state
+                .xwayland_client_identity
+                .as_ref()
+                .is_some_and(|identity| identity.generation == generation)
+            {
+                self.state.xwayland_client_identity = None;
+            }
+            self.state.clear_xwayland_generation(generation);
+        }
+    }
+
+    pub fn take_xwayland_shell_bind_events(&mut self) -> Vec<XwaylandClientIdentity> {
+        self.xwayland_global_data
+            .bind_events
+            .lock()
+            .map(|mut events| std::mem::take(&mut *events))
+            .unwrap_or_default()
+    }
+
+    pub fn take_xwayland_association_events(&mut self) -> Vec<XwaylandAssociationEvent> {
+        self.state.take_xwayland_association_events()
     }
 
     pub fn accepted_clients(&self) -> usize {
@@ -901,6 +985,7 @@ fn register_minimum_globals(
     input_capabilities: InputProtocolCapabilities,
     selection_capabilities: SelectionProtocolCapabilities,
     renderer_capabilities: RendererProtocolCapabilities,
+    xwayland_global_data: XwaylandShellGlobalData,
 ) {
     debug_assert!(
         versions::all_globals()
@@ -1008,6 +1093,10 @@ fn register_minimum_globals(
     display.create_global::<CompositorState, xdg_wm_base::XdgWmBase, _>(versions::XDG_WM_BASE, ());
     display.create_global::<CompositorState, wl_output::WlOutput, _>(versions::WL_OUTPUT, ());
     display.create_global::<CompositorState, wl_seat::WlSeat, _>(versions::WL_SEAT, ());
+    display.create_global::<CompositorState, xwayland_shell_v1::XwaylandShellV1, _>(
+        versions::XWAYLAND_SHELL_V1,
+        xwayland_global_data,
+    );
 }
 
 fn register_gpu_buffer_globals(display: &DisplayHandle, syncobj_available: bool) {

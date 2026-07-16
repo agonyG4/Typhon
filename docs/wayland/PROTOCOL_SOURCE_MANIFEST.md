@@ -147,6 +147,7 @@ The target contract is:
 | `xdg_wm_base` | 6 | always |
 | `wl_output` | 4 | always |
 | `wl_seat` | 7 | always |
+| `xwayland_shell_v1` | 1 | registered; visible only to the active private XWayland client |
 | `wp_color_manager_v1` | 1 | color capability |
 | `zwp_relative_pointer_manager_v1` | 1 | relative-pointer capability |
 | `zwp_pointer_constraints_v1` | 1 | pointer-constraints capability |

@@ -83,6 +83,22 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
             }
             wl_surface::Request::Commit => {
                 let surface_id = data.surface_id();
+                if matches!(
+                    state.commit_xwayland_surface_serial(surface_id),
+                    Ok(XwaylandSurfaceCommit::AlreadyAssociated) | Err(_)
+                ) {
+                    if let Some(xwayland_surface) =
+                        state.xwayland_surface_resources.get(&surface_id).cloned()
+                    {
+                        state.post_protocol_error(
+                            client,
+                            &xwayland_surface,
+                            xwayland_surface_v1::Error::AlreadyAssociated,
+                            "wl_surface already has an XWayland association",
+                        );
+                    }
+                    return;
+                }
                 let commit_sequence = state.allocate_surface_commit_sequence();
                 let commit_id = SurfaceCommitId::from_sequence(commit_sequence);
                 state.apply_pending_toplevel_constraints(surface_id);

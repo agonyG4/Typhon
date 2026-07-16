@@ -57,6 +57,7 @@ Core/XDG request matrix, but they must remain synchronized with
 | `xdg_wm_base` | 6 | Implemented |
 | `wl_output` | 4 | Implemented |
 | `wl_seat` | 7 | Implemented |
+| `xwayland_shell_v1` | 1 | Implemented for the active private XWayland client |
 
 The current dispatch audit still finds generated-protocol wildcard arms in
 some extension handlers. Covered Core/XDG requests have explicit dispatch or

@@ -4,6 +4,8 @@ use super::{
     client_setup::*, clipboard_dmabuf::*, frame_buffer_client::*, input_client::*,
     locked_relative::*, output_bindings::*, server_runtime::*, subsurface_client::*, window_ops::*,
 };
+use wayland_protocols::xwayland::shell::v1::client::xwayland_shell_v1 as client_xwayland_shell_v1;
+use wayland_protocols::xwayland::shell::v1::client::xwayland_surface_v1 as client_xwayland_surface_v1;
 #[derive(Default)]
 pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) frame_done: bool,
@@ -418,6 +420,30 @@ impl Dispatch<client_wl_compositor::WlCompositor, ()> for RegistryTestState {
         _state: &mut Self,
         _proxy: &client_wl_compositor::WlCompositor,
         _event: client_wl_compositor::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_xwayland_shell_v1::XwaylandShellV1, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_xwayland_shell_v1::XwaylandShellV1,
+        _event: client_xwayland_shell_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_xwayland_surface_v1::XwaylandSurfaceV1, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_xwayland_surface_v1::XwaylandSurfaceV1,
+        _event: client_xwayland_surface_v1::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,

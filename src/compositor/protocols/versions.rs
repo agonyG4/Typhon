@@ -543,6 +543,7 @@ pub(crate) const ASTREA_SHELL_CONTROL_MANAGER_V1: u32 = 1;
 pub(crate) const XDG_WM_BASE: u32 = 6;
 pub(crate) const WL_OUTPUT: u32 = 4;
 pub(crate) const WL_SEAT: u32 = 7;
+pub(crate) const XWAYLAND_SHELL_V1: u32 = crate::xwayland::XWAYLAND_SHELL_V1_VERSION;
 
 pub(crate) const ALL_GLOBALS: &[GlobalAdvertisement] = &[
     GlobalAdvertisement::new("wl_compositor", WL_COMPOSITOR),
@@ -585,6 +586,7 @@ pub(crate) const ALL_GLOBALS: &[GlobalAdvertisement] = &[
     GlobalAdvertisement::new("xdg_wm_base", XDG_WM_BASE),
     GlobalAdvertisement::new("wl_output", WL_OUTPUT),
     GlobalAdvertisement::new("wl_seat", WL_SEAT),
+    GlobalAdvertisement::new("xwayland_shell_v1", XWAYLAND_SHELL_V1),
 ];
 
 pub(crate) const fn all_globals() -> &'static [GlobalAdvertisement] {

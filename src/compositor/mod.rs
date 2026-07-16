@@ -45,6 +45,7 @@ use wayland_protocols::xdg::{
     decoration::zv1::server::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1},
     shell::server::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base},
 };
+use wayland_protocols::xwayland::shell::v1::server::xwayland_surface_v1;
 use wayland_protocols_wlr::layer_shell::v1::server::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
@@ -63,6 +64,7 @@ use crate::render_backend::buffer::{
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
+use crate::xwayland::{AssociationRegistry, XwaylandGeneration};
 
 mod clipboard_bridge;
 mod color;
@@ -169,7 +171,7 @@ pub use render::{
 use runtime_files::{compositor_debug_surface_logging_enabled, unique_runtime_file_path};
 pub use runtime_files::{resize_debug_log, resize_debug_logging_enabled};
 pub use selection::{SelectionOfferRecord, SelectionState};
-pub use server::{CompositorError, OwnCompositorServer};
+pub use server::{CompositorError, OwnCompositorServer, XwaylandClientIdentity};
 use shm::{
     ShmBufferData, ShmPoolData, WL_SHM_FORMAT_ABGR8888, WL_SHM_FORMAT_ABGR2101010,
     WL_SHM_FORMAT_ARGB2101010, WL_SHM_FORMAT_XBGR8888, WL_SHM_FORMAT_XBGR2101010,
@@ -542,6 +544,10 @@ pub struct CompositorState {
     cursor_surface_ids: HashSet<u32>,
     active_client_cursor: Option<ActiveClientCursor>,
     client_cursor_surfaces: HashMap<u32, RenderableSurface>,
+    xwayland_surface_states: HashMap<u32, XwaylandSurfaceState>,
+    xwayland_surface_resources: HashMap<u32, xwayland_surface_v1::XwaylandSurfaceV1>,
+    xwayland_associations: AssociationRegistry,
+    xwayland_client_identity: Option<XwaylandClientIdentity>,
     surface_damage_journals: HashMap<u32, SurfaceDamageJournal>,
     presented_surface_commits: HashMap<u32, SurfaceCommitCounter>,
     surface_presentation_generations: HashMap<u32, u64>,

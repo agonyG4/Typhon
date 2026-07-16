@@ -1265,7 +1265,7 @@ impl CompositorState {
     ) -> bool {
         if matches!(
             self.surface_role(surface_id),
-            SurfaceRole::Unassigned | SurfaceRole::Cursor
+            SurfaceRole::Unassigned | SurfaceRole::Cursor | SurfaceRole::Xwayland
         ) {
             return false;
         }
@@ -1332,7 +1332,7 @@ impl CompositorState {
             SurfaceRole::Cursor => {
                 self.commit_cursor_surface_buffer(surface_id, pending, damage, frame_callbacks);
             }
-            SurfaceRole::Unassigned | SurfaceRole::DragIcon => {
+            SurfaceRole::Unassigned | SurfaceRole::DragIcon | SurfaceRole::Xwayland => {
                 self.commit_unassigned_surface_buffer(surface_id, pending, frame_callbacks, source);
             }
             SurfaceRole::XdgToplevel
