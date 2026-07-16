@@ -70,9 +70,6 @@ impl SurfaceAssociationJoin {
         serial: NonZeroU64,
         surface_id: u32,
     ) -> Result<(), SurfaceAssociationJoinError> {
-        if serial == NonZeroU64::MIN {
-            return Err(SurfaceAssociationJoinError::InvalidSerial);
-        }
         if self.wayland_by_serial.contains_key(&serial) {
             return Err(SurfaceAssociationJoinError::DuplicateWaylandSerial);
         }
@@ -98,9 +95,6 @@ impl SurfaceAssociationJoin {
         window: X11WindowHandle,
         serial: NonZeroU64,
     ) -> Result<(), SurfaceAssociationJoinError> {
-        if serial == NonZeroU64::MIN {
-            return Err(SurfaceAssociationJoinError::InvalidSerial);
-        }
         if let Some(previous) = self.serial_by_x11.get(&window) {
             let _ = previous;
             return Err(SurfaceAssociationJoinError::X11Reassociation);
@@ -247,6 +241,19 @@ mod tests {
     }
 
     #[test]
+    fn serial_one_is_valid_wayland_first() {
+        let generation = generation(1);
+        let handle = window(generation, 10);
+        let serial = NonZeroU64::new(1).unwrap();
+        let mut join = SurfaceAssociationJoin::default();
+
+        join.commit_wayland(generation, serial, 42).unwrap();
+        join.note_x11_serial(handle, serial).unwrap();
+
+        assert_eq!(join.completed[&handle].serial, serial);
+    }
+
+    #[test]
     fn x11_first_then_wayland_serial_completes_once() {
         let generation = generation(1);
         let handle = window(generation, 10);
@@ -258,6 +265,19 @@ mod tests {
 
         assert_eq!(join.completed[&handle].surface_id, 43);
         assert_eq!(join.take_events().len(), 1);
+    }
+
+    #[test]
+    fn serial_one_is_valid_x11_first() {
+        let generation = generation(1);
+        let handle = window(generation, 10);
+        let serial = NonZeroU64::new(1).unwrap();
+        let mut join = SurfaceAssociationJoin::default();
+
+        join.note_x11_serial(handle, serial).unwrap();
+        join.commit_wayland(generation, serial, 43).unwrap();
+
+        assert_eq!(join.completed[&handle].surface_id, 43);
     }
 
     #[test]

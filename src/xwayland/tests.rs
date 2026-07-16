@@ -59,8 +59,7 @@ fn managed_mode_is_the_only_mode_with_a_normal_app_profile() {
     managed_config.profile = super::config::XwaylandProfile::Managed;
     let managed =
         XwaylandService::bootstrap_with_config(managed_config).expect("bootstrap managed mode");
-    assert!(managed.normal_app_environment().is_none());
-    assert!(managed.app_environment().is_some());
+    assert!(managed.normal_app_environment().is_some());
 
     drop(base);
     drop(managed);
@@ -353,6 +352,25 @@ fn base_mode_arms_both_listeners_without_starting_a_process() {
     assert_eq!(service.state_kind(), XwaylandStateKind::Armed);
     assert_eq!(service.reactor_registrations().count(), 2);
     assert_eq!(supervisor.active_count(), 0);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn managed_lazy_environment_triggers_first_generation() {
+    let (root, mut service, mut supervisor) =
+        service_at_root(XwaylandMode::ManagedLazy, "/bin/true");
+    assert!(service.normal_app_environment().is_some());
+    assert_eq!(service.reactor_registrations().count(), 2);
+
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start managed generation");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Starting);
+    assert_eq!(supervisor.active_count(), 1);
+
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
     drop(service);
     drop(supervisor);
     fs::remove_dir_all(root).expect("remove test root");

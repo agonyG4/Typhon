@@ -199,7 +199,9 @@ impl XwaylandService {
     }
 
     pub fn normal_app_environment(&self) -> Option<XwaylandAppEnvironment> {
-        if !self.mode.is_managed() || !matches!(self.state, ServiceState::Running(_)) {
+        if !self.mode.is_managed()
+            || matches!(self.state, ServiceState::Disabled | ServiceState::Failed)
+        {
             return None;
         }
         self.app_environment()
@@ -284,6 +286,15 @@ impl XwaylandService {
         };
         match drain {
             Ok(drain) => {
+                let property_metrics = match &self.state {
+                    ServiceState::Running(resources) => resources.xwm.property_metrics(),
+                    _ => unreachable!("managed XWM state changed during drain"),
+                };
+                self.metrics.property_refresh_requested = property_metrics.requested;
+                self.metrics.property_refresh_completed = property_metrics.completed;
+                self.metrics.property_refresh_coalesced = property_metrics.coalesced;
+                self.metrics.property_refresh_rejected = property_metrics.rejected;
+                self.metrics.property_refresh_stale = property_metrics.stale;
                 self.metrics.xwm_events_received = self
                     .metrics
                     .xwm_events_received
@@ -881,7 +892,10 @@ impl XwaylandService {
         supervisor: &mut ChildSupervisor,
     ) -> io::Result<()> {
         if let ServiceState::Running(resources) = &mut self.state {
-            resources.xwm.handle_resize_sync_deadline(now_ns);
+            resources
+                .xwm
+                .handle_resize_sync_deadline(now_ns)
+                .map_err(io::Error::other)?;
         }
         match self.state {
             ServiceState::Starting(ref resources) if now_ns >= resources.deadline_ns => {
