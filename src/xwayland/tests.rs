@@ -1,15 +1,27 @@
 use std::{
     fs,
     os::unix::fs::{PermissionsExt, symlink},
+    os::unix::net::UnixStream,
     path::PathBuf,
-    sync::{Mutex, MutexGuard, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc, Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use wayland_client::{
+    Connection, Dispatch, QueueHandle,
+    globals::{GlobalListContents, registry_queue_init},
+    protocol::wl_registry,
 };
 
 use crate::process::ChildSupervisor;
 
 use super::{
-    XwaylandConfig, XwaylandMode, XwaylandService, XwaylandStateKind,
+    XwaylandConfig, XwaylandMode, XwaylandReactorPurpose, XwaylandService, XwaylandStateKind,
     auth::read_cookie_for_tests,
     display::{DisplayLease, connect_abstract_socket_for_tests},
 };
@@ -38,9 +50,11 @@ fn off_bootstrap_is_disabled_without_lease_or_process() {
 
 #[test]
 fn generation_allocator_returns_distinct_nonzero_values() {
-    let mut service = XwaylandService::bootstrap_with_config(XwaylandConfig::for_tests(
+    let root = test_root("generation");
+    let mut service = XwaylandService::bootstrap_with_config(XwaylandConfig::for_tests_at_root(
         XwaylandMode::BaseLazy,
         PathBuf::from("Xwayland"),
+        root.clone(),
     ))
     .expect("bootstrap base mode");
 
@@ -49,6 +63,8 @@ fn generation_allocator_returns_distinct_nonzero_values() {
     assert_ne!(first, second);
     assert_ne!(first.get(), 0);
     assert_ne!(second.get(), 0);
+    drop(service);
+    fs::remove_dir_all(root).expect("remove test root");
 }
 
 fn test_root(label: &str) -> PathBuf {
@@ -91,6 +107,23 @@ fn live_lock_is_skipped() {
     let _lock = display_test_lock();
     let root = test_root("live-lock");
     fs::write(root.join(".X0-lock"), format!("{}\n", std::process::id())).expect("write live lock");
+
+    let lease = DisplayLease::allocate_for_tests(&root, 0, 1).expect("allocate after live lock");
+    assert_eq!(lease.display_number(), 1);
+    drop(lease);
+    fs::remove_file(root.join(".X0-lock")).expect("remove simulated lock");
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn nul_padded_live_lock_is_skipped() {
+    let _lock = display_test_lock();
+    let root = test_root("live-lock-nul");
+    fs::write(
+        root.join(".X0-lock"),
+        format!("{:010}\0", std::process::id()),
+    )
+    .expect("write NUL-padded live lock");
 
     let lease = DisplayLease::allocate_for_tests(&root, 0, 1).expect("allocate after live lock");
     assert_eq!(lease.display_number(), 1);
@@ -500,4 +533,147 @@ fn third_abnormal_exit_enters_failed_without_rearming() {
     drop(service);
     drop(supervisor);
     fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[derive(Default)]
+struct SmokeRegistryState;
+
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for SmokeRegistryState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_registry::WlRegistry,
+        _event: wl_registry::Event,
+        _data: &GlobalListContents,
+        _connection: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+#[test]
+#[ignore = "requires an installed Xwayland and an explicit --ignored invocation"]
+fn installed_xwayland_private_socket_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) else {
+        eprintln!("skipping XWayland smoke test: XDG_RUNTIME_DIR is unset");
+        return Ok(());
+    };
+    let binary = std::env::var_os("TYPHON_XWAYLAND_BINARY")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            ["/usr/bin/Xwayland", "/usr/local/bin/Xwayland"]
+                .into_iter()
+                .map(PathBuf::from)
+                .find(|path| path.is_file())
+        });
+    let Some(binary) = binary else {
+        eprintln!("skipping XWayland smoke test: Xwayland is not installed");
+        return Ok(());
+    };
+
+    let socket_name = format!("typhon-xwayland-smoke-{}", std::process::id());
+    let socket_path = runtime_dir.join(&socket_name);
+    let mut compositor =
+        crate::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)?;
+    let mut config = XwaylandConfig::for_tests(XwaylandMode::BaseLazy, binary);
+    config.display_min = 0;
+    config.display_max = 63;
+    let mut supervisor = ChildSupervisor::new();
+    let mut service = XwaylandService::bootstrap_with_config(config)?;
+    let display = service
+        .display_number()
+        .expect("enabled service has display");
+    let lock_path = PathBuf::from(format!("/tmp/.X{display}-lock"));
+    let display_socket_path = PathBuf::from(format!("/tmp/.X11-unix/X{display}"));
+    let auth_path = service
+        .app_environment()
+        .expect("enabled service has app environment")
+        .xauthority;
+
+    // A real local connection is the lazy trigger. The connection is closed
+    // immediately; the inherited X listener remains owned by the service.
+    drop(UnixStream::connect(&display_socket_path)?);
+    service.handle_reactor_event(
+        XwaylandReactorPurpose::ListenFilesystem,
+        None,
+        libc::EPOLLIN as u32,
+        &mut supervisor,
+    )?;
+
+    let generation = service
+        .generation()
+        .expect("listener trigger starts generation");
+    let private_stream = service
+        .private_wayland_client(generation)
+        .expect("generation owns a private Wayland stream");
+    let identity = compositor.insert_xwayland_client(private_stream, generation)?;
+    service.authorize_private_client(generation, identity.client_id.clone());
+
+    let (bind_sender, bind_receiver) = mpsc::channel();
+    let running = Arc::new(AtomicBool::new(true));
+    let server_running = Arc::clone(&running);
+    let server_thread = thread::spawn(move || {
+        while server_running.load(Ordering::Relaxed) {
+            let _ = compositor.tick();
+            let binds = compositor.take_xwayland_shell_bind_events();
+            if !binds.is_empty() {
+                let _ = bind_sender.send(binds);
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        compositor
+    });
+
+    let normal_connection = Connection::from_socket(UnixStream::connect(&socket_path)?)?;
+    let (globals, _queue) = registry_queue_init::<SmokeRegistryState>(&normal_connection)?;
+    assert!(
+        !globals
+            .contents()
+            .clone_list()
+            .into_iter()
+            .any(|global| global.interface == "xwayland_shell_v1")
+    );
+    drop(normal_connection);
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut private_bind_seen = false;
+    while Instant::now() < deadline {
+        service.handle_displayfd_ready(generation, &mut supervisor)?;
+        while let Ok(binds) = bind_receiver.try_recv() {
+            for bind in binds {
+                assert_eq!(bind.client_id, identity.client_id);
+                assert_eq!(bind.generation, generation);
+                service.handle_shell_bind_for_client(bind.generation, &bind.client_id)?;
+                private_bind_seen = true;
+            }
+        }
+        if service.state_kind() == XwaylandStateKind::RunningBase {
+            break;
+        }
+        for exit in supervisor.reap_exited()? {
+            service.handle_process_exit(&exit)?;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(private_bind_seen, "Xwayland did not bind xwayland-shell-v1");
+    assert_eq!(service.state_kind(), XwaylandStateKind::RunningBase);
+
+    service.emergency_cleanup(&mut supervisor)?;
+    let reap_deadline = Instant::now() + Duration::from_secs(2);
+    while supervisor.active_count() != 0 && Instant::now() < reap_deadline {
+        let _ = supervisor.reap_exited()?;
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(supervisor.active_count(), 0);
+    running.store(false, Ordering::Relaxed);
+    drop(
+        server_thread
+            .join()
+            .map_err(|_| std::io::Error::other("XWayland smoke server panicked"))?,
+    );
+    drop(service);
+    assert!(!lock_path.exists());
+    assert!(!display_socket_path.exists());
+    assert!(!auth_path.exists());
+    Ok(())
 }

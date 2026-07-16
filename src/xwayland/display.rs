@@ -310,10 +310,12 @@ fn inspect_existing_lock(lock_path: &Path, socket_path: &Path) -> io::Result<Opt
             ),
         ));
     }
-    let pid = fs::read_to_string(lock_path)?
-        .trim()
-        .parse::<u32>()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "X11 display lock has no PID"))?;
+    let bytes = fs::read(lock_path)?;
+    let pid_bytes = bytes.split(|byte| *byte == 0).next().unwrap_or_default();
+    let pid = std::str::from_utf8(pid_bytes)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "X11 display lock has no PID"))?;
     if process_is_alive(pid) || socket_is_active(socket_path)? {
         Ok(Some(true))
     } else {
