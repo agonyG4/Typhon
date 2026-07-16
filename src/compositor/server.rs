@@ -37,7 +37,7 @@ use crate::astrea_shortcuts::server::astrea_shortcuts_manager_v1;
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
-use crate::xwayland::xwm::XwmEvent;
+use crate::xwayland::xwm::{XwmCommand, XwmEvent};
 use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 
 use super::protocols::versions;
@@ -403,26 +403,91 @@ impl OwnCompositorServer {
         self.state.take_xwayland_buffer_ready_events()
     }
 
-    pub fn apply_xwayland_window_event(&mut self, event: XwmEvent) -> bool {
+    pub fn apply_xwayland_window_event(&mut self, event: XwmEvent) -> Vec<XwmCommand> {
         match event {
-            XwmEvent::WindowReady(snapshot) => self.state.insert_x11_window(snapshot).is_ok(),
-            XwmEvent::WindowDestroyed(handle) => self.remove_x11_desktop_window(handle),
+            XwmEvent::WindowReady(snapshot) => {
+                let handle = snapshot.handle;
+                if self.state.insert_x11_window(snapshot).is_ok() {
+                    vec![XwmCommand::Map(handle), self.sync_xwayland_client_lists()]
+                } else {
+                    Vec::new()
+                }
+            }
+            XwmEvent::WindowDestroyed(handle) => {
+                if self.remove_x11_desktop_window(handle) {
+                    vec![self.sync_xwayland_client_lists()]
+                } else {
+                    Vec::new()
+                }
+            }
             XwmEvent::WindowWithdrawn(handle) => {
                 let Some(window_id) = self.state.window_id_for_x11_handle(handle) else {
-                    return false;
+                    return Vec::new();
                 };
-                self.state
+                if self
+                    .state
                     .window(window_id)
                     .is_some_and(|window| window.kind == DesktopWindowKind::OverrideRedirect)
                     && self.state.remove_desktop_window(window_id).is_some()
+                {
+                    vec![self.sync_xwayland_client_lists()]
+                } else {
+                    Vec::new()
+                }
             }
             XwmEvent::MetadataChanged { window, delta } => {
-                self.state.apply_x11_metadata_delta(window, delta)
+                self.state.apply_x11_metadata_delta(window, delta);
+                Vec::new()
             }
-            XwmEvent::ConfigureRequested { .. }
-            | XwmEvent::StateRequested { .. }
-            | XwmEvent::FocusRequested(_)
-            | XwmEvent::CloseRequestedByClient(_) => false,
+            XwmEvent::ConfigureRequested { window, request } => self
+                .state
+                .filter_x11_geometry(window, request.requested)
+                .map(|geometry| {
+                    self.state.set_x11_geometry(window, geometry);
+                    XwmCommand::Configure { window, geometry }
+                })
+                .into_iter()
+                .collect(),
+            XwmEvent::StateRequested { window, request } => {
+                let was_hidden = self
+                    .state
+                    .window_id_for_x11_handle(window)
+                    .and_then(|id| self.state.window(id))
+                    .is_some_and(|window| window.state.is_minimized());
+                let Some(state) = self.state.apply_x11_state_request(window, request) else {
+                    return Vec::new();
+                };
+                let mut commands = Vec::with_capacity(2);
+                if state.hidden != was_hidden {
+                    commands.push(if state.hidden {
+                        XwmCommand::Unmap(window)
+                    } else {
+                        XwmCommand::Map(window)
+                    });
+                }
+                commands.push(XwmCommand::SetState { window, state });
+                commands
+            }
+            XwmEvent::FocusRequested(window) => {
+                if self.state.x11_focus_request_allowed(window)
+                    && self
+                        .state
+                        .window_id_for_x11_handle(window)
+                        .is_some_and(|window_id| self.state.focus_desktop_window(window_id))
+                {
+                    vec![
+                        XwmCommand::Focus {
+                            window: Some(window),
+                            timestamp: 0,
+                        },
+                        XwmCommand::Raise(window),
+                        self.sync_xwayland_client_lists(),
+                    ]
+                } else {
+                    Vec::new()
+                }
+            }
+            XwmEvent::CloseRequestedByClient(_) => Vec::new(),
         }
     }
 
@@ -431,6 +496,14 @@ impl OwnCompositorServer {
             return false;
         };
         self.state.remove_desktop_window(window_id).is_some()
+    }
+
+    fn sync_xwayland_client_lists(&self) -> XwmCommand {
+        let (client_list, stacking) = self.state.x11_client_lists();
+        XwmCommand::SyncClientLists {
+            client_list,
+            stacking,
+        }
     }
 
     pub fn accepted_clients(&self) -> usize {

@@ -10,6 +10,15 @@ use x11rb::{
 use super::{X11Geometry, X11PublishedState, Xwm, XwmCommand, XwmError, atoms::XwmAtomName};
 
 pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError> {
+    if let XwmCommand::SyncClientLists {
+        client_list,
+        stacking,
+    } = &command
+    {
+        for handle in client_list.iter().chain(stacking.iter()) {
+            validate_handle(xwm, *handle)?;
+        }
+    }
     let handle = command_handle(&command);
     if let Some(handle) = handle {
         validate_handle(xwm, handle)?;
@@ -38,6 +47,31 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             xwm.connection
                 .set_input_focus(InputFocus::NONE, focus, timestamp)
                 .map_err(XwmError::Connection)?;
+            if let Some(handle) = window
+                && xwm
+                    .windows
+                    .get(handle)
+                    .and_then(|record| record.snapshot.as_ref())
+                    .is_some_and(|snapshot| snapshot.supports_take_focus)
+            {
+                let event = xproto::ClientMessageEvent {
+                    response_type: xproto::CLIENT_MESSAGE_EVENT,
+                    format: 32,
+                    sequence: 0,
+                    window: handle.xid(),
+                    type_: xwm.atoms.get(XwmAtomName::WmProtocols),
+                    data: xproto::ClientMessageData::from([
+                        xwm.atoms.get(XwmAtomName::WmTakeFocus),
+                        timestamp,
+                        0,
+                        0,
+                        0,
+                    ]),
+                };
+                xwm.connection
+                    .send_event(false, handle.xid(), xproto::EventMask::NO_EVENT, event)
+                    .map_err(XwmError::Connection)?;
+            }
             let value = window.map_or_else(Vec::new, |handle| vec![handle.xid()]);
             if value.is_empty() {
                 xwm.connection
@@ -64,12 +98,44 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
                 .map_err(XwmError::Connection)?;
         }
         XwmCommand::Close(handle) => {
-            xwm.connection
-                .kill_client(handle.xid())
-                .map_err(XwmError::Connection)?;
+            let supports_delete = xwm
+                .windows
+                .get(handle)
+                .and_then(|record| record.snapshot.as_ref())
+                .is_some_and(|snapshot| snapshot.supports_delete);
+            if supports_delete {
+                let event = xproto::ClientMessageEvent {
+                    response_type: xproto::CLIENT_MESSAGE_EVENT,
+                    format: 32,
+                    sequence: 0,
+                    window: handle.xid(),
+                    type_: xwm.atoms.get(XwmAtomName::WmProtocols),
+                    data: xproto::ClientMessageData::from([
+                        xwm.atoms.get(XwmAtomName::WmDeleteWindow),
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]),
+                };
+                xwm.connection
+                    .send_event(false, handle.xid(), xproto::EventMask::NO_EVENT, event)
+                    .map_err(XwmError::Connection)?;
+            } else {
+                xwm.connection
+                    .kill_client(handle.xid())
+                    .map_err(XwmError::Connection)?;
+            }
         }
         XwmCommand::SetState { window, state } => {
             publish_state(xwm, window, state)?;
+        }
+        XwmCommand::SyncClientLists {
+            client_list,
+            stacking,
+        } => {
+            publish_client_list(xwm, XwmAtomName::NetClientList, &client_list)?;
+            publish_client_list(xwm, XwmAtomName::NetClientListStacking, &stacking)?;
         }
     }
     Ok(())
@@ -87,7 +153,29 @@ fn command_handle(command: &XwmCommand) -> Option<super::X11WindowHandle> {
         | XwmCommand::Close(handle) => Some(*handle),
         XwmCommand::Configure { window, .. } | XwmCommand::SetState { window, .. } => Some(*window),
         XwmCommand::Focus { window, .. } => *window,
+        XwmCommand::SyncClientLists { .. } => None,
     }
+}
+
+fn publish_client_list(
+    xwm: &Xwm,
+    atom: XwmAtomName,
+    handles: &[super::X11WindowHandle],
+) -> Result<(), XwmError> {
+    let values = handles
+        .iter()
+        .map(|handle| handle.xid())
+        .collect::<Vec<_>>();
+    xwm.connection
+        .change_property32(
+            PropMode::REPLACE,
+            xwm.root,
+            xwm.atoms.get(atom),
+            AtomEnum::WINDOW,
+            &values,
+        )
+        .map_err(XwmError::Connection)?;
+    Ok(())
 }
 
 fn validate_handle(xwm: &Xwm, handle: super::X11WindowHandle) -> Result<(), XwmError> {

@@ -24,6 +24,7 @@ mod window_interaction;
 mod window_resize;
 mod windows;
 mod xdg_lifecycle;
+mod xwayland_windows;
 
 #[allow(unused_imports)]
 pub(in crate::compositor) use client_lifecycle::*;
@@ -73,6 +74,8 @@ pub(in crate::compositor) use window_resize::*;
 pub(in crate::compositor) use windows::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use xdg_lifecycle::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use xwayland_windows::*;
 
 #[cfg(test)]
 mod desktop_window_tests;

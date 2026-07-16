@@ -810,6 +810,22 @@ impl XwaylandService {
         }
     }
 
+    pub fn execute_managed_command(&mut self, command: super::xwm::XwmCommand) -> io::Result<()> {
+        match &mut self.state {
+            ServiceState::Running(resources) => {
+                resources.xwm.execute(command).map_err(io::Error::other)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn flush_managed_commands(&mut self) -> io::Result<()> {
+        match &mut self.state {
+            ServiceState::Running(resources) => resources.xwm.flush().map_err(io::Error::other),
+            _ => Ok(()),
+        }
+    }
+
     pub fn handle_deadline(
         &mut self,
         now_ns: u64,

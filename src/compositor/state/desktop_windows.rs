@@ -122,8 +122,18 @@ impl CompositorState {
         let window_id = self
             .allocate_window_id()
             .map_err(|_| X11WindowAdmissionError::WindowIdExhausted)?;
+        let handle = snapshot.handle;
+        let geometry = snapshot.geometry;
+        let transient_for = snapshot.transient_for;
         self.insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
             .map_err(|_| X11WindowAdmissionError::DuplicateRootSurface)?;
+        let _ = self.set_x11_geometry(handle, geometry);
+        if let Some(parent_handle) = transient_for
+            && let Some(parent_id) = self.window_id_for_x11_handle(parent_handle)
+            && let Some(window) = self.window_mut(window_id)
+        {
+            window.relationships.transient_for = Some(parent_id);
+        }
         Ok(window_id)
     }
 
@@ -164,6 +174,125 @@ impl CompositorState {
         true
     }
 
+    pub(in crate::compositor) fn filter_x11_geometry(
+        &self,
+        handle: X11WindowHandle,
+        requested: crate::xwayland::xwm::X11Geometry,
+    ) -> Option<crate::xwayland::xwm::X11Geometry> {
+        let window_id = self.window_id_for_x11_handle(handle)?;
+        let window = self.window(window_id)?;
+        let width = requested
+            .width
+            .max(1)
+            .max(window.constraints.min_width.unwrap_or(1))
+            .min(window.constraints.max_width.unwrap_or(u32::MAX));
+        let height = requested
+            .height
+            .max(1)
+            .max(window.constraints.min_height.unwrap_or(1))
+            .min(window.constraints.max_height.unwrap_or(u32::MAX));
+        Some(crate::xwayland::xwm::X11Geometry {
+            width,
+            height,
+            ..requested
+        })
+    }
+
+    pub(in crate::compositor) fn set_x11_geometry(
+        &mut self,
+        handle: X11WindowHandle,
+        geometry: crate::xwayland::xwm::X11Geometry,
+    ) -> bool {
+        let Some(window_id) = self.window_id_for_x11_handle(handle) else {
+            return false;
+        };
+        let Some(filtered) = self.filter_x11_geometry(handle, geometry) else {
+            return false;
+        };
+        let root_surface_id = self.window(window_id).map(|window| window.root_surface_id);
+        let Some(root_surface_id) = root_surface_id else {
+            return false;
+        };
+        self.set_surface_placement_with_cause(
+            root_surface_id,
+            SurfacePlacement::absolute_root_at(filtered.x, filtered.y),
+            RenderGenerationCause::WindowMove,
+        );
+        true
+    }
+
+    pub(in crate::compositor) fn apply_x11_published_state(
+        &mut self,
+        handle: X11WindowHandle,
+        state: crate::xwayland::xwm::X11PublishedState,
+    ) -> bool {
+        let Some(window_id) = self.window_id_for_x11_handle(handle) else {
+            return false;
+        };
+        let mode = if state.fullscreen {
+            ToplevelMode::Fullscreen
+        } else if state.maximized {
+            ToplevelMode::Maximized
+        } else {
+            ToplevelMode::Floating
+        };
+        let Some(root_surface_id) = self.window(window_id).map(|window| window.root_surface_id)
+        else {
+            return false;
+        };
+        let minimized = self
+            .window(window_id)
+            .is_some_and(|window| window.state.is_minimized());
+        if let Some(window) = self.window_mut(window_id) {
+            window.state.set_mode(mode);
+        }
+        if state.hidden && !minimized {
+            let _ = self.minimize_desktop_window(window_id);
+        } else if !state.hidden && minimized {
+            let _ = self.restore_minimized_desktop_window(window_id);
+        }
+        let placement = match mode {
+            ToplevelMode::Fullscreen => self.fullscreen_window_geometry().placement,
+            ToplevelMode::Maximized => self.maximized_window_geometry().placement,
+            ToplevelMode::Floating => self.surface_placement(root_surface_id),
+        };
+        self.set_surface_placement_with_cause(
+            root_surface_id,
+            placement,
+            RenderGenerationCause::WindowMode,
+        );
+        true
+    }
+
+    pub(in crate::compositor) fn apply_x11_state_request(
+        &mut self,
+        handle: X11WindowHandle,
+        request: crate::xwayland::xwm::X11StateRequest,
+    ) -> Option<crate::xwayland::xwm::X11PublishedState> {
+        let window_id = self.window_id_for_x11_handle(handle)?;
+        let window = self.window(window_id)?;
+        let mut state = crate::xwayland::xwm::X11PublishedState {
+            fullscreen: window.state.mode() == ToplevelMode::Fullscreen,
+            maximized: window.state.mode() == ToplevelMode::Maximized,
+            hidden: window.state.is_minimized(),
+            activated: self.focused_window_id == Some(window_id),
+        };
+        for atom in [request.first, request.second].into_iter().flatten() {
+            let value = match atom {
+                crate::xwayland::xwm::X11StateAtom::Fullscreen => &mut state.fullscreen,
+                crate::xwayland::xwm::X11StateAtom::Maximized => &mut state.maximized,
+                crate::xwayland::xwm::X11StateAtom::Hidden => &mut state.hidden,
+            };
+            match request.action {
+                crate::xwayland::xwm::X11StateAction::Remove => *value = false,
+                crate::xwayland::xwm::X11StateAction::Add => *value = true,
+                crate::xwayland::xwm::X11StateAction::Toggle => *value = !*value,
+            }
+        }
+        self.apply_x11_published_state(handle, state);
+        Some(state)
+    }
+
     pub(in crate::compositor) fn raise_window_id(&mut self, id: WindowId) -> bool {
         if !self.desktop_windows.contains_key(&id) {
             return false;
@@ -171,6 +300,37 @@ impl CompositorState {
         self.window_stacking.retain(|window_id| *window_id != id);
         self.window_stacking.push(id);
         true
+    }
+
+    pub(in crate::compositor) fn x11_client_lists(
+        &self,
+    ) -> (
+        Vec<crate::xwayland::X11WindowHandle>,
+        Vec<crate::xwayland::X11WindowHandle>,
+    ) {
+        let mut client_list = self
+            .desktop_windows
+            .values()
+            .filter_map(|window| match window.backend {
+                WindowBackend::X11(handle) => Some((window.id, handle)),
+                WindowBackend::Xdg(_) => None,
+            })
+            .collect::<Vec<_>>();
+        client_list.sort_by_key(|(id, _)| *id);
+        let client_list = client_list
+            .iter()
+            .map(|(_, handle)| *handle)
+            .collect::<Vec<_>>();
+        let stacking = self
+            .window_stacking
+            .iter()
+            .filter_map(|id| self.window(*id))
+            .filter_map(|window| match window.backend {
+                WindowBackend::X11(handle) => Some(handle),
+                WindowBackend::Xdg(_) => None,
+            })
+            .collect::<Vec<_>>();
+        (client_list, stacking)
     }
 
     pub(in crate::compositor) fn window_id_for_surface(&self, surface_id: u32) -> Option<WindowId> {

@@ -219,7 +219,6 @@ impl CompositorState {
             }
             self.raise_renderable_surface_tree(surface_id);
         }
-
         self.track_committed_buffer_lifetime(surface_id, &pending);
         let published_buffer_id = pending.data.buffer_id();
         self.current_surface_buffers.insert(surface_id, pending);
@@ -251,7 +250,6 @@ impl CompositorState {
             self.reconcile_surface_output_membership(&surface);
         }
     }
-
     pub(in crate::compositor) fn minimized_root_surface_id_for_surface(
         &self,
         surface_id: u32,
@@ -261,7 +259,6 @@ impl CompositorState {
             .is_some_and(WindowState::is_minimized)
             .then_some(root_surface_id)
     }
-
     #[allow(clippy::too_many_arguments)]
     pub(in crate::compositor) fn commit_minimized_surface_buffer(
         &mut self,
@@ -1338,8 +1335,11 @@ impl CompositorState {
             SurfaceRole::Cursor => {
                 self.commit_cursor_surface_buffer(surface_id, pending, damage, frame_callbacks);
             }
-            SurfaceRole::Unassigned | SurfaceRole::DragIcon | SurfaceRole::Xwayland => {
+            SurfaceRole::Unassigned | SurfaceRole::DragIcon => {
                 self.commit_unassigned_surface_buffer(surface_id, pending, frame_callbacks, source);
+            }
+            SurfaceRole::Xwayland => {
+                self.commit_xwayland_surface_buffer(surface_id, pending, frame_callbacks, source);
             }
             SurfaceRole::XdgToplevel
             | SurfaceRole::XdgPopup

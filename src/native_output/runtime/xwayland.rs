@@ -2,11 +2,14 @@ use super::*;
 
 impl NativeRuntime {
     pub(super) fn dispatch_xwayland_window_events(&mut self) -> NativeResult<()> {
+        let mut commands = Vec::new();
         for event in self.xwayland.take_managed_xwm_events() {
-            if !self.server.apply_xwayland_window_event(event) {
-                self.xwayland.record_stale_reactor_event();
-            }
+            commands.extend(self.server.apply_xwayland_window_event(event));
         }
+        for command in commands {
+            self.xwayland.execute_managed_command(command)?;
+        }
+        self.xwayland.flush_managed_commands()?;
         Ok(())
     }
 

@@ -162,6 +162,10 @@ pub enum XwmCommand {
         window: X11WindowHandle,
         state: X11PublishedState,
     },
+    SyncClientLists {
+        client_list: Vec<X11WindowHandle>,
+        stacking: Vec<X11WindowHandle>,
+    },
 }
 
 #[derive(Debug)]

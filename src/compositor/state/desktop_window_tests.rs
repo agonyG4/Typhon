@@ -231,6 +231,97 @@ fn x11_metadata_delta_updates_generic_metadata() {
 }
 
 #[test]
+fn x11_client_lists_follow_identity_and_generic_stacking() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let first = x11_snapshot(generation, 107, 58);
+    let second = x11_snapshot(generation, 108, 59);
+    let first_id = state.allocate_window_id().expect("first window id");
+    let second_id = state.allocate_window_id().expect("second window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(first_id, first.clone()))
+        .expect("insert first X11 window");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(second_id, second.clone()))
+        .expect("insert second X11 window");
+
+    let (client_list, stacking) = state.x11_client_lists();
+    assert_eq!(client_list, vec![first.handle, second.handle]);
+    assert_eq!(stacking, vec![first.handle, second.handle]);
+
+    assert!(state.raise_window_id(first_id));
+    let (_, stacking) = state.x11_client_lists();
+    assert_eq!(stacking, vec![second.handle, first.handle]);
+}
+
+#[test]
+fn background_x11_activation_request_is_denied() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let first = x11_snapshot(generation, 109, 60);
+    let second = x11_snapshot(generation, 110, 61);
+    let first_id = state.allocate_window_id().expect("first window id");
+    let second_id = state.allocate_window_id().expect("second window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(first_id, first.clone()))
+        .expect("insert first X11 window");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(second_id, second.clone()))
+        .expect("insert second X11 window");
+    state.focused_window_id = Some(first_id);
+
+    assert!(!state.x11_focus_request_allowed(second.handle));
+    assert!(state.x11_focus_request_allowed(first.handle));
+}
+
+#[test]
+fn x11_fullscreen_uses_output_geometry_and_maximize_publishes_both_axes() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let snapshot = x11_snapshot(generation, 111, 62);
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(id, snapshot.clone()))
+        .expect("insert X11 window");
+
+    let maximized = state
+        .apply_x11_state_request(
+            snapshot.handle,
+            crate::xwayland::xwm::X11StateRequest {
+                action: crate::xwayland::xwm::X11StateAction::Add,
+                first: Some(crate::xwayland::xwm::X11StateAtom::Maximized),
+                second: None,
+            },
+        )
+        .expect("maximized state");
+    assert!(maximized.maximized);
+    assert_eq!(
+        state.window(id).expect("window").state.mode(),
+        ToplevelMode::Maximized
+    );
+    assert_eq!(
+        state.surface_placement(62),
+        state.maximized_window_geometry().placement
+    );
+
+    let fullscreen = state
+        .apply_x11_state_request(
+            snapshot.handle,
+            crate::xwayland::xwm::X11StateRequest {
+                action: crate::xwayland::xwm::X11StateAction::Add,
+                first: Some(crate::xwayland::xwm::X11StateAtom::Fullscreen),
+                second: None,
+            },
+        )
+        .expect("fullscreen state");
+    assert!(fullscreen.fullscreen);
+    assert_eq!(
+        state.surface_placement(62),
+        state.fullscreen_window_geometry().placement
+    );
+}
+
+#[test]
 fn override_redirect_window_is_excluded_from_normal_window_cycle() {
     let mut state = CompositorState::new(None);
     let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
@@ -246,4 +337,66 @@ fn override_redirect_window_is_excluded_from_normal_window_cycle() {
         DesktopWindowKind::OverrideRedirect
     );
     assert!(!state.window(id).expect("window").state.is_minimized());
+}
+
+#[test]
+fn x11_configure_request_is_filtered_by_generic_constraints() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let snapshot = x11_snapshot(generation, 106, 57);
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(id, snapshot.clone()))
+        .expect("insert X11 window");
+    state.window_mut(id).expect("window").constraints = WindowConstraints {
+        min_width: Some(400),
+        min_height: Some(300),
+        max_width: Some(1000),
+        max_height: Some(900),
+        ..WindowConstraints::default()
+    };
+
+    let filtered = state.filter_x11_geometry(
+        snapshot.handle,
+        X11Geometry {
+            x: -20,
+            y: 30,
+            width: 1200,
+            height: 100,
+        },
+    );
+    assert_eq!(
+        filtered,
+        Some(X11Geometry {
+            x: -20,
+            y: 30,
+            width: 1000,
+            height: 300,
+        })
+    );
+}
+
+#[test]
+fn x11_published_state_updates_generic_window_state() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let snapshot = x11_snapshot(generation, 107, 58);
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(id, snapshot.clone()))
+        .expect("insert X11 window");
+
+    assert!(state.apply_x11_published_state(
+        snapshot.handle,
+        X11PublishedState {
+            fullscreen: true,
+            maximized: false,
+            hidden: false,
+            activated: true,
+        }
+    ));
+    assert_eq!(
+        state.window(id).expect("window").state.mode(),
+        ToplevelMode::Fullscreen
+    );
 }
