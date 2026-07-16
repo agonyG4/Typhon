@@ -31,7 +31,7 @@ use super::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 
 const XWM_EVENT_BUDGET: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct X11Geometry {
     pub x: i32,
     pub y: i32,
@@ -257,10 +257,21 @@ impl Xwm {
     }
 
     pub fn observe_window(&mut self, handle: X11WindowHandle) -> Result<bool, XwmError> {
+        self.observe_window_with_kind(handle, DesktopWindowKind::Managed, X11Geometry::default())
+    }
+
+    pub(crate) fn observe_window_with_kind(
+        &mut self,
+        handle: X11WindowHandle,
+        kind: DesktopWindowKind,
+        geometry: X11Geometry,
+    ) -> Result<bool, XwmError> {
         if handle.generation() != self.generation {
             return Err(XwmError::StaleGeneration);
         }
-        Ok(self.windows.insert_observed(handle))
+        Ok(self
+            .windows
+            .insert_observed_with_kind(handle, kind, geometry))
     }
 
     pub fn register_snapshot(&mut self, snapshot: X11WindowSnapshot) -> Result<bool, XwmError> {
@@ -286,6 +297,16 @@ impl Xwm {
         self.association.clear_generation(generation);
     }
 
+    pub fn mark_window_buffer_ready(&mut self, handle: X11WindowHandle) -> Result<(), XwmError> {
+        if handle.generation() != self.generation {
+            return Err(XwmError::StaleGeneration);
+        }
+        self.windows
+            .mark_buffer_ready(handle)
+            .map_err(XwmError::InvalidCommand)?;
+        self.emit_ready_if_complete(handle)
+    }
+
     pub fn note_x11_surface_serial(
         &mut self,
         handle: X11WindowHandle,
@@ -302,7 +323,9 @@ impl Xwm {
         };
         self.association
             .note_x11_serial(handle, serial)
-            .map_err(XwmError::Association)
+            .map_err(XwmError::Association)?;
+        self.sync_completed_associations();
+        Ok(())
     }
 
     pub fn ingest_wayland_association(
@@ -324,12 +347,13 @@ impl Xwm {
             } => self
                 .association
                 .commit_wayland(generation, serial, surface_id)
-                .map_err(XwmError::Association),
+                .map_err(XwmError::Association)?,
             XwaylandAssociationEvent::Removed { surface_id, .. } => {
                 self.association.remove_wayland_surface(surface_id);
-                Ok(())
             }
         }
+        self.sync_completed_associations();
+        Ok(())
     }
 
     pub fn remove_x11_association(&mut self, handle: X11WindowHandle) -> Result<(), XwmError> {
@@ -376,6 +400,40 @@ impl Xwm {
 
     pub fn take_events(&mut self) -> impl Iterator<Item = XwmEvent> + '_ {
         self.outgoing_events.drain(..)
+    }
+
+    fn sync_completed_associations(&mut self) {
+        let associations = self
+            .association
+            .completed
+            .iter()
+            .map(|(handle, association)| (*handle, *association))
+            .collect::<Vec<_>>();
+        for (handle, association) in associations {
+            if !self.windows.contains(handle) {
+                continue;
+            }
+            let needs_association = self
+                .windows
+                .get(handle)
+                .is_some_and(|record| record.association.is_none());
+            if needs_association {
+                let _ = self.windows.mark_associated(handle, association);
+            }
+            let _ = self.emit_ready_if_complete(handle);
+        }
+    }
+
+    fn emit_ready_if_complete(&mut self, handle: X11WindowHandle) -> Result<(), XwmError> {
+        let snapshot = self
+            .windows
+            .try_ready(handle)
+            .map_err(XwmError::InvalidCommand)?;
+        if let Some(snapshot) = snapshot {
+            self.outgoing_events
+                .push_back(XwmEvent::WindowReady(snapshot));
+        }
+        Ok(())
     }
 }
 

@@ -137,13 +137,9 @@ fn publish_state(
 }
 
 fn set_lifecycle_mapped(xwm: &mut Xwm, handle: super::X11WindowHandle) {
-    if let Some(record) = xwm.windows.get_mut(handle) {
-        record.lifecycle = super::window::X11WindowLifecycle::Mapped;
-    }
+    let _ = xwm.windows.mark_mapped(handle);
 }
 
 fn set_lifecycle_withdrawn(xwm: &mut Xwm, handle: super::X11WindowHandle) {
-    if let Some(record) = xwm.windows.get_mut(handle) {
-        record.lifecycle = super::window::X11WindowLifecycle::Withdrawn;
-    }
+    let _ = xwm.windows.mark_unmapped(handle);
 }
