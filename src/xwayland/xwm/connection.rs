@@ -1,11 +1,20 @@
-use std::{os::fd::AsRawFd, os::unix::net::UnixStream};
+use std::{
+    io,
+    os::fd::{AsRawFd, RawFd},
+    os::unix::net::UnixStream,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
+use x11rb::utils::RawFdContainer;
 use x11rb::{
     connection::Connection,
     protocol::composite::ConnectionExt as CompositeConnectionExt,
     protocol::xproto::ConnectionExt as XprotoConnectionExt,
     protocol::{composite, xproto},
-    rust_connection::{DefaultStream, RustConnection},
+    rust_connection::{DefaultStream, PollMode, RustConnection, Stream},
     wrapper::ConnectionExt,
 };
 
@@ -14,12 +23,86 @@ use super::{
 };
 use crate::xwayland::XwaylandGeneration;
 
+#[derive(Debug)]
+pub(crate) struct ReactorStream {
+    inner: DefaultStream,
+    nonblocking_poll: Arc<AtomicBool>,
+}
+
+impl ReactorStream {
+    fn new(inner: DefaultStream) -> (Self, Arc<AtomicBool>) {
+        let nonblocking_poll = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                inner,
+                nonblocking_poll: Arc::clone(&nonblocking_poll),
+            },
+            nonblocking_poll,
+        )
+    }
+}
+
+impl AsRawFd for ReactorStream {
+    fn as_raw_fd(&self) -> RawFd {
+        self.inner.as_raw_fd()
+    }
+}
+
+impl Stream for ReactorStream {
+    fn poll(&self, mode: PollMode) -> io::Result<()> {
+        if !self.nonblocking_poll.load(Ordering::Acquire) {
+            return self.inner.poll(mode);
+        }
+        let mut events = 0;
+        if mode.readable() {
+            events |= libc::POLLIN;
+        }
+        if mode.writable() {
+            events |= libc::POLLOUT;
+        }
+        let mut pollfd = libc::pollfd {
+            fd: self.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        // SAFETY: `pollfd` is initialized and points to one valid descriptor.
+        let result = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        if result > 0 {
+            Ok(())
+        } else if result == 0 {
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "XWM socket is not ready",
+            ))
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn read(&self, buffer: &mut [u8], fds: &mut Vec<RawFdContainer>) -> io::Result<usize> {
+        self.inner.read(buffer, fds)
+    }
+
+    fn write(&self, buffer: &[u8], fds: &mut Vec<RawFdContainer>) -> io::Result<usize> {
+        self.inner.write(buffer, fds)
+    }
+
+    fn write_vectored(
+        &self,
+        buffers: &[std::io::IoSlice<'_>],
+        fds: &mut Vec<RawFdContainer>,
+    ) -> io::Result<usize> {
+        self.inner.write_vectored(buffers, fds)
+    }
+}
+
 pub(crate) fn connect(
     generation: XwaylandGeneration,
     stream: UnixStream,
 ) -> Result<Xwm, XwmStartupError> {
     let (stream, _) = DefaultStream::from_unix_stream(stream)
         .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
+    let (stream, nonblocking_poll) = ReactorStream::new(stream);
     let raw_fd = stream.as_raw_fd();
     let connection =
         RustConnection::connect_to_stream(stream, 0).map_err(XwmStartupError::Connection)?;
@@ -36,6 +119,7 @@ pub(crate) fn connect(
     connection
         .flush()
         .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
+    nonblocking_poll.store(true, Ordering::Release);
 
     Ok(Xwm {
         generation,
@@ -59,8 +143,8 @@ pub(crate) fn connect(
     })
 }
 
-fn setup_root(
-    connection: &RustConnection<DefaultStream>,
+fn setup_root<S: Stream>(
+    connection: &RustConnection<S>,
     root: u32,
     atoms: &XwmAtoms,
     capabilities: &XwmCapabilities,

@@ -11,7 +11,7 @@ use std::{
 };
 
 use crate::compositor::{DesktopWindowKind, WindowConstraints, WindowMetadata};
-use x11rb::rust_connection::{DefaultStream, RustConnection};
+use x11rb::rust_connection::RustConnection;
 
 mod association;
 mod atoms;
@@ -246,7 +246,7 @@ impl std::error::Error for XwmError {}
 #[derive(Debug)]
 pub struct Xwm {
     pub(crate) generation: XwaylandGeneration,
-    pub(crate) connection: RustConnection<DefaultStream>,
+    pub(crate) connection: RustConnection<connection::ReactorStream>,
     pub(crate) screen_number: usize,
     pub(crate) root: u32,
     pub(crate) atoms: XwmAtoms,

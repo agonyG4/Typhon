@@ -219,7 +219,16 @@ pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize) -> Result<usize, XwmErr
         };
         debug_assert_eq!(pending.sequence, sequence);
         let cookie = Cookie::<_, xproto::GetPropertyReply>::new(&xwm.connection, sequence);
-        let reply = cookie.reply_unchecked().map_err(XwmError::Connection)?;
+        let reply = match cookie.reply_unchecked() {
+            Ok(reply) => reply,
+            Err(x11rb::errors::ConnectionError::IoError(error))
+                if error.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                xwm.pending_properties.insert(sequence, pending);
+                continue;
+            }
+            Err(error) => return Err(XwmError::Connection(error)),
+        };
         let Some(reply) = reply else {
             resolve_fallback(xwm, pending.handle, pending.kind, pending.epoch);
             xwm.property_metrics.completed = xwm.property_metrics.completed.saturating_add(1);
