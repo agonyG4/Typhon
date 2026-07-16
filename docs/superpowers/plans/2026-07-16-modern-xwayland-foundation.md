@@ -226,4 +226,3 @@
 | `/tmp` display artifacts are concurrently manipulated | High | `O_NOFOLLOW`, exact lease ownership, live-PID/socket checks, rollback, and never unlink paths not created by this lease. |
 | Reactor HUP handling currently treats all source errors as fatal | Medium | Special-case only XWayland displayfd HUP/RDHUP and preserve existing fatal behavior elsewhere. |
 | NativeRuntime bootstrap is large and tightly coupled | Medium | Add the service at the narrow bootstrap/event/shutdown seams and do not alter render/KMS code. |
-

@@ -29,8 +29,8 @@ pub struct XwaylandAppEnvironment {
     pub xauthority: PathBuf,
 }
 
-pub(crate) fn next_nonzero(value: &mut NonZeroU64) -> XwaylandGeneration {
+pub(crate) fn next_nonzero(value: &mut NonZeroU64) -> Option<XwaylandGeneration> {
     let generation = XwaylandGeneration::new(*value);
-    *value = NonZeroU64::new(value.get().saturating_add(1)).unwrap_or(NonZeroU64::MAX);
-    generation
+    *value = value.get().checked_add(1).and_then(NonZeroU64::new)?;
+    Some(generation)
 }

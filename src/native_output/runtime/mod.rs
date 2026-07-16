@@ -193,7 +193,7 @@ impl NativeRuntime {
         {
             return Ok(());
         }
-        let Some(stream) = self.xwayland.private_wayland_client(generation) else {
+        let Some(stream) = self.xwayland.take_private_wayland_client(generation) else {
             return Ok(());
         };
         let identity = self.server.insert_xwayland_client(stream, generation)?;

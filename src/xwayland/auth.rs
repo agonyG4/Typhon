@@ -10,14 +10,19 @@ const FAMILY_LOCAL: u16 = 256;
 
 pub(crate) struct AuthFile {
     pub(crate) path: PathBuf,
-    pub(crate) cookie: Vec<u8>,
 }
 
 pub(crate) fn create_auth_file(directory: &Path, display_number: u32) -> io::Result<AuthFile> {
     fs::create_dir_all(directory)?;
     fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
 
-    let path = directory.join(format!(".Xauthority-{display_number}"));
+    let mut suffix_bytes = vec![0u8; 16];
+    File::open("/dev/urandom")?.read_exact(&mut suffix_bytes)?;
+    let suffix = suffix_bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let path = directory.join(format!(".Xauthority-{display_number}-{suffix}"));
     let mut cookie = vec![0u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut cookie)?;
     let mut file = OpenOptions::new();
@@ -38,7 +43,7 @@ pub(crate) fn create_auth_file(directory: &Path, display_number: u32) -> io::Res
         let _ = fs::remove_file(&path);
         return Err(error);
     }
-    Ok(AuthFile { path, cookie })
+    Ok(AuthFile { path })
 }
 
 fn authority_record(display_number: u32, cookie: &[u8]) -> Vec<u8> {

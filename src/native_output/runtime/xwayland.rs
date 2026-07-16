@@ -45,6 +45,21 @@ impl NativeRuntime {
         Ok(())
     }
 
+    pub(super) fn dispatch_xwayland_client_disconnects(&mut self) -> NativeResult<()> {
+        for identity in self.server.take_xwayland_client_disconnect_events() {
+            if self.xwayland_client_identity.as_ref() != Some(&identity) {
+                self.xwayland.record_stale_reactor_event();
+                continue;
+            }
+            self.xwayland_client_identity = None;
+            self.xwayland.handle_private_client_disconnected(
+                identity.generation,
+                &mut self.process_supervisor,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn dispatch_xwayland_events(&mut self, wakeup: &NativeWakeup) -> NativeResult<()> {
         for event in wakeup.xwayland_events.iter().copied() {
             let Some((_, registration)) = self

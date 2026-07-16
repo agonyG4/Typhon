@@ -54,6 +54,7 @@ impl NativeRuntime {
             return Ok(());
         }
         self.dispatch_wayland_and_input(&mut cycle)?;
+        self.dispatch_xwayland_client_disconnects()?;
         self.dispatch_xwayland_shell_binds()?;
         let association_events = self.server.take_xwayland_association_events();
         self.xwayland.record_association_events(&association_events);

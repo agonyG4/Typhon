@@ -61,6 +61,7 @@ pub struct OwnCompositorServer {
     disconnected_clients: Arc<Mutex<Vec<DisconnectedClient>>>,
     client_pids: Arc<Mutex<HashMap<ClientId, i32>>>,
     xwayland_global_data: XwaylandShellGlobalData,
+    xwayland_disconnects: Vec<XwaylandClientIdentity>,
     gpu_buffer_protocols_enabled: bool,
 }
 
@@ -255,6 +256,7 @@ impl OwnCompositorServer {
             disconnected_clients,
             client_pids,
             xwayland_global_data,
+            xwayland_disconnects: Vec::new(),
             gpu_buffer_protocols_enabled: gpu_buffers_enabled,
         })
     }
@@ -386,6 +388,10 @@ impl OwnCompositorServer {
             .lock()
             .map(|mut events| std::mem::take(&mut *events))
             .unwrap_or_default()
+    }
+
+    pub fn take_xwayland_client_disconnect_events(&mut self) -> Vec<XwaylandClientIdentity> {
+        std::mem::take(&mut self.xwayland_disconnects)
     }
 
     pub fn take_xwayland_association_events(&mut self) -> Vec<XwaylandAssociationEvent> {
@@ -964,6 +970,21 @@ impl OwnCompositorServer {
             let summary = self
                 .state
                 .teardown_client_resources(&disconnected.client_id);
+            let xwayland_identity =
+                self.xwayland_global_data
+                    .active
+                    .lock()
+                    .ok()
+                    .and_then(|active| {
+                        active
+                            .as_ref()
+                            .filter(|identity| identity.client_id == disconnected.client_id)
+                            .cloned()
+                    });
+            if let Some(identity) = xwayland_identity {
+                self.revoke_xwayland_generation(identity.generation);
+                self.xwayland_disconnects.push(identity);
+            }
             eprintln!(
                 "oblivion-one compositor: client_disconnect client={:?} pid={} surfaces_removed={} visible_removed={} repaint_scheduled={}",
                 disconnected.client_id,

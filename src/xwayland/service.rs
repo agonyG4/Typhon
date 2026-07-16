@@ -50,22 +50,12 @@ pub struct XwaylandReactorRegistration {
     pub purpose: XwaylandReactorPurpose,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum XwaylandState {
-    Disabled,
-    Armed,
-    Starting(XwaylandGeneration),
-    RunningBase(XwaylandGeneration),
-    Backoff,
-    Failed,
-}
-
 #[derive(Debug)]
 struct StartingResources {
     generation: XwaylandGeneration,
     process: SpawnedProcess,
     displayfd: OwnedFd,
-    private_wayland: UnixStream,
+    private_wayland: Option<UnixStream>,
     wm: UnixStream,
     display_ready: bool,
     shell_ready: bool,
@@ -78,7 +68,7 @@ struct StartingResources {
 struct RunningResources {
     generation: XwaylandGeneration,
     process: SpawnedProcess,
-    private_wayland: UnixStream,
+    private_wayland: Option<UnixStream>,
     #[allow(dead_code)]
     wm: UnixStream,
 }
@@ -96,12 +86,11 @@ enum ServiceState {
 #[derive(Debug)]
 pub struct XwaylandService {
     pub(crate) mode: XwaylandMode,
-    pub(crate) state: XwaylandState,
     pub(crate) next_generation: NonZeroU64,
     pub(crate) config: XwaylandConfig,
     pub(crate) metrics: XwaylandMetrics,
     lease: Option<DisplayLease>,
-    detailed_state: ServiceState,
+    state: ServiceState,
     crash_times_ns: VecDeque<u64>,
     backoff_level: usize,
     private_client: Option<(XwaylandGeneration, ClientId)>,
@@ -136,23 +125,18 @@ impl XwaylandService {
         } else {
             None
         };
-        let detailed_state = if mode.is_enabled() {
+        let state = if mode.is_enabled() {
             ServiceState::Armed
         } else {
             ServiceState::Disabled
         };
         Ok(Self {
             mode,
-            state: if mode.is_enabled() {
-                XwaylandState::Armed
-            } else {
-                XwaylandState::Disabled
-            },
             next_generation: NonZeroU64::new(1).expect("one is nonzero"),
             config,
             metrics: XwaylandMetrics::default(),
             lease,
-            detailed_state,
+            state,
             crash_times_ns: VecDeque::new(),
             backoff_level: 0,
             private_client: None,
@@ -172,7 +156,7 @@ impl XwaylandService {
     }
 
     pub fn state_kind(&self) -> XwaylandStateKind {
-        match self.detailed_state {
+        match self.state {
             ServiceState::Disabled => XwaylandStateKind::Disabled,
             ServiceState::Armed => XwaylandStateKind::Armed,
             ServiceState::Starting(_) => XwaylandStateKind::Starting,
@@ -196,10 +180,8 @@ impl XwaylandService {
     pub fn reactor_registrations(&self) -> impl Iterator<Item = XwaylandReactorRegistration> {
         let mut registrations = Vec::new();
         let generation = self.generation();
-        if !matches!(
-            self.detailed_state,
-            ServiceState::Disabled | ServiceState::Failed
-        ) && let Some(lease) = self.lease.as_ref()
+        if matches!(self.state, ServiceState::Armed)
+            && let Some(lease) = self.lease.as_ref()
         {
             let (filesystem, abstract_socket) = lease.listener_fds();
             registrations.push(XwaylandReactorRegistration {
@@ -213,7 +195,7 @@ impl XwaylandService {
                 purpose: XwaylandReactorPurpose::ListenAbstract,
             });
         }
-        if let ServiceState::Starting(resources) = &self.detailed_state {
+        if let ServiceState::Starting(resources) = &self.state {
             registrations.push(XwaylandReactorRegistration {
                 fd: resources.displayfd.as_raw_fd(),
                 generation: Some(resources.generation),
@@ -224,7 +206,7 @@ impl XwaylandService {
     }
 
     pub fn next_deadline_ns(&self) -> Option<u64> {
-        match self.detailed_state {
+        match self.state {
             ServiceState::Starting(ref resources) => Some(resources.deadline_ns),
             ServiceState::Backoff { deadline_ns, .. } => Some(deadline_ns),
             ServiceState::Disabled
@@ -235,7 +217,7 @@ impl XwaylandService {
     }
 
     pub fn generation(&self) -> Option<XwaylandGeneration> {
-        match self.detailed_state {
+        match self.state {
             ServiceState::Starting(ref resources) => Some(resources.generation),
             ServiceState::RunningBase(ref resources) => Some(resources.generation),
             ServiceState::Disabled
@@ -249,23 +231,48 @@ impl XwaylandService {
         self.lease.as_ref().map(DisplayLease::display_number)
     }
 
-    pub fn private_wayland_client(&mut self, generation: XwaylandGeneration) -> Option<UnixStream> {
-        match &mut self.detailed_state {
+    pub fn take_private_wayland_client(
+        &mut self,
+        generation: XwaylandGeneration,
+    ) -> Option<UnixStream> {
+        match &mut self.state {
             ServiceState::Starting(resources) if resources.generation == generation => {
-                resources.private_wayland.try_clone().ok()
+                resources.private_wayland.take()
             }
             ServiceState::RunningBase(resources) if resources.generation == generation => {
-                resources.private_wayland.try_clone().ok()
+                resources.private_wayland.take()
             }
             _ => None,
         }
+    }
+
+    pub fn handle_private_client_disconnected(
+        &mut self,
+        generation: XwaylandGeneration,
+        supervisor: &mut ChildSupervisor,
+    ) -> io::Result<()> {
+        if self.generation() != Some(generation) {
+            self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
+            return Ok(());
+        }
+        self.private_client = None;
+        let process_id = match &self.state {
+            ServiceState::Starting(resources) => Some(resources.process.id),
+            ServiceState::RunningBase(resources) => Some(resources.process.id),
+            _ => None,
+        };
+        if let Some(process_id) = process_id {
+            self.kill_process_now(supervisor, process_id)?;
+        }
+        self.enter_backoff(now_ns()?);
+        Ok(())
     }
 
     pub fn handle_listener_readiness(
         &mut self,
         supervisor: &mut ChildSupervisor,
     ) -> io::Result<bool> {
-        if !matches!(self.detailed_state, ServiceState::Armed) {
+        if !matches!(self.state, ServiceState::Armed) {
             return Ok(false);
         }
         if self.mode == XwaylandMode::BaseLazy {
@@ -306,7 +313,7 @@ impl XwaylandService {
     }
 
     fn start_generation(&mut self, supervisor: &mut ChildSupervisor) -> io::Result<()> {
-        let generation = self.allocate_generation();
+        let generation = self.allocate_generation()?;
         let started_ns = now_ns()?;
         let deadline_ns = started_ns.saturating_add(STARTUP_TIMEOUT_NS);
         let lease = self
@@ -338,11 +345,11 @@ impl XwaylandService {
                 .session_owned(true)
                 .with_process_group_policy(ProcessGroupPolicy::Dedicated),
         )?;
-        self.detailed_state = ServiceState::Starting(StartingResources {
+        self.state = ServiceState::Starting(StartingResources {
             generation,
             process,
             displayfd,
-            private_wayland,
+            private_wayland: Some(private_wayland),
             wm,
             display_ready: false,
             shell_ready: false,
@@ -350,7 +357,6 @@ impl XwaylandService {
             started_ns,
             deadline_ns,
         });
-        self.state = XwaylandState::Starting(generation);
         self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
         self.log_state_transition();
         Ok(())
@@ -363,7 +369,7 @@ impl XwaylandService {
     ) -> io::Result<()> {
         let mut bytes = [0u8; 64];
         loop {
-            let read_result = match &self.detailed_state {
+            let read_result = match &self.state {
                 ServiceState::Starting(resources) if resources.generation == generation => unsafe {
                     libc::read(
                         resources.displayfd.as_raw_fd(),
@@ -391,7 +397,7 @@ impl XwaylandService {
                 );
             }
             self.handle_displayfd_bytes(generation, &bytes[..read_result as usize], supervisor)?;
-            if !matches!(self.detailed_state, ServiceState::Starting(_)) {
+            if !matches!(self.state, ServiceState::Starting(_)) {
                 return Ok(());
             }
             if bytes[..read_result as usize].contains(&b'\n') {
@@ -407,7 +413,7 @@ impl XwaylandService {
         supervisor: &mut ChildSupervisor,
     ) -> io::Result<()> {
         let reserved_display = self.display_number();
-        let ServiceState::Starting(resources) = &mut self.detailed_state else {
+        let ServiceState::Starting(resources) = &mut self.state else {
             return Ok(());
         };
         if resources.generation != generation {
@@ -502,7 +508,7 @@ impl XwaylandService {
     }
 
     fn mark_shell_ready(&mut self, generation: XwaylandGeneration) -> io::Result<()> {
-        let ServiceState::Starting(resources) = &mut self.detailed_state else {
+        let ServiceState::Starting(resources) = &mut self.state else {
             return Ok(());
         };
         if resources.generation != generation {
@@ -516,24 +522,23 @@ impl XwaylandService {
 
     fn maybe_mark_running(&mut self) {
         let ready = matches!(
-            &self.detailed_state,
+            &self.state,
             ServiceState::Starting(resources) if resources.display_ready && resources.shell_ready
         );
         if !ready {
             return;
         }
         let ServiceState::Starting(resources) =
-            std::mem::replace(&mut self.detailed_state, ServiceState::Disabled)
+            std::mem::replace(&mut self.state, ServiceState::Disabled)
         else {
             unreachable!("readiness state changed while promoting XWayland")
         };
-        self.detailed_state = ServiceState::RunningBase(RunningResources {
+        self.state = ServiceState::RunningBase(RunningResources {
             generation: resources.generation,
             process: resources.process,
             private_wayland: resources.private_wayland,
             wm: resources.wm,
         });
-        self.state = XwaylandState::RunningBase(resources.generation);
         self.metrics.startup_duration_ns = now_ns()
             .ok()
             .map(|now| now.saturating_sub(resources.started_ns));
@@ -548,7 +553,7 @@ impl XwaylandService {
     }
 
     pub fn handle_process_exit(&mut self, exit: &ChildExit) -> io::Result<bool> {
-        let process = match &self.detailed_state {
+        let process = match &self.state {
             ServiceState::Starting(resources) => resources.process,
             ServiceState::RunningBase(resources) => resources.process,
             _ => return Ok(false),
@@ -572,8 +577,7 @@ impl XwaylandService {
         self.crash_times_ns.push_back(now);
         self.metrics.crashes = self.metrics.crashes.saturating_add(1);
         if self.crash_times_ns.len() >= 3 {
-            self.detailed_state = ServiceState::Failed;
-            self.state = XwaylandState::Failed;
+            self.state = ServiceState::Failed;
             self.log_state_transition();
             return Ok(true);
         }
@@ -603,7 +607,7 @@ impl XwaylandService {
         now_ns: u64,
         supervisor: &mut ChildSupervisor,
     ) -> io::Result<()> {
-        match self.detailed_state {
+        match self.state {
             ServiceState::Starting(ref resources) if now_ns >= resources.deadline_ns => {
                 self.metrics.readiness_failures = self.metrics.readiness_failures.saturating_add(1);
                 let process_id = resources.process.id;
@@ -622,8 +626,7 @@ impl XwaylandService {
         self.stop_current(supervisor)?;
         self.private_client = None;
         self.lease.take();
-        self.detailed_state = ServiceState::Disabled;
-        self.state = XwaylandState::Disabled;
+        self.state = ServiceState::Disabled;
         self.log_state_transition();
         Ok(())
     }
@@ -633,7 +636,7 @@ impl XwaylandService {
     }
 
     fn stop_current(&mut self, supervisor: &mut ChildSupervisor) -> io::Result<()> {
-        let process_id = match &self.detailed_state {
+        let process_id = match &self.state {
             ServiceState::Starting(resources) => Some(resources.process.id),
             ServiceState::RunningBase(resources) => Some(resources.process.id),
             ServiceState::Disabled
@@ -675,11 +678,9 @@ impl XwaylandService {
     fn rearm(&mut self) {
         self.private_client = None;
         if self.mode.is_enabled() && self.lease.is_some() {
-            self.detailed_state = ServiceState::Armed;
-            self.state = XwaylandState::Armed;
+            self.state = ServiceState::Armed;
         } else {
-            self.detailed_state = ServiceState::Disabled;
-            self.state = XwaylandState::Disabled;
+            self.state = ServiceState::Disabled;
         }
         self.backoff_level = 0;
         self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
@@ -692,8 +693,7 @@ impl XwaylandService {
         let deadline_ns = now_ns.saturating_add(BACKOFF_NS[level]);
         self.backoff_level = self.backoff_level.saturating_add(1);
         self.metrics.backoff_level = self.backoff_level;
-        self.detailed_state = ServiceState::Backoff { deadline_ns };
-        self.state = XwaylandState::Backoff;
+        self.state = ServiceState::Backoff { deadline_ns };
         self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
         eprintln!(
             "oblivion-one xwayland: event=backoff level={} deadline_ns={deadline_ns}",
@@ -707,7 +707,7 @@ impl XwaylandService {
         supervisor: &mut ChildSupervisor,
         error: io::Error,
     ) -> io::Result<()> {
-        let process_id = match &self.detailed_state {
+        let process_id = match &self.state {
             ServiceState::Starting(resources) => Some(resources.process.id),
             _ => None,
         };
@@ -733,9 +733,12 @@ impl XwaylandService {
         );
     }
 
-    pub(crate) fn allocate_generation(&mut self) -> XwaylandGeneration {
+    pub(crate) fn allocate_generation(&mut self) -> io::Result<XwaylandGeneration> {
         self.metrics.generations_started = self.metrics.generations_started.saturating_add(1);
-        next_nonzero(&mut self.next_generation)
+        next_nonzero(&mut self.next_generation).ok_or_else(|| {
+            self.state = ServiceState::Failed;
+            io::Error::other("XWayland generation identity exhausted")
+        })
     }
 }
 
