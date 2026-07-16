@@ -1,5 +1,10 @@
 use super::*;
+use oblivion_one::cursor_theme::{
+    CompositorCursorImage, install_shared_compositor_cursor,
+    load_compositor_cursor_from_environment,
+};
 use oblivion_one::native::kms::{AtomicDiscovery, AtomicKmsError, KmsBackendKind};
+use std::sync::Arc;
 
 pub(super) fn log_native_runtime_bootstrap(
     server: &OwnCompositorServer,
@@ -158,6 +163,7 @@ fn build_native_kms_startup_plan(
 
 struct NativeRuntimeBootstrapTail {
     server: OwnCompositorServer,
+    cursor_image: Arc<CompositorCursorImage>,
     perf: NativePerfLogger,
     kms: NativeDrmDevice,
     kms_backend: KmsBackendSelection,
@@ -186,6 +192,7 @@ impl NativeRuntime {
     fn finish_bootstrap(parts: NativeRuntimeBootstrapTail) -> NativeResult<Self> {
         let NativeRuntimeBootstrapTail {
             mut server,
+            cursor_image,
             perf,
             kms,
             kms_backend,
@@ -450,6 +457,7 @@ impl NativeRuntime {
         }
         Ok(Self {
             server,
+            cursor_image,
             perf,
             kms,
             kms_backend,
@@ -605,6 +613,8 @@ impl NativeRuntime {
 
         server.set_output_size(target.width, target.height);
         server.set_output_refresh_hz(refresh_hz);
+        let cursor_image = Arc::new(load_compositor_cursor_from_environment());
+        install_shared_compositor_cursor(cursor_image.clone());
         let scanout_preference = NativeScanoutPreference::from_env();
         let scanout_plan = NativeScanoutPlan::choose(NativeScanoutChoice {
             preference: scanout_preference,
@@ -774,6 +784,7 @@ impl NativeRuntime {
                         discovery.cursor_width,
                         discovery.cursor_height,
                         drm_file_generation,
+                        cursor_image.clone(),
                     ) {
                         Ok(mut cursor) => {
                             let (x, y) = input_state.cursor_position();
@@ -812,7 +823,11 @@ impl NativeRuntime {
                     .into());
                 }
             } else if atomic_discovery.is_none() {
-                match NativeLegacyHardwareCursor::create(kms.file(), target.crtc_id) {
+                match NativeLegacyHardwareCursor::create(
+                    kms.file(),
+                    target.crtc_id,
+                    cursor_image.as_ref(),
+                ) {
                     Ok(cursor) => pre_kms_legacy_cursor = Some(cursor),
                     Err(error) if cursor_preference == NativeCursorPreference::Hardware => {
                         return Err(error.into());
@@ -1118,6 +1133,7 @@ impl NativeRuntime {
         });
         Self::finish_bootstrap(NativeRuntimeBootstrapTail {
             server,
+            cursor_image,
             perf,
             kms,
             kms_backend,

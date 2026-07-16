@@ -3,10 +3,8 @@ use std::{collections::HashMap, error::Error, ffi::c_void, io, ptr};
 use glow::HasContext;
 use khronos_egl as egl;
 use oblivion_one::{
-    compositor::{
-        self, DesktopVisualState, RenderableSurface, SurfaceDamageRect, cursor_texture_pixels,
-        cursor_texture_size,
-    },
+    compositor::{self, DesktopVisualState, RenderableSurface, SurfaceDamageRect},
+    cursor_theme::CompositorCursorImage,
     render_backend::{
         buffer::{DmabufImageKey, WeakBufferIdentity},
         egl_gles::{EGL_LINUX_DMA_BUF_EXT, EglGlesDmabufImportAttributes},
@@ -165,6 +163,7 @@ pub struct EglSceneDrawRequest<'a> {
 }
 
 pub(crate) struct GlesSceneRenderer {
+    cursor_image: std::sync::Arc<CompositorCursorImage>,
     gl: glow::Context,
     program: GlProgram,
     vertex_array: GlVertexArray,
@@ -211,6 +210,7 @@ impl GlesSceneRenderer {
         height: u32,
         egl_image_target_texture_2d: Option<GlEglImageTargetTexture2DOes>,
         partial_repaint_capabilities: EglPartialRepaintCapabilities,
+        cursor_image: std::sync::Arc<CompositorCursorImage>,
     ) -> RendererResult<Self> {
         let gl = unsafe {
             glow::Context::from_loader_function(|name| {
@@ -257,6 +257,7 @@ impl GlesSceneRenderer {
             vertex_array,
             vertex_buffer,
             vertex_buffer_capacity: MIN_VERTEX_BUFFER_BYTES,
+            cursor_image: cursor_image.clone(),
             current_size: (width, height),
             texture_upload_rgba: Vec::new(),
             vertices: Vec::new(),
@@ -274,7 +275,7 @@ impl GlesSceneRenderer {
             failed_surface_generations: HashMap::new(),
             frame_resources: HashMap::new(),
             egl_image_target_texture_2d,
-            damage_tracker: EglOutputDamageTracker::default(),
+            damage_tracker: EglOutputDamageTracker::with_cursor_image(cursor_image),
             repaint_planner: PartialRepaintPlanner::new(
                 (width, height),
                 partial_repaint_capabilities,
@@ -446,6 +447,7 @@ impl GlesSceneRenderer {
             height,
             scaled_visual_state,
             client_cursor_damage,
+            &self.cursor_image,
         );
 
         if commands_changed {
@@ -587,7 +589,8 @@ impl GlesSceneRenderer {
         egl: &EglInstance,
         egl_display: egl::Display,
     ) -> RendererResult<()> {
-        let (width, height) = cursor_texture_size();
+        let width = self.cursor_image.width;
+        let height = self.cursor_image.height;
         if width == 0 || height == 0 {
             return Ok(());
         }
@@ -599,13 +602,12 @@ impl GlesSceneRenderer {
             return Ok(());
         }
 
-        let pixels = cursor_texture_pixels();
         let mut resource = create_uploaded_resource(&self.gl, width, height)?;
         write_argb_pixels_to_resource(
             &self.gl,
             &resource,
             SurfaceDamageRect::full(width, height),
-            &pixels,
+            &self.cursor_image.pixels_argb8888,
             &mut self.texture_upload_rgba,
         );
         if let Some(old) = self.cursor_resource.take() {
@@ -1119,13 +1121,14 @@ impl GlesSceneRenderer {
         if let Some((cursor_x, cursor_y)) = visual_state.cursor
             && let Some(cursor) = self.cursor_resource.as_ref()
         {
+            let (top_left_x, top_left_y) = self.cursor_image.top_left(cursor_x, cursor_y);
             push_draw_command(
                 &mut self.cursor_vertices,
                 &mut self.cursor_commands,
                 EglDrawLayer::Cursor,
                 EglRect::new(
-                    cursor_x as f32,
-                    cursor_y as f32,
+                    top_left_x as f32,
+                    top_left_y as f32,
                     cursor.size.0 as f32,
                     cursor.size.1 as f32,
                 ),
@@ -2421,6 +2424,7 @@ mod tests {
             800,
             DesktopVisualState::wallpaper_only(),
             None,
+            &oblivion_one::cursor_theme::CompositorCursorImage::builtin_fallback(),
         ));
         let precise = OutputDamage::rects(1280, 800, [OutputRect::new(10, 20, 30, 40)]);
 
@@ -2453,6 +2457,7 @@ mod tests {
             800,
             DesktopVisualState::with_cursor(10, 10),
             None,
+            &oblivion_one::cursor_theme::CompositorCursorImage::builtin_fallback(),
         ));
         let damage = tracker.damage_for_frame(
             1280,
@@ -2464,10 +2469,55 @@ mod tests {
         );
 
         assert_eq!(damage.rect_count(), 2);
-        let (cursor_width, cursor_height) = compositor::cursor_texture_size();
+        let cursor_image = oblivion_one::cursor_theme::CompositorCursorImage::builtin_fallback();
         assert_eq!(
             damage.pixels(1280, 800),
-            Some(u64::from(cursor_width) * u64::from(cursor_height) * 2)
+            Some(u64::from(cursor_image.width) * u64::from(cursor_image.height) * 2)
+        );
+    }
+
+    #[test]
+    fn egl_damage_uses_hotspot_adjusted_bounds() {
+        let image = std::sync::Arc::new(
+            oblivion_one::cursor_theme::CompositorCursorImage::from_argb8888(
+                vec![0xff00_0000; 4 * 3],
+                4,
+                3,
+                2,
+                1,
+            )
+            .unwrap(),
+        );
+        let mut tracker = EglOutputDamageTracker::with_cursor_image(image.clone());
+        tracker.damage_for_frame(
+            1280,
+            800,
+            true,
+            None,
+            DesktopVisualState::with_cursor(10, 10),
+            None,
+        );
+        tracker.commit_presented(EglOutputDamageTracker::candidate_state(
+            1280,
+            800,
+            DesktopVisualState::with_cursor(10, 10),
+            None,
+            &image,
+        ));
+
+        assert_eq!(
+            tracker.damage_for_frame(
+                1280,
+                800,
+                false,
+                Some(OutputDamage::Empty),
+                DesktopVisualState::with_cursor(20, 22),
+                None,
+            ),
+            OutputDamage::Rects(vec![
+                OutputRect::new(8, 9, 4, 3),
+                OutputRect::new(18, 21, 4, 3),
+            ])
         );
     }
 
@@ -2487,6 +2537,7 @@ mod tests {
             800,
             DesktopVisualState::with_cursor(10, 10),
             None,
+            &oblivion_one::cursor_theme::CompositorCursorImage::builtin_fallback(),
         ));
 
         let first = tracker.damage_for_frame(

@@ -434,6 +434,7 @@ impl NativeEglGbmScanout {
                 egl_display,
                 swap_buffers_with_damage.is_some(),
             ),
+            oblivion_one::cursor_theme::shared_compositor_cursor_image(),
         ) {
             Ok(scene) => scene,
             Err(error) => {

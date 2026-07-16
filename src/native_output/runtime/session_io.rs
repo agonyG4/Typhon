@@ -293,7 +293,11 @@ impl NativeSessionIo for NativeRuntime {
             self.cursor_render_mode = NativeCursorRenderMode::Software;
             return Ok(());
         }
-        match NativeLegacyHardwareCursor::create(self.kms.file(), self.target.crtc_id) {
+        match NativeLegacyHardwareCursor::create(
+            self.kms.file(),
+            self.target.crtc_id,
+            self.cursor_image.as_ref(),
+        ) {
             Ok(mut cursor) => {
                 let (x, y) = self.input_state.cursor_position();
                 cursor.enable().and_then(|()| cursor.move_to(x, y))?;

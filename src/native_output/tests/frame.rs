@@ -228,7 +228,7 @@ fn native_frame_renderer_reports_full_scene_rebuild_when_surface_identity_change
 }
 
 #[test]
-fn native_cursor_argb_bytes_places_texture_pixels_in_pitched_buffer() {
+fn atomic_cursor_upload_clears_unused_pixels() {
     let pixels = [0xff11_2233, 0x8044_5566, 0xff77_8899, 0];
 
     let bytes = native_cursor_argb_bytes(&pixels, 2, 2, 4, 4, 16).unwrap();

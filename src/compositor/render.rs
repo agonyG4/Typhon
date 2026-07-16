@@ -1,15 +1,19 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::{
     ClientCursorRenderState, RenderableSurface, RenderableSurfaceDamage, RootPlacementMode,
     SurfaceDamageRect,
 };
+use crate::cursor_theme::{CompositorCursorImage, shared_compositor_cursor_image};
 use crate::render_backend::buffer::{BufferSize, SurfaceBufferSource};
 #[cfg(test)]
 use wayland_server::protocol::wl_output;
 
 pub const OUTPUT_BACKGROUND: u32 = 0xff08_0a0e;
+#[cfg(test)]
 pub const CURSOR_FILL: u32 = 0xffff_ffff;
+#[cfg(test)]
 pub const CURSOR_OUTLINE: u32 = 0xff10_1116;
 pub const FIRST_SURFACE_OFFSET: (i32, i32) = (72, 72);
 pub const SURFACE_CASCADE_STEP: i32 = 32;
@@ -290,8 +294,9 @@ struct SceneFullRebuild<'a> {
     snapshots: Vec<SceneSurfaceSnapshot>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DesktopSceneRenderer {
+    cursor_image: Arc<CompositorCursorImage>,
     wallpaper: Vec<u32>,
     wallpaper_width: u32,
     wallpaper_height: u32,
@@ -320,6 +325,29 @@ struct ReusableFrameKey {
 }
 
 impl DesktopSceneRenderer {
+    pub fn with_cursor_image(cursor_image: Arc<CompositorCursorImage>) -> Self {
+        Self {
+            cursor_image,
+            wallpaper: Vec::new(),
+            wallpaper_width: 0,
+            wallpaper_height: 0,
+            wallpaper_generation: 0,
+            scene: Vec::new(),
+            scene_width: 0,
+            scene_height: 0,
+            scene_output_scale_key: 0,
+            scene_content_generation: 0,
+            scene_generation: 0,
+            scene_surface_snapshots: Vec::new(),
+            last_rebuild_damage_rects: Vec::new(),
+            last_rebuild_kind: DesktopSceneRebuildKind::default(),
+            last_frame_copy_kind: DesktopFrameCopyKind::default(),
+            last_damage_debug_stats: DamageDebugStats::default(),
+            reusable_frame_key: None,
+            reusable_frame_had_client_cursor: false,
+        }
+    }
+
     pub fn compose(
         &mut self,
         frame: &mut [u32],
@@ -338,7 +366,14 @@ impl DesktopSceneRenderer {
         );
         self.copy_scene_to_frame(frame, frame_width, frame_height);
         if let Some((cursor_x, cursor_y)) = visual_state.cursor {
-            draw_cursor(frame, frame_width, frame_height, cursor_x, cursor_y);
+            draw_cursor(
+                frame,
+                frame_width,
+                frame_height,
+                cursor_x,
+                cursor_y,
+                &self.cursor_image,
+            );
         }
     }
 
@@ -361,7 +396,14 @@ impl DesktopSceneRenderer {
         );
         self.copy_scene_to_frame(frame, frame_width, frame_height);
         if let Some((cursor_x, cursor_y)) = visual_state.cursor {
-            draw_cursor(frame, frame_width, frame_height, cursor_x, cursor_y);
+            draw_cursor(
+                frame,
+                frame_width,
+                frame_height,
+                cursor_x,
+                cursor_y,
+                &self.cursor_image,
+            );
         }
     }
 
@@ -460,7 +502,14 @@ impl DesktopSceneRenderer {
         if client_cursor.is_none()
             && let Some((cursor_x, cursor_y)) = scaled_visual_state.cursor
         {
-            draw_cursor(frame, frame_width, frame_height, cursor_x, cursor_y);
+            draw_cursor(
+                frame,
+                frame_width,
+                frame_height,
+                cursor_x,
+                cursor_y,
+                &self.cursor_image,
+            );
         }
         if let Some(cursor) = client_cursor {
             draw_client_cursor(frame, frame_width, frame_height, cursor, output_scale);
@@ -804,7 +853,15 @@ pub fn compose_output(
     draw_client_surfaces(frame, frame_width, frame_height, surfaces);
 
     if let Some((cursor_x, cursor_y)) = visual_state.cursor {
-        draw_cursor(frame, frame_width, frame_height, cursor_x, cursor_y);
+        let cursor_image = shared_compositor_cursor_image();
+        draw_cursor(
+            frame,
+            frame_width,
+            frame_height,
+            cursor_x,
+            cursor_y,
+            &cursor_image,
+        );
     }
 }
 
@@ -1648,33 +1705,28 @@ pub fn draw_wallpaper(frame: &mut [u32], frame_width: u32, frame_height: u32) {
     }
 }
 
-pub fn cursor_texture_size() -> (u32, u32) {
-    let width = CURSOR_PATTERN
-        .iter()
-        .map(|line| line.len() as u32)
-        .max()
-        .unwrap_or(0);
-    (width, CURSOR_PATTERN.len() as u32)
-}
-
-pub fn cursor_texture_pixels() -> Vec<u32> {
-    let (width, height) = cursor_texture_size();
-    let mut pixels = vec![0; width.saturating_mul(height) as usize];
-    for (row, line) in CURSOR_PATTERN.iter().enumerate() {
-        for (column, marker) in line.bytes().enumerate() {
-            let color = match marker {
-                b'X' => CURSOR_OUTLINE,
-                b'O' => CURSOR_FILL,
-                _ => continue,
-            };
-            let index = row * width as usize + column;
-            if let Some(pixel) = pixels.get_mut(index) {
-                *pixel = color;
-            }
-        }
-    }
-
-    pixels
+pub fn cursor_damage_rect(
+    cursor_x: i32,
+    cursor_y: i32,
+    frame_width: u32,
+    frame_height: u32,
+    cursor_image: &CompositorCursorImage,
+) -> Option<SurfaceDamageRect> {
+    let (top_left_x, top_left_y) = cursor_image.top_left(cursor_x, cursor_y);
+    let left = i64::from(top_left_x).clamp(0, i64::from(frame_width));
+    let top = i64::from(top_left_y).clamp(0, i64::from(frame_height));
+    let right = i64::from(top_left_x)
+        .checked_add(i64::from(cursor_image.width))?
+        .clamp(0, i64::from(frame_width));
+    let bottom = i64::from(top_left_y)
+        .checked_add(i64::from(cursor_image.height))?
+        .clamp(0, i64::from(frame_height));
+    (right > left && bottom > top).then_some(SurfaceDamageRect {
+        x: u32::try_from(left).ok()?,
+        y: u32::try_from(top).ok()?,
+        width: u32::try_from(right - left).ok()?,
+        height: u32::try_from(bottom - top).ok()?,
+    })
 }
 
 fn wallpaper_pixel(x: u32, y: u32, width: u32, height: u32) -> u32 {
@@ -1783,17 +1835,22 @@ fn draw_cursor(
     frame_height: u32,
     cursor_x: i32,
     cursor_y: i32,
+    cursor_image: &CompositorCursorImage,
 ) {
-    for (row, line) in CURSOR_PATTERN.iter().enumerate() {
-        for (column, marker) in line.bytes().enumerate() {
-            let color = match marker {
-                b'X' => CURSOR_OUTLINE,
-                b'O' => CURSOR_FILL,
-                _ => continue,
+    let (top_left_x, top_left_y) = cursor_image.top_left(cursor_x, cursor_y);
+    for row in 0..cursor_image.height {
+        for column in 0..cursor_image.width {
+            let source_index = row
+                .saturating_mul(cursor_image.width)
+                .saturating_add(column) as usize;
+            let Some(&source) = cursor_image.pixels_argb8888.get(source_index) else {
+                continue;
             };
-
-            let target_x = cursor_x + column as i32;
-            let target_y = cursor_y + row as i32;
+            if source >> 24 == 0 {
+                continue;
+            }
+            let target_x = top_left_x.saturating_add(column as i32);
+            let target_y = top_left_y.saturating_add(row as i32);
             if !(0..frame_width as i32).contains(&target_x)
                 || !(0..frame_height as i32).contains(&target_y)
             {
@@ -1802,7 +1859,7 @@ fn draw_cursor(
 
             let pixel_index = (target_y as u32 * frame_width + target_x as u32) as usize;
             if let Some(pixel) = frame.get_mut(pixel_index) {
-                *pixel = color;
+                *pixel = blend_premultiplied_argb_over_opaque(source, *pixel);
             }
         }
     }
@@ -2040,25 +2097,11 @@ fn blend_premultiplied_channel(source: u32, target: u32, inverse_alpha: u32) -> 
         .min(255)
 }
 
-const CURSOR_PATTERN: [&str; 17] = [
-    "X",
-    "XX",
-    "XOX",
-    "XOOX",
-    "XOOOX",
-    "XOOOOX",
-    "XOOOOOX",
-    "XOOOOOOX",
-    "XOOOOOOOX",
-    "XOOOOOOOOX",
-    "XOOOOXXXXX",
-    "XOOXOOX",
-    "XOX XOOX",
-    "XX  XOOX",
-    "X    XOOX",
-    "     XOOX",
-    "      XX",
-];
+impl Default for DesktopSceneRenderer {
+    fn default() -> Self {
+        Self::with_cursor_image(shared_compositor_cursor_image())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2067,7 +2110,7 @@ mod tests {
     use crate::render_backend::buffer::{
         BufferIdAllocator, BufferIdentity, BufferSize, CommittedSurfaceBuffer,
     };
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     fn test_buffer_identity() -> BufferIdentity {
         static IDS: OnceLock<Mutex<BufferIdAllocator>> = OnceLock::new();
@@ -3161,6 +3204,45 @@ mod tests {
 
         assert_eq!(frame[10 * 48 + 12], CURSOR_OUTLINE);
         assert_eq!(frame[14 * 48 + 14], CURSOR_FILL);
+    }
+
+    #[test]
+    fn software_cursor_draws_at_hotspot_adjusted_position() {
+        let image = Arc::new(CompositorCursorImage {
+            pixels_argb8888: vec![0xff00_0000, 0xffff_0000, 0xff00_ff00, 0],
+            width: 2,
+            height: 2,
+            hotspot_x: 1,
+            hotspot_y: 1,
+            requested_size: 2,
+            theme: "test".to_string(),
+            source: None,
+        });
+        let mut renderer = DesktopSceneRenderer::with_cursor_image(image);
+        let mut frame = vec![0; 8 * 8];
+
+        renderer.compose(&mut frame, 8, 8, &[], DesktopVisualState::with_cursor(4, 4));
+
+        assert_eq!(frame[3 * 8 + 3], 0xff00_0000);
+        assert_eq!(frame[3 * 8 + 4], 0xffff_0000);
+        assert_eq!(frame[4 * 8 + 3], 0xff00_ff00);
+        assert_ne!(frame[4 * 8 + 4], 0xff00_0000);
+    }
+
+    #[test]
+    fn software_damage_uses_hotspot_adjusted_bounds() {
+        let image =
+            CompositorCursorImage::from_argb8888(vec![0xffff_ffff; 4 * 3], 4, 3, 2, 1).unwrap();
+
+        assert_eq!(
+            cursor_damage_rect(10, 10, 1280, 800, &image),
+            Some(SurfaceDamageRect {
+                x: 8,
+                y: 9,
+                width: 4,
+                height: 3,
+            })
+        );
     }
 
     #[test]

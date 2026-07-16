@@ -1,4 +1,5 @@
 use super::*;
+use oblivion_one::cursor_theme::CompositorCursorImage;
 
 pub(crate) struct NativeLegacyHardwareCursor {
     pub(crate) bo: gbm::BufferObject<()>,
@@ -7,11 +8,17 @@ pub(crate) struct NativeLegacyHardwareCursor {
     pub(crate) crtc_id: u32,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) hotspot_x: i32,
+    pub(crate) hotspot_y: i32,
     pub(crate) active: bool,
 }
 
 impl NativeLegacyHardwareCursor {
-    pub(crate) fn create(kms: &fs::File, crtc_id: u32) -> io::Result<Self> {
+    pub(crate) fn create(
+        kms: &fs::File,
+        crtc_id: u32,
+        image: &CompositorCursorImage,
+    ) -> io::Result<Self> {
         let gbm_fd = duplicate_fd_cloexec(kms.as_raw_fd()).map_err(io::Error::from_raw_os_error)?;
         let device = gbm::Device::new(gbm_fd)?;
         let usage = gbm::BufferObjectFlags::CURSOR | gbm::BufferObjectFlags::WRITE;
@@ -26,11 +33,19 @@ impl NativeLegacyHardwareCursor {
             gbm::Format::Argb8888,
             usage,
         )?;
-        let (texture_width, texture_height) = cursor_texture_size();
+        if image.width > bo.width() || image.height > bo.height() {
+            return Err(io::Error::other(format!(
+                "Legacy cursor theme image {}x{} exceeds cursor buffer {}x{}",
+                image.width,
+                image.height,
+                bo.width(),
+                bo.height()
+            )));
+        }
         let cursor_bytes = native_cursor_argb_bytes(
-            &cursor_texture_pixels(),
-            texture_width,
-            texture_height,
+            &image.pixels_argb8888,
+            image.width,
+            image.height,
             bo.width(),
             bo.height(),
             bo.stride(),
@@ -41,6 +56,8 @@ impl NativeLegacyHardwareCursor {
             crtc_id,
             width: bo.width(),
             height: bo.height(),
+            hotspot_x: image.hotspot_x,
+            hotspot_y: image.hotspot_y,
             bo,
             _device: device,
             active: false,
@@ -58,7 +75,10 @@ impl NativeLegacyHardwareCursor {
     pub(crate) fn move_to(&mut self, x: i32, y: i32) -> io::Result<()> {
         let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
         #[allow(deprecated)]
-        drm_ffi::mode::move_cursor(fd, self.crtc_id, x, y)?;
+        {
+            let (x, y) = legacy_cursor_position(x, y, self.hotspot_x, self.hotspot_y);
+            drm_ffi::mode::move_cursor(fd, self.crtc_id, x, y)?;
+        }
         Ok(())
     }
 
@@ -82,8 +102,30 @@ impl NativeLegacyHardwareCursor {
     }
 }
 
+pub(crate) const fn legacy_cursor_position(
+    pointer_x: i32,
+    pointer_y: i32,
+    hotspot_x: i32,
+    hotspot_y: i32,
+) -> (i32, i32) {
+    (
+        pointer_x.saturating_sub(hotspot_x),
+        pointer_y.saturating_sub(hotspot_y),
+    )
+}
+
 impl Drop for NativeLegacyHardwareCursor {
     fn drop(&mut self) {
         let _ = self.disable();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::legacy_cursor_position;
+
+    #[test]
+    fn legacy_cursor_move_subtracts_hotspot() {
+        assert_eq!(legacy_cursor_position(40, 30, 7, 9), (33, 21));
     }
 }

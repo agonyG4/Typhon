@@ -1,7 +1,10 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 
 use khronos_egl as egl;
-use oblivion_one::compositor::{DesktopVisualState, SurfaceDamageRect, cursor_texture_size};
+use oblivion_one::{
+    compositor::{DesktopVisualState, SurfaceDamageRect, cursor_damage_rect},
+    cursor_theme::{CompositorCursorImage, shared_compositor_cursor_image},
+};
 
 use super::OutputFramebufferOrigin;
 
@@ -676,11 +679,18 @@ impl EglDamageRects {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct EglOutputDamageTracker {
+    cursor_image: Arc<CompositorCursorImage>,
     output_size: (u32, u32),
     last_cursor_rect: Option<SurfaceDamageRect>,
     last_client_cursor: Option<ClientCursorDamageState>,
+}
+
+impl Default for EglOutputDamageTracker {
+    fn default() -> Self {
+        Self::with_cursor_image(shared_compositor_cursor_image())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -725,6 +735,15 @@ impl ClientCursorDamageState {
 }
 
 impl EglOutputDamageTracker {
+    pub(super) fn with_cursor_image(cursor_image: Arc<CompositorCursorImage>) -> Self {
+        Self {
+            cursor_image,
+            output_size: (0, 0),
+            last_cursor_rect: None,
+            last_client_cursor: None,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn damage_for_frame(
         &self,
@@ -735,9 +754,9 @@ impl EglOutputDamageTracker {
         visual_state: DesktopVisualState,
         client_cursor: Option<ClientCursorDamageState>,
     ) -> OutputDamage {
-        let cursor_rect = visual_state
-            .cursor
-            .and_then(|(x, y)| cursor_damage_rect(x, y, width, height));
+        let cursor_rect = visual_state.cursor.and_then(|(x, y)| {
+            cursor_damage_rect_for_image(x, y, width, height, &self.cursor_image)
+        });
         let size_changed = self.output_size != (width, height);
 
         let mut damage = if size_changed {
@@ -771,12 +790,13 @@ impl EglOutputDamageTracker {
         height: u32,
         visual_state: DesktopVisualState,
         client_cursor: Option<ClientCursorDamageState>,
+        cursor_image: &CompositorCursorImage,
     ) -> EglPresentedDamageState {
         EglPresentedDamageState {
             output_size: (width, height),
             cursor_rect: visual_state
                 .cursor
-                .and_then(|(x, y)| cursor_damage_rect(x, y, width, height)),
+                .and_then(|(x, y)| cursor_damage_rect_for_image(x, y, width, height, cursor_image)),
             client_cursor,
         }
     }
@@ -788,20 +808,19 @@ impl EglOutputDamageTracker {
     }
 }
 
-pub(super) fn cursor_damage_rect(
+pub(super) fn cursor_damage_rect_for_image(
     cursor_x: i32,
     cursor_y: i32,
     output_width: u32,
     output_height: u32,
+    cursor_image: &CompositorCursorImage,
 ) -> Option<SurfaceDamageRect> {
-    let (cursor_width, cursor_height) = cursor_texture_size();
-    arbitrary_cursor_damage_rect(
+    cursor_damage_rect(
         cursor_x,
         cursor_y,
-        cursor_width,
-        cursor_height,
         output_width,
         output_height,
+        cursor_image,
     )
 }
 

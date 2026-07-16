@@ -42,6 +42,7 @@ the compositor launch environment.
 The exact `native-egl-gbm-opaque` value is the rollback-only opaque window
 surface implementation and is never selected by `auto`.
 - `OBLIVION_ONE_CURSOR=auto|hardware|software`
+- `OBLIVION_ONE_CURSOR_THEME=<theme>` and `OBLIVION_ONE_CURSOR_SIZE=<pixels>`
 - `OBLIVION_ONE_NATIVE_APP_GPU=auto|gpu|cpu`
 - `OBLIVION_ONE_SHELL_COMMAND='...'`
 - `OBLIVION_ONE_PERF_LOG=1`
@@ -63,6 +64,14 @@ timeouts follow the same final-drain and recovery path as primary timeouts. A
 hidden pointer disables the cursor plane without blocking Direct Scanout; a
 visible software or unsupported client cursor forces composition. Legacy cursor
 ioctls are used only when the effective KMS backend is Legacy.
+
+Typhon loads the compositor-owned `left_ptr` once at native startup. Theme and
+size overrides use `OBLIVION_ONE_CURSOR_THEME`/`OBLIVION_ONE_CURSOR_SIZE`, then
+`XCURSOR_THEME`/`XCURSOR_SIZE`, with the XCursor default theme and size 24 as
+fallback. `XCURSOR_PATH` and standard XDG icon paths, including
+`index.theme` inheritance, are resolved by the pinned pure-Rust `xcursor`
+dependency. Its immutable ARGB8888 image and hotspot are shared by software
+composition, EGL, Atomic, and Legacy cursor uploads without `libXcursor` FFI.
 
 The compositor CLI retains only native configuration: `--check`, `--socket`,
 and an optional application after `--`. Former host-window and demo commands

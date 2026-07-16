@@ -84,6 +84,10 @@ state, so it does not create disabled-plane commits. Visible cursor planes
 normalize alpha to the advertised maximum and use the discovered premultiplied
 blend enum when present.
 
+All compositor-owned pointer paths consume one immutable XCursor image loaded
+at startup, including software composition, EGL fallback, Atomic cursor-plane
+uploads, and Legacy cursor uploads.
+
 While a valid Direct Scanout candidate remains active, predictive render-ahead
 cannot select a composed primary path. Pointer movement selects a cursor-only
 commit when the effective hardware cursor is usable, and an unchanged direct

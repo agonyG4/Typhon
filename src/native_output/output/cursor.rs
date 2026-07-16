@@ -1,4 +1,6 @@
 use super::*;
+use oblivion_one::cursor_theme::CompositorCursorImage;
+use std::sync::Arc;
 
 pub(crate) const NATIVE_HARDWARE_CURSOR_SIZE: u32 = 64;
 
@@ -81,12 +83,11 @@ impl AtomicCursorBuffer {
         })
     }
 
-    fn upload_default_cursor(&mut self) -> io::Result<()> {
-        let (source_width, source_height) = cursor_texture_size();
+    fn upload_image(&mut self, image: &CompositorCursorImage) -> io::Result<()> {
         let bytes = native_cursor_argb_bytes(
-            &cursor_texture_pixels(),
-            source_width,
-            source_height,
+            &image.pixels_argb8888,
+            image.width,
+            image.height,
             self.width,
             self.height,
             self.pitch,
@@ -162,6 +163,7 @@ pub(crate) struct AtomicCursorCounters {
 
 #[derive(Debug)]
 pub(crate) struct NativeAtomicCursor {
+    pub(crate) image: Arc<CompositorCursorImage>,
     desired: AtomicCursorVisualState,
     submitted: AtomicCursorVisualState,
     current: AtomicCursorVisualState,
@@ -184,29 +186,22 @@ impl NativeAtomicCursor {
         width: u32,
         height: u32,
         generation: u64,
+        image: Arc<CompositorCursorImage>,
     ) -> io::Result<Self> {
         if plane.format_modifier.modifier != 0 {
             return Err(io::Error::other(
                 "Atomic cursor CPU fallback requires a linear cursor format",
             ));
         }
+        validate_atomic_cursor_image(&image, width, height)?;
         let mut buffer = AtomicCursorBuffer::create(file, width, height)?;
-        if let Err(error) = buffer.upload_default_cursor() {
+        if let Err(error) = buffer.upload_image(&image) {
             drop(buffer);
             return Err(error);
         }
-        let state = AtomicCursorVisualState {
-            visible: true,
-            x: 0,
-            y: 0,
-            hotspot_x: 0,
-            hotspot_y: 0,
-            width,
-            height,
-            framebuffer_id: Some(buffer.framebuffer.get()),
-            image_generation: 1,
-        };
+        let state = atomic_cursor_state_for_image(&image, Some(buffer.framebuffer.get()));
         Ok(Self {
+            image,
             desired: state.clone(),
             submitted: state.clone(),
             current: state,
@@ -365,9 +360,18 @@ impl NativeAtomicCursor {
 
     #[allow(dead_code)]
     pub(crate) fn replace_default_image(&mut self, file: &fs::File) -> io::Result<()> {
-        let mut replacement =
-            AtomicCursorBuffer::create(file, self.desired.width, self.desired.height)?;
-        if let Err(error) = replacement.upload_default_cursor() {
+        let mut replacement = AtomicCursorBuffer::create(
+            file,
+            self.resources
+                .current
+                .as_ref()
+                .map_or(self.image.width, |buffer| buffer.width),
+            self.resources
+                .current
+                .as_ref()
+                .map_or(self.image.height, |buffer| buffer.height),
+        )?;
+        if let Err(error) = replacement.upload_image(&self.image) {
             drop(replacement);
             return Err(error);
         }
@@ -405,8 +409,9 @@ impl NativeAtomicCursor {
         height: u32,
         generation: u64,
     ) -> io::Result<AtomicCursorVisualState> {
+        validate_atomic_cursor_image(&self.image, width, height)?;
         let mut replacement = AtomicCursorBuffer::create(file, width, height)?;
-        if let Err(error) = replacement.upload_default_cursor() {
+        if let Err(error) = replacement.upload_image(&self.image) {
             drop(replacement);
             return Err(error);
         }
@@ -424,11 +429,13 @@ impl NativeAtomicCursor {
             .suspended_desired
             .take()
             .unwrap_or_else(|| self.desired.clone());
-        restored.width = width;
-        restored.height = height;
+        restored.hotspot_x = self.image.hotspot_x;
+        restored.hotspot_y = self.image.hotspot_y;
+        restored.width = self.image.width;
+        restored.height = self.image.height;
         restored.framebuffer_id = framebuffer_id;
         self.desired = restored.clone();
-        self.submitted = AtomicCursorVisualState::hidden(width, height);
+        self.submitted = AtomicCursorVisualState::hidden(self.image.width, self.image.height);
         self.submitted.framebuffer_id = framebuffer_id;
         self.current = self.submitted.clone();
         self.pending_token = None;
@@ -455,6 +462,45 @@ impl NativeAtomicCursor {
     }
 }
 
+pub(crate) fn cursor_image_fits_buffer(
+    image: &CompositorCursorImage,
+    width: u32,
+    height: u32,
+) -> bool {
+    image.width <= width && image.height <= height
+}
+
+pub(crate) fn validate_atomic_cursor_image(
+    image: &CompositorCursorImage,
+    width: u32,
+    height: u32,
+) -> io::Result<()> {
+    if cursor_image_fits_buffer(image, width, height) {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "Atomic cursor theme image {}x{} exceeds usable cursor buffer {}x{}",
+        image.width, image.height, width, height
+    )))
+}
+
+fn atomic_cursor_state_for_image(
+    image: &CompositorCursorImage,
+    framebuffer_id: Option<u32>,
+) -> AtomicCursorVisualState {
+    AtomicCursorVisualState {
+        visible: true,
+        x: 0,
+        y: 0,
+        hotspot_x: image.hotspot_x,
+        hotspot_y: image.hotspot_y,
+        width: image.width,
+        height: image.height,
+        framebuffer_id,
+        image_generation: 1,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
@@ -470,6 +516,7 @@ mod tests {
     fn test_cursor() -> NativeAtomicCursor {
         let state = AtomicCursorVisualState::hidden(64, 64);
         NativeAtomicCursor {
+            image: Arc::new(CompositorCursorImage::builtin_fallback()),
             desired: state.clone(),
             submitted: state.clone(),
             current: state,
@@ -533,6 +580,36 @@ mod tests {
         cursor.set_position(100, 200);
 
         assert!(!cursor.needs_submission());
+    }
+
+    #[test]
+    fn atomic_cursor_state_uses_theme_hotspot() {
+        let image =
+            CompositorCursorImage::from_argb8888(vec![0xffff_ffff; 2 * 3], 2, 3, 1, 2).unwrap();
+        let state = atomic_cursor_state_for_image(&image, Some(7));
+
+        assert_eq!(state.hotspot_x, 1);
+        assert_eq!(state.hotspot_y, 2);
+        assert_eq!((state.width, state.height), (2, 3));
+        assert_eq!(state.framebuffer_id, Some(7));
+    }
+
+    #[test]
+    fn oversized_theme_cursor_falls_back_to_software_in_auto() {
+        let image =
+            CompositorCursorImage::from_argb8888(vec![0xffff_ffff; 65 * 64], 65, 64, 0, 0).unwrap();
+        assert!(!cursor_image_fits_buffer(
+            &image,
+            NATIVE_HARDWARE_CURSOR_SIZE,
+            64
+        ));
+    }
+
+    #[test]
+    fn oversized_theme_cursor_fails_in_hardware_mode() {
+        let image =
+            CompositorCursorImage::from_argb8888(vec![0xffff_ffff; 65 * 64], 65, 64, 0, 0).unwrap();
+        assert!(validate_atomic_cursor_image(&image, NATIVE_HARDWARE_CURSOR_SIZE, 64).is_err());
     }
 
     #[test]

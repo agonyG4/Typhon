@@ -413,6 +413,7 @@ impl AtomicEglGbmScanout {
                 height,
                 Some(image_target),
                 detect_partial_repaint_capabilities(&egl, egl_display, false),
+                oblivion_one::cursor_theme::shared_compositor_cursor_image(),
             )
             .map_err(native_egl_io_error)?;
             let renderer_dmabuf_feedback = query_egl_dmabuf_feedback(&egl, egl_display);

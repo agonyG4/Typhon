@@ -73,6 +73,7 @@ pub(crate) struct NativeRuntimeConfig {
 
 pub(crate) struct NativeRuntime {
     server: OwnCompositorServer,
+    cursor_image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
     perf: NativePerfLogger,
     target: KmsTarget,
     mode_label: String,

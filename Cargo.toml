@@ -24,6 +24,7 @@ wayland-client = "0.31.14"
 wayland-server = "0.31.13"
 wayland-scanner = "0.31.10"
 zbus = { version = "5.16.0", default-features = false, features = ["async-io"] }
+xcursor = "=0.3.10"
 
 [workspace]
 members = ["."]
