@@ -350,6 +350,15 @@ fn pre_map_fullscreen_snapshot_enters_fullscreen_on_admission() {
             ..
         } if *window == id
     )));
+    assert!(state.restore_floating_root_window(snapshot.surface_id));
+    assert_eq!(
+        state.window(id).expect("window").state.mode(),
+        ToplevelMode::Floating
+    );
+    assert_eq!(
+        state.surface_placement(snapshot.surface_id),
+        SurfacePlacement::absolute_root_at(snapshot.geometry.x, snapshot.geometry.y)
+    );
 }
 
 #[test]

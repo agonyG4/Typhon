@@ -20,7 +20,7 @@ impl WindowState {
     }
 
     pub(super) fn is_minimized(&self) -> bool {
-        !self.minimized_surfaces.is_empty()
+        self.minimized
     }
 
     pub(super) fn minimize(&mut self, surfaces: Vec<RenderableSurface>) {
@@ -55,6 +55,7 @@ impl WindowState {
     }
 
     pub(super) fn push_minimized_surface(&mut self, surface: RenderableSurface) {
+        self.minimized = true;
         self.minimized_surfaces.push(surface);
     }
 

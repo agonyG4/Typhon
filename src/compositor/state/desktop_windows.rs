@@ -165,10 +165,10 @@ impl CompositorState {
             ToplevelMode::Floating
         };
         if let Some(window) = self.window_mut(window_id) {
-            window.state.set_mode(mode);
             if mode != ToplevelMode::Floating {
                 window.state.capture_restore_geometry(restore_geometry);
             }
+            window.state.set_mode(mode);
         }
         let target_geometry = self.window_geometry_for_mode(mode);
         self.set_surface_placement_with_cause(
