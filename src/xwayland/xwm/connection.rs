@@ -47,6 +47,7 @@ pub(crate) fn connect(
         windows: X11WindowRegistry::default(),
         outgoing_events: Default::default(),
         association: super::association::SurfaceAssociationJoin::default(),
+        buffer_ready_surfaces: Default::default(),
         supporting_wm_check,
         raw_fd,
     })

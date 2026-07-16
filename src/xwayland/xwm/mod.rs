@@ -3,7 +3,12 @@
 //! Raw x11rb values stay below this module.  The compositor receives only the
 //! generation-bound handles, snapshots, events, and commands defined here.
 
-use std::{collections::VecDeque, fmt, os::fd::RawFd, os::unix::net::UnixStream};
+use std::{
+    collections::{HashSet, VecDeque},
+    fmt,
+    os::fd::RawFd,
+    os::unix::net::UnixStream,
+};
 
 use crate::compositor::{DesktopWindowKind, WindowConstraints, WindowMetadata};
 use x11rb::rust_connection::{DefaultStream, RustConnection};
@@ -216,6 +221,7 @@ pub struct Xwm {
     pub(crate) windows: X11WindowRegistry,
     pub(crate) outgoing_events: VecDeque<XwmEvent>,
     pub(crate) association: SurfaceAssociationJoin,
+    buffer_ready_surfaces: HashSet<u32>,
     pub(crate) supporting_wm_check: u32,
     raw_fd: RawFd,
 }
@@ -295,6 +301,9 @@ impl Xwm {
     pub fn clear_generation(&mut self, generation: XwaylandGeneration) {
         self.windows.clear_generation(generation);
         self.association.clear_generation(generation);
+        if generation == self.generation {
+            self.buffer_ready_surfaces.clear();
+        }
     }
 
     pub fn mark_window_buffer_ready(&mut self, handle: X11WindowHandle) -> Result<(), XwmError> {
@@ -305,6 +314,29 @@ impl Xwm {
             .mark_buffer_ready(handle)
             .map_err(XwmError::InvalidCommand)?;
         self.emit_ready_if_complete(handle)
+    }
+
+    pub fn mark_surface_buffer_ready(
+        &mut self,
+        generation: XwaylandGeneration,
+        surface_id: u32,
+    ) -> Result<(), XwmError> {
+        if generation != self.generation {
+            return Err(XwmError::StaleGeneration);
+        }
+        self.buffer_ready_surfaces.insert(surface_id);
+        let handles = self
+            .association
+            .completed
+            .iter()
+            .filter_map(|(handle, association)| {
+                (association.surface_id == surface_id).then_some(*handle)
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            self.mark_window_buffer_ready(handle)?;
+        }
+        Ok(())
     }
 
     pub fn note_x11_surface_serial(
@@ -419,6 +451,9 @@ impl Xwm {
                 .is_some_and(|record| record.association.is_none());
             if needs_association {
                 let _ = self.windows.mark_associated(handle, association);
+            }
+            if self.buffer_ready_surfaces.contains(&association.surface_id) {
+                let _ = self.windows.mark_buffer_ready(handle);
             }
             let _ = self.emit_ready_if_complete(handle);
         }

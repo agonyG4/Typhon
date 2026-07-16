@@ -37,13 +37,14 @@ use crate::astrea_shortcuts::server::astrea_shortcuts_manager_v1;
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
-use crate::xwayland::{XwaylandAssociationEvent, XwaylandGeneration};
+use crate::xwayland::xwm::XwmEvent;
+use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 
 use super::protocols::versions;
 use super::{
     AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, BufferReleaseMetrics,
     ClientCursorRenderState, CompositorFrameBatchId, CompositorState, CoreComplianceMetrics,
-    DirectScanoutSceneCandidate, DirectScanoutSceneRejection, ExplicitSyncPoint,
+    DesktopWindowKind, DirectScanoutSceneCandidate, DirectScanoutSceneRejection, ExplicitSyncPoint,
     FrameBatchDiscardReason, FramePresentation, FullscreenRenderPlanMetrics,
     InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PointerAxisFrame,
     PresentationClock, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
@@ -396,6 +397,40 @@ impl OwnCompositorServer {
 
     pub fn take_xwayland_association_events(&mut self) -> Vec<XwaylandAssociationEvent> {
         self.state.take_xwayland_association_events()
+    }
+
+    pub fn take_xwayland_buffer_ready_events(&mut self) -> Vec<(XwaylandGeneration, u32)> {
+        self.state.take_xwayland_buffer_ready_events()
+    }
+
+    pub fn apply_xwayland_window_event(&mut self, event: XwmEvent) -> bool {
+        match event {
+            XwmEvent::WindowReady(snapshot) => self.state.insert_x11_window(snapshot).is_ok(),
+            XwmEvent::WindowDestroyed(handle) => self.remove_x11_desktop_window(handle),
+            XwmEvent::WindowWithdrawn(handle) => {
+                let Some(window_id) = self.state.window_id_for_x11_handle(handle) else {
+                    return false;
+                };
+                self.state
+                    .window(window_id)
+                    .is_some_and(|window| window.kind == DesktopWindowKind::OverrideRedirect)
+                    && self.state.remove_desktop_window(window_id).is_some()
+            }
+            XwmEvent::MetadataChanged { window, delta } => {
+                self.state.apply_x11_metadata_delta(window, delta)
+            }
+            XwmEvent::ConfigureRequested { .. }
+            | XwmEvent::StateRequested { .. }
+            | XwmEvent::FocusRequested(_)
+            | XwmEvent::CloseRequestedByClient(_) => false,
+        }
+    }
+
+    fn remove_x11_desktop_window(&mut self, handle: X11WindowHandle) -> bool {
+        let Some(window_id) = self.state.window_id_for_x11_handle(handle) else {
+            return false;
+        };
+        self.state.remove_desktop_window(window_id).is_some()
     }
 
     pub fn accepted_clients(&self) -> usize {

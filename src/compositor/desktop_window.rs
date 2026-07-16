@@ -3,6 +3,7 @@
 use std::{io, num::NonZeroU64};
 
 use crate::xwayland::X11WindowHandle;
+use crate::xwayland::xwm::X11WindowSnapshot;
 
 use super::WindowState;
 
@@ -94,6 +95,19 @@ impl DesktopWindow {
             kind: DesktopWindowKind::Managed,
             metadata: WindowMetadata::default(),
             constraints: WindowConstraints::default(),
+            relationships: WindowRelationships::default(),
+            state: WindowState::default(),
+        }
+    }
+
+    pub(crate) fn new_x11(id: WindowId, snapshot: X11WindowSnapshot) -> Self {
+        Self {
+            id,
+            root_surface_id: snapshot.surface_id,
+            backend: WindowBackend::X11(snapshot.handle),
+            kind: snapshot.kind,
+            metadata: snapshot.metadata,
+            constraints: snapshot.constraints,
             relationships: WindowRelationships::default(),
             state: WindowState::default(),
         }

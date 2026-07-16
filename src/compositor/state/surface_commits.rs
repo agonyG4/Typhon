@@ -206,7 +206,6 @@ impl CompositorState {
         {
             self.update_toplevel_visual_render_assignment(root_surface_id);
         }
-
         let committed_popup = self.popup_surfaces.contains_key(&surface_id);
         if committed_popup {
             if let Some(node) = self.popup_nodes.get_mut(&surface_id) {
@@ -1254,6 +1253,7 @@ impl CompositorState {
             .retain(|surface| surface.surface_id != surface_id);
         self.track_committed_buffer_lifetime(surface_id, &pending);
         self.current_surface_buffers.insert(surface_id, pending);
+        self.note_xwayland_buffer_ready(surface_id);
         self.record_surface_publication(
             surface_id,
             root_surface_id,

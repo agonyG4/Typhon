@@ -1,4 +1,32 @@
 use super::*;
+use crate::xwayland::xwm::{X11Geometry, X11PublishedState, X11WindowSnapshot};
+use crate::xwayland::{X11WindowHandle, XwaylandGeneration};
+use std::num::NonZeroU64;
+
+fn x11_snapshot(generation: XwaylandGeneration, xid: u32, surface_id: u32) -> X11WindowSnapshot {
+    X11WindowSnapshot {
+        handle: X11WindowHandle::new(generation, xid),
+        surface_id,
+        kind: DesktopWindowKind::Managed,
+        geometry: X11Geometry {
+            x: 10,
+            y: 20,
+            width: 800,
+            height: 600,
+        },
+        metadata: WindowMetadata {
+            app_id: Some("TyphonApp".into()),
+            title: Some("Typhon Window".into()),
+            pid: Some(42),
+        },
+        constraints: WindowConstraints::default(),
+        state: X11PublishedState::default(),
+        transient_for: None,
+        supports_delete: true,
+        supports_take_focus: true,
+        sync_counter: None,
+    }
+}
 
 #[test]
 fn window_id_is_nonzero_monotonic_and_not_reused() {
@@ -103,4 +131,119 @@ fn window_stacking_uses_stable_ids() {
     assert!(state.raise_window_id(first));
     assert_eq!(state.window_stacking, vec![second, first]);
     assert_eq!(state.window(first).expect("first").root_surface_id, 10);
+}
+
+#[test]
+fn ready_x11_event_creates_one_desktop_window() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let snapshot = x11_snapshot(generation, 100, 50);
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(id, snapshot.clone()))
+        .expect("insert X11 window");
+
+    assert_eq!(state.desktop_windows.len(), 1);
+    assert_eq!(state.window_id_for_surface(50), Some(id));
+    assert_eq!(state.window_id_for_x11_handle(snapshot.handle), Some(id));
+    assert_eq!(
+        state.window(id).expect("window").metadata.title.as_deref(),
+        Some("Typhon Window")
+    );
+}
+
+#[test]
+fn duplicate_ready_event_is_rejected_without_duplicate_window() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let snapshot = x11_snapshot(generation, 101, 51);
+    let first = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(first, snapshot.clone()))
+        .expect("insert X11 window");
+    let second = state.allocate_window_id().expect("window id");
+
+    assert_eq!(
+        state.insert_desktop_window(DesktopWindow::new_x11(second, snapshot)),
+        Err(DesktopWindowError::DuplicateWindowId)
+    );
+    assert_eq!(state.desktop_windows.len(), 1);
+}
+
+#[test]
+fn destroyed_x11_window_removes_surface_index_focus_and_interaction() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let snapshot = x11_snapshot(generation, 102, 52);
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(id, snapshot.clone()))
+        .expect("insert X11 window");
+
+    assert!(state.remove_desktop_window(id).is_some());
+    assert!(state.window_id_for_surface(snapshot.surface_id).is_none());
+    assert!(state.window_id_for_x11_handle(snapshot.handle).is_none());
+    assert!(state.window_stacking.is_empty());
+}
+
+#[test]
+fn old_generation_destroy_cannot_remove_new_generation_window() {
+    let mut state = CompositorState::new(None);
+    let old = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let new = XwaylandGeneration::new(NonZeroU64::new(2).unwrap());
+    let old_snapshot = x11_snapshot(old, 103, 53);
+    let new_snapshot = x11_snapshot(new, 103, 54);
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(id, new_snapshot.clone()))
+        .expect("insert new X11 window");
+
+    assert!(
+        state
+            .window_id_for_x11_handle(old_snapshot.handle)
+            .is_none()
+    );
+    assert!(state.window(id).is_some());
+    assert_eq!(
+        state.window_id_for_surface(new_snapshot.surface_id),
+        Some(id)
+    );
+}
+
+#[test]
+fn x11_metadata_delta_updates_generic_metadata() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let snapshot = x11_snapshot(generation, 104, 55);
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(id, snapshot.clone()))
+        .expect("insert X11 window");
+
+    assert!(state.apply_x11_metadata_delta(
+        snapshot.handle,
+        crate::xwayland::xwm::X11MetadataDelta::Title(Some("Updated".into()))
+    ));
+    assert_eq!(
+        state.window(id).expect("window").metadata.title.as_deref(),
+        Some("Updated")
+    );
+}
+
+#[test]
+fn override_redirect_window_is_excluded_from_normal_window_cycle() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let mut snapshot = x11_snapshot(generation, 105, 56);
+    snapshot.kind = DesktopWindowKind::OverrideRedirect;
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(id, snapshot))
+        .expect("insert override-redirect window");
+
+    assert_eq!(
+        state.window(id).expect("window").kind,
+        DesktopWindowKind::OverrideRedirect
+    );
+    assert!(!state.window(id).expect("window").state.is_minimized());
 }

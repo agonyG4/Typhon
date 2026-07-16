@@ -7,7 +7,7 @@ use crate::render_backend::buffer::{
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
-use crate::xwayland::XwaylandGeneration;
+use crate::xwayland::{X11WindowHandle, XwaylandGeneration};
 pub use clipboard_bridge::{
     ClipboardBridge, ClipboardBridgeError, ClipboardBridgeEvent, HostClipboardOfferId,
     NoopClipboardBridge,
@@ -535,6 +535,7 @@ pub struct CompositorState {
     surface_client_ids: HashMap<u32, ClientId>,
     pub(in crate::compositor) desktop_windows: HashMap<WindowId, DesktopWindow>,
     pub(in crate::compositor) window_by_root_surface: HashMap<u32, WindowId>,
+    pub(in crate::compositor) window_by_x11_handle: HashMap<X11WindowHandle, WindowId>,
     pub(in crate::compositor) next_window_id: u64,
     pub(in crate::compositor) window_stacking: Vec<WindowId>,
     cursor_surface_ids: HashSet<u32>,

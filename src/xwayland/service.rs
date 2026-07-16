@@ -785,6 +785,31 @@ impl XwaylandService {
         }
     }
 
+    pub fn mark_managed_surface_buffer_ready(
+        &mut self,
+        generation: XwaylandGeneration,
+        surface_id: u32,
+    ) -> io::Result<()> {
+        match &mut self.state {
+            ServiceState::Running(resources) if resources.generation == generation => resources
+                .xwm
+                .mark_surface_buffer_ready(generation, surface_id)
+                .map_err(io::Error::other),
+            ServiceState::Running(_) => {
+                self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn take_managed_xwm_events(&mut self) -> Vec<super::xwm::XwmEvent> {
+        match &mut self.state {
+            ServiceState::Running(resources) => resources.xwm.take_events().collect(),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn handle_deadline(
         &mut self,
         now_ns: u64,
