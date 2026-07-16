@@ -183,10 +183,30 @@ impl XwaylandService {
     }
 
     pub fn app_environment(&self) -> Option<XwaylandAppEnvironment> {
-        self.lease.as_ref().map(|lease| XwaylandAppEnvironment {
-            display: lease.display().to_string(),
-            xauthority: lease.xauthority_path().to_owned(),
-        })
+        match self.state {
+            ServiceState::Disabled | ServiceState::Failed => None,
+            ServiceState::Armed
+            | ServiceState::Starting(_)
+            | ServiceState::RunningBase(_)
+            | ServiceState::Running(_)
+            | ServiceState::Backoff { .. } => {
+                self.lease.as_ref().map(|lease| XwaylandAppEnvironment {
+                    display: lease.display().to_string(),
+                    xauthority: lease.xauthority_path().to_owned(),
+                })
+            }
+        }
+    }
+
+    pub fn normal_app_environment(&self) -> Option<XwaylandAppEnvironment> {
+        if !self.mode.is_managed() || !matches!(self.state, ServiceState::Running(_)) {
+            return None;
+        }
+        self.app_environment()
+    }
+
+    pub fn is_managed(&self) -> bool {
+        self.mode.is_managed()
     }
 
     pub fn reactor_registrations(&self) -> impl Iterator<Item = XwaylandReactorRegistration> {
@@ -356,7 +376,10 @@ impl XwaylandService {
         if !matches!(self.state, ServiceState::Armed) {
             return Ok(false);
         }
-        if self.mode == XwaylandMode::BaseLazy {
+        if matches!(
+            self.mode,
+            XwaylandMode::BaseLazy | XwaylandMode::ManagedLazy
+        ) {
             self.metrics.lazy_triggers = self.metrics.lazy_triggers.saturating_add(1);
         }
         match self.start_generation(supervisor) {

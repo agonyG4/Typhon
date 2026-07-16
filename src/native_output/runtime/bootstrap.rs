@@ -442,13 +442,15 @@ impl NativeRuntime {
         let last_acquire_ready_at_ns = None;
         let resize_perf = NativeResizePerfState::default();
         let pointer_constraint_backend = NativePointerConstraintBackend::new();
+        let xwayland_app_environment = xwayland.normal_app_environment();
         if let Some(command) = external_shell_command()
-            && let Some(launch) = launch_native_shell_command(
+            && let Some(launch) = launch_native_shell_command_with_xwayland_environment(
                 &server,
                 &mut process_supervisor,
                 command,
                 effective_app_gpu_policy,
                 NativeLaunchSource::ExternalShell,
+                xwayland_app_environment.clone(),
             )
             .map_err(|error| {
                 eprintln!("native external shell launch failed: {error}");
@@ -462,12 +464,13 @@ impl NativeRuntime {
             pending_launches.push_back(launch);
         }
         if let Some(command) = startup_app
-            && let Some(launch) = launch_native_shell_command(
+            && let Some(launch) = launch_native_shell_command_with_xwayland_environment(
                 &server,
                 &mut process_supervisor,
                 command,
                 effective_app_gpu_policy,
                 NativeLaunchSource::Startup,
+                xwayland_app_environment,
             )?
         {
             log_native_app_spawn(perf, &launch);

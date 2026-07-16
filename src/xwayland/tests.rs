@@ -32,8 +32,39 @@ fn xwayland_mode_parses_only_opt_in_values() {
     assert_eq!(XwaylandMode::parse(None), XwaylandMode::Off);
     assert_eq!(XwaylandMode::parse(Some("off")), XwaylandMode::Off);
     assert_eq!(XwaylandMode::parse(Some("base")), XwaylandMode::BaseLazy);
-    assert_eq!(XwaylandMode::parse(Some("eager")), XwaylandMode::BaseEager);
+    assert_eq!(XwaylandMode::parse(Some("lazy")), XwaylandMode::ManagedLazy);
+    assert_eq!(
+        XwaylandMode::parse(Some("eager")),
+        XwaylandMode::ManagedEager
+    );
     assert_eq!(XwaylandMode::parse(Some("host")), XwaylandMode::Off);
+}
+
+#[test]
+fn managed_mode_is_the_only_mode_with_a_normal_app_profile() {
+    let root = test_root("managed-profile");
+    let base = XwaylandService::bootstrap_with_config(XwaylandConfig::for_tests_at_root(
+        XwaylandMode::BaseLazy,
+        PathBuf::from("Xwayland"),
+        root.clone(),
+    ))
+    .expect("bootstrap base mode");
+    assert!(base.normal_app_environment().is_none());
+
+    let mut managed_config = XwaylandConfig::for_tests_at_root(
+        XwaylandMode::ManagedLazy,
+        PathBuf::from("Xwayland"),
+        root.clone(),
+    );
+    managed_config.profile = super::config::XwaylandProfile::Managed;
+    let managed =
+        XwaylandService::bootstrap_with_config(managed_config).expect("bootstrap managed mode");
+    assert!(managed.normal_app_environment().is_none());
+    assert!(managed.app_environment().is_some());
+
+    drop(base);
+    drop(managed);
+    fs::remove_dir_all(root).expect("remove test root");
 }
 
 #[test]

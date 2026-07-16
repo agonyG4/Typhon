@@ -1,6 +1,28 @@
 use super::*;
 
 impl NativeRuntime {
+    pub(super) fn initialize_managed_xwayland(&mut self) -> NativeResult<()> {
+        if !self.xwayland.is_managed()
+            || self.xwayland.state_kind() != oblivion_one::xwayland::XwaylandStateKind::Starting
+        {
+            return Ok(());
+        }
+        let Some(generation) = self.xwayland.generation() else {
+            return Ok(());
+        };
+        match self
+            .xwayland
+            .initialize_managed_xwm(generation, &mut self.process_supervisor)
+        {
+            Ok(()) => self.sync_xwayland_reactor_sources(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            Err(error) => {
+                eprintln!("native XWayland managed startup contained: {error}");
+                self.sync_xwayland_reactor_sources()
+            }
+        }
+    }
+
     pub(super) fn dispatch_xwayland_window_events(&mut self) -> NativeResult<()> {
         let mut commands = Vec::new();
         for event in self.xwayland.take_managed_xwm_events() {

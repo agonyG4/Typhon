@@ -56,6 +56,7 @@ impl NativeRuntime {
         self.dispatch_wayland_and_input(&mut cycle)?;
         self.dispatch_xwayland_client_disconnects()?;
         self.dispatch_xwayland_shell_binds()?;
+        self.initialize_managed_xwayland()?;
         let association_events = self.server.take_xwayland_association_events();
         self.xwayland.record_association_events(&association_events);
         for (generation, surface_id) in self.server.take_xwayland_buffer_ready_events() {
@@ -69,13 +70,14 @@ impl NativeRuntime {
         if !self.shutdown.is_running() || !self.session.permits_output() {
             return Ok(());
         }
-        drain_pending_process_launches(
+        drain_pending_process_launches_with_xwayland_environment(
             &mut self.server,
             &mut self.process_supervisor,
             &mut self.astrea_launch_tracker,
             self.effective_app_gpu_policy,
             self.perf,
             &mut self.pending_launches,
+            self.xwayland.normal_app_environment(),
         );
         self.process_acquire_and_prepare(&cycle)?;
         if !self.shutdown.is_running() || !self.session.permits_output() {
