@@ -753,6 +753,14 @@ impl XwaylandService {
     }
 
     pub fn record_association_events(&mut self, events: &[XwaylandAssociationEvent]) {
+        let mut stale_or_rejected = 0u64;
+        if let ServiceState::Running(resources) = &mut self.state {
+            for event in events.iter().copied() {
+                if resources.xwm.ingest_wayland_association(event).is_err() {
+                    stale_or_rejected = stale_or_rejected.saturating_add(1);
+                }
+            }
+        }
         for event in events {
             match event {
                 XwaylandAssociationEvent::Committed { .. } => {
@@ -766,6 +774,14 @@ impl XwaylandService {
                     eprintln!("oblivion-one xwayland: event=association_remove detail={event:?}");
                 }
             }
+        }
+        self.metrics.stale_events = self.metrics.stale_events.saturating_add(stale_or_rejected);
+    }
+
+    pub fn take_managed_association_events(&mut self) -> Vec<super::xwm::XwmAssociationEvent> {
+        match &mut self.state {
+            ServiceState::Running(resources) => resources.xwm.take_association_events(),
+            _ => Vec::new(),
         }
     }
 

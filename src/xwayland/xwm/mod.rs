@@ -8,6 +8,7 @@ use std::{collections::VecDeque, fmt, os::fd::RawFd, os::unix::net::UnixStream};
 use crate::compositor::{DesktopWindowKind, WindowConstraints, WindowMetadata};
 use x11rb::rust_connection::{DefaultStream, RustConnection};
 
+mod association;
 mod atoms;
 mod capabilities;
 mod commands;
@@ -18,12 +19,15 @@ mod window;
 #[cfg(test)]
 mod tests;
 
+pub use association::{
+    AssociatedSurface, SurfaceAssociationJoin, SurfaceAssociationJoinError, XwmAssociationEvent,
+};
 use atoms::XwmAtoms;
 use capabilities::XwmCapabilities;
 pub use window::X11WindowLifecycle;
 use window::X11WindowRegistry;
 
-use super::{X11WindowHandle, XwaylandGeneration};
+use super::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 
 const XWM_EVENT_BUDGET: usize = 256;
 
@@ -185,6 +189,7 @@ pub enum XwmError {
     Connection(x11rb::errors::ConnectionError),
     InvalidCommand(&'static str),
     StaleGeneration,
+    Association(SurfaceAssociationJoinError),
 }
 
 impl fmt::Display for XwmError {
@@ -193,6 +198,7 @@ impl fmt::Display for XwmError {
             Self::Connection(error) => write!(formatter, "XWM connection error: {error}"),
             Self::InvalidCommand(command) => write!(formatter, "invalid XWM command: {command}"),
             Self::StaleGeneration => formatter.write_str("stale XWM generation"),
+            Self::Association(error) => write!(formatter, "XWM association error: {error}"),
         }
     }
 }
@@ -209,6 +215,7 @@ pub struct Xwm {
     pub(crate) capabilities: XwmCapabilities,
     pub(crate) windows: X11WindowRegistry,
     pub(crate) outgoing_events: VecDeque<XwmEvent>,
+    pub(crate) association: SurfaceAssociationJoin,
     pub(crate) supporting_wm_check: u32,
     raw_fd: RawFd,
 }
@@ -276,6 +283,65 @@ impl Xwm {
 
     pub fn clear_generation(&mut self, generation: XwaylandGeneration) {
         self.windows.clear_generation(generation);
+        self.association.clear_generation(generation);
+    }
+
+    pub fn note_x11_surface_serial(
+        &mut self,
+        handle: X11WindowHandle,
+        serial_lo: u32,
+        serial_hi: u32,
+    ) -> Result<(), XwmError> {
+        if handle.generation() != self.generation {
+            return Err(XwmError::StaleGeneration);
+        }
+        let Some(serial) = super::serial_from_parts(serial_lo, serial_hi) else {
+            return Err(XwmError::Association(
+                SurfaceAssociationJoinError::InvalidSerial,
+            ));
+        };
+        self.association
+            .note_x11_serial(handle, serial)
+            .map_err(XwmError::Association)
+    }
+
+    pub fn ingest_wayland_association(
+        &mut self,
+        event: XwaylandAssociationEvent,
+    ) -> Result<(), XwmError> {
+        let generation = match event {
+            XwaylandAssociationEvent::Committed { generation, .. }
+            | XwaylandAssociationEvent::Removed { generation, .. } => generation,
+        };
+        if generation != self.generation {
+            return Err(XwmError::StaleGeneration);
+        }
+        match event {
+            XwaylandAssociationEvent::Committed {
+                generation,
+                serial,
+                surface_id,
+            } => self
+                .association
+                .commit_wayland(generation, serial, surface_id)
+                .map_err(XwmError::Association),
+            XwaylandAssociationEvent::Removed { surface_id, .. } => {
+                self.association.remove_wayland_surface(surface_id);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn remove_x11_association(&mut self, handle: X11WindowHandle) -> Result<(), XwmError> {
+        if handle.generation() != self.generation {
+            return Err(XwmError::StaleGeneration);
+        }
+        self.association.remove_x11_window(handle);
+        Ok(())
+    }
+
+    pub fn take_association_events(&mut self) -> Vec<XwmAssociationEvent> {
+        self.association.take_events()
     }
 
     pub fn set_window_lifecycle(
