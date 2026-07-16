@@ -43,6 +43,7 @@ pub enum XwaylandReactorPurpose {
     ListenFilesystem,
     ListenAbstract,
     DisplayReady,
+    Xwm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +214,13 @@ impl XwaylandService {
                 purpose: XwaylandReactorPurpose::DisplayReady,
             });
         }
+        if let ServiceState::Running(resources) = &self.state {
+            registrations.push(XwaylandReactorRegistration {
+                fd: resources.xwm.raw_fd(),
+                generation: Some(resources.generation),
+                purpose: XwaylandReactorPurpose::Xwm,
+            });
+        }
         registrations.into_iter()
     }
 
@@ -247,6 +255,53 @@ impl XwaylandService {
             }
             _ => None,
         }
+    }
+
+    fn drain_managed_xwm(&mut self, supervisor: &mut ChildSupervisor) -> io::Result<bool> {
+        let drain = match &mut self.state {
+            ServiceState::Running(resources) => resources.xwm.drain_events(256),
+            _ => return Ok(false),
+        };
+        match drain {
+            Ok(drain) => {
+                self.metrics.xwm_events_received = self
+                    .metrics
+                    .xwm_events_received
+                    .saturating_add(drain.processed as u64);
+                if drain.budget_exhausted {
+                    self.metrics.xwm_drain_budget_exhaustions =
+                        self.metrics.xwm_drain_budget_exhaustions.saturating_add(1);
+                }
+                Ok(drain.budget_exhausted)
+            }
+            Err(error) => {
+                self.fail_managed_xwm(supervisor, io::Error::other(error))?;
+                Ok(false)
+            }
+        }
+    }
+
+    fn fail_managed_xwm(
+        &mut self,
+        supervisor: &mut ChildSupervisor,
+        error: io::Error,
+    ) -> io::Result<()> {
+        let Some(process_id) = (match &self.state {
+            ServiceState::Running(resources) => Some(resources.process.id),
+            _ => None,
+        }) else {
+            return Ok(());
+        };
+        self.metrics.xwm_connection_failures =
+            self.metrics.xwm_connection_failures.saturating_add(1);
+        eprintln!(
+            "oblivion-one xwayland: event=xwm_failure generation={:?} reason={error}",
+            self.generation()
+        );
+        self.private_client = None;
+        self.kill_process_now(supervisor, process_id)?;
+        self.enter_backoff(now_ns()?);
+        Ok(())
     }
 
     pub fn display_number(&self) -> Option<u32> {
@@ -319,9 +374,10 @@ impl XwaylandService {
         generation: Option<XwaylandGeneration>,
         flags: u32,
         supervisor: &mut ChildSupervisor,
-    ) -> io::Result<()> {
-        if flags & (libc::EPOLLIN as u32 | libc::EPOLLHUP as u32 | libc::EPOLLRDHUP as u32) == 0 {
-            return Ok(());
+    ) -> io::Result<bool> {
+        let error_flags = libc::EPOLLERR as u32 | libc::EPOLLHUP as u32 | libc::EPOLLRDHUP as u32;
+        if flags & (libc::EPOLLIN as u32 | error_flags) == 0 {
+            return Ok(false);
         }
         match purpose {
             XwaylandReactorPurpose::ListenFilesystem | XwaylandReactorPurpose::ListenAbstract => {
@@ -334,8 +390,27 @@ impl XwaylandService {
                     self.handle_displayfd_ready(generation, supervisor)?;
                 }
             }
+            XwaylandReactorPurpose::Xwm => {
+                if generation != self.generation() {
+                    self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
+                    return Ok(false);
+                }
+                if flags & error_flags != 0 {
+                    self.fail_managed_xwm(
+                        supervisor,
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "XWM connection reported a reactor error",
+                        ),
+                    )?;
+                    return Ok(false);
+                }
+                if flags & libc::EPOLLIN as u32 != 0 {
+                    return self.drain_managed_xwm(supervisor);
+                }
+            }
         }
-        Ok(())
+        Ok(false)
     }
 
     fn start_generation(&mut self, supervisor: &mut ChildSupervisor) -> io::Result<()> {

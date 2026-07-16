@@ -71,16 +71,23 @@ impl NativeRuntime {
                 self.xwayland.record_stale_reactor_event();
                 continue;
             };
-            if let Err(error) = self.xwayland.handle_reactor_event(
+            let continuation = match self.xwayland.handle_reactor_event(
                 registration.purpose,
                 registration.generation,
                 event.flags,
                 &mut self.process_supervisor,
             ) {
-                eprintln!(
-                    "native XWayland event contained generation={:?} purpose={:?}: {error}",
-                    registration.generation, registration.purpose
-                );
+                Ok(continuation) => continuation,
+                Err(error) => {
+                    eprintln!(
+                        "native XWayland event contained generation={:?} purpose={:?}: {error}",
+                        registration.generation, registration.purpose
+                    );
+                    false
+                }
+            };
+            if continuation {
+                self.event_loop.arm_deadline(Some(monotonic_now_ns()?))?;
             }
         }
         self.sync_xwayland_reactor_sources()?;

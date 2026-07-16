@@ -175,6 +175,7 @@ impl NativeRuntime {
                 XwaylandReactorPurpose::ListenFilesystem
                 | XwaylandReactorPurpose::ListenAbstract => NativeEventSource::XwaylandListen,
                 XwaylandReactorPurpose::DisplayReady => NativeEventSource::XwaylandDisplayReady,
+                XwaylandReactorPurpose::Xwm => NativeEventSource::XwaylandXwm,
             };
             let token = self.event_loop.register(registration.fd, source)?;
             self.xwayland_reactor_tokens.push((token, registration));

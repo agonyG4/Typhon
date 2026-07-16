@@ -13,4 +13,7 @@ pub(crate) struct XwaylandMetrics {
     pub(crate) association_removals: u64,
     pub(crate) cleanup_attempts: u64,
     pub(crate) cleanup_failures: u64,
+    pub(crate) xwm_events_received: u64,
+    pub(crate) xwm_drain_budget_exhaustions: u64,
+    pub(crate) xwm_connection_failures: u64,
 }

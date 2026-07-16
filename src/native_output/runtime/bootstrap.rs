@@ -1207,6 +1207,7 @@ fn register_xwayland_reactor_sources(
                 NativeEventSource::XwaylandListen
             }
             XwaylandReactorPurpose::DisplayReady => NativeEventSource::XwaylandDisplayReady,
+            XwaylandReactorPurpose::Xwm => NativeEventSource::XwaylandXwm,
         };
         let token = event_loop.register(registration.fd, source)?;
         tokens.push((token, registration));
