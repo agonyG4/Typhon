@@ -272,6 +272,33 @@ fn display_and_private_shell_readiness_are_both_required() {
 }
 
 #[test]
+fn shell_readiness_alone_remains_starting_and_reverse_order_completes() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/true");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let generation = service.generation().expect("starting generation");
+    service
+        .handle_shell_bind(generation)
+        .expect("shell readiness");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Starting);
+    let display = service.display_number().expect("reserved display");
+    service
+        .handle_displayfd_bytes(
+            generation,
+            format!("{display}\n").as_bytes(),
+            &mut supervisor,
+        )
+        .expect("display readiness");
+    assert_eq!(service.state_kind(), XwaylandStateKind::RunningBase);
+    let exit = reap_one(&mut supervisor);
+    service.handle_process_exit(&exit).expect("handle exit");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
 fn wrong_display_readiness_fails_the_generation_without_running() {
     let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/sleep");
     service
@@ -403,6 +430,73 @@ fn abnormal_exit_enters_backoff_and_clean_exit_rearms() {
         .handle_process_exit(&exit)
         .expect("handle clean exit");
     assert_eq!(service.state_kind(), XwaylandStateKind::Armed);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn startup_timeout_kills_generation_and_enters_backoff() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/sleep");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    assert_eq!(supervisor.active_count(), 1);
+    service
+        .handle_deadline(u64::MAX, &mut supervisor)
+        .expect("handle startup timeout");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+    let _ = reap_one(&mut supervisor);
+    assert_eq!(supervisor.active_count(), 0);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn stale_child_exit_cannot_stop_current_generation() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/true");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start first generation");
+    let first_exit = reap_one(&mut supervisor);
+    service
+        .handle_process_exit(&first_exit)
+        .expect("rearm after first exit");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start second generation");
+    assert!(
+        !service
+            .handle_process_exit(&first_exit)
+            .expect("ignore stale exit")
+    );
+    assert_eq!(service.state_kind(), XwaylandStateKind::Starting);
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn third_abnormal_exit_enters_failed_without_rearming() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/false");
+    for attempt in 0..3 {
+        service
+            .handle_listener_readiness(&mut supervisor)
+            .expect("start crashing generation");
+        let exit = reap_one(&mut supervisor);
+        service.handle_process_exit(&exit).expect("handle crash");
+        if attempt < 2 {
+            assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+            service
+                .handle_deadline(u64::MAX, &mut supervisor)
+                .expect("leave backoff");
+        }
+    }
+    assert_eq!(service.state_kind(), XwaylandStateKind::Failed);
+    assert!(service.next_deadline_ns().is_none());
+    assert_eq!(supervisor.active_count(), 0);
     drop(service);
     drop(supervisor);
     fs::remove_dir_all(root).expect("remove test root");
