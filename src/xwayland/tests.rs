@@ -230,6 +230,23 @@ fn service_at_root(
     (root, service, ChildSupervisor::new())
 }
 
+fn service_at_root_with_sleeping_binary(
+    mode: XwaylandMode,
+    label: &str,
+) -> (PathBuf, XwaylandService, ChildSupervisor) {
+    let root = test_root(label);
+    let binary = root.join("xwayland-test-binary");
+    fs::write(&binary, "#!/bin/sh\nexec /bin/sleep 30\n").expect("write sleeping test binary");
+    let mut permissions = fs::metadata(&binary)
+        .expect("stat sleeping test binary")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&binary, permissions).expect("make sleeping test binary executable");
+    let config = XwaylandConfig::for_tests_at_root(mode, binary, root.clone());
+    let service = XwaylandService::bootstrap_with_config(config).expect("bootstrap service");
+    (root, service, ChildSupervisor::new())
+}
+
 fn reap_one(supervisor: &mut ChildSupervisor) -> crate::process::ChildExit {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
@@ -333,7 +350,8 @@ fn shell_readiness_alone_remains_starting_and_reverse_order_completes() {
 
 #[test]
 fn wrong_display_readiness_fails_the_generation_without_running() {
-    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/sleep");
+    let (root, mut service, mut supervisor) =
+        service_at_root_with_sleeping_binary(XwaylandMode::BaseLazy, "wrong-display");
     service
         .handle_listener_readiness(&mut supervisor)
         .expect("start generation");
@@ -404,7 +422,8 @@ fn eager_mode_uses_the_same_generation_start_path() {
 
 #[test]
 fn malformed_and_oversized_displayfd_payloads_fail_safely() {
-    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/sleep");
+    let (root, mut service, mut supervisor) =
+        service_at_root_with_sleeping_binary(XwaylandMode::BaseLazy, "malformed-display");
     service
         .handle_listener_readiness(&mut supervisor)
         .expect("start generation");
@@ -420,7 +439,8 @@ fn malformed_and_oversized_displayfd_payloads_fail_safely() {
     drop(supervisor);
     fs::remove_dir_all(root).expect("remove test root");
 
-    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/sleep");
+    let (root, mut service, mut supervisor) =
+        service_at_root_with_sleeping_binary(XwaylandMode::BaseLazy, "oversized-display");
     service
         .handle_listener_readiness(&mut supervisor)
         .expect("start generation");
@@ -470,7 +490,8 @@ fn abnormal_exit_enters_backoff_and_clean_exit_rearms() {
 
 #[test]
 fn startup_timeout_kills_generation_and_enters_backoff() {
-    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/sleep");
+    let (root, mut service, mut supervisor) =
+        service_at_root_with_sleeping_binary(XwaylandMode::BaseLazy, "startup-timeout");
     service
         .handle_listener_readiness(&mut supervisor)
         .expect("start generation");
@@ -479,7 +500,11 @@ fn startup_timeout_kills_generation_and_enters_backoff() {
         .handle_deadline(u64::MAX, &mut supervisor)
         .expect("handle startup timeout");
     assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
-    let _ = reap_one(&mut supervisor);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while supervisor.active_count() != 0 && Instant::now() < deadline {
+        let _ = supervisor.reap_exited().expect("reap timed out child");
+        thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(supervisor.active_count(), 0);
     drop(service);
     drop(supervisor);
