@@ -4,7 +4,7 @@
 //! generation-bound handles, snapshots, events, and commands defined here.
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     os::fd::RawFd,
     os::unix::net::UnixStream,
@@ -19,6 +19,7 @@ mod capabilities;
 mod commands;
 mod connection;
 mod events;
+mod resize_sync;
 mod window;
 
 #[cfg(test)]
@@ -29,6 +30,8 @@ pub use association::{
 };
 use atoms::XwmAtoms;
 use capabilities::XwmCapabilities;
+pub use resize_sync::{RESIZE_SYNC_TIMEOUT_NS, ResizeSyncError, ResizeSyncState};
+pub(crate) use resize_sync::{ResizeSyncCommit, ResizeSyncTracker};
 pub use window::X11WindowLifecycle;
 use window::X11WindowRegistry;
 
@@ -142,6 +145,12 @@ pub enum XwmEvent {
     },
     FocusRequested(X11WindowHandle),
     CloseRequestedByClient(X11WindowHandle),
+    ResizeSyncAcked {
+        window: X11WindowHandle,
+        counter_value: u64,
+    },
+    ResizeSyncPresented(X11WindowHandle),
+    ResizeSyncTimedOut(X11WindowHandle),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -166,6 +175,17 @@ pub enum XwmCommand {
         client_list: Vec<X11WindowHandle>,
         stacking: Vec<X11WindowHandle>,
     },
+    BeginResizeSync {
+        window: X11WindowHandle,
+        geometry: X11Geometry,
+        counter_value: u64,
+        deadline_ns: u64,
+    },
+    SetAllowCommits {
+        window: X11WindowHandle,
+        allowed: bool,
+    },
+    CompleteResizeSync(X11WindowHandle),
 }
 
 #[derive(Debug)]
@@ -197,8 +217,10 @@ impl std::error::Error for XwmStartupError {}
 pub enum XwmError {
     Connection(x11rb::errors::ConnectionError),
     InvalidCommand(&'static str),
+    IdAllocation(String),
     StaleGeneration,
     Association(SurfaceAssociationJoinError),
+    ResizeSync(ResizeSyncError),
 }
 
 impl fmt::Display for XwmError {
@@ -206,8 +228,14 @@ impl fmt::Display for XwmError {
         match self {
             Self::Connection(error) => write!(formatter, "XWM connection error: {error}"),
             Self::InvalidCommand(command) => write!(formatter, "invalid XWM command: {command}"),
+            Self::IdAllocation(error) => {
+                write!(formatter, "XWM resource allocation failed: {error}")
+            }
             Self::StaleGeneration => formatter.write_str("stale XWM generation"),
             Self::Association(error) => write!(formatter, "XWM association error: {error}"),
+            Self::ResizeSync(error) => {
+                write!(formatter, "XWM resize synchronization error: {error}")
+            }
         }
     }
 }
@@ -225,6 +253,10 @@ pub struct Xwm {
     pub(crate) windows: X11WindowRegistry,
     pub(crate) outgoing_events: VecDeque<XwmEvent>,
     pub(crate) association: SurfaceAssociationJoin,
+    pub(crate) resize_sync: ResizeSyncTracker,
+    pub(crate) sync_alarms: HashMap<X11WindowHandle, u32>,
+    pub(crate) sync_handles_by_counter: HashMap<u32, X11WindowHandle>,
+    pub(crate) next_resize_counter_values: HashMap<X11WindowHandle, u64>,
     buffer_ready_surfaces: HashSet<u32>,
     pub(crate) supporting_wm_check: u32,
     raw_fd: RawFd,
@@ -295,6 +327,7 @@ impl Xwm {
         if handle.generation() != self.generation {
             return Err(XwmError::StaleGeneration);
         }
+        self.clear_resize_sync(handle);
         Ok(self.windows.remove(handle).is_some())
     }
 
@@ -305,6 +338,7 @@ impl Xwm {
     pub fn clear_generation(&mut self, generation: XwaylandGeneration) {
         self.windows.clear_generation(generation);
         self.association.clear_generation(generation);
+        self.clear_resize_sync_generation(generation);
         if generation == self.generation {
             self.buffer_ready_surfaces.clear();
         }
@@ -339,8 +373,77 @@ impl Xwm {
             .collect::<Vec<_>>();
         for handle in handles {
             self.mark_window_buffer_ready(handle)?;
+            match self.resize_sync.note_commit(handle) {
+                ResizeSyncCommit::Presented | ResizeSyncCommit::FallbackPresented => self
+                    .outgoing_events
+                    .push_back(XwmEvent::ResizeSyncPresented(handle)),
+                ResizeSyncCommit::Deferred | ResizeSyncCommit::Ignored => {}
+            }
         }
         Ok(())
+    }
+
+    pub(crate) fn note_sync_counter_notify(&mut self, counter: u32, value: u64) {
+        let Some(handle) = self.sync_handles_by_counter.get(&counter).copied() else {
+            return;
+        };
+        if self.resize_sync.acknowledge(handle, value) {
+            self.outgoing_events.push_back(XwmEvent::ResizeSyncAcked {
+                window: handle,
+                counter_value: value,
+            });
+        }
+    }
+
+    pub(crate) fn next_resize_sync_deadline_ns(&self) -> Option<u64> {
+        self.resize_sync.next_deadline_ns()
+    }
+
+    pub(crate) fn handle_resize_sync_deadline(&mut self, now_ns: u64) {
+        for handle in self.resize_sync.expired_handles(now_ns) {
+            if self.resize_sync.timeout(handle, now_ns) {
+                self.outgoing_events
+                    .push_back(XwmEvent::ResizeSyncTimedOut(handle));
+            }
+        }
+    }
+
+    pub(crate) fn complete_resize_sync(&mut self, handle: X11WindowHandle) -> Result<(), XwmError> {
+        if !self.resize_sync.complete(handle) {
+            return Err(XwmError::InvalidCommand("resize sync is not presented"));
+        }
+        self.clear_resize_sync_alarm(handle);
+        Ok(())
+    }
+
+    pub(crate) fn clear_resize_sync(&mut self, handle: X11WindowHandle) {
+        self.resize_sync.clear(handle);
+        self.clear_resize_sync_alarm(handle);
+    }
+
+    fn clear_resize_sync_generation(&mut self, generation: XwaylandGeneration) {
+        let handles = self
+            .sync_alarms
+            .keys()
+            .filter(|handle| handle.generation() == generation)
+            .copied()
+            .collect::<Vec<_>>();
+        self.resize_sync.clear_generation(generation);
+        self.next_resize_counter_values
+            .retain(|handle, _| handle.generation() != generation);
+        for handle in handles {
+            self.clear_resize_sync_alarm(handle);
+        }
+    }
+
+    fn clear_resize_sync_alarm(&mut self, handle: X11WindowHandle) {
+        let Some(alarm) = self.sync_alarms.remove(&handle) else {
+            return;
+        };
+        self.sync_handles_by_counter
+            .retain(|_, mapped_handle| *mapped_handle != handle);
+        use x11rb::protocol::sync::ConnectionExt as _;
+        let _ = self.connection.sync_destroy_alarm(alarm);
     }
 
     pub fn note_x11_surface_serial(
@@ -458,6 +561,12 @@ impl Xwm {
             }
             if self.buffer_ready_surfaces.contains(&association.surface_id) {
                 let _ = self.windows.mark_buffer_ready(handle);
+                match self.resize_sync.note_commit(handle) {
+                    ResizeSyncCommit::Presented | ResizeSyncCommit::FallbackPresented => self
+                        .outgoing_events
+                        .push_back(XwmEvent::ResizeSyncPresented(handle)),
+                    ResizeSyncCommit::Deferred | ResizeSyncCommit::Ignored => {}
+                }
             }
             let _ = self.emit_ready_if_complete(handle);
         }
@@ -478,10 +587,14 @@ impl Xwm {
 
 impl Drop for Xwm {
     fn drop(&mut self) {
+        use x11rb::protocol::sync::ConnectionExt as _;
         use x11rb::{
             connection::Connection as _, protocol::xproto::ConnectionExt as XprotoConnectionExt,
         };
 
+        for alarm in self.sync_alarms.values().copied() {
+            let _ = self.connection.sync_destroy_alarm(alarm);
+        }
         let _ = self.connection.destroy_window(self.supporting_wm_check);
         let _ = self.connection.flush();
     }

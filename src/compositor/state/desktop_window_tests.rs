@@ -322,6 +322,34 @@ fn x11_fullscreen_uses_output_geometry_and_maximize_publishes_both_axes() {
 }
 
 #[test]
+fn x11_resize_queues_a_typed_backend_command() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let snapshot = x11_snapshot(generation, 112, 63);
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(id, snapshot))
+        .expect("insert X11 window");
+
+    state.queue_backend_configure(
+        id,
+        WindowGeometry::new(SurfacePlacement::root_at(30, 40), 1024, 768),
+        ToplevelMode::Floating,
+        true,
+    );
+    let commands = state.take_backend_commands();
+    assert_eq!(commands.len(), 1);
+    assert!(matches!(
+        commands[0],
+        crate::compositor::window_backend::WindowBackendCommand::Configure {
+            window,
+            resizing: true,
+            ..
+        } if window == id
+    ));
+}
+
+#[test]
 fn override_redirect_window_is_excluded_from_normal_window_cycle() {
     let mut state = CompositorState::new(None);
     let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());

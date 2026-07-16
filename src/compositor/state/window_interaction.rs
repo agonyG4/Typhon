@@ -547,11 +547,26 @@ impl CompositorState {
                     interaction.start_placement.local_x + dx,
                     interaction.start_placement.local_y + dy,
                 );
-                self.set_surface_placement_with_cause(
+                let moved = self.set_surface_placement_with_cause(
                     interaction.root_surface_id,
                     placement,
                     RenderGenerationCause::WindowMove,
-                )
+                );
+                if moved {
+                    self.queue_backend_configure(
+                        interaction.window_id,
+                        WindowGeometry::new(
+                            placement,
+                            interaction.start_width,
+                            interaction.start_height,
+                        ),
+                        self.window(interaction.window_id)
+                            .map(|window| window.state.mode())
+                            .unwrap_or(ToplevelMode::Floating),
+                        false,
+                    );
+                }
+                moved
             }
             WindowInteractionKind::Resize(edges) => {
                 if !interaction.drag_committed && !resize_drag_threshold_reached(edges, dx, dy) {

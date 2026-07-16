@@ -225,13 +225,13 @@ impl XwaylandService {
     }
 
     pub fn next_deadline_ns(&self) -> Option<u64> {
-        match self.state {
-            ServiceState::Starting(ref resources) => Some(resources.deadline_ns),
-            ServiceState::Backoff { deadline_ns, .. } => Some(deadline_ns),
+        match &self.state {
+            ServiceState::Starting(resources) => Some(resources.deadline_ns),
+            ServiceState::Backoff { deadline_ns, .. } => Some(*deadline_ns),
+            ServiceState::Running(resources) => resources.xwm.next_resize_sync_deadline_ns(),
             ServiceState::Disabled
             | ServiceState::Armed
             | ServiceState::RunningBase(_)
-            | ServiceState::Running(_)
             | ServiceState::Failed => None,
         }
     }
@@ -805,16 +805,42 @@ impl XwaylandService {
 
     pub fn take_managed_xwm_events(&mut self) -> Vec<super::xwm::XwmEvent> {
         match &mut self.state {
-            ServiceState::Running(resources) => resources.xwm.take_events().collect(),
+            ServiceState::Running(resources) => resources
+                .xwm
+                .take_events()
+                .inspect(|event| match event {
+                    super::xwm::XwmEvent::ResizeSyncAcked { .. } => {
+                        self.metrics.resize_sync_acks =
+                            self.metrics.resize_sync_acks.saturating_add(1);
+                    }
+                    super::xwm::XwmEvent::ResizeSyncPresented(_) => {
+                        self.metrics.resize_sync_presented =
+                            self.metrics.resize_sync_presented.saturating_add(1);
+                    }
+                    super::xwm::XwmEvent::ResizeSyncTimedOut(_) => {
+                        self.metrics.resize_sync_timeouts =
+                            self.metrics.resize_sync_timeouts.saturating_add(1);
+                    }
+                    _ => {}
+                })
+                .collect(),
             _ => Vec::new(),
         }
     }
 
     pub fn execute_managed_command(&mut self, command: super::xwm::XwmCommand) -> io::Result<()> {
+        if matches!(command, super::xwm::XwmCommand::BeginResizeSync { .. }) {
+            self.metrics.resize_sync_started = self.metrics.resize_sync_started.saturating_add(1);
+        }
         match &mut self.state {
-            ServiceState::Running(resources) => {
-                resources.xwm.execute(command).map_err(io::Error::other)
-            }
+            ServiceState::Running(resources) => match resources.xwm.execute(command) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    self.metrics.resize_sync_command_failures =
+                        self.metrics.resize_sync_command_failures.saturating_add(1);
+                    Err(io::Error::other(error))
+                }
+            },
             _ => Ok(()),
         }
     }
@@ -831,6 +857,9 @@ impl XwaylandService {
         now_ns: u64,
         supervisor: &mut ChildSupervisor,
     ) -> io::Result<()> {
+        if let ServiceState::Running(resources) = &mut self.state {
+            resources.xwm.handle_resize_sync_deadline(now_ns);
+        }
         match self.state {
             ServiceState::Starting(ref resources) if now_ns >= resources.deadline_ns => {
                 self.metrics.readiness_failures = self.metrics.readiness_failures.saturating_add(1);

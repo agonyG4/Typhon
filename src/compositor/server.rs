@@ -37,7 +37,7 @@ use crate::astrea_shortcuts::server::astrea_shortcuts_manager_v1;
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
-use crate::xwayland::xwm::{XwmCommand, XwmEvent};
+use crate::xwayland::xwm::{RESIZE_SYNC_TIMEOUT_NS, XwmCommand, XwmEvent};
 use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 
 use super::protocols::versions;
@@ -403,6 +403,49 @@ impl OwnCompositorServer {
         self.state.take_xwayland_buffer_ready_events()
     }
 
+    pub fn take_xwayland_backend_commands(&mut self, now_ns: u64) -> Vec<XwmCommand> {
+        self.state
+            .take_backend_commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                crate::compositor::window_backend::WindowBackendCommand::Configure {
+                    window,
+                    geometry,
+                    mode: _,
+                    resizing,
+                } => {
+                    let handle = match self.state.window(window)?.backend {
+                        super::WindowBackend::X11(handle) => handle,
+                        super::WindowBackend::Xdg(_) => return None,
+                    };
+                    let x11_geometry = crate::xwayland::xwm::X11Geometry {
+                        x: geometry.placement.local_x,
+                        y: geometry.placement.local_y,
+                        width: geometry.width,
+                        height: geometry.height,
+                    };
+                    if resizing {
+                        Some(XwmCommand::BeginResizeSync {
+                            window: handle,
+                            geometry: x11_geometry,
+                            counter_value: 0,
+                            deadline_ns: now_ns.saturating_add(RESIZE_SYNC_TIMEOUT_NS),
+                        })
+                    } else {
+                        Some(XwmCommand::Configure {
+                            window: handle,
+                            geometry: x11_geometry,
+                        })
+                    }
+                }
+                crate::compositor::window_backend::WindowBackendCommand::Close { .. }
+                | crate::compositor::window_backend::WindowBackendCommand::SetActivated {
+                    ..
+                } => None,
+            })
+            .collect()
+    }
+
     pub fn apply_xwayland_window_event(&mut self, event: XwmEvent) -> Vec<XwmCommand> {
         match event {
             XwmEvent::WindowReady(snapshot) => {
@@ -486,6 +529,21 @@ impl OwnCompositorServer {
                 } else {
                     Vec::new()
                 }
+            }
+            XwmEvent::ResizeSyncAcked { window, .. } => {
+                vec![XwmCommand::SetAllowCommits {
+                    window,
+                    allowed: true,
+                }]
+            }
+            XwmEvent::ResizeSyncPresented(window) => {
+                vec![XwmCommand::CompleteResizeSync(window)]
+            }
+            XwmEvent::ResizeSyncTimedOut(window) => {
+                vec![XwmCommand::SetAllowCommits {
+                    window,
+                    allowed: true,
+                }]
             }
             XwmEvent::CloseRequestedByClient(_) => Vec::new(),
         }

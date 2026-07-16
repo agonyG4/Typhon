@@ -1,7 +1,7 @@
 use crate::compositor::DesktopWindowKind;
 use x11rb::{
     connection::Connection,
-    protocol::{Event, xproto},
+    protocol::{Event, sync::Int64, xproto},
 };
 
 use super::{
@@ -80,6 +80,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         }
         Event::DestroyNotify(event) => {
             let handle = X11WindowHandle::new(xwm.generation, event.window);
+            xwm.clear_resize_sync(handle);
             xwm.association.remove_x11_window(handle);
             let Some(record) = xwm
                 .windows
@@ -137,6 +138,9 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             normalize_client_message(xwm, event)?;
         }
         Event::PropertyNotify(event) => normalize_property_change(xwm, event),
+        Event::SyncCounterNotify(event) => {
+            xwm.note_sync_counter_notify(event.counter, int64_to_u64(event.counter_value));
+        }
         Event::FocusIn(_) | Event::FocusOut(_) => {
             // Focus events are reconciliation signals only.  Typhon remains the focus authority.
         }
@@ -146,6 +150,13 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         _ => {}
     }
     Ok(())
+}
+
+fn int64_to_u64(value: Int64) -> u64 {
+    if value.hi < 0 {
+        return 0;
+    }
+    (u64::try_from(value.hi).unwrap_or(0) << 32) | u64::from(value.lo)
 }
 
 fn normalize_client_message(

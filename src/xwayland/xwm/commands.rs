@@ -1,5 +1,8 @@
 use x11rb::{
     connection::Connection,
+    protocol::sync::{
+        ConnectionExt as SyncConnectionExt, CreateAlarmAux, Int64, TESTTYPE, VALUETYPE,
+    },
     protocol::xproto::{
         self, AtomEnum, ConfigureWindowAux, ConnectionExt as XprotoConnectionExt, InputFocus,
         PropMode,
@@ -35,6 +38,7 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             xwm.connection
                 .unmap_window(handle.xid())
                 .map_err(XwmError::Connection)?;
+            xwm.clear_resize_sync(handle);
             set_lifecycle_withdrawn(xwm, handle);
         }
         XwmCommand::Configure { window, geometry } => {
@@ -137,6 +141,18 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             publish_client_list(xwm, XwmAtomName::NetClientList, &client_list)?;
             publish_client_list(xwm, XwmAtomName::NetClientListStacking, &stacking)?;
         }
+        XwmCommand::BeginResizeSync {
+            window,
+            geometry,
+            counter_value,
+            deadline_ns,
+        } => begin_resize_sync(xwm, window, geometry, counter_value, deadline_ns)?,
+        XwmCommand::SetAllowCommits { window, allowed } => {
+            set_allow_commits(xwm, window, allowed)?;
+        }
+        XwmCommand::CompleteResizeSync(window) => {
+            xwm.complete_resize_sync(window)?;
+        }
     }
     Ok(())
 }
@@ -154,6 +170,9 @@ fn command_handle(command: &XwmCommand) -> Option<super::X11WindowHandle> {
         XwmCommand::Configure { window, .. } | XwmCommand::SetState { window, .. } => Some(*window),
         XwmCommand::Focus { window, .. } => *window,
         XwmCommand::SyncClientLists { .. } => None,
+        XwmCommand::BeginResizeSync { window, .. }
+        | XwmCommand::SetAllowCommits { window, .. }
+        | XwmCommand::CompleteResizeSync(window) => Some(*window),
     }
 }
 
@@ -176,6 +195,120 @@ fn publish_client_list(
         )
         .map_err(XwmError::Connection)?;
     Ok(())
+}
+
+fn begin_resize_sync(
+    xwm: &mut Xwm,
+    window: super::X11WindowHandle,
+    geometry: X11Geometry,
+    counter_value: u64,
+    deadline_ns: u64,
+) -> Result<(), XwmError> {
+    let Some(sync_counter) = xwm
+        .windows
+        .get(window)
+        .and_then(|record| record.snapshot.as_ref())
+        .and_then(|snapshot| snapshot.sync_counter)
+    else {
+        xwm.connection
+            .configure_window(window.xid(), &configure_aux(geometry))
+            .map_err(XwmError::Connection)?;
+        return Ok(());
+    };
+    let sync_counter = u32::try_from(sync_counter)
+        .map_err(|_| XwmError::InvalidCommand("XSync counter ID exceeds X11 width"))?;
+    xwm.clear_resize_sync(window);
+    let alarm = xwm
+        .connection
+        .generate_id()
+        .map_err(|error| XwmError::IdAllocation(error.to_string()))?;
+    let requested_counter_value = if counter_value == 0 {
+        let next = xwm.next_resize_counter_values.entry(window).or_insert(0);
+        *next = next
+            .checked_add(1)
+            .ok_or(XwmError::InvalidCommand("XSync counter value exhausted"))?;
+        *next
+    } else {
+        counter_value
+    };
+    let counter_value = int64(requested_counter_value);
+    xwm.connection
+        .sync_create_alarm(
+            alarm,
+            &CreateAlarmAux::new()
+                .counter(sync_counter)
+                .value_type(VALUETYPE::ABSOLUTE)
+                .value(counter_value)
+                .test_type(TESTTYPE::POSITIVE_COMPARISON)
+                .delta(Int64 { hi: 0, lo: 0 })
+                .events(1u32),
+        )
+        .map_err(XwmError::Connection)?;
+    if let Err(error) = xwm
+        .resize_sync
+        .begin(window, requested_counter_value, deadline_ns)
+    {
+        let _ = xwm.connection.sync_destroy_alarm(alarm);
+        return Err(XwmError::ResizeSync(error));
+    }
+    xwm.sync_alarms.insert(window, alarm);
+    xwm.sync_handles_by_counter.insert(sync_counter, window);
+
+    if let Err(error) = set_allow_commits(xwm, window, false)
+        .and_then(|_| {
+            xwm.connection
+                .configure_window(window.xid(), &configure_aux(geometry))
+                .map_err(XwmError::Connection)
+        })
+        .and_then(|_| send_sync_request(xwm, window, counter_value))
+    {
+        xwm.clear_resize_sync(window);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn set_allow_commits(
+    xwm: &Xwm,
+    window: super::X11WindowHandle,
+    allowed: bool,
+) -> Result<(), XwmError> {
+    xwm.connection
+        .change_property32(
+            PropMode::REPLACE,
+            window.xid(),
+            xwm.atoms.get(XwmAtomName::XwaylandAllowCommits),
+            AtomEnum::CARDINAL,
+            &[u32::from(allowed)],
+        )
+        .map_err(XwmError::Connection)?;
+    Ok(())
+}
+
+fn send_sync_request(
+    xwm: &Xwm,
+    window: super::X11WindowHandle,
+    counter_value: Int64,
+) -> Result<(), XwmError> {
+    let event = xproto::ClientMessageEvent {
+        response_type: xproto::CLIENT_MESSAGE_EVENT,
+        format: 32,
+        sequence: 0,
+        window: window.xid(),
+        type_: xwm.atoms.get(XwmAtomName::NetWmSyncRequest),
+        data: xproto::ClientMessageData::from([0, counter_value.lo, counter_value.hi as u32, 0, 0]),
+    };
+    xwm.connection
+        .send_event(false, window.xid(), xproto::EventMask::NO_EVENT, event)
+        .map_err(XwmError::Connection)?;
+    Ok(())
+}
+
+fn int64(value: u64) -> Int64 {
+    Int64 {
+        hi: (value >> 32) as i32,
+        lo: value as u32,
+    }
 }
 
 fn validate_handle(xwm: &Xwm, handle: super::X11WindowHandle) -> Result<(), XwmError> {

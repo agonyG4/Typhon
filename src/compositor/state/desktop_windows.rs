@@ -333,6 +333,29 @@ impl CompositorState {
         (client_list, stacking)
     }
 
+    pub(in crate::compositor) fn queue_backend_configure(
+        &mut self,
+        window_id: WindowId,
+        geometry: WindowGeometry,
+        mode: ToplevelMode,
+        resizing: bool,
+    ) {
+        self.backend_commands.push(
+            crate::compositor::window_backend::WindowBackendCommand::Configure {
+                window: window_id,
+                geometry,
+                mode,
+                resizing,
+            },
+        );
+    }
+
+    pub(in crate::compositor) fn take_backend_commands(
+        &mut self,
+    ) -> Vec<crate::compositor::window_backend::WindowBackendCommand> {
+        std::mem::take(&mut self.backend_commands)
+    }
+
     pub(in crate::compositor) fn window_id_for_surface(&self, surface_id: u32) -> Option<WindowId> {
         self.window_by_root_surface.get(&surface_id).copied()
     }

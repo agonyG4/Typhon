@@ -187,7 +187,6 @@ pub use surface::{
     SurfacePlacement,
 };
 use window_state::{ToplevelMode, WindowGeometry, WindowState, xdg_toplevel_state_bytes};
-
 const MIN_WINDOW_WIDTH: u32 = 160;
 const MIN_WINDOW_HEIGHT: u32 = 120;
 const WL_SEAT_NAME_SINCE: u32 = 2;
@@ -538,6 +537,7 @@ pub struct CompositorState {
     pub(in crate::compositor) window_by_x11_handle: HashMap<X11WindowHandle, WindowId>,
     pub(in crate::compositor) next_window_id: u64,
     pub(in crate::compositor) window_stacking: Vec<WindowId>,
+    pub(in crate::compositor) backend_commands: Vec<window_backend::WindowBackendCommand>,
     cursor_surface_ids: HashSet<u32>,
     active_client_cursor: Option<ActiveClientCursor>,
     client_cursor_surfaces: HashMap<u32, RenderableSurface>,

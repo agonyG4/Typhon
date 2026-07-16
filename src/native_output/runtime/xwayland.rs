@@ -6,6 +6,8 @@ impl NativeRuntime {
         for event in self.xwayland.take_managed_xwm_events() {
             commands.extend(self.server.apply_xwayland_window_event(event));
         }
+        let now_ns = monotonic_now_ns()?;
+        commands.extend(self.server.take_xwayland_backend_commands(now_ns));
         for command in commands {
             self.xwayland.execute_managed_command(command)?;
         }

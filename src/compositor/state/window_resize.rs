@@ -10,6 +10,35 @@ impl CompositorState {
         edges: ResizeEdges,
         interaction_id: ResizeInteractionId,
     ) -> bool {
+        let Some(window_id) = self.window_id_for_surface(surface_id) else {
+            return false;
+        };
+        if !self.toplevel_surfaces.contains_key(&surface_id) {
+            let geometry = self.clamp_resize_geometry(
+                surface_id,
+                WindowGeometry::new(placement, width, height),
+                edges,
+            );
+            let applied = self.preview_resize_root_window_to(
+                surface_id,
+                geometry.width,
+                geometry.height,
+                geometry.placement,
+                edges,
+                interaction_id,
+            );
+            if applied {
+                self.queue_backend_configure(
+                    window_id,
+                    geometry,
+                    self.window(window_id)
+                        .map(|window| window.state.mode())
+                        .unwrap_or(ToplevelMode::Floating),
+                    true,
+                );
+            }
+            return applied;
+        }
         if !self.toplevel_surfaces.contains_key(&surface_id) {
             return false;
         };
@@ -332,6 +361,26 @@ impl CompositorState {
         edges: ResizeEdges,
         interaction_id: ResizeInteractionId,
     ) -> bool {
+        let Some(window_id) = self.window_id_for_surface(surface_id) else {
+            return false;
+        };
+        if !self.toplevel_surfaces.contains_key(&surface_id) {
+            let Some(geometry) = self
+                .current_visual_root_window_geometry(surface_id)
+                .or_else(|| self.current_root_window_geometry(surface_id))
+            else {
+                return false;
+            };
+            self.queue_backend_configure(
+                window_id,
+                geometry,
+                self.window(window_id)
+                    .map(|window| window.state.mode())
+                    .unwrap_or(ToplevelMode::Floating),
+                true,
+            );
+            return true;
+        }
         let desired = self
             .resize_configure_flows
             .get(&surface_id)
