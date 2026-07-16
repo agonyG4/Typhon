@@ -3,10 +3,11 @@ use wayland_protocols::xdg::shell::server::xdg_toplevel;
 use super::{RenderableSurface, SurfacePlacement};
 
 #[derive(Debug, Clone)]
-pub(super) struct WindowState {
+pub(crate) struct WindowState {
     mode: ToplevelMode,
     restore_geometry: Option<WindowGeometry>,
     minimized_surfaces: Vec<RenderableSurface>,
+    minimized: bool,
 }
 
 impl WindowState {
@@ -19,16 +20,23 @@ impl WindowState {
     }
 
     pub(super) fn is_minimized(&self) -> bool {
-        !self.minimized_surfaces.is_empty()
+        self.minimized
     }
 
     pub(super) fn minimize(&mut self, surfaces: Vec<RenderableSurface>) {
+        self.minimized = true;
         self.minimized_surfaces = surfaces;
     }
 
     pub(super) fn restore_minimized(&mut self) -> Option<Vec<RenderableSurface>> {
-        self.is_minimized()
-            .then(|| std::mem::take(&mut self.minimized_surfaces))
+        self.is_minimized().then(|| {
+            self.minimized = false;
+            std::mem::take(&mut self.minimized_surfaces)
+        })
+    }
+
+    pub(super) fn mark_minimized_without_surfaces(&mut self) {
+        self.minimized = true;
     }
 
     pub(super) fn minimized_root_surface(&self, surface_id: u32) -> Option<&RenderableSurface> {
@@ -47,6 +55,7 @@ impl WindowState {
     }
 
     pub(super) fn push_minimized_surface(&mut self, surface: RenderableSurface) {
+        self.minimized = true;
         self.minimized_surfaces.push(surface);
     }
 
@@ -67,6 +76,7 @@ impl Default for WindowState {
             mode: ToplevelMode::Floating,
             restore_geometry: None,
             minimized_surfaces: Vec::new(),
+            minimized: false,
         }
     }
 }

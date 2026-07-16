@@ -206,7 +206,6 @@ impl CompositorState {
         {
             self.update_toplevel_visual_render_assignment(root_surface_id);
         }
-
         let committed_popup = self.popup_surfaces.contains_key(&surface_id);
         if committed_popup {
             if let Some(node) = self.popup_nodes.get_mut(&surface_id) {
@@ -220,7 +219,6 @@ impl CompositorState {
             }
             self.raise_renderable_surface_tree(surface_id);
         }
-
         self.track_committed_buffer_lifetime(surface_id, &pending);
         let published_buffer_id = pending.data.buffer_id();
         self.current_surface_buffers.insert(surface_id, pending);
@@ -252,18 +250,15 @@ impl CompositorState {
             self.reconcile_surface_output_membership(&surface);
         }
     }
-
     pub(in crate::compositor) fn minimized_root_surface_id_for_surface(
         &self,
         surface_id: u32,
     ) -> Option<u32> {
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
-        self.toplevel_surfaces
-            .get(&root_surface_id)
-            .is_some_and(|toplevel| toplevel.window.is_minimized())
+        self.toplevel_window_state(root_surface_id)
+            .is_some_and(WindowState::is_minimized)
             .then_some(root_surface_id)
     }
-
     #[allow(clippy::too_many_arguments)]
     pub(in crate::compositor) fn commit_minimized_surface_buffer(
         &mut self,
@@ -283,10 +278,13 @@ impl CompositorState {
         if self.renderable_surfaces.len() != renderable_count {
             self.invalidate_surface_origin_cache();
         }
-        let Some(toplevel) = self.toplevel_surfaces.get_mut(&root_surface_id) else {
+        if self.toplevel_window_state(root_surface_id).is_none() {
             return Ok(());
-        };
-        if let Some(existing) = toplevel.window.minimized_surface_mut(surface_id) {
+        }
+        if let Some(existing) = self
+            .toplevel_window_state_mut(root_surface_id)
+            .and_then(|window| window.minimized_surface_mut(surface_id))
+        {
             update_renderable_surface_buffer(
                 existing,
                 pending,
@@ -301,7 +299,9 @@ impl CompositorState {
         } else {
             let surface =
                 pending.to_renderable_surface(surface_id, placement, generation, damage)?;
-            toplevel.window.push_minimized_surface(surface);
+            if let Some(window) = self.toplevel_window_state_mut(root_surface_id) {
+                window.push_minimized_surface(surface);
+            }
         }
         Ok(())
     }
@@ -989,6 +989,7 @@ impl CompositorState {
             .is_some_and(|surface| removed_surface_ids.contains(&compositor_surface_id(surface)))
         {
             self.focused_surface = None;
+            self.focused_window_id = None;
             if self.keyboard_surface.as_ref().is_some_and(|surface| {
                 removed_surface_ids.contains(&compositor_surface_id(surface))
             }) {
@@ -1056,6 +1057,7 @@ impl CompositorState {
             .is_some_and(|surface| removed_surface_ids.contains(&compositor_surface_id(surface)))
         {
             self.focused_surface = None;
+            self.focused_window_id = None;
             if self.keyboard_surface.as_ref().is_some_and(|surface| {
                 removed_surface_ids.contains(&compositor_surface_id(surface))
             }) {
@@ -1248,6 +1250,7 @@ impl CompositorState {
             .retain(|surface| surface.surface_id != surface_id);
         self.track_committed_buffer_lifetime(surface_id, &pending);
         self.current_surface_buffers.insert(surface_id, pending);
+        self.note_xwayland_buffer_ready(surface_id);
         self.record_surface_publication(
             surface_id,
             root_surface_id,
@@ -1332,8 +1335,11 @@ impl CompositorState {
             SurfaceRole::Cursor => {
                 self.commit_cursor_surface_buffer(surface_id, pending, damage, frame_callbacks);
             }
-            SurfaceRole::Unassigned | SurfaceRole::DragIcon | SurfaceRole::Xwayland => {
+            SurfaceRole::Unassigned | SurfaceRole::DragIcon => {
                 self.commit_unassigned_surface_buffer(surface_id, pending, frame_callbacks, source);
+            }
+            SurfaceRole::Xwayland => {
+                self.commit_xwayland_surface_buffer(surface_id, pending, frame_callbacks, source);
             }
             SurfaceRole::XdgToplevel
             | SurfaceRole::XdgPopup

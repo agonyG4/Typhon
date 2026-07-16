@@ -25,6 +25,7 @@ pub use paths::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::xwayland::XwaylandAppEnvironment;
     use std::{collections::HashMap, path::PathBuf, process::Command};
 
     #[test]
@@ -336,6 +337,44 @@ mod tests {
         assert_eq!(
             env.get("QT_QPA_PLATFORM").and_then(Option::as_deref),
             Some("wayland;xcb")
+        );
+    }
+
+    #[test]
+    fn opt_in_xwayland_launch_removes_host_routing_before_applying_owned_values() {
+        let mut command = Command::new("true");
+        command.env("DISPLAY", "host:0");
+        command.env("XAUTHORITY", "/host/.Xauthority");
+        command.env("OBLIVION_ONE_XWAYLAND_DISPLAY", ":host");
+        let xwayland = XwaylandAppEnvironment {
+            display: ":41".to_owned(),
+            xauthority: PathBuf::from("/run/user/1000/typhon/xwayland/.Xauthority-41-token"),
+        };
+
+        configure_compositor_app_command_with_xwayland_environment(
+            &mut command,
+            "typhon-test",
+            &xwayland,
+        );
+        let env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(env.get("DISPLAY").and_then(Option::as_deref), Some(":41"));
+        assert_eq!(
+            env.get("XAUTHORITY").and_then(Option::as_deref),
+            Some("/run/user/1000/typhon/xwayland/.Xauthority-41-token")
+        );
+        assert_eq!(
+            env.get("OBLIVION_ONE_XWAYLAND_DISPLAY")
+                .and_then(Option::as_deref),
+            Some(":41")
         );
     }
 

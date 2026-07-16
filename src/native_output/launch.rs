@@ -99,6 +99,24 @@ pub(crate) fn launch_native_shell_command(
     app_gpu_policy: EffectiveCompositorAppGpuPolicy,
     source: NativeLaunchSource,
 ) -> NativeResult<Option<NativeAppLaunchPerf>> {
+    launch_native_shell_command_with_xwayland_environment(
+        server,
+        supervisor,
+        command,
+        app_gpu_policy,
+        source,
+        None,
+    )
+}
+
+pub(crate) fn launch_native_shell_command_with_xwayland_environment(
+    server: &OwnCompositorServer,
+    supervisor: &mut ChildSupervisor,
+    command: Vec<String>,
+    app_gpu_policy: EffectiveCompositorAppGpuPolicy,
+    source: NativeLaunchSource,
+    xwayland: Option<oblivion_one::xwayland::XwaylandAppEnvironment>,
+) -> NativeResult<Option<NativeAppLaunchPerf>> {
     let Some(request) = native_launch_request(command, app_gpu_policy, source) else {
         return Ok(None);
     };
@@ -110,18 +128,25 @@ pub(crate) fn launch_native_shell_command(
             let socket_name = socket_name.clone();
             let argv = request.argv.clone();
             let gpu_policy = request.gpu_policy;
+            let xwayland = xwayland.clone();
             supervisor.spawn_restartable(
                 move || {
-                    compositor_app_command_with_policy(&socket_name, &argv, gpu_policy)?
-                        .ok_or_else(|| io::Error::other("native shell command is empty"))
+                    compositor_app_command_with_policy_and_xwayland(
+                        &socket_name,
+                        &argv,
+                        gpu_policy,
+                        xwayland.as_ref(),
+                    )?
+                    .ok_or_else(|| io::Error::other("native shell command is empty"))
                 },
                 process_options,
             )
         }
-        _ => match compositor_app_command_with_policy(
+        _ => match compositor_app_command_with_policy_and_xwayland(
             &socket_name,
             &request.argv,
             request.gpu_policy,
+            xwayland.as_ref(),
         )? {
             Some(command) => supervisor.spawn(command, process_options),
             None => return Ok(None),
@@ -156,6 +181,7 @@ pub(crate) fn launch_native_shell_command(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn drain_pending_process_launches(
     server: &mut OwnCompositorServer,
     supervisor: &mut ChildSupervisor,
@@ -163,6 +189,26 @@ pub(crate) fn drain_pending_process_launches(
     app_gpu_policy: EffectiveCompositorAppGpuPolicy,
     perf: NativePerfLogger,
     pending_launches: &mut VecDeque<NativeAppLaunchPerf>,
+) {
+    drain_pending_process_launches_with_xwayland_environment(
+        server,
+        supervisor,
+        launch_tracker,
+        app_gpu_policy,
+        perf,
+        pending_launches,
+        None,
+    );
+}
+
+pub(crate) fn drain_pending_process_launches_with_xwayland_environment(
+    server: &mut OwnCompositorServer,
+    supervisor: &mut ChildSupervisor,
+    launch_tracker: &mut AstreaLaunchLifecycleTracker,
+    app_gpu_policy: EffectiveCompositorAppGpuPolicy,
+    perf: NativePerfLogger,
+    pending_launches: &mut VecDeque<NativeAppLaunchPerf>,
+    xwayland: Option<oblivion_one::xwayland::XwaylandAppEnvironment>,
 ) {
     let socket_name = server.socket_name().to_string();
     for pending in server.take_pending_process_launches() {
@@ -179,10 +225,11 @@ pub(crate) fn drain_pending_process_launches(
         };
         let spawn_start = Instant::now();
         let process_options = native_process_options(&request);
-        let command = match compositor_app_command_with_policy(
+        let command = match compositor_app_command_with_policy_and_xwayland(
             &socket_name,
             &request.argv,
             request.gpu_policy,
+            xwayland.as_ref(),
         ) {
             Ok(Some(command)) => command,
             Ok(None) => {

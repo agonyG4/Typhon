@@ -3,7 +3,7 @@ use std::{collections::VecDeque, time::Instant};
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 use wayland_server::{WEnum, protocol::wl_surface};
 
-use super::{SurfacePlacement, XdgWindowGeometry, render};
+use super::{SurfacePlacement, WindowId, XdgWindowGeometry, render};
 
 const MIN_WINDOW_WIDTH: u32 = 160;
 const MIN_WINDOW_HEIGHT: u32 = 120;
@@ -29,6 +29,7 @@ pub(super) struct PointerPress {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RootSurfaceHit {
+    pub(super) window_id: WindowId,
     pub(super) root_surface_id: u32,
     pub(super) local_x: f64,
     pub(super) local_y: f64,
@@ -38,6 +39,7 @@ pub(super) struct RootSurfaceHit {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct WindowFrameHit {
+    pub(super) window_id: WindowId,
     pub(super) root_surface_id: u32,
     pub(super) kind: WindowInteractionKind,
 }
@@ -160,6 +162,7 @@ impl ResizeInteractionId {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct WindowInteraction {
     pub(super) id: WindowInteractionId,
+    pub(super) window_id: WindowId,
     pub(super) root_surface_id: u32,
     pub(super) kind: WindowInteractionKind,
     pub(super) source: WindowInteractionSource,
@@ -179,6 +182,7 @@ pub(super) struct WindowInteraction {
 pub struct WindowInteractionDebugSnapshot {
     pub interaction_id: u64,
     pub resize_interaction_id: Option<u64>,
+    pub window_id: u64,
     pub root_surface_id: u32,
     pub pointer_motion_surface_id: Option<u32>,
     pub kind: WindowInteractionKind,
@@ -198,6 +202,7 @@ impl WindowInteraction {
                 Some(id) => Some(id.get()),
                 None => None,
             },
+            window_id: self.window_id.get(),
             root_surface_id: self.root_surface_id,
             pointer_motion_surface_id: self.pointer_motion_surface_id,
             kind: self.kind,
@@ -810,10 +815,12 @@ pub(super) fn window_frame_action_for_local_point(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU64;
 
     fn resize_interaction(edges: ResizeEdges) -> WindowInteraction {
         WindowInteraction {
             id: WindowInteractionId::new(1),
+            window_id: WindowId::new(NonZeroU64::new(1).expect("nonzero")),
             root_surface_id: 1,
             kind: WindowInteractionKind::Resize(edges),
             source: WindowInteractionSource::NativeBinding,

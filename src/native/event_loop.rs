@@ -20,6 +20,7 @@ pub enum NativeEventSource {
     ChildSignal,
     XwaylandListen,
     XwaylandDisplayReady,
+    XwaylandXwm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -72,6 +73,7 @@ impl WakeReasons {
     const OUTPUT_RENDER_FENCE: u32 = 1 << 8;
     const XWAYLAND_LISTEN: u32 = 1 << 9;
     const XWAYLAND_DISPLAY_READY: u32 = 1 << 10;
+    const XWAYLAND_XWM: u32 = 1 << 11;
 
     pub const fn drm(self) -> bool {
         self.0 & Self::DRM != 0
@@ -117,6 +119,10 @@ impl WakeReasons {
         self.0 & Self::XWAYLAND_DISPLAY_READY != 0
     }
 
+    pub const fn xwayland_xwm(self) -> bool {
+        self.0 & Self::XWAYLAND_XWM != 0
+    }
+
     pub const fn bits(self) -> u32 {
         self.0
     }
@@ -134,6 +140,7 @@ impl WakeReasons {
             NativeEventSource::ChildSignal => Self::CHILD_SIGNAL,
             NativeEventSource::XwaylandListen => Self::XWAYLAND_LISTEN,
             NativeEventSource::XwaylandDisplayReady => Self::XWAYLAND_DISPLAY_READY,
+            NativeEventSource::XwaylandXwm => Self::XWAYLAND_XWM,
         };
     }
 }
@@ -328,7 +335,9 @@ impl NativeEventLoop {
             if event_flags & error_events != 0 {
                 if matches!(
                     registration.source,
-                    NativeEventSource::XwaylandListen | NativeEventSource::XwaylandDisplayReady
+                    NativeEventSource::XwaylandListen
+                        | NativeEventSource::XwaylandDisplayReady
+                        | NativeEventSource::XwaylandXwm
                 ) {
                     reasons.insert(registration.source);
                     xwayland_events.push(XwaylandReadyEvent {
@@ -349,7 +358,9 @@ impl NativeEventLoop {
                     NativeEventSource::ExplicitSyncAcquire => {
                         explicit_sync_acquire_tokens.push(token);
                     }
-                    NativeEventSource::XwaylandListen | NativeEventSource::XwaylandDisplayReady => {
+                    NativeEventSource::XwaylandListen
+                    | NativeEventSource::XwaylandDisplayReady
+                    | NativeEventSource::XwaylandXwm => {
                         xwayland_events.push(XwaylandReadyEvent {
                             token,
                             flags: event_flags,
@@ -775,6 +786,22 @@ mod tests {
         assert!(wakeup.reasons.xwayland_display_ready());
         assert_eq!(wakeup.xwayland_events[0].token, token);
         assert_ne!(wakeup.xwayland_events[0].flags & libc::EPOLLHUP as u32, 0);
+    }
+
+    #[test]
+    fn xwayland_xwm_readiness_preserves_exact_token_and_flags() {
+        let xwm_fd = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let token = event_loop
+            .register(xwm_fd.as_raw_fd(), NativeEventSource::XwaylandXwm)
+            .unwrap();
+
+        signal(xwm_fd.as_raw_fd());
+        let wakeup = event_loop.wait().unwrap();
+
+        assert!(wakeup.reasons.xwayland_xwm());
+        assert_eq!(wakeup.xwayland_events[0].token, token);
+        assert_ne!(wakeup.xwayland_events[0].flags & libc::EPOLLIN as u32, 0);
     }
 
     #[test]

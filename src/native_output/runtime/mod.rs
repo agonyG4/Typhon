@@ -175,6 +175,7 @@ impl NativeRuntime {
                 XwaylandReactorPurpose::ListenFilesystem
                 | XwaylandReactorPurpose::ListenAbstract => NativeEventSource::XwaylandListen,
                 XwaylandReactorPurpose::DisplayReady => NativeEventSource::XwaylandDisplayReady,
+                XwaylandReactorPurpose::Xwm => NativeEventSource::XwaylandXwm,
             };
             let token = self.event_loop.register(registration.fd, source)?;
             self.xwayland_reactor_tokens.push((token, registration));
@@ -193,7 +194,7 @@ impl NativeRuntime {
         {
             return Ok(());
         }
-        let Some(stream) = self.xwayland.private_wayland_client(generation) else {
+        let Some(stream) = self.xwayland.take_private_wayland_client(generation) else {
             return Ok(());
         };
         let identity = self.server.insert_xwayland_client(stream, generation)?;

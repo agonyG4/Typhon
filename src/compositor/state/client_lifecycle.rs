@@ -176,6 +176,7 @@ impl CompositorState {
             .is_some_and(|surface| resource_owned_by_client(surface, client_id))
         {
             self.focused_surface = None;
+            self.focused_window_id = None;
         }
         if self
             .keyboard_surface

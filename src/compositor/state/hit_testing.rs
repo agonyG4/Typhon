@@ -34,9 +34,12 @@ impl CompositorState {
             };
 
             let root_surface_id = self.root_surface_id_for_surface(renderable.surface_id);
-            if !self.toplevel_surfaces.contains_key(&root_surface_id) {
+            if self.window_id_for_surface(root_surface_id).is_none() {
                 continue;
             }
+            let Some(window_id) = self.window_id_for_surface(root_surface_id) else {
+                continue;
+            };
             let Some(root_index) = self
                 .renderable_surfaces
                 .iter()
@@ -59,6 +62,7 @@ impl CompositorState {
             .is_some()
             {
                 return Some(RootSurfaceHit {
+                    window_id,
                     root_surface_id,
                     local_x,
                     local_y,

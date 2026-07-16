@@ -40,8 +40,6 @@ pub(crate) struct DisplayLease {
     abstract_listener: UnixListener,
     xauthority_path: PathBuf,
     xauthority_identity: FileIdentity,
-    #[allow(dead_code)]
-    cookie: Vec<u8>,
 }
 
 impl DisplayLease {
@@ -101,6 +99,7 @@ impl DisplayLease {
             ) {
                 Ok(Some(lease)) => return Ok(lease),
                 Ok(None) => continue,
+                Err(error) if is_slot_local_error(&error) => continue,
                 Err(error) => return Err(error),
             }
         }
@@ -212,7 +211,6 @@ impl DisplayLease {
             abstract_listener,
             xauthority_path: auth_file.path,
             xauthority_identity,
-            cookie: auth_file.cookie,
         }))
     }
 
@@ -386,6 +384,16 @@ fn process_is_alive(pid: u32) -> bool {
     };
     let result = unsafe { libc::kill(pid, 0) };
     result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn is_slot_local_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::AddrInUse
+            | io::ErrorKind::AlreadyExists
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::InvalidData
+    )
 }
 
 fn cleanup_artifact(path: &Path, expected: FileIdentity) {

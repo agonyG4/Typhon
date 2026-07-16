@@ -412,6 +412,13 @@ fn pipe_read_end() -> OwnedFd {
     unsafe { OwnedFd::from_raw_fd(pipe[0]) }
 }
 
+fn pipe_read_end_at_stable_range() -> OwnedFd {
+    let read_end = pipe_read_end();
+    let duplicated = unsafe { libc::fcntl(read_end.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10_000) };
+    assert!(duplicated >= 10_000, "failed to allocate stable test fd");
+    unsafe { OwnedFd::from_raw_fd(duplicated) }
+}
+
 fn discovery() -> AtomicDiscovery {
     let (connector, crtc, plane, connector_props, crtc_props, plane_props) = ids();
     AtomicDiscovery {
@@ -748,7 +755,7 @@ fn explicit_atomic_flip_adopts_out_fence_and_closes_input_after_success() {
     let pipeline = explicit_fence_pipeline();
     let input = pipe_read_end();
     let input_raw = input.as_raw_fd();
-    let returned_out = pipe_read_end();
+    let returned_out = pipe_read_end_at_stable_range();
     let returned_out_raw = returned_out.as_raw_fd();
     std::mem::forget(returned_out);
     let out_property = pipeline.crtc_props.out_fence_ptr.unwrap().0.get();
@@ -788,7 +795,7 @@ fn explicit_atomic_flip_closes_kernel_written_out_fence_on_ioctl_failure() {
     let pipeline = explicit_fence_pipeline();
     let input = pipe_read_end();
     let input_raw = input.as_raw_fd();
-    let returned_out = pipe_read_end();
+    let returned_out = pipe_read_end_at_stable_range();
     let returned_out_raw = returned_out.as_raw_fd();
     std::mem::forget(returned_out);
     let out_property = pipeline.crtc_props.out_fence_ptr.unwrap().0.get();

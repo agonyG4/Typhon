@@ -167,8 +167,9 @@ pub fn configure_compositor_app_command_with_environment(
     );
 }
 
-/// Diagnostic-only launch routing for an explicitly armed XWayland service.
-/// Normal application launch continues to use the Wayland-only helpers above.
+/// Launch routing for an explicitly ready, service-owned XWayland profile.
+/// Callers decide when the managed service is ready; the default helpers above
+/// remain Wayland-only.
 pub fn configure_compositor_app_command_with_xwayland_environment(
     command: &mut Command,
     socket_name: &str,
@@ -286,6 +287,26 @@ pub fn compositor_app_command_with_policy(
         &argv,
         gpu_policy,
     ))
+}
+
+pub fn compositor_app_command_with_policy_and_xwayland(
+    socket_name: &str,
+    app: &[String],
+    gpu_policy: EffectiveCompositorAppGpuPolicy,
+    xwayland: Option<&XwaylandAppEnvironment>,
+) -> io::Result<Option<Command>> {
+    let Some(mut command) = compositor_app_command_with_policy(socket_name, app, gpu_policy)?
+    else {
+        return Ok(None);
+    };
+    if let Some(xwayland) = xwayland {
+        configure_compositor_app_command_with_xwayland_environment(
+            &mut command,
+            socket_name,
+            xwayland,
+        );
+    }
+    Ok(Some(command))
 }
 
 pub fn compositor_app_spawn_argv_for_policy(

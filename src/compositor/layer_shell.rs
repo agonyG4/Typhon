@@ -876,6 +876,7 @@ impl CompositorState {
                 self.ensure_keyboard_focus(&previous);
             } else {
                 self.focused_surface = None;
+                self.focused_window_id = None;
                 self.clear_keyboard_focus();
                 let _ = self.focus_topmost_renderable_toplevel();
             }

@@ -66,6 +66,7 @@ pub(in crate::compositor) struct XwaylandCompositorState {
         HashMap<u32, xwayland_surface_v1::XwaylandSurfaceV1>,
     pub(in crate::compositor) associations: AssociationRegistry,
     pub(in crate::compositor) client_identity: Option<XwaylandClientIdentity>,
+    pub(in crate::compositor) buffer_ready_events: Vec<(XwaylandGeneration, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -439,10 +440,46 @@ impl CompositorState {
         &mut self,
         generation: XwaylandGeneration,
     ) {
+        let windows = self
+            .desktop_windows
+            .values()
+            .filter_map(|window| match window.backend {
+                WindowBackend::X11(handle) if handle.generation() == generation => Some(window.id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for window_id in windows {
+            self.remove_desktop_window(window_id);
+        }
         self.xwayland.associations.clear_generation(generation);
         self.xwayland
             .surface_states
             .retain(|_, state| state.generation != generation);
+        self.xwayland
+            .buffer_ready_events
+            .retain(|(event_generation, _)| *event_generation != generation);
+    }
+
+    pub(in crate::compositor) fn take_xwayland_buffer_ready_events(
+        &mut self,
+    ) -> Vec<(XwaylandGeneration, u32)> {
+        std::mem::take(&mut self.xwayland.buffer_ready_events)
+    }
+
+    pub(in crate::compositor) fn note_xwayland_buffer_ready(&mut self, surface_id: u32) {
+        if !matches!(self.surface_role(surface_id), SurfaceRole::Xwayland) {
+            return;
+        }
+        if let Some(generation) = self
+            .xwayland
+            .surface_states
+            .get(&surface_id)
+            .map(|state| state.generation)
+        {
+            self.xwayland
+                .buffer_ready_events
+                .push((generation, surface_id));
+        }
     }
 
     pub(in crate::compositor) fn surface_role_lifecycle(
@@ -642,6 +679,13 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn scrub_surface_lifecycle(&mut self, surface_id: u32) {
+        if let Some(window_id) = self.window_id_for_surface(surface_id)
+            && self
+                .window(window_id)
+                .is_some_and(|window| matches!(window.backend, WindowBackend::X11(_)))
+        {
+            self.remove_desktop_window(window_id);
+        }
         self.surface_role_lifecycles.remove(&surface_id);
         self.xwayland.surface_states.remove(&surface_id);
         self.xwayland.surface_resources.remove(&surface_id);

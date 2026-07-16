@@ -1,6 +1,37 @@
 use super::*;
 
 impl CompositorState {
+    pub(in crate::compositor) fn focus_desktop_window(&mut self, window_id: WindowId) -> bool {
+        let Some(window) = self.window(window_id) else {
+            return false;
+        };
+        if window.kind == DesktopWindowKind::OverrideRedirect {
+            return false;
+        }
+        let surface_id = window.root_surface_id;
+        let Some(surface) = self.surface_resource_by_id(surface_id) else {
+            return false;
+        };
+        self.focus_surface(surface);
+        let _ = self.raise_root_window(surface_id);
+        true
+    }
+
+    pub(in crate::compositor) fn x11_focus_request_allowed(&self, handle: X11WindowHandle) -> bool {
+        let Some(target_id) = self.window_id_for_x11_handle(handle) else {
+            return false;
+        };
+        let Some(target) = self.window(target_id) else {
+            return false;
+        };
+        if target.kind == DesktopWindowKind::OverrideRedirect {
+            return false;
+        }
+        self.focused_window_id.is_none_or(|focused| {
+            focused == target_id || target.relationships.transient_for == Some(focused)
+        })
+    }
+
     pub(in crate::compositor) fn register_toplevel_surface(
         &mut self,
         surface: wl_surface::WlSurface,
@@ -16,16 +47,21 @@ impl CompositorState {
             return;
         }
         self.clear_resize_state_for_surfaces(&[surface_id]);
+        let Ok(window_id) = self.allocate_window_id() else {
+            return;
+        };
+        if self
+            .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
+            .is_err()
+        {
+            return;
+        }
         self.toplevel_surfaces.insert(
             surface_id,
             ToplevelSurface {
-                app_id: None,
-                title: None,
-                parent_surface_id: None,
+                window_id,
                 xdg_surface,
                 toplevel,
-                window: WindowState::default(),
-                constraints: Default::default(),
                 pending_constraints: None,
                 wm_capabilities_sent: false,
             },
@@ -95,6 +131,10 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn unregister_toplevel_surface(&mut self, surface_id: u32) {
+        let window_id = self
+            .toplevel_surfaces
+            .get(&surface_id)
+            .map(|toplevel| toplevel.window_id);
         if self.toplevel_surfaces.contains_key(&surface_id)
             || self
                 .surface_role_lifecycle(surface_id)
@@ -108,6 +148,9 @@ impl CompositorState {
         }
         self.unmap_xdg_role_surfaces(surface_id);
         self.toplevel_surfaces.remove(&surface_id);
+        if let Some(window_id) = window_id {
+            self.remove_desktop_window(window_id);
+        }
         self.clear_fullscreen_presentation_owner(surface_id);
         self.deactivate_role_instance_if(surface_id, SurfaceRole::XdgToplevel);
         self.surface_placements.remove(&surface_id);
@@ -116,10 +159,23 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn apply_pending_toplevel_constraints(&mut self, surface_id: u32) {
-        if let Some(toplevel) = self.toplevel_surfaces.get_mut(&surface_id)
-            && let Some(pending) = toplevel.pending_constraints.take()
-        {
-            toplevel.constraints = pending;
+        let Some((window_id, pending)) =
+            self.toplevel_surfaces
+                .get_mut(&surface_id)
+                .and_then(|toplevel| {
+                    toplevel
+                        .pending_constraints
+                        .take()
+                        .map(|pending| (toplevel.window_id, pending))
+                })
+        else {
+            return;
+        };
+        if let Some(window) = self.window_mut(window_id) {
+            window.constraints.min_width = pending.min_width;
+            window.constraints.min_height = pending.min_height;
+            window.constraints.max_width = pending.max_width;
+            window.constraints.max_height = pending.max_height;
         }
     }
 
@@ -137,14 +193,24 @@ impl CompositorState {
                 return Err(());
             }
             current = self
-                .toplevel_surfaces
-                .get(&candidate)
-                .and_then(|toplevel| toplevel.parent_surface_id);
+                .window_id_for_surface(candidate)
+                .and_then(|window_id| self.window(window_id))
+                .and_then(|window| window.relationships.parent)
+                .and_then(|window_id| self.window(window_id))
+                .map(|window| window.root_surface_id);
         }
-        let Some(toplevel) = self.toplevel_surfaces.get_mut(&surface_id) else {
+        let Some(window_id) = self
+            .toplevel_surfaces
+            .get(&surface_id)
+            .map(|toplevel| toplevel.window_id)
+        else {
             return Err(());
         };
-        toplevel.parent_surface_id = parent_surface_id;
+        let parent = parent_surface_id
+            .and_then(|parent_surface_id| self.window_id_for_surface(parent_surface_id));
+        if let Some(window) = self.window_mut(window_id) {
+            window.relationships.parent = parent;
+        }
         Ok(())
     }
 
@@ -300,6 +366,7 @@ impl CompositorState {
                 self.focus_surface(parent_surface);
             } else {
                 self.focused_surface = None;
+                self.focused_window_id = None;
                 if self
                     .keyboard_surface
                     .as_ref()
@@ -859,30 +926,48 @@ impl CompositorState {
         self.minimize_root_window(surface_id)
     }
 
-    pub(in crate::compositor) fn restore_next_minimized_window(&mut self) -> bool {
-        let Some(surface_id) = self
-            .toplevel_surfaces
-            .iter()
-            .find_map(|(surface_id, toplevel)| {
-                toplevel.window.is_minimized().then_some(*surface_id)
-            })
-        else {
+    pub(in crate::compositor) fn close_focused_window(&mut self) -> bool {
+        let Some(window_id) = self.focused_window_id else {
             return false;
         };
+        let Some(window) = self.window(window_id).cloned() else {
+            return false;
+        };
+        match window.backend {
+            WindowBackend::X11(_) => {
+                self.backend_commands.push(
+                    crate::compositor::window_backend::WindowBackendCommand::Close {
+                        window: window_id,
+                    },
+                );
+                true
+            }
+            WindowBackend::Xdg(_) => self
+                .toplevel_surfaces
+                .get(&window.root_surface_id)
+                .is_some_and(|role| role.toplevel.send_event(xdg_toplevel::Event::Close).is_ok()),
+        }
+    }
 
-        self.restore_minimized_root_window(surface_id)
+    pub(in crate::compositor) fn restore_next_minimized_window(&mut self) -> bool {
+        let Some(window_id) = self.window_stacking.iter().copied().find(|window_id| {
+            self.window(*window_id)
+                .is_some_and(|window| window.state.is_minimized())
+        }) else {
+            return false;
+        };
+        self.restore_minimized_desktop_window(window_id)
     }
 
     pub(in crate::compositor) fn activate_root_window(&mut self, surface_id: u32) -> bool {
-        if !self.toplevel_surfaces.contains_key(&surface_id) {
+        let Some(window_id) = self.window_id_for_surface(surface_id) else {
             return false;
-        }
+        };
         if self
-            .toplevel_surfaces
-            .get(&surface_id)
-            .is_some_and(|toplevel| toplevel.window.is_minimized())
+            .window(window_id)
+            .is_some_and(|window| window.state.is_minimized())
         {
-            self.restore_minimized_root_window(surface_id);
+            self.restore_minimized_desktop_window(window_id);
         }
         let focused = self
             .surface_resource_by_id(surface_id)
@@ -910,26 +995,35 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn minimize_root_window(&mut self, surface_id: u32) -> bool {
-        if !self.toplevel_surfaces.contains_key(&surface_id)
-            || self
-                .toplevel_surfaces
-                .get(&surface_id)
-                .is_some_and(|toplevel| toplevel.window.is_minimized())
+        let Some(window_id) = self.window_id_for_surface(surface_id) else {
+            return false;
+        };
+        self.minimize_desktop_window(window_id)
+    }
+
+    pub(in crate::compositor) fn minimize_desktop_window(&mut self, window_id: WindowId) -> bool {
+        let Some(root_surface_id) = self.window(window_id).map(|window| window.root_surface_id)
+        else {
+            return false;
+        };
+        if self
+            .window(window_id)
+            .is_some_and(|window| window.state.is_minimized())
         {
             return false;
         }
         self.clear_resize_state_for_surfaces_with_reason(
-            &[surface_id],
+            &[root_surface_id],
             WindowInteractionEndReason::ExplicitCancel,
         );
-        self.clear_fullscreen_presentation_owner(surface_id);
+        self.clear_fullscreen_presentation_owner(root_surface_id);
 
         let surface_placements = &self.surface_placements;
         let mut minimized_surfaces = Vec::new();
         let mut visible_surfaces = Vec::with_capacity(self.renderable_surfaces.len());
         for surface in self.renderable_surfaces.drain(..) {
             if root_surface_id_for_surface_in_placements(surface_placements, surface.surface_id)
-                == surface_id
+                == root_surface_id
             {
                 minimized_surfaces.push(surface);
             } else {
@@ -942,36 +1036,50 @@ impl CompositorState {
             return false;
         }
 
-        if let Some(toplevel) = self.toplevel_surfaces.get_mut(&surface_id) {
-            toplevel.window.minimize(minimized_surfaces);
+        if let Some(window) = self.window_mut(window_id) {
+            window.state.minimize(minimized_surfaces);
         }
-        if self.focused_root_surface_id() == Some(surface_id) {
+        if self.focused_root_surface_id() == Some(root_surface_id) {
             self.focused_surface = None;
+            self.focused_window_id = None;
             self.clear_keyboard_focus();
             if self.pointer_surface.as_ref().is_some_and(|surface| {
-                self.root_surface_id_for_surface(compositor_surface_id(surface)) == surface_id
+                self.root_surface_id_for_surface(compositor_surface_id(surface)) == root_surface_id
             }) {
                 self.clear_pointer_focus();
             }
         }
+        self.queue_backend_state(window_id);
         self.focus_topmost_renderable_toplevel();
         self.advance_render_generation(RenderGenerationCause::WindowMinimize);
         true
     }
 
     pub(in crate::compositor) fn restore_minimized_root_window(&mut self, surface_id: u32) -> bool {
+        let Some(window_id) = self.window_id_for_surface(surface_id) else {
+            return false;
+        };
+        self.restore_minimized_desktop_window(window_id)
+    }
+
+    pub(in crate::compositor) fn restore_minimized_desktop_window(
+        &mut self,
+        window_id: WindowId,
+    ) -> bool {
         let Some(minimized_surfaces) = self
-            .toplevel_surfaces
-            .get_mut(&surface_id)
-            .and_then(|toplevel| toplevel.window.restore_minimized())
+            .window_mut(window_id)
+            .and_then(|window| window.state.restore_minimized())
         else {
             return false;
         };
 
         self.renderable_surfaces.extend(minimized_surfaces);
-        if let Some(surface) = self.surface_resource_by_id(surface_id) {
+        if let Some(surface_id) = self.window(window_id).map(|window| window.root_surface_id)
+            && let Some(surface) = self.surface_resource_by_id(surface_id)
+        {
             self.focus_surface(surface);
         }
+        self.queue_backend_state(window_id);
         self.advance_render_generation(RenderGenerationCause::WindowRestore);
         true
     }
@@ -981,13 +1089,23 @@ impl CompositorState {
         surface_id: u32,
         mode: ToplevelMode,
     ) -> bool {
-        let Some(current_mode) = self
-            .toplevel_surfaces
-            .get(&surface_id)
-            .map(|toplevel| toplevel.window.mode())
-        else {
+        let Some(window_id) = self.window_id_for_surface(surface_id) else {
             return false;
         };
+        let Some(current_mode) = self.window(window_id).map(|window| window.state.mode()) else {
+            return false;
+        };
+
+        if matches!(
+            self.window(window_id).map(|window| window.backend),
+            Some(WindowBackend::X11(_))
+        ) {
+            return if current_mode == mode {
+                self.restore_floating_root_window(surface_id)
+            } else {
+                self.set_root_window_mode(surface_id, mode)
+            };
+        }
 
         if current_mode == mode {
             self.restore_floating_root_window(surface_id)
@@ -1001,6 +1119,45 @@ impl CompositorState {
         surface_id: u32,
         mode: ToplevelMode,
     ) -> bool {
+        if let Some(window_id) = self.window_id_for_surface(surface_id)
+            && matches!(
+                self.window(window_id).map(|window| window.backend),
+                Some(WindowBackend::X11(_))
+            )
+        {
+            let restore_geometry = self
+                .current_visual_root_window_geometry(surface_id)
+                .or_else(|| self.current_root_window_geometry(surface_id))
+                .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(surface_id), 0, 0));
+            self.clear_resize_state_for_surfaces_with_reason(
+                &[surface_id],
+                WindowInteractionEndReason::ModeTransition,
+            );
+            if self
+                .window(window_id)
+                .is_some_and(|window| window.state.is_minimized())
+            {
+                self.restore_minimized_desktop_window(window_id);
+            }
+            if let Some(window) = self.window_mut(window_id) {
+                window.state.capture_restore_geometry(restore_geometry);
+                window.state.set_mode(mode);
+            }
+            let geometry = self.window_geometry_for_mode(mode);
+            self.set_surface_placement_with_cause(
+                surface_id,
+                geometry.placement,
+                RenderGenerationCause::WindowMode,
+            );
+            self.queue_backend_configure(window_id, geometry, mode, false);
+            self.queue_backend_state(window_id);
+            if mode == ToplevelMode::Fullscreen {
+                self.set_fullscreen_presentation_owner(surface_id);
+            } else {
+                self.clear_fullscreen_presentation_owner(surface_id);
+            }
+            return true;
+        }
         if !self.toplevel_surfaces.contains_key(&surface_id) {
             return false;
         }
@@ -1015,14 +1172,17 @@ impl CompositorState {
         if self
             .toplevel_surfaces
             .get(&surface_id)
-            .is_some_and(|toplevel| toplevel.window.is_minimized())
+            .is_some_and(|toplevel| {
+                self.window(toplevel.window_id)
+                    .is_some_and(|window| window.state.is_minimized())
+            })
         {
             self.restore_minimized_root_window(surface_id);
         }
 
-        if let Some(toplevel) = self.toplevel_surfaces.get_mut(&surface_id) {
-            toplevel.window.capture_restore_geometry(restore_geometry);
-            toplevel.window.set_mode(mode);
+        if let Some(window) = self.toplevel_window_state_mut(surface_id) {
+            window.capture_restore_geometry(restore_geometry);
+            window.set_mode(mode);
         }
 
         let geometry = self.window_geometry_for_mode(mode);
@@ -1044,17 +1204,45 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn restore_floating_root_window(&mut self, surface_id: u32) -> bool {
+        if let Some(window_id) = self.window_id_for_surface(surface_id)
+            && matches!(
+                self.window(window_id).map(|window| window.backend),
+                Some(WindowBackend::X11(_))
+            )
+        {
+            let restore_geometry = self
+                .window_mut(window_id)
+                .and_then(|window| window.state.take_restore_geometry())
+                .or_else(|| self.current_root_window_geometry(surface_id))
+                .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(surface_id), 0, 0));
+            if let Some(window) = self.window_mut(window_id) {
+                window.state.set_mode(ToplevelMode::Floating);
+            }
+            self.clear_fullscreen_presentation_owner(surface_id);
+            self.set_surface_placement_with_cause(
+                surface_id,
+                restore_geometry.placement,
+                RenderGenerationCause::WindowMode,
+            );
+            self.queue_backend_configure(
+                window_id,
+                restore_geometry,
+                ToplevelMode::Floating,
+                false,
+            );
+            self.queue_backend_state(window_id);
+            return true;
+        }
         self.clear_resize_state_for_surfaces_with_reason(
             &[surface_id],
             WindowInteractionEndReason::ModeTransition,
         );
         self.clear_fullscreen_presentation_owner(surface_id);
-        let Some(restore_geometry) = self.toplevel_surfaces.get_mut(&surface_id).map(|toplevel| {
-            toplevel.window.set_mode(ToplevelMode::Floating);
-            toplevel.window.take_restore_geometry()
-        }) else {
+        let Some(window) = self.toplevel_window_state_mut(surface_id) else {
             return false;
         };
+        window.set_mode(ToplevelMode::Floating);
+        let restore_geometry = window.take_restore_geometry();
         let restore_geometry = restore_geometry
             .or_else(|| self.current_root_window_geometry(surface_id))
             .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(surface_id), 0, 0));
@@ -1076,6 +1264,11 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn focused_root_surface_id(&self) -> Option<u32> {
+        if let Some(window_id) = self.focused_window_id
+            && let Some(window) = self.window(window_id)
+        {
+            return Some(window.root_surface_id);
+        }
         self.focused_surface
             .as_ref()
             .map(|surface| self.root_surface_id_for_surface(compositor_surface_id(surface)))
@@ -1090,9 +1283,7 @@ impl CompositorState {
             .iter()
             .find(|surface| surface.surface_id == surface_id)
             .or_else(|| {
-                self.toplevel_surfaces
-                    .get(&surface_id)?
-                    .window
+                self.toplevel_window_state(surface_id)?
                     .minimized_root_surface(surface_id)
             })?;
         let (width, height) = self
@@ -1118,9 +1309,7 @@ impl CompositorState {
             .iter()
             .find(|surface| surface.surface_id == surface_id)
             .or_else(|| {
-                self.toplevel_surfaces
-                    .get(&surface_id)?
-                    .window
+                self.toplevel_window_state(surface_id)?
                     .minimized_root_surface(surface_id)
             })?;
         let (width, height) = self
@@ -1141,10 +1330,11 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn focus_topmost_renderable_toplevel(&mut self) -> bool {
-        let Some(surface_id) = self.renderable_surfaces.iter().rev().find_map(|surface| {
-            let root_surface_id = self.root_surface_id_for_surface(surface.surface_id);
-            self.toplevel_surfaces
-                .contains_key(&root_surface_id)
+        let Some(surface_id) = self.window_stacking.iter().rev().find_map(|window_id| {
+            let root_surface_id = self.window(*window_id)?.root_surface_id;
+            self.renderable_surfaces
+                .iter()
+                .any(|surface| surface.surface_id == root_surface_id)
                 .then_some(root_surface_id)
         }) else {
             return false;
@@ -1157,6 +1347,9 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn raise_root_window(&mut self, surface_id: u32) -> bool {
+        if let Some(window_id) = self.window_id_for_surface(surface_id) {
+            let _ = self.raise_window_id(window_id);
+        }
         let surface_placements = &self.surface_placements;
         let mut raised_surfaces = Vec::new();
         let mut lower_surfaces = Vec::with_capacity(self.renderable_surfaces.len());

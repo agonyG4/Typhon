@@ -1,5 +1,17 @@
 use crate::astrea_shell_control::server::astrea_launch_request_v1;
 use crate::astrea_shortcuts::server::astrea_shortcut_v1;
+use crate::render_backend::buffer::{
+    BufferId, BufferIdAllocator, BufferIdentity, BufferSize, DmabufBufferHandle,
+    DmabufPlane as RenderDmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
+};
+use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
+use crate::syncobj::DrmSyncobjDevice;
+use crate::wayland_drm::server::wl_drm;
+use crate::xwayland::{X11WindowHandle, XwaylandGeneration};
+pub use clipboard_bridge::{
+    ClipboardBridge, ClipboardBridgeError, ClipboardBridgeEvent, HostClipboardOfferId,
+    NoopClipboardBridge,
+};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::File,
@@ -8,20 +20,6 @@ use std::{
     sync::{Arc, Mutex},
     time::Instant,
 };
-
-pub use clipboard_bridge::{
-    ClipboardBridge, ClipboardBridgeError, ClipboardBridgeEvent, HostClipboardOfferId,
-    NoopClipboardBridge,
-};
-
-use crate::render_backend::buffer::{
-    BufferId, BufferIdAllocator, BufferIdentity, BufferSize, DmabufBufferHandle,
-    DmabufPlane as RenderDmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
-};
-use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
-use crate::syncobj::DrmSyncobjDevice;
-use crate::wayland_drm::server::wl_drm;
-use crate::xwayland::XwaylandGeneration;
 use wayland_protocols::ext::data_control::v1::server::{
     ext_data_control_device_v1, ext_data_control_manager_v1, ext_data_control_offer_v1,
     ext_data_control_source_v1,
@@ -66,6 +64,7 @@ use wayland_server::{
 mod clipboard_bridge;
 mod color;
 mod commit_debug;
+mod desktop_window;
 mod dmabuf;
 mod explicit_sync;
 mod frame_batch;
@@ -88,11 +87,16 @@ mod shm;
 mod state_data;
 mod subsurface;
 mod surface;
+mod window_backend;
 mod window_state;
-
 use commit_debug::*;
 use pacing::*;
 
+#[allow(unused_imports)]
+pub(crate) use desktop_window::{
+    DesktopWindow, DesktopWindowError, WindowBackend, WindowRelationships, XdgWindowHandle,
+};
+pub use desktop_window::{DesktopWindowKind, WindowConstraints, WindowId, WindowMetadata};
 use dmabuf::{
     DmabufBufferData, DmabufFeedbackData, DmabufParamsData, PendingDmabufPlane,
     default_dmabuf_main_device, send_dmabuf_feedback, send_dmabuf_format_modifiers,
@@ -183,7 +187,6 @@ pub use surface::{
     SurfacePlacement,
 };
 use window_state::{ToplevelMode, WindowGeometry, WindowState, xdg_toplevel_state_bytes};
-
 const MIN_WINDOW_WIDTH: u32 = 160;
 const MIN_WINDOW_HEIGHT: u32 = 120;
 const WL_SEAT_NAME_SINCE: u32 = 2;
@@ -191,7 +194,6 @@ const WL_SEAT_NAME_SINCE: u32 = 2;
 const DRM_FORMAT_ARGB8888: u32 = DrmFormat::ARGB8888_FOURCC;
 #[cfg(test)]
 const DRM_FORMAT_MOD_LINEAR: u64 = DrmModifier::LINEAR.0;
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ResizeFlowMetrics {
     pub configures_requested: u64,
@@ -241,7 +243,6 @@ pub struct ResizeFlowMetrics {
     pub surface_sampling_exact: u64,
     pub surface_sampling_scaled: u64,
 }
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SubsurfaceTransactionMetrics {
     pub synchronized_child_commits_cached: u64,
@@ -276,7 +277,6 @@ pub struct SubsurfaceTransactionMetrics {
     pub surface_tree_publications: u64,
     pub surface_tree_stale_rejections: u64,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ToplevelVisualGeometry {
     placement: SurfacePlacement,
@@ -284,13 +284,11 @@ struct ToplevelVisualGeometry {
     height: u32,
     active_resize: Option<ResizeInteractionId>,
 }
-
 impl ToplevelVisualGeometry {
     const fn window_geometry(self) -> WindowGeometry {
         WindowGeometry::new(self.placement, self.width, self.height)
     }
 }
-
 #[derive(Debug, Clone, Copy)]
 struct ActiveToplevelResize {
     interaction_id: ResizeInteractionId,
@@ -298,7 +296,6 @@ struct ActiveToplevelResize {
     edges: ResizeEdges,
     activated_at: Instant,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingInteractiveResizeUpdate {
     root_surface_id: u32,
@@ -308,13 +305,11 @@ struct PendingInteractiveResizeUpdate {
     edges: ResizeEdges,
     interaction_id: ResizeInteractionId,
 }
-
 #[derive(Debug, Default, Clone, Copy)]
 struct XdgConfigureSerialState {
     latest_sent: u32,
     latest_acked: u32,
 }
-
 #[derive(Debug)]
 struct SurfaceTreeAcquireDependency {
     surface_commit_id: SurfaceCommitId,
@@ -324,7 +319,6 @@ struct SurfaceTreeAcquireDependency {
     acquire: ExplicitSyncPoint,
     state: PendingAcquireState,
 }
-
 #[derive(Debug)]
 struct PendingSurfaceTreeTransaction {
     root_surface_id: u32,
@@ -332,7 +326,6 @@ struct PendingSurfaceTreeTransaction {
     dependencies: Vec<SurfaceTreeAcquireDependency>,
     received_at: Instant,
 }
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SurfacePublicationState {
     latest_received: SurfaceCommitSequence,
@@ -515,6 +508,7 @@ pub struct CompositorState {
     output_refresh: OutputRefreshRate,
     presentation_clock: PresentationClock,
     focused_surface: Option<wl_surface::WlSurface>,
+    focused_window_id: Option<WindowId>,
     focus_generation: u64,
     keyboard_surface: Option<wl_surface::WlSurface>,
     keyboard_modifiers: KeyboardModifierState,
@@ -538,6 +532,12 @@ pub struct CompositorState {
     pointer_enter_serials: Vec<PointerEnterSerial>,
     surface_role_lifecycles: HashMap<u32, SurfaceRoleLifecycle>,
     surface_client_ids: HashMap<u32, ClientId>,
+    pub(in crate::compositor) desktop_windows: HashMap<WindowId, DesktopWindow>,
+    pub(in crate::compositor) window_by_root_surface: HashMap<u32, WindowId>,
+    pub(in crate::compositor) window_by_x11_handle: HashMap<X11WindowHandle, WindowId>,
+    pub(in crate::compositor) next_window_id: u64,
+    pub(in crate::compositor) window_stacking: Vec<WindowId>,
+    pub(in crate::compositor) backend_commands: Vec<window_backend::WindowBackendCommand>,
     cursor_surface_ids: HashSet<u32>,
     active_client_cursor: Option<ActiveClientCursor>,
     client_cursor_surfaces: HashMap<u32, RenderableSurface>,

@@ -37,7 +37,8 @@ use crate::astrea_shortcuts::server::astrea_shortcuts_manager_v1;
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
-use crate::xwayland::{XwaylandAssociationEvent, XwaylandGeneration};
+use crate::xwayland::xwm::{RESIZE_SYNC_TIMEOUT_NS, XwmCommand, XwmEvent};
+use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 
 use super::protocols::versions;
 use super::{
@@ -48,7 +49,8 @@ use super::{
     InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PointerAxisFrame,
     PresentationClock, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
     ResizeFlowMetrics, SelectionProtocolCapabilities, SubsurfaceTransactionMetrics,
-    SurfaceDamagePresentation, WindowInteractionDebugSnapshot, WindowInteractionEndReason, color,
+    SurfaceDamagePresentation, ToplevelMode, WindowInteractionDebugSnapshot,
+    WindowInteractionEndReason, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 
@@ -61,6 +63,7 @@ pub struct OwnCompositorServer {
     disconnected_clients: Arc<Mutex<Vec<DisconnectedClient>>>,
     client_pids: Arc<Mutex<HashMap<ClientId, i32>>>,
     xwayland_global_data: XwaylandShellGlobalData,
+    xwayland_disconnects: Vec<XwaylandClientIdentity>,
     gpu_buffer_protocols_enabled: bool,
 }
 
@@ -255,6 +258,7 @@ impl OwnCompositorServer {
             disconnected_clients,
             client_pids,
             xwayland_global_data,
+            xwayland_disconnects: Vec::new(),
             gpu_buffer_protocols_enabled: gpu_buffers_enabled,
         })
     }
@@ -388,8 +392,215 @@ impl OwnCompositorServer {
             .unwrap_or_default()
     }
 
+    pub fn take_xwayland_client_disconnect_events(&mut self) -> Vec<XwaylandClientIdentity> {
+        std::mem::take(&mut self.xwayland_disconnects)
+    }
+
     pub fn take_xwayland_association_events(&mut self) -> Vec<XwaylandAssociationEvent> {
         self.state.take_xwayland_association_events()
+    }
+
+    pub fn take_xwayland_buffer_ready_events(&mut self) -> Vec<(XwaylandGeneration, u32)> {
+        self.state.take_xwayland_buffer_ready_events()
+    }
+
+    pub fn take_xwayland_backend_commands(&mut self, now_ns: u64) -> Vec<XwmCommand> {
+        self.state
+            .take_backend_commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                crate::compositor::window_backend::WindowBackendCommand::Configure {
+                    window,
+                    geometry,
+                    mode: _,
+                    resizing,
+                } => {
+                    let handle = match self.state.window(window)?.backend {
+                        super::WindowBackend::X11(handle) => handle,
+                        super::WindowBackend::Xdg(_) => return None,
+                    };
+                    let x11_geometry = crate::xwayland::xwm::X11Geometry {
+                        x: geometry.placement.local_x,
+                        y: geometry.placement.local_y,
+                        width: geometry.width,
+                        height: geometry.height,
+                    };
+                    if resizing {
+                        Some(XwmCommand::BeginResizeSync {
+                            window: handle,
+                            geometry: x11_geometry,
+                            counter_value: 0,
+                            deadline_ns: now_ns.saturating_add(RESIZE_SYNC_TIMEOUT_NS),
+                        })
+                    } else {
+                        Some(XwmCommand::Configure {
+                            window: handle,
+                            geometry: x11_geometry,
+                        })
+                    }
+                }
+                crate::compositor::window_backend::WindowBackendCommand::Close { window } => {
+                    let handle = match self.state.window(window)?.backend {
+                        super::WindowBackend::X11(handle) => handle,
+                        super::WindowBackend::Xdg(_) => return None,
+                    };
+                    Some(XwmCommand::Close(handle))
+                }
+                crate::compositor::window_backend::WindowBackendCommand::SetActivated {
+                    window,
+                    activated,
+                } => {
+                    let handle = match self.state.window(window)?.backend {
+                        super::WindowBackend::X11(handle) => handle,
+                        super::WindowBackend::Xdg(_) => return None,
+                    };
+                    Some(XwmCommand::Focus {
+                        window: activated.then_some(handle),
+                        timestamp: 0,
+                    })
+                }
+                crate::compositor::window_backend::WindowBackendCommand::PublishState {
+                    window,
+                    mode,
+                    minimized,
+                    activated,
+                } => {
+                    let handle = match self.state.window(window)?.backend {
+                        super::WindowBackend::X11(handle) => handle,
+                        super::WindowBackend::Xdg(_) => return None,
+                    };
+                    Some(XwmCommand::SetState {
+                        window: handle,
+                        state: crate::xwayland::xwm::X11PublishedState {
+                            fullscreen: mode == ToplevelMode::Fullscreen,
+                            maximized: mode == ToplevelMode::Maximized,
+                            hidden: minimized,
+                            activated,
+                        },
+                    })
+                }
+            })
+            .collect()
+    }
+
+    pub fn apply_xwayland_window_event(&mut self, event: XwmEvent) -> Vec<XwmCommand> {
+        match event {
+            XwmEvent::WindowReady(snapshot) => {
+                let handle = snapshot.handle;
+                if self.state.insert_x11_window(snapshot).is_ok() {
+                    vec![XwmCommand::Map(handle), self.sync_xwayland_client_lists()]
+                } else {
+                    Vec::new()
+                }
+            }
+            XwmEvent::WindowDestroyed(handle) => {
+                if self.remove_x11_desktop_window(handle) {
+                    vec![self.sync_xwayland_client_lists()]
+                } else {
+                    Vec::new()
+                }
+            }
+            XwmEvent::WindowWithdrawn(handle) => {
+                if self.remove_x11_desktop_window(handle) {
+                    vec![self.sync_xwayland_client_lists()]
+                } else {
+                    Vec::new()
+                }
+            }
+            XwmEvent::MetadataChanged { window, delta } => {
+                self.state.apply_x11_metadata_delta(window, delta);
+                Vec::new()
+            }
+            XwmEvent::ConfigureRequested { window, request } => self
+                .state
+                .filter_x11_geometry(window, request.requested)
+                .map(|geometry| {
+                    self.state.set_x11_geometry(window, geometry);
+                    XwmCommand::Configure { window, geometry }
+                })
+                .into_iter()
+                .collect(),
+            XwmEvent::StateRequested { window, request } => {
+                let was_hidden = self
+                    .state
+                    .window_id_for_x11_handle(window)
+                    .and_then(|id| self.state.window(id))
+                    .is_some_and(|window| window.state.is_minimized());
+                let Some(state) = self.state.apply_x11_state_request(window, request) else {
+                    return Vec::new();
+                };
+                let mut commands = Vec::with_capacity(2);
+                if state.hidden != was_hidden {
+                    commands.push(if state.hidden {
+                        XwmCommand::Unmap(window)
+                    } else {
+                        XwmCommand::Map(window)
+                    });
+                }
+                commands.push(XwmCommand::SetState { window, state });
+                commands
+            }
+            XwmEvent::FocusRequested(window) => {
+                if self.state.x11_focus_request_allowed(window)
+                    && self
+                        .state
+                        .window_id_for_x11_handle(window)
+                        .is_some_and(|window_id| self.state.focus_desktop_window(window_id))
+                {
+                    vec![XwmCommand::Raise(window), self.sync_xwayland_client_lists()]
+                } else {
+                    Vec::new()
+                }
+            }
+            XwmEvent::ResizeSyncAcked { window, .. } => {
+                vec![XwmCommand::SetAllowCommits {
+                    window,
+                    allowed: true,
+                }]
+            }
+            XwmEvent::ResizeSyncPresented(window) => {
+                vec![XwmCommand::CompleteResizeSync(window)]
+            }
+            XwmEvent::ResizeSyncTimedOut(window) => {
+                vec![XwmCommand::SetAllowCommits {
+                    window,
+                    allowed: true,
+                }]
+            }
+            XwmEvent::CloseRequestedByClient(window) => {
+                if let Some(window_id) = self.state.window_id_for_x11_handle(window) {
+                    self.state.backend_commands.push(
+                        crate::compositor::window_backend::WindowBackendCommand::Close {
+                            window: window_id,
+                        },
+                    );
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    fn remove_x11_desktop_window(&mut self, handle: X11WindowHandle) -> bool {
+        let Some(window_id) = self.state.window_id_for_x11_handle(handle) else {
+            return false;
+        };
+        let was_focused = self.state.focused_window_id == Some(window_id);
+        let removed = self.state.remove_desktop_window(window_id).is_some();
+        if removed && was_focused {
+            self.state.focused_window_id = None;
+            self.state.focused_surface = None;
+            self.state.clear_keyboard_focus();
+            let _ = self.state.focus_topmost_renderable_toplevel();
+        }
+        removed
+    }
+
+    fn sync_xwayland_client_lists(&self) -> XwmCommand {
+        let (client_list, stacking) = self.state.x11_client_lists();
+        XwmCommand::SyncClientLists {
+            client_list,
+            stacking,
+        }
     }
 
     pub fn accepted_clients(&self) -> usize {
@@ -770,6 +981,12 @@ impl OwnCompositorServer {
         minimized
     }
 
+    pub fn close_focused_window(&mut self) -> bool {
+        let closed = self.state.close_focused_window();
+        let _ = self.display.flush_clients();
+        closed
+    }
+
     pub fn restore_next_minimized_window(&mut self) -> bool {
         let restored = self.state.restore_next_minimized_window();
         let _ = self.display.flush_clients();
@@ -964,6 +1181,21 @@ impl OwnCompositorServer {
             let summary = self
                 .state
                 .teardown_client_resources(&disconnected.client_id);
+            let xwayland_identity =
+                self.xwayland_global_data
+                    .active
+                    .lock()
+                    .ok()
+                    .and_then(|active| {
+                        active
+                            .as_ref()
+                            .filter(|identity| identity.client_id == disconnected.client_id)
+                            .cloned()
+                    });
+            if let Some(identity) = xwayland_identity {
+                self.revoke_xwayland_generation(identity.generation);
+                self.xwayland_disconnects.push(identity);
+            }
             eprintln!(
                 "oblivion-one compositor: client_disconnect client={:?} pid={} surfaces_removed={} visible_removed={} repaint_scheduled={}",
                 disconnected.client_id,

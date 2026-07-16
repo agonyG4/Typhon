@@ -76,7 +76,7 @@ impl CompositorState {
                 software_cursor_visible: false,
             };
         };
-        let Some(toplevel) = self.toplevel_surfaces.get(&owner.owner_root_surface_id) else {
+        let Some(_toplevel) = self.toplevel_surfaces.get(&owner.owner_root_surface_id) else {
             return FullscreenPresentationEligibility {
                 owner: Some(owner),
                 eligible: false,
@@ -87,7 +87,10 @@ impl CompositorState {
                 software_cursor_visible: false,
             };
         };
-        if toplevel.window.is_minimized() {
+        if self
+            .toplevel_window_state(owner.owner_root_surface_id)
+            .is_some_and(WindowState::is_minimized)
+        {
             return FullscreenPresentationEligibility {
                 owner: Some(owner),
                 eligible: false,
@@ -171,11 +174,14 @@ impl CompositorState {
         let owner = self
             .fullscreen_presentation
             .ok_or(DirectScanoutSceneRejection::NoFullscreenOwner)?;
-        let toplevel = self
+        let _toplevel = self
             .toplevel_surfaces
             .get(&owner.owner_root_surface_id)
             .ok_or(DirectScanoutSceneRejection::OwnerMissing)?;
-        if toplevel.window.is_minimized() {
+        if self
+            .toplevel_window_state(owner.owner_root_surface_id)
+            .is_some_and(WindowState::is_minimized)
+        {
             return Err(DirectScanoutSceneRejection::OwnerMinimized);
         }
 

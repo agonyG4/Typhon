@@ -1,6 +1,42 @@
 use super::*;
 
 impl NativeRuntime {
+    pub(super) fn initialize_managed_xwayland(&mut self) -> NativeResult<()> {
+        if !self.xwayland.is_managed()
+            || self.xwayland.state_kind() != oblivion_one::xwayland::XwaylandStateKind::Starting
+        {
+            return Ok(());
+        }
+        let Some(generation) = self.xwayland.generation() else {
+            return Ok(());
+        };
+        match self
+            .xwayland
+            .initialize_managed_xwm(generation, &mut self.process_supervisor)
+        {
+            Ok(()) => self.sync_xwayland_reactor_sources(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            Err(error) => {
+                eprintln!("native XWayland managed startup contained: {error}");
+                self.sync_xwayland_reactor_sources()
+            }
+        }
+    }
+
+    pub(super) fn dispatch_xwayland_window_events(&mut self) -> NativeResult<()> {
+        let mut commands = Vec::new();
+        for event in self.xwayland.take_managed_xwm_events() {
+            commands.extend(self.server.apply_xwayland_window_event(event));
+        }
+        let now_ns = monotonic_now_ns()?;
+        commands.extend(self.server.take_xwayland_backend_commands(now_ns));
+        for command in commands {
+            self.xwayland.execute_managed_command(command)?;
+        }
+        self.xwayland.flush_managed_commands()?;
+        Ok(())
+    }
+
     pub(super) fn reap_supervised_children(
         &mut self,
         cycle: &NativeCycleState,
@@ -45,6 +81,21 @@ impl NativeRuntime {
         Ok(())
     }
 
+    pub(super) fn dispatch_xwayland_client_disconnects(&mut self) -> NativeResult<()> {
+        for identity in self.server.take_xwayland_client_disconnect_events() {
+            if self.xwayland_client_identity.as_ref() != Some(&identity) {
+                self.xwayland.record_stale_reactor_event();
+                continue;
+            }
+            self.xwayland_client_identity = None;
+            self.xwayland.handle_private_client_disconnected(
+                identity.generation,
+                &mut self.process_supervisor,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn dispatch_xwayland_events(&mut self, wakeup: &NativeWakeup) -> NativeResult<()> {
         for event in wakeup.xwayland_events.iter().copied() {
             let Some((_, registration)) = self
@@ -56,16 +107,23 @@ impl NativeRuntime {
                 self.xwayland.record_stale_reactor_event();
                 continue;
             };
-            if let Err(error) = self.xwayland.handle_reactor_event(
+            let continuation = match self.xwayland.handle_reactor_event(
                 registration.purpose,
                 registration.generation,
                 event.flags,
                 &mut self.process_supervisor,
             ) {
-                eprintln!(
-                    "native XWayland event contained generation={:?} purpose={:?}: {error}",
-                    registration.generation, registration.purpose
-                );
+                Ok(continuation) => continuation,
+                Err(error) => {
+                    eprintln!(
+                        "native XWayland event contained generation={:?} purpose={:?}: {error}",
+                        registration.generation, registration.purpose
+                    );
+                    false
+                }
+            };
+            if continuation {
+                self.event_loop.arm_deadline(Some(monotonic_now_ns()?))?;
             }
         }
         self.sync_xwayland_reactor_sources()?;

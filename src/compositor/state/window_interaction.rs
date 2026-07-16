@@ -2,6 +2,7 @@ use super::*;
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::compositor) struct BeginWindowInteraction {
+    pub(super) window_id: Option<WindowId>,
     pub(super) root_surface_id: u32,
     pub(super) x: f64,
     pub(super) y: f64,
@@ -66,6 +67,7 @@ impl CompositorState {
             self.root_window_local_point_at(root_surface_id, x, y)
         else {
             return self.begin_window_interaction_for_root(BeginWindowInteraction {
+                window_id: self.window_id_for_surface(root_surface_id),
                 root_surface_id,
                 x,
                 y,
@@ -78,6 +80,7 @@ impl CompositorState {
         };
         let edges = resize_edges_for_window_point(local_x, local_y, width, height);
         self.begin_window_interaction_for_root(BeginWindowInteraction {
+            window_id: self.window_id_for_surface(root_surface_id),
             root_surface_id,
             x,
             y,
@@ -102,6 +105,7 @@ impl CompositorState {
             return false;
         };
         self.begin_window_interaction_for_root(BeginWindowInteraction {
+            window_id: Some(hit.window_id),
             root_surface_id: hit.root_surface_id,
             x,
             y,
@@ -135,6 +139,7 @@ impl CompositorState {
         };
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
         self.begin_window_interaction_for_root(BeginWindowInteraction {
+            window_id: self.window_id_for_surface(root_surface_id),
             root_surface_id,
             x,
             y,
@@ -165,6 +170,7 @@ impl CompositorState {
             return false;
         };
         self.begin_window_interaction_for_root(BeginWindowInteraction {
+            window_id: self.window_id_for_surface(root_surface_id),
             root_surface_id,
             x: press.output_x,
             y: press.output_y,
@@ -196,6 +202,7 @@ impl CompositorState {
             return false;
         };
         self.begin_window_interaction_for_root(BeginWindowInteraction {
+            window_id: self.window_id_for_surface(root_surface_id),
             root_surface_id,
             x: press.output_x,
             y: press.output_y,
@@ -220,6 +227,7 @@ impl CompositorState {
             return false;
         }
         let BeginWindowInteraction {
+            window_id: begin_window_id,
             root_surface_id,
             x,
             y,
@@ -235,6 +243,12 @@ impl CompositorState {
             .find(|surface| surface.surface_id == root_surface_id)
         else {
             log_begin_rejection(self, begin, "root_missing");
+            return false;
+        };
+        let Some(window_id) =
+            begin_window_id.or_else(|| self.window_id_for_surface(root_surface_id))
+        else {
+            log_begin_rejection(self, begin, "window_identity_missing");
             return false;
         };
         if let Some(pointer_motion_surface_id) = pointer_motion_surface_id {
@@ -325,6 +339,7 @@ impl CompositorState {
         let id = self.allocate_window_interaction_id();
         self.window_interaction = Some(WindowInteraction {
             id,
+            window_id,
             root_surface_id,
             kind,
             source,
@@ -495,6 +510,7 @@ impl CompositorState {
                 hit.height,
             )?;
             return Some(WindowFrameHit {
+                window_id: hit.window_id,
                 root_surface_id: hit.root_surface_id,
                 kind,
             });
@@ -531,11 +547,26 @@ impl CompositorState {
                     interaction.start_placement.local_x + dx,
                     interaction.start_placement.local_y + dy,
                 );
-                self.set_surface_placement_with_cause(
+                let moved = self.set_surface_placement_with_cause(
                     interaction.root_surface_id,
                     placement,
                     RenderGenerationCause::WindowMove,
-                )
+                );
+                if moved {
+                    self.queue_backend_configure(
+                        interaction.window_id,
+                        WindowGeometry::new(
+                            placement,
+                            interaction.start_width,
+                            interaction.start_height,
+                        ),
+                        self.window(interaction.window_id)
+                            .map(|window| window.state.mode())
+                            .unwrap_or(ToplevelMode::Floating),
+                        false,
+                    );
+                }
+                moved
             }
             WindowInteractionKind::Resize(edges) => {
                 if !interaction.drag_committed && !resize_drag_threshold_reached(edges, dx, dy) {

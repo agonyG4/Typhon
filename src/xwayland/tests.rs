@@ -1,5 +1,6 @@
 use std::{
     fs,
+    num::NonZeroU64,
     os::unix::fs::{PermissionsExt, symlink},
     os::unix::net::UnixStream,
     path::PathBuf,
@@ -31,8 +32,38 @@ fn xwayland_mode_parses_only_opt_in_values() {
     assert_eq!(XwaylandMode::parse(None), XwaylandMode::Off);
     assert_eq!(XwaylandMode::parse(Some("off")), XwaylandMode::Off);
     assert_eq!(XwaylandMode::parse(Some("base")), XwaylandMode::BaseLazy);
-    assert_eq!(XwaylandMode::parse(Some("eager")), XwaylandMode::BaseEager);
+    assert_eq!(XwaylandMode::parse(Some("lazy")), XwaylandMode::ManagedLazy);
+    assert_eq!(
+        XwaylandMode::parse(Some("eager")),
+        XwaylandMode::ManagedEager
+    );
     assert_eq!(XwaylandMode::parse(Some("host")), XwaylandMode::Off);
+}
+
+#[test]
+fn managed_mode_is_the_only_mode_with_a_normal_app_profile() {
+    let root = test_root("managed-profile");
+    let base = XwaylandService::bootstrap_with_config(XwaylandConfig::for_tests_at_root(
+        XwaylandMode::BaseLazy,
+        PathBuf::from("Xwayland"),
+        root.clone(),
+    ))
+    .expect("bootstrap base mode");
+    assert!(base.normal_app_environment().is_none());
+
+    let mut managed_config = XwaylandConfig::for_tests_at_root(
+        XwaylandMode::ManagedLazy,
+        PathBuf::from("Xwayland"),
+        root.clone(),
+    );
+    managed_config.profile = super::config::XwaylandProfile::Managed;
+    let managed =
+        XwaylandService::bootstrap_with_config(managed_config).expect("bootstrap managed mode");
+    assert!(managed.normal_app_environment().is_some());
+
+    drop(base);
+    drop(managed);
+    fs::remove_dir_all(root).expect("remove test root");
 }
 
 #[test]
@@ -58,8 +89,8 @@ fn generation_allocator_returns_distinct_nonzero_values() {
     ))
     .expect("bootstrap base mode");
 
-    let first = service.allocate_generation();
-    let second = service.allocate_generation();
+    let first = service.allocate_generation().expect("first generation");
+    let second = service.allocate_generation().expect("second generation");
     assert_ne!(first, second);
     assert_ne!(first.get(), 0);
     assert_ne!(second.get(), 0);
@@ -161,6 +192,36 @@ fn symlink_lock_is_rejected_without_following_target() {
 }
 
 #[test]
+fn unsafe_first_display_slot_does_not_hide_safe_later_slot() {
+    let _lock = display_test_lock();
+    let root = test_root("unsafe-first-slot");
+    let target = root.join("target");
+    fs::write(&target, "keep").expect("write target");
+    symlink(&target, root.join(".X0-lock")).expect("create lock symlink");
+
+    let lease = DisplayLease::allocate_for_tests(&root, 0, 1).expect("use safe later slot");
+    assert_eq!(lease.display_number(), 1);
+    drop(lease);
+    assert_eq!(fs::read_to_string(target).expect("read target"), "keep");
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn stale_authority_file_does_not_block_new_display_lease() {
+    let _lock = display_test_lock();
+    let root = test_root("stale-authority");
+    let auth_dir = root.join("typhon/xwayland");
+    fs::create_dir_all(&auth_dir).expect("create auth directory");
+    fs::write(auth_dir.join(".Xauthority-0"), b"stale").expect("write stale authority");
+
+    let lease = DisplayLease::allocate_for_tests(&root, 0, 0).expect("ignore stale authority");
+    assert_eq!(lease.display_number(), 0);
+    assert!(auth_dir.join(".Xauthority-0").exists());
+    drop(lease);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
 fn partial_lease_failure_rolls_back_lock_and_auth_artifacts() {
     let _lock = display_test_lock();
     let root = test_root("rollback");
@@ -170,7 +231,18 @@ fn partial_lease_failure_rolls_back_lock_and_auth_artifacts() {
 
     assert!(DisplayLease::allocate_for_tests(&root, 0, 0).is_err());
     assert!(!root.join(".X0-lock").exists());
-    assert!(!root.join("typhon/xwayland/.Xauthority-0").exists());
+    let auth_dir = root.join("typhon/xwayland");
+    assert!(
+        !auth_dir.exists()
+            || !auth_dir
+                .read_dir()
+                .expect("read auth directory")
+                .any(|entry| entry
+                    .expect("read auth entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".Xauthority-0-"))
+    );
     fs::remove_dir_all(root).expect("remove test root");
 }
 
@@ -196,6 +268,21 @@ fn auth_file_is_private_and_contains_a_cookie() {
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     let cookie = read_cookie_for_tests(lease.xauthority_path()).expect("parse auth record");
     assert!(cookie.len() >= 16);
+    drop(lease);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn display_lease_debug_never_contains_cookie_bytes() {
+    let _lock = display_test_lock();
+    let root = test_root("auth-debug");
+    let lease = DisplayLease::allocate_for_tests(&root, 0, 0).expect("allocate lease");
+    let cookie = read_cookie_for_tests(lease.xauthority_path()).expect("parse auth record");
+    let cookie_hex = cookie
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert!(!format!("{lease:?}").contains(&cookie_hex));
     drop(lease);
     fs::remove_dir_all(root).expect("remove test root");
 }
@@ -267,6 +354,187 @@ fn base_mode_arms_both_listeners_without_starting_a_process() {
     assert_eq!(supervisor.active_count(), 0);
     drop(service);
     drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn managed_lazy_environment_triggers_first_generation() {
+    let (root, mut service, mut supervisor) =
+        service_at_root(XwaylandMode::ManagedLazy, "/bin/true");
+    assert!(service.normal_app_environment().is_some());
+    assert_eq!(service.reactor_registrations().count(), 2);
+
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start managed generation");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Starting);
+    assert_eq!(supervisor.active_count(), 1);
+
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn listeners_are_registered_only_while_armed() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/true");
+    assert_eq!(
+        service
+            .reactor_registrations()
+            .filter(|registration| {
+                matches!(
+                    registration.purpose,
+                    XwaylandReactorPurpose::ListenFilesystem
+                        | XwaylandReactorPurpose::ListenAbstract
+                )
+            })
+            .count(),
+        2
+    );
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    assert_eq!(
+        service
+            .reactor_registrations()
+            .filter(|registration| {
+                matches!(
+                    registration.purpose,
+                    XwaylandReactorPurpose::ListenFilesystem
+                        | XwaylandReactorPurpose::ListenAbstract
+                )
+            })
+            .count(),
+        0
+    );
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn starting_generation_unregisters_parent_listener_sources() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/true");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let registrations: Vec<_> = service.reactor_registrations().collect();
+    assert_eq!(registrations.len(), 1);
+    assert_eq!(
+        registrations[0].purpose,
+        XwaylandReactorPurpose::DisplayReady
+    );
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn backoff_does_not_register_readable_listener_sources() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/false");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let exit = reap_one(&mut supervisor);
+    service.handle_process_exit(&exit).expect("handle crash");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+    assert_eq!(service.reactor_registrations().count(), 0);
+    service
+        .handle_deadline(u64::MAX, &mut supervisor)
+        .expect("rearm after backoff");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Armed);
+    assert_eq!(service.reactor_registrations().count(), 2);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn rearmed_service_registers_listeners_once_after_backoff() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/false");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let exit = reap_one(&mut supervisor);
+    service.handle_process_exit(&exit).expect("handle crash");
+    service
+        .handle_deadline(u64::MAX, &mut supervisor)
+        .expect("rearm after backoff");
+    assert!(
+        service
+            .handle_listener_readiness(&mut supervisor)
+            .expect("start rearmed generation")
+    );
+    assert_eq!(
+        service
+            .reactor_registrations()
+            .filter(|registration| {
+                matches!(
+                    registration.purpose,
+                    XwaylandReactorPurpose::ListenFilesystem
+                        | XwaylandReactorPurpose::ListenAbstract
+                )
+            })
+            .count(),
+        0
+    );
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn private_wayland_endpoint_can_be_taken_only_once() {
+    let (root, mut service, mut supervisor) =
+        service_at_root_with_sleeping_binary(XwaylandMode::BaseLazy, "private-endpoint");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let generation = service.generation().expect("starting generation");
+    assert!(service.take_private_wayland_client(generation).is_some());
+    assert!(service.take_private_wayland_client(generation).is_none());
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn private_client_protocol_disconnect_fails_only_its_generation() {
+    let (root, mut service, mut supervisor) =
+        service_at_root_with_sleeping_binary(XwaylandMode::BaseLazy, "private-disconnect");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let generation = service.generation().expect("starting generation");
+    assert!(service.take_private_wayland_client(generation).is_some());
+    service
+        .handle_private_client_disconnected(generation, &mut supervisor)
+        .expect("handle private client disconnect");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+    assert_eq!(service.reactor_registrations().count(), 0);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn generation_exhaustion_fails_instead_of_reusing_identity() {
+    let root = test_root("generation-exhaustion");
+    let mut service = XwaylandService::bootstrap_with_config(XwaylandConfig::for_tests_at_root(
+        XwaylandMode::BaseLazy,
+        PathBuf::from("Xwayland"),
+        root.clone(),
+    ))
+    .expect("bootstrap service");
+    service.next_generation = NonZeroU64::MAX;
+    assert!(service.allocate_generation().is_err());
+    assert_eq!(service.state_kind(), XwaylandStateKind::Failed);
+    drop(service);
     fs::remove_dir_all(root).expect("remove test root");
 }
 
@@ -629,7 +897,7 @@ fn installed_xwayland_private_socket_smoke_test() -> Result<(), Box<dyn std::err
         .generation()
         .expect("listener trigger starts generation");
     let private_stream = service
-        .private_wayland_client(generation)
+        .take_private_wayland_client(generation)
         .expect("generation owns a private Wayland stream");
     let identity = compositor.insert_xwayland_client(private_stream, generation)?;
     service.authorize_private_client(generation, identity.client_id.clone());

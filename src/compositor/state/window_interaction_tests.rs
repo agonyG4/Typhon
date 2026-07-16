@@ -1,4 +1,5 @@
 use super::*;
+use std::num::NonZeroU64;
 
 fn test_window_interaction(
     id: u64,
@@ -23,6 +24,7 @@ fn test_window_interaction_with_target(
 ) -> WindowInteraction {
     WindowInteraction {
         id: WindowInteractionId::new(id),
+        window_id: WindowId::new(NonZeroU64::new(1).expect("nonzero")),
         root_surface_id: 42,
         kind,
         source,
@@ -47,6 +49,7 @@ fn test_begin_window_interaction(
     source: WindowInteractionSource,
 ) -> BeginWindowInteraction {
     BeginWindowInteraction {
+        window_id: None,
         root_surface_id,
         x: 100.0,
         y: 100.0,

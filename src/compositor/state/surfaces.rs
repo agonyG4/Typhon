@@ -1,5 +1,4 @@
 use super::*;
-
 impl CompositorState {
     pub(in crate::compositor) fn allocate_surface_commit_sequence(
         &mut self,
@@ -7,7 +6,6 @@ impl CompositorState {
         self.next_surface_commit_sequence = self.next_surface_commit_sequence.saturating_add(1);
         SurfaceCommitSequence(self.next_surface_commit_sequence)
     }
-
     pub(in crate::compositor) fn record_surface_commit_received(
         &mut self,
         surface_id: u32,
@@ -24,7 +22,6 @@ impl CompositorState {
             );
         }
     }
-
     pub(in crate::compositor) fn surface_publication_decision(
         &self,
         surface_id: u32,
@@ -49,7 +46,6 @@ impl CompositorState {
         }
         SurfacePublicationDecision::Publish
     }
-
     pub(in crate::compositor) fn record_surface_publication(
         &mut self,
         surface_id: u32,
@@ -99,7 +95,6 @@ impl CompositorState {
             );
         }
     }
-
     pub(in crate::compositor) fn record_surface_publication_rejection(
         &mut self,
         surface_id: u32,
@@ -156,7 +151,6 @@ impl CompositorState {
             );
         }
     }
-
     pub(in crate::compositor) fn supersede_older_pending_attachments_for_surface(
         &mut self,
         surface_id: u32,
@@ -268,7 +262,6 @@ impl CompositorState {
         self.pending_surface_tree_transactions = retained_trees;
         callbacks
     }
-
     pub(in crate::compositor) fn capture_surface_damage_presentation(
         &self,
     ) -> SurfaceDamagePresentation {
@@ -303,7 +296,6 @@ impl CompositorState {
         }
         SurfaceDamagePresentation { sampled_commits }
     }
-
     pub(in crate::compositor) fn capture_surface_damage_presentation_for_surface(
         &self,
         surface_id: u32,
@@ -336,7 +328,6 @@ impl CompositorState {
             )],
         }
     }
-
     pub(in crate::compositor) fn commit_surface_damage_presented(
         &mut self,
         token: SurfaceDamagePresentation,
@@ -377,7 +368,6 @@ impl CompositorState {
             }
         }
     }
-
     pub(in crate::compositor) fn mark_render_damage_presented(&mut self) {
         let token = self.capture_surface_damage_presentation();
         self.commit_surface_damage_presented(token);
@@ -400,6 +390,7 @@ impl CompositorState {
         let default_dmabuf_device = default_dmabuf_main_device();
         Self {
             frame_clock_start: Some(Instant::now()),
+            next_window_id: 1,
             dmabuf_feedback: EglGlesDmabufFeedback::default(),
             dmabuf_main_device: default_dmabuf_device
                 .as_ref()
@@ -581,6 +572,7 @@ impl CompositorState {
             });
         }
         self.focused_surface = Some(surface.clone());
+        self.focused_window_id = self.update_desktop_focus_window(new_surface_id, changed);
         self.ensure_keyboard_focus(&surface);
         self.apply_pending_pointer_constraint_state_for_surface(new_surface_id);
         if !self
@@ -1138,10 +1130,16 @@ impl CompositorState {
         let toplevels = self
             .toplevel_surfaces
             .iter()
-            .filter_map(|(surface_id, toplevel)| {
-                let mode = toplevel.window.mode();
-                (mode != ToplevelMode::Floating && !toplevel.window.is_minimized())
-                    .then_some((*surface_id, mode))
+            .filter_map(|(surface_id, _toplevel)| {
+                let mode = self
+                    .toplevel_window_state(*surface_id)
+                    .map(WindowState::mode)
+                    .unwrap_or(ToplevelMode::Floating);
+                (mode != ToplevelMode::Floating
+                    && !self
+                        .toplevel_window_state(*surface_id)
+                        .is_some_and(WindowState::is_minimized))
+                .then_some((*surface_id, mode))
             })
             .collect::<Vec<_>>();
 
@@ -1299,6 +1297,7 @@ impl CompositorState {
             .is_some_and(|surface| compositor_surface_id(surface) == surface_id)
         {
             self.focused_surface = None;
+            self.focused_window_id = None;
             focus_debug_log(|| format!("focus_leave reason=surface_destroyed old={surface_id}"));
         }
 
