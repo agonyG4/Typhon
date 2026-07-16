@@ -14,6 +14,14 @@ pub use clipboard_bridge::{
     NoopClipboardBridge,
 };
 
+use crate::render_backend::buffer::{
+    BufferId, BufferIdAllocator, BufferIdentity, BufferSize, DmabufBufferHandle,
+    DmabufPlane as RenderDmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
+};
+use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
+use crate::syncobj::DrmSyncobjDevice;
+use crate::wayland_drm::server::wl_drm;
+use crate::xwayland::XwaylandGeneration;
 use wayland_protocols::ext::data_control::v1::server::{
     ext_data_control_device_v1, ext_data_control_manager_v1, ext_data_control_offer_v1,
     ext_data_control_source_v1,
@@ -45,7 +53,6 @@ use wayland_protocols::xdg::{
     decoration::zv1::server::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1},
     shell::server::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base},
 };
-use wayland_protocols::xwayland::shell::v1::server::xwayland_surface_v1;
 use wayland_protocols_wlr::layer_shell::v1::server::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
@@ -56,16 +63,6 @@ use wayland_server::{
         wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
     },
 };
-
-use crate::render_backend::buffer::{
-    BufferId, BufferIdAllocator, BufferIdentity, BufferSize, DmabufBufferHandle,
-    DmabufPlane as RenderDmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
-};
-use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
-use crate::syncobj::DrmSyncobjDevice;
-use crate::wayland_drm::server::wl_drm;
-use crate::xwayland::{AssociationRegistry, XwaylandGeneration};
-
 mod clipboard_bridge;
 mod color;
 mod commit_debug;
@@ -544,10 +541,7 @@ pub struct CompositorState {
     cursor_surface_ids: HashSet<u32>,
     active_client_cursor: Option<ActiveClientCursor>,
     client_cursor_surfaces: HashMap<u32, RenderableSurface>,
-    xwayland_surface_states: HashMap<u32, XwaylandSurfaceState>,
-    xwayland_surface_resources: HashMap<u32, xwayland_surface_v1::XwaylandSurfaceV1>,
-    xwayland_associations: AssociationRegistry,
-    xwayland_client_identity: Option<XwaylandClientIdentity>,
+    xwayland: XwaylandCompositorState,
     surface_damage_journals: HashMap<u32, SurfaceDamageJournal>,
     presented_surface_commits: HashMap<u32, SurfaceCommitCounter>,
     surface_presentation_generations: HashMap<u32, u64>,

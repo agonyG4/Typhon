@@ -12,6 +12,7 @@ mod session;
 mod session_io;
 mod shutdown;
 mod shutdown_cycle;
+mod xwayland;
 
 pub(super) use atomic_commit::validate_atomic_pageflip;
 pub(super) use atomic_commit::{

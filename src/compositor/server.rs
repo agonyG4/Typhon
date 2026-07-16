@@ -348,7 +348,7 @@ impl OwnCompositorServer {
         if let Ok(mut active) = self.xwayland_global_data.active.lock() {
             *active = Some(identity.clone());
         }
-        self.state.xwayland_client_identity = Some(identity.clone());
+        self.state.xwayland.client_identity = Some(identity.clone());
         Ok(identity)
     }
 
@@ -369,11 +369,12 @@ impl OwnCompositorServer {
             }
             if self
                 .state
-                .xwayland_client_identity
+                .xwayland
+                .client_identity
                 .as_ref()
                 .is_some_and(|identity| identity.generation == generation)
             {
-                self.state.xwayland_client_identity = None;
+                self.state.xwayland.client_identity = None;
             }
             self.state.clear_xwayland_generation(generation);
         }

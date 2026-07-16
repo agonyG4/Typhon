@@ -61,7 +61,7 @@ impl Dispatch<xwayland_shell_v1::XwaylandShellV1, XwaylandShellData> for Composi
         _dhandle: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
-        if state.xwayland_client_identity.as_ref() != Some(&data.identity)
+        if state.xwayland.client_identity.as_ref() != Some(&data.identity)
             || data.identity.client_id != client.id()
         {
             state.post_protocol_error(
@@ -118,7 +118,8 @@ impl Dispatch<xwayland_surface_v1::XwaylandSurfaceV1, XwaylandSurfaceData> for C
         _data_init: &mut DataInit<'_, Self>,
     ) {
         if state
-            .xwayland_client_identity
+            .xwayland
+            .client_identity
             .as_ref()
             .is_none_or(|identity| {
                 identity.client_id != client.id() || identity.generation != data.generation

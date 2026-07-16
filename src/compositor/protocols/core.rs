@@ -1,4 +1,5 @@
 use super::super::*;
+use wayland_protocols::xwayland::shell::v1::server::xwayland_surface_v1;
 
 impl Dispatch<wl_compositor::WlCompositor, ()> for CompositorState {
     fn request(
@@ -88,7 +89,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     Ok(XwaylandSurfaceCommit::AlreadyAssociated) | Err(_)
                 ) {
                     if let Some(xwayland_surface) =
-                        state.xwayland_surface_resources.get(&surface_id).cloned()
+                        state.xwayland.surface_resources.get(&surface_id).cloned()
                     {
                         state.post_protocol_error(
                             client,

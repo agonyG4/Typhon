@@ -1,7 +1,9 @@
 use super::*;
 use std::num::NonZeroU64;
 
-use crate::xwayland::{AssociationError, XwaylandAssociationEvent};
+use wayland_protocols::xwayland::shell::v1::server::xwayland_surface_v1;
+
+use crate::xwayland::{AssociationError, AssociationRegistry, XwaylandAssociationEvent};
 
 /// A role is permanent for the lifetime of its wl_surface.  The associated
 /// protocol object is deliberately tracked separately because destroying that
@@ -55,6 +57,15 @@ pub(in crate::compositor) struct XwaylandSurfaceState {
     pub(in crate::compositor) pending_serial: Option<NonZeroU64>,
     pub(in crate::compositor) committed_serial: Option<NonZeroU64>,
     pub(in crate::compositor) association_object_alive: bool,
+}
+
+#[derive(Debug, Default)]
+pub(in crate::compositor) struct XwaylandCompositorState {
+    pub(in crate::compositor) surface_states: HashMap<u32, XwaylandSurfaceState>,
+    pub(in crate::compositor) surface_resources:
+        HashMap<u32, xwayland_surface_v1::XwaylandSurfaceV1>,
+    pub(in crate::compositor) associations: AssociationRegistry,
+    pub(in crate::compositor) client_identity: Option<XwaylandClientIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,7 +361,7 @@ impl CompositorState {
         generation: XwaylandGeneration,
     ) -> Result<(), SurfaceRoleError> {
         self.assign_surface_role(surface_id, SurfaceRole::Xwayland)?;
-        self.xwayland_surface_states.insert(
+        self.xwayland.surface_states.insert(
             surface_id,
             XwaylandSurfaceState {
                 generation,
@@ -367,7 +378,7 @@ impl CompositorState {
         surface_id: u32,
         resource: xwayland_surface_v1::XwaylandSurfaceV1,
     ) {
-        self.xwayland_surface_resources.insert(surface_id, resource);
+        self.xwayland.surface_resources.insert(surface_id, resource);
     }
 
     pub(in crate::compositor) fn set_xwayland_pending_serial(
@@ -376,7 +387,7 @@ impl CompositorState {
         generation: XwaylandGeneration,
         serial: NonZeroU64,
     ) -> Result<(), ()> {
-        let Some(state) = self.xwayland_surface_states.get_mut(&surface_id) else {
+        let Some(state) = self.xwayland.surface_states.get_mut(&surface_id) else {
             return Err(());
         };
         if state.generation != generation || !state.association_object_alive {
@@ -390,7 +401,7 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
     ) -> Result<XwaylandSurfaceCommit, AssociationError> {
-        let Some(state) = self.xwayland_surface_states.get_mut(&surface_id) else {
+        let Some(state) = self.xwayland.surface_states.get_mut(&surface_id) else {
             return Ok(XwaylandSurfaceCommit::None);
         };
         let Some(serial) = state.pending_serial.take() else {
@@ -399,7 +410,8 @@ impl CompositorState {
         if state.committed_serial.is_some() {
             return Ok(XwaylandSurfaceCommit::AlreadyAssociated);
         }
-        self.xwayland_associations
+        self.xwayland
+            .associations
             .commit_surface_serial(state.generation, serial, surface_id)?;
         state.committed_serial = Some(serial);
         Ok(XwaylandSurfaceCommit::Committed {
@@ -409,26 +421,27 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn destroy_xwayland_surface_object(&mut self, surface_id: u32) {
-        if let Some(state) = self.xwayland_surface_states.get_mut(&surface_id) {
+        if let Some(state) = self.xwayland.surface_states.get_mut(&surface_id) {
             state.pending_serial = None;
             state.association_object_alive = false;
         }
-        self.xwayland_surface_resources.remove(&surface_id);
+        self.xwayland.surface_resources.remove(&surface_id);
         self.deactivate_role_instance_if(surface_id, SurfaceRole::Xwayland);
     }
 
     pub(in crate::compositor) fn take_xwayland_association_events(
         &mut self,
     ) -> Vec<XwaylandAssociationEvent> {
-        self.xwayland_associations.take_events()
+        self.xwayland.associations.take_events()
     }
 
     pub(in crate::compositor) fn clear_xwayland_generation(
         &mut self,
         generation: XwaylandGeneration,
     ) {
-        self.xwayland_associations.clear_generation(generation);
-        self.xwayland_surface_states
+        self.xwayland.associations.clear_generation(generation);
+        self.xwayland
+            .surface_states
             .retain(|_, state| state.generation != generation);
     }
 
@@ -636,9 +649,9 @@ impl CompositorState {
 
     pub(in crate::compositor) fn scrub_surface_lifecycle(&mut self, surface_id: u32) {
         self.surface_role_lifecycles.remove(&surface_id);
-        self.xwayland_surface_states.remove(&surface_id);
-        self.xwayland_surface_resources.remove(&surface_id);
-        self.xwayland_associations.remove_surface(surface_id);
+        self.xwayland.surface_states.remove(&surface_id);
+        self.xwayland.surface_resources.remove(&surface_id);
+        self.xwayland.associations.remove_surface(surface_id);
     }
 
     fn surface_role_for_error(&self, surface_id: u32) -> SurfaceRole {
