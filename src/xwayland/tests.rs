@@ -6,6 +6,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::process::ChildSupervisor;
+
 use super::{
     XwaylandConfig, XwaylandMode, XwaylandService, XwaylandStateKind,
     auth::read_cookie_for_tests,
@@ -182,5 +184,226 @@ fn dropping_lease_removes_only_owned_artifacts() {
         fs::read_to_string(unrelated).expect("read unrelated"),
         "keep"
     );
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+fn service_at_root(
+    mode: XwaylandMode,
+    binary: &str,
+) -> (PathBuf, XwaylandService, ChildSupervisor) {
+    let root = test_root("service");
+    let config = XwaylandConfig::for_tests_at_root(mode, PathBuf::from(binary), root.clone());
+    let service = XwaylandService::bootstrap_with_config(config).expect("bootstrap service");
+    (root, service, ChildSupervisor::new())
+}
+
+fn reap_one(supervisor: &mut ChildSupervisor) -> crate::process::ChildExit {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let mut exits = supervisor.reap_exited().expect("reap child");
+        if let Some(exit) = exits.pop() {
+            return exit;
+        }
+        assert!(std::time::Instant::now() < deadline, "child did not exit");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn base_mode_arms_both_listeners_without_starting_a_process() {
+    let (root, service, supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/true");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Armed);
+    assert_eq!(service.reactor_registrations().count(), 2);
+    assert_eq!(supervisor.active_count(), 0);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn listener_readiness_starts_one_generation_even_when_delivered_twice() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/true");
+    assert!(
+        service
+            .handle_listener_readiness(&mut supervisor)
+            .expect("start generation")
+    );
+    assert!(
+        !service
+            .handle_listener_readiness(&mut supervisor)
+            .expect("coalesce second readiness")
+    );
+    assert_eq!(service.state_kind(), XwaylandStateKind::Starting);
+    assert_eq!(supervisor.active_count(), 1);
+    let exit = reap_one(&mut supervisor);
+    service.handle_process_exit(&exit).expect("handle exit");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn display_and_private_shell_readiness_are_both_required() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/true");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let generation = service.generation().expect("starting generation");
+    let display = service.display_number().expect("reserved display");
+
+    service
+        .handle_displayfd_bytes(
+            generation,
+            format!("{display}\n").as_bytes(),
+            &mut supervisor,
+        )
+        .expect("display readiness");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Starting);
+    service
+        .handle_shell_bind(generation)
+        .expect("shell readiness");
+    assert_eq!(service.state_kind(), XwaylandStateKind::RunningBase);
+
+    let exit = reap_one(&mut supervisor);
+    service.handle_process_exit(&exit).expect("handle exit");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn wrong_display_readiness_fails_the_generation_without_running() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/sleep");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let generation = service.generation().expect("starting generation");
+    let display = service.display_number().expect("reserved display");
+
+    assert!(
+        service
+            .handle_displayfd_bytes(
+                generation,
+                format!("{}\n", display.saturating_add(1)).as_bytes(),
+                &mut supervisor,
+            )
+            .is_err()
+    );
+    assert_ne!(service.state_kind(), XwaylandStateKind::RunningBase);
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn stale_generation_readiness_cannot_complete_new_generation() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/true");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start first generation");
+    let first = service.generation().expect("first generation");
+    let exit = reap_one(&mut supervisor);
+    service
+        .handle_process_exit(&exit)
+        .expect("rearm after clean exit");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start second generation");
+    let second = service.generation().expect("second generation");
+    assert_ne!(first, second);
+    let display = service.display_number().expect("reserved display");
+    service
+        .handle_displayfd_bytes(first, format!("{display}\n").as_bytes(), &mut supervisor)
+        .expect("stale readiness is ignored");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Starting);
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn eager_mode_uses_the_same_generation_start_path() {
+    let root = test_root("eager");
+    let config = XwaylandConfig::for_tests_at_root(
+        XwaylandMode::BaseEager,
+        PathBuf::from("/bin/true"),
+        root.clone(),
+    );
+    let mut supervisor = ChildSupervisor::new();
+    let mut service = XwaylandService::bootstrap_with_supervisor(config, &mut supervisor)
+        .expect("bootstrap eager service");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Starting);
+    assert_eq!(supervisor.active_count(), 1);
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn malformed_and_oversized_displayfd_payloads_fail_safely() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/sleep");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let generation = service.generation().expect("generation");
+    assert!(
+        service
+            .handle_displayfd_bytes(generation, b"not-a-display\n", &mut supervisor)
+            .is_err()
+    );
+    assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/sleep");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let generation = service.generation().expect("generation");
+    assert!(
+        service
+            .handle_displayfd_bytes(generation, &[b'1'; 33], &mut supervisor)
+            .is_err()
+    );
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn abnormal_exit_enters_backoff_and_clean_exit_rearms() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/false");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start crashing generation");
+    let exit = reap_one(&mut supervisor);
+    service.handle_process_exit(&exit).expect("handle crash");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+    assert!(service.next_deadline_ns().is_some());
+    service
+        .handle_deadline(u64::MAX, &mut supervisor)
+        .expect("leave backoff");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Armed);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/true");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start clean generation");
+    let exit = reap_one(&mut supervisor);
+    service
+        .handle_process_exit(&exit)
+        .expect("handle clean exit");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Armed);
+    drop(service);
+    drop(supervisor);
     fs::remove_dir_all(root).expect("remove test root");
 }

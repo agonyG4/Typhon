@@ -628,6 +628,15 @@ impl ChildSupervisor {
         Ok(())
     }
 
+    pub fn kill_managed_now(&mut self, id: ManagedProcessId) -> io::Result<bool> {
+        let Some(child) = self.children.get(&id) else {
+            return Ok(false);
+        };
+        signal_spawned_process(child.spawned, libc::SIGKILL)?;
+        let _ = self.reap_exited()?;
+        Ok(!self.children.contains_key(&id))
+    }
+
     pub fn bootstrap_guard(&mut self) -> BootstrapChildGuard<'_> {
         BootstrapChildGuard {
             supervisor: self,

@@ -28,6 +28,7 @@ impl FileIdentity {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct DisplayLease {
     display_number: u32,
     display: String,
@@ -223,10 +224,12 @@ impl DisplayLease {
         &self.display
     }
 
+    #[cfg(test)]
     pub(crate) fn lock_path(&self) -> &Path {
         &self.lock_path
     }
 
+    #[cfg(test)]
     pub(crate) fn filesystem_socket_path(&self) -> &Path {
         &self.filesystem_socket_path
     }

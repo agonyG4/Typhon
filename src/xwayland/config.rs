@@ -35,6 +35,8 @@ pub struct XwaylandConfig {
     pub binary: PathBuf,
     pub display_min: u32,
     pub display_max: u32,
+    #[cfg(test)]
+    pub test_root: Option<PathBuf>,
 }
 
 impl XwaylandConfig {
@@ -46,6 +48,8 @@ impl XwaylandConfig {
                 .unwrap_or_else(|| PathBuf::from("Xwayland")),
             display_min: 0,
             display_max: 63,
+            #[cfg(test)]
+            test_root: None,
         }
     }
 
@@ -56,6 +60,18 @@ impl XwaylandConfig {
             binary,
             display_min: 0,
             display_max: 63,
+            test_root: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn for_tests_at_root(mode: XwaylandMode, binary: PathBuf, root: PathBuf) -> Self {
+        Self {
+            mode,
+            binary,
+            display_min: 0,
+            display_max: 63,
+            test_root: Some(root),
         }
     }
 }
