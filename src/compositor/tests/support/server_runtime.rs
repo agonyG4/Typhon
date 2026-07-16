@@ -508,6 +508,8 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             surface_id
                         };
                         let toplevel = server.state.toplevel_surfaces.get(&tracked_surface_id);
+                        let desktop_window =
+                            toplevel.and_then(|toplevel| server.state.window(toplevel.window_id));
                         let _ = reply.send(XdgRoleSnapshot {
                             surface_id: tracked_surface_id,
                             surface_registered: server
@@ -536,17 +538,19 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             xdg_association: server
                                 .state
                                 .xdg_association_exists(tracked_surface_id),
-                            toplevel_has_app_id: toplevel
-                                .is_some_and(|toplevel| toplevel.app_id.is_some()),
-                            toplevel_has_title: toplevel
-                                .is_some_and(|toplevel| toplevel.title.is_some()),
-                            toplevel_has_non_default_constraints: toplevel.is_some_and(
-                                |toplevel| {
-                                    toplevel.constraints != ToplevelSizeConstraints::default()
-                                        || toplevel.pending_constraints.is_some()
+                            toplevel_has_app_id: desktop_window
+                                .is_some_and(|window| window.metadata.app_id.is_some()),
+                            toplevel_has_title: desktop_window
+                                .is_some_and(|window| window.metadata.title.is_some()),
+                            toplevel_has_non_default_constraints: desktop_window.is_some_and(
+                                |window| {
+                                    window.constraints != WindowConstraints::default()
+                                        || toplevel.is_some_and(|toplevel| {
+                                            toplevel.pending_constraints.is_some()
+                                        })
                                 },
                             ),
-                            toplevel_mode: toplevel.map(|toplevel| toplevel.window.mode()),
+                            toplevel_mode: desktop_window.map(|window| window.state.mode()),
                             popup_parent_surface_id: server
                                 .state
                                 .popup_surfaces

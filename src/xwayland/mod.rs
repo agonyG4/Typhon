@@ -23,6 +23,27 @@ pub use service::{
     XwaylandReactorPurpose, XwaylandReactorRegistration, XwaylandService, XwaylandStateKind,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct X11WindowHandle {
+    pub(crate) generation: XwaylandGeneration,
+    pub(crate) xid: u32,
+}
+
+impl X11WindowHandle {
+    #[allow(dead_code)]
+    pub(crate) const fn new(generation: XwaylandGeneration, xid: u32) -> Self {
+        Self { generation, xid }
+    }
+
+    pub const fn generation(self) -> XwaylandGeneration {
+        self.generation
+    }
+
+    pub const fn xid(self) -> u32 {
+        self.xid
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XwaylandAppEnvironment {
     pub display: String,

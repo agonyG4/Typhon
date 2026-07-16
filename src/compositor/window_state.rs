@@ -3,7 +3,7 @@ use wayland_protocols::xdg::shell::server::xdg_toplevel;
 use super::{RenderableSurface, SurfacePlacement};
 
 #[derive(Debug, Clone)]
-pub(super) struct WindowState {
+pub(crate) struct WindowState {
     mode: ToplevelMode,
     restore_geometry: Option<WindowGeometry>,
     minimized_surfaces: Vec<RenderableSurface>,

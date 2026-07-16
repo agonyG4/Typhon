@@ -16,16 +16,21 @@ impl CompositorState {
             return;
         }
         self.clear_resize_state_for_surfaces(&[surface_id]);
+        let Ok(window_id) = self.allocate_window_id() else {
+            return;
+        };
+        if self
+            .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
+            .is_err()
+        {
+            return;
+        }
         self.toplevel_surfaces.insert(
             surface_id,
             ToplevelSurface {
-                app_id: None,
-                title: None,
-                parent_surface_id: None,
+                window_id,
                 xdg_surface,
                 toplevel,
-                window: WindowState::default(),
-                constraints: Default::default(),
                 pending_constraints: None,
                 wm_capabilities_sent: false,
             },
@@ -95,6 +100,10 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn unregister_toplevel_surface(&mut self, surface_id: u32) {
+        let window_id = self
+            .toplevel_surfaces
+            .get(&surface_id)
+            .map(|toplevel| toplevel.window_id);
         if self.toplevel_surfaces.contains_key(&surface_id)
             || self
                 .surface_role_lifecycle(surface_id)
@@ -108,6 +117,9 @@ impl CompositorState {
         }
         self.unmap_xdg_role_surfaces(surface_id);
         self.toplevel_surfaces.remove(&surface_id);
+        if let Some(window_id) = window_id {
+            self.remove_desktop_window(window_id);
+        }
         self.clear_fullscreen_presentation_owner(surface_id);
         self.deactivate_role_instance_if(surface_id, SurfaceRole::XdgToplevel);
         self.surface_placements.remove(&surface_id);
@@ -116,10 +128,23 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn apply_pending_toplevel_constraints(&mut self, surface_id: u32) {
-        if let Some(toplevel) = self.toplevel_surfaces.get_mut(&surface_id)
-            && let Some(pending) = toplevel.pending_constraints.take()
-        {
-            toplevel.constraints = pending;
+        let Some((window_id, pending)) =
+            self.toplevel_surfaces
+                .get_mut(&surface_id)
+                .and_then(|toplevel| {
+                    toplevel
+                        .pending_constraints
+                        .take()
+                        .map(|pending| (toplevel.window_id, pending))
+                })
+        else {
+            return;
+        };
+        if let Some(window) = self.window_mut(window_id) {
+            window.constraints.min_width = pending.min_width;
+            window.constraints.min_height = pending.min_height;
+            window.constraints.max_width = pending.max_width;
+            window.constraints.max_height = pending.max_height;
         }
     }
 
@@ -137,14 +162,24 @@ impl CompositorState {
                 return Err(());
             }
             current = self
-                .toplevel_surfaces
-                .get(&candidate)
-                .and_then(|toplevel| toplevel.parent_surface_id);
+                .window_id_for_surface(candidate)
+                .and_then(|window_id| self.window(window_id))
+                .and_then(|window| window.relationships.parent)
+                .and_then(|window_id| self.window(window_id))
+                .map(|window| window.root_surface_id);
         }
-        let Some(toplevel) = self.toplevel_surfaces.get_mut(&surface_id) else {
+        let Some(window_id) = self
+            .toplevel_surfaces
+            .get(&surface_id)
+            .map(|toplevel| toplevel.window_id)
+        else {
             return Err(());
         };
-        toplevel.parent_surface_id = parent_surface_id;
+        let parent = parent_surface_id
+            .and_then(|parent_surface_id| self.window_id_for_surface(parent_surface_id));
+        if let Some(window) = self.window_mut(window_id) {
+            window.relationships.parent = parent;
+        }
         Ok(())
     }
 
@@ -860,13 +895,11 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn restore_next_minimized_window(&mut self) -> bool {
-        let Some(surface_id) = self
-            .toplevel_surfaces
-            .iter()
-            .find_map(|(surface_id, toplevel)| {
-                toplevel.window.is_minimized().then_some(*surface_id)
-            })
-        else {
+        let Some(surface_id) = self.toplevel_surfaces.iter().find_map(|(surface_id, _)| {
+            self.toplevel_window_state(*surface_id)
+                .is_some_and(WindowState::is_minimized)
+                .then_some(*surface_id)
+        }) else {
             return false;
         };
 
@@ -880,7 +913,10 @@ impl CompositorState {
         if self
             .toplevel_surfaces
             .get(&surface_id)
-            .is_some_and(|toplevel| toplevel.window.is_minimized())
+            .is_some_and(|toplevel| {
+                self.window(toplevel.window_id)
+                    .is_some_and(|window| window.state.is_minimized())
+            })
         {
             self.restore_minimized_root_window(surface_id);
         }
@@ -914,7 +950,10 @@ impl CompositorState {
             || self
                 .toplevel_surfaces
                 .get(&surface_id)
-                .is_some_and(|toplevel| toplevel.window.is_minimized())
+                .is_some_and(|toplevel| {
+                    self.window(toplevel.window_id)
+                        .is_some_and(|window| window.state.is_minimized())
+                })
         {
             return false;
         }
@@ -942,8 +981,8 @@ impl CompositorState {
             return false;
         }
 
-        if let Some(toplevel) = self.toplevel_surfaces.get_mut(&surface_id) {
-            toplevel.window.minimize(minimized_surfaces);
+        if let Some(window) = self.toplevel_window_state_mut(surface_id) {
+            window.minimize(minimized_surfaces);
         }
         if self.focused_root_surface_id() == Some(surface_id) {
             self.focused_surface = None;
@@ -961,9 +1000,8 @@ impl CompositorState {
 
     pub(in crate::compositor) fn restore_minimized_root_window(&mut self, surface_id: u32) -> bool {
         let Some(minimized_surfaces) = self
-            .toplevel_surfaces
-            .get_mut(&surface_id)
-            .and_then(|toplevel| toplevel.window.restore_minimized())
+            .toplevel_window_state_mut(surface_id)
+            .and_then(WindowState::restore_minimized)
         else {
             return false;
         };
@@ -984,7 +1022,8 @@ impl CompositorState {
         let Some(current_mode) = self
             .toplevel_surfaces
             .get(&surface_id)
-            .map(|toplevel| toplevel.window.mode())
+            .and_then(|_| self.toplevel_window_state(surface_id))
+            .map(WindowState::mode)
         else {
             return false;
         };
@@ -1015,14 +1054,17 @@ impl CompositorState {
         if self
             .toplevel_surfaces
             .get(&surface_id)
-            .is_some_and(|toplevel| toplevel.window.is_minimized())
+            .is_some_and(|toplevel| {
+                self.window(toplevel.window_id)
+                    .is_some_and(|window| window.state.is_minimized())
+            })
         {
             self.restore_minimized_root_window(surface_id);
         }
 
-        if let Some(toplevel) = self.toplevel_surfaces.get_mut(&surface_id) {
-            toplevel.window.capture_restore_geometry(restore_geometry);
-            toplevel.window.set_mode(mode);
+        if let Some(window) = self.toplevel_window_state_mut(surface_id) {
+            window.capture_restore_geometry(restore_geometry);
+            window.set_mode(mode);
         }
 
         let geometry = self.window_geometry_for_mode(mode);
@@ -1049,12 +1091,11 @@ impl CompositorState {
             WindowInteractionEndReason::ModeTransition,
         );
         self.clear_fullscreen_presentation_owner(surface_id);
-        let Some(restore_geometry) = self.toplevel_surfaces.get_mut(&surface_id).map(|toplevel| {
-            toplevel.window.set_mode(ToplevelMode::Floating);
-            toplevel.window.take_restore_geometry()
-        }) else {
+        let Some(window) = self.toplevel_window_state_mut(surface_id) else {
             return false;
         };
+        window.set_mode(ToplevelMode::Floating);
+        let restore_geometry = window.take_restore_geometry();
         let restore_geometry = restore_geometry
             .or_else(|| self.current_root_window_geometry(surface_id))
             .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(surface_id), 0, 0));
@@ -1090,9 +1131,7 @@ impl CompositorState {
             .iter()
             .find(|surface| surface.surface_id == surface_id)
             .or_else(|| {
-                self.toplevel_surfaces
-                    .get(&surface_id)?
-                    .window
+                self.toplevel_window_state(surface_id)?
                     .minimized_root_surface(surface_id)
             })?;
         let (width, height) = self
@@ -1118,9 +1157,7 @@ impl CompositorState {
             .iter()
             .find(|surface| surface.surface_id == surface_id)
             .or_else(|| {
-                self.toplevel_surfaces
-                    .get(&surface_id)?
-                    .window
+                self.toplevel_window_state(surface_id)?
                     .minimized_root_surface(surface_id)
             })?;
         let (width, height) = self

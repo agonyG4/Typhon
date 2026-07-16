@@ -400,6 +400,7 @@ impl CompositorState {
         let default_dmabuf_device = default_dmabuf_main_device();
         Self {
             frame_clock_start: Some(Instant::now()),
+            next_window_id: 1,
             dmabuf_feedback: EglGlesDmabufFeedback::default(),
             dmabuf_main_device: default_dmabuf_device
                 .as_ref()
@@ -1138,10 +1139,16 @@ impl CompositorState {
         let toplevels = self
             .toplevel_surfaces
             .iter()
-            .filter_map(|(surface_id, toplevel)| {
-                let mode = toplevel.window.mode();
-                (mode != ToplevelMode::Floating && !toplevel.window.is_minimized())
-                    .then_some((*surface_id, mode))
+            .filter_map(|(surface_id, _toplevel)| {
+                let mode = self
+                    .toplevel_window_state(*surface_id)
+                    .map(WindowState::mode)
+                    .unwrap_or(ToplevelMode::Floating);
+                (mode != ToplevelMode::Floating
+                    && !self
+                        .toplevel_window_state(*surface_id)
+                        .is_some_and(WindowState::is_minimized))
+                .then_some((*surface_id, mode))
             })
             .collect::<Vec<_>>();
 

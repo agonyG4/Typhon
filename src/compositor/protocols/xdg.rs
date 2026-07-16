@@ -634,14 +634,18 @@ impl Dispatch<xdg_toplevel::XdgToplevel, XdgToplevelData> for CompositorState {
         match request {
             xdg_toplevel::Request::SetTitle { title } => {
                 let surface_id = compositor_surface_id(&data.surface);
-                if let Some(toplevel) = state.toplevel_surfaces.get_mut(&surface_id) {
-                    toplevel.title = Some(title);
+                if let Some(toplevel) = state.toplevel_surfaces.get(&surface_id)
+                    && let Some(window) = state.window_mut(toplevel.window_id)
+                {
+                    window.metadata.title = Some(title);
                 }
             }
             xdg_toplevel::Request::SetAppId { app_id } => {
                 let surface_id = compositor_surface_id(&data.surface);
-                if let Some(toplevel) = state.toplevel_surfaces.get_mut(&surface_id) {
-                    toplevel.app_id = Some(app_id.clone());
+                if let Some(toplevel) = state.toplevel_surfaces.get(&surface_id)
+                    && let Some(window) = state.window_mut(toplevel.window_id)
+                {
+                    window.metadata.app_id = Some(app_id.clone());
                 }
                 state.last_app_id = Some(app_id);
             }
@@ -730,17 +734,29 @@ impl Dispatch<xdg_toplevel::XdgToplevel, XdgToplevelData> for CompositorState {
             }
             xdg_toplevel::Request::SetMinSize { width, height } => {
                 let surface_id = compositor_surface_id(&data.surface);
+                if width < 0 || height < 0 {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        xdg_toplevel::Error::InvalidSize,
+                        "xdg_toplevel minimum size cannot be negative".to_string(),
+                    );
+                    return;
+                }
+                let Some(window_id) = state
+                    .toplevel_surfaces
+                    .get(&surface_id)
+                    .map(|toplevel| toplevel.window_id)
+                else {
+                    return;
+                };
+                let pending = state
+                    .toplevel_surfaces
+                    .get(&surface_id)
+                    .and_then(|toplevel| toplevel.pending_constraints)
+                    .or_else(|| state.window(window_id).map(|window| window.constraints))
+                    .unwrap_or_default();
                 if let Some(toplevel) = state.toplevel_surfaces.get_mut(&surface_id) {
-                    if width < 0 || height < 0 {
-                        state.post_protocol_error(
-                            client,
-                            resource,
-                            xdg_toplevel::Error::InvalidSize,
-                            "xdg_toplevel minimum size cannot be negative".to_string(),
-                        );
-                        return;
-                    }
-                    let pending = toplevel.pending_constraints.unwrap_or(toplevel.constraints);
                     toplevel.pending_constraints = Some(ToplevelSizeConstraints {
                         min_width: (width > 0).then_some(width as u32),
                         min_height: (height > 0).then_some(height as u32),
@@ -750,34 +766,46 @@ impl Dispatch<xdg_toplevel::XdgToplevel, XdgToplevelData> for CompositorState {
             }
             xdg_toplevel::Request::SetMaxSize { width, height } => {
                 let surface_id = compositor_surface_id(&data.surface);
+                if width < 0 || height < 0 {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        xdg_toplevel::Error::InvalidSize,
+                        "xdg_toplevel maximum size cannot be negative".to_string(),
+                    );
+                    return;
+                }
+                let Some(window_id) = state
+                    .toplevel_surfaces
+                    .get(&surface_id)
+                    .map(|toplevel| toplevel.window_id)
+                else {
+                    return;
+                };
+                let pending = state
+                    .toplevel_surfaces
+                    .get(&surface_id)
+                    .and_then(|toplevel| toplevel.pending_constraints)
+                    .or_else(|| state.window(window_id).map(|window| window.constraints))
+                    .unwrap_or_default();
+                let max_width = (width > 0).then_some(width as u32);
+                let max_height = (height > 0).then_some(height as u32);
+                if pending
+                    .min_width
+                    .is_some_and(|min| max_width.is_some_and(|max| max < min))
+                    || pending
+                        .min_height
+                        .is_some_and(|min| max_height.is_some_and(|max| max < min))
+                {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        xdg_toplevel::Error::InvalidSize,
+                        "xdg_toplevel maximum size is smaller than minimum size".to_string(),
+                    );
+                    return;
+                }
                 if let Some(toplevel) = state.toplevel_surfaces.get_mut(&surface_id) {
-                    if width < 0 || height < 0 {
-                        state.post_protocol_error(
-                            client,
-                            resource,
-                            xdg_toplevel::Error::InvalidSize,
-                            "xdg_toplevel maximum size cannot be negative".to_string(),
-                        );
-                        return;
-                    }
-                    let pending = toplevel.pending_constraints.unwrap_or(toplevel.constraints);
-                    let max_width = (width > 0).then_some(width as u32);
-                    let max_height = (height > 0).then_some(height as u32);
-                    if pending
-                        .min_width
-                        .is_some_and(|min| max_width.is_some_and(|max| max < min))
-                        || pending
-                            .min_height
-                            .is_some_and(|min| max_height.is_some_and(|max| max < min))
-                    {
-                        state.post_protocol_error(
-                            client,
-                            resource,
-                            xdg_toplevel::Error::InvalidSize,
-                            "xdg_toplevel maximum size is smaller than minimum size".to_string(),
-                        );
-                        return;
-                    }
                     toplevel.pending_constraints = Some(ToplevelSizeConstraints {
                         max_width,
                         max_height,

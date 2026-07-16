@@ -2,6 +2,7 @@ use super::*;
 
 mod client_lifecycle;
 mod data_device;
+mod desktop_windows;
 mod frames;
 mod fullscreen;
 mod helpers;
@@ -28,6 +29,8 @@ mod xdg_lifecycle;
 pub(in crate::compositor) use client_lifecycle::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use data_device::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use desktop_windows::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use frames::*;
 #[allow(unused_imports)]
@@ -71,6 +74,8 @@ pub(in crate::compositor) use windows::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use xdg_lifecycle::*;
 
+#[cfg(test)]
+mod desktop_window_tests;
 #[cfg(test)]
 mod frame_tests;
 #[cfg(test)]

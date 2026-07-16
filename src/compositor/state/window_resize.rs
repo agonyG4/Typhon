@@ -117,10 +117,7 @@ impl CompositorState {
         &self,
         surface_id: u32,
     ) -> ToplevelSizeConstraints {
-        self.toplevel_surfaces
-            .get(&surface_id)
-            .map(|toplevel| toplevel.constraints)
-            .unwrap_or_default()
+        self.toplevel_window_constraints(surface_id)
     }
 
     pub(in crate::compositor) fn preview_resize_root_window_to(

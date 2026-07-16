@@ -258,9 +258,8 @@ impl CompositorState {
         surface_id: u32,
     ) -> Option<u32> {
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
-        self.toplevel_surfaces
-            .get(&root_surface_id)
-            .is_some_and(|toplevel| toplevel.window.is_minimized())
+        self.toplevel_window_state(root_surface_id)
+            .is_some_and(WindowState::is_minimized)
             .then_some(root_surface_id)
     }
 
@@ -283,10 +282,13 @@ impl CompositorState {
         if self.renderable_surfaces.len() != renderable_count {
             self.invalidate_surface_origin_cache();
         }
-        let Some(toplevel) = self.toplevel_surfaces.get_mut(&root_surface_id) else {
+        if self.toplevel_window_state(root_surface_id).is_none() {
             return Ok(());
-        };
-        if let Some(existing) = toplevel.window.minimized_surface_mut(surface_id) {
+        }
+        if let Some(existing) = self
+            .toplevel_window_state_mut(root_surface_id)
+            .and_then(|window| window.minimized_surface_mut(surface_id))
+        {
             update_renderable_surface_buffer(
                 existing,
                 pending,
@@ -301,7 +303,9 @@ impl CompositorState {
         } else {
             let surface =
                 pending.to_renderable_surface(surface_id, placement, generation, damage)?;
-            toplevel.window.push_minimized_surface(surface);
+            if let Some(window) = self.toplevel_window_state_mut(root_surface_id) {
+                window.push_minimized_surface(surface);
+            }
         }
         Ok(())
     }

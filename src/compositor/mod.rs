@@ -66,6 +66,7 @@ use wayland_server::{
 mod clipboard_bridge;
 mod color;
 mod commit_debug;
+mod desktop_window;
 mod dmabuf;
 mod explicit_sync;
 mod frame_batch;
@@ -88,11 +89,17 @@ mod shm;
 mod state_data;
 mod subsurface;
 mod surface;
+mod window_backend;
 mod window_state;
 
 use commit_debug::*;
 use pacing::*;
 
+#[allow(unused_imports)]
+pub(crate) use desktop_window::{
+    DesktopWindow, DesktopWindowError, DesktopWindowKind, WindowBackend, WindowConstraints,
+    WindowId, WindowMetadata, WindowRelationships, XdgWindowHandle,
+};
 use dmabuf::{
     DmabufBufferData, DmabufFeedbackData, DmabufParamsData, PendingDmabufPlane,
     default_dmabuf_main_device, send_dmabuf_feedback, send_dmabuf_format_modifiers,
@@ -538,6 +545,9 @@ pub struct CompositorState {
     pointer_enter_serials: Vec<PointerEnterSerial>,
     surface_role_lifecycles: HashMap<u32, SurfaceRoleLifecycle>,
     surface_client_ids: HashMap<u32, ClientId>,
+    pub(in crate::compositor) desktop_windows: HashMap<WindowId, DesktopWindow>,
+    pub(in crate::compositor) window_by_root_surface: HashMap<u32, WindowId>,
+    pub(in crate::compositor) next_window_id: u64,
     cursor_surface_ids: HashSet<u32>,
     active_client_cursor: Option<ActiveClientCursor>,
     client_cursor_surfaces: HashMap<u32, RenderableSurface>,
