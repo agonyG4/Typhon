@@ -53,6 +53,7 @@ impl NativeRuntime {
                 .find(|(token, _)| *token == event.token)
                 .copied()
             else {
+                self.xwayland.record_stale_reactor_event();
                 continue;
             };
             if let Err(error) = self.xwayland.handle_reactor_event(

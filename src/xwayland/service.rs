@@ -352,6 +352,7 @@ impl XwaylandService {
         });
         self.state = XwaylandState::Starting(generation);
         self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
+        self.log_state_transition();
         Ok(())
     }
 
@@ -459,7 +460,8 @@ impl XwaylandService {
         Ok(())
     }
 
-    pub fn handle_shell_bind(&mut self, generation: XwaylandGeneration) -> io::Result<()> {
+    #[cfg(test)]
+    pub(crate) fn handle_shell_bind(&mut self, generation: XwaylandGeneration) -> io::Result<()> {
         self.mark_shell_ready(generation)
     }
 
@@ -484,9 +486,19 @@ impl XwaylandService {
             })
         {
             self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
+            self.metrics.unauthorized_bind_attempts =
+                self.metrics.unauthorized_bind_attempts.saturating_add(1);
+            eprintln!(
+                "oblivion-one xwayland: event=unauthorized_shell_bind generation={generation:?}"
+            );
             return Ok(());
         }
         self.mark_shell_ready(generation)
+    }
+
+    pub fn record_stale_reactor_event(&mut self) {
+        self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
+        eprintln!("oblivion-one xwayland: event=stale_reactor_event");
     }
 
     fn mark_shell_ready(&mut self, generation: XwaylandGeneration) -> io::Result<()> {
@@ -526,6 +538,13 @@ impl XwaylandService {
             .ok()
             .map(|now| now.saturating_sub(resources.started_ns));
         self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
+        eprintln!(
+            "oblivion-one xwayland: event=readiness_complete generation={:?} display={:?} startup_ns={:?}",
+            resources.generation,
+            self.display_number(),
+            self.metrics.startup_duration_ns
+        );
+        self.log_state_transition();
     }
 
     pub fn handle_process_exit(&mut self, exit: &ChildExit) -> io::Result<bool> {
@@ -555,6 +574,7 @@ impl XwaylandService {
         if self.crash_times_ns.len() >= 3 {
             self.detailed_state = ServiceState::Failed;
             self.state = XwaylandState::Failed;
+            self.log_state_transition();
             return Ok(true);
         }
         self.enter_backoff(now);
@@ -567,10 +587,12 @@ impl XwaylandService {
                 XwaylandAssociationEvent::Committed { .. } => {
                     self.metrics.association_commits =
                         self.metrics.association_commits.saturating_add(1);
+                    eprintln!("oblivion-one xwayland: event=association_commit detail={event:?}");
                 }
                 XwaylandAssociationEvent::Removed { .. } => {
                     self.metrics.association_removals =
                         self.metrics.association_removals.saturating_add(1);
+                    eprintln!("oblivion-one xwayland: event=association_remove detail={event:?}");
                 }
             }
         }
@@ -602,6 +624,7 @@ impl XwaylandService {
         self.lease.take();
         self.detailed_state = ServiceState::Disabled;
         self.state = XwaylandState::Disabled;
+        self.log_state_transition();
         Ok(())
     }
 
@@ -631,9 +654,19 @@ impl XwaylandService {
     ) -> io::Result<()> {
         self.metrics.cleanup_attempts = self.metrics.cleanup_attempts.saturating_add(1);
         match supervisor.kill_managed_now(process_id) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                eprintln!(
+                    "oblivion-one xwayland: event=cleanup_result process_id={} result=ok",
+                    process_id.get()
+                );
+                Ok(())
+            }
             Err(error) => {
                 self.metrics.cleanup_failures = self.metrics.cleanup_failures.saturating_add(1);
+                eprintln!(
+                    "oblivion-one xwayland: event=cleanup_result process_id={} result=error error={error}",
+                    process_id.get()
+                );
                 Err(error)
             }
         }
@@ -650,6 +683,7 @@ impl XwaylandService {
         }
         self.backoff_level = 0;
         self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
+        self.log_state_transition();
     }
 
     fn enter_backoff(&mut self, now_ns: u64) {
@@ -661,6 +695,11 @@ impl XwaylandService {
         self.detailed_state = ServiceState::Backoff { deadline_ns };
         self.state = XwaylandState::Backoff;
         self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
+        eprintln!(
+            "oblivion-one xwayland: event=backoff level={} deadline_ns={deadline_ns}",
+            self.backoff_level
+        );
+        self.log_state_transition();
     }
 
     fn fail_generation(
@@ -677,8 +716,21 @@ impl XwaylandService {
         }
         self.private_client = None;
         self.metrics.readiness_failures = self.metrics.readiness_failures.saturating_add(1);
+        eprintln!(
+            "oblivion-one xwayland: event=readiness_failure generation={:?} reason={error}",
+            self.generation()
+        );
         self.enter_backoff(now_ns()?);
         Err(error)
+    }
+
+    fn log_state_transition(&self) {
+        eprintln!(
+            "oblivion-one xwayland: event=state_transition state={:?} generation={:?} display={:?}",
+            self.state_kind(),
+            self.generation(),
+            self.display_number()
+        );
     }
 
     pub(crate) fn allocate_generation(&mut self) -> XwaylandGeneration {
