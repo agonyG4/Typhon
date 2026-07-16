@@ -467,16 +467,10 @@ impl CompositorState {
         lifecycle
             .live_instance
             .map(LiveRoleInstance::surface_role)
-            .or_else(|| {
-                matches!(
-                    lifecycle.permanent,
-                    Some(PermanentSurfaceRole::DragIcon | PermanentSurfaceRole::Xwayland)
-                )
-                .then_some(match lifecycle.permanent {
-                    Some(PermanentSurfaceRole::DragIcon) => SurfaceRole::DragIcon,
-                    Some(PermanentSurfaceRole::Xwayland) => SurfaceRole::Xwayland,
-                    _ => unreachable!(),
-                })
+            .or_else(|| match lifecycle.permanent {
+                Some(PermanentSurfaceRole::DragIcon) => Some(SurfaceRole::DragIcon),
+                Some(PermanentSurfaceRole::Xwayland) => Some(SurfaceRole::Xwayland),
+                _ => None,
             })
             .unwrap_or(SurfaceRole::Unassigned)
     }
