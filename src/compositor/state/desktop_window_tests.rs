@@ -322,6 +322,77 @@ fn x11_fullscreen_uses_output_geometry_and_maximize_publishes_both_axes() {
 }
 
 #[test]
+fn pre_map_fullscreen_snapshot_enters_fullscreen_on_admission() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let mut snapshot = x11_snapshot(generation, 113, 64);
+    snapshot.state.fullscreen = true;
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(id, snapshot.clone()))
+        .expect("insert X11 window");
+
+    assert!(state.apply_initial_x11_state(snapshot.handle, snapshot.state, snapshot.geometry));
+    assert_eq!(
+        state.window(id).expect("window").state.mode(),
+        ToplevelMode::Fullscreen
+    );
+    assert_eq!(
+        state.surface_placement(snapshot.surface_id),
+        state.fullscreen_window_geometry().placement
+    );
+    assert!(state.take_backend_commands().iter().any(|command| matches!(
+        command,
+        crate::compositor::window_backend::WindowBackendCommand::Configure {
+            window,
+            mode: ToplevelMode::Fullscreen,
+            resizing: false,
+            ..
+        } if *window == id
+    )));
+}
+
+#[test]
+fn pre_map_maximized_snapshot_uses_usable_output_geometry() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let mut snapshot = x11_snapshot(generation, 114, 65);
+    snapshot.state.maximized = true;
+    snapshot.state.fullscreen = true;
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(id, snapshot.clone()))
+        .expect("insert X11 window");
+
+    assert!(state.apply_initial_x11_state(snapshot.handle, snapshot.state, snapshot.geometry));
+    assert_eq!(
+        state.window(id).expect("window").state.mode(),
+        ToplevelMode::Fullscreen
+    );
+
+    let mut maximized_snapshot = snapshot;
+    maximized_snapshot.handle = X11WindowHandle::new(generation, 115);
+    maximized_snapshot.surface_id = 66;
+    maximized_snapshot.state.fullscreen = false;
+    let maximized_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(
+            maximized_id,
+            maximized_snapshot.clone(),
+        ))
+        .expect("insert maximized X11 window");
+    assert!(state.apply_initial_x11_state(
+        maximized_snapshot.handle,
+        maximized_snapshot.state,
+        maximized_snapshot.geometry
+    ));
+    assert_eq!(
+        state.surface_placement(maximized_snapshot.surface_id),
+        state.maximized_window_geometry().placement
+    );
+}
+
+#[test]
 fn x11_resize_queues_a_typed_backend_command() {
     let mut state = CompositorState::new(None);
     let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());

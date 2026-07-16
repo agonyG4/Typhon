@@ -124,6 +124,7 @@ impl CompositorState {
             .map_err(|_| X11WindowAdmissionError::WindowIdExhausted)?;
         let handle = snapshot.handle;
         let geometry = snapshot.geometry;
+        let requested_state = snapshot.state;
         let transient_for = snapshot.transient_for;
         self.insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
             .map_err(|_| X11WindowAdmissionError::DuplicateRootSurface)?;
@@ -134,7 +135,73 @@ impl CompositorState {
         {
             window.relationships.transient_for = Some(parent_id);
         }
+        self.apply_initial_x11_state(handle, requested_state, geometry);
         Ok(window_id)
+    }
+
+    pub(in crate::compositor) fn apply_initial_x11_state(
+        &mut self,
+        handle: X11WindowHandle,
+        state: crate::xwayland::xwm::X11PublishedState,
+        geometry: crate::xwayland::xwm::X11Geometry,
+    ) -> bool {
+        let Some(window_id) = self.window_id_for_x11_handle(handle) else {
+            return false;
+        };
+        let root_surface_id = self.window(window_id).map(|window| window.root_surface_id);
+        let Some(root_surface_id) = root_surface_id else {
+            return false;
+        };
+        let restore_geometry = WindowGeometry::new(
+            SurfacePlacement::absolute_root_at(geometry.x, geometry.y),
+            geometry.width.max(1),
+            geometry.height.max(1),
+        );
+        let mode = if state.fullscreen {
+            ToplevelMode::Fullscreen
+        } else if state.maximized {
+            ToplevelMode::Maximized
+        } else {
+            ToplevelMode::Floating
+        };
+        if let Some(window) = self.window_mut(window_id) {
+            window.state.set_mode(mode);
+            if mode != ToplevelMode::Floating {
+                window.state.capture_restore_geometry(restore_geometry);
+            }
+        }
+        let target_geometry = self.window_geometry_for_mode(mode);
+        self.set_surface_placement_with_cause(
+            root_surface_id,
+            if mode == ToplevelMode::Floating {
+                restore_geometry.placement
+            } else {
+                target_geometry.placement
+            },
+            RenderGenerationCause::WindowMode,
+        );
+        if state.hidden {
+            if !self.minimize_desktop_window(window_id)
+                && let Some(window) = self.window_mut(window_id)
+            {
+                window.state.mark_minimized_without_surfaces();
+            }
+        } else if self
+            .window(window_id)
+            .is_some_and(|window| window.state.is_minimized())
+        {
+            self.restore_minimized_desktop_window(window_id);
+        }
+        if mode == ToplevelMode::Fullscreen && !state.hidden {
+            self.set_fullscreen_presentation_owner(root_surface_id);
+        } else {
+            self.clear_fullscreen_presentation_owner(root_surface_id);
+        }
+        if mode != ToplevelMode::Floating {
+            self.queue_backend_configure(window_id, target_geometry, mode, false);
+        }
+        self.queue_backend_state(window_id);
+        true
     }
 
     pub(in crate::compositor) fn window_id_for_x11_handle(

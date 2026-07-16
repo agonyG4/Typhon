@@ -7,6 +7,7 @@ pub(crate) struct WindowState {
     mode: ToplevelMode,
     restore_geometry: Option<WindowGeometry>,
     minimized_surfaces: Vec<RenderableSurface>,
+    minimized: bool,
 }
 
 impl WindowState {
@@ -23,12 +24,19 @@ impl WindowState {
     }
 
     pub(super) fn minimize(&mut self, surfaces: Vec<RenderableSurface>) {
+        self.minimized = true;
         self.minimized_surfaces = surfaces;
     }
 
     pub(super) fn restore_minimized(&mut self) -> Option<Vec<RenderableSurface>> {
-        self.is_minimized()
-            .then(|| std::mem::take(&mut self.minimized_surfaces))
+        self.is_minimized().then(|| {
+            self.minimized = false;
+            std::mem::take(&mut self.minimized_surfaces)
+        })
+    }
+
+    pub(super) fn mark_minimized_without_surfaces(&mut self) {
+        self.minimized = true;
     }
 
     pub(super) fn minimized_root_surface(&self, surface_id: u32) -> Option<&RenderableSurface> {
@@ -67,6 +75,7 @@ impl Default for WindowState {
             mode: ToplevelMode::Floating,
             restore_geometry: None,
             minimized_surfaces: Vec::new(),
+            minimized: false,
         }
     }
 }
