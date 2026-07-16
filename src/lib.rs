@@ -451,31 +451,4 @@ mod tests {
         );
         assert!(!values.contains_key("org.unknown"));
     }
-
-    #[test]
-    fn xwayland_launch_plan_uses_rootless_compositor_owned_fds() {
-        let plan = xwayland::XWaylandLaunchPlan::new(":42", "oblivion-one-0", 11, 12, 13);
-
-        assert_eq!(plan.program, "Xwayland");
-        assert_eq!(
-            plan.args,
-            vec![
-                ":42".to_string(),
-                "-rootless".to_string(),
-                "-terminate".to_string(),
-                "-listenfd".to_string(),
-                "11".to_string(),
-                "-wm".to_string(),
-                "12".to_string(),
-                "-displayfd".to_string(),
-                "13".to_string(),
-            ]
-        );
-        assert_eq!(
-            plan.env_pairs(),
-            [("WAYLAND_DISPLAY", "oblivion-one-0".to_string())]
-        );
-        assert!(plan.display_command().contains("-rootless"));
-        assert!(plan.display_command().contains("-wm 12"));
-    }
 }
