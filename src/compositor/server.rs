@@ -44,12 +44,13 @@ use super::protocols::versions;
 use super::{
     AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, BufferReleaseMetrics,
     ClientCursorRenderState, CompositorFrameBatchId, CompositorState, CoreComplianceMetrics,
-    DesktopWindowKind, DirectScanoutSceneCandidate, DirectScanoutSceneRejection, ExplicitSyncPoint,
+    DirectScanoutSceneCandidate, DirectScanoutSceneRejection, ExplicitSyncPoint,
     FrameBatchDiscardReason, FramePresentation, FullscreenRenderPlanMetrics,
     InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PointerAxisFrame,
     PresentationClock, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
     ResizeFlowMetrics, SelectionProtocolCapabilities, SubsurfaceTransactionMetrics,
-    SurfaceDamagePresentation, WindowInteractionDebugSnapshot, WindowInteractionEndReason, color,
+    SurfaceDamagePresentation, ToplevelMode, WindowInteractionDebugSnapshot,
+    WindowInteractionEndReason, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 
@@ -438,10 +439,46 @@ impl OwnCompositorServer {
                         })
                     }
                 }
-                crate::compositor::window_backend::WindowBackendCommand::Close { .. }
-                | crate::compositor::window_backend::WindowBackendCommand::SetActivated {
-                    ..
-                } => None,
+                crate::compositor::window_backend::WindowBackendCommand::Close { window } => {
+                    let handle = match self.state.window(window)?.backend {
+                        super::WindowBackend::X11(handle) => handle,
+                        super::WindowBackend::Xdg(_) => return None,
+                    };
+                    Some(XwmCommand::Close(handle))
+                }
+                crate::compositor::window_backend::WindowBackendCommand::SetActivated {
+                    window,
+                    activated,
+                } => {
+                    let handle = match self.state.window(window)?.backend {
+                        super::WindowBackend::X11(handle) => handle,
+                        super::WindowBackend::Xdg(_) => return None,
+                    };
+                    Some(XwmCommand::Focus {
+                        window: activated.then_some(handle),
+                        timestamp: 0,
+                    })
+                }
+                crate::compositor::window_backend::WindowBackendCommand::PublishState {
+                    window,
+                    mode,
+                    minimized,
+                    activated,
+                } => {
+                    let handle = match self.state.window(window)?.backend {
+                        super::WindowBackend::X11(handle) => handle,
+                        super::WindowBackend::Xdg(_) => return None,
+                    };
+                    Some(XwmCommand::SetState {
+                        window: handle,
+                        state: crate::xwayland::xwm::X11PublishedState {
+                            fullscreen: mode == ToplevelMode::Fullscreen,
+                            maximized: mode == ToplevelMode::Maximized,
+                            hidden: minimized,
+                            activated,
+                        },
+                    })
+                }
             })
             .collect()
     }
@@ -464,15 +501,7 @@ impl OwnCompositorServer {
                 }
             }
             XwmEvent::WindowWithdrawn(handle) => {
-                let Some(window_id) = self.state.window_id_for_x11_handle(handle) else {
-                    return Vec::new();
-                };
-                if self
-                    .state
-                    .window(window_id)
-                    .is_some_and(|window| window.kind == DesktopWindowKind::OverrideRedirect)
-                    && self.state.remove_desktop_window(window_id).is_some()
-                {
+                if self.remove_x11_desktop_window(handle) {
                     vec![self.sync_xwayland_client_lists()]
                 } else {
                     Vec::new()
@@ -518,14 +547,7 @@ impl OwnCompositorServer {
                         .window_id_for_x11_handle(window)
                         .is_some_and(|window_id| self.state.focus_desktop_window(window_id))
                 {
-                    vec![
-                        XwmCommand::Focus {
-                            window: Some(window),
-                            timestamp: 0,
-                        },
-                        XwmCommand::Raise(window),
-                        self.sync_xwayland_client_lists(),
-                    ]
+                    vec![XwmCommand::Raise(window), self.sync_xwayland_client_lists()]
                 } else {
                     Vec::new()
                 }
@@ -545,7 +567,16 @@ impl OwnCompositorServer {
                     allowed: true,
                 }]
             }
-            XwmEvent::CloseRequestedByClient(_) => Vec::new(),
+            XwmEvent::CloseRequestedByClient(window) => {
+                if let Some(window_id) = self.state.window_id_for_x11_handle(window) {
+                    self.state.backend_commands.push(
+                        crate::compositor::window_backend::WindowBackendCommand::Close {
+                            window: window_id,
+                        },
+                    );
+                }
+                Vec::new()
+            }
         }
     }
 
@@ -553,7 +584,15 @@ impl OwnCompositorServer {
         let Some(window_id) = self.state.window_id_for_x11_handle(handle) else {
             return false;
         };
-        self.state.remove_desktop_window(window_id).is_some()
+        let was_focused = self.state.focused_window_id == Some(window_id);
+        let removed = self.state.remove_desktop_window(window_id).is_some();
+        if removed && was_focused {
+            self.state.focused_window_id = None;
+            self.state.focused_surface = None;
+            self.state.clear_keyboard_focus();
+            let _ = self.state.focus_topmost_renderable_toplevel();
+        }
+        removed
     }
 
     fn sync_xwayland_client_lists(&self) -> XwmCommand {
@@ -940,6 +979,12 @@ impl OwnCompositorServer {
         let minimized = self.state.minimize_focused_window();
         let _ = self.display.flush_clients();
         minimized
+    }
+
+    pub fn close_focused_window(&mut self) -> bool {
+        let closed = self.state.close_focused_window();
+        let _ = self.display.flush_clients();
+        closed
     }
 
     pub fn restore_next_minimized_window(&mut self) -> bool {

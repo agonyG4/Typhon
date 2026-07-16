@@ -572,8 +572,7 @@ impl CompositorState {
             });
         }
         self.focused_surface = Some(surface.clone());
-        self.focused_window_id =
-            self.window_id_for_surface(self.root_surface_id_for_surface(new_surface_id));
+        self.focused_window_id = self.update_desktop_focus_window(new_surface_id, changed);
         self.ensure_keyboard_focus(&surface);
         self.apply_pending_pointer_constraint_state_for_surface(new_surface_id);
         if !self

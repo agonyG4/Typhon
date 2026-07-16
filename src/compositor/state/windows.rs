@@ -926,31 +926,48 @@ impl CompositorState {
         self.minimize_root_window(surface_id)
     }
 
+    pub(in crate::compositor) fn close_focused_window(&mut self) -> bool {
+        let Some(window_id) = self.focused_window_id else {
+            return false;
+        };
+        let Some(window) = self.window(window_id).cloned() else {
+            return false;
+        };
+        match window.backend {
+            WindowBackend::X11(_) => {
+                self.backend_commands.push(
+                    crate::compositor::window_backend::WindowBackendCommand::Close {
+                        window: window_id,
+                    },
+                );
+                true
+            }
+            WindowBackend::Xdg(_) => self
+                .toplevel_surfaces
+                .get(&window.root_surface_id)
+                .is_some_and(|role| role.toplevel.send_event(xdg_toplevel::Event::Close).is_ok()),
+        }
+    }
+
     pub(in crate::compositor) fn restore_next_minimized_window(&mut self) -> bool {
-        let Some(surface_id) = self.toplevel_surfaces.iter().find_map(|(surface_id, _)| {
-            self.toplevel_window_state(*surface_id)
-                .is_some_and(WindowState::is_minimized)
-                .then_some(*surface_id)
+        let Some(window_id) = self.window_stacking.iter().copied().find(|window_id| {
+            self.window(*window_id)
+                .is_some_and(|window| window.state.is_minimized())
         }) else {
             return false;
         };
-
-        self.restore_minimized_root_window(surface_id)
+        self.restore_minimized_desktop_window(window_id)
     }
 
     pub(in crate::compositor) fn activate_root_window(&mut self, surface_id: u32) -> bool {
-        if !self.toplevel_surfaces.contains_key(&surface_id) {
+        let Some(window_id) = self.window_id_for_surface(surface_id) else {
             return false;
-        }
+        };
         if self
-            .toplevel_surfaces
-            .get(&surface_id)
-            .is_some_and(|toplevel| {
-                self.window(toplevel.window_id)
-                    .is_some_and(|window| window.state.is_minimized())
-            })
+            .window(window_id)
+            .is_some_and(|window| window.state.is_minimized())
         {
-            self.restore_minimized_root_window(surface_id);
+            self.restore_minimized_desktop_window(window_id);
         }
         let focused = self
             .surface_resource_by_id(surface_id)
@@ -978,11 +995,7 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn minimize_root_window(&mut self, surface_id: u32) -> bool {
-        let Some(window_id) = self
-            .toplevel_surfaces
-            .get(&surface_id)
-            .map(|toplevel| toplevel.window_id)
-        else {
+        let Some(window_id) = self.window_id_for_surface(surface_id) else {
             return false;
         };
         self.minimize_desktop_window(window_id)
@@ -1036,13 +1049,14 @@ impl CompositorState {
                 self.clear_pointer_focus();
             }
         }
+        self.queue_backend_state(window_id);
         self.focus_topmost_renderable_toplevel();
         self.advance_render_generation(RenderGenerationCause::WindowMinimize);
         true
     }
 
     pub(in crate::compositor) fn restore_minimized_root_window(&mut self, surface_id: u32) -> bool {
-        let Some(window_id) = self.toplevel_window_id(surface_id) else {
+        let Some(window_id) = self.window_id_for_surface(surface_id) else {
             return false;
         };
         self.restore_minimized_desktop_window(window_id)
@@ -1065,6 +1079,7 @@ impl CompositorState {
         {
             self.focus_surface(surface);
         }
+        self.queue_backend_state(window_id);
         self.advance_render_generation(RenderGenerationCause::WindowRestore);
         true
     }
@@ -1074,14 +1089,23 @@ impl CompositorState {
         surface_id: u32,
         mode: ToplevelMode,
     ) -> bool {
-        let Some(current_mode) = self
-            .toplevel_surfaces
-            .get(&surface_id)
-            .and_then(|_| self.toplevel_window_state(surface_id))
-            .map(WindowState::mode)
-        else {
+        let Some(window_id) = self.window_id_for_surface(surface_id) else {
             return false;
         };
+        let Some(current_mode) = self.window(window_id).map(|window| window.state.mode()) else {
+            return false;
+        };
+
+        if matches!(
+            self.window(window_id).map(|window| window.backend),
+            Some(WindowBackend::X11(_))
+        ) {
+            return if current_mode == mode {
+                self.restore_floating_root_window(surface_id)
+            } else {
+                self.set_root_window_mode(surface_id, mode)
+            };
+        }
 
         if current_mode == mode {
             self.restore_floating_root_window(surface_id)
@@ -1095,6 +1119,45 @@ impl CompositorState {
         surface_id: u32,
         mode: ToplevelMode,
     ) -> bool {
+        if let Some(window_id) = self.window_id_for_surface(surface_id)
+            && matches!(
+                self.window(window_id).map(|window| window.backend),
+                Some(WindowBackend::X11(_))
+            )
+        {
+            let restore_geometry = self
+                .current_visual_root_window_geometry(surface_id)
+                .or_else(|| self.current_root_window_geometry(surface_id))
+                .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(surface_id), 0, 0));
+            self.clear_resize_state_for_surfaces_with_reason(
+                &[surface_id],
+                WindowInteractionEndReason::ModeTransition,
+            );
+            if self
+                .window(window_id)
+                .is_some_and(|window| window.state.is_minimized())
+            {
+                self.restore_minimized_desktop_window(window_id);
+            }
+            if let Some(window) = self.window_mut(window_id) {
+                window.state.capture_restore_geometry(restore_geometry);
+                window.state.set_mode(mode);
+            }
+            let geometry = self.window_geometry_for_mode(mode);
+            self.set_surface_placement_with_cause(
+                surface_id,
+                geometry.placement,
+                RenderGenerationCause::WindowMode,
+            );
+            self.queue_backend_configure(window_id, geometry, mode, false);
+            self.queue_backend_state(window_id);
+            if mode == ToplevelMode::Fullscreen {
+                self.set_fullscreen_presentation_owner(surface_id);
+            } else {
+                self.clear_fullscreen_presentation_owner(surface_id);
+            }
+            return true;
+        }
         if !self.toplevel_surfaces.contains_key(&surface_id) {
             return false;
         }
@@ -1141,6 +1204,35 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn restore_floating_root_window(&mut self, surface_id: u32) -> bool {
+        if let Some(window_id) = self.window_id_for_surface(surface_id)
+            && matches!(
+                self.window(window_id).map(|window| window.backend),
+                Some(WindowBackend::X11(_))
+            )
+        {
+            let restore_geometry = self
+                .window_mut(window_id)
+                .and_then(|window| window.state.take_restore_geometry())
+                .or_else(|| self.current_root_window_geometry(surface_id))
+                .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(surface_id), 0, 0));
+            if let Some(window) = self.window_mut(window_id) {
+                window.state.set_mode(ToplevelMode::Floating);
+            }
+            self.clear_fullscreen_presentation_owner(surface_id);
+            self.set_surface_placement_with_cause(
+                surface_id,
+                restore_geometry.placement,
+                RenderGenerationCause::WindowMode,
+            );
+            self.queue_backend_configure(
+                window_id,
+                restore_geometry,
+                ToplevelMode::Floating,
+                false,
+            );
+            self.queue_backend_state(window_id);
+            return true;
+        }
         self.clear_resize_state_for_surfaces_with_reason(
             &[surface_id],
             WindowInteractionEndReason::ModeTransition,

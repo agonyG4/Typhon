@@ -17,6 +17,12 @@ pub(crate) enum WindowBackendCommand {
         window: WindowId,
         activated: bool,
     },
+    PublishState {
+        window: WindowId,
+        mode: ToplevelMode,
+        minimized: bool,
+        activated: bool,
+    },
 }
 
 pub(crate) fn backend_for_window(window: WindowBackend) -> WindowBackend {

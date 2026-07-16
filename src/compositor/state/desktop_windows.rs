@@ -350,6 +350,59 @@ impl CompositorState {
         );
     }
 
+    pub(in crate::compositor) fn queue_backend_activation(
+        &mut self,
+        window_id: WindowId,
+        activated: bool,
+    ) {
+        if self
+            .window(window_id)
+            .is_some_and(|window| matches!(window.backend, WindowBackend::X11(_)))
+        {
+            self.backend_commands.push(
+                crate::compositor::window_backend::WindowBackendCommand::SetActivated {
+                    window: window_id,
+                    activated,
+                },
+            );
+        }
+    }
+
+    pub(in crate::compositor) fn update_desktop_focus_window(
+        &mut self,
+        new_surface_id: u32,
+        changed: bool,
+    ) -> Option<WindowId> {
+        let old_window_id = self.focused_window_id;
+        let new_window_id =
+            self.window_id_for_surface(self.root_surface_id_for_surface(new_surface_id));
+        if changed {
+            if let Some(window_id) = old_window_id {
+                self.queue_backend_activation(window_id, false);
+            }
+            if let Some(window_id) = new_window_id {
+                self.queue_backend_activation(window_id, true);
+            }
+        }
+        new_window_id
+    }
+
+    pub(in crate::compositor) fn queue_backend_state(&mut self, window_id: WindowId) {
+        let Some(window) = self.window(window_id) else {
+            return;
+        };
+        if matches!(window.backend, WindowBackend::X11(_)) {
+            self.backend_commands.push(
+                crate::compositor::window_backend::WindowBackendCommand::PublishState {
+                    window: window_id,
+                    mode: window.state.mode(),
+                    minimized: window.state.is_minimized(),
+                    activated: self.focused_window_id == Some(window_id),
+                },
+            );
+        }
+    }
+
     pub(in crate::compositor) fn take_backend_commands(
         &mut self,
     ) -> Vec<crate::compositor::window_backend::WindowBackendCommand> {

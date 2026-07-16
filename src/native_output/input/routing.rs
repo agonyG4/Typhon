@@ -1321,7 +1321,7 @@ pub(crate) fn apply_native_window_action(
             server.end_window_interaction();
             was_active
         }
-        NativeWindowAction::CloseActiveWindow => false,
+        NativeWindowAction::CloseActiveWindow => server.close_focused_window(),
         NativeWindowAction::ToggleFullscreen => server.toggle_fullscreen_focused_window(),
     };
     resize_perf.observe_action(action, changed, perf);

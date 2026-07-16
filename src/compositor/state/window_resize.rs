@@ -377,7 +377,7 @@ impl CompositorState {
                 self.window(window_id)
                     .map(|window| window.state.mode())
                     .unwrap_or(ToplevelMode::Floating),
-                true,
+                false,
             );
             return true;
         }

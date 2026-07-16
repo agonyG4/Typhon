@@ -262,13 +262,14 @@ fn begin_resize_sync(
         })
         .and_then(|_| send_sync_request(xwm, window, counter_value))
     {
+        let _ = set_allow_commits(xwm, window, true);
         xwm.clear_resize_sync(window);
         return Err(error);
     }
     Ok(())
 }
 
-fn set_allow_commits(
+pub(crate) fn set_allow_commits(
     xwm: &Xwm,
     window: super::X11WindowHandle,
     allowed: bool,
