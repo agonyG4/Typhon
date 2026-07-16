@@ -1181,7 +1181,6 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
     server: &mut OwnCompositorServer,
     backend: &mut NativePointerConstraintBackend,
     input_state: &mut NativeInputState,
-    hardware_cursor: &mut Option<NativeHardwareCursor>,
     cursor_mode: NativeCursorRenderMode,
 ) -> NativeResult<bool> {
     let mut redraw_requested = false;
@@ -1243,20 +1242,10 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
                 input_state.clear_pointer_constraint();
                 let effect = input_state.restore_cursor_position(restore_position);
                 redraw_requested |= effect.requires_frame_repaint(cursor_mode);
-                if let Some((cursor_x, cursor_y)) = effect.cursor_position
-                    && let Some(cursor) = hardware_cursor.as_mut()
-                {
-                    cursor.move_to(cursor_x, cursor_y)?;
-                }
             }
             if let Some(cursor_position) = action.cursor_position {
                 let effect = input_state.restore_cursor_position(cursor_position);
                 redraw_requested |= effect.requires_frame_repaint(cursor_mode);
-                if let Some((cursor_x, cursor_y)) = effect.cursor_position
-                    && let Some(cursor) = hardware_cursor.as_mut()
-                {
-                    cursor.move_to(cursor_x, cursor_y)?;
-                }
             }
             if let Some(id) = action.deactivated {
                 native_pointer_debug_log(format!(
@@ -1270,16 +1259,6 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
                 let changed = input_state.set_cursor_visible(visible);
                 if cursor_mode == NativeCursorRenderMode::Software && changed {
                     redraw_requested = true;
-                }
-                if let Some(cursor) = hardware_cursor.as_mut() {
-                    if visible {
-                        let (cursor_x, cursor_y) = input_state.cursor_position();
-                        cursor
-                            .enable()
-                            .and_then(|()| cursor.move_to(cursor_x, cursor_y))?;
-                    } else {
-                        cursor.disable()?;
-                    }
                 }
             }
         }

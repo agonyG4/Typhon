@@ -1,4 +1,5 @@
 use super::*;
+use crate::compositor::fullscreen::direct_scanout_viewport_compatibility;
 use crate::render_backend::buffer::SurfaceBufferSource;
 use std::borrow::Cow;
 
@@ -110,12 +111,22 @@ impl CompositorState {
             .renderable_surfaces
             .iter()
             .find(|surface| surface.surface_id == owner.owner_root_surface_id);
-        let transform_or_scale_compatible = root.is_some_and(|surface| {
-            surface.buffer_scale == 1
-                && surface.buffer_transform == wl_output::Transform::Normal
-                && surface.viewport_source.is_none()
-                && surface.viewport_destination.is_none()
+        let viewport_compatibility = root.and_then(|surface| {
+            surface.dmabuf_handle().map(|buffer| {
+                direct_scanout_viewport_compatibility(
+                    buffer.size(),
+                    BufferSize::new(self.output_size.width, self.output_size.height)
+                        .expect("configured output size is nonzero"),
+                    surface.buffer_scale,
+                    surface.buffer_transform,
+                    surface.viewport_source,
+                    surface.viewport_destination,
+                )
+            })
         });
+        let transform_or_scale_compatible = viewport_compatibility
+            .as_ref()
+            .is_some_and(|compatibility| compatibility.is_ok());
         let fully_opaque = root
             .and_then(RenderableSurface::dmabuf_handle)
             .is_some_and(|buffer| {
@@ -178,6 +189,9 @@ impl CompositorState {
         ) {
             return Err(rejection);
         }
+        if self.client_cursor_render_state().is_some() {
+            return Err(DirectScanoutSceneRejection::ClientCursorUnsupported);
+        }
 
         let geometry = self
             .current_visual_root_window_geometry(owner.owner_root_surface_id)
@@ -217,15 +231,14 @@ impl CompositorState {
         if buffer.size() != output_size {
             return Err(DirectScanoutSceneRejection::BufferSizeMismatch);
         }
-        if root.buffer_scale != 1 {
-            return Err(DirectScanoutSceneRejection::BufferScaleUnsupported);
-        }
-        if root.buffer_transform != wl_output::Transform::Normal {
-            return Err(DirectScanoutSceneRejection::BufferTransformUnsupported);
-        }
-        if root.viewport_source.is_some() || root.viewport_destination.is_some() {
-            return Err(DirectScanoutSceneRejection::ViewportUnsupported);
-        }
+        let viewport_compatibility = direct_scanout_viewport_compatibility(
+            buffer.size(),
+            output_size,
+            root.buffer_scale,
+            root.buffer_transform,
+            root.viewport_source,
+            root.viewport_destination,
+        )?;
         if root.visual_clip.is_some() {
             return Err(DirectScanoutSceneRejection::VisualClipPresent);
         }
@@ -257,6 +270,7 @@ impl CompositorState {
             buffer,
             buffer_size: output_size,
             output_size,
+            viewport_identity_metadata_present: viewport_compatibility.metadata_present,
         })
     }
 

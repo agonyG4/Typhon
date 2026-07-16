@@ -88,6 +88,10 @@ impl NativeInputState {
         true
     }
 
+    pub(crate) const fn cursor_visible(&self) -> bool {
+        self.cursor_visible
+    }
+
     pub(crate) fn restore_cursor_position(
         &mut self,
         position: CompositorOutputPosition,

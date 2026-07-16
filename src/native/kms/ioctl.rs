@@ -6,7 +6,7 @@ use std::{
 
 use super::{
     AtomicCommitFlags, AtomicKmsError, AtomicKmsErrorKind, AtomicSubmission, BlobId, DrmProperty,
-    ModeBlobIo, PropertyId, SerializedAtomicRequest,
+    DrmPropertyEnum, ModeBlobIo, PropertyId, SerializedAtomicRequest,
 };
 
 pub fn enable_atomic_client_capability(fd: BorrowedFd<'_>) -> Result<(), AtomicKmsError> {
@@ -19,6 +19,22 @@ pub fn enable_atomic_client_capability(fd: BorrowedFd<'_>) -> Result<(), AtomicK
                 "enable atomic client capability",
             )
         })
+}
+
+pub fn enable_universal_planes_client_capability(fd: BorrowedFd<'_>) -> Result<(), AtomicKmsError> {
+    drm_ffi::set_capability(
+        fd,
+        u64::from(drm_sys::DRM_CLIENT_CAP_UNIVERSAL_PLANES),
+        true,
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        classify_io_error(
+            error,
+            AtomicKmsErrorKind::Unsupported,
+            "enable universal planes client capability",
+        )
+    })
 }
 
 pub fn disable_atomic_client_capability(fd: BorrowedFd<'_>) {
@@ -59,7 +75,7 @@ pub fn object_properties(
     ids.into_iter()
         .zip(values)
         .map(|(id, value)| {
-            let property = query_property_for_object_with(
+            let (property, property_values, property_enums) = query_property_for_object_with(
                 object_id,
                 object_type,
                 id,
@@ -80,10 +96,18 @@ pub fn object_properties(
                     ),
                 )
             })?;
-            Ok(DrmProperty::new(
+            Ok(DrmProperty::with_metadata(
                 id,
                 drm_property_name(&property.name),
                 value,
+                property_values,
+                property_enums
+                    .iter()
+                    .map(|entry| DrmPropertyEnum {
+                        value: entry.value,
+                        name: drm_property_name(&entry.name),
+                    })
+                    .collect(),
             ))
         })
         .collect()
@@ -98,20 +122,29 @@ fn query_property_for_object_with(
         &mut Vec<u64>,
         &mut Vec<drm_sys::drm_mode_property_enum>,
     ) -> io::Result<drm_sys::drm_mode_get_property>,
-) -> Result<drm_sys::drm_mode_get_property, AtomicKmsError> {
+) -> Result<
+    (
+        drm_sys::drm_mode_get_property,
+        Vec<u64>,
+        Vec<drm_sys::drm_mode_property_enum>,
+    ),
+    AtomicKmsError,
+> {
     let mut property_values = Vec::new();
     let mut property_enums = Vec::new();
-    query(property_id, &mut property_values, &mut property_enums).map_err(|error| {
-        let mut error = classify_io_error(
-            error,
-            AtomicKmsErrorKind::MissingProperty,
-            "query property metadata",
-        );
-        error.detail.push_str(&format!(
-            "; object_id={object_id} object_type={object_type} property_id={property_id}"
-        ));
-        error
-    })
+    let property =
+        query(property_id, &mut property_values, &mut property_enums).map_err(|error| {
+            let mut error = classify_io_error(
+                error,
+                AtomicKmsErrorKind::MissingProperty,
+                "query property metadata",
+            );
+            error.detail.push_str(&format!(
+                "; object_id={object_id} object_type={object_type} property_id={property_id}"
+            ));
+            error
+        })?;
+    Ok((property, property_values, property_enums))
 }
 
 pub fn property_blob(fd: BorrowedFd<'_>, blob_id: u32) -> Result<Vec<u8>, AtomicKmsError> {
@@ -298,7 +331,7 @@ mod tests {
 
     #[test]
     fn property_metadata_query_supplies_storage_for_values_and_enums() {
-        let property = query_property_for_object_with(
+        let (property, values, enums) = query_property_for_object_with(
             41,
             drm_sys::DRM_MODE_OBJECT_PLANE,
             73,
@@ -320,6 +353,8 @@ mod tests {
 
         assert_eq!(property.count_values, 2);
         assert_eq!(property.count_enum_blobs, 1);
+        assert_eq!(values, vec![0, 1]);
+        assert_eq!(enums.len(), 1);
     }
 
     #[test]

@@ -125,6 +125,63 @@ fn plane(
     }
 }
 
+fn cursor_plane(id: u32, possible_crtcs: u32, formats: &[u32], crtc_id: u32) -> PlaneCandidate {
+    plane(id, PlaneType::Cursor, possible_crtcs, formats, crtc_id)
+}
+
+#[test]
+fn cursor_plane_selection_requires_compatible_crtc_and_argb8888() {
+    let argb = u32::from_le_bytes(*b"AR24");
+    let crtc = CrtcId::new(42).unwrap();
+    let candidates = vec![
+        cursor_plane(3, 2, &[argb], 0),
+        cursor_plane(7, 1, &[u32::from_le_bytes(*b"XR24")], 0),
+        cursor_plane(9, 1, &[argb], 0),
+    ];
+
+    assert_eq!(
+        select_cursor_plane(&candidates, 0, crtc, argb, PlaneId::new(5).unwrap())
+            .unwrap()
+            .id,
+        PlaneId::new(9).unwrap()
+    );
+}
+
+#[test]
+fn cursor_plane_selection_never_aliases_primary_plane() {
+    let argb = u32::from_le_bytes(*b"AR24");
+    let crtc = CrtcId::new(42).unwrap();
+    let candidates = vec![
+        plane(5, PlaneType::Primary, 1, &[argb], 0),
+        cursor_plane(5, 1, &[argb], 0),
+    ];
+
+    let selected = select_cursor_plane(&candidates, 0, crtc, argb, PlaneId::new(5).unwrap());
+    assert!(selected.is_none());
+}
+
+#[test]
+fn cursor_plane_selection_allows_absence() {
+    let argb = u32::from_le_bytes(*b"AR24");
+    assert!(
+        select_cursor_plane(
+            &[],
+            0,
+            CrtcId::new(42).unwrap(),
+            argb,
+            PlaneId::new(5).unwrap()
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn cursor_dimensions_honor_advertised_caps_and_fallback_only_for_zero_or_unavailable() {
+    assert_eq!(cursor_dimension_from_capability(Some(128)), 128);
+    assert_eq!(cursor_dimension_from_capability(Some(0)), 64);
+    assert_eq!(cursor_dimension_from_capability(None), 64);
+}
+
 #[test]
 fn primary_plane_selection_is_compatible_and_deterministic() {
     let format = u32::from_le_bytes(*b"XR24");
@@ -235,6 +292,99 @@ fn ids() -> (
     )
 }
 
+fn cursor_properties() -> AtomicCursorPlaneProperties {
+    let properties = complete_plane_properties()
+        .into_iter()
+        .map(|entry| DrmProperty::new(entry.id(), entry.name(), entry.value))
+        .collect::<Vec<_>>();
+    AtomicCursorPlaneProperties {
+        plane_id: 4,
+        crtc_id: 2,
+        fb_id: 0,
+        crtc_x: 0,
+        crtc_y: 0,
+        crtc_w: 0,
+        crtc_h: 0,
+        src_x: 0,
+        src_y: 0,
+        src_w: 0,
+        src_h: 0,
+        in_formats: None,
+        rotation: None,
+        property_ids: AtomicPlaneProperties::discover_cursor(&properties).unwrap(),
+        format_modifier: DrmFormatModifierPair {
+            fourcc: DRM_FORMAT_ARGB8888,
+            modifier: 0,
+        },
+        alpha_maximum: None,
+        pixel_blend_mode_premultiplied: None,
+    }
+}
+
+fn cursor_properties_with_blend() -> AtomicCursorPlaneProperties {
+    let mut properties = complete_plane_properties()
+        .into_iter()
+        .map(|entry| DrmProperty::new(entry.id(), entry.name(), entry.value))
+        .collect::<Vec<_>>();
+    properties.push(DrmProperty::with_metadata(
+        PropertyId::new(30).unwrap(),
+        "alpha",
+        0,
+        vec![0, 65_535],
+        Vec::new(),
+    ));
+    properties.push(DrmProperty::with_metadata(
+        PropertyId::new(31).unwrap(),
+        "pixel blend mode",
+        17,
+        Vec::new(),
+        vec![
+            DrmPropertyEnum {
+                value: 17,
+                name: "Coverage".to_string(),
+            },
+            DrmPropertyEnum {
+                value: 41,
+                name: "Pre-multiplied".to_string(),
+            },
+        ],
+    ));
+    let property_set = PropertySet::new(DrmObjectKind::CursorPlane, properties.clone()).unwrap();
+    AtomicCursorPlaneProperties {
+        property_ids: AtomicPlaneProperties::discover_cursor(&properties).unwrap(),
+        alpha_maximum: property_set.alpha_maximum(),
+        pixel_blend_mode_premultiplied: property_set.premultiplied_blend_value().flatten(),
+        ..cursor_properties()
+    }
+}
+
+fn pipeline_with_cursor() -> AtomicPipelineProperties {
+    let (connector, crtc, plane, connector_props, crtc_props, plane_props) = ids();
+    AtomicPipelineProperties {
+        connector,
+        crtc,
+        plane,
+        connector_props,
+        crtc_props,
+        plane_props,
+        cursor_plane: Some(cursor_properties()),
+    }
+}
+
+fn visible_cursor() -> AtomicCursorVisualState {
+    AtomicCursorVisualState {
+        visible: true,
+        x: 25,
+        y: 40,
+        hotspot_x: 5,
+        hotspot_y: 7,
+        width: 64,
+        height: 64,
+        framebuffer_id: Some(99),
+        image_generation: 3,
+    }
+}
+
 fn explicit_fence_pipeline() -> AtomicPipelineProperties {
     let (connector, crtc, plane, connector_props, _, _) = ids();
     let mut crtc_properties = complete_crtc_properties();
@@ -248,6 +398,7 @@ fn explicit_fence_pipeline() -> AtomicPipelineProperties {
         connector_props,
         crtc_props: AtomicCrtcProperties::discover(&crtc_properties).unwrap(),
         plane_props: AtomicPlaneProperties::discover(&plane_properties).unwrap(),
+        cursor_plane: None,
     }
 }
 
@@ -271,6 +422,7 @@ fn discovery() -> AtomicDiscovery {
             connector_props,
             crtc_props,
             plane_props,
+            cursor_plane: None,
         },
         snapshot: AtomicPipelineSnapshot {
             connector_crtc_id: 0,
@@ -286,6 +438,7 @@ fn discovery() -> AtomicDiscovery {
             crtc_y: 0,
             crtc_w: 0,
             crtc_h: 0,
+            cursor: None,
         },
         optional: AtomicOptionalCapabilities {
             vrr_enabled: false,
@@ -293,9 +446,13 @@ fn discovery() -> AtomicDiscovery {
             out_fence_ptr: false,
             framebuffer_damage_clips: false,
         },
+        framebuffer_format: u32::from_le_bytes(*b"XR24"),
         plane_possible_crtcs: 1,
         plane_formats: vec![u32::from_le_bytes(*b"XR24")],
         plane_scanout_formats: Vec::new(),
+        cursor_plane: None,
+        cursor_width: 64,
+        cursor_height: 64,
     }
 }
 
@@ -602,6 +759,7 @@ fn explicit_atomic_flip_adopts_out_fence_and_closes_input_after_success() {
             framebuffer: FramebufferId::new(81).unwrap(),
             token: PageFlipToken::new(55).unwrap(),
             in_fence: input,
+            cursor: None,
         },
         |submission| {
             let serialized = submission.request.serialize();
@@ -641,6 +799,7 @@ fn explicit_atomic_flip_closes_kernel_written_out_fence_on_ioctl_failure() {
             framebuffer: FramebufferId::new(81).unwrap(),
             token: PageFlipToken::new(55).unwrap(),
             in_fence: input,
+            cursor: None,
         },
         |submission| {
             let serialized = submission.request.serialize();
@@ -672,6 +831,7 @@ fn explicit_atomic_flip_ignores_negative_out_fence() {
             framebuffer: FramebufferId::new(81).unwrap(),
             token: PageFlipToken::new(55).unwrap(),
             in_fence: pipe_read_end(),
+            cursor: None,
         },
         |_| Ok(()),
     )
@@ -838,7 +998,7 @@ fn mode_blob_is_owned_and_destroyed_exactly_once() {
 }
 
 #[test]
-fn restore_and_safe_disable_requests_are_complete_and_cursor_free() {
+fn restore_and_safe_disable_requests_restore_cursor_plane() {
     let (connector, crtc, plane, connector_props, crtc_props, plane_props) = ids();
     let pipeline = AtomicPipelineProperties {
         connector,
@@ -847,6 +1007,7 @@ fn restore_and_safe_disable_requests_are_complete_and_cursor_free() {
         connector_props,
         crtc_props,
         plane_props,
+        cursor_plane: Some(cursor_properties()),
     };
     let snapshot = AtomicPipelineSnapshot {
         connector_crtc_id: 12,
@@ -862,13 +1023,234 @@ fn restore_and_safe_disable_requests_are_complete_and_cursor_free() {
         crtc_y: 0,
         crtc_w: 1920,
         crtc_h: 1080,
+        cursor: Some(AtomicCursorPlaneSnapshot {
+            fb_id: 77,
+            crtc_id: 2,
+            src_x: 0,
+            src_y: 0,
+            src_w: 64 << 16,
+            src_h: 64 << 16,
+            crtc_x: 10,
+            crtc_y: 11,
+            crtc_w: 64,
+            crtc_h: 64,
+            alpha: None,
+            pixel_blend_mode: None,
+        }),
     };
 
     let restore = snapshot.restore_request(&pipeline).unwrap();
     let disable = AtomicRequest::safe_disable(&pipeline).unwrap();
-    assert_eq!(restore.assignment_count(), 13);
-    assert_eq!(disable.assignment_count(), 5);
-    assert!(!restore.touches_object_kind(DrmObjectKind::CursorPlane));
-    assert!(!disable.touches_object_kind(DrmObjectKind::CursorPlane));
-    assert_eq!(disable.serialize().values, vec![0, 0, 0, 0, 0]);
+    assert!(restore.touches_object_kind(DrmObjectKind::CursorPlane));
+    assert!(disable.touches_object_kind(DrmObjectKind::CursorPlane));
+    assert_eq!(disable.serialize().values.len(), 7);
+    assert!(disable.serialize().values.iter().all(|value| *value == 0));
+}
+
+#[test]
+fn visible_cursor_state_uses_hotspot_subtraction_and_normal_geometry() {
+    let pipeline = pipeline_with_cursor();
+    let request = AtomicRequest::cursor_only(&pipeline, Some(&visible_cursor())).unwrap();
+    let serialized = request.serialize();
+
+    assert!(request.touches_object_kind(DrmObjectKind::CursorPlane));
+    assert_eq!(
+        serialized.values,
+        vec![99, 2, 0, 0, 64 << 16, 64 << 16, 20, 33, 64, 64]
+    );
+}
+
+#[test]
+fn cursor_plane_discovers_alpha_maximum() {
+    assert_eq!(cursor_properties_with_blend().alpha_maximum, Some(65_535));
+}
+
+#[test]
+fn cursor_plane_discovers_premultiplied_blend_enum() {
+    assert_eq!(
+        cursor_properties_with_blend().pixel_blend_mode_premultiplied,
+        Some(41)
+    );
+}
+
+#[test]
+fn visible_cursor_request_sets_alpha_maximum() {
+    let pipeline = AtomicPipelineProperties {
+        cursor_plane: Some(cursor_properties_with_blend()),
+        ..pipeline_with_cursor()
+    };
+    let request = AtomicRequest::cursor_only(&pipeline, Some(&visible_cursor())).unwrap();
+
+    assert!(request.serialize().values.contains(&65_535));
+}
+
+#[test]
+fn visible_cursor_request_sets_premultiplied_blend() {
+    let pipeline = AtomicPipelineProperties {
+        cursor_plane: Some(cursor_properties_with_blend()),
+        ..pipeline_with_cursor()
+    };
+    let request = AtomicRequest::cursor_only(&pipeline, Some(&visible_cursor())).unwrap();
+
+    assert!(request.serialize().values.contains(&41));
+}
+
+#[test]
+fn missing_optional_alpha_is_supported() {
+    assert_eq!(cursor_properties().alpha_maximum, None);
+    AtomicRequest::cursor_only(&pipeline_with_cursor(), Some(&visible_cursor())).unwrap();
+}
+
+#[test]
+fn missing_optional_blend_is_supported() {
+    assert_eq!(cursor_properties().pixel_blend_mode_premultiplied, None);
+    AtomicRequest::cursor_only(&pipeline_with_cursor(), Some(&visible_cursor())).unwrap();
+}
+
+#[test]
+fn advertised_blend_without_compatible_value_rejects_cursor_plane() {
+    let set = PropertySet::new(
+        DrmObjectKind::CursorPlane,
+        vec![DrmProperty::with_metadata(
+            PropertyId::new(1).unwrap(),
+            "pixel blend mode",
+            0,
+            Vec::new(),
+            vec![DrmPropertyEnum {
+                value: 0,
+                name: "Coverage".to_string(),
+            }],
+        )],
+    )
+    .unwrap();
+    assert_eq!(set.premultiplied_blend_value(), Some(None));
+}
+
+#[test]
+fn hidden_cursor_state_disables_both_cursor_plane_ids() {
+    let pipeline = pipeline_with_cursor();
+    let request = AtomicRequest::cursor_only(&pipeline, None).unwrap();
+    let serialized = request.serialize();
+
+    assert!(request.touches_object_kind(DrmObjectKind::CursorPlane));
+    assert_eq!(serialized.values[0..2], [0, 0]);
+}
+
+#[test]
+fn cursor_only_request_does_not_touch_primary_plane() {
+    let pipeline = pipeline_with_cursor();
+    let request = AtomicRequest::cursor_only(&pipeline, Some(&visible_cursor())).unwrap();
+
+    assert!(!request.touches_object_kind(DrmObjectKind::PrimaryPlane));
+    assert!(request.touches_object_kind(DrmObjectKind::CursorPlane));
+}
+
+#[test]
+fn visible_cursor_geometry_preserves_negative_partially_offscreen_coordinates() {
+    let pipeline = pipeline_with_cursor();
+    let mut cursor = visible_cursor();
+    cursor.x = 2;
+    cursor.y = 3;
+    cursor.hotspot_x = 7;
+    cursor.hotspot_y = 9;
+    let request = AtomicRequest::cursor_only(&pipeline, Some(&cursor)).unwrap();
+    let serialized = request.serialize();
+
+    assert_eq!(serialized.values[6], (-5i64) as u64);
+    assert_eq!(serialized.values[7], (-6i64) as u64);
+}
+
+#[test]
+fn primary_flip_with_cursor_includes_both_planes() {
+    let pipeline = pipeline_with_cursor();
+    let request = AtomicRequest::primary_flip_with_cursor(
+        &pipeline,
+        FramebufferId::new(81).unwrap(),
+        Some(&visible_cursor()),
+    )
+    .unwrap();
+
+    assert!(request.touches_object_kind(DrmObjectKind::PrimaryPlane));
+    assert!(request.touches_object_kind(DrmObjectKind::CursorPlane));
+}
+
+#[test]
+fn compatibility_atomic_primary_request_includes_visible_cursor() {
+    let pipeline = pipeline_with_cursor();
+    let request = AtomicRequest::primary_flip_with_cursor(
+        &pipeline,
+        FramebufferId::new(81).unwrap(),
+        Some(&visible_cursor()),
+    )
+    .unwrap();
+
+    assert_eq!(request.serialize().values[0], 81);
+    assert!(request.touches_object_kind(DrmObjectKind::CursorPlane));
+    assert!(request.serialize().values.contains(&99));
+}
+
+#[test]
+fn compatibility_atomic_primary_request_disables_software_cursor_plane() {
+    let pipeline = pipeline_with_cursor();
+    let request =
+        AtomicRequest::primary_flip_with_cursor(&pipeline, FramebufferId::new(81).unwrap(), None)
+            .unwrap();
+
+    assert_eq!(request.serialize().values[0], 81);
+    assert_eq!(request.serialize().values[1..3], [0, 0]);
+}
+
+#[test]
+fn compatibility_atomic_primary_request_disables_client_cursor_plane() {
+    let pipeline = pipeline_with_cursor();
+    let request =
+        AtomicRequest::primary_flip_with_cursor(&pipeline, FramebufferId::new(81).unwrap(), None)
+            .unwrap();
+
+    assert!(request.touches_object_kind(DrmObjectKind::CursorPlane));
+    assert!(
+        request.serialize().values[1..3]
+            .iter()
+            .all(|value| *value == 0)
+    );
+}
+
+#[test]
+fn compatibility_legacy_primary_does_not_build_atomic_cursor_properties() {
+    let (_, _, plane, _, _, plane_props) = ids();
+    let request =
+        AtomicRequest::primary_flip(plane, plane_props.fb_id, FramebufferId::new(81).unwrap())
+            .unwrap();
+
+    assert!(!request.touches_object_kind(DrmObjectKind::CursorPlane));
+}
+
+#[test]
+fn direct_test_only_includes_visible_cursor_plane() {
+    let pipeline = pipeline_with_cursor();
+    let request = AtomicRequest::primary_flip_with_cursor(
+        &pipeline,
+        FramebufferId::new(82).unwrap(),
+        Some(&visible_cursor()),
+    )
+    .unwrap();
+
+    assert!(request.touches_object_kind(DrmObjectKind::PrimaryPlane));
+    assert!(request.touches_object_kind(DrmObjectKind::CursorPlane));
+}
+
+#[test]
+fn initial_modeset_with_cursor_includes_cursor_plane_state() {
+    let pipeline = pipeline_with_cursor();
+    let request = AtomicRequest::initial_modeset_for_pipeline(
+        &pipeline,
+        BlobId::new(90).unwrap(),
+        FramebufferId::new(80).unwrap(),
+        AtomicPlaneGeometry::fullscreen(1920, 1080).unwrap(),
+        Some(&visible_cursor()),
+    )
+    .unwrap();
+
+    assert!(request.touches_object_kind(DrmObjectKind::PrimaryPlane));
+    assert!(request.touches_object_kind(DrmObjectKind::CursorPlane));
 }

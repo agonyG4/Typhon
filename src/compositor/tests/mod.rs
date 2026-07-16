@@ -108,6 +108,7 @@ use support::window_ops::*;
 
 mod astrea_shortcuts;
 mod data_device;
+mod direct_scanout;
 mod input_output;
 mod layer_shell;
 mod lifecycle;

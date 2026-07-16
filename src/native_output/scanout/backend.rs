@@ -1,6 +1,23 @@
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativePresentResult {
+    Noop,
+    AsyncSubmitted { token: u64, framebuffer_id: u32 },
+    Immediate,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct NativePageFlipDrain {
+    pub(crate) completion: Option<DrmPresentationEvent>,
+    pub(crate) deferred_promotion_token: Option<u64>,
+    pub(crate) mismatched_events: u64,
+    pub(crate) stale_events: u64,
+    pub(crate) last_mismatch: Option<(u64, u64)>,
+    pub(crate) last_stale_token: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeScanoutKind {
     AtomicEglGbmExplicit,
     NativeEglGbmOpaqueCompatibility,

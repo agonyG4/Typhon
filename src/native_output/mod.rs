@@ -40,10 +40,9 @@ use oblivion_one::compositor::{
     RenderSceneElement, RenderSceneElementId, RenderableSurface, cursor_texture_pixels,
     cursor_texture_size, render_scene_elements_for_surfaces, resize_debug_log,
 };
-#[cfg(test)]
-use oblivion_one::native::kms::KmsBackendKind;
 use oblivion_one::native::kms::{
-    AtomicCommitState, AtomicCompletion, AtomicKmsErrorKind, ConnectorId, CrtcId, FramebufferId,
+    AtomicCommitState, AtomicCompletion, AtomicCursorPlaneProperties, AtomicCursorVisualState,
+    AtomicKmsErrorKind, ConnectorId, CrtcId, DRM_FORMAT_ARGB8888, FramebufferId,
     KmsBackendSelection, KmsPolicy, PageFlipToken,
 };
 use oblivion_one::native::{

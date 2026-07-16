@@ -1,10 +1,57 @@
 use std::collections::BTreeMap;
 
 use super::{
-    AtomicConnectorProperties, AtomicCrtcProperties, AtomicKmsError, AtomicKmsErrorKind,
-    AtomicPlaneProperties, BlobId, ConnectorId, ConnectorPropertyId, CrtcId, CrtcPropertyId,
-    DrmObjectKind, FramebufferId, PageFlipToken, PlaneId, PlanePropertyId,
+    AtomicConnectorProperties, AtomicCrtcProperties, AtomicCursorPlaneProperties, AtomicKmsError,
+    AtomicKmsErrorKind, AtomicPlaneProperties, AtomicPlaneRole, BlobId, ConnectorId,
+    ConnectorPropertyId, CrtcId, CrtcPropertyId, DrmFormatModifierPair, DrmObjectKind,
+    FramebufferId, PageFlipToken, PlaneId, PlanePropertyId,
 };
+
+pub const DRM_FORMAT_ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtomicCursorVisualState {
+    pub visible: bool,
+    pub x: i32,
+    pub y: i32,
+    pub hotspot_x: i32,
+    pub hotspot_y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub framebuffer_id: Option<u32>,
+    pub image_generation: u64,
+}
+
+impl AtomicCursorVisualState {
+    pub const fn hidden(width: u32, height: u32) -> Self {
+        Self {
+            visible: false,
+            x: 0,
+            y: 0,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            width,
+            height,
+            framebuffer_id: None,
+            image_generation: 0,
+        }
+    }
+
+    pub fn kms_equivalent(&self, other: &Self) -> bool {
+        if !self.visible && !other.visible {
+            return true;
+        }
+        self.visible == other.visible
+            && self.x == other.x
+            && self.y == other.y
+            && self.hotspot_x == other.hotspot_x
+            && self.hotspot_y == other.hotspot_y
+            && self.width == other.width
+            && self.height == other.height
+            && self.framebuffer_id == other.framebuffer_id
+            && self.image_generation == other.image_generation
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaneType {
@@ -12,6 +59,41 @@ pub enum PlaneType {
     Primary,
     Cursor,
     Unknown(u64),
+}
+
+pub const fn cursor_dimension_from_capability(value: Option<u64>) -> u32 {
+    match value {
+        Some(value) if value > 0 && value <= u32::MAX as u64 => value as u32,
+        _ => 64,
+    }
+}
+
+pub(crate) fn plane_type_from_value(value: u64) -> PlaneType {
+    match u32::try_from(value).ok() {
+        Some(drm_sys::DRM_PLANE_TYPE_OVERLAY) => PlaneType::Overlay,
+        Some(drm_sys::DRM_PLANE_TYPE_PRIMARY) => PlaneType::Primary,
+        Some(drm_sys::DRM_PLANE_TYPE_CURSOR) => PlaneType::Cursor,
+        _ => PlaneType::Unknown(value),
+    }
+}
+
+pub(crate) fn select_cursor_format_modifier(
+    scanout_formats: &[DrmFormatModifierPair],
+    legacy_formats: &[u32],
+) -> Option<DrmFormatModifierPair> {
+    scanout_formats
+        .iter()
+        .copied()
+        .filter(|pair| pair.fourcc == DRM_FORMAT_ARGB8888)
+        .min_by_key(|pair| (pair.modifier != 0, pair.modifier))
+        .or_else(|| {
+            legacy_formats
+                .contains(&DRM_FORMAT_ARGB8888)
+                .then_some(DrmFormatModifierPair {
+                    fourcc: DRM_FORMAT_ARGB8888,
+                    modifier: 0,
+                })
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +133,24 @@ pub fn select_primary_plane(
                 ),
             )
         })
+}
+
+pub fn select_cursor_plane(
+    candidates: &[PlaneCandidate],
+    crtc_index: usize,
+    crtc: CrtcId,
+    framebuffer_format: u32,
+    primary_plane: PlaneId,
+) -> Option<&PlaneCandidate> {
+    let mask = 1u32.checked_shl(u32::try_from(crtc_index).ok()?)?;
+    candidates
+        .iter()
+        .filter(|candidate| candidate.plane_type == PlaneType::Cursor)
+        .filter(|candidate| candidate.id != primary_plane)
+        .filter(|candidate| candidate.possible_crtcs & mask != 0)
+        .filter(|candidate| candidate.formats.contains(&framebuffer_format))
+        .filter(|candidate| candidate.current_crtc.is_none_or(|current| current == crtc))
+        .min_by_key(|candidate| (candidate.current_crtc != Some(crtc), candidate.id))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,7 +288,7 @@ impl AtomicPlaneGeometry {
 enum AtomicObjectId {
     Connector(ConnectorId),
     Crtc(CrtcId),
-    Plane(PlaneId),
+    Plane(PlaneId, AtomicPlaneRole),
 }
 
 impl AtomicObjectId {
@@ -196,7 +296,7 @@ impl AtomicObjectId {
         match self {
             Self::Connector(id) => id.get(),
             Self::Crtc(id) => id.get(),
-            Self::Plane(id) => id.get(),
+            Self::Plane(id, _) => id.get(),
         }
     }
 
@@ -204,7 +304,8 @@ impl AtomicObjectId {
         match self {
             Self::Connector(_) => DrmObjectKind::Connector,
             Self::Crtc(_) => DrmObjectKind::Crtc,
-            Self::Plane(_) => DrmObjectKind::PrimaryPlane,
+            Self::Plane(_, AtomicPlaneRole::Primary) => DrmObjectKind::PrimaryPlane,
+            Self::Plane(_, AtomicPlaneRole::Cursor) => DrmObjectKind::CursorPlane,
         }
     }
 }
@@ -245,7 +346,24 @@ impl AtomicRequest {
         property: PlanePropertyId,
         value: u64,
     ) -> Result<(), AtomicKmsError> {
-        self.set(AtomicObjectId::Plane(object), property.0.get(), value)
+        self.set(
+            AtomicObjectId::Plane(object, AtomicPlaneRole::Primary),
+            property.0.get(),
+            value,
+        )
+    }
+
+    pub fn set_cursor_plane(
+        &mut self,
+        object: PlaneId,
+        property: PlanePropertyId,
+        value: u64,
+    ) -> Result<(), AtomicKmsError> {
+        self.set(
+            AtomicObjectId::Plane(object, AtomicPlaneRole::Cursor),
+            property.0.get(),
+            value,
+        )
     }
 
     fn set(
@@ -296,6 +414,28 @@ impl AtomicRequest {
         Ok(request)
     }
 
+    pub fn initial_modeset_for_pipeline(
+        pipeline: &AtomicPipelineProperties,
+        mode_blob: BlobId,
+        framebuffer: FramebufferId,
+        geometry: AtomicPlaneGeometry,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<Self, AtomicKmsError> {
+        let mut request = Self::initial_modeset(
+            pipeline.connector,
+            pipeline.crtc,
+            pipeline.plane,
+            &pipeline.connector_props,
+            &pipeline.crtc_props,
+            &pipeline.plane_props,
+            mode_blob,
+            framebuffer,
+            geometry,
+        )?;
+        append_cursor_plane_state(&mut request, pipeline, cursor)?;
+        Ok(request)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn resume_modeset(
         connector: ConnectorId,
@@ -321,6 +461,16 @@ impl AtomicRequest {
         )
     }
 
+    pub fn resume_modeset_for_pipeline(
+        pipeline: &AtomicPipelineProperties,
+        mode_blob: BlobId,
+        framebuffer: FramebufferId,
+        geometry: AtomicPlaneGeometry,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<Self, AtomicKmsError> {
+        Self::initial_modeset_for_pipeline(pipeline, mode_blob, framebuffer, geometry, cursor)
+    }
+
     pub fn primary_flip(
         plane: PlaneId,
         fb_property: PlanePropertyId,
@@ -328,6 +478,26 @@ impl AtomicRequest {
     ) -> Result<Self, AtomicKmsError> {
         let mut request = Self::new();
         request.set_plane(plane, fb_property, u64::from(framebuffer.get()))?;
+        Ok(request)
+    }
+
+    pub fn primary_flip_with_cursor(
+        pipeline: &AtomicPipelineProperties,
+        framebuffer: FramebufferId,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<Self, AtomicKmsError> {
+        let mut request =
+            Self::primary_flip(pipeline.plane, pipeline.plane_props.fb_id, framebuffer)?;
+        append_cursor_plane_state(&mut request, pipeline, cursor)?;
+        Ok(request)
+    }
+
+    pub fn cursor_only(
+        pipeline: &AtomicPipelineProperties,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<Self, AtomicKmsError> {
+        let mut request = Self::new();
+        append_cursor_plane_state(&mut request, pipeline, cursor)?;
         Ok(request)
     }
 
@@ -399,6 +569,7 @@ impl AtomicRequest {
         request.set_crtc(pipeline.crtc, pipeline.crtc_props.mode_id, 0)?;
         request.set_plane(pipeline.plane, pipeline.plane_props.fb_id, 0)?;
         request.set_plane(pipeline.plane, pipeline.plane_props.crtc_id, 0)?;
+        append_cursor_plane_state(&mut request, pipeline, None)?;
         Ok(request)
     }
 
@@ -447,6 +618,23 @@ pub struct AtomicPipelineProperties {
     pub connector_props: AtomicConnectorProperties,
     pub crtc_props: AtomicCrtcProperties,
     pub plane_props: AtomicPlaneProperties,
+    pub cursor_plane: Option<AtomicCursorPlaneProperties>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtomicCursorPlaneSnapshot {
+    pub fb_id: u64,
+    pub crtc_id: u64,
+    pub src_x: u64,
+    pub src_y: u64,
+    pub src_w: u64,
+    pub src_h: u64,
+    pub crtc_x: u64,
+    pub crtc_y: u64,
+    pub crtc_w: u64,
+    pub crtc_h: u64,
+    pub alpha: Option<u64>,
+    pub pixel_blend_mode: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,6 +652,7 @@ pub struct AtomicPipelineSnapshot {
     pub crtc_y: u64,
     pub crtc_w: u64,
     pub crtc_h: u64,
+    pub cursor: Option<AtomicCursorPlaneSnapshot>,
 }
 
 impl AtomicPipelineSnapshot {
@@ -497,8 +686,117 @@ impl AtomicPipelineSnapshot {
         request.set_plane(pipeline.plane, pipeline.plane_props.crtc_y, self.crtc_y)?;
         request.set_plane(pipeline.plane, pipeline.plane_props.crtc_w, self.crtc_w)?;
         request.set_plane(pipeline.plane, pipeline.plane_props.crtc_h, self.crtc_h)?;
+        append_cursor_plane_snapshot(&mut request, pipeline, self.cursor)?;
         Ok(request)
     }
+}
+
+impl AtomicCursorPlaneProperties {
+    const fn plane_id(&self) -> PlaneId {
+        // Discovery rejects zero object IDs before constructing this value.
+        PlaneId::new(self.plane_id).expect("cursor plane ID is nonzero")
+    }
+}
+
+fn append_cursor_plane_snapshot(
+    request: &mut AtomicRequest,
+    pipeline: &AtomicPipelineProperties,
+    snapshot: Option<AtomicCursorPlaneSnapshot>,
+) -> Result<(), AtomicKmsError> {
+    let Some((cursor, snapshot)) = pipeline.cursor_plane.as_ref().zip(snapshot) else {
+        return Ok(());
+    };
+    let plane = cursor.plane_id();
+    let props = &cursor.property_ids;
+    request.set_cursor_plane(plane, props.fb_id, snapshot.fb_id)?;
+    request.set_cursor_plane(plane, props.crtc_id, snapshot.crtc_id)?;
+    request.set_cursor_plane(plane, props.src_x, snapshot.src_x)?;
+    request.set_cursor_plane(plane, props.src_y, snapshot.src_y)?;
+    request.set_cursor_plane(plane, props.src_w, snapshot.src_w)?;
+    request.set_cursor_plane(plane, props.src_h, snapshot.src_h)?;
+    request.set_cursor_plane(plane, props.crtc_x, snapshot.crtc_x)?;
+    request.set_cursor_plane(plane, props.crtc_y, snapshot.crtc_y)?;
+    request.set_cursor_plane(plane, props.crtc_w, snapshot.crtc_w)?;
+    request.set_cursor_plane(plane, props.crtc_h, snapshot.crtc_h)?;
+    if let (Some(property), Some(value)) = (props.alpha, snapshot.alpha) {
+        request.set_cursor_plane(plane, property, value)?;
+    }
+    if let (Some(property), Some(value)) = (props.pixel_blend_mode, snapshot.pixel_blend_mode) {
+        request.set_cursor_plane(plane, property, value)?;
+    }
+    Ok(())
+}
+
+pub fn append_cursor_plane_state(
+    request: &mut AtomicRequest,
+    pipeline: &AtomicPipelineProperties,
+    cursor: Option<&AtomicCursorVisualState>,
+) -> Result<(), AtomicKmsError> {
+    let Some(cursor_plane) = pipeline.cursor_plane.as_ref() else {
+        if cursor.is_some_and(|cursor| cursor.visible) {
+            return Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "visible Atomic cursor requested without a compatible cursor plane",
+            ));
+        }
+        return Ok(());
+    };
+    let plane = cursor_plane.plane_id();
+    let props = &cursor_plane.property_ids;
+    let Some(cursor) = cursor.filter(|cursor| cursor.visible) else {
+        request.set_cursor_plane(plane, props.fb_id, 0)?;
+        request.set_cursor_plane(plane, props.crtc_id, 0)?;
+        return Ok(());
+    };
+    let framebuffer_id = cursor.framebuffer_id.ok_or_else(|| {
+        AtomicKmsError::new(
+            AtomicKmsErrorKind::MissingProperty,
+            "visible Atomic cursor has no framebuffer",
+        )
+    })?;
+    let src_w = u64::from(cursor.width).checked_shl(16).ok_or_else(|| {
+        AtomicKmsError::new(
+            AtomicKmsErrorKind::InvalidGeometry,
+            "cursor source width overflows unsigned 16.16",
+        )
+    })?;
+    let src_h = u64::from(cursor.height).checked_shl(16).ok_or_else(|| {
+        AtomicKmsError::new(
+            AtomicKmsErrorKind::InvalidGeometry,
+            "cursor source height overflows unsigned 16.16",
+        )
+    })?;
+    request.set_cursor_plane(plane, props.fb_id, u64::from(framebuffer_id))?;
+    request.set_cursor_plane(plane, props.crtc_id, u64::from(cursor_plane.crtc_id))?;
+    request.set_cursor_plane(plane, props.src_x, 0)?;
+    request.set_cursor_plane(plane, props.src_y, 0)?;
+    request.set_cursor_plane(plane, props.src_w, src_w)?;
+    request.set_cursor_plane(plane, props.src_h, src_h)?;
+    request.set_cursor_plane(
+        plane,
+        props.crtc_x,
+        i64::from(cursor.x.saturating_sub(cursor.hotspot_x)) as u64,
+    )?;
+    request.set_cursor_plane(
+        plane,
+        props.crtc_y,
+        i64::from(cursor.y.saturating_sub(cursor.hotspot_y)) as u64,
+    )?;
+    request.set_cursor_plane(plane, props.crtc_w, u64::from(cursor.width))?;
+    request.set_cursor_plane(plane, props.crtc_h, u64::from(cursor.height))?;
+    if let Some(rotation) = props.rotation {
+        request.set_cursor_plane(plane, rotation, u64::from(drm_sys::DRM_MODE_ROTATE_0))?;
+    }
+    if let (Some(alpha), Some(maximum)) = (props.alpha, cursor_plane.alpha_maximum) {
+        request.set_cursor_plane(plane, alpha, maximum)?;
+    }
+    if let (Some(blend), Some(premultiplied)) = (
+        props.pixel_blend_mode,
+        cursor_plane.pixel_blend_mode_premultiplied,
+    ) {
+        request.set_cursor_plane(plane, blend, premultiplied)?;
+    }
+    Ok(())
 }
 
 impl Default for AtomicRequest {

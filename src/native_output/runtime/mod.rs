@@ -1,13 +1,24 @@
 use super::*;
 
+mod atomic_commit;
 mod bootstrap;
+mod cursor_cycle;
 mod cycle;
 mod frame;
+mod metrics;
+mod planner;
 mod presentation;
 mod session;
 mod session_io;
 mod shutdown;
+mod shutdown_cycle;
 
+pub(super) use atomic_commit::validate_atomic_pageflip;
+pub(super) use atomic_commit::{
+    AtomicCommitArbiter, AtomicCommitCompletion, AtomicCommitKind,
+    register_atomic_primary_submission,
+};
+pub(super) use cursor_cycle::{atomic_cursor_visibility_policy, effective_atomic_cursor_state};
 pub(crate) use cycle::run;
 pub(crate) use frame::{
     NativeCursorPreference, NativeCursorRenderMode, NativeFrameRenderer,
@@ -18,6 +29,10 @@ pub(crate) use frame::{
 pub(crate) use frame::{
     NativeFrameRequest, NativePointerConstraint, NativePointerConstraintBackendAction,
     NativeRepaintDecision, NativeRepaintInputs, native_repaint_decision,
+};
+pub(super) use planner::{
+    NativeCursorOwnerPlan, NativeKmsStartupDecision, decide_native_cursor_owner,
+    decide_native_kms_startup,
 };
 pub(crate) use session::{NativeSessionLifecycle, NativeSessionTransition};
 #[cfg(test)]
@@ -72,7 +87,8 @@ pub(crate) struct NativeRuntime {
     cursor_preference: NativeCursorPreference,
     direct_scanout_preference: NativeDirectScanoutPreference,
     cursor_render_mode: NativeCursorRenderMode,
-    hardware_cursor: Option<NativeHardwareCursor>,
+    atomic_cursor: Option<NativeAtomicCursor>,
+    legacy_cursor: Option<NativeLegacyHardwareCursor>,
     kms: NativeDrmDevice,
     input_devices: NativeInputBackend,
     seat_session: Option<NativeSeatSession>,
@@ -87,6 +103,7 @@ pub(crate) struct NativeRuntime {
     drm_reactor_token: Option<ReactorToken>,
     output_render_fence_token: Option<ReactorToken>,
     frame_scheduler: NativeFrameScheduler,
+    atomic_commit_arbiter: AtomicCommitArbiter,
     presentation_deadline: PresentationDeadlinePlanner,
     scheduled_presentation_target: Option<PresentationTarget>,
     render_journal: AdaptiveRenderJournal,
@@ -146,7 +163,10 @@ impl Drop for NativeRuntime {
         if !self.session.permits_output() {
             self.scanout.disarm_drm_cleanup();
             self.kms_backend.disarm_drm_io();
-            if let Some(cursor) = self.hardware_cursor.as_mut() {
+            if let Some(cursor) = self.atomic_cursor.as_mut() {
+                cursor.disarm_drm_cleanup();
+            }
+            if let Some(cursor) = self.legacy_cursor.as_mut() {
                 cursor.disarm_drm_cleanup();
             }
         } else if let Err(error) = self.kms_backend.restore() {

@@ -1,4 +1,5 @@
 use super::*;
+use oblivion_one::native::kms::KmsBackendKind;
 
 pub(crate) struct NativeGbmScanout {
     pub(crate) _device: gbm::Device<OwnedFd>,
@@ -10,6 +11,7 @@ pub(crate) struct NativeGbmScanout {
     pub(crate) ready_index: Option<usize>,
     pub(crate) pending_index: Option<usize>,
     pub(crate) page_flip: AtomicCommitState,
+    pub(crate) deferred_promotion_token: Option<u64>,
     pub(crate) backend_generation: u64,
     pub(crate) drm_cleanup_armed: bool,
     pub(crate) staging: Vec<u8>,
@@ -118,6 +120,7 @@ impl NativeGbmScanout {
             ready_index: None,
             pending_index: None,
             page_flip: AtomicCommitState::default(),
+            deferred_promotion_token: None,
             backend_generation,
             drm_cleanup_armed: true,
             staging: Vec::new(),
@@ -208,7 +211,11 @@ impl NativeGbmScanout {
         }
     }
 
-    pub(crate) fn present(&mut self, kms: &KmsBackendSelection) -> io::Result<Option<u64>> {
+    pub(crate) fn present(
+        &mut self,
+        kms: &KmsBackendSelection,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> io::Result<Option<(u64, u32)>> {
         if self.page_flip.is_pending() {
             return Ok(None);
         }
@@ -225,10 +232,10 @@ impl NativeGbmScanout {
         self.page_flip
             .begin(token, framebuffer, self.backend_generation, Instant::now())
             .map_err(io::Error::other)?;
-        match kms.submit_flip(framebuffer, token) {
+        match kms.submit_flip_with_cursor(framebuffer, token, cursor) {
             Ok(()) => {
                 self.pending_index = Some(index);
-                Ok(Some(token.get()))
+                Ok(Some((token.get(), framebuffer.get())))
             }
             Err(error) => {
                 self.page_flip.submission_failed(token);
@@ -238,9 +245,22 @@ impl NativeGbmScanout {
         }
     }
 
-    pub(crate) fn drain_page_flip_events(&mut self, fd: RawFd) -> io::Result<NativePageFlipDrain> {
+    pub(crate) fn drain_page_flip_events(
+        &mut self,
+        fd: RawFd,
+        backend_kind: KmsBackendKind,
+    ) -> io::Result<NativePageFlipDrain> {
         let mut drain = NativePageFlipDrain::default();
         for event in drain_drm_page_flip_events(fd)? {
+            if backend_kind == KmsBackendKind::Atomic && !self.page_flip.is_pending() {
+                if drain.completion.is_none() {
+                    drain.completion = Some(event);
+                } else {
+                    drain.stale_events = drain.stale_events.saturating_add(1);
+                    drain.last_stale_token = Some(event.user_data);
+                }
+                continue;
+            }
             let expected = self.page_flip.pending_token().map(PageFlipToken::get);
             let Some(token) = PageFlipToken::new(event.user_data) else {
                 drain.stale_events = drain.stale_events.saturating_add(1);
@@ -250,9 +270,8 @@ impl NativeGbmScanout {
             match self.page_flip.complete(token, self.backend_generation) {
                 AtomicCompletion::Completed { .. } => {
                     if drain.completion.is_none() {
-                        if let Some(index) = self.pending_index.take() {
-                            self.current_index = index;
-                        }
+                        drain.deferred_promotion_token = Some(token.get());
+                        self.deferred_promotion_token = Some(token.get());
                         drain.completion = Some(event);
                     } else {
                         drain.stale_events = drain.stale_events.saturating_add(1);
@@ -272,7 +291,23 @@ impl NativeGbmScanout {
     }
 
     pub(crate) fn page_flip_pending(&self) -> bool {
-        self.page_flip.is_pending()
+        self.page_flip.is_pending() || self.deferred_promotion_token.is_some()
+    }
+
+    pub(crate) fn promote_page_flip(&mut self, token: PageFlipToken) -> io::Result<()> {
+        if self.deferred_promotion_token != Some(token.get()) {
+            return Err(io::Error::other(
+                "GBM pageflip promotion token does not match deferred completion",
+            ));
+        }
+        let Some(index) = self.pending_index.take() else {
+            return Err(io::Error::other(
+                "GBM pageflip promotion has no pending buffer",
+            ));
+        };
+        self.current_index = index;
+        self.deferred_promotion_token = None;
+        Ok(())
     }
 
     pub(crate) fn suspend_page_flip(&mut self) {
@@ -285,6 +320,7 @@ impl NativeGbmScanout {
         &mut self,
         recovery: NativeIndexedScanoutRecovery,
     ) -> io::Result<()> {
+        self.deferred_promotion_token = None;
         let framebuffer_ids = self
             .buffers
             .iter()

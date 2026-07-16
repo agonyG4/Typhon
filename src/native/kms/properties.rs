@@ -62,11 +62,25 @@ pub enum DrmObjectKind {
     CursorPlane,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AtomicPlaneRole {
+    Primary,
+    Cursor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrmPropertyEnum {
+    pub value: u64,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrmProperty {
     id: PropertyId,
     name: String,
     pub value: u64,
+    pub values: Vec<u64>,
+    pub enums: Vec<DrmPropertyEnum>,
 }
 
 impl DrmProperty {
@@ -75,11 +89,33 @@ impl DrmProperty {
             id,
             name: name.into(),
             value,
+            values: Vec::new(),
+            enums: Vec::new(),
+        }
+    }
+
+    pub fn with_metadata(
+        id: PropertyId,
+        name: impl Into<String>,
+        value: u64,
+        values: Vec<u64>,
+        enums: Vec<DrmPropertyEnum>,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            value,
+            values,
+            enums,
         }
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub const fn id(&self) -> PropertyId {
+        self.id
     }
 }
 
@@ -130,8 +166,36 @@ impl PropertySet {
         self.by_name.get(name).map(|property| property.id)
     }
 
+    pub fn contains(&self, name: &str) -> bool {
+        self.by_name.contains_key(name)
+    }
+
     pub fn value(&self, name: &str) -> Option<u64> {
         self.by_name.get(name).map(|property| property.value)
+    }
+
+    pub fn alpha_maximum(&self) -> Option<u64> {
+        self.by_name
+            .get("alpha")
+            .and_then(|property| property.values.last().copied())
+    }
+
+    pub fn premultiplied_blend_value(&self) -> Option<Option<u64>> {
+        let property = self.by_name.get("pixel blend mode")?;
+        Some(
+            property
+                .enums
+                .iter()
+                .find(|entry| {
+                    entry
+                        .name
+                        .chars()
+                        .filter(|character| character.is_ascii_alphanumeric())
+                        .collect::<String>()
+                        .eq_ignore_ascii_case("premultiplied")
+                })
+                .map(|entry| entry.value),
+        )
     }
 }
 
@@ -209,7 +273,22 @@ pub struct AtomicPlaneProperties {
 
 impl AtomicPlaneProperties {
     pub fn discover(properties: &[DrmProperty]) -> Result<Self, AtomicKmsError> {
-        let set = PropertySet::new(DrmObjectKind::PrimaryPlane, properties.to_vec())?;
+        Self::discover_for_role(properties, AtomicPlaneRole::Primary)
+    }
+
+    pub fn discover_cursor(properties: &[DrmProperty]) -> Result<Self, AtomicKmsError> {
+        Self::discover_for_role(properties, AtomicPlaneRole::Cursor)
+    }
+
+    fn discover_for_role(
+        properties: &[DrmProperty],
+        role: AtomicPlaneRole,
+    ) -> Result<Self, AtomicKmsError> {
+        let kind = match role {
+            AtomicPlaneRole::Primary => DrmObjectKind::PrimaryPlane,
+            AtomicPlaneRole::Cursor => DrmObjectKind::CursorPlane,
+        };
+        let set = PropertySet::new(kind, properties.to_vec())?;
         Ok(Self {
             fb_id: PlanePropertyId(set.required("FB_ID")?),
             crtc_id: PlanePropertyId(set.required("CRTC_ID")?),
@@ -232,6 +311,27 @@ impl AtomicPlaneProperties {
             color_range: set.optional("COLOR_RANGE").map(PlanePropertyId),
         })
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct AtomicCursorPlaneProperties {
+    pub plane_id: u32,
+    pub crtc_id: u32,
+    pub fb_id: u32,
+    pub crtc_x: u32,
+    pub crtc_y: u32,
+    pub crtc_w: u32,
+    pub crtc_h: u32,
+    pub src_x: u32,
+    pub src_y: u32,
+    pub src_w: u32,
+    pub src_h: u32,
+    pub in_formats: Option<u32>,
+    pub rotation: Option<u32>,
+    pub property_ids: AtomicPlaneProperties,
+    pub format_modifier: DrmFormatModifierPair,
+    pub alpha_maximum: Option<u64>,
+    pub pixel_blend_mode_premultiplied: Option<u64>,
 }
 
 pub fn parse_in_formats_blob(bytes: &[u8]) -> Result<Vec<DrmFormatModifierPair>, AtomicKmsError> {

@@ -1,4 +1,5 @@
 use super::*;
+use oblivion_one::native::kms::{AtomicDiscovery, AtomicKmsError, KmsBackendKind};
 
 pub(super) fn log_native_runtime_bootstrap(
     server: &OwnCompositorServer,
@@ -121,6 +122,40 @@ pub(super) fn log_native_runtime_bootstrap(
     }
 }
 
+enum NativeKmsStartupPlan {
+    Atomic {
+        discovery: Box<AtomicDiscovery>,
+    },
+    Legacy {
+        atomic_fallback_reason: Option<AtomicKmsError>,
+    },
+}
+
+fn build_native_kms_startup_plan(
+    policy: KmsPolicy,
+    scanout: NativeScanoutKind,
+    discovery: Result<AtomicDiscovery, AtomicKmsError>,
+) -> NativeResult<NativeKmsStartupPlan> {
+    let decision = decide_native_kms_startup(
+        policy,
+        scanout,
+        discovery.as_ref().map(|_| ()).map_err(Clone::clone),
+    )?;
+    match decision {
+        NativeKmsStartupDecision::Atomic => match discovery {
+            Ok(discovery) => Ok(NativeKmsStartupPlan::Atomic {
+                discovery: Box::new(discovery),
+            }),
+            Err(error) => Err(error.into()),
+        },
+        NativeKmsStartupDecision::Legacy {
+            atomic_fallback_reason,
+        } => Ok(NativeKmsStartupPlan::Legacy {
+            atomic_fallback_reason,
+        }),
+    }
+}
+
 struct NativeRuntimeBootstrapTail {
     server: OwnCompositorServer,
     perf: NativePerfLogger,
@@ -138,7 +173,8 @@ struct NativeRuntimeBootstrapTail {
     input_state: NativeInputState,
     cursor_preference: NativeCursorPreference,
     direct_scanout_preference: NativeDirectScanoutPreference,
-    pre_kms_hardware_cursor: Option<NativeHardwareCursor>,
+    pre_kms_atomic_cursor: Option<NativeAtomicCursor>,
+    pre_kms_legacy_cursor: Option<NativeLegacyHardwareCursor>,
     cursor_render_mode: NativeCursorRenderMode,
     input_plan: NativeInputBackendPlan,
     seat_session: Option<NativeSeatSession>,
@@ -165,16 +201,18 @@ impl NativeRuntime {
             input_state,
             cursor_preference,
             direct_scanout_preference,
-            pre_kms_hardware_cursor,
+            pre_kms_atomic_cursor,
+            pre_kms_legacy_cursor,
             mut cursor_render_mode,
             input_plan,
             seat_session,
             startup_app,
             effective_app_gpu_policy,
         } = parts;
-        let mut hardware_cursor = pre_kms_hardware_cursor;
+        let atomic_cursor = pre_kms_atomic_cursor;
+        let mut legacy_cursor = pre_kms_legacy_cursor;
         scanout.finish_initial_scanout();
-        if let Some(cursor) = hardware_cursor.as_mut() {
+        if let Some(cursor) = legacy_cursor.as_mut() {
             let (cursor_x, cursor_y) = input_state.cursor_position();
             if let Err(error) = cursor
                 .enable()
@@ -186,7 +224,7 @@ impl NativeRuntime {
                 eprintln!(
                     "native cursor: hardware cursor activation failed: {error}; using software"
                 );
-                hardware_cursor = None;
+                legacy_cursor = None;
                 cursor_render_mode = NativeCursorRenderMode::Software;
                 let fallback_damage = NativeOutputDamage::full_output(target.width, target.height);
                 let fallback_paint = scanout
@@ -214,7 +252,7 @@ impl NativeRuntime {
                     ]);
                     fields
                 });
-                scanout.present(&kms_backend)?;
+                scanout.present(&kms_backend, None)?;
                 perf.log("native.cursor", || {
                     vec![
                         NativePerfField::str("backend", cursor_render_mode.as_str()),
@@ -237,6 +275,29 @@ impl NativeRuntime {
                     ]
                 });
             }
+        } else if let Some(cursor) = atomic_cursor.as_ref() {
+            println!(
+                "atomic cursor: plane selected id={} size={}x{} format=0x{:08x} modifier={}",
+                cursor.plane.plane_id,
+                cursor.current().width,
+                cursor.current().height,
+                cursor.plane.format_modifier.fourcc,
+                cursor.plane.format_modifier.modifier,
+            );
+            println!(
+                "native cursor backend active: atomic hardware ({}x{})",
+                cursor.current().width,
+                cursor.current().height
+            );
+            perf.log("native.cursor", || {
+                vec![
+                    NativePerfField::str("backend", "hardware"),
+                    NativePerfField::str("implementation", "atomic-plane"),
+                    NativePerfField::str("policy", cursor_preference.as_str()),
+                    NativePerfField::u64("width", u64::from(cursor.current().width)),
+                    NativePerfField::u64("height", u64::from(cursor.current().height)),
+                ]
+            });
         } else {
             println!("native cursor backend active: software");
             perf.log("native.cursor", || {
@@ -404,7 +465,8 @@ impl NativeRuntime {
             cursor_preference,
             direct_scanout_preference,
             cursor_render_mode,
-            hardware_cursor,
+            atomic_cursor,
+            legacy_cursor,
             input_devices,
             seat_session,
             session: NativeSessionLifecycle::default(),
@@ -418,6 +480,7 @@ impl NativeRuntime {
             drm_reactor_token: Some(drm_reactor_token),
             output_render_fence_token: None,
             frame_scheduler,
+            atomic_commit_arbiter: AtomicCommitArbiter::new(),
             presentation_deadline,
             scheduled_presentation_target,
             render_journal,
@@ -558,54 +621,129 @@ impl NativeRuntime {
             .ok_or_else(|| io::Error::other("selected connector ID is zero"))?;
         let crtc_id = CrtcId::new(target.crtc_id)
             .ok_or_else(|| io::Error::other("selected CRTC ID is zero"))?;
-        let mut atomic_discovery = None;
-        let mut scanout = if scanout_plan.primary == NativeScanoutKind::AtomicEglGbmExplicit {
-            if kms_policy == KmsPolicy::Legacy {
-                return Err(io::Error::other(
-                    "explicit Atomic EGL/GBM output cannot run with OBLIVION_ONE_KMS_MODE=legacy",
-                )
-                .into());
+        let (startup_plan, mut scanout) = if scanout_plan.primary
+            == NativeScanoutKind::AtomicEglGbmExplicit
+        {
+            if kms_policy == KmsPolicy::Legacy
+                && scanout_preference != NativeScanoutPreference::Auto
+            {
+                return Err(
+                    io::Error::other("explicit Atomic scanout cannot use Legacy KMS").into(),
+                );
             }
-            let discovery = KmsBackendSelection::discover_atomic_pipeline(
-                kms.file().as_fd(),
-                connector_id,
-                crtc_id,
-                u32::from_le_bytes(*b"XR24"),
-            )
-            .or_else(|error| {
-                if error.kind != AtomicKmsErrorKind::NoCompatiblePrimaryPlane {
-                    return Err(error);
-                }
+            let discovery_result = if kms_policy == KmsPolicy::Legacy {
+                Err(AtomicKmsError::new(
+                    AtomicKmsErrorKind::Unsupported,
+                    "Atomic discovery skipped for Legacy KMS",
+                ))
+            } else {
                 KmsBackendSelection::discover_atomic_pipeline(
                     kms.file().as_fd(),
                     connector_id,
                     crtc_id,
-                    u32::from_le_bytes(*b"AR24"),
+                    u32::from_le_bytes(*b"XR24"),
                 )
-            })?;
-            if !discovery.optional.in_fence_fd {
-                return Err(io::Error::other(
-                    "explicit Atomic EGL/GBM requires primary-plane IN_FENCE_FD",
-                )
-                .into());
+                .or_else(|error| {
+                    if error.kind != AtomicKmsErrorKind::NoCompatiblePrimaryPlane {
+                        return Err(error);
+                    }
+                    KmsBackendSelection::discover_atomic_pipeline(
+                        kms.file().as_fd(),
+                        connector_id,
+                        crtc_id,
+                        u32::from_le_bytes(*b"AR24"),
+                    )
+                })
+            };
+            match discovery_result {
+                Ok(discovery) => {
+                    if !discovery.optional.in_fence_fd {
+                        return Err(io::Error::other(
+                            "explicit Atomic EGL/GBM requires primary-plane IN_FENCE_FD",
+                        )
+                        .into());
+                    }
+                    let explicit = AtomicEglGbmScanout::create_unattached_pool(
+                        kms.file(),
+                        &discovery,
+                        target.width,
+                        target.height,
+                        drm_file_generation,
+                    )?;
+                    let startup_plan = build_native_kms_startup_plan(
+                        kms_policy,
+                        NativeScanoutKind::AtomicEglGbmExplicit,
+                        Ok(discovery),
+                    )?;
+                    (
+                        startup_plan,
+                        NativeScanoutBackend::from_atomic_explicit(explicit),
+                    )
+                }
+                Err(error)
+                    if kms_policy == KmsPolicy::Legacy
+                        || (kms_policy == KmsPolicy::Auto
+                            && scanout_preference == NativeScanoutPreference::Auto) =>
+                {
+                    eprintln!(
+                        "native KMS: explicit Atomic discovery failed ({error}); trying compatibility scanout"
+                    );
+                    let fallback_plan =
+                        scanout_plan.after_failed(NativeScanoutKind::AtomicEglGbmExplicit);
+                    let scanout = NativeScanoutBackend::open(
+                        fallback_plan,
+                        kms.file(),
+                        target.width,
+                        target.height,
+                        drm_file_generation,
+                    )?;
+                    let discovery = if kms_policy == KmsPolicy::Legacy {
+                        Err(AtomicKmsError::new(
+                            AtomicKmsErrorKind::Unsupported,
+                            "Atomic discovery skipped for Legacy KMS",
+                        ))
+                    } else {
+                        KmsBackendSelection::discover_atomic_pipeline(
+                            kms.file().as_fd(),
+                            connector_id,
+                            crtc_id,
+                            scanout.scanout_format(),
+                        )
+                    };
+                    let startup_plan =
+                        build_native_kms_startup_plan(kms_policy, scanout.kind(), discovery)?;
+                    (startup_plan, scanout)
+                }
+                Err(error) => return Err(error.into()),
             }
-            let explicit = AtomicEglGbmScanout::create_unattached_pool(
-                kms.file(),
-                &discovery,
-                target.width,
-                target.height,
-                drm_file_generation,
-            )?;
-            atomic_discovery = Some(discovery);
-            NativeScanoutBackend::from_atomic_explicit(explicit)
         } else {
-            NativeScanoutBackend::open(
+            let scanout = NativeScanoutBackend::open(
                 scanout_plan.clone(),
                 kms.file(),
                 target.width,
                 target.height,
                 drm_file_generation,
-            )?
+            )?;
+            let discovery = if kms_policy == KmsPolicy::Legacy {
+                Err(AtomicKmsError::new(
+                    AtomicKmsErrorKind::Unsupported,
+                    "Atomic discovery skipped for Legacy KMS",
+                ))
+            } else {
+                KmsBackendSelection::discover_atomic_pipeline(
+                    kms.file().as_fd(),
+                    connector_id,
+                    crtc_id,
+                    scanout.scanout_format(),
+                )
+            };
+            let startup_plan =
+                build_native_kms_startup_plan(kms_policy, scanout.kind(), discovery)?;
+            (startup_plan, scanout)
+        };
+        let atomic_discovery = match &startup_plan {
+            NativeKmsStartupPlan::Atomic { discovery } => Some(discovery.as_ref()),
+            NativeKmsStartupPlan::Legacy { .. } => None,
         };
         perf.log("native.backend", || {
             vec![
@@ -625,36 +763,93 @@ impl NativeRuntime {
             "native cursor backend target: {}",
             cursor_preference.as_str()
         );
-        let pre_kms_hardware_cursor = match cursor_preference {
-            NativeCursorPreference::Software => None,
-            NativeCursorPreference::Auto | NativeCursorPreference::Hardware => {
-                match NativeHardwareCursor::create(kms.file(), target.crtc_id) {
-                    Ok(cursor) => Some(cursor),
+        let mut pre_kms_atomic_cursor = None;
+        let mut pre_kms_legacy_cursor = None;
+        if cursor_preference != NativeCursorPreference::Software {
+            if let Some(discovery) = atomic_discovery.as_ref() {
+                if let Some(plane) = discovery.cursor_plane.clone() {
+                    match NativeAtomicCursor::create(
+                        kms.file(),
+                        plane,
+                        discovery.cursor_width,
+                        discovery.cursor_height,
+                        drm_file_generation,
+                    ) {
+                        Ok(mut cursor) => {
+                            let (x, y) = input_state.cursor_position();
+                            cursor.set_position(x, y);
+                            cursor.set_visible(
+                                input_state.cursor_visible()
+                                    && server.client_cursor_render_state().is_none(),
+                            );
+                            println!(
+                                "atomic cursor: framebuffer allocated id={} backing=dumb",
+                                cursor.desired().framebuffer_id.unwrap_or(0)
+                            );
+                            pre_kms_atomic_cursor = Some(cursor);
+                        }
+                        Err(error) if cursor_preference == NativeCursorPreference::Hardware => {
+                            return Err(error.into());
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "native cursor: Atomic hardware cursor unavailable: {error}; using software"
+                            );
+                            perf.log("native.cursor", || {
+                                vec![
+                                    NativePerfField::str("backend", "software"),
+                                    NativePerfField::str("policy", cursor_preference.as_str()),
+                                    NativePerfField::str("fallback", "create_failed"),
+                                    NativePerfField::str("error", error.to_string()),
+                                ]
+                            });
+                        }
+                    }
+                } else if cursor_preference == NativeCursorPreference::Hardware {
+                    return Err(io::Error::other(
+                        "Atomic hardware cursor requested but no compatible cursor plane was discovered",
+                    )
+                    .into());
+                }
+            } else if atomic_discovery.is_none() {
+                match NativeLegacyHardwareCursor::create(kms.file(), target.crtc_id) {
+                    Ok(cursor) => pre_kms_legacy_cursor = Some(cursor),
                     Err(error) if cursor_preference == NativeCursorPreference::Hardware => {
                         return Err(error.into());
                     }
-                    Err(error) => {
-                        eprintln!(
-                            "native cursor: hardware cursor unavailable: {error}; using software"
-                        );
-                        perf.log("native.cursor", || {
-                            vec![
-                                NativePerfField::str("backend", "software"),
-                                NativePerfField::str("policy", cursor_preference.as_str()),
-                                NativePerfField::str("fallback", "create_failed"),
-                                NativePerfField::str("error", error.to_string()),
-                            ]
-                        });
-                        None
-                    }
+                    Err(error) => eprintln!(
+                        "native cursor: legacy hardware cursor unavailable: {error}; using software"
+                    ),
                 }
             }
-        };
-        let cursor_render_mode = if pre_kms_hardware_cursor.is_some() {
-            NativeCursorRenderMode::Hardware
+        }
+        let effective_kms_kind = if atomic_discovery.is_some() {
+            KmsBackendKind::Atomic
         } else {
-            NativeCursorRenderMode::Software
+            KmsBackendKind::Legacy
         };
+        let cursor_owner = decide_native_cursor_owner(
+            effective_kms_kind,
+            cursor_preference,
+            pre_kms_atomic_cursor.is_some() || pre_kms_legacy_cursor.is_some(),
+        )
+        .map_err(io::Error::other)?;
+        debug_assert!(matches!(
+            (effective_kms_kind, cursor_owner),
+            (
+                KmsBackendKind::Atomic,
+                NativeCursorOwnerPlan::AtomicHardware
+            ) | (
+                KmsBackendKind::Legacy,
+                NativeCursorOwnerPlan::LegacyHardware
+            ) | (_, NativeCursorOwnerPlan::Software)
+        ));
+        let cursor_render_mode =
+            if pre_kms_atomic_cursor.is_some() || pre_kms_legacy_cursor.is_some() {
+                NativeCursorRenderMode::Hardware
+            } else {
+                NativeCursorRenderMode::Software
+            };
         let input_plan = NativeInputBackendPlan::choose(NativeInputBackendChoice {
             preference: NativeInputBackendPreference::from_env(),
             libseat_available: seat_session.is_some(),
@@ -666,12 +861,22 @@ impl NativeRuntime {
             input_plan.primary.as_str()
         );
         let initial_damage = NativeOutputDamage::full_output(target.width, target.height);
+        let initial_cursor_state = pre_kms_atomic_cursor.as_ref().and_then(|cursor| {
+            effective_atomic_cursor_state(
+                cursor,
+                cursor_render_mode,
+                input_state.cursor_visible(),
+                server.client_cursor_render_state().is_some(),
+            )
+            .kms_state()
+            .cloned()
+        });
         let mut initial_atomic_parts = None;
         let mut initial_surface_damage = None;
         let initial_paint = if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut scanout {
             let slot = explicit.initial_slot();
             let framebuffer = explicit.framebuffer(slot)?;
-            KmsBackendSelection::test_atomic_modeset_from_discovery(
+            KmsBackendSelection::test_atomic_modeset_from_discovery_with_cursor(
                 kms.file().as_fd(),
                 atomic_discovery
                     .as_ref()
@@ -680,6 +885,7 @@ impl NativeRuntime {
                 target.width,
                 target.height,
                 framebuffer,
+                initial_cursor_state.as_ref(),
             )?;
             initial_surface_damage = Some(server.capture_surface_damage_presentation());
             let mut initial_gpu_sampling_started = false;
@@ -792,48 +998,67 @@ impl NativeRuntime {
             ]);
             fields
         });
-        let kms_backend = if let Some(discovery) = atomic_discovery.take() {
-            let mut parts = initial_atomic_parts
-                .take()
-                .expect("explicit initial render produced frame ownership");
-            let initial_framebuffer = match &scanout {
-                NativeScanoutBackend::AtomicEglGbm(explicit) => explicit.framebuffer(parts.slot)?,
-                _ => unreachable!("Atomic discovery belongs to explicit scanout"),
-            };
-            let submission_fence = parts.render_fence.take_submission_fd()?;
-            let backend = KmsBackendSelection::initialize_atomic_from_discovery_with_fence(
-                kms.file().as_fd(),
-                kms_policy,
-                discovery,
-                target.mode,
-                target.width,
-                target.height,
-                initial_framebuffer,
-                submission_fence,
-            )?;
-            let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut scanout else {
-                unreachable!("Atomic discovery belongs to explicit scanout");
-            };
-            explicit.promote_initial_presented(parts.slot, parts.scene_commit)?;
-            if let Some(surface_damage) = initial_surface_damage.take() {
-                server.commit_surface_damage_presented(surface_damage);
+        let kms_backend = match startup_plan {
+            NativeKmsStartupPlan::Atomic { discovery } => {
+                if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut scanout {
+                    let mut parts = initial_atomic_parts
+                        .take()
+                        .expect("explicit initial render produced frame ownership");
+                    let initial_framebuffer = explicit.framebuffer(parts.slot)?;
+                    let submission_fence = parts.render_fence.take_submission_fd()?;
+                    let backend =
+                        KmsBackendSelection::initialize_atomic_from_discovery_with_fence_and_cursor(
+                            kms.file().as_fd(),
+                            kms_policy,
+                            *discovery,
+                            target.mode,
+                            target.width,
+                            target.height,
+                            initial_framebuffer,
+                            submission_fence,
+                            initial_cursor_state.as_ref(),
+                        )?;
+                    explicit.promote_initial_presented(parts.slot, parts.scene_commit)?;
+                    if let Some(surface_damage) = initial_surface_damage.take() {
+                        server.commit_surface_damage_presented(surface_damage);
+                    }
+                    backend
+                } else {
+                    let initial_framebuffer =
+                        FramebufferId::new(scanout.fb_id()).ok_or_else(|| {
+                            io::Error::other("initial scanout framebuffer ID is zero")
+                        })?;
+                    KmsBackendSelection::initialize_atomic_from_discovery_with_cursor(
+                        kms.file().as_fd(),
+                        kms_policy,
+                        *discovery,
+                        target.mode,
+                        target.width,
+                        target.height,
+                        initial_framebuffer,
+                        initial_cursor_state.as_ref(),
+                    )?
+                }
             }
-            backend
-        } else {
-            let initial_framebuffer = FramebufferId::new(scanout.fb_id())
-                .ok_or_else(|| io::Error::other("initial scanout framebuffer ID is zero"))?;
-            KmsBackendSelection::initialize(
-                kms.file().as_fd(),
-                kms_policy,
-                connector_id,
-                crtc_id,
-                target.mode,
-                target.width,
-                target.height,
-                scanout.scanout_format(),
-                initial_framebuffer,
-            )?
+            NativeKmsStartupPlan::Legacy {
+                atomic_fallback_reason,
+            } => {
+                let initial_framebuffer = FramebufferId::new(scanout.fb_id())
+                    .ok_or_else(|| io::Error::other("initial scanout framebuffer ID is zero"))?;
+                KmsBackendSelection::initialize_legacy(
+                    kms.file().as_fd(),
+                    kms_policy,
+                    atomic_fallback_reason,
+                    connector_id,
+                    crtc_id,
+                    target.mode,
+                    initial_framebuffer,
+                )?
+            }
         };
+        if let Some(cursor) = pre_kms_atomic_cursor.as_mut() {
+            cursor.mark_initial_submitted(initial_cursor_state.as_ref());
+        }
         println!(
             "native KMS backend active: {}",
             kms_backend.effective_kind().as_str()
@@ -908,7 +1133,8 @@ impl NativeRuntime {
             input_state,
             cursor_preference,
             direct_scanout_preference,
-            pre_kms_hardware_cursor,
+            pre_kms_atomic_cursor,
+            pre_kms_legacy_cursor,
             cursor_render_mode,
             input_plan,
             seat_session,

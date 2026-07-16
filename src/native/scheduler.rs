@@ -436,6 +436,11 @@ impl NativeFrameScheduler {
         Ok(())
     }
 
+    pub fn discard_ready_frame(&mut self) {
+        self.ready_frame_queued = false;
+        self.ready_target = None;
+    }
+
     pub fn note_page_flip_completion(
         &mut self,
         token: u64,
@@ -525,6 +530,14 @@ impl NativeFrameScheduler {
 
     pub fn watchdog_timeout_count(&self) -> u64 {
         self.watchdog_timeout_count
+    }
+
+    /// Explicit Atomic output has a total commit arbiter that owns the kernel
+    /// watchdog. Keep the scheduler's pacing state pending without creating a
+    /// second timeout owner for the same commit.
+    pub fn defer_page_flip_watchdog_to_atomic_arbiter(&mut self) {
+        self.watchdog_deadline_ns = None;
+        self.watchdog_reported = false;
     }
 
     pub fn state(&self) -> SchedulerState {

@@ -1,5 +1,8 @@
+use super::cursor_cycle::{
+    apply_cursor_position, complete_cursor_only_pageflip, complete_primary_cursor_pageflip,
+    schedule_coalesced_cursor_update, synchronize_cursor_state,
+};
 use super::*;
-
 pub fn run(
     server: OwnCompositorServer,
     app: Vec<String>,
@@ -24,8 +27,9 @@ impl NativeRuntime {
 
     fn run_cycle(&mut self) -> NativeResult<()> {
         let mut cycle = self.wait_for_events_and_pageflips()?;
-        self.server
-            .set_commit_debug_pageflip_pending(self.scanout.page_flip_pending());
+        self.server.set_commit_debug_pageflip_pending(
+            self.scanout.page_flip_pending() || self.atomic_commit_arbiter.atomic_commit_pending(),
+        );
         self.reap_supervised_children(&cycle)?;
         self.advance_shutdown_lifecycle(&cycle)?;
         if !self.session.permits_output() {
@@ -87,60 +91,10 @@ impl NativeRuntime {
         Ok(())
     }
 
-    fn request_native_shutdown(&mut self) -> NativeResult<()> {
-        let now_ns = monotonic_now_ns()?;
-        let pending_pageflip_token = self
-            .scanout
-            .pending_page_flip_token()
-            .or_else(|| self.frame_scheduler.pending_page_flip_token());
-        match self
-            .shutdown
-            .request_shutdown(now_ns, pending_pageflip_token)
-        {
-            Some(transition) => {
-                native_shutdown_debug_log("shortcut_exit_requested");
-                native_shutdown_debug_log("shutdown_begin");
-                println!("native input exit requested; shutting down cleanly");
-                self.process_supervisor.begin_quiesce();
-                self.log_shutdown_transition(transition);
-            }
-            None => {
-                native_shutdown_debug_log("shortcut_exit_requested_duplicate");
-            }
-        }
-        self.advance_shutdown_lifecycle_without_cycle()
-    }
-
-    fn advance_shutdown_lifecycle_without_cycle(&mut self) -> NativeResult<()> {
-        let cycle = NativeCycleState {
-            wakeup: NativeWakeup {
-                reasons: Default::default(),
-                ready_sources: 0,
-                blocked_ns: 0,
-                timer_lateness_ns: None,
-                explicit_sync_acquire_tokens: Vec::new(),
-            },
-            pageflip_drain_us: 0,
-            pageflip_completed: false,
-            completed_pageflip_token: None,
-            frame_completed: false,
-            frame_rendered: false,
-            frame_submitted: false,
-            present_us: 0,
-            pageflip_pending_at_tick: self.scanout.page_flip_pending(),
-            tick_us: 0,
-            accepted: 0,
-            redraw_requested: false,
-            skipped_input_repaints: 0,
-            input_drain_us: 0,
-            raw_input_events: 0,
-            coalesced_input_events: 0,
-            shutdown_requested: false,
-        };
-        self.advance_shutdown_lifecycle(&cycle)
-    }
-
-    fn advance_shutdown_lifecycle(&mut self, cycle: &NativeCycleState) -> NativeResult<()> {
+    pub(super) fn advance_shutdown_lifecycle(
+        &mut self,
+        cycle: &NativeCycleState,
+    ) -> NativeResult<()> {
         loop {
             match self.shutdown.state() {
                 ShutdownState::Running | ShutdownState::Complete => return Ok(()),
@@ -212,57 +166,13 @@ impl NativeRuntime {
         }
     }
 
-    fn restore_kms_for_shutdown(&mut self) -> NativeResult<()> {
-        let Some(reason) = self.shutdown.begin_kms_restore() else {
-            return Ok(());
-        };
-        native_shutdown_debug_log("input_backend_stop");
-        self.acquire_watches.shutdown(&mut self.event_loop)?;
-        if !self.session.permits_output() {
-            teardown_without_drm_io(self);
-            self.parked_acquire_watches.clear();
-            self.perf.log("native.shutdown_session", || {
-                vec![NativePerfField::str(
-                    "action",
-                    "skip_kms_restore_while_seat_inactive",
-                )]
-            });
-            if let Some(transition) = self.shutdown.note_kms_restore_complete() {
-                self.log_shutdown_transition(transition);
-            }
-            return Ok(());
-        }
-        if let Some(cursor) = self.hardware_cursor.as_mut() {
-            let _ = cursor.disable();
-        }
-        native_shutdown_debug_log("kms_restore_begin");
-        NativeSessionIo::observe(self, NativeIoOperation::KmsRestore);
-        let restoration = self.kms_backend.restore()?;
-        native_shutdown_debug_log("kms_restore_end");
-        self.perf.log("native.kms_restore", || {
-            vec![
-                NativePerfField::str("backend", self.kms_backend.effective_kind().as_str()),
-                NativePerfField::str("outcome", restoration.as_str()),
-                NativePerfField::str("shutdown_pageflip", reason.as_str()),
-                NativePerfField::bool("pageflip_pending", self.scanout.page_flip_pending()),
-            ]
-        });
-        native_shutdown_debug_log("drm_release");
-        native_shutdown_debug_log("vt_restore");
-        if let Some(transition) = self.shutdown.note_kms_restore_complete() {
-            self.log_shutdown_transition(transition);
-        }
-        self.event_loop.arm_deadline(None)?;
-        Ok(())
-    }
-
     fn arm_shutdown_deadline(&mut self) -> NativeResult<()> {
         self.event_loop
             .arm_deadline(self.shutdown.pageflip_deadline_ns())?;
         Ok(())
     }
 
-    fn log_shutdown_transition(&self, transition: ShutdownTransition) {
+    pub(super) fn log_shutdown_transition(&self, transition: ShutdownTransition) {
         self.perf.log("native.shutdown_transition", || {
             vec![
                 NativePerfField::str("from", transition.from.as_str()),
@@ -287,7 +197,9 @@ impl NativeRuntime {
         self.dispatch_runtime_seat_events(&wakeup)?;
         if self.session.permits_output()
             && (wakeup.reasons.drm()
-                || (wakeup.reasons.timer() && self.scanout.page_flip_pending()))
+                || (wakeup.reasons.timer()
+                    && (self.scanout.page_flip_pending()
+                        || self.atomic_commit_arbiter.atomic_commit_pending())))
         {
             NativeSessionIo::observe(self, NativeIoOperation::PageflipDrain);
         }
@@ -308,7 +220,8 @@ impl NativeRuntime {
             input_state,
             cursor_preference,
             cursor_render_mode,
-            hardware_cursor,
+            atomic_cursor,
+            legacy_cursor,
             input_devices,
             seat_session: _,
             session: _,
@@ -319,6 +232,7 @@ impl NativeRuntime {
             drm_reactor_token: _,
             output_render_fence_token,
             frame_scheduler,
+            atomic_commit_arbiter,
             presentation_deadline,
             scheduled_presentation_target,
             render_journal,
@@ -445,10 +359,11 @@ impl NativeRuntime {
         let should_drain_pageflips = wakeup.reasons.drm()
             || (wakeup.reasons.timer()
                 && (frame_scheduler.page_flip_pending()
+                    || atomic_commit_arbiter.atomic_commit_pending()
                     || shutdown.state() == ShutdownState::Draining));
         let pageflip_drain = if should_drain_pageflips {
             scanout
-                .drain_page_flip_events(kms.file().as_raw_fd())
+                .drain_page_flip_events(kms.file().as_raw_fd(), kms_backend.effective_kind())
                 .map_err(|error| {
                     native_runtime_error(
                         NativeRuntimeStage::DrainPageFlipEvents,
@@ -496,6 +411,36 @@ impl NativeRuntime {
         let pageflip_event = pageflip_drain
             .completion
             .filter(|event| event.crtc_id == target.crtc_id);
+        let (pageflip_event, atomic_completion, atomic_watchdog_kind) = validate_atomic_pageflip(
+            atomic_commit_arbiter,
+            kms_backend.effective_kind(),
+            pageflip_event,
+            *drm_file_generation,
+            monotonic_now_ns()?,
+            mismatched_pageflip_events,
+            stale_pageflip_events,
+        )?;
+        if let Some(kind) = atomic_watchdog_kind {
+            perf.log("native.atomic_commit_watchdog", || {
+                vec![
+                    NativePerfField::str("kind", format!("{kind:?}")),
+                    NativePerfField::u64(
+                        "token",
+                        atomic_commit_arbiter
+                            .pending_atomic_token()
+                            .map_or(0, PageFlipToken::get),
+                    ),
+                    NativePerfField::u64("crtc", u64::from(target.crtc_id)),
+                    NativePerfField::u64("generation", *drm_file_generation),
+                    NativePerfField::bool("final_drain_completed", false),
+                ]
+            });
+            acquire_watches.shutdown(event_loop)?;
+            return Err(io::Error::other(
+                "native Atomic commit watchdog expired; final DRM drain found no completion",
+            )
+            .into());
+        }
         let pageflip_completed = pageflip_event.is_some();
         let mut completed_pageflip_token = None;
         let mut frame_completed = false;
@@ -503,11 +448,54 @@ impl NativeRuntime {
         let frame_submitted = false;
         if let Some(pageflip) = pageflip_event {
             completed_pageflip_token = Some(pageflip.user_data);
+            let cursor_commit = atomic_completion.is_some_and(|completion| {
+                matches!(
+                    completion,
+                    AtomicCommitCompletion::Completed(AtomicCommitKind::CursorOnly { .. })
+                )
+            });
+            if cursor_commit
+                && complete_cursor_only_pageflip(
+                    atomic_cursor,
+                    pageflip.user_data,
+                    *drm_file_generation,
+                    perf,
+                )?
+            {
+                schedule_coalesced_cursor_update(atomic_cursor, event_loop)?;
+                return Ok(NativeCycleState {
+                    wakeup,
+                    pageflip_drain_us,
+                    pageflip_completed: true,
+                    completed_pageflip_token,
+                    frame_completed: false,
+                    frame_rendered: false,
+                    frame_submitted: false,
+                    present_us: 0,
+                    pageflip_pending_at_tick: scanout.page_flip_pending(),
+                    tick_us: 0,
+                    accepted: 0,
+                    redraw_requested: false,
+                    skipped_input_repaints: 0,
+                    input_drain_us: 0,
+                    raw_input_events: 0,
+                    coalesced_input_events: 0,
+                    shutdown_requested: false,
+                });
+            }
             let compositor_receive_ns = monotonic_now_ns()?;
             let scheduler_state_at_completion = frame_scheduler.state();
             let direct_pending = scanout.direct_scanout_pending();
             let completion = frame_scheduler
                 .note_page_flip_completion(pageflip.user_data, compositor_receive_ns);
+            if matches!(completion, PageFlipCompletionResult::Completed { .. })
+                && let Some(token) = pageflip_drain.deferred_promotion_token
+            {
+                scanout.promote_page_flip(
+                    PageFlipToken::new(token)
+                        .ok_or_else(|| io::Error::other("pageflip promotion token is zero"))?,
+                )?;
+            }
             if let PageFlipCompletionResult::Completed { submitted_at_ns } = completion {
                 let completed_frame_id = frame_pacing.pending;
                 let presentation = if direct_pending {
@@ -539,6 +527,11 @@ impl NativeRuntime {
                         presentation,
                         server,
                     )?;
+                    complete_primary_cursor_pageflip(
+                        atomic_cursor,
+                        pageflip.user_data,
+                        *drm_file_generation,
+                    )?;
                     let presented_at = MonotonicTimestampNs::new(presented_at_ns);
                     let actual_logical_sequence =
                         presentation_deadline.note_presented(presented_at);
@@ -565,6 +558,11 @@ impl NativeRuntime {
                             .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
                         presentation,
                         server,
+                    )?;
+                    complete_primary_cursor_pageflip(
+                        atomic_cursor,
+                        pageflip.user_data,
+                        *drm_file_generation,
                     )?;
                     let presented_at = MonotonicTimestampNs::new(presented_at_ns);
                     let actual_logical_sequence =
@@ -639,6 +637,11 @@ impl NativeRuntime {
                     });
                     *scheduled_presentation_target = None;
                 } else {
+                    complete_primary_cursor_pageflip(
+                        atomic_cursor,
+                        pageflip.user_data,
+                        *drm_file_generation,
+                    )?;
                     server.finish_frame_with_presentation(presentation);
                 }
                 frame_pacing.note_pageflip(
@@ -807,7 +810,7 @@ impl NativeRuntime {
             {
                 self.parked_acquire_watches.extend(parked);
             }
-            if let Some(mut cursor) = self.hardware_cursor.take() {
+            if let Some(mut cursor) = self.legacy_cursor.take() {
                 cursor.disarm_drm_cleanup();
             }
             self.pending_session_recovery = None;
@@ -895,7 +898,8 @@ impl NativeRuntime {
             input_state,
             cursor_preference,
             cursor_render_mode,
-            hardware_cursor,
+            atomic_cursor,
+            legacy_cursor,
             input_devices,
             acquire_notifier,
             acquire_watches,
@@ -931,9 +935,9 @@ impl NativeRuntime {
             server,
             pointer_constraint_backend,
             input_state,
-            hardware_cursor,
             *cursor_render_mode,
         )?;
+        synchronize_cursor_state(atomic_cursor, legacy_cursor, input_state)?;
         let current_toplevels = server.xdg_toplevels();
         if current_toplevels > *known_toplevels {
             for _ in *known_toplevels..current_toplevels {
@@ -992,25 +996,20 @@ impl NativeRuntime {
             let may_change_pointer_constraints = event.may_change_pointer_constraints();
             let effect = input_state.handle_hardware_input_event(event);
             let effect_requested_redraw = effect.redraw_requested;
-            if let Some((cursor_x, cursor_y)) = effect.cursor_position
-                && let Some(cursor) = hardware_cursor.as_mut()
-                && let Err(error) = cursor.move_to(cursor_x, cursor_y)
-            {
+            if let Err(error) = apply_cursor_position(
+                atomic_cursor,
+                legacy_cursor,
+                effect.cursor_position,
+                input_state.cursor_visible(),
+                *cursor_preference,
+                cursor_render_mode,
+                perf,
+            ) {
                 if *cursor_preference == NativeCursorPreference::Hardware {
                     acquire_watches.shutdown(event_loop)?;
                     return Err(error.into());
                 }
-                eprintln!("native cursor: hardware cursor move failed: {error}; using software");
-                *hardware_cursor = None;
-                *cursor_render_mode = NativeCursorRenderMode::Software;
-                perf.log("native.cursor", || {
-                    vec![
-                        NativePerfField::str("backend", cursor_render_mode.as_str()),
-                        NativePerfField::str("policy", cursor_preference.as_str()),
-                        NativePerfField::str("fallback", "move_failed"),
-                        NativePerfField::str("error", error.to_string()),
-                    ]
-                });
+                return Err(error.into());
             }
             let application = apply_native_input_effect(
                 effect,
@@ -1048,9 +1047,9 @@ impl NativeRuntime {
                     server,
                     pointer_constraint_backend,
                     input_state,
-                    hardware_cursor,
                     *cursor_render_mode,
                 )?;
+                synchronize_cursor_state(atomic_cursor, legacy_cursor, input_state)?;
             }
         }
         let interaction_reconciled = reconcile_trigger_liveness(server, input_state, "batch_end");
@@ -1059,9 +1058,9 @@ impl NativeRuntime {
             server,
             pointer_constraint_backend,
             input_state,
-            hardware_cursor,
             *cursor_render_mode,
         )?;
+        synchronize_cursor_state(atomic_cursor, legacy_cursor, input_state)?;
         if let Some(event_timestamp_us) = input_event_timestamp_usec {
             let dispatch_latency_us = monotonic_now_ns()?
                 .saturating_div(1_000)
@@ -1107,7 +1106,7 @@ impl NativeRuntime {
             input_state,
             cursor_preference,
             cursor_render_mode,
-            hardware_cursor,
+            legacy_cursor,
             input_devices,
             acquire_notifier,
             acquire_watches,

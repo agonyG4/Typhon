@@ -4,6 +4,7 @@ use super::{
     client_setup::*, clipboard_dmabuf::*, input_client::*, locked_relative::*, output_bindings::*,
     registry_state::*, server_runtime::*, subsurface_client::*, window_ops::*,
 };
+use crate::render_backend::buffer::DrmFormat;
 use std::cell::RefCell;
 
 type ExplicitBatchReleaseTrace = ((u32, u32, u32), Vec<u32>, Vec<u32>);
@@ -710,6 +711,85 @@ pub(in crate::compositor::tests) fn create_test_dmabuf_buffer_with_size(
         qh,
         (),
     ))
+}
+
+pub(in crate::compositor::tests) fn create_test_xrgb_dmabuf_buffer_with_size(
+    dmabuf: &client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+    qh: &QueueHandle<RegistryTestState>,
+    pixel: u32,
+    width: i32,
+    height: i32,
+) -> Result<client_wl_buffer::WlBuffer, Box<dyn std::error::Error>> {
+    let pixels = vec![pixel; usize::try_from(width.saturating_mul(height))?];
+    let file = create_test_shm_file(&pixels)?;
+    let stride = u32::try_from(width.saturating_mul(4))?;
+    let params = dmabuf.create_params(qh, ());
+    params.add(file.as_fd(), 0, 0, stride, 0, 0);
+    Ok(params.create_immed(
+        width,
+        height,
+        DrmFormat::XRGB8888_FOURCC,
+        client_zwp_linux_buffer_params_v1::Flags::empty(),
+        qh,
+        (),
+    ))
+}
+
+pub(in crate::compositor::tests) fn create_fullscreen_identity_viewport_xrgb_dmabuf(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    create_fullscreen_viewport_xrgb_dmabuf(
+        socket_path,
+        commands,
+        Some((0.0, 0.0, 1280.0, 800.0)),
+        Some((1280, 800)),
+    )
+}
+
+pub(in crate::compositor::tests) fn create_fullscreen_viewport_xrgb_dmabuf(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    source: Option<(f64, f64, f64, f64)>,
+    destination: Option<(i32, i32)>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 = globals.bind(&qh, 3..=3, ())?;
+    let viewporter: client_wp_viewporter::WpViewporter = globals.bind(&qh, 1..=1, ())?;
+    let width = 1280;
+    let height = 800;
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let toplevel = xdg_surface.get_toplevel(&qh, ());
+    let viewport = viewporter.get_viewport(&surface, &qh, ());
+    if let Some((x, y, width, height)) = source {
+        viewport.set_source(x, y, width, height);
+    }
+    if let Some((width, height)) = destination {
+        viewport.set_destination(width, height);
+    }
+    toplevel.set_app_id("oblivion.identity-viewport-test".to_string());
+    toplevel.set_fullscreen(None);
+    surface.commit();
+    connection.flush()?;
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+
+    let buffer =
+        create_test_xrgb_dmabuf_buffer_with_size(&dmabuf, &qh, 0xff22_4466, width, height)?;
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage_buffer(0, 0, width, height);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    wait_for_server_commands(commands);
+    retain_live_test_connection(connection);
+    Ok(state)
 }
 
 pub(in crate::compositor::tests) fn test_syncobj_device() -> Option<DrmSyncobjDevice> {

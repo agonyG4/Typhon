@@ -4,14 +4,17 @@ use std::{
 };
 
 use super::{
-    AtomicCommitFlags, AtomicConnectorProperties, AtomicCrtcProperties, AtomicFailureAction,
-    AtomicFailurePhase, AtomicKmsError, AtomicKmsErrorKind, AtomicPipelineProperties,
-    AtomicPipelineSnapshot, AtomicPlaneGeometry, AtomicPlaneProperties, AtomicRequest,
-    AtomicSubmission, BlobId, ConnectorId, CrtcId, DrmFormatModifierPair, DrmModeBlobIo,
-    DrmObjectKind, DrmProperty, FramebufferId, KmsBackendKind, KmsPolicy, LegacyKmsBackend,
-    ModeBlob, PageFlipToken, PlaneCandidate, PlaneId, PlaneType, RestorationOutcome,
-    disable_atomic_client_capability, enable_atomic_client_capability, object_properties,
-    parse_in_formats_blob, property_blob, select_primary_plane, submit_atomic,
+    AtomicCommitFlags, AtomicConnectorProperties, AtomicCrtcProperties,
+    AtomicCursorPlaneProperties, AtomicCursorPlaneSnapshot, AtomicCursorVisualState,
+    AtomicFailureAction, AtomicFailurePhase, AtomicKmsError, AtomicKmsErrorKind,
+    AtomicPipelineProperties, AtomicPipelineSnapshot, AtomicPlaneGeometry, AtomicPlaneProperties,
+    AtomicRequest, AtomicSubmission, BlobId, ConnectorId, CrtcId, DrmFormatModifierPair,
+    DrmModeBlobIo, DrmObjectKind, DrmProperty, FramebufferId, KmsBackendKind, KmsPolicy,
+    LegacyKmsBackend, ModeBlob, PageFlipToken, PlaneCandidate, PlaneId, PlaneType, PropertySet,
+    RestorationOutcome, cursor_dimension_from_capability, disable_atomic_client_capability,
+    enable_atomic_client_capability, enable_universal_planes_client_capability, object_properties,
+    parse_in_formats_blob, plane_type_from_value, property_blob, select_cursor_format_modifier,
+    select_cursor_plane, select_primary_plane, submit_atomic,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,9 +30,13 @@ pub struct AtomicDiscovery {
     pub pipeline: AtomicPipelineProperties,
     pub snapshot: AtomicPipelineSnapshot,
     pub optional: AtomicOptionalCapabilities,
+    pub framebuffer_format: u32,
     pub plane_possible_crtcs: u32,
     pub plane_formats: Vec<u32>,
     pub plane_scanout_formats: Vec<DrmFormatModifierPair>,
+    pub cursor_plane: Option<AtomicCursorPlaneProperties>,
+    pub cursor_width: u32,
+    pub cursor_height: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +51,7 @@ pub struct AtomicFlipRequest {
     pub framebuffer: FramebufferId,
     pub token: PageFlipToken,
     pub in_fence: OwnedFd,
+    pub cursor: Option<AtomicCursorVisualState>,
 }
 
 #[derive(Debug)]
@@ -77,6 +85,7 @@ pub fn discover_atomic_pipeline(
     fd: BorrowedFd<'_>,
     request: AtomicDiscoveryRequest,
 ) -> Result<AtomicDiscovery, AtomicKmsError> {
+    enable_universal_planes_client_capability(fd)?;
     enable_atomic_client_capability(fd)?;
     AtomicDiscovery::discover(
         fd,
@@ -163,10 +172,17 @@ impl AtomicDiscovery {
         let selected_id = selected.id;
         let selected_possible_crtcs = selected.possible_crtcs;
         let selected_formats = selected.formats.clone();
+        let cursor_selected = select_cursor_plane(
+            &candidates,
+            crtc_index,
+            crtc,
+            super::DRM_FORMAT_ARGB8888,
+            selected_id,
+        );
         let plane_entries = plane_property_entries
-            .into_iter()
+            .iter()
             .find(|(id, _)| *id == selected_id)
-            .map(|(_, entries)| entries)
+            .map(|(_, entries)| entries.clone())
             .ok_or_else(|| {
                 AtomicKmsError::new(
                     AtomicKmsErrorKind::MissingObject,
@@ -186,6 +202,82 @@ impl AtomicDiscovery {
             }
             _ => Vec::new(),
         };
+        let cursor_plane = cursor_selected.and_then(|selected_cursor| {
+            let entries = plane_property_entries
+                .iter()
+                .find(|(id, _)| *id == selected_cursor.id)
+                .map(|(_, entries)| entries.clone())?;
+            let property_ids = AtomicPlaneProperties::discover_cursor(&entries).ok()?;
+            let property_set =
+                PropertySet::new(DrmObjectKind::CursorPlane, entries.clone()).ok()?;
+            let alpha_maximum = property_set.alpha_maximum();
+            if property_set.contains("alpha") && alpha_maximum.is_none() {
+                return None;
+            }
+            let pixel_blend_mode_premultiplied = match property_set.premultiplied_blend_value() {
+                None => None,
+                Some(Some(value)) => Some(value),
+                Some(None) => return None,
+            };
+            let scanout_formats = match property_value(&entries, "IN_FORMATS") {
+                Some(blob_id) if blob_id != 0 => {
+                    let blob_id = u32::try_from(blob_id).ok()?;
+                    parse_in_formats_blob(&property_blob(fd, blob_id).ok()?).ok()?
+                }
+                _ => Vec::new(),
+            };
+            let format_modifier =
+                select_cursor_format_modifier(&scanout_formats, &selected_cursor.formats)?;
+            Some(AtomicCursorPlaneProperties {
+                plane_id: selected_cursor.id.get(),
+                crtc_id: crtc.get(),
+                fb_id: property_ids.fb_id.0.get(),
+                crtc_x: property_ids.crtc_x.0.get(),
+                crtc_y: property_ids.crtc_y.0.get(),
+                crtc_w: property_ids.crtc_w.0.get(),
+                crtc_h: property_ids.crtc_h.0.get(),
+                src_x: property_ids.src_x.0.get(),
+                src_y: property_ids.src_y.0.get(),
+                src_w: property_ids.src_w.0.get(),
+                src_h: property_ids.src_h.0.get(),
+                in_formats: property_ids.in_formats.map(|id| id.0.get()),
+                rotation: property_ids.rotation.map(|id| id.0.get()),
+                property_ids,
+                format_modifier,
+                alpha_maximum,
+                pixel_blend_mode_premultiplied,
+            })
+        });
+        let cursor_snapshot = cursor_plane.as_ref().and_then(|cursor| {
+            let entries = plane_property_entries
+                .iter()
+                .find(|(id, _)| *id == PlaneId::new(cursor.plane_id).unwrap())
+                .map(|(_, entries)| entries)?;
+            Some(AtomicCursorPlaneSnapshot {
+                fb_id: required_value(entries, "FB_ID", DrmObjectKind::CursorPlane).ok()?,
+                crtc_id: required_value(entries, "CRTC_ID", DrmObjectKind::CursorPlane).ok()?,
+                src_x: required_value(entries, "SRC_X", DrmObjectKind::CursorPlane).ok()?,
+                src_y: required_value(entries, "SRC_Y", DrmObjectKind::CursorPlane).ok()?,
+                src_w: required_value(entries, "SRC_W", DrmObjectKind::CursorPlane).ok()?,
+                src_h: required_value(entries, "SRC_H", DrmObjectKind::CursorPlane).ok()?,
+                crtc_x: required_value(entries, "CRTC_X", DrmObjectKind::CursorPlane).ok()?,
+                crtc_y: required_value(entries, "CRTC_Y", DrmObjectKind::CursorPlane).ok()?,
+                crtc_w: required_value(entries, "CRTC_W", DrmObjectKind::CursorPlane).ok()?,
+                crtc_h: required_value(entries, "CRTC_H", DrmObjectKind::CursorPlane).ok()?,
+                alpha: property_value(entries, "alpha"),
+                pixel_blend_mode: property_value(entries, "pixel blend mode"),
+            })
+        });
+        let cursor_width = cursor_dimension_from_capability(
+            drm_ffi::get_capability(fd, u64::from(drm_sys::DRM_CAP_CURSOR_WIDTH))
+                .ok()
+                .map(|capability| capability.value),
+        );
+        let cursor_height = cursor_dimension_from_capability(
+            drm_ffi::get_capability(fd, u64::from(drm_sys::DRM_CAP_CURSOR_HEIGHT))
+                .ok()
+                .map(|capability| capability.value),
+        );
         let optional = AtomicOptionalCapabilities {
             vrr_enabled: crtc_props.vrr_enabled.is_some(),
             in_fence_fd: plane_props.in_fence_fd.is_some(),
@@ -210,6 +302,7 @@ impl AtomicDiscovery {
             crtc_y: required_value(&plane_entries, "CRTC_Y", DrmObjectKind::PrimaryPlane)?,
             crtc_w: required_value(&plane_entries, "CRTC_W", DrmObjectKind::PrimaryPlane)?,
             crtc_h: required_value(&plane_entries, "CRTC_H", DrmObjectKind::PrimaryPlane)?,
+            cursor: cursor_snapshot,
         };
         Ok(Self {
             pipeline: AtomicPipelineProperties {
@@ -219,12 +312,17 @@ impl AtomicDiscovery {
                 connector_props,
                 crtc_props,
                 plane_props,
+                cursor_plane: cursor_plane.clone(),
             },
             snapshot,
             optional,
+            framebuffer_format,
             plane_possible_crtcs: selected_possible_crtcs,
             plane_formats: selected_formats,
             plane_scanout_formats,
+            cursor_plane,
+            cursor_width,
+            cursor_height,
         })
     }
 
@@ -304,6 +402,17 @@ impl AtomicDiscovery {
                 ),
             ));
         }
+        if let Some(cursor) = self.cursor_plane.as_ref()
+            && !planes.contains(&cursor.plane_id)
+        {
+            return Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::DeviceLost,
+                format!(
+                    "recovery cursor plane {} is no longer present",
+                    cursor.plane_id
+                ),
+            ));
+        }
 
         let connector_properties = object_properties(
             fd,
@@ -320,6 +429,11 @@ impl AtomicDiscovery {
             drm_sys::DRM_MODE_OBJECT_PLANE,
         )?;
         AtomicPlaneProperties::discover(&plane_properties)?;
+        if let Some(cursor) = self.cursor_plane.as_ref() {
+            let cursor_properties =
+                object_properties(fd, cursor.plane_id, drm_sys::DRM_MODE_OBJECT_PLANE)?;
+            AtomicPlaneProperties::discover_cursor(&cursor_properties)?;
+        }
         Ok(())
     }
 }
@@ -342,15 +456,6 @@ fn required_value(
             format!("{kind:?} is missing property value {name}"),
         )
     })
-}
-
-fn plane_type_from_value(value: u64) -> PlaneType {
-    match u32::try_from(value).ok() {
-        Some(drm_sys::DRM_PLANE_TYPE_OVERLAY) => PlaneType::Overlay,
-        Some(drm_sys::DRM_PLANE_TYPE_PRIMARY) => PlaneType::Primary,
-        Some(drm_sys::DRM_PLANE_TYPE_CURSOR) => PlaneType::Cursor,
-        _ => PlaneType::Unknown(value),
-    }
 }
 
 #[derive(Debug)]
@@ -376,13 +481,34 @@ impl DrmAtomicBackend {
         height: u32,
         framebuffer: FramebufferId,
     ) -> Result<(), AtomicKmsError> {
+        Self::test_initial_from_discovery_with_cursor(
+            fd,
+            discovery,
+            mode,
+            width,
+            height,
+            framebuffer,
+            None,
+        )
+    }
+
+    pub fn test_initial_from_discovery_with_cursor(
+        fd: BorrowedFd<'_>,
+        discovery: &AtomicDiscovery,
+        mode: drm_sys::drm_mode_modeinfo,
+        width: u32,
+        height: u32,
+        framebuffer: FramebufferId,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<(), AtomicKmsError> {
         let mode_blob = ModeBlob::create(DrmModeBlobIo::new(fd.as_raw_fd()), &mode)?;
         let geometry = AtomicPlaneGeometry::fullscreen(width, height)?;
-        let mut request = initial_modeset_request_from_discovery(
+        let mut request = initial_modeset_request_from_discovery_with_cursor(
             discovery,
             mode_blob.id(),
             framebuffer,
             geometry,
+            cursor,
         )?;
         request.set_test_input_fence_none(&discovery.pipeline)?;
         submit_atomic(
@@ -416,6 +542,27 @@ impl DrmAtomicBackend {
         )
     }
 
+    pub fn initialize_from_discovery_with_cursor(
+        fd: BorrowedFd<'_>,
+        discovery: AtomicDiscovery,
+        mode: drm_sys::drm_mode_modeinfo,
+        width: u32,
+        height: u32,
+        framebuffer: FramebufferId,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<Self, AtomicKmsError> {
+        Self::initialize_from_discovery_with_fence_and_cursor(
+            fd,
+            discovery,
+            mode,
+            width,
+            height,
+            framebuffer,
+            None,
+            cursor,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn initialize_from_discovery_with_fence(
         fd: BorrowedFd<'_>,
@@ -426,13 +573,37 @@ impl DrmAtomicBackend {
         framebuffer: FramebufferId,
         initial_in_fence: Option<OwnedFd>,
     ) -> Result<Self, AtomicKmsError> {
+        Self::initialize_from_discovery_with_fence_and_cursor(
+            fd,
+            discovery,
+            mode,
+            width,
+            height,
+            framebuffer,
+            initial_in_fence,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn initialize_from_discovery_with_fence_and_cursor(
+        fd: BorrowedFd<'_>,
+        discovery: AtomicDiscovery,
+        mode: drm_sys::drm_mode_modeinfo,
+        width: u32,
+        height: u32,
+        framebuffer: FramebufferId,
+        initial_in_fence: Option<OwnedFd>,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<Self, AtomicKmsError> {
         let mode_blob = ModeBlob::create(DrmModeBlobIo::new(fd.as_raw_fd()), &mode)?;
         let geometry = AtomicPlaneGeometry::fullscreen(width, height)?;
-        let mut request = initial_modeset_request_from_discovery(
+        let mut request = initial_modeset_request_from_discovery_with_cursor(
             &discovery,
             mode_blob.id(),
             framebuffer,
             geometry,
+            cursor,
         )?;
         let mut test_request = request.clone();
         test_request.set_test_input_fence_none(&discovery.pipeline)?;
@@ -483,16 +654,14 @@ impl DrmAtomicBackend {
         })
     }
 
-    pub fn submit_flip(
+    pub fn submit_flip_with_cursor(
         &self,
         framebuffer: FramebufferId,
         token: PageFlipToken,
+        cursor: Option<&AtomicCursorVisualState>,
     ) -> Result<(), AtomicKmsError> {
-        let request = AtomicRequest::primary_flip(
-            self.discovery.pipeline.plane,
-            self.discovery.pipeline.plane_props.fb_id,
-            framebuffer,
-        )?;
+        let request =
+            AtomicRequest::primary_flip_with_cursor(&self.discovery.pipeline, framebuffer, cursor)?;
         let submission = AtomicSubmission::page_flip(request, token);
         let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
         submit_atomic(
@@ -503,15 +672,50 @@ impl DrmAtomicBackend {
         )
     }
 
+    pub fn submit_cursor_flip(
+        &self,
+        cursor: Option<&AtomicCursorVisualState>,
+        token: PageFlipToken,
+    ) -> Result<(), AtomicKmsError> {
+        let request = AtomicRequest::cursor_only(&self.discovery.pipeline, cursor)?;
+        let submission = AtomicSubmission::page_flip(request, token);
+        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        submit_atomic(
+            fd,
+            &submission,
+            AtomicKmsErrorKind::FlipRejected,
+            "atomic cursor-plane update",
+        )
+    }
+
+    pub fn test_atomic_cursor_flip(
+        &self,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<(), AtomicKmsError> {
+        let request = AtomicRequest::cursor_only(&self.discovery.pipeline, cursor)?;
+        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        submit_atomic(
+            fd,
+            &AtomicSubmission::test_only(request),
+            AtomicKmsErrorKind::TestOnlyRejected,
+            "atomic cursor-plane TEST_ONLY update",
+        )
+    }
+
     pub fn test_atomic_primary_flip(
         &self,
         framebuffer: FramebufferId,
     ) -> Result<(), AtomicKmsError> {
-        let mut request = AtomicRequest::primary_flip(
-            self.discovery.pipeline.plane,
-            self.discovery.pipeline.plane_props.fb_id,
-            framebuffer,
-        )?;
+        self.test_atomic_primary_flip_with_cursor(framebuffer, None)
+    }
+
+    pub fn test_atomic_primary_flip_with_cursor(
+        &self,
+        framebuffer: FramebufferId,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<(), AtomicKmsError> {
+        let mut request =
+            AtomicRequest::primary_flip_with_cursor(&self.discovery.pipeline, framebuffer, cursor)?;
         request.set_test_input_fence_none(&self.discovery.pipeline)?;
         let submission = AtomicSubmission::test_only(request);
         let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
@@ -528,11 +732,17 @@ impl DrmAtomicBackend {
         framebuffer: FramebufferId,
         token: PageFlipToken,
     ) -> Result<(), AtomicKmsError> {
-        let request = AtomicRequest::primary_flip(
-            self.discovery.pipeline.plane,
-            self.discovery.pipeline.plane_props.fb_id,
-            framebuffer,
-        )?;
+        self.submit_direct_flip_with_cursor(framebuffer, token, None)
+    }
+
+    pub fn submit_direct_flip_with_cursor(
+        &self,
+        framebuffer: FramebufferId,
+        token: PageFlipToken,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<(), AtomicKmsError> {
+        let request =
+            AtomicRequest::primary_flip_with_cursor(&self.discovery.pipeline, framebuffer, cursor)?;
         let submission = AtomicSubmission::page_flip(request, token);
         let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
         submit_atomic(
@@ -559,19 +769,23 @@ impl DrmAtomicBackend {
     }
 
     pub fn recover(&self, framebuffer: FramebufferId) -> Result<(), AtomicKmsError> {
+        self.recover_with_cursor(framebuffer, None)
+    }
+
+    pub fn recover_with_cursor(
+        &self,
+        framebuffer: FramebufferId,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<(), AtomicKmsError> {
         let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
         self.discovery.validate_live_pipeline(fd, &self.mode)?;
         let pipeline = &self.discovery.pipeline;
-        let request = AtomicRequest::resume_modeset(
-            pipeline.connector,
-            pipeline.crtc,
-            pipeline.plane,
-            &pipeline.connector_props,
-            &pipeline.crtc_props,
-            &pipeline.plane_props,
+        let request = AtomicRequest::resume_modeset_for_pipeline(
+            pipeline,
             self.mode_blob.id(),
             framebuffer,
             self.geometry,
+            cursor,
         )?;
         let submission = AtomicSubmission::resume_modeset(request);
         submit_atomic(
@@ -580,6 +794,32 @@ impl DrmAtomicBackend {
             AtomicKmsErrorKind::InitialCommitRejected,
             "atomic native-session recovery modeset",
         )
+    }
+
+    pub fn rediscover_cursor_for_recovery(
+        &mut self,
+        fd: BorrowedFd<'_>,
+    ) -> Result<(), AtomicKmsError> {
+        let request = AtomicDiscoveryRequest::new(
+            self.discovery.pipeline.connector,
+            self.discovery.pipeline.crtc,
+            self.discovery.framebuffer_format,
+        );
+        let refreshed = discover_atomic_pipeline(fd, request)?;
+        if refreshed.pipeline.plane != self.discovery.pipeline.plane
+            || refreshed.pipeline.connector != self.discovery.pipeline.connector
+            || refreshed.pipeline.crtc != self.discovery.pipeline.crtc
+        {
+            return Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::DeviceLost,
+                "Atomic recovery rediscovered a different output pipeline",
+            ));
+        }
+        self.discovery.pipeline.cursor_plane = refreshed.pipeline.cursor_plane.clone();
+        self.discovery.cursor_plane = refreshed.cursor_plane;
+        self.discovery.cursor_width = refreshed.cursor_width;
+        self.discovery.cursor_height = refreshed.cursor_height;
+        Ok(())
     }
 
     pub fn disarm_drm_io(&mut self) {
@@ -629,12 +869,30 @@ pub(crate) fn submit_atomic_flip_with(
         .crtc_props
         .out_fence_ptr
         .map(|_| std::ptr::addr_of_mut!(out_fence_storage));
-    let atomic_request = AtomicRequest::primary_flip_with_fences(
+    let in_fence_property = pipeline.plane_props.in_fence_fd.ok_or_else(|| {
+        AtomicKmsError::new(
+            AtomicKmsErrorKind::MissingProperty,
+            "primary plane is missing required IN_FENCE_FD",
+        )
+    })?;
+    let mut atomic_request = AtomicRequest::primary_flip_with_cursor(
         pipeline,
         request.framebuffer,
-        request.in_fence.as_raw_fd(),
-        out_fence_ptr,
+        request.cursor.as_ref(),
     )?;
+    atomic_request.set_plane(
+        pipeline.plane,
+        in_fence_property,
+        u64::try_from(request.in_fence.as_raw_fd()).map_err(|_| {
+            AtomicKmsError::new(
+                AtomicKmsErrorKind::MissingProperty,
+                "Atomic input fence FD is negative",
+            )
+        })?,
+    )?;
+    if let (Some(property), Some(pointer)) = (pipeline.crtc_props.out_fence_ptr, out_fence_ptr) {
+        atomic_request.set_crtc(pipeline.crtc, property, pointer as u64)?;
+    }
     let submission = AtomicSubmission::page_flip(atomic_request, request.token);
     let result = submit(&submission);
     match result {
@@ -658,18 +916,24 @@ pub fn initial_modeset_request_from_discovery(
     framebuffer: FramebufferId,
     geometry: AtomicPlaneGeometry,
 ) -> Result<AtomicRequest, AtomicKmsError> {
-    let pipeline = &discovery.pipeline;
-    AtomicRequest::initial_modeset(
-        pipeline.connector,
-        pipeline.crtc,
-        pipeline.plane,
-        &pipeline.connector_props,
-        &pipeline.crtc_props,
-        &pipeline.plane_props,
+    initial_modeset_request_from_discovery_with_cursor(
+        discovery,
         mode_blob,
         framebuffer,
         geometry,
+        None,
     )
+}
+
+pub fn initial_modeset_request_from_discovery_with_cursor(
+    discovery: &AtomicDiscovery,
+    mode_blob: BlobId,
+    framebuffer: FramebufferId,
+    geometry: AtomicPlaneGeometry,
+    cursor: Option<&AtomicCursorVisualState>,
+) -> Result<AtomicRequest, AtomicKmsError> {
+    let pipeline = &discovery.pipeline;
+    AtomicRequest::initial_modeset_for_pipeline(pipeline, mode_blob, framebuffer, geometry, cursor)
 }
 
 fn elapsed_micros(started: Instant) -> u64 {
@@ -753,6 +1017,7 @@ fn restore_pipeline(
     Ok(RestorationOutcome::SafeDisable)
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum KmsDisplayBackend {
     Atomic(DrmAtomicBackend),
@@ -804,6 +1069,33 @@ impl KmsBackendSelection {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn initialize_atomic_from_discovery_with_cursor(
+        fd: BorrowedFd<'_>,
+        policy: KmsPolicy,
+        discovery: AtomicDiscovery,
+        mode: drm_sys::drm_mode_modeinfo,
+        width: u32,
+        height: u32,
+        framebuffer: FramebufferId,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<Self, AtomicKmsError> {
+        let backend = DrmAtomicBackend::initialize_from_discovery_with_cursor(
+            fd,
+            discovery,
+            mode,
+            width,
+            height,
+            framebuffer,
+            cursor,
+        )?;
+        Ok(Self {
+            requested: policy,
+            fallback_reason: None,
+            backend: KmsDisplayBackend::Atomic(backend),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn initialize_atomic_from_discovery_with_fence(
         fd: BorrowedFd<'_>,
         policy: KmsPolicy,
@@ -814,7 +1106,32 @@ impl KmsBackendSelection {
         framebuffer: FramebufferId,
         initial_in_fence: OwnedFd,
     ) -> Result<Self, AtomicKmsError> {
-        let backend = DrmAtomicBackend::initialize_from_discovery_with_fence(
+        Self::initialize_atomic_from_discovery_with_fence_and_cursor(
+            fd,
+            policy,
+            discovery,
+            mode,
+            width,
+            height,
+            framebuffer,
+            initial_in_fence,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn initialize_atomic_from_discovery_with_fence_and_cursor(
+        fd: BorrowedFd<'_>,
+        policy: KmsPolicy,
+        discovery: AtomicDiscovery,
+        mode: drm_sys::drm_mode_modeinfo,
+        width: u32,
+        height: u32,
+        framebuffer: FramebufferId,
+        initial_in_fence: OwnedFd,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<Self, AtomicKmsError> {
+        let backend = DrmAtomicBackend::initialize_from_discovery_with_fence_and_cursor(
             fd,
             discovery,
             mode,
@@ -822,6 +1139,7 @@ impl KmsBackendSelection {
             height,
             framebuffer,
             Some(initial_in_fence),
+            cursor,
         )?;
         Ok(Self {
             requested: policy,
@@ -838,13 +1156,34 @@ impl KmsBackendSelection {
         height: u32,
         framebuffer: FramebufferId,
     ) -> Result<(), AtomicKmsError> {
-        DrmAtomicBackend::test_initial_from_discovery(
+        Self::test_atomic_modeset_from_discovery_with_cursor(
             fd,
             discovery,
             mode,
             width,
             height,
             framebuffer,
+            None,
+        )
+    }
+
+    pub fn test_atomic_modeset_from_discovery_with_cursor(
+        fd: BorrowedFd<'_>,
+        discovery: &AtomicDiscovery,
+        mode: drm_sys::drm_mode_modeinfo,
+        width: u32,
+        height: u32,
+        framebuffer: FramebufferId,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<(), AtomicKmsError> {
+        DrmAtomicBackend::test_initial_from_discovery_with_cursor(
+            fd,
+            discovery,
+            mode,
+            width,
+            height,
+            framebuffer,
+            cursor,
         )
     }
 
@@ -915,6 +1254,29 @@ impl KmsBackendSelection {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn initialize_legacy(
+        fd: BorrowedFd<'_>,
+        policy: KmsPolicy,
+        fallback_reason: Option<AtomicKmsError>,
+        connector: ConnectorId,
+        crtc: CrtcId,
+        mode: drm_sys::drm_mode_modeinfo,
+        framebuffer: FramebufferId,
+    ) -> Result<Self, AtomicKmsError> {
+        Ok(Self {
+            requested: policy,
+            fallback_reason,
+            backend: KmsDisplayBackend::Legacy(LegacyKmsBackend::initialize(
+                fd,
+                connector,
+                crtc,
+                mode,
+                framebuffer,
+            )?),
+        })
+    }
+
     pub const fn effective_kind(&self) -> KmsBackendKind {
         match self.backend {
             KmsDisplayBackend::Atomic(_) => KmsBackendKind::Atomic,
@@ -922,13 +1284,16 @@ impl KmsBackendSelection {
         }
     }
 
-    pub fn submit_flip(
+    pub fn submit_flip_with_cursor(
         &self,
         framebuffer: FramebufferId,
         token: PageFlipToken,
+        cursor: Option<&AtomicCursorVisualState>,
     ) -> Result<(), AtomicKmsError> {
         match &self.backend {
-            KmsDisplayBackend::Atomic(backend) => backend.submit_flip(framebuffer, token),
+            KmsDisplayBackend::Atomic(backend) => {
+                backend.submit_flip_with_cursor(framebuffer, token, cursor)
+            }
             KmsDisplayBackend::Legacy(backend) => backend.submit_flip(framebuffer, token),
         }
     }
@@ -973,6 +1338,66 @@ impl KmsBackendSelection {
         }
     }
 
+    pub fn submit_cursor_flip(
+        &self,
+        cursor: Option<&AtomicCursorVisualState>,
+        token: PageFlipToken,
+    ) -> Result<(), AtomicKmsError> {
+        match &self.backend {
+            KmsDisplayBackend::Atomic(backend) => backend.submit_cursor_flip(cursor, token),
+            KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "legacy KMS cannot submit an Atomic cursor-plane update",
+            )),
+        }
+    }
+
+    pub fn test_atomic_cursor_flip(
+        &self,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<(), AtomicKmsError> {
+        match &self.backend {
+            KmsDisplayBackend::Atomic(backend) => backend.test_atomic_cursor_flip(cursor),
+            KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "legacy KMS cannot test an Atomic cursor-plane update",
+            )),
+        }
+    }
+
+    pub fn test_atomic_primary_flip_with_cursor(
+        &self,
+        framebuffer: FramebufferId,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<(), AtomicKmsError> {
+        match &self.backend {
+            KmsDisplayBackend::Atomic(backend) => {
+                backend.test_atomic_primary_flip_with_cursor(framebuffer, cursor)
+            }
+            KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "legacy KMS cannot test a direct Atomic primary flip",
+            )),
+        }
+    }
+
+    pub fn submit_direct_flip_with_cursor(
+        &self,
+        framebuffer: FramebufferId,
+        token: PageFlipToken,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<(), AtomicKmsError> {
+        match &self.backend {
+            KmsDisplayBackend::Atomic(backend) => {
+                backend.submit_direct_flip_with_cursor(framebuffer, token, cursor)
+            }
+            KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "legacy KMS cannot submit a direct Atomic primary flip",
+            )),
+        }
+    }
+
     pub fn restore(&mut self) -> Result<RestorationOutcome, AtomicKmsError> {
         match &mut self.backend {
             KmsDisplayBackend::Atomic(backend) => backend.restore(),
@@ -981,8 +1406,16 @@ impl KmsBackendSelection {
     }
 
     pub fn recover(&self, framebuffer: FramebufferId) -> Result<(), AtomicKmsError> {
+        self.recover_with_cursor(framebuffer, None)
+    }
+
+    pub fn recover_with_cursor(
+        &self,
+        framebuffer: FramebufferId,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<(), AtomicKmsError> {
         match &self.backend {
-            KmsDisplayBackend::Atomic(backend) => backend.recover(framebuffer),
+            KmsDisplayBackend::Atomic(backend) => backend.recover_with_cursor(framebuffer, cursor),
             KmsDisplayBackend::Legacy(backend) => backend.recover(framebuffer),
         }
     }
@@ -998,6 +1431,19 @@ impl KmsBackendSelection {
         match &self.backend {
             KmsDisplayBackend::Atomic(backend) => Some(backend),
             KmsDisplayBackend::Legacy(_) => None,
+        }
+    }
+
+    pub fn rediscover_atomic_cursor_for_recovery(
+        &mut self,
+        fd: BorrowedFd<'_>,
+    ) -> Result<(), AtomicKmsError> {
+        match &mut self.backend {
+            KmsDisplayBackend::Atomic(backend) => backend.rediscover_cursor_for_recovery(fd),
+            KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
+                AtomicKmsErrorKind::Unsupported,
+                "legacy KMS cannot rediscover an Atomic cursor plane",
+            )),
         }
     }
 }

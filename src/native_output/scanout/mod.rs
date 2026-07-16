@@ -1,4 +1,5 @@
 use super::*;
+use oblivion_one::native::kms::KmsBackendKind;
 
 #[allow(dead_code)] // Runtime attachment is completed after frame-owned rendering is available.
 mod atomic_egl_gbm;
@@ -243,22 +244,6 @@ pub(crate) struct AtomicExplicitRecovery {
     pool_generation: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NativePresentResult {
-    Noop,
-    AsyncSubmitted { token: u64 },
-    Immediate,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct NativePageFlipDrain {
-    pub(crate) completion: Option<DrmPresentationEvent>,
-    pub(crate) mismatched_events: u64,
-    pub(crate) stale_events: u64,
-    pub(crate) last_mismatch: Option<(u64, u64)>,
-    pub(crate) last_stale_token: Option<u64>,
-}
-
 impl NativeScanoutBackend {
     pub(crate) fn explicit_output_counters(&self) -> Option<ExplicitOutputCounters> {
         match self {
@@ -442,24 +427,35 @@ impl NativeScanoutBackend {
         }
     }
 
-    pub(crate) fn present(&mut self, kms: &KmsBackendSelection) -> io::Result<NativePresentResult> {
+    pub(crate) fn present(
+        &mut self,
+        kms: &KmsBackendSelection,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> io::Result<NativePresentResult> {
         let submitted_token = match self {
             Self::AtomicEglGbm(_) => {
                 return Err(io::Error::other(
                     "explicit Atomic output requires IN_FENCE_FD submission",
                 ));
             }
-            Self::NativeEglGbm(scanout) => scanout.present(kms)?,
-            Self::Gbm(scanout) => scanout.present(kms)?,
+            Self::NativeEglGbm(scanout) => scanout.present(kms, cursor)?,
+            Self::Gbm(scanout) => scanout.present(kms, cursor)?,
             Self::Dumb(_) => return Ok(NativePresentResult::Immediate),
         };
         match submitted_token {
-            Some(token) => Ok(NativePresentResult::AsyncSubmitted { token }),
+            Some((token, framebuffer_id)) => Ok(NativePresentResult::AsyncSubmitted {
+                token,
+                framebuffer_id,
+            }),
             None => Ok(NativePresentResult::Noop),
         }
     }
 
-    pub(crate) fn drain_page_flip_events(&mut self, fd: RawFd) -> io::Result<NativePageFlipDrain> {
+    pub(crate) fn drain_page_flip_events(
+        &mut self,
+        fd: RawFd,
+        backend_kind: KmsBackendKind,
+    ) -> io::Result<NativePageFlipDrain> {
         match self {
             Self::AtomicEglGbm(_) => {
                 let events = drain_drm_page_flip_events(fd)?;
@@ -468,9 +464,17 @@ impl NativeScanoutBackend {
                     ..NativePageFlipDrain::default()
                 })
             }
-            Self::NativeEglGbm(scanout) => scanout.drain_page_flip_events(fd),
-            Self::Gbm(scanout) => scanout.drain_page_flip_events(fd),
+            Self::NativeEglGbm(scanout) => scanout.drain_page_flip_events(fd, backend_kind),
+            Self::Gbm(scanout) => scanout.drain_page_flip_events(fd, backend_kind),
             Self::Dumb(_) => Ok(NativePageFlipDrain::default()),
+        }
+    }
+
+    pub(crate) fn promote_page_flip(&mut self, token: PageFlipToken) -> io::Result<()> {
+        match self {
+            Self::NativeEglGbm(scanout) => scanout.promote_page_flip(token),
+            Self::Gbm(scanout) => scanout.promote_page_flip(token),
+            Self::AtomicEglGbm(_) | Self::Dumb(_) => Ok(()),
         }
     }
 
@@ -526,6 +530,16 @@ impl NativeScanoutBackend {
             Self::NativeEglGbm(scanout) => scanout.ready_frame_queued(),
             Self::Gbm(scanout) => scanout.ready_frame_queued(),
             Self::Dumb(_) => false,
+        }
+    }
+
+    pub(crate) fn discard_ready_frame_before_direct(
+        &mut self,
+        server: &mut OwnCompositorServer,
+    ) -> io::Result<bool> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.discard_ready_frame_before_direct(server),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Ok(false),
         }
     }
 
@@ -676,14 +690,21 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn note_direct_composited_render_ahead_suppressed(&mut self) {
+        if let Self::AtomicEglGbm(scanout) = self {
+            scanout.note_composited_render_ahead_suppressed();
+        }
+    }
+
     pub(crate) fn try_direct_scanout(
         &mut self,
         kms: &KmsBackendSelection,
         server: &mut OwnCompositorServer,
         target: oblivion_one::native::presentation_deadline::PresentationTarget,
+        cursor: Option<&AtomicCursorVisualState>,
     ) -> io::Result<DirectScanoutAttempt> {
         match self {
-            Self::AtomicEglGbm(scanout) => scanout.try_direct_scanout(kms, server, target),
+            Self::AtomicEglGbm(scanout) => scanout.try_direct_scanout(kms, server, target, cursor),
             Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
                 "direct scanout is unsupported by this backend",
             )),

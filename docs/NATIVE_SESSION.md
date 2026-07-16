@@ -46,6 +46,24 @@ surface implementation and is never selected by `auto`.
 - `OBLIVION_ONE_SHELL_COMMAND='...'`
 - `OBLIVION_ONE_PERF_LOG=1`
 
+With Atomic KMS, `OBLIVION_ONE_CURSOR=auto` selects the discovered universal
+cursor plane when its ARGB8888 storage can be allocated safely. This applies to
+the explicit EGL/GBM, opaque EGL/GBM compatibility, CPU GBM, and asynchronous
+dumb-framebuffer scanout paths. `hardware` fails startup if that plane or its
+linear cursor buffer cannot be established; `auto` uses a visible software
+cursor instead. Atomic cursor state participates in every primary `TEST_ONLY`
+and commit, including compatibility scanouts, while cursor-only pageflips
+preserve Direct Scanout and do not complete compositor frame batches. A
+client-provided cursor that cannot be reproduced exactly in the Atomic cursor
+buffer blocks Direct Scanout and is composed.
+
+All nonblocking Atomic commits share one CRTC ownership slot and watchdog,
+including Atomic commits submitted by compatibility scanouts. Cursor-only
+timeouts follow the same final-drain and recovery path as primary timeouts. A
+hidden pointer disables the cursor plane without blocking Direct Scanout; a
+visible software or unsupported client cursor forces composition. Legacy cursor
+ioctls are used only when the effective KMS backend is Legacy.
+
 The compositor CLI retains only native configuration: `--check`, `--socket`,
 and an optional application after `--`. Former host-window and demo commands
 are invalid.

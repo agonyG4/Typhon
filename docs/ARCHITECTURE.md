@@ -49,6 +49,49 @@ modes:
 - hardware or software cursor;
 - accelerated or CPU-only application launch policy.
 
+Atomic output ownership
+
+On every effective Atomic KMS backend, the primary and cursor planes are one
+output state. This includes the explicit EGL/GBM scanout, opaque EGL/GBM
+compatibility, CPU GBM, and any asynchronous dumb-framebuffer pageflip path.
+Discovery is part of the effective KMS startup plan: it enables universal
+planes, selects a CRTC-compatible ARGB8888 cursor plane when available, records
+its original property snapshot, and reads the cursor size capabilities with a
+64×64 fallback. The cursor owner uses a pageflip-safe CPU/dumb ARGB buffer and
+AddFB2; it never calls legacy cursor ioctls. NVIDIA therefore follows the same
+visible hardware-cursor path when a linear cursor buffer is available, and
+otherwise falls back visibly to a software cursor.
+
+One output commit authority serializes composited-primary, direct-primary, and
+cursor-only Atomic commits and owns the token, DRM generation, CRTC, and
+watchdog for all three kinds. Compatibility scanouts use this same total
+arbiter whenever their effective KMS backend is Atomic. Cursor-only completion
+promotes cursor state only; it does not complete compositor frame batches,
+presentation feedback, damage, or Direct Scanout transitions. Cursor movement
+is coalesced behind the pending primary or cursor commit. Primary and cursor
+state are validated together with `TEST_ONLY`, and framebuffer ownership ends
+only at the matching pageflip (or through generation-aware recovery).
+
+Direct Scanout remains available only to the explicit EGL/GBM scanout. Legacy
+cursor ioctls are a Legacy-KMS-only implementation detail; compatibility
+scanouts never combine an Atomic primary with a legacy cursor owner.
+
+The effective KMS cursor state is centralized: software fallback, a latched
+cursor-plane failure, and an unsupported client cursor keep the Atomic cursor
+plane disabled until explicit recovery. Hidden logical cursor movement still
+updates the next show position but is KMS-equivalent to the current hidden
+state, so it does not create disabled-plane commits. Visible cursor planes
+normalize alpha to the advertised maximum and use the discovered premultiplied
+blend enum when present.
+
+While a valid Direct Scanout candidate remains active, predictive render-ahead
+cannot select a composed primary path. Pointer movement selects a cursor-only
+commit when the effective hardware cursor is usable, and an unchanged direct
+scene is idle. A hidden pointer keeps Direct Scanout eligible even without a
+hardware cursor. Popups, overlays, software cursors, unsupported client
+cursors, and other genuine scene changes force one composited fallback; closing
+them permits the next eligible direct re-entry.
+
 The server initially advertises the safe native protocol set. GPU buffer
 protocols are enabled only after the active native scanout backend is known.
 

@@ -1,4 +1,5 @@
 use super::*;
+use oblivion_one::native::kms::KmsBackendKind;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +165,7 @@ impl NativeSessionIo for NativeRuntime {
 
     fn quarantine_pageflip(&mut self) -> NativeResult<()> {
         self.frame_scheduler.abandon_for_session_suspend();
+        self.atomic_commit_arbiter.abandon_for_recovery();
         if let Some(token) = self.output_render_fence_token.take() {
             self.event_loop.unregister(token)?;
         }
@@ -179,16 +181,69 @@ impl NativeSessionIo for NativeRuntime {
     }
 
     fn disable_hardware_cursor(&mut self) -> NativeResult<()> {
-        if let Some(mut cursor) = self.hardware_cursor.take() {
+        if let Some(cursor) = self.atomic_cursor.as_mut() {
+            cursor.suspend_for_session();
+        }
+        if let Some(mut cursor) = self.legacy_cursor.take() {
             cursor.disable()?;
         }
         Ok(())
     }
 
     fn recover_kms_pipeline(&mut self) -> NativeResult<()> {
+        if self.atomic_cursor.is_some() {
+            self.kms_backend
+                .rediscover_atomic_cursor_for_recovery(self.kms.file().as_fd())?;
+        }
         let recovery = self.scanout.prepare_session_recovery()?;
         let framebuffer = recovery.framebuffer_id();
-        self.kms_backend.recover(framebuffer)?;
+        let _cursor_state = if self.atomic_cursor.is_some() {
+            let atomic = self.kms_backend.atomic().ok_or_else(|| {
+                io::Error::other("Atomic cursor exists without an Atomic KMS backend")
+            })?;
+            match atomic.discovery().cursor_plane.clone() {
+                Some(plane) => {
+                    if let Some(cursor) = self.atomic_cursor.as_mut() {
+                        Some(cursor.prepare_for_recovery(
+                            self.kms.file(),
+                            plane,
+                            atomic.discovery().cursor_width,
+                            atomic.discovery().cursor_height,
+                            self.drm_file_generation.saturating_add(1),
+                        )?)
+                    } else {
+                        None
+                    }
+                }
+                None => {
+                    if self.cursor_preference == NativeCursorPreference::Hardware {
+                        return Err(io::Error::other(
+                            "Atomic cursor plane disappeared during recovery",
+                        )
+                        .into());
+                    }
+                    if let Some(mut cursor) = self.atomic_cursor.take() {
+                        cursor.disarm_drm_cleanup();
+                    }
+                    self.cursor_render_mode = NativeCursorRenderMode::Software;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let cursor_kms_state = self.atomic_cursor.as_ref().and_then(|cursor| {
+            effective_atomic_cursor_state(
+                cursor,
+                self.cursor_render_mode,
+                self.input_state.cursor_visible(),
+                self.server.client_cursor_render_state().is_some(),
+            )
+            .kms_state()
+            .cloned()
+        });
+        self.kms_backend
+            .recover_with_cursor(framebuffer, cursor_kms_state.as_ref())?;
         self.pending_session_recovery = Some(recovery);
         self.perf.log("native.session_recovery", || {
             vec![
@@ -223,11 +278,26 @@ impl NativeSessionIo for NativeRuntime {
         if self.cursor_preference == NativeCursorPreference::Software {
             return Ok(());
         }
-        match NativeHardwareCursor::create(self.kms.file(), self.target.crtc_id) {
+        if let Some(cursor) = self.atomic_cursor.as_mut() {
+            cursor.rearm_generation(self.drm_file_generation);
+            self.cursor_render_mode = NativeCursorRenderMode::Hardware;
+            return Ok(());
+        }
+        if self.kms_backend.effective_kind() == KmsBackendKind::Atomic {
+            if self.cursor_preference == NativeCursorPreference::Hardware {
+                return Err(io::Error::other(
+                    "Atomic hardware cursor was not available during session recovery",
+                )
+                .into());
+            }
+            self.cursor_render_mode = NativeCursorRenderMode::Software;
+            return Ok(());
+        }
+        match NativeLegacyHardwareCursor::create(self.kms.file(), self.target.crtc_id) {
             Ok(mut cursor) => {
                 let (x, y) = self.input_state.cursor_position();
                 cursor.enable().and_then(|()| cursor.move_to(x, y))?;
-                self.hardware_cursor = Some(cursor);
+                self.legacy_cursor = Some(cursor);
                 self.cursor_render_mode = NativeCursorRenderMode::Hardware;
             }
             Err(error) if self.cursor_preference == NativeCursorPreference::Hardware => {
@@ -285,7 +355,10 @@ impl NativeSessionIo for NativeRuntime {
     fn disarm_drm_destructors(&mut self) {
         self.scanout.disarm_drm_cleanup();
         self.kms_backend.disarm_drm_io();
-        if let Some(cursor) = self.hardware_cursor.as_mut() {
+        if let Some(cursor) = self.atomic_cursor.as_mut() {
+            cursor.disarm_drm_cleanup();
+        }
+        if let Some(cursor) = self.legacy_cursor.as_mut() {
             cursor.disarm_drm_cleanup();
         }
     }

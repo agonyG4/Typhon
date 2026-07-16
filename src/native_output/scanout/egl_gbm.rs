@@ -1,4 +1,5 @@
 use super::*;
+use oblivion_one::native::kms::KmsBackendKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativePageFlipBuffers<T> {
@@ -245,6 +246,7 @@ pub(crate) struct NativeEglGbmScanout {
     pub(crate) framebuffer_cache: NativeGbmFramebufferCache,
     pub(crate) buffers: NativePageFlipBuffers<NativePresentedGbmBuffer>,
     pub(crate) page_flip: AtomicCommitState,
+    pub(crate) deferred_promotion_token: Option<u64>,
     pub(crate) backend_generation: u64,
     pub(crate) drm_cleanup_armed: bool,
 }
@@ -485,6 +487,7 @@ impl NativeEglGbmScanout {
             framebuffer_cache: NativeGbmFramebufferCache::default(),
             buffers: NativePageFlipBuffers::default(),
             page_flip: AtomicCommitState::default(),
+            deferred_promotion_token: None,
             backend_generation,
             drm_cleanup_armed: true,
         })
@@ -605,6 +608,7 @@ impl NativeEglGbmScanout {
         &mut self,
         recovery: NativePageFlipRecovery,
     ) -> io::Result<()> {
+        self.deferred_promotion_token = None;
         self.buffers
             .complete_session_recovery(recovery, |buffer| buffer.fb_id)
     }
@@ -613,7 +617,11 @@ impl NativeEglGbmScanout {
         self.buffers.finish_initial_scanout();
     }
 
-    pub(crate) fn present(&mut self, kms: &KmsBackendSelection) -> io::Result<Option<u64>> {
+    pub(crate) fn present(
+        &mut self,
+        kms: &KmsBackendSelection,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> io::Result<Option<(u64, u32)>> {
         if self.page_flip.is_pending() {
             return Ok(None);
         }
@@ -627,10 +635,10 @@ impl NativeEglGbmScanout {
         self.page_flip
             .begin(token, framebuffer, self.backend_generation, Instant::now())
             .map_err(io::Error::other)?;
-        match kms.submit_flip(framebuffer, token) {
+        match kms.submit_flip_with_cursor(framebuffer, token, cursor) {
             Ok(()) => {
                 self.buffers.set_pending(buffer);
-                Ok(Some(token.get()))
+                Ok(Some((token.get(), framebuffer.get())))
             }
             Err(error) => {
                 self.page_flip.submission_failed(token);
@@ -640,9 +648,22 @@ impl NativeEglGbmScanout {
         }
     }
 
-    pub(crate) fn drain_page_flip_events(&mut self, fd: RawFd) -> io::Result<NativePageFlipDrain> {
+    pub(crate) fn drain_page_flip_events(
+        &mut self,
+        fd: RawFd,
+        backend_kind: KmsBackendKind,
+    ) -> io::Result<NativePageFlipDrain> {
         let mut drain = NativePageFlipDrain::default();
         for event in drain_drm_page_flip_events(fd)? {
+            if backend_kind == KmsBackendKind::Atomic && !self.page_flip.is_pending() {
+                if drain.completion.is_none() {
+                    drain.completion = Some(event);
+                } else {
+                    drain.stale_events = drain.stale_events.saturating_add(1);
+                    drain.last_stale_token = Some(event.user_data);
+                }
+                continue;
+            }
             let expected = self.page_flip.pending_token().map(PageFlipToken::get);
             let Some(token) = PageFlipToken::new(event.user_data) else {
                 drain.stale_events = drain.stale_events.saturating_add(1);
@@ -652,7 +673,8 @@ impl NativeEglGbmScanout {
             match self.page_flip.complete(token, self.backend_generation) {
                 AtomicCompletion::Completed { .. } => {
                     if drain.completion.is_none() {
-                        self.buffers.complete_page_flip();
+                        drain.deferred_promotion_token = Some(token.get());
+                        self.deferred_promotion_token = Some(token.get());
                         drain.completion = Some(event);
                     } else {
                         drain.stale_events = drain.stale_events.saturating_add(1);
@@ -672,7 +694,22 @@ impl NativeEglGbmScanout {
     }
 
     pub(crate) fn page_flip_pending(&self) -> bool {
-        self.page_flip.is_pending()
+        self.page_flip.is_pending() || self.deferred_promotion_token.is_some()
+    }
+
+    pub(crate) fn promote_page_flip(&mut self, token: PageFlipToken) -> io::Result<()> {
+        if self.deferred_promotion_token != Some(token.get()) {
+            return Err(io::Error::other(
+                "EGL/GBM pageflip promotion token does not match deferred completion",
+            ));
+        }
+        if !self.buffers.complete_page_flip() {
+            return Err(io::Error::other(
+                "EGL/GBM pageflip promotion has no pending buffer",
+            ));
+        }
+        self.deferred_promotion_token = None;
+        Ok(())
     }
 
     pub(crate) fn suspend_page_flip(&mut self) {

@@ -129,6 +129,9 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureCommittedWindowGeometry(Sender<Option<XdgWindowGeometry>>),
     CaptureToplevelVisualGeometry(Sender<Option<ToplevelVisualGeometrySnapshot>>),
     CaptureFullscreenPresentationEligibility(Sender<FullscreenPresentationEligibility>),
+    CaptureDirectScanoutCandidate(
+        Sender<Result<DirectScanoutCandidateSnapshot, DirectScanoutSceneRejection>>,
+    ),
     CaptureClientCursorSnapshot(Sender<Option<ClientCursorSnapshot>>),
     CaptureInteractionCursorState(Sender<InteractionCursorStateSnapshot>),
     CaptureClipboardState(Sender<ClipboardStateSnapshot>),
@@ -198,6 +201,17 @@ pub(in crate::compositor::tests) enum ServerCommand {
     },
     PresentFrame,
     Stop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor::tests) struct DirectScanoutCandidateSnapshot {
+    pub(in crate::compositor::tests) surface_id: u32,
+    pub(in crate::compositor::tests) root_surface_id: u32,
+    pub(in crate::compositor::tests) generation: u64,
+    pub(in crate::compositor::tests) commit_sequence: SurfaceCommitSequence,
+    pub(in crate::compositor::tests) buffer_size: BufferSize,
+    pub(in crate::compositor::tests) output_size: BufferSize,
+    pub(in crate::compositor::tests) viewport_identity_metadata_present: bool,
 }
 
 pub(in crate::compositor::tests) fn spawn_controllable_test_server(
@@ -432,6 +446,21 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureFullscreenPresentationEligibility(reply) => {
                         let _ = reply.send(server.state.fullscreen_presentation_eligibility());
+                    }
+                    ServerCommand::CaptureDirectScanoutCandidate(reply) => {
+                        let candidate = server.direct_scanout_scene_candidate().map(|candidate| {
+                            DirectScanoutCandidateSnapshot {
+                                surface_id: candidate.surface_id,
+                                root_surface_id: candidate.root_surface_id,
+                                generation: candidate.generation,
+                                commit_sequence: candidate.commit_sequence,
+                                buffer_size: candidate.buffer_size,
+                                output_size: candidate.output_size,
+                                viewport_identity_metadata_present: candidate
+                                    .viewport_identity_metadata_present,
+                            }
+                        });
+                        let _ = reply.send(candidate);
                     }
                     ServerCommand::CaptureClientCursorSnapshot(reply) => {
                         let snapshot = server.client_cursor_render_state().map(|cursor| {
@@ -879,6 +908,18 @@ pub(in crate::compositor::tests) fn capture_fullscreen_presentation_eligibility(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report fullscreen presentation eligibility")
+}
+
+pub(in crate::compositor::tests) fn capture_direct_scanout_candidate(
+    commands: &Sender<ServerCommand>,
+) -> Result<DirectScanoutCandidateSnapshot, DirectScanoutSceneRejection> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureDirectScanoutCandidate(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report direct scanout candidate")
 }
 
 pub(in crate::compositor::tests) fn focus_root_window(

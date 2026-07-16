@@ -89,6 +89,7 @@ pub(crate) struct DirectScanoutCounters {
     pub(crate) composited_fallbacks: u64,
     pub(crate) stale_candidate_rejections: u64,
     pub(crate) cleanup_failures: u64,
+    pub(crate) composited_render_ahead_suppressed: u64,
 }
 
 pub(crate) struct DirectScanoutState {
@@ -99,6 +100,8 @@ pub(crate) struct DirectScanoutState {
     pub(crate) inhibit_until_composited_present: bool,
     pub(crate) counters: DirectScanoutCounters,
     pub(crate) drm_generation: u64,
+    identity_viewport_metadata_logged: bool,
+    last_debug_candidate: Option<(u32, u64, u64, u64)>,
 }
 
 fn direct_candidate_matches(
@@ -130,6 +133,8 @@ impl DirectScanoutState {
             inhibit_until_composited_present: true,
             counters: DirectScanoutCounters::default(),
             drm_generation: generation,
+            identity_viewport_metadata_logged: false,
+            last_debug_candidate: None,
         }
     }
 
@@ -318,6 +323,8 @@ impl AtomicEglGbmScanout {
         self.direct.current = None;
         self.direct.pending = None;
         self.direct.inhibit_until_composited_present = true;
+        self.direct.identity_viewport_metadata_logged = false;
+        self.direct.last_debug_candidate = None;
         self.scene.invalidate_presented_damage_history();
     }
 
@@ -696,17 +703,27 @@ impl AtomicEglGbmScanout {
         kms: &KmsBackendSelection,
         server: &mut OwnCompositorServer,
         target: PresentationTarget,
+        cursor: Option<&AtomicCursorVisualState>,
     ) -> io::Result<DirectScanoutAttempt> {
         self.direct.counters.candidate_checks += 1;
         let candidate = match server.direct_scanout_scene_candidate() {
             Ok(candidate) => {
-                direct_scanout_debug(format_args!(
-                    "candidate surface={} buffer={} generation={} commit={}",
+                let debug_key = (
                     candidate.surface_id,
                     candidate.buffer_identity.id().get(),
                     candidate.generation,
                     candidate.commit_sequence.get(),
-                ));
+                );
+                if self.direct.last_debug_candidate != Some(debug_key) {
+                    direct_scanout_debug(format_args!(
+                        "candidate surface={} buffer={} generation={} commit={}",
+                        candidate.surface_id,
+                        candidate.buffer_identity.id().get(),
+                        candidate.generation,
+                        candidate.commit_sequence.get(),
+                    ));
+                    self.direct.last_debug_candidate = Some(debug_key);
+                }
                 candidate
             }
             Err(rejection) => {
@@ -716,6 +733,19 @@ impl AtomicEglGbmScanout {
             }
         };
         self.direct.counters.candidates_accepted += 1;
+        if candidate.viewport_identity_metadata_present
+            && !self.direct.identity_viewport_metadata_logged
+        {
+            direct_scanout_debug(format_args!(
+                "accepted identity viewport metadata surface={} buffer={}x{} output={}x{}",
+                candidate.surface_id,
+                candidate.buffer_size.width,
+                candidate.buffer_size.height,
+                candidate.output_size.width,
+                candidate.output_size.height,
+            ));
+            self.direct.identity_viewport_metadata_logged = true;
+        }
         self.direct.counters.import_attempts += 1;
         let (framebuffer, cache_hit) = match self
             .direct
@@ -740,12 +770,20 @@ impl AtomicEglGbmScanout {
         });
 
         self.direct.counters.test_only_attempts += 1;
-        if let Err(error) = kms.test_atomic_primary_flip(framebuffer.framebuffer) {
+        if let Err(error) =
+            kms.test_atomic_primary_flip_with_cursor(framebuffer.framebuffer, cursor)
+        {
             self.direct.counters.test_only_rejections += 1;
             self.direct.counters.composited_fallbacks += 1;
             direct_scanout_debug(format_args!("TEST_ONLY rejected: {error}"));
             eprintln!("direct scanout: Atomic TEST_ONLY rejected: {error}");
-            return Ok(DirectScanoutAttempt::Fallback("test_only_rejected"));
+            return Ok(DirectScanoutAttempt::Fallback(
+                if cursor.is_some_and(|cursor| cursor.visible) {
+                    "cursor_test_only_rejected"
+                } else {
+                    "test_only_rejected"
+                },
+            ));
         }
         direct_scanout_debug("TEST_ONLY accepted");
 
@@ -767,7 +805,7 @@ impl AtomicEglGbmScanout {
         let token = PageFlipToken::new(allocate_native_page_flip_token())
             .expect("allocated native pageflip token is nonzero");
         let submit_started_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
-        let submission = kms.submit_direct_flip(framebuffer.framebuffer, token);
+        let submission = kms.submit_direct_flip_with_cursor(framebuffer.framebuffer, token, cursor);
         let submit_returned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         if let Err(error) = submission {
             server.restore_frame_batch_after_render_failure(protocol_batch_id);
@@ -924,6 +962,14 @@ impl AtomicEglGbmScanout {
         self.direct.inhibit_until_composited_present
     }
 
+    pub(crate) fn note_composited_render_ahead_suppressed(&mut self) {
+        self.direct.counters.composited_render_ahead_suppressed = self
+            .direct
+            .counters
+            .composited_render_ahead_suppressed
+            .saturating_add(1);
+    }
+
     pub(crate) fn direct_scanout_suspend(
         &mut self,
         _server: &mut OwnCompositorServer,
@@ -952,7 +998,8 @@ impl AtomicEglGbmScanout {
         &mut self,
         kms: &KmsBackendSelection,
         server: &mut OwnCompositorServer,
-    ) -> io::Result<u64> {
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> io::Result<(u64, u32)> {
         let mut frame = self.swapchain_mut()?.take_ready_for_submission()?;
         let framebuffer = self.framebuffer(frame.slot)?;
         let token = PageFlipToken::new(allocate_native_page_flip_token())
@@ -999,6 +1046,7 @@ impl AtomicEglGbmScanout {
             framebuffer,
             token,
             in_fence,
+            cursor: cursor.cloned(),
         });
         let submit_returned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         match submission {
@@ -1016,7 +1064,7 @@ impl AtomicEglGbmScanout {
                     submit_started_at,
                     submit_returned_at,
                 )?;
-                Ok(token.get())
+                Ok((token.get(), framebuffer.get()))
             }
             Err(error) => {
                 let frame = self.swapchain_mut()?.submission_failed(frame)?;
@@ -1026,6 +1074,19 @@ impl AtomicEglGbmScanout {
                 )))
             }
         }
+    }
+
+    pub(crate) fn discard_ready_frame_before_direct(
+        &mut self,
+        server: &mut OwnCompositorServer,
+    ) -> io::Result<bool> {
+        let Some(frame) = self.swapchain_mut()?.take_ready_for_submission().ok() else {
+            return Ok(false);
+        };
+        server.restore_frame_batch_after_render_failure(frame.protocol_batch_id);
+        self.scene.discard_rendered(frame.scene_commit);
+        drop(frame.surface_damage);
+        Ok(true)
     }
 
     pub(crate) fn complete_pageflip(
