@@ -31,6 +31,20 @@ impl NativeRuntime {
             self.scanout.page_flip_pending() || self.atomic_commit_arbiter.atomic_commit_pending(),
         );
         self.reap_supervised_children(&cycle)?;
+        self.dispatch_xwayland_events(&cycle.wakeup)?;
+        if self.xwayland.generation().is_some() {
+            self.attach_xwayland_private_client()?;
+        } else {
+            self.revoke_xwayland_private_client();
+        }
+        if cycle.wakeup.reasons.timer() {
+            self.xwayland
+                .handle_deadline(monotonic_now_ns()?, &mut self.process_supervisor)?;
+            if self.xwayland.generation().is_none() {
+                self.revoke_xwayland_private_client();
+            }
+            self.sync_xwayland_reactor_sources()?;
+        }
         self.advance_shutdown_lifecycle(&cycle)?;
         if !self.session.permits_output() {
             self.dispatch_suspended_sources(&cycle)?;
@@ -40,6 +54,9 @@ impl NativeRuntime {
             return Ok(());
         }
         self.dispatch_wayland_and_input(&mut cycle)?;
+        self.dispatch_xwayland_shell_binds()?;
+        let association_events = self.server.take_xwayland_association_events();
+        self.xwayland.record_association_events(&association_events);
         if cycle.shutdown_requested {
             self.request_native_shutdown()?;
         }
@@ -70,6 +87,10 @@ impl NativeRuntime {
             return Ok(());
         }
         for exit in self.process_supervisor.reap_exited()? {
+            let xwayland_exit = self.xwayland.handle_process_exit(&exit)?;
+            if xwayland_exit {
+                self.revoke_xwayland_private_client();
+            }
             let finished_status = astrea_launch_finished_status(exit.status);
             self.perf.log("process.exit", || {
                 vec![
@@ -88,6 +109,40 @@ impl NativeRuntime {
                 });
             }
         }
+        Ok(())
+    }
+
+    fn dispatch_xwayland_shell_binds(&mut self) -> NativeResult<()> {
+        for identity in self.server.take_xwayland_shell_bind_events() {
+            self.xwayland
+                .handle_shell_bind_for_client(identity.generation, &identity.client_id)?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_xwayland_events(&mut self, wakeup: &NativeWakeup) -> NativeResult<()> {
+        for event in wakeup.xwayland_events.iter().copied() {
+            let Some((_, registration)) = self
+                .xwayland_reactor_tokens
+                .iter()
+                .find(|(token, _)| *token == event.token)
+                .copied()
+            else {
+                continue;
+            };
+            if let Err(error) = self.xwayland.handle_reactor_event(
+                registration.purpose,
+                registration.generation,
+                event.flags,
+                &mut self.process_supervisor,
+            ) {
+                eprintln!(
+                    "native XWayland event contained generation={:?} purpose={:?}: {error}",
+                    registration.generation, registration.purpose
+                );
+            }
+        }
+        self.sync_xwayland_reactor_sources()?;
         Ok(())
     }
 
@@ -146,6 +201,9 @@ impl NativeRuntime {
                         self.perf.log("native.shutdown_children", || {
                             vec![NativePerfField::str("stage", "begin")]
                         });
+                        self.revoke_xwayland_private_client();
+                        self.xwayland.begin_shutdown(&mut self.process_supervisor)?;
+                        self.sync_xwayland_reactor_sources()?;
                         self.process_supervisor.begin_shutdown(Instant::now())?;
                     }
                     if self.process_supervisor.advance_shutdown(Instant::now())?

@@ -18,6 +18,8 @@ pub enum NativeEventSource {
     ExplicitSyncAcquire,
     OutputRenderFence,
     ChildSignal,
+    XwaylandListen,
+    XwaylandDisplayReady,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -68,6 +70,8 @@ impl WakeReasons {
     const EXPLICIT_SYNC_ACQUIRE: u32 = 1 << 5;
     const CHILD_SIGNAL: u32 = 1 << 6;
     const OUTPUT_RENDER_FENCE: u32 = 1 << 8;
+    const XWAYLAND_LISTEN: u32 = 1 << 9;
+    const XWAYLAND_DISPLAY_READY: u32 = 1 << 10;
 
     pub const fn drm(self) -> bool {
         self.0 & Self::DRM != 0
@@ -105,6 +109,14 @@ impl WakeReasons {
         self.0 & Self::OUTPUT_RENDER_FENCE != 0
     }
 
+    pub const fn xwayland_listen(self) -> bool {
+        self.0 & Self::XWAYLAND_LISTEN != 0
+    }
+
+    pub const fn xwayland_display_ready(self) -> bool {
+        self.0 & Self::XWAYLAND_DISPLAY_READY != 0
+    }
+
     pub const fn bits(self) -> u32 {
         self.0
     }
@@ -120,8 +132,16 @@ impl WakeReasons {
             NativeEventSource::ExplicitSyncAcquire => Self::EXPLICIT_SYNC_ACQUIRE,
             NativeEventSource::OutputRenderFence => Self::OUTPUT_RENDER_FENCE,
             NativeEventSource::ChildSignal => Self::CHILD_SIGNAL,
+            NativeEventSource::XwaylandListen => Self::XWAYLAND_LISTEN,
+            NativeEventSource::XwaylandDisplayReady => Self::XWAYLAND_DISPLAY_READY,
         };
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XwaylandReadyEvent {
+    pub token: ReactorToken,
+    pub flags: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +151,7 @@ pub struct NativeWakeup {
     pub blocked_ns: u64,
     pub timer_lateness_ns: Option<u64>,
     pub explicit_sync_acquire_tokens: Vec<ReactorToken>,
+    pub xwayland_events: Vec<XwaylandReadyEvent>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -284,6 +305,7 @@ impl NativeEventLoop {
         let observed_ns = monotonic_now_ns()?;
         let mut reasons = WakeReasons::default();
         let mut explicit_sync_acquire_tokens = Vec::new();
+        let mut xwayland_events = Vec::new();
 
         for index in 0..ready {
             let event = self.events[index];
@@ -304,6 +326,17 @@ impl NativeEventLoop {
             let error_events =
                 libc::EPOLLERR as u32 | libc::EPOLLHUP as u32 | libc::EPOLLRDHUP as u32;
             if event_flags & error_events != 0 {
+                if matches!(
+                    registration.source,
+                    NativeEventSource::XwaylandListen | NativeEventSource::XwaylandDisplayReady
+                ) {
+                    reasons.insert(registration.source);
+                    xwayland_events.push(XwaylandReadyEvent {
+                        token,
+                        flags: event_flags,
+                    });
+                    continue;
+                }
                 let _ = self.unregister(token);
                 return Err(io::Error::other(format!(
                     "native event source {:?} fd {} reported readiness error 0x{:x}",
@@ -312,8 +345,17 @@ impl NativeEventLoop {
             }
             if event_flags & libc::EPOLLIN as u32 != 0 {
                 reasons.insert(registration.source);
-                if registration.source == NativeEventSource::ExplicitSyncAcquire {
-                    explicit_sync_acquire_tokens.push(token);
+                match registration.source {
+                    NativeEventSource::ExplicitSyncAcquire => {
+                        explicit_sync_acquire_tokens.push(token);
+                    }
+                    NativeEventSource::XwaylandListen | NativeEventSource::XwaylandDisplayReady => {
+                        xwayland_events.push(XwaylandReadyEvent {
+                            token,
+                            flags: event_flags,
+                        });
+                    }
+                    _ => {}
                 }
             }
         }
@@ -334,6 +376,7 @@ impl NativeEventLoop {
             blocked_ns: observed_ns.saturating_sub(wait_started_ns),
             timer_lateness_ns,
             explicit_sync_acquire_tokens,
+            xwayland_events,
         })
     }
 
@@ -693,6 +736,45 @@ mod tests {
 
         assert!(wakeup.reasons.explicit_sync_acquire());
         assert_eq!(wakeup.explicit_sync_acquire_tokens, vec![token]);
+    }
+
+    #[test]
+    fn xwayland_readiness_preserves_exact_token_and_epoll_flags() {
+        let listen = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let token = event_loop
+            .register(listen.as_raw_fd(), NativeEventSource::XwaylandListen)
+            .unwrap();
+
+        signal(listen.as_raw_fd());
+        let wakeup = event_loop.wait().unwrap();
+
+        assert!(wakeup.reasons.xwayland_listen());
+        assert_eq!(wakeup.xwayland_events.len(), 1);
+        assert_eq!(wakeup.xwayland_events[0].token, token);
+        assert_ne!(wakeup.xwayland_events[0].flags & libc::EPOLLIN as u32, 0);
+    }
+
+    #[test]
+    fn xwayland_displayfd_hup_is_routed_without_fatal_native_error() {
+        let mut pipe = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            0
+        );
+        let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+        let write = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let token = event_loop
+            .register(read.as_raw_fd(), NativeEventSource::XwaylandDisplayReady)
+            .unwrap();
+
+        drop(write);
+        let wakeup = event_loop.wait().unwrap();
+
+        assert!(wakeup.reasons.xwayland_display_ready());
+        assert_eq!(wakeup.xwayland_events[0].token, token);
+        assert_ne!(wakeup.xwayland_events[0].flags & libc::EPOLLHUP as u32, 0);
     }
 
     #[test]

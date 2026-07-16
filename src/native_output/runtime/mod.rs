@@ -101,6 +101,9 @@ pub(crate) struct NativeRuntime {
     acquire_watches: ExplicitSyncWatchRegistry,
     parked_acquire_watches: Vec<oblivion_one::compositor::AcquireWatchRequest>,
     event_loop: NativeEventLoop,
+    xwayland: XwaylandService,
+    xwayland_reactor_tokens: Vec<(ReactorToken, XwaylandReactorRegistration)>,
+    xwayland_client_identity: Option<oblivion_one::compositor::XwaylandClientIdentity>,
     drm_reactor_token: Option<ReactorToken>,
     output_render_fence_token: Option<ReactorToken>,
     frame_scheduler: NativeFrameScheduler,
@@ -136,12 +139,82 @@ impl NativeRuntime {
     }
 
     pub(crate) fn run(&mut self) -> NativeResult<()> {
-        self.run_native_cycle()
+        match self.run_native_cycle() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = self
+                    .xwayland
+                    .emergency_cleanup(&mut self.process_supervisor);
+                let _ = self.process_supervisor.kill_session_owned_now();
+                Err(error)
+            }
+        }
+    }
+
+    fn sync_xwayland_reactor_sources(&mut self) -> NativeResult<()> {
+        let desired: Vec<_> = self.xwayland.reactor_registrations().collect();
+        let mut retained = Vec::new();
+        for (token, registration) in self.xwayland_reactor_tokens.drain(..) {
+            if desired.contains(&registration) {
+                retained.push((token, registration));
+            } else {
+                self.event_loop.unregister(token)?;
+            }
+        }
+        self.xwayland_reactor_tokens = retained;
+        for registration in desired {
+            if self
+                .xwayland_reactor_tokens
+                .iter()
+                .any(|(_, current)| *current == registration)
+            {
+                continue;
+            }
+            let source = match registration.purpose {
+                XwaylandReactorPurpose::ListenFilesystem
+                | XwaylandReactorPurpose::ListenAbstract => NativeEventSource::XwaylandListen,
+                XwaylandReactorPurpose::DisplayReady => NativeEventSource::XwaylandDisplayReady,
+            };
+            let token = self.event_loop.register(registration.fd, source)?;
+            self.xwayland_reactor_tokens.push((token, registration));
+        }
+        Ok(())
+    }
+
+    fn attach_xwayland_private_client(&mut self) -> NativeResult<()> {
+        let Some(generation) = self.xwayland.generation() else {
+            return Ok(());
+        };
+        if self
+            .xwayland_client_identity
+            .as_ref()
+            .is_some_and(|identity| identity.generation == generation)
+        {
+            return Ok(());
+        }
+        let Some(stream) = self.xwayland.private_wayland_client(generation) else {
+            return Ok(());
+        };
+        let identity = self.server.insert_xwayland_client(stream, generation)?;
+        self.xwayland
+            .authorize_private_client(generation, identity.client_id.clone());
+        self.xwayland_client_identity = Some(identity);
+        Ok(())
+    }
+
+    fn revoke_xwayland_private_client(&mut self) {
+        if let Some(identity) = self.xwayland_client_identity.take() {
+            self.server.revoke_xwayland_generation(identity.generation);
+        }
     }
 }
 
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
+        self.revoke_xwayland_private_client();
+        let _ = self
+            .xwayland
+            .emergency_cleanup(&mut self.process_supervisor);
         if self.frame_pacing.enabled() {
             println!(
                 "{}",

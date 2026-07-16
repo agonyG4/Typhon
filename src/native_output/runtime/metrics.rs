@@ -258,7 +258,10 @@ impl NativeRuntime {
                 earliest_native_deadline(scheduler_deadline, visual_deadline),
                 atomic_commit_deadline,
             ),
-            self.acquire_watches.next_fallback_deadline_ns(),
+            earliest_native_deadline(
+                self.acquire_watches.next_fallback_deadline_ns(),
+                self.xwayland.next_deadline_ns(),
+            ),
         ))?;
         Ok(())
     }

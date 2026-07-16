@@ -333,8 +333,11 @@ impl NativeSessionIo for NativeRuntime {
         self.pending_proven_deadline_miss = None;
         self.queued_redraw_requested = true;
         self.event_loop.arm_deadline(earliest_native_deadline(
-            self.frame_scheduler.next_deadline_ns(),
-            self.acquire_watches.next_fallback_deadline_ns(),
+            earliest_native_deadline(
+                self.frame_scheduler.next_deadline_ns(),
+                self.acquire_watches.next_fallback_deadline_ns(),
+            ),
+            self.xwayland.next_deadline_ns(),
         ))?;
         Ok(())
     }

@@ -340,6 +340,21 @@ impl NativeRuntime {
         server.enable_external_acquire_readiness();
         let mut event_loop = NativeEventLoop::new()?;
         let mut process_supervisor = ChildSupervisor::with_sigchld_reaper()?;
+        let mut xwayland = XwaylandService::bootstrap()?;
+        let mut xwayland_reactor_tokens = Vec::new();
+        register_xwayland_reactor_sources(
+            &mut event_loop,
+            &xwayland,
+            &mut xwayland_reactor_tokens,
+        )?;
+        if xwayland.is_eager() {
+            xwayland.handle_listener_readiness(&mut process_supervisor)?;
+            register_xwayland_reactor_sources(
+                &mut event_loop,
+                &xwayland,
+                &mut xwayland_reactor_tokens,
+            )?;
+        }
         let drm_reactor_token =
             event_loop.register(kms.file().as_raw_fd(), NativeEventSource::Drm)?;
         if let Some(session) = seat_session.as_ref() {
@@ -408,8 +423,11 @@ impl NativeRuntime {
                 .map_err(io::Error::other)?;
         }
         event_loop.arm_deadline(earliest_native_deadline(
-            frame_scheduler.next_deadline_ns(),
-            acquire_watches.next_fallback_deadline_ns(),
+            earliest_native_deadline(
+                frame_scheduler.next_deadline_ns(),
+                acquire_watches.next_fallback_deadline_ns(),
+            ),
+            xwayland.next_deadline_ns(),
         ))?;
         let last_render_generation = server.render_generation();
         let last_renderable_surfaces = server.renderable_surfaces().to_vec();
@@ -455,7 +473,7 @@ impl NativeRuntime {
             log_native_app_spawn(perf, &launch);
             pending_launches.push_back(launch);
         }
-        Ok(Self {
+        let mut runtime = Self {
             server,
             cursor_image,
             perf,
@@ -485,6 +503,9 @@ impl NativeRuntime {
             acquire_watches,
             parked_acquire_watches: Vec::new(),
             event_loop,
+            xwayland,
+            xwayland_reactor_tokens,
+            xwayland_client_identity: None,
             drm_reactor_token: Some(drm_reactor_token),
             output_render_fence_token: None,
             frame_scheduler,
@@ -512,7 +533,9 @@ impl NativeRuntime {
             process_supervisor,
             astrea_launch_tracker: AstreaLaunchLifecycleTracker::default(),
             shutdown: NativeShutdownLifecycle::new(),
-        })
+        };
+        runtime.attach_xwayland_private_client()?;
+        Ok(runtime)
     }
 
     pub(super) fn bootstrap_native(config: NativeRuntimeConfig) -> NativeResult<Self> {
@@ -1158,4 +1181,35 @@ impl NativeRuntime {
             effective_app_gpu_policy,
         })
     }
+}
+
+fn register_xwayland_reactor_sources(
+    event_loop: &mut NativeEventLoop,
+    service: &XwaylandService,
+    tokens: &mut Vec<(ReactorToken, XwaylandReactorRegistration)>,
+) -> NativeResult<()> {
+    let desired: Vec<_> = service.reactor_registrations().collect();
+    let mut retained = Vec::new();
+    for (token, registration) in tokens.drain(..) {
+        if desired.contains(&registration) {
+            retained.push((token, registration));
+        } else {
+            event_loop.unregister(token)?;
+        }
+    }
+    *tokens = retained;
+    for registration in desired {
+        if tokens.iter().any(|(_, current)| *current == registration) {
+            continue;
+        }
+        let source = match registration.purpose {
+            XwaylandReactorPurpose::ListenFilesystem | XwaylandReactorPurpose::ListenAbstract => {
+                NativeEventSource::XwaylandListen
+            }
+            XwaylandReactorPurpose::DisplayReady => NativeEventSource::XwaylandDisplayReady,
+        };
+        let token = event_loop.register(registration.fd, source)?;
+        tokens.push((token, registration));
+    }
+    Ok(())
 }

@@ -76,6 +76,9 @@ use oblivion_one::process::{ChildSupervisor, ProcessKind, ProcessOptions, Restar
 use oblivion_one::render_backend::egl_gles::EglGlesDmabufFeedback;
 use oblivion_one::session::NativeSessionProbe;
 use oblivion_one::syncobj::DrmSyncobjDevice;
+use oblivion_one::xwayland::{
+    XwaylandReactorPurpose, XwaylandReactorRegistration, XwaylandService,
+};
 use oblivion_one::{
     CompositorAppGpuPreference, EffectiveCompositorAppGpuPolicy,
     compositor_app_command_with_policy, shell_quote,

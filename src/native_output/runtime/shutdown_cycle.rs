@@ -38,6 +38,7 @@ impl NativeRuntime {
                 blocked_ns: 0,
                 timer_lateness_ns: None,
                 explicit_sync_acquire_tokens: Vec::new(),
+                xwayland_events: Vec::new(),
             },
             pageflip_drain_us: 0,
             pageflip_completed: false,
