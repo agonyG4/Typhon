@@ -144,6 +144,8 @@ pub struct SpawnCommand {
     pub inherited_fds: Vec<ChildFdMapping>,
 }
 
+const MAX_MAPPED_CHILD_FDS: usize = 32;
+
 impl SpawnCommand {
     pub fn new(command: Command) -> Self {
         Self {
@@ -169,6 +171,12 @@ impl SpawnCommand {
                 "inherited fd targets must be unique",
             ));
         }
+        if self.inherited_fds.len() >= MAX_MAPPED_CHILD_FDS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many inherited child fds",
+            ));
+        }
         self.inherited_fds.push(ChildFdMapping { source, target });
         Ok(())
     }
@@ -182,6 +190,7 @@ impl SpawnCommand {
             mut command,
             inherited_fds,
         } = self;
+        validate_fd_mappings(&inherited_fds)?;
         let mappings = inherited_fds
             .iter()
             .map(|mapping| (mapping.source.as_raw_fd(), mapping.target))
@@ -196,22 +205,49 @@ impl SpawnCommand {
     }
 }
 
+fn validate_fd_mappings(mappings: &[ChildFdMapping]) -> io::Result<()> {
+    if mappings.len() > MAX_MAPPED_CHILD_FDS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many inherited child fds",
+        ));
+    }
+    for (index, mapping) in mappings.iter().enumerate() {
+        if mapping.source.as_raw_fd() < 0 || mapping.target < 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "inherited fd source and target must be valid non-stdio descriptors",
+            ));
+        }
+        if mappings[..index]
+            .iter()
+            .any(|previous| previous.target == mapping.target)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "inherited fd targets must be unique",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn configure_child_fds(mappings: &[(RawFd, RawFd)]) -> io::Result<()> {
-    let mut temporary_fds = Vec::with_capacity(mappings.len());
-    for (source, _) in mappings {
+    let mut temporary_fds = [-1; MAX_MAPPED_CHILD_FDS];
+    for (index, (source, _)) in mappings.iter().enumerate() {
         let temporary = unsafe { libc::fcntl(*source, libc::F_DUPFD_CLOEXEC, 100) };
         if temporary < 0 {
-            close_temporary_fds(&temporary_fds);
+            close_temporary_fds(&temporary_fds[..index]);
             return Err(io::Error::last_os_error());
         }
-        temporary_fds.push(temporary);
+        temporary_fds[index] = temporary;
     }
 
     let close_range_result = unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 4u32) };
     if close_range_result < 0 {
         let error = io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::ENOSYS) {
-            close_temporary_fds(&temporary_fds);
+            close_temporary_fds(&temporary_fds[..mappings.len()]);
             return Err(error);
         }
         for fd in 3..=65_535 {
@@ -222,25 +258,26 @@ fn configure_child_fds(mappings: &[(RawFd, RawFd)]) -> io::Result<()> {
         }
     }
 
-    for ((_, target), temporary) in mappings.iter().zip(temporary_fds.iter().copied()) {
+    for (index, (_, target)) in mappings.iter().enumerate() {
+        let temporary = temporary_fds[index];
         if unsafe { libc::dup2(temporary, *target) } < 0 {
             let error = io::Error::last_os_error();
-            close_temporary_fds(&temporary_fds);
+            close_temporary_fds(&temporary_fds[..mappings.len()]);
             return Err(error);
         }
         let flags = unsafe { libc::fcntl(*target, libc::F_GETFD) };
         if flags < 0 {
             let error = io::Error::last_os_error();
-            close_temporary_fds(&temporary_fds);
+            close_temporary_fds(&temporary_fds[..mappings.len()]);
             return Err(error);
         }
         if unsafe { libc::fcntl(*target, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
             let error = io::Error::last_os_error();
-            close_temporary_fds(&temporary_fds);
+            close_temporary_fds(&temporary_fds[..mappings.len()]);
             return Err(error);
         }
     }
-    close_temporary_fds(&temporary_fds);
+    close_temporary_fds(&temporary_fds[..mappings.len()]);
     Ok(())
 }
 
