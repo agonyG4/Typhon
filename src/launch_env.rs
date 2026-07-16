@@ -8,12 +8,16 @@ use std::{
 use crate::{
     default_state_dir,
     portal::{PortalRuntime, prepend_data_dir},
+    xwayland::XwaylandAppEnvironment,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum X11Bridge {
     Disabled,
-    IsolatedXWayland { display: String },
+    IsolatedXWayland {
+        display: String,
+        xauthority: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +118,21 @@ impl CompositorAppEnvironment {
             wayland_display: wayland_display.into(),
             x11_bridge: X11Bridge::IsolatedXWayland {
                 display: xwayland_display.into(),
+                xauthority: PathBuf::new(),
+            },
+        }
+    }
+
+    pub fn with_isolated_xwayland_and_auth(
+        wayland_display: impl Into<String>,
+        xwayland_display: impl Into<String>,
+        xauthority: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            wayland_display: wayland_display.into(),
+            x11_bridge: X11Bridge::IsolatedXWayland {
+                display: xwayland_display.into(),
+                xauthority: xauthority.into(),
             },
         }
     }
@@ -148,6 +167,21 @@ pub fn configure_compositor_app_command_with_environment(
     );
 }
 
+/// Diagnostic-only launch routing for an explicitly armed XWayland service.
+/// Normal application launch continues to use the Wayland-only helpers above.
+pub fn configure_compositor_app_command_with_xwayland_environment(
+    command: &mut Command,
+    socket_name: &str,
+    xwayland: &XwaylandAppEnvironment,
+) {
+    let environment = CompositorAppEnvironment::with_isolated_xwayland_and_auth(
+        socket_name,
+        &xwayland.display,
+        &xwayland.xauthority,
+    );
+    configure_compositor_app_command_with_environment(command, &environment);
+}
+
 fn configure_compositor_app_command_with_environment_and_policy(
     command: &mut Command,
     environment: &CompositorAppEnvironment,
@@ -178,14 +212,23 @@ fn configure_compositor_app_command_with_environment_and_policy(
     match &environment.x11_bridge {
         X11Bridge::Disabled => {
             command.env_remove("DISPLAY");
+            command.env_remove("XAUTHORITY");
             command.env_remove("OBLIVION_ONE_XWAYLAND_DISPLAY");
             command.env("GDK_BACKEND", "wayland");
             command.env("QT_QPA_PLATFORM", "wayland");
             command.env("SDL_VIDEODRIVER", "wayland");
             command.env("CLUTTER_BACKEND", "wayland");
         }
-        X11Bridge::IsolatedXWayland { display } => {
+        X11Bridge::IsolatedXWayland {
+            display,
+            xauthority,
+        } => {
             command.env("DISPLAY", display);
+            if xauthority.as_os_str().is_empty() {
+                command.env_remove("XAUTHORITY");
+            } else {
+                command.env("XAUTHORITY", xauthority);
+            }
             command.env("OBLIVION_ONE_XWAYLAND_DISPLAY", display);
             command.env("GDK_BACKEND", "wayland,x11");
             command.env("QT_QPA_PLATFORM", "wayland;xcb");
@@ -277,6 +320,8 @@ fn remove_host_desktop_activation_environment(command: &mut Command) {
     for key in [
         "WAYLAND_SOCKET",
         "DISPLAY",
+        "XAUTHORITY",
+        "OBLIVION_ONE_XWAYLAND_DISPLAY",
         "DESKTOP_STARTUP_ID",
         "XDG_ACTIVATION_TOKEN",
         "GIO_LAUNCHED_DESKTOP_FILE",

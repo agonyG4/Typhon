@@ -297,8 +297,11 @@ mod tests {
 
     #[test]
     fn compositor_app_env_can_expose_only_an_oblivion_owned_xwayland_display() {
-        let launch_env =
-            CompositorAppEnvironment::with_isolated_xwayland("oblivion-one-test", ":42");
+        let launch_env = CompositorAppEnvironment::with_isolated_xwayland_and_auth(
+            "oblivion-one-test",
+            ":42",
+            "/run/user/1000/typhon/xwayland/.Xauthority-42",
+        );
         let mut command = Command::new("true");
 
         configure_compositor_app_command_with_environment(&mut command, &launch_env);
@@ -317,6 +320,10 @@ mod tests {
             Some("oblivion-one-test")
         );
         assert_eq!(env.get("DISPLAY").and_then(Option::as_deref), Some(":42"));
+        assert_eq!(
+            env.get("XAUTHORITY").and_then(Option::as_deref),
+            Some("/run/user/1000/typhon/xwayland/.Xauthority-42")
+        );
         assert_eq!(
             env.get("OBLIVION_ONE_XWAYLAND_DISPLAY")
                 .and_then(Option::as_deref),
