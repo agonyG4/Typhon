@@ -1008,6 +1008,50 @@ fn process_exit_during_starting_retires_sources_before_resources() {
 }
 
 #[test]
+fn shutdown_unregisters_listeners_before_lease_release() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/true");
+    let display = service.display_number().expect("display");
+    let environment = service.app_environment().expect("app environment");
+    let registrations = service.reactor_registrations().collect::<Vec<_>>();
+    assert_eq!(registrations.len(), 2);
+
+    let mut event_loop = NativeEventLoop::new().expect("reactor");
+    let tokens = registrations
+        .iter()
+        .map(|registration| {
+            let source = match registration.purpose {
+                XwaylandReactorPurpose::ListenFilesystem
+                | XwaylandReactorPurpose::ListenAbstract => NativeEventSource::XwaylandListen,
+                _ => panic!("unexpected armed registration"),
+            };
+            event_loop
+                .register(registration.fd, source)
+                .expect("register listener")
+        })
+        .collect::<Vec<_>>();
+
+    service
+        .begin_shutdown(&mut supervisor)
+        .expect("shutdown service");
+    assert!(service.has_pending_reactor_teardown());
+    for token in tokens {
+        assert!(event_loop.unregister(token).expect("unregister listener"));
+    }
+    assert_eq!(event_loop.benign_unregistration_count(), 0);
+    service
+        .finish_reactor_teardown()
+        .expect("finish lease teardown");
+    assert!(!service.has_pending_reactor_teardown());
+    assert!(!PathBuf::from(format!("/tmp/.X{display}-lock")).exists());
+    assert!(!environment.xauthority.exists());
+
+    drop(event_loop);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
 fn stale_child_exit_cannot_stop_current_generation() {
     let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/true");
     service

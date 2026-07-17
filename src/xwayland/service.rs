@@ -145,6 +145,7 @@ pub struct XwaylandService {
     backoff_level: usize,
     private_client: Option<(XwaylandGeneration, ClientId)>,
     retired_resources: Vec<RetiredResources>,
+    retired_lease: Option<DisplayLease>,
     last_readiness: Option<XwaylandReadinessSnapshot>,
 }
 
@@ -193,6 +194,7 @@ impl XwaylandService {
             backoff_level: 0,
             private_client: None,
             retired_resources: Vec::new(),
+            retired_lease: None,
             last_readiness: None,
         })
     }
@@ -349,12 +351,13 @@ impl XwaylandService {
                 RetiredResources::Running(resources) => drop(resources),
             }
         }
+        drop(self.retired_lease.take());
         Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn has_pending_reactor_teardown(&self) -> bool {
-        !self.retired_resources.is_empty()
+        !self.retired_resources.is_empty() || self.retired_lease.is_some()
     }
 
     pub fn next_deadline_ns(&self) -> Option<u64> {
@@ -1225,7 +1228,11 @@ impl XwaylandService {
     pub fn begin_shutdown(&mut self, supervisor: &mut ChildSupervisor) -> io::Result<()> {
         self.stop_current(supervisor)?;
         self.private_client = None;
-        self.lease.take();
+        if self.retired_lease.is_none() {
+            self.retired_lease = self.lease.take();
+        } else {
+            drop(self.lease.take());
+        }
         self.replace_state(ServiceState::Disabled);
         self.log_state_transition();
         Ok(())
