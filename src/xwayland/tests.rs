@@ -768,6 +768,11 @@ fn startup_timeout_kills_generation_and_enters_backoff() {
         .handle_deadline(u64::MAX, &mut supervisor)
         .expect("handle startup timeout");
     assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+    assert!(service.has_pending_reactor_teardown());
+    service
+        .finish_reactor_teardown()
+        .expect("finish source teardown");
+    assert!(!service.has_pending_reactor_teardown());
     let deadline = Instant::now() + Duration::from_secs(2);
     while supervisor.active_count() != 0 && Instant::now() < deadline {
         let _ = supervisor.reap_exited().expect("reap timed out child");

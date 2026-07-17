@@ -95,6 +95,13 @@ enum ServiceState {
 }
 
 #[derive(Debug)]
+enum RetiredResources {
+    Starting(StartingResources),
+    RunningBase(RunningBaseResources),
+    Running(Box<RunningResources>),
+}
+
+#[derive(Debug)]
 pub struct XwaylandService {
     pub(crate) mode: XwaylandMode,
     pub(crate) next_generation: NonZeroU64,
@@ -105,6 +112,7 @@ pub struct XwaylandService {
     crash_times_ns: VecDeque<u64>,
     backoff_level: usize,
     private_client: Option<(XwaylandGeneration, ClientId)>,
+    retired_resources: Vec<RetiredResources>,
 }
 
 impl XwaylandService {
@@ -151,6 +159,7 @@ impl XwaylandService {
             crash_times_ns: VecDeque::new(),
             backoff_level: 0,
             private_client: None,
+            retired_resources: Vec::new(),
         })
     }
 
@@ -244,6 +253,24 @@ impl XwaylandService {
             });
         }
         registrations.into_iter()
+    }
+
+    /// Release retired generation resources only after the runtime has removed
+    /// their reactor registrations.
+    pub fn finish_reactor_teardown(&mut self) -> io::Result<()> {
+        while let Some(resources) = self.retired_resources.pop() {
+            match resources {
+                RetiredResources::Starting(resources) => drop(resources),
+                RetiredResources::RunningBase(resources) => drop(resources),
+                RetiredResources::Running(resources) => drop(resources),
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_reactor_teardown(&self) -> bool {
+        !self.retired_resources.is_empty()
     }
 
     pub fn next_deadline_ns(&self) -> Option<u64> {
@@ -778,7 +805,7 @@ impl XwaylandService {
         self.crash_times_ns.push_back(now);
         self.metrics.crashes = self.metrics.crashes.saturating_add(1);
         if self.crash_times_ns.len() >= 3 {
-            self.state = ServiceState::Failed;
+            self.replace_state(ServiceState::Failed);
             self.log_state_transition();
             return Ok(true);
         }
@@ -916,7 +943,7 @@ impl XwaylandService {
         self.stop_current(supervisor)?;
         self.private_client = None;
         self.lease.take();
-        self.state = ServiceState::Disabled;
+        self.replace_state(ServiceState::Disabled);
         self.log_state_transition();
         Ok(())
     }
@@ -969,9 +996,9 @@ impl XwaylandService {
     fn rearm(&mut self) {
         self.private_client = None;
         if self.mode.is_enabled() && self.lease.is_some() {
-            self.state = ServiceState::Armed;
+            self.replace_state(ServiceState::Armed);
         } else {
-            self.state = ServiceState::Disabled;
+            self.replace_state(ServiceState::Disabled);
         }
         self.backoff_level = 0;
         self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
@@ -984,7 +1011,7 @@ impl XwaylandService {
         let deadline_ns = now_ns.saturating_add(BACKOFF_NS[level]);
         self.backoff_level = self.backoff_level.saturating_add(1);
         self.metrics.backoff_level = self.backoff_level;
-        self.state = ServiceState::Backoff { deadline_ns };
+        self.replace_state(ServiceState::Backoff { deadline_ns });
         self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
         eprintln!(
             "oblivion-one xwayland: event=backoff level={} deadline_ns={deadline_ns}",
@@ -1015,6 +1042,28 @@ impl XwaylandService {
         Err(error)
     }
 
+    fn replace_state(&mut self, next: ServiceState) {
+        let previous = std::mem::replace(&mut self.state, next);
+        match previous {
+            ServiceState::Starting(resources) => {
+                self.retired_resources
+                    .push(RetiredResources::Starting(resources));
+            }
+            ServiceState::RunningBase(resources) => {
+                self.retired_resources
+                    .push(RetiredResources::RunningBase(resources));
+            }
+            ServiceState::Running(resources) => {
+                self.retired_resources
+                    .push(RetiredResources::Running(resources));
+            }
+            ServiceState::Disabled
+            | ServiceState::Armed
+            | ServiceState::Backoff { .. }
+            | ServiceState::Failed => {}
+        }
+    }
+
     fn log_state_transition(&self) {
         eprintln!(
             "oblivion-one xwayland: event=state_transition state={:?} generation={:?} display={:?}",
@@ -1027,7 +1076,7 @@ impl XwaylandService {
     pub(crate) fn allocate_generation(&mut self) -> io::Result<XwaylandGeneration> {
         self.metrics.generations_started = self.metrics.generations_started.saturating_add(1);
         next_nonzero(&mut self.next_generation).ok_or_else(|| {
-            self.state = ServiceState::Failed;
+            self.replace_state(ServiceState::Failed);
             io::Error::other("XWayland generation identity exhausted")
         })
     }

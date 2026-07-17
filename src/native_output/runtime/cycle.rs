@@ -45,6 +45,7 @@ impl NativeRuntime {
             }
             self.sync_xwayland_reactor_sources()?;
         }
+        self.sync_xwayland_reactor_sources()?;
         self.advance_shutdown_lifecycle(&cycle)?;
         if !self.session.permits_output() {
             self.dispatch_suspended_sources(&cycle)?;
@@ -64,6 +65,7 @@ impl NativeRuntime {
                 .mark_managed_surface_buffer_ready(generation, surface_id)?;
         }
         self.dispatch_xwayland_window_events()?;
+        self.sync_xwayland_reactor_sources()?;
         if cycle.shutdown_requested {
             self.request_native_shutdown()?;
         }

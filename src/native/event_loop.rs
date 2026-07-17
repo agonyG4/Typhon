@@ -165,6 +165,14 @@ pub struct NativeWakeup {
 struct Registration {
     fd: RawFd,
     source: NativeEventSource,
+    identity: FdIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FdIdentity {
+    device: u64,
+    inode: u64,
+    mode: u32,
 }
 
 #[derive(Debug)]
@@ -181,6 +189,8 @@ pub struct NativeEventLoop {
     free_registration_slots: Vec<usize>,
     events: Vec<libc::epoll_event>,
     armed_deadline_ns: Option<u64>,
+    benign_unregistration_count: u64,
+    stale_unregistration_count: u64,
 }
 
 impl NativeEventLoop {
@@ -208,6 +218,8 @@ impl NativeEventLoop {
             free_registration_slots: Vec::new(),
             events: vec![libc::epoll_event { events: 0, u64: 0 }; MAX_READY_EVENTS],
             armed_deadline_ns: None,
+            benign_unregistration_count: 0,
+            stale_unregistration_count: 0,
         };
         event_loop.register_raw(timer_fd, NativeEventSource::Timer)?;
         Ok(event_loop)
@@ -225,17 +237,31 @@ impl NativeEventLoop {
 
     pub fn unregister(&mut self, token: ReactorToken) -> io::Result<bool> {
         let Some((slot_index, generation)) = token.decode() else {
+            self.stale_unregistration_count = self.stale_unregistration_count.saturating_add(1);
             return Ok(false);
         };
         let Some(slot) = self.registrations.get(slot_index) else {
+            self.stale_unregistration_count = self.stale_unregistration_count.saturating_add(1);
             return Ok(false);
         };
         if slot.generation != generation {
+            self.stale_unregistration_count = self.stale_unregistration_count.saturating_add(1);
             return Ok(false);
         }
         let Some(registration) = slot.registration else {
+            self.stale_unregistration_count = self.stale_unregistration_count.saturating_add(1);
             return Ok(false);
         };
+        let current_identity = match fd_identity(registration.fd) {
+            Ok(identity) => Some(identity),
+            Err(error) if error.raw_os_error() == Some(libc::EBADF) => None,
+            Err(error) => return Err(error),
+        };
+        if current_identity.is_some_and(|identity| identity != registration.identity) {
+            self.stale_unregistration_count = self.stale_unregistration_count.saturating_add(1);
+            self.retire_registration_slot(slot_index);
+            return Ok(true);
+        }
         let result = unsafe {
             libc::epoll_ctl(
                 self.epoll.as_raw_fd(),
@@ -245,15 +271,36 @@ impl NativeEventLoop {
             )
         };
         if result < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            if is_xwayland_source(registration.source)
+                && matches!(error.raw_os_error(), Some(libc::EBADF | libc::ENOENT))
+            {
+                self.benign_unregistration_count =
+                    self.benign_unregistration_count.saturating_add(1);
+                self.retire_registration_slot(slot_index);
+                return Ok(true);
+            }
+            return Err(error);
         }
+        self.retire_registration_slot(slot_index);
+        Ok(true)
+    }
+
+    pub fn benign_unregistration_count(&self) -> u64 {
+        self.benign_unregistration_count
+    }
+
+    pub fn stale_unregistration_count(&self) -> u64 {
+        self.stale_unregistration_count
+    }
+
+    fn retire_registration_slot(&mut self, slot_index: usize) {
         let slot = &mut self.registrations[slot_index];
         slot.registration = None;
         if slot.generation != u32::MAX {
             slot.generation += 1;
             self.free_registration_slots.push(slot_index);
         }
-        Ok(true)
     }
 
     #[cfg(test)]
@@ -409,12 +456,17 @@ impl NativeEventLoop {
             events: (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32,
             u64: token.raw(),
         };
+        let identity = fd_identity(fd)?;
         let result =
             unsafe { libc::epoll_ctl(self.epoll.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut event) };
         if result < 0 {
             return Err(io::Error::last_os_error());
         }
-        let registration = Registration { fd, source };
+        let registration = Registration {
+            fd,
+            source,
+            identity,
+        };
         if reusing_slot {
             self.free_registration_slots.pop();
             self.registrations[slot_index].registration = Some(registration);
@@ -476,6 +528,31 @@ pub fn monotonic_now_ns() -> io::Result<u64> {
     Ok((time.tv_sec as u64)
         .saturating_mul(1_000_000_000)
         .saturating_add(time.tv_nsec as u64))
+}
+
+fn is_xwayland_source(source: NativeEventSource) -> bool {
+    matches!(
+        source,
+        NativeEventSource::XwaylandListen
+            | NativeEventSource::XwaylandDisplayReady
+            | NativeEventSource::XwaylandXwm
+    )
+}
+
+fn fd_identity(fd: RawFd) -> io::Result<FdIdentity> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `stat` points to writable storage and `fd` is supplied by the
+    // caller as a descriptor being registered or retired.
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fstat` initialized `stat` on success.
+    let stat = unsafe { stat.assume_init() };
+    Ok(FdIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+        mode: stat.st_mode,
+    })
 }
 
 fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
@@ -829,6 +906,38 @@ mod tests {
         assert!(event_loop.unregister(token).unwrap());
         assert!(!event_loop.unregister(token).unwrap());
         assert_eq!(event_loop.source_for_token(token), None);
+        assert_eq!(event_loop.stale_unregistration_count(), 1);
+    }
+
+    #[test]
+    fn xwayland_retiring_registration_tolerates_closed_fd_and_counts_it() {
+        let source = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let token = event_loop
+            .register(source.as_raw_fd(), NativeEventSource::XwaylandDisplayReady)
+            .unwrap();
+
+        drop(source);
+
+        assert!(event_loop.unregister(token).unwrap());
+        assert_eq!(event_loop.benign_unregistration_count(), 1);
+        assert_eq!(event_loop.source_for_token(token), None);
+    }
+
+    #[test]
+    fn non_xwayland_closed_registration_still_surfaces_ebadf() {
+        let source = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let token = event_loop
+            .register(source.as_raw_fd(), NativeEventSource::ExplicitSyncAcquire)
+            .unwrap();
+
+        drop(source);
+
+        assert_eq!(
+            event_loop.unregister(token).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
     }
 
     #[test]

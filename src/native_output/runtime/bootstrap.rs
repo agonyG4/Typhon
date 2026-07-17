@@ -344,14 +344,14 @@ impl NativeRuntime {
         let mut xwayland_reactor_tokens = Vec::new();
         register_xwayland_reactor_sources(
             &mut event_loop,
-            &xwayland,
+            &mut xwayland,
             &mut xwayland_reactor_tokens,
         )?;
         if xwayland.is_eager() {
             xwayland.handle_listener_readiness(&mut process_supervisor)?;
             register_xwayland_reactor_sources(
                 &mut event_loop,
-                &xwayland,
+                &mut xwayland,
                 &mut xwayland_reactor_tokens,
             )?;
         }
@@ -1188,7 +1188,7 @@ impl NativeRuntime {
 
 fn register_xwayland_reactor_sources(
     event_loop: &mut NativeEventLoop,
-    service: &XwaylandService,
+    service: &mut XwaylandService,
     tokens: &mut Vec<(ReactorToken, XwaylandReactorRegistration)>,
 ) -> NativeResult<()> {
     let desired: Vec<_> = service.reactor_registrations().collect();
@@ -1215,5 +1215,6 @@ fn register_xwayland_reactor_sources(
         let token = event_loop.register(registration.fd, source)?;
         tokens.push((token, registration));
     }
+    service.finish_reactor_teardown()?;
     Ok(())
 }

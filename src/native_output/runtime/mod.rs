@@ -180,6 +180,7 @@ impl NativeRuntime {
             let token = self.event_loop.register(registration.fd, source)?;
             self.xwayland_reactor_tokens.push((token, registration));
         }
+        self.xwayland.finish_reactor_teardown()?;
         Ok(())
     }
 
