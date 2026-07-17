@@ -50,7 +50,7 @@ impl ReactorToken {
         Some(((slot - 1) as usize, generation))
     }
 
-    const fn raw(self) -> u64 {
+    pub const fn raw(self) -> u64 {
         self.0
     }
 

@@ -4,6 +4,7 @@ mod association;
 mod auth;
 mod config;
 mod display;
+mod displayfd;
 mod generation;
 mod launch;
 mod metrics;

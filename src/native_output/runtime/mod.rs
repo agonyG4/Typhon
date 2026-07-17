@@ -162,7 +162,11 @@ impl NativeRuntime {
             } else {
                 let removed = self.event_loop.unregister(token)?;
                 if removed {
-                    self.xwayland.note_reactor_registration(registration, false);
+                    self.xwayland.note_reactor_registration_with_token(
+                        registration,
+                        false,
+                        Some(token.raw()),
+                    );
                 }
             }
         }
@@ -183,7 +187,11 @@ impl NativeRuntime {
                 XwaylandReactorPurpose::Stderr => NativeEventSource::XwaylandStderr,
             };
             let token = self.event_loop.register(registration.fd, source)?;
-            self.xwayland.note_reactor_registration(registration, true);
+            self.xwayland.note_reactor_registration_with_token(
+                registration,
+                true,
+                Some(token.raw()),
+            );
             self.xwayland_reactor_tokens.push((token, registration));
         }
         self.xwayland.finish_reactor_teardown()?;

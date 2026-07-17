@@ -28,6 +28,9 @@ use super::{
     display::{DisplayLease, connect_abstract_socket_for_tests},
 };
 
+#[path = "displayfd_tests.rs"]
+mod displayfd_tests;
+
 #[test]
 fn xwayland_mode_parses_only_opt_in_values() {
     assert_eq!(XwaylandMode::parse(None), XwaylandMode::Off);
@@ -313,7 +316,8 @@ fn service_at_root(
     binary: &str,
 ) -> (PathBuf, XwaylandService, ChildSupervisor) {
     let root = test_root("service");
-    let config = XwaylandConfig::for_tests_at_root(mode, PathBuf::from(binary), root.clone());
+    let mut config = XwaylandConfig::for_tests_at_root(mode, PathBuf::from(binary), root.clone());
+    config.display_min = 1;
     let service = XwaylandService::bootstrap_with_config(config).expect("bootstrap service");
     (root, service, ChildSupervisor::new())
 }
@@ -330,7 +334,8 @@ fn service_at_root_with_sleeping_binary(
         .permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(&binary, permissions).expect("make sleeping test binary executable");
-    let config = XwaylandConfig::for_tests_at_root(mode, binary, root.clone());
+    let mut config = XwaylandConfig::for_tests_at_root(mode, binary, root.clone());
+    config.display_min = 1;
     let service = XwaylandService::bootstrap_with_config(config).expect("bootstrap service");
     (root, service, ChildSupervisor::new())
 }
@@ -350,7 +355,65 @@ fn service_at_root_with_stderr_binary() -> (PathBuf, XwaylandService, ChildSuper
     fs::set_permissions(&binary, permissions).expect("make stderr test binary executable");
     let mut config =
         XwaylandConfig::for_tests_at_root(XwaylandMode::BaseLazy, binary, root.clone());
+    config.display_min = 1;
     config.log_stderr = true;
+    let service = XwaylandService::bootstrap_with_config(config).expect("bootstrap service");
+    (root, service, ChildSupervisor::new())
+}
+
+fn service_at_root_with_displayfd_writer(
+    mode: XwaylandMode,
+    label: &str,
+    close_after_write: bool,
+) -> (PathBuf, XwaylandService, ChildSupervisor) {
+    let root = test_root(label);
+    let binary = root.join("xwayland-test-binary");
+    let tail = if close_after_write {
+        "exit 0"
+    } else {
+        "exec /bin/sleep 30"
+    };
+    fs::write(
+        &binary,
+        format!("#!/bin/sh\nprintf '%s\\n' \"${{1#:}}\" >&5\n{tail}\n"),
+    )
+    .expect("write displayfd test binary");
+    let mut permissions = fs::metadata(&binary)
+        .expect("stat displayfd test binary")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&binary, permissions).expect("make displayfd test binary executable");
+    let mut config = XwaylandConfig::for_tests_at_root(mode, binary, root.clone());
+    config.display_min = 1;
+    let service = XwaylandService::bootstrap_with_config(config).expect("bootstrap service");
+    (root, service, ChildSupervisor::new())
+}
+
+fn service_at_root_with_delayed_displayfd_writer(
+    label: &str,
+    close_after_write: bool,
+) -> (PathBuf, XwaylandService, ChildSupervisor) {
+    let root = test_root(label);
+    let binary = root.join("xwayland-test-binary");
+    let tail = if close_after_write {
+        "exit 0"
+    } else {
+        "exec /bin/sleep 30"
+    };
+    fs::write(
+        &binary,
+        format!("#!/bin/sh\nsleep 0.05\nprintf '%s\\n' \"${{1#:}}\" >&5\n{tail}\n"),
+    )
+    .expect("write delayed displayfd test binary");
+    let mut permissions = fs::metadata(&binary)
+        .expect("stat delayed displayfd test binary")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&binary, permissions)
+        .expect("make delayed displayfd test binary executable");
+    let mut config =
+        XwaylandConfig::for_tests_at_root(XwaylandMode::BaseLazy, binary, root.clone());
+    config.display_min = 1;
     let service = XwaylandService::bootstrap_with_config(config).expect("bootstrap service");
     (root, service, ChildSupervisor::new())
 }
@@ -522,6 +585,16 @@ fn backoff_does_not_register_readable_listener_sources() {
     service.handle_process_exit(&exit).expect("handle crash");
     assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
     assert_eq!(service.reactor_registrations().count(), 0);
+    assert!(
+        !service
+            .handle_reactor_event(
+                XwaylandReactorPurpose::ListenFilesystem,
+                None,
+                libc::EPOLLIN as u32,
+                &mut supervisor,
+            )
+            .expect("ignore listener readiness during backoff")
+    );
     service
         .handle_deadline(u64::MAX, &mut supervisor)
         .expect("rearm after backoff");
@@ -1042,7 +1115,7 @@ fn shutdown_unregisters_listeners_before_lease_release() {
         .finish_reactor_teardown()
         .expect("finish lease teardown");
     assert!(!service.has_pending_reactor_teardown());
-    assert!(!PathBuf::from(format!("/tmp/.X{display}-lock")).exists());
+    assert!(!root.join(format!(".X{display}-lock")).exists());
     assert!(!environment.xauthority.exists());
 
     drop(event_loop);
@@ -1141,7 +1214,7 @@ fn installed_xwayland_private_socket_smoke_test() -> Result<(), Box<dyn std::err
     let mut compositor =
         crate::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)?;
     let mut config = XwaylandConfig::for_tests(XwaylandMode::BaseLazy, binary);
-    config.display_min = 0;
+    config.display_min = 1;
     config.display_max = 63;
     let mut supervisor = ChildSupervisor::new();
     let mut service = XwaylandService::bootstrap_with_config(config)?;

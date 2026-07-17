@@ -354,6 +354,18 @@ impl NativeRuntime {
                 &mut xwayland,
                 &mut xwayland_reactor_tokens,
             )?;
+            if let Some(generation) = xwayland.generation() {
+                if let Err(error) = xwayland.probe_displayfd(generation, &mut process_supervisor) {
+                    eprintln!(
+                        "native XWayland eager displayfd probe contained generation={generation:?}: {error}"
+                    );
+                }
+                register_xwayland_reactor_sources(
+                    &mut event_loop,
+                    &mut xwayland,
+                    &mut xwayland_reactor_tokens,
+                )?;
+            }
         }
         let drm_reactor_token =
             event_loop.register(kms.file().as_raw_fd(), NativeEventSource::Drm)?;
@@ -1199,7 +1211,11 @@ fn register_xwayland_reactor_sources(
         } else {
             let removed = event_loop.unregister(token)?;
             if removed {
-                service.note_reactor_registration(registration, false);
+                service.note_reactor_registration_with_token(
+                    registration,
+                    false,
+                    Some(token.raw()),
+                );
             }
         }
     }
@@ -1217,7 +1233,7 @@ fn register_xwayland_reactor_sources(
             XwaylandReactorPurpose::Stderr => NativeEventSource::XwaylandStderr,
         };
         let token = event_loop.register(registration.fd, source)?;
-        service.note_reactor_registration(registration, true);
+        service.note_reactor_registration_with_token(registration, true, Some(token.raw()));
         tokens.push((token, registration));
     }
     service.finish_reactor_teardown()?;

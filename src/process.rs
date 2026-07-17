@@ -1226,6 +1226,55 @@ mod tests {
     }
 
     #[test]
+    fn mapped_inherited_fd_cycles_preserve_overlapping_sources() {
+        let root = std::env::temp_dir().join(format!(
+            "typhon-fd-cycle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create fd cycle directory");
+        let first_path = root.join("first");
+        let second_path = root.join("second");
+        std::fs::write(&first_path, b"first\n").expect("write first source");
+        std::fs::write(&second_path, b"second\n").expect("write second source");
+        let first: OwnedFd = std::fs::File::open(&first_path)
+            .expect("open first source")
+            .into();
+        let second: OwnedFd = std::fs::File::open(&second_path)
+            .expect("open second source")
+            .into();
+        let first_fd = first.as_raw_fd();
+        let second_fd = second.as_raw_fd();
+        let script = format!(
+            "cmp /proc/self/fd/{first_fd} {second} && cmp /proc/self/fd/{second_fd} {first}",
+            first = first_path.display(),
+            second = second_path.display(),
+        );
+        let mut launch = SpawnCommand::new(shell_command(&script));
+        launch
+            .map_fd(first, second_fd)
+            .expect("map first source over second target");
+        launch
+            .map_fd(second, first_fd)
+            .expect("map second source over first target");
+
+        let mut supervisor = ChildSupervisor::new();
+        launch
+            .spawn(
+                &mut supervisor,
+                ProcessOptions::new(ProcessKind::Application).session_owned(false),
+            )
+            .expect("spawn cyclic mapping child");
+        let exits = wait_for_reap(&mut supervisor);
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].status.code(), Some(0));
+        std::fs::remove_dir_all(root).expect("remove fd cycle directory");
+    }
+
+    #[test]
     fn failed_mapped_spawn_closes_owned_sources_and_registers_no_child() {
         let source: OwnedFd = std::fs::File::open("/dev/null")
             .expect("open source fd")

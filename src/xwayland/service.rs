@@ -16,12 +16,16 @@ use super::{
     XwaylandAppEnvironment, XwaylandAssociationEvent, XwaylandGeneration, XwaylandMode,
     config::XwaylandConfig,
     display::DisplayLease,
+    displayfd,
     launch::{ChildFdTarget, build_command},
     metrics::XwaylandMetrics,
     next_nonzero,
     readiness::XwaylandReadinessSnapshot,
     xwm::Xwm,
 };
+
+#[path = "displayfd_service.rs"]
+mod displayfd_service;
 
 const DISPLAYFD_MAX_BYTES: usize = 32;
 const STARTUP_TIMEOUT_NS: u64 = 3_000_000_000;
@@ -79,6 +83,8 @@ struct StartingResources {
     generation: XwaylandGeneration,
     process: SpawnedProcess,
     displayfd: OwnedFd,
+    displayfd_child_source_fd: RawFd,
+    displayfd_reactor_token: Option<u64>,
     private_wayland: Option<UnixStream>,
     wm: Option<UnixStream>,
     display_ready: bool,
@@ -285,7 +291,9 @@ impl XwaylandService {
                 purpose: XwaylandReactorPurpose::ListenAbstract,
             });
         }
-        if let ServiceState::Starting(resources) = &self.state {
+        if let ServiceState::Starting(resources) = &self.state
+            && !resources.display_ready
+        {
             registrations.push(XwaylandReactorRegistration {
                 fd: resources.displayfd.as_raw_fd(),
                 generation: Some(resources.generation),
@@ -330,15 +338,51 @@ impl XwaylandService {
         registration: XwaylandReactorRegistration,
         registered: bool,
     ) {
+        self.note_reactor_registration_with_token(registration, registered, None);
+    }
+
+    pub fn note_reactor_registration_with_token(
+        &mut self,
+        registration: XwaylandReactorRegistration,
+        registered: bool,
+        reactor_token: Option<u64>,
+    ) {
         if registration.purpose != XwaylandReactorPurpose::DisplayReady {
             return;
         }
-        let ServiceState::Starting(resources) = &mut self.state else {
+        let Some((generation, process_id, parent_fd, child_source_fd)) = (match &mut self.state {
+            ServiceState::Starting(resources)
+                if registration.generation == Some(resources.generation) =>
+            {
+                resources.displayfd_registered = registered;
+                resources.displayfd_reactor_token =
+                    registered.then_some(reactor_token.unwrap_or(0));
+                Some((
+                    resources.generation,
+                    resources.process.id,
+                    resources.displayfd.as_raw_fd(),
+                    resources.displayfd_child_source_fd,
+                ))
+            }
+            _ => None,
+        }) else {
             return;
         };
-        if registration.generation == Some(resources.generation) {
-            resources.displayfd_registered = registered;
-        }
+        self.log_displayfd_event(
+            "displayfd_registered",
+            Some(if registered {
+                "registered"
+            } else {
+                "unregistered"
+            }),
+            Some(generation),
+            Some(process_id),
+            Some(parent_fd),
+            Some(child_source_fd),
+            reactor_token,
+            None,
+            None,
+        );
     }
 
     /// Release retired generation resources only after the runtime has removed
@@ -445,7 +489,7 @@ impl XwaylandService {
         );
         self.private_client = None;
         self.kill_process_now(supervisor, process_id)?;
-        self.enter_backoff(now_ns()?);
+        self.enter_failure_backoff(now_ns()?);
         Ok(())
     }
 
@@ -494,7 +538,7 @@ impl XwaylandService {
         if let Some(process_id) = process_id {
             self.kill_process_now(supervisor, process_id)?;
         }
-        self.enter_backoff(now_ns()?);
+        self.enter_failure_backoff(now_ns()?);
         Ok(())
     }
 
@@ -514,7 +558,7 @@ impl XwaylandService {
         match self.start_generation(supervisor) {
             Ok(()) => Ok(true),
             Err(error) => {
-                self.enter_backoff(now_ns()?);
+                self.enter_failure_backoff(now_ns()?);
                 Err(error)
             }
         }
@@ -527,6 +571,17 @@ impl XwaylandService {
         flags: u32,
         supervisor: &mut ChildSupervisor,
     ) -> io::Result<bool> {
+        self.handle_reactor_event_with_token(purpose, generation, flags, 0, supervisor)
+    }
+
+    pub fn handle_reactor_event_with_token(
+        &mut self,
+        purpose: XwaylandReactorPurpose,
+        generation: Option<XwaylandGeneration>,
+        flags: u32,
+        reactor_token: u64,
+        supervisor: &mut ChildSupervisor,
+    ) -> io::Result<bool> {
         let error_flags = libc::EPOLLERR as u32 | libc::EPOLLHUP as u32 | libc::EPOLLRDHUP as u32;
         if flags & (libc::EPOLLIN as u32 | error_flags) == 0 {
             return Ok(false);
@@ -534,12 +589,29 @@ impl XwaylandService {
         match purpose {
             XwaylandReactorPurpose::ListenFilesystem | XwaylandReactorPurpose::ListenAbstract => {
                 if flags & libc::EPOLLIN as u32 != 0 {
-                    let _ = self.handle_listener_readiness(supervisor)?;
+                    return self.handle_listener_readiness(supervisor);
                 }
             }
             XwaylandReactorPurpose::DisplayReady => {
                 if let Some(generation) = generation {
-                    self.handle_displayfd_ready(generation, supervisor)?;
+                    if reactor_token != 0
+                        && self.displayfd_reactor_token(generation) != Some(reactor_token)
+                    {
+                        self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
+                        return Ok(false);
+                    }
+                    self.log_displayfd_event(
+                        "displayfd_epoll",
+                        None,
+                        Some(generation),
+                        self.process_id_for_generation(generation),
+                        self.displayfd_parent_fd(generation),
+                        self.displayfd_child_source_fd(generation),
+                        Some(reactor_token),
+                        Some(flags),
+                        None,
+                    );
+                    self.handle_displayfd_ready_with_flags(generation, flags, supervisor)?;
                 }
             }
             XwaylandReactorPurpose::Xwm => {
@@ -586,7 +658,20 @@ impl XwaylandService {
             .ok_or_else(|| io::Error::other("XWayland start requested without a display lease"))?;
         let (private_wayland, private_wayland_child) = UnixStream::pair()?;
         let (wm, wm_child) = UnixStream::pair()?;
-        let (displayfd, displayfd_child) = pipe_pair()?;
+        let (displayfd, displayfd_child) = displayfd::create_pipe()?;
+        let displayfd_parent_fd = displayfd.as_raw_fd();
+        let displayfd_child_source_fd = displayfd_child.as_raw_fd();
+        self.log_displayfd_event(
+            "displayfd_created",
+            None,
+            Some(generation),
+            None,
+            Some(displayfd_parent_fd),
+            Some(displayfd_child_source_fd),
+            None,
+            None,
+            Some(0),
+        );
         let mut launch = SpawnCommand::new(build_command(
             &self.config.binary,
             lease,
@@ -616,10 +701,23 @@ impl XwaylandService {
         } else {
             (launch.spawn(supervisor, options)?, None)
         };
+        self.log_displayfd_event(
+            "displayfd_child_mapped",
+            None,
+            Some(generation),
+            Some(process.id),
+            Some(displayfd_parent_fd),
+            Some(displayfd_child_source_fd),
+            None,
+            None,
+            None,
+        );
         self.state = ServiceState::Starting(StartingResources {
             generation,
             process,
             displayfd,
+            displayfd_child_source_fd,
+            displayfd_reactor_token: None,
             private_wayland: Some(private_wayland),
             wm: Some(wm),
             display_ready: false,
@@ -640,50 +738,6 @@ impl XwaylandService {
         self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
         self.log_state_transition();
         Ok(())
-    }
-
-    pub fn handle_displayfd_ready(
-        &mut self,
-        generation: XwaylandGeneration,
-        supervisor: &mut ChildSupervisor,
-    ) -> io::Result<()> {
-        let mut bytes = [0u8; 64];
-        loop {
-            let read_result = match &self.state {
-                ServiceState::Starting(resources) if resources.generation == generation => unsafe {
-                    libc::read(
-                        resources.displayfd.as_raw_fd(),
-                        bytes.as_mut_ptr().cast(),
-                        bytes.len(),
-                    )
-                },
-                ServiceState::Starting(_) => {
-                    self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
-                    return Ok(());
-                }
-                _ => return Ok(()),
-            };
-            if read_result < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::WouldBlock {
-                    return Ok(());
-                }
-                return self.fail_generation(supervisor, error);
-            }
-            if read_result == 0 {
-                return self.fail_generation(
-                    supervisor,
-                    io::Error::new(io::ErrorKind::UnexpectedEof, "XWayland displayfd closed"),
-                );
-            }
-            self.handle_displayfd_bytes(generation, &bytes[..read_result as usize], supervisor)?;
-            if !matches!(self.state, ServiceState::Starting(_)) {
-                return Ok(());
-            }
-            if bytes[..read_result as usize].contains(&b'\n') {
-                return Ok(());
-            }
-        }
     }
 
     pub fn handle_stderr_ready(&mut self, generation: XwaylandGeneration) -> io::Result<()> {
@@ -790,68 +844,6 @@ impl XwaylandService {
                 truncated,
             );
         }
-        Ok(())
-    }
-
-    pub fn handle_displayfd_bytes(
-        &mut self,
-        generation: XwaylandGeneration,
-        bytes: &[u8],
-        supervisor: &mut ChildSupervisor,
-    ) -> io::Result<()> {
-        let reserved_display = self.display_number();
-        let ServiceState::Starting(resources) = &mut self.state else {
-            return Ok(());
-        };
-        if resources.generation != generation {
-            self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
-            self.metrics.unauthorized_bind_attempts =
-                self.metrics.unauthorized_bind_attempts.saturating_add(1);
-            return Ok(());
-        }
-        resources.displayfd_readable = true;
-        if resources.displayfd_bytes.len().saturating_add(bytes.len()) > DISPLAYFD_MAX_BYTES {
-            return self.fail_generation(
-                supervisor,
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "XWayland displayfd payload is oversized",
-                ),
-            );
-        }
-        resources.displayfd_bytes.extend_from_slice(bytes);
-        let Some(newline) = resources
-            .displayfd_bytes
-            .iter()
-            .position(|byte| *byte == b'\n')
-        else {
-            return Ok(());
-        };
-        let payload = &resources.displayfd_bytes[..newline];
-        if payload.is_empty() || !payload.iter().all(u8::is_ascii_digit) {
-            return self.fail_generation(
-                supervisor,
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "XWayland displayfd payload is malformed",
-                ),
-            );
-        }
-        let value = std::str::from_utf8(payload)
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok());
-        if value != reserved_display {
-            return self.fail_generation(
-                supervisor,
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "XWayland displayfd does not match lease",
-                ),
-            );
-        }
-        resources.display_ready = true;
-        self.maybe_mark_running();
-        self.log_readiness_progress("display_number_validated");
         Ok(())
     }
 
@@ -1020,7 +1012,7 @@ impl XwaylandService {
                 let error = io::Error::other(error);
                 self.state = ServiceState::Starting(resources);
                 self.kill_process_now(supervisor, process_id)?;
-                self.enter_backoff(now_ns()?);
+                self.enter_failure_backoff(now_ns()?);
                 Err(error)
             }
         }
@@ -1051,25 +1043,10 @@ impl XwaylandService {
             self.last_readiness = Some(readiness);
         }
         if exit.status.success() {
-            self.rearm();
+            self.rearm(true);
             return Ok(true);
         }
-        let now = now_ns()?;
-        while self
-            .crash_times_ns
-            .front()
-            .is_some_and(|started| now.saturating_sub(*started) > CRASH_WINDOW_NS)
-        {
-            self.crash_times_ns.pop_front();
-        }
-        self.crash_times_ns.push_back(now);
-        self.metrics.crashes = self.metrics.crashes.saturating_add(1);
-        if self.crash_times_ns.len() >= 3 {
-            self.replace_state(ServiceState::Failed);
-            self.log_state_transition();
-            return Ok(true);
-        }
-        self.enter_backoff(now);
+        self.enter_failure_backoff(now_ns()?);
         Ok(true)
     }
 
@@ -1189,12 +1166,38 @@ impl XwaylandService {
             ServiceState::Starting(resources) if now_ns >= resources.deadline_ns
         );
         if startup_timed_out {
-            let (process_id, readiness) = match &self.state {
-                ServiceState::Starting(resources) => {
-                    (resources.process.id, self.snapshot_for_starting(resources))
-                }
+            let (generation, process_id) = match &self.state {
+                ServiceState::Starting(resources) => (resources.generation, resources.process.id),
                 _ => unreachable!("startup timeout state changed before diagnostics"),
             };
+            let process_alive = supervisor.contains_id(process_id);
+            self.log_displayfd_event(
+                "displayfd_probe",
+                Some("timeout_final"),
+                Some(generation),
+                Some(process_id),
+                self.displayfd_parent_fd(generation),
+                self.displayfd_child_source_fd(generation),
+                self.displayfd_reactor_token(generation),
+                None,
+                None,
+            );
+            if process_alive && let Err(error) = self.probe_displayfd(generation, supervisor) {
+                eprintln!(
+                    "oblivion-one xwayland: event=displayfd_final_probe_failed generation={generation:?} error={error}"
+                );
+            }
+            if !matches!(
+                &self.state,
+                ServiceState::Starting(resources) if resources.generation == generation
+            ) {
+                return Ok(());
+            }
+            let mut readiness = match &self.state {
+                ServiceState::Starting(resources) => self.snapshot_for_starting(resources),
+                _ => unreachable!("startup timeout state changed after final probe"),
+            };
+            readiness.process_alive = process_alive;
             self.last_readiness = Some(readiness);
             eprintln!(
                 "oblivion-one xwayland: event=readiness_timeout generation={:?} display={} process_id={} elapsed_ns={} process_alive={} displayfd_registered={} displayfd_readable={} display_number_validated={} private_wayland_endpoint_transferred={} private_client_attached={} private_client_authorized={} xwayland_shell_bound={} xwm_connected={} xwm_capabilities_validated={} root_initialized={} readiness_complete=false missing={:?}",
@@ -1217,10 +1220,10 @@ impl XwaylandService {
             );
             self.metrics.readiness_failures = self.metrics.readiness_failures.saturating_add(1);
             self.kill_process_now(supervisor, process_id)?;
-            self.enter_backoff(now_ns);
+            self.enter_failure_backoff(now_ns);
         } else if matches!(&self.state, ServiceState::Backoff { deadline_ns, .. } if now_ns >= *deadline_ns)
         {
-            self.rearm();
+            self.rearm(false);
         }
         Ok(())
     }
@@ -1283,14 +1286,18 @@ impl XwaylandService {
         }
     }
 
-    fn rearm(&mut self) {
+    fn rearm(&mut self, reset_failure_budget: bool) {
         self.private_client = None;
         if self.mode.is_enabled() && self.lease.is_some() {
             self.replace_state(ServiceState::Armed);
         } else {
             self.replace_state(ServiceState::Disabled);
         }
-        self.backoff_level = 0;
+        if reset_failure_budget {
+            self.crash_times_ns.clear();
+            self.backoff_level = 0;
+            self.metrics.backoff_level = 0;
+        }
         self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
         self.log_state_transition();
     }
@@ -1308,6 +1315,30 @@ impl XwaylandService {
             self.backoff_level
         );
         self.log_state_transition();
+    }
+
+    fn enter_failure_backoff(&mut self, now_ns: u64) {
+        while self
+            .crash_times_ns
+            .front()
+            .is_some_and(|started| now_ns.saturating_sub(*started) > CRASH_WINDOW_NS)
+        {
+            self.crash_times_ns.pop_front();
+        }
+        self.crash_times_ns.push_back(now_ns);
+        self.metrics.crashes = self.metrics.crashes.saturating_add(1);
+        if self.crash_times_ns.len() >= 3 {
+            self.private_client = None;
+            self.replace_state(ServiceState::Failed);
+            self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
+            eprintln!(
+                "oblivion-one xwayland: event=failure_budget_exhausted failures={} ",
+                self.crash_times_ns.len()
+            );
+            self.log_state_transition();
+        } else {
+            self.enter_backoff(now_ns);
+        }
     }
 
     fn fail_generation(
@@ -1328,7 +1359,7 @@ impl XwaylandService {
             "oblivion-one xwayland: event=readiness_failure generation={:?} reason={error}",
             self.generation()
         );
-        self.enter_backoff(now_ns()?);
+        self.enter_failure_backoff(now_ns()?);
         Err(error)
     }
 
@@ -1444,17 +1475,6 @@ impl XwaylandService {
         })
     }
 }
-
-fn pipe_pair() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [-1; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok((unsafe { OwnedFd::from_raw_fd(fds[0]) }, unsafe {
-        OwnedFd::from_raw_fd(fds[1])
-    }))
-}
-
 fn duplicate_fd(fd: RawFd) -> io::Result<OwnedFd> {
     let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 100) };
     if duplicate < 0 {
@@ -1463,11 +1483,9 @@ fn duplicate_fd(fd: RawFd) -> io::Result<OwnedFd> {
         Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
     }
 }
-
 fn owned_fd_from_stream(stream: UnixStream) -> OwnedFd {
     unsafe { OwnedFd::from_raw_fd(stream.into_raw_fd()) }
 }
-
 fn now_ns() -> io::Result<u64> {
     let mut time = libc::timespec {
         tv_sec: 0,

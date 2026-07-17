@@ -97,6 +97,7 @@ impl NativeRuntime {
     }
 
     pub(super) fn dispatch_xwayland_events(&mut self, wakeup: &NativeWakeup) -> NativeResult<()> {
+        let mut started_generation = None;
         for event in wakeup.xwayland_events.iter().copied() {
             let Some((_, registration)) = self
                 .xwayland_reactor_tokens
@@ -107,10 +108,11 @@ impl NativeRuntime {
                 self.xwayland.record_stale_reactor_event();
                 continue;
             };
-            let continuation = match self.xwayland.handle_reactor_event(
+            let continuation = match self.xwayland.handle_reactor_event_with_token(
                 registration.purpose,
                 registration.generation,
                 event.flags,
+                event.token.raw(),
                 &mut self.process_supervisor,
             ) {
                 Ok(continuation) => continuation,
@@ -122,11 +124,31 @@ impl NativeRuntime {
                     false
                 }
             };
+            if continuation
+                && matches!(
+                    registration.purpose,
+                    XwaylandReactorPurpose::ListenFilesystem
+                        | XwaylandReactorPurpose::ListenAbstract
+                )
+            {
+                started_generation = self.xwayland.generation();
+            }
             if continuation {
                 self.event_loop.arm_deadline(Some(monotonic_now_ns()?))?;
             }
         }
         self.sync_xwayland_reactor_sources()?;
+        if let Some(generation) = started_generation {
+            if let Err(error) = self
+                .xwayland
+                .probe_displayfd(generation, &mut self.process_supervisor)
+            {
+                eprintln!(
+                    "native XWayland displayfd probe contained generation={generation:?}: {error}"
+                );
+            }
+            self.sync_xwayland_reactor_sources()?;
+        }
         Ok(())
     }
 }

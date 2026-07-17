@@ -87,7 +87,7 @@ impl XwaylandConfig {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("Xwayland")),
             log_stderr: env::var_os("TYPHON_XWAYLAND_LOG").is_some_and(|value| value == "1"),
-            display_min: 0,
+            display_min: 1,
             display_max: 63,
             #[cfg(test)]
             test_root: None,
