@@ -26,4 +26,8 @@ pub(crate) struct XwaylandMetrics {
     pub(crate) property_refresh_coalesced: u64,
     pub(crate) property_refresh_rejected: u64,
     pub(crate) property_refresh_stale: u64,
+    pub(crate) stderr_bytes: u64,
+    pub(crate) stderr_lines: u64,
+    pub(crate) stderr_truncated: u64,
+    pub(crate) stderr_closed: u64,
 }

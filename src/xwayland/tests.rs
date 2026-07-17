@@ -19,6 +19,7 @@ use wayland_client::{
     protocol::wl_registry,
 };
 
+use crate::native::event_loop::{NativeEventLoop, NativeEventSource};
 use crate::process::ChildSupervisor;
 
 use super::{
@@ -334,6 +335,26 @@ fn service_at_root_with_sleeping_binary(
     (root, service, ChildSupervisor::new())
 }
 
+fn service_at_root_with_stderr_binary() -> (PathBuf, XwaylandService, ChildSupervisor) {
+    let root = test_root("stderr");
+    let binary = root.join("xwayland-test-binary");
+    fs::write(
+        &binary,
+        "#!/bin/sh\nprintf 'xwayland diagnostic\\n' >&2\nexec /bin/sleep 30\n",
+    )
+    .expect("write stderr test binary");
+    let mut permissions = fs::metadata(&binary)
+        .expect("stat stderr test binary")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&binary, permissions).expect("make stderr test binary executable");
+    let mut config =
+        XwaylandConfig::for_tests_at_root(XwaylandMode::BaseLazy, binary, root.clone());
+    config.log_stderr = true;
+    let service = XwaylandService::bootstrap_with_config(config).expect("bootstrap service");
+    (root, service, ChildSupervisor::new())
+}
+
 fn reap_one(supervisor: &mut ChildSupervisor) -> crate::process::ChildExit {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
@@ -352,6 +373,65 @@ fn base_mode_arms_both_listeners_without_starting_a_process() {
     assert_eq!(service.state_kind(), XwaylandStateKind::Armed);
     assert_eq!(service.reactor_registrations().count(), 2);
     assert_eq!(supervisor.active_count(), 0);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn stderr_pipe_is_nonblocking_and_closes_without_failing_generation() {
+    let (root, mut service, mut supervisor) = service_at_root_with_stderr_binary();
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let generation = service.generation().expect("generation");
+    assert_eq!(
+        service
+            .reactor_registrations()
+            .filter(|registration| registration.purpose == XwaylandReactorPurpose::Stderr)
+            .count(),
+        1
+    );
+    service
+        .handle_stderr_ready(generation)
+        .expect("drain stderr");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while service.metrics.stderr_lines == 0 && Instant::now() < deadline {
+        service
+            .handle_stderr_ready(generation)
+            .expect("poll stderr");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(service.metrics.stderr_lines >= 1);
+
+    let process_id = service
+        .readiness_snapshot()
+        .expect("readiness snapshot")
+        .process_id;
+    supervisor
+        .kill_managed_now(process_id)
+        .expect("kill process");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while service
+        .reactor_registrations()
+        .any(|registration| registration.purpose == XwaylandReactorPurpose::Stderr)
+        && Instant::now() < deadline
+    {
+        service
+            .handle_stderr_ready(generation)
+            .expect("handle stderr EOF");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        service
+            .reactor_registrations()
+            .filter(|registration| registration.purpose == XwaylandReactorPurpose::Stderr)
+            .count(),
+        0
+    );
+    assert_eq!(service.state_kind(), XwaylandStateKind::Starting);
+
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
     drop(service);
     drop(supervisor);
     fs::remove_dir_all(root).expect("remove test root");
@@ -590,6 +670,68 @@ fn display_and_private_shell_readiness_are_both_required() {
 }
 
 #[test]
+fn displayfd_ready_but_shell_not_bound_reports_shell_as_missing() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/true");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let display_registration = service
+        .reactor_registrations()
+        .find(|registration| registration.purpose == XwaylandReactorPurpose::DisplayReady)
+        .expect("displayfd registration");
+    service.note_reactor_registration(display_registration, true);
+    let generation = service.generation().expect("starting generation");
+    let display = service.display_number().expect("reserved display");
+    service
+        .handle_displayfd_bytes(
+            generation,
+            format!("{display}\n").as_bytes(),
+            &mut supervisor,
+        )
+        .expect("display readiness");
+
+    let readiness = service.readiness_snapshot().expect("readiness snapshot");
+    assert!(readiness.displayfd_readable);
+    assert!(readiness.display_number_validated);
+    assert_eq!(readiness.missing_conditions(), ["xwayland_shell_bound"]);
+
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn shell_bound_but_displayfd_incomplete_reports_display_validation_as_missing() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/true");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let display_registration = service
+        .reactor_registrations()
+        .find(|registration| registration.purpose == XwaylandReactorPurpose::DisplayReady)
+        .expect("displayfd registration");
+    service.note_reactor_registration(display_registration, true);
+    let generation = service.generation().expect("starting generation");
+    service
+        .handle_shell_bind(generation)
+        .expect("shell readiness");
+
+    let readiness = service.readiness_snapshot().expect("readiness snapshot");
+    assert!(!readiness.displayfd_readable);
+    assert!(!readiness.display_number_validated);
+    assert_eq!(
+        readiness.missing_conditions(),
+        ["displayfd_readable", "display_number_validated"]
+    );
+
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
 fn shell_readiness_alone_remains_starting_and_reverse_order_completes() {
     let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/true");
     service
@@ -768,6 +910,14 @@ fn startup_timeout_kills_generation_and_enters_backoff() {
         .handle_deadline(u64::MAX, &mut supervisor)
         .expect("handle startup timeout");
     assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+    let readiness = service.readiness_snapshot().expect("timeout diagnostics");
+    assert_eq!(readiness.process_id.get(), 1);
+    assert!(!readiness.readiness_complete);
+    assert!(
+        readiness
+            .missing_conditions()
+            .contains(&"xwayland_shell_bound")
+    );
     assert!(service.has_pending_reactor_teardown());
     service
         .finish_reactor_teardown()
@@ -779,6 +929,79 @@ fn startup_timeout_kills_generation_and_enters_backoff() {
         thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(supervisor.active_count(), 0);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn timeout_unregisters_generation_source_before_descriptor_release() {
+    let (root, mut service, mut supervisor) =
+        service_at_root_with_sleeping_binary(XwaylandMode::BaseLazy, "timeout-order");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let registration = service
+        .reactor_registrations()
+        .find(|registration| registration.purpose == XwaylandReactorPurpose::DisplayReady)
+        .expect("displayfd registration");
+    let mut event_loop = NativeEventLoop::new().expect("reactor");
+    let token = event_loop
+        .register(registration.fd, NativeEventSource::XwaylandDisplayReady)
+        .expect("register displayfd");
+    service.note_reactor_registration(registration, true);
+
+    service
+        .handle_deadline(u64::MAX, &mut supervisor)
+        .expect("handle startup timeout");
+    assert!(service.has_pending_reactor_teardown());
+    assert!(
+        event_loop
+            .unregister(token)
+            .expect("unregister before close")
+    );
+    service
+        .finish_reactor_teardown()
+        .expect("release after unregister");
+    assert!(!service.has_pending_reactor_teardown());
+
+    drop(event_loop);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn process_exit_during_starting_retires_sources_before_resources() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/false");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let registration = service
+        .reactor_registrations()
+        .find(|registration| registration.purpose == XwaylandReactorPurpose::DisplayReady)
+        .expect("displayfd registration");
+    let mut event_loop = NativeEventLoop::new().expect("reactor");
+    let token = event_loop
+        .register(registration.fd, NativeEventSource::XwaylandDisplayReady)
+        .expect("register displayfd");
+    service.note_reactor_registration(registration, true);
+
+    let exit = reap_one(&mut supervisor);
+    assert!(
+        service
+            .handle_process_exit(&exit)
+            .expect("handle startup exit")
+    );
+    assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+    assert!(service.has_pending_reactor_teardown());
+    assert!(event_loop.unregister(token).expect("unregister displayfd"));
+    service
+        .finish_reactor_teardown()
+        .expect("finish source teardown");
+    assert!(!service.has_pending_reactor_teardown());
+
+    drop(event_loop);
     drop(service);
     drop(supervisor);
     fs::remove_dir_all(root).expect("remove test root");

@@ -1197,7 +1197,10 @@ fn register_xwayland_reactor_sources(
         if desired.contains(&registration) {
             retained.push((token, registration));
         } else {
-            event_loop.unregister(token)?;
+            let removed = event_loop.unregister(token)?;
+            if removed {
+                service.note_reactor_registration(registration, false);
+            }
         }
     }
     *tokens = retained;
@@ -1211,8 +1214,10 @@ fn register_xwayland_reactor_sources(
             }
             XwaylandReactorPurpose::DisplayReady => NativeEventSource::XwaylandDisplayReady,
             XwaylandReactorPurpose::Xwm => NativeEventSource::XwaylandXwm,
+            XwaylandReactorPurpose::Stderr => NativeEventSource::XwaylandStderr,
         };
         let token = event_loop.register(registration.fd, source)?;
+        service.note_reactor_registration(registration, true);
         tokens.push((token, registration));
     }
     service.finish_reactor_teardown()?;

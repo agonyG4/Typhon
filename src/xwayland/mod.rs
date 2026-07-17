@@ -8,6 +8,7 @@ mod generation;
 mod launch;
 mod metrics;
 mod protocol;
+mod readiness;
 mod service;
 pub mod xwm;
 pub(crate) use protocol::{XWAYLAND_SHELL_V1_VERSION, serial_from_parts};
@@ -20,6 +21,7 @@ pub use association::{
 };
 pub use config::{XwaylandConfig, XwaylandMode, XwaylandProfile, XwaylandStartPolicy};
 pub use generation::XwaylandGeneration;
+pub use readiness::XwaylandReadinessSnapshot;
 pub use service::{
     XwaylandReactorPurpose, XwaylandReactorRegistration, XwaylandService, XwaylandStateKind,
 };

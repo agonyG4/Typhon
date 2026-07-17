@@ -146,6 +146,7 @@ impl NativeRuntime {
                 let _ = self
                     .xwayland
                     .emergency_cleanup(&mut self.process_supervisor);
+                let _ = self.sync_xwayland_reactor_sources();
                 let _ = self.process_supervisor.kill_session_owned_now();
                 Err(error)
             }
@@ -159,7 +160,10 @@ impl NativeRuntime {
             if desired.contains(&registration) {
                 retained.push((token, registration));
             } else {
-                self.event_loop.unregister(token)?;
+                let removed = self.event_loop.unregister(token)?;
+                if removed {
+                    self.xwayland.note_reactor_registration(registration, false);
+                }
             }
         }
         self.xwayland_reactor_tokens = retained;
@@ -176,8 +180,10 @@ impl NativeRuntime {
                 | XwaylandReactorPurpose::ListenAbstract => NativeEventSource::XwaylandListen,
                 XwaylandReactorPurpose::DisplayReady => NativeEventSource::XwaylandDisplayReady,
                 XwaylandReactorPurpose::Xwm => NativeEventSource::XwaylandXwm,
+                XwaylandReactorPurpose::Stderr => NativeEventSource::XwaylandStderr,
             };
             let token = self.event_loop.register(registration.fd, source)?;
+            self.xwayland.note_reactor_registration(registration, true);
             self.xwayland_reactor_tokens.push((token, registration));
         }
         self.xwayland.finish_reactor_teardown()?;
@@ -218,6 +224,7 @@ impl Drop for NativeRuntime {
         let _ = self
             .xwayland
             .emergency_cleanup(&mut self.process_supervisor);
+        let _ = self.sync_xwayland_reactor_sources();
         if self.frame_pacing.enabled() {
             println!(
                 "{}",

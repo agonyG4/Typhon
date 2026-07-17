@@ -21,6 +21,7 @@ pub enum NativeEventSource {
     XwaylandListen,
     XwaylandDisplayReady,
     XwaylandXwm,
+    XwaylandStderr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -74,6 +75,7 @@ impl WakeReasons {
     const XWAYLAND_LISTEN: u32 = 1 << 9;
     const XWAYLAND_DISPLAY_READY: u32 = 1 << 10;
     const XWAYLAND_XWM: u32 = 1 << 11;
+    const XWAYLAND_STDERR: u32 = 1 << 12;
 
     pub const fn drm(self) -> bool {
         self.0 & Self::DRM != 0
@@ -123,6 +125,10 @@ impl WakeReasons {
         self.0 & Self::XWAYLAND_XWM != 0
     }
 
+    pub const fn xwayland_stderr(self) -> bool {
+        self.0 & Self::XWAYLAND_STDERR != 0
+    }
+
     pub const fn bits(self) -> u32 {
         self.0
     }
@@ -141,6 +147,7 @@ impl WakeReasons {
             NativeEventSource::XwaylandListen => Self::XWAYLAND_LISTEN,
             NativeEventSource::XwaylandDisplayReady => Self::XWAYLAND_DISPLAY_READY,
             NativeEventSource::XwaylandXwm => Self::XWAYLAND_XWM,
+            NativeEventSource::XwaylandStderr => Self::XWAYLAND_STDERR,
         };
     }
 }
@@ -161,18 +168,11 @@ pub struct NativeWakeup {
     pub xwayland_events: Vec<XwaylandReadyEvent>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct Registration {
     fd: RawFd,
     source: NativeEventSource,
-    identity: FdIdentity,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FdIdentity {
-    device: u64,
-    inode: u64,
-    mode: u32,
+    identity_fd: OwnedFd,
 }
 
 #[derive(Debug)]
@@ -248,19 +248,27 @@ impl NativeEventLoop {
             self.stale_unregistration_count = self.stale_unregistration_count.saturating_add(1);
             return Ok(false);
         }
-        let Some(registration) = slot.registration else {
+        let Some(registration) = slot.registration.as_ref() else {
             self.stale_unregistration_count = self.stale_unregistration_count.saturating_add(1);
             return Ok(false);
         };
-        let current_identity = match fd_identity(registration.fd) {
-            Ok(identity) => Some(identity),
-            Err(error) if error.raw_os_error() == Some(libc::EBADF) => None,
+        match same_open_file(registration.fd, registration.identity_fd.as_raw_fd()) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.stale_unregistration_count = self.stale_unregistration_count.saturating_add(1);
+                self.retire_registration_slot(slot_index);
+                return Ok(true);
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EBADF) => {
+                if is_xwayland_source(registration.source) {
+                    self.benign_unregistration_count =
+                        self.benign_unregistration_count.saturating_add(1);
+                    self.retire_registration_slot(slot_index);
+                    return Ok(true);
+                }
+                return Err(error);
+            }
             Err(error) => return Err(error),
-        };
-        if current_identity.is_some_and(|identity| identity != registration.identity) {
-            self.stale_unregistration_count = self.stale_unregistration_count.saturating_add(1);
-            self.retire_registration_slot(slot_index);
-            return Ok(true);
         }
         let result = unsafe {
             libc::epoll_ctl(
@@ -307,9 +315,7 @@ impl NativeEventLoop {
     fn source_for_token(&self, token: ReactorToken) -> Option<NativeEventSource> {
         let (slot_index, generation) = token.decode()?;
         let slot = self.registrations.get(slot_index)?;
-        (slot.generation == generation)
-            .then_some(slot.registration?)
-            .map(|registration| registration.source)
+        (slot.generation == generation).then_some(slot.registration.as_ref()?.source)
     }
 
     pub fn arm_deadline(&mut self, deadline_ns: Option<u64>) -> io::Result<()> {
@@ -374,19 +380,22 @@ impl NativeEventLoop {
             if slot.generation != generation {
                 continue;
             }
-            let Some(registration) = slot.registration else {
+            let Some(registration) = slot.registration.as_ref() else {
                 continue;
             };
+            let registration_source = registration.source;
+            let registration_fd = registration.fd;
             let error_events =
                 libc::EPOLLERR as u32 | libc::EPOLLHUP as u32 | libc::EPOLLRDHUP as u32;
             if event_flags & error_events != 0 {
                 if matches!(
-                    registration.source,
+                    registration_source,
                     NativeEventSource::XwaylandListen
                         | NativeEventSource::XwaylandDisplayReady
                         | NativeEventSource::XwaylandXwm
+                        | NativeEventSource::XwaylandStderr
                 ) {
-                    reasons.insert(registration.source);
+                    reasons.insert(registration_source);
                     xwayland_events.push(XwaylandReadyEvent {
                         token,
                         flags: event_flags,
@@ -396,18 +405,19 @@ impl NativeEventLoop {
                 let _ = self.unregister(token);
                 return Err(io::Error::other(format!(
                     "native event source {:?} fd {} reported readiness error 0x{:x}",
-                    registration.source, registration.fd, event_flags
+                    registration_source, registration_fd, event_flags
                 )));
             }
             if event_flags & libc::EPOLLIN as u32 != 0 {
-                reasons.insert(registration.source);
-                match registration.source {
+                reasons.insert(registration_source);
+                match registration_source {
                     NativeEventSource::ExplicitSyncAcquire => {
                         explicit_sync_acquire_tokens.push(token);
                     }
                     NativeEventSource::XwaylandListen
                     | NativeEventSource::XwaylandDisplayReady
-                    | NativeEventSource::XwaylandXwm => {
+                    | NativeEventSource::XwaylandXwm
+                    | NativeEventSource::XwaylandStderr => {
                         xwayland_events.push(XwaylandReadyEvent {
                             token,
                             flags: event_flags,
@@ -456,7 +466,7 @@ impl NativeEventLoop {
             events: (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32,
             u64: token.raw(),
         };
-        let identity = fd_identity(fd)?;
+        let identity_fd = duplicate_fd(fd)?;
         let result =
             unsafe { libc::epoll_ctl(self.epoll.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut event) };
         if result < 0 {
@@ -465,7 +475,7 @@ impl NativeEventLoop {
         let registration = Registration {
             fd,
             source,
-            identity,
+            identity_fd,
         };
         if reusing_slot {
             self.free_registration_slots.pop();
@@ -503,7 +513,7 @@ impl Drop for NativeEventLoop {
         for registration in self
             .registrations
             .iter()
-            .filter_map(|slot| slot.registration)
+            .filter_map(|slot| slot.registration.as_ref())
         {
             unsafe {
                 libc::epoll_ctl(
@@ -536,23 +546,38 @@ fn is_xwayland_source(source: NativeEventSource) -> bool {
         NativeEventSource::XwaylandListen
             | NativeEventSource::XwaylandDisplayReady
             | NativeEventSource::XwaylandXwm
+            | NativeEventSource::XwaylandStderr
     )
 }
 
-fn fd_identity(fd: RawFd) -> io::Result<FdIdentity> {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: `stat` points to writable storage and `fd` is supplied by the
-    // caller as a descriptor being registered or retired.
-    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
-        return Err(io::Error::last_os_error());
+fn duplicate_fd(fd: RawFd) -> io::Result<OwnedFd> {
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 100) };
+    if duplicate < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: `F_DUPFD_CLOEXEC` returned a new owned descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
     }
-    // SAFETY: `fstat` initialized `stat` on success.
-    let stat = unsafe { stat.assume_init() };
-    Ok(FdIdentity {
-        device: stat.st_dev,
-        inode: stat.st_ino,
-        mode: stat.st_mode,
-    })
+}
+
+fn same_open_file(fd: RawFd, identity_fd: RawFd) -> io::Result<bool> {
+    // SAFETY: `kcmp` compares two descriptors owned by this process and does
+    // not dereference either value in Rust.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_kcmp,
+            libc::getpid(),
+            libc::getpid(),
+            0,
+            fd,
+            identity_fd,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result == 0)
+    }
 }
 
 fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
@@ -983,5 +1008,44 @@ mod tests {
 
         assert_ne!(first_token, replacement_token);
         assert_eq!(event_loop.source_for_token(first_token), None);
+    }
+
+    #[test]
+    fn stale_xwayland_unregister_cannot_remove_reused_fd_registration() {
+        let first = event_fd();
+        let reused_fd_number = first.as_raw_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let first_token = event_loop
+            .register(reused_fd_number, NativeEventSource::XwaylandDisplayReady)
+            .unwrap();
+
+        drop(first);
+        let replacement_source = event_fd();
+        let replacement = if replacement_source.as_raw_fd() == reused_fd_number {
+            replacement_source
+        } else {
+            let result = unsafe {
+                // SAFETY: `reused_fd_number` was closed above and the source
+                // descriptor is live, so this creates the replacement open
+                // file description at the exact reused number.
+                libc::dup2(replacement_source.as_raw_fd(), reused_fd_number)
+            };
+            assert_eq!(result, reused_fd_number);
+            drop(replacement_source);
+            // SAFETY: `dup2` returned the owned replacement descriptor.
+            unsafe { OwnedFd::from_raw_fd(reused_fd_number) }
+        };
+        let replacement_token = event_loop
+            .register(
+                replacement.as_raw_fd(),
+                NativeEventSource::XwaylandDisplayReady,
+            )
+            .unwrap();
+
+        assert!(event_loop.unregister(first_token).unwrap());
+        signal(replacement.as_raw_fd());
+        let wakeup = event_loop.wait().unwrap();
+        assert_eq!(wakeup.xwayland_events[0].token, replacement_token);
+        assert_eq!(event_loop.stale_unregistration_count(), 1);
     }
 }

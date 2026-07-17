@@ -23,7 +23,7 @@ impl ChildFdTarget {
     }
 }
 
-pub(crate) fn build_command(binary: &Path, lease: &DisplayLease) -> Command {
+pub(crate) fn build_command(binary: &Path, lease: &DisplayLease, verbose: bool) -> Command {
     let mut command = Command::new(binary);
     command
         .arg(lease.display())
@@ -49,5 +49,8 @@ pub(crate) fn build_command(binary: &Path, lease: &DisplayLease) -> Command {
             "WAYLAND_SOCKET",
             ChildFdTarget::WaylandSocket.raw_fd().to_string(),
         );
+    if verbose {
+        command.arg("-verbose").arg("3");
+    }
     command
 }

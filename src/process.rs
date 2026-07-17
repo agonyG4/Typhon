@@ -3,7 +3,7 @@ use std::{
     io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     os::unix::process::CommandExt,
-    process::{Child, Command, ExitStatus},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -22,6 +22,12 @@ pub struct SpawnedProcess {
     pub id: ManagedProcessId,
     pub pid: u32,
     pub pgid: Option<i32>,
+}
+
+#[derive(Debug)]
+pub struct SpawnedProcessWithStderr {
+    pub process: SpawnedProcess,
+    pub stderr: OwnedFd,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -203,6 +209,30 @@ impl SpawnCommand {
         }
         supervisor.spawn_with_identity(command, options)
     }
+
+    pub fn spawn_with_stderr(
+        self,
+        supervisor: &mut ChildSupervisor,
+        options: ProcessOptions,
+    ) -> io::Result<SpawnedProcessWithStderr> {
+        let Self {
+            mut command,
+            inherited_fds,
+        } = self;
+        validate_fd_mappings(&inherited_fds)?;
+        let mappings = inherited_fds
+            .iter()
+            .map(|mapping| (mapping.source.as_raw_fd(), mapping.target))
+            .collect::<Vec<_>>();
+        // SAFETY: the closure is installed only for the child between fork and
+        // exec and calls configure_child_fds, which uses only libc syscalls and
+        // does not access Rust allocation, locks, or other non-async-safe APIs.
+        unsafe {
+            command.pre_exec(move || configure_child_fds(&mappings));
+        }
+        command.stderr(Stdio::piped());
+        supervisor.spawn_with_identity_and_stderr(command, options)
+    }
 }
 
 fn validate_fd_mappings(mappings: &[ChildFdMapping]) -> io::Result<()> {
@@ -361,6 +391,7 @@ impl ChildSupervisor {
     pub fn spawn(&mut self, mut command: Command, options: ProcessOptions) -> io::Result<u32> {
         Ok(self
             .spawn_inner(&mut command, options, None, VecDeque::new())?
+            .0
             .pid)
     }
 
@@ -369,7 +400,24 @@ impl ChildSupervisor {
         mut command: Command,
         options: ProcessOptions,
     ) -> io::Result<SpawnedProcess> {
-        self.spawn_inner(&mut command, options, None, VecDeque::new())
+        Ok(self
+            .spawn_inner(&mut command, options, None, VecDeque::new())?
+            .0)
+    }
+
+    pub fn spawn_with_identity_and_stderr(
+        &mut self,
+        mut command: Command,
+        options: ProcessOptions,
+    ) -> io::Result<SpawnedProcessWithStderr> {
+        command.stderr(Stdio::piped());
+        let (process, stderr) = self.spawn_inner(&mut command, options, None, VecDeque::new())?;
+        let stderr = stderr.ok_or_else(|| io::Error::other("child stderr pipe was not created"))?;
+        if let Err(error) = set_fd_nonblocking(stderr.as_raw_fd()) {
+            let _ = self.kill_managed_now(process.id);
+            return Err(error);
+        }
+        Ok(SpawnedProcessWithStderr { process, stderr })
     }
 
     pub fn spawn_restartable<F>(&mut self, factory: F, options: ProcessOptions) -> io::Result<u32>
@@ -380,6 +428,7 @@ impl ChildSupervisor {
         let mut command = factory()?;
         Ok(self
             .spawn_inner(&mut command, options, Some(factory), VecDeque::new())?
+            .0
             .pid)
     }
 
@@ -389,7 +438,7 @@ impl ChildSupervisor {
         options: ProcessOptions,
         restart_factory: Option<RestartFactory>,
         restart_history: VecDeque<Instant>,
-    ) -> io::Result<SpawnedProcess> {
+    ) -> io::Result<(SpawnedProcess, Option<OwnedFd>)> {
         if options.process_group_policy == ProcessGroupPolicy::Dedicated && !options.session_owned {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -400,7 +449,13 @@ impl ChildSupervisor {
             command.process_group(0);
         }
         let id = self.allocate_process_id()?;
-        let child = command.spawn()?;
+        let mut child = command.spawn()?;
+        let stderr = child.stderr.take().map(|stderr| {
+            let raw_fd = std::os::fd::IntoRawFd::into_raw_fd(stderr);
+            // SAFETY: `ChildStderr::into_raw_fd` transfers ownership of this
+            // descriptor to the returned `OwnedFd`.
+            unsafe { OwnedFd::from_raw_fd(raw_fd) }
+        });
         let pid = child.id();
         let pgid = match options.process_group_policy {
             ProcessGroupPolicy::Inherit => None,
@@ -408,6 +463,7 @@ impl ChildSupervisor {
                 Ok(pgid) => Some(pgid),
                 Err(error) => {
                     let mut child = child;
+                    drop(stderr);
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(error);
@@ -437,7 +493,7 @@ impl ChildSupervisor {
             },
         );
         self.pid_to_id.insert(pid, id);
-        Ok(spawned)
+        Ok((spawned, stderr))
     }
 
     pub fn contains(&self, pid: u32) -> bool {
@@ -564,7 +620,7 @@ impl ChildSupervisor {
             Some(factory),
             child.restart_history.clone(),
         ) {
-            Ok(spawned) => spawned,
+            Ok((spawned, _stderr)) => spawned,
             Err(error) => {
                 self.restart_suppression_count = self.restart_suppression_count.saturating_add(1);
                 eprintln!(
@@ -790,6 +846,20 @@ fn signal_process(pid: u32, signal: libc::c_int) -> io::Result<()> {
         if error.raw_os_error() != Some(libc::ESRCH) {
             return Err(error);
         }
+    }
+    Ok(())
+}
+
+fn set_fd_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: `fd` is owned by the caller and remains alive for both fcntl
+    // operations.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the flags came from `F_GETFL` for the same live descriptor.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }

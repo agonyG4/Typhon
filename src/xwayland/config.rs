@@ -70,6 +70,7 @@ pub struct XwaylandConfig {
     pub mode: XwaylandMode,
     pub profile: XwaylandProfile,
     pub binary: PathBuf,
+    pub log_stderr: bool,
     pub display_min: u32,
     pub display_max: u32,
     #[cfg(test)]
@@ -85,6 +86,7 @@ impl XwaylandConfig {
             binary: env::var_os("TYPHON_XWAYLAND_BINARY")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("Xwayland")),
+            log_stderr: env::var_os("TYPHON_XWAYLAND_LOG").is_some_and(|value| value == "1"),
             display_min: 0,
             display_max: 63,
             #[cfg(test)]
@@ -98,6 +100,7 @@ impl XwaylandConfig {
             mode,
             profile: XwaylandProfile::Foundation,
             binary,
+            log_stderr: false,
             display_min: 0,
             display_max: 63,
             test_root: None,
@@ -110,6 +113,7 @@ impl XwaylandConfig {
             mode,
             profile: XwaylandProfile::Foundation,
             binary,
+            log_stderr: false,
             display_min: 0,
             display_max: 63,
             test_root: Some(root),
