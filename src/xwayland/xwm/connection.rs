@@ -1,44 +1,112 @@
 use std::{
+    collections::{HashMap, VecDeque},
     io,
+    io::IoSlice,
     os::fd::{AsRawFd, RawFd},
     os::unix::net::UnixStream,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Mutex,
 };
 
-use x11rb::utils::RawFdContainer;
 use x11rb::{
-    connection::Connection,
-    protocol::composite::ConnectionExt as CompositeConnectionExt,
-    protocol::xproto::ConnectionExt as XprotoConnectionExt,
-    protocol::{composite, xproto},
+    connection::{
+        BufWithFds, Connection, DiscardMode, ReplyOrError, RequestConnection, RequestKind,
+    },
+    cookie::{Cookie, CookieWithFds, VoidCookie},
+    errors::{ConnectionError, ParseError, ReplyOrIdError},
+    protocol::{Event, xproto::Setup},
     rust_connection::{DefaultStream, PollMode, RustConnection, Stream},
-    wrapper::ConnectionExt,
+    utils::RawFdContainer,
+    x11_utils::{ExtensionInformation, TryParse, TryParseFd, X11Error},
 };
+use x11rb_protocol::{RawEventAndSeqNumber, SequenceNumber};
 
 use super::{
     Xwm, XwmStartupError, atoms::XwmAtoms, capabilities::XwmCapabilities, window::X11WindowRegistry,
 };
 use crate::xwayland::XwaylandGeneration;
 
+pub(crate) const MAX_XWM_OUTPUT_BYTES: usize = 1024 * 1024;
+
+/// The stream used by the reactor-owned XWM connection.
+///
+/// `DefaultStream` sets the Unix socket to `O_NONBLOCK`, but its `poll` method
+/// deliberately waits forever.  This wrapper changes only that policy and
+/// adds a bounded transport queue so x11rb's request machinery cannot spin on
+/// a full socket or block the compositor thread.
 #[derive(Debug)]
 pub(crate) struct ReactorStream {
     inner: DefaultStream,
-    nonblocking_poll: Arc<AtomicBool>,
+    queued_output: Mutex<VecDeque<u8>>,
 }
 
 impl ReactorStream {
-    fn new(inner: DefaultStream) -> (Self, Arc<AtomicBool>) {
-        let nonblocking_poll = Arc::new(AtomicBool::new(false));
-        (
-            Self {
-                inner,
-                nonblocking_poll: Arc::clone(&nonblocking_poll),
-            },
-            nonblocking_poll,
-        )
+    pub(crate) fn from_unix_stream(stream: UnixStream) -> io::Result<Self> {
+        let (inner, _) = DefaultStream::from_unix_stream(stream)?;
+        let flags = unsafe { libc::fcntl(inner.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if flags & libc::O_NONBLOCK == 0 {
+            return Err(io::Error::other("XWM socket is not nonblocking"));
+        }
+        Ok(Self {
+            inner,
+            queued_output: Mutex::new(VecDeque::new()),
+        })
+    }
+
+    pub(crate) fn wants_writable(&self) -> bool {
+        !self
+            .queued_output
+            .lock()
+            .expect("XWM output mutex poisoned")
+            .is_empty()
+    }
+
+    pub(crate) fn flush_pending(&self) -> io::Result<bool> {
+        let mut queued = self
+            .queued_output
+            .lock()
+            .expect("XWM output mutex poisoned");
+        while let Some(byte) = queued.front().copied() {
+            let mut scratch = [0u8; 16 * 1024];
+            let count = scratch.len().min(queued.len());
+            for (slot, value) in scratch[..count].iter_mut().zip(queued.iter().take(count)) {
+                *slot = *value;
+            }
+            match self.inner.write(&scratch[..count], &mut Vec::new()) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "XWM output closed",
+                    ));
+                }
+                Ok(written) => {
+                    for _ in 0..written {
+                        queued.pop_front();
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+            if queued.front().copied() == Some(byte) && count != 0 {
+                // The write path must make progress when it reported bytes.
+                break;
+            }
+        }
+        Ok(!queued.is_empty())
+    }
+
+    fn queue(&self, bytes: &[u8]) -> io::Result<()> {
+        let mut queued = self
+            .queued_output
+            .lock()
+            .expect("XWM output mutex poisoned");
+        if queued.len().saturating_add(bytes.len()) > MAX_XWM_OUTPUT_BYTES {
+            return Err(io::Error::other("XWM output queue exceeded its hard bound"));
+        }
+        queued.extend(bytes);
+        Ok(())
     }
 }
 
@@ -50,9 +118,22 @@ impl AsRawFd for ReactorStream {
 
 impl Stream for ReactorStream {
     fn poll(&self, mode: PollMode) -> io::Result<()> {
-        if !self.nonblocking_poll.load(Ordering::Acquire) {
-            return self.inner.poll(mode);
+        let _ = self.flush_pending()?;
+
+        // A bounded in-process queue is writable until it reaches its limit.
+        // This lets x11rb accept a request without retrying forever while the
+        // reactor waits for the next EPOLLOUT notification.
+        if mode.writable()
+            && self
+                .queued_output
+                .lock()
+                .expect("XWM output mutex poisoned")
+                .len()
+                < MAX_XWM_OUTPUT_BYTES
+        {
+            return Ok(());
         }
+
         let mut events = 0;
         if mode.readable() {
             events |= libc::POLLIN;
@@ -84,15 +165,203 @@ impl Stream for ReactorStream {
     }
 
     fn write(&self, buffer: &[u8], fds: &mut Vec<RawFdContainer>) -> io::Result<usize> {
-        self.inner.write(buffer, fds)
+        if !fds.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "XWM transport does not support ancillary descriptors",
+            ));
+        }
+        let _ = self.flush_pending()?;
+        match self.inner.write(buffer, fds) {
+            Ok(written) if written == buffer.len() => Ok(written),
+            Ok(written) => {
+                self.queue(&buffer[written..])?;
+                Ok(buffer.len())
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                self.queue(buffer)?;
+                Ok(buffer.len())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn write_vectored(
         &self,
-        buffers: &[std::io::IoSlice<'_>],
+        buffers: &[IoSlice<'_>],
         fds: &mut Vec<RawFdContainer>,
     ) -> io::Result<usize> {
-        self.inner.write_vectored(buffers, fds)
+        let total = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
+        let mut flattened = Vec::with_capacity(total);
+        for buffer in buffers {
+            flattened.extend_from_slice(buffer);
+        }
+        self.write(&flattened, fds)
+    }
+}
+
+/// A small adapter that keeps x11rb's generated request/reply types while
+/// supplying extension information discovered by the incremental handshake.
+#[derive(Debug)]
+pub(crate) struct X11Connection {
+    inner: RustConnection<ReactorStream>,
+    extensions: HashMap<&'static str, ExtensionInformation>,
+}
+
+impl X11Connection {
+    pub(crate) fn new(
+        inner: RustConnection<ReactorStream>,
+        extensions: HashMap<&'static str, ExtensionInformation>,
+    ) -> Self {
+        Self { inner, extensions }
+    }
+
+    pub(crate) fn stream(&self) -> &ReactorStream {
+        self.inner.stream()
+    }
+
+    pub(crate) fn setup(&self) -> &Setup {
+        self.inner.setup()
+    }
+
+    pub(crate) fn set_extensions(
+        &mut self,
+        extensions: HashMap<&'static str, ExtensionInformation>,
+    ) {
+        self.extensions = extensions;
+    }
+}
+
+impl RequestConnection for X11Connection {
+    type Buf = Vec<u8>;
+
+    fn send_request_with_reply<R>(
+        &self,
+        bufs: &[IoSlice<'_>],
+        fds: Vec<RawFdContainer>,
+    ) -> Result<Cookie<'_, Self, R>, ConnectionError>
+    where
+        R: TryParse,
+    {
+        let cookie = self.inner.send_request_with_reply::<R>(bufs, fds)?;
+        let sequence = cookie.sequence_number();
+        std::mem::forget(cookie);
+        Ok(Cookie::new(self, sequence))
+    }
+
+    fn send_request_with_reply_with_fds<R>(
+        &self,
+        bufs: &[IoSlice<'_>],
+        fds: Vec<RawFdContainer>,
+    ) -> Result<CookieWithFds<'_, Self, R>, ConnectionError>
+    where
+        R: TryParseFd,
+    {
+        let cookie = self
+            .inner
+            .send_request_with_reply_with_fds::<R>(bufs, fds)?;
+        let sequence = cookie.sequence_number();
+        std::mem::forget(cookie);
+        Ok(CookieWithFds::new(self, sequence))
+    }
+
+    fn send_request_without_reply(
+        &self,
+        bufs: &[IoSlice<'_>],
+        fds: Vec<RawFdContainer>,
+    ) -> Result<VoidCookie<'_, Self>, ConnectionError> {
+        let cookie = self.inner.send_request_without_reply(bufs, fds)?;
+        let sequence = cookie.sequence_number();
+        std::mem::forget(cookie);
+        Ok(VoidCookie::new(self, sequence))
+    }
+
+    fn discard_reply(&self, sequence: SequenceNumber, kind: RequestKind, mode: DiscardMode) {
+        self.inner.discard_reply(sequence, kind, mode);
+    }
+
+    fn prefetch_extension_information(
+        &self,
+        _extension_name: &'static str,
+    ) -> Result<(), ConnectionError> {
+        Ok(())
+    }
+
+    fn extension_information(
+        &self,
+        extension_name: &'static str,
+    ) -> Result<Option<ExtensionInformation>, ConnectionError> {
+        Ok(self.extensions.get(extension_name).copied())
+    }
+
+    fn wait_for_reply_or_raw_error(
+        &self,
+        sequence: SequenceNumber,
+    ) -> Result<ReplyOrError<Self::Buf>, ConnectionError> {
+        self.inner.wait_for_reply_or_raw_error(sequence)
+    }
+
+    fn wait_for_reply(
+        &self,
+        sequence: SequenceNumber,
+    ) -> Result<Option<Self::Buf>, ConnectionError> {
+        self.inner.wait_for_reply(sequence)
+    }
+
+    fn wait_for_reply_with_fds_raw(
+        &self,
+        sequence: SequenceNumber,
+    ) -> Result<ReplyOrError<BufWithFds<Self::Buf>, Self::Buf>, ConnectionError> {
+        self.inner.wait_for_reply_with_fds_raw(sequence)
+    }
+
+    fn check_for_raw_error(
+        &self,
+        sequence: SequenceNumber,
+    ) -> Result<Option<Self::Buf>, ConnectionError> {
+        self.inner.check_for_raw_error(sequence)
+    }
+
+    fn prefetch_maximum_request_bytes(&self) {
+        self.inner.prefetch_maximum_request_bytes();
+    }
+
+    fn maximum_request_bytes(&self) -> usize {
+        self.inner.maximum_request_bytes()
+    }
+
+    fn parse_error(&self, error: &[u8]) -> Result<X11Error, ParseError> {
+        self.inner.parse_error(error)
+    }
+
+    fn parse_event(&self, event: &[u8]) -> Result<Event, ParseError> {
+        self.inner.parse_event(event)
+    }
+}
+
+impl Connection for X11Connection {
+    fn generate_id(&self) -> Result<u32, ReplyOrIdError> {
+        self.inner.generate_id()
+    }
+
+    fn wait_for_raw_event_with_sequence(
+        &self,
+    ) -> Result<RawEventAndSeqNumber<Self::Buf>, ConnectionError> {
+        self.inner.wait_for_raw_event_with_sequence()
+    }
+
+    fn poll_for_raw_event_with_sequence(
+        &self,
+    ) -> Result<Option<RawEventAndSeqNumber<Self::Buf>>, ConnectionError> {
+        self.inner.poll_for_raw_event_with_sequence()
+    }
+
+    fn flush(&self) -> Result<(), ConnectionError> {
+        self.inner.flush()
+    }
+
+    fn setup(&self) -> &Setup {
+        self.inner.setup()
     }
 }
 
@@ -100,9 +369,8 @@ pub(crate) fn connect(
     generation: XwaylandGeneration,
     stream: UnixStream,
 ) -> Result<Xwm, XwmStartupError> {
-    let (stream, _) = DefaultStream::from_unix_stream(stream)
+    let stream = ReactorStream::from_unix_stream(stream)
         .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-    let (stream, nonblocking_poll) = ReactorStream::new(stream);
     let raw_fd = stream.as_raw_fd();
     let connection =
         RustConnection::connect_to_stream(stream, 0).map_err(XwmStartupError::Connection)?;
@@ -113,17 +381,19 @@ pub(crate) fn connect(
         .get(screen_number)
         .ok_or(XwmStartupError::InvalidScreen)?
         .root;
+    // This compatibility path is retained for tests and callers that already
+    // have a completed handshake. Managed startup uses `startup::XwmStartup`.
     let capabilities = XwmCapabilities::discover(&connection)?;
     let atoms = XwmAtoms::intern(&connection)?;
-    let supporting_wm_check = setup_root(&connection, root, &atoms, &capabilities)?;
+    let supporting_wm_check = super::startup::setup_root(&connection, root, &atoms, &capabilities)?;
     connection
         .flush()
         .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-    nonblocking_poll.store(true, Ordering::Release);
-
+    let connection = X11Connection::new(connection, HashMap::new());
     Ok(Xwm {
         generation,
         connection,
+        adoption: Default::default(),
         screen_number,
         root,
         atoms,
@@ -143,135 +413,21 @@ pub(crate) fn connect(
     })
 }
 
-fn setup_root<S: Stream>(
-    connection: &RustConnection<S>,
-    root: u32,
-    atoms: &XwmAtoms,
-    capabilities: &XwmCapabilities,
-) -> Result<u32, XwmStartupError> {
-    if !capabilities.composite
-        || !capabilities.xfixes
-        || !capabilities.shape
-        || !capabilities.randr
-        || !capabilities.sync
-    {
-        return Err(XwmStartupError::Protocol(
-            "XWM capability record is incomplete".to_owned(),
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixStream;
+
+    use super::*;
+
+    #[test]
+    fn reactor_stream_is_nonblocking_before_any_x11_request() {
+        let (stream, _peer) = UnixStream::pair().expect("socket pair");
+        let stream = ReactorStream::from_unix_stream(stream).expect("nonblocking stream");
+        let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
+        assert!(matches!(
+            Stream::poll(&stream, PollMode::Readable),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
         ));
     }
-
-    let event_mask = xproto::EventMask::SUBSTRUCTURE_REDIRECT
-        | xproto::EventMask::SUBSTRUCTURE_NOTIFY
-        | xproto::EventMask::PROPERTY_CHANGE
-        | xproto::EventMask::FOCUS_CHANGE;
-    connection
-        .change_window_attributes(
-            root,
-            &xproto::ChangeWindowAttributesAux::new().event_mask(event_mask),
-        )
-        .map_err(|error| XwmStartupError::Protocol(error.to_string()))?
-        .check()
-        .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-    connection
-        .composite_redirect_subwindows(root, composite::Redirect::MANUAL)
-        .map_err(|error| XwmStartupError::Protocol(error.to_string()))?
-        .check()
-        .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-
-    let screen = connection
-        .setup()
-        .roots
-        .first()
-        .ok_or(XwmStartupError::InvalidScreen)?;
-    let supporting_wm_check = connection
-        .generate_id()
-        .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-    connection
-        .create_window(
-            screen.root_depth,
-            supporting_wm_check,
-            root,
-            0,
-            0,
-            1,
-            1,
-            0,
-            xproto::WindowClass::INPUT_OUTPUT,
-            screen.root_visual,
-            &xproto::CreateWindowAux::new(),
-        )
-        .map_err(|error| XwmStartupError::Protocol(error.to_string()))?
-        .check()
-        .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-
-    let supporting_atom = atoms.get(super::atoms::XwmAtomName::NetSupportingWmCheck);
-    connection
-        .change_property32(
-            xproto::PropMode::REPLACE,
-            root,
-            supporting_atom,
-            xproto::AtomEnum::WINDOW,
-            &[supporting_wm_check],
-        )
-        .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-    connection
-        .change_property32(
-            xproto::PropMode::REPLACE,
-            supporting_wm_check,
-            supporting_atom,
-            xproto::AtomEnum::WINDOW,
-            &[supporting_wm_check],
-        )
-        .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-    connection
-        .change_property8(
-            xproto::PropMode::REPLACE,
-            supporting_wm_check,
-            atoms.get(super::atoms::XwmAtomName::NetWmName),
-            atoms.get(super::atoms::XwmAtomName::Utf8String),
-            b"Typhon",
-        )
-        .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-
-    let supported = XwmAtoms::advertised_names()
-        .iter()
-        .map(|name| atoms.get(*name))
-        .collect::<Vec<_>>();
-    connection
-        .change_property32(
-            xproto::PropMode::REPLACE,
-            root,
-            atoms.get(super::atoms::XwmAtomName::NetSupported),
-            xproto::AtomEnum::ATOM,
-            &supported,
-        )
-        .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-    connection
-        .change_property32(
-            xproto::PropMode::REPLACE,
-            root,
-            atoms.get(super::atoms::XwmAtomName::NetActiveWindow),
-            xproto::AtomEnum::WINDOW,
-            &[],
-        )
-        .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-    connection
-        .change_property32(
-            xproto::PropMode::REPLACE,
-            root,
-            atoms.get(super::atoms::XwmAtomName::NetClientList),
-            xproto::AtomEnum::WINDOW,
-            &[],
-        )
-        .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-    connection
-        .change_property32(
-            xproto::PropMode::REPLACE,
-            root,
-            atoms.get(super::atoms::XwmAtomName::NetClientListStacking),
-            xproto::AtomEnum::WINDOW,
-            &[],
-        )
-        .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-    Ok(supporting_wm_check)
 }

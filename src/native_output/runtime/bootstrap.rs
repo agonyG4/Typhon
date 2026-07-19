@@ -1330,7 +1330,13 @@ fn register_xwayland_reactor_sources(
             XwaylandReactorPurpose::Xwm => NativeEventSource::XwaylandXwm,
             XwaylandReactorPurpose::Stderr => NativeEventSource::XwaylandStderr,
         };
-        let token = event_loop.register(registration.fd, source)?;
+        let events = (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32
+            | if registration.writable {
+                libc::EPOLLOUT as u32
+            } else {
+                0
+            };
+        let token = event_loop.register_with_events(registration.fd, source, events)?;
         service.note_reactor_registration_with_token(registration, true, Some(token.raw()));
         tokens.push((token, registration));
     }

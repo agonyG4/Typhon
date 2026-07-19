@@ -3,6 +3,7 @@ use std::{num::NonZeroU64, path::PathBuf};
 mod association;
 mod auth;
 mod config;
+mod diagnostics;
 mod display;
 mod displayfd;
 mod generation;

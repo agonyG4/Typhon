@@ -31,6 +31,7 @@ x11rb = { version = "0.13.2", default-features = false, features = [
     "xfixes",
     "extra-traits",
 ] }
+x11rb-protocol = "0.13.2"
 zbus = { version = "5.16.0", default-features = false, features = ["async-io"] }
 xcursor = "=0.3.10"
 

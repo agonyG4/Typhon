@@ -4,6 +4,8 @@ use std::{env, path::PathBuf};
 pub enum XwaylandMode {
     Off,
     BaseLazy,
+    /// Foundation-profile eager startup, retained for explicit deployments
+    /// that do not request managed XWM.
     BaseEager,
     ManagedLazy,
     ManagedEager,
@@ -98,7 +100,7 @@ impl XwaylandConfig {
     pub fn for_tests(mode: XwaylandMode, binary: PathBuf) -> Self {
         Self {
             mode,
-            profile: XwaylandProfile::Foundation,
+            profile: mode.profile(),
             binary,
             log_stderr: false,
             display_min: 0,
@@ -111,7 +113,7 @@ impl XwaylandConfig {
     pub fn for_tests_at_root(mode: XwaylandMode, binary: PathBuf, root: PathBuf) -> Self {
         Self {
             mode,
-            profile: XwaylandProfile::Foundation,
+            profile: mode.profile(),
             binary,
             log_stderr: false,
             display_min: 0,

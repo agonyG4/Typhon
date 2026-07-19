@@ -144,6 +144,14 @@ pub(crate) struct XwmAtoms {
 }
 
 impl XwmAtoms {
+    pub(crate) fn from_values(values: HashMap<XwmAtomName, Atom>) -> Self {
+        Self { values }
+    }
+
+    pub(crate) fn into_values(self) -> HashMap<XwmAtomName, Atom> {
+        self.values
+    }
+
     pub(crate) fn intern<C: RequestConnection>(connection: &C) -> Result<Self, XwmStartupError> {
         let mut values = HashMap::with_capacity(XwmAtomName::ALL.len());
         for name in XwmAtomName::ALL {

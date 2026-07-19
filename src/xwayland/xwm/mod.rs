@@ -11,8 +11,8 @@ use std::{
 };
 
 use crate::compositor::{DesktopWindowKind, WindowConstraints, WindowMetadata};
-use x11rb::rust_connection::RustConnection;
 
+mod adoption;
 mod association;
 mod atoms;
 mod capabilities;
@@ -21,6 +21,7 @@ mod connection;
 mod events;
 mod properties;
 mod resize_sync;
+pub(crate) mod startup;
 mod window;
 
 #[cfg(test)]
@@ -129,6 +130,7 @@ pub struct XwmDrain {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum XwmEvent {
+    WindowMapRequested(X11WindowHandle),
     WindowReady(X11WindowSnapshot),
     WindowWithdrawn(X11WindowHandle),
     WindowDestroyed(X11WindowHandle),
@@ -246,7 +248,8 @@ impl std::error::Error for XwmError {}
 #[derive(Debug)]
 pub struct Xwm {
     pub(crate) generation: XwaylandGeneration,
-    pub(crate) connection: RustConnection<connection::ReactorStream>,
+    pub(crate) connection: connection::X11Connection,
+    pub(crate) adoption: adoption::AdoptionTracker,
     pub(crate) screen_number: usize,
     pub(crate) root: u32,
     pub(crate) atoms: XwmAtoms,
@@ -276,6 +279,17 @@ impl Xwm {
 
     pub fn raw_fd(&self) -> RawFd {
         self.raw_fd
+    }
+
+    pub(crate) fn wants_writable(&self) -> bool {
+        self.connection.stream().wants_writable()
+    }
+
+    pub(crate) fn flush_output(&self) -> Result<bool, XwmError> {
+        self.connection
+            .stream()
+            .flush_pending()
+            .map_err(|error| XwmError::Connection(x11rb::errors::ConnectionError::IoError(error)))
     }
 
     pub fn screen_number(&self) -> usize {
@@ -323,6 +337,11 @@ impl Xwm {
             .windows
             .insert_observed_with_kind(handle, kind, geometry);
         if inserted {
+            let deadline = crate::native::event_loop::monotonic_now_ns()
+                .unwrap_or_default()
+                .saturating_add(adoption::ADOPTION_TIMEOUT_NS);
+            self.adoption
+                .observe(handle, adoption::AdoptionWait::MapToAssociation, deadline);
             properties::begin_initial(self, handle)?;
         }
         Ok(inserted)
@@ -369,6 +388,7 @@ impl Xwm {
 
     pub fn clear_generation(&mut self, generation: XwaylandGeneration) {
         self.windows.clear_generation(generation);
+        self.adoption.clear_generation(generation);
         self.association.clear_generation(generation);
         self.clear_resize_sync_generation(generation);
         properties::cancel_generation(self, generation);
@@ -501,6 +521,11 @@ impl Xwm {
                 SurfaceAssociationJoinError::InvalidSerial,
             ));
         };
+        let deadline = crate::native::event_loop::monotonic_now_ns()
+            .unwrap_or_default()
+            .saturating_add(adoption::ADOPTION_TIMEOUT_NS);
+        self.adoption
+            .observe(handle, adoption::AdoptionWait::SerialPair, deadline);
         self.association
             .note_x11_serial(handle, serial)
             .map_err(XwmError::Association)?;
@@ -580,11 +605,28 @@ impl Xwm {
     }
 
     pub fn flush(&self) -> Result<(), XwmError> {
-        commands::flush(self)
+        commands::flush(self)?;
+        let _ = self.flush_output()?;
+        Ok(())
     }
 
     pub fn take_events(&mut self) -> impl Iterator<Item = XwmEvent> + '_ {
         self.outgoing_events.drain(..)
+    }
+
+    pub(crate) fn next_adoption_deadline_ns(&self) -> Option<u64> {
+        self.adoption.next_deadline_ns()
+    }
+
+    pub(crate) fn collect_adoption_expirations(&mut self, now_ns: u64) {
+        for (handle, _) in self.adoption.expired(now_ns) {
+            self.cancel_window_properties(handle);
+            if let Some(record) = self.windows.get(handle)
+                && record.snapshot.is_none()
+            {
+                let _ = self.windows.mark_unmapped(handle);
+            }
+        }
     }
 
     fn sync_completed_associations(&mut self) {
@@ -604,8 +646,17 @@ impl Xwm {
                 .is_some_and(|record| record.association.is_none());
             if needs_association {
                 let _ = self.windows.mark_associated(handle, association);
+                let deadline = crate::native::event_loop::monotonic_now_ns()
+                    .unwrap_or_default()
+                    .saturating_add(adoption::ADOPTION_TIMEOUT_NS);
+                self.adoption.observe(
+                    handle,
+                    adoption::AdoptionWait::AssociationToBuffer,
+                    deadline,
+                );
             }
             if self.buffer_ready_surfaces.contains(&association.surface_id) {
+                self.adoption.complete(handle);
                 let _ = self.windows.mark_buffer_ready(handle);
                 match self.resize_sync.note_commit(handle) {
                     ResizeSyncCommit::Presented | ResizeSyncCommit::FallbackPresented => self
@@ -619,11 +670,25 @@ impl Xwm {
     }
 
     fn emit_ready_if_complete(&mut self, handle: X11WindowHandle) -> Result<(), XwmError> {
-        if !self
+        let Some((properties_ready, kind, map_authorized)) = self
             .windows
             .get(handle)
-            .is_some_and(|record| record.properties_ready)
+            .map(|record| (record.properties_ready, record.kind, record.map_authorized))
+        else {
+            return Ok(());
+        };
+        if properties_ready
+            && kind == DesktopWindowKind::Managed
+            && !map_authorized
+            && self
+                .windows
+                .mark_map_authorized(handle)
+                .map_err(XwmError::InvalidCommand)?
         {
+            self.outgoing_events
+                .push_back(XwmEvent::WindowMapRequested(handle));
+        }
+        if !properties_ready {
             return Ok(());
         }
         let snapshot = self

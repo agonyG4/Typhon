@@ -408,7 +408,7 @@ impl NativeEventLoop {
                     registration_source, registration_fd, event_flags
                 )));
             }
-            if event_flags & libc::EPOLLIN as u32 != 0 {
+            if event_flags & (libc::EPOLLIN | libc::EPOLLOUT) as u32 != 0 {
                 reasons.insert(registration_source);
                 match registration_source {
                     NativeEventSource::ExplicitSyncAcquire => {
@@ -449,6 +449,28 @@ impl NativeEventLoop {
     }
 
     fn register_raw(&mut self, fd: RawFd, source: NativeEventSource) -> io::Result<ReactorToken> {
+        self.register_raw_with_events(
+            fd,
+            source,
+            (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32,
+        )
+    }
+
+    pub fn register_with_events(
+        &mut self,
+        fd: RawFd,
+        source: NativeEventSource,
+        events: u32,
+    ) -> io::Result<ReactorToken> {
+        self.register_raw_with_events(fd, source, events)
+    }
+
+    fn register_raw_with_events(
+        &mut self,
+        fd: RawFd,
+        source: NativeEventSource,
+        events: u32,
+    ) -> io::Result<ReactorToken> {
         if fd < 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -463,7 +485,7 @@ impl NativeEventLoop {
             };
         let token = ReactorToken::new(slot_index, generation)?;
         let mut event = libc::epoll_event {
-            events: (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32,
+            events,
             u64: token.raw(),
         };
         let identity_fd = duplicate_fd(fd)?;
@@ -487,6 +509,43 @@ impl NativeEventLoop {
             });
         }
         Ok(token)
+    }
+
+    pub fn modify(&mut self, token: ReactorToken, events: u32) -> io::Result<bool> {
+        let Some((slot_index, generation)) = token.decode() else {
+            self.stale_unregistration_count = self.stale_unregistration_count.saturating_add(1);
+            return Ok(false);
+        };
+        let Some(slot) = self.registrations.get_mut(slot_index) else {
+            self.stale_unregistration_count = self.stale_unregistration_count.saturating_add(1);
+            return Ok(false);
+        };
+        if slot.generation != generation {
+            self.stale_unregistration_count = self.stale_unregistration_count.saturating_add(1);
+            return Ok(false);
+        }
+        let Some(registration) = slot.registration.as_ref() else {
+            self.stale_unregistration_count = self.stale_unregistration_count.saturating_add(1);
+            return Ok(false);
+        };
+        let mut event = libc::epoll_event {
+            events,
+            u64: token.raw(),
+        };
+        // SAFETY: the registration owns a valid descriptor and the event is
+        // initialized for this token.
+        let result = unsafe {
+            libc::epoll_ctl(
+                self.epoll.as_raw_fd(),
+                libc::EPOLL_CTL_MOD,
+                registration.fd,
+                &mut event,
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(true)
     }
 
     fn drain_timer(&self) -> io::Result<()> {
@@ -561,23 +620,22 @@ fn duplicate_fd(fd: RawFd) -> io::Result<OwnedFd> {
 }
 
 fn same_open_file(fd: RawFd, identity_fd: RawFd) -> io::Result<bool> {
-    // SAFETY: `kcmp` compares two descriptors owned by this process and does
-    // not dereference either value in Rust.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_kcmp,
-            libc::getpid(),
-            libc::getpid(),
-            0,
-            fd,
-            identity_fd,
-        )
-    };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(result == 0)
+    let mut first = unsafe { std::mem::zeroed::<libc::stat>() };
+    let mut second = unsafe { std::mem::zeroed::<libc::stat>() };
+    // SAFETY: both descriptors are borrowed for the duration of the identity
+    // check and point to caller-owned open files.
+    let first_result = unsafe { libc::fstat(fd, &mut first) };
+    let second_result = unsafe { libc::fstat(identity_fd, &mut second) };
+    if first_result < 0 {
+        return Err(io::Error::last_os_error());
     }
+    if second_result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(first.st_dev == second.st_dev
+        && first.st_ino == second.st_ino
+        && first.st_mode == second.st_mode
+        && first.st_rdev == second.st_rdev)
 }
 
 fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
