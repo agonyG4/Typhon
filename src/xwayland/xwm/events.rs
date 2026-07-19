@@ -47,6 +47,13 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         }
         Event::MapRequest(event) => {
             let handle = ensure_window(xwm, event.window)?;
+            if xwm
+                .windows
+                .get(handle)
+                .is_some_and(|record| record.map_requested)
+            {
+                return Ok(());
+            }
             xwm.cancel_window_properties(handle);
             xwm.windows
                 .mark_map_requested(handle)
@@ -67,11 +74,19 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                     .map_err(XwmError::InvalidCommand)?;
                 return Ok(());
             }
-            if xwm
+            let externally_mapped = xwm
                 .windows
                 .confirm_external_map_notify(handle)
-                .map_err(XwmError::InvalidCommand)?
-            {
+                .map_err(XwmError::InvalidCommand)?;
+            if externally_mapped {
+                if !xwm
+                    .windows
+                    .get(handle)
+                    .is_some_and(|record| record.properties_ready)
+                {
+                    xwm.refresh_window_properties(handle)?;
+                }
+                xwm.emit_ready_if_complete(handle)?;
                 return Ok(());
             }
             xwm.cancel_window_properties(handle);
@@ -87,10 +102,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 return Ok(());
             };
             let was_ready = record.snapshot.is_some()
-                || matches!(
-                    record.lifecycle,
-                    X11WindowLifecycle::Ready | X11WindowLifecycle::Mapped
-                );
+                || matches!(record.lifecycle, X11WindowLifecycle::Renderable);
             if let Some(association) = record.association {
                 xwm.clear_surface_buffer_ready(association.surface_id);
             }
@@ -117,9 +129,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             if record.snapshot.is_some()
                 || matches!(
                     record.lifecycle,
-                    X11WindowLifecycle::Ready
-                        | X11WindowLifecycle::Mapped
-                        | X11WindowLifecycle::Withdrawn
+                    X11WindowLifecycle::Renderable | X11WindowLifecycle::Withdrawn
                 )
             {
                 xwm.outgoing_events

@@ -45,7 +45,7 @@ use super::protocols::versions;
 use super::{
     AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, BufferReleaseMetrics,
     ClientCursorRenderState, CompositorFrameBatchId, CompositorState, CoreComplianceMetrics,
-    DirectScanoutSceneCandidate, DirectScanoutSceneRejection, ExplicitSyncPoint,
+    DesktopWindowKind, DirectScanoutSceneCandidate, DirectScanoutSceneRejection, ExplicitSyncPoint,
     FrameBatchDiscardReason, FramePresentation, FullscreenRenderPlanMetrics,
     InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PointerAxisFrame,
     PresentationClock, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
@@ -515,10 +515,23 @@ impl OwnCompositorServer {
 
     pub fn apply_xwayland_window_event(&mut self, event: XwmEvent) -> Vec<XwmCommand> {
         match event {
+            XwmEvent::WindowMapRequested(handle) => vec![XwmCommand::Map(handle)],
             XwmEvent::WindowReady(snapshot) => {
                 let handle = snapshot.handle;
                 if self.state.insert_x11_window(snapshot).is_ok() {
-                    vec![XwmCommand::Map(handle), self.sync_xwayland_client_lists()]
+                    let map = if self
+                        .state
+                        .window_id_for_x11_handle(handle)
+                        .and_then(|id| self.state.window(id))
+                        .is_some_and(|window| window.kind == DesktopWindowKind::OverrideRedirect)
+                    {
+                        Vec::new()
+                    } else {
+                        vec![XwmCommand::Map(handle)]
+                    };
+                    map.into_iter()
+                        .chain([self.sync_xwayland_client_lists()])
+                        .collect()
                 } else {
                     Vec::new()
                 }

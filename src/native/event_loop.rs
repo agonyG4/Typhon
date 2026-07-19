@@ -253,9 +253,30 @@ impl NativeEventLoop {
             return Ok(false);
         };
         match same_open_file(registration.fd, registration.identity_fd.as_raw_fd()) {
-            Ok(true) => {}
+            Ok(true) => {
+                // Some anonymous kernel objects intentionally share the
+                // fstat tuple.  A best-effort kcmp result is diagnostic only;
+                // teardown still uses the owned identity descriptor below.
+                if diagnostic_same_open_file(registration.fd, registration.identity_fd.as_raw_fd())
+                    == Some(false)
+                {
+                    self.stale_unregistration_count =
+                        self.stale_unregistration_count.saturating_add(1);
+                }
+            }
             Ok(false) => {
                 self.stale_unregistration_count = self.stale_unregistration_count.saturating_add(1);
+                // The numeric descriptor may already name a replacement
+                // open file.  Delete using the stable duplicate so the old
+                // epoll entry is retired without touching that replacement.
+                let _ = unsafe {
+                    libc::epoll_ctl(
+                        self.epoll.as_raw_fd(),
+                        libc::EPOLL_CTL_DEL,
+                        registration.identity_fd.as_raw_fd(),
+                        std::ptr::null_mut(),
+                    )
+                };
                 self.retire_registration_slot(slot_index);
                 return Ok(true);
             }
@@ -263,6 +284,14 @@ impl NativeEventLoop {
                 if is_xwayland_source(registration.source) {
                     self.benign_unregistration_count =
                         self.benign_unregistration_count.saturating_add(1);
+                    let _ = unsafe {
+                        libc::epoll_ctl(
+                            self.epoll.as_raw_fd(),
+                            libc::EPOLL_CTL_DEL,
+                            registration.identity_fd.as_raw_fd(),
+                            std::ptr::null_mut(),
+                        )
+                    };
                     self.retire_registration_slot(slot_index);
                     return Ok(true);
                 }
@@ -274,7 +303,7 @@ impl NativeEventLoop {
             libc::epoll_ctl(
                 self.epoll.as_raw_fd(),
                 libc::EPOLL_CTL_DEL,
-                registration.fd,
+                registration.identity_fd.as_raw_fd(),
                 std::ptr::null_mut(),
             )
         };
@@ -489,8 +518,14 @@ impl NativeEventLoop {
             u64: token.raw(),
         };
         let identity_fd = duplicate_fd(fd)?;
-        let result =
-            unsafe { libc::epoll_ctl(self.epoll.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut event) };
+        let result = unsafe {
+            libc::epoll_ctl(
+                self.epoll.as_raw_fd(),
+                libc::EPOLL_CTL_ADD,
+                identity_fd.as_raw_fd(),
+                &mut event,
+            )
+        };
         if result < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -636,6 +671,22 @@ fn same_open_file(fd: RawFd, identity_fd: RawFd) -> io::Result<bool> {
         && first.st_ino == second.st_ino
         && first.st_mode == second.st_mode
         && first.st_rdev == second.st_rdev)
+}
+
+fn diagnostic_same_open_file(fd: RawFd, identity_fd: RawFd) -> Option<bool> {
+    // SAFETY: kcmp only compares descriptors owned by this process.  Its
+    // result is diagnostic and never gates registration retirement.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_kcmp,
+            libc::getpid(),
+            libc::getpid(),
+            0,
+            fd,
+            identity_fd,
+        )
+    };
+    if result < 0 { None } else { Some(result == 0) }
 }
 
 fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {

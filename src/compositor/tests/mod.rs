@@ -121,3 +121,4 @@ mod surface_frames;
 mod windows;
 mod windows_resize_liveness;
 mod xdg;
+mod xwayland;
