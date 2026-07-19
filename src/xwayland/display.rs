@@ -4,29 +4,16 @@ use std::{
     io::{self, Write},
     os::fd::{AsRawFd, FromRawFd, RawFd},
     os::unix::{
-        fs::{MetadataExt, OpenOptionsExt},
+        fs::OpenOptionsExt,
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
 };
 
 use super::auth::create_auth_file;
+use super::fs_security;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
-
-impl FileIdentity {
-    fn from_path(path: &Path) -> io::Result<Self> {
-        let metadata = fs::symlink_metadata(path)?;
-        Ok(Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-}
+type FileIdentity = fs_security::Identity;
 
 #[derive(Debug)]
 pub(crate) struct DisplayLease {
@@ -40,6 +27,9 @@ pub(crate) struct DisplayLease {
     abstract_listener: UnixListener,
     xauthority_path: PathBuf,
     xauthority_identity: FileIdentity,
+    _lock_directory_fd: std::os::fd::OwnedFd,
+    _socket_directory_fd: std::os::fd::OwnedFd,
+    _auth_directory_fd: std::os::fd::OwnedFd,
 }
 
 impl DisplayLease {
@@ -51,6 +41,7 @@ impl DisplayLease {
             )
         })?;
         let runtime_dir = PathBuf::from(runtime_dir);
+        fs_security::validate_runtime_directory(&runtime_dir)?;
         Self::allocate_at(
             Path::new("/tmp"),
             Path::new("/tmp/.X11-unix"),
@@ -63,7 +54,6 @@ impl DisplayLease {
 
     #[cfg(test)]
     pub(crate) fn allocate_for_tests(root: &Path, min: u32, max: u32) -> io::Result<Self> {
-        fs::create_dir_all(root.join(".X11-unix"))?;
         Self::allocate_at(
             root,
             &root.join(".X11-unix"),
@@ -153,6 +143,7 @@ impl DisplayLease {
                 return Err(error);
             }
         };
+        fs_security::set_socket_mode(filesystem_listener.as_raw_fd())?;
         filesystem_listener.set_nonblocking(true)?;
         let filesystem_socket_identity = match FileIdentity::from_path(&socket_path) {
             Ok(identity) => identity,
@@ -189,16 +180,12 @@ impl DisplayLease {
             Err(error) => {
                 cleanup_artifact(&lock_path, lock_identity);
                 cleanup_artifact(&socket_path, filesystem_socket_identity);
-                cleanup_artifact(
-                    &auth_file.path,
-                    FileIdentity {
-                        device: 0,
-                        inode: 0,
-                    },
-                );
                 return Err(error);
             }
         };
+        let lock_directory_fd = fs_security::open_directory(lock_directory)?;
+        let socket_directory_fd = fs_security::open_directory(socket_directory)?;
+        let auth_directory_fd = fs_security::open_directory(auth_directory)?;
 
         Ok(Some(Self {
             display_number,
@@ -211,6 +198,9 @@ impl DisplayLease {
             abstract_listener,
             xauthority_path: auth_file.path,
             xauthority_identity,
+            _lock_directory_fd: lock_directory_fd,
+            _socket_directory_fd: socket_directory_fd,
+            _auth_directory_fd: auth_directory_fd,
         }))
     }
 
@@ -256,41 +246,7 @@ impl Drop for DisplayLease {
 }
 
 fn ensure_socket_directory(path: &Path) -> io::Result<()> {
-    if path.exists() {
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "X11 socket directory is not a safe directory: {}",
-                    path.display()
-                ),
-            ));
-        }
-        let uid = unsafe { libc::geteuid() } as u32;
-        if metadata.uid() != uid && metadata.uid() != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "X11 socket directory has an unexpected owner: {}",
-                    path.display()
-                ),
-            ));
-        }
-        let mode = metadata.mode();
-        if mode & 0o002 != 0 && mode & 0o1000 == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "X11 socket directory is world-writable without sticky bit: {}",
-                    path.display()
-                ),
-            ));
-        }
-        return Ok(());
-    }
-    fs::create_dir_all(path)?;
-    Ok(())
+    fs_security::ensure_socket_directory(path)
 }
 
 fn inspect_existing_lock(lock_path: &Path, socket_path: &Path) -> io::Result<Option<bool>> {
@@ -397,16 +353,7 @@ fn is_slot_local_error(error: &io::Error) -> bool {
 }
 
 fn cleanup_artifact(path: &Path, expected: FileIdentity) {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return;
-    };
-    if metadata.file_type().is_symlink()
-        || (expected.device != 0
-            && (metadata.dev() != expected.device || metadata.ino() != expected.inode))
-    {
-        return;
-    }
-    let _ = fs::remove_file(path);
+    let _ = fs_security::unlink_owned(path, expected);
 }
 
 fn abstract_socket_name(directory: &Path, display_number: u32) -> Vec<u8> {

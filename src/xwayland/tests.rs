@@ -255,6 +255,12 @@ fn filesystem_and_abstract_sockets_accept_local_connections() {
     let _lock = display_test_lock();
     let root = test_root("sockets");
     let lease = DisplayLease::allocate_for_tests(&root, 0, 0).expect("allocate lease");
+    let mode = fs::metadata(lease.filesystem_socket_path())
+        .expect("stat filesystem socket")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o666);
     std::os::unix::net::UnixStream::connect(lease.filesystem_socket_path())
         .expect("connect filesystem socket");
     connect_abstract_socket_for_tests(&root.join(".X11-unix"), lease.display_number())

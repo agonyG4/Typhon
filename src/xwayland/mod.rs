@@ -6,6 +6,7 @@ mod config;
 mod diagnostics;
 mod display;
 mod displayfd;
+mod fs_security;
 mod generation;
 mod launch;
 mod metrics;

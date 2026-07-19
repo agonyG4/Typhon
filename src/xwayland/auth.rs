@@ -5,6 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use super::fs_security;
+
 const COOKIE_NAME: &[u8] = b"MIT-MAGIC-COOKIE-1";
 const FAMILY_LOCAL: u16 = 256;
 
@@ -13,8 +15,7 @@ pub(crate) struct AuthFile {
 }
 
 pub(crate) fn create_auth_file(directory: &Path, display_number: u32) -> io::Result<AuthFile> {
-    fs::create_dir_all(directory)?;
-    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    fs_security::ensure_private_directory(directory)?;
 
     let mut suffix_bytes = vec![0u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut suffix_bytes)?;
@@ -32,7 +33,7 @@ pub(crate) fn create_auth_file(directory: &Path, display_number: u32) -> io::Res
         .mode(0o600);
     let mut file = file.open(&path)?;
     let result = (|| {
-        file.write_all(&authority_record(display_number, &cookie))?;
+        file.write_all(&authority_record(display_number, &cookie)?)?;
         file.flush()?;
         file.sync_all()?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
@@ -46,20 +47,27 @@ pub(crate) fn create_auth_file(directory: &Path, display_number: u32) -> io::Res
     Ok(AuthFile { path })
 }
 
-fn authority_record(display_number: u32, cookie: &[u8]) -> Vec<u8> {
+fn authority_record(display_number: u32, cookie: &[u8]) -> io::Result<Vec<u8>> {
     let number = display_number.to_string();
     let mut record = Vec::new();
-    append_field(&mut record, FAMILY_LOCAL.to_be_bytes().as_slice());
-    append_field(&mut record, &[]);
-    append_field(&mut record, number.as_bytes());
-    append_field(&mut record, COOKIE_NAME);
-    append_field(&mut record, cookie);
-    record
+    append_field(&mut record, FAMILY_LOCAL.to_be_bytes().as_slice())?;
+    append_field(&mut record, &[])?;
+    append_field(&mut record, number.as_bytes())?;
+    append_field(&mut record, COOKIE_NAME)?;
+    append_field(&mut record, cookie)?;
+    Ok(record)
 }
 
-fn append_field(record: &mut Vec<u8>, value: &[u8]) {
-    record.extend_from_slice(&(u16::try_from(value.len()).unwrap_or(u16::MAX)).to_be_bytes());
+fn append_field(record: &mut Vec<u8>, value: &[u8]) -> io::Result<()> {
+    let length = u16::try_from(value.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Xauthority field exceeds 16-bit length",
+        )
+    })?;
+    record.extend_from_slice(&length.to_be_bytes());
     record.extend_from_slice(value);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -110,4 +118,14 @@ fn read_field<'a>(bytes: &'a [u8], cursor: &mut usize) -> io::Result<&'a [u8]> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated Xauthority data"))?;
     *cursor = end;
     Ok(field)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_authority_field_is_rejected() {
+        assert!(authority_record(0, &vec![0u8; usize::from(u16::MAX) + 1]).is_err());
+    }
 }
