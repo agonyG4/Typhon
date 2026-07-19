@@ -143,7 +143,7 @@ impl DisplayLease {
                 return Err(error);
             }
         };
-        fs_security::set_socket_mode(filesystem_listener.as_raw_fd())?;
+        fs_security::set_socket_mode(&socket_path)?;
         filesystem_listener.set_nonblocking(true)?;
         let filesystem_socket_identity = match FileIdentity::from_path(&socket_path) {
             Ok(identity) => identity,

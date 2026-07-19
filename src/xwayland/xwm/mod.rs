@@ -24,6 +24,7 @@ pub(crate) mod ewmh;
 pub(crate) mod focus;
 pub(crate) mod icccm;
 mod properties;
+pub mod randr;
 mod resize_sync;
 pub(crate) mod shape;
 pub(crate) mod startup;
@@ -312,6 +313,7 @@ pub struct Xwm {
     pub(crate) next_resize_counter_values: HashMap<X11WindowHandle, u64>,
     pub(crate) shapes: HashMap<X11WindowHandle, shape::ShapeRegion>,
     pub(crate) data_bridge: data_bridge::DataBridge,
+    pub(crate) randr: randr::RandrSnapshot,
     pub(crate) pending_properties:
         HashMap<x11rb::connection::SequenceNumber, properties::PendingProperty>,
     pub(crate) deferred_properties: VecDeque<properties::PendingProperty>,
@@ -354,6 +356,10 @@ impl Xwm {
 
     pub fn supporting_wm_check(&self) -> u32 {
         self.supporting_wm_check
+    }
+
+    pub fn randr_snapshot(&self) -> &randr::RandrSnapshot {
+        &self.randr
     }
 
     pub fn window_count(&self) -> usize {

@@ -135,6 +135,10 @@ impl TransferManager {
     pub fn len(&self) -> usize {
         self.transfers.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.transfers.is_empty()
+    }
 }
 
 fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
@@ -171,6 +175,6 @@ mod tests {
             .expect("transfer");
         let _ = manager.pump(id, 0).expect("pump");
         let _ = sink_reader;
-        assert!(MAX_TRANSFER_CHUNK <= 64 * 1024);
+        const _: () = assert!(MAX_TRANSFER_CHUNK <= 64 * 1024);
     }
 }

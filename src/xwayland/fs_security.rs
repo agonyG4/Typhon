@@ -2,7 +2,7 @@
 
 use std::{
     fs, io,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::{
         ffi::OsStrExt,
         fs::{MetadataExt, PermissionsExt},
@@ -77,15 +77,17 @@ fn ensure_private_directory_inner(path: &Path, require_private: bool) -> io::Res
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             let uid = unsafe { libc::geteuid() } as u32;
-            if metadata.file_type().is_symlink()
-                || !metadata.is_dir()
-                || metadata.uid() != uid
-                || (require_private && metadata.mode() & 0o777 != 0o700)
-            {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.uid() != uid {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     format!("unsafe private directory: {}", path.display()),
                 ));
+            }
+            if require_private && metadata.mode() & 0o777 != 0o700 {
+                let fd = open_directory(path)?;
+                if unsafe { libc::fchmod(fd.as_raw_fd(), 0o700) } < 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -117,11 +119,28 @@ pub(crate) fn open_directory(path: &Path) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-pub(crate) fn set_socket_mode(fd: RawFd) -> io::Result<()> {
-    if unsafe { libc::fchmod(fd, 0o666) } < 0 {
+pub(crate) fn set_socket_mode(path: &Path) -> io::Result<()> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path contains NUL"))?;
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
+    let proc_path = std::ffi::CString::new(format!("/proc/self/fd/{fd}"))
+        .expect("proc fd path contains no NUL");
+    let result = unsafe { libc::chmod(proc_path.as_ptr(), 0o666) };
+    let error = if result < 0 {
+        Some(io::Error::last_os_error())
+    } else {
+        None
+    };
+    unsafe { libc::close(fd) };
+    error.map_or(Ok(()), Err)
 }
 
 pub(crate) fn unlink_owned(path: &Path, expected: Identity) -> bool {

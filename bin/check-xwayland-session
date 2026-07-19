@@ -1,0 +1,36 @@
+#!/bin/sh
+set -u
+
+echo "DISPLAY=${DISPLAY-<unset>}"
+echo "XAUTHORITY=${XAUTHORITY-<unset>}"
+
+display_number=${DISPLAY#:}
+display_number=${display_number%%.*}
+if [ "${display_number}" != "${DISPLAY-}" ] && [ -n "${display_number}" ]; then
+    socket="/tmp/.X11-unix/X${display_number}"
+    echo "filesystem_socket=${socket}"
+    if [ -S "$socket" ]; then
+        stat -c 'socket_mode=%a socket_uid=%u socket_inode=%i' "$socket" 2>/dev/null || true
+    else
+        echo "filesystem_socket=missing"
+    fi
+fi
+
+echo "abstract_socket=${display_number:+@/tmp/.X11-unix/X${display_number}}"
+echo "xwayland_processes:"
+ps -eo pid=,ppid=,args= | awk '/[X]wayland/ { print }'
+
+if command -v ss >/dev/null 2>&1; then
+    echo "unix_sockets:"
+    ss -x -a 2>/dev/null | awk '/X11-unix|xwayland/ { print }'
+fi
+
+if command -v xdpyinfo >/dev/null 2>&1 && [ -n "${DISPLAY-}" ]; then
+    echo "xdpyinfo:"
+    xdpyinfo 2>&1 | sed -n '1,24p'
+else
+    echo "xdpyinfo=unavailable"
+fi
+
+echo "xwm_state=reported by Typhon stderr/state diagnostics"
+echo "generation/client_count/selection_bridge=reported by compositor diagnostics when enabled"

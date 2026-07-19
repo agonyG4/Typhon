@@ -660,6 +660,7 @@ impl XwmStartup {
             next_resize_counter_values: Default::default(),
             shapes: Default::default(),
             data_bridge: Default::default(),
+            randr: default_randr_snapshot(),
             pending_properties: Default::default(),
             deferred_properties: Default::default(),
             property_metrics: Default::default(),
@@ -674,6 +675,22 @@ impl XwmStartup {
         self.state = XwmStartupState::Running;
         Some(xwm)
     }
+}
+
+pub(crate) fn default_randr_snapshot() -> super::randr::RandrSnapshot {
+    super::randr::RandrSnapshot::from_outputs(
+        vec![super::randr::RandrOutput {
+            name: "default".to_owned(),
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            mm_width: 1,
+            mm_height: 1,
+        }],
+        96,
+    )
+    .expect("default RandR snapshot")
 }
 
 pub(crate) fn setup_root<C: Connection>(

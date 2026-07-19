@@ -407,6 +407,7 @@ pub(crate) fn connect(
         next_resize_counter_values: Default::default(),
         shapes: Default::default(),
         data_bridge: Default::default(),
+        randr: super::startup::default_randr_snapshot(),
         pending_properties: Default::default(),
         deferred_properties: Default::default(),
         property_metrics: Default::default(),
