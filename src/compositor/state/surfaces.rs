@@ -372,7 +372,6 @@ impl CompositorState {
         let token = self.capture_surface_damage_presentation();
         self.commit_surface_damage_presented(token);
     }
-
     pub(in crate::compositor) fn record_surface_damage_commit(
         &mut self,
         surface_id: u32,
@@ -385,24 +384,18 @@ impl CompositorState {
             .or_insert_with(|| SurfaceDamageJournal::new(64))
             .record(damage, width, height);
     }
-
     pub(in crate::compositor) fn new(syncobj_device: Option<DrmSyncobjDevice>) -> Self {
-        let default_dmabuf_device = default_dmabuf_main_device();
         Self {
             frame_clock_start: Some(Instant::now()),
             next_window_id: 1,
             dmabuf_feedback: EglGlesDmabufFeedback::default(),
-            dmabuf_main_device: default_dmabuf_device
-                .as_ref()
-                .map(|device| device.rdev)
-                .unwrap_or(0),
-            dmabuf_main_device_path: default_dmabuf_device.map(|device| device.path),
+            dmabuf_main_device: 0,
+            dmabuf_main_device_path: None,
             syncobj_device,
             clipboard_bridge: Some(Box::new(NoopClipboardBridge)),
             ..Self::default()
         }
     }
-
     pub(in crate::compositor) fn allocate_buffer_identity(&mut self) -> Option<BufferIdentity> {
         self.buffer_ids.allocate()
     }
@@ -461,6 +454,14 @@ impl CompositorState {
         self.dmabuf_feedback = feedback;
         self.dmabuf_main_device = main_device.filter(|device| *device != 0).unwrap_or(0);
         self.dmabuf_main_device_path = main_device_path.filter(|path| !path.is_empty());
+    }
+    pub(in crate::compositor) fn set_gpu_protocol_capabilities(
+        &mut self,
+        capabilities: GpuProtocolCapabilities,
+    ) {
+        self.dmabuf_main_device = capabilities.dmabuf_device().unwrap_or(0);
+        self.dmabuf_main_device_path = capabilities.wl_drm_device().map(ToOwned::to_owned);
+        self.gpu_protocol_capabilities = capabilities;
     }
 
     pub(in crate::compositor) fn set_output_size(&mut self, width: u32, height: u32) -> bool {

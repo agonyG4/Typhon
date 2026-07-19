@@ -1,10 +1,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Seek, Write},
-    os::{
-        fd::{AsFd, OwnedFd},
-        unix::fs::MetadataExt,
-    },
+    os::fd::{AsFd, OwnedFd},
     sync::Mutex,
 };
 
@@ -20,45 +17,33 @@ use crate::render_backend::buffer::{
 use crate::render_backend::egl_gles::{EglGlesDmabufFeedback, EglGlesDmabufFormat};
 use crate::wayland_drm::server::wl_drm;
 
-use super::{CompositorState, CoreComplianceMetrics, unique_runtime_file_path};
+use super::{
+    CompositorState, CoreComplianceMetrics, gpu_protocol_capabilities::GpuFormat,
+    unique_runtime_file_path,
+};
 
 const WL_DRM_CAPABILITIES_SINCE: u32 = 2;
 
 pub(super) fn send_wl_drm_capabilities(drm: &wl_drm::WlDrm, state: &CompositorState) {
-    if let Some(path) = state.dmabuf_main_device_path.as_deref() {
+    if let Some(path) = state.gpu_protocol_capabilities.wl_drm_device() {
         drm.device(path.to_string());
     }
-    if drm.version() >= WL_DRM_CAPABILITIES_SINCE {
+    if drm.version() >= WL_DRM_CAPABILITIES_SINCE && state.gpu_protocol_capabilities.wl_drm_prime()
+    {
         drm.capabilities(1);
     }
-    for format in wl_drm_formats(&state.dmabuf_feedback) {
-        drm.format(format);
+    for fourcc in state.gpu_protocol_capabilities.wl_drm_formats() {
+        drm.format(*fourcc);
     }
-}
-
-fn wl_drm_formats(feedback: &EglGlesDmabufFeedback) -> Vec<u32> {
-    let mut formats = vec![
-        DrmFormat::Argb8888.as_fourcc(),
-        DrmFormat::Xrgb8888.as_fourcc(),
-    ];
-    formats.extend(
-        feedback
-            .format_table_formats()
-            .iter()
-            .map(|format| format.format.as_fourcc()),
-    );
-    formats.sort_unstable();
-    formats.dedup();
-    formats
 }
 
 pub(super) fn send_dmabuf_format_modifiers(
     dmabuf: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
-    feedback: &EglGlesDmabufFeedback,
+    formats: &[GpuFormat],
 ) {
     let mut announced_formats = Vec::new();
-    for format in feedback.format_table_formats() {
-        let fourcc = format.format.as_fourcc();
+    for format in formats {
+        let fourcc = format.fourcc;
         if !announced_formats.contains(&fourcc) {
             dmabuf.format(fourcc);
             announced_formats.push(fourcc);
@@ -66,20 +51,11 @@ pub(super) fn send_dmabuf_format_modifiers(
     }
 
     if dmabuf.version() >= zwp_linux_dmabuf_v1::EVT_MODIFIER_SINCE {
-        for format in feedback.format_table_formats() {
-            let modifier = format.modifier.0;
-            dmabuf.modifier(
-                format.format.as_fourcc(),
-                (modifier >> 32) as u32,
-                modifier as u32,
-            );
+        for format in formats {
+            let modifier = format.modifier;
+            dmabuf.modifier(format.fourcc, (modifier >> 32) as u32, modifier as u32);
         }
     }
-}
-
-pub(super) struct DrmDeviceNode {
-    pub(super) path: String,
-    pub(super) rdev: u64,
 }
 
 pub(super) struct DmabufFeedbackData {
@@ -90,10 +66,47 @@ pub(super) struct DmabufFeedbackData {
 }
 
 impl DmabufFeedbackData {
-    pub(super) fn new(feedback: &EglGlesDmabufFeedback, main_device: u64) -> io::Result<Self> {
-        let format_table_formats = feedback.format_table_formats().to_vec();
-        let scanout = dmabuf_tranche_indices(&format_table_formats, feedback.scanout_formats());
-        let render = dmabuf_tranche_indices(&format_table_formats, feedback.formats());
+    pub(super) fn new(
+        feedback: &EglGlesDmabufFeedback,
+        main_device: u64,
+        allowed_formats: &[GpuFormat],
+    ) -> io::Result<Self> {
+        if main_device == 0 || feedback.format_table_formats().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "dmabuf feedback has no valid main device or format table",
+            ));
+        }
+        let format_table_formats = feedback
+            .format_table_formats()
+            .iter()
+            .copied()
+            .filter(|format| gpu_format_is_allowed(*format, allowed_formats))
+            .collect::<Vec<_>>();
+        if format_table_formats.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "dmabuf feedback has no format supported by the selected importer",
+            ));
+        }
+        let scanout = dmabuf_tranche_indices(
+            &format_table_formats,
+            &feedback
+                .scanout_formats()
+                .iter()
+                .copied()
+                .filter(|format| gpu_format_is_allowed(*format, allowed_formats))
+                .collect::<Vec<_>>(),
+        );
+        let render = dmabuf_tranche_indices(
+            &format_table_formats,
+            &feedback
+                .formats()
+                .iter()
+                .copied()
+                .filter(|format| gpu_format_is_allowed(*format, allowed_formats))
+                .collect::<Vec<_>>(),
+        );
         let tranches = if scanout.is_empty() {
             vec![(render, false)]
         } else {
@@ -107,6 +120,12 @@ impl DmabufFeedbackData {
             tranches,
         })
     }
+}
+
+fn gpu_format_is_allowed(format: EglGlesDmabufFormat, allowed_formats: &[GpuFormat]) -> bool {
+    allowed_formats.iter().any(|allowed| {
+        allowed.fourcc == format.format.as_fourcc() && allowed.modifier == format.modifier.0
+    })
 }
 
 fn dmabuf_tranche_indices(
@@ -141,23 +160,6 @@ fn dmabuf_format_table_file(formats: &[EglGlesDmabufFormat]) -> io::Result<(File
     file.flush()?;
     file.rewind()?;
     Ok((file, (formats.len() * 16) as u32))
-}
-
-pub(super) fn default_dmabuf_main_device() -> Option<DrmDeviceNode> {
-    [
-        "/dev/dri/renderD128",
-        "/dev/dri/renderD129",
-        "/dev/dri/renderD130",
-        "/dev/dri/card0",
-        "/dev/dri/card1",
-    ]
-    .into_iter()
-    .find_map(|path| {
-        fs::metadata(path).ok().map(|metadata| DrmDeviceNode {
-            path: path.to_string(),
-            rdev: metadata.rdev(),
-        })
-    })
 }
 
 pub(super) fn send_dmabuf_feedback(
@@ -239,6 +241,7 @@ impl DmabufParamsData {
         planes.push(plane);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn validate_for_create(
         &self,
         params: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
@@ -246,6 +249,7 @@ impl DmabufParamsData {
         height: i32,
         format: u32,
         feedback: &EglGlesDmabufFeedback,
+        allowed_formats: &[GpuFormat],
         metrics: &mut CoreComplianceMetrics,
     ) -> bool {
         if !self.mark_used(params, metrics) {
@@ -269,7 +273,12 @@ impl DmabufParamsData {
             return false;
         };
         let drm_format = DrmFormat::from_fourcc(format);
-        if !feedback.advertises(drm_format, DrmModifier(plane.modifier)) {
+        if !feedback.advertises(drm_format, DrmModifier(plane.modifier))
+            || !gpu_format_is_allowed(
+                EglGlesDmabufFormat::new(drm_format, DrmModifier(plane.modifier)),
+                allowed_formats,
+            )
+        {
             metrics.note_protocol_error();
             params.post_error(
                 zwp_linux_buffer_params_v1::Error::InvalidFormat,
@@ -299,10 +308,19 @@ impl DmabufParamsData {
         height: i32,
         format: u32,
         feedback: &EglGlesDmabufFeedback,
+        allowed_formats: &[GpuFormat],
         metrics: &mut CoreComplianceMetrics,
         identity: BufferIdentity,
     ) -> Option<DmabufBufferData> {
-        if !self.validate_for_create(params, width, height, format, feedback, metrics) {
+        if !self.validate_for_create(
+            params,
+            width,
+            height,
+            format,
+            feedback,
+            allowed_formats,
+            metrics,
+        ) {
             return None;
         }
         let drm_format = DrmFormat::from_fourcc(format);
@@ -399,7 +417,11 @@ mod tests {
         let scanout = EglGlesDmabufFormat::new(DrmFormat::Xrgb8888, DrmModifier(7));
         let render = EglGlesDmabufFormat::new(DrmFormat::Argb8888, DrmModifier::LINEAR);
         let feedback = EglGlesDmabufFeedback::with_scanout_tranche([scanout], [render]);
-        let data = DmabufFeedbackData::new(&feedback, 0x1234).unwrap();
+        let allowed = [
+            GpuFormat::new(DrmFormat::Xrgb8888.as_fourcc(), 7),
+            GpuFormat::new(DrmFormat::Argb8888.as_fourcc(), DrmModifier::LINEAR.0),
+        ];
+        let data = DmabufFeedbackData::new(&feedback, 0x1234, &allowed).unwrap();
 
         assert_eq!(data.tranches.len(), 2);
         assert!(data.tranches[0].1);

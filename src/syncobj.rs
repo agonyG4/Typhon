@@ -1,10 +1,14 @@
 use std::{
     fmt,
-    fs::{File, OpenOptions},
+    fs::File,
     io,
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+    os::unix::fs::MetadataExt,
     sync::Arc,
 };
+
+#[cfg(test)]
+use std::fs::OpenOptions;
 
 #[derive(Clone)]
 pub struct DrmSyncobjDevice {
@@ -20,27 +24,29 @@ impl fmt::Debug for DrmSyncobjDevice {
 }
 
 impl DrmSyncobjDevice {
+    #[cfg(test)]
     pub fn open_available() -> Option<Self> {
         syncobj_device_candidates()
             .into_iter()
             .filter_map(|path| OpenOptions::new().read(true).write(true).open(path).ok())
-            .find(device_supports_timeline_syncobj)
             .map(|file| Self {
                 file: Arc::new(file),
             })
+            .find(device_supports_timeline_contract)
     }
 
     pub fn from_active_drm_file(file: &File) -> io::Result<Self> {
         let file = duplicate_file_cloexec(file.as_fd())?;
-        if !device_supports_timeline_syncobj(&file) {
+        let device = Self {
+            file: Arc::new(file),
+        };
+        if !device_supports_timeline_contract(&device) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "active DRM device does not support timeline syncobj",
+                "active DRM device does not support timeline create/import",
             ));
         }
-        Ok(Self {
-            file: Arc::new(file),
-        })
+        Ok(device)
     }
 
     pub fn import_timeline_fd(&self, fd: OwnedFd) -> io::Result<DrmSyncobjTimeline> {
@@ -62,12 +68,21 @@ impl DrmSyncobjDevice {
         ))
     }
 
-    pub fn create_timeline_for_tests(&self) -> io::Result<DrmSyncobjTimeline> {
+    pub fn device_identity(&self) -> io::Result<u64> {
+        Ok(self.file.metadata()?.rdev())
+    }
+
+    pub fn create_timeline(&self) -> io::Result<DrmSyncobjTimeline> {
         let handle = drm_ffi::syncobj::create(self.file.as_fd(), false)?.handle;
         Ok(DrmSyncobjTimeline::from_imported_handle(
             self.clone(),
             handle,
         ))
+    }
+
+    #[cfg(test)]
+    pub fn create_timeline_for_tests(&self) -> io::Result<DrmSyncobjTimeline> {
+        self.create_timeline()
     }
 
     fn destroy_handle(&self, handle: u32) {
@@ -291,6 +306,7 @@ impl Drop for DrmSyncobjTimelineInner {
     }
 }
 
+#[cfg(test)]
 fn syncobj_device_candidates() -> Vec<String> {
     (128..144)
         .map(|index| format!("/dev/dri/renderD{index}"))
@@ -305,6 +321,19 @@ fn device_supports_timeline_syncobj(file: &File) -> bool {
     let timeline = drm_ffi::get_capability(fd, u64::from(drm_sys::DRM_CAP_SYNCOBJ_TIMELINE))
         .is_ok_and(|cap| cap.value != 0);
     syncobj && timeline
+}
+
+fn device_supports_timeline_contract(device: &DrmSyncobjDevice) -> bool {
+    if !device_supports_timeline_syncobj(device.as_file()) {
+        return false;
+    }
+    let Ok(timeline) = device.create_timeline() else {
+        return false;
+    };
+    let Ok(exported) = timeline.export_timeline_fd() else {
+        return false;
+    };
+    device.import_timeline_fd(exported.into()).is_ok()
 }
 
 fn syncobj_wait_timed_out(error: &io::Error) -> bool {

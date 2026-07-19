@@ -218,7 +218,7 @@ fn wayland_client_receives_wl_drm_compatibility_events() {
     assert!(state.wl_drm_device);
     assert!(state.wl_drm_capabilities);
     assert!(state.wl_drm_format);
-    assert!(state.wl_drm_authenticated);
+    assert!(!state.wl_drm_authenticated);
 }
 
 #[test]
@@ -314,7 +314,20 @@ fn wl_drm_v1_bind_does_not_receive_capabilities() {
     assert!(state.wl_drm_device);
     assert!(!state.wl_drm_capabilities);
     assert!(state.wl_drm_format);
-    assert!(state.wl_drm_authenticated);
+    assert!(!state.wl_drm_authenticated);
+}
+
+#[test]
+fn wl_drm_authentication_is_rejected_without_magic_authentication_contract() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let result = request_wl_drm_authentication(&socket_path);
+    stop_test_server(running, server_thread);
+
+    assert!(result.is_err());
 }
 
 #[test]

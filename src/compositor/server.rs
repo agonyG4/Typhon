@@ -40,6 +40,7 @@ use crate::wayland_drm::server::wl_drm;
 use crate::xwayland::xwm::{RESIZE_SYNC_TIMEOUT_NS, XwmCommand, XwmEvent};
 use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 
+use super::gpu_protocol_capabilities::{GpuGlobal, GpuProtocolCapabilities};
 use super::protocols::versions;
 use super::{
     AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, BufferReleaseMetrics,
@@ -229,14 +230,29 @@ impl OwnCompositorServer {
         let socket_name = socket_name.into();
         let display =
             Display::new().map_err(|error| CompositorError::DisplayInit(error.to_string()))?;
-        let syncobj_device = DrmSyncobjDevice::open_available();
+        #[cfg(test)]
+        let syncobj_device = if gpu_buffers_enabled {
+            DrmSyncobjDevice::open_available()
+        } else {
+            None
+        };
+        #[cfg(not(test))]
+        let syncobj_device = None;
+        #[cfg(test)]
+        let gpu_capabilities = if gpu_buffers_enabled {
+            GpuProtocolCapabilities::test_contract(syncobj_device.is_some())
+        } else {
+            GpuProtocolCapabilities::default()
+        };
+        #[cfg(not(test))]
+        let gpu_capabilities = GpuProtocolCapabilities::default();
         let xwayland_global_data = XwaylandShellGlobalData {
             active: Arc::new(Mutex::new(None)),
             bind_events: Arc::new(Mutex::new(Vec::new())),
         };
         register_minimum_globals(
             &display.handle(),
-            syncobj_device.is_some(),
+            &gpu_capabilities,
             gpu_buffers_enabled,
             input_capabilities,
             selection_capabilities,
@@ -247,6 +263,7 @@ impl OwnCompositorServer {
             .map_err(|error| CompositorError::Bind(error.to_string()))?;
 
         let mut state = CompositorState::new(syncobj_device);
+        state.set_gpu_protocol_capabilities(gpu_capabilities.clone());
         state.set_typhon_socket_name(socket_name.clone());
         let disconnected_clients = Arc::new(Mutex::new(Vec::new()));
         let client_pids = Arc::new(Mutex::new(HashMap::new()));
@@ -259,16 +276,29 @@ impl OwnCompositorServer {
             client_pids,
             xwayland_global_data,
             xwayland_disconnects: Vec::new(),
-            gpu_buffer_protocols_enabled: gpu_buffers_enabled,
+            gpu_buffer_protocols_enabled: gpu_buffers_enabled
+                && gpu_capabilities.any_global_enabled(),
         })
     }
 
-    pub fn enable_gpu_buffer_protocols(&mut self) {
+    pub fn enable_gpu_buffer_protocols_with_capabilities(
+        &mut self,
+        capabilities: GpuProtocolCapabilities,
+    ) {
         if self.gpu_buffer_protocols_enabled {
             return;
         }
-        register_gpu_buffer_globals(&self.display.handle(), self.state.syncobj_device.is_some());
-        self.gpu_buffer_protocols_enabled = true;
+        self.state
+            .set_gpu_protocol_capabilities(capabilities.clone());
+        register_gpu_buffer_globals(&self.display.handle(), &capabilities);
+        self.gpu_buffer_protocols_enabled = capabilities.any_global_enabled();
+    }
+
+    #[cfg(test)]
+    pub fn enable_gpu_buffer_protocols(&mut self) {
+        let capabilities =
+            GpuProtocolCapabilities::test_contract(self.state.syncobj_device.is_some());
+        self.enable_gpu_buffer_protocols_with_capabilities(capabilities);
     }
 
     #[doc(hidden)]
@@ -1213,7 +1243,7 @@ impl OwnCompositorServer {
 
 fn register_minimum_globals(
     display: &DisplayHandle,
-    syncobj_available: bool,
+    gpu_capabilities: &GpuProtocolCapabilities,
     gpu_buffers_enabled: bool,
     input_capabilities: InputProtocolCapabilities,
     selection_capabilities: SelectionProtocolCapabilities,
@@ -1307,7 +1337,7 @@ fn register_minimum_globals(
             (),
         );
     if gpu_buffers_enabled {
-        register_gpu_buffer_globals(display, syncobj_available);
+        register_gpu_buffer_globals(display, gpu_capabilities);
     }
     display.create_global::<CompositorState, xdg_activation_v1::XdgActivationV1, _>(
         versions::XDG_ACTIVATION_V1,
@@ -1332,19 +1362,23 @@ fn register_minimum_globals(
     );
 }
 
-fn register_gpu_buffer_globals(display: &DisplayHandle, syncobj_available: bool) {
-    display.create_global::<CompositorState, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _>(
-        versions::ZWP_LINUX_DMABUF_V1,
-        (),
-    );
-    if syncobj_available {
+fn register_gpu_buffer_globals(display: &DisplayHandle, capabilities: &GpuProtocolCapabilities) {
+    if capabilities.global_enabled(GpuGlobal::LinuxDmabuf) {
+        display.create_global::<CompositorState, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _>(
+            capabilities.dmabuf_version().wayland_version(),
+            (),
+        );
+    }
+    if capabilities.global_enabled(GpuGlobal::LinuxDrmSyncobj) {
         display.create_global::<
             CompositorState,
             wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1,
             _,
         >(versions::WP_LINUX_DRM_SYNCOBJ_MANAGER_V1, ());
     }
-    display.create_global::<CompositorState, wl_drm::WlDrm, _>(versions::WL_DRM, ());
+    if capabilities.global_enabled(GpuGlobal::WlDrm) {
+        display.create_global::<CompositorState, wl_drm::WlDrm, _>(versions::WL_DRM, ());
+    }
 }
 
 #[derive(Debug)]

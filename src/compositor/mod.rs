@@ -12,6 +12,7 @@ pub use clipboard_bridge::{
     ClipboardBridge, ClipboardBridgeError, ClipboardBridgeEvent, HostClipboardOfferId,
     NoopClipboardBridge,
 };
+use gpu_protocol_capabilities::GpuProtocolCapabilities;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::File,
@@ -69,6 +70,7 @@ mod dmabuf;
 mod explicit_sync;
 mod frame_batch;
 mod fullscreen;
+pub mod gpu_protocol_capabilities;
 mod idle;
 mod input;
 mod interaction;
@@ -90,8 +92,6 @@ mod surface;
 mod window_backend;
 mod window_state;
 use commit_debug::*;
-use pacing::*;
-
 #[allow(unused_imports)]
 pub(crate) use desktop_window::{
     DesktopWindow, DesktopWindowError, WindowBackend, WindowRelationships, XdgWindowHandle,
@@ -99,8 +99,7 @@ pub(crate) use desktop_window::{
 pub use desktop_window::{DesktopWindowKind, WindowConstraints, WindowId, WindowMetadata};
 use dmabuf::{
     DmabufBufferData, DmabufFeedbackData, DmabufParamsData, PendingDmabufPlane,
-    default_dmabuf_main_device, send_dmabuf_feedback, send_dmabuf_format_modifiers,
-    send_wl_drm_capabilities,
+    send_dmabuf_feedback, send_dmabuf_format_modifiers, send_wl_drm_capabilities,
 };
 #[doc(hidden)]
 pub use explicit_sync::{
@@ -147,6 +146,7 @@ use output::{
     OutputRefreshRate, OutputScale, OutputSize, send_output_description,
     send_output_done_if_supported, send_output_mode, send_output_scale,
 };
+use pacing::*;
 pub use plan::{
     ArchitectureLayer, CompositorArchitecture, CompositorPlan, InputProtocolCapabilities,
     ProtocolGlobal, RendererProtocolCapabilities, SelectionProtocolCapabilities,
@@ -333,7 +333,6 @@ struct SurfacePublicationState {
     latest_published: Option<SurfaceCommitSequence>,
     latest_published_buffer_id: Option<BufferId>,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SurfacePublicationDecision {
     Publish,
@@ -613,6 +612,7 @@ pub struct CompositorState {
     render_generation_cause: RenderGenerationCause,
     surface_origin_cache_generation: Option<u64>,
     surface_origin_cache: Vec<(i32, i32)>,
+    gpu_protocol_capabilities: GpuProtocolCapabilities,
     dmabuf_feedback: EglGlesDmabufFeedback,
     dmabuf_main_device: u64,
     dmabuf_main_device_path: Option<String>,

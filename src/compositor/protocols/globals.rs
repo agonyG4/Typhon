@@ -81,7 +81,7 @@ impl GlobalDispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for CompositorSta
     ) {
         let dmabuf = data_init.init(resource, ());
         if dmabuf.version() < 4 {
-            send_dmabuf_format_modifiers(&dmabuf, &state.dmabuf_feedback);
+            send_dmabuf_format_modifiers(&dmabuf, state.gpu_protocol_capabilities.dmabuf_formats());
         }
     }
 }

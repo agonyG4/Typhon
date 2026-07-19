@@ -4,7 +4,15 @@ use oblivion_one::cursor_theme::{
     load_compositor_cursor_from_environment,
 };
 use oblivion_one::native::kms::{AtomicDiscovery, AtomicKmsError, KmsBackendKind};
-use std::sync::Arc;
+use std::{
+    fs::OpenOptions,
+    os::{fd::AsFd, unix::fs::MetadataExt},
+    sync::Arc,
+};
+
+use oblivion_one::compositor::gpu_protocol_capabilities::{
+    GpuFormat, GpuProtocolCapabilities, GpuProtocolProbe, inspect_render_node,
+};
 
 pub(super) fn log_native_runtime_bootstrap(
     server: &OwnCompositorServer,
@@ -602,15 +610,6 @@ impl NativeRuntime {
         let drm_file_generation = allocate_native_drm_file_generation();
         let kms_policy = KmsPolicy::parse(std::env::var("OBLIVION_ONE_KMS_MODE").ok().as_deref())?;
         println!("native KMS policy requested: {}", kms_policy.as_str());
-        let native_syncobj_device = match DrmSyncobjDevice::from_active_drm_file(kms.file()) {
-            Ok(device) => Some(device),
-            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
-                eprintln!("native explicit sync unavailable on active DRM device: {error}");
-                None
-            }
-            Err(error) => return Err(error.into()),
-        };
-        server.set_native_syncobj_device(native_syncobj_device);
         let drm_timestamp_clock = query_drm_timestamp_clock(kms.file().as_fd())?;
         let presentation_clock = match drm_timestamp_clock {
             DrmTimestampClock::Monotonic => PresentationClock::Monotonic,
@@ -1014,10 +1013,34 @@ impl NativeRuntime {
         println!("native scanout backend active: {}", scanout.kind().as_str());
         let effective_app_gpu_policy =
             resolve_native_app_gpu_policy(app_gpu_preference, scanout.kind())?;
-        if scanout.supports_gpu_buffer_protocols() {
-            server.enable_gpu_buffer_protocols();
-        }
         apply_native_scanout_feedback(&mut server, &scanout);
+        let native_syncobj_device = scanout
+            .dmabuf_main_device_path()
+            .and_then(|path| OpenOptions::new().read(true).write(true).open(path).ok())
+            .and_then(|file| match DrmSyncobjDevice::from_active_drm_file(&file) {
+                Ok(device) => Some(device),
+                Err(error) => {
+                    eprintln!(
+                        "native explicit sync unavailable on selected dmabuf device: {error}"
+                    );
+                    None
+                }
+            });
+        let native_syncobj_identity = native_syncobj_device
+            .as_ref()
+            .and_then(|device| device.device_identity().ok());
+        server.set_native_syncobj_device(native_syncobj_device);
+        if scanout.supports_gpu_buffer_protocols() {
+            let capabilities =
+                native_gpu_protocol_capabilities(&bootstrap, &scanout, native_syncobj_identity);
+            for diagnostic in capabilities.diagnostics() {
+                println!(
+                    "native GPU protocol: {:?} enabled={} reason={}",
+                    diagnostic.global, diagnostic.enabled, diagnostic.reason
+                );
+            }
+            server.enable_gpu_buffer_protocols_with_capabilities(capabilities);
+        }
         println!("native app GPU preference: {}", app_gpu_preference.as_str());
         println!(
             "native app GPU policy effective: {}",
@@ -1196,6 +1219,81 @@ impl NativeRuntime {
             effective_app_gpu_policy,
         })
     }
+}
+
+fn native_gpu_protocol_capabilities(
+    bootstrap: &NativeOutputBootstrap,
+    scanout: &NativeScanoutBackend,
+    syncobj_device: Option<u64>,
+) -> GpuProtocolCapabilities {
+    let feedback = scanout.dmabuf_feedback();
+    let importer_formats = feedback
+        .formats()
+        .iter()
+        .map(|format| GpuFormat::new(format.format.as_fourcc(), format.modifier.0))
+        .collect::<Vec<_>>();
+    let feedback_format_table = feedback
+        .format_table_formats()
+        .iter()
+        .map(|format| GpuFormat::new(format.format.as_fourcc(), format.modifier.0))
+        .collect::<Vec<_>>();
+    let render_node_path = scanout
+        .dmabuf_main_device_path()
+        .map(std::path::PathBuf::from)
+        .or_else(|| bootstrap.render_device.clone());
+    let render_node = inspect_render_node(render_node_path.as_deref());
+    let dmabuf_device = scanout.dmabuf_main_device().or_else(|| {
+        render_node_path
+            .as_deref()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|metadata| metadata.rdev())
+    });
+    let kms_device = bootstrap
+        .kms_device
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    let feedback_tranches_valid = !feedback.formats().is_empty()
+        && scanout
+            .dmabuf_main_device()
+            .is_some_and(|device| device != 0)
+        && feedback
+            .formats()
+            .iter()
+            .all(|format| feedback.format_table_formats().contains(format))
+        && feedback
+            .scanout_formats()
+            .iter()
+            .all(|format| feedback.format_table_formats().contains(format));
+    let prime = render_node
+        .path
+        .as_deref()
+        .and_then(|path| OpenOptions::new().read(true).write(true).open(path).ok())
+        .and_then(|file| {
+            drm_ffi::get_capability(file.as_fd(), u64::from(drm_sys::DRM_CAP_PRIME)).ok()
+        })
+        .is_some_and(|capability| {
+            let required = u64::from(drm_sys::DRM_PRIME_CAP_IMPORT | drm_sys::DRM_PRIME_CAP_EXPORT);
+            capability.value & required == required
+        });
+    GpuProtocolCapabilities::from_probe(GpuProtocolProbe {
+        kms_device,
+        dmabuf_device,
+        render_node,
+        importer_formats,
+        feedback_format_table,
+        feedback_main_device: scanout.dmabuf_main_device(),
+        feedback_tranches_valid,
+        feedback_has_modifiers: feedback.format_table_formats().iter().any(|format| {
+            format.modifier != oblivion_one::render_backend::buffer::DrmModifier::INVALID
+        }),
+        basic_import_valid: scanout.supports_gpu_buffer_protocols()
+            && !feedback.formats().is_empty(),
+        syncobj_device,
+        syncobj_timeline_create: syncobj_device.is_some(),
+        syncobj_timeline_import: syncobj_device.is_some(),
+        wl_drm_prime: prime,
+        wl_drm_magic_authentication: false,
+    })
 }
 
 fn register_xwayland_reactor_sources(

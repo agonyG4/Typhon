@@ -171,6 +171,25 @@ fn native_base_registry_can_publish_gpu_buffer_globals_after_backend_is_known() 
 }
 
 #[test]
+fn native_base_registry_omits_gpu_globals_when_contract_is_incomplete() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    server.enable_gpu_buffer_protocols_with_capabilities(
+        crate::compositor::gpu_protocol_capabilities::GpuProtocolCapabilities::default(),
+    );
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let result = read_registry_globals(&socket_path);
+    stop_test_server(running, server_thread);
+
+    let globals = result.unwrap();
+    assert!(!globals.contains(&"zwp_linux_dmabuf_v1".to_string()));
+    assert!(!globals.contains(&"wp_linux_drm_syncobj_manager_v1".to_string()));
+    assert!(!globals.contains(&"wl_drm".to_string()));
+}
+
+#[test]
 fn deferred_renderer_registry_omits_gpu_buffer_globals_until_renderer_enables_them() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind_with_capabilities(

@@ -363,7 +363,23 @@ pub(in crate::compositor::tests) fn request_wl_drm_at_version(
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
-    let drm: client_wl_drm::WlDrm = globals.bind(&qh, version..=version, ())?;
+    let _drm: client_wl_drm::WlDrm = globals.bind(&qh, version..=version, ())?;
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    Ok(state)
+}
+
+pub(in crate::compositor::tests) fn request_wl_drm_authentication(
+    socket_path: &PathBuf,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let drm: client_wl_drm::WlDrm = globals.bind(&qh, 2..=2, ())?;
     drm.authenticate(0);
     connection.flush()?;
 

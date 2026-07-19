@@ -206,7 +206,17 @@ impl Dispatch<wl_drm::WlDrm, ()> for CompositorState {
     ) {
         match request {
             wl_drm::Request::Authenticate { .. } => {
-                resource.authenticated();
+                if state.gpu_protocol_capabilities.wl_drm_authentication() {
+                    resource.authenticated();
+                } else {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        wl_drm::Error::AuthenticateFail,
+                        "wl_drm authentication is not supported for the selected render-node contract"
+                            .to_string(),
+                    );
+                }
             }
             wl_drm::Request::CreatePrimeBuffer {
                 id,
@@ -231,6 +241,7 @@ impl Dispatch<wl_drm::WlDrm, ()> for CompositorState {
                         resource,
                         request,
                         &state.dmabuf_feedback,
+                        state.gpu_protocol_capabilities.wl_drm_formats(),
                         &mut state.compliance_metrics,
                         identity,
                     )
@@ -263,6 +274,7 @@ fn wl_drm_prime_buffer_data(
     drm: &wl_drm::WlDrm,
     request: WlDrmPrimeBufferRequest,
     feedback: &EglGlesDmabufFeedback,
+    allowed_formats: &[u32],
     metrics: &mut CoreComplianceMetrics,
     identity: BufferIdentity,
 ) -> Option<DmabufBufferData> {
@@ -284,7 +296,9 @@ fn wl_drm_prime_buffer_data(
         );
         return None;
     }
-    if !feedback.supports(drm_format, DrmModifier::LINEAR) {
+    if !feedback.supports(drm_format, DrmModifier::LINEAR)
+        || !allowed_formats.contains(&request.format)
+    {
         metrics.note_protocol_error();
         drm.post_error(
             wl_drm::Error::InvalidFormat,
@@ -339,7 +353,11 @@ impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for CompositorState {
             zwp_linux_dmabuf_v1::Request::Destroy => {}
             zwp_linux_dmabuf_v1::Request::GetDefaultFeedback { id }
             | zwp_linux_dmabuf_v1::Request::GetSurfaceFeedback { id, .. } => {
-                match DmabufFeedbackData::new(&state.dmabuf_feedback, state.dmabuf_main_device) {
+                match DmabufFeedbackData::new(
+                    &state.dmabuf_feedback,
+                    state.dmabuf_main_device,
+                    state.gpu_protocol_capabilities.dmabuf_formats(),
+                ) {
                     Ok(data) => {
                         let feedback = data_init.init(id, data);
                         send_dmabuf_feedback(&feedback);
@@ -427,6 +445,7 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, DmabufParamsDa
                     height,
                     format,
                     &state.dmabuf_feedback,
+                    state.gpu_protocol_capabilities.dmabuf_formats(),
                     &mut state.compliance_metrics,
                     identity,
                 ) else {
@@ -458,6 +477,7 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, DmabufParamsDa
                     height,
                     format,
                     &state.dmabuf_feedback,
+                    state.gpu_protocol_capabilities.dmabuf_formats(),
                     &mut state.compliance_metrics,
                     identity,
                 ) {

@@ -1,7 +1,6 @@
 use std::{
     fs, io, iter,
     os::fd::{AsFd, AsRawFd, OwnedFd},
-    os::unix::fs::MetadataExt,
     ptr,
     sync::Arc,
 };
@@ -22,7 +21,7 @@ use oblivion_one::render_backend::{
     egl_gles::EglGlesDmabufFormat,
 };
 
-use crate::egl_renderer::dmabuf::query_egl_renderable_dmabuf_formats;
+use crate::egl_renderer::dmabuf::{query_egl_main_device, query_egl_renderable_dmabuf_formats};
 use crate::egl_renderer::native_fence::{NativeFenceFunctions, NativeRenderFence};
 use crate::egl_renderer::{
     EglFrameOutcome, EglInstance, EglOutputRenderTarget, EglSceneFrameCommit, GlesSceneRenderer,
@@ -431,8 +430,9 @@ impl AtomicEglGbmScanout {
                 scanout_formats,
                 renderer_dmabuf_feedback.formats().iter().copied(),
             );
-            let dmabuf_main_device = Some(kms.metadata()?.rdev());
-            let dmabuf_main_device_path = None;
+            let (dmabuf_main_device_path, dmabuf_main_device) =
+                query_egl_main_device(&egl, egl_display)
+                    .map_or((None, None), |(path, device)| (Some(path), Some(device)));
             let format = gbm::Format::try_from(format_modifier.fourcc)
                 .map_err(|_| io::Error::other("selected output FourCC is unsupported by GBM"))?;
             let usage = gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING;
