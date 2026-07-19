@@ -10,7 +10,12 @@ use x11rb::{
     wrapper::ConnectionExt,
 };
 
-use super::{X11Geometry, X11PublishedState, Xwm, XwmCommand, XwmError, atoms::XwmAtomName};
+use super::{
+    X11ConfigureFlags, X11Geometry, X11PublishedState, X11StackMode, Xwm, XwmCommand, XwmError,
+    atoms::XwmAtomName,
+    ewmh::publishable_state,
+    focus::{FocusModel, focus_model, should_send_take_focus},
+};
 
 pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError> {
     if let XwmCommand::SyncClientLists {
@@ -26,11 +31,36 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
     if let Some(handle) = handle {
         validate_handle(xwm, handle)?;
     }
+    if let XwmCommand::Stack {
+        sibling: Some(sibling),
+        ..
+    } = &command
+    {
+        validate_handle(xwm, *sibling)?;
+    }
 
     match command {
         XwmCommand::Map(handle) => {
             xwm.connection
                 .map_window(handle.xid())
+                .map_err(XwmError::Connection)?;
+            xwm.connection
+                .change_property32(
+                    PropMode::REPLACE,
+                    handle.xid(),
+                    xwm.atoms.get(XwmAtomName::WmState),
+                    xwm.atoms.get(XwmAtomName::WmState),
+                    &[1, 0],
+                )
+                .map_err(XwmError::Connection)?;
+            xwm.connection
+                .change_property32(
+                    PropMode::REPLACE,
+                    handle.xid(),
+                    xwm.atoms.get(XwmAtomName::NetFrameExtents),
+                    AtomEnum::CARDINAL,
+                    &[0, 0, 0, 0],
+                )
                 .map_err(XwmError::Connection)?;
             set_lifecycle_map_commanded(xwm, handle);
         }
@@ -41,22 +71,49 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             xwm.clear_resize_sync(handle);
             set_lifecycle_withdrawn(xwm, handle);
         }
-        XwmCommand::Configure { window, geometry } => {
+        XwmCommand::Configure {
+            window,
+            geometry,
+            fields,
+            border_width,
+        } => {
             xwm.connection
-                .configure_window(window.xid(), &configure_aux(geometry))
+                .configure_window(window.xid(), &configure_aux(geometry, fields, border_width))
+                .map_err(XwmError::Connection)?;
+        }
+        XwmCommand::Stack {
+            window,
+            sibling,
+            mode,
+        } => {
+            let mut aux = ConfigureWindowAux::new().stack_mode(to_x11_stack_mode(mode));
+            if let Some(sibling) = sibling {
+                aux = aux.sibling(sibling.xid());
+            }
+            xwm.connection
+                .configure_window(window.xid(), &aux)
                 .map_err(XwmError::Connection)?;
         }
         XwmCommand::Focus { window, timestamp } => {
             let focus = window.map_or(x11rb::NONE, |handle| handle.xid());
-            xwm.connection
-                .set_input_focus(InputFocus::NONE, focus, timestamp)
-                .map_err(XwmError::Connection)?;
+            let model = window
+                .and_then(|handle| xwm.windows.get(handle))
+                .and_then(|record| record.snapshot.as_ref())
+                .map(|snapshot| focus_model(snapshot.accepts_input, snapshot.supports_take_focus))
+                .unwrap_or(FocusModel::Input);
+            if matches!(model, FocusModel::Input) {
+                xwm.connection
+                    .set_input_focus(InputFocus::NONE, focus, timestamp)
+                    .map_err(XwmError::Connection)?;
+            }
             if let Some(handle) = window
                 && xwm
                     .windows
                     .get(handle)
                     .and_then(|record| record.snapshot.as_ref())
-                    .is_some_and(|snapshot| snapshot.supports_take_focus)
+                    .is_some_and(|snapshot| {
+                        should_send_take_focus(snapshot.accepts_input, snapshot.supports_take_focus)
+                    })
             {
                 let event = xproto::ClientMessageEvent {
                     response_type: xproto::CLIENT_MESSAGE_EVENT,
@@ -168,6 +225,7 @@ fn command_handle(command: &XwmCommand) -> Option<super::X11WindowHandle> {
         | XwmCommand::Raise(handle)
         | XwmCommand::Close(handle) => Some(*handle),
         XwmCommand::Configure { window, .. } | XwmCommand::SetState { window, .. } => Some(*window),
+        XwmCommand::Stack { window, .. } => Some(*window),
         XwmCommand::Focus { window, .. } => *window,
         XwmCommand::SyncClientLists { .. } => None,
         XwmCommand::BeginResizeSync { window, .. }
@@ -211,10 +269,22 @@ fn begin_resize_sync(
         .and_then(|snapshot| snapshot.sync_counter)
     else {
         xwm.connection
-            .configure_window(window.xid(), &configure_aux(geometry))
+            .configure_window(
+                window.xid(),
+                &configure_aux(geometry, X11ConfigureFlags::all(), 0),
+            )
             .map_err(XwmError::Connection)?;
         return Ok(());
     };
+    if !xwm.capabilities.sync {
+        xwm.connection
+            .configure_window(
+                window.xid(),
+                &configure_aux(geometry, X11ConfigureFlags::all(), 0),
+            )
+            .map_err(XwmError::Connection)?;
+        return Ok(());
+    }
     let sync_counter = u32::try_from(sync_counter)
         .map_err(|_| XwmError::InvalidCommand("XSync counter ID exceeds X11 width"))?;
     xwm.clear_resize_sync(window);
@@ -257,7 +327,10 @@ fn begin_resize_sync(
     if let Err(error) = set_allow_commits(xwm, window, false)
         .and_then(|_| {
             xwm.connection
-                .configure_window(window.xid(), &configure_aux(geometry))
+                .configure_window(
+                    window.xid(),
+                    &configure_aux(geometry, X11ConfigureFlags::all(), 0),
+                )
                 .map_err(XwmError::Connection)
         })
         .and_then(|_| send_sync_request(xwm, window, counter_value))
@@ -296,8 +369,14 @@ fn send_sync_request(
         format: 32,
         sequence: 0,
         window: window.xid(),
-        type_: xwm.atoms.get(XwmAtomName::NetWmSyncRequest),
-        data: xproto::ClientMessageData::from([0, counter_value.lo, counter_value.hi as u32, 0, 0]),
+        type_: xwm.atoms.get(XwmAtomName::WmProtocols),
+        data: xproto::ClientMessageData::from([
+            xwm.atoms.get(XwmAtomName::NetWmSyncRequest),
+            0,
+            counter_value.lo,
+            counter_value.hi as u32,
+            0,
+        ]),
     };
     xwm.connection
         .send_event(false, window.xid(), xproto::EventMask::NO_EVENT, event)
@@ -322,12 +401,38 @@ fn validate_handle(xwm: &Xwm, handle: super::X11WindowHandle) -> Result<(), XwmE
     Ok(())
 }
 
-fn configure_aux(geometry: X11Geometry) -> ConfigureWindowAux {
-    ConfigureWindowAux::new()
-        .x(geometry.x)
-        .y(geometry.y)
-        .width(geometry.width.max(1))
-        .height(geometry.height.max(1))
+fn configure_aux(
+    geometry: X11Geometry,
+    fields: X11ConfigureFlags,
+    border_width: u32,
+) -> ConfigureWindowAux {
+    let mut aux = ConfigureWindowAux::new();
+    if fields.x {
+        aux = aux.x(geometry.x);
+    }
+    if fields.y {
+        aux = aux.y(geometry.y);
+    }
+    if fields.width {
+        aux = aux.width(geometry.width.max(1));
+    }
+    if fields.height {
+        aux = aux.height(geometry.height.max(1));
+    }
+    if fields.border_width {
+        aux = aux.border_width(border_width);
+    }
+    aux
+}
+
+fn to_x11_stack_mode(mode: X11StackMode) -> xproto::StackMode {
+    match mode {
+        X11StackMode::Above => xproto::StackMode::ABOVE,
+        X11StackMode::Below => xproto::StackMode::BELOW,
+        X11StackMode::TopIf => xproto::StackMode::TOP_IF,
+        X11StackMode::BottomIf => xproto::StackMode::BOTTOM_IF,
+        X11StackMode::Opposite => xproto::StackMode::OPPOSITE,
+    }
 }
 
 fn publish_state(
@@ -335,6 +440,7 @@ fn publish_state(
     handle: super::X11WindowHandle,
     state: X11PublishedState,
 ) -> Result<(), XwmError> {
+    let state = publishable_state(state);
     let mut atoms = Vec::with_capacity(3);
     if state.fullscreen {
         atoms.push(xwm.atoms.get(XwmAtomName::NetWmStateFullscreen));
@@ -353,6 +459,15 @@ fn publish_state(
             xwm.atoms.get(XwmAtomName::NetWmState),
             AtomEnum::ATOM,
             &atoms,
+        )
+        .map_err(XwmError::Connection)?;
+    xwm.connection
+        .change_property32(
+            PropMode::REPLACE,
+            handle.xid(),
+            xwm.atoms.get(XwmAtomName::WmState),
+            xwm.atoms.get(XwmAtomName::WmState),
+            &[if state.hidden { 3 } else { 1 }, 0],
         )
         .map_err(XwmError::Connection)?;
     Ok(())

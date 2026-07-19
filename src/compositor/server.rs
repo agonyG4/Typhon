@@ -466,6 +466,8 @@ impl OwnCompositorServer {
                         Some(XwmCommand::Configure {
                             window: handle,
                             geometry: x11_geometry,
+                            fields: crate::xwayland::xwm::X11ConfigureFlags::all(),
+                            border_width: 0,
                         })
                     }
                 }
@@ -554,15 +556,41 @@ impl OwnCompositorServer {
                 self.state.apply_x11_metadata_delta(window, delta);
                 Vec::new()
             }
-            XwmEvent::ConfigureRequested { window, request } => self
-                .state
-                .filter_x11_geometry(window, request.requested)
-                .map(|geometry| {
-                    self.state.set_x11_geometry(window, geometry);
-                    XwmCommand::Configure { window, geometry }
-                })
-                .into_iter()
-                .collect(),
+            XwmEvent::ConfigureRequested { window, request } => {
+                let constraints = self
+                    .state
+                    .window_id_for_x11_handle(window)
+                    .and_then(|id| self.state.window(id))
+                    .map(|window| window.constraints)
+                    .unwrap_or_default();
+                let geometry = crate::xwayland::xwm::icccm::apply_configure_request(
+                    request.requested,
+                    request.requested,
+                    request.fields,
+                    constraints,
+                );
+                if request.fields.x
+                    || request.fields.y
+                    || request.fields.width
+                    || request.fields.height
+                {
+                    let _ = self.state.set_x11_geometry(window, geometry);
+                }
+                let mut commands = vec![XwmCommand::Configure {
+                    window,
+                    geometry,
+                    fields: request.fields,
+                    border_width: request.border_width,
+                }];
+                if let Some(mode) = request.stack_mode {
+                    commands.push(XwmCommand::Stack {
+                        window,
+                        sibling: request.sibling,
+                        mode,
+                    });
+                }
+                commands
+            }
             XwmEvent::StateRequested { window, request } => {
                 let was_hidden = self
                     .state
@@ -583,14 +611,33 @@ impl OwnCompositorServer {
                 commands.push(XwmCommand::SetState { window, state });
                 commands
             }
-            XwmEvent::FocusRequested(window) => {
-                if self.state.x11_focus_request_allowed(window)
-                    && self
-                        .state
-                        .window_id_for_x11_handle(window)
-                        .is_some_and(|window_id| self.state.focus_desktop_window(window_id))
+            XwmEvent::FocusRequested {
+                window,
+                source,
+                timestamp,
+            } => {
+                let relationship_allowed = self.state.x11_focus_request_allowed(window);
+                if crate::xwayland::xwm::focus::activation_allowed(
+                    source == 2,
+                    timestamp,
+                    timestamp,
+                    None,
+                    relationship_allowed,
+                    relationship_allowed,
+                    false,
+                ) && self
+                    .state
+                    .window_id_for_x11_handle(window)
+                    .is_some_and(|window_id| self.state.focus_desktop_window(window_id))
                 {
-                    vec![XwmCommand::Raise(window), self.sync_xwayland_client_lists()]
+                    vec![
+                        XwmCommand::Focus {
+                            window: Some(window),
+                            timestamp,
+                        },
+                        XwmCommand::Raise(window),
+                        self.sync_xwayland_client_lists(),
+                    ]
                 } else {
                     Vec::new()
                 }

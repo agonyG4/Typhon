@@ -54,7 +54,7 @@ pub(crate) enum XwmStartupState {
     Running,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum PendingVersion {
     Composite,
     Xfixes,
@@ -380,7 +380,10 @@ impl XwmStartup {
             };
             self.pending_extensions.remove(&sequence);
             if !reply.present {
-                return Err(XwmStartupError::MissingRequiredExtension(name));
+                if name == composite::X11_EXTENSION_NAME {
+                    return Err(XwmStartupError::MissingRequiredExtension(name));
+                }
+                continue;
             }
             self.extensions.insert(
                 name,
@@ -406,36 +409,46 @@ impl XwmStartup {
             .connection
             .as_ref()
             .ok_or_else(|| XwmStartupError::Protocol("missing XWM connection".to_owned()))?;
-        let cookie = connection
-            .composite_query_version(0, 4)
-            .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
-        self.pending_versions
-            .insert(cookie.sequence_number(), PendingVersion::Composite);
-        std::mem::forget(cookie);
-        let cookie = connection
-            .xfixes_query_version(5, 0)
-            .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
-        self.pending_versions
-            .insert(cookie.sequence_number(), PendingVersion::Xfixes);
-        std::mem::forget(cookie);
-        let cookie = connection
-            .shape_query_version()
-            .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
-        self.pending_versions
-            .insert(cookie.sequence_number(), PendingVersion::Shape);
-        std::mem::forget(cookie);
-        let cookie = connection
-            .randr_query_version(1, 5)
-            .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
-        self.pending_versions
-            .insert(cookie.sequence_number(), PendingVersion::Randr);
-        std::mem::forget(cookie);
-        let cookie = connection
-            .sync_initialize(3, 1)
-            .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
-        self.pending_versions
-            .insert(cookie.sequence_number(), PendingVersion::Sync);
-        std::mem::forget(cookie);
+        if self.extensions.contains_key(composite::X11_EXTENSION_NAME) {
+            let cookie = connection
+                .composite_query_version(0, 4)
+                .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
+            self.pending_versions
+                .insert(cookie.sequence_number(), PendingVersion::Composite);
+            std::mem::forget(cookie);
+        }
+        if self.extensions.contains_key(xfixes::X11_EXTENSION_NAME) {
+            let cookie = connection
+                .xfixes_query_version(5, 0)
+                .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
+            self.pending_versions
+                .insert(cookie.sequence_number(), PendingVersion::Xfixes);
+            std::mem::forget(cookie);
+        }
+        if self.extensions.contains_key(shape::X11_EXTENSION_NAME) {
+            let cookie = connection
+                .shape_query_version()
+                .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
+            self.pending_versions
+                .insert(cookie.sequence_number(), PendingVersion::Shape);
+            std::mem::forget(cookie);
+        }
+        if self.extensions.contains_key(randr::X11_EXTENSION_NAME) {
+            let cookie = connection
+                .randr_query_version(1, 5)
+                .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
+            self.pending_versions
+                .insert(cookie.sequence_number(), PendingVersion::Randr);
+            std::mem::forget(cookie);
+        }
+        if self.extensions.contains_key(sync::X11_EXTENSION_NAME) {
+            let cookie = connection
+                .sync_initialize(3, 1)
+                .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
+            self.pending_versions
+                .insert(cookie.sequence_number(), PendingVersion::Sync);
+            std::mem::forget(cookie);
+        }
         connection
             .flush()
             .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
@@ -449,8 +462,13 @@ impl XwmStartup {
             ));
         };
         let sequences = self.pending_versions.keys().copied().collect::<Vec<_>>();
+        let mut composite_ok = self.extensions.contains_key(composite::X11_EXTENSION_NAME);
+        let mut xfixes_ok = self.extensions.contains_key(xfixes::X11_EXTENSION_NAME);
+        let mut shape_ok = self.extensions.contains_key(shape::X11_EXTENSION_NAME);
+        let mut randr_ok = self.extensions.contains_key(randr::X11_EXTENSION_NAME);
+        let mut sync_ok = self.extensions.contains_key(sync::X11_EXTENSION_NAME);
         for sequence in sequences {
-            let Some(kind) = self.pending_versions.get(&sequence) else {
+            let Some(kind) = self.pending_versions.get(&sequence).copied() else {
                 continue;
             };
             let result = match kind {
@@ -502,12 +520,38 @@ impl XwmStartup {
                 {
                     continue;
                 }
-                Err(error) => return Err(XwmStartupError::Protocol(error.to_string())),
+                Err(_) => {
+                    match kind {
+                        PendingVersion::Composite => composite_ok = false,
+                        PendingVersion::Xfixes => xfixes_ok = false,
+                        PendingVersion::Shape => shape_ok = false,
+                        PendingVersion::Randr => randr_ok = false,
+                        PendingVersion::Sync => sync_ok = false,
+                    }
+                    self.pending_versions.remove(&sequence);
+                    continue;
+                }
             };
-            if version == (0, 0) {
-                return Err(XwmStartupError::Protocol(
-                    "extension negotiated an unusable version".to_owned(),
-                ));
+            let required = match kind {
+                PendingVersion::Composite => (0, 4),
+                PendingVersion::Xfixes => (5, 0),
+                PendingVersion::Shape => (1, 1),
+                PendingVersion::Randr => (1, 5),
+                PendingVersion::Sync => (3, 1),
+            };
+            if version < required {
+                if matches!(kind, PendingVersion::Composite) {
+                    return Err(XwmStartupError::Protocol(
+                        "Composite negotiated below the required 0.4 contract".to_owned(),
+                    ));
+                }
+                match kind {
+                    PendingVersion::Xfixes => xfixes_ok = false,
+                    PendingVersion::Shape => shape_ok = false,
+                    PendingVersion::Randr => randr_ok = false,
+                    PendingVersion::Sync => sync_ok = false,
+                    PendingVersion::Composite => unreachable!(),
+                }
             }
             self.pending_versions.remove(&sequence);
         }
@@ -515,11 +559,11 @@ impl XwmStartup {
             return Ok(false);
         }
         self.capabilities = Some(XwmCapabilities {
-            composite: true,
-            xfixes: true,
-            shape: true,
-            randr: true,
-            sync: true,
+            composite: composite_ok,
+            xfixes: xfixes_ok,
+            shape: shape_ok,
+            randr: randr_ok,
+            sync: sync_ok,
         });
         self.begin_atoms()?;
         self.state = XwmStartupState::AtomsInterned;
@@ -614,7 +658,9 @@ impl XwmStartup {
             sync_alarms: Default::default(),
             sync_handles_by_counter: Default::default(),
             next_resize_counter_values: Default::default(),
+            shapes: Default::default(),
             pending_properties: Default::default(),
+            deferred_properties: Default::default(),
             property_metrics: Default::default(),
             buffer_ready_surfaces: Default::default(),
             supporting_wm_check,
@@ -728,6 +774,25 @@ pub(crate) fn setup_root<C: Connection>(
     ] {
         connection
             .change_property32(xproto::PropMode::REPLACE, root, atoms.get(atom), ty, &[])
+            .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
+    }
+    let width = u32::from(screen.width_in_pixels);
+    let height = u32::from(screen.height_in_pixels);
+    for (atom, values) in [
+        (XwmAtomName::NetNumberOfDesktops, vec![1]),
+        (XwmAtomName::NetCurrentDesktop, vec![0]),
+        (XwmAtomName::NetDesktopGeometry, vec![width, height]),
+        (XwmAtomName::NetDesktopViewport, vec![0, 0]),
+        (XwmAtomName::NetWorkarea, vec![0, 0, width, height]),
+    ] {
+        connection
+            .change_property32(
+                xproto::PropMode::REPLACE,
+                root,
+                atoms.get(atom),
+                xproto::AtomEnum::CARDINAL,
+                &values,
+            )
             .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
     }
     Ok(supporting_wm_check)

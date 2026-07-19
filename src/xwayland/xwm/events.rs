@@ -5,9 +5,13 @@ use x11rb::{
 };
 
 use super::{
-    X11ConfigureRequest, X11Geometry, X11StackMode, X11StateAction, X11StateAtom, X11StateRequest,
-    X11WindowHandle, Xwm, XwmDrain, XwmError, XwmEvent, atoms::XwmAtomName,
-    properties::PropertyKind, window::X11WindowLifecycle,
+    X11ConfigureFlags, X11ConfigureRequest, X11Geometry, X11StackMode, X11StateRequest,
+    X11WindowHandle, Xwm, XwmDrain, XwmError, XwmEvent,
+    atoms::XwmAtomName,
+    ewmh::{decode_state_action, state_atom as decode_state_atom},
+    properties::PropertyKind,
+    shape,
+    window::X11WindowLifecycle,
 };
 
 pub(crate) fn drain(xwm: &mut Xwm, budget: usize) -> Result<XwmDrain, XwmError> {
@@ -147,6 +151,8 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                     width: u32::from(event.width),
                     height: u32::from(event.height),
                 },
+                fields: configure_flags(event.value_mask),
+                border_width: u32::from(event.border_width),
                 sibling,
                 stack_mode: stack_mode(event.stack_mode),
             };
@@ -179,8 +185,23 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         Event::FocusIn(_) | Event::FocusOut(_) => {
             // Focus events are reconciliation signals only.  Typhon remains the focus authority.
         }
-        Event::ShapeNotify(_) => {
-            // Shape affects the later rendering adapter, not generic compositor policy.
+        Event::ShapeNotify(event) => {
+            let handle = X11WindowHandle::new(xwm.generation, event.affected_window);
+            if xwm.windows.contains(handle) {
+                let fallback = shape::ShapeRect {
+                    x: event.extents_x,
+                    y: event.extents_y,
+                    width: event.extents_width.max(1),
+                    height: event.extents_height.max(1),
+                };
+                let rectangles = event
+                    .shaped
+                    .then_some(fallback)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                xwm.shapes
+                    .insert(handle, shape::normalize_region(&rectangles, fallback));
+            }
         }
         _ => {}
     }
@@ -203,21 +224,47 @@ fn normalize_client_message(
     if event.type_ == xwm.atoms.get(XwmAtomName::WlSurfaceSerial) {
         xwm.note_x11_surface_serial(handle, data[0], data[1])?;
     } else if event.type_ == xwm.atoms.get(XwmAtomName::NetWmState) {
-        let request = X11StateRequest {
-            action: state_action(data[0]),
-            first: state_atom(xwm, data[1]),
-            second: state_atom(xwm, data[2]),
-        };
-        xwm.outgoing_events.push_back(XwmEvent::StateRequested {
-            window: handle,
-            request,
-        });
+        if let Some(action) = decode_state_action(data[0]) {
+            let request = X11StateRequest {
+                action,
+                first: decode_state_atom(
+                    data[1],
+                    xwm.atoms.get(XwmAtomName::NetWmStateFullscreen),
+                    xwm.atoms.get(XwmAtomName::NetWmStateMaximizedHorz),
+                    xwm.atoms.get(XwmAtomName::NetWmStateMaximizedVert),
+                    xwm.atoms.get(XwmAtomName::NetWmStateHidden),
+                ),
+                second: decode_state_atom(
+                    data[2],
+                    xwm.atoms.get(XwmAtomName::NetWmStateFullscreen),
+                    xwm.atoms.get(XwmAtomName::NetWmStateMaximizedHorz),
+                    xwm.atoms.get(XwmAtomName::NetWmStateMaximizedVert),
+                    xwm.atoms.get(XwmAtomName::NetWmStateHidden),
+                ),
+            };
+            xwm.outgoing_events.push_back(XwmEvent::StateRequested {
+                window: handle,
+                request,
+            });
+        }
     } else if event.type_ == xwm.atoms.get(XwmAtomName::NetActiveWindow) {
-        xwm.outgoing_events
-            .push_back(XwmEvent::FocusRequested(handle));
+        xwm.outgoing_events.push_back(XwmEvent::FocusRequested {
+            window: handle,
+            source: data[0],
+            timestamp: data[1],
+        });
     } else if event.type_ == xwm.atoms.get(XwmAtomName::NetCloseWindow) {
         xwm.outgoing_events
             .push_back(XwmEvent::CloseRequestedByClient(handle));
+    } else if event.type_ == xwm.atoms.get(XwmAtomName::WmChangeState) && data[0] == 3 {
+        xwm.outgoing_events.push_back(XwmEvent::StateRequested {
+            window: handle,
+            request: X11StateRequest {
+                action: super::X11StateAction::Add,
+                first: Some(super::X11StateAtom::Hidden),
+                second: None,
+            },
+        });
     }
     Ok(())
 }
@@ -303,25 +350,17 @@ fn window_kind(override_redirect: bool) -> DesktopWindowKind {
     }
 }
 
-fn state_action(value: u32) -> X11StateAction {
-    match value {
-        1 => X11StateAction::Add,
-        2 => X11StateAction::Toggle,
-        _ => X11StateAction::Remove,
-    }
-}
-
-fn state_atom(xwm: &Xwm, atom: u32) -> Option<X11StateAtom> {
-    if atom == xwm.atoms.get(XwmAtomName::NetWmStateFullscreen) {
-        Some(X11StateAtom::Fullscreen)
-    } else if atom == xwm.atoms.get(XwmAtomName::NetWmStateMaximizedVert)
-        || atom == xwm.atoms.get(XwmAtomName::NetWmStateMaximizedHorz)
-    {
-        Some(X11StateAtom::Maximized)
-    } else if atom == xwm.atoms.get(XwmAtomName::NetWmStateHidden) {
-        Some(X11StateAtom::Hidden)
-    } else {
-        None
+fn configure_flags(mask: xproto::ConfigWindow) -> X11ConfigureFlags {
+    let mask = u16::from(mask);
+    let has = |flag| mask & u16::from(flag) != 0;
+    X11ConfigureFlags {
+        x: has(xproto::ConfigWindow::X),
+        y: has(xproto::ConfigWindow::Y),
+        width: has(xproto::ConfigWindow::WIDTH),
+        height: has(xproto::ConfigWindow::HEIGHT),
+        border_width: has(xproto::ConfigWindow::BORDER_WIDTH),
+        sibling: has(xproto::ConfigWindow::SIBLING),
+        stack_mode: has(xproto::ConfigWindow::STACK_MODE),
     }
 }
 
@@ -380,9 +419,19 @@ mod tests {
 
     #[test]
     fn state_action_and_stack_mode_values_are_normalized() {
-        assert_eq!(state_action(0), X11StateAction::Remove);
-        assert_eq!(state_action(1), X11StateAction::Add);
-        assert_eq!(state_action(2), X11StateAction::Toggle);
+        assert_eq!(
+            decode_state_action(0),
+            Some(super::super::X11StateAction::Remove)
+        );
+        assert_eq!(
+            decode_state_action(1),
+            Some(super::super::X11StateAction::Add)
+        );
+        assert_eq!(
+            decode_state_action(2),
+            Some(super::super::X11StateAction::Toggle)
+        );
+        assert_eq!(decode_state_action(3), None);
         assert_eq!(
             stack_mode(xproto::StackMode::ABOVE),
             Some(X11StackMode::Above)

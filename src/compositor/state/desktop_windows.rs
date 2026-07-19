@@ -344,18 +344,23 @@ impl CompositorState {
             hidden: window.state.is_minimized(),
             activated: self.focused_window_id == Some(window_id),
         };
+        let mut maximized_horizontal = state.maximized;
+        let mut maximized_vertical = state.maximized;
         for atom in [request.first, request.second].into_iter().flatten() {
             let value = match atom {
                 crate::xwayland::xwm::X11StateAtom::Fullscreen => &mut state.fullscreen,
-                crate::xwayland::xwm::X11StateAtom::Maximized => &mut state.maximized,
+                crate::xwayland::xwm::X11StateAtom::MaximizedHorizontal => {
+                    &mut maximized_horizontal
+                }
+                crate::xwayland::xwm::X11StateAtom::MaximizedVertical => &mut maximized_vertical,
                 crate::xwayland::xwm::X11StateAtom::Hidden => &mut state.hidden,
             };
-            match request.action {
-                crate::xwayland::xwm::X11StateAction::Remove => *value = false,
-                crate::xwayland::xwm::X11StateAction::Add => *value = true,
-                crate::xwayland::xwm::X11StateAction::Toggle => *value = !*value,
-            }
+            *value = crate::xwayland::xwm::ewmh::apply_state_action(*value, request.action);
         }
+        state.maximized = crate::xwayland::xwm::ewmh::aggregate_maximize(
+            maximized_horizontal,
+            maximized_vertical,
+        );
         self.apply_x11_published_state(handle, state);
         Some(state)
     }

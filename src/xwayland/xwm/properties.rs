@@ -18,6 +18,7 @@ use super::{
 pub(crate) const MAX_TEXT_PROPERTY_BYTES: usize = 64 * 1024;
 const MAX_PENDING_PROPERTIES: usize = 256;
 const MAX_PENDING_PROPERTIES_PER_WINDOW: usize = 32;
+const MAX_DEFERRED_PROPERTIES: usize = 512;
 const MAX_PROPERTY_ITEMS_TEXT: u32 = (MAX_TEXT_PROPERTY_BYTES / 4) as u32;
 const MAX_PROPERTY_ITEMS_SCALAR: u32 = 64;
 
@@ -41,13 +42,15 @@ pub(crate) enum PropertyKind {
     WmNormalHints,
     WmHints,
     WmProtocols,
+    WmWindowRole,
+    NetStartupId,
+    NetWmUserTime,
     NetWmSyncRequestCounter,
     NetWmState,
-    MotifWmHints,
 }
 
 impl PropertyKind {
-    pub(crate) const ALL: [Self; 12] = [
+    pub(crate) const ALL: [Self; 14] = [
         Self::NetWmName,
         Self::WmName,
         Self::WmClass,
@@ -57,9 +60,11 @@ impl PropertyKind {
         Self::WmNormalHints,
         Self::WmHints,
         Self::WmProtocols,
+        Self::WmWindowRole,
+        Self::NetStartupId,
+        Self::NetWmUserTime,
         Self::NetWmSyncRequestCounter,
         Self::NetWmState,
-        Self::MotifWmHints,
     ];
 
     const fn bit(self) -> u16 {
@@ -73,9 +78,11 @@ impl PropertyKind {
             Self::WmNormalHints => 1 << 6,
             Self::WmHints => 1 << 7,
             Self::WmProtocols => 1 << 8,
-            Self::NetWmSyncRequestCounter => 1 << 9,
-            Self::NetWmState => 1 << 10,
-            Self::MotifWmHints => 1 << 11,
+            Self::WmWindowRole => 1 << 9,
+            Self::NetStartupId => 1 << 10,
+            Self::NetWmUserTime => 1 << 11,
+            Self::NetWmSyncRequestCounter => 1 << 12,
+            Self::NetWmState => 1 << 13,
         }
     }
 
@@ -90,9 +97,11 @@ impl PropertyKind {
             Self::WmNormalHints => XwmAtomName::WmNormalHints,
             Self::WmHints => XwmAtomName::WmHints,
             Self::WmProtocols => XwmAtomName::WmProtocols,
+            Self::WmWindowRole => XwmAtomName::WmWindowRole,
+            Self::NetStartupId => XwmAtomName::NetStartupId,
+            Self::NetWmUserTime => XwmAtomName::NetWmUserTime,
             Self::NetWmSyncRequestCounter => XwmAtomName::NetWmSyncRequestCounter,
             Self::NetWmState => XwmAtomName::NetWmState,
-            Self::MotifWmHints => XwmAtomName::MotifWmHints,
         })
     }
 
@@ -117,6 +126,7 @@ enum ParsedProperty {
     Text(Option<String>),
     AppId(Option<String>),
     Pid(Option<u32>),
+    UserTime(Option<u32>),
     WindowType(Option<X11WindowType>),
     TransientFor(Option<u32>),
     Constraints(crate::compositor::WindowConstraints),
@@ -128,8 +138,8 @@ enum ParsedProperty {
     State(crate::xwayland::xwm::X11PublishedState),
     Hints {
         accepts_input: Option<bool>,
+        urgency: bool,
     },
-    MotifHints,
 }
 
 pub(crate) fn begin_initial(xwm: &mut Xwm, handle: X11WindowHandle) -> Result<(), XwmError> {
@@ -216,6 +226,8 @@ pub(crate) fn refresh_property(
 }
 
 pub(crate) fn cancel(xwm: &mut Xwm, handle: X11WindowHandle) {
+    xwm.deferred_properties
+        .retain(|pending| pending.handle != handle);
     let sequences = xwm
         .pending_properties
         .iter()
@@ -248,6 +260,7 @@ pub(crate) fn cancel_generation(xwm: &mut Xwm, generation: super::XwaylandGenera
 }
 
 pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize) -> Result<usize, XwmError> {
+    drain_deferred(xwm)?;
     let sequences = xwm
         .pending_properties
         .keys()
@@ -285,6 +298,7 @@ pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize) -> Result<usize, XwmErr
         xwm.emit_ready_if_complete(pending.handle)?;
         xwm.property_metrics.completed = xwm.property_metrics.completed.saturating_add(1);
         completed += 1;
+        drain_deferred(xwm)?;
     }
     Ok(completed)
 }
@@ -354,19 +368,68 @@ fn issue_property(
     if pending_for_window(xwm, handle) >= MAX_PENDING_PROPERTIES_PER_WINDOW
         || xwm.pending_properties.len() >= MAX_PENDING_PROPERTIES
     {
-        xwm.property_metrics.rejected = xwm.property_metrics.rejected.saturating_add(1);
-        complete_property(
-            xwm,
-            PendingProperty {
-                sequence: 0,
-                handle,
-                kind,
-                epoch,
-            },
-            fallback_for(kind),
-        )?;
+        if !xwm.deferred_properties.iter().any(|pending| {
+            pending.handle == handle && pending.kind == kind && pending.epoch == epoch
+        }) {
+            if xwm.deferred_properties.len() < MAX_DEFERRED_PROPERTIES {
+                xwm.deferred_properties.push_back(PendingProperty {
+                    sequence: 0,
+                    handle,
+                    kind,
+                    epoch,
+                });
+            } else {
+                // The deferred queue is itself bounded.  Drop the oldest
+                // stale-generation work first; a current request is only
+                // resolved by its bounded cleanup fallback when no queue
+                // capacity remains.
+                if let Some(index) = xwm
+                    .deferred_properties
+                    .iter()
+                    .position(|pending| pending.handle.generation() != xwm.generation)
+                {
+                    xwm.deferred_properties.remove(index);
+                    xwm.deferred_properties.push_back(PendingProperty {
+                        sequence: 0,
+                        handle,
+                        kind,
+                        epoch,
+                    });
+                } else {
+                    xwm.property_metrics.rejected = xwm.property_metrics.rejected.saturating_add(1);
+                    complete_property(
+                        xwm,
+                        PendingProperty {
+                            sequence: 0,
+                            handle,
+                            kind,
+                            epoch,
+                        },
+                        fallback_for(kind),
+                    )?;
+                }
+            }
+        }
     } else {
         request(xwm, handle, kind, epoch)?;
+    }
+    Ok(())
+}
+
+fn drain_deferred(xwm: &mut Xwm) -> Result<(), XwmError> {
+    while xwm.pending_properties.len() < MAX_PENDING_PROPERTIES {
+        let Some(pending) = xwm.deferred_properties.front().copied() else {
+            break;
+        };
+        if pending.handle.generation() != xwm.generation || !xwm.windows.contains(pending.handle) {
+            xwm.deferred_properties.pop_front();
+            continue;
+        }
+        if pending_for_window(xwm, pending.handle) >= MAX_PENDING_PROPERTIES_PER_WINDOW {
+            break;
+        }
+        xwm.deferred_properties.pop_front();
+        request(xwm, pending.handle, pending.kind, pending.epoch)?;
     }
     Ok(())
 }
@@ -380,6 +443,17 @@ fn complete_property(
         xwm.property_metrics.stale = xwm.property_metrics.stale.saturating_add(1);
         return Ok(());
     }
+    let parsed = if pending.kind == PropertyKind::WmTransientFor
+        && let ParsedProperty::TransientFor(Some(parent)) = &parsed
+    {
+        if valid_transient_parent(xwm, pending.handle, *parent) {
+            parsed
+        } else {
+            ParsedProperty::TransientFor(None)
+        }
+    } else {
+        parsed
+    };
     let bit = pending.kind.bit();
     let mut requery = false;
     let mut delta = None;
@@ -424,6 +498,20 @@ fn complete_property(
         }
     }
     Ok(())
+}
+
+fn valid_transient_parent(xwm: &Xwm, child: X11WindowHandle, parent: u32) -> bool {
+    let parent_handle = X11WindowHandle::new(child.generation(), parent);
+    if !xwm.windows.contains(parent_handle) {
+        return false;
+    }
+    super::icccm::validate_transient_parent(child.xid(), Some(parent), |xid| {
+        xwm.windows
+            .get(X11WindowHandle::new(child.generation(), xid))
+            .and_then(|record| record.properties.transient_for)
+            .map(|handle| handle.xid())
+    })
+    .is_ok()
 }
 
 fn maybe_finish_refresh(xwm: &mut Xwm, handle: X11WindowHandle) -> Result<(), XwmError> {
@@ -473,6 +561,15 @@ fn commit_property(
         PropertyKind::NetWmPid => {
             record.properties.pid = record.staging_properties.pid;
         }
+        PropertyKind::WmWindowRole => {
+            record.properties.window_role = record.staging_properties.window_role.clone();
+        }
+        PropertyKind::NetStartupId => {
+            record.properties.startup_id = record.staging_properties.startup_id.clone();
+        }
+        PropertyKind::NetWmUserTime => {
+            record.properties.user_time = record.staging_properties.user_time;
+        }
         PropertyKind::NetWmWindowType => {
             record.properties.window_type = record.staging_properties.window_type;
         }
@@ -484,6 +581,7 @@ fn commit_property(
         }
         PropertyKind::WmHints => {
             record.properties.accepts_input = record.staging_properties.accepts_input;
+            record.properties.urgency = record.staging_properties.urgency;
         }
         PropertyKind::WmProtocols => {
             record.properties.supports_delete = record.staging_properties.supports_delete;
@@ -495,7 +593,6 @@ fn commit_property(
         PropertyKind::NetWmState => {
             record.properties.state = record.staging_properties.state;
         }
-        PropertyKind::MotifWmHints => {}
     }
     let was_admitted = record.snapshot.is_some();
     update_snapshot(record);
@@ -510,6 +607,7 @@ fn commit_property(
             record.properties.app_id.clone(),
         )),
         PropertyKind::NetWmPid => Some(super::X11MetadataDelta::Pid(record.properties.pid)),
+        PropertyKind::NetWmUserTime => None,
         PropertyKind::WmNormalHints => Some(super::X11MetadataDelta::Constraints(
             record.properties.constraints,
         )),
@@ -535,6 +633,7 @@ fn update_snapshot(record: &mut X11WindowRecord) {
     snapshot.transient_for = record.properties.transient_for;
     snapshot.supports_delete = record.properties.supports_delete;
     snapshot.supports_take_focus = record.properties.supports_take_focus;
+    snapshot.accepts_input = record.properties.accepts_input;
     snapshot.sync_counter = record.properties.sync_counter;
     snapshot.state = record.properties.state;
 }
@@ -549,10 +648,13 @@ fn apply_parsed(
         ParsedProperty::Text(value) => match kind {
             PropertyKind::NetWmName => properties.net_wm_name = value,
             PropertyKind::WmName => properties.wm_name = value,
+            PropertyKind::WmWindowRole => properties.window_role = value,
+            PropertyKind::NetStartupId => properties.startup_id = value,
             _ => {}
         },
         ParsedProperty::AppId(value) => properties.app_id = value,
         ParsedProperty::Pid(value) => properties.pid = value,
+        ParsedProperty::UserTime(value) => properties.user_time = value,
         ParsedProperty::WindowType(value) => properties.window_type = value,
         ParsedProperty::TransientFor(value) => {
             properties.transient_for =
@@ -568,8 +670,13 @@ fn apply_parsed(
         }
         ParsedProperty::SyncCounter(value) => properties.sync_counter = value,
         ParsedProperty::State(value) => properties.state = value,
-        ParsedProperty::Hints { accepts_input } => properties.accepts_input = accepts_input,
-        ParsedProperty::MotifHints => {}
+        ParsedProperty::Hints {
+            accepts_input,
+            urgency,
+        } => {
+            properties.accepts_input = accepts_input;
+            properties.urgency = urgency;
+        }
     }
     if matches!(kind, PropertyKind::NetWmName | PropertyKind::WmName) {
         properties.title = properties
@@ -584,11 +691,14 @@ fn fallback_for(kind: PropertyKind) -> ParsedProperty {
         PropertyKind::NetWmName | PropertyKind::WmName => ParsedProperty::Text(None),
         PropertyKind::WmClass => ParsedProperty::AppId(None),
         PropertyKind::NetWmPid => ParsedProperty::Pid(None),
+        PropertyKind::WmWindowRole | PropertyKind::NetStartupId => ParsedProperty::Text(None),
+        PropertyKind::NetWmUserTime => ParsedProperty::UserTime(None),
         PropertyKind::NetWmWindowType => ParsedProperty::WindowType(None),
         PropertyKind::WmTransientFor => ParsedProperty::TransientFor(None),
         PropertyKind::WmNormalHints => ParsedProperty::Constraints(Default::default()),
         PropertyKind::WmHints => ParsedProperty::Hints {
             accepts_input: None,
+            urgency: false,
         },
         PropertyKind::WmProtocols => ParsedProperty::Protocols {
             supports_delete: false,
@@ -596,7 +706,6 @@ fn fallback_for(kind: PropertyKind) -> ParsedProperty {
         },
         PropertyKind::NetWmSyncRequestCounter => ParsedProperty::SyncCounter(None),
         PropertyKind::NetWmState => ParsedProperty::State(Default::default()),
-        PropertyKind::MotifWmHints => ParsedProperty::MotifHints,
     }
 }
 
@@ -611,6 +720,9 @@ fn parse(
     if reply.bytes_after != 0 {
         return None;
     }
+    if expected_type(kind, xwm).is_some_and(|expected| reply.type_ != expected) {
+        return None;
+    }
     match kind {
         PropertyKind::NetWmName | PropertyKind::WmName => {
             (reply.format == 8).then(|| ParsedProperty::Text(parse_text(&reply.value)))
@@ -620,6 +732,12 @@ fn parse(
         }
         PropertyKind::NetWmPid => parse_u32s(reply)
             .and_then(|values| (values.len() == 1).then(|| ParsedProperty::Pid(Some(values[0])))),
+        PropertyKind::WmWindowRole | PropertyKind::NetStartupId => {
+            (reply.format == 8).then(|| ParsedProperty::Text(parse_text(&reply.value)))
+        }
+        PropertyKind::NetWmUserTime => parse_u32s(reply).and_then(|values| {
+            (values.len() == 1).then(|| ParsedProperty::UserTime(Some(values[0])))
+        }),
         PropertyKind::NetWmWindowType => parse_window_type(reply, xwm),
         PropertyKind::WmTransientFor => parse_u32s(reply).and_then(|values| {
             (values.len() == 1).then(|| ParsedProperty::TransientFor(Some(values[0])))
@@ -631,8 +749,27 @@ fn parse(
             (values.len() == 1).then(|| ParsedProperty::SyncCounter(Some(u64::from(values[0]))))
         }),
         PropertyKind::NetWmState => parse_state(reply, xwm),
-        PropertyKind::MotifWmHints => (reply.format == 32).then_some(ParsedProperty::MotifHints),
     }
+}
+
+fn expected_type(kind: PropertyKind, xwm: &Xwm) -> Option<u32> {
+    Some(match kind {
+        PropertyKind::NetWmName | PropertyKind::NetStartupId => {
+            xwm.atoms.get(XwmAtomName::Utf8String)
+        }
+        PropertyKind::WmName | PropertyKind::WmClass | PropertyKind::WmWindowRole => {
+            u32::from(xproto::AtomEnum::STRING)
+        }
+        PropertyKind::NetWmPid
+        | PropertyKind::NetWmUserTime
+        | PropertyKind::NetWmSyncRequestCounter => u32::from(xproto::AtomEnum::CARDINAL),
+        PropertyKind::NetWmWindowType | PropertyKind::WmProtocols | PropertyKind::NetWmState => {
+            u32::from(xproto::AtomEnum::ATOM)
+        }
+        PropertyKind::WmTransientFor => u32::from(xproto::AtomEnum::WINDOW),
+        PropertyKind::WmNormalHints => u32::from(xproto::AtomEnum::WM_SIZE_HINTS),
+        PropertyKind::WmHints => u32::from(xproto::AtomEnum::WM_HINTS),
+    })
 }
 
 fn parse_window_type(reply: &xproto::GetPropertyReply, xwm: &Xwm) -> Option<ParsedProperty> {
@@ -665,6 +802,7 @@ fn parse_wm_hints(reply: &xproto::GetPropertyReply) -> Option<ParsedProperty> {
     let flags = *values.first()?;
     Some(ParsedProperty::Hints {
         accepts_input: (flags & 1 != 0).then(|| values.get(1).copied().unwrap_or(0) != 0),
+        urgency: flags & (1 << 8) != 0,
     })
 }
 
@@ -849,7 +987,8 @@ mod tests {
         assert_eq!(
             parse_wm_hints(&reply),
             Some(ParsedProperty::Hints {
-                accepts_input: Some(true)
+                accepts_input: Some(true),
+                urgency: false,
             })
         );
     }
@@ -872,6 +1011,11 @@ mod tests {
             transient_for: None,
             supports_delete: true,
             supports_take_focus: true,
+            accepts_input: Some(true),
+            window_role: None,
+            startup_id: None,
+            user_time: None,
+            urgency: false,
             sync_counter: Some(9),
         });
         let record = registry.get_mut(handle).expect("snapshot record");
@@ -902,6 +1046,11 @@ mod tests {
             transient_for: None,
             supports_delete: true,
             supports_take_focus: false,
+            accepts_input: Some(true),
+            window_role: None,
+            startup_id: None,
+            user_time: None,
+            urgency: false,
             sync_counter: Some(11),
         });
         let record = registry.get_mut(handle).expect("snapshot record");

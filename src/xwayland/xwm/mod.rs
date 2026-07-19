@@ -19,8 +19,12 @@ mod capabilities;
 mod commands;
 mod connection;
 mod events;
+pub(crate) mod ewmh;
+pub(crate) mod focus;
+pub(crate) mod icccm;
 mod properties;
 mod resize_sync;
+pub(crate) mod shape;
 pub(crate) mod startup;
 mod window;
 
@@ -52,7 +56,8 @@ pub struct X11Geometry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum X11StateAtom {
     Fullscreen,
-    Maximized,
+    MaximizedHorizontal,
+    MaximizedVertical,
     Hidden,
 }
 
@@ -82,8 +87,35 @@ pub enum X11StackMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct X11ConfigureRequest {
     pub requested: X11Geometry,
+    pub fields: X11ConfigureFlags,
+    pub border_width: u32,
     pub sibling: Option<X11WindowHandle>,
     pub stack_mode: Option<X11StackMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct X11ConfigureFlags {
+    pub x: bool,
+    pub y: bool,
+    pub width: bool,
+    pub height: bool,
+    pub border_width: bool,
+    pub sibling: bool,
+    pub stack_mode: bool,
+}
+
+impl X11ConfigureFlags {
+    pub const fn all() -> Self {
+        Self {
+            x: true,
+            y: true,
+            width: true,
+            height: true,
+            border_width: true,
+            sibling: false,
+            stack_mode: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -106,6 +138,11 @@ pub struct X11WindowSnapshot {
     pub transient_for: Option<X11WindowHandle>,
     pub supports_delete: bool,
     pub supports_take_focus: bool,
+    pub accepts_input: Option<bool>,
+    pub window_role: Option<String>,
+    pub startup_id: Option<String>,
+    pub user_time: Option<u32>,
+    pub urgency: bool,
     pub sync_counter: Option<u64>,
 }
 
@@ -146,7 +183,11 @@ pub enum XwmEvent {
         window: X11WindowHandle,
         request: X11StateRequest,
     },
-    FocusRequested(X11WindowHandle),
+    FocusRequested {
+        window: X11WindowHandle,
+        source: u32,
+        timestamp: u32,
+    },
     CloseRequestedByClient(X11WindowHandle),
     ResizeSyncAcked {
         window: X11WindowHandle,
@@ -163,6 +204,13 @@ pub enum XwmCommand {
     Configure {
         window: X11WindowHandle,
         geometry: X11Geometry,
+        fields: X11ConfigureFlags,
+        border_width: u32,
+    },
+    Stack {
+        window: X11WindowHandle,
+        sibling: Option<X11WindowHandle>,
+        mode: X11StackMode,
     },
     Focus {
         window: Option<X11WindowHandle>,
@@ -261,8 +309,10 @@ pub struct Xwm {
     pub(crate) sync_alarms: HashMap<X11WindowHandle, u32>,
     pub(crate) sync_handles_by_counter: HashMap<u32, X11WindowHandle>,
     pub(crate) next_resize_counter_values: HashMap<X11WindowHandle, u64>,
+    pub(crate) shapes: HashMap<X11WindowHandle, shape::ShapeRegion>,
     pub(crate) pending_properties:
         HashMap<x11rb::connection::SequenceNumber, properties::PendingProperty>,
+    pub(crate) deferred_properties: VecDeque<properties::PendingProperty>,
     pub(crate) property_metrics: properties::PropertyMetrics,
     buffer_ready_surfaces: HashSet<u32>,
     pub(crate) supporting_wm_check: u32,
@@ -310,10 +360,6 @@ impl Xwm {
 
     pub fn required_extensions_available(&self) -> bool {
         self.capabilities.composite
-            && self.capabilities.xfixes
-            && self.capabilities.shape
-            && self.capabilities.randr
-            && self.capabilities.sync
     }
 
     pub(crate) fn property_metrics(&self) -> properties::PropertyMetrics {
@@ -391,6 +437,8 @@ impl Xwm {
         self.adoption.clear_generation(generation);
         self.association.clear_generation(generation);
         self.clear_resize_sync_generation(generation);
+        self.shapes
+            .retain(|handle, _| handle.generation() != generation);
         properties::cancel_generation(self, generation);
         if generation == self.generation {
             self.buffer_ready_surfaces.clear();

@@ -24,6 +24,11 @@ fn x11_snapshot(generation: XwaylandGeneration, xid: u32, surface_id: u32) -> X1
         transient_for: None,
         supports_delete: true,
         supports_take_focus: true,
+        accepts_input: Some(true),
+        window_role: None,
+        startup_id: None,
+        user_time: None,
+        urgency: false,
         sync_counter: None,
     }
 }
@@ -289,8 +294,8 @@ fn x11_fullscreen_uses_output_geometry_and_maximize_publishes_both_axes() {
             snapshot.handle,
             crate::xwayland::xwm::X11StateRequest {
                 action: crate::xwayland::xwm::X11StateAction::Add,
-                first: Some(crate::xwayland::xwm::X11StateAtom::Maximized),
-                second: None,
+                first: Some(crate::xwayland::xwm::X11StateAtom::MaximizedHorizontal),
+                second: Some(crate::xwayland::xwm::X11StateAtom::MaximizedVertical),
             },
         )
         .expect("maximized state");

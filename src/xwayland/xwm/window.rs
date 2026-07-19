@@ -57,6 +57,10 @@ pub(crate) struct X11PropertySnapshot {
     pub(crate) sync_counter: Option<u64>,
     pub(crate) net_wm_name: Option<String>,
     pub(crate) wm_name: Option<String>,
+    pub(crate) window_role: Option<String>,
+    pub(crate) startup_id: Option<String>,
+    pub(crate) user_time: Option<u32>,
+    pub(crate) urgency: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +165,11 @@ impl X11WindowRegistry {
             transient_for: snapshot.transient_for,
             supports_delete: snapshot.supports_delete,
             supports_take_focus: snapshot.supports_take_focus,
+            accepts_input: snapshot.accepts_input,
+            window_role: snapshot.window_role.clone(),
+            startup_id: snapshot.startup_id.clone(),
+            user_time: snapshot.user_time,
+            urgency: snapshot.urgency,
             sync_counter: snapshot.sync_counter,
             ..X11PropertySnapshot::default()
         };
@@ -318,6 +327,11 @@ impl X11WindowRegistry {
             transient_for: record.properties.transient_for,
             supports_delete: record.properties.supports_delete,
             supports_take_focus: record.properties.supports_take_focus,
+            accepts_input: record.properties.accepts_input,
+            window_role: record.properties.window_role.clone(),
+            startup_id: record.properties.startup_id.clone(),
+            user_time: record.properties.user_time,
+            urgency: record.properties.urgency,
             sync_counter: record.properties.sync_counter,
         };
         record.lifecycle = X11WindowLifecycle::Renderable;

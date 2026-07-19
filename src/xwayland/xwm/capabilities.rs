@@ -19,16 +19,10 @@ impl XwmCapabilities {
         let randr = has_extension(connection, protocol::randr::X11_EXTENSION_NAME)?;
         let sync = has_extension(connection, protocol::sync::X11_EXTENSION_NAME)?;
 
-        for (present, name) in [
-            (composite, protocol::composite::X11_EXTENSION_NAME),
-            (xfixes, protocol::xfixes::X11_EXTENSION_NAME),
-            (shape, protocol::shape::X11_EXTENSION_NAME),
-            (randr, protocol::randr::X11_EXTENSION_NAME),
-            (sync, protocol::sync::X11_EXTENSION_NAME),
-        ] {
-            if !present {
-                return Err(XwmStartupError::MissingRequiredExtension(name));
-            }
+        if !composite {
+            return Err(XwmStartupError::MissingRequiredExtension(
+                protocol::composite::X11_EXTENSION_NAME,
+            ));
         }
 
         Ok(Self {
