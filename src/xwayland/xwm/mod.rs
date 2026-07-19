@@ -18,6 +18,7 @@ mod atoms;
 mod capabilities;
 mod commands;
 mod connection;
+pub mod data_bridge;
 mod events;
 pub(crate) mod ewmh;
 pub(crate) mod focus;
@@ -310,6 +311,7 @@ pub struct Xwm {
     pub(crate) sync_handles_by_counter: HashMap<u32, X11WindowHandle>,
     pub(crate) next_resize_counter_values: HashMap<X11WindowHandle, u64>,
     pub(crate) shapes: HashMap<X11WindowHandle, shape::ShapeRegion>,
+    pub(crate) data_bridge: data_bridge::DataBridge,
     pub(crate) pending_properties:
         HashMap<x11rb::connection::SequenceNumber, properties::PendingProperty>,
     pub(crate) deferred_properties: VecDeque<properties::PendingProperty>,
@@ -439,6 +441,8 @@ impl Xwm {
         self.clear_resize_sync_generation(generation);
         self.shapes
             .retain(|handle, _| handle.generation() != generation);
+        self.data_bridge
+            .clear_generation(data_bridge::BridgeGeneration::from(generation));
         properties::cancel_generation(self, generation);
         if generation == self.generation {
             self.buffer_ready_surfaces.clear();

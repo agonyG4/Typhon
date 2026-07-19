@@ -406,6 +406,7 @@ pub(crate) fn connect(
         sync_handles_by_counter: Default::default(),
         next_resize_counter_values: Default::default(),
         shapes: Default::default(),
+        data_bridge: Default::default(),
         pending_properties: Default::default(),
         deferred_properties: Default::default(),
         property_metrics: Default::default(),
