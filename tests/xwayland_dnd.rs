@@ -6,7 +6,7 @@ use oblivion_one::xwayland::xwm::data_bridge::{
 };
 
 #[test]
-fn xdnd_target_change_and_terminal_cleanup_are_bounded() {
+fn xdnd_foundation_bounds_target_change_and_terminal_cleanup() {
     let generation = BridgeGeneration::new(NonZeroU64::new(7).expect("nonzero"));
     let mut manager = DndManager::default();
     let id = manager.begin(generation, 11, 100);

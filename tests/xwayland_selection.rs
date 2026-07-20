@@ -5,7 +5,7 @@ use oblivion_one::xwayland::xwm::data_bridge::{
 };
 
 #[test]
-fn clipboard_and_primary_are_separate_generation_bound_selections() {
+fn selection_foundation_keeps_clipboard_and_primary_generation_bound() {
     let generation = BridgeGeneration::new(NonZeroU64::new(1).expect("nonzero"));
     let mut bridge = SelectionBridge::default();
     bridge

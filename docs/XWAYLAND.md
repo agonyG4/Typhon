@@ -16,13 +16,23 @@ The supported X11 window contract is:
   stacking requests, `WM_STATE`, and the implemented EWMH root/client
   properties are generation-cleaned;
 - Composite is required for the current rootless redirection architecture;
-  XFixes, Shape, RandR, and Sync are optional and version-gated;
+  XFixes, Shape, RandR, and Sync are optional and version-gated. Their absence
+  does not prevent XWM from reaching `Running`;
 - one global X11 DPI policy is used. Mixed per-monitor DPI is not advertised.
 
-CLIPBOARD, PRIMARY, and Xdnd are adapted to the existing Wayland data-device
-authority. The adapter uses bounded MIME lists and nonblocking owned-fd
-transfers; it does not maintain a second selection owner or buffer arbitrary
-contents in compositor memory.
+The following are present only as generation-bound adapter/model foundations;
+they are not connected end to end and must not be treated as compatibility
+support:
+
+- XFixes CLIPBOARD bridge: inactive foundation;
+- PRIMARY bridge: inactive foundation;
+- Xdnd ClientMessage bridge: inactive foundation;
+- runtime RandR publication: inactive foundation; no live output publication;
+- X11 cursor ownership integration: inactive foundation.
+
+The Wayland data-device authority remains the intended future owner for
+CLIPBOARD, PRIMARY, and Xdnd. Until the bridges are connected and tested,
+Typhon does not advertise or report them as working.
 
 Diagnostics are available through `TYPHON_XWAYLAND_LOG=1` for forwarding the
 bounded stderr ring and through `bin/check-xwayland-session` for a session

@@ -1,8 +1,8 @@
 #!/bin/sh
 set -u
 
-echo "DISPLAY=${DISPLAY-<unset>}"
-echo "XAUTHORITY=${XAUTHORITY-<unset>}"
+echo "DISPLAY=${DISPLAY-unsupported/not connected}"
+echo "XAUTHORITY=${XAUTHORITY-unsupported/not connected}"
 
 display_number=${DISPLAY#:}
 display_number=${display_number%%.*}
@@ -29,8 +29,10 @@ if command -v xdpyinfo >/dev/null 2>&1 && [ -n "${DISPLAY-}" ]; then
     echo "xdpyinfo:"
     xdpyinfo 2>&1 | sed -n '1,24p'
 else
-    echo "xdpyinfo=unavailable"
+    echo "xdpyinfo=unsupported/not connected"
 fi
 
-echo "xwm_state=reported by Typhon stderr/state diagnostics"
-echo "generation/client_count/selection_bridge=reported by compositor diagnostics when enabled"
+echo "xwm_state=unsupported/not connected"
+echo "generation=unsupported/not connected"
+echo "client_count=unsupported/not connected"
+echo "selection_bridge=unsupported/not connected"

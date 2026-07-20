@@ -35,9 +35,10 @@ descriptors.
 
 A generation is ready only after `displayfd` reports the leased display and
 the exact private Wayland client binds `xwayland-shell-v1`. Managed startup
-then requires the pure-Rust XWM connection and required Composite, XFixes,
-Shape, RandR, and Sync capabilities. Old generations cannot satisfy a newer
-readiness barrier.
+then requires the pure-Rust XWM connection and Composite. XFixes, Shape,
+RandR, and Sync are optional; their absence does not block `Running`, and
+their adapter/model foundations are not advertised as end-to-end application
+support. Old generations cannot satisfy a newer readiness barrier.
 
 Surface association uses committed `WL_SURFACE_SERIAL` values only. There is
 no `WL_SURFACE_ID` fallback. Clipboard, primary selection, and drag-and-drop

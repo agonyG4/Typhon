@@ -238,14 +238,20 @@ impl OwnCompositorServer {
         };
         #[cfg(not(test))]
         let syncobj_device = None;
-        #[cfg(test)]
-        let gpu_capabilities = if gpu_buffers_enabled {
-            GpuProtocolCapabilities::test_contract(syncobj_device.is_some())
-        } else {
-            GpuProtocolCapabilities::default()
+        let gpu_capabilities = {
+            #[cfg(test)]
+            {
+                if gpu_buffers_enabled {
+                    GpuProtocolCapabilities::test_contract(syncobj_device.is_some())
+                } else {
+                    GpuProtocolCapabilities::default()
+                }
+            }
+            #[cfg(not(test))]
+            {
+                GpuProtocolCapabilities::default()
+            }
         };
-        #[cfg(not(test))]
-        let gpu_capabilities = GpuProtocolCapabilities::default();
         let xwayland_global_data = XwaylandShellGlobalData {
             active: Arc::new(Mutex::new(None)),
             bind_events: Arc::new(Mutex::new(Vec::new())),
