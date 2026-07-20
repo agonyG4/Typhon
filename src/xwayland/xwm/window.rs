@@ -245,7 +245,6 @@ impl X11WindowRegistry {
         record.map_authorized = false;
         record.mapped_notified = false;
         record.snapshot = None;
-        record.buffer_ready = false;
         record.properties_ready = false;
         self.update_pending_lifecycle(handle)
     }
@@ -558,6 +557,35 @@ mod tests {
             registry.lifecycle(window),
             Some(X11WindowLifecycle::Observed)
         );
+    }
+
+    #[test]
+    fn buffer_before_first_map_request_completes_mapping_gate() {
+        let generation = generation(1);
+        let window = handle(generation, 26);
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::Managed,
+            X11Geometry::default(),
+        );
+        registry
+            .mark_associated(window, associated(generation, 9, 45))
+            .expect("association");
+        registry.mark_buffer_ready(window).expect("retained buffer");
+
+        registry
+            .mark_map_requested(window)
+            .expect("first map request");
+        complete_properties(&mut registry, window);
+        registry.mark_map_commanded(window).expect("map command");
+        registry.confirm_map_notify(window).expect("map notify");
+
+        let snapshot = registry
+            .try_ready(window)
+            .expect("known window")
+            .expect("retained buffer completes first map");
+        assert_eq!(snapshot.surface_id, 45);
     }
 
     #[test]
