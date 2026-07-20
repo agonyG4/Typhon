@@ -180,12 +180,17 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         }
         Event::PropertyNotify(event) => normalize_property_change(xwm, event)?,
         Event::SyncCounterNotify(event) => {
-            xwm.note_sync_counter_notify(event.counter, int64_to_u64(event.counter_value));
+            if xwm.capabilities.sync {
+                xwm.note_sync_counter_notify(event.counter, int64_to_u64(event.counter_value));
+            }
         }
         Event::FocusIn(_) | Event::FocusOut(_) => {
             // Focus events are reconciliation signals only.  Typhon remains the focus authority.
         }
         Event::ShapeNotify(event) => {
+            if !xwm.capabilities.shape {
+                return Ok(());
+            }
             let handle = X11WindowHandle::new(xwm.generation, event.affected_window);
             if xwm.windows.contains(handle) {
                 let fallback = shape::ShapeRect {

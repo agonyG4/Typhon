@@ -355,6 +355,11 @@ impl X11WindowRegistry {
         Ok(())
     }
 
+    pub(crate) fn map_command_is_new(&self, handle: X11WindowHandle) -> Result<bool, &'static str> {
+        let record = self.records.get(&handle).ok_or("unknown X11 window")?;
+        Ok(!record.map_operation_pending && !record.mapped_notified && record.snapshot.is_none())
+    }
+
     pub(crate) fn confirm_map_notify(
         &mut self,
         handle: X11WindowHandle,
@@ -628,6 +633,126 @@ mod tests {
                 .expect("duplicate map notify")
         );
         assert!(registry.try_ready(window).expect("known window").is_none());
+    }
+
+    #[test]
+    fn managed_window_receives_exactly_one_map_command() {
+        let generation = generation(1);
+        let window = handle(generation, 20);
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::Managed,
+            X11Geometry::default(),
+        );
+        registry.mark_map_requested(window).expect("map request");
+        assert!(registry.map_command_is_new(window).expect("known window"));
+        registry.mark_map_commanded(window).expect("map command");
+        assert!(!registry.map_command_is_new(window).expect("known window"));
+    }
+
+    #[test]
+    fn window_ready_does_not_remap() {
+        let generation = generation(1);
+        let window = handle(generation, 21);
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::Managed,
+            X11Geometry::default(),
+        );
+        registry.mark_map_requested(window).expect("map request");
+        complete_properties(&mut registry, window);
+        registry.mark_map_commanded(window).expect("map command");
+        registry.confirm_map_notify(window).expect("map notify");
+        assert!(!registry.map_command_is_new(window).expect("known window"));
+    }
+
+    #[test]
+    fn duplicate_map_request_is_idempotent() {
+        let generation = generation(1);
+        let window = handle(generation, 22);
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::Managed,
+            X11Geometry::default(),
+        );
+        registry
+            .mark_map_requested(window)
+            .expect("first map request");
+        registry
+            .mark_map_requested(window)
+            .expect("duplicate map request");
+        assert!(registry.map_command_is_new(window).expect("known window"));
+    }
+
+    #[test]
+    fn map_notify_clears_pending_map_state() {
+        let generation = generation(1);
+        let window = handle(generation, 23);
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::Managed,
+            X11Geometry::default(),
+        );
+        registry.mark_map_requested(window).expect("map request");
+        registry.mark_map_commanded(window).expect("map command");
+        registry.confirm_map_notify(window).expect("map notify");
+        assert!(
+            !registry
+                .get(window)
+                .expect("known window")
+                .map_operation_pending
+        );
+    }
+
+    #[test]
+    fn unmap_remap_creates_one_new_map_operation() {
+        let generation = generation(1);
+        let window = handle(generation, 24);
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::Managed,
+            X11Geometry::default(),
+        );
+        registry
+            .mark_map_requested(window)
+            .expect("first map request");
+        registry
+            .mark_map_commanded(window)
+            .expect("first map command");
+        registry
+            .confirm_map_notify(window)
+            .expect("first map notify");
+        registry.mark_unmapped(window).expect("unmap");
+        registry.mark_map_requested(window).expect("remap request");
+        assert!(registry.map_command_is_new(window).expect("known window"));
+        registry.mark_map_commanded(window).expect("remap command");
+        assert!(!registry.map_command_is_new(window).expect("known window"));
+    }
+
+    #[test]
+    fn override_redirect_never_receives_managed_map_command() {
+        let generation = generation(1);
+        let window = handle(generation, 25);
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::OverrideRedirect,
+            X11Geometry::default(),
+        );
+        registry
+            .confirm_external_map_notify(window)
+            .expect("external map notify");
+        assert!(
+            !registry
+                .get(window)
+                .expect("known window")
+                .map_operation_pending
+        );
     }
 
     #[test]

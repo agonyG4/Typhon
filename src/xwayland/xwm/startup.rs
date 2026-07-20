@@ -699,14 +699,9 @@ pub(crate) fn setup_root<C: Connection>(
     atoms: &XwmAtoms,
     capabilities: &XwmCapabilities,
 ) -> Result<u32, XwmStartupError> {
-    if !capabilities.composite
-        || !capabilities.xfixes
-        || !capabilities.shape
-        || !capabilities.randr
-        || !capabilities.sync
-    {
+    if !capabilities.required_contract_available() {
         return Err(XwmStartupError::Protocol(
-            "XWM capability record is incomplete".to_owned(),
+            "XWM Composite capability is unavailable".to_owned(),
         ));
     }
     let event_mask = xproto::EventMask::SUBSTRUCTURE_REDIRECT
@@ -774,7 +769,9 @@ pub(crate) fn setup_root<C: Connection>(
         .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
     let supported = XwmAtoms::advertised_names()
         .iter()
-        .map(|name| atoms.get(*name))
+        .copied()
+        .filter(|name| capabilities.supports_atom(*name))
+        .map(|name| atoms.get(name))
         .collect::<Vec<_>>();
     connection
         .change_property32(

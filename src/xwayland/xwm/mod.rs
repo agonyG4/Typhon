@@ -367,7 +367,7 @@ impl Xwm {
     }
 
     pub fn required_extensions_available(&self) -> bool {
-        self.capabilities.composite
+        self.capabilities.required_contract_available()
     }
 
     pub(crate) fn property_metrics(&self) -> properties::PropertyMetrics {

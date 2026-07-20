@@ -41,6 +41,13 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
 
     match command {
         XwmCommand::Map(handle) => {
+            if !xwm
+                .windows
+                .map_command_is_new(handle)
+                .map_err(XwmError::InvalidCommand)?
+            {
+                return Ok(());
+            }
             xwm.connection
                 .map_window(handle.xid())
                 .map_err(XwmError::Connection)?;

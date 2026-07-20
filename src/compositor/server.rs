@@ -45,7 +45,7 @@ use super::protocols::versions;
 use super::{
     AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, BufferReleaseMetrics,
     ClientCursorRenderState, CompositorFrameBatchId, CompositorState, CoreComplianceMetrics,
-    DesktopWindowKind, DirectScanoutSceneCandidate, DirectScanoutSceneRejection, ExplicitSyncPoint,
+    DirectScanoutSceneCandidate, DirectScanoutSceneRejection, ExplicitSyncPoint,
     FrameBatchDiscardReason, FramePresentation, FullscreenRenderPlanMetrics,
     InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PointerAxisFrame,
     PresentationClock, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
@@ -519,21 +519,8 @@ impl OwnCompositorServer {
         match event {
             XwmEvent::WindowMapRequested(handle) => vec![XwmCommand::Map(handle)],
             XwmEvent::WindowReady(snapshot) => {
-                let handle = snapshot.handle;
                 if self.state.insert_x11_window(snapshot).is_ok() {
-                    let map = if self
-                        .state
-                        .window_id_for_x11_handle(handle)
-                        .and_then(|id| self.state.window(id))
-                        .is_some_and(|window| window.kind == DesktopWindowKind::OverrideRedirect)
-                    {
-                        Vec::new()
-                    } else {
-                        vec![XwmCommand::Map(handle)]
-                    };
-                    map.into_iter()
-                        .chain([self.sync_xwayland_client_lists()])
-                        .collect()
+                    vec![self.sync_xwayland_client_lists()]
                 } else {
                     Vec::new()
                 }
