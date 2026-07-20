@@ -6,7 +6,7 @@ Steam creates a burst of X11 windows and property traffic. The XWM event drain s
 
 ## Selected Approach
 
-After draining X events, always invoke the existing nonblocking property-reply poll with the existing bounded budget. `reply_unchecked` already returns `WouldBlock` when a reply is unavailable, so raw socket readability is neither necessary nor a correct proxy for replies buffered inside `x11rb`.
+Within one reactor dispatch, alternate the existing bounded X-event drain and nonblocking property-reply poll until neither makes progress or each reaches its existing budget. `reply_unchecked` already returns `WouldBlock` when a reply is unavailable, so raw socket readability is neither necessary nor a correct proxy for packets buffered inside `x11rb`. Alternation is required because event polling can move more reply packets from the stream reader into X11RB's reply map after an earlier reply poll.
 
 Alternatives rejected:
 
@@ -16,10 +16,10 @@ Alternatives rejected:
 ## Data Flow
 
 1. The XWM reactor reports readiness.
-2. `drain_events` drains at most the existing X event budget.
-3. `poll_replies` attempts at most the same bounded reply budget regardless of raw-fd state.
+2. `drain_events` alternates X-event parsing and property-reply polling while either makes progress.
+3. Each side retains its independent existing budget.
 4. Available replies, including replies already buffered by `x11rb`, complete property discovery.
-5. Unavailable replies return `WouldBlock` and remain pending without blocking.
+5. Unavailable replies return `WouldBlock` and remain pending without blocking; a no-progress pass ends the dispatch.
 6. Existing readiness logic emits map authorization and later `WindowReady` when association and buffer gates are complete.
 
 ## Scope and Safety

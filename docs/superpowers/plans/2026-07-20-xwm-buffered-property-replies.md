@@ -4,7 +4,7 @@
 
 **Goal:** Ensure XWM property replies already buffered inside `x11rb` are drained so managed X11 windows can be mapped and admitted.
 
-**Architecture:** Keep the single XWM reactor and existing bounded budgets. After draining X events, invoke the existing nonblocking property reply poll unconditionally; unavailable replies remain pending through the current `WouldBlock` path.
+**Architecture:** Keep the single XWM reactor and existing bounded budgets. Within each dispatch, alternate X-event parsing and the existing nonblocking property-reply poll until neither makes progress; unavailable replies remain pending through the current `WouldBlock` path.
 
 **Tech Stack:** Rust, x11rb, Unix socket-pair X11 protocol fixtures, Cargo.
 
@@ -43,13 +43,18 @@ Expected: FAIL because the raw-fd gate prevents `poll_replies` from consuming re
 
 - [ ] **Step 3: Implement the minimal fix**
 
-Change `Xwm::drain_events` to always call:
+Change `Xwm::drain_events` to alternate bounded event and reply drains until neither makes progress, retaining independent caps for each side:
 
 ```rust
-let drain = events::drain(self, budget.min(XWM_EVENT_BUDGET))?;
-self.poll_root_event_mask()?;
-let _ = properties::poll_replies(self, budget.min(XWM_EVENT_BUDGET))?;
-Ok(drain)
+while events_processed < budget || replies_processed < budget {
+    let event_drain = events::drain(self, budget - events_processed)?;
+    let replies = properties::poll_replies(self, budget - replies_processed)?;
+    if event_drain.processed == 0 && replies == 0 {
+        break;
+    }
+    events_processed += event_drain.processed;
+    replies_processed += replies;
+}
 ```
 
 Remove `properties::socket_has_input` if it has no remaining callers and adjust test-only imports accordingly.
