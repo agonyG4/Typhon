@@ -1,12 +1,22 @@
 #!/bin/sh
 set -u
 
-echo "DISPLAY=${DISPLAY-unsupported/not connected}"
-echo "XAUTHORITY=${XAUTHORITY-unsupported/not connected}"
+display_value=${DISPLAY-}
+xauthority_value=${XAUTHORITY-}
+if [ -n "$display_value" ]; then
+    echo "DISPLAY=$display_value"
+else
+    echo "DISPLAY=unsupported/not connected"
+fi
+if [ -n "$xauthority_value" ]; then
+    echo "XAUTHORITY=$xauthority_value"
+else
+    echo "XAUTHORITY=unsupported/not connected"
+fi
 
-display_number=${DISPLAY#:}
+display_number=${display_value#:}
 display_number=${display_number%%.*}
-if [ "${display_number}" != "${DISPLAY-}" ] && [ -n "${display_number}" ]; then
+if [ -n "$display_number" ]; then
     socket="/tmp/.X11-unix/X${display_number}"
     echo "filesystem_socket=${socket}"
     if [ -S "$socket" ]; then
@@ -14,15 +24,33 @@ if [ "${display_number}" != "${DISPLAY-}" ] && [ -n "${display_number}" ]; then
     else
         echo "filesystem_socket=missing"
     fi
+else
+    echo "filesystem_socket=unsupported/not connected"
 fi
 
-echo "abstract_socket=${display_number:+@/tmp/.X11-unix/X${display_number}}"
-echo "xwayland_processes:"
-ps -eo pid=,ppid=,args= | awk '/[X]wayland/ { print }'
+if [ -n "$display_number" ]; then
+    echo "abstract_socket=@/tmp/.X11-unix/X${display_number}"
+else
+    echo "abstract_socket=unsupported/not connected"
+fi
+processes=$(ps -eo pid=,ppid=,args= 2>/dev/null | awk '/[X]wayland/ { print }' || true)
+if [ -n "$processes" ]; then
+    echo "xwayland_processes:"
+    printf '%s\n' "$processes"
+else
+    echo "xwayland_processes=unsupported/not connected"
+fi
 
 if command -v ss >/dev/null 2>&1; then
-    echo "unix_sockets:"
-    ss -x -a 2>/dev/null | awk '/X11-unix|xwayland/ { print }'
+    sockets=$(ss -x -a 2>/dev/null | awk '/X11-unix|xwayland/ { print }' || true)
+    if [ -n "$sockets" ]; then
+        echo "unix_sockets:"
+        printf '%s\n' "$sockets"
+    else
+        echo "unix_sockets=unsupported/not connected"
+    fi
+else
+    echo "unix_sockets=unsupported/not connected"
 fi
 
 if command -v xdpyinfo >/dev/null 2>&1 && [ -n "${DISPLAY-}" ]; then

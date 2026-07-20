@@ -29,35 +29,12 @@ mod displayfd_service;
 #[path = "service_support.rs"]
 mod service_support;
 
-use service_support::{classify_exit, duplicate_fd, now_ns, owned_fd_from_stream};
+use service_support::{StderrPipe, classify_exit, duplicate_fd, now_ns, owned_fd_from_stream};
 
 const DISPLAYFD_MAX_BYTES: usize = 32;
 const STARTUP_TIMEOUT_NS: u64 = 3_000_000_000;
 const BACKOFF_NS: [u64; 3] = [250_000_000, 1_000_000_000, 4_000_000_000];
 const CRASH_WINDOW_NS: u64 = 600_000_000_000;
-const STDERR_MAX_BUFFER: usize = 64 * 1024;
-const STDERR_MAX_LINE: usize = 8 * 1024;
-
-#[derive(Debug)]
-struct StderrPipe {
-    fd: OwnedFd,
-    buffer: Vec<u8>,
-    active: bool,
-    forward: bool,
-    ring: StderrRing,
-}
-
-impl StderrPipe {
-    fn new(fd: OwnedFd, forward: bool) -> Self {
-        Self {
-            fd,
-            buffer: Vec::new(),
-            active: true,
-            forward,
-            ring: StderrRing::default(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XwaylandStateKind {
@@ -317,20 +294,6 @@ impl XwaylandService {
         self.note_reactor_registration_with_token_impl(registration, registered, reactor_token);
     }
 
-    /// Release retired generation resources only after the runtime has removed
-    /// their reactor registrations.
-    pub fn finish_reactor_teardown(&mut self) -> io::Result<()> {
-        while let Some(resources) = self.retired_resources.pop() {
-            match resources {
-                RetiredResources::Starting(resources) => drop(resources),
-                RetiredResources::RunningBase(resources) => drop(resources),
-                RetiredResources::Running(resources) => drop(resources),
-            }
-        }
-        drop(self.retired_lease.take());
-        Ok(())
-    }
-
     #[cfg(test)]
     pub(crate) fn has_pending_reactor_teardown(&self) -> bool {
         !self.retired_resources.is_empty() || self.retired_lease.is_some()
@@ -470,7 +433,7 @@ impl XwaylandService {
             "oblivion-one xwayland: event=xwm_failure generation={generation:?} stage={stage:?} reason={error}"
         );
         self.private_client = None;
-        self.capture_failure_stderr();
+        self.mark_stderr_failure();
         if let Err(cleanup_error) = self.request_process_termination(supervisor, process_id) {
             eprintln!(
                 "oblivion-one xwayland: event=xwm_cleanup_failure generation={generation:?} reason={cleanup_error}"
@@ -537,6 +500,7 @@ impl XwaylandService {
         if let Some(process_id) = process_id {
             self.request_process_termination(supervisor, process_id)?;
         }
+        self.mark_stderr_failure();
         self.enter_failure_backoff(now_ns()?);
         Ok(())
     }
@@ -748,11 +712,7 @@ impl XwaylandService {
             None,
             Some(0),
         );
-        let mut launch = SpawnCommand::new(build_command(
-            &self.config.binary,
-            lease,
-            self.config.log_stderr,
-        ));
+        let mut launch = SpawnCommand::new(build_command(&self.config.binary, lease));
         launch.map_fd(
             owned_fd_from_stream(private_wayland_child),
             ChildFdTarget::WaylandSocket.raw_fd(),
@@ -1065,6 +1025,7 @@ impl XwaylandService {
             }
             super::diagnostics::XwaylandExitClass::StartupExitBeforeReadiness
             | super::diagnostics::XwaylandExitClass::CrashOrSignal => {
+                self.mark_stderr_failure();
                 self.enter_failure_backoff(now_ns()?);
             }
         }
@@ -1274,6 +1235,7 @@ impl XwaylandService {
             );
             self.metrics.readiness_failures = self.metrics.readiness_failures.saturating_add(1);
             self.request_process_termination(supervisor, process_id)?;
+            self.mark_stderr_failure();
             self.enter_failure_backoff(now_ns);
         } else if matches!(&self.state, ServiceState::Backoff { deadline_ns, .. } if now_ns >= *deadline_ns)
         {
@@ -1446,7 +1408,7 @@ impl XwaylandService {
             );
         }
         self.private_client = None;
-        self.capture_failure_stderr();
+        self.mark_stderr_failure();
         self.metrics.readiness_failures = self.metrics.readiness_failures.saturating_add(1);
         eprintln!(
             "oblivion-one xwayland: event=readiness_failure generation={generation:?} stage={stage:?} reason={error}"

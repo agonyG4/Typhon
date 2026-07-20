@@ -419,6 +419,27 @@ fn reap_one(supervisor: &mut ChildSupervisor) -> crate::process::ChildExit {
     }
 }
 
+fn finish_reactor_teardown_bounded(
+    service: &mut XwaylandService,
+    supervisor: &mut ChildSupervisor,
+) {
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while service.has_pending_reactor_teardown() {
+        service
+            .finish_reactor_teardown()
+            .expect("finish bounded retired-resource drain");
+        if !service.has_pending_reactor_teardown() {
+            return;
+        }
+        let _ = supervisor.reap_exited().expect("reap retired generation");
+        assert!(
+            Instant::now() < deadline,
+            "retired-resource drain exceeded bound"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn base_mode_arms_both_listeners_without_starting_a_process() {
     let (root, service, supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/true");
@@ -1136,9 +1157,7 @@ fn startup_timeout_kills_generation_and_enters_backoff() {
             .contains(&"xwayland_shell_bound")
     );
     assert!(service.has_pending_reactor_teardown());
-    service
-        .finish_reactor_teardown()
-        .expect("finish source teardown");
+    finish_reactor_teardown_bounded(&mut service, &mut supervisor);
     assert!(!service.has_pending_reactor_teardown());
     let deadline = Instant::now() + Duration::from_secs(2);
     while supervisor.active_count() != 0 && Instant::now() < deadline {
@@ -1177,9 +1196,7 @@ fn timeout_unregisters_generation_source_before_descriptor_release() {
             .unregister(token)
             .expect("unregister before close")
     );
-    service
-        .finish_reactor_teardown()
-        .expect("release after unregister");
+    finish_reactor_teardown_bounded(&mut service, &mut supervisor);
     assert!(!service.has_pending_reactor_teardown());
 
     drop(event_loop);
@@ -1213,9 +1230,7 @@ fn process_exit_during_starting_retires_sources_before_resources() {
     assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
     assert!(service.has_pending_reactor_teardown());
     assert!(event_loop.unregister(token).expect("unregister displayfd"));
-    service
-        .finish_reactor_teardown()
-        .expect("finish source teardown");
+    finish_reactor_teardown_bounded(&mut service, &mut supervisor);
     assert!(!service.has_pending_reactor_teardown());
 
     drop(event_loop);

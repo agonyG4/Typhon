@@ -40,7 +40,7 @@ fn service_at_root_with_stderr_binary_and_logging(
 }
 
 #[test]
-fn stderr_capture_is_retained_when_live_logging_is_disabled() {
+fn failed_generation_drains_final_stderr_with_live_logging_disabled() {
     let (root, mut service, mut supervisor) = service_at_root_with_stderr_binary();
     service
         .handle_listener_readiness(&mut supervisor)
@@ -59,15 +59,23 @@ fn stderr_capture_is_retained_when_live_logging_is_disabled() {
         XwaylandFailureStage::Startup,
         "preserve stderr after startup failure",
     );
+    service
+        .handle_deadline(u64::MAX, &mut supervisor)
+        .expect("escalate failed generation cleanup");
+    let reap_deadline = Instant::now() + Duration::from_secs(2);
+    while supervisor.active_count() != 0 && Instant::now() < reap_deadline {
+        let _ = supervisor.reap_exited().expect("reap failed generation");
+        thread::sleep(Duration::from_millis(10));
+    }
+    service
+        .finish_reactor_teardown()
+        .expect("finish bounded stderr drain");
     assert!(
         service
             .recent_failure_diagnostics()
             .iter()
             .any(|line| line.contains("xwayland diagnostic"))
     );
-    service
-        .handle_deadline(u64::MAX, &mut supervisor)
-        .expect("kill failed generation");
     drop(service);
     drop(supervisor);
     fs::remove_dir_all(root).expect("remove test root");
@@ -82,6 +90,98 @@ fn stderr_forwarding_is_controlled_independently_of_capture() {
         .expect("start generation");
     let generation = service.generation().expect("generation");
     assert_eq!(service.stderr_forwarding_for_tests(generation), Some(true));
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn crash_preserves_final_stderr_ring() {
+    let (root, mut service, mut supervisor) = service_at_root_with_stderr_binary();
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let generation = service.generation().expect("generation");
+    let stderr_deadline = Instant::now() + Duration::from_secs(2);
+    while service.metrics.stderr_lines == 0 && Instant::now() < stderr_deadline {
+        service
+            .handle_stderr_ready(generation)
+            .expect("drain crash diagnostics");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let process_id = service
+        .readiness_snapshot()
+        .expect("readiness snapshot")
+        .process_id;
+    supervisor
+        .kill_managed_now(process_id)
+        .expect("kill Xwayland test process");
+    let exit = super::reap_one(&mut supervisor);
+    service
+        .handle_process_exit(&exit)
+        .expect("contain crashed generation");
+    service
+        .finish_reactor_teardown()
+        .expect("finish crash stderr drain");
+    assert!(
+        service
+            .recent_failure_diagnostics()
+            .iter()
+            .any(|line| line.contains("xwayland diagnostic"))
+    );
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn stderr_generation_replacement_keeps_latest_failed_ring() {
+    let (root, mut service, mut supervisor) = service_at_root_with_stderr_binary();
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start first generation");
+    let first_generation = service.generation().expect("first generation");
+    let stderr_deadline = Instant::now() + Duration::from_secs(2);
+    while service.metrics.stderr_lines == 0 && Instant::now() < stderr_deadline {
+        service
+            .handle_stderr_ready(first_generation)
+            .expect("drain first generation stderr");
+        thread::sleep(Duration::from_millis(10));
+    }
+    service.inject_xwm_failure_for_tests(
+        &mut supervisor,
+        XwaylandFailureStage::Startup,
+        "first generation failed",
+    );
+    service
+        .handle_deadline(u64::MAX, &mut supervisor)
+        .expect("terminate first generation");
+    let reap_deadline = Instant::now() + Duration::from_secs(2);
+    while supervisor.active_count() != 0 && Instant::now() < reap_deadline {
+        let _ = supervisor.reap_exited().expect("reap first generation");
+        thread::sleep(Duration::from_millis(10));
+    }
+    service
+        .finish_reactor_teardown()
+        .expect("publish first generation stderr");
+    let first_diagnostics = service.recent_failure_diagnostics();
+    assert!(
+        first_diagnostics
+            .iter()
+            .any(|line| line.contains("xwayland diagnostic"))
+    );
+
+    service
+        .handle_deadline(u64::MAX, &mut supervisor)
+        .expect("rearm after first failure");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start replacement generation");
+    let second_generation = service.generation().expect("replacement generation");
+    assert_ne!(first_generation, second_generation);
+    assert_eq!(service.recent_failure_diagnostics(), first_diagnostics);
     service.emergency_cleanup(&mut supervisor).expect("cleanup");
     drop(service);
     drop(supervisor);

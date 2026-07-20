@@ -24,9 +24,7 @@ use x11rb::{
         sync::ConnectionExt as SyncConnectionExt,
         xfixes,
         xfixes::ConnectionExt as XfixesConnectionExt,
-        xproto::{
-            self, ClientMessageEvent, ConnectionExt as XprotoConnectionExt, MapState, WindowClass,
-        },
+        xproto::{self, ClientMessageEvent, ConnectionExt as XprotoConnectionExt},
     },
     rust_connection::{RustConnection, Stream},
     wrapper::ConnectionExt as WrapperConnectionExt,
@@ -35,7 +33,7 @@ use x11rb::{
 use x11rb_protocol::{SequenceNumber, connect::Connect};
 
 use super::{
-    Xwm, XwmStartupError, adoption,
+    Xwm, XwmStartupError,
     atoms::{XwmAtomName, XwmAtoms},
     capabilities::XwmCapabilities,
     connection::{ReactorStream, X11Connection},
@@ -47,7 +45,10 @@ use super::{
 use crate::xwayland::XwaylandGeneration;
 
 const MAX_SETUP_BYTES: usize = 64 * 1024;
-const MAX_ADOPTION_IN_FLIGHT: usize = 64;
+
+#[path = "startup_adoption.rs"]
+mod startup_adoption;
+use startup_adoption::{AdoptedWindow, AdoptionCandidate, PendingAdoptionReply};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum XwmStartupState {
@@ -78,39 +79,6 @@ enum PendingCheckedKind {
     EwmhProperty,
     SelectionClaim,
     ManagerMessage,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum PendingAdoptionKind {
-    Attributes,
-    Geometry,
-}
-
-enum AdoptionReply {
-    Attributes(xproto::GetWindowAttributesReply),
-    Geometry(xproto::GetGeometryReply),
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PendingAdoptionReply {
-    xid: u32,
-    kind: PendingAdoptionKind,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AdoptionCandidate {
-    xid: u32,
-    kind: Option<crate::compositor::DesktopWindowKind>,
-    geometry: Option<super::X11Geometry>,
-    mapped: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AdoptedWindow {
-    xid: u32,
-    kind: crate::compositor::DesktopWindowKind,
-    geometry: super::X11Geometry,
-    mapped: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -783,190 +751,6 @@ impl XwmStartup {
         };
         self.pending_tree = Some(sequence);
         self.flush_connection()
-    }
-
-    fn start_adoption_batch(&mut self) -> Result<(), XwmStartupError> {
-        let mut queued = false;
-        let available = MAX_ADOPTION_IN_FLIGHT.saturating_sub(self.adoption_candidates.len());
-        for xid in adoption::take_batch(&mut self.adoption_queue, available) {
-            if self.adoption_candidates.contains_key(&xid) {
-                continue;
-            }
-            self.adoption_candidates.insert(
-                xid,
-                AdoptionCandidate {
-                    xid,
-                    kind: None,
-                    geometry: None,
-                    mapped: false,
-                },
-            );
-            let attributes = {
-                let cookie = self
-                    .connection()?
-                    .get_window_attributes(xid)
-                    .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-                let sequence = cookie.sequence_number();
-                std::mem::forget(cookie);
-                sequence
-            };
-            let geometry = {
-                let cookie = self
-                    .connection()?
-                    .get_geometry(xid)
-                    .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-                let sequence = cookie.sequence_number();
-                std::mem::forget(cookie);
-                sequence
-            };
-            self.pending_adoption.insert(
-                attributes,
-                PendingAdoptionReply {
-                    xid,
-                    kind: PendingAdoptionKind::Attributes,
-                },
-            );
-            self.pending_adoption.insert(
-                geometry,
-                PendingAdoptionReply {
-                    xid,
-                    kind: PendingAdoptionKind::Geometry,
-                },
-            );
-            queued = true;
-        }
-        if queued {
-            self.flush_connection()?;
-        }
-        Ok(())
-    }
-
-    fn complete_adoption(&mut self) -> Result<bool, XwmStartupError> {
-        let sequences = self.pending_adoption.keys().copied().collect::<Vec<_>>();
-        for sequence in sequences {
-            let Some(pending) = self.pending_adoption.get(&sequence).copied() else {
-                continue;
-            };
-            let result = match pending.kind {
-                PendingAdoptionKind::Attributes => {
-                    let result = {
-                        let cookie = Cookie::<X11Connection, xproto::GetWindowAttributesReply>::new(
-                            self.connection()?,
-                            sequence,
-                        );
-                        cookie.reply_unchecked()
-                    };
-                    result.map(|reply| reply.map(AdoptionReply::Attributes))
-                }
-                PendingAdoptionKind::Geometry => {
-                    let result = {
-                        let cookie = Cookie::<X11Connection, xproto::GetGeometryReply>::new(
-                            self.connection()?,
-                            sequence,
-                        );
-                        cookie.reply_unchecked()
-                    };
-                    result.map(|reply| reply.map(AdoptionReply::Geometry))
-                }
-            };
-            match result {
-                Ok(Some(reply)) => {
-                    self.pending_adoption.remove(&sequence);
-                    self.apply_adoption_reply(pending.xid, reply)?;
-                }
-                Ok(None) => {
-                    self.pending_adoption.remove(&sequence);
-                    self.adoption_candidates.remove(&pending.xid);
-                    self.drain_adoption_errors()?;
-                }
-                Err(x11rb::errors::ConnectionError::IoError(error))
-                    if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => {
-                    return Err(XwmStartupError::Protocol(format!(
-                        "existing-window adoption connection failed: {error}"
-                    )));
-                }
-            }
-        }
-        self.finalize_adoption_candidates();
-        self.start_adoption_batch()?;
-        Ok(self.pending_adoption.is_empty()
-            && self.adoption_queue.is_empty()
-            && self.adoption_candidates.is_empty())
-    }
-
-    fn apply_adoption_reply(
-        &mut self,
-        xid: u32,
-        reply: AdoptionReply,
-    ) -> Result<(), XwmStartupError> {
-        match reply {
-            AdoptionReply::Attributes(attributes) => {
-                if attributes.class != WindowClass::INPUT_OUTPUT {
-                    self.adoption_candidates.remove(&xid);
-                    return Ok(());
-                }
-                let Some(candidate) = self.adoption_candidates.get_mut(&xid) else {
-                    return Ok(());
-                };
-                candidate.kind = Some(if attributes.override_redirect {
-                    crate::compositor::DesktopWindowKind::OverrideRedirect
-                } else {
-                    crate::compositor::DesktopWindowKind::Managed
-                });
-                candidate.mapped = attributes.map_state != MapState::UNMAPPED;
-            }
-            AdoptionReply::Geometry(geometry) => {
-                if geometry.width == 0 || geometry.height == 0 {
-                    self.adoption_candidates.remove(&xid);
-                    return Ok(());
-                }
-                let Some(candidate) = self.adoption_candidates.get_mut(&xid) else {
-                    return Ok(());
-                };
-                candidate.geometry = Some(super::X11Geometry {
-                    x: i32::from(geometry.x),
-                    y: i32::from(geometry.y),
-                    width: u32::from(geometry.width),
-                    height: u32::from(geometry.height),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    fn finalize_adoption_candidates(&mut self) {
-        let ready = self
-            .adoption_candidates
-            .values()
-            .filter_map(|candidate| {
-                Some(AdoptedWindow {
-                    xid: candidate.xid,
-                    kind: candidate.kind?,
-                    geometry: candidate.geometry?,
-                    mapped: candidate.mapped,
-                })
-            })
-            .collect::<Vec<_>>();
-        for adopted in ready {
-            self.adoption_candidates.remove(&adopted.xid);
-            self.adopted_windows.push(adopted);
-        }
-    }
-
-    fn drain_adoption_errors(&mut self) -> Result<(), XwmStartupError> {
-        loop {
-            let Some((raw, _sequence)) = self
-                .connection()?
-                .poll_new_raw_event_with_sequence()
-                .map_err(|error| XwmStartupError::Protocol(error.to_string()))?
-            else {
-                return Ok(());
-            };
-            if raw.first().copied() != Some(0) {
-                self.connection()?.defer_raw_event((raw, _sequence));
-            }
-        }
     }
 
     fn queue_selection_claim(&mut self) -> Result<(), XwmStartupError> {

@@ -2,6 +2,7 @@ use std::{
     io,
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
     os::unix::net::UnixStream,
+    time::{Duration, Instant},
 };
 
 use super::super::{
@@ -11,23 +12,114 @@ use super::super::{
     readiness::XwaylandReadinessSnapshot,
 };
 use super::{
-    STDERR_MAX_BUFFER, STDERR_MAX_LINE, ServiceState, StartingResources, XwaylandReactorPurpose,
+    RetiredResources, ServiceState, StartingResources, XwaylandReactorPurpose,
     XwaylandReactorRegistration, XwaylandService,
 };
+
+const STDERR_MAX_BUFFER: usize = 64 * 1024;
+const STDERR_MAX_LINE: usize = 8 * 1024;
+const STDERR_EVENT_MAX_BYTES: usize = 64 * 1024;
+const STDERR_EVENT_MAX_NS: u64 = 5_000_000;
+const STDERR_FINAL_DRAIN_MAX_BYTES: usize = 64 * 1024;
+const STDERR_FINAL_DRAIN_MAX_NS: u64 = 50_000_000;
+
+#[derive(Debug)]
+pub(super) struct StderrPipe {
+    pub(super) fd: OwnedFd,
+    pub(super) buffer: Vec<u8>,
+    pub(super) active: bool,
+    pub(super) forward: bool,
+    pub(super) failed: bool,
+    pub(super) final_drain_deadline: Option<Instant>,
+    pub(super) ring: StderrRing,
+}
+
+impl StderrPipe {
+    pub(super) fn new(fd: OwnedFd, forward: bool) -> Self {
+        Self {
+            fd,
+            buffer: Vec::new(),
+            active: true,
+            forward,
+            failed: false,
+            final_drain_deadline: None,
+            ring: StderrRing::default(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct StderrDrain {
+    pub(crate) bytes_read: u64,
+    pub(crate) truncated_chunks: u64,
+    pub(crate) closed: bool,
+    pub(crate) lines: Vec<(String, bool)>,
+}
+
+pub(crate) fn drain_stderr_pipe(
+    stderr: &mut StderrPipe,
+    max_bytes: usize,
+    deadline: Instant,
+) -> StderrDrain {
+    let mut drain = StderrDrain::default();
+    let mut bytes = [0u8; 4096];
+    while stderr.active && (drain.bytes_read as usize) < max_bytes && Instant::now() < deadline {
+        let remaining = max_bytes.saturating_sub(drain.bytes_read as usize);
+        let read_len = remaining.min(bytes.len());
+        // SAFETY: stderr.fd is owned by the generation and remains alive for
+        // the duration of this nonblocking drain.
+        let read =
+            unsafe { libc::read(stderr.fd.as_raw_fd(), bytes.as_mut_ptr().cast(), read_len) };
+        if read < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::WouldBlock {
+                stderr.active = false;
+                drain.closed = true;
+            }
+            break;
+        }
+        if read == 0 {
+            stderr.active = false;
+            drain.closed = true;
+            break;
+        }
+        let read = read as usize;
+        drain.bytes_read = drain.bytes_read.saturating_add(read as u64);
+        stderr.ring.push(&bytes[..read]);
+        stderr.buffer.extend_from_slice(&bytes[..read]);
+        if stderr.buffer.len() > STDERR_MAX_BUFFER {
+            let excess = stderr.buffer.len() - STDERR_MAX_BUFFER;
+            stderr.buffer.drain(..excess);
+            drain.truncated_chunks = drain.truncated_chunks.saturating_add(1);
+        }
+        while let Some(newline) = stderr.buffer.iter().position(|byte| *byte == b'\n') {
+            let raw = stderr.buffer.drain(..=newline).collect::<Vec<_>>();
+            let text = String::from_utf8_lossy(&raw[..raw.len().saturating_sub(1)]).into_owned();
+            drain.lines.push((text, false));
+        }
+        while stderr.buffer.len() > STDERR_MAX_LINE {
+            let raw = stderr.buffer.drain(..STDERR_MAX_LINE).collect::<Vec<_>>();
+            drain
+                .lines
+                .push((String::from_utf8_lossy(&raw).into_owned(), true));
+        }
+    }
+    if drain.closed && !stderr.buffer.is_empty() {
+        let raw = std::mem::take(&mut stderr.buffer);
+        drain
+            .lines
+            .push((String::from_utf8_lossy(&raw).into_owned(), false));
+    }
+    drain
+}
 
 impl XwaylandService {
     pub(crate) fn handle_stderr_ready_impl(
         &mut self,
         generation: super::XwaylandGeneration,
     ) -> io::Result<()> {
-        let mut lines = Vec::<(String, bool)>::new();
-        let mut bytes_read = 0u64;
-        let mut truncated_chunks = 0u64;
-        let mut closed = false;
-        let process_id;
-        let forward;
-        {
-            let (resources_generation, resource_process_id, stderr) = match &mut self.state {
+        let (process_id, forward, drain) = {
+            let (resources_generation, process_id, stderr) = match &mut self.state {
                 ServiceState::Starting(resources) => (
                     resources.generation,
                     resources.process.id,
@@ -55,67 +147,36 @@ impl XwaylandService {
             if !stderr.active {
                 return Ok(());
             }
-            process_id = resource_process_id;
-            forward = stderr.forward;
-            let mut bytes = [0u8; 4096];
-            loop {
-                // SAFETY: the stderr descriptor is owned by `stderr` for the
-                // duration of this scoped read loop.
-                let read = unsafe {
-                    libc::read(
-                        stderr.fd.as_raw_fd(),
-                        bytes.as_mut_ptr().cast(),
-                        bytes.len(),
-                    )
-                };
-                if read < 0 {
-                    let error = io::Error::last_os_error();
-                    if error.kind() == io::ErrorKind::WouldBlock {
-                        break;
-                    }
-                    stderr.active = false;
-                    closed = true;
-                    break;
-                }
-                if read == 0 {
-                    stderr.active = false;
-                    closed = true;
-                    break;
-                }
-                let read = read as usize;
-                bytes_read = bytes_read.saturating_add(read as u64);
-                stderr.ring.push(&bytes[..read]);
-                stderr.buffer.extend_from_slice(&bytes[..read]);
-                if stderr.buffer.len() > STDERR_MAX_BUFFER {
-                    let excess = stderr.buffer.len() - STDERR_MAX_BUFFER;
-                    stderr.buffer.drain(..excess);
-                    truncated_chunks = truncated_chunks.saturating_add(1);
-                }
-                while let Some(newline) = stderr.buffer.iter().position(|byte| *byte == b'\n') {
-                    let raw = stderr.buffer.drain(..=newline).collect::<Vec<_>>();
-                    let text =
-                        String::from_utf8_lossy(&raw[..raw.len().saturating_sub(1)]).into_owned();
-                    lines.push((text, false));
-                }
-                while stderr.buffer.len() > STDERR_MAX_LINE {
-                    let raw = stderr.buffer.drain(..STDERR_MAX_LINE).collect::<Vec<_>>();
-                    lines.push((String::from_utf8_lossy(&raw).into_owned(), true));
-                }
-            }
-            if closed && !stderr.buffer.is_empty() {
-                let raw = std::mem::take(&mut stderr.buffer);
-                lines.push((String::from_utf8_lossy(&raw).into_owned(), false));
-            }
-        }
-        self.metrics.stderr_bytes = self.metrics.stderr_bytes.saturating_add(bytes_read);
+            (
+                process_id,
+                stderr.forward,
+                drain_stderr_pipe(
+                    stderr,
+                    STDERR_EVENT_MAX_BYTES,
+                    Instant::now() + Duration::from_nanos(STDERR_EVENT_MAX_NS),
+                ),
+            )
+        };
+        self.record_stderr_drain(generation, process_id, forward, drain);
+        Ok(())
+    }
+
+    pub(super) fn record_stderr_drain(
+        &mut self,
+        generation: super::XwaylandGeneration,
+        process_id: super::ManagedProcessId,
+        forward: bool,
+        drain: StderrDrain,
+    ) {
+        self.metrics.stderr_bytes = self.metrics.stderr_bytes.saturating_add(drain.bytes_read);
         self.metrics.stderr_truncated = self
             .metrics
             .stderr_truncated
-            .saturating_add(truncated_chunks);
-        if closed {
+            .saturating_add(drain.truncated_chunks);
+        if drain.closed {
             self.metrics.stderr_closed = self.metrics.stderr_closed.saturating_add(1);
         }
-        for (line, truncated) in lines {
+        for (line, truncated) in drain.lines {
             self.metrics.stderr_lines = self.metrics.stderr_lines.saturating_add(1);
             if truncated {
                 self.metrics.stderr_truncated = self.metrics.stderr_truncated.saturating_add(1);
@@ -128,7 +189,116 @@ impl XwaylandService {
                 );
             }
         }
+    }
+
+    /// Release retired generation resources only after the runtime has removed
+    /// their reactor registrations. Retired stderr remains unregistered but
+    /// owned until EOF or the strict final-drain deadline.
+    pub fn finish_reactor_teardown(&mut self) -> io::Result<()> {
+        let mut final_stderr = Vec::new();
+        let mut retained_resources = Vec::new();
+        while let Some(resources) = self.retired_resources.pop() {
+            let mut resources = resources;
+            let drained = match &mut resources {
+                RetiredResources::Starting(resources) => resources.stderr.as_mut().map(|stderr| {
+                    let deadline = *stderr.final_drain_deadline.get_or_insert_with(|| {
+                        Instant::now() + Duration::from_nanos(STDERR_FINAL_DRAIN_MAX_NS)
+                    });
+                    let drain = drain_stderr_pipe(stderr, STDERR_FINAL_DRAIN_MAX_BYTES, deadline);
+                    (
+                        resources.generation,
+                        resources.process.id,
+                        stderr.forward,
+                        stderr.failed,
+                        stderr.ring.clone(),
+                        drain,
+                        stderr.active && Instant::now() < deadline,
+                    )
+                }),
+                RetiredResources::RunningBase(resources) => {
+                    resources.stderr.as_mut().map(|stderr| {
+                        let deadline = *stderr.final_drain_deadline.get_or_insert_with(|| {
+                            Instant::now() + Duration::from_nanos(STDERR_FINAL_DRAIN_MAX_NS)
+                        });
+                        let drain =
+                            drain_stderr_pipe(stderr, STDERR_FINAL_DRAIN_MAX_BYTES, deadline);
+                        (
+                            resources.generation,
+                            resources.process.id,
+                            stderr.forward,
+                            stderr.failed,
+                            stderr.ring.clone(),
+                            drain,
+                            stderr.active && Instant::now() < deadline,
+                        )
+                    })
+                }
+                RetiredResources::Running(resources) => resources.stderr.as_mut().map(|stderr| {
+                    let deadline = *stderr.final_drain_deadline.get_or_insert_with(|| {
+                        Instant::now() + Duration::from_nanos(STDERR_FINAL_DRAIN_MAX_NS)
+                    });
+                    let drain = drain_stderr_pipe(stderr, STDERR_FINAL_DRAIN_MAX_BYTES, deadline);
+                    (
+                        resources.generation,
+                        resources.process.id,
+                        stderr.forward,
+                        stderr.failed,
+                        stderr.ring.clone(),
+                        drain,
+                        stderr.active && Instant::now() < deadline,
+                    )
+                }),
+            };
+            if let Some((generation, process_id, forward, failed, ring, drain, retain)) = drained {
+                if retain {
+                    retained_resources.push(resources);
+                    continue;
+                }
+                final_stderr.push((generation, process_id, forward, failed, ring, drain));
+            }
+            match resources {
+                RetiredResources::Starting(resources) => drop(resources),
+                RetiredResources::RunningBase(resources) => drop(resources),
+                RetiredResources::Running(resources) => drop(resources),
+            }
+        }
+        self.retired_resources = retained_resources;
+        let mut published_failed_stderr = false;
+        for (generation, process_id, forward, failed, ring, drain) in final_stderr {
+            self.record_stderr_drain(generation, process_id, forward, drain);
+            if failed && !published_failed_stderr {
+                self.latest_failed_stderr = ring;
+                published_failed_stderr = true;
+            }
+        }
+        if self.retired_resources.is_empty() {
+            drop(self.retired_lease.take());
+        }
         Ok(())
+    }
+
+    pub(crate) fn mark_stderr_failure(&mut self) {
+        match &mut self.state {
+            ServiceState::Starting(resources) => {
+                if let Some(stderr) = resources.stderr.as_mut() {
+                    stderr.failed = true;
+                }
+            }
+            ServiceState::RunningBase(resources) => {
+                if let Some(stderr) = resources.stderr.as_mut() {
+                    stderr.failed = true;
+                }
+            }
+            ServiceState::Running(resources) => {
+                if let Some(stderr) = resources.stderr.as_mut() {
+                    stderr.failed = true;
+                }
+            }
+            ServiceState::Disabled
+            | ServiceState::Armed
+            | ServiceState::Backoff { .. }
+            | ServiceState::Failed => {}
+        }
     }
 
     pub(crate) fn note_reactor_registration_with_token_impl(
@@ -273,30 +443,6 @@ impl XwaylandService {
             }
         }
         registrations.into_iter()
-    }
-
-    pub(super) fn capture_failure_stderr(&mut self) {
-        self.latest_failed_stderr = match &self.state {
-            ServiceState::Starting(resources) => resources
-                .stderr
-                .as_ref()
-                .map(|stderr| stderr.ring.clone())
-                .unwrap_or_default(),
-            ServiceState::RunningBase(resources) => resources
-                .stderr
-                .as_ref()
-                .map(|stderr| stderr.ring.clone())
-                .unwrap_or_default(),
-            ServiceState::Running(resources) => resources
-                .stderr
-                .as_ref()
-                .map(|stderr| stderr.ring.clone())
-                .unwrap_or_default(),
-            ServiceState::Disabled
-            | ServiceState::Armed
-            | ServiceState::Backoff { .. }
-            | ServiceState::Failed => StderrRing::default(),
-        };
     }
 
     pub(super) fn snapshot_for_starting(
