@@ -494,7 +494,7 @@ impl Xwm {
         self.windows
             .mark_buffer_ready(handle)
             .map_err(XwmError::InvalidCommand)?;
-        self.emit_ready_if_complete(handle)
+        self.emit_ready_if_complete(handle).map(|_| ())
     }
 
     pub fn mark_surface_buffer_ready(
@@ -759,13 +759,13 @@ impl Xwm {
         }
     }
 
-    fn emit_ready_if_complete(&mut self, handle: X11WindowHandle) -> Result<(), XwmError> {
+    fn emit_ready_if_complete(&mut self, handle: X11WindowHandle) -> Result<bool, XwmError> {
         let Some((properties_ready, kind, map_authorized)) = self
             .windows
             .get(handle)
             .map(|record| (record.properties_ready, record.kind, record.map_authorized))
         else {
-            return Ok(());
+            return Ok(false);
         };
         if properties_ready
             && kind == DesktopWindowKind::Managed
@@ -779,7 +779,7 @@ impl Xwm {
                 .push_back(XwmEvent::WindowMapRequested(handle));
         }
         if !properties_ready {
-            return Ok(());
+            return Ok(false);
         }
         let snapshot = self
             .windows
@@ -788,7 +788,8 @@ impl Xwm {
         if let Some(snapshot) = snapshot {
             self.outgoing_events
                 .push_back(XwmEvent::WindowReady(snapshot));
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 }

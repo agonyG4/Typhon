@@ -10,9 +10,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use x11rb::protocol::xproto::ConnectionExt;
+use x11rb::{
+    connection::Connection,
+    protocol::xproto::{AtomEnum, ConnectionExt, CreateWindowAux, PropMode, WindowClass},
+    wrapper::ConnectionExt as WrapperConnectionExt,
+};
 
-use super::super::{XwaylandGeneration, xwm::startup::XwmStartup};
+use super::super::{
+    XwaylandAssociationEvent, XwaylandGeneration,
+    xwm::{XwmCommand, XwmEvent, startup::XwmStartup},
+};
 
 struct XwaylandChild {
     process: Child,
@@ -139,7 +146,7 @@ fn installed_xwayland_listener_reaches_running_through_real_xwm_startup() {
     let mut startup = XwmStartup::new(generation, wm_parent).expect("create XwmStartup");
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut seen_states = Vec::new();
-    let xwm = loop {
+    let mut xwm = loop {
         assert!(
             Instant::now() < deadline,
             "XwmStartup did not reach Running"
@@ -190,6 +197,144 @@ fn installed_xwayland_listener_reaches_running_through_real_xwm_startup() {
     assert_eq!(owner, xwm.supporting_wm_check());
     assert_eq!(screen, 0);
     assert!(probe_xdpyinfo(&display, Duration::from_secs(2)).expect("probe after startup"));
+
+    let root = client.setup().roots[screen].root;
+    let window = client.generate_id().expect("allocate test X11 window");
+    client
+        .create_window(
+            client.setup().roots[screen].root_depth,
+            window,
+            root,
+            100,
+            100,
+            420,
+            180,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            client.setup().roots[screen].root_visual,
+            &CreateWindowAux::new(),
+        )
+        .expect("create managed X11 window");
+    let wm_name = client
+        .intern_atom(false, b"WM_NAME")
+        .expect("intern WM_NAME")
+        .reply()
+        .expect("WM_NAME reply")
+        .atom;
+    client
+        .change_property8(
+            PropMode::REPLACE,
+            window,
+            wm_name,
+            AtomEnum::STRING,
+            b"Typhon production-driver MapNotify regression",
+        )
+        .expect("set test window title");
+    client
+        .map_window(window)
+        .expect("request managed X11 window map");
+    client.flush().expect("flush managed X11 window");
+    client
+        .get_geometry(window)
+        .expect("query managed X11 window geometry")
+        .reply()
+        .expect("managed X11 window geometry reply");
+    client
+        .get_window_attributes(root)
+        .expect("query X11 root attributes")
+        .reply()
+        .expect("X11 root attributes reply");
+
+    let event_deadline = Instant::now() + Duration::from_secs(10);
+    let mut map_handle = None;
+    let mut association_injected = false;
+    let mut ready_snapshot = None;
+    let mut drained_events = 0usize;
+    while Instant::now() < event_deadline {
+        let revents = poll_xwm(xwm.raw_fd(), 100).expect("poll running XWM");
+        if revents & libc::POLLOUT != 0 {
+            let _ = xwm
+                .flush_output()
+                .expect("running XWM writable flush should be nonblocking");
+        }
+        if revents & libc::POLLIN != 0 {
+            drained_events = drained_events.saturating_add(
+                xwm.drain_events(256)
+                    .expect("running XWM event drain should succeed")
+                    .processed as usize,
+            );
+        }
+        let events = xwm.take_events().collect::<Vec<_>>();
+        for event in events {
+            match event {
+                XwmEvent::WindowMapRequested(handle) if handle.xid() == window => {
+                    xwm.execute(XwmCommand::Map(handle))
+                        .expect("production XWM map command");
+                    xwm.flush().expect("flush production XWM map command");
+                    map_handle = Some(handle);
+                }
+                XwmEvent::WindowReady(snapshot) if snapshot.handle.xid() == window => {
+                    ready_snapshot = Some(snapshot);
+                }
+                _ => {}
+            }
+        }
+        if let Some(handle) = map_handle
+            && !association_injected
+        {
+            let serial = std::num::NonZeroU64::new(0xfeed_beef).expect("association serial");
+            xwm.note_x11_surface_serial(handle, serial.get() as u32, (serial.get() >> 32) as u32)
+                .expect("record X11 surface serial");
+            xwm.ingest_wayland_association(XwaylandAssociationEvent::Committed {
+                generation,
+                serial,
+                surface_id: 77,
+            })
+            .expect("record Wayland surface association");
+            xwm.mark_surface_buffer_ready(generation, 77)
+                .expect("record first surface buffer");
+            association_injected = true;
+        }
+        if ready_snapshot.is_some() {
+            break;
+        }
+    }
+    let snapshot = ready_snapshot.unwrap_or_else(|| {
+        let attributes = client
+            .get_window_attributes(window)
+            .expect("query failed managed X11 window attributes")
+            .reply()
+            .expect("failed managed X11 window attributes reply");
+        panic!(
+            "real XWM event path should emit WindowReady; drained_events={drained_events} window_count={} map_state={:?}",
+            xwm.window_count(),
+            attributes.map_state,
+        );
+    });
+    assert_eq!(snapshot.handle.xid(), window);
+    assert_eq!(snapshot.surface_id, 77);
+    xwm.execute(XwmCommand::SyncClientLists {
+        client_list: vec![snapshot.handle],
+        stacking: vec![snapshot.handle],
+    })
+    .expect("publish real X11 client list");
+    xwm.flush().expect("flush real X11 client list");
+    let client_list_atom = client
+        .intern_atom(false, b"_NET_CLIENT_LIST")
+        .expect("intern client list atom")
+        .reply()
+        .expect("client list atom reply")
+        .atom;
+    let client_list = client
+        .get_property(false, root, client_list_atom, AtomEnum::WINDOW, 0, 1024)
+        .expect("query real client list")
+        .reply()
+        .expect("real client list reply");
+    assert!(
+        client_list
+            .value32()
+            .is_some_and(|mut values| values.any(|xid| xid == window))
+    );
 
     drop(client);
     drop(xwm);

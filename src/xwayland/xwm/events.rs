@@ -75,6 +75,17 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 xwm.windows
                     .confirm_map_notify(handle)
                     .map_err(XwmError::InvalidCommand)?;
+                let ready_emitted = xwm.emit_ready_if_complete(handle)?;
+                let lifecycle = xwm
+                    .windows
+                    .get(handle)
+                    .map(|record| format!("{:?}", record.lifecycle))
+                    .unwrap_or_else(|| "Unknown".to_owned());
+                eprintln!(
+                    "oblivion-one xwayland: event=xwm_map_notify window={} pending_map=true ready_emitted={} lifecycle={lifecycle}",
+                    handle.xid(),
+                    ready_emitted,
+                );
                 return Ok(());
             }
             let externally_mapped = xwm
@@ -373,7 +384,284 @@ fn stack_mode(mode: xproto::StackMode) -> Option<X11StackMode> {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, num::NonZeroU64, os::unix::net::UnixStream};
+
+    use crate::xwayland::XwaylandAssociationEvent;
+    use x11rb::{
+        protocol::xproto::{Screen, Setup},
+        rust_connection::RustConnection,
+    };
+
     use super::*;
+
+    fn test_fixture(generation: super::super::XwaylandGeneration) -> (Xwm, UnixStream) {
+        let (stream, peer) = UnixStream::pair().expect("XWM fixture socket pair");
+        let reactor_stream = super::super::connection::ReactorStream::from_unix_stream(stream)
+            .expect("XWM fixture reactor stream");
+        let setup = Setup {
+            roots: vec![Screen {
+                root: 1,
+                root_visual: 1,
+                root_depth: 24,
+                width_in_pixels: 1920,
+                height_in_pixels: 1080,
+                ..Screen::default()
+            }],
+            resource_id_base: 0x100000,
+            resource_id_mask: 0x0fffff,
+            maximum_request_length: u16::MAX,
+            ..Setup::default()
+        };
+        let inner = RustConnection::for_connected_stream(reactor_stream, setup)
+            .expect("XWM fixture X11 connection");
+        let raw_fd = std::os::fd::AsRawFd::as_raw_fd(inner.stream());
+        let connection = super::super::connection::X11Connection::new(inner, HashMap::new());
+        let atoms = super::super::atoms::XwmAtoms::from_values(
+            super::super::atoms::XwmAtomName::ALL
+                .iter()
+                .enumerate()
+                .map(|(index, name)| (*name, (index as u32).saturating_add(1)))
+                .collect(),
+        );
+        let xwm = Xwm {
+            generation,
+            connection,
+            adoption: Default::default(),
+            screen_number: 0,
+            root: 1,
+            atoms,
+            capabilities: super::super::capabilities::XwmCapabilities {
+                composite: true,
+                xfixes: true,
+                shape: false,
+                randr: false,
+                sync: false,
+            },
+            windows: super::super::window::X11WindowRegistry::default(),
+            outgoing_events: Default::default(),
+            association: super::super::association::SurfaceAssociationJoin::default(),
+            resize_sync: super::super::resize_sync::ResizeSyncTracker::default(),
+            focus: super::super::focus::FocusTracker::default(),
+            sync_alarms: Default::default(),
+            sync_handles_by_counter: Default::default(),
+            next_resize_counter_values: Default::default(),
+            shapes: Default::default(),
+            data_bridge: super::super::data_bridge::DataBridge::default(),
+            randr: super::super::startup::default_randr_snapshot(),
+            pending_properties: Default::default(),
+            deferred_properties: Default::default(),
+            property_metrics: Default::default(),
+            buffer_ready_surfaces: Default::default(),
+            supporting_wm_check: 2,
+            raw_fd,
+        };
+        (xwm, peer)
+    }
+
+    fn generation(value: u64) -> super::super::XwaylandGeneration {
+        super::super::XwaylandGeneration::new(NonZeroU64::new(value).expect("nonzero"))
+    }
+
+    fn map_event(window: u32, override_redirect: bool) -> Event {
+        Event::MapNotify(xproto::MapNotifyEvent {
+            response_type: 19,
+            sequence: 0,
+            event: 1,
+            window,
+            override_redirect,
+        })
+    }
+
+    fn prepare_managed_window(
+        xwm: &mut Xwm,
+        xid: u32,
+        properties_ready: bool,
+        associated: bool,
+        buffer_ready: bool,
+    ) -> X11WindowHandle {
+        let handle = X11WindowHandle::new(xwm.generation, xid);
+        assert!(xwm.windows.insert_observed(handle));
+        xwm.windows.mark_map_requested(handle).expect("map request");
+        if properties_ready {
+            xwm.windows
+                .get_mut(handle)
+                .expect("window record")
+                .properties_ready = true;
+        }
+        xwm.windows.mark_map_commanded(handle).expect("map command");
+        if associated {
+            xwm.windows
+                .mark_associated(
+                    handle,
+                    super::super::AssociatedSurface {
+                        generation: xwm.generation,
+                        serial: NonZeroU64::new(0x1234).expect("serial"),
+                        surface_id: 42,
+                    },
+                )
+                .expect("association");
+        }
+        if buffer_ready {
+            xwm.windows
+                .mark_buffer_ready(handle)
+                .expect("buffer readiness");
+        }
+        handle
+    }
+
+    fn ready_events(xwm: &mut Xwm) -> Vec<super::super::XwmEvent> {
+        xwm.take_events().collect()
+    }
+
+    fn ready_surface_id(events: &[super::super::XwmEvent]) -> Option<u32> {
+        events.iter().find_map(|event| match event {
+            super::super::XwmEvent::WindowReady(snapshot) => Some(snapshot.surface_id),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn managed_map_notify_emits_window_ready_when_it_is_the_final_gate() {
+        let generation = generation(1);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = prepare_managed_window(&mut xwm, 100, true, true, true);
+
+        normalize(&mut xwm, map_event(handle.xid(), false)).expect("normalize MapNotify");
+
+        let events = ready_events(&mut xwm);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events.first(),
+            Some(super::super::XwmEvent::WindowReady(snapshot))
+                if snapshot.handle == handle && snapshot.surface_id == 42
+        ));
+        assert_eq!(ready_surface_id(&events), Some(42));
+    }
+
+    #[test]
+    fn map_notify_then_buffer_ready_emits_once() {
+        let generation = generation(2);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = prepare_managed_window(&mut xwm, 101, true, true, false);
+
+        normalize(&mut xwm, map_event(handle.xid(), false)).expect("normalize MapNotify");
+        assert!(ready_events(&mut xwm).is_empty());
+        xwm.mark_window_buffer_ready(handle)
+            .expect("buffer readiness");
+        let events = ready_events(&mut xwm);
+        assert_eq!(events.len(), 1);
+        assert_eq!(ready_surface_id(&events), Some(42));
+    }
+
+    #[test]
+    fn map_notify_then_association_emits_once() {
+        let generation = generation(3);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = prepare_managed_window(&mut xwm, 102, true, false, true);
+
+        normalize(&mut xwm, map_event(handle.xid(), false)).expect("normalize MapNotify");
+        assert!(ready_events(&mut xwm).is_empty());
+        xwm.note_x11_surface_serial(handle, 0x1234, 0)
+            .expect("X11 surface serial");
+        xwm.ingest_wayland_association(XwaylandAssociationEvent::Committed {
+            generation,
+            serial: NonZeroU64::new(0x1234).expect("serial"),
+            surface_id: 42,
+        })
+        .expect("Wayland association");
+        let events = ready_events(&mut xwm);
+        assert_eq!(events.len(), 1);
+        assert_eq!(ready_surface_id(&events), Some(42));
+    }
+
+    #[test]
+    fn map_notify_then_final_property_reply_emits_once() {
+        let generation = generation(4);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = prepare_managed_window(&mut xwm, 103, false, true, true);
+
+        normalize(&mut xwm, map_event(handle.xid(), false)).expect("normalize MapNotify");
+        assert!(ready_events(&mut xwm).is_empty());
+        xwm.windows
+            .get_mut(handle)
+            .expect("window record")
+            .properties_ready = true;
+        xwm.emit_ready_if_complete(handle)
+            .expect("final property readiness");
+        let events = ready_events(&mut xwm);
+        assert_eq!(events.len(), 1);
+        assert_eq!(ready_surface_id(&events), Some(42));
+    }
+
+    #[test]
+    fn duplicate_map_notify_does_not_duplicate_window_ready() {
+        let generation = generation(5);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = prepare_managed_window(&mut xwm, 104, true, true, true);
+
+        normalize(&mut xwm, map_event(handle.xid(), false)).expect("first MapNotify");
+        normalize(&mut xwm, map_event(handle.xid(), false)).expect("duplicate MapNotify");
+        let events = ready_events(&mut xwm);
+        assert_eq!(events.len(), 1);
+        assert_eq!(ready_surface_id(&events), Some(42));
+    }
+
+    #[test]
+    fn map_notify_before_map_command_is_classified_as_external_mapping() {
+        let generation = generation(6);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = X11WindowHandle::new(generation, 105);
+        assert!(xwm.windows.insert_observed(handle));
+        let record = xwm.windows.get_mut(handle).expect("window record");
+        record.map_requested = true;
+        record.properties_ready = true;
+        record.association = Some(super::super::AssociatedSurface {
+            generation,
+            serial: NonZeroU64::new(0x1234).expect("serial"),
+            surface_id: 42,
+        });
+        record.buffer_ready = true;
+
+        normalize(&mut xwm, map_event(handle.xid(), false)).expect("external MapNotify");
+        let events = ready_events(&mut xwm);
+        assert_eq!(events.len(), 1);
+        assert_eq!(ready_surface_id(&events), Some(42));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, super::super::XwmEvent::WindowMapRequested(_)))
+        );
+    }
+
+    #[test]
+    fn override_redirect_map_notify_keeps_external_lifecycle() {
+        let generation = generation(7);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = X11WindowHandle::new(generation, 106);
+        assert!(xwm.windows.insert_observed_with_kind(
+            handle,
+            DesktopWindowKind::OverrideRedirect,
+            X11Geometry::default()
+        ));
+        let record = xwm.windows.get_mut(handle).expect("window record");
+        record.properties_ready = true;
+        record.association = Some(super::super::AssociatedSurface {
+            generation,
+            serial: NonZeroU64::new(0x1234).expect("serial"),
+            surface_id: 42,
+        });
+        record.buffer_ready = true;
+
+        normalize(&mut xwm, map_event(handle.xid(), true)).expect("override MapNotify");
+        let events = ready_events(&mut xwm);
+        assert_eq!(events.len(), 1);
+        assert_eq!(ready_surface_id(&events), Some(42));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, super::super::XwmEvent::WindowMapRequested(_)))
+        );
+    }
 
     #[test]
     fn title_prefers_net_wm_name_over_wm_name() {
