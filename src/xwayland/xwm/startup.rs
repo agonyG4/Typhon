@@ -39,7 +39,7 @@ use super::{
     connection::{ReactorStream, X11Connection},
     ownership::{
         OwnershipFailure, OwnershipFailureKind, OwnershipGate, OwnershipStep,
-        STARTUP_SELECTION_TIMESTAMP, manager_message_data,
+        OwnershipTransitionError, STARTUP_SELECTION_TIMESTAMP, manager_message_data,
     },
 };
 use crate::xwayland::XwaylandGeneration;
@@ -264,11 +264,12 @@ impl XwmStartup {
                 if !self.complete_checked()? {
                     return Ok(None);
                 }
-                self.ownership.note_root_redirect_verified();
+                self.note_ownership(|ownership| ownership.note_root_redirect_verified())?;
                 self.state = XwmStartupState::RootRedirectVerified;
                 Ok(None)
             }
             XwmStartupState::RootRedirectVerified => {
+                self.note_ownership(|ownership| ownership.note_composite_redirect_requested())?;
                 self.queue_composite_redirect()?;
                 self.state = XwmStartupState::CompositeRedirectPending;
                 Ok(None)
@@ -277,11 +278,12 @@ impl XwmStartup {
                 if !self.complete_checked()? {
                     return Ok(None);
                 }
-                self.ownership.note_composite_redirect_verified();
+                self.note_ownership(|ownership| ownership.note_composite_redirect_verified())?;
                 self.state = XwmStartupState::CompositeRedirectVerified;
                 Ok(None)
             }
             XwmStartupState::CompositeRedirectVerified => {
+                self.note_ownership(|ownership| ownership.note_supporting_window_requested())?;
                 self.queue_supporting_window()?;
                 self.state = XwmStartupState::SupportingWindowPending;
                 Ok(None)
@@ -295,7 +297,10 @@ impl XwmStartup {
                         "stage=supporting-window-creation missing window id".to_owned(),
                     )
                 })?;
-                self.ownership.note_supporting_window_created(supporting);
+                self.note_ownership(|ownership| {
+                    ownership.note_supporting_window_created(supporting)
+                })?;
+                self.note_ownership(|ownership| ownership.note_ewmh_properties_requested())?;
                 self.queue_ewmh_properties()?;
                 self.state = XwmStartupState::EwmhPropertiesPending;
                 Ok(None)
@@ -304,7 +309,7 @@ impl XwmStartup {
                 if !self.complete_checked()? {
                     return Ok(None);
                 }
-                self.ownership.note_ewmh_properties_installed();
+                self.note_ownership(|ownership| ownership.note_ewmh_properties_installed())?;
                 self.queue_existing_window_query()?;
                 self.state = XwmStartupState::ExistingWindowsPending;
                 Ok(None)
@@ -346,7 +351,7 @@ impl XwmStartup {
                 if !self.complete_adoption()? {
                     return Ok(None);
                 }
-                self.ownership.note_existing_windows_adopted();
+                self.note_ownership(|ownership| ownership.note_existing_windows_adopted())?;
                 self.state = XwmStartupState::ExistingWindowsAdopted;
                 Ok(None)
             }
@@ -404,7 +409,7 @@ impl XwmStartup {
                     if !self.complete_checked()? {
                         return Ok(None);
                     }
-                    self.ownership.note_selection_claim_requested();
+                    self.note_ownership(|ownership| ownership.note_selection_claim_requested())?;
                     self.selection_claim_queued = true;
                     let connection = self.connection.as_ref().ok_or_else(|| {
                         XwmStartupError::Protocol("XWM connection disappeared".to_owned())
@@ -467,7 +472,9 @@ impl XwmStartup {
                         ),
                     );
                 }
-                self.ownership.note_selection_owner_verified(reply.owner);
+                self.note_ownership(|ownership| {
+                    ownership.note_selection_owner_verified(reply.owner)
+                })?;
                 self.state = XwmStartupState::SelectionVerified;
                 Ok(None)
             }
@@ -580,7 +587,6 @@ impl XwmStartup {
             std::mem::forget(cookie);
             sequence
         };
-        self.ownership.note_composite_redirect_requested();
         self.track_checked(sequence, PendingCheckedKind::CompositeRedirect)?;
         self.flush_connection()
     }
@@ -618,7 +624,6 @@ impl XwmStartup {
             sequence
         };
         self.supporting_wm_check = Some(supporting);
-        self.ownership.note_supporting_window_requested();
         self.track_checked(sequence, PendingCheckedKind::SupportingWindowCreation)?;
         self.flush_connection()
     }
@@ -681,7 +686,6 @@ impl XwmStartup {
             XwmStartupError::Ownership("stage=ewmh-properties missing supporting window".to_owned())
         })?;
         let capabilities = *self.capabilities()?;
-        self.ownership.note_ewmh_properties_requested();
         self.queue_property32(
             root,
             XwmAtomName::NetSupportingWmCheck,
@@ -812,12 +816,7 @@ impl XwmStartup {
             std::mem::forget(cookie);
             sequence
         };
-        if !self.ownership.queue_manager_message() {
-            return self.fail_ownership(
-                OwnershipFailureKind::ManagerMessage,
-                "MANAGER was queued before verified WM_S0 ownership",
-            );
-        }
+        self.note_ownership(|ownership| ownership.queue_manager_message())?;
         self.track_checked(sequence, PendingCheckedKind::ManagerMessage)?;
         self.flush_connection()
     }
@@ -930,6 +929,23 @@ impl XwmStartup {
             failure.reason
         );
         self.ownership.fail(failure);
+        Err(XwmStartupError::Ownership(message))
+    }
+
+    fn note_ownership<F>(&mut self, operation: F) -> Result<(), XwmStartupError>
+    where
+        F: FnOnce(&mut OwnershipGate) -> Result<(), OwnershipTransitionError>,
+    {
+        let result = operation(&mut self.ownership);
+        let Err(error) = result else {
+            return Ok(());
+        };
+        let message = error.to_string();
+        self.ownership.fail(OwnershipFailure::new(
+            self.generation,
+            OwnershipFailureKind::Transition,
+            message.clone(),
+        ));
         Err(XwmStartupError::Ownership(message))
     }
 

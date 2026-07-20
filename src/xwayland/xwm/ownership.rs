@@ -1,3 +1,5 @@
+use std::fmt;
+
 use crate::xwayland::XwaylandGeneration;
 
 /// Startup has no input-event timestamp yet.  ICCCM explicitly permits
@@ -35,6 +37,7 @@ pub(crate) enum OwnershipFailureKind {
     SelectionConflict,
     SelectionVerification,
     ManagerMessage,
+    Transition,
     #[allow(dead_code)]
     ConnectionLoss,
     #[allow(dead_code)]
@@ -46,6 +49,29 @@ pub(crate) struct OwnershipFailure {
     pub(crate) generation: XwaylandGeneration,
     pub(crate) kind: OwnershipFailureKind,
     pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnershipTransitionError {
+    pub(crate) generation: XwaylandGeneration,
+    pub(crate) attempted_generation: XwaylandGeneration,
+    pub(crate) current: OwnershipStep,
+    pub(crate) expected: OwnershipStep,
+    pub(crate) attempted: OwnershipStep,
+}
+
+impl fmt::Display for OwnershipTransitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "XWM ownership transition rejected: generation={} attempted_generation={} current={:?} expected={:?} attempted={:?}",
+            self.generation.get(),
+            self.attempted_generation.get(),
+            self.current,
+            self.expected,
+            self.attempted,
+        )
+    }
 }
 
 impl OwnershipFailure {
@@ -112,87 +138,156 @@ impl OwnershipGate {
         self.step == OwnershipStep::ManagerMessageQueued && self.manager_message_queued
     }
 
-    pub(crate) fn note_root_redirect_verified(&mut self) {
-        if self.step == OwnershipStep::RootRedirectPending {
-            self.step = OwnershipStep::RootRedirectVerified;
-        }
+    fn transition(
+        &mut self,
+        expected: OwnershipStep,
+        next: OwnershipStep,
+    ) -> Result<(), OwnershipTransitionError> {
+        self.transition_for_generation(self.generation, expected, next)
     }
 
-    pub(crate) fn note_composite_redirect_requested(&mut self) {
-        if self.step == OwnershipStep::RootRedirectVerified {
-            self.step = OwnershipStep::CompositeRedirectPending;
+    pub(crate) fn transition_for_generation(
+        &mut self,
+        generation: XwaylandGeneration,
+        expected: OwnershipStep,
+        next: OwnershipStep,
+    ) -> Result<(), OwnershipTransitionError> {
+        if generation != self.generation || self.step != expected {
+            let error = OwnershipTransitionError {
+                generation: self.generation,
+                attempted_generation: generation,
+                current: self.step,
+                expected,
+                attempted: next,
+            };
+            eprintln!(
+                "event=xwm_ownership_transition_rejected generation={} current={:?} expected={:?} attempted={:?} attempted_generation={}",
+                error.generation.get(),
+                error.current,
+                error.expected,
+                error.attempted,
+                error.attempted_generation.get(),
+            );
+            return Err(error);
         }
+        eprintln!(
+            "event=xwm_ownership_transition generation={} from={:?} to={:?}",
+            self.generation.get(),
+            expected,
+            next,
+        );
+        self.step = next;
+        Ok(())
     }
 
-    pub(crate) fn note_composite_redirect_verified(&mut self) {
-        if self.step == OwnershipStep::RootRedirectVerified {
-            self.step = OwnershipStep::CompositeRedirectVerified;
-        }
+    pub(crate) fn note_root_redirect_verified(&mut self) -> Result<(), OwnershipTransitionError> {
+        self.transition(
+            OwnershipStep::RootRedirectPending,
+            OwnershipStep::RootRedirectVerified,
+        )
     }
 
-    pub(crate) fn note_supporting_window_created(&mut self, window: u32) {
-        if matches!(
-            self.step,
-            OwnershipStep::CompositeRedirectVerified | OwnershipStep::SupportingWindowPending
-        ) {
-            self.supporting_window = Some(window);
-            self.step = OwnershipStep::SupportingWindowCreated;
-        }
+    pub(crate) fn note_composite_redirect_requested(
+        &mut self,
+    ) -> Result<(), OwnershipTransitionError> {
+        self.transition(
+            OwnershipStep::RootRedirectVerified,
+            OwnershipStep::CompositeRedirectPending,
+        )
     }
 
-    pub(crate) fn note_supporting_window_requested(&mut self) {
-        if self.step == OwnershipStep::CompositeRedirectVerified {
-            self.step = OwnershipStep::SupportingWindowPending;
-        }
+    pub(crate) fn note_composite_redirect_verified(
+        &mut self,
+    ) -> Result<(), OwnershipTransitionError> {
+        self.transition(
+            OwnershipStep::CompositeRedirectPending,
+            OwnershipStep::CompositeRedirectVerified,
+        )
     }
 
-    pub(crate) fn note_ewmh_properties_installed(&mut self) {
-        if self.step == OwnershipStep::SupportingWindowCreated {
-            self.step = OwnershipStep::EwmhPropertiesInstalled;
-        }
+    pub(crate) fn note_supporting_window_requested(
+        &mut self,
+    ) -> Result<(), OwnershipTransitionError> {
+        self.transition(
+            OwnershipStep::CompositeRedirectVerified,
+            OwnershipStep::SupportingWindowPending,
+        )
     }
 
-    pub(crate) fn note_ewmh_properties_requested(&mut self) {
-        if self.step == OwnershipStep::SupportingWindowCreated {
-            self.step = OwnershipStep::EwmhPropertiesPending;
-        }
+    pub(crate) fn note_supporting_window_created(
+        &mut self,
+        window: u32,
+    ) -> Result<(), OwnershipTransitionError> {
+        self.transition(
+            OwnershipStep::SupportingWindowPending,
+            OwnershipStep::SupportingWindowCreated,
+        )?;
+        self.supporting_window = Some(window);
+        Ok(())
     }
 
-    pub(crate) fn note_existing_windows_adopted(&mut self) {
-        if self.step == OwnershipStep::EwmhPropertiesInstalled {
-            self.step = OwnershipStep::ExistingWindowsAdopted;
-        }
+    pub(crate) fn note_ewmh_properties_requested(
+        &mut self,
+    ) -> Result<(), OwnershipTransitionError> {
+        self.transition(
+            OwnershipStep::SupportingWindowCreated,
+            OwnershipStep::EwmhPropertiesPending,
+        )
     }
 
-    pub(crate) fn note_selection_claim_requested(&mut self) {
-        if matches!(
-            self.step,
-            OwnershipStep::ExistingWindowsAdopted | OwnershipStep::SupportingWindowCreated
-        ) {
-            self.step = OwnershipStep::SelectionPending;
-        }
+    pub(crate) fn note_ewmh_properties_installed(
+        &mut self,
+    ) -> Result<(), OwnershipTransitionError> {
+        self.transition(
+            OwnershipStep::EwmhPropertiesPending,
+            OwnershipStep::EwmhPropertiesInstalled,
+        )
     }
 
-    pub(crate) fn note_selection_owner_verified(&mut self, owner: u32) {
-        if self.step == OwnershipStep::SelectionPending && self.supporting_window == Some(owner) {
-            self.selection_owner = Some(owner);
-            self.step = OwnershipStep::SelectionVerified;
-        }
+    pub(crate) fn note_existing_windows_adopted(&mut self) -> Result<(), OwnershipTransitionError> {
+        self.transition(
+            OwnershipStep::EwmhPropertiesInstalled,
+            OwnershipStep::ExistingWindowsAdopted,
+        )
     }
 
-    pub(crate) fn queue_manager_message(&mut self) -> bool {
-        if self.step != OwnershipStep::SelectionVerified {
-            return false;
-        }
-        self.note_manager_message_queued();
-        true
+    pub(crate) fn note_selection_claim_requested(
+        &mut self,
+    ) -> Result<(), OwnershipTransitionError> {
+        self.transition(
+            OwnershipStep::ExistingWindowsAdopted,
+            OwnershipStep::SelectionPending,
+        )
     }
 
-    pub(crate) fn note_manager_message_queued(&mut self) {
-        if self.step == OwnershipStep::SelectionVerified {
-            self.manager_message_queued = true;
-            self.step = OwnershipStep::ManagerMessageQueued;
+    pub(crate) fn note_selection_owner_verified(
+        &mut self,
+        owner: u32,
+    ) -> Result<(), OwnershipTransitionError> {
+        if self.supporting_window != Some(owner) {
+            return Err(OwnershipTransitionError {
+                generation: self.generation,
+                attempted_generation: self.generation,
+                current: self.step,
+                expected: OwnershipStep::SelectionPending,
+                attempted: OwnershipStep::SelectionVerified,
+            });
         }
+        self.transition(
+            OwnershipStep::SelectionPending,
+            OwnershipStep::SelectionVerified,
+        )?;
+        self.selection_owner = Some(owner);
+        Ok(())
+    }
+
+    pub(crate) fn queue_manager_message(&mut self) -> Result<(), OwnershipTransitionError> {
+        self.transition(
+            OwnershipStep::SelectionVerified,
+            OwnershipStep::ManagerMessageQueued,
+        )?;
+        self.manager_message_queued = true;
+        Ok(())
     }
 
     pub(crate) fn fail(&mut self, failure: OwnershipFailure) {
@@ -219,34 +314,70 @@ mod tests {
         ))
     }
 
+    fn selection_verified(gate: &mut OwnershipGate) {
+        gate.note_root_redirect_verified().unwrap();
+        gate.note_composite_redirect_requested().unwrap();
+        gate.note_composite_redirect_verified().unwrap();
+        gate.note_supporting_window_requested().unwrap();
+        gate.note_supporting_window_created(42).unwrap();
+        gate.note_ewmh_properties_requested().unwrap();
+        gate.note_ewmh_properties_installed().unwrap();
+        gate.note_existing_windows_adopted().unwrap();
+        gate.note_selection_claim_requested().unwrap();
+        gate.note_selection_owner_verified(42).unwrap();
+    }
+
     #[test]
     fn xwm_does_not_reach_running_before_wm_s0_verification() {
         let mut gate = gate();
-        gate.note_root_redirect_verified();
-        gate.note_composite_redirect_verified();
-        gate.note_supporting_window_created(42);
-        gate.note_ewmh_properties_installed();
-        gate.note_existing_windows_adopted();
-        gate.note_selection_claim_requested();
-        gate.note_selection_owner_verified(42);
+        selection_verified(&mut gate);
 
         assert_eq!(gate.step(), OwnershipStep::SelectionVerified);
         assert!(!gate.running_ready());
 
-        gate.note_manager_message_queued();
+        gate.queue_manager_message().unwrap();
+        assert!(gate.running_ready());
+    }
+
+    #[test]
+    fn full_production_ownership_sequence_reaches_running_only_after_manager_message() {
+        let mut gate = gate();
+        assert!(!gate.running_ready());
+
+        gate.note_root_redirect_verified().unwrap();
+        gate.note_composite_redirect_requested().unwrap();
+        gate.note_composite_redirect_verified().unwrap();
+        gate.note_supporting_window_requested().unwrap();
+        gate.note_supporting_window_created(42).unwrap();
+        gate.note_ewmh_properties_requested().unwrap();
+        gate.note_ewmh_properties_installed().unwrap();
+        gate.note_existing_windows_adopted().unwrap();
+        gate.note_selection_claim_requested().unwrap();
+        gate.note_selection_owner_verified(42).unwrap();
+
+        assert_eq!(gate.step(), OwnershipStep::SelectionVerified);
+        assert!(!gate.running_ready());
+
+        gate.queue_manager_message().unwrap();
+        assert_eq!(gate.step(), OwnershipStep::ManagerMessageQueued);
         assert!(gate.running_ready());
     }
 
     #[test]
     fn wm_s0_is_claimed_by_supporting_window() {
         let mut gate = gate();
-        gate.note_root_redirect_verified();
-        gate.note_composite_redirect_verified();
-        gate.note_supporting_window_created(42);
-        gate.note_selection_claim_requested();
+        gate.note_root_redirect_verified().unwrap();
+        gate.note_composite_redirect_requested().unwrap();
+        gate.note_composite_redirect_verified().unwrap();
+        gate.note_supporting_window_requested().unwrap();
+        gate.note_supporting_window_created(42).unwrap();
+        gate.note_ewmh_properties_requested().unwrap();
+        gate.note_ewmh_properties_installed().unwrap();
+        gate.note_existing_windows_adopted().unwrap();
+        gate.note_selection_claim_requested().unwrap();
         assert_eq!(gate.step(), OwnershipStep::SelectionPending);
 
-        gate.note_selection_owner_verified(42);
+        gate.note_selection_owner_verified(42).unwrap();
         assert_eq!(gate.selection_owner(), Some(42));
         assert_eq!(gate.step(), OwnershipStep::SelectionVerified);
     }
@@ -254,14 +385,9 @@ mod tests {
     #[test]
     fn manager_client_message_is_emitted_after_selection_claim() {
         let mut gate = gate();
-        gate.note_root_redirect_verified();
-        gate.note_composite_redirect_verified();
-        gate.note_supporting_window_created(42);
-        assert!(!gate.queue_manager_message());
-        gate.note_selection_claim_requested();
-        assert!(!gate.queue_manager_message());
-        gate.note_selection_owner_verified(42);
-        assert!(gate.queue_manager_message());
+        assert!(gate.queue_manager_message().is_err());
+        selection_verified(&mut gate);
+        gate.queue_manager_message().unwrap();
         assert!(gate.manager_message_queued());
         assert_eq!(
             manager_message_data(STARTUP_SELECTION_TIMESTAMP, 11, 42),
@@ -270,10 +396,70 @@ mod tests {
     }
 
     #[test]
+    fn invalid_ownership_transitions_are_rejected() {
+        let mut root_gate = gate();
+        root_gate.note_root_redirect_verified().unwrap();
+
+        let error = root_gate.note_composite_redirect_verified().unwrap_err();
+        assert_eq!(error.current, OwnershipStep::RootRedirectVerified);
+        assert_eq!(error.expected, OwnershipStep::CompositeRedirectPending);
+        assert_eq!(error.attempted, OwnershipStep::CompositeRedirectVerified);
+
+        let mut ewmh_gate = gate();
+        ewmh_gate.note_root_redirect_verified().unwrap();
+        ewmh_gate.note_composite_redirect_requested().unwrap();
+        ewmh_gate.note_composite_redirect_verified().unwrap();
+        ewmh_gate.note_supporting_window_requested().unwrap();
+        ewmh_gate.note_supporting_window_created(42).unwrap();
+        let error = ewmh_gate.note_ewmh_properties_installed().unwrap_err();
+        assert_eq!(error.current, OwnershipStep::SupportingWindowCreated);
+        assert_eq!(error.expected, OwnershipStep::EwmhPropertiesPending);
+
+        let mut selection_gate = gate();
+        selection_gate.note_root_redirect_verified().unwrap();
+        selection_gate.note_composite_redirect_requested().unwrap();
+        selection_gate.note_composite_redirect_verified().unwrap();
+        selection_gate.note_supporting_window_requested().unwrap();
+        selection_gate.note_supporting_window_created(42).unwrap();
+        selection_gate.note_ewmh_properties_requested().unwrap();
+        selection_gate.note_ewmh_properties_installed().unwrap();
+        selection_gate.note_existing_windows_adopted().unwrap();
+        let error = selection_gate
+            .note_selection_owner_verified(42)
+            .unwrap_err();
+        assert_eq!(error.current, OwnershipStep::ExistingWindowsAdopted);
+        assert_eq!(error.expected, OwnershipStep::SelectionPending);
+
+        let mut manager_gate = gate();
+        selection_verified(&mut manager_gate);
+        manager_gate.queue_manager_message().unwrap();
+        let error = manager_gate.queue_manager_message().unwrap_err();
+        assert_eq!(error.current, OwnershipStep::ManagerMessageQueued);
+        assert_eq!(error.expected, OwnershipStep::SelectionVerified);
+    }
+
+    #[test]
+    fn stale_generation_transition_is_rejected() {
+        let mut gate = gate();
+        let stale = XwaylandGeneration::new(NonZeroU64::new(8).unwrap());
+        let error = gate
+            .transition_for_generation(
+                stale,
+                OwnershipStep::RootRedirectPending,
+                OwnershipStep::RootRedirectVerified,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.generation.get(), 7);
+        assert_eq!(error.attempted_generation.get(), 8);
+        assert_eq!(gate.step(), OwnershipStep::RootRedirectPending);
+    }
+
+    #[test]
     fn selection_ownership_failure_fails_only_generation() {
         let mut gate = gate();
-        gate.note_supporting_window_created(42);
-        gate.note_selection_claim_requested();
+        selection_verified(&mut gate);
+        assert_eq!(gate.step(), OwnershipStep::SelectionVerified);
         gate.fail(OwnershipFailure::new(
             gate.generation(),
             OwnershipFailureKind::SelectionConflict,
