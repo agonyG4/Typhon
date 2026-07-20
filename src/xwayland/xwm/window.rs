@@ -399,20 +399,7 @@ impl X11WindowRegistry {
         handle: X11WindowHandle,
     ) -> Result<bool, &'static str> {
         let record = self.record_mut(handle)?;
-        if record.kind == DesktopWindowKind::OverrideRedirect && !record.map_requested {
-            record.map_requested = true;
-            record.map_authorized = true;
-            record.mapped_notified = true;
-            record.lifecycle = if record.association.is_some() {
-                X11WindowLifecycle::AssociatedAwaitingBuffer
-            } else {
-                X11WindowLifecycle::MappedAwaitingAssociation
-            };
-            return Ok(true);
-        }
-        if !record.map_requested {
-            return Ok(false);
-        }
+        record.map_requested = true;
         record.map_operation_pending = false;
         record.map_authorized = true;
         record.mapped_notified = true;

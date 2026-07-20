@@ -88,27 +88,27 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 );
                 return Ok(());
             }
-            let externally_mapped = xwm
-                .windows
+            xwm.windows
                 .confirm_external_map_notify(handle)
                 .map_err(XwmError::InvalidCommand)?;
-            if externally_mapped {
-                if !xwm
-                    .windows
-                    .get(handle)
-                    .is_some_and(|record| record.properties_ready)
-                {
-                    xwm.refresh_window_properties(handle)?;
-                }
-                xwm.emit_ready_if_complete(handle)?;
-                return Ok(());
+            if !xwm
+                .windows
+                .get(handle)
+                .is_some_and(|record| record.properties_ready)
+            {
+                xwm.refresh_window_properties(handle)?;
             }
-            xwm.cancel_window_properties(handle);
-            xwm.windows
-                .mark_map_requested(handle)
-                .map_err(XwmError::InvalidCommand)?;
-            xwm.refresh_window_properties(handle)?;
-            xwm.emit_ready_if_complete(handle)?;
+            let ready_emitted = xwm.emit_ready_if_complete(handle)?;
+            let lifecycle = xwm
+                .windows
+                .get(handle)
+                .map(|record| format!("{:?}", record.lifecycle))
+                .unwrap_or_else(|| "Unknown".to_owned());
+            eprintln!(
+                "oblivion-one xwayland: event=xwm_map_notify window={} pending_map=false ready_emitted={} lifecycle={lifecycle}",
+                handle.xid(),
+                ready_emitted,
+            );
         }
         Event::UnmapNotify(event) => {
             let handle = X11WindowHandle::new(xwm.generation, event.window);
@@ -709,6 +709,47 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, super::super::XwmEvent::WindowMapRequested(_)))
         );
+    }
+
+    #[test]
+    fn managed_map_notify_without_prior_request_is_adopted_as_mapped() {
+        let generation = generation(12);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = X11WindowHandle::new(generation, 109);
+        assert!(xwm.windows.insert_observed(handle));
+        xwm.windows
+            .get_mut(handle)
+            .expect("window record")
+            .properties_ready = true;
+        xwm.windows
+            .mark_associated(
+                handle,
+                super::super::AssociatedSurface {
+                    generation,
+                    serial: NonZeroU64::new(0x1234).expect("serial"),
+                    surface_id: 42,
+                },
+            )
+            .expect("association");
+        xwm.windows
+            .mark_buffer_ready(handle)
+            .expect("buffer readiness");
+
+        normalize(&mut xwm, map_event(handle.xid(), false)).expect("external MapNotify");
+
+        let events = ready_events(&mut xwm);
+        assert_eq!(events.len(), 1);
+        assert_eq!(ready_surface_id(&events), Some(42));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, super::super::XwmEvent::WindowMapRequested(_)))
+        );
+        let record = xwm.windows.get(handle).expect("managed window record");
+        assert!(record.map_requested);
+        assert!(record.map_authorized);
+        assert!(record.mapped_notified);
+        assert!(!record.map_operation_pending);
     }
 
     #[test]
