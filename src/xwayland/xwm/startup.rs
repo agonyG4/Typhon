@@ -1343,6 +1343,8 @@ impl XwmStartup {
             pending_properties: Default::default(),
             deferred_properties: Default::default(),
             property_metrics: Default::default(),
+            root_event_mask_probe: None,
+            root_event_mask: None,
             buffer_ready_surfaces: Default::default(),
             supporting_wm_check,
             raw_fd,

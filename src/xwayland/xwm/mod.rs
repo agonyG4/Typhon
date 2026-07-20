@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::compositor::{DesktopWindowKind, WindowConstraints, WindowMetadata};
-
+use x11rb::protocol::xproto;
 mod adoption;
 mod association;
 mod atoms;
@@ -26,6 +26,7 @@ mod lifecycle;
 mod ownership;
 mod properties;
 pub mod randr;
+mod reactor;
 mod resize_sync;
 #[allow(dead_code)]
 pub(crate) mod shape;
@@ -277,6 +278,7 @@ pub enum XwmError {
     Connection(x11rb::errors::ConnectionError),
     InvalidCommand(&'static str),
     IdAllocation(String),
+    RootEventMask(u32),
     StaleGeneration,
     Association(SurfaceAssociationJoinError),
     ResizeSync(ResizeSyncError),
@@ -290,6 +292,10 @@ impl fmt::Display for XwmError {
             Self::IdAllocation(error) => {
                 write!(formatter, "XWM resource allocation failed: {error}")
             }
+            Self::RootEventMask(mask) => write!(
+                formatter,
+                "XWM root event mask is incomplete: observed=0x{mask:x}"
+            ),
             Self::StaleGeneration => formatter.write_str("stale XWM generation"),
             Self::Association(error) => write!(formatter, "XWM association error: {error}"),
             Self::ResizeSync(error) => {
@@ -325,39 +331,14 @@ pub struct Xwm {
         HashMap<x11rb::connection::SequenceNumber, properties::PendingProperty>,
     pub(crate) deferred_properties: VecDeque<properties::PendingProperty>,
     pub(crate) property_metrics: properties::PropertyMetrics,
+    root_event_mask_probe: Option<x11rb::connection::SequenceNumber>,
+    root_event_mask: Option<xproto::EventMask>,
     buffer_ready_surfaces: HashSet<u32>,
     pub(crate) supporting_wm_check: u32,
     raw_fd: RawFd,
 }
 
 impl Xwm {
-    pub fn raw_fd(&self) -> RawFd {
-        self.raw_fd
-    }
-
-    pub(crate) fn wants_writable(&self) -> bool {
-        self.connection.stream().wants_writable()
-    }
-
-    pub(crate) fn flush_output(&self) -> Result<bool, XwmError> {
-        self.connection
-            .stream()
-            .flush_pending()
-            .map_err(|error| XwmError::Connection(x11rb::errors::ConnectionError::IoError(error)))
-    }
-
-    pub fn screen_number(&self) -> usize {
-        self.screen_number
-    }
-
-    pub fn root(&self) -> u32 {
-        self.root
-    }
-
-    pub fn supporting_wm_check(&self) -> u32 {
-        self.supporting_wm_check
-    }
-
     pub fn randr_snapshot(&self) -> &randr::RandrSnapshot {
         &self.randr
     }
@@ -684,6 +665,7 @@ impl Xwm {
     pub fn drain_events(&mut self, budget: usize) -> Result<XwmDrain, XwmError> {
         let property_input_ready = properties::socket_has_input(self.raw_fd);
         let drain = events::drain(self, budget.min(XWM_EVENT_BUDGET))?;
+        self.poll_root_event_mask()?;
         if property_input_ready {
             let _ = properties::poll_replies(self, budget.min(XWM_EVENT_BUDGET))?;
         }

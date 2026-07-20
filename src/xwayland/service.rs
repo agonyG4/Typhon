@@ -57,11 +57,19 @@ pub enum XwaylandReactorPurpose {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum XwaylandReactorOwner {
+    Service,
+    Startup,
+    Running,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XwaylandReactorRegistration {
     pub fd: RawFd,
     pub generation: Option<XwaylandGeneration>,
     pub purpose: XwaylandReactorPurpose,
     pub writable: bool,
+    pub(crate) owner: XwaylandReactorOwner,
 }
 
 #[derive(Debug)]
@@ -294,6 +302,18 @@ impl XwaylandService {
         self.note_reactor_registration_with_token_impl(registration, registered, reactor_token);
     }
 
+    fn reactor_state_label(&self) -> &'static str {
+        match self.state {
+            ServiceState::Starting(_) => "Starting",
+            ServiceState::Running(_) => "Running",
+            ServiceState::Disabled
+            | ServiceState::Armed
+            | ServiceState::RunningBase(_)
+            | ServiceState::Backoff { .. }
+            | ServiceState::Failed => "Inactive",
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn has_pending_reactor_teardown(&self) -> bool {
         !self.retired_resources.is_empty() || self.retired_lease.is_some()
@@ -335,6 +355,15 @@ impl XwaylandService {
             }
             ServiceState::Starting(resources) if resources.generation == generation => {
                 resources.xwm_startup.as_ref().and_then(XwmStartup::raw_fd)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn managed_xwm_root_event_mask(&self, generation: XwaylandGeneration) -> Option<u32> {
+        match &self.state {
+            ServiceState::Running(resources) if resources.generation == generation => {
+                resources.xwm.root_event_mask()
             }
             _ => None,
         }
@@ -383,10 +412,18 @@ impl XwaylandService {
         };
         match drain {
             Ok(drain) => {
-                let property_metrics = match &self.state {
-                    ServiceState::Running(resources) => resources.xwm.property_metrics(),
+                let (property_metrics, pending_events, generation) = match &self.state {
+                    ServiceState::Running(resources) => (
+                        resources.xwm.property_metrics(),
+                        resources.xwm.pending_event_count(),
+                        resources.generation,
+                    ),
                     _ => return false,
                 };
+                eprintln!(
+                    "oblivion-one xwayland: event=xwm_reactor_drain generation={generation:?} processed={} budget_exhausted={} pending_events={pending_events}",
+                    drain.processed, drain.budget_exhausted,
+                );
                 self.metrics.property_refresh_requested = property_metrics.requested;
                 self.metrics.property_refresh_completed = property_metrics.completed;
                 self.metrics.property_refresh_coalesced = property_metrics.coalesced;
@@ -583,8 +620,18 @@ impl XwaylandService {
                 }
             }
             XwaylandReactorPurpose::Xwm => {
+                let state = self.reactor_state_label();
+                let fd = generation
+                    .and_then(|generation| self.managed_xwm_fd(generation))
+                    .unwrap_or(-1);
+                eprintln!(
+                    "oblivion-one xwayland: event=xwm_reactor_ready state={state} generation={generation:?} fd={fd} token={reactor_token} flags=0x{flags:x}",
+                );
                 if generation != self.generation() {
                     self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
+                    eprintln!(
+                        "oblivion-one xwayland: event=xwm_reactor_rejected reason=stale_generation"
+                    );
                     return Ok(false);
                 }
                 if reactor_token != 0
@@ -592,6 +639,9 @@ impl XwaylandService {
                         != Some(reactor_token)
                 {
                     self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
+                    eprintln!(
+                        "oblivion-one xwayland: event=xwm_reactor_rejected reason=stale_token"
+                    );
                     return Ok(false);
                 }
                 self.metrics.xwm_reactor_events = self.metrics.xwm_reactor_events.saturating_add(1);
@@ -901,105 +951,6 @@ impl XwaylandService {
             self.metrics.startup_duration_ns
         );
         self.log_state_transition();
-    }
-
-    /// Complete the managed profile's XWM half of the readiness transaction.
-    ///
-    /// Foundation mode intentionally never calls this path.  The WM socket is
-    /// moved into `Xwm`; the service retains no duplicate endpoint.
-    pub fn initialize_managed_xwm(
-        &mut self,
-        generation: XwaylandGeneration,
-        supervisor: &mut ChildSupervisor,
-    ) -> io::Result<()> {
-        if self.config.profile != super::config::XwaylandProfile::Managed {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "managed XWM requested for foundation profile",
-            ));
-        }
-        let ServiceState::Starting(mut resources) =
-            std::mem::replace(&mut self.state, ServiceState::Disabled)
-        else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "managed XWM requested outside XWayland startup",
-            ));
-        };
-        let ready = resources.generation == generation
-            && resources.display_ready
-            && resources.shell_ready
-            && self
-                .private_client
-                .as_ref()
-                .is_some_and(|(client_generation, _)| *client_generation == generation);
-        if !ready {
-            self.state = ServiceState::Starting(resources);
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "managed XWM readiness barrier is incomplete",
-            ));
-        }
-        if resources.xwm_startup.is_none() {
-            let Some(wm_stream) = resources.wm.take() else {
-                let error = io::Error::other("managed XWM stream was already transferred");
-                self.state = ServiceState::Starting(resources);
-                return self.fail_generation(supervisor, error);
-            };
-            match XwmStartup::new(generation, wm_stream) {
-                Ok(startup) => resources.xwm_startup = Some(startup),
-                Err(error) => {
-                    self.state = ServiceState::Starting(resources);
-                    return self.fail_generation(supervisor, io::Error::other(error));
-                }
-            }
-        }
-        let progress = resources
-            .xwm_startup
-            .as_mut()
-            .expect("XWM startup driver installed")
-            .progress();
-        match progress {
-            Ok(Some(xwm)) => {
-                let mut readiness = self.snapshot_for_starting(&resources);
-                readiness.xwm_connected = true;
-                readiness.xwm_capabilities_validated = true;
-                readiness.root_initialized = true;
-                readiness.readiness_complete = true;
-                self.last_readiness = Some(readiness);
-                self.state = ServiceState::Running(Box::new(RunningResources {
-                    generation: resources.generation,
-                    process: resources.process,
-                    private_wayland: resources.private_wayland,
-                    xwm,
-                    xwm_reactor_token: resources.xwm_reactor_token,
-                    stderr: resources.stderr,
-                }));
-                self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
-                self.log_readiness_progress("xwm_running_wm_s0_verified");
-                self.log_state_transition();
-                Ok(())
-            }
-            Ok(None) => {
-                if let Some(startup) = resources.xwm_startup.as_ref() {
-                    eprintln!(
-                        "oblivion-one xwayland: event=xwm_startup_progress generation={generation:?} state={:?} ownership_step={:?}",
-                        startup.state(),
-                        startup.ownership_step(),
-                    );
-                }
-                self.state = ServiceState::Starting(resources);
-                Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "managed XWM startup is waiting for the reactor",
-                ))
-            }
-            Err(error) => {
-                let error = io::Error::other(error);
-                self.state = ServiceState::Starting(resources);
-                self.fail_generation(supervisor, error)
-            }
-        }
     }
 
     pub fn handle_process_exit(&mut self, exit: &ChildExit) -> io::Result<bool> {

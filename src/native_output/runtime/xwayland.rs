@@ -120,6 +120,9 @@ impl NativeRuntime {
                 .copied()
             else {
                 self.xwayland.record_stale_reactor_event();
+                eprintln!(
+                    "oblivion-one xwayland: event=xwm_reactor_rejected reason=missing_registration"
+                );
                 continue;
             };
             let continuation = match self.xwayland.handle_reactor_event_with_token(

@@ -112,7 +112,7 @@ fn spawn_xwayland(display_number: u32, wm_child: UnixStream) -> io::Result<Xwayl
 }
 
 #[test]
-fn installed_xwayland_listener_reaches_running_through_real_xwm_startup() {
+fn installed_xwayland_transport_reaches_running_through_direct_xwm_poll() {
     let Some(_wayland_display) = std::env::var_os("WAYLAND_DISPLAY") else {
         return;
     };

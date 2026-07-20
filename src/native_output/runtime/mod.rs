@@ -13,6 +13,9 @@ mod session_io;
 mod shutdown;
 mod shutdown_cycle;
 mod xwayland;
+mod xwayland_reactor;
+#[cfg(test)]
+mod xwayland_reactor_tests;
 
 pub(super) use atomic_commit::validate_atomic_pageflip;
 pub(super) use atomic_commit::{
@@ -45,6 +48,7 @@ pub(crate) use session_io::{
 pub(crate) use shutdown::{
     NativeShutdownLifecycle, ShutdownState, ShutdownTransition, native_shutdown_debug_log,
 };
+pub(super) use xwayland_reactor::sync_xwayland_reactor_sources;
 
 pub(super) struct NativeCycleState {
     pub(super) wakeup: NativeWakeup,
@@ -154,57 +158,11 @@ impl NativeRuntime {
     }
 
     fn sync_xwayland_reactor_sources(&mut self) -> NativeResult<()> {
-        let desired: Vec<_> = self.xwayland.reactor_registrations().collect();
-        let mut retained = Vec::new();
-        for (token, registration) in self.xwayland_reactor_tokens.drain(..) {
-            if desired.contains(&registration) {
-                retained.push((token, registration));
-            } else {
-                let removed = self.event_loop.unregister(token)?;
-                if removed {
-                    self.xwayland.note_reactor_registration_with_token(
-                        registration,
-                        false,
-                        Some(token.raw()),
-                    );
-                }
-            }
-        }
-        self.xwayland_reactor_tokens = retained;
-        for registration in desired {
-            if self
-                .xwayland_reactor_tokens
-                .iter()
-                .any(|(_, current)| *current == registration)
-            {
-                continue;
-            }
-            let source = match registration.purpose {
-                XwaylandReactorPurpose::ListenFilesystem
-                | XwaylandReactorPurpose::ListenAbstract => NativeEventSource::XwaylandListen,
-                XwaylandReactorPurpose::DisplayReady => NativeEventSource::XwaylandDisplayReady,
-                XwaylandReactorPurpose::Xwm => NativeEventSource::XwaylandXwm,
-                XwaylandReactorPurpose::Stderr => NativeEventSource::XwaylandStderr,
-            };
-            let events = (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP)
-                as u32
-                | if registration.writable {
-                    libc::EPOLLOUT as u32
-                } else {
-                    0
-                };
-            let token = self
-                .event_loop
-                .register_with_events(registration.fd, source, events)?;
-            self.xwayland.note_reactor_registration_with_token(
-                registration,
-                true,
-                Some(token.raw()),
-            );
-            self.xwayland_reactor_tokens.push((token, registration));
-        }
-        self.xwayland.finish_reactor_teardown()?;
-        Ok(())
+        sync_xwayland_reactor_sources(
+            &mut self.event_loop,
+            &mut self.xwayland,
+            &mut self.xwayland_reactor_tokens,
+        )
     }
 
     fn attach_xwayland_private_client(&mut self) -> NativeResult<()> {
