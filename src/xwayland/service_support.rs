@@ -396,14 +396,16 @@ impl XwaylandService {
                 purpose: XwaylandReactorPurpose::DisplayReady,
                 writable: false,
             });
-            if let Some(stderr) = resources.stderr.as_ref().filter(|stderr| stderr.active) {
-                registrations.push(XwaylandReactorRegistration {
-                    fd: stderr.fd.as_raw_fd(),
-                    generation: Some(resources.generation),
-                    purpose: XwaylandReactorPurpose::Stderr,
-                    writable: false,
-                });
-            }
+        }
+        if let ServiceState::Starting(resources) = &self.state
+            && let Some(stderr) = resources.stderr.as_ref().filter(|stderr| stderr.active)
+        {
+            registrations.push(XwaylandReactorRegistration {
+                fd: stderr.fd.as_raw_fd(),
+                generation: Some(resources.generation),
+                purpose: XwaylandReactorPurpose::Stderr,
+                writable: false,
+            });
         }
         if let ServiceState::Starting(resources) = &self.state
             && let Some(startup) = resources.xwm_startup.as_ref()

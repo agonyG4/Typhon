@@ -246,3 +246,53 @@ fn stderr_pipe_is_nonblocking_and_closes_without_failing_generation() {
     drop(supervisor);
     fs::remove_dir_all(root).expect("remove test root");
 }
+
+#[test]
+fn stderr_registration_survives_entire_managed_startup() {
+    let (root, mut service, mut supervisor) = super::service_at_root_with_sleeping_binary(
+        super::XwaylandMode::ManagedLazy,
+        "stderr-managed-startup",
+    );
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start managed generation");
+    let generation = service.generation().expect("managed generation");
+
+    let stderr_count = |service: &super::XwaylandService| {
+        service
+            .reactor_registrations()
+            .filter(|registration| registration.purpose == XwaylandReactorPurpose::Stderr)
+            .count()
+    };
+    let display_count = |service: &super::XwaylandService| {
+        service
+            .reactor_registrations()
+            .filter(|registration| registration.purpose == XwaylandReactorPurpose::DisplayReady)
+            .count()
+    };
+    let xwm_count = |service: &super::XwaylandService| {
+        service
+            .reactor_registrations()
+            .filter(|registration| registration.purpose == XwaylandReactorPurpose::Xwm)
+            .count()
+    };
+
+    assert_eq!(stderr_count(&service), 1);
+    assert_eq!(display_count(&service), 1);
+
+    service.mark_display_ready_for_tests(generation);
+    assert_eq!(stderr_count(&service), 1);
+    assert_eq!(display_count(&service), 0);
+
+    service
+        .handle_shell_bind(generation)
+        .expect("mark shell ready");
+    service.install_xwm_startup_for_tests(generation);
+    assert_eq!(stderr_count(&service), 1);
+    assert_eq!(xwm_count(&service), 1);
+
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}

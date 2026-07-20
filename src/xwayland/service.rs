@@ -784,6 +784,32 @@ impl XwaylandService {
         self.mark_shell_ready(generation)
     }
 
+    #[cfg(test)]
+    pub(crate) fn mark_display_ready_for_tests(&mut self, generation: XwaylandGeneration) {
+        if let ServiceState::Starting(resources) = &mut self.state
+            && resources.generation == generation
+        {
+            resources.display_ready = true;
+            resources.displayfd_registered = false;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_xwm_startup_for_tests(&mut self, generation: XwaylandGeneration) {
+        let ServiceState::Starting(resources) = &mut self.state else {
+            return;
+        };
+        if resources.generation != generation {
+            return;
+        }
+        let Ok((startup_stream, _peer)) = UnixStream::pair() else {
+            return;
+        };
+        resources.wm = None;
+        resources.xwm_startup =
+            Some(XwmStartup::new(generation, startup_stream).expect("test XWM startup transport"));
+    }
+
     pub fn authorize_private_client(
         &mut self,
         generation: XwaylandGeneration,
