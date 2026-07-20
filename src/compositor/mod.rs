@@ -85,6 +85,7 @@ mod render;
 mod runtime_files;
 mod selection;
 mod server;
+mod server_error;
 mod shm;
 mod state_data;
 mod subsurface;
@@ -174,7 +175,8 @@ pub use render::{
 use runtime_files::{compositor_debug_surface_logging_enabled, unique_runtime_file_path};
 pub use runtime_files::{resize_debug_log, resize_debug_logging_enabled};
 pub use selection::{SelectionOfferRecord, SelectionState};
-pub use server::{CompositorError, OwnCompositorServer, XwaylandClientIdentity};
+pub use server::{OwnCompositorServer, XwaylandClientIdentity};
+pub use server_error::CompositorError;
 use shm::{
     ShmBufferData, ShmPoolData, WL_SHM_FORMAT_ABGR8888, WL_SHM_FORMAT_ABGR2101010,
     WL_SHM_FORMAT_ARGB2101010, WL_SHM_FORMAT_XBGR8888, WL_SHM_FORMAT_XBGR2101010,
@@ -767,17 +769,6 @@ impl PointerConstraint {
 }
 
 #[derive(Debug, Clone)]
-struct DataSourceData {
-    client_id: ClientId,
-}
-
-#[derive(Debug, Clone)]
-struct DataDeviceData {
-    client_id: ClientId,
-    seat_id: ObjectId,
-}
-
-#[derive(Debug, Clone)]
 struct DataOfferData {
     target_client_id: ClientId,
     source_generation: u64,
@@ -796,6 +787,7 @@ struct ClipboardDataSource {
 
 mod clipboard_state;
 use clipboard_state::*;
+use clipboard_state::{DataDeviceData, DataSourceData};
 mod state;
 use state::*;
 #[cfg(test)]

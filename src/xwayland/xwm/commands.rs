@@ -85,10 +85,10 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             fields,
             border_width,
         } => {
-            if fields.x || fields.y || fields.width || fields.height || fields.border_width {
-                if queue_resize_desired(xwm, window, geometry, true)? {
-                    return Ok(());
-                }
+            if (fields.x || fields.y || fields.width || fields.height || fields.border_width)
+                && queue_resize_desired(xwm, window, geometry, true)?
+            {
+                return Ok(());
             }
             xwm.connection
                 .configure_window(window.xid(), &configure_aux(geometry, fields, border_width))
@@ -128,13 +128,24 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             sibling,
             mode,
         } => {
-            let mut aux = ConfigureWindowAux::new().stack_mode(to_x11_stack_mode(mode));
-            if let Some(sibling) = sibling {
-                aux = aux.sibling(sibling.xid());
+            if sibling.is_none() && matches!(mode, X11StackMode::Above) {
+                for family_handle in transient_family_handles(xwm, window) {
+                    xwm.connection
+                        .configure_window(
+                            family_handle.xid(),
+                            &ConfigureWindowAux::new().stack_mode(to_x11_stack_mode(mode)),
+                        )
+                        .map_err(XwmError::Connection)?;
+                }
+            } else {
+                let mut aux = ConfigureWindowAux::new().stack_mode(to_x11_stack_mode(mode));
+                if let Some(sibling) = sibling {
+                    aux = aux.sibling(sibling.xid());
+                }
+                xwm.connection
+                    .configure_window(window.xid(), &aux)
+                    .map_err(XwmError::Connection)?;
             }
-            xwm.connection
-                .configure_window(window.xid(), &aux)
-                .map_err(XwmError::Connection)?;
         }
         XwmCommand::Focus { window, timestamp } => {
             xwm.note_focus_command(window, timestamp);

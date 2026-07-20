@@ -1,14 +1,12 @@
 use std::{
     borrow::Cow,
     collections::HashMap,
-    fmt, io,
+    io,
     os::fd::{AsFd, BorrowedFd},
     sync::{Arc, Mutex},
 };
 
 use wayland_protocols::ext::data_control::v1::server::ext_data_control_manager_v1;
-use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1;
-use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_manager_v1;
 use wayland_protocols::wp::{
     fractional_scale::v1::server::wp_fractional_scale_manager_v1,
     idle_inhibit::zv1::server::zwp_idle_inhibit_manager_v1,
@@ -32,23 +30,23 @@ use wayland_server::{
     },
 };
 
+use super::gpu_protocol_capabilities::GpuProtocolCapabilities;
+use super::protocols::versions;
 use crate::astrea_shell_control::server::astrea_shell_control_manager_v1;
 use crate::astrea_shortcuts::server::astrea_shortcuts_manager_v1;
 #[cfg(test)]
 use crate::render_backend::buffer::BufferId;
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
-use crate::wayland_drm::server::wl_drm;
 use crate::xwayland::xwm::{RESIZE_SYNC_TIMEOUT_NS, XwmCommand, XwmEvent};
 use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
-
-use super::gpu_protocol_capabilities::{GpuGlobal, GpuProtocolCapabilities};
-use super::protocols::versions;
+#[path = "server_gpu_globals.rs"]
+mod server_gpu_globals;
 use super::{
     AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, BufferReleaseMetrics,
-    ClientCursorRenderState, CompositorFrameBatchId, CompositorState, CoreComplianceMetrics,
-    DirectScanoutSceneCandidate, DirectScanoutSceneRejection, ExplicitSyncPoint,
-    FrameBatchDiscardReason, FramePresentation, FullscreenRenderPlanMetrics,
+    ClientCursorRenderState, CompositorError, CompositorFrameBatchId, CompositorState,
+    CoreComplianceMetrics, DirectScanoutSceneCandidate, DirectScanoutSceneRejection,
+    ExplicitSyncPoint, FrameBatchDiscardReason, FramePresentation, FullscreenRenderPlanMetrics,
     InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PointerAxisFrame,
     PresentationClock, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
     ResizeFlowMetrics, SelectionProtocolCapabilities, SubsurfaceTransactionMetrics,
@@ -56,7 +54,6 @@ use super::{
     WindowInteractionEndReason, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
-
 #[derive(Debug)]
 pub struct OwnCompositorServer {
     pub(super) display: Display<CompositorState>,
@@ -298,7 +295,7 @@ impl OwnCompositorServer {
         }
         self.state
             .set_gpu_protocol_capabilities(capabilities.clone());
-        register_gpu_buffer_globals(&self.display.handle(), &capabilities);
+        server_gpu_globals::register_gpu_buffer_globals(&self.display.handle(), &capabilities);
         self.gpu_buffer_protocols_enabled = capabilities.any_global_enabled();
     }
 
@@ -569,8 +566,31 @@ impl OwnCompositorServer {
                 }
             }
             XwmEvent::MetadataChanged { window, delta } => {
+                let prior_id = self.state.window_id_for_x11_handle(window);
+                let prior_focused =
+                    prior_id.is_some_and(|id| self.state.focused_window_id == Some(id));
+                let publish_lists = matches!(
+                    &delta,
+                    crate::xwayland::xwm::X11MetadataDelta::TransientFor(_)
+                        | crate::xwayland::xwm::X11MetadataDelta::WindowType(_)
+                );
                 self.state.apply_x11_metadata_delta(window, delta);
-                Vec::new()
+                if prior_focused
+                    && prior_id.is_some_and(|id| {
+                        self.state
+                            .window(id)
+                            .is_some_and(|window| !window.is_normal_x11_role())
+                    })
+                {
+                    self.state.focused_window_id = None;
+                    self.state.focused_surface = None;
+                    self.state.clear_keyboard_focus();
+                    let _ = self.state.focus_topmost_renderable_toplevel();
+                }
+                publish_lists
+                    .then(|| self.sync_xwayland_client_lists())
+                    .into_iter()
+                    .collect()
             }
             XwmEvent::ConfigureRequested { window, request } => {
                 if self.state.x11_resize_active(window) {
@@ -582,15 +602,14 @@ impl OwnCompositorServer {
                             mode,
                         });
                     }
-                    if request.fields.x
+                    if (request.fields.x
                         || request.fields.y
                         || request.fields.width
                         || request.fields.height
-                        || request.fields.border_width
+                        || request.fields.border_width)
+                        && let Some(geometry) = self.state.x11_authoritative_geometry(window)
                     {
-                        if let Some(geometry) = self.state.x11_authoritative_geometry(window) {
-                            commands.push(XwmCommand::ConfigureNotify { window, geometry });
-                        }
+                        commands.push(XwmCommand::ConfigureNotify { window, geometry });
                     }
                     return commands;
                 }
@@ -703,6 +722,7 @@ impl OwnCompositorServer {
                 let _ = self.state.finalize_x11_resize(window);
                 Vec::new()
             }
+            XwmEvent::ResizeSyncTimedOutWithFollowup(_) => Vec::new(),
             XwmEvent::CloseRequestedByClient(window) => {
                 if let Some(window_id) = self.state.window_id_for_x11_handle(window) {
                     self.state.backend_commands.push(
@@ -1453,7 +1473,7 @@ fn register_minimum_globals(
             (),
         );
     if gpu_buffers_enabled {
-        register_gpu_buffer_globals(display, gpu_capabilities);
+        server_gpu_globals::register_gpu_buffer_globals(display, gpu_capabilities);
     }
     display.create_global::<CompositorState, xdg_activation_v1::XdgActivationV1, _>(
         versions::XDG_ACTIVATION_V1,
@@ -1476,57 +1496,4 @@ fn register_minimum_globals(
         versions::XWAYLAND_SHELL_V1,
         xwayland_global_data,
     );
-}
-
-fn register_gpu_buffer_globals(display: &DisplayHandle, capabilities: &GpuProtocolCapabilities) {
-    if capabilities.global_enabled(GpuGlobal::LinuxDmabuf) {
-        display.create_global::<CompositorState, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _>(
-            capabilities.dmabuf_version().wayland_version(),
-            (),
-        );
-    }
-    if capabilities.global_enabled(GpuGlobal::LinuxDrmSyncobj) {
-        display.create_global::<
-            CompositorState,
-            wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1,
-            _,
-        >(versions::WP_LINUX_DRM_SYNCOBJ_MANAGER_V1, ());
-    }
-    if capabilities.global_enabled(GpuGlobal::WlDrm) {
-        display.create_global::<CompositorState, wl_drm::WlDrm, _>(versions::WL_DRM, ());
-    }
-}
-
-#[derive(Debug)]
-pub enum CompositorError {
-    DisplayInit(String),
-    Bind(String),
-    Io(io::Error),
-}
-
-impl fmt::Display for CompositorError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DisplayInit(error) => {
-                write!(formatter, "failed to initialize Wayland display: {error}")
-            }
-            Self::Bind(error) => write!(formatter, "failed to bind Wayland socket: {error}"),
-            Self::Io(error) => write!(formatter, "{error}"),
-        }
-    }
-}
-
-impl std::error::Error for CompositorError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            Self::DisplayInit(_) | Self::Bind(_) => None,
-        }
-    }
-}
-
-impl From<io::Error> for CompositorError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
 }

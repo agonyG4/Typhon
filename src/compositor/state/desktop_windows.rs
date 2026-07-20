@@ -560,7 +560,7 @@ impl CompositorState {
         let changed_surfaces = lower
             .iter()
             .map(|surface| surface.surface_id)
-            .ne(original_order.into_iter());
+            .ne(original_order);
         self.renderable_surfaces = lower;
         if changed_surfaces {
             self.invalidate_surface_origin_cache();

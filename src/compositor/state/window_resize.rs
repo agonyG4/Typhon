@@ -589,29 +589,29 @@ fn constrain_icccm_size(width: u32, height: u32, constraints: WindowConstraints)
         constraints.height_increment,
         MIN_WINDOW_HEIGHT,
     );
-    if let Some(min_aspect) = constraints.min_aspect.filter(|aspect| *aspect > 0.0) {
-        if f64::from(width) / f64::from(height) < min_aspect {
-            width = constrain_icccm_dimension(
-                (f64::from(height) * min_aspect).ceil() as u32,
-                constraints.min_width,
-                constraints.max_width,
-                constraints.base_width,
-                constraints.width_increment,
-                MIN_WINDOW_WIDTH,
-            );
-        }
+    if let Some(min_aspect) = constraints.min_aspect.filter(|aspect| *aspect > 0.0)
+        && f64::from(width) / f64::from(height) < min_aspect
+    {
+        width = constrain_icccm_dimension(
+            (f64::from(height) * min_aspect).ceil() as u32,
+            constraints.min_width,
+            constraints.max_width,
+            constraints.base_width,
+            constraints.width_increment,
+            MIN_WINDOW_WIDTH,
+        );
     }
-    if let Some(max_aspect) = constraints.max_aspect.filter(|aspect| *aspect > 0.0) {
-        if f64::from(width) / f64::from(height) > max_aspect {
-            height = constrain_icccm_dimension(
-                (f64::from(width) / max_aspect).ceil() as u32,
-                constraints.min_height,
-                constraints.max_height,
-                constraints.base_height,
-                constraints.height_increment,
-                MIN_WINDOW_HEIGHT,
-            );
-        }
+    if let Some(max_aspect) = constraints.max_aspect.filter(|aspect| *aspect > 0.0)
+        && f64::from(width) / f64::from(height) > max_aspect
+    {
+        height = constrain_icccm_dimension(
+            (f64::from(width) / max_aspect).ceil() as u32,
+            constraints.min_height,
+            constraints.max_height,
+            constraints.base_height,
+            constraints.height_increment,
+            MIN_WINDOW_HEIGHT,
+        );
     }
     (width, height)
 }

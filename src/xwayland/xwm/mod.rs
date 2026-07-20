@@ -1,5 +1,3 @@
-//! The X11 window manager boundary.
-//!
 //! Raw x11rb values stay below this module.  The compositor receives only the
 //! generation-bound handles, snapshots, events, and commands defined here.
 
@@ -27,6 +25,7 @@ mod ownership;
 mod properties;
 pub mod randr;
 mod reactor;
+mod resize_runtime;
 mod resize_sync;
 #[allow(dead_code)]
 pub(crate) mod shape;
@@ -211,6 +210,7 @@ pub enum XwmEvent {
     ResizeSyncPresented(X11WindowHandle),
     ResizeSyncImmediate(X11WindowHandle),
     ResizeSyncTimedOut(X11WindowHandle),
+    ResizeSyncTimedOutWithFollowup(X11WindowHandle),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -607,8 +607,7 @@ impl Xwm {
                         latest_desired,
                     );
                 }
-                self.outgoing_events
-                    .push_back(XwmEvent::ResizeSyncTimedOut(handle));
+                let has_followup = self.resize_sync.desired(handle).is_some();
                 if let Some(desired) = self.resize_sync.take_desired(handle) {
                     let now = crate::native::event_loop::monotonic_now_ns().unwrap_or(now_ns);
                     commands::begin_resize_sync(
@@ -619,6 +618,11 @@ impl Xwm {
                         now.saturating_add(RESIZE_SYNC_TIMEOUT_NS),
                     )?;
                 }
+                self.outgoing_events.push_back(if has_followup {
+                    XwmEvent::ResizeSyncTimedOutWithFollowup(handle)
+                } else {
+                    XwmEvent::ResizeSyncTimedOut(handle)
+                });
             }
         }
         Ok(())
@@ -650,28 +654,6 @@ impl Xwm {
         self.last_resize_geometries.remove(&handle);
     }
 
-    pub(crate) fn note_expected_configure(
-        &mut self,
-        handle: X11WindowHandle,
-        geometry: X11Geometry,
-    ) {
-        self.expected_configures.insert(handle, geometry);
-    }
-
-    pub(crate) fn note_configure_notify(
-        &mut self,
-        handle: X11WindowHandle,
-        geometry: X11Geometry,
-    ) -> bool {
-        let expected = self.expected_configures.get(&handle).copied();
-        if expected == Some(geometry) {
-            self.expected_configures.remove(&handle);
-            true
-        } else {
-            false
-        }
-    }
-
     fn clear_resize_sync_generation(&mut self, generation: XwaylandGeneration) {
         let handles = self
             .sync_alarms
@@ -687,16 +669,6 @@ impl Xwm {
         for handle in handles {
             self.clear_resize_sync_alarm(handle);
         }
-    }
-
-    fn clear_resize_sync_alarm(&mut self, handle: X11WindowHandle) {
-        let Some(alarm) = self.sync_alarms.remove(&handle) else {
-            return;
-        };
-        self.sync_handles_by_counter
-            .retain(|_, mapped_handle| *mapped_handle != handle);
-        use x11rb::protocol::sync::ConnectionExt as _;
-        let _ = self.connection.sync_destroy_alarm(alarm);
     }
 
     pub fn note_x11_surface_serial(
@@ -821,88 +793,5 @@ impl Xwm {
 
     pub(crate) fn next_adoption_deadline_ns(&self) -> Option<u64> {
         self.adoption.next_deadline_ns()
-    }
-
-    pub(crate) fn collect_adoption_expirations(&mut self, now_ns: u64) {
-        for (handle, wait) in self.adoption.expired(now_ns) {
-            eprintln!(
-                "oblivion-one xwayland: event=adoption_timeout window={} wait={wait:?}",
-                handle.xid()
-            );
-        }
-    }
-
-    fn sync_completed_associations(&mut self) {
-        let associations = self
-            .association
-            .completed
-            .iter()
-            .map(|(handle, association)| (*handle, *association))
-            .collect::<Vec<_>>();
-        for (handle, association) in associations {
-            if !self.windows.contains(handle) {
-                continue;
-            }
-            let needs_association = self
-                .windows
-                .get(handle)
-                .is_some_and(|record| record.association.is_none());
-            if needs_association {
-                let _ = self.windows.mark_associated(handle, association);
-                let deadline = crate::native::event_loop::monotonic_now_ns()
-                    .unwrap_or_default()
-                    .saturating_add(adoption::ADOPTION_TIMEOUT_NS);
-                self.adoption.observe(
-                    handle,
-                    adoption::AdoptionWait::AssociationToBuffer,
-                    deadline,
-                );
-            }
-            if self.buffer_ready_surfaces.contains(&association.surface_id) {
-                self.adoption.complete(handle);
-                let _ = self.windows.mark_buffer_ready(handle);
-                match self.resize_sync.note_commit(handle) {
-                    ResizeSyncCommit::Presented | ResizeSyncCommit::FallbackPresented => self
-                        .outgoing_events
-                        .push_back(XwmEvent::ResizeSyncPresented(handle)),
-                    ResizeSyncCommit::Deferred | ResizeSyncCommit::Ignored => {}
-                }
-            }
-            let _ = self.emit_ready_if_complete(handle);
-        }
-    }
-
-    fn emit_ready_if_complete(&mut self, handle: X11WindowHandle) -> Result<bool, XwmError> {
-        let Some((properties_ready, kind, map_authorized)) = self
-            .windows
-            .get(handle)
-            .map(|record| (record.properties_ready, record.kind, record.map_authorized))
-        else {
-            return Ok(false);
-        };
-        if properties_ready
-            && kind == DesktopWindowKind::Managed
-            && !map_authorized
-            && self
-                .windows
-                .mark_map_authorized(handle)
-                .map_err(XwmError::InvalidCommand)?
-        {
-            self.outgoing_events
-                .push_back(XwmEvent::WindowMapRequested(handle));
-        }
-        if !properties_ready {
-            return Ok(false);
-        }
-        let snapshot = self
-            .windows
-            .try_ready(handle)
-            .map_err(XwmError::InvalidCommand)?;
-        if let Some(snapshot) = snapshot {
-            self.outgoing_events
-                .push_back(XwmEvent::WindowReady(snapshot));
-            return Ok(true);
-        }
-        Ok(false)
     }
 }

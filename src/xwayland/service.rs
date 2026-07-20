@@ -1083,6 +1083,10 @@ impl XwaylandService {
                         self.metrics.resize_sync_timeouts =
                             self.metrics.resize_sync_timeouts.saturating_add(1);
                     }
+                    super::xwm::XwmEvent::ResizeSyncTimedOutWithFollowup(_) => {
+                        self.metrics.resize_sync_timeouts =
+                            self.metrics.resize_sync_timeouts.saturating_add(1);
+                    }
                     _ => {}
                 })
                 .collect(),

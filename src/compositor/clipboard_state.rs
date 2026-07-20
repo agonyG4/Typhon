@@ -1,6 +1,17 @@
 use super::*;
 
 #[derive(Debug, Clone)]
+pub(super) struct DataSourceData {
+    pub(super) client_id: ClientId,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DataDeviceData {
+    pub(super) client_id: ClientId,
+    pub(super) seat_id: ObjectId,
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct ClipboardDataDevice {
     pub(super) device: wl_data_device::WlDataDevice,
     pub(super) client_id: ClientId,
