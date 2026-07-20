@@ -25,6 +25,7 @@ impl XwaylandService {
         let mut truncated_chunks = 0u64;
         let mut closed = false;
         let process_id;
+        let forward;
         {
             let (resources_generation, resource_process_id, stderr) = match &mut self.state {
                 ServiceState::Starting(resources) => (
@@ -55,6 +56,7 @@ impl XwaylandService {
                 return Ok(());
             }
             process_id = resource_process_id;
+            forward = stderr.forward;
             let mut bytes = [0u8; 4096];
             loop {
                 // SAFETY: the stderr descriptor is owned by `stderr` for the
@@ -118,11 +120,13 @@ impl XwaylandService {
             if truncated {
                 self.metrics.stderr_truncated = self.metrics.stderr_truncated.saturating_add(1);
             }
-            eprintln!(
-                "oblivion-one xwayland: event=stderr generation={generation:?} process_id={} truncated={} line={line}",
-                process_id.get(),
-                truncated,
-            );
+            if forward {
+                eprintln!(
+                    "oblivion-one xwayland: event=stderr generation={generation:?} process_id={} truncated={} line={line}",
+                    process_id.get(),
+                    truncated,
+                );
+            }
         }
         Ok(())
     }

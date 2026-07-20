@@ -32,6 +32,9 @@ use super::{
 #[path = "displayfd_tests.rs"]
 mod displayfd_tests;
 
+#[path = "stderr_tests.rs"]
+mod stderr_tests;
+
 #[test]
 fn xwayland_mode_parses_only_opt_in_values() {
     assert_eq!(XwaylandMode::parse(None), XwaylandMode::Off);
@@ -347,27 +350,6 @@ fn service_at_root_with_sleeping_binary(
     (root, service, ChildSupervisor::new())
 }
 
-fn service_at_root_with_stderr_binary() -> (PathBuf, XwaylandService, ChildSupervisor) {
-    let root = test_root("stderr");
-    let binary = root.join("xwayland-test-binary");
-    fs::write(
-        &binary,
-        "#!/bin/sh\nprintf 'xwayland diagnostic\\n' >&2\nexec /bin/sleep 30\n",
-    )
-    .expect("write stderr test binary");
-    let mut permissions = fs::metadata(&binary)
-        .expect("stat stderr test binary")
-        .permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&binary, permissions).expect("make stderr test binary executable");
-    let mut config =
-        XwaylandConfig::for_tests_at_root(XwaylandMode::BaseLazy, binary, root.clone());
-    config.display_min = 1;
-    config.log_stderr = true;
-    let service = XwaylandService::bootstrap_with_config(config).expect("bootstrap service");
-    (root, service, ChildSupervisor::new())
-}
-
 fn service_at_root_with_displayfd_writer(
     mode: XwaylandMode,
     label: &str,
@@ -449,65 +431,6 @@ fn base_mode_arms_both_listeners_without_starting_a_process() {
 }
 
 #[test]
-fn stderr_pipe_is_nonblocking_and_closes_without_failing_generation() {
-    let (root, mut service, mut supervisor) = service_at_root_with_stderr_binary();
-    service
-        .handle_listener_readiness(&mut supervisor)
-        .expect("start generation");
-    let generation = service.generation().expect("generation");
-    assert_eq!(
-        service
-            .reactor_registrations()
-            .filter(|registration| registration.purpose == XwaylandReactorPurpose::Stderr)
-            .count(),
-        1
-    );
-    service
-        .handle_stderr_ready(generation)
-        .expect("drain stderr");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while service.metrics.stderr_lines == 0 && Instant::now() < deadline {
-        service
-            .handle_stderr_ready(generation)
-            .expect("poll stderr");
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(service.metrics.stderr_lines >= 1);
-
-    let process_id = service
-        .readiness_snapshot()
-        .expect("readiness snapshot")
-        .process_id;
-    supervisor
-        .kill_managed_now(process_id)
-        .expect("kill process");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while service
-        .reactor_registrations()
-        .any(|registration| registration.purpose == XwaylandReactorPurpose::Stderr)
-        && Instant::now() < deadline
-    {
-        service
-            .handle_stderr_ready(generation)
-            .expect("handle stderr EOF");
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert_eq!(
-        service
-            .reactor_registrations()
-            .filter(|registration| registration.purpose == XwaylandReactorPurpose::Stderr)
-            .count(),
-        0
-    );
-    assert_eq!(service.state_kind(), XwaylandStateKind::Starting);
-
-    service.emergency_cleanup(&mut supervisor).expect("cleanup");
-    drop(service);
-    drop(supervisor);
-    fs::remove_dir_all(root).expect("remove test root");
-}
-
-#[test]
 fn managed_lazy_environment_triggers_first_generation() {
     let (root, mut service, mut supervisor) =
         service_at_root(XwaylandMode::ManagedLazy, "/bin/true");
@@ -570,11 +493,19 @@ fn starting_generation_unregisters_parent_listener_sources() {
     service
         .handle_listener_readiness(&mut supervisor)
         .expect("start generation");
-    let registrations: Vec<_> = service.reactor_registrations().collect();
-    assert_eq!(registrations.len(), 1);
     assert_eq!(
-        registrations[0].purpose,
-        XwaylandReactorPurpose::DisplayReady
+        service
+            .reactor_registrations()
+            .filter(|registration| registration.purpose == XwaylandReactorPurpose::DisplayReady)
+            .count(),
+        1
+    );
+    assert_eq!(
+        service
+            .reactor_registrations()
+            .filter(|registration| registration.purpose == XwaylandReactorPurpose::Stderr)
+            .count(),
+        1
     );
     service.emergency_cleanup(&mut supervisor).expect("cleanup");
     drop(service);

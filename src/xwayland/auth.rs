@@ -1,9 +1,13 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::File,
     io::{self, Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::fd::{AsRawFd, FromRawFd, RawFd},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
+
+#[cfg(test)]
+use std::fs;
 
 use super::fs_security;
 
@@ -14,9 +18,11 @@ pub(crate) struct AuthFile {
     pub(crate) path: PathBuf,
 }
 
-pub(crate) fn create_auth_file(directory: &Path, display_number: u32) -> io::Result<AuthFile> {
-    fs_security::ensure_private_directory(directory)?;
-
+pub(crate) fn create_auth_file_at(
+    directory_fd: RawFd,
+    directory: &Path,
+    display_number: u32,
+) -> io::Result<AuthFile> {
     let mut suffix_bytes = vec![0u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut suffix_bytes)?;
     let suffix = suffix_bytes
@@ -26,22 +32,43 @@ pub(crate) fn create_auth_file(directory: &Path, display_number: u32) -> io::Res
     let path = directory.join(format!(".Xauthority-{display_number}-{suffix}"));
     let mut cookie = vec![0u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut cookie)?;
-    let mut file = OpenOptions::new();
-    file.write(true)
-        .create_new(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .mode(0o600);
-    let mut file = file.open(&path)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "authority file has no name"))?;
+    let name_c = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "authority name contains NUL"))?;
+    let fd = unsafe {
+        libc::openat(
+            directory_fd,
+            name_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let identity = match fs_security::Identity::from_fd(file.as_raw_fd()) {
+        Ok(identity) => identity,
+        Err(error) => {
+            drop(file);
+            return Err(error);
+        }
+    };
     let result = (|| {
         file.write_all(&authority_record(display_number, &cookie)?)?;
         file.flush()?;
         file.sync_all()?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
         Ok::<(), io::Error>(())
     })();
     if let Err(error) = result {
         drop(file);
-        let _ = fs::remove_file(&path);
+        let _ = fs_security::unlink_owned_at(directory_fd, name, identity);
         return Err(error);
     }
     Ok(AuthFile { path })

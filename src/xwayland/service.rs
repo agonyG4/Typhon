@@ -43,15 +43,17 @@ struct StderrPipe {
     fd: OwnedFd,
     buffer: Vec<u8>,
     active: bool,
+    forward: bool,
     ring: StderrRing,
 }
 
 impl StderrPipe {
-    fn new(fd: OwnedFd) -> Self {
+    fn new(fd: OwnedFd, forward: bool) -> Self {
         Self {
             fd,
             buffer: Vec::new(),
             active: true,
+            forward,
             ring: StderrRing::default(),
         }
     }
@@ -390,6 +392,25 @@ impl XwaylandService {
     #[cfg(test)]
     pub(crate) fn xwm_reactor_events_for_tests(&self) -> u64 {
         self.metrics.xwm_reactor_events
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stderr_forwarding_for_tests(
+        &self,
+        generation: XwaylandGeneration,
+    ) -> Option<bool> {
+        match &self.state {
+            ServiceState::Starting(resources) if resources.generation == generation => {
+                resources.stderr.as_ref().map(|stderr| stderr.forward)
+            }
+            ServiceState::RunningBase(resources) if resources.generation == generation => {
+                resources.stderr.as_ref().map(|stderr| stderr.forward)
+            }
+            ServiceState::Running(resources) if resources.generation == generation => {
+                resources.stderr.as_ref().map(|stderr| stderr.forward)
+            }
+            _ => None,
+        }
     }
 
     fn drain_managed_xwm(&mut self, supervisor: &mut ChildSupervisor) -> bool {
@@ -750,12 +771,9 @@ impl XwaylandService {
         let options = ProcessOptions::new(ProcessKind::Xwayland)
             .session_owned(true)
             .with_process_group_policy(ProcessGroupPolicy::Dedicated);
-        let (process, stderr) = if self.config.log_stderr {
-            let spawned = launch.spawn_with_stderr(supervisor, options)?;
-            (spawned.process, Some(StderrPipe::new(spawned.stderr)))
-        } else {
-            (launch.spawn(supervisor, options)?, None)
-        };
+        let spawned = launch.spawn_with_stderr(supervisor, options)?;
+        let process = spawned.process;
+        let stderr = Some(StderrPipe::new(spawned.stderr, self.config.log_stderr));
         self.log_displayfd_event(
             "displayfd_child_mapped",
             None,

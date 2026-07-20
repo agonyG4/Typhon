@@ -1,16 +1,12 @@
 use std::{
     env,
-    fs::{self, File, OpenOptions},
-    io::{self, Write},
+    fs::File,
+    io::{self, Read, Write},
     os::fd::{AsRawFd, FromRawFd, RawFd},
-    os::unix::{
-        fs::OpenOptionsExt,
-        net::{UnixListener, UnixStream},
-    },
+    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
 };
 
-use super::auth::create_auth_file;
 use super::fs_security;
 
 type FileIdentity = fs_security::Identity;
@@ -106,27 +102,53 @@ impl DisplayLease {
         auth_directory: &Path,
         display_number: u32,
     ) -> io::Result<Option<Self>> {
+        fs_security::ensure_private_directory(auth_directory)?;
+        let lock_directory_fd = fs_security::open_directory(lock_directory)?;
+        let socket_directory_fd = fs_security::open_directory(socket_directory)?;
+        let auth_directory_fd = fs_security::open_directory(auth_directory)?;
         let lock_path = lock_directory.join(format!(".X{display_number}-lock"));
         let socket_path = socket_directory.join(format!("X{display_number}"));
-        if let Some(should_skip) = inspect_existing_lock(&lock_path, &socket_path)? {
+        let lock_name = lock_path
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "lock has no name"))?;
+        let socket_name = socket_path
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket has no name"))?;
+        if let Some((should_skip, existing_identity)) =
+            inspect_existing_lock(lock_directory_fd.as_raw_fd(), lock_name, &socket_path)?
+        {
             if should_skip {
                 return Ok(None);
             }
-            fs::remove_file(&lock_path)?;
+            match fs_security::unlink_owned_at(
+                lock_directory_fd.as_raw_fd(),
+                lock_name,
+                existing_identity,
+            ) {
+                fs_security::OwnershipCleanup::Removed | fs_security::OwnershipCleanup::Missing => {
+                }
+                fs_security::OwnershipCleanup::OwnershipMismatch => return Ok(None),
+                fs_security::OwnershipCleanup::Failed => {
+                    return Err(io::Error::other("could not retire stale X11 display lock"));
+                }
+            }
         }
 
-        let lock_file = match create_lock(&lock_path)? {
+        let lock_file = match fs_security::create_lock_at(lock_directory_fd.as_raw_fd(), lock_name)?
+        {
             Some(file) => file,
             None => return Ok(None),
         };
-        let lock_identity = FileIdentity::from_path(&lock_path)?;
+        let lock_identity = FileIdentity::from_at(lock_directory_fd.as_raw_fd(), lock_name)?;
         if let Err(error) = write_lock_pid(&lock_file) {
-            cleanup_artifact(&lock_path, lock_identity);
+            cleanup_artifact_at(&lock_directory_fd, lock_name, lock_identity);
             return Err(error);
         }
 
-        if let Err(error) = reject_or_remove_socket(&socket_path) {
-            cleanup_artifact(&lock_path, lock_identity);
+        if let Err(error) =
+            reject_or_remove_socket(socket_directory_fd.as_raw_fd(), socket_name, &socket_path)
+        {
+            cleanup_artifact_at(&lock_directory_fd, lock_name, lock_identity);
             if error.kind() == io::ErrorKind::AddrInUse {
                 return Ok(None);
             }
@@ -135,57 +157,99 @@ impl DisplayLease {
         let filesystem_listener = match UnixListener::bind(&socket_path) {
             Ok(listener) => listener,
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-                cleanup_artifact(&lock_path, lock_identity);
+                cleanup_artifact_at(&lock_directory_fd, lock_name, lock_identity);
                 return Ok(None);
             }
             Err(error) => {
-                cleanup_artifact(&lock_path, lock_identity);
+                cleanup_artifact_at(&lock_directory_fd, lock_name, lock_identity);
                 return Err(error);
             }
         };
-        fs_security::set_socket_mode(&socket_path)?;
-        filesystem_listener.set_nonblocking(true)?;
-        let filesystem_socket_identity = match FileIdentity::from_path(&socket_path) {
-            Ok(identity) => identity,
-            Err(error) => {
-                cleanup_artifact(&lock_path, lock_identity);
-                let _ = fs::remove_file(&socket_path);
-                return Err(error);
-            }
-        };
+        let filesystem_socket_identity =
+            match FileIdentity::from_at(socket_directory_fd.as_raw_fd(), socket_name) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    cleanup_artifact_at(&lock_directory_fd, lock_name, lock_identity);
+                    return Err(error);
+                }
+            };
+        if let Err(error) = fs_security::set_socket_mode_at(
+            socket_directory_fd.as_raw_fd(),
+            socket_name,
+            filesystem_socket_identity,
+        ) {
+            cleanup_artifact_at(&lock_directory_fd, lock_name, lock_identity);
+            cleanup_artifact_at(
+                &socket_directory_fd,
+                socket_name,
+                filesystem_socket_identity,
+            );
+            return Err(error);
+        }
+        if let Err(error) = filesystem_listener.set_nonblocking(true) {
+            cleanup_artifact_at(&lock_directory_fd, lock_name, lock_identity);
+            cleanup_artifact_at(
+                &socket_directory_fd,
+                socket_name,
+                filesystem_socket_identity,
+            );
+            return Err(error);
+        }
         let abstract_listener =
             match bind_abstract_listener(abstract_socket_directory, display_number) {
                 Ok(listener) => listener,
                 Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-                    cleanup_artifact(&lock_path, lock_identity);
-                    cleanup_artifact(&socket_path, filesystem_socket_identity);
+                    cleanup_artifact_at(&lock_directory_fd, lock_name, lock_identity);
+                    cleanup_artifact_at(
+                        &socket_directory_fd,
+                        socket_name,
+                        filesystem_socket_identity,
+                    );
                     return Ok(None);
                 }
                 Err(error) => {
-                    cleanup_artifact(&lock_path, lock_identity);
-                    cleanup_artifact(&socket_path, filesystem_socket_identity);
+                    cleanup_artifact_at(&lock_directory_fd, lock_name, lock_identity);
+                    cleanup_artifact_at(
+                        &socket_directory_fd,
+                        socket_name,
+                        filesystem_socket_identity,
+                    );
                     return Err(error);
                 }
             };
-        let auth_file = match create_auth_file(auth_directory, display_number) {
+        let auth_file = match super::auth::create_auth_file_at(
+            auth_directory_fd.as_raw_fd(),
+            auth_directory,
+            display_number,
+        ) {
             Ok(auth_file) => auth_file,
             Err(error) => {
-                cleanup_artifact(&lock_path, lock_identity);
-                cleanup_artifact(&socket_path, filesystem_socket_identity);
+                cleanup_artifact_at(&lock_directory_fd, lock_name, lock_identity);
+                cleanup_artifact_at(
+                    &socket_directory_fd,
+                    socket_name,
+                    filesystem_socket_identity,
+                );
                 return Err(error);
             }
         };
-        let xauthority_identity = match FileIdentity::from_path(&auth_file.path) {
-            Ok(identity) => identity,
-            Err(error) => {
-                cleanup_artifact(&lock_path, lock_identity);
-                cleanup_artifact(&socket_path, filesystem_socket_identity);
-                return Err(error);
-            }
-        };
-        let lock_directory_fd = fs_security::open_directory(lock_directory)?;
-        let socket_directory_fd = fs_security::open_directory(socket_directory)?;
-        let auth_directory_fd = fs_security::open_directory(auth_directory)?;
+        let auth_name = auth_file
+            .path
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "authority has no name"))?;
+        let xauthority_identity =
+            match FileIdentity::from_at(auth_directory_fd.as_raw_fd(), auth_name) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    cleanup_artifact_at(&lock_directory_fd, lock_name, lock_identity);
+                    cleanup_artifact_at(
+                        &socket_directory_fd,
+                        socket_name,
+                        filesystem_socket_identity,
+                    );
+                    return Err(error);
+                }
+            };
 
         Ok(Some(Self {
             display_number,
@@ -236,12 +300,19 @@ impl DisplayLease {
 
 impl Drop for DisplayLease {
     fn drop(&mut self) {
-        cleanup_artifact(&self.xauthority_path, self.xauthority_identity);
-        cleanup_artifact(
-            &self.filesystem_socket_path,
-            self.filesystem_socket_identity,
-        );
-        cleanup_artifact(&self.lock_path, self.lock_identity);
+        if let Some(name) = self.xauthority_path.file_name() {
+            cleanup_artifact_at(&self._auth_directory_fd, name, self.xauthority_identity);
+        }
+        if let Some(name) = self.filesystem_socket_path.file_name() {
+            cleanup_artifact_at(
+                &self._socket_directory_fd,
+                name,
+                self.filesystem_socket_identity,
+            );
+        }
+        if let Some(name) = self.lock_path.file_name() {
+            cleanup_artifact_at(&self._lock_directory_fd, name, self.lock_identity);
+        }
     }
 }
 
@@ -249,45 +320,53 @@ fn ensure_socket_directory(path: &Path) -> io::Result<()> {
     fs_security::ensure_socket_directory(path)
 }
 
-fn inspect_existing_lock(lock_path: &Path, socket_path: &Path) -> io::Result<Option<bool>> {
-    let metadata = match fs::symlink_metadata(lock_path) {
-        Ok(metadata) => metadata,
+fn inspect_existing_lock(
+    lock_directory_fd: RawFd,
+    lock_name: &std::ffi::OsStr,
+    socket_path: &Path,
+) -> io::Result<Option<(bool, FileIdentity)>> {
+    let stat = match fs_security::stat_at(lock_directory_fd, lock_name) {
+        Ok(stat) => stat,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    let file_type = stat.st_mode & libc::S_IFMT as libc::mode_t;
+    if file_type != libc::S_IFREG as libc::mode_t {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!(
-                "X11 display lock is not a safe regular file: {}",
-                lock_path.display()
-            ),
+            "X11 display lock is not a safe regular file",
         ));
     }
-    let bytes = fs::read(lock_path)?;
+    let mut file = fs_security::open_read_at(lock_directory_fd, lock_name)?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file).take(4097).read_to_end(&mut bytes)?;
+    if bytes.len() > 4096 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "X11 display lock is too large",
+        ));
+    }
     let pid_bytes = bytes.split(|byte| *byte == 0).next().unwrap_or_default();
     let pid = std::str::from_utf8(pid_bytes)
         .ok()
         .and_then(|value| value.trim().parse::<u32>().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "X11 display lock has no PID"))?;
     if process_is_alive(pid) || socket_is_active(socket_path)? {
-        Ok(Some(true))
+        Ok(Some((
+            true,
+            FileIdentity {
+                device: stat.st_dev,
+                inode: stat.st_ino,
+            },
+        )))
     } else {
-        Ok(Some(false))
-    }
-}
-
-fn create_lock(path: &Path) -> io::Result<Option<File>> {
-    let mut options = OpenOptions::new();
-    options
-        .write(true)
-        .create_new(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .mode(0o644);
-    match options.open(path) {
-        Ok(file) => Ok(Some(file)),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(None),
-        Err(error) => Err(error),
+        Ok(Some((
+            false,
+            FileIdentity {
+                device: stat.st_dev,
+                inode: stat.st_ino,
+            },
+        )))
     }
 }
 
@@ -296,25 +375,42 @@ fn write_lock_pid(file: &File) -> io::Result<()> {
     writeln!(file, "{}", std::process::id())
 }
 
-fn reject_or_remove_socket(path: &Path) -> io::Result<()> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+fn reject_or_remove_socket(
+    socket_directory_fd: RawFd,
+    socket_name: &std::ffi::OsStr,
+    path: &Path,
+) -> io::Result<()> {
+    let stat = match fs_security::stat_at(socket_directory_fd, socket_name) {
+        Ok(stat) => stat,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    if metadata.file_type().is_symlink() {
+    if stat.st_mode & libc::S_IFMT as libc::mode_t == libc::S_IFLNK as libc::mode_t {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("X11 socket path is a symlink: {}", path.display()),
         ));
     }
+    let identity = FileIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    };
     if socket_is_active(path)? {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             format!("X11 socket is active: {}", path.display()),
         ));
     }
-    fs::remove_file(path)
+    match fs_security::unlink_owned_at(socket_directory_fd, socket_name, identity) {
+        fs_security::OwnershipCleanup::Removed | fs_security::OwnershipCleanup::Missing => Ok(()),
+        fs_security::OwnershipCleanup::OwnershipMismatch => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "X11 socket changed during stale cleanup",
+        )),
+        fs_security::OwnershipCleanup::Failed => {
+            Err(io::Error::other("could not retire stale X11 socket"))
+        }
+    }
 }
 
 fn socket_is_active(path: &Path) -> io::Result<bool> {
@@ -352,8 +448,20 @@ fn is_slot_local_error(error: &io::Error) -> bool {
     )
 }
 
-fn cleanup_artifact(path: &Path, expected: FileIdentity) {
-    let _ = fs_security::unlink_owned(path, expected);
+fn cleanup_artifact_at(
+    directory_fd: &std::os::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+    expected: FileIdentity,
+) {
+    if matches!(
+        fs_security::unlink_owned_at(directory_fd.as_raw_fd(), name, expected),
+        fs_security::OwnershipCleanup::OwnershipMismatch
+    ) {
+        eprintln!(
+            "oblivion-one xwayland: event=filesystem_ownership_mismatch entry={:?}",
+            name
+        );
+    }
 }
 
 fn abstract_socket_name(directory: &Path, display_number: u32) -> Vec<u8> {
