@@ -1,10 +1,14 @@
 //! Generation-bound adoption and readiness deadlines.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use super::X11WindowHandle;
 
 pub(crate) const ADOPTION_TIMEOUT_NS: u64 = 5_000_000_000;
+
+pub(crate) fn take_batch(queue: &mut VecDeque<u32>, capacity: usize) -> Vec<u32> {
+    (0..capacity).filter_map(|_| queue.pop_front()).collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdoptionWait {
@@ -91,5 +95,17 @@ mod tests {
             tracker.expired(10),
             [(handle, AdoptionWait::MapToAssociation)]
         );
+    }
+
+    #[test]
+    fn query_tree_over_capacity_is_processed_in_batches() {
+        let mut queue = (1..=257).collect::<VecDeque<_>>();
+        let mut seen = Vec::new();
+        while !queue.is_empty() {
+            seen.extend(take_batch(&mut queue, 64));
+        }
+        assert_eq!(seen.len(), 257);
+        assert_eq!(seen.first(), Some(&1));
+        assert_eq!(seen.last(), Some(&257));
     }
 }

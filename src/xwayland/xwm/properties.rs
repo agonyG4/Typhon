@@ -489,6 +489,13 @@ fn complete_property(
         issue_property(xwm, pending.handle, pending.kind, pending.epoch)?;
     } else {
         maybe_finish_refresh(xwm, pending.handle)?;
+        if pending.kind == PropertyKind::NetWmUserTime {
+            let user_time = xwm
+                .windows
+                .get(pending.handle)
+                .and_then(|record| record.properties.user_time);
+            xwm.focus.note_user_time(user_time);
+        }
         if let Some(delta) = delta {
             xwm.outgoing_events
                 .push_back(super::XwmEvent::MetadataChanged {

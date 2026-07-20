@@ -10,7 +10,6 @@ use super::{
     atoms::XwmAtomName,
     ewmh::{decode_state_action, state_atom as decode_state_atom},
     properties::PropertyKind,
-    shape,
     window::X11WindowLifecycle,
 };
 
@@ -121,6 +120,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         }
         Event::DestroyNotify(event) => {
             let handle = X11WindowHandle::new(xwm.generation, event.window);
+            xwm.note_focus_destroyed(event.window);
             xwm.clear_resize_sync(handle);
             xwm.association.remove_x11_window(handle);
             let Some(record) = xwm
@@ -184,29 +184,17 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 xwm.note_sync_counter_notify(event.counter, int64_to_u64(event.counter_value));
             }
         }
-        Event::FocusIn(_) | Event::FocusOut(_) => {
-            // Focus events are reconciliation signals only.  Typhon remains the focus authority.
+        Event::FocusIn(event) => {
+            xwm.note_focus_in(event.event);
+        }
+        Event::FocusOut(event) => {
+            xwm.note_focus_out(event.event);
         }
         Event::ShapeNotify(event) => {
-            if !xwm.capabilities.shape {
-                return Ok(());
-            }
-            let handle = X11WindowHandle::new(xwm.generation, event.affected_window);
-            if xwm.windows.contains(handle) {
-                let fallback = shape::ShapeRect {
-                    x: event.extents_x,
-                    y: event.extents_y,
-                    width: event.extents_width.max(1),
-                    height: event.extents_height.max(1),
-                };
-                let rectangles = event
-                    .shaped
-                    .then_some(fallback)
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                xwm.shapes
-                    .insert(handle, shape::normalize_region(&rectangles, fallback));
-            }
+            // Shape is negotiated only for version diagnostics.  Until the
+            // compositor visual/input regions consume the region, rectangular
+            // fallback is the sole advertised behavior.
+            let _ = event;
         }
         _ => {}
     }
@@ -253,10 +241,13 @@ fn normalize_client_message(
             });
         }
     } else if event.type_ == xwm.atoms.get(XwmAtomName::NetActiveWindow) {
+        let (current_time, user_time) = xwm.note_active_window_request(handle, data[1]);
         xwm.outgoing_events.push_back(XwmEvent::FocusRequested {
             window: handle,
             source: data[0],
             timestamp: data[1],
+            current_time,
+            user_time,
         });
     } else if event.type_ == xwm.atoms.get(XwmAtomName::NetCloseWindow) {
         xwm.outgoing_events

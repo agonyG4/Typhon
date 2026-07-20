@@ -355,6 +355,20 @@ impl X11WindowRegistry {
         Ok(())
     }
 
+    pub(crate) fn adopt_mapped(&mut self, handle: X11WindowHandle) -> Result<(), &'static str> {
+        let record = self.record_mut(handle)?;
+        record.map_requested = true;
+        record.map_authorized = true;
+        record.mapped_notified = true;
+        record.map_operation_pending = false;
+        record.lifecycle = if record.association.is_some() {
+            X11WindowLifecycle::AssociatedAwaitingBuffer
+        } else {
+            X11WindowLifecycle::MappedAwaitingAssociation
+        };
+        Ok(())
+    }
+
     pub(crate) fn map_command_is_new(&self, handle: X11WindowHandle) -> Result<bool, &'static str> {
         let record = self.records.get(&handle).ok_or("unknown X11 window")?;
         Ok(!record.map_operation_pending && !record.mapped_notified && record.snapshot.is_none())
@@ -753,6 +767,45 @@ mod tests {
                 .expect("known window")
                 .map_operation_pending
         );
+    }
+
+    #[test]
+    fn existing_override_redirect_window_is_adopted_correctly() {
+        let generation = generation(21);
+        let window = handle(generation, 210);
+        let geometry = X11Geometry {
+            x: 12,
+            y: 14,
+            width: 320,
+            height: 180,
+        };
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(window, DesktopWindowKind::OverrideRedirect, geometry);
+        registry.adopt_mapped(window).expect("adopt mapped popup");
+        let record = registry.get(window).expect("adopted popup");
+        assert_eq!(record.kind, DesktopWindowKind::OverrideRedirect);
+        assert_eq!(record.geometry, geometry);
+        assert!(record.map_requested);
+        assert!(record.map_authorized);
+        assert!(record.mapped_notified);
+        assert!(!record.map_operation_pending);
+    }
+
+    #[test]
+    fn existing_window_uses_real_attributes_and_geometry() {
+        let generation = generation(22);
+        let window = handle(generation, 220);
+        let geometry = X11Geometry {
+            x: -7,
+            y: 9,
+            width: 1024,
+            height: 768,
+        };
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(window, DesktopWindowKind::Managed, geometry);
+        let record = registry.get(window).expect("adopted window");
+        assert_eq!(record.geometry, geometry);
+        assert_eq!(record.lifecycle, X11WindowLifecycle::Observed);
     }
 
     #[test]

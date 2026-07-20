@@ -608,13 +608,15 @@ impl OwnCompositorServer {
                 window,
                 source,
                 timestamp,
+                current_time,
+                user_time,
             } => {
                 let relationship_allowed = self.state.x11_focus_request_allowed(window);
                 if crate::xwayland::xwm::focus::activation_allowed(
                     source == 2,
                     timestamp,
-                    timestamp,
-                    None,
+                    current_time,
+                    user_time,
                     relationship_allowed,
                     relationship_allowed,
                     false,

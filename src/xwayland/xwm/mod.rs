@@ -27,6 +27,7 @@ mod ownership;
 mod properties;
 pub mod randr;
 mod resize_sync;
+#[allow(dead_code)]
 pub(crate) mod shape;
 pub(crate) mod startup;
 mod window;
@@ -190,6 +191,8 @@ pub enum XwmEvent {
         window: X11WindowHandle,
         source: u32,
         timestamp: u32,
+        current_time: u32,
+        user_time: Option<u32>,
     },
     CloseRequestedByClient(X11WindowHandle),
     ResizeSyncAcked {
@@ -311,6 +314,7 @@ pub struct Xwm {
     pub(crate) outgoing_events: VecDeque<XwmEvent>,
     pub(crate) association: SurfaceAssociationJoin,
     pub(crate) resize_sync: ResizeSyncTracker,
+    pub(crate) focus: focus::FocusTracker,
     pub(crate) sync_alarms: HashMap<X11WindowHandle, u32>,
     pub(crate) sync_handles_by_counter: HashMap<u32, X11WindowHandle>,
     pub(crate) next_resize_counter_values: HashMap<X11WindowHandle, u64>,
@@ -372,6 +376,38 @@ impl Xwm {
 
     pub fn window_count(&self) -> usize {
         self.windows.len()
+    }
+
+    pub(crate) fn note_focus_in(&mut self, xid: u32) {
+        self.focus.note_focus_in(xid);
+    }
+
+    pub(crate) fn note_focus_out(&mut self, xid: u32) {
+        self.focus.note_focus_out(xid);
+    }
+
+    pub(crate) fn note_focus_destroyed(&mut self, xid: u32) {
+        self.focus.note_destroyed(xid);
+    }
+
+    pub(crate) fn note_active_window_request(
+        &mut self,
+        handle: X11WindowHandle,
+        timestamp: u32,
+    ) -> (u32, Option<u32>) {
+        let user_time = self
+            .windows
+            .get(handle)
+            .and_then(|record| record.properties.user_time);
+        self.focus.note_user_time(user_time);
+        let (current_time, last_user_time) =
+            self.focus.note_activation_request(handle.xid(), timestamp);
+        (current_time, last_user_time.or(user_time))
+    }
+
+    pub(crate) fn note_focus_command(&mut self, handle: Option<X11WindowHandle>, timestamp: u32) {
+        self.focus
+            .note_focus_command(handle.map(X11WindowHandle::xid), timestamp);
     }
 
     pub fn required_extensions_available(&self) -> bool {

@@ -1017,20 +1017,23 @@ impl XwaylandService {
     }
 
     pub fn handle_process_exit(&mut self, exit: &ChildExit) -> io::Result<bool> {
-        if self
+        let compositor_requested = self
             .pending_termination
-            .is_some_and(|pending| pending.process_id == exit.id)
-        {
+            .is_some_and(|pending| pending.process_id == exit.id);
+        if compositor_requested {
             self.pending_termination = None;
         }
-        let running = matches!(self.state, ServiceState::Running(_));
+        let ready = matches!(
+            self.state,
+            ServiceState::RunningBase(_) | ServiceState::Running(_)
+        );
         let process = match &self.state {
             ServiceState::Starting(resources) => resources.process,
             ServiceState::RunningBase(resources) => resources.process,
             ServiceState::Running(resources) => resources.process,
             _ => return Ok(false),
         };
-        let exit_class = classify_exit(running, false, exit.status.success());
+        let exit_class = classify_exit(ready, compositor_requested, exit.status.success());
         eprintln!(
             "oblivion-one xwayland: event=exit_class generation={:?} class={exit_class:?}",
             self.generation()
@@ -1052,11 +1055,19 @@ impl XwaylandService {
             );
             self.last_readiness = Some(readiness);
         }
-        if exit.status.success() {
-            self.rearm(true);
-            return Ok(true);
+        match exit_class {
+            super::diagnostics::XwaylandExitClass::ExpectedIdleExitAfterRunning => {
+                self.rearm(true);
+            }
+            super::diagnostics::XwaylandExitClass::ExpectedShutdownAfterRunning
+            | super::diagnostics::XwaylandExitClass::CompositorRequestedTermination => {
+                self.disable_after_process_exit();
+            }
+            super::diagnostics::XwaylandExitClass::StartupExitBeforeReadiness
+            | super::diagnostics::XwaylandExitClass::CrashOrSignal => {
+                self.enter_failure_backoff(now_ns()?);
+            }
         }
-        self.enter_failure_backoff(now_ns()?);
         Ok(true)
     }
 
@@ -1357,6 +1368,13 @@ impl XwaylandService {
             self.backoff_level = 0;
             self.metrics.backoff_level = 0;
         }
+        self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
+        self.log_state_transition();
+    }
+
+    fn disable_after_process_exit(&mut self) {
+        self.private_client = None;
+        self.replace_state(ServiceState::Disabled);
         self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
         self.log_state_transition();
     }

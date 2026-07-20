@@ -946,6 +946,33 @@ fn shell_readiness_alone_remains_starting_and_reverse_order_completes() {
 }
 
 #[test]
+fn successful_post_ready_expected_exit_can_reset_budget() {
+    let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/true");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let generation = service.generation().expect("generation");
+    let display = service.display_number().expect("display");
+    service
+        .handle_displayfd_bytes(
+            generation,
+            format!("{}\n", display).as_bytes(),
+            &mut supervisor,
+        )
+        .expect("display readiness");
+    service
+        .handle_shell_bind(generation)
+        .expect("shell readiness");
+    assert_eq!(service.state_kind(), XwaylandStateKind::RunningBase);
+    let exit = reap_one(&mut supervisor);
+    service.handle_process_exit(&exit).expect("post-ready exit");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Armed);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
 fn wrong_display_readiness_fails_the_generation_without_running() {
     let (root, mut service, mut supervisor) =
         service_at_root_with_sleeping_binary(XwaylandMode::BaseLazy, "wrong-display");
@@ -982,6 +1009,9 @@ fn stale_generation_readiness_cannot_complete_new_generation() {
     service
         .handle_process_exit(&exit)
         .expect("rearm after clean exit");
+    service
+        .handle_deadline(u64::MAX, &mut supervisor)
+        .expect("leave startup-exit backoff");
     service
         .handle_listener_readiness(&mut supervisor)
         .expect("start second generation");
@@ -1054,7 +1084,7 @@ fn malformed_and_oversized_displayfd_payloads_fail_safely() {
 }
 
 #[test]
-fn abnormal_exit_enters_backoff_and_clean_exit_rearms() {
+fn abnormal_exit_and_pre_ready_clean_exit_enter_backoff() {
     let (root, mut service, mut supervisor) = service_at_root(XwaylandMode::BaseLazy, "/bin/false");
     service
         .handle_listener_readiness(&mut supervisor)
@@ -1079,7 +1109,7 @@ fn abnormal_exit_enters_backoff_and_clean_exit_rearms() {
     service
         .handle_process_exit(&exit)
         .expect("handle clean exit");
-    assert_eq!(service.state_kind(), XwaylandStateKind::Armed);
+    assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
     drop(service);
     drop(supervisor);
     fs::remove_dir_all(root).expect("remove test root");
@@ -1248,6 +1278,9 @@ fn stale_child_exit_cannot_stop_current_generation() {
     service
         .handle_process_exit(&first_exit)
         .expect("rearm after first exit");
+    service
+        .handle_deadline(u64::MAX, &mut supervisor)
+        .expect("leave startup-exit backoff");
     service
         .handle_listener_readiness(&mut supervisor)
         .expect("start second generation");

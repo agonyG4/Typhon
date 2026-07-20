@@ -102,6 +102,7 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
                 .map_err(XwmError::Connection)?;
         }
         XwmCommand::Focus { window, timestamp } => {
+            xwm.note_focus_command(window, timestamp);
             let focus = window.map_or(x11rb::NONE, |handle| handle.xid());
             let model = window
                 .and_then(|handle| xwm.windows.get(handle))
