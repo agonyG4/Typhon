@@ -703,13 +703,11 @@ impl Xwm {
     }
 
     pub(crate) fn collect_adoption_expirations(&mut self, now_ns: u64) {
-        for (handle, _) in self.adoption.expired(now_ns) {
-            self.cancel_window_properties(handle);
-            if let Some(record) = self.windows.get(handle)
-                && record.snapshot.is_none()
-            {
-                let _ = self.windows.mark_unmapped(handle);
-            }
+        for (handle, wait) in self.adoption.expired(now_ns) {
+            eprintln!(
+                "oblivion-one xwayland: event=adoption_timeout window={} wait={wait:?}",
+                handle.xid()
+            );
         }
     }
 

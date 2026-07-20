@@ -562,6 +562,43 @@ mod tests {
     }
 
     #[test]
+    fn adoption_timeout_does_not_fabricate_unmap_before_late_readiness() {
+        let generation = generation(11);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = prepare_managed_window(&mut xwm, 108, true, false, false);
+
+        normalize(&mut xwm, map_event(handle.xid(), false)).expect("normalize MapNotify");
+        assert!(ready_events(&mut xwm).is_empty());
+
+        xwm.adoption.observe(
+            handle,
+            super::super::adoption::AdoptionWait::MapToAssociation,
+            10,
+        );
+        xwm.collect_adoption_expirations(10);
+
+        let record = xwm.windows.get(handle).expect("managed window record");
+        assert!(record.map_requested);
+        assert!(record.mapped_notified);
+        assert!(record.properties_ready);
+
+        xwm.note_x11_surface_serial(handle, 0x1234, 0)
+            .expect("late X11 surface serial");
+        xwm.ingest_wayland_association(XwaylandAssociationEvent::Committed {
+            generation,
+            serial: NonZeroU64::new(0x1234).expect("serial"),
+            surface_id: 42,
+        })
+        .expect("late Wayland association");
+        xwm.mark_window_buffer_ready(handle)
+            .expect("late buffer readiness");
+
+        let events = ready_events(&mut xwm);
+        assert_eq!(events.len(), 1);
+        assert_eq!(ready_surface_id(&events), Some(42));
+    }
+
+    #[test]
     fn managed_map_notify_emits_window_ready_when_it_is_the_final_gate() {
         let generation = generation(1);
         let (mut xwm, _peer) = test_fixture(generation);
