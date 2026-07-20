@@ -35,6 +35,9 @@ mod displayfd_tests;
 #[path = "stderr_tests.rs"]
 mod stderr_tests;
 
+#[path = "managed_startup_tests.rs"]
+mod managed_startup_tests;
+
 #[test]
 fn xwayland_mode_parses_only_opt_in_values() {
     assert_eq!(XwaylandMode::parse(None), XwaylandMode::Off);

@@ -73,7 +73,7 @@ fn probe_xdpyinfo(display: &str, timeout: Duration) -> io::Result<XdpyinfoProbe>
 }
 
 #[test]
-fn installed_xwayland_listener_opens_only_after_verified_wm_s0() {
+fn installed_xwayland_listener_contract_after_external_wm_s0_claim() {
     let Some(wayland_display) = std::env::var_os("WAYLAND_DISPLAY") else {
         return;
     };
