@@ -241,11 +241,17 @@ fn x11_client_lists_follow_identity_and_generic_stacking() {
     let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
     let first = x11_snapshot(generation, 107, 58);
     let second = x11_snapshot(generation, 108, 59);
+    let mut popup = x11_snapshot(generation, 109, 60);
+    popup.kind = DesktopWindowKind::OverrideRedirect;
     let first_id = state.allocate_window_id().expect("first window id");
+    let popup_id = state.allocate_window_id().expect("popup window id");
     let second_id = state.allocate_window_id().expect("second window id");
     state
         .insert_desktop_window(DesktopWindow::new_x11(first_id, first.clone()))
         .expect("insert first X11 window");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(popup_id, popup))
+        .expect("insert override-redirect X11 window");
     state
         .insert_desktop_window(DesktopWindow::new_x11(second_id, second.clone()))
         .expect("insert second X11 window");

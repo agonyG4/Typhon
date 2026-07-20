@@ -383,6 +383,7 @@ impl CompositorState {
         let mut client_list = self
             .desktop_windows
             .values()
+            .filter(|window| window.kind == DesktopWindowKind::Managed)
             .filter_map(|window| match window.backend {
                 WindowBackend::X11(handle) => Some((window.id, handle)),
                 WindowBackend::Xdg(_) => None,
@@ -397,6 +398,7 @@ impl CompositorState {
             .window_stacking
             .iter()
             .filter_map(|id| self.window(*id))
+            .filter(|window| window.kind == DesktopWindowKind::Managed)
             .filter_map(|window| match window.backend {
                 WindowBackend::X11(handle) => Some(handle),
                 WindowBackend::Xdg(_) => None,
