@@ -9,6 +9,7 @@ use super::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum X11WindowLifecycle {
     Observed,
+    Auxiliary,
     MapRequested,
     PropertiesPending,
     MapCommanded,
@@ -60,6 +61,8 @@ pub(crate) struct X11PropertySnapshot {
     pub(crate) window_role: Option<String>,
     pub(crate) startup_id: Option<String>,
     pub(crate) user_time: Option<u32>,
+    pub(crate) client_leader: Option<X11WindowHandle>,
+    pub(crate) user_time_window: Option<X11WindowHandle>,
     pub(crate) urgency: bool,
 }
 
@@ -311,6 +314,10 @@ impl X11WindowRegistry {
             return Ok(None);
         }
         let association = record.association.expect("association checked");
+        if is_auxiliary_client_leader(handle, record) {
+            record.lifecycle = X11WindowLifecycle::Auxiliary;
+            return Ok(None);
+        }
         let snapshot = X11WindowSnapshot {
             handle,
             surface_id: association.surface_id,
@@ -465,6 +472,19 @@ impl X11WindowRegistry {
         };
         Ok(())
     }
+}
+
+fn is_auxiliary_client_leader(handle: X11WindowHandle, record: &X11WindowRecord) -> bool {
+    record.kind == DesktopWindowKind::Managed
+        && record.geometry.width <= 16
+        && record.geometry.height <= 16
+        && record.properties.client_leader == Some(handle)
+        && record
+            .properties
+            .user_time_window
+            .is_some_and(|window| window != handle)
+        && record.properties.window_type.is_none()
+        && record.properties.accepts_input.is_none()
 }
 
 #[cfg(test)]
@@ -922,5 +942,75 @@ mod tests {
 
         assert_eq!(snapshot.kind, DesktopWindowKind::OverrideRedirect);
         assert!(!snapshot.state.activated);
+    }
+
+    #[test]
+    fn client_leader_support_window_is_not_desktop_ready() {
+        let generation = generation(1);
+        let window = handle(generation, 27);
+        let user_time_window = handle(generation, 28);
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::Managed,
+            X11Geometry {
+                x: 10,
+                y: 10,
+                width: 10,
+                height: 10,
+            },
+        );
+        registry.mark_map_requested(window).expect("map request");
+        complete_properties(&mut registry, window);
+        {
+            let properties = &mut registry.get_mut(window).expect("window").properties;
+            properties.client_leader = Some(window);
+            properties.user_time_window = Some(user_time_window);
+        }
+        registry
+            .mark_associated(window, associated(generation, 11, 46))
+            .expect("association");
+        registry.mark_buffer_ready(window).expect("buffer");
+        registry.mark_map_commanded(window).expect("map command");
+        registry.confirm_map_notify(window).expect("map notify");
+
+        assert_eq!(registry.try_ready(window).expect("known window"), None);
+        assert_eq!(
+            registry.get(window).expect("support window").lifecycle,
+            X11WindowLifecycle::Auxiliary
+        );
+    }
+
+    #[test]
+    fn tiny_typed_input_window_remains_desktop_ready() {
+        let generation = generation(1);
+        let window = handle(generation, 29);
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::Managed,
+            X11Geometry {
+                width: 10,
+                height: 10,
+                ..X11Geometry::default()
+            },
+        );
+        registry.mark_map_requested(window).expect("map request");
+        complete_properties(&mut registry, window);
+        {
+            let properties = &mut registry.get_mut(window).expect("window").properties;
+            properties.client_leader = Some(window);
+            properties.user_time_window = Some(handle(generation, 30));
+            properties.window_type = Some(X11WindowType::Normal);
+            properties.accepts_input = Some(true);
+        }
+        registry
+            .mark_associated(window, associated(generation, 12, 47))
+            .expect("association");
+        registry.mark_buffer_ready(window).expect("buffer");
+        registry.mark_map_commanded(window).expect("map command");
+        registry.confirm_map_notify(window).expect("map notify");
+
+        assert!(registry.try_ready(window).expect("known window").is_some());
     }
 }

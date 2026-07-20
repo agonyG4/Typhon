@@ -47,10 +47,12 @@ pub(crate) enum PropertyKind {
     NetWmUserTime,
     NetWmSyncRequestCounter,
     NetWmState,
+    WmClientLeader,
+    NetWmUserTimeWindow,
 }
 
 impl PropertyKind {
-    pub(crate) const ALL: [Self; 14] = [
+    pub(crate) const ALL: [Self; 16] = [
         Self::NetWmName,
         Self::WmName,
         Self::WmClass,
@@ -65,6 +67,8 @@ impl PropertyKind {
         Self::NetWmUserTime,
         Self::NetWmSyncRequestCounter,
         Self::NetWmState,
+        Self::WmClientLeader,
+        Self::NetWmUserTimeWindow,
     ];
 
     const fn bit(self) -> u16 {
@@ -83,6 +87,8 @@ impl PropertyKind {
             Self::NetWmUserTime => 1 << 11,
             Self::NetWmSyncRequestCounter => 1 << 12,
             Self::NetWmState => 1 << 13,
+            Self::WmClientLeader => 1 << 14,
+            Self::NetWmUserTimeWindow => 1 << 15,
         }
     }
 
@@ -102,6 +108,8 @@ impl PropertyKind {
             Self::NetWmUserTime => XwmAtomName::NetWmUserTime,
             Self::NetWmSyncRequestCounter => XwmAtomName::NetWmSyncRequestCounter,
             Self::NetWmState => XwmAtomName::NetWmState,
+            Self::WmClientLeader => XwmAtomName::WmClientLeader,
+            Self::NetWmUserTimeWindow => XwmAtomName::NetWmUserTimeWindow,
         })
     }
 
@@ -129,6 +137,8 @@ enum ParsedProperty {
     UserTime(Option<u32>),
     WindowType(Option<X11WindowType>),
     TransientFor(Option<u32>),
+    ClientLeader(Option<u32>),
+    UserTimeWindow(Option<u32>),
     Constraints(crate::compositor::WindowConstraints),
     Protocols {
         supports_delete: bool,
@@ -601,6 +611,12 @@ fn commit_property(
         PropertyKind::NetWmState => {
             record.properties.state = record.staging_properties.state;
         }
+        PropertyKind::WmClientLeader => {
+            record.properties.client_leader = record.staging_properties.client_leader;
+        }
+        PropertyKind::NetWmUserTimeWindow => {
+            record.properties.user_time_window = record.staging_properties.user_time_window;
+        }
     }
     let was_admitted = record.snapshot.is_some();
     update_snapshot(record);
@@ -668,6 +684,14 @@ fn apply_parsed(
             properties.transient_for =
                 value.map(|xid| X11WindowHandle::new(handle.generation(), xid));
         }
+        ParsedProperty::ClientLeader(value) => {
+            properties.client_leader =
+                value.map(|xid| X11WindowHandle::new(handle.generation(), xid));
+        }
+        ParsedProperty::UserTimeWindow(value) => {
+            properties.user_time_window =
+                value.map(|xid| X11WindowHandle::new(handle.generation(), xid));
+        }
         ParsedProperty::Constraints(value) => properties.constraints = value,
         ParsedProperty::Protocols {
             supports_delete,
@@ -703,6 +727,8 @@ fn fallback_for(kind: PropertyKind) -> ParsedProperty {
         PropertyKind::NetWmUserTime => ParsedProperty::UserTime(None),
         PropertyKind::NetWmWindowType => ParsedProperty::WindowType(None),
         PropertyKind::WmTransientFor => ParsedProperty::TransientFor(None),
+        PropertyKind::WmClientLeader => ParsedProperty::ClientLeader(None),
+        PropertyKind::NetWmUserTimeWindow => ParsedProperty::UserTimeWindow(None),
         PropertyKind::WmNormalHints => ParsedProperty::Constraints(Default::default()),
         PropertyKind::WmHints => ParsedProperty::Hints {
             accepts_input: None,
@@ -750,6 +776,12 @@ fn parse(
         PropertyKind::WmTransientFor => parse_u32s(reply).and_then(|values| {
             (values.len() == 1).then(|| ParsedProperty::TransientFor(Some(values[0])))
         }),
+        PropertyKind::WmClientLeader => parse_u32s(reply).and_then(|values| {
+            (values.len() == 1).then(|| ParsedProperty::ClientLeader(Some(values[0])))
+        }),
+        PropertyKind::NetWmUserTimeWindow => parse_u32s(reply).and_then(|values| {
+            (values.len() == 1).then(|| ParsedProperty::UserTimeWindow(Some(values[0])))
+        }),
         PropertyKind::WmNormalHints => parse_normal_hints(reply),
         PropertyKind::WmHints => parse_wm_hints(reply),
         PropertyKind::WmProtocols => parse_protocols(reply, xwm),
@@ -774,7 +806,9 @@ fn expected_type(kind: PropertyKind, xwm: &Xwm) -> Option<u32> {
         PropertyKind::NetWmWindowType | PropertyKind::WmProtocols | PropertyKind::NetWmState => {
             u32::from(xproto::AtomEnum::ATOM)
         }
-        PropertyKind::WmTransientFor => u32::from(xproto::AtomEnum::WINDOW),
+        PropertyKind::WmTransientFor
+        | PropertyKind::WmClientLeader
+        | PropertyKind::NetWmUserTimeWindow => u32::from(xproto::AtomEnum::WINDOW),
         PropertyKind::WmNormalHints => u32::from(xproto::AtomEnum::WM_SIZE_HINTS),
         PropertyKind::WmHints => u32::from(xproto::AtomEnum::WM_HINTS),
     })
@@ -932,6 +966,34 @@ mod tests {
     #[test]
     fn property_mask_covers_every_initial_property() {
         assert_eq!(all_mask().count_ones(), PropertyKind::ALL.len() as u32);
+    }
+
+    #[test]
+    fn client_leader_and_user_time_window_bind_to_the_current_generation() {
+        let handle = test_handle();
+        let mut properties = X11PropertySnapshot::default();
+
+        apply_parsed(
+            &mut properties,
+            handle,
+            PropertyKind::WmClientLeader,
+            ParsedProperty::ClientLeader(Some(77)),
+        );
+        apply_parsed(
+            &mut properties,
+            handle,
+            PropertyKind::NetWmUserTimeWindow,
+            ParsedProperty::UserTimeWindow(Some(78)),
+        );
+
+        assert_eq!(
+            properties.client_leader,
+            Some(X11WindowHandle::new(handle.generation(), 77))
+        );
+        assert_eq!(
+            properties.user_time_window,
+            Some(X11WindowHandle::new(handle.generation(), 78))
+        );
     }
 
     #[test]
