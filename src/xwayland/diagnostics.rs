@@ -3,8 +3,27 @@
 
 use std::collections::VecDeque;
 
+use super::XwaylandGeneration;
+
 pub(crate) const STDERR_RING_LINES: usize = 256;
 pub(crate) const STDERR_LINE_BYTES: usize = 8 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum XwaylandFailureStage {
+    Startup,
+    StartupFlush,
+    CommandWrite,
+    CommandFlush,
+    BufferReady,
+    Reactor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct XwaylandFailure {
+    pub(crate) generation: Option<XwaylandGeneration>,
+    pub(crate) stage: XwaylandFailureStage,
+    pub(crate) reason: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum XwaylandExitClass {

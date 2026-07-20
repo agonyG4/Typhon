@@ -31,10 +31,24 @@ impl NativeRuntime {
         let now_ns = monotonic_now_ns()?;
         commands.extend(self.server.take_xwayland_backend_commands(now_ns));
         for command in commands {
-            self.xwayland.execute_managed_command(command)?;
+            let _ = self
+                .xwayland
+                .execute_managed_command(&mut self.process_supervisor, command);
         }
-        self.xwayland.flush_managed_commands()?;
+        let _ = self
+            .xwayland
+            .flush_managed_commands(&mut self.process_supervisor);
         Ok(())
+    }
+
+    pub(super) fn dispatch_xwayland_buffer_ready(&mut self) {
+        for (generation, surface_id) in self.server.take_xwayland_buffer_ready_events() {
+            let _ = self.xwayland.mark_managed_surface_buffer_ready(
+                &mut self.process_supervisor,
+                generation,
+                surface_id,
+            );
+        }
     }
 
     pub(super) fn reap_supervised_children(

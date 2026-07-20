@@ -60,10 +60,7 @@ impl NativeRuntime {
         self.initialize_managed_xwayland()?;
         let association_events = self.server.take_xwayland_association_events();
         self.xwayland.record_association_events(&association_events);
-        for (generation, surface_id) in self.server.take_xwayland_buffer_ready_events() {
-            self.xwayland
-                .mark_managed_surface_buffer_ready(generation, surface_id)?;
-        }
+        self.dispatch_xwayland_buffer_ready();
         self.dispatch_xwayland_window_events()?;
         self.sync_xwayland_reactor_sources()?;
         if cycle.shutdown_requested {

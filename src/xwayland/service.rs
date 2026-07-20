@@ -15,7 +15,7 @@ use crate::process::{
 use super::{
     XwaylandAppEnvironment, XwaylandAssociationEvent, XwaylandGeneration, XwaylandMode,
     config::XwaylandConfig,
-    diagnostics::StderrRing,
+    diagnostics::{StderrRing, XwaylandFailure, XwaylandFailureStage},
     display::DisplayLease,
     displayfd,
     launch::{ChildFdTarget, build_command},
@@ -95,6 +95,7 @@ struct StartingResources {
     private_wayland: Option<UnixStream>,
     wm: Option<UnixStream>,
     xwm_startup: Option<XwmStartup>,
+    xwm_reactor_token: Option<u64>,
     display_ready: bool,
     displayfd_registered: bool,
     displayfd_readable: bool,
@@ -126,6 +127,7 @@ struct RunningResources {
     process: SpawnedProcess,
     private_wayland: Option<UnixStream>,
     xwm: Xwm,
+    xwm_reactor_token: Option<u64>,
     stderr: Option<StderrPipe>,
 }
 
@@ -172,6 +174,7 @@ pub struct XwaylandService {
     last_readiness: Option<XwaylandReadinessSnapshot>,
     pending_termination: Option<PendingTermination>,
     latest_failed_stderr: StderrRing,
+    latest_failure: Option<XwaylandFailure>,
 }
 
 impl XwaylandService {
@@ -223,6 +226,7 @@ impl XwaylandService {
             last_readiness: None,
             pending_termination: None,
             latest_failed_stderr: StderrRing::default(),
+            latest_failure: None,
         })
     }
 
@@ -308,42 +312,7 @@ impl XwaylandService {
         registered: bool,
         reactor_token: Option<u64>,
     ) {
-        if registration.purpose != XwaylandReactorPurpose::DisplayReady {
-            return;
-        }
-        let Some((generation, process_id, parent_fd, child_source_fd)) = (match &mut self.state {
-            ServiceState::Starting(resources)
-                if registration.generation == Some(resources.generation) =>
-            {
-                resources.displayfd_registered = registered;
-                resources.displayfd_reactor_token =
-                    registered.then_some(reactor_token.unwrap_or(0));
-                Some((
-                    resources.generation,
-                    resources.process.id,
-                    resources.displayfd.as_raw_fd(),
-                    resources.displayfd_child_source_fd,
-                ))
-            }
-            _ => None,
-        }) else {
-            return;
-        };
-        self.log_displayfd_event(
-            "displayfd_registered",
-            Some(if registered {
-                "registered"
-            } else {
-                "unregistered"
-            }),
-            Some(generation),
-            Some(process_id),
-            Some(parent_fd),
-            Some(child_source_fd),
-            reactor_token,
-            None,
-            None,
-        );
+        self.note_reactor_registration_with_token_impl(registration, registered, reactor_token);
     }
 
     /// Release retired generation resources only after the runtime has removed
@@ -406,16 +375,33 @@ impl XwaylandService {
         }
     }
 
-    fn drain_managed_xwm(&mut self, supervisor: &mut ChildSupervisor) -> io::Result<bool> {
+    fn xwm_reactor_token(&self, generation: XwaylandGeneration) -> Option<u64> {
+        match &self.state {
+            ServiceState::Starting(resources) if resources.generation == generation => {
+                resources.xwm_reactor_token
+            }
+            ServiceState::Running(resources) if resources.generation == generation => {
+                resources.xwm_reactor_token
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn xwm_reactor_events_for_tests(&self) -> u64 {
+        self.metrics.xwm_reactor_events
+    }
+
+    fn drain_managed_xwm(&mut self, supervisor: &mut ChildSupervisor) -> bool {
         let drain = match &mut self.state {
             ServiceState::Running(resources) => resources.xwm.drain_events(256),
-            _ => return Ok(false),
+            _ => return false,
         };
         match drain {
             Ok(drain) => {
                 let property_metrics = match &self.state {
                     ServiceState::Running(resources) => resources.xwm.property_metrics(),
-                    _ => unreachable!("managed XWM state changed during drain"),
+                    _ => return false,
                 };
                 self.metrics.property_refresh_requested = property_metrics.requested;
                 self.metrics.property_refresh_completed = property_metrics.completed;
@@ -430,11 +416,15 @@ impl XwaylandService {
                     self.metrics.xwm_drain_budget_exhaustions =
                         self.metrics.xwm_drain_budget_exhaustions.saturating_add(1);
                 }
-                Ok(drain.budget_exhausted)
+                drain.budget_exhausted
             }
             Err(error) => {
-                self.fail_managed_xwm(supervisor, io::Error::other(error))?;
-                Ok(false)
+                self.fail_managed_xwm(
+                    supervisor,
+                    XwaylandFailureStage::Reactor,
+                    io::Error::other(error),
+                );
+                false
             }
         }
     }
@@ -442,25 +432,30 @@ impl XwaylandService {
     fn fail_managed_xwm(
         &mut self,
         supervisor: &mut ChildSupervisor,
+        stage: XwaylandFailureStage,
         error: io::Error,
-    ) -> io::Result<()> {
+    ) {
         let Some(process_id) = (match &self.state {
             ServiceState::Running(resources) => Some(resources.process.id),
-            _ => None,
+            _ => return,
         }) else {
-            return Ok(());
+            return;
         };
+        let generation = self.generation();
         self.metrics.xwm_connection_failures =
             self.metrics.xwm_connection_failures.saturating_add(1);
+        self.record_failure(generation, stage, &error);
         eprintln!(
-            "oblivion-one xwayland: event=xwm_failure generation={:?} reason={error}",
-            self.generation()
+            "oblivion-one xwayland: event=xwm_failure generation={generation:?} stage={stage:?} reason={error}"
         );
         self.private_client = None;
         self.capture_failure_stderr();
-        self.request_process_termination(supervisor, process_id)?;
-        self.enter_failure_backoff(now_ns()?);
-        Ok(())
+        if let Err(cleanup_error) = self.request_process_termination(supervisor, process_id) {
+            eprintln!(
+                "oblivion-one xwayland: event=xwm_cleanup_failure generation={generation:?} reason={cleanup_error}"
+            );
+        }
+        self.enter_failure_backoff(now_ns().unwrap_or_default());
     }
 
     pub fn display_number(&self) -> Option<u32> {
@@ -565,8 +560,13 @@ impl XwaylandService {
         reactor_token: u64,
         supervisor: &mut ChildSupervisor,
     ) -> io::Result<bool> {
+        let event_flags = libc::EPOLLIN as u32
+            | libc::EPOLLOUT as u32
+            | libc::EPOLLERR as u32
+            | libc::EPOLLHUP as u32
+            | libc::EPOLLRDHUP as u32;
         let error_flags = libc::EPOLLERR as u32 | libc::EPOLLHUP as u32 | libc::EPOLLRDHUP as u32;
-        if flags & (libc::EPOLLIN as u32 | error_flags) == 0 {
+        if flags & event_flags == 0 {
             return Ok(false);
         }
         match purpose {
@@ -602,6 +602,14 @@ impl XwaylandService {
                     self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
                     return Ok(false);
                 }
+                if reactor_token != 0
+                    && self.xwm_reactor_token(generation.expect("XWM event generation"))
+                        != Some(reactor_token)
+                {
+                    self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
+                    return Ok(false);
+                }
+                self.metrics.xwm_reactor_events = self.metrics.xwm_reactor_events.saturating_add(1);
                 let readable = flags & libc::EPOLLIN as u32 != 0;
                 let writable = flags & libc::EPOLLOUT as u32 != 0;
                 if matches!(self.state, ServiceState::Starting(_)) && (readable || writable) {
@@ -625,34 +633,57 @@ impl XwaylandService {
                         }
                     }
                 }
-                if writable
-                    && let ServiceState::Starting(resources) = &self.state
-                    && let Some(startup) = resources.xwm_startup.as_ref()
-                {
-                    let _ = startup.flush_output()?;
+                let startup_flush = if writable {
+                    match &self.state {
+                        ServiceState::Starting(resources) => {
+                            resources.xwm_startup.as_ref().map(XwmStartup::flush_output)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(Err(error)) = startup_flush {
+                    let error = io::Error::other(error);
+                    let _ = self.fail_generation_with_stage(
+                        supervisor,
+                        XwaylandFailureStage::StartupFlush,
+                        error,
+                    );
+                    return Ok(false);
                 }
                 // A readable edge paired with HUP/RDHUP is drained first. This
                 // preserves the final replies/events and only then retires the
                 // generation if the connection is actually closed.
                 let mut continuation = false;
                 if readable && matches!(self.state, ServiceState::Running(_)) {
-                    continuation = self.drain_managed_xwm(supervisor)?;
+                    continuation = self.drain_managed_xwm(supervisor);
                 }
                 if writable
                     && let ServiceState::Running(resources) = &self.state
                     && let Err(error) = resources.xwm.flush_output()
                 {
-                    self.fail_managed_xwm(supervisor, io::Error::other(error))?;
+                    self.fail_managed_xwm(
+                        supervisor,
+                        XwaylandFailureStage::CommandFlush,
+                        io::Error::other(error),
+                    );
                     return Ok(false);
                 }
                 if flags & error_flags != 0 {
-                    self.fail_managed_xwm(
-                        supervisor,
-                        io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "XWM connection reported a reactor error",
-                        ),
-                    )?;
+                    let error = io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "XWM connection reported a reactor error",
+                    );
+                    if matches!(self.state, ServiceState::Starting(_)) {
+                        let _ = self.fail_generation_with_stage(
+                            supervisor,
+                            XwaylandFailureStage::Reactor,
+                            error,
+                        );
+                    } else {
+                        self.fail_managed_xwm(supervisor, XwaylandFailureStage::Reactor, error);
+                    }
                     return Ok(false);
                 }
                 return Ok(continuation);
@@ -745,6 +776,7 @@ impl XwaylandService {
             private_wayland: Some(private_wayland),
             wm: Some(wm),
             xwm_startup: None,
+            xwm_reactor_token: None,
             display_ready: false,
             displayfd_registered: false,
             displayfd_readable: false,
@@ -766,111 +798,7 @@ impl XwaylandService {
     }
 
     pub fn handle_stderr_ready(&mut self, generation: XwaylandGeneration) -> io::Result<()> {
-        let mut lines = Vec::<(String, bool)>::new();
-        let mut bytes_read = 0u64;
-        let mut truncated_chunks = 0u64;
-        let mut closed = false;
-        let process_id;
-        {
-            let (resources_generation, resource_process_id, stderr) = match &mut self.state {
-                ServiceState::Starting(resources) => (
-                    resources.generation,
-                    resources.process.id,
-                    resources.stderr.as_mut(),
-                ),
-                ServiceState::RunningBase(resources) => (
-                    resources.generation,
-                    resources.process.id,
-                    resources.stderr.as_mut(),
-                ),
-                ServiceState::Running(resources) => (
-                    resources.generation,
-                    resources.process.id,
-                    resources.stderr.as_mut(),
-                ),
-                _ => return Ok(()),
-            };
-            if resources_generation != generation {
-                self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
-                return Ok(());
-            }
-            let Some(stderr) = stderr else {
-                return Ok(());
-            };
-            if !stderr.active {
-                return Ok(());
-            }
-            process_id = resource_process_id;
-            let mut bytes = [0u8; 4096];
-            loop {
-                // SAFETY: the stderr descriptor is owned by `stderr` for the
-                // duration of this scoped read loop.
-                let read = unsafe {
-                    libc::read(
-                        stderr.fd.as_raw_fd(),
-                        bytes.as_mut_ptr().cast(),
-                        bytes.len(),
-                    )
-                };
-                if read < 0 {
-                    let error = io::Error::last_os_error();
-                    if error.kind() == io::ErrorKind::WouldBlock {
-                        break;
-                    }
-                    stderr.active = false;
-                    closed = true;
-                    break;
-                }
-                if read == 0 {
-                    stderr.active = false;
-                    closed = true;
-                    break;
-                }
-                let read = read as usize;
-                bytes_read = bytes_read.saturating_add(read as u64);
-                stderr.ring.push(&bytes[..read]);
-                stderr.buffer.extend_from_slice(&bytes[..read]);
-                if stderr.buffer.len() > STDERR_MAX_BUFFER {
-                    let excess = stderr.buffer.len() - STDERR_MAX_BUFFER;
-                    stderr.buffer.drain(..excess);
-                    truncated_chunks = truncated_chunks.saturating_add(1);
-                }
-                while let Some(newline) = stderr.buffer.iter().position(|byte| *byte == b'\n') {
-                    let raw = stderr.buffer.drain(..=newline).collect::<Vec<_>>();
-                    let text =
-                        String::from_utf8_lossy(&raw[..raw.len().saturating_sub(1)]).into_owned();
-                    lines.push((text, false));
-                }
-                while stderr.buffer.len() > STDERR_MAX_LINE {
-                    let raw = stderr.buffer.drain(..STDERR_MAX_LINE).collect::<Vec<_>>();
-                    lines.push((String::from_utf8_lossy(&raw).into_owned(), true));
-                }
-            }
-            if closed && !stderr.buffer.is_empty() {
-                let raw = std::mem::take(&mut stderr.buffer);
-                lines.push((String::from_utf8_lossy(&raw).into_owned(), false));
-            }
-        }
-        self.metrics.stderr_bytes = self.metrics.stderr_bytes.saturating_add(bytes_read);
-        self.metrics.stderr_truncated = self
-            .metrics
-            .stderr_truncated
-            .saturating_add(truncated_chunks);
-        if closed {
-            self.metrics.stderr_closed = self.metrics.stderr_closed.saturating_add(1);
-        }
-        for (line, truncated) in lines {
-            self.metrics.stderr_lines = self.metrics.stderr_lines.saturating_add(1);
-            if truncated {
-                self.metrics.stderr_truncated = self.metrics.stderr_truncated.saturating_add(1);
-            }
-            eprintln!(
-                "oblivion-one xwayland: event=stderr generation={generation:?} process_id={} truncated={} line={line}",
-                process_id.get(),
-                truncated,
-            );
-        }
-        Ok(())
+        self.handle_stderr_ready_impl(generation)
     }
 
     #[cfg(test)]
@@ -1040,6 +968,7 @@ impl XwaylandService {
                     process: resources.process,
                     private_wayland: resources.private_wayland,
                     xwm,
+                    xwm_reactor_token: resources.xwm_reactor_token,
                     stderr: resources.stderr,
                 }));
                 self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
@@ -1147,10 +1076,11 @@ impl XwaylandService {
 
     pub fn mark_managed_surface_buffer_ready(
         &mut self,
+        supervisor: &mut ChildSupervisor,
         generation: XwaylandGeneration,
         surface_id: u32,
     ) -> io::Result<()> {
-        match &mut self.state {
+        let result = match &mut self.state {
             ServiceState::Running(resources) if resources.generation == generation => resources
                 .xwm
                 .mark_surface_buffer_ready(generation, surface_id)
@@ -1160,7 +1090,11 @@ impl XwaylandService {
                 Ok(())
             }
             _ => Ok(()),
+        };
+        if let Err(error) = result {
+            self.fail_managed_xwm(supervisor, XwaylandFailureStage::BufferReady, error);
         }
+        Ok(())
     }
 
     pub fn take_managed_xwm_events(&mut self) -> Vec<super::xwm::XwmEvent> {
@@ -1188,28 +1122,38 @@ impl XwaylandService {
         }
     }
 
-    pub fn execute_managed_command(&mut self, command: super::xwm::XwmCommand) -> io::Result<()> {
+    pub fn execute_managed_command(
+        &mut self,
+        supervisor: &mut ChildSupervisor,
+        command: super::xwm::XwmCommand,
+    ) -> io::Result<()> {
         if matches!(command, super::xwm::XwmCommand::BeginResizeSync { .. }) {
             self.metrics.resize_sync_started = self.metrics.resize_sync_started.saturating_add(1);
         }
-        match &mut self.state {
+        let result = match &mut self.state {
             ServiceState::Running(resources) => match resources.xwm.execute(command) {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    self.metrics.resize_sync_command_failures =
-                        self.metrics.resize_sync_command_failures.saturating_add(1);
-                    Err(io::Error::other(error))
-                }
+                Ok(()) => None,
+                Err(error) => Some(io::Error::other(error)),
             },
-            _ => Ok(()),
+            _ => None,
+        };
+        if let Some(error) = result {
+            self.metrics.resize_sync_command_failures =
+                self.metrics.resize_sync_command_failures.saturating_add(1);
+            self.fail_managed_xwm(supervisor, XwaylandFailureStage::CommandWrite, error);
         }
+        Ok(())
     }
 
-    pub fn flush_managed_commands(&mut self) -> io::Result<()> {
-        match &mut self.state {
-            ServiceState::Running(resources) => resources.xwm.flush().map_err(io::Error::other),
-            _ => Ok(()),
+    pub fn flush_managed_commands(&mut self, supervisor: &mut ChildSupervisor) -> io::Result<()> {
+        let result = match &mut self.state {
+            ServiceState::Running(resources) => resources.xwm.flush().err().map(io::Error::other),
+            _ => None,
+        };
+        if let Some(error) = result {
+            self.fail_managed_xwm(supervisor, XwaylandFailureStage::CommandFlush, error);
         }
+        Ok(())
     }
 
     pub fn handle_deadline(
@@ -1228,12 +1172,18 @@ impl XwaylandService {
                 });
             }
         }
-        if let ServiceState::Running(resources) = &mut self.state {
+        let resize_sync_error = if let ServiceState::Running(resources) = &mut self.state {
             resources.xwm.collect_adoption_expirations(now_ns);
             resources
                 .xwm
                 .handle_resize_sync_deadline(now_ns)
-                .map_err(io::Error::other)?;
+                .err()
+                .map(io::Error::other)
+        } else {
+            None
+        };
+        if let Some(error) = resize_sync_error {
+            self.fail_managed_xwm(supervisor, XwaylandFailureStage::CommandFlush, error);
         }
         let startup_timed_out = matches!(
             &self.state,
@@ -1436,22 +1386,69 @@ impl XwaylandService {
         supervisor: &mut ChildSupervisor,
         error: io::Error,
     ) -> io::Result<()> {
+        self.fail_generation_with_stage(supervisor, XwaylandFailureStage::Startup, error)
+    }
+
+    fn fail_generation_with_stage(
+        &mut self,
+        supervisor: &mut ChildSupervisor,
+        stage: XwaylandFailureStage,
+        error: io::Error,
+    ) -> io::Result<()> {
+        let generation = self.generation();
+        self.record_failure(generation, stage, &error);
         let process_id = match &self.state {
             ServiceState::Starting(resources) => Some(resources.process.id),
             _ => None,
         };
-        if let Some(process_id) = process_id {
-            self.request_process_termination(supervisor, process_id)?;
+        if let Some(process_id) = process_id
+            && let Err(cleanup_error) = self.request_process_termination(supervisor, process_id)
+        {
+            eprintln!(
+                "oblivion-one xwayland: event=startup_cleanup_failure generation={generation:?} reason={cleanup_error}"
+            );
         }
         self.private_client = None;
         self.capture_failure_stderr();
         self.metrics.readiness_failures = self.metrics.readiness_failures.saturating_add(1);
         eprintln!(
-            "oblivion-one xwayland: event=readiness_failure generation={:?} reason={error}",
-            self.generation()
+            "oblivion-one xwayland: event=readiness_failure generation={generation:?} stage={stage:?} reason={error}"
         );
-        self.enter_failure_backoff(now_ns()?);
+        self.enter_failure_backoff(now_ns().unwrap_or_default());
         Err(error)
+    }
+
+    fn record_failure(
+        &mut self,
+        generation: Option<XwaylandGeneration>,
+        stage: XwaylandFailureStage,
+        error: &io::Error,
+    ) {
+        self.latest_failure = Some(XwaylandFailure {
+            generation,
+            stage,
+            reason: error.to_string(),
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_xwm_failure_for_tests(
+        &mut self,
+        supervisor: &mut ChildSupervisor,
+        stage: XwaylandFailureStage,
+        reason: &str,
+    ) {
+        let error = io::Error::other(reason);
+        if matches!(self.state, ServiceState::Running(_)) {
+            self.fail_managed_xwm(supervisor, stage, error);
+        } else {
+            let _ = self.fail_generation_with_stage(supervisor, stage, error);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn latest_failure_stage_for_tests(&self) -> Option<XwaylandFailureStage> {
+        self.latest_failure.as_ref().map(|failure| failure.stage)
     }
 
     fn replace_state(&mut self, next: ServiceState) {

@@ -11,11 +11,188 @@ use super::super::{
     readiness::XwaylandReadinessSnapshot,
 };
 use super::{
-    ServiceState, StartingResources, XwaylandReactorPurpose, XwaylandReactorRegistration,
-    XwaylandService,
+    STDERR_MAX_BUFFER, STDERR_MAX_LINE, ServiceState, StartingResources, XwaylandReactorPurpose,
+    XwaylandReactorRegistration, XwaylandService,
 };
 
 impl XwaylandService {
+    pub(crate) fn handle_stderr_ready_impl(
+        &mut self,
+        generation: super::XwaylandGeneration,
+    ) -> io::Result<()> {
+        let mut lines = Vec::<(String, bool)>::new();
+        let mut bytes_read = 0u64;
+        let mut truncated_chunks = 0u64;
+        let mut closed = false;
+        let process_id;
+        {
+            let (resources_generation, resource_process_id, stderr) = match &mut self.state {
+                ServiceState::Starting(resources) => (
+                    resources.generation,
+                    resources.process.id,
+                    resources.stderr.as_mut(),
+                ),
+                ServiceState::RunningBase(resources) => (
+                    resources.generation,
+                    resources.process.id,
+                    resources.stderr.as_mut(),
+                ),
+                ServiceState::Running(resources) => (
+                    resources.generation,
+                    resources.process.id,
+                    resources.stderr.as_mut(),
+                ),
+                _ => return Ok(()),
+            };
+            if resources_generation != generation {
+                self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
+                return Ok(());
+            }
+            let Some(stderr) = stderr else {
+                return Ok(());
+            };
+            if !stderr.active {
+                return Ok(());
+            }
+            process_id = resource_process_id;
+            let mut bytes = [0u8; 4096];
+            loop {
+                // SAFETY: the stderr descriptor is owned by `stderr` for the
+                // duration of this scoped read loop.
+                let read = unsafe {
+                    libc::read(
+                        stderr.fd.as_raw_fd(),
+                        bytes.as_mut_ptr().cast(),
+                        bytes.len(),
+                    )
+                };
+                if read < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::WouldBlock {
+                        break;
+                    }
+                    stderr.active = false;
+                    closed = true;
+                    break;
+                }
+                if read == 0 {
+                    stderr.active = false;
+                    closed = true;
+                    break;
+                }
+                let read = read as usize;
+                bytes_read = bytes_read.saturating_add(read as u64);
+                stderr.ring.push(&bytes[..read]);
+                stderr.buffer.extend_from_slice(&bytes[..read]);
+                if stderr.buffer.len() > STDERR_MAX_BUFFER {
+                    let excess = stderr.buffer.len() - STDERR_MAX_BUFFER;
+                    stderr.buffer.drain(..excess);
+                    truncated_chunks = truncated_chunks.saturating_add(1);
+                }
+                while let Some(newline) = stderr.buffer.iter().position(|byte| *byte == b'\n') {
+                    let raw = stderr.buffer.drain(..=newline).collect::<Vec<_>>();
+                    let text =
+                        String::from_utf8_lossy(&raw[..raw.len().saturating_sub(1)]).into_owned();
+                    lines.push((text, false));
+                }
+                while stderr.buffer.len() > STDERR_MAX_LINE {
+                    let raw = stderr.buffer.drain(..STDERR_MAX_LINE).collect::<Vec<_>>();
+                    lines.push((String::from_utf8_lossy(&raw).into_owned(), true));
+                }
+            }
+            if closed && !stderr.buffer.is_empty() {
+                let raw = std::mem::take(&mut stderr.buffer);
+                lines.push((String::from_utf8_lossy(&raw).into_owned(), false));
+            }
+        }
+        self.metrics.stderr_bytes = self.metrics.stderr_bytes.saturating_add(bytes_read);
+        self.metrics.stderr_truncated = self
+            .metrics
+            .stderr_truncated
+            .saturating_add(truncated_chunks);
+        if closed {
+            self.metrics.stderr_closed = self.metrics.stderr_closed.saturating_add(1);
+        }
+        for (line, truncated) in lines {
+            self.metrics.stderr_lines = self.metrics.stderr_lines.saturating_add(1);
+            if truncated {
+                self.metrics.stderr_truncated = self.metrics.stderr_truncated.saturating_add(1);
+            }
+            eprintln!(
+                "oblivion-one xwayland: event=stderr generation={generation:?} process_id={} truncated={} line={line}",
+                process_id.get(),
+                truncated,
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn note_reactor_registration_with_token_impl(
+        &mut self,
+        registration: super::XwaylandReactorRegistration,
+        registered: bool,
+        reactor_token: Option<u64>,
+    ) {
+        match registration.purpose {
+            super::XwaylandReactorPurpose::DisplayReady => {
+                let Some((generation, process_id, parent_fd, child_source_fd)) =
+                    (match &mut self.state {
+                        ServiceState::Starting(resources)
+                            if registration.generation == Some(resources.generation) =>
+                        {
+                            resources.displayfd_registered = registered;
+                            resources.displayfd_reactor_token =
+                                registered.then_some(reactor_token.unwrap_or(0));
+                            Some((
+                                resources.generation,
+                                resources.process.id,
+                                resources.displayfd.as_raw_fd(),
+                                resources.displayfd_child_source_fd,
+                            ))
+                        }
+                        _ => None,
+                    })
+                else {
+                    return;
+                };
+                self.log_displayfd_event(
+                    "displayfd_registered",
+                    Some(if registered {
+                        "registered"
+                    } else {
+                        "unregistered"
+                    }),
+                    Some(generation),
+                    Some(process_id),
+                    Some(parent_fd),
+                    Some(child_source_fd),
+                    reactor_token,
+                    None,
+                    None,
+                );
+            }
+            super::XwaylandReactorPurpose::Xwm => {
+                let token = registered.then_some(reactor_token.unwrap_or(0));
+                match &mut self.state {
+                    ServiceState::Starting(resources)
+                        if registration.generation == Some(resources.generation) =>
+                    {
+                        resources.xwm_reactor_token = token;
+                    }
+                    ServiceState::Running(resources)
+                        if registration.generation == Some(resources.generation) =>
+                    {
+                        resources.xwm_reactor_token = token;
+                    }
+                    _ => {}
+                }
+            }
+            super::XwaylandReactorPurpose::ListenFilesystem
+            | super::XwaylandReactorPurpose::ListenAbstract
+            | super::XwaylandReactorPurpose::Stderr => {}
+        }
+    }
+
     pub fn reactor_registrations(&self) -> impl Iterator<Item = XwaylandReactorRegistration> {
         let mut registrations = Vec::new();
         let generation = self.generation();

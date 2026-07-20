@@ -16,6 +16,7 @@ pub(crate) struct XwaylandMetrics {
     pub(crate) xwm_events_received: u64,
     pub(crate) xwm_drain_budget_exhaustions: u64,
     pub(crate) xwm_connection_failures: u64,
+    pub(crate) xwm_reactor_events: u64,
     pub(crate) resize_sync_started: u64,
     pub(crate) resize_sync_acks: u64,
     pub(crate) resize_sync_presented: u64,

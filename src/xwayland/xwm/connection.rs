@@ -419,7 +419,7 @@ pub(crate) fn connect(
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::net::UnixStream;
+    use std::{io::Write, os::unix::net::UnixStream};
 
     use super::*;
 
@@ -433,5 +433,46 @@ mod tests {
             Stream::poll(&stream, PollMode::Readable),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock
         ));
+    }
+
+    #[test]
+    fn pure_epollout_flushes_managed_output() {
+        let (stream, _peer) = UnixStream::pair().expect("socket pair");
+        let stream = ReactorStream::from_unix_stream(stream).expect("reactor stream");
+        stream.queue(b"pending XWM output").expect("queue output");
+        assert!(stream.wants_writable());
+        assert!(!stream.flush_pending().expect("flush output"));
+        assert!(!stream.wants_writable());
+    }
+
+    #[test]
+    fn writable_interest_is_removed_after_drain() {
+        let (stream, _peer) = UnixStream::pair().expect("socket pair");
+        let stream = ReactorStream::from_unix_stream(stream).expect("reactor stream");
+        stream.queue(b"one bounded request").expect("queue output");
+        assert!(stream.wants_writable());
+        stream.flush_pending().expect("drain output");
+        assert!(!stream.wants_writable());
+    }
+
+    #[test]
+    fn epollout_without_pending_output_does_not_spin() {
+        let (stream, _peer) = UnixStream::pair().expect("socket pair");
+        let stream = ReactorStream::from_unix_stream(stream).expect("reactor stream");
+        assert!(!stream.flush_pending().expect("empty flush"));
+        assert!(!stream.wants_writable());
+        assert!(matches!(Stream::poll(&stream, PollMode::Writable), Ok(())));
+    }
+
+    #[test]
+    fn readable_hup_drains_before_failure() {
+        let (stream, mut peer) = UnixStream::pair().expect("socket pair");
+        let stream = ReactorStream::from_unix_stream(stream).expect("reactor stream");
+        peer.write_all(b"final X11 event").expect("event");
+        let mut bytes = [0u8; 32];
+        let read = stream
+            .read(&mut bytes, &mut Vec::new())
+            .expect("drain event");
+        assert_eq!(&bytes[..read], b"final X11 event");
     }
 }

@@ -25,6 +25,7 @@ use crate::process::ChildSupervisor;
 use super::{
     XwaylandConfig, XwaylandMode, XwaylandReactorPurpose, XwaylandService, XwaylandStateKind,
     auth::read_cookie_for_tests,
+    diagnostics::XwaylandFailureStage,
     display::{DisplayLease, connect_abstract_socket_for_tests},
 };
 
@@ -714,6 +715,182 @@ fn listener_readiness_starts_one_generation_even_when_delivered_twice() {
     assert_eq!(supervisor.active_count(), 1);
     let exit = reap_one(&mut supervisor);
     service.handle_process_exit(&exit).expect("handle exit");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn pure_epollout_advances_incremental_setup() {
+    let (root, mut service, mut supervisor) =
+        service_at_root_with_sleeping_binary(XwaylandMode::ManagedLazy, "epollout-setup");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let generation = service.generation().expect("generation");
+    assert!(
+        !service
+            .handle_reactor_event(
+                XwaylandReactorPurpose::Xwm,
+                Some(generation),
+                libc::EPOLLOUT as u32,
+                &mut supervisor,
+            )
+            .expect("pure writable event is nonfatal")
+    );
+    assert_eq!(service.xwm_reactor_events_for_tests(), 1);
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn stale_writable_token_is_ignored() {
+    let (root, mut service, mut supervisor) =
+        service_at_root_with_sleeping_binary(XwaylandMode::ManagedLazy, "stale-writable");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let generation = service.generation().expect("generation");
+    assert!(
+        !service
+            .handle_reactor_event_with_token(
+                XwaylandReactorPurpose::Xwm,
+                Some(generation),
+                libc::EPOLLOUT as u32,
+                u64::MAX,
+                &mut supervisor,
+            )
+            .expect("stale writable event is nonfatal")
+    );
+    assert_eq!(service.xwm_reactor_events_for_tests(), 0);
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn command_write_failure_does_not_terminate_native_runtime() {
+    let (root, mut service, mut supervisor) =
+        service_at_root_with_sleeping_binary(XwaylandMode::ManagedLazy, "command-write-failure");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    service.inject_xwm_failure_for_tests(
+        &mut supervisor,
+        XwaylandFailureStage::CommandWrite,
+        "injected command write failure",
+    );
+    assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+    assert_eq!(
+        service.latest_failure_stage_for_tests(),
+        Some(XwaylandFailureStage::CommandWrite)
+    );
+    service
+        .handle_deadline(u64::MAX, &mut supervisor)
+        .expect("kill failed generation");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn command_flush_failure_does_not_terminate_native_runtime() {
+    let (root, mut service, mut supervisor) =
+        service_at_root_with_sleeping_binary(XwaylandMode::ManagedLazy, "command-flush-failure");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    service.inject_xwm_failure_for_tests(
+        &mut supervisor,
+        XwaylandFailureStage::CommandFlush,
+        "injected command flush failure",
+    );
+    assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+    assert_eq!(
+        service.latest_failure_stage_for_tests(),
+        Some(XwaylandFailureStage::CommandFlush)
+    );
+    service
+        .handle_deadline(u64::MAX, &mut supervisor)
+        .expect("kill failed generation");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn startup_flush_failure_fails_generation() {
+    let (root, mut service, mut supervisor) =
+        service_at_root_with_sleeping_binary(XwaylandMode::ManagedLazy, "startup-flush-failure");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    service.inject_xwm_failure_for_tests(
+        &mut supervisor,
+        XwaylandFailureStage::StartupFlush,
+        "injected startup flush failure",
+    );
+    assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+    assert_eq!(
+        service.latest_failure_stage_for_tests(),
+        Some(XwaylandFailureStage::StartupFlush)
+    );
+    service
+        .handle_deadline(u64::MAX, &mut supervisor)
+        .expect("kill failed generation");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn buffer_ready_for_stale_generation_is_nonfatal() {
+    let (root, mut service, mut supervisor) =
+        service_at_root_with_sleeping_binary(XwaylandMode::ManagedLazy, "stale-buffer-ready");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let generation = service.generation().expect("generation");
+    let stale = super::XwaylandGeneration::new(
+        NonZeroU64::new(generation.get().saturating_add(1)).expect("nonzero stale generation"),
+    );
+    service
+        .mark_managed_surface_buffer_ready(&mut supervisor, stale, 17)
+        .expect("stale buffer-ready event is nonfatal");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Starting);
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn xwm_hup_restarts_only_xwayland_generation() {
+    let (root, mut service, mut supervisor) =
+        service_at_root_with_sleeping_binary(XwaylandMode::ManagedLazy, "xwm-hup");
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("start generation");
+    let generation = service.generation().expect("generation");
+    service
+        .handle_reactor_event(
+            XwaylandReactorPurpose::Xwm,
+            Some(generation),
+            libc::EPOLLHUP as u32,
+            &mut supervisor,
+        )
+        .expect("XWM HUP is contained");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+    assert_eq!(
+        service.latest_failure_stage_for_tests(),
+        Some(XwaylandFailureStage::Reactor)
+    );
+    service
+        .handle_deadline(u64::MAX, &mut supervisor)
+        .expect("kill failed generation");
     drop(service);
     drop(supervisor);
     fs::remove_dir_all(root).expect("remove test root");
