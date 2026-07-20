@@ -94,7 +94,9 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
                 .configure_window(window.xid(), &configure_aux(geometry, fields, border_width))
                 .map_err(XwmError::Connection)?;
             xwm.note_expected_configure(window, geometry);
-            if xwm.immediate_resize_windows.remove(&window) {
+            if xwm.immediate_resize_windows.remove(&window)
+                || xwm.fallback_resize_windows.remove(&window)
+            {
                 xwm.last_resize_geometries.remove(&window);
                 xwm.outgoing_events
                     .push_back(XwmEvent::ResizeSyncImmediate(window));
@@ -259,7 +261,15 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             geometry,
             counter_value,
             deadline_ns,
-        } => begin_resize_sync(xwm, window, geometry, counter_value, deadline_ns)?,
+            final_pending,
+        } => begin_resize_sync(
+            xwm,
+            window,
+            geometry,
+            counter_value,
+            deadline_ns,
+            final_pending,
+        )?,
         XwmCommand::SetAllowCommits { window, allowed } => {
             set_allow_commits(xwm, window, allowed)?;
         }
@@ -369,7 +379,9 @@ pub(crate) fn begin_resize_sync(
     geometry: X11Geometry,
     counter_value: u64,
     deadline_ns: u64,
+    final_pending: bool,
 ) -> Result<(), XwmError> {
+    xwm.fallback_resize_windows.remove(&window);
     let Some(sync_counter) = xwm
         .windows
         .get(window)
@@ -445,7 +457,7 @@ pub(crate) fn begin_resize_sync(
         requested_counter_value,
         deadline_ns,
         desired,
-        false,
+        final_pending,
     ) {
         let _ = xwm.connection.sync_destroy_alarm(alarm);
         return Err(XwmError::ResizeSync(error));

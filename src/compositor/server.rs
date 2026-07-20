@@ -474,6 +474,7 @@ impl OwnCompositorServer {
                             geometry: x11_geometry,
                             counter_value: 0,
                             deadline_ns: now_ns.saturating_add(RESIZE_SYNC_TIMEOUT_NS),
+                            final_pending: false,
                         })
                     } else {
                         Some(XwmCommand::Configure {
@@ -714,12 +715,15 @@ impl OwnCompositorServer {
                 let _ = self.state.finalize_x11_resize(window);
                 vec![XwmCommand::CompleteResizeSync(window)]
             }
+            XwmEvent::ResizeSyncPresentedIntermediate(window) => {
+                vec![XwmCommand::CompleteResizeSync(window)]
+            }
             XwmEvent::ResizeSyncImmediate(window) => {
                 let _ = self.state.finalize_x11_resize(window);
                 Vec::new()
             }
             XwmEvent::ResizeSyncTimedOut(window) => {
-                let _ = self.state.finalize_x11_resize(window);
+                let _ = self.state.finalize_x11_resize_if_interaction_ended(window);
                 Vec::new()
             }
             XwmEvent::ResizeSyncTimedOutWithFollowup(_) => Vec::new(),
@@ -735,7 +739,6 @@ impl OwnCompositorServer {
             }
         }
     }
-
     fn remove_x11_desktop_window(&mut self, handle: X11WindowHandle) -> bool {
         let Some(window_id) = self.state.window_id_for_x11_handle(handle) else {
             return false;
@@ -760,7 +763,6 @@ impl OwnCompositorServer {
         }
         removed
     }
-
     fn sync_xwayland_client_lists(&self) -> XwmCommand {
         let (client_list, stacking) = self.state.x11_client_lists();
         XwmCommand::SyncClientLists {
@@ -768,7 +770,6 @@ impl OwnCompositorServer {
             stacking,
         }
     }
-
     pub fn accepted_clients(&self) -> usize {
         self.state.accepted_clients
     }

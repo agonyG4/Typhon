@@ -360,6 +360,38 @@ fn dynamic_transient_for_rebuilds_family_and_rejects_cycles() {
 }
 
 #[test]
+fn dynamic_transient_for_reorders_child_above_parent_immediately() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let parent = x11_snapshot(generation, 210, 210);
+    let parent_id = insert_x11(&mut state, parent.clone());
+    let child = x11_snapshot(generation, 211, 211);
+    let child_id = insert_x11(&mut state, child.clone());
+    state.window_stacking.reverse();
+
+    assert!(state.apply_x11_metadata_delta(
+        child.handle,
+        X11MetadataDelta::TransientFor(Some(parent.handle))
+    ));
+    assert_eq!(state.window_stacking, vec![parent_id, child_id]);
+}
+
+#[test]
+fn admitting_missing_transient_parent_reorders_existing_child() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let parent = x11_snapshot(generation, 212, 212);
+    let child_handle = X11WindowHandle::new(generation, 213);
+    let mut child = x11_snapshot(generation, child_handle.xid(), 213);
+    child.transient_for = Some(parent.handle);
+    let child_id = insert_x11(&mut state, child);
+    assert_eq!(state.window_stacking, vec![child_id]);
+
+    let parent_id = insert_x11(&mut state, parent);
+    assert_eq!(state.window_stacking, vec![parent_id, child_id]);
+}
+
+#[test]
 fn background_x11_activation_request_is_denied() {
     let mut state = CompositorState::new(None);
     let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());

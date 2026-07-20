@@ -1,6 +1,106 @@
 use super::*;
 
 impl Xwm {
+    pub(crate) fn handle_resize_sync_deadline(&mut self, now_ns: u64) -> Result<(), XwmError> {
+        for handle in self.resize_sync.expired_handles(now_ns) {
+            if self.resize_sync.timeout(handle, now_ns) {
+                let transaction = self.resize_sync.transaction(handle);
+                let counter_value = self
+                    .resize_sync
+                    .state(handle)
+                    .counter_value()
+                    .unwrap_or_default();
+                let latest_desired = self
+                    .resize_sync
+                    .desired(handle)
+                    .map(|desired| desired.geometry);
+                let allow_result = commands::set_allow_commits(self, handle, true);
+                self.clear_resize_sync_alarm(handle);
+                self.resize_sync.finish_timeout(handle);
+                allow_result?;
+                if std::env::var_os("TYPHON_XWAYLAND_LOG").is_some() {
+                    let (transaction_id, geometry, _) = transaction.unwrap_or_default();
+                    eprintln!(
+                        "oblivion-one xwayland: event=x11_resize_timeout xid={} transaction_id={} counter={} geometry={:?} latest_desired={:?}",
+                        handle.xid(),
+                        transaction_id,
+                        counter_value,
+                        geometry,
+                        latest_desired,
+                    );
+                }
+                let has_followup = self.resize_sync.desired(handle).is_some();
+                if !has_followup {
+                    self.fallback_resize_windows.insert(handle);
+                }
+                if let Some(desired) = self.resize_sync.take_desired(handle) {
+                    let now = crate::native::event_loop::monotonic_now_ns().unwrap_or(now_ns);
+                    commands::begin_resize_sync(
+                        self,
+                        handle,
+                        desired.geometry,
+                        0,
+                        now.saturating_add(RESIZE_SYNC_TIMEOUT_NS),
+                        desired.final_pending,
+                    )?;
+                }
+                self.outgoing_events.push_back(if has_followup {
+                    XwmEvent::ResizeSyncTimedOutWithFollowup(handle)
+                } else {
+                    XwmEvent::ResizeSyncTimedOut(handle)
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_resize_sync(&mut self, handle: X11WindowHandle) -> Result<(), XwmError> {
+        if !self.resize_sync.complete(handle) {
+            return Err(XwmError::InvalidCommand("resize sync is not presented"));
+        }
+        self.clear_resize_sync_alarm(handle);
+        if let Some(desired) = self.resize_sync.take_desired(handle) {
+            let now = crate::native::event_loop::monotonic_now_ns().unwrap_or_default();
+            commands::begin_resize_sync(
+                self,
+                handle,
+                desired.geometry,
+                0,
+                now.saturating_add(RESIZE_SYNC_TIMEOUT_NS),
+                desired.final_pending,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_resize_sync(&mut self, handle: X11WindowHandle) {
+        self.resize_sync.clear(handle);
+        self.clear_resize_sync_alarm(handle);
+        self.expected_configures.remove(&handle);
+        self.immediate_resize_windows.remove(&handle);
+        self.fallback_resize_windows.remove(&handle);
+        self.last_resize_geometries.remove(&handle);
+    }
+
+    pub(crate) fn clear_resize_sync_generation(&mut self, generation: XwaylandGeneration) {
+        let handles = self
+            .sync_alarms
+            .keys()
+            .filter(|handle| handle.generation() == generation)
+            .copied()
+            .collect::<Vec<_>>();
+        self.resize_sync.clear_generation(generation);
+        self.next_resize_counter_values
+            .retain(|handle, _| handle.generation() != generation);
+        self.expected_configures
+            .retain(|handle, _| handle.generation() != generation);
+        self.fallback_resize_windows
+            .retain(|handle| handle.generation() != generation);
+        for handle in handles {
+            self.clear_resize_sync_alarm(handle);
+        }
+    }
+
     pub(crate) fn note_expected_configure(
         &mut self,
         handle: X11WindowHandle,
@@ -72,9 +172,18 @@ impl Xwm {
                 self.adoption.complete(handle);
                 let _ = self.windows.mark_buffer_ready(handle);
                 match self.resize_sync.note_commit(handle) {
-                    ResizeSyncCommit::Presented | ResizeSyncCommit::FallbackPresented => self
-                        .outgoing_events
-                        .push_back(XwmEvent::ResizeSyncPresented(handle)),
+                    ResizeSyncCommit::Presented | ResizeSyncCommit::FallbackPresented => {
+                        let final_presented = self.resize_sync.transaction(handle).is_some_and(
+                            |(_, _, final_pending)| {
+                                final_pending && self.resize_sync.desired(handle).is_none()
+                            },
+                        );
+                        self.outgoing_events.push_back(if final_presented {
+                            XwmEvent::ResizeSyncPresented(handle)
+                        } else {
+                            XwmEvent::ResizeSyncPresentedIntermediate(handle)
+                        });
+                    }
                     ResizeSyncCommit::Deferred | ResizeSyncCommit::Ignored => {}
                 }
             }

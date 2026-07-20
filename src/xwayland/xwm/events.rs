@@ -454,6 +454,7 @@ mod tests {
             next_resize_counter_values: Default::default(),
             expected_configures: Default::default(),
             immediate_resize_windows: Default::default(),
+            fallback_resize_windows: Default::default(),
             last_resize_geometries: Default::default(),
             shapes: Default::default(),
             data_bridge: super::super::data_bridge::DataBridge::default(),

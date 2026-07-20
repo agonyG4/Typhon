@@ -560,6 +560,40 @@ mod tests {
     }
 
     #[test]
+    fn presented_resize_chain_keeps_preview_until_final_transaction() {
+        let window = handle(1, 26);
+        let mut tracker = ResizeSyncTracker::default();
+        let first = X11Geometry {
+            width: 900,
+            height: 700,
+            ..X11Geometry::default()
+        };
+        let second = X11Geometry {
+            width: 1000,
+            height: 800,
+            ..X11Geometry::default()
+        };
+        tracker
+            .begin_transaction(window, 7, 100, first, false)
+            .expect("first transaction");
+        tracker.queue_desired(window, second, true);
+        assert!(tracker.acknowledge(window, 7));
+        assert_eq!(tracker.note_commit(window), ResizeSyncCommit::Presented);
+        // Completing the first transaction only advances the X11 protocol
+        // chain; its queued final target still owns the resize preview.
+        assert!(tracker.complete(window));
+        let desired = tracker.take_desired(window).expect("final target");
+        tracker
+            .begin_transaction(window, 8, 200, desired.geometry, desired.final_pending)
+            .expect("final transaction");
+        assert!(tracker.transaction(window).unwrap().2);
+        assert!(tracker.acknowledge(window, 8));
+        assert_eq!(tracker.note_commit(window), ResizeSyncCommit::Presented);
+        assert!(tracker.complete(window));
+        assert_eq!(tracker.state(window), ResizeSyncState::Idle);
+    }
+
+    #[test]
     fn timeout_restores_allow_commits() {
         let window = handle(1, 24);
         let mut tracker = ResizeSyncTracker::default();

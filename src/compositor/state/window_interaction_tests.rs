@@ -554,7 +554,13 @@ fn x11_resize_release_finalizes_preview_without_xdg_commit() {
         WindowBackend::X11(handle) => handle,
         WindowBackend::Xdg(_) => panic!("expected X11 backend"),
     };
+    // Transaction 1 may have presented while the final release target is
+    // already queued. The compositor preview and clip remain owned by the
+    // chained resize until that final transaction presents.
+    assert!(state.x11_resize_active(handle));
+    assert!(state.renderable_surfaces[0].visual_clip.is_some());
     assert!(state.finalize_x11_resize(handle));
+    assert!(!state.finalize_x11_resize(handle));
     assert!(!state.active_toplevel_resizes.contains_key(&surface_id));
     assert_eq!(
         state.toplevel_visual_geometries[&surface_id].active_resize,

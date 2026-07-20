@@ -570,6 +570,31 @@ impl CompositorState {
                     .contains_key(&window.root_surface_id)
             })
     }
+
+    pub(in crate::compositor) fn x11_resize_interaction_active(
+        &self,
+        handle: crate::xwayland::X11WindowHandle,
+    ) -> bool {
+        let Some(root_surface_id) = self
+            .window_id_for_x11_handle(handle)
+            .and_then(|window_id| self.window(window_id))
+            .map(|window| window.root_surface_id)
+        else {
+            return false;
+        };
+        self.window_interaction
+            .is_some_and(|interaction| interaction.root_surface_id == root_surface_id)
+    }
+
+    pub(in crate::compositor) fn finalize_x11_resize_if_interaction_ended(
+        &mut self,
+        handle: crate::xwayland::X11WindowHandle,
+    ) -> bool {
+        if self.x11_resize_interaction_active(handle) {
+            return false;
+        }
+        self.finalize_x11_resize(handle)
+    }
 }
 
 fn constrain_icccm_size(width: u32, height: u32, constraints: WindowConstraints) -> (u32, u32) {

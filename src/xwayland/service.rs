@@ -1079,6 +1079,10 @@ impl XwaylandService {
                         self.metrics.resize_sync_presented =
                             self.metrics.resize_sync_presented.saturating_add(1);
                     }
+                    super::xwm::XwmEvent::ResizeSyncPresentedIntermediate(_) => {
+                        self.metrics.resize_sync_presented =
+                            self.metrics.resize_sync_presented.saturating_add(1);
+                    }
                     super::xwm::XwmEvent::ResizeSyncTimedOut(_) => {
                         self.metrics.resize_sync_timeouts =
                             self.metrics.resize_sync_timeouts.saturating_add(1);
@@ -1091,6 +1095,18 @@ impl XwaylandService {
                 })
                 .collect(),
             _ => Vec::new(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn resize_sync_snapshot(&self, handle: super::X11WindowHandle) -> Option<(u64, bool)> {
+        match &self.state {
+            ServiceState::Running(resources) => resources
+                .xwm
+                .resize_sync
+                .transaction(handle)
+                .map(|(id, _, final_pending)| (id, final_pending)),
+            _ => None,
         }
     }
 

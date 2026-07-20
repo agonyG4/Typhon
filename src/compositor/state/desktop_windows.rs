@@ -295,19 +295,68 @@ impl CompositorState {
     }
 
     fn rebuild_x11_transient_relationships(&mut self) {
-        let handles = self
+        let mut handles_by_id = std::collections::HashMap::new();
+        for window in self.desktop_windows.values() {
+            let WindowBackend::X11(handle) = window.backend else {
+                continue;
+            };
+            handles_by_id.insert(handle, window.id);
+        }
+        let requested = self
             .desktop_windows
             .values()
-            .filter_map(|window| match window.backend {
-                WindowBackend::X11(handle) => Some((window.id, handle, window.x11_transient_for)),
-                WindowBackend::Xdg(_) => None,
+            .filter_map(|window| {
+                matches!(window.backend, WindowBackend::X11(_)).then_some((
+                    window.id,
+                    window
+                        .x11_transient_for
+                        .and_then(|parent| handles_by_id.get(&parent).copied()),
+                ))
             })
-            .collect::<Vec<_>>();
-        for (id, _, transient_for) in handles {
-            let parent = transient_for.and_then(|handle| self.window_id_for_x11_handle(handle));
+            .collect::<std::collections::HashMap<_, _>>();
+
+        // Resolve parent handles against the complete admission set, then
+        // reject any edge that would leave a cycle in the relationship graph.
+        let mut accepted = requested
+            .iter()
+            .map(|(id, parent)| (*id, *parent))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut rejected = std::collections::HashSet::new();
+        for id in requested.keys().copied().collect::<Vec<_>>() {
+            if relationship_cycle(id, &accepted) {
+                accepted.insert(id, None);
+                rejected.insert(id);
+            }
+        }
+        for (id, parent) in accepted {
             if let Some(window) = self.window_mut(id) {
                 window.relationships.transient_for = parent;
+                if rejected.contains(&id)
+                    && window
+                        .x11_transient_for
+                        .and_then(|handle| handles_by_id.get(&handle).copied())
+                        .is_some()
+                {
+                    window.x11_transient_for = None;
+                }
             }
+        }
+
+        let roots = self
+            .desktop_windows
+            .values()
+            .filter_map(|window| {
+                matches!(window.backend, WindowBackend::X11(_))
+                    .then_some(window.id)
+                    .filter(|id| {
+                        self.window(*id)
+                            .and_then(|candidate| candidate.relationships.transient_for)
+                            .is_none()
+                    })
+            })
+            .collect::<Vec<_>>();
+        for root in roots {
+            self.reorder_x11_family(root);
         }
     }
 
@@ -525,6 +574,81 @@ impl CompositorState {
             .retain(|window_id| !family.contains(window_id));
         self.window_stacking.extend(family);
         true
+    }
+
+    fn reorder_x11_family(&mut self, root: WindowId) -> bool {
+        let family = self.x11_family_order(root);
+        if family.len() < 2 {
+            return false;
+        }
+        let family_set = family
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let insertion = self
+            .window_stacking
+            .iter()
+            .enumerate()
+            .filter_map(|(index, id)| family_set.contains(id).then_some(index))
+            .min()
+            .unwrap_or(self.window_stacking.len());
+        let original_stack = self.window_stacking.clone();
+        self.window_stacking.retain(|id| !family_set.contains(id));
+        let insertion = insertion.min(self.window_stacking.len());
+        self.window_stacking
+            .splice(insertion..insertion, family.iter().copied());
+        let stack_changed = self.window_stacking != original_stack;
+
+        let family_roots = family
+            .iter()
+            .filter_map(|id| {
+                self.window(*id)
+                    .map(|window| (window.id, window.root_surface_id))
+            })
+            .collect::<Vec<_>>();
+        let root_rank = family_roots
+            .iter()
+            .enumerate()
+            .map(|(rank, (_, surface_id))| (*surface_id, rank))
+            .collect::<std::collections::HashMap<_, _>>();
+        let original = std::mem::take(&mut self.renderable_surfaces);
+        let original_surface_order = original
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>();
+        let mut family_surfaces = Vec::new();
+        let mut lower = Vec::with_capacity(original.len());
+        let mut first_family_index = None;
+        for (index, surface) in original.into_iter().enumerate() {
+            let root_surface = root_surface_id_for_surface_in_placements(
+                &self.surface_placements,
+                surface.surface_id,
+            );
+            if root_rank.contains_key(&root_surface) {
+                first_family_index.get_or_insert(index);
+                family_surfaces.push((index, surface, root_surface));
+            } else {
+                lower.push(surface);
+            }
+        }
+        family_surfaces.sort_by_key(|(index, _, root_surface)| (root_rank[root_surface], *index));
+        let family_surfaces = family_surfaces
+            .into_iter()
+            .map(|(_, surface, _)| surface)
+            .collect::<Vec<_>>();
+        let insertion = first_family_index.unwrap_or(lower.len()).min(lower.len());
+        lower.splice(insertion..insertion, family_surfaces);
+        let surfaces_changed = original_surface_order
+            != lower
+                .iter()
+                .map(|surface| surface.surface_id)
+                .collect::<Vec<_>>();
+        self.renderable_surfaces = lower;
+        if surfaces_changed {
+            self.invalidate_surface_origin_cache();
+            self.advance_render_generation(RenderGenerationCause::WindowStack);
+        }
+        stack_changed || surfaces_changed
     }
 
     pub(in crate::compositor) fn raise_x11_family_for_surface(&mut self, surface_id: u32) -> bool {
@@ -759,6 +883,24 @@ impl CompositorState {
     pub(in crate::compositor) fn window_mut(&mut self, id: WindowId) -> Option<&mut DesktopWindow> {
         self.desktop_windows.get_mut(&id)
     }
+}
+
+fn relationship_cycle(
+    child: WindowId,
+    parents: &std::collections::HashMap<WindowId, Option<WindowId>>,
+) -> bool {
+    let mut current = child;
+    let mut seen = std::collections::HashSet::new();
+    while seen.insert(current) {
+        let Some(Some(parent)) = parents.get(&current) else {
+            return false;
+        };
+        current = *parent;
+        if current == child {
+            return true;
+        }
+    }
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
