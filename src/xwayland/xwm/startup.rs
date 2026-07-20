@@ -11,7 +11,7 @@ use std::{
 };
 
 use x11rb::{
-    connection::Connection,
+    connection::{Connection, RequestConnection},
     cookie::Cookie,
     protocol::{
         composite,
@@ -24,7 +24,7 @@ use x11rb::{
         sync::ConnectionExt as SyncConnectionExt,
         xfixes,
         xfixes::ConnectionExt as XfixesConnectionExt,
-        xproto::{self, ConnectionExt as XprotoConnectionExt},
+        xproto::{self, ClientMessageEvent, ConnectionExt as XprotoConnectionExt},
     },
     rust_connection::{RustConnection, Stream},
     wrapper::ConnectionExt as WrapperConnectionExt,
@@ -37,11 +37,14 @@ use super::{
     atoms::{XwmAtomName, XwmAtoms},
     capabilities::XwmCapabilities,
     connection::{ReactorStream, X11Connection},
+    ownership::{
+        OwnershipFailure, OwnershipFailureKind, OwnershipGate, OwnershipStep,
+        STARTUP_SELECTION_TIMESTAMP, manager_message_data,
+    },
 };
 use crate::xwayland::XwaylandGeneration;
 
 const MAX_SETUP_BYTES: usize = 64 * 1024;
-const MAX_STARTUP_REPLIES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum XwmStartupState {
@@ -49,9 +52,33 @@ pub(crate) enum XwmStartupState {
     SetupReceived,
     ExtensionsDiscovered,
     AtomsInterned,
-    RootClaimed,
-    ExistingWindowsAdopted,
+    RootRedirectPending,
+    RootRedirectVerified,
+    CompositeRedirectPending,
+    CompositeRedirectVerified,
+    SupportingWindowPending,
+    EwmhPropertiesPending,
+    ExistingWindowsPending,
+    SelectionPending,
+    SelectionVerified,
+    ManagerMessagePending,
     Running,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PendingCheckedKind {
+    RootRedirect,
+    CompositeRedirect,
+    SupportingWindowCreation,
+    EwmhProperty,
+    SelectionClaim,
+    ManagerMessage,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingChecked {
+    request: SequenceNumber,
+    kind: PendingCheckedKind,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -86,6 +113,9 @@ pub(crate) struct XwmStartup {
     root: Option<u32>,
     supporting_wm_check: Option<u32>,
     pending_tree: Option<SequenceNumber>,
+    pending_selection_owner: Option<SequenceNumber>,
+    pending_checked: BTreeMap<SequenceNumber, PendingChecked>,
+    ownership: OwnershipGate,
     adopted_windows: Vec<u32>,
     last_error: Option<String>,
 }
@@ -122,6 +152,9 @@ impl XwmStartup {
             root: None,
             supporting_wm_check: None,
             pending_tree: None,
+            pending_selection_owner: None,
+            pending_checked: BTreeMap::new(),
+            ownership: OwnershipGate::new(generation),
             adopted_windows: Vec::new(),
             last_error: None,
         })
@@ -129,6 +162,10 @@ impl XwmStartup {
 
     pub(crate) fn state(&self) -> XwmStartupState {
         self.state
+    }
+
+    pub(crate) fn ownership_step(&self) -> OwnershipStep {
+        self.ownership.step()
     }
 
     pub(crate) fn raw_fd(&self) -> Option<RawFd> {
@@ -203,37 +240,60 @@ impl XwmStartup {
                 if !self.pending_atoms.is_empty() && !self.complete_atoms()? {
                     return Ok(None);
                 }
-                let connection = self.connection.as_ref().ok_or_else(|| {
-                    XwmStartupError::Protocol("XWM connection disappeared".to_owned())
-                })?;
-                let root = connection
-                    .setup()
-                    .roots
-                    .first()
-                    .ok_or(XwmStartupError::InvalidScreen)?
-                    .root;
-                let atoms = self
-                    .atoms
-                    .as_ref()
-                    .ok_or_else(|| XwmStartupError::Protocol("XWM atoms disappeared".to_owned()))?;
-                let capabilities = self.capabilities.as_ref().ok_or_else(|| {
-                    XwmStartupError::Protocol("XWM capabilities disappeared".to_owned())
-                })?;
-                let supporting = setup_root(connection, root, atoms, capabilities)?;
-                self.root = Some(root);
-                self.supporting_wm_check = Some(supporting);
-                connection
-                    .flush()
-                    .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-                let cookie = connection
-                    .query_tree(root)
-                    .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-                self.pending_tree = Some(cookie.sequence_number());
-                std::mem::forget(cookie);
-                self.state = XwmStartupState::RootClaimed;
+                self.queue_root_redirect()?;
+                self.state = XwmStartupState::RootRedirectPending;
                 Ok(None)
             }
-            XwmStartupState::RootClaimed => {
+            XwmStartupState::RootRedirectPending => {
+                if !self.complete_checked()? {
+                    return Ok(None);
+                }
+                self.ownership.note_root_redirect_verified();
+                self.state = XwmStartupState::RootRedirectVerified;
+                Ok(None)
+            }
+            XwmStartupState::RootRedirectVerified => {
+                self.queue_composite_redirect()?;
+                self.state = XwmStartupState::CompositeRedirectPending;
+                Ok(None)
+            }
+            XwmStartupState::CompositeRedirectPending => {
+                if !self.complete_checked()? {
+                    return Ok(None);
+                }
+                self.ownership.note_composite_redirect_verified();
+                self.state = XwmStartupState::CompositeRedirectVerified;
+                Ok(None)
+            }
+            XwmStartupState::CompositeRedirectVerified => {
+                self.queue_supporting_window()?;
+                self.state = XwmStartupState::SupportingWindowPending;
+                Ok(None)
+            }
+            XwmStartupState::SupportingWindowPending => {
+                if !self.complete_checked()? {
+                    return Ok(None);
+                }
+                let supporting = self.supporting_wm_check.ok_or_else(|| {
+                    XwmStartupError::Ownership(
+                        "stage=supporting-window-creation missing window id".to_owned(),
+                    )
+                })?;
+                self.ownership.note_supporting_window_created(supporting);
+                self.queue_ewmh_properties()?;
+                self.state = XwmStartupState::EwmhPropertiesPending;
+                Ok(None)
+            }
+            XwmStartupState::EwmhPropertiesPending => {
+                if !self.complete_checked()? {
+                    return Ok(None);
+                }
+                self.ownership.note_ewmh_properties_installed();
+                self.queue_existing_window_query()?;
+                self.state = XwmStartupState::ExistingWindowsPending;
+                Ok(None)
+            }
+            XwmStartupState::ExistingWindowsPending => {
                 let Some(sequence) = self.pending_tree else {
                     return Err(XwmStartupError::Protocol(
                         "missing QueryTree reply".to_owned(),
@@ -260,19 +320,530 @@ impl XwmStartup {
                     }
                     Err(error) => return Err(XwmStartupError::Protocol(error.to_string())),
                 };
-                self.adopted_windows = reply
-                    .children
-                    .iter()
-                    .copied()
-                    .take(MAX_STARTUP_REPLIES)
-                    .collect();
+                self.adopted_windows = reply.children.to_vec();
                 self.pending_tree = None;
-                self.state = XwmStartupState::ExistingWindowsAdopted;
-                Ok(self.finish())
+                self.ownership.note_existing_windows_adopted();
+                self.queue_selection_claim()?;
+                self.state = XwmStartupState::SelectionPending;
+                Ok(None)
             }
-            XwmStartupState::ExistingWindowsAdopted => Ok(self.finish()),
+            XwmStartupState::SelectionPending => {
+                if self.pending_selection_owner.is_none() {
+                    if !self.complete_checked()? {
+                        return Ok(None);
+                    }
+                    self.ownership.note_selection_claim_requested();
+                    let connection = self.connection.as_ref().ok_or_else(|| {
+                        XwmStartupError::Protocol("XWM connection disappeared".to_owned())
+                    })?;
+                    let cookie = connection
+                        .get_selection_owner(self.atoms().get(XwmAtomName::WmS0))
+                        .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
+                    self.pending_selection_owner = Some(cookie.sequence_number());
+                    std::mem::forget(cookie);
+                    self.flush_connection()?;
+                    return Ok(None);
+                }
+                let sequence = self.pending_selection_owner.ok_or_else(|| {
+                    XwmStartupError::Ownership(
+                        "stage=selection-verify missing GetSelectionOwner sequence".to_owned(),
+                    )
+                })?;
+                let connection = self.connection.as_ref().ok_or_else(|| {
+                    XwmStartupError::Protocol("XWM connection disappeared".to_owned())
+                })?;
+                let cookie = Cookie::<X11Connection, xproto::GetSelectionOwnerReply>::new(
+                    connection, sequence,
+                );
+                let reply = match cookie.reply_unchecked() {
+                    Ok(Some(reply)) => {
+                        self.drain_reply_errors(OwnershipFailureKind::SelectionVerification)?;
+                        reply
+                    }
+                    Ok(None) => {
+                        self.drain_reply_errors(OwnershipFailureKind::SelectionVerification)?;
+                        return self.fail_ownership(
+                            OwnershipFailureKind::SelectionVerification,
+                            "stage=selection-verify malformed GetSelectionOwner reply",
+                        );
+                    }
+                    Err(x11rb::errors::ConnectionError::IoError(error))
+                        if error.kind() == io::ErrorKind::WouldBlock =>
+                    {
+                        return Ok(None);
+                    }
+                    Err(error) => {
+                        return self.fail_ownership(
+                            OwnershipFailureKind::ConnectionLoss,
+                            error.to_string(),
+                        );
+                    }
+                };
+                self.pending_selection_owner = None;
+                let supporting = self.supporting_wm_check.ok_or_else(|| {
+                    XwmStartupError::Ownership(
+                        "stage=selection-verify missing supporting window".to_owned(),
+                    )
+                })?;
+                if reply.owner != supporting {
+                    return self.fail_ownership(
+                        OwnershipFailureKind::SelectionConflict,
+                        format!(
+                            "stage=selection-verify expected owner {supporting:#x}, got {:#x}",
+                            reply.owner
+                        ),
+                    );
+                }
+                self.ownership.note_selection_owner_verified(reply.owner);
+                self.state = XwmStartupState::SelectionVerified;
+                Ok(None)
+            }
+            XwmStartupState::SelectionVerified => {
+                self.queue_manager_message()?;
+                self.state = XwmStartupState::ManagerMessagePending;
+                Ok(None)
+            }
+            XwmStartupState::ManagerMessagePending => {
+                if !self.complete_checked()? {
+                    return Ok(None);
+                }
+                let xwm = self.finish().ok_or_else(|| {
+                    XwmStartupError::Ownership(
+                        "stage=running missing verified WM_S0 resources".to_owned(),
+                    )
+                })?;
+                Ok(Some(xwm))
+            }
             XwmStartupState::Running => Ok(None),
         }
+    }
+
+    fn atoms(&self) -> &XwmAtoms {
+        self.atoms
+            .as_ref()
+            .expect("atoms are interned before ownership startup")
+    }
+
+    fn root(&self) -> Result<u32, XwmStartupError> {
+        self.root.ok_or(XwmStartupError::InvalidScreen)
+    }
+
+    fn capabilities(&self) -> Result<&XwmCapabilities, XwmStartupError> {
+        self.capabilities
+            .as_ref()
+            .ok_or_else(|| XwmStartupError::Protocol("XWM capabilities disappeared".to_owned()))
+    }
+
+    fn connection(&self) -> Result<&X11Connection, XwmStartupError> {
+        self.connection
+            .as_ref()
+            .ok_or_else(|| XwmStartupError::Protocol("XWM connection disappeared".to_owned()))
+    }
+
+    fn flush_connection(&self) -> Result<(), XwmStartupError> {
+        self.connection()?
+            .flush()
+            .map_err(|error| XwmStartupError::Protocol(error.to_string()))
+    }
+
+    fn track_checked(
+        &mut self,
+        request: SequenceNumber,
+        kind: PendingCheckedKind,
+    ) -> Result<(), XwmStartupError> {
+        let barrier_sequence = {
+            let barrier = self
+                .connection()?
+                .get_input_focus()
+                .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
+            let sequence = barrier.sequence_number();
+            std::mem::forget(barrier);
+            sequence
+        };
+        self.pending_checked
+            .insert(barrier_sequence, PendingChecked { request, kind });
+        Ok(())
+    }
+
+    fn queue_root_redirect(&mut self) -> Result<(), XwmStartupError> {
+        if self.root.is_none() {
+            let root = self
+                .connection()?
+                .setup()
+                .roots
+                .first()
+                .ok_or(XwmStartupError::InvalidScreen)?
+                .root;
+            self.root = Some(root);
+        }
+        let root = self.root()?;
+        let event_mask = xproto::EventMask::SUBSTRUCTURE_REDIRECT
+            | xproto::EventMask::SUBSTRUCTURE_NOTIFY
+            | xproto::EventMask::PROPERTY_CHANGE
+            | xproto::EventMask::FOCUS_CHANGE;
+        let sequence = {
+            let cookie = self
+                .connection()?
+                .change_window_attributes(
+                    root,
+                    &xproto::ChangeWindowAttributesAux::new().event_mask(event_mask),
+                )
+                .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
+            let sequence = cookie.sequence_number();
+            std::mem::forget(cookie);
+            sequence
+        };
+        self.track_checked(sequence, PendingCheckedKind::RootRedirect)?;
+        self.flush_connection()
+    }
+
+    fn queue_composite_redirect(&mut self) -> Result<(), XwmStartupError> {
+        let sequence = {
+            let cookie = self
+                .connection()?
+                .composite_redirect_subwindows(self.root()?, composite::Redirect::MANUAL)
+                .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
+            let sequence = cookie.sequence_number();
+            std::mem::forget(cookie);
+            sequence
+        };
+        self.ownership.note_composite_redirect_requested();
+        self.track_checked(sequence, PendingCheckedKind::CompositeRedirect)?;
+        self.flush_connection()
+    }
+
+    fn queue_supporting_window(&mut self) -> Result<(), XwmStartupError> {
+        let screen = self
+            .connection()?
+            .setup()
+            .roots
+            .first()
+            .ok_or(XwmStartupError::InvalidScreen)?;
+        let supporting = self
+            .connection()?
+            .generate_id()
+            .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
+        let sequence = {
+            let cookie = self
+                .connection()?
+                .create_window(
+                    screen.root_depth,
+                    supporting,
+                    self.root()?,
+                    0,
+                    0,
+                    1,
+                    1,
+                    0,
+                    xproto::WindowClass::INPUT_OUTPUT,
+                    screen.root_visual,
+                    &xproto::CreateWindowAux::new(),
+                )
+                .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
+            let sequence = cookie.sequence_number();
+            std::mem::forget(cookie);
+            sequence
+        };
+        self.supporting_wm_check = Some(supporting);
+        self.ownership.note_supporting_window_requested();
+        self.track_checked(sequence, PendingCheckedKind::SupportingWindowCreation)?;
+        self.flush_connection()
+    }
+
+    fn queue_property32(
+        &mut self,
+        window: u32,
+        property: XwmAtomName,
+        ty: xproto::Atom,
+        values: &[u32],
+    ) -> Result<(), XwmStartupError> {
+        let sequence = {
+            let cookie = self
+                .connection()?
+                .change_property32(
+                    xproto::PropMode::REPLACE,
+                    window,
+                    self.atoms().get(property),
+                    ty,
+                    values,
+                )
+                .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
+            let sequence = cookie.sequence_number();
+            std::mem::forget(cookie);
+            sequence
+        };
+        self.track_checked(sequence, PendingCheckedKind::EwmhProperty)?;
+        Ok(())
+    }
+
+    fn queue_property8(
+        &mut self,
+        window: u32,
+        property: XwmAtomName,
+        ty: xproto::Atom,
+        value: &[u8],
+    ) -> Result<(), XwmStartupError> {
+        let sequence = {
+            let cookie = self
+                .connection()?
+                .change_property8(
+                    xproto::PropMode::REPLACE,
+                    window,
+                    self.atoms().get(property),
+                    ty,
+                    value,
+                )
+                .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
+            let sequence = cookie.sequence_number();
+            std::mem::forget(cookie);
+            sequence
+        };
+        self.track_checked(sequence, PendingCheckedKind::EwmhProperty)?;
+        Ok(())
+    }
+
+    fn queue_ewmh_properties(&mut self) -> Result<(), XwmStartupError> {
+        let root = self.root()?;
+        let supporting = self.supporting_wm_check.ok_or_else(|| {
+            XwmStartupError::Ownership("stage=ewmh-properties missing supporting window".to_owned())
+        })?;
+        let capabilities = *self.capabilities()?;
+        self.ownership.note_ewmh_properties_requested();
+        self.queue_property32(
+            root,
+            XwmAtomName::NetSupportingWmCheck,
+            xproto::AtomEnum::WINDOW.into(),
+            &[supporting],
+        )?;
+        self.queue_property32(
+            supporting,
+            XwmAtomName::NetSupportingWmCheck,
+            xproto::AtomEnum::WINDOW.into(),
+            &[supporting],
+        )?;
+        self.queue_property8(
+            supporting,
+            XwmAtomName::NetWmName,
+            self.atoms().get(XwmAtomName::Utf8String),
+            b"Typhon",
+        )?;
+        let supported = XwmAtoms::advertised_names()
+            .iter()
+            .copied()
+            .filter(|name| capabilities.supports_atom(*name))
+            .map(|name| self.atoms().get(name))
+            .collect::<Vec<_>>();
+        self.queue_property32(
+            root,
+            XwmAtomName::NetSupported,
+            xproto::AtomEnum::ATOM.into(),
+            &supported,
+        )?;
+        for (atom, ty) in [
+            (XwmAtomName::NetActiveWindow, xproto::AtomEnum::WINDOW),
+            (XwmAtomName::NetClientList, xproto::AtomEnum::WINDOW),
+            (XwmAtomName::NetClientListStacking, xproto::AtomEnum::WINDOW),
+        ] {
+            self.queue_property32(root, atom, ty.into(), &[])?;
+        }
+        let screen = self
+            .connection()?
+            .setup()
+            .roots
+            .first()
+            .ok_or(XwmStartupError::InvalidScreen)?;
+        let width = u32::from(screen.width_in_pixels);
+        let height = u32::from(screen.height_in_pixels);
+        for (atom, values) in [
+            (XwmAtomName::NetNumberOfDesktops, vec![1]),
+            (XwmAtomName::NetCurrentDesktop, vec![0]),
+            (XwmAtomName::NetDesktopGeometry, vec![width, height]),
+            (XwmAtomName::NetDesktopViewport, vec![0, 0]),
+            (XwmAtomName::NetWorkarea, vec![0, 0, width, height]),
+        ] {
+            self.queue_property32(root, atom, xproto::AtomEnum::CARDINAL.into(), &values)?;
+        }
+        self.flush_connection()
+    }
+
+    fn queue_existing_window_query(&mut self) -> Result<(), XwmStartupError> {
+        let sequence = {
+            let cookie = self
+                .connection()?
+                .query_tree(self.root()?)
+                .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
+            let sequence = cookie.sequence_number();
+            std::mem::forget(cookie);
+            sequence
+        };
+        self.pending_tree = Some(sequence);
+        self.flush_connection()
+    }
+
+    fn queue_selection_claim(&mut self) -> Result<(), XwmStartupError> {
+        let supporting = self.supporting_wm_check.ok_or_else(|| {
+            XwmStartupError::Ownership("stage=selection-claim missing supporting window".to_owned())
+        })?;
+        let sequence = {
+            let cookie = self
+                .connection()?
+                .set_selection_owner(
+                    supporting,
+                    self.atoms().get(XwmAtomName::WmS0),
+                    x11rb::CURRENT_TIME,
+                )
+                .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
+            let sequence = cookie.sequence_number();
+            std::mem::forget(cookie);
+            sequence
+        };
+        self.track_checked(sequence, PendingCheckedKind::SelectionClaim)?;
+        self.flush_connection()
+    }
+
+    fn queue_manager_message(&mut self) -> Result<(), XwmStartupError> {
+        let root = self.root()?;
+        let supporting = self.supporting_wm_check.ok_or_else(|| {
+            XwmStartupError::Ownership("stage=manager-message missing supporting window".to_owned())
+        })?;
+        let event = ClientMessageEvent::new(
+            32,
+            root,
+            self.atoms().get(XwmAtomName::Manager),
+            manager_message_data(
+                STARTUP_SELECTION_TIMESTAMP,
+                self.atoms().get(XwmAtomName::WmS0),
+                supporting,
+            ),
+        );
+        let sequence = {
+            let cookie = self
+                .connection()?
+                .send_event(false, root, xproto::EventMask::STRUCTURE_NOTIFY, event)
+                .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
+            let sequence = cookie.sequence_number();
+            std::mem::forget(cookie);
+            sequence
+        };
+        if !self.ownership.queue_manager_message() {
+            return self.fail_ownership(
+                OwnershipFailureKind::ManagerMessage,
+                "MANAGER was queued before verified WM_S0 ownership",
+            );
+        }
+        self.track_checked(sequence, PendingCheckedKind::ManagerMessage)?;
+        self.flush_connection()
+    }
+
+    fn complete_checked(&mut self) -> Result<bool, XwmStartupError> {
+        let sequences = self.pending_checked.keys().copied().collect::<Vec<_>>();
+        for barrier in sequences {
+            let Some(pending) = self.pending_checked.get(&barrier).copied() else {
+                continue;
+            };
+            let cookie = Cookie::<X11Connection, xproto::GetInputFocusReply>::new(
+                self.connection()?,
+                barrier,
+            );
+            match cookie.reply_unchecked() {
+                Ok(Some(_)) => {
+                    self.pending_checked.remove(&barrier);
+                    self.drain_checked_errors(pending)?;
+                }
+                Ok(None) => {
+                    return self.fail_ownership(
+                        Self::failure_kind(pending.kind),
+                        "checked barrier returned no reply",
+                    );
+                }
+                Err(x11rb::errors::ConnectionError::IoError(error))
+                    if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    return self.fail_ownership(
+                        OwnershipFailureKind::ConnectionLoss,
+                        format!("checked barrier failed: {error}"),
+                    );
+                }
+            }
+        }
+        Ok(self.pending_checked.is_empty())
+    }
+
+    fn drain_checked_errors(&mut self, completed: PendingChecked) -> Result<(), XwmStartupError> {
+        loop {
+            let Some((raw, sequence)) = self
+                .connection()?
+                .poll_new_raw_event_with_sequence()
+                .map_err(|error| XwmStartupError::Protocol(error.to_string()))?
+            else {
+                return Ok(());
+            };
+            if raw.first().copied() == Some(0) {
+                let kind = self
+                    .pending_checked
+                    .values()
+                    .find(|pending| pending.request == sequence)
+                    .map(|pending| pending.kind)
+                    .unwrap_or(completed.kind);
+                let reason = self
+                    .connection()?
+                    .parse_error(&raw)
+                    .map(|error| format!("{error:?}"))
+                    .unwrap_or_else(|_| "malformed X11 error packet".to_owned());
+                return self.fail_ownership(Self::failure_kind(kind), reason);
+            }
+            self.connection()?.defer_raw_event((raw, sequence));
+        }
+    }
+
+    fn drain_reply_errors(&mut self, kind: OwnershipFailureKind) -> Result<(), XwmStartupError> {
+        loop {
+            let Some((raw, sequence)) = self
+                .connection()?
+                .poll_new_raw_event_with_sequence()
+                .map_err(|error| XwmStartupError::Protocol(error.to_string()))?
+            else {
+                return Ok(());
+            };
+            if raw.first().copied() == Some(0) {
+                let reason = self
+                    .connection()?
+                    .parse_error(&raw)
+                    .map(|error| format!("sequence={sequence:?} error={error:?}"))
+                    .unwrap_or_else(|_| "malformed X11 error packet".to_owned());
+                return self.fail_ownership(kind, reason);
+            }
+            self.connection()?.defer_raw_event((raw, sequence));
+        }
+    }
+
+    const fn failure_kind(kind: PendingCheckedKind) -> OwnershipFailureKind {
+        match kind {
+            PendingCheckedKind::RootRedirect => OwnershipFailureKind::RootSubstructureRedirect,
+            PendingCheckedKind::CompositeRedirect => OwnershipFailureKind::CompositeRedirect,
+            PendingCheckedKind::SupportingWindowCreation => {
+                OwnershipFailureKind::SupportingWindowCreation
+            }
+            PendingCheckedKind::EwmhProperty => OwnershipFailureKind::EwmhProperties,
+            PendingCheckedKind::SelectionClaim => OwnershipFailureKind::SelectionConflict,
+            PendingCheckedKind::ManagerMessage => OwnershipFailureKind::ManagerMessage,
+        }
+    }
+
+    fn fail_ownership<T>(
+        &mut self,
+        kind: OwnershipFailureKind,
+        reason: impl Into<String>,
+    ) -> Result<T, XwmStartupError> {
+        let failure = OwnershipFailure::new(self.generation, kind, reason);
+        let message = format!(
+            "step={:?} kind={:?}: {}",
+            self.ownership.step(),
+            kind,
+            failure.reason
+        );
+        self.ownership.fail(failure);
+        Err(XwmStartupError::Ownership(message))
     }
 
     fn drive_setup(&mut self) -> Result<bool, XwmStartupError> {
@@ -637,6 +1208,9 @@ impl XwmStartup {
     }
 
     fn finish(&mut self) -> Option<Xwm> {
+        if !self.ownership.running_ready() {
+            return None;
+        }
         let connection = self.connection.take()?;
         let atoms = self.atoms.take()?;
         let capabilities = self.capabilities.take()?;
@@ -691,126 +1265,6 @@ pub(crate) fn default_randr_snapshot() -> super::randr::RandrSnapshot {
         96,
     )
     .expect("default RandR snapshot")
-}
-
-pub(crate) fn setup_root<C: Connection>(
-    connection: &C,
-    root: u32,
-    atoms: &XwmAtoms,
-    capabilities: &XwmCapabilities,
-) -> Result<u32, XwmStartupError> {
-    if !capabilities.required_contract_available() {
-        return Err(XwmStartupError::Protocol(
-            "XWM Composite capability is unavailable".to_owned(),
-        ));
-    }
-    let event_mask = xproto::EventMask::SUBSTRUCTURE_REDIRECT
-        | xproto::EventMask::SUBSTRUCTURE_NOTIFY
-        | xproto::EventMask::PROPERTY_CHANGE
-        | xproto::EventMask::FOCUS_CHANGE;
-    connection
-        .change_window_attributes(
-            root,
-            &xproto::ChangeWindowAttributesAux::new().event_mask(event_mask),
-        )
-        .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
-    connection
-        .composite_redirect_subwindows(root, composite::Redirect::MANUAL)
-        .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
-    let screen = connection
-        .setup()
-        .roots
-        .first()
-        .ok_or(XwmStartupError::InvalidScreen)?;
-    let supporting_wm_check = connection
-        .generate_id()
-        .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
-    connection
-        .create_window(
-            screen.root_depth,
-            supporting_wm_check,
-            root,
-            0,
-            0,
-            1,
-            1,
-            0,
-            xproto::WindowClass::INPUT_OUTPUT,
-            screen.root_visual,
-            &xproto::CreateWindowAux::new(),
-        )
-        .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
-    connection
-        .change_property32(
-            xproto::PropMode::REPLACE,
-            root,
-            atoms.get(XwmAtomName::NetSupportingWmCheck),
-            xproto::AtomEnum::WINDOW,
-            &[supporting_wm_check],
-        )
-        .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
-    connection
-        .change_property32(
-            xproto::PropMode::REPLACE,
-            supporting_wm_check,
-            atoms.get(XwmAtomName::NetSupportingWmCheck),
-            xproto::AtomEnum::WINDOW,
-            &[supporting_wm_check],
-        )
-        .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
-    connection
-        .change_property8(
-            xproto::PropMode::REPLACE,
-            supporting_wm_check,
-            atoms.get(XwmAtomName::NetWmName),
-            atoms.get(XwmAtomName::Utf8String),
-            b"Typhon",
-        )
-        .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
-    let supported = XwmAtoms::advertised_names()
-        .iter()
-        .copied()
-        .filter(|name| capabilities.supports_atom(*name))
-        .map(|name| atoms.get(name))
-        .collect::<Vec<_>>();
-    connection
-        .change_property32(
-            xproto::PropMode::REPLACE,
-            root,
-            atoms.get(XwmAtomName::NetSupported),
-            xproto::AtomEnum::ATOM,
-            &supported,
-        )
-        .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
-    for (atom, ty) in [
-        (XwmAtomName::NetActiveWindow, xproto::AtomEnum::WINDOW),
-        (XwmAtomName::NetClientList, xproto::AtomEnum::WINDOW),
-        (XwmAtomName::NetClientListStacking, xproto::AtomEnum::WINDOW),
-    ] {
-        connection
-            .change_property32(xproto::PropMode::REPLACE, root, atoms.get(atom), ty, &[])
-            .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
-    }
-    let width = u32::from(screen.width_in_pixels);
-    let height = u32::from(screen.height_in_pixels);
-    for (atom, values) in [
-        (XwmAtomName::NetNumberOfDesktops, vec![1]),
-        (XwmAtomName::NetCurrentDesktop, vec![0]),
-        (XwmAtomName::NetDesktopGeometry, vec![width, height]),
-        (XwmAtomName::NetDesktopViewport, vec![0, 0]),
-        (XwmAtomName::NetWorkarea, vec![0, 0, width, height]),
-    ] {
-        connection
-            .change_property32(
-                xproto::PropMode::REPLACE,
-                root,
-                atoms.get(atom),
-                xproto::AtomEnum::CARDINAL,
-                &values,
-            )
-            .map_err(|e| XwmStartupError::Protocol(e.to_string()))?;
-    }
-    Ok(supporting_wm_check)
 }
 
 #[cfg(test)]

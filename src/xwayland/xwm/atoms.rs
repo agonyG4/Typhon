@@ -1,14 +1,11 @@
 use std::collections::HashMap;
 
-use x11rb::{
-    connection::RequestConnection,
-    protocol::xproto::{Atom, ConnectionExt as XprotoConnectionExt},
-};
-
-use super::XwmStartupError;
+use x11rb::protocol::xproto::Atom;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum XwmAtomName {
+    WmS0,
+    Manager,
     WlSurfaceSerial,
     Utf8String,
     WmProtocols,
@@ -64,6 +61,8 @@ pub(crate) enum XwmAtomName {
 
 impl XwmAtomName {
     pub(crate) const ALL: &'static [Self] = &[
+        Self::WmS0,
+        Self::Manager,
         Self::WlSurfaceSerial,
         Self::Utf8String,
         Self::WmProtocols,
@@ -119,6 +118,8 @@ impl XwmAtomName {
 
     pub(crate) const fn as_bytes(self) -> &'static [u8] {
         match self {
+            Self::WmS0 => b"WM_S0",
+            Self::Manager => b"MANAGER",
             Self::WlSurfaceSerial => b"WL_SURFACE_SERIAL",
             Self::Utf8String => b"UTF8_STRING",
             Self::WmProtocols => b"WM_PROTOCOLS",
@@ -186,20 +187,6 @@ impl XwmAtoms {
 
     pub(crate) fn into_values(self) -> HashMap<XwmAtomName, Atom> {
         self.values
-    }
-
-    pub(crate) fn intern<C: RequestConnection>(connection: &C) -> Result<Self, XwmStartupError> {
-        let mut values = HashMap::with_capacity(XwmAtomName::ALL.len());
-        for name in XwmAtomName::ALL {
-            let atom = connection
-                .intern_atom(false, name.as_bytes())
-                .map_err(|error| XwmStartupError::Protocol(error.to_string()))?
-                .reply()
-                .map_err(|error| XwmStartupError::Protocol(error.to_string()))?
-                .atom;
-            values.insert(*name, atom);
-        }
-        Ok(Self { values })
     }
 
     pub(crate) fn get(&self, name: XwmAtomName) -> Atom {

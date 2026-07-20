@@ -1,6 +1,4 @@
-use x11rb::{connection::Connection, protocol};
-
-use super::{XwmStartupError, atoms::XwmAtomName};
+use super::atoms::XwmAtomName;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct XwmCapabilities {
@@ -12,28 +10,6 @@ pub(crate) struct XwmCapabilities {
 }
 
 impl XwmCapabilities {
-    pub(crate) fn discover<C: Connection>(connection: &C) -> Result<Self, XwmStartupError> {
-        let composite = has_extension(connection, protocol::composite::X11_EXTENSION_NAME)?;
-        let xfixes = has_extension(connection, protocol::xfixes::X11_EXTENSION_NAME)?;
-        let shape = has_extension(connection, protocol::shape::X11_EXTENSION_NAME)?;
-        let randr = has_extension(connection, protocol::randr::X11_EXTENSION_NAME)?;
-        let sync = has_extension(connection, protocol::sync::X11_EXTENSION_NAME)?;
-
-        if !composite {
-            return Err(XwmStartupError::MissingRequiredExtension(
-                protocol::composite::X11_EXTENSION_NAME,
-            ));
-        }
-
-        Ok(Self {
-            composite,
-            xfixes,
-            shape,
-            randr,
-            sync,
-        })
-    }
-
     pub(crate) const fn required_contract_available(self) -> bool {
         self.composite
     }
@@ -44,16 +20,6 @@ impl XwmCapabilities {
             _ => true,
         }
     }
-}
-
-fn has_extension<C: Connection>(
-    connection: &C,
-    name: &'static str,
-) -> Result<bool, XwmStartupError> {
-    connection
-        .extension_information(name)
-        .map(|information| information.is_some())
-        .map_err(|error| XwmStartupError::Protocol(error.to_string()))
 }
 
 #[cfg(test)]

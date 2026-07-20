@@ -23,6 +23,7 @@ mod events;
 pub(crate) mod ewmh;
 pub(crate) mod focus;
 pub(crate) mod icccm;
+mod ownership;
 mod properties;
 pub mod randr;
 mod resize_sync;
@@ -247,6 +248,7 @@ pub enum XwmStartupError {
     MissingRequiredExtension(&'static str),
     InvalidScreen,
     RootSetup(x11rb::errors::ConnectionError),
+    Ownership(String),
     Protocol(String),
 }
 
@@ -259,6 +261,7 @@ impl fmt::Display for XwmStartupError {
             }
             Self::InvalidScreen => formatter.write_str("XWM received an invalid X11 screen"),
             Self::RootSetup(error) => write!(formatter, "XWM root setup failed: {error}"),
+            Self::Ownership(error) => write!(formatter, "XWM ownership setup failed: {error}"),
             Self::Protocol(error) => write!(formatter, "XWM protocol setup failed: {error}"),
         }
     }
@@ -328,7 +331,12 @@ impl Xwm {
         generation: XwaylandGeneration,
         stream: UnixStream,
     ) -> Result<Self, XwmStartupError> {
-        connection::connect(generation, stream)
+        let _ = generation;
+        drop(stream);
+        Err(XwmStartupError::Protocol(
+            "synchronous XWM connection is unavailable; use the incremental startup driver"
+                .to_owned(),
+        ))
     }
 
     pub fn raw_fd(&self) -> RawFd {

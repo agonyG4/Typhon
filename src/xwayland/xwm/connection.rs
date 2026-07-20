@@ -20,11 +20,6 @@ use x11rb::{
 };
 use x11rb_protocol::{RawEventAndSeqNumber, SequenceNumber};
 
-use super::{
-    Xwm, XwmStartupError, atoms::XwmAtoms, capabilities::XwmCapabilities, window::X11WindowRegistry,
-};
-use crate::xwayland::XwaylandGeneration;
-
 pub(crate) const MAX_XWM_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// The stream used by the reactor-owned XWM connection.
@@ -206,6 +201,7 @@ impl Stream for ReactorStream {
 pub(crate) struct X11Connection {
     inner: RustConnection<ReactorStream>,
     extensions: HashMap<&'static str, ExtensionInformation>,
+    deferred_events: Mutex<VecDeque<RawEventAndSeqNumber<Vec<u8>>>>,
 }
 
 impl X11Connection {
@@ -213,7 +209,11 @@ impl X11Connection {
         inner: RustConnection<ReactorStream>,
         extensions: HashMap<&'static str, ExtensionInformation>,
     ) -> Self {
-        Self { inner, extensions }
+        Self {
+            inner,
+            extensions,
+            deferred_events: Mutex::new(VecDeque::new()),
+        }
     }
 
     pub(crate) fn stream(&self) -> &ReactorStream {
@@ -229,6 +229,19 @@ impl X11Connection {
         extensions: HashMap<&'static str, ExtensionInformation>,
     ) {
         self.extensions = extensions;
+    }
+
+    pub(crate) fn defer_raw_event(&self, event: RawEventAndSeqNumber<Vec<u8>>) {
+        self.deferred_events
+            .lock()
+            .expect("XWM deferred-event mutex poisoned")
+            .push_back(event);
+    }
+
+    pub(crate) fn poll_new_raw_event_with_sequence(
+        &self,
+    ) -> Result<Option<RawEventAndSeqNumber<Vec<u8>>>, ConnectionError> {
+        self.inner.poll_for_raw_event_with_sequence()
     }
 }
 
@@ -353,6 +366,14 @@ impl Connection for X11Connection {
     fn poll_for_raw_event_with_sequence(
         &self,
     ) -> Result<Option<RawEventAndSeqNumber<Self::Buf>>, ConnectionError> {
+        if let Some(event) = self
+            .deferred_events
+            .lock()
+            .expect("XWM deferred-event mutex poisoned")
+            .pop_front()
+        {
+            return Ok(Some(event));
+        }
         self.inner.poll_for_raw_event_with_sequence()
     }
 
@@ -363,58 +384,6 @@ impl Connection for X11Connection {
     fn setup(&self) -> &Setup {
         self.inner.setup()
     }
-}
-
-pub(crate) fn connect(
-    generation: XwaylandGeneration,
-    stream: UnixStream,
-) -> Result<Xwm, XwmStartupError> {
-    let stream = ReactorStream::from_unix_stream(stream)
-        .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-    let raw_fd = stream.as_raw_fd();
-    let connection =
-        RustConnection::connect_to_stream(stream, 0).map_err(XwmStartupError::Connection)?;
-    let screen_number = 0;
-    let root = connection
-        .setup()
-        .roots
-        .get(screen_number)
-        .ok_or(XwmStartupError::InvalidScreen)?
-        .root;
-    // This compatibility path is retained for tests and callers that already
-    // have a completed handshake. Managed startup uses `startup::XwmStartup`.
-    let capabilities = XwmCapabilities::discover(&connection)?;
-    let atoms = XwmAtoms::intern(&connection)?;
-    let supporting_wm_check = super::startup::setup_root(&connection, root, &atoms, &capabilities)?;
-    connection
-        .flush()
-        .map_err(|error| XwmStartupError::Protocol(error.to_string()))?;
-    let connection = X11Connection::new(connection, HashMap::new());
-    Ok(Xwm {
-        generation,
-        connection,
-        adoption: Default::default(),
-        screen_number,
-        root,
-        atoms,
-        capabilities,
-        windows: X11WindowRegistry::default(),
-        outgoing_events: Default::default(),
-        association: super::association::SurfaceAssociationJoin::default(),
-        resize_sync: super::resize_sync::ResizeSyncTracker::default(),
-        sync_alarms: Default::default(),
-        sync_handles_by_counter: Default::default(),
-        next_resize_counter_values: Default::default(),
-        shapes: Default::default(),
-        data_bridge: Default::default(),
-        randr: super::startup::default_randr_snapshot(),
-        pending_properties: Default::default(),
-        deferred_properties: Default::default(),
-        property_metrics: Default::default(),
-        buffer_ready_surfaces: Default::default(),
-        supporting_wm_check,
-        raw_fd,
-    })
 }
 
 #[cfg(test)]

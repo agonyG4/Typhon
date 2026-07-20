@@ -990,15 +990,16 @@ impl XwaylandService {
                     stderr: resources.stderr,
                 }));
                 self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
-                self.log_readiness_progress("xwm_root_initialized");
+                self.log_readiness_progress("xwm_running_wm_s0_verified");
                 self.log_state_transition();
                 Ok(())
             }
             Ok(None) => {
                 if let Some(startup) = resources.xwm_startup.as_ref() {
                     eprintln!(
-                        "oblivion-one xwayland: event=xwm_startup_progress generation={generation:?} state={:?}",
-                        startup.state()
+                        "oblivion-one xwayland: event=xwm_startup_progress generation={generation:?} state={:?} ownership_step={:?}",
+                        startup.state(),
+                        startup.ownership_step(),
                     );
                 }
                 self.state = ServiceState::Starting(resources);
