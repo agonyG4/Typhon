@@ -224,6 +224,97 @@ fn xwayland_first_buffer_before_window_is_retained() {
 }
 
 #[test]
+fn xwayland_buffer_committed_before_serial_becomes_ready() {
+    let socket_name = super::unique_socket_name();
+    let mut server = super::OwnCompositorServer::bind_cpu_composition(&socket_name)
+        .expect("bind compositor server");
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).expect("nonzero generation"));
+    let (server_stream, client_stream) = std::os::unix::net::UnixStream::pair().unwrap();
+    server
+        .insert_xwayland_client(server_stream, generation)
+        .expect("insert private XWayland client");
+    let (running, server_thread) = super::spawn_test_server(server);
+
+    let connection = Connection::from_socket(client_stream).expect("create Wayland client");
+    let (globals, mut queue) = registry_queue_init::<super::RegistryTestState>(&connection)
+        .expect("read compositor globals");
+    let qh = queue.handle();
+    let shell: client_xwayland_shell_v1::XwaylandShellV1 =
+        globals.bind(&qh, 1..=1, ()).expect("bind XWayland shell");
+    let compositor: client_wl_compositor::WlCompositor =
+        globals.bind(&qh, 1..=6, ()).expect("bind compositor");
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).expect("bind shm");
+    let surface = compositor.create_surface(&qh, ());
+
+    let file = super::create_test_shm_file(&[
+        0xffff_0000,
+        0xff00_ff00,
+        0xff00_00ff,
+        0xffff_ffff,
+        0xff10_1010,
+        0xff20_2020,
+        0xff30_3030,
+        0xff40_4040,
+    ])
+    .expect("create shm buffer");
+    let pool = shm.create_pool(file.as_fd(), 32, &qh, ());
+    let buffer = pool.create_buffer(0, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage_buffer(0, 0, 2, 2);
+    surface.commit();
+    connection.flush().expect("flush unassigned buffer");
+    queue
+        .roundtrip(&mut super::RegistryTestState::default())
+        .expect("complete unassigned buffer commit");
+
+    let xwayland_surface = shell.get_xwayland_surface(&surface, &qh, ());
+    xwayland_surface.set_serial(0x0123_4567, 0x89ab_cdef);
+    surface.commit();
+    connection.flush().expect("flush serial-only association");
+    queue
+        .roundtrip(&mut super::RegistryTestState::default())
+        .expect("complete serial-only association");
+
+    let mut server = super::stop_test_server(running, server_thread);
+    let associations = server.take_xwayland_association_events();
+    assert_eq!(associations.len(), 1);
+    let surface_id = associations
+        .iter()
+        .find_map(|event| match event {
+            XwaylandAssociationEvent::Committed { surface_id, .. } => Some(*surface_id),
+            XwaylandAssociationEvent::Removed { .. } => None,
+        })
+        .expect("association has compositor surface id");
+    let initial_buffer_id = server
+        .current_surface_buffer_id(surface_id)
+        .expect("pre-association buffer retained")
+        .get();
+
+    assert_eq!(server.take_xwayland_buffer_ready_events().len(), 1);
+    assert!(server.renderable_surfaces().is_empty());
+
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = surface_id;
+    snapshot.geometry.x = 37;
+    snapshot.geometry.y = 42;
+    assert_eq!(
+        server
+            .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot))
+            .len(),
+        1
+    );
+    assert_eq!(server.renderable_surfaces().len(), 1);
+    assert_eq!(
+        server.renderable_surfaces()[0].buffer_id().get(),
+        initial_buffer_id
+    );
+    assert_eq!(
+        server.renderable_surfaces()[0].placement,
+        SurfacePlacement::absolute_root_at(37, 42)
+    );
+}
+
+#[test]
 fn window_ready_publishes_retained_xwayland_buffer() {
     let mut fixture = first_buffer_fixture();
     assert!(fixture.server.renderable_surfaces().is_empty());

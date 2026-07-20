@@ -402,23 +402,31 @@ impl CompositorState {
         &mut self,
         surface_id: u32,
     ) -> Result<XwaylandSurfaceCommit, AssociationError> {
-        let Some(state) = self.xwayland.surface_states.get_mut(&surface_id) else {
-            return Ok(XwaylandSurfaceCommit::None);
+        let committed = {
+            let Some(state) = self.xwayland.surface_states.get_mut(&surface_id) else {
+                return Ok(XwaylandSurfaceCommit::None);
+            };
+            let Some(serial) = state.pending_serial.take() else {
+                return Ok(XwaylandSurfaceCommit::None);
+            };
+            if state.committed_serial.is_some() {
+                return Ok(XwaylandSurfaceCommit::AlreadyAssociated);
+            }
+            self.xwayland.associations.commit_surface_serial(
+                state.generation,
+                serial,
+                surface_id,
+            )?;
+            state.committed_serial = Some(serial);
+            XwaylandSurfaceCommit::Committed {
+                generation: state.generation,
+                serial,
+            }
         };
-        let Some(serial) = state.pending_serial.take() else {
-            return Ok(XwaylandSurfaceCommit::None);
-        };
-        if state.committed_serial.is_some() {
-            return Ok(XwaylandSurfaceCommit::AlreadyAssociated);
+        if self.current_surface_buffers.contains_key(&surface_id) {
+            self.note_xwayland_buffer_ready(surface_id);
         }
-        self.xwayland
-            .associations
-            .commit_surface_serial(state.generation, serial, surface_id)?;
-        state.committed_serial = Some(serial);
-        Ok(XwaylandSurfaceCommit::Committed {
-            generation: state.generation,
-            serial,
-        })
+        Ok(committed)
     }
 
     pub(in crate::compositor) fn destroy_xwayland_surface_object(&mut self, surface_id: u32) {
@@ -476,9 +484,10 @@ impl CompositorState {
             .get(&surface_id)
             .map(|state| state.generation)
         {
-            self.xwayland
-                .buffer_ready_events
-                .push((generation, surface_id));
+            let event = (generation, surface_id);
+            if !self.xwayland.buffer_ready_events.contains(&event) {
+                self.xwayland.buffer_ready_events.push(event);
+            }
         }
     }
 
