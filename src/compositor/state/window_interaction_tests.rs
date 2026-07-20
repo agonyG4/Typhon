@@ -89,6 +89,34 @@ fn test_renderable_surface(surface_id: u32, width: u32, height: u32) -> Renderab
     }
 }
 
+fn test_x11_snapshot(surface_id: u32) -> crate::xwayland::xwm::X11WindowSnapshot {
+    let generation =
+        crate::xwayland::XwaylandGeneration::new(NonZeroU64::new(1).expect("nonzero generation"));
+    crate::xwayland::xwm::X11WindowSnapshot {
+        handle: crate::xwayland::X11WindowHandle::new(generation, 0x100),
+        surface_id,
+        kind: DesktopWindowKind::Managed,
+        geometry: crate::xwayland::xwm::X11Geometry {
+            x: 10,
+            y: 20,
+            width: 300,
+            height: 200,
+        },
+        metadata: WindowMetadata::default(),
+        constraints: WindowConstraints::default(),
+        state: crate::xwayland::xwm::X11PublishedState::default(),
+        transient_for: None,
+        supports_delete: true,
+        supports_take_focus: true,
+        accepts_input: Some(true),
+        window_role: None,
+        startup_id: None,
+        user_time: None,
+        urgency: false,
+        sync_counter: None,
+    }
+}
+
 #[test]
 fn failed_begin_does_not_capture_native_input() {
     let mut state = CompositorState::default();
@@ -460,6 +488,62 @@ fn interaction_end_does_not_wait_for_resize_commit() {
     assert!(state.end_window_interaction_for_button(0x111));
     assert!(!state.window_interaction_active());
     assert_eq!(state.resize_configure_flows[&42].captured_count(), 1);
+}
+
+#[test]
+fn x11_resize_release_finalizes_preview_without_xdg_commit() {
+    let surface_id = 42;
+    let interaction_id = ResizeInteractionId::new(1);
+    let final_placement = SurfacePlacement::root_at(30, 40);
+    let snapshot = test_x11_snapshot(surface_id);
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
+        .expect("X11 desktop window");
+    state
+        .renderable_surfaces
+        .push(test_renderable_surface(surface_id, 300, 200));
+    state.set_surface_placement(surface_id, SurfacePlacement::root_at(10, 20));
+    state.toplevel_visual_geometries.insert(
+        surface_id,
+        ToplevelVisualGeometry {
+            placement: final_placement,
+            width: 360,
+            height: 240,
+            active_resize: Some(interaction_id),
+        },
+    );
+    state.active_toplevel_resizes.insert(
+        surface_id,
+        ActiveToplevelResize {
+            interaction_id,
+            flow_sequence: 1,
+            edges: ResizeEdges::BOTTOM_RIGHT,
+            activated_at: Instant::now(),
+        },
+    );
+    state.update_toplevel_visual_render_assignment(surface_id);
+    let mut interaction = test_window_interaction(
+        1,
+        WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+        Some(0x111),
+    );
+    interaction.window_id = window_id;
+    interaction.drag_committed = true;
+    state.window_interaction = Some(interaction);
+    assert!(state.renderable_surfaces[0].visual_clip.is_some());
+
+    assert!(state.end_window_interaction_for_button(0x111));
+
+    assert!(!state.active_toplevel_resizes.contains_key(&surface_id));
+    assert_eq!(
+        state.toplevel_visual_geometries[&surface_id].active_resize,
+        None
+    );
+    assert_eq!(state.renderable_surfaces[0].visual_clip, None);
+    assert_eq!(state.surface_placement(surface_id), final_placement);
+    assert_eq!(state.take_backend_commands().len(), 1);
 }
 
 #[test]

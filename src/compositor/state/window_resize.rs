@@ -379,6 +379,24 @@ impl CompositorState {
                     .unwrap_or(ToplevelMode::Floating),
                 false,
             );
+            let _ = self.set_surface_placement_with_cause(
+                surface_id,
+                geometry.placement,
+                RenderGenerationCause::WindowResize,
+            );
+            let owns_preview = self
+                .active_toplevel_resizes
+                .get(&surface_id)
+                .is_some_and(|active| active.interaction_id == interaction_id);
+            if owns_preview {
+                self.active_toplevel_resizes.remove(&surface_id);
+                if let Some(visual) = self.toplevel_visual_geometries.get_mut(&surface_id)
+                    && visual.active_resize == Some(interaction_id)
+                {
+                    visual.active_resize = None;
+                }
+                self.update_toplevel_visual_render_assignment(surface_id);
+            }
             return true;
         }
         let desired = self
