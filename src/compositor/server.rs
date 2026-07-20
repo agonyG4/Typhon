@@ -34,6 +34,8 @@ use wayland_server::{
 
 use crate::astrea_shell_control::server::astrea_shell_control_manager_v1;
 use crate::astrea_shortcuts::server::astrea_shortcuts_manager_v1;
+#[cfg(test)]
+use crate::render_backend::buffer::BufferId;
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
 use crate::wayland_drm::server::wl_drm;
@@ -440,6 +442,14 @@ impl OwnCompositorServer {
         self.state.take_xwayland_buffer_ready_events()
     }
 
+    #[cfg(test)]
+    pub(crate) fn current_surface_buffer_id(&self, surface_id: u32) -> Option<BufferId> {
+        self.state
+            .current_surface_buffers
+            .get(&surface_id)
+            .map(|pending| pending.data.buffer_id())
+    }
+
     pub fn take_xwayland_backend_commands(&mut self, now_ns: u64) -> Vec<XwmCommand> {
         self.state
             .take_backend_commands()
@@ -525,10 +535,23 @@ impl OwnCompositorServer {
         match event {
             XwmEvent::WindowMapRequested(handle) => vec![XwmCommand::Map(handle)],
             XwmEvent::WindowReady(snapshot) => {
-                if self.state.insert_x11_window(snapshot).is_ok() {
-                    vec![self.sync_xwayland_client_lists()]
-                } else {
-                    Vec::new()
+                let surface_id = snapshot.surface_id;
+                match self.state.insert_x11_window(snapshot) {
+                    Ok(_) => {
+                        let published = self
+                            .state
+                            .adopt_current_xwayland_surface_content(surface_id);
+                        eprintln!(
+                            "oblivion-one compositor: event=xwayland_window_admitted surface_id={surface_id} retained_buffer={published} published={published}"
+                        );
+                        vec![self.sync_xwayland_client_lists()]
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "oblivion-one compositor: event=xwayland_window_admission_failed surface_id={surface_id} error={error:?}"
+                        );
+                        Vec::new()
+                    }
                 }
             }
             XwmEvent::WindowDestroyed(handle) => {

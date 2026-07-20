@@ -1,6 +1,72 @@
 use super::*;
 
 impl CompositorState {
+    pub(in crate::compositor) fn adopt_current_xwayland_surface_content(
+        &mut self,
+        surface_id: u32,
+    ) -> bool {
+        if !matches!(self.surface_role(surface_id), SurfaceRole::Xwayland) {
+            return false;
+        }
+
+        let Some(surface_generation) = self
+            .xwayland
+            .surface_states
+            .get(&surface_id)
+            .map(|state| state.generation)
+        else {
+            return false;
+        };
+        if self
+            .xwayland
+            .client_identity
+            .as_ref()
+            .is_none_or(|identity| identity.generation != surface_generation)
+        {
+            return false;
+        }
+
+        let Some(window_id) = self.window_id_for_surface(surface_id) else {
+            return false;
+        };
+        if !self.window(window_id).is_some_and(|window| {
+            matches!(
+                window.backend,
+                WindowBackend::X11(handle) if handle.generation() == surface_generation
+            )
+        }) {
+            return false;
+        }
+
+        let Some(current) = self.current_surface_buffers.get(&surface_id).cloned() else {
+            return false;
+        };
+        let generation = self.next_render_generation_value();
+        let placement = self.surface_placement(surface_id);
+        let Ok(surface) = current.to_renderable_surface(
+            surface_id,
+            placement,
+            generation,
+            RenderableSurfaceDamage::Full,
+        ) else {
+            return false;
+        };
+        let buffer_size = surface.buffer_size();
+
+        self.renderable_surfaces
+            .retain(|existing| existing.surface_id != surface_id);
+        self.renderable_surfaces.push(surface);
+        self.record_surface_damage_commit(
+            surface_id,
+            RenderableSurfaceDamage::Full,
+            buffer_size.width,
+            buffer_size.height,
+        );
+        self.reorder_renderable_surfaces_by_committed_stack();
+        self.set_render_generation(generation, RenderGenerationCause::SurfaceCommit);
+        true
+    }
+
     pub(in crate::compositor) fn commit_xwayland_surface_buffer(
         &mut self,
         surface_id: u32,
