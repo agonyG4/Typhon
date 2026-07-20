@@ -174,16 +174,23 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         }
         Event::ConfigureNotify(event) => {
             let handle = X11WindowHandle::new(xwm.generation, event.window);
+            let geometry = X11Geometry {
+                x: i32::from(event.x),
+                y: i32::from(event.y),
+                width: u32::from(event.width),
+                height: u32::from(event.height),
+            };
             if let Some(record) = xwm.windows.get_mut(handle) {
-                record.geometry = X11Geometry {
-                    x: i32::from(event.x),
-                    y: i32::from(event.y),
-                    width: u32::from(event.width),
-                    height: u32::from(event.height),
-                };
+                record.geometry = geometry;
                 if let Some(snapshot) = record.snapshot.as_mut() {
                     snapshot.geometry = record.geometry;
                 }
+            }
+            if !xwm.note_configure_notify(handle, geometry) && xwm.windows.get(handle).is_some() {
+                xwm.outgoing_events.push_back(XwmEvent::ConfigureNotify {
+                    window: handle,
+                    geometry,
+                });
             }
         }
         Event::ClientMessage(event) if event.format == 32 => {
@@ -445,6 +452,9 @@ mod tests {
             sync_alarms: Default::default(),
             sync_handles_by_counter: Default::default(),
             next_resize_counter_values: Default::default(),
+            expected_configures: Default::default(),
+            immediate_resize_windows: Default::default(),
+            last_resize_geometries: Default::default(),
             shapes: Default::default(),
             data_bridge: super::super::data_bridge::DataBridge::default(),
             randr: super::super::startup::default_randr_snapshot(),

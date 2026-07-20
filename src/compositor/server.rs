@@ -573,6 +573,27 @@ impl OwnCompositorServer {
                 Vec::new()
             }
             XwmEvent::ConfigureRequested { window, request } => {
+                if self.state.x11_resize_active(window) {
+                    let mut commands = Vec::with_capacity(2);
+                    if let Some(mode) = request.stack_mode {
+                        commands.push(XwmCommand::Stack {
+                            window,
+                            sibling: request.sibling,
+                            mode,
+                        });
+                    }
+                    if request.fields.x
+                        || request.fields.y
+                        || request.fields.width
+                        || request.fields.height
+                        || request.fields.border_width
+                    {
+                        if let Some(geometry) = self.state.x11_authoritative_geometry(window) {
+                            commands.push(XwmCommand::ConfigureNotify { window, geometry });
+                        }
+                    }
+                    return commands;
+                }
                 let constraints = self
                     .state
                     .window_id_for_x11_handle(window)
@@ -606,6 +627,10 @@ impl OwnCompositorServer {
                     });
                 }
                 commands
+            }
+            XwmEvent::ConfigureNotify { window, geometry } => {
+                let _ = self.state.reconcile_x11_configure_notify(window, geometry);
+                Vec::new()
             }
             XwmEvent::StateRequested { window, request } => {
                 let was_hidden = self
@@ -667,13 +692,16 @@ impl OwnCompositorServer {
                 }]
             }
             XwmEvent::ResizeSyncPresented(window) => {
+                let _ = self.state.finalize_x11_resize(window);
                 vec![XwmCommand::CompleteResizeSync(window)]
             }
+            XwmEvent::ResizeSyncImmediate(window) => {
+                let _ = self.state.finalize_x11_resize(window);
+                Vec::new()
+            }
             XwmEvent::ResizeSyncTimedOut(window) => {
-                vec![XwmCommand::SetAllowCommits {
-                    window,
-                    allowed: true,
-                }]
+                let _ = self.state.finalize_x11_resize(window);
+                Vec::new()
             }
             XwmEvent::CloseRequestedByClient(window) => {
                 if let Some(window_id) = self.state.window_id_for_x11_handle(window) {
@@ -693,12 +721,22 @@ impl OwnCompositorServer {
             return false;
         };
         let was_focused = self.state.focused_window_id == Some(window_id);
+        let parent_id = self
+            .state
+            .window(window_id)
+            .and_then(|window| window.relationships.transient_for);
         let removed = self.state.remove_desktop_window(window_id).is_some();
         if removed && was_focused {
             self.state.focused_window_id = None;
             self.state.focused_surface = None;
             self.state.clear_keyboard_focus();
-            let _ = self.state.focus_topmost_renderable_toplevel();
+            if let Some(parent_id) = parent_id {
+                if !self.state.focus_desktop_window(parent_id) {
+                    let _ = self.state.focus_topmost_renderable_toplevel();
+                }
+            } else {
+                let _ = self.state.focus_topmost_renderable_toplevel();
+            }
         }
         removed
     }

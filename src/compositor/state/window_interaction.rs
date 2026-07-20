@@ -251,6 +251,12 @@ impl CompositorState {
             log_begin_rejection(self, begin, "window_identity_missing");
             return false;
         };
+        if self
+            .window(window_id)
+            .is_some_and(|window| !window.is_normal_x11_role())
+        {
+            return false;
+        }
         if let Some(pointer_motion_surface_id) = pointer_motion_surface_id {
             if self
                 .surface_resource_by_id(pointer_motion_surface_id)
@@ -503,6 +509,12 @@ impl CompositorState {
         y: f64,
     ) -> Option<WindowFrameHit> {
         if let Some(hit) = self.root_surface_hit_at(x, y) {
+            if self
+                .window(hit.window_id)
+                .is_some_and(|window| !window.is_normal_x11_role())
+            {
+                return None;
+            }
             let kind = window_frame_action_for_local_point(
                 hit.local_x,
                 hit.local_y,

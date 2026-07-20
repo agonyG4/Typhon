@@ -662,7 +662,12 @@ impl CompositorState {
                 self.focus_surface(surface.clone());
             } else if self.layer_surfaces.contains_key(&root_surface_id) {
                 let _ = self.activate_ondemand_layer_surface(root_surface_id);
-            } else if let Some(root_surface) = self.surface_resource_by_id(root_surface_id) {
+            } else if self
+                .window_id_for_surface(root_surface_id)
+                .and_then(|window_id| self.window(window_id))
+                .is_none_or(|window| window.is_normal_x11_role())
+                && let Some(root_surface) = self.surface_resource_by_id(root_surface_id)
+            {
                 self.focus_surface(root_surface);
             }
             let press = PointerPress {

@@ -101,8 +101,8 @@ impl CompositorState {
         geometry: WindowGeometry,
         edges: ResizeEdges,
     ) -> WindowGeometry {
-        let width = self.clamp_toplevel_width(surface_id, geometry.width);
-        let height = self.clamp_toplevel_height(surface_id, geometry.height);
+        let constraints = self.toplevel_constraints(surface_id);
+        let (width, height) = constrain_icccm_size(geometry.width, geometry.height, constraints);
         let mut placement = geometry.placement;
         if edges.left && width != geometry.width {
             let requested_right = placement
@@ -124,22 +124,26 @@ impl CompositorState {
 
     pub(in crate::compositor) fn clamp_toplevel_width(&self, surface_id: u32, width: u32) -> u32 {
         let constraints = self.toplevel_constraints(surface_id);
-        let min_width = constraints.min_width.unwrap_or(MIN_WINDOW_WIDTH);
-        let mut clamped = width.max(min_width);
-        if let Some(max_width) = constraints.max_width {
-            clamped = clamped.min(max_width.max(min_width));
-        }
-        clamped
+        constrain_icccm_dimension(
+            width,
+            constraints.min_width,
+            constraints.max_width,
+            constraints.base_width,
+            constraints.width_increment,
+            MIN_WINDOW_WIDTH,
+        )
     }
 
     pub(in crate::compositor) fn clamp_toplevel_height(&self, surface_id: u32, height: u32) -> u32 {
         let constraints = self.toplevel_constraints(surface_id);
-        let min_height = constraints.min_height.unwrap_or(MIN_WINDOW_HEIGHT);
-        let mut clamped = height.max(min_height);
-        if let Some(max_height) = constraints.max_height {
-            clamped = clamped.min(max_height.max(min_height));
-        }
-        clamped
+        constrain_icccm_dimension(
+            height,
+            constraints.min_height,
+            constraints.max_height,
+            constraints.base_height,
+            constraints.height_increment,
+            MIN_WINDOW_HEIGHT,
+        )
     }
 
     pub(in crate::compositor) fn toplevel_constraints(
@@ -379,24 +383,6 @@ impl CompositorState {
                     .unwrap_or(ToplevelMode::Floating),
                 false,
             );
-            let _ = self.set_surface_placement_with_cause(
-                surface_id,
-                geometry.placement,
-                RenderGenerationCause::WindowResize,
-            );
-            let owns_preview = self
-                .active_toplevel_resizes
-                .get(&surface_id)
-                .is_some_and(|active| active.interaction_id == interaction_id);
-            if owns_preview {
-                self.active_toplevel_resizes.remove(&surface_id);
-                if let Some(visual) = self.toplevel_visual_geometries.get_mut(&surface_id)
-                    && visual.active_resize == Some(interaction_id)
-                {
-                    visual.active_resize = None;
-                }
-                self.update_toplevel_visual_render_assignment(surface_id);
-            }
             return true;
         }
         let desired = self
@@ -543,5 +529,152 @@ impl CompositorState {
             );
         }
         true
+    }
+
+    pub(in crate::compositor) fn finalize_x11_resize(
+        &mut self,
+        handle: crate::xwayland::X11WindowHandle,
+    ) -> bool {
+        let Some(window_id) = self.window_id_for_x11_handle(handle) else {
+            return false;
+        };
+        let Some(surface_id) = self.window(window_id).map(|window| window.root_surface_id) else {
+            return false;
+        };
+        let Some(active) = self.active_toplevel_resizes.remove(&surface_id) else {
+            return false;
+        };
+        if let Some(visual) = self.toplevel_visual_geometries.get_mut(&surface_id)
+            && visual.active_resize == Some(active.interaction_id)
+        {
+            let placement = visual.placement;
+            visual.active_resize = None;
+            let _ = self.set_surface_placement_with_cause(
+                surface_id,
+                placement,
+                RenderGenerationCause::WindowResize,
+            );
+        }
+        self.update_toplevel_visual_render_assignment(surface_id);
+        true
+    }
+
+    pub(in crate::compositor) fn x11_resize_active(
+        &self,
+        handle: crate::xwayland::X11WindowHandle,
+    ) -> bool {
+        self.window_id_for_x11_handle(handle)
+            .and_then(|window_id| self.window(window_id))
+            .is_some_and(|window| {
+                self.active_toplevel_resizes
+                    .contains_key(&window.root_surface_id)
+            })
+    }
+}
+
+fn constrain_icccm_size(width: u32, height: u32, constraints: WindowConstraints) -> (u32, u32) {
+    let mut width = constrain_icccm_dimension(
+        width,
+        constraints.min_width,
+        constraints.max_width,
+        constraints.base_width,
+        constraints.width_increment,
+        MIN_WINDOW_WIDTH,
+    );
+    let mut height = constrain_icccm_dimension(
+        height,
+        constraints.min_height,
+        constraints.max_height,
+        constraints.base_height,
+        constraints.height_increment,
+        MIN_WINDOW_HEIGHT,
+    );
+    if let Some(min_aspect) = constraints.min_aspect.filter(|aspect| *aspect > 0.0) {
+        if f64::from(width) / f64::from(height) < min_aspect {
+            width = constrain_icccm_dimension(
+                (f64::from(height) * min_aspect).ceil() as u32,
+                constraints.min_width,
+                constraints.max_width,
+                constraints.base_width,
+                constraints.width_increment,
+                MIN_WINDOW_WIDTH,
+            );
+        }
+    }
+    if let Some(max_aspect) = constraints.max_aspect.filter(|aspect| *aspect > 0.0) {
+        if f64::from(width) / f64::from(height) > max_aspect {
+            height = constrain_icccm_dimension(
+                (f64::from(width) / max_aspect).ceil() as u32,
+                constraints.min_height,
+                constraints.max_height,
+                constraints.base_height,
+                constraints.height_increment,
+                MIN_WINDOW_HEIGHT,
+            );
+        }
+    }
+    (width, height)
+}
+
+fn constrain_icccm_dimension(
+    requested: u32,
+    min: Option<u32>,
+    max: Option<u32>,
+    base: Option<u32>,
+    increment: Option<u32>,
+    fallback_min: u32,
+) -> u32 {
+    let fixed = min
+        .zip(max)
+        .filter(|(min, max)| min == max)
+        .map(|(min, _)| min);
+    if let Some(fixed) = fixed {
+        return fixed.max(1);
+    }
+    let lower = min
+        .or(base)
+        .unwrap_or(if max.is_none() { fallback_min } else { 1 });
+    let upper = max.unwrap_or(u32::MAX).max(lower);
+    let requested = requested.max(lower).min(upper);
+    let Some(increment) = increment.filter(|increment| *increment > 0) else {
+        return requested;
+    };
+    let anchor = base.unwrap_or(lower).min(upper);
+    let steps = requested.saturating_sub(anchor) / increment;
+    anchor
+        .saturating_add(steps.saturating_mul(increment))
+        .max(lower)
+        .min(upper)
+}
+
+#[cfg(test)]
+mod icccm_tests {
+    use super::*;
+
+    #[test]
+    fn x11_resize_respects_base_size_and_increments() {
+        let constraints = WindowConstraints {
+            min_width: Some(320),
+            min_height: Some(200),
+            base_width: Some(320),
+            base_height: Some(200),
+            width_increment: Some(8),
+            height_increment: Some(10),
+            ..WindowConstraints::default()
+        };
+        assert_eq!(constrain_icccm_size(327, 209, constraints), (320, 200));
+        assert_eq!(constrain_icccm_size(329, 211, constraints), (328, 210));
+    }
+
+    #[test]
+    fn fixed_size_constraints_win_over_generic_minimum() {
+        let constraints = WindowConstraints {
+            min_width: Some(100),
+            max_width: Some(100),
+            min_height: Some(80),
+            max_height: Some(80),
+            ..WindowConstraints::default()
+        };
+        assert_eq!(constrain_icccm_size(900, 700, constraints), (100, 80));
     }
 }

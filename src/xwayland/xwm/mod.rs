@@ -43,8 +43,8 @@ use atoms::XwmAtoms;
 use capabilities::XwmCapabilities;
 pub use resize_sync::{RESIZE_SYNC_TIMEOUT_NS, ResizeSyncError, ResizeSyncState};
 pub(crate) use resize_sync::{ResizeSyncCommit, ResizeSyncTracker};
-pub use window::X11WindowLifecycle;
 use window::X11WindowRegistry;
+pub use window::{X11WindowLifecycle, X11WindowType};
 
 use super::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 
@@ -136,6 +136,8 @@ pub struct X11WindowSnapshot {
     pub handle: X11WindowHandle,
     pub surface_id: u32,
     pub kind: DesktopWindowKind,
+    pub window_type: Option<X11WindowType>,
+    pub override_redirect: bool,
     pub geometry: X11Geometry,
     pub metadata: WindowMetadata,
     pub constraints: WindowConstraints,
@@ -158,6 +160,8 @@ pub enum X11MetadataDelta {
     Pid(Option<u32>),
     Constraints(WindowConstraints),
     TransientFor(Option<X11WindowHandle>),
+    WindowType(Option<X11WindowType>),
+    AcceptsInput(Option<bool>),
     Protocols {
         supports_delete: bool,
         supports_take_focus: bool,
@@ -184,6 +188,10 @@ pub enum XwmEvent {
         window: X11WindowHandle,
         request: X11ConfigureRequest,
     },
+    ConfigureNotify {
+        window: X11WindowHandle,
+        geometry: X11Geometry,
+    },
     StateRequested {
         window: X11WindowHandle,
         request: X11StateRequest,
@@ -201,6 +209,7 @@ pub enum XwmEvent {
         counter_value: u64,
     },
     ResizeSyncPresented(X11WindowHandle),
+    ResizeSyncImmediate(X11WindowHandle),
     ResizeSyncTimedOut(X11WindowHandle),
 }
 
@@ -213,6 +222,10 @@ pub enum XwmCommand {
         geometry: X11Geometry,
         fields: X11ConfigureFlags,
         border_width: u32,
+    },
+    ConfigureNotify {
+        window: X11WindowHandle,
+        geometry: X11Geometry,
     },
     Stack {
         window: X11WindowHandle,
@@ -324,6 +337,9 @@ pub struct Xwm {
     pub(crate) sync_alarms: HashMap<X11WindowHandle, u32>,
     pub(crate) sync_handles_by_counter: HashMap<u32, X11WindowHandle>,
     pub(crate) next_resize_counter_values: HashMap<X11WindowHandle, u64>,
+    pub(crate) expected_configures: HashMap<X11WindowHandle, X11Geometry>,
+    pub(crate) immediate_resize_windows: HashSet<X11WindowHandle>,
+    pub(crate) last_resize_geometries: HashMap<X11WindowHandle, X11Geometry>,
     pub(crate) shapes: HashMap<X11WindowHandle, shape::ShapeRegion>,
     pub(crate) data_bridge: data_bridge::DataBridge,
     pub(crate) randr: randr::RandrSnapshot,
@@ -498,9 +514,29 @@ impl Xwm {
         for handle in handles {
             self.mark_window_buffer_ready(handle)?;
             match self.resize_sync.note_commit(handle) {
-                ResizeSyncCommit::Presented | ResizeSyncCommit::FallbackPresented => self
-                    .outgoing_events
-                    .push_back(XwmEvent::ResizeSyncPresented(handle)),
+                ResizeSyncCommit::Presented | ResizeSyncCommit::FallbackPresented => {
+                    if std::env::var_os("TYPHON_XWAYLAND_LOG").is_some() {
+                        let geometry = self
+                            .resize_sync
+                            .transaction(handle)
+                            .map(|(_, geometry, _)| geometry);
+                        eprintln!(
+                            "oblivion-one xwayland: event=x11_resize_presented xid={} transaction_id={} counter={} geometry={:?} latest_desired={:?}",
+                            handle.xid(),
+                            self.resize_sync.transaction_id(handle).unwrap_or_default(),
+                            self.resize_sync
+                                .state(handle)
+                                .counter_value()
+                                .unwrap_or_default(),
+                            geometry,
+                            self.resize_sync
+                                .desired(handle)
+                                .map(|desired| desired.geometry),
+                        );
+                    }
+                    self.outgoing_events
+                        .push_back(XwmEvent::ResizeSyncPresented(handle))
+                }
                 ResizeSyncCommit::Deferred | ResizeSyncCommit::Ignored => {}
             }
         }
@@ -516,6 +552,22 @@ impl Xwm {
             return;
         };
         if self.resize_sync.acknowledge(handle, value) {
+            if std::env::var_os("TYPHON_XWAYLAND_LOG").is_some() {
+                let geometry = self
+                    .resize_sync
+                    .transaction(handle)
+                    .map(|(_, geometry, _)| geometry);
+                eprintln!(
+                    "oblivion-one xwayland: event=x11_resize_acked xid={} transaction_id={} counter={} geometry={:?} latest_desired={:?}",
+                    handle.xid(),
+                    self.resize_sync.transaction_id(handle).unwrap_or_default(),
+                    value,
+                    geometry,
+                    self.resize_sync
+                        .desired(handle)
+                        .map(|desired| desired.geometry),
+                );
+            }
             self.outgoing_events.push_back(XwmEvent::ResizeSyncAcked {
                 window: handle,
                 counter_value: value,
@@ -530,11 +582,43 @@ impl Xwm {
     pub(crate) fn handle_resize_sync_deadline(&mut self, now_ns: u64) -> Result<(), XwmError> {
         for handle in self.resize_sync.expired_handles(now_ns) {
             if self.resize_sync.timeout(handle, now_ns) {
+                let transaction = self.resize_sync.transaction(handle);
+                let counter_value = self
+                    .resize_sync
+                    .state(handle)
+                    .counter_value()
+                    .unwrap_or_default();
+                let latest_desired = self
+                    .resize_sync
+                    .desired(handle)
+                    .map(|desired| desired.geometry);
                 let allow_result = commands::set_allow_commits(self, handle, true);
-                self.clear_resize_sync(handle);
+                self.clear_resize_sync_alarm(handle);
+                self.resize_sync.finish_timeout(handle);
                 allow_result?;
+                if std::env::var_os("TYPHON_XWAYLAND_LOG").is_some() {
+                    let (transaction_id, geometry, _) = transaction.unwrap_or_default();
+                    eprintln!(
+                        "oblivion-one xwayland: event=x11_resize_timeout xid={} transaction_id={} counter={} geometry={:?} latest_desired={:?}",
+                        handle.xid(),
+                        transaction_id,
+                        counter_value,
+                        geometry,
+                        latest_desired,
+                    );
+                }
                 self.outgoing_events
                     .push_back(XwmEvent::ResizeSyncTimedOut(handle));
+                if let Some(desired) = self.resize_sync.take_desired(handle) {
+                    let now = crate::native::event_loop::monotonic_now_ns().unwrap_or(now_ns);
+                    commands::begin_resize_sync(
+                        self,
+                        handle,
+                        desired.geometry,
+                        0,
+                        now.saturating_add(RESIZE_SYNC_TIMEOUT_NS),
+                    )?;
+                }
             }
         }
         Ok(())
@@ -545,12 +629,47 @@ impl Xwm {
             return Err(XwmError::InvalidCommand("resize sync is not presented"));
         }
         self.clear_resize_sync_alarm(handle);
+        if let Some(desired) = self.resize_sync.take_desired(handle) {
+            let now = crate::native::event_loop::monotonic_now_ns().unwrap_or_default();
+            commands::begin_resize_sync(
+                self,
+                handle,
+                desired.geometry,
+                0,
+                now.saturating_add(RESIZE_SYNC_TIMEOUT_NS),
+            )?;
+        }
         Ok(())
     }
 
     pub(crate) fn clear_resize_sync(&mut self, handle: X11WindowHandle) {
         self.resize_sync.clear(handle);
         self.clear_resize_sync_alarm(handle);
+        self.expected_configures.remove(&handle);
+        self.immediate_resize_windows.remove(&handle);
+        self.last_resize_geometries.remove(&handle);
+    }
+
+    pub(crate) fn note_expected_configure(
+        &mut self,
+        handle: X11WindowHandle,
+        geometry: X11Geometry,
+    ) {
+        self.expected_configures.insert(handle, geometry);
+    }
+
+    pub(crate) fn note_configure_notify(
+        &mut self,
+        handle: X11WindowHandle,
+        geometry: X11Geometry,
+    ) -> bool {
+        let expected = self.expected_configures.get(&handle).copied();
+        if expected == Some(geometry) {
+            self.expected_configures.remove(&handle);
+            true
+        } else {
+            false
+        }
     }
 
     fn clear_resize_sync_generation(&mut self, generation: XwaylandGeneration) {
@@ -562,6 +681,8 @@ impl Xwm {
             .collect::<Vec<_>>();
         self.resize_sync.clear_generation(generation);
         self.next_resize_counter_values
+            .retain(|handle, _| handle.generation() != generation);
+        self.expected_configures
             .retain(|handle, _| handle.generation() != generation);
         for handle in handles {
             self.clear_resize_sync_alarm(handle);

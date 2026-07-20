@@ -30,6 +30,7 @@ impl CompositorState {
         surface_id: u32,
     ) -> WindowConstraints {
         self.toplevel_window_id(surface_id)
+            .or_else(|| self.window_id_for_surface(surface_id))
             .and_then(|window_id| self.window(window_id))
             .map(|window| window.constraints)
             .unwrap_or_default()
@@ -67,6 +68,7 @@ impl CompositorState {
         }
         self.window_stacking.push(window.id);
         self.desktop_windows.insert(window.id, window);
+        self.rebuild_x11_transient_relationships();
         Ok(())
     }
 
@@ -80,6 +82,7 @@ impl CompositorState {
             self.window_by_x11_handle.remove(&handle);
         }
         self.window_stacking.retain(|window_id| *window_id != id);
+        self.rebuild_x11_transient_relationships();
         Some(window)
     }
 
@@ -125,16 +128,10 @@ impl CompositorState {
         let handle = snapshot.handle;
         let geometry = snapshot.geometry;
         let requested_state = snapshot.state;
-        let transient_for = snapshot.transient_for;
         self.insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
             .map_err(|_| X11WindowAdmissionError::DuplicateRootSurface)?;
         let _ = self.set_x11_geometry(handle, geometry);
-        if let Some(parent_handle) = transient_for
-            && let Some(parent_id) = self.window_id_for_x11_handle(parent_handle)
-            && let Some(window) = self.window_mut(window_id)
-        {
-            window.relationships.transient_for = Some(parent_id);
-        }
+        self.rebuild_x11_transient_relationships();
         self.apply_initial_x11_state(handle, requested_state, geometry);
         Ok(window_id)
     }
@@ -219,6 +216,14 @@ impl CompositorState {
         let Some(window_id) = self.window_id_for_x11_handle(handle) else {
             return false;
         };
+        let transient_handle = match &delta {
+            crate::xwayland::xwm::X11MetadataDelta::TransientFor(parent) => *parent,
+            _ => None,
+        };
+        let accepted_transient_handle = transient_handle
+            .filter(|parent| !self.x11_transient_would_cycle(window_id, Some(*parent)));
+        let transient_parent_id =
+            accepted_transient_handle.and_then(|parent| self.window_id_for_x11_handle(parent));
         let Some(window) = self.window_mut(window_id) else {
             return false;
         };
@@ -235,10 +240,75 @@ impl CompositorState {
             crate::xwayland::xwm::X11MetadataDelta::Constraints(constraints) => {
                 window.constraints = constraints;
             }
-            crate::xwayland::xwm::X11MetadataDelta::TransientFor(_) => {}
+            crate::xwayland::xwm::X11MetadataDelta::TransientFor(_) => {
+                window.relationships.transient_for = transient_parent_id;
+                window.x11_transient_for = accepted_transient_handle;
+                window.x11_role = Some(crate::compositor::desktop_window::classify_x11_role(
+                    window.kind,
+                    window.x11_window_type,
+                    accepted_transient_handle.is_some(),
+                    window.kind == DesktopWindowKind::OverrideRedirect,
+                ));
+            }
+            crate::xwayland::xwm::X11MetadataDelta::WindowType(window_type) => {
+                window.x11_window_type = window_type;
+                window.x11_role = Some(crate::compositor::desktop_window::classify_x11_role(
+                    window.kind,
+                    window.x11_window_type,
+                    window.x11_transient_for.is_some(),
+                    window.kind == DesktopWindowKind::OverrideRedirect,
+                ));
+            }
+            crate::xwayland::xwm::X11MetadataDelta::AcceptsInput(accepts_input) => {
+                window.x11_accepts_input = accepts_input;
+            }
             crate::xwayland::xwm::X11MetadataDelta::Protocols { .. } => {}
         }
+        self.rebuild_x11_transient_relationships();
         true
+    }
+
+    fn x11_transient_would_cycle(
+        &self,
+        child_id: WindowId,
+        parent_handle: Option<crate::xwayland::X11WindowHandle>,
+    ) -> bool {
+        let Some(mut current) =
+            parent_handle.and_then(|handle| self.window_id_for_x11_handle(handle))
+        else {
+            return false;
+        };
+        let mut seen = std::collections::HashSet::new();
+        while seen.insert(current) {
+            if current == child_id {
+                return true;
+            }
+            let Some(parent) = self
+                .window(current)
+                .and_then(|window| window.relationships.transient_for)
+            else {
+                return false;
+            };
+            current = parent;
+        }
+        true
+    }
+
+    fn rebuild_x11_transient_relationships(&mut self) {
+        let handles = self
+            .desktop_windows
+            .values()
+            .filter_map(|window| match window.backend {
+                WindowBackend::X11(handle) => Some((window.id, handle, window.x11_transient_for)),
+                WindowBackend::Xdg(_) => None,
+            })
+            .collect::<Vec<_>>();
+        for (id, _, transient_for) in handles {
+            let parent = transient_for.and_then(|handle| self.window_id_for_x11_handle(handle));
+            if let Some(window) = self.window_mut(id) {
+                window.relationships.transient_for = parent;
+            }
+        }
     }
 
     pub(in crate::compositor) fn filter_x11_geometry(
@@ -286,6 +356,83 @@ impl CompositorState {
             RenderGenerationCause::WindowMove,
         );
         true
+    }
+
+    pub(in crate::compositor) fn reconcile_x11_configure_notify(
+        &mut self,
+        handle: X11WindowHandle,
+        geometry: crate::xwayland::xwm::X11Geometry,
+    ) -> bool {
+        let Some(window_id) = self.window_id_for_x11_handle(handle) else {
+            return false;
+        };
+        let Some(root_surface_id) = self.window(window_id).map(|window| window.root_surface_id)
+        else {
+            return false;
+        };
+        if self.active_toplevel_resizes.contains_key(&root_surface_id) {
+            return false;
+        }
+        let placement = SurfacePlacement::absolute_root_at(geometry.x, geometry.y);
+        let changed = self.surface_placement(root_surface_id) != placement
+            || self
+                .current_visual_root_window_geometry(root_surface_id)
+                .is_some_and(|current| {
+                    current.width != geometry.width || current.height != geometry.height
+                });
+        self.set_surface_placement_with_cause(
+            root_surface_id,
+            placement,
+            RenderGenerationCause::WindowMove,
+        );
+        if let Some(visual) = self.toplevel_visual_geometries.get_mut(&root_surface_id) {
+            visual.placement = placement;
+            visual.width = geometry.width;
+            visual.height = geometry.height;
+            self.update_toplevel_visual_render_assignment(root_surface_id);
+        }
+        let child_surfaces = self
+            .renderable_surfaces
+            .iter()
+            .filter_map(|surface| {
+                (self.root_surface_id_for_surface(surface.surface_id) == root_surface_id)
+                    .then_some(surface.surface_id)
+            })
+            .collect::<Vec<_>>();
+        for surface_id in child_surfaces {
+            if let Some(surface) = self
+                .renderable_surfaces
+                .iter_mut()
+                .find(|surface| surface.surface_id == surface_id)
+            {
+                surface.placement = placement;
+                if surface_id == root_surface_id {
+                    surface.width = geometry.width;
+                    surface.height = geometry.height;
+                }
+            }
+        }
+        if changed {
+            self.advance_render_generation(RenderGenerationCause::WindowMove);
+        }
+        changed
+    }
+
+    pub(in crate::compositor) fn x11_authoritative_geometry(
+        &self,
+        handle: X11WindowHandle,
+    ) -> Option<crate::xwayland::xwm::X11Geometry> {
+        let window_id = self.window_id_for_x11_handle(handle)?;
+        let window = self.window(window_id)?;
+        let geometry = self
+            .current_visual_root_window_geometry(window.root_surface_id)
+            .or_else(|| self.current_root_window_geometry(window.root_surface_id))?;
+        Some(crate::xwayland::xwm::X11Geometry {
+            x: geometry.placement.local_x,
+            y: geometry.placement.local_y,
+            width: geometry.width,
+            height: geometry.height,
+        })
     }
 
     pub(in crate::compositor) fn apply_x11_published_state(
@@ -369,9 +516,123 @@ impl CompositorState {
         if !self.desktop_windows.contains_key(&id) {
             return false;
         }
-        self.window_stacking.retain(|window_id| *window_id != id);
-        self.window_stacking.push(id);
+        let root = self.x11_family_root(id);
+        let family = self.x11_family_order(root);
+        if family.is_empty() {
+            return false;
+        }
+        self.window_stacking
+            .retain(|window_id| !family.contains(window_id));
+        self.window_stacking.extend(family);
         true
+    }
+
+    pub(in crate::compositor) fn raise_x11_family_for_surface(&mut self, surface_id: u32) -> bool {
+        let Some(id) = self.window_id_for_surface(surface_id) else {
+            return false;
+        };
+        let root = self.x11_family_root(id);
+        let family = self.x11_family_order(root);
+        let changed_stack = self.raise_window_id(id);
+        let family_roots = family
+            .iter()
+            .filter_map(|id| self.window(*id).map(|window| window.root_surface_id))
+            .collect::<std::collections::HashSet<_>>();
+        let original_order = self
+            .renderable_surfaces
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>();
+        let placements = &self.surface_placements;
+        let mut raised = Vec::new();
+        let mut lower = Vec::with_capacity(self.renderable_surfaces.len());
+        for surface in self.renderable_surfaces.drain(..) {
+            if family_roots.contains(&root_surface_id_for_surface_in_placements(
+                placements,
+                surface.surface_id,
+            )) {
+                raised.push(surface);
+            } else {
+                lower.push(surface);
+            }
+        }
+        lower.extend(raised);
+        let changed_surfaces = lower
+            .iter()
+            .map(|surface| surface.surface_id)
+            .ne(original_order.into_iter());
+        self.renderable_surfaces = lower;
+        if changed_surfaces {
+            self.invalidate_surface_origin_cache();
+            self.advance_render_generation(RenderGenerationCause::WindowStack);
+        }
+        changed_stack || changed_surfaces
+    }
+
+    fn x11_family_root(&self, mut id: WindowId) -> WindowId {
+        let mut seen = std::collections::HashSet::new();
+        while seen.insert(id) {
+            let Some(parent) = self
+                .window(id)
+                .and_then(|window| window.relationships.transient_for)
+            else {
+                break;
+            };
+            id = parent;
+        }
+        id
+    }
+
+    fn x11_family_order(&self, root: WindowId) -> Vec<WindowId> {
+        let members = self
+            .desktop_windows
+            .values()
+            .filter(|window| {
+                let mut current = window.id;
+                let mut seen = std::collections::HashSet::new();
+                while seen.insert(current) {
+                    if current == root {
+                        return true;
+                    }
+                    let Some(parent) = self
+                        .window(current)
+                        .and_then(|candidate| candidate.relationships.transient_for)
+                    else {
+                        break;
+                    };
+                    current = parent;
+                }
+                false
+            })
+            .map(|window| window.id)
+            .collect::<std::collections::HashSet<_>>();
+        let mut ordered = members.into_iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|id| {
+            let depth = self.x11_family_depth(*id, root);
+            let map_order = self
+                .window_stacking
+                .iter()
+                .position(|candidate| candidate == id)
+                .unwrap_or(usize::MAX);
+            (depth, map_order)
+        });
+        ordered
+    }
+
+    fn x11_family_depth(&self, mut id: WindowId, root: WindowId) -> usize {
+        let mut depth = 0;
+        let mut seen = std::collections::HashSet::new();
+        while id != root && seen.insert(id) {
+            let Some(parent) = self
+                .window(id)
+                .and_then(|window| window.relationships.transient_for)
+            else {
+                break;
+            };
+            id = parent;
+            depth += 1;
+        }
+        depth
     }
 
     pub(in crate::compositor) fn x11_client_lists(
@@ -383,7 +644,9 @@ impl CompositorState {
         let mut client_list = self
             .desktop_windows
             .values()
-            .filter(|window| window.kind == DesktopWindowKind::Managed)
+            .filter(|window| {
+                window.kind == DesktopWindowKind::Managed && window.is_normal_x11_role()
+            })
             .filter_map(|window| match window.backend {
                 WindowBackend::X11(handle) => Some((window.id, handle)),
                 WindowBackend::Xdg(_) => None,
@@ -398,7 +661,9 @@ impl CompositorState {
             .window_stacking
             .iter()
             .filter_map(|id| self.window(*id))
-            .filter(|window| window.kind == DesktopWindowKind::Managed)
+            .filter(|window| {
+                window.kind == DesktopWindowKind::Managed && window.is_normal_x11_role()
+            })
             .filter_map(|window| match window.backend {
                 WindowBackend::X11(handle) => Some(handle),
                 WindowBackend::Xdg(_) => None,

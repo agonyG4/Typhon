@@ -5,7 +5,7 @@ impl CompositorState {
         let Some(window) = self.window(window_id) else {
             return false;
         };
-        if window.kind == DesktopWindowKind::OverrideRedirect {
+        if !window.is_normal_x11_role() {
             return false;
         }
         let surface_id = window.root_surface_id;
@@ -24,7 +24,7 @@ impl CompositorState {
         let Some(target) = self.window(target_id) else {
             return false;
         };
-        if target.kind == DesktopWindowKind::OverrideRedirect {
+        if !target.is_normal_x11_role() {
             return false;
         }
         self.focused_window_id.is_none_or(|focused| {
@@ -952,7 +952,7 @@ impl CompositorState {
     pub(in crate::compositor) fn restore_next_minimized_window(&mut self) -> bool {
         let Some(window_id) = self.window_stacking.iter().copied().find(|window_id| {
             self.window(*window_id)
-                .is_some_and(|window| window.state.is_minimized())
+                .is_some_and(|window| window.state.is_minimized() && window.is_normal_x11_role())
         }) else {
             return false;
         };
@@ -963,6 +963,12 @@ impl CompositorState {
         let Some(window_id) = self.window_id_for_surface(surface_id) else {
             return false;
         };
+        if self
+            .window(window_id)
+            .is_some_and(|window| !window.is_normal_x11_role())
+        {
+            return false;
+        }
         if self
             .window(window_id)
             .is_some_and(|window| window.state.is_minimized())
@@ -1002,6 +1008,12 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn minimize_desktop_window(&mut self, window_id: WindowId) -> bool {
+        if self
+            .window(window_id)
+            .is_some_and(|window| !window.is_normal_x11_role())
+        {
+            return false;
+        }
         let Some(root_surface_id) = self.window(window_id).map(|window| window.root_surface_id)
         else {
             return false;
@@ -1092,6 +1104,12 @@ impl CompositorState {
         let Some(window_id) = self.window_id_for_surface(surface_id) else {
             return false;
         };
+        if self
+            .window(window_id)
+            .is_some_and(|window| !window.is_normal_x11_role())
+        {
+            return false;
+        }
         let Some(current_mode) = self.window(window_id).map(|window| window.state.mode()) else {
             return false;
         };
@@ -1119,6 +1137,13 @@ impl CompositorState {
         surface_id: u32,
         mode: ToplevelMode,
     ) -> bool {
+        if self
+            .window_id_for_surface(surface_id)
+            .and_then(|window_id| self.window(window_id))
+            .is_some_and(|window| !window.is_normal_x11_role())
+        {
+            return false;
+        }
         if let Some(window_id) = self.window_id_for_surface(surface_id)
             && matches!(
                 self.window(window_id).map(|window| window.backend),
@@ -1331,6 +1356,12 @@ impl CompositorState {
 
     pub(in crate::compositor) fn focus_topmost_renderable_toplevel(&mut self) -> bool {
         let Some(surface_id) = self.window_stacking.iter().rev().find_map(|window_id| {
+            if !self
+                .window(*window_id)
+                .is_some_and(DesktopWindow::is_normal_x11_role)
+            {
+                return None;
+            }
             let root_surface_id = self.window(*window_id)?.root_surface_id;
             self.renderable_surfaces
                 .iter()
@@ -1347,6 +1378,13 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn raise_root_window(&mut self, surface_id: u32) -> bool {
+        if self
+            .window_id_for_surface(surface_id)
+            .and_then(|window_id| self.window(window_id))
+            .is_some_and(|window| matches!(window.backend, WindowBackend::X11(_)))
+        {
+            return self.raise_x11_family_for_surface(surface_id);
+        }
         if let Some(window_id) = self.window_id_for_surface(surface_id) {
             let _ = self.raise_window_id(window_id);
         }

@@ -121,6 +121,8 @@ fn fake_snapshot() -> X11WindowSnapshot {
         ),
         surface_id: 7,
         kind: DesktopWindowKind::Managed,
+        window_type: None,
+        override_redirect: false,
         geometry: X11Geometry {
             x: 0,
             y: 0,

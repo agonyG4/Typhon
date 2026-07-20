@@ -12,6 +12,7 @@ use x11rb::{
 
 use super::{
     X11ConfigureFlags, X11Geometry, X11PublishedState, X11StackMode, Xwm, XwmCommand, XwmError,
+    XwmEvent,
     atoms::XwmAtomName,
     ewmh::publishable_state,
     focus::{FocusModel, focus_model, should_send_take_focus},
@@ -84,8 +85,42 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             fields,
             border_width,
         } => {
+            if fields.x || fields.y || fields.width || fields.height || fields.border_width {
+                if queue_resize_desired(xwm, window, geometry, true)? {
+                    return Ok(());
+                }
+            }
             xwm.connection
                 .configure_window(window.xid(), &configure_aux(geometry, fields, border_width))
+                .map_err(XwmError::Connection)?;
+            xwm.note_expected_configure(window, geometry);
+            if xwm.immediate_resize_windows.remove(&window) {
+                xwm.last_resize_geometries.remove(&window);
+                xwm.outgoing_events
+                    .push_back(XwmEvent::ResizeSyncImmediate(window));
+            }
+        }
+        XwmCommand::ConfigureNotify { window, geometry } => {
+            let event = xproto::ConfigureNotifyEvent {
+                response_type: xproto::CONFIGURE_NOTIFY_EVENT,
+                sequence: 0,
+                event: window.xid(),
+                window: window.xid(),
+                above_sibling: x11rb::NONE,
+                x: geometry.x as i16,
+                y: geometry.y as i16,
+                width: geometry.width.min(u32::from(u16::MAX)) as u16,
+                height: geometry.height.min(u32::from(u16::MAX)) as u16,
+                border_width: 0,
+                override_redirect: false,
+            };
+            xwm.connection
+                .send_event(
+                    false,
+                    window.xid(),
+                    xproto::EventMask::STRUCTURE_NOTIFY,
+                    event,
+                )
                 .map_err(XwmError::Connection)?;
         }
         XwmCommand::Stack {
@@ -159,12 +194,14 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             }
         }
         XwmCommand::Raise(handle) => {
-            xwm.connection
-                .configure_window(
-                    handle.xid(),
-                    &ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE),
-                )
-                .map_err(XwmError::Connection)?;
+            for family_handle in transient_family_handles(xwm, handle) {
+                xwm.connection
+                    .configure_window(
+                        family_handle.xid(),
+                        &ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE),
+                    )
+                    .map_err(XwmError::Connection)?;
+            }
         }
         XwmCommand::Close(handle) => {
             let supports_delete = xwm
@@ -232,7 +269,9 @@ fn command_handle(command: &XwmCommand) -> Option<super::X11WindowHandle> {
         | XwmCommand::Unmap(handle)
         | XwmCommand::Raise(handle)
         | XwmCommand::Close(handle) => Some(*handle),
-        XwmCommand::Configure { window, .. } | XwmCommand::SetState { window, .. } => Some(*window),
+        XwmCommand::Configure { window, .. }
+        | XwmCommand::ConfigureNotify { window, .. }
+        | XwmCommand::SetState { window, .. } => Some(*window),
         XwmCommand::Stack { window, .. } => Some(*window),
         XwmCommand::Focus { window, .. } => *window,
         XwmCommand::SyncClientLists { .. } => None,
@@ -240,6 +279,56 @@ fn command_handle(command: &XwmCommand) -> Option<super::X11WindowHandle> {
         | XwmCommand::SetAllowCommits { window, .. }
         | XwmCommand::CompleteResizeSync(window) => Some(*window),
     }
+}
+
+fn transient_family_handles(
+    xwm: &Xwm,
+    requested: super::X11WindowHandle,
+) -> Vec<super::X11WindowHandle> {
+    let mut parent_by_handle = std::collections::HashMap::new();
+    for (handle, snapshot) in xwm.windows.snapshots() {
+        parent_by_handle.insert(handle, snapshot.transient_for);
+    }
+    let mut root = requested;
+    let mut seen = std::collections::HashSet::new();
+    while seen.insert(root) {
+        let Some(Some(parent)) = parent_by_handle.get(&root) else {
+            break;
+        };
+        root = *parent;
+    }
+    let mut family = parent_by_handle
+        .keys()
+        .copied()
+        .filter(|handle| {
+            let mut current = *handle;
+            let mut seen = std::collections::HashSet::new();
+            while seen.insert(current) {
+                if current == root {
+                    return true;
+                }
+                let Some(Some(parent)) = parent_by_handle.get(&current) else {
+                    break;
+                };
+                current = *parent;
+            }
+            false
+        })
+        .collect::<Vec<_>>();
+    family.sort_by_key(|handle| {
+        let mut depth = 0usize;
+        let mut current = *handle;
+        let mut seen = std::collections::HashSet::new();
+        while current != root && seen.insert(current) {
+            let Some(Some(parent)) = parent_by_handle.get(&current) else {
+                break;
+            };
+            current = *parent;
+            depth += 1;
+        }
+        (depth, handle.xid())
+    });
+    family
 }
 
 fn publish_client_list(
@@ -263,7 +352,7 @@ fn publish_client_list(
     Ok(())
 }
 
-fn begin_resize_sync(
+pub(crate) fn begin_resize_sync(
     xwm: &mut Xwm,
     window: super::X11WindowHandle,
     geometry: X11Geometry,
@@ -276,26 +365,44 @@ fn begin_resize_sync(
         .and_then(|record| record.snapshot.as_ref())
         .and_then(|snapshot| snapshot.sync_counter)
     else {
+        if xwm.last_resize_geometries.get(&window).copied() == Some(geometry) {
+            return Ok(());
+        }
         xwm.connection
             .configure_window(
                 window.xid(),
                 &configure_aux(geometry, X11ConfigureFlags::all(), 0),
             )
             .map_err(XwmError::Connection)?;
+        xwm.immediate_resize_windows.insert(window);
+        xwm.last_resize_geometries.insert(window, geometry);
+        xwm.note_expected_configure(window, geometry);
         return Ok(());
     };
     if !xwm.capabilities.sync {
+        if xwm.last_resize_geometries.get(&window).copied() == Some(geometry) {
+            return Ok(());
+        }
         xwm.connection
             .configure_window(
                 window.xid(),
                 &configure_aux(geometry, X11ConfigureFlags::all(), 0),
             )
             .map_err(XwmError::Connection)?;
+        xwm.immediate_resize_windows.insert(window);
+        xwm.last_resize_geometries.insert(window, geometry);
+        xwm.note_expected_configure(window, geometry);
         return Ok(());
     }
+    if xwm.resize_sync.is_pending(window) {
+        if xwm.resize_sync.queue_desired(window, geometry, false) {
+            log_resize_event("x11_resize_coalesced", xwm, window, Some(geometry), None);
+        }
+        return Ok(());
+    }
+    let desired = geometry;
     let sync_counter = u32::try_from(sync_counter)
         .map_err(|_| XwmError::InvalidCommand("XSync counter ID exceeds X11 width"))?;
-    xwm.clear_resize_sync(window);
     let alarm = xwm
         .connection
         .generate_id()
@@ -322,10 +429,13 @@ fn begin_resize_sync(
                 .events(1u32),
         )
         .map_err(XwmError::Connection)?;
-    if let Err(error) = xwm
-        .resize_sync
-        .begin(window, requested_counter_value, deadline_ns)
-    {
+    if let Err(error) = xwm.resize_sync.begin_transaction(
+        window,
+        requested_counter_value,
+        deadline_ns,
+        desired,
+        false,
+    ) {
         let _ = xwm.connection.sync_destroy_alarm(alarm);
         return Err(XwmError::ResizeSync(error));
     }
@@ -347,7 +457,81 @@ fn begin_resize_sync(
         xwm.clear_resize_sync(window);
         return Err(error);
     }
+    xwm.note_expected_configure(window, geometry);
+    log_resize_event(
+        "x11_resize_sync_started",
+        xwm,
+        window,
+        Some(geometry),
+        Some(requested_counter_value),
+    );
     Ok(())
+}
+
+fn queue_resize_desired(
+    xwm: &mut Xwm,
+    window: super::X11WindowHandle,
+    geometry: X11Geometry,
+    final_pending: bool,
+) -> Result<bool, XwmError> {
+    if !xwm.resize_sync.is_pending(window) {
+        return Ok(false);
+    }
+    if xwm
+        .resize_sync
+        .queue_desired(window, geometry, final_pending)
+    {
+        log_resize_event(
+            if final_pending {
+                "x11_resize_final_pending"
+            } else {
+                "x11_resize_coalesced"
+            },
+            xwm,
+            window,
+            Some(geometry),
+            None,
+        );
+    }
+    Ok(true)
+}
+
+fn log_resize_event(
+    event: &str,
+    xwm: &Xwm,
+    window: super::X11WindowHandle,
+    geometry: Option<X11Geometry>,
+    counter_value: Option<u64>,
+) {
+    if std::env::var_os("TYPHON_XWAYLAND_LOG").is_none() {
+        return;
+    }
+    let current = geometry.or_else(|| {
+        xwm.resize_sync
+            .transaction(window)
+            .map(|(_, geometry, _)| geometry)
+    });
+    let latest = xwm
+        .resize_sync
+        .desired(window)
+        .map(|desired| desired.geometry);
+    let transaction_id = xwm.resize_sync.transaction_id(window).unwrap_or_default();
+    let counter = counter_value
+        .or_else(|| match xwm.resize_sync.state(window) {
+            super::ResizeSyncState::ConfigureSent { counter_value, .. }
+            | super::ResizeSyncState::AckedWaitingCommit { counter_value, .. }
+            | super::ResizeSyncState::Presented { counter_value } => Some(counter_value),
+            _ => None,
+        })
+        .unwrap_or_default();
+    eprintln!(
+        "oblivion-one xwayland: event={event} xid={} transaction_id={} counter={} geometry={:?} latest_desired={:?}",
+        window.xid(),
+        transaction_id,
+        counter,
+        current,
+        latest
+    );
 }
 
 pub(crate) fn set_allow_commits(

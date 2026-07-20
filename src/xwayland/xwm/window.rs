@@ -67,7 +67,7 @@ pub(crate) struct X11PropertySnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum X11WindowType {
+pub enum X11WindowType {
     Normal,
     Dialog,
     Utility,
@@ -174,6 +174,7 @@ impl X11WindowRegistry {
             user_time: snapshot.user_time,
             urgency: snapshot.urgency,
             sync_counter: snapshot.sync_counter,
+            window_type: snapshot.window_type,
             ..X11PropertySnapshot::default()
         };
         self.records.insert(
@@ -205,6 +206,12 @@ impl X11WindowRegistry {
 
     pub(crate) fn get(&self, handle: X11WindowHandle) -> Option<&X11WindowRecord> {
         self.records.get(&handle)
+    }
+
+    pub(crate) fn snapshots(&self) -> impl Iterator<Item = (X11WindowHandle, &X11WindowSnapshot)> {
+        self.records.iter().filter_map(|(handle, record)| {
+            record.snapshot.as_ref().map(|snapshot| (*handle, snapshot))
+        })
     }
 
     pub(crate) fn get_mut(&mut self, handle: X11WindowHandle) -> Option<&mut X11WindowRecord> {
@@ -322,6 +329,8 @@ impl X11WindowRegistry {
             handle,
             surface_id: association.surface_id,
             kind: record.kind,
+            window_type: record.properties.window_type,
+            override_redirect: record.kind == DesktopWindowKind::OverrideRedirect,
             geometry: record.geometry,
             metadata: WindowMetadata {
                 app_id: record.properties.app_id.clone(),

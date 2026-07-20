@@ -96,7 +96,9 @@ use commit_debug::*;
 pub(crate) use desktop_window::{
     DesktopWindow, DesktopWindowError, WindowBackend, WindowRelationships, XdgWindowHandle,
 };
-pub use desktop_window::{DesktopWindowKind, WindowConstraints, WindowId, WindowMetadata};
+pub use desktop_window::{
+    DesktopWindowKind, WindowConstraints, WindowId, WindowMetadata, X11DesktopRole,
+};
 use dmabuf::{
     DmabufBufferData, DmabufFeedbackData, DmabufParamsData, PendingDmabufPlane,
     send_dmabuf_feedback, send_dmabuf_format_modifiers, send_wl_drm_capabilities,

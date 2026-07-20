@@ -638,6 +638,12 @@ fn commit_property(
         PropertyKind::WmTransientFor => Some(super::X11MetadataDelta::TransientFor(
             record.properties.transient_for,
         )),
+        PropertyKind::NetWmWindowType => Some(super::X11MetadataDelta::WindowType(
+            record.properties.window_type,
+        )),
+        PropertyKind::WmHints => Some(super::X11MetadataDelta::AcceptsInput(
+            record.properties.accepts_input,
+        )),
         PropertyKind::WmProtocols => Some(super::X11MetadataDelta::Protocols {
             supports_delete: record.properties.supports_delete,
             supports_take_focus: record.properties.supports_take_focus,
@@ -655,6 +661,9 @@ fn update_snapshot(record: &mut X11WindowRecord) {
     snapshot.metadata.pid = record.properties.pid;
     snapshot.constraints = record.properties.constraints;
     snapshot.transient_for = record.properties.transient_for;
+    snapshot.window_type = record.properties.window_type;
+    snapshot.override_redirect =
+        record.kind == crate::compositor::DesktopWindowKind::OverrideRedirect;
     snapshot.supports_delete = record.properties.supports_delete;
     snapshot.supports_take_focus = record.properties.supports_take_focus;
     snapshot.accepts_input = record.properties.accepts_input;
@@ -1071,6 +1080,8 @@ mod tests {
             handle,
             surface_id: 7,
             kind: DesktopWindowKind::Managed,
+            window_type: None,
+            override_redirect: false,
             geometry: Default::default(),
             metadata: crate::compositor::WindowMetadata {
                 title: Some("old".to_owned()),
@@ -1109,6 +1120,8 @@ mod tests {
             handle,
             surface_id: 8,
             kind: DesktopWindowKind::Managed,
+            window_type: None,
+            override_redirect: false,
             geometry: Default::default(),
             metadata: Default::default(),
             constraints: Default::default(),

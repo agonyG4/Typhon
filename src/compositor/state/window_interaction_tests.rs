@@ -96,6 +96,8 @@ fn test_x11_snapshot(surface_id: u32) -> crate::xwayland::xwm::X11WindowSnapshot
         handle: crate::xwayland::X11WindowHandle::new(generation, 0x100),
         surface_id,
         kind: DesktopWindowKind::Managed,
+        window_type: None,
+        override_redirect: false,
         geometry: crate::xwayland::xwm::X11Geometry {
             x: 10,
             y: 20,
@@ -536,6 +538,23 @@ fn x11_resize_release_finalizes_preview_without_xdg_commit() {
 
     assert!(state.end_window_interaction_for_button(0x111));
 
+    assert!(state.active_toplevel_resizes.contains_key(&surface_id));
+    assert_eq!(
+        state.toplevel_visual_geometries[&surface_id].active_resize,
+        Some(interaction_id)
+    );
+    assert!(state.renderable_surfaces[0].visual_clip.is_some());
+    assert_eq!(
+        state.surface_placement(surface_id),
+        SurfacePlacement::root_at(10, 20)
+    );
+    assert_eq!(state.take_backend_commands().len(), 1);
+
+    let handle = match state.window(window_id).expect("window").backend {
+        WindowBackend::X11(handle) => handle,
+        WindowBackend::Xdg(_) => panic!("expected X11 backend"),
+    };
+    assert!(state.finalize_x11_resize(handle));
     assert!(!state.active_toplevel_resizes.contains_key(&surface_id));
     assert_eq!(
         state.toplevel_visual_geometries[&surface_id].active_resize,
@@ -543,7 +562,31 @@ fn x11_resize_release_finalizes_preview_without_xdg_commit() {
     );
     assert_eq!(state.renderable_surfaces[0].visual_clip, None);
     assert_eq!(state.surface_placement(surface_id), final_placement);
-    assert_eq!(state.take_backend_commands().len(), 1);
+}
+
+#[test]
+fn left_and_top_resize_preserve_fixed_opposite_edges() {
+    let surface_id = 42;
+    let snapshot = test_x11_snapshot(surface_id);
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
+        .expect("X11 desktop window");
+    state.window_mut(window_id).expect("window").constraints = WindowConstraints {
+        min_width: Some(500),
+        min_height: Some(400),
+        ..WindowConstraints::default()
+    };
+
+    let geometry = state.clamp_resize_geometry(
+        surface_id,
+        WindowGeometry::new(SurfacePlacement::root_at(100, 100), 300, 200),
+        ResizeEdges::new(true, false, true, false),
+    );
+    assert_eq!(geometry.width, 500);
+    assert_eq!(geometry.height, 400);
+    assert_eq!(geometry.placement, SurfacePlacement::root_at(-100, -100));
 }
 
 #[test]

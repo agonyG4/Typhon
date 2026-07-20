@@ -1,5 +1,7 @@
 use super::*;
-use crate::xwayland::xwm::{X11Geometry, X11PublishedState, X11WindowSnapshot};
+use crate::xwayland::xwm::{
+    X11Geometry, X11MetadataDelta, X11PublishedState, X11WindowSnapshot, X11WindowType,
+};
 use crate::xwayland::{X11WindowHandle, XwaylandGeneration};
 use std::num::NonZeroU64;
 
@@ -8,6 +10,8 @@ fn x11_snapshot(generation: XwaylandGeneration, xid: u32, surface_id: u32) -> X1
         handle: X11WindowHandle::new(generation, xid),
         surface_id,
         kind: DesktopWindowKind::Managed,
+        window_type: None,
+        override_redirect: false,
         geometry: X11Geometry {
             x: 10,
             y: 20,
@@ -31,6 +35,14 @@ fn x11_snapshot(generation: XwaylandGeneration, xid: u32, surface_id: u32) -> X1
         urgency: false,
         sync_counter: None,
     }
+}
+
+fn insert_x11(state: &mut CompositorState, snapshot: X11WindowSnapshot) -> WindowId {
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(id, snapshot))
+        .expect("X11 window");
+    id
 }
 
 #[test]
@@ -263,6 +275,88 @@ fn x11_client_lists_follow_identity_and_generic_stacking() {
     assert!(state.raise_window_id(first_id));
     let (_, stacking) = state.x11_client_lists();
     assert_eq!(stacking, vec![second.handle, first.handle]);
+}
+
+#[test]
+fn popup_menu_is_rendered_but_not_a_desktop_client() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let parent = x11_snapshot(generation, 201, 201);
+    let parent_id = insert_x11(&mut state, parent.clone());
+    let mut popup = x11_snapshot(generation, 202, 202);
+    popup.window_type = Some(X11WindowType::PopupMenu);
+    popup.transient_for = Some(parent.handle);
+    let popup_id = insert_x11(&mut state, popup.clone());
+
+    assert_eq!(
+        state.window(popup_id).unwrap().x11_role,
+        Some(X11DesktopRole::AuxiliaryPopup)
+    );
+    assert_eq!(state.x11_client_lists().0, vec![parent.handle]);
+    assert!(!state.focus_desktop_window(popup_id));
+    assert!(state.x11_focus_request_allowed(parent.handle));
+    assert!(state.window(parent_id).unwrap().is_normal_x11_role());
+}
+
+#[test]
+fn dialog_remains_a_managed_client() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let parent = x11_snapshot(generation, 203, 203);
+    insert_x11(&mut state, parent.clone());
+    let mut dialog = x11_snapshot(generation, 204, 204);
+    dialog.window_type = Some(X11WindowType::Dialog);
+    dialog.transient_for = Some(parent.handle);
+    insert_x11(&mut state, dialog.clone());
+    assert_eq!(
+        state.x11_client_lists().0,
+        vec![parent.handle, dialog.handle]
+    );
+    assert_eq!(state.window_stacking.len(), 2);
+}
+
+#[test]
+fn transient_family_raise_preserves_parent_below_child() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let parent = x11_snapshot(generation, 205, 205);
+    let parent_id = insert_x11(&mut state, parent.clone());
+    let unrelated = insert_x11(&mut state, x11_snapshot(generation, 206, 206));
+    let mut popup = x11_snapshot(generation, 207, 207);
+    popup.window_type = Some(X11WindowType::Menu);
+    popup.transient_for = Some(parent.handle);
+    let popup_id = insert_x11(&mut state, popup);
+
+    assert!(state.raise_window_id(parent_id));
+    assert_eq!(state.window_stacking, vec![unrelated, parent_id, popup_id]);
+    assert!(state.raise_window_id(popup_id));
+    assert_eq!(state.window_stacking, vec![unrelated, parent_id, popup_id]);
+}
+
+#[test]
+fn dynamic_transient_for_rebuilds_family_and_rejects_cycles() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let parent = x11_snapshot(generation, 208, 208);
+    let parent_id = insert_x11(&mut state, parent.clone());
+    let child = x11_snapshot(generation, 209, 209);
+    let child_id = insert_x11(&mut state, child.clone());
+    assert!(state.apply_x11_metadata_delta(
+        child.handle,
+        X11MetadataDelta::TransientFor(Some(parent.handle))
+    ));
+    assert_eq!(
+        state.window(child_id).unwrap().relationships.transient_for,
+        Some(parent_id)
+    );
+    assert!(state.apply_x11_metadata_delta(
+        parent.handle,
+        X11MetadataDelta::TransientFor(Some(child.handle))
+    ));
+    assert_eq!(
+        state.window(parent_id).unwrap().relationships.transient_for,
+        None
+    );
 }
 
 #[test]
