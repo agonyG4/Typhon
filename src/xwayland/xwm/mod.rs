@@ -663,13 +663,25 @@ impl Xwm {
     }
 
     pub fn drain_events(&mut self, budget: usize) -> Result<XwmDrain, XwmError> {
-        let property_input_ready = properties::socket_has_input(self.raw_fd);
-        let drain = events::drain(self, budget.min(XWM_EVENT_BUDGET))?;
-        self.poll_root_event_mask()?;
-        if property_input_ready {
-            let _ = properties::poll_replies(self, budget.min(XWM_EVENT_BUDGET))?;
+        let budget = budget.min(XWM_EVENT_BUDGET);
+        let mut events_processed = 0;
+        let mut replies_processed = 0;
+        loop {
+            let event_drain = events::drain(self, budget.saturating_sub(events_processed))?;
+            events_processed = events_processed.saturating_add(event_drain.processed);
+            self.poll_root_event_mask()?;
+            let replies = properties::poll_replies(self, budget.saturating_sub(replies_processed))?;
+            replies_processed = replies_processed.saturating_add(replies);
+            if event_drain.processed == 0 && replies == 0
+                || events_processed == budget && replies_processed == budget
+            {
+                break;
+            }
         }
-        Ok(drain)
+        Ok(XwmDrain {
+            processed: events_processed,
+            budget_exhausted: events_processed == budget && budget != 0,
+        })
     }
 
     pub fn execute(&mut self, command: XwmCommand) -> Result<(), XwmError> {

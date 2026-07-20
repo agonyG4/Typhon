@@ -384,7 +384,7 @@ fn stack_mode(mode: xproto::StackMode) -> Option<X11StackMode> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, num::NonZeroU64, os::unix::net::UnixStream};
+    use std::{collections::HashMap, io::Write, num::NonZeroU64, os::unix::net::UnixStream};
 
     use crate::xwayland::XwaylandAssociationEvent;
     use x11rb::{
@@ -520,6 +520,45 @@ mod tests {
             super::super::XwmEvent::WindowReady(snapshot) => Some(snapshot.surface_id),
             _ => None,
         })
+    }
+
+    #[test]
+    fn buffered_property_replies_are_drained_without_raw_socket_input() {
+        let generation = generation(10);
+        let (mut xwm, mut peer) = test_fixture(generation);
+        let handle = X11WindowHandle::new(generation, 107);
+        xwm.observe_window(handle).expect("observe managed window");
+        xwm.flush().expect("flush property requests");
+
+        let mut sequences = xwm.pending_properties.keys().copied().collect::<Vec<_>>();
+        sequences.sort_unstable();
+        let property_count = sequences.len();
+        assert_eq!(
+            property_count,
+            super::super::properties::PropertyKind::ALL.len()
+        );
+        for sequence in sequences {
+            let mut reply = [0u8; 32];
+            reply[0] = 1;
+            reply[2..4].copy_from_slice(&(sequence as u16).to_ne_bytes());
+            peer.write_all(&reply).expect("write property reply");
+        }
+        let mut expose = [0u8; 32];
+        expose[0] = 12;
+        expose[4..8].copy_from_slice(&handle.xid().to_ne_bytes());
+        peer.write_all(&expose).expect("write trailing X event");
+
+        let event_drain = super::drain(&mut xwm, 1).expect("buffer replies while draining event");
+        assert_eq!(event_drain.processed, 1);
+        assert!(!super::super::properties::socket_has_input(xwm.raw_fd));
+
+        xwm.drain_events(256).expect("drain buffered replies");
+        let record = xwm.windows.get(handle).expect("managed window record");
+        assert_eq!(
+            (xwm.property_metrics.completed, xwm.pending_properties.len()),
+            (property_count as u64, 0)
+        );
+        assert!(record.properties_ready);
     }
 
     #[test]

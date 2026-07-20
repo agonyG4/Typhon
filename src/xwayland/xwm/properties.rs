@@ -303,6 +303,7 @@ pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize) -> Result<usize, XwmErr
     Ok(completed)
 }
 
+#[cfg(test)]
 pub(crate) fn socket_has_input(fd: std::os::fd::RawFd) -> bool {
     let mut pollfd = libc::pollfd {
         fd,
