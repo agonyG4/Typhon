@@ -3,8 +3,13 @@ mod x11_client;
 
 use x11_client::RegressionX11Client;
 
+/// Send a native X11 request sequence to an existing display.
+///
+/// This is a request-generation smoke test, not an end-to-end compositor
+/// assertion. Behavioral coverage for popup admission, resize presentation,
+/// and remap association ordering lives in the deterministic XWayland tests.
 #[test]
-fn opt_in_x11_client_drives_popup_resize_and_remap_sequence() {
+fn opt_in_x11_client_generates_popup_resize_and_remap_requests() {
     if std::env::var_os("TYPHON_XWAYLAND_NATIVE_TESTS").as_deref() != Some("1".as_ref()) {
         return;
     }

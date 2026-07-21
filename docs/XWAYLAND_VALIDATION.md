@@ -16,7 +16,7 @@ cargo test --locked compositor::tests::xwayland::
 cargo test --locked native_output::runtime::xwayland_reactor_tests::
 ```
 
-The opt-in X11 driver exercises the event order used by the native checks:
+The opt-in X11 driver generates the request order used by the native checks:
 managed creation, late popup properties, OR reconciliation, moveresize,
 commit blocking/release, and unmap/remap.
 
@@ -27,6 +27,13 @@ TYPHON_XWAYLAND_NATIVE_TESTS=1 \
 
 The driver is intentionally opt-in because it mutates the X11 display named
 by `DISPLAY`.
+
+This driver is only a request-generation smoke test. It does not attach
+Wayland surfaces, deliver XSync acknowledgements, inspect Typhon events,
+assert focus or client-list membership, or verify rendered pixels. A passing
+run must not be reported as Steam or end-to-end behavioral qualification.
+Those assertions are covered by the deterministic tests below and by the
+separate native TTY matrix.
 
 ## Trace capture
 
@@ -55,6 +62,9 @@ association/buffer, stale resize commit, missing commit edge, moveresize
 rejection, or behavior not correlated with Typhon events.
 
 ## Steam qualification
+
+No Steam result is implied by the opt-in X11 smoke test. Run and record the
+following matrix on a native TTY session with Steam already configured:
 
 Run the following on a native TTY session with Steam already configured:
 
