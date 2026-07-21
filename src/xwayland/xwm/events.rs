@@ -134,22 +134,15 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             xwm.note_focus_destroyed(event.window);
             xwm.clear_resize_sync(handle);
             xwm.association.remove_x11_window(handle);
-            let Some(record) = xwm
+            let Some(_record) = xwm
                 .windows
                 .destroy(handle)
                 .map_err(XwmError::InvalidCommand)?
             else {
                 return Ok(());
             };
-            if record.snapshot.is_some()
-                || matches!(
-                    record.lifecycle,
-                    X11WindowLifecycle::Renderable | X11WindowLifecycle::Withdrawn
-                )
-            {
-                xwm.outgoing_events
-                    .push_back(XwmEvent::WindowDestroyed(handle));
-            }
+            xwm.outgoing_events
+                .push_back(XwmEvent::WindowDestroyed(handle));
         }
         Event::ConfigureRequest(event) => {
             let handle = ensure_window(xwm, event.window)?;
@@ -487,6 +480,15 @@ mod tests {
         })
     }
 
+    fn destroy_event(window: u32) -> Event {
+        Event::DestroyNotify(xproto::DestroyNotifyEvent {
+            response_type: 17,
+            sequence: 0,
+            event: 1,
+            window,
+        })
+    }
+
     fn prepare_managed_window(
         xwm: &mut Xwm,
         xid: u32,
@@ -695,6 +697,29 @@ mod tests {
         let events = ready_events(&mut xwm);
         assert_eq!(events.len(), 1);
         assert_eq!(ready_surface_id(&events), Some(42));
+    }
+
+    #[test]
+    fn destroy_after_auxiliary_reclassification_emits_terminal_cleanup() {
+        let generation = generation(13);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = prepare_managed_window(&mut xwm, 110, true, true, true);
+
+        normalize(&mut xwm, map_event(handle.xid(), false)).expect("ready MapNotify");
+        assert_eq!(ready_surface_id(&ready_events(&mut xwm)), Some(42));
+        let record = xwm
+            .windows
+            .get_mut(handle)
+            .expect("published window record");
+        record.snapshot = None;
+        record.lifecycle = super::super::X11WindowLifecycle::Auxiliary;
+
+        normalize(&mut xwm, destroy_event(handle.xid())).expect("terminal DestroyNotify");
+
+        assert_eq!(
+            ready_events(&mut xwm),
+            vec![super::super::XwmEvent::WindowDestroyed(handle)]
+        );
     }
 
     #[test]
