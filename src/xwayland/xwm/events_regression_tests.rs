@@ -1,11 +1,12 @@
 use std::num::NonZeroU64;
 
 use crate::xwayland::XwaylandAssociationEvent;
+use x11rb::protocol::{Event, xproto};
 
 use super::super::{ResizeSyncState, XwmCommand, XwmEvent};
 use super::tests::{
-    generation, map_event, prepare_managed_window, ready_events, ready_surface_id, test_fixture,
-    unmap_event,
+    complete_property_refresh, generation, map_event, prepare_managed_window, ready_events,
+    ready_surface_id, test_fixture, unmap_event,
 };
 use super::{X11Geometry, X11WindowLifecycle, normalize};
 
@@ -141,4 +142,49 @@ fn old_surface_removal_after_new_map_association_keeps_replacement() {
             .map(|association| association.surface_id),
         Some(43)
     );
+}
+
+#[test]
+fn iconic_client_map_request_starts_a_new_map_epoch() {
+    let generation = generation(31);
+    let (mut xwm, mut peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 131, true, false, false);
+
+    super::super::commands::execute(&mut xwm, XwmCommand::Unmap(handle)).expect("WM unmap command");
+    normalize(&mut xwm, unmap_event(handle.xid())).expect("WM UnmapNotify");
+    assert_eq!(
+        xwm.windows.lifecycle(handle),
+        Some(super::super::X11WindowLifecycle::Iconic)
+    );
+
+    normalize(
+        &mut xwm,
+        Event::MapRequest(xproto::MapRequestEvent {
+            response_type: 20,
+            sequence: 0,
+            parent: 1,
+            window: handle.xid(),
+        }),
+    )
+    .expect("client MapRequest");
+    complete_property_refresh(&mut xwm, &mut peer);
+
+    let events = ready_events(&mut xwm);
+    assert!(
+        events.iter().any(
+            |event| matches!(event, XwmEvent::WindowMapRequested(window) if *window == handle)
+        )
+    );
+
+    normalize(
+        &mut xwm,
+        Event::MapRequest(xproto::MapRequestEvent {
+            response_type: 20,
+            sequence: 0,
+            parent: 1,
+            window: handle.xid(),
+        }),
+    )
+    .expect("duplicate client MapRequest");
+    assert!(ready_events(&mut xwm).is_empty());
 }

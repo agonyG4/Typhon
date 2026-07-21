@@ -55,11 +55,13 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         }
         Event::MapRequest(event) => {
             let handle = ensure_window(xwm, event.window)?;
-            if xwm
-                .windows
-                .get(handle)
-                .is_some_and(|record| record.map_requested)
-            {
+            if xwm.windows.get(handle).is_some_and(|record| {
+                record.map_requested
+                    && !matches!(
+                        record.lifecycle,
+                        X11WindowLifecycle::Iconic | X11WindowLifecycle::Withdrawn
+                    )
+            }) {
                 return Ok(());
             }
             xwm.cancel_window_properties(handle);
@@ -801,7 +803,7 @@ mod tests {
         })
     }
 
-    fn complete_property_refresh(xwm: &mut Xwm, peer: &mut UnixStream) {
+    pub(crate) fn complete_property_refresh(xwm: &mut Xwm, peer: &mut UnixStream) {
         xwm.flush().expect("flush property refresh");
         let mut sequences = xwm.pending_properties.keys().copied().collect::<Vec<_>>();
         sequences.sort_unstable();
