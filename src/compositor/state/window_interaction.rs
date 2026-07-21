@@ -221,24 +221,83 @@ impl CompositorState {
         y: f64,
         kind: WindowInteractionKind,
         x11_button: u32,
-    ) -> bool {
+    ) -> X11MoveResizeBeginResult {
         let Some(window_id) = self.window_id_for_x11_handle(handle) else {
-            return false;
+            return self.log_x11_move_resize_result(
+                handle,
+                x,
+                y,
+                kind,
+                x11_button,
+                X11MoveResizeBeginResult::WindowNotRenderable,
+            );
         };
         let Some(root_surface_id) = self.window(window_id).map(|window| window.root_surface_id)
         else {
-            return false;
+            return self.log_x11_move_resize_result(
+                handle,
+                x,
+                y,
+                kind,
+                x11_button,
+                X11MoveResizeBeginResult::WindowNotRenderable,
+            );
         };
+        if self
+            .window(window_id)
+            .is_some_and(|window| !window.is_normal_x11_role())
+        {
+            return self.log_x11_move_resize_result(
+                handle,
+                x,
+                y,
+                kind,
+                x11_button,
+                X11MoveResizeBeginResult::WindowNotFocusable,
+            );
+        }
+        if self
+            .renderable_surfaces
+            .iter()
+            .all(|surface| surface.surface_id != root_surface_id)
+        {
+            return self.log_x11_move_resize_result(
+                handle,
+                x,
+                y,
+                kind,
+                x11_button,
+                X11MoveResizeBeginResult::WindowNotRenderable,
+            );
+        }
+        if self.window_interaction.is_some() {
+            return self.log_x11_move_resize_result(
+                handle,
+                x,
+                y,
+                kind,
+                x11_button,
+                X11MoveResizeBeginResult::ExistingInteraction,
+            );
+        }
         let requested_button = x11_button_to_evdev(x11_button);
-        let Some(press) = self.held_pointer_buttons.iter().rev().find(|press| {
-            press.root_surface_id == root_surface_id
-                && requested_button.is_none_or(|button| press.button == button)
-        }) else {
-            return false;
+        let Some(press) = self
+            .held_pointer_buttons
+            .iter()
+            .rev()
+            .find(|press| requested_button.is_none_or(|button| press.button == button))
+        else {
+            let result = if self.held_pointer_buttons.is_empty() {
+                X11MoveResizeBeginResult::NoPressedButton
+            } else {
+                X11MoveResizeBeginResult::ButtonMismatch
+            };
+            return self.log_x11_move_resize_result(handle, x, y, kind, x11_button, result);
         };
         let trigger_button = press.button;
+        let trigger_serial = press.serial;
         let pointer_motion_surface_id = compositor_surface_id(&press.surface);
-        self.begin_window_interaction_for_root(BeginWindowInteraction {
+        let began = self.begin_window_interaction_for_root(BeginWindowInteraction {
             window_id: Some(window_id),
             root_surface_id,
             x,
@@ -246,9 +305,39 @@ impl CompositorState {
             kind,
             source: WindowInteractionSource::X11NetWmMoveResize,
             trigger_button: Some(trigger_button),
-            trigger_serial: None,
+            trigger_serial: Some(trigger_serial),
             pointer_motion_surface_id: Some(pointer_motion_surface_id),
-        })
+        });
+        self.log_x11_move_resize_result(
+            handle,
+            x,
+            y,
+            kind,
+            x11_button,
+            if began {
+                X11MoveResizeBeginResult::Began
+            } else {
+                X11MoveResizeBeginResult::StaleRequest
+            },
+        )
+    }
+
+    fn log_x11_move_resize_result(
+        &self,
+        handle: X11WindowHandle,
+        x: f64,
+        y: f64,
+        kind: WindowInteractionKind,
+        x11_button: u32,
+        result: X11MoveResizeBeginResult,
+    ) -> X11MoveResizeBeginResult {
+        resize_debug_log(|| {
+            format!(
+                "event=x11_moveresize result={result:?} xid={} root=({x},{y}) kind={kind:?} button={x11_button}",
+                handle.xid(),
+            )
+        });
+        result
     }
 
     pub(in crate::compositor) fn cancel_x11_client_window_interaction(

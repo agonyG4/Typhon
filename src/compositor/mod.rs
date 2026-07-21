@@ -136,6 +136,7 @@ pub use input::{
     PointerAxisSource, PointerConstraintBackendId, PointerConstraintBackendRequest,
     PointerConstraintMode, PointerConstraintState, PointerMotionSample, RelativePointerMotion,
 };
+pub use interaction::X11MoveResizeBeginResult;
 use interaction::{
     InteractionCursorOverride, InteractionCursorShape, PendingResizeConfigure, PointerPress,
     PointerTarget, ResizeAckDecision, ResizeCommitSnapshot, ResizeConfigureFlow, ResizeEdges,

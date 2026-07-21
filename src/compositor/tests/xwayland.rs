@@ -2,6 +2,7 @@ use std::{fs::File, num::NonZeroU64, os::fd::AsFd, path::PathBuf};
 
 use crate::compositor::{
     DesktopWindowKind, RenderGenerationCause, SurfacePlacement, WindowConstraints, WindowMetadata,
+    X11MoveResizeBeginResult,
 };
 use crate::xwayland::xwm::{
     X11ConfigureFlags, X11ConfigureRequest, X11Geometry, X11MoveResizeDirection,
@@ -520,6 +521,106 @@ fn x11_client_moveresize_requires_held_button_and_starts_move() {
 }
 
 #[test]
+fn x11_moveresize_uses_seat_button_state_across_surface_boundary() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+
+    fixture.server.send_pointer_motion(101.0, 101.0);
+    fixture.server.send_pointer_button(0x110, true);
+    fixture
+        .server
+        .state
+        .held_pointer_buttons
+        .last_mut()
+        .expect("held seat button")
+        .root_surface_id = fixture.surface_id.saturating_add(1);
+
+    let result = fixture.server.state.begin_x11_client_window_interaction(
+        handle,
+        101.0,
+        101.0,
+        crate::compositor::WindowInteractionKind::Move,
+        1,
+    );
+    assert_eq!(result, X11MoveResizeBeginResult::Began);
+}
+
+#[test]
+fn release_after_client_message_does_not_retroactively_reject_request() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    fixture.server.send_pointer_motion(101.0, 101.0);
+    fixture.server.send_pointer_button(0x110, true);
+
+    let result = fixture.server.state.begin_x11_client_window_interaction(
+        handle,
+        101.0,
+        101.0,
+        crate::compositor::WindowInteractionKind::Move,
+        1,
+    );
+    assert_eq!(result, X11MoveResizeBeginResult::Began);
+    assert!(fixture.server.end_window_interaction_for_button(0x110));
+    fixture.server.send_pointer_button(0x110, false);
+    assert!(!fixture.server.window_interaction_active());
+}
+
+#[test]
+fn release_before_client_message_rejects_stale_request() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    fixture.server.send_pointer_motion(101.0, 101.0);
+    fixture.server.send_pointer_button(0x110, true);
+    fixture.server.send_pointer_button(0x110, false);
+
+    let result = fixture.server.state.begin_x11_client_window_interaction(
+        handle,
+        101.0,
+        101.0,
+        crate::compositor::WindowInteractionKind::Move,
+        1,
+    );
+    assert_eq!(result, X11MoveResizeBeginResult::NoPressedButton);
+}
+
+#[test]
+fn moveresize_button_mismatch_is_observable() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    fixture.server.send_pointer_motion(101.0, 101.0);
+    fixture.server.send_pointer_button(0x110, true);
+
+    let result = fixture.server.state.begin_x11_client_window_interaction(
+        handle,
+        101.0,
+        101.0,
+        crate::compositor::WindowInteractionKind::Move,
+        3,
+    );
+    assert_eq!(result, X11MoveResizeBeginResult::ButtonMismatch);
+}
+
+#[test]
 fn x11_client_moveresize_maps_edges_and_accepts_cancel() {
     let mut fixture = first_buffer_fixture();
     let mut snapshot = fake_snapshot();
@@ -559,6 +660,18 @@ fn x11_client_moveresize_maps_edges_and_accepts_cancel() {
             true, false, true, false
         ))
     );
+
+    let other_handle = X11WindowHandle::new(
+        XwaylandGeneration::new(NonZeroU64::new(1).expect("generation")),
+        handle.xid().saturating_add(1),
+    );
+    assert!(
+        !fixture
+            .server
+            .state
+            .cancel_x11_client_window_interaction(other_handle)
+    );
+    assert!(fixture.server.window_interaction_active());
 
     fixture
         .server

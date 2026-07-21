@@ -104,6 +104,17 @@ pub enum WindowInteractionSource {
     X11NetWmMoveResize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum X11MoveResizeBeginResult {
+    Began,
+    NoPressedButton,
+    ButtonMismatch,
+    WindowNotFocusable,
+    WindowNotRenderable,
+    ExistingInteraction,
+    StaleRequest,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) enum WindowInteractionEndReason {
