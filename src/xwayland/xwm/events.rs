@@ -613,6 +613,7 @@ mod tests {
         rust_connection::RustConnection,
     };
 
+    use super::super::ResizeSyncState;
     use super::*;
 
     fn test_fixture(generation: super::super::XwaylandGeneration) -> (Xwm, UnixStream) {
@@ -887,6 +888,34 @@ mod tests {
         let events = ready_events(&mut xwm);
         assert_eq!(events.len(), 1);
         assert_eq!(ready_surface_id(&events), Some(42));
+    }
+
+    #[test]
+    fn runtime_timeout_records_original_counter_and_matching_late_ack_reenables_future_sync() {
+        let generation = generation(1);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = prepare_managed_window(&mut xwm, 71, true, false, false);
+
+        xwm.resize_sync
+            .begin_transaction(handle, 19, 100, X11Geometry::default(), false)
+            .expect("begin resize transaction");
+        xwm.handle_resize_sync_deadline(100)
+            .expect("handle resize timeout");
+
+        assert_eq!(
+            xwm.timed_out_resize_counters.get(&handle),
+            Some(&19),
+            "timeout recovery must retain the original nonzero counter"
+        );
+        assert!(xwm.resize_sync.sync_disabled(handle));
+
+        xwm.note_resize_sync_ack_for_test(handle, 20);
+        assert!(xwm.resize_sync.sync_disabled(handle));
+
+        xwm.note_resize_sync_ack_for_test(handle, 19);
+        assert!(!xwm.resize_sync.sync_disabled(handle));
+        assert!(!xwm.timed_out_resize_counters.contains_key(&handle));
+        assert_eq!(xwm.resize_sync.state(handle), ResizeSyncState::Idle);
     }
 
     #[test]

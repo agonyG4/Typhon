@@ -5,14 +5,10 @@ use x11rb::connection::Connection;
 impl Xwm {
     pub(crate) fn handle_resize_sync_deadline(&mut self, now_ns: u64) -> Result<(), XwmError> {
         for handle in self.resize_sync.expired_handles(now_ns) {
-            if self.resize_sync.timeout(handle, now_ns) {
+            if let Some(timed_out) = self.resize_sync.timeout(handle, now_ns) {
                 self.resize_sync.disable_after_timeout(handle);
                 let transaction = self.resize_sync.transaction(handle);
-                let counter_value = self
-                    .resize_sync
-                    .state(handle)
-                    .counter_value()
-                    .unwrap_or_default();
+                let counter_value = timed_out.counter_value;
                 let latest_desired = self
                     .resize_sync
                     .desired(handle)

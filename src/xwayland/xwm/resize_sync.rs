@@ -50,6 +50,11 @@ pub(crate) enum ResizeSyncCommit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TimedOutResize {
+    pub(crate) counter_value: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResizeSyncDesired {
     pub(crate) geometry: X11Geometry,
     pub(crate) final_pending: bool,
@@ -257,15 +262,28 @@ impl ResizeSyncTracker {
         true
     }
 
-    pub(crate) fn timeout(&mut self, handle: X11WindowHandle, now_ns: u64) -> bool {
-        let timed_out = matches!(
-            self.state(handle),
-            ResizeSyncState::ConfigureSent { deadline_ns, .. }
-                | ResizeSyncState::AckObserved { deadline_ns, .. }
-                | ResizeSyncState::AckedWaitingCommit { deadline_ns, .. }
-                if now_ns >= deadline_ns
-        );
-        if timed_out {
+    pub(crate) fn timeout(
+        &mut self,
+        handle: X11WindowHandle,
+        now_ns: u64,
+    ) -> Option<TimedOutResize> {
+        let timed_out = match self.state(handle) {
+            ResizeSyncState::ConfigureSent {
+                counter_value,
+                deadline_ns,
+            }
+            | ResizeSyncState::AckObserved {
+                counter_value,
+                deadline_ns,
+            }
+            | ResizeSyncState::AckedWaitingCommit {
+                counter_value,
+                deadline_ns,
+                ..
+            } if now_ns >= deadline_ns => Some(TimedOutResize { counter_value }),
+            _ => None,
+        };
+        if timed_out.is_some() {
             self.states
                 .insert(handle, ResizeSyncState::FallbackUnsynchronized);
             self.sync_disabled.insert(handle);
@@ -482,7 +500,7 @@ mod tests {
         tracker
             .begin_transaction(window, 30, 100, X11Geometry::default(), false)
             .expect("resize sync");
-        assert!(tracker.timeout(window, 100));
+        assert!(tracker.timeout(window, 100).is_some());
         assert_eq!(
             tracker.state(window),
             ResizeSyncState::FallbackUnsynchronized
@@ -869,7 +887,7 @@ mod tests {
         tracker
             .begin_transaction(window, 7, 100, X11Geometry::default(), false)
             .expect("transaction");
-        assert!(tracker.timeout(window, 100));
+        assert!(tracker.timeout(window, 100).is_some());
         assert!(tracker.finish_timeout(window));
         assert_eq!(tracker.state(window), ResizeSyncState::Idle);
     }
@@ -886,7 +904,7 @@ mod tests {
         tracker
             .begin_transaction(window, 7, 100, X11Geometry::default(), false)
             .expect("transaction");
-        assert!(tracker.timeout(window, 100));
+        assert!(tracker.timeout(window, 100).is_some());
         tracker.disable_after_timeout(window);
         assert!(tracker.sync_disabled(window));
         assert!(!tracker.acknowledge(window, 7));
