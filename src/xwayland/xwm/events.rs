@@ -371,8 +371,8 @@ fn trace_window_state(
             .field("map_serial", record.map_serial)
             .field("inflight_wm_unmaps", record.inflight_wm_unmaps)
             .field(
-                "window_type",
-                format!("{:?}", record.properties.window_type),
+                "window_types",
+                format!("{:?}", record.properties.window_types),
             )
             .optional(
                 "transient_for",

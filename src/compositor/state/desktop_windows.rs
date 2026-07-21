@@ -300,16 +300,16 @@ impl CompositorState {
                 window.x11_transient_for = accepted_transient_handle;
                 window.x11_role = Some(crate::compositor::desktop_window::classify_x11_role(
                     window.kind,
-                    window.x11_window_type,
+                    &window.x11_window_types,
                     accepted_transient_handle.is_some(),
                     window.kind == DesktopWindowKind::OverrideRedirect,
                 ));
             }
-            crate::xwayland::xwm::X11MetadataDelta::WindowType(window_type) => {
-                window.x11_window_type = window_type;
+            crate::xwayland::xwm::X11MetadataDelta::WindowTypes(window_types) => {
+                window.x11_window_types = window_types;
                 window.x11_role = Some(crate::compositor::desktop_window::classify_x11_role(
                     window.kind,
-                    window.x11_window_type,
+                    &window.x11_window_types,
                     window.x11_transient_for.is_some(),
                     window.kind == DesktopWindowKind::OverrideRedirect,
                 ));
@@ -318,7 +318,7 @@ impl CompositorState {
                 window.kind = kind;
                 window.x11_role = Some(crate::compositor::desktop_window::classify_x11_role(
                     window.kind,
-                    window.x11_window_type,
+                    &window.x11_window_types,
                     window.x11_transient_for.is_some(),
                     window.kind == DesktopWindowKind::OverrideRedirect,
                 ));

@@ -1069,7 +1069,7 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
         Some(window)
     );
     assert_eq!(
-        popup_snapshot.window_type,
+        popup_snapshot.window_types.preferred_supported_type(),
         Some(oblivion_one::xwayland::xwm::X11WindowType::PopupMenu)
     );
 

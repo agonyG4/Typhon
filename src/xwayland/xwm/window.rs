@@ -51,7 +51,7 @@ pub(crate) struct X11PropertySnapshot {
     pub(crate) title: Option<String>,
     pub(crate) app_id: Option<String>,
     pub(crate) pid: Option<u32>,
-    pub(crate) window_type: Option<X11WindowType>,
+    pub(crate) window_types: X11WindowTypes,
     pub(crate) accepts_input: Option<bool>,
     pub(crate) constraints: WindowConstraints,
     pub(crate) state: X11PublishedState,
@@ -79,7 +79,35 @@ pub enum X11WindowType {
     DropdownMenu,
     Tooltip,
     Notification,
+    Combo,
+    Splash,
+    Toolbar,
+    Dock,
+    Desktop,
+    Dnd,
     Other(u32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct X11WindowTypes {
+    pub atoms: Vec<X11WindowType>,
+}
+
+impl X11WindowTypes {
+    pub fn new(atoms: Vec<X11WindowType>) -> Self {
+        Self { atoms }
+    }
+
+    pub fn preferred_supported_type(&self) -> Option<X11WindowType> {
+        self.atoms
+            .iter()
+            .copied()
+            .find(|window_type| !matches!(window_type, X11WindowType::Other(_)))
+    }
+
+    pub fn contains(&self, window_type: X11WindowType) -> bool {
+        self.atoms.contains(&window_type)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -197,7 +225,7 @@ impl X11WindowRegistry {
             user_time: snapshot.user_time,
             urgency: snapshot.urgency,
             sync_counter: snapshot.sync_counter,
-            window_type: snapshot.window_type,
+            window_types: snapshot.window_types.clone(),
             ..X11PropertySnapshot::default()
         };
         self.records.insert(
@@ -430,7 +458,7 @@ impl X11WindowRegistry {
             handle,
             surface_id: association.surface_id,
             kind: record.kind,
-            window_type: record.properties.window_type,
+            window_types: record.properties.window_types.clone(),
             override_redirect: record.kind == DesktopWindowKind::OverrideRedirect,
             geometry: record.geometry,
             metadata: WindowMetadata {
@@ -657,7 +685,7 @@ fn is_auxiliary_client_leader(handle: X11WindowHandle, record: &X11WindowRecord)
         && record.geometry.width <= 16
         && record.geometry.height <= 16
         && record.properties.client_leader == Some(handle)
-        && record.properties.window_type.is_none()
+        && record.properties.window_types.atoms.is_empty()
         && record.properties.accepts_input.is_none()
 }
 
@@ -1360,7 +1388,7 @@ mod tests {
             let properties = &mut registry.get_mut(window).expect("window").properties;
             properties.client_leader = Some(window);
             properties.user_time_window = Some(handle(generation, 30));
-            properties.window_type = Some(X11WindowType::Normal);
+            properties.window_types = X11WindowTypes::new(vec![X11WindowType::Normal]);
             properties.accepts_input = Some(true);
         }
         registry
@@ -1483,7 +1511,7 @@ mod tests {
 
         {
             let properties = &mut registry.get_mut(window).expect("window").properties;
-            properties.window_type = Some(X11WindowType::Normal);
+            properties.window_types = X11WindowTypes::new(vec![X11WindowType::Normal]);
             properties.accepts_input = Some(true);
         }
         assert_eq!(

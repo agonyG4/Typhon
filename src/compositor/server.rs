@@ -407,8 +407,8 @@ impl OwnCompositorServer {
                                 .optional("focus_before", focus_before)
                                 .optional("focus_after", focus_after)
                                 .field(
-                                    "window_type",
-                                    format!("{:?}", snapshot_for_trace.window_type),
+                                    "window_types",
+                                    format!("{:?}", snapshot_for_trace.window_types),
                                 )
                                 .field(
                                     "override_redirect_stored",
@@ -476,7 +476,7 @@ impl OwnCompositorServer {
                 let publish_lists = matches!(
                     &delta,
                     crate::xwayland::xwm::X11MetadataDelta::TransientFor(_)
-                        | crate::xwayland::xwm::X11MetadataDelta::WindowType(_)
+                        | crate::xwayland::xwm::X11MetadataDelta::WindowTypes(_)
                         | crate::xwayland::xwm::X11MetadataDelta::Kind(_)
                 );
                 self.state.apply_x11_metadata_delta(window, delta);

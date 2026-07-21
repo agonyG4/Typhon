@@ -49,7 +49,7 @@ pub use moveresize::{X11MoveResizeDirection, X11MoveResizeRequest};
 pub use resize_sync::{RESIZE_SYNC_TIMEOUT_NS, ResizeSyncError, ResizeSyncState};
 pub(crate) use resize_sync::{ResizeSyncCommit, ResizeSyncTracker};
 use window::{KindReconciliation, X11WindowRegistry};
-pub use window::{X11WindowLifecycle, X11WindowType};
+pub use window::{X11WindowLifecycle, X11WindowType, X11WindowTypes};
 
 use super::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 
@@ -141,7 +141,7 @@ pub struct X11WindowSnapshot {
     pub handle: X11WindowHandle,
     pub surface_id: u32,
     pub kind: DesktopWindowKind,
-    pub window_type: Option<X11WindowType>,
+    pub window_types: X11WindowTypes,
     pub override_redirect: bool,
     pub geometry: X11Geometry,
     pub metadata: WindowMetadata,
@@ -165,7 +165,7 @@ pub enum X11MetadataDelta {
     Pid(Option<u32>),
     Constraints(WindowConstraints),
     TransientFor(Option<X11WindowHandle>),
-    WindowType(Option<X11WindowType>),
+    WindowTypes(X11WindowTypes),
     Kind(DesktopWindowKind),
     AcceptsInput(Option<bool>),
     Protocols {

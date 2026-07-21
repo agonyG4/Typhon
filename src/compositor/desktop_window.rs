@@ -3,7 +3,7 @@
 use std::{io, num::NonZeroU64};
 
 use crate::xwayland::X11WindowHandle;
-use crate::xwayland::xwm::{X11Geometry, X11WindowSnapshot, X11WindowType};
+use crate::xwayland::xwm::{X11Geometry, X11WindowSnapshot, X11WindowType, X11WindowTypes};
 
 use super::{SurfacePlacement, WindowGeometry, WindowState};
 
@@ -98,7 +98,7 @@ pub struct DesktopWindow {
     pub(crate) x11_surface_id: Option<u32>,
     pub kind: DesktopWindowKind,
     pub x11_role: Option<X11DesktopRole>,
-    pub x11_window_type: Option<X11WindowType>,
+    pub x11_window_types: X11WindowTypes,
     pub x11_accepts_input: Option<bool>,
     pub x11_transient_for: Option<X11WindowHandle>,
     pub(super) x11_geometry: Option<X11GeometryState>,
@@ -136,7 +136,7 @@ impl DesktopWindow {
             x11_surface_id: None,
             kind: DesktopWindowKind::Managed,
             x11_role: None,
-            x11_window_type: None,
+            x11_window_types: X11WindowTypes::default(),
             x11_accepts_input: None,
             x11_transient_for: None,
             x11_geometry: None,
@@ -157,11 +157,11 @@ impl DesktopWindow {
             kind: snapshot.kind,
             x11_role: Some(classify_x11_role(
                 snapshot.kind,
-                snapshot.window_type,
+                &snapshot.window_types,
                 snapshot.transient_for.is_some(),
                 snapshot.override_redirect,
             )),
-            x11_window_type: snapshot.window_type,
+            x11_window_types: snapshot.window_types,
             x11_accepts_input: snapshot.accepts_input,
             x11_transient_for: snapshot.transient_for,
             x11_geometry: Some(X11GeometryState {
@@ -182,14 +182,14 @@ impl DesktopWindow {
 
 pub(crate) fn classify_x11_role(
     kind: DesktopWindowKind,
-    window_type: Option<X11WindowType>,
+    window_types: &X11WindowTypes,
     transient_for: bool,
     override_redirect: bool,
 ) -> X11DesktopRole {
     if override_redirect || kind == DesktopWindowKind::OverrideRedirect {
         return X11DesktopRole::OverrideRedirect;
     }
-    match (window_type, transient_for) {
+    match (window_types.preferred_supported_type(), transient_for) {
         (Some(X11WindowType::Dialog), true) => X11DesktopRole::Dialog,
         (Some(X11WindowType::Utility), true) => X11DesktopRole::Dialog,
         (
@@ -197,10 +197,21 @@ pub(crate) fn classify_x11_role(
                 X11WindowType::Menu
                 | X11WindowType::PopupMenu
                 | X11WindowType::DropdownMenu
-                | X11WindowType::Tooltip,
+                | X11WindowType::Tooltip
+                | X11WindowType::Combo,
             ),
             _,
         ) => X11DesktopRole::AuxiliaryPopup,
+        (
+            Some(
+                X11WindowType::Splash
+                | X11WindowType::Toolbar
+                | X11WindowType::Dnd
+                | X11WindowType::Dock
+                | X11WindowType::Desktop,
+            ),
+            _,
+        ) => X11DesktopRole::AuxiliarySupport,
         (Some(X11WindowType::Notification), _) => X11DesktopRole::Notification,
         _ => X11DesktopRole::Toplevel,
     }

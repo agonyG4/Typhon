@@ -8,7 +8,7 @@ use crate::compositor::{
 use crate::xwayland::xwm::{
     X11ConfigureFlags, X11ConfigureRequest, X11Geometry, X11MoveResizeDirection,
     X11MoveResizeRequest, X11PublishedState, X11WindowLifecycle, X11WindowSnapshot, X11WindowType,
-    XwmAssociationEvent, XwmCommand, XwmEvent,
+    X11WindowTypes, XwmAssociationEvent, XwmCommand, XwmEvent,
 };
 use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 use wayland_client::protocol::{
@@ -125,7 +125,7 @@ fn fake_snapshot() -> X11WindowSnapshot {
         ),
         surface_id: 7,
         kind: DesktopWindowKind::Managed,
-        window_type: None,
+        window_types: X11WindowTypes::default(),
         override_redirect: false,
         geometry: X11Geometry {
             x: 0,
@@ -630,7 +630,7 @@ fn x11_window_ready_initial_focus_skips_auxiliary_popup() {
     let mut fixture = first_buffer_fixture();
     let mut snapshot = fake_snapshot();
     snapshot.surface_id = fixture.surface_id;
-    snapshot.window_type = Some(X11WindowType::PopupMenu);
+    snapshot.window_types = X11WindowTypes::new(vec![X11WindowType::PopupMenu]);
     let handle = snapshot.handle;
 
     fixture

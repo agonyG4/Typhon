@@ -12,7 +12,10 @@ use x11rb::{
 use super::{
     X11PublishedState, X11WindowHandle, Xwm, XwmError,
     atoms::XwmAtomName,
-    window::{AuxiliaryReconciliation, X11PropertySnapshot, X11WindowRecord, X11WindowType},
+    window::{
+        AuxiliaryReconciliation, X11PropertySnapshot, X11WindowRecord, X11WindowType,
+        X11WindowTypes,
+    },
 };
 use crate::xwayland::trace::{self, TraceFields};
 
@@ -136,7 +139,7 @@ enum ParsedProperty {
     AppId(Option<String>),
     Pid(Option<u32>),
     UserTime(Option<u32>),
-    WindowType(Option<X11WindowType>),
+    WindowTypes(X11WindowTypes),
     TransientFor(Option<u32>),
     ClientLeader(Option<u32>),
     UserTimeWindow(Option<u32>),
@@ -597,7 +600,7 @@ fn maybe_finish_refresh(xwm: &mut Xwm, handle: X11WindowHandle) -> Result<(), Xw
             sync_counter_changed,
             property_epoch,
             properties_ready,
-            window_type,
+            window_types,
             transient_for,
         )) = xwm.windows.get_mut(handle).map(|record| {
             let sync_counter_changed =
@@ -612,7 +615,7 @@ fn maybe_finish_refresh(xwm: &mut Xwm, handle: X11WindowHandle) -> Result<(), Xw
                 sync_counter_changed,
                 record.property_epoch,
                 record.properties_ready,
-                record.properties.window_type,
+                record.properties.window_types.clone(),
                 record.properties.transient_for,
             )
         })
@@ -625,7 +628,7 @@ fn maybe_finish_refresh(xwm: &mut Xwm, handle: X11WindowHandle) -> Result<(), Xw
                 .field("xid", handle.xid())
                 .field("property_epoch", property_epoch)
                 .field("properties_ready", properties_ready)
-                .field("window_type", format!("{:?}", window_type))
+                .field("window_types", format!("{:?}", window_types))
                 .optional("transient_for", transient_for.map(|parent| parent.xid()))
         });
         if sync_counter_changed {
@@ -664,7 +667,7 @@ fn commit_property(
             record.properties.user_time = record.staging_properties.user_time;
         }
         PropertyKind::NetWmWindowType => {
-            record.properties.window_type = record.staging_properties.window_type;
+            record.properties.window_types = record.staging_properties.window_types.clone();
         }
         PropertyKind::WmTransientFor => {
             record.properties.transient_for = record.staging_properties.transient_for;
@@ -713,8 +716,8 @@ fn commit_property(
         PropertyKind::WmTransientFor => Some(super::X11MetadataDelta::TransientFor(
             record.properties.transient_for,
         )),
-        PropertyKind::NetWmWindowType => Some(super::X11MetadataDelta::WindowType(
-            record.properties.window_type,
+        PropertyKind::NetWmWindowType => Some(super::X11MetadataDelta::WindowTypes(
+            record.properties.window_types.clone(),
         )),
         PropertyKind::WmHints => Some(super::X11MetadataDelta::AcceptsInput(
             record.properties.accepts_input,
@@ -736,7 +739,7 @@ fn update_snapshot(record: &mut X11WindowRecord) {
     snapshot.metadata.pid = record.properties.pid;
     snapshot.constraints = record.properties.constraints;
     snapshot.transient_for = record.properties.transient_for;
-    snapshot.window_type = record.properties.window_type;
+    snapshot.window_types = record.properties.window_types.clone();
     snapshot.override_redirect =
         record.kind == crate::compositor::DesktopWindowKind::OverrideRedirect;
     snapshot.supports_delete = record.properties.supports_delete;
@@ -763,7 +766,7 @@ fn apply_parsed(
         ParsedProperty::AppId(value) => properties.app_id = value,
         ParsedProperty::Pid(value) => properties.pid = value,
         ParsedProperty::UserTime(value) => properties.user_time = value,
-        ParsedProperty::WindowType(value) => properties.window_type = value,
+        ParsedProperty::WindowTypes(value) => properties.window_types = value,
         ParsedProperty::TransientFor(value) => {
             properties.transient_for =
                 value.map(|xid| X11WindowHandle::new(handle.generation(), xid));
@@ -809,7 +812,7 @@ fn fallback_for(kind: PropertyKind) -> ParsedProperty {
         PropertyKind::NetWmPid => ParsedProperty::Pid(None),
         PropertyKind::WmWindowRole | PropertyKind::NetStartupId => ParsedProperty::Text(None),
         PropertyKind::NetWmUserTime => ParsedProperty::UserTime(None),
-        PropertyKind::NetWmWindowType => ParsedProperty::WindowType(None),
+        PropertyKind::NetWmWindowType => ParsedProperty::WindowTypes(X11WindowTypes::default()),
         PropertyKind::WmTransientFor => ParsedProperty::TransientFor(None),
         PropertyKind::WmClientLeader => ParsedProperty::ClientLeader(None),
         PropertyKind::NetWmUserTimeWindow => ParsedProperty::UserTimeWindow(None),
@@ -900,27 +903,51 @@ fn expected_type(kind: PropertyKind, xwm: &Xwm) -> Option<u32> {
 
 fn parse_window_type(reply: &xproto::GetPropertyReply, xwm: &Xwm) -> Option<ParsedProperty> {
     let values = parse_u32s(reply)?;
-    let atom = *values.first()?;
-    let window_type = if atom == xwm.atoms.get(XwmAtomName::NetWmWindowTypeNormal) {
-        X11WindowType::Normal
-    } else if atom == xwm.atoms.get(XwmAtomName::NetWmWindowTypeDialog) {
-        X11WindowType::Dialog
-    } else if atom == xwm.atoms.get(XwmAtomName::NetWmWindowTypeUtility) {
-        X11WindowType::Utility
-    } else if atom == xwm.atoms.get(XwmAtomName::NetWmWindowTypeMenu) {
-        X11WindowType::Menu
-    } else if atom == xwm.atoms.get(XwmAtomName::NetWmWindowTypePopupMenu) {
-        X11WindowType::PopupMenu
-    } else if atom == xwm.atoms.get(XwmAtomName::NetWmWindowTypeDropdownMenu) {
-        X11WindowType::DropdownMenu
-    } else if atom == xwm.atoms.get(XwmAtomName::NetWmWindowTypeTooltip) {
-        X11WindowType::Tooltip
-    } else if atom == xwm.atoms.get(XwmAtomName::NetWmWindowTypeNotification) {
-        X11WindowType::Notification
-    } else {
-        X11WindowType::Other(atom)
-    };
-    Some(ParsedProperty::WindowType(Some(window_type)))
+    Some(ParsedProperty::WindowTypes(parse_window_type_values(
+        &values, &xwm.atoms,
+    )))
+}
+
+fn parse_window_type_values(values: &[u32], atoms: &super::atoms::XwmAtoms) -> X11WindowTypes {
+    X11WindowTypes::new(
+        values
+            .iter()
+            .copied()
+            .map(|atom| {
+                let names = [
+                    (XwmAtomName::NetWmWindowTypeNormal, X11WindowType::Normal),
+                    (XwmAtomName::NetWmWindowTypeDialog, X11WindowType::Dialog),
+                    (XwmAtomName::NetWmWindowTypeUtility, X11WindowType::Utility),
+                    (XwmAtomName::NetWmWindowTypeMenu, X11WindowType::Menu),
+                    (
+                        XwmAtomName::NetWmWindowTypePopupMenu,
+                        X11WindowType::PopupMenu,
+                    ),
+                    (
+                        XwmAtomName::NetWmWindowTypeDropdownMenu,
+                        X11WindowType::DropdownMenu,
+                    ),
+                    (XwmAtomName::NetWmWindowTypeTooltip, X11WindowType::Tooltip),
+                    (
+                        XwmAtomName::NetWmWindowTypeNotification,
+                        X11WindowType::Notification,
+                    ),
+                    (XwmAtomName::NetWmWindowTypeCombo, X11WindowType::Combo),
+                    (XwmAtomName::NetWmWindowTypeSplash, X11WindowType::Splash),
+                    (XwmAtomName::NetWmWindowTypeToolbar, X11WindowType::Toolbar),
+                    (XwmAtomName::NetWmWindowTypeDock, X11WindowType::Dock),
+                    (XwmAtomName::NetWmWindowTypeDesktop, X11WindowType::Desktop),
+                    (XwmAtomName::NetWmWindowTypeDnd, X11WindowType::Dnd),
+                ];
+                names
+                    .iter()
+                    .find_map(|(name, window_type)| {
+                        (atom == atoms.get(*name)).then_some(*window_type)
+                    })
+                    .unwrap_or(X11WindowType::Other(atom))
+            })
+            .collect(),
+    )
 }
 
 fn parse_wm_hints(reply: &xproto::GetPropertyReply) -> Option<ParsedProperty> {
@@ -1032,10 +1059,12 @@ fn all_mask() -> u16 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::num::NonZeroU64;
 
     use crate::compositor::DesktopWindowKind;
     use crate::xwayland::XwaylandGeneration;
+    use crate::xwayland::xwm::atoms::{XwmAtomName, XwmAtoms};
     use crate::xwayland::xwm::{X11WindowSnapshot, window::X11WindowRegistry};
 
     use super::*;
@@ -1085,6 +1114,27 @@ mod tests {
         assert_eq!(parse_text("títle".as_bytes()), Some("títle".to_owned()));
         assert_eq!(parse_app_id(b"instance\0QtApp\0"), Some("QtApp".to_owned()));
         assert!(parse_text(&vec![b'x'; MAX_TEXT_PROPERTY_BYTES + 1]).is_none());
+    }
+
+    #[test]
+    fn window_type_parser_preserves_all_atoms_and_finds_later_supported_type() {
+        let mut values = XwmAtomName::ALL
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (*name, (index + 1) as u32))
+            .collect::<HashMap<_, _>>();
+        values.insert(XwmAtomName::NetWmWindowTypePopupMenu, 77);
+        let atoms = XwmAtoms::from_values(values);
+
+        let parsed = parse_window_type_values(&[0xfeed_beef, 77], &atoms);
+        assert_eq!(
+            parsed.atoms,
+            vec![X11WindowType::Other(0xfeed_beef), X11WindowType::PopupMenu]
+        );
+        assert_eq!(
+            parsed.preferred_supported_type(),
+            Some(X11WindowType::PopupMenu)
+        );
     }
 
     #[test]
@@ -1155,7 +1205,7 @@ mod tests {
             handle,
             surface_id: 7,
             kind: DesktopWindowKind::Managed,
-            window_type: None,
+            window_types: X11WindowTypes::default(),
             override_redirect: false,
             geometry: Default::default(),
             metadata: crate::compositor::WindowMetadata {
@@ -1195,7 +1245,7 @@ mod tests {
             handle,
             surface_id: 8,
             kind: DesktopWindowKind::Managed,
-            window_type: None,
+            window_types: X11WindowTypes::default(),
             override_redirect: false,
             geometry: Default::default(),
             metadata: Default::default(),

@@ -96,7 +96,7 @@ fn test_x11_snapshot(surface_id: u32) -> crate::xwayland::xwm::X11WindowSnapshot
         handle: crate::xwayland::X11WindowHandle::new(generation, 0x100),
         surface_id,
         kind: DesktopWindowKind::Managed,
-        window_type: None,
+        window_types: crate::xwayland::xwm::X11WindowTypes::default(),
         override_redirect: false,
         geometry: crate::xwayland::xwm::X11Geometry {
             x: 10,
