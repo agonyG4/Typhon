@@ -91,6 +91,15 @@ pub(crate) enum AuxiliaryReconciliation {
     ReadinessRestored,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KindReconciliation {
+    Unchanged,
+    Changed {
+        old: DesktopWindowKind,
+        new: DesktopWindowKind,
+    },
+}
+
 impl X11WindowRegistry {
     #[cfg(test)]
     pub(crate) fn insert_observed(&mut self, handle: X11WindowHandle) -> bool {
@@ -223,6 +232,24 @@ impl X11WindowRegistry {
 
     pub(crate) fn get_mut(&mut self, handle: X11WindowHandle) -> Option<&mut X11WindowRecord> {
         self.records.get_mut(&handle)
+    }
+
+    pub(crate) fn reconcile_kind(
+        &mut self,
+        handle: X11WindowHandle,
+        kind: DesktopWindowKind,
+    ) -> Result<KindReconciliation, &'static str> {
+        let record = self.record_mut(handle)?;
+        if record.kind == kind {
+            return Ok(KindReconciliation::Unchanged);
+        }
+        let old = record.kind;
+        record.kind = kind;
+        if let Some(snapshot) = record.snapshot.as_mut() {
+            snapshot.kind = kind;
+            snapshot.override_redirect = kind == DesktopWindowKind::OverrideRedirect;
+        }
+        Ok(KindReconciliation::Changed { old, new: kind })
     }
 
     pub(crate) fn remove(&mut self, handle: X11WindowHandle) -> Option<X11WindowRecord> {
@@ -894,6 +921,50 @@ mod tests {
         let record = registry.get(window).expect("adopted window");
         assert_eq!(record.geometry, geometry);
         assert_eq!(record.lifecycle, X11WindowLifecycle::Observed);
+    }
+
+    #[test]
+    fn reconcile_kind_updates_existing_snapshot() {
+        let generation = generation(23);
+        let window = handle(generation, 230);
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::Managed,
+            X11Geometry::default(),
+        );
+        registry.mark_map_requested(window).expect("map request");
+        complete_properties(&mut registry, window);
+        registry
+            .mark_associated(window, associated(generation, 1, 230))
+            .expect("association");
+        registry.mark_buffer_ready(window).expect("buffer");
+        registry.mark_map_commanded(window).expect("map command");
+        registry.confirm_map_notify(window).expect("map notify");
+        registry
+            .try_ready(window)
+            .expect("known window")
+            .expect("ready snapshot");
+
+        assert_eq!(
+            registry.reconcile_kind(window, DesktopWindowKind::OverrideRedirect),
+            Ok(KindReconciliation::Changed {
+                old: DesktopWindowKind::Managed,
+                new: DesktopWindowKind::OverrideRedirect,
+            })
+        );
+        let record = registry.get(window).expect("known window");
+        assert_eq!(record.kind, DesktopWindowKind::OverrideRedirect);
+        assert_eq!(
+            record.snapshot.as_ref().map(|snapshot| snapshot.kind),
+            Some(DesktopWindowKind::OverrideRedirect)
+        );
+        assert!(
+            record
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.override_redirect)
+        );
     }
 
     #[test]

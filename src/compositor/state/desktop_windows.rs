@@ -259,6 +259,15 @@ impl CompositorState {
                     window.kind == DesktopWindowKind::OverrideRedirect,
                 ));
             }
+            crate::xwayland::xwm::X11MetadataDelta::Kind(kind) => {
+                window.kind = kind;
+                window.x11_role = Some(crate::compositor::desktop_window::classify_x11_role(
+                    window.kind,
+                    window.x11_window_type,
+                    window.x11_transient_for.is_some(),
+                    window.kind == DesktopWindowKind::OverrideRedirect,
+                ));
+            }
             crate::xwayland::xwm::X11MetadataDelta::AcceptsInput(accepts_input) => {
                 window.x11_accepts_input = accepts_input;
             }

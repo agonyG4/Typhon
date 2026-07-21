@@ -468,7 +468,10 @@ impl OwnCompositorServer {
                         let published = self
                             .state
                             .adopt_current_xwayland_surface_content(surface_id);
-                        let focused = self.state.focus_desktop_window(window_id);
+                        let wants_initial_focus =
+                            self.state.x11_window_wants_initial_focus(window_id);
+                        let focused =
+                            wants_initial_focus && self.state.focus_desktop_window(window_id);
                         let focus_after = self.focused_x11_window_xid();
                         trace::emit("focus_decision", || {
                             TraceFields::new()
@@ -476,7 +479,7 @@ impl OwnCompositorServer {
                                 .field("xid", handle.xid())
                                 .field("surface_id", surface_id)
                                 .field("focus_decision", "initial_focus")
-                                .field("focus_requested", true)
+                                .field("focus_requested", wants_initial_focus)
                                 .field("focus_result", focused)
                                 .optional("focus_before", focus_before)
                                 .optional("focus_after", focus_after)
@@ -551,6 +554,7 @@ impl OwnCompositorServer {
                     &delta,
                     crate::xwayland::xwm::X11MetadataDelta::TransientFor(_)
                         | crate::xwayland::xwm::X11MetadataDelta::WindowType(_)
+                        | crate::xwayland::xwm::X11MetadataDelta::Kind(_)
                 );
                 self.state.apply_x11_metadata_delta(window, delta);
                 if prior_focused

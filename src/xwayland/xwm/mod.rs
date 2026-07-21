@@ -45,7 +45,7 @@ use capabilities::XwmCapabilities;
 pub use moveresize::{X11MoveResizeDirection, X11MoveResizeRequest};
 pub use resize_sync::{RESIZE_SYNC_TIMEOUT_NS, ResizeSyncError, ResizeSyncState};
 pub(crate) use resize_sync::{ResizeSyncCommit, ResizeSyncTracker};
-use window::X11WindowRegistry;
+use window::{KindReconciliation, X11WindowRegistry};
 pub use window::{X11WindowLifecycle, X11WindowType};
 
 use super::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
@@ -163,6 +163,7 @@ pub enum X11MetadataDelta {
     Constraints(WindowConstraints),
     TransientFor(Option<X11WindowHandle>),
     WindowType(Option<X11WindowType>),
+    Kind(DesktopWindowKind),
     AcceptsInput(Option<bool>),
     Protocols {
         supports_delete: bool,
@@ -451,6 +452,29 @@ impl Xwm {
             properties::begin_initial(self, handle)?;
         }
         Ok(inserted)
+    }
+
+    pub(crate) fn reconcile_window_kind(
+        &mut self,
+        handle: X11WindowHandle,
+        kind: DesktopWindowKind,
+    ) -> Result<KindReconciliation, XwmError> {
+        let reconciliation = self
+            .windows
+            .reconcile_kind(handle, kind)
+            .map_err(XwmError::InvalidCommand)?;
+        if matches!(reconciliation, KindReconciliation::Changed { .. })
+            && self
+                .windows
+                .get(handle)
+                .is_some_and(|record| record.snapshot.is_some())
+        {
+            self.outgoing_events.push_back(XwmEvent::MetadataChanged {
+                window: handle,
+                delta: X11MetadataDelta::Kind(kind),
+            });
+        }
+        Ok(reconciliation)
     }
 
     pub fn register_snapshot(&mut self, snapshot: X11WindowSnapshot) -> Result<bool, XwmError> {

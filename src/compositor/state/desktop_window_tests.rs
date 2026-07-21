@@ -248,6 +248,23 @@ fn x11_metadata_delta_updates_generic_metadata() {
 }
 
 #[test]
+fn x11_kind_delta_reclassifies_existing_window_as_override_redirect() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let snapshot = x11_snapshot(generation, 105, 56);
+    let id = insert_x11(&mut state, snapshot.clone());
+
+    assert!(state.apply_x11_metadata_delta(
+        snapshot.handle,
+        X11MetadataDelta::Kind(DesktopWindowKind::OverrideRedirect)
+    ));
+    let window = state.window(id).expect("window");
+    assert_eq!(window.kind, DesktopWindowKind::OverrideRedirect);
+    assert_eq!(window.x11_role, Some(X11DesktopRole::OverrideRedirect));
+    assert!(state.x11_client_lists().0.is_empty());
+}
+
+#[test]
 fn x11_client_lists_follow_identity_and_generic_stacking() {
     let mut state = CompositorState::new(None);
     let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());

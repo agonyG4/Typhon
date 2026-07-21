@@ -1,6 +1,14 @@
 use super::*;
 
 impl CompositorState {
+    pub(in crate::compositor) fn x11_window_wants_initial_focus(
+        &self,
+        window_id: WindowId,
+    ) -> bool {
+        self.window(window_id)
+            .is_some_and(DesktopWindow::is_normal_x11_role)
+    }
+
     pub(in crate::compositor) fn focus_desktop_window(&mut self, window_id: WindowId) -> bool {
         let Some(window) = self.window(window_id) else {
             return false;

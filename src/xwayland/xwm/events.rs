@@ -48,7 +48,9 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 width: u32::from(event.width),
                 height: u32::from(event.height),
             };
-            xwm.observe_window_with_kind(handle, kind, geometry)?;
+            if !xwm.observe_window_with_kind(handle, kind, geometry)? {
+                xwm.reconcile_window_kind(handle, kind)?;
+            }
             trace_window_state(xwm, "create_window_observed", handle, TraceFields::new());
         }
         Event::MapRequest(event) => {
@@ -71,6 +73,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         Event::MapNotify(event) => {
             let handle =
                 ensure_window_with_kind(xwm, event.window, window_kind(event.override_redirect))?;
+            xwm.reconcile_window_kind(handle, window_kind(event.override_redirect))?;
             if xwm
                 .windows
                 .get(handle)
@@ -101,13 +104,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             xwm.windows
                 .confirm_external_map_notify(handle)
                 .map_err(XwmError::InvalidCommand)?;
-            if !xwm
-                .windows
-                .get(handle)
-                .is_some_and(|record| record.properties_ready)
-            {
-                xwm.refresh_window_properties(handle)?;
-            }
+            xwm.refresh_window_properties(handle)?;
             let ready_emitted = xwm.emit_ready_if_complete(handle)?;
             let lifecycle = xwm
                 .windows
@@ -201,6 +198,9 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 width: u32::from(event.width),
                 height: u32::from(event.height),
             };
+            if xwm.windows.contains(handle) {
+                xwm.reconcile_window_kind(handle, window_kind(event.override_redirect))?;
+            }
             if let Some(record) = xwm.windows.get_mut(handle) {
                 record.geometry = geometry;
                 if let Some(snapshot) = record.snapshot.as_mut() {
@@ -685,6 +685,22 @@ mod tests {
         })
     }
 
+    fn configure_event(window: u32, override_redirect: bool) -> Event {
+        Event::ConfigureNotify(xproto::ConfigureNotifyEvent {
+            response_type: 22,
+            sequence: 0,
+            event: 1,
+            window,
+            above_sibling: 0,
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 480,
+            border_width: 0,
+            override_redirect,
+        })
+    }
+
     fn unmap_event(window: u32) -> Event {
         Event::UnmapNotify(xproto::UnmapNotifyEvent {
             response_type: 18,
@@ -750,6 +766,19 @@ mod tests {
             super::super::XwmEvent::WindowReady(snapshot) => Some(snapshot.surface_id),
             _ => None,
         })
+    }
+
+    fn complete_property_refresh(xwm: &mut Xwm, peer: &mut UnixStream) {
+        xwm.flush().expect("flush property refresh");
+        let mut sequences = xwm.pending_properties.keys().copied().collect::<Vec<_>>();
+        sequences.sort_unstable();
+        for sequence in sequences {
+            let mut reply = [0u8; 32];
+            reply[0] = 1;
+            reply[2..4].copy_from_slice(&(sequence as u16).to_ne_bytes());
+            peer.write_all(&reply).expect("write property reply");
+        }
+        xwm.drain_events(256).expect("drain property refresh");
     }
 
     #[test]
@@ -940,7 +969,7 @@ mod tests {
     #[test]
     fn map_notify_before_map_command_is_classified_as_external_mapping() {
         let generation = generation(6);
-        let (mut xwm, _peer) = test_fixture(generation);
+        let (mut xwm, mut peer) = test_fixture(generation);
         let handle = X11WindowHandle::new(generation, 105);
         assert!(xwm.windows.insert_observed(handle));
         let record = xwm.windows.get_mut(handle).expect("window record");
@@ -954,6 +983,7 @@ mod tests {
         record.buffer_ready = true;
 
         normalize(&mut xwm, map_event(handle.xid(), false)).expect("external MapNotify");
+        complete_property_refresh(&mut xwm, &mut peer);
         let events = ready_events(&mut xwm);
         assert_eq!(events.len(), 1);
         assert_eq!(ready_surface_id(&events), Some(42));
@@ -967,7 +997,7 @@ mod tests {
     #[test]
     fn managed_map_notify_without_prior_request_is_adopted_as_mapped() {
         let generation = generation(12);
-        let (mut xwm, _peer) = test_fixture(generation);
+        let (mut xwm, mut peer) = test_fixture(generation);
         let handle = X11WindowHandle::new(generation, 109);
         assert!(xwm.windows.insert_observed(handle));
         xwm.windows
@@ -989,6 +1019,7 @@ mod tests {
             .expect("buffer readiness");
 
         normalize(&mut xwm, map_event(handle.xid(), false)).expect("external MapNotify");
+        complete_property_refresh(&mut xwm, &mut peer);
 
         let events = ready_events(&mut xwm);
         assert_eq!(events.len(), 1);
@@ -1006,9 +1037,56 @@ mod tests {
     }
 
     #[test]
+    fn external_map_notify_refreshes_properties_after_create_scan() {
+        let generation = generation(24);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = X11WindowHandle::new(generation, 124);
+        assert!(xwm.windows.insert_observed(handle));
+        let record = xwm.windows.get_mut(handle).expect("window record");
+        record.properties_ready = true;
+        record.property_epoch = 7;
+
+        normalize(&mut xwm, map_event(handle.xid(), false)).expect("external MapNotify");
+
+        let record = xwm.windows.get(handle).expect("window record");
+        assert_eq!(record.property_epoch, 8);
+        assert!(record.refresh_all);
+    }
+
+    #[test]
+    fn map_notify_reconciles_existing_override_redirect_kind() {
+        let generation = generation(25);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = X11WindowHandle::new(generation, 125);
+        assert!(xwm.windows.insert_observed(handle));
+
+        normalize(&mut xwm, map_event(handle.xid(), true)).expect("override MapNotify");
+
+        assert_eq!(
+            xwm.windows.get(handle).expect("window record").kind,
+            DesktopWindowKind::OverrideRedirect
+        );
+    }
+
+    #[test]
+    fn configure_notify_reconciles_override_redirect_kind() {
+        let generation = generation(26);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = X11WindowHandle::new(generation, 126);
+        assert!(xwm.windows.insert_observed(handle));
+
+        normalize(&mut xwm, configure_event(handle.xid(), true)).expect("override ConfigureNotify");
+
+        assert_eq!(
+            xwm.windows.get(handle).expect("window record").kind,
+            DesktopWindowKind::OverrideRedirect
+        );
+    }
+
+    #[test]
     fn override_redirect_map_notify_keeps_external_lifecycle() {
         let generation = generation(7);
-        let (mut xwm, _peer) = test_fixture(generation);
+        let (mut xwm, mut peer) = test_fixture(generation);
         let handle = X11WindowHandle::new(generation, 106);
         assert!(xwm.windows.insert_observed_with_kind(
             handle,
@@ -1025,6 +1103,7 @@ mod tests {
         record.buffer_ready = true;
 
         normalize(&mut xwm, map_event(handle.xid(), true)).expect("override MapNotify");
+        complete_property_refresh(&mut xwm, &mut peer);
         let events = ready_events(&mut xwm);
         assert_eq!(events.len(), 1);
         assert_eq!(ready_surface_id(&events), Some(42));
@@ -1038,7 +1117,7 @@ mod tests {
     #[test]
     fn override_redirect_unmap_can_remap_with_a_fresh_wayland_surface() {
         let generation = generation(14);
-        let (mut xwm, _peer) = test_fixture(generation);
+        let (mut xwm, mut peer) = test_fixture(generation);
         let handle = X11WindowHandle::new(generation, 111);
         assert!(xwm.windows.insert_observed_with_kind(
             handle,
@@ -1061,6 +1140,7 @@ mod tests {
         xwm.mark_window_buffer_ready(handle)
             .expect("first buffer readiness");
         normalize(&mut xwm, map_event(handle.xid(), true)).expect("first MapNotify");
+        complete_property_refresh(&mut xwm, &mut peer);
         assert_eq!(ready_surface_id(&ready_events(&mut xwm)), Some(42));
 
         normalize(&mut xwm, unmap_event(handle.xid())).expect("popup UnmapNotify");
@@ -1087,6 +1167,7 @@ mod tests {
         xwm.mark_window_buffer_ready(handle)
             .expect("replacement buffer readiness");
         normalize(&mut xwm, map_event(handle.xid(), true)).expect("replacement MapNotify");
+        complete_property_refresh(&mut xwm, &mut peer);
 
         assert_eq!(ready_surface_id(&ready_events(&mut xwm)), Some(43));
     }
@@ -1094,7 +1175,7 @@ mod tests {
     #[test]
     fn wayland_surface_removal_clears_the_mapped_x11_record() {
         let generation = generation(17);
-        let (mut xwm, _peer) = test_fixture(generation);
+        let (mut xwm, mut peer) = test_fixture(generation);
         let handle = X11WindowHandle::new(generation, 114);
         assert!(xwm.windows.insert_observed_with_kind(
             handle,
@@ -1116,6 +1197,7 @@ mod tests {
         xwm.mark_window_buffer_ready(handle)
             .expect("first buffer readiness");
         normalize(&mut xwm, map_event(handle.xid(), true)).expect("first MapNotify");
+        complete_property_refresh(&mut xwm, &mut peer);
         assert_eq!(ready_surface_id(&ready_events(&mut xwm)), Some(42));
 
         xwm.ingest_wayland_association(XwaylandAssociationEvent::Removed {

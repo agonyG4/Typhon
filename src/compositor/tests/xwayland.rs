@@ -394,6 +394,43 @@ fn x11_window_ready_initial_focus_skips_auxiliary_popup() {
 }
 
 #[test]
+fn late_kind_change_removes_normal_membership_without_focus_flash() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    let handle = snapshot.handle;
+
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let _ = fixture.server.take_xwayland_backend_commands(0);
+
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::MetadataChanged {
+            window: handle,
+            delta: crate::xwayland::xwm::X11MetadataDelta::Kind(
+                DesktopWindowKind::OverrideRedirect,
+            ),
+        });
+
+    assert!(fixture.server.state.x11_client_lists().0.is_empty());
+    assert!(
+        fixture
+            .server
+            .take_xwayland_backend_commands(0)
+            .iter()
+            .all(|command| !matches!(
+                command,
+                XwmCommand::Focus {
+                    window: Some(window),
+                    ..
+                } if *window == handle
+            ))
+    );
+}
+
+#[test]
 fn x11_client_moveresize_requires_held_button_and_starts_move() {
     let mut fixture = first_buffer_fixture();
     let mut snapshot = fake_snapshot();
