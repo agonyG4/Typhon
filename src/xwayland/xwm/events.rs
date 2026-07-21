@@ -764,6 +764,7 @@ mod tests {
                         generation: xwm.generation,
                         serial: NonZeroU64::new(0x1234).expect("serial"),
                         surface_id: 42,
+                        map_serial: 0,
                     },
                 )
                 .expect("association");
@@ -1040,6 +1041,7 @@ mod tests {
             generation,
             serial: NonZeroU64::new(0x1234).expect("serial"),
             surface_id: 42,
+            map_serial: 0,
         });
         record.buffer_ready = true;
 
@@ -1072,6 +1074,7 @@ mod tests {
                     generation,
                     serial: NonZeroU64::new(0x1234).expect("serial"),
                     surface_id: 42,
+                    map_serial: 0,
                 },
             )
             .expect("association");
@@ -1160,6 +1163,7 @@ mod tests {
             generation,
             serial: NonZeroU64::new(0x1234).expect("serial"),
             surface_id: 42,
+            map_serial: 0,
         });
         record.buffer_ready = true;
 
@@ -1355,6 +1359,68 @@ mod tests {
         assert!(record.snapshot.is_some());
         assert!(record.association.is_none());
         assert!(!record.buffer_ready);
+    }
+
+    #[test]
+    fn old_surface_removal_after_new_map_association_keeps_replacement() {
+        let generation = generation(30);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = prepare_managed_window(&mut xwm, 130, true, false, false);
+        xwm.note_x11_surface_serial(handle, 0x1234, 0)
+            .expect("old X11 surface serial");
+        xwm.ingest_wayland_association(XwaylandAssociationEvent::Committed {
+            generation,
+            serial: NonZeroU64::new(0x1234).expect("old serial"),
+            surface_id: 42,
+        })
+        .expect("old Wayland association");
+        xwm.mark_window_buffer_ready(handle)
+            .expect("old buffer readiness");
+        normalize(&mut xwm, map_event(handle.xid(), false)).expect("first MapNotify");
+        assert_eq!(ready_surface_id(&ready_events(&mut xwm)), Some(42));
+        let old_association = xwm
+            .windows
+            .get(handle)
+            .and_then(|record| record.association)
+            .expect("old association");
+
+        super::super::commands::execute(&mut xwm, super::super::XwmCommand::Unmap(handle))
+            .expect("WM unmap command");
+        normalize(&mut xwm, unmap_event(handle.xid())).expect("WM UnmapNotify");
+        super::super::commands::execute(&mut xwm, super::super::XwmCommand::Map(handle))
+            .expect("restore map command");
+
+        xwm.note_x11_surface_serial(handle, 0x5678, 0)
+            .expect("new X11 surface serial");
+        xwm.ingest_wayland_association(XwaylandAssociationEvent::Committed {
+            generation,
+            serial: NonZeroU64::new(0x5678).expect("new serial"),
+            surface_id: 43,
+        })
+        .expect("new Wayland association");
+        let new_association = xwm
+            .windows
+            .get(handle)
+            .and_then(|record| record.association)
+            .expect("replacement association");
+        assert_eq!(new_association.surface_id, 43);
+        assert!(new_association.map_serial > old_association.map_serial);
+
+        xwm.ingest_wayland_association(XwaylandAssociationEvent::Removed {
+            generation,
+            serial: old_association.serial,
+            surface_id: old_association.surface_id,
+        })
+        .expect("late old Wayland surface removal");
+
+        assert!(ready_events(&mut xwm).is_empty());
+        assert_eq!(
+            xwm.windows
+                .get(handle)
+                .and_then(|record| record.association)
+                .map(|association| association.surface_id),
+            Some(43)
+        );
     }
 
     #[test]

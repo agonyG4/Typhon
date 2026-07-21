@@ -20,11 +20,17 @@ impl Xwm {
                 SurfaceAssociationJoinError::InvalidSerial,
             ));
         };
+        let map_serial = self
+            .windows
+            .get(handle)
+            .map(|record| record.map_serial)
+            .unwrap_or_default();
         trace::emit("association_x11_serial_observed", || {
             TraceFields::new()
                 .field("source", "x11")
                 .field("xid", handle.xid())
                 .field("association_serial", serial.get())
+                .field("map_serial", map_serial)
                 .field("surface_id", "pending")
         });
         let deadline = crate::native::event_loop::monotonic_now_ns()
@@ -33,7 +39,7 @@ impl Xwm {
         self.adoption
             .observe(handle, adoption::AdoptionWait::SerialPair, deadline);
         self.association
-            .note_x11_serial(handle, serial)
+            .note_x11_serial_for_map(handle, serial, map_serial)
             .map_err(XwmError::Association)?;
         self.sync_completed_associations();
         Ok(())

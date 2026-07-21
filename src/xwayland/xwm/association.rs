@@ -13,6 +13,13 @@ pub struct AssociatedSurface {
     pub(crate) generation: XwaylandGeneration,
     pub(crate) serial: NonZeroU64,
     pub(crate) surface_id: u32,
+    pub(crate) map_serial: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct X11Association {
+    pub(crate) window: X11WindowHandle,
+    pub(crate) map_serial: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +64,7 @@ pub enum XwmAssociationEvent {
 #[derive(Debug, Default)]
 pub struct SurfaceAssociationJoin {
     pub(crate) wayland_by_serial: HashMap<NonZeroU64, WaylandAssociation>,
-    pub(crate) x11_by_serial: HashMap<NonZeroU64, X11WindowHandle>,
+    pub(crate) x11_by_serial: HashMap<NonZeroU64, X11Association>,
     pub(crate) serial_by_x11: HashMap<X11WindowHandle, NonZeroU64>,
     pub(crate) completed: HashMap<X11WindowHandle, AssociatedSurface>,
     events: Vec<XwmAssociationEvent>,
@@ -90,20 +97,33 @@ impl SurfaceAssociationJoin {
         self.complete_if_ready(serial)
     }
 
+    #[cfg(test)]
     pub(crate) fn note_x11_serial(
         &mut self,
         window: X11WindowHandle,
         serial: NonZeroU64,
     ) -> Result<(), SurfaceAssociationJoinError> {
-        if let Some(previous) = self.serial_by_x11.get(&window) {
-            let _ = previous;
-            return Err(SurfaceAssociationJoinError::X11Reassociation);
-        }
+        self.note_x11_serial_for_map(window, serial, 0)
+    }
+
+    pub(crate) fn note_x11_serial_for_map(
+        &mut self,
+        window: X11WindowHandle,
+        serial: NonZeroU64,
+        map_serial: u64,
+    ) -> Result<(), SurfaceAssociationJoinError> {
         if self.x11_by_serial.contains_key(&serial) {
+            if self.serial_by_x11.get(&window) == Some(&serial) {
+                return self.complete_if_ready(serial);
+            }
             return Err(SurfaceAssociationJoinError::DuplicateX11Serial);
         }
-        self.x11_by_serial.insert(serial, window);
-        self.serial_by_x11.insert(window, serial);
+        if let Some(previous) = self.serial_by_x11.insert(window, serial) {
+            self.completed.remove(&window);
+            debug_assert!(self.x11_by_serial.contains_key(&previous));
+        }
+        self.x11_by_serial
+            .insert(serial, X11Association { window, map_serial });
         self.complete_if_ready(serial)
     }
 
@@ -118,12 +138,17 @@ impl SurfaceAssociationJoin {
             return;
         };
         self.wayland_by_serial.remove(&serial);
-        if let Some(window) = self.x11_by_serial.remove(&serial) {
-            self.serial_by_x11.remove(&window);
-            if let Some(association) = self.completed.remove(&window) {
+        if let Some(x11) = self.x11_by_serial.remove(&serial) {
+            let current = self.serial_by_x11.get(&x11.window).copied();
+            if current == Some(serial) {
+                self.serial_by_x11.remove(&x11.window);
+            }
+            if current == Some(serial)
+                && let Some(association) = self.completed.remove(&x11.window)
+            {
                 self.events.push(XwmAssociationEvent::Removed {
                     generation: association.generation,
-                    window,
+                    window: x11.window,
                     surface_id: association.surface_id,
                 });
             }
@@ -131,12 +156,17 @@ impl SurfaceAssociationJoin {
     }
 
     pub(crate) fn remove_x11_window(&mut self, window: X11WindowHandle) {
-        let Some(serial) = self.serial_by_x11.remove(&window) else {
-            return;
-        };
-        self.x11_by_serial.remove(&serial);
-        if let Some(association) = self.completed.remove(&window) {
+        self.serial_by_x11.remove(&window);
+        let serials = self
+            .x11_by_serial
+            .iter()
+            .filter_map(|(serial, association)| (association.window == window).then_some(*serial))
+            .collect::<Vec<_>>();
+        for serial in serials {
+            self.x11_by_serial.remove(&serial);
             self.wayland_by_serial.remove(&serial);
+        }
+        if let Some(association) = self.completed.remove(&window) {
             self.events.push(XwmAssociationEvent::Removed {
                 generation: association.generation,
                 window,
@@ -146,27 +176,6 @@ impl SurfaceAssociationJoin {
     }
 
     pub(crate) fn clear_generation(&mut self, generation: XwaylandGeneration) {
-        let wayland_serials = self
-            .wayland_by_serial
-            .iter()
-            .filter_map(|(serial, association)| {
-                (association.generation == generation).then_some(*serial)
-            })
-            .collect::<Vec<_>>();
-        for serial in wayland_serials {
-            if let Some(association) = self.wayland_by_serial.remove(&serial)
-                && let Some(window) = self.x11_by_serial.remove(&serial)
-            {
-                self.serial_by_x11.remove(&window);
-                if self.completed.remove(&window).is_some() {
-                    self.events.push(XwmAssociationEvent::Removed {
-                        generation,
-                        window,
-                        surface_id: association.surface_id,
-                    });
-                }
-            }
-        }
         let windows = self
             .serial_by_x11
             .keys()
@@ -176,6 +185,17 @@ impl SurfaceAssociationJoin {
         for window in windows {
             self.remove_x11_window(window);
         }
+        let wayland_serials = self
+            .wayland_by_serial
+            .iter()
+            .filter_map(|(serial, association)| {
+                (association.generation == generation).then_some(*serial)
+            })
+            .collect::<Vec<_>>();
+        for serial in wayland_serials {
+            self.wayland_by_serial.remove(&serial);
+            self.x11_by_serial.remove(&serial);
+        }
     }
 
     pub(crate) fn take_events(&mut self) -> Vec<XwmAssociationEvent> {
@@ -183,12 +203,13 @@ impl SurfaceAssociationJoin {
     }
 
     fn complete_if_ready(&mut self, serial: NonZeroU64) -> Result<(), SurfaceAssociationJoinError> {
-        let (Some(wayland), Some(window)) = (
+        let (Some(wayland), Some(x11)) = (
             self.wayland_by_serial.get(&serial).copied(),
             self.x11_by_serial.get(&serial).copied(),
         ) else {
             return Ok(());
         };
+        let window = x11.window;
         if wayland.generation != window.generation() {
             self.wayland_by_serial.remove(&serial);
             self.x11_by_serial.remove(&serial);
@@ -202,6 +223,7 @@ impl SurfaceAssociationJoin {
             generation: wayland.generation,
             serial,
             surface_id: wayland.surface_id,
+            map_serial: x11.map_serial,
         };
         self.completed.insert(window, association);
         self.events.push(XwmAssociationEvent::Associated {
@@ -294,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn x11_reassociation_is_rejected_without_disturbing_original() {
+    fn x11_reassociation_replaces_current_serial_without_disturbing_old_pending() {
         let generation = generation(1);
         let handle = window(generation, 1);
         let first = NonZeroU64::new(10).unwrap();
@@ -302,11 +324,79 @@ mod tests {
         let mut join = SurfaceAssociationJoin::default();
         join.note_x11_serial(handle, first).unwrap();
 
+        join.note_x11_serial(handle, second)
+            .expect("reassociation replaces current serial");
+        assert_eq!(join.serial_by_x11.get(&handle), Some(&second));
         assert_eq!(
-            join.note_x11_serial(handle, second),
-            Err(SurfaceAssociationJoinError::X11Reassociation)
+            join.x11_by_serial.get(&first).map(|value| value.window),
+            Some(handle)
         );
-        assert_eq!(join.serial_by_x11.get(&handle), Some(&first));
+    }
+
+    #[test]
+    fn new_serial_before_old_surface_removed_reassociates_same_xid() {
+        let generation = generation(1);
+        let handle = window(generation, 1);
+        let first = NonZeroU64::new(10).unwrap();
+        let second = NonZeroU64::new(11).unwrap();
+        let mut join = SurfaceAssociationJoin::default();
+        join.note_x11_serial(handle, first).unwrap();
+        join.commit_wayland(generation, first, 41).unwrap();
+        join.take_events();
+
+        join.note_x11_serial(handle, second)
+            .expect("new map epoch may arrive before old surface removal");
+
+        assert_eq!(join.serial_by_x11.get(&handle), Some(&second));
+        assert_eq!(
+            join.x11_by_serial.get(&first).map(|value| value.window),
+            Some(handle)
+        );
+        assert_eq!(
+            join.x11_by_serial.get(&second).map(|value| value.window),
+            Some(handle)
+        );
+    }
+
+    #[test]
+    fn old_surface_removed_after_new_association_does_not_clear_replacement() {
+        let generation = generation(1);
+        let handle = window(generation, 1);
+        let first = NonZeroU64::new(10).unwrap();
+        let second = NonZeroU64::new(11).unwrap();
+        let mut join = SurfaceAssociationJoin::default();
+        join.note_x11_serial(handle, first).unwrap();
+        join.commit_wayland(generation, first, 41).unwrap();
+        join.take_events();
+        join.note_x11_serial(handle, second).unwrap();
+        join.commit_wayland(generation, second, 42).unwrap();
+        join.take_events();
+
+        join.remove_wayland_surface(41);
+
+        assert_eq!(join.serial_by_x11.get(&handle), Some(&second));
+        assert_eq!(join.completed[&handle].serial, second);
+        assert_eq!(join.completed[&handle].surface_id, 42);
+        assert!(join.take_events().is_empty());
+    }
+
+    #[test]
+    fn new_serial_then_old_surface_removal_still_allows_new_wayland_commit() {
+        let generation = generation(1);
+        let handle = window(generation, 1);
+        let first = NonZeroU64::new(10).unwrap();
+        let second = NonZeroU64::new(11).unwrap();
+        let mut join = SurfaceAssociationJoin::default();
+        join.note_x11_serial(handle, first).unwrap();
+        join.commit_wayland(generation, first, 41).unwrap();
+        join.take_events();
+        join.note_x11_serial(handle, second).unwrap();
+
+        join.remove_wayland_surface(41);
+        join.commit_wayland(generation, second, 42).unwrap();
+
+        assert_eq!(join.completed[&handle].serial, second);
+        assert_eq!(join.completed[&handle].surface_id, 42);
     }
 
     #[test]

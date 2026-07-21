@@ -373,6 +373,20 @@ impl X11WindowRegistry {
         Ok(true)
     }
 
+    pub(crate) fn replace_associated(
+        &mut self,
+        handle: X11WindowHandle,
+        association: AssociatedSurface,
+    ) -> Result<(), &'static str> {
+        let record = self.record_mut(handle)?;
+        record.association = Some(association);
+        record.buffer_ready = false;
+        if record.lifecycle != X11WindowLifecycle::Iconic {
+            self.update_pending_lifecycle(handle)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn clear_association(
         &mut self,
         handle: X11WindowHandle,
@@ -691,6 +705,7 @@ mod tests {
             generation,
             serial: NonZeroU64::new(serial).expect("nonzero"),
             surface_id,
+            map_serial: 0,
         }
     }
 

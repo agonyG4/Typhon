@@ -177,17 +177,23 @@ impl Xwm {
             if !self.windows.contains(handle) {
                 continue;
             }
-            let needs_association = self
+            let current_association = self
                 .windows
                 .get(handle)
-                .is_some_and(|record| record.association.is_none());
-            if needs_association {
-                let _ = self.windows.mark_associated(handle, association);
+                .and_then(|record| record.association);
+            if current_association != Some(association) {
+                let result = if current_association.is_some() {
+                    self.windows.replace_associated(handle, association)
+                } else {
+                    self.windows.mark_associated(handle, association)
+                };
+                let _ = result;
                 trace::emit("association_complete", || {
                     TraceFields::new()
                         .field("source", "xwm")
                         .field("xid", handle.xid())
                         .field("association_serial", association.serial.get())
+                        .field("map_serial", association.map_serial)
                         .field("surface_id", association.surface_id)
                         .field("lifecycle", "associated")
                 });
