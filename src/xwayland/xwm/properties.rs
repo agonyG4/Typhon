@@ -12,7 +12,7 @@ use x11rb::{
 use super::{
     X11PublishedState, X11WindowHandle, Xwm, XwmError,
     atoms::XwmAtomName,
-    window::{X11PropertySnapshot, X11WindowRecord, X11WindowType},
+    window::{AuxiliaryReconciliation, X11PropertySnapshot, X11WindowRecord, X11WindowType},
 };
 
 pub(crate) const MAX_TEXT_PROPERTY_BYTES: usize = 64 * 1024;
@@ -500,6 +500,16 @@ fn complete_property(
         issue_property(xwm, pending.handle, pending.kind, pending.epoch)?;
     } else {
         maybe_finish_refresh(xwm, pending.handle)?;
+        match xwm
+            .windows
+            .reconcile_auxiliary(pending.handle)
+            .map_err(XwmError::InvalidCommand)?
+        {
+            AuxiliaryReconciliation::WithdrawDesktop => xwm
+                .outgoing_events
+                .push_back(super::XwmEvent::WindowWithdrawn(pending.handle)),
+            AuxiliaryReconciliation::Unchanged | AuxiliaryReconciliation::ReadinessRestored => {}
+        }
         if pending.kind == PropertyKind::NetWmUserTime {
             let user_time = xwm
                 .windows

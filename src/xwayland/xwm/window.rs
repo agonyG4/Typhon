@@ -84,6 +84,13 @@ pub(crate) struct X11WindowRegistry {
     records: HashMap<X11WindowHandle, X11WindowRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuxiliaryReconciliation {
+    Unchanged,
+    WithdrawDesktop,
+    ReadinessRestored,
+}
+
 impl X11WindowRegistry {
     #[cfg(test)]
     pub(crate) fn insert_observed(&mut self, handle: X11WindowHandle) -> bool {
@@ -354,6 +361,28 @@ impl X11WindowRegistry {
         Ok(Some(snapshot))
     }
 
+    pub(crate) fn reconcile_auxiliary(
+        &mut self,
+        handle: X11WindowHandle,
+    ) -> Result<AuxiliaryReconciliation, &'static str> {
+        let record = self.record_mut(handle)?;
+        if is_auxiliary_client_leader(handle, record) {
+            let transition = if record.snapshot.take().is_some() {
+                AuxiliaryReconciliation::WithdrawDesktop
+            } else {
+                AuxiliaryReconciliation::Unchanged
+            };
+            record.lifecycle = X11WindowLifecycle::Auxiliary;
+            return Ok(transition);
+        }
+        if record.lifecycle != X11WindowLifecycle::Auxiliary {
+            return Ok(AuxiliaryReconciliation::Unchanged);
+        }
+        record.lifecycle = X11WindowLifecycle::Observed;
+        self.update_pending_lifecycle(handle)?;
+        Ok(AuxiliaryReconciliation::ReadinessRestored)
+    }
+
     pub(crate) fn mark_map_commanded(
         &mut self,
         handle: X11WindowHandle,
@@ -488,10 +517,6 @@ fn is_auxiliary_client_leader(handle: X11WindowHandle, record: &X11WindowRecord)
         && record.geometry.width <= 16
         && record.geometry.height <= 16
         && record.properties.client_leader == Some(handle)
-        && record
-            .properties
-            .user_time_window
-            .is_some_and(|window| window != handle)
         && record.properties.window_type.is_none()
         && record.properties.accepts_input.is_none()
 }
@@ -1020,6 +1045,126 @@ mod tests {
         registry.mark_map_commanded(window).expect("map command");
         registry.confirm_map_notify(window).expect("map notify");
 
+        assert!(registry.try_ready(window).expect("known window").is_some());
+    }
+
+    #[test]
+    fn late_auxiliary_identity_withdraws_ready_snapshot() {
+        let generation = generation(1);
+        let window = handle(generation, 31);
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::Managed,
+            X11Geometry {
+                x: 10,
+                y: 10,
+                width: 10,
+                height: 10,
+            },
+        );
+        registry.mark_map_requested(window).expect("map request");
+        complete_properties(&mut registry, window);
+        registry
+            .mark_associated(window, associated(generation, 13, 48))
+            .expect("association");
+        registry.mark_buffer_ready(window).expect("buffer");
+        registry.mark_map_commanded(window).expect("map command");
+        registry.confirm_map_notify(window).expect("map notify");
+        assert!(registry.try_ready(window).expect("known window").is_some());
+
+        registry
+            .get_mut(window)
+            .expect("window")
+            .properties
+            .client_leader = Some(window);
+
+        assert_eq!(
+            registry.reconcile_auxiliary(window).expect("known window"),
+            AuxiliaryReconciliation::WithdrawDesktop,
+        );
+        let record = registry.get(window).expect("window");
+        assert!(record.snapshot.is_none());
+        assert_eq!(record.lifecycle, X11WindowLifecycle::Auxiliary);
+    }
+
+    #[test]
+    fn self_client_leader_without_user_time_is_auxiliary() {
+        let generation = generation(1);
+        let window = handle(generation, 32);
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::Managed,
+            X11Geometry {
+                width: 10,
+                height: 10,
+                ..X11Geometry::default()
+            },
+        );
+        registry.mark_map_requested(window).expect("map request");
+        complete_properties(&mut registry, window);
+        registry
+            .get_mut(window)
+            .expect("window")
+            .properties
+            .client_leader = Some(window);
+        registry
+            .mark_associated(window, associated(generation, 14, 49))
+            .expect("association");
+        registry.mark_buffer_ready(window).expect("buffer");
+        registry.mark_map_commanded(window).expect("map command");
+        registry.confirm_map_notify(window).expect("map notify");
+
+        assert!(registry.try_ready(window).expect("known window").is_none());
+        assert_eq!(
+            registry.get(window).expect("window").lifecycle,
+            X11WindowLifecycle::Auxiliary,
+        );
+    }
+
+    #[test]
+    fn late_auxiliary_can_be_readmitted_as_typed_input_window() {
+        let generation = generation(1);
+        let window = handle(generation, 33);
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::Managed,
+            X11Geometry {
+                width: 10,
+                height: 10,
+                ..X11Geometry::default()
+            },
+        );
+        registry.mark_map_requested(window).expect("map request");
+        complete_properties(&mut registry, window);
+        registry
+            .mark_associated(window, associated(generation, 15, 50))
+            .expect("association");
+        registry.mark_buffer_ready(window).expect("buffer");
+        registry.mark_map_commanded(window).expect("map command");
+        registry.confirm_map_notify(window).expect("map notify");
+        assert!(registry.try_ready(window).expect("known window").is_some());
+        registry
+            .get_mut(window)
+            .expect("window")
+            .properties
+            .client_leader = Some(window);
+        assert_eq!(
+            registry.reconcile_auxiliary(window).expect("known window"),
+            AuxiliaryReconciliation::WithdrawDesktop,
+        );
+
+        {
+            let properties = &mut registry.get_mut(window).expect("window").properties;
+            properties.window_type = Some(X11WindowType::Normal);
+            properties.accepts_input = Some(true);
+        }
+        assert_eq!(
+            registry.reconcile_auxiliary(window).expect("known window"),
+            AuxiliaryReconciliation::ReadinessRestored,
+        );
         assert!(registry.try_ready(window).expect("known window").is_some());
     }
 }
