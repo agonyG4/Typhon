@@ -24,6 +24,7 @@ use super::{
     readiness::XwaylandReadinessSnapshot,
     xwm::{Xwm, startup::XwmStartup},
 };
+use crate::compositor::{SurfaceCommitSequence, XwaylandSurfaceCommitObserved};
 
 #[path = "displayfd_service.rs"]
 mod displayfd_service;
@@ -1096,13 +1097,82 @@ impl XwaylandService {
         Ok(())
     }
 
+    pub fn mark_managed_surface_commit_observed(
+        &mut self,
+        supervisor: &mut ChildSupervisor,
+        event: XwaylandSurfaceCommitObserved,
+    ) -> io::Result<()> {
+        trace::emit("commit_observed_forwarded", || {
+            TraceFields::new()
+                .field("source", "native_runtime")
+                .field("generation", event.generation.get())
+                .field("surface_id", event.surface_id)
+                .field("association_serial", event.association_serial.get())
+                .field("commit_sequence", event.commit_sequence.get())
+                .optional("buffer_id", event.buffer_id.map(|buffer| buffer.get()))
+                .optional("buffer_width", event.buffer_size.map(|size| size.width))
+                .optional("buffer_height", event.buffer_size.map(|size| size.height))
+        });
+        let result = match &mut self.state {
+            ServiceState::Running(resources) if resources.generation == event.generation => {
+                resources
+                    .xwm
+                    .mark_surface_commit_observed(event)
+                    .map_err(io::Error::other)
+            }
+            ServiceState::Running(_) => {
+                self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
+                Ok(())
+            }
+            _ => Ok(()),
+        };
+        if let Err(error) = result {
+            self.fail_managed_xwm(supervisor, XwaylandFailureStage::BufferReady, error);
+        }
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn mark_managed_surface_commit_for_test(
+        &mut self,
+        supervisor: &mut ChildSupervisor,
+        generation: XwaylandGeneration,
+        surface_id: u32,
+        commit_sequence: u64,
+    ) -> io::Result<()> {
+        let association_serial = match &self.state {
+            ServiceState::Running(resources) if resources.generation == generation => resources
+                .xwm
+                .association
+                .completed
+                .values()
+                .find(|association| association.surface_id == surface_id)
+                .map(|association| association.serial),
+            _ => None,
+        };
+        let Some(association_serial) = association_serial else {
+            return Ok(());
+        };
+        self.mark_managed_surface_commit_observed(
+            supervisor,
+            XwaylandSurfaceCommitObserved {
+                generation,
+                surface_id,
+                association_serial,
+                commit_sequence: SurfaceCommitSequence(commit_sequence),
+                buffer_id: None,
+                buffer_size: None,
+            },
+        )
+    }
+
     pub fn take_managed_xwm_events(&mut self) -> Vec<super::xwm::XwmEvent> {
         let events = match &mut self.state {
             ServiceState::Running(resources) => resources
                 .xwm
                 .take_events()
                 .inspect(|event| match event {
-                    super::xwm::XwmEvent::ResizeSyncAcked { .. } => {
+                    super::xwm::XwmEvent::ResizeSyncAckObserved { .. } => {
                         self.metrics.resize_sync_acks =
                             self.metrics.resize_sync_acks.saturating_add(1);
                     }

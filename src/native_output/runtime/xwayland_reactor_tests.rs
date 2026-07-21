@@ -22,7 +22,7 @@ use x11rb::{
 
 use super::*;
 use oblivion_one::{
-    compositor::{OwnCompositorServer, XwaylandClientIdentity},
+    compositor::{OwnCompositorServer, XwaylandClientIdentity, XwaylandSurfaceCommitObserved},
     native::event_loop::monotonic_now_ns,
     process::ChildSupervisor,
     xwayland::{
@@ -36,7 +36,8 @@ use oblivion_one::{
 struct ServerEvents {
     binds: Vec<XwaylandClientIdentity>,
     associations: Vec<XwaylandAssociationEvent>,
-    buffers: Vec<(XwaylandGeneration, u32)>,
+    buffer_levels: Vec<(XwaylandGeneration, u32)>,
+    commits: Vec<XwaylandSurfaceCommitObserved>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -121,10 +122,15 @@ fn process_server_events(
                 }
             }
         }
-        for (generation, surface_id) in events.buffers {
+        for (generation, surface_id) in events.buffer_levels {
             service
                 .mark_managed_surface_buffer_ready(supervisor, generation, surface_id)
                 .expect("mark native reactor buffer ready");
+        }
+        for event in events.commits {
+            service
+                .mark_managed_surface_commit_observed(supervisor, event)
+                .expect("mark native reactor commit edge");
         }
     }
 }
@@ -318,11 +324,13 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
             let events = ServerEvents {
                 binds: compositor.take_xwayland_shell_bind_events(),
                 associations: compositor.take_xwayland_association_events(),
-                buffers: compositor.take_xwayland_buffer_ready_events(),
+                buffer_levels: compositor.take_xwayland_buffer_level_events(),
+                commits: compositor.take_xwayland_buffer_ready_events(),
             };
             if !events.binds.is_empty()
                 || !events.associations.is_empty()
-                || !events.buffers.is_empty()
+                || !events.buffer_levels.is_empty()
+                || !events.commits.is_empty()
             {
                 let _ = events_sender.send(events);
             }
@@ -566,6 +574,11 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
                         .expect("send parent WindowReady to compositor");
                     ready_snapshot = Some(snapshot);
                 }
+                event @ XwmEvent::ResizeSyncAckObserved { .. } => {
+                    compositor_event_sender
+                        .send(CompositorEvent::Xwayland(event))
+                        .expect("send resize ACK observation to compositor");
+                }
                 _ => {}
             }
         }
@@ -640,7 +653,12 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
             let counter_value = requested_values[committed_resize_buffers];
             service.acknowledge_resize_sync_for_test(snapshot.handle, counter_value);
             service
-                .mark_managed_surface_buffer_ready(&mut supervisor, generation, snapshot.surface_id)
+                .mark_managed_surface_commit_for_test(
+                    &mut supervisor,
+                    generation,
+                    snapshot.surface_id,
+                    1_000_000 + committed_resize_buffers as u64,
+                )
                 .expect("publish native XSync resize buffer commit");
             committed_resize_buffers += 1;
         }
@@ -709,6 +727,11 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
                         .send(CompositorEvent::Xwayland(event))
                         .expect("send final presentation to compositor");
                 }
+                event @ XwmEvent::ResizeSyncAckObserved { .. } => {
+                    compositor_event_sender
+                        .send(CompositorEvent::Xwayland(event))
+                        .expect("send resize ACK observation to compositor");
+                }
                 _ => {}
             }
         }
@@ -729,7 +752,12 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
         let counter_value = requested_values[committed_resize_buffers];
         service.acknowledge_resize_sync_for_test(snapshot.handle, counter_value);
         service
-            .mark_managed_surface_buffer_ready(&mut supervisor, generation, snapshot.surface_id)
+            .mark_managed_surface_commit_for_test(
+                &mut supervisor,
+                generation,
+                snapshot.surface_id,
+                1_000_000 + committed_resize_buffers as u64,
+            )
             .expect("publish final native XSync resize buffer commit");
         committed_resize_buffers += 1;
     }

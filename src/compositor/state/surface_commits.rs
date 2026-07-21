@@ -443,6 +443,14 @@ impl CompositorState {
         {
             self.update_toplevel_visual_render_assignment(root_surface_id);
         }
+        if matches!(self.surface_role(surface_id), SurfaceRole::Xwayland) {
+            self.note_xwayland_commit_observed(
+                surface_id,
+                commit_sequence,
+                Some(current.data.buffer_id()),
+                Some(buffer_size),
+            );
+        }
         true
     }
 
@@ -1239,6 +1247,13 @@ impl CompositorState {
     ) {
         let commit_sequence = pending.commit_sequence;
         let buffer_id = pending.data.buffer_id();
+        let buffer_size = pending.data.width().ok().and_then(|width| {
+            pending
+                .data
+                .height()
+                .ok()
+                .and_then(|height| BufferSize::new(width, height))
+        });
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
         if surface_tree_debug_enabled() {
             eprintln!(
@@ -1251,6 +1266,12 @@ impl CompositorState {
         self.track_committed_buffer_lifetime(surface_id, &pending);
         self.current_surface_buffers.insert(surface_id, pending);
         self.note_xwayland_buffer_ready(surface_id);
+        self.note_xwayland_commit_observed(
+            surface_id,
+            commit_sequence,
+            Some(buffer_id),
+            buffer_size,
+        );
         self.record_surface_publication(
             surface_id,
             root_surface_id,

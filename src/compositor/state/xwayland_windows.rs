@@ -157,6 +157,12 @@ impl CompositorState {
         self.reorder_renderable_surfaces_by_committed_stack();
         self.set_render_generation(generation, RenderGenerationCause::SurfaceCommit);
         self.note_xwayland_buffer_ready(surface_id);
+        self.note_xwayland_commit_observed(
+            surface_id,
+            commit_sequence,
+            Some(buffer_id),
+            Some(buffer_size),
+        );
         self.complete_frame_callbacks(frame_callbacks);
     }
 }

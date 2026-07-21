@@ -62,7 +62,7 @@ impl NativeRuntime {
     }
 
     pub(super) fn dispatch_xwayland_buffer_ready(&mut self) {
-        for (generation, surface_id) in self.server.take_xwayland_buffer_ready_events() {
+        for (generation, surface_id) in self.server.take_xwayland_buffer_level_events() {
             trace::emit("buffer_ready_event_dispatched", || {
                 TraceFields::new()
                     .field("source", "native_runtime")
@@ -74,6 +74,19 @@ impl NativeRuntime {
                 generation,
                 surface_id,
             );
+        }
+        for event in self.server.take_xwayland_buffer_ready_events() {
+            trace::emit("commit_observed_dispatched", || {
+                TraceFields::new()
+                    .field("source", "native_runtime")
+                    .field("generation", event.generation.get())
+                    .field("surface_id", event.surface_id)
+                    .field("association_serial", event.association_serial.get())
+                    .field("commit_sequence", event.commit_sequence.get())
+            });
+            let _ = self
+                .xwayland
+                .mark_managed_surface_commit_observed(&mut self.process_supervisor, event);
         }
     }
 

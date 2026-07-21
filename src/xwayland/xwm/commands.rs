@@ -327,6 +327,23 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             });
             set_allow_commits(xwm, window, allowed)?;
         }
+        XwmCommand::ReleaseResizeCommits {
+            window,
+            counter_value,
+            association_serial,
+            commit_floor,
+        } => {
+            trace::emit("resize_commits_released", || {
+                TraceFields::new()
+                    .field("source", "xwm")
+                    .field("xid", window.xid())
+                    .field("resize_counter", counter_value)
+                    .field("association_serial", association_serial.get())
+                    .field("commit_floor", commit_floor.get())
+                    .field("allow_commits", true)
+            });
+            release_resize_commits(xwm, window, counter_value, association_serial, commit_floor)?;
+        }
         XwmCommand::CompleteResizeSync(window) => {
             trace::emit("resize_complete_commanded", || {
                 TraceFields::new()
@@ -360,6 +377,7 @@ fn command_handle(command: &XwmCommand) -> Option<super::X11WindowHandle> {
         XwmCommand::SyncClientLists { .. } => None,
         XwmCommand::BeginResizeSync { window, .. }
         | XwmCommand::SetAllowCommits { window, .. }
+        | XwmCommand::ReleaseResizeCommits { window, .. }
         | XwmCommand::CompleteResizeSync(window) => Some(*window),
     }
 }
@@ -642,6 +660,7 @@ fn log_resize_event(
     let counter = counter_value
         .or_else(|| match xwm.resize_sync.state(window) {
             super::ResizeSyncState::ConfigureSent { counter_value, .. }
+            | super::ResizeSyncState::AckObserved { counter_value, .. }
             | super::ResizeSyncState::AckedWaitingCommit { counter_value, .. }
             | super::ResizeSyncState::Presented { counter_value } => Some(counter_value),
             _ => None,
@@ -671,6 +690,49 @@ pub(crate) fn set_allow_commits(
             &[u32::from(allowed)],
         )
         .map_err(XwmError::Connection)?;
+    Ok(())
+}
+
+fn release_resize_commits(
+    xwm: &mut Xwm,
+    window: super::X11WindowHandle,
+    counter_value: u64,
+    association_serial: std::num::NonZeroU64,
+    commit_floor: crate::compositor::SurfaceCommitSequence,
+) -> Result<(), XwmError> {
+    let valid_ack = matches!(
+        xwm.resize_sync.state(window),
+        super::ResizeSyncState::AckObserved {
+            counter_value: expected,
+            ..
+        } if expected == counter_value
+    );
+    if !valid_ack {
+        return Err(XwmError::InvalidCommand(
+            "resize commit release does not match observed ACK",
+        ));
+    }
+    let valid_association = xwm
+        .association
+        .completed
+        .get(&window)
+        .is_some_and(|association| association.serial == association_serial);
+    if !valid_association {
+        return Err(XwmError::InvalidCommand(
+            "resize commit release does not match current association",
+        ));
+    }
+    set_allow_commits(xwm, window, true)?;
+    xwm.connection.flush().map_err(XwmError::Connection)?;
+    if !xwm
+        .resize_sync
+        .release_commits(window, counter_value, association_serial, commit_floor)
+    {
+        return Err(XwmError::InvalidCommand(
+            "resize commit release was not accepted",
+        ));
+    }
+    xwm.process_pending_resize_commits();
     Ok(())
 }
 

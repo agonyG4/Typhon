@@ -1352,6 +1352,7 @@ impl XwmStartup {
             root_event_mask_probe: None,
             root_event_mask: None,
             buffer_ready_surfaces: Default::default(),
+            buffer_ready_commits: Default::default(),
             supporting_wm_check,
             raw_fd,
         };

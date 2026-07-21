@@ -66,7 +66,8 @@ pub(in crate::compositor) struct XwaylandCompositorState {
         HashMap<u32, xwayland_surface_v1::XwaylandSurfaceV1>,
     pub(in crate::compositor) associations: AssociationRegistry,
     pub(in crate::compositor) client_identity: Option<XwaylandClientIdentity>,
-    pub(in crate::compositor) buffer_ready_events: Vec<(XwaylandGeneration, u32)>,
+    pub(in crate::compositor) buffer_ready_events: Vec<super::XwaylandSurfaceCommitObserved>,
+    pub(in crate::compositor) buffer_level_events: Vec<(XwaylandGeneration, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -465,13 +466,22 @@ impl CompositorState {
             .retain(|_, state| state.generation != generation);
         self.xwayland
             .buffer_ready_events
+            .retain(|event| event.generation != generation);
+        self.xwayland
+            .buffer_level_events
             .retain(|(event_generation, _)| *event_generation != generation);
     }
 
     pub(in crate::compositor) fn take_xwayland_buffer_ready_events(
         &mut self,
-    ) -> Vec<(XwaylandGeneration, u32)> {
+    ) -> Vec<super::XwaylandSurfaceCommitObserved> {
         std::mem::take(&mut self.xwayland.buffer_ready_events)
+    }
+
+    pub(in crate::compositor) fn take_xwayland_buffer_level_events(
+        &mut self,
+    ) -> Vec<(XwaylandGeneration, u32)> {
+        std::mem::take(&mut self.xwayland.buffer_level_events)
     }
 
     pub(in crate::compositor) fn note_xwayland_buffer_ready(&mut self, surface_id: u32) {
@@ -485,10 +495,61 @@ impl CompositorState {
             .map(|state| state.generation)
         {
             let event = (generation, surface_id);
-            if !self.xwayland.buffer_ready_events.contains(&event) {
-                self.xwayland.buffer_ready_events.push(event);
+            if !self.xwayland.buffer_level_events.contains(&event) {
+                self.xwayland.buffer_level_events.push(event);
             }
         }
+    }
+
+    pub(in crate::compositor) fn note_xwayland_commit_observed(
+        &mut self,
+        surface_id: u32,
+        commit_sequence: SurfaceCommitSequence,
+        buffer_id: Option<BufferId>,
+        buffer_size: Option<BufferSize>,
+    ) {
+        if !matches!(self.surface_role(surface_id), SurfaceRole::Xwayland) {
+            return;
+        }
+        let Some(generation) = self
+            .xwayland
+            .surface_states
+            .get(&surface_id)
+            .map(|state| state.generation)
+        else {
+            return;
+        };
+        let Some((_, association_serial)) =
+            self.xwayland.associations.serial_for_surface(surface_id)
+        else {
+            return;
+        };
+        self.xwayland
+            .buffer_ready_events
+            .push(super::XwaylandSurfaceCommitObserved {
+                generation,
+                surface_id,
+                association_serial,
+                commit_sequence,
+                buffer_id,
+                buffer_size,
+            });
+    }
+
+    pub(in crate::compositor) fn xwayland_resize_commit_floor(
+        &self,
+        handle: X11WindowHandle,
+    ) -> Option<(std::num::NonZeroU64, SurfaceCommitSequence)> {
+        let window_id = self.window_id_for_x11_handle(handle)?;
+        let surface_id = self.window(window_id)?.root_surface_id;
+        let (_, serial) = self.xwayland.associations.serial_for_surface(surface_id)?;
+        let floor = self
+            .surface_publications
+            .get(&surface_id)
+            .map_or(SurfaceCommitSequence::initial(), |state| {
+                state.latest_received
+            });
+        Some((serial, floor))
     }
 
     pub(in crate::compositor) fn surface_role_lifecycle(

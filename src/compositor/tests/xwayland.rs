@@ -228,6 +228,46 @@ fn xwayland_first_buffer_before_window_is_retained() {
 }
 
 #[test]
+fn multiple_xwayland_commits_preserve_ordered_edges_without_deduplication() {
+    let mut fixture = first_buffer_fixture();
+    let _ = fixture.server.take_xwayland_buffer_level_events();
+    let _ = fixture.server.take_xwayland_buffer_ready_events();
+
+    let server = fixture.server;
+    let (running, server_thread) = super::spawn_test_server(server);
+    let qh = fixture.queue.handle();
+    let second_buffer =
+        fixture
+            ._pool
+            .create_buffer(0, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
+    let third_buffer =
+        fixture
+            ._pool
+            .create_buffer(16, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
+    fixture.surface.attach(Some(&second_buffer), 0, 0);
+    fixture.surface.damage_buffer(0, 0, 2, 2);
+    fixture.surface.commit();
+    fixture.surface.attach(Some(&third_buffer), 0, 0);
+    fixture.surface.damage_buffer(0, 0, 2, 2);
+    fixture.surface.commit();
+    fixture
+        .connection
+        .flush()
+        .expect("flush same-cycle XWayland commits");
+    fixture
+        .queue
+        .roundtrip(&mut super::RegistryTestState::default())
+        .expect("complete same-cycle XWayland commits");
+    fixture.server = super::stop_test_server(running, server_thread);
+
+    let commits = fixture.server.take_xwayland_buffer_ready_events();
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[0].association_serial, commits[1].association_serial);
+    assert!(commits[0].commit_sequence < commits[1].commit_sequence);
+    assert_ne!(commits[0].buffer_id, commits[1].buffer_id);
+}
+
+#[test]
 fn xwayland_buffer_committed_before_serial_becomes_ready() {
     let socket_name = super::unique_socket_name();
     let mut server = super::OwnCompositorServer::bind_cpu_composition(&socket_name)
@@ -294,7 +334,8 @@ fn xwayland_buffer_committed_before_serial_becomes_ready() {
         .expect("pre-association buffer retained")
         .get();
 
-    assert_eq!(server.take_xwayland_buffer_ready_events().len(), 1);
+    assert_eq!(server.take_xwayland_buffer_level_events().len(), 1);
+    assert!(server.take_xwayland_buffer_ready_events().is_empty());
     assert!(server.renderable_surfaces().is_empty());
 
     let mut snapshot = fake_snapshot();

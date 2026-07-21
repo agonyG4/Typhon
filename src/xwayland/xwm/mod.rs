@@ -7,7 +7,9 @@ use std::{
     os::fd::RawFd,
 };
 
-use crate::compositor::{DesktopWindowKind, WindowConstraints, WindowMetadata};
+use crate::compositor::{
+    DesktopWindowKind, WindowConstraints, WindowMetadata, XwaylandSurfaceCommitObserved,
+};
 use crate::xwayland::trace::{self, TraceFields};
 use x11rb::protocol::xproto;
 mod adoption;
@@ -211,7 +213,7 @@ pub enum XwmEvent {
         user_time: Option<u32>,
     },
     CloseRequestedByClient(X11WindowHandle),
-    ResizeSyncAcked {
+    ResizeSyncAckObserved {
         window: X11WindowHandle,
         counter_value: u64,
     },
@@ -276,6 +278,12 @@ pub enum XwmCommand {
     SetAllowCommits {
         window: X11WindowHandle,
         allowed: bool,
+    },
+    ReleaseResizeCommits {
+        window: X11WindowHandle,
+        counter_value: u64,
+        association_serial: std::num::NonZeroU64,
+        commit_floor: crate::compositor::SurfaceCommitSequence,
     },
     CompleteResizeSync(X11WindowHandle),
 }
@@ -374,6 +382,7 @@ pub struct Xwm {
     root_event_mask_probe: Option<x11rb::connection::SequenceNumber>,
     root_event_mask: Option<xproto::EventMask>,
     buffer_ready_surfaces: HashSet<u32>,
+    buffer_ready_commits: Vec<XwaylandSurfaceCommitObserved>,
     pub(crate) supporting_wm_check: u32,
     raw_fd: RawFd,
 }
@@ -528,6 +537,7 @@ impl Xwm {
         properties::cancel_generation(self, generation);
         if generation == self.generation {
             self.buffer_ready_surfaces.clear();
+            self.buffer_ready_commits.clear();
         }
     }
 
@@ -567,62 +577,99 @@ impl Xwm {
             .collect::<Vec<_>>();
         for handle in handles {
             self.mark_window_buffer_ready(handle)?;
-            let commit_result = self.resize_sync.note_commit(handle);
-            trace::emit("resize_commit_result", || {
-                TraceFields::new()
-                    .field("source", "xwm")
-                    .field("xid", handle.xid())
-                    .field("surface_id", surface_id)
-                    .field("resize_result", format!("{commit_result:?}"))
-                    .field(
-                        "resize_state",
-                        format!("{:?}", self.resize_sync.state(handle)),
-                    )
-                    .optional(
-                        "resize_counter",
-                        self.resize_sync.state(handle).counter_value(),
-                    )
-            });
-            match commit_result {
-                ResizeSyncCommit::Presented | ResizeSyncCommit::FallbackPresented => {
-                    if std::env::var_os("TYPHON_XWAYLAND_LOG").is_some() {
-                        let geometry = self
-                            .resize_sync
-                            .transaction(handle)
-                            .map(|(_, geometry, _)| geometry);
-                        eprintln!(
-                            "oblivion-one xwayland: event=x11_resize_presented xid={} transaction_id={} counter={} geometry={:?} latest_desired={:?}",
-                            handle.xid(),
-                            self.resize_sync.transaction_id(handle).unwrap_or_default(),
-                            self.resize_sync
-                                .state(handle)
-                                .counter_value()
-                                .unwrap_or_default(),
-                            geometry,
-                            self.resize_sync
-                                .desired(handle)
-                                .map(|desired| desired.geometry),
+        }
+        self.process_pending_resize_commits();
+        Ok(())
+    }
+
+    pub fn mark_surface_commit_observed(
+        &mut self,
+        event: XwaylandSurfaceCommitObserved,
+    ) -> Result<(), XwmError> {
+        if event.generation != self.generation {
+            return Err(XwmError::StaleGeneration);
+        }
+        trace::emit("buffer_commit_edge_observed", || {
+            TraceFields::new()
+                .field("source", "compositor")
+                .field("generation", event.generation.get())
+                .field("surface_id", event.surface_id)
+                .field("association_serial", event.association_serial.get())
+                .field("commit_sequence", event.commit_sequence.get())
+                .optional("buffer_id", event.buffer_id.map(|buffer| buffer.get()))
+                .optional("buffer_width", event.buffer_size.map(|size| size.width))
+                .optional("buffer_height", event.buffer_size.map(|size| size.height))
+        });
+        self.buffer_ready_commits.push(event);
+        self.process_pending_resize_commits();
+        Ok(())
+    }
+
+    pub(crate) fn process_pending_resize_commits(&mut self) {
+        let pending = std::mem::take(&mut self.buffer_ready_commits);
+        for event in pending {
+            let handles = self
+                .association
+                .completed
+                .iter()
+                .filter_map(|(handle, association)| {
+                    (association.surface_id == event.surface_id
+                        && association.serial == event.association_serial)
+                        .then_some(*handle)
+                })
+                .collect::<Vec<_>>();
+            let mut retain = handles.is_empty();
+            for handle in handles {
+                let commit_result = self.resize_sync.note_commit(
+                    handle,
+                    event.association_serial,
+                    event.commit_sequence,
+                );
+                trace::emit("resize_commit_result", || {
+                    TraceFields::new()
+                        .field("source", "xwm")
+                        .field("xid", handle.xid())
+                        .field("surface_id", event.surface_id)
+                        .field("association_serial", event.association_serial.get())
+                        .field("commit_sequence", event.commit_sequence.get())
+                        .field("resize_result", format!("{commit_result:?}"))
+                        .field(
+                            "resize_state",
+                            format!("{:?}", self.resize_sync.state(handle)),
+                        )
+                        .optional(
+                            "resize_counter",
+                            self.resize_sync.state(handle).counter_value(),
+                        )
+                });
+                match commit_result {
+                    ResizeSyncCommit::Presented | ResizeSyncCommit::FallbackPresented => {
+                        retain = false;
+                        let final_presented = self.resize_sync.transaction(handle).is_some_and(
+                            |(_, _, final_pending)| {
+                                final_pending && self.resize_sync.desired(handle).is_none()
+                            },
                         );
+                        self.outgoing_events.push_back(if final_presented {
+                            XwmEvent::ResizeSyncPresented(handle)
+                        } else {
+                            XwmEvent::ResizeSyncPresentedIntermediate(handle)
+                        });
                     }
-                    let final_presented = self.resize_sync.transaction(handle).is_some_and(
-                        |(_, _, final_pending)| {
-                            final_pending && self.resize_sync.desired(handle).is_none()
-                        },
-                    );
-                    self.outgoing_events.push_back(if final_presented {
-                        XwmEvent::ResizeSyncPresented(handle)
-                    } else {
-                        XwmEvent::ResizeSyncPresentedIntermediate(handle)
-                    });
+                    ResizeSyncCommit::Deferred => retain = true,
+                    ResizeSyncCommit::Ignored => {}
                 }
-                ResizeSyncCommit::Deferred | ResizeSyncCommit::Ignored => {}
+            }
+            if retain {
+                self.buffer_ready_commits.push(event);
             }
         }
-        Ok(())
     }
 
     pub(crate) fn clear_surface_buffer_ready(&mut self, surface_id: u32) {
         self.buffer_ready_surfaces.remove(&surface_id);
+        self.buffer_ready_commits
+            .retain(|event| event.surface_id != surface_id);
     }
 
     pub(crate) fn note_sync_counter_notify(&mut self, counter: u32, value: u64) {
@@ -674,10 +721,11 @@ impl Xwm {
                         .map(|desired| desired.geometry),
                 );
             }
-            self.outgoing_events.push_back(XwmEvent::ResizeSyncAcked {
-                window: handle,
-                counter_value: value,
-            });
+            self.outgoing_events
+                .push_back(XwmEvent::ResizeSyncAckObserved {
+                    window: handle,
+                    counter_value: value,
+                });
         }
     }
 

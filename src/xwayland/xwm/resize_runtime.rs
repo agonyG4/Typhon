@@ -208,37 +208,10 @@ impl Xwm {
             if self.buffer_ready_surfaces.contains(&association.surface_id) {
                 self.adoption.complete(handle);
                 let _ = self.windows.mark_buffer_ready(handle);
-                let commit_result = self.resize_sync.note_commit(handle);
-                trace::emit("resize_commit_result", || {
-                    TraceFields::new()
-                        .field("source", "xwm")
-                        .field("xid", handle.xid())
-                        .field("surface_id", association.surface_id)
-                        .field("resize_result", format!("{commit_result:?}"))
-                        .field("readiness_replayed", true)
-                        .field(
-                            "resize_state",
-                            format!("{:?}", self.resize_sync.state(handle)),
-                        )
-                });
-                match commit_result {
-                    ResizeSyncCommit::Presented | ResizeSyncCommit::FallbackPresented => {
-                        let final_presented = self.resize_sync.transaction(handle).is_some_and(
-                            |(_, _, final_pending)| {
-                                final_pending && self.resize_sync.desired(handle).is_none()
-                            },
-                        );
-                        self.outgoing_events.push_back(if final_presented {
-                            XwmEvent::ResizeSyncPresented(handle)
-                        } else {
-                            XwmEvent::ResizeSyncPresentedIntermediate(handle)
-                        });
-                    }
-                    ResizeSyncCommit::Deferred | ResizeSyncCommit::Ignored => {}
-                }
             }
             let _ = self.emit_ready_if_complete(handle);
         }
+        self.process_pending_resize_commits();
     }
 
     pub(crate) fn emit_ready_if_complete(

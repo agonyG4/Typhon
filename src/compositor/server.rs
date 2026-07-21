@@ -443,8 +443,24 @@ impl OwnCompositorServer {
         self.state.take_xwayland_association_events()
     }
 
-    pub fn take_xwayland_buffer_ready_events(&mut self) -> Vec<(XwaylandGeneration, u32)> {
+    pub fn take_xwayland_buffer_ready_events(
+        &mut self,
+    ) -> Vec<crate::compositor::XwaylandSurfaceCommitObserved> {
         self.state.take_xwayland_buffer_ready_events()
+    }
+
+    pub fn take_xwayland_buffer_level_events(&mut self) -> Vec<(XwaylandGeneration, u32)> {
+        self.state.take_xwayland_buffer_level_events()
+    }
+
+    pub(crate) fn xwayland_resize_commit_floor(
+        &self,
+        handle: X11WindowHandle,
+    ) -> Option<(
+        std::num::NonZeroU64,
+        crate::compositor::SurfaceCommitSequence,
+    )> {
+        self.state.xwayland_resize_commit_floor(handle)
     }
 
     #[cfg(test)]
@@ -735,10 +751,20 @@ impl OwnCompositorServer {
                     Vec::new()
                 }
             }
-            XwmEvent::ResizeSyncAcked { window, .. } => {
-                vec![XwmCommand::SetAllowCommits {
+            XwmEvent::ResizeSyncAckObserved {
+                window,
+                counter_value,
+            } => {
+                let Some((association_serial, commit_floor)) =
+                    self.xwayland_resize_commit_floor(window)
+                else {
+                    return Vec::new();
+                };
+                vec![XwmCommand::ReleaseResizeCommits {
                     window,
-                    allowed: true,
+                    counter_value,
+                    association_serial,
+                    commit_floor,
                 }]
             }
             XwmEvent::ResizeSyncPresented(window) => {

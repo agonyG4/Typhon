@@ -191,6 +191,16 @@ pub use surface::{
     SurfaceCommitCounter, SurfaceCommitSequence, SurfaceDamageJournal, SurfaceDamageRect,
     SurfacePlacement,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XwaylandSurfaceCommitObserved {
+    pub generation: XwaylandGeneration,
+    pub surface_id: u32,
+    pub association_serial: std::num::NonZeroU64,
+    pub commit_sequence: SurfaceCommitSequence,
+    pub buffer_id: Option<BufferId>,
+    pub buffer_size: Option<BufferSize>,
+}
 use window_state::{ToplevelMode, WindowGeometry, WindowState, xdg_toplevel_state_bytes};
 const MIN_WINDOW_WIDTH: u32 = 160;
 const MIN_WINDOW_HEIGHT: u32 = 120;

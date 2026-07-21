@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 
 use super::{X11Geometry, X11WindowHandle, XwaylandGeneration};
+use crate::compositor::SurfaceCommitSequence;
 
 pub const RESIZE_SYNC_TIMEOUT_NS: u64 = 500_000_000;
 
@@ -11,8 +13,14 @@ pub enum ResizeSyncState {
         counter_value: u64,
         deadline_ns: u64,
     },
+    AckObserved {
+        counter_value: u64,
+        deadline_ns: u64,
+    },
     AckedWaitingCommit {
         counter_value: u64,
+        association_serial: NonZeroU64,
+        commit_floor: SurfaceCommitSequence,
         deadline_ns: u64,
     },
     Presented {
@@ -25,6 +33,7 @@ impl ResizeSyncState {
     pub(crate) const fn counter_value(self) -> Option<u64> {
         match self {
             Self::ConfigureSent { counter_value, .. }
+            | Self::AckObserved { counter_value, .. }
             | Self::AckedWaitingCommit { counter_value, .. }
             | Self::Presented { counter_value } => Some(counter_value),
             Self::Idle | Self::FallbackUnsynchronized => None,
@@ -171,7 +180,7 @@ impl ResizeSyncTracker {
         }
         self.states.insert(
             handle,
-            ResizeSyncState::AckedWaitingCommit {
+            ResizeSyncState::AckObserved {
                 counter_value,
                 deadline_ns,
             },
@@ -179,9 +188,48 @@ impl ResizeSyncTracker {
         true
     }
 
-    pub(crate) fn note_commit(&mut self, handle: X11WindowHandle) -> ResizeSyncCommit {
+    pub(crate) fn release_commits(
+        &mut self,
+        handle: X11WindowHandle,
+        counter_value: u64,
+        association_serial: NonZeroU64,
+        commit_floor: SurfaceCommitSequence,
+    ) -> bool {
+        let Some(ResizeSyncState::AckObserved {
+            counter_value: expected,
+            deadline_ns,
+        }) = self.states.get(&handle).copied()
+        else {
+            return false;
+        };
+        if expected != counter_value {
+            return false;
+        }
+        self.states.insert(
+            handle,
+            ResizeSyncState::AckedWaitingCommit {
+                counter_value,
+                association_serial,
+                commit_floor,
+                deadline_ns,
+            },
+        );
+        true
+    }
+
+    pub(crate) fn note_commit(
+        &mut self,
+        handle: X11WindowHandle,
+        association_serial: NonZeroU64,
+        commit_sequence: SurfaceCommitSequence,
+    ) -> ResizeSyncCommit {
         match self.state(handle) {
-            ResizeSyncState::AckedWaitingCommit { counter_value, .. } => {
+            ResizeSyncState::AckedWaitingCommit {
+                counter_value,
+                association_serial: expected_serial,
+                commit_floor,
+                ..
+            } if expected_serial == association_serial && commit_sequence > commit_floor => {
                 self.states
                     .insert(handle, ResizeSyncState::Presented { counter_value });
                 ResizeSyncCommit::Presented
@@ -191,7 +239,10 @@ impl ResizeSyncTracker {
                     .insert(handle, ResizeSyncState::Presented { counter_value: 0 });
                 ResizeSyncCommit::FallbackPresented
             }
-            ResizeSyncState::ConfigureSent { .. } => ResizeSyncCommit::Deferred,
+            ResizeSyncState::ConfigureSent { .. } | ResizeSyncState::AckObserved { .. } => {
+                ResizeSyncCommit::Deferred
+            }
+            ResizeSyncState::AckedWaitingCommit { .. } => ResizeSyncCommit::Ignored,
             ResizeSyncState::Idle | ResizeSyncState::Presented { .. } => ResizeSyncCommit::Ignored,
         }
     }
@@ -209,6 +260,7 @@ impl ResizeSyncTracker {
         let timed_out = matches!(
             self.state(handle),
             ResizeSyncState::ConfigureSent { deadline_ns, .. }
+                | ResizeSyncState::AckObserved { deadline_ns, .. }
                 | ResizeSyncState::AckedWaitingCommit { deadline_ns, .. }
                 if now_ns >= deadline_ns
         );
@@ -224,6 +276,7 @@ impl ResizeSyncTracker {
             .values()
             .filter_map(|state| match state {
                 ResizeSyncState::ConfigureSent { deadline_ns, .. }
+                | ResizeSyncState::AckObserved { deadline_ns, .. }
                 | ResizeSyncState::AckedWaitingCommit { deadline_ns, .. } => Some(*deadline_ns),
                 ResizeSyncState::Idle
                 | ResizeSyncState::Presented { .. }
@@ -237,6 +290,7 @@ impl ResizeSyncTracker {
             .iter()
             .filter_map(|(handle, state)| match state {
                 ResizeSyncState::ConfigureSent { deadline_ns, .. }
+                | ResizeSyncState::AckObserved { deadline_ns, .. }
                 | ResizeSyncState::AckedWaitingCommit { deadline_ns, .. }
                     if now_ns >= *deadline_ns =>
                 {
@@ -284,6 +338,7 @@ impl ResizeSyncTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compositor::SurfaceCommitSequence;
     use std::num::NonZeroU64;
 
     fn handle(generation: u64, xid: u32) -> X11WindowHandle {
@@ -291,6 +346,37 @@ mod tests {
             XwaylandGeneration::new(NonZeroU64::new(generation).unwrap()),
             xid,
         )
+    }
+
+    fn association_serial(value: u64) -> NonZeroU64 {
+        NonZeroU64::new(value).expect("association serial")
+    }
+
+    fn note_commit(
+        tracker: &mut ResizeSyncTracker,
+        window: X11WindowHandle,
+        sequence: u64,
+    ) -> ResizeSyncCommit {
+        tracker.note_commit(
+            window,
+            association_serial(9),
+            SurfaceCommitSequence(sequence),
+        )
+    }
+
+    fn release_commits(
+        tracker: &mut ResizeSyncTracker,
+        window: X11WindowHandle,
+        counter_value: u64,
+        commit_floor: u64,
+    ) {
+        assert!(tracker.acknowledge(window, counter_value));
+        assert!(tracker.release_commits(
+            window,
+            counter_value,
+            association_serial(9),
+            SurfaceCommitSequence(commit_floor),
+        ));
     }
 
     #[test]
@@ -337,8 +423,11 @@ mod tests {
         tracker
             .begin_transaction(window, 12, 100, X11Geometry::default(), false)
             .expect("begin resize sync");
-        assert!(tracker.acknowledge(window, 12));
-        assert_eq!(tracker.note_commit(window), ResizeSyncCommit::Presented);
+        release_commits(&mut tracker, window, 12, 0);
+        assert_eq!(
+            note_commit(&mut tracker, window, 1),
+            ResizeSyncCommit::Presented
+        );
         assert!(tracker.complete(window));
         assert_eq!(tracker.state(window), ResizeSyncState::Idle);
     }
@@ -350,8 +439,11 @@ mod tests {
         tracker
             .begin_transaction(window, 20, 100, X11Geometry::default(), false)
             .expect("first resize sync");
-        assert!(tracker.acknowledge(window, 20));
-        assert_eq!(tracker.note_commit(window), ResizeSyncCommit::Presented);
+        release_commits(&mut tracker, window, 20, 0);
+        assert_eq!(
+            note_commit(&mut tracker, window, 1),
+            ResizeSyncCommit::Presented
+        );
         assert!(tracker.complete(window));
         tracker
             .begin_transaction(window, 21, 200, X11Geometry::default(), false)
@@ -379,7 +471,7 @@ mod tests {
             ResizeSyncState::FallbackUnsynchronized
         );
         assert_eq!(
-            tracker.note_commit(window),
+            note_commit(&mut tracker, window, 1),
             ResizeSyncCommit::FallbackPresented
         );
         assert!(tracker.complete(window));
@@ -395,7 +487,10 @@ mod tests {
             .expect("resize sync");
         tracker.clear(window);
         assert_eq!(tracker.state(window), ResizeSyncState::Idle);
-        assert_eq!(tracker.note_commit(window), ResizeSyncCommit::Ignored);
+        assert_eq!(
+            note_commit(&mut tracker, window, 1),
+            ResizeSyncCommit::Ignored
+        );
     }
 
     #[test]
@@ -418,7 +513,10 @@ mod tests {
         let window = handle(1, 18);
         let mut tracker = ResizeSyncTracker::default();
         assert_eq!(tracker.state(window), ResizeSyncState::Idle);
-        assert_eq!(tracker.note_commit(window), ResizeSyncCommit::Ignored);
+        assert_eq!(
+            note_commit(&mut tracker, window, 1),
+            ResizeSyncCommit::Ignored
+        );
     }
 
     #[test]
@@ -493,7 +591,10 @@ mod tests {
         tracker
             .begin_transaction(window, 7, 100, X11Geometry::default(), false)
             .expect("transaction");
-        assert_eq!(tracker.note_commit(window), ResizeSyncCommit::Deferred);
+        assert_eq!(
+            note_commit(&mut tracker, window, 1),
+            ResizeSyncCommit::Deferred
+        );
         assert_eq!(
             tracker.state(window),
             ResizeSyncState::ConfigureSent {
@@ -510,10 +611,119 @@ mod tests {
         tracker
             .begin_transaction(window, 7, 100, X11Geometry::default(), false)
             .expect("transaction");
-        assert!(tracker.acknowledge(window, 7));
-        assert_eq!(tracker.note_commit(window), ResizeSyncCommit::Presented);
+        release_commits(&mut tracker, window, 7, 0);
+        assert_eq!(
+            note_commit(&mut tracker, window, 1),
+            ResizeSyncCommit::Presented
+        );
         assert!(tracker.complete(window));
         assert_eq!(tracker.state(window), ResizeSyncState::Idle);
+    }
+
+    #[test]
+    fn retained_surface_readiness_never_presents_resize() {
+        let window = handle(1, 122);
+        let mut tracker = ResizeSyncTracker::default();
+        tracker
+            .begin_transaction(window, 7, 100, X11Geometry::default(), false)
+            .expect("transaction");
+        assert!(tracker.acknowledge(window, 7));
+        assert_eq!(
+            tracker.note_commit(
+                window,
+                NonZeroU64::new(9).expect("association serial"),
+                SurfaceCommitSequence(10),
+            ),
+            ResizeSyncCommit::Deferred
+        );
+    }
+
+    #[test]
+    fn pre_ack_commit_delivered_after_ack_is_below_commit_floor() {
+        let window = handle(1, 123);
+        let mut tracker = ResizeSyncTracker::default();
+        tracker
+            .begin_transaction(window, 7, 100, X11Geometry::default(), false)
+            .expect("transaction");
+        assert_eq!(
+            tracker.note_commit(
+                window,
+                NonZeroU64::new(9).expect("association serial"),
+                SurfaceCommitSequence(10),
+            ),
+            ResizeSyncCommit::Deferred
+        );
+        assert!(tracker.acknowledge(window, 7));
+        assert!(tracker.release_commits(
+            window,
+            7,
+            NonZeroU64::new(9).expect("association serial"),
+            SurfaceCommitSequence(10),
+        ));
+        assert_eq!(
+            tracker.note_commit(
+                window,
+                NonZeroU64::new(9).expect("association serial"),
+                SurfaceCommitSequence(10),
+            ),
+            ResizeSyncCommit::Ignored
+        );
+    }
+
+    #[test]
+    fn first_post_release_commit_presents_resize_exactly_once() {
+        let window = handle(1, 124);
+        let mut tracker = ResizeSyncTracker::default();
+        tracker
+            .begin_transaction(window, 7, 100, X11Geometry::default(), false)
+            .expect("transaction");
+        assert!(tracker.acknowledge(window, 7));
+        assert!(tracker.release_commits(
+            window,
+            7,
+            NonZeroU64::new(9).expect("association serial"),
+            SurfaceCommitSequence(10),
+        ));
+        assert_eq!(
+            tracker.note_commit(
+                window,
+                NonZeroU64::new(9).expect("association serial"),
+                SurfaceCommitSequence(11),
+            ),
+            ResizeSyncCommit::Presented
+        );
+        assert_eq!(
+            tracker.note_commit(
+                window,
+                NonZeroU64::new(9).expect("association serial"),
+                SurfaceCommitSequence(12),
+            ),
+            ResizeSyncCommit::Ignored
+        );
+    }
+
+    #[test]
+    fn commit_from_previous_association_cannot_present_resize() {
+        let window = handle(1, 125);
+        let mut tracker = ResizeSyncTracker::default();
+        tracker
+            .begin_transaction(window, 7, 100, X11Geometry::default(), false)
+            .expect("transaction");
+        assert!(tracker.acknowledge(window, 7));
+        assert!(tracker.release_commits(
+            window,
+            7,
+            NonZeroU64::new(9).expect("association serial"),
+            SurfaceCommitSequence(10),
+        ));
+        assert_eq!(
+            tracker.note_commit(
+                window,
+                NonZeroU64::new(8).expect("old association serial"),
+                SurfaceCommitSequence(11),
+            ),
+            ResizeSyncCommit::Ignored
+        );
     }
 
     #[test]
@@ -548,8 +758,11 @@ mod tests {
             ..X11Geometry::default()
         };
         tracker.queue_desired(window, desired, true);
-        assert!(tracker.acknowledge(window, 7));
-        assert_eq!(tracker.note_commit(window), ResizeSyncCommit::Presented);
+        release_commits(&mut tracker, window, 7, 0);
+        assert_eq!(
+            note_commit(&mut tracker, window, 1),
+            ResizeSyncCommit::Presented
+        );
         assert!(tracker.complete(window));
         let desired = tracker.take_desired(window).expect("queued target");
         tracker
@@ -577,8 +790,11 @@ mod tests {
             .begin_transaction(window, 7, 100, first, false)
             .expect("first transaction");
         tracker.queue_desired(window, second, true);
-        assert!(tracker.acknowledge(window, 7));
-        assert_eq!(tracker.note_commit(window), ResizeSyncCommit::Presented);
+        release_commits(&mut tracker, window, 7, 0);
+        assert_eq!(
+            note_commit(&mut tracker, window, 1),
+            ResizeSyncCommit::Presented
+        );
         // Completing the first transaction only advances the X11 protocol
         // chain; its queued final target still owns the resize preview.
         assert!(tracker.complete(window));
@@ -587,8 +803,11 @@ mod tests {
             .begin_transaction(window, 8, 200, desired.geometry, desired.final_pending)
             .expect("final transaction");
         assert!(tracker.transaction(window).unwrap().2);
-        assert!(tracker.acknowledge(window, 8));
-        assert_eq!(tracker.note_commit(window), ResizeSyncCommit::Presented);
+        release_commits(&mut tracker, window, 8, 0);
+        assert_eq!(
+            note_commit(&mut tracker, window, 1),
+            ResizeSyncCommit::Presented
+        );
         assert!(tracker.complete(window));
         assert_eq!(tracker.state(window), ResizeSyncState::Idle);
     }
@@ -600,8 +819,11 @@ mod tests {
         tracker
             .begin_transaction(window, 7, 100, X11Geometry::default(), false)
             .expect("intermediate transaction");
-        assert!(tracker.acknowledge(window, 7));
-        assert_eq!(tracker.note_commit(window), ResizeSyncCommit::Presented);
+        release_commits(&mut tracker, window, 7, 0);
+        assert_eq!(
+            note_commit(&mut tracker, window, 1),
+            ResizeSyncCommit::Presented
+        );
         assert!(tracker.complete(window));
         assert_eq!(tracker.state(window), ResizeSyncState::Idle);
 
@@ -614,8 +836,11 @@ mod tests {
             .begin_transaction(window, 8, 200, final_geometry, true)
             .expect("final transaction after idle gap");
         assert!(tracker.transaction(window).unwrap().2);
-        assert!(tracker.acknowledge(window, 8));
-        assert_eq!(tracker.note_commit(window), ResizeSyncCommit::Presented);
+        release_commits(&mut tracker, window, 8, 0);
+        assert_eq!(
+            note_commit(&mut tracker, window, 1),
+            ResizeSyncCommit::Presented
+        );
         assert!(tracker.complete(window));
         assert_eq!(tracker.state(window), ResizeSyncState::Idle);
     }
