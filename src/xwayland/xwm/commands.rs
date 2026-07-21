@@ -1,3 +1,4 @@
+use crate::xwayland::trace::{self, TraceFields};
 use x11rb::{
     connection::Connection,
     protocol::sync::{
@@ -19,6 +20,11 @@ use super::{
 };
 
 pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError> {
+    trace::emit("xwm_command", || {
+        TraceFields::new()
+            .field("source", "xwm")
+            .field("command", format!("{command:?}"))
+    });
     if let XwmCommand::SyncClientLists {
         client_list,
         stacking,
@@ -293,18 +299,40 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             counter_value,
             deadline_ns,
             final_pending,
-        } => begin_resize_sync(
-            xwm,
-            window,
-            geometry,
-            counter_value,
-            deadline_ns,
-            final_pending,
-        )?,
+        } => {
+            trace::emit("resize_begin_commanded", || {
+                TraceFields::new()
+                    .field("source", "xwm")
+                    .field("xid", window.xid())
+                    .field("resize_counter", counter_value)
+                    .field("deadline_ns", deadline_ns)
+                    .field("allow_commits", false)
+                    .field("final_pending", final_pending)
+            });
+            begin_resize_sync(
+                xwm,
+                window,
+                geometry,
+                counter_value,
+                deadline_ns,
+                final_pending,
+            )?
+        }
         XwmCommand::SetAllowCommits { window, allowed } => {
+            trace::emit("resize_allow_commits_commanded", || {
+                TraceFields::new()
+                    .field("source", "xwm")
+                    .field("xid", window.xid())
+                    .field("allow_commits", allowed)
+            });
             set_allow_commits(xwm, window, allowed)?;
         }
         XwmCommand::CompleteResizeSync(window) => {
+            trace::emit("resize_complete_commanded", || {
+                TraceFields::new()
+                    .field("source", "xwm")
+                    .field("xid", window.xid())
+            });
             xwm.complete_resize_sync(window)?;
         }
     }

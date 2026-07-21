@@ -14,6 +14,7 @@ use super::{
     atoms::XwmAtomName,
     window::{AuxiliaryReconciliation, X11PropertySnapshot, X11WindowRecord, X11WindowType},
 };
+use crate::xwayland::trace::{self, TraceFields};
 
 pub(crate) const MAX_TEXT_PROPERTY_BYTES: usize = 64 * 1024;
 const MAX_PENDING_PROPERTIES: usize = 256;
@@ -189,6 +190,15 @@ pub(crate) fn begin_refresh(
         epoch
     };
 
+    trace::emit("property_refresh_begin", || {
+        TraceFields::new()
+            .field("source", "xwm")
+            .field("xid", handle.xid())
+            .field("property_epoch", epoch)
+            .field("refresh_initial", initial)
+            .field("refresh_all", true)
+    });
+
     for kind in PropertyKind::ALL {
         issue_property(xwm, handle, kind, epoch)?;
     }
@@ -236,6 +246,17 @@ pub(crate) fn refresh_property(
 }
 
 pub(crate) fn cancel(xwm: &mut Xwm, handle: X11WindowHandle) {
+    let epoch = xwm.windows.get(handle).map(|record| record.property_epoch);
+    let pending = pending_for_window(xwm, handle);
+    if pending != 0 || epoch.is_some() {
+        trace::emit("property_refresh_cancel", || {
+            TraceFields::new()
+                .field("source", "xwm")
+                .field("xid", handle.xid())
+                .optional("property_epoch", epoch)
+                .field("pending_properties", pending)
+        });
+    }
     xwm.deferred_properties
         .retain(|pending| pending.handle != handle);
     let sequences = xwm
@@ -525,6 +546,14 @@ fn complete_property(
                 });
         }
     }
+    trace::emit("property_refresh_property_complete", || {
+        TraceFields::new()
+            .field("source", "xwm")
+            .field("xid", pending.handle.xid())
+            .field("property", format!("{:?}", pending.kind))
+            .field("property_epoch", pending.epoch)
+            .field("requery", requery)
+    });
     Ok(())
 }
 
@@ -566,6 +595,21 @@ fn maybe_finish_refresh(xwm: &mut Xwm, handle: X11WindowHandle) -> Result<(), Xw
         record.refresh_properties = 0;
         record.refresh_all = false;
         record.resolved_properties = all_mask();
+        trace::emit("property_refresh_complete", || {
+            TraceFields::new()
+                .field("source", "xwm")
+                .field("xid", handle.xid())
+                .field("property_epoch", record.property_epoch)
+                .field("properties_ready", record.properties_ready)
+                .field(
+                    "window_type",
+                    format!("{:?}", record.properties.window_type),
+                )
+                .optional(
+                    "transient_for",
+                    record.properties.transient_for.map(|parent| parent.xid()),
+                )
+        });
     } else if let Some(record) = xwm.windows.get_mut(handle) {
         record.refresh_properties = 0;
         record.staging_properties = record.properties.clone();

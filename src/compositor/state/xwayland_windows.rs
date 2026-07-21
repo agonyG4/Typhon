@@ -1,4 +1,5 @@
 use super::*;
+use crate::xwayland::trace::{self, TraceFields};
 
 impl CompositorState {
     pub(in crate::compositor) fn withdraw_xwayland_surface_content(
@@ -105,6 +106,11 @@ impl CompositorState {
         }
         let commit_sequence = pending.commit_sequence;
         let buffer_id = pending.data.buffer_id();
+        let association_serial = self
+            .xwayland
+            .associations
+            .serial_for_surface(surface_id)
+            .map(|(_, serial)| serial.get());
         let generation = self.next_render_generation_value();
         let placement = self.surface_placement(root_surface_id);
         let Ok(surface) = pending.to_renderable_surface(
@@ -120,6 +126,17 @@ impl CompositorState {
         let buffer_size = surface.buffer_size();
         self.track_committed_buffer_lifetime(surface_id, &pending);
         self.current_surface_buffers.insert(surface_id, pending);
+        trace::emit("xwayland_commit_observed", || {
+            TraceFields::new()
+                .field("source", "wayland")
+                .field("surface_id", surface_id)
+                .field("commit_sequence", commit_sequence.get())
+                .field("buffer_id", buffer_id.get())
+                .field("buffer_width", buffer_size.width)
+                .field("buffer_height", buffer_size.height)
+                .optional("association_serial", association_serial)
+                .field("buffer_ready_level", true)
+        });
         self.renderable_surfaces
             .retain(|existing| existing.surface_id != surface_id);
         self.renderable_surfaces.push(surface);

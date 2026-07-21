@@ -13,6 +13,7 @@ mod metrics;
 mod protocol;
 mod readiness;
 mod service;
+pub mod trace;
 pub mod xwm;
 pub(crate) use protocol::{XWAYLAND_SHELL_V1_VERSION, serial_from_parts};
 

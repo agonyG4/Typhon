@@ -1,4 +1,5 @@
 use crate::compositor::DesktopWindowKind;
+use crate::xwayland::trace::{self, TraceFields};
 use x11rb::{
     connection::Connection,
     protocol::{Event, sync::Int64, xproto},
@@ -33,6 +34,7 @@ pub(crate) fn drain(xwm: &mut Xwm, budget: usize) -> Result<XwmDrain, XwmError> 
 }
 
 fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
+    trace_raw_event(&event);
     match event {
         Event::CreateNotify(event) => {
             if event.window == xwm.root {
@@ -47,6 +49,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 height: u32::from(event.height),
             };
             xwm.observe_window_with_kind(handle, kind, geometry)?;
+            trace_window_state(xwm, "create_window_observed", handle, TraceFields::new());
         }
         Event::MapRequest(event) => {
             let handle = ensure_window(xwm, event.window)?;
@@ -63,6 +66,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 .map_err(XwmError::InvalidCommand)?;
             xwm.refresh_window_properties(handle)?;
             xwm.emit_ready_if_complete(handle)?;
+            trace_window_state(xwm, "map_request_processed", handle, TraceFields::new());
         }
         Event::MapNotify(event) => {
             let handle =
@@ -85,6 +89,12 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                     "oblivion-one xwayland: event=xwm_map_notify window={} pending_map=true ready_emitted={} lifecycle={lifecycle}",
                     handle.xid(),
                     ready_emitted,
+                );
+                trace_window_state(
+                    xwm,
+                    "map_notify_processed",
+                    handle,
+                    TraceFields::new().field("map_path", "wm_requested"),
                 );
                 return Ok(());
             }
@@ -109,6 +119,12 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 handle.xid(),
                 ready_emitted,
             );
+            trace_window_state(
+                xwm,
+                "map_notify_processed",
+                handle,
+                TraceFields::new().field("map_path", "external"),
+            );
         }
         Event::UnmapNotify(event) => {
             let handle = X11WindowHandle::new(xwm.generation, event.window);
@@ -129,6 +145,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             xwm.windows
                 .mark_unmapped(handle)
                 .map_err(XwmError::InvalidCommand)?;
+            trace_window_state(xwm, "unmap_notify_processed", handle, TraceFields::new());
             if was_ready {
                 xwm.outgoing_events
                     .push_back(XwmEvent::WindowWithdrawn(handle));
@@ -146,6 +163,12 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             else {
                 return Ok(());
             };
+            trace::emit("destroy_window_processed", || {
+                TraceFields::new()
+                    .field("source", "xwm")
+                    .field("xid", handle.xid())
+                    .field("lifecycle", "Destroyed")
+            });
             xwm.outgoing_events
                 .push_back(XwmEvent::WindowDestroyed(handle));
         }
@@ -184,6 +207,16 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                     snapshot.geometry = record.geometry;
                 }
             }
+            trace_window_state(
+                xwm,
+                "configure_notify_processed",
+                handle,
+                TraceFields::new()
+                    .field("geometry_x", geometry.x)
+                    .field("geometry_y", geometry.y)
+                    .field("geometry_width", geometry.width)
+                    .field("geometry_height", geometry.height),
+            );
             if !xwm.note_configure_notify(handle, geometry) && xwm.windows.get(handle).is_some() {
                 xwm.outgoing_events.push_back(XwmEvent::ConfigureNotify {
                     window: handle,
@@ -215,6 +248,124 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         _ => {}
     }
     Ok(())
+}
+
+fn trace_raw_event(event: &Event) {
+    match event {
+        Event::CreateNotify(event) => trace::emit("CreateNotify", || {
+            TraceFields::new()
+                .field("source", "x11")
+                .field("x_event_send_event", event.response_type & 0x80 != 0)
+                .field("xid", event.window)
+                .field("parent_xid", event.parent)
+                .field("override_redirect_event", event.override_redirect)
+        }),
+        Event::MapRequest(event) => trace::emit("MapRequest", || {
+            TraceFields::new()
+                .field("source", "x11")
+                .field("x_event_send_event", event.response_type & 0x80 != 0)
+                .field("xid", event.window)
+                .field("parent_xid", event.parent)
+        }),
+        Event::MapNotify(event) => trace::emit("MapNotify", || {
+            TraceFields::new()
+                .field("source", "x11")
+                .field("x_event_send_event", event.response_type & 0x80 != 0)
+                .field("xid", event.window)
+                .field("override_redirect_event", event.override_redirect)
+        }),
+        Event::ConfigureNotify(event) => trace::emit("ConfigureNotify", || {
+            TraceFields::new()
+                .field("source", "x11")
+                .field("x_event_send_event", event.response_type & 0x80 != 0)
+                .field("xid", event.window)
+                .field("override_redirect_event", event.override_redirect)
+                .field("geometry_x", event.x)
+                .field("geometry_y", event.y)
+                .field("geometry_width", event.width)
+                .field("geometry_height", event.height)
+        }),
+        Event::PropertyNotify(event) => trace::emit("PropertyNotify", || {
+            TraceFields::new()
+                .field("source", "x11")
+                .field("x_event_send_event", event.response_type & 0x80 != 0)
+                .field("xid", event.window)
+                .field("property_atom", event.atom)
+                .field("property_state", format!("{:?}", event.state))
+        }),
+        Event::UnmapNotify(event) => trace::emit("UnmapNotify", || {
+            TraceFields::new()
+                .field("source", "x11")
+                .field("x_event_send_event", event.response_type & 0x80 != 0)
+                .field("xid", event.window)
+                .field("from_configure", event.from_configure)
+        }),
+        Event::DestroyNotify(event) => trace::emit("DestroyNotify", || {
+            TraceFields::new()
+                .field("source", "x11")
+                .field("x_event_send_event", event.response_type & 0x80 != 0)
+                .field("xid", event.window)
+        }),
+        Event::ClientMessage(event) if event.format == 32 => trace::emit("ClientMessage", || {
+            let data = event.data.as_data32();
+            TraceFields::new()
+                .field("source", "x11")
+                .field("x_event_send_event", event.response_type & 0x80 != 0)
+                .field("xid", event.window)
+                .field("client_message_atom", event.type_)
+                .field("client_message_data0", data[0])
+                .field("client_message_data1", data[1])
+                .field("client_message_data2", data[2])
+                .field("client_message_data3", data[3])
+                .field("client_message_data4", data[4])
+        }),
+        Event::SyncCounterNotify(event) => trace::emit("SyncCounterNotify", || {
+            TraceFields::new()
+                .field("source", "x11")
+                .field("x_event_send_event", event.response_type & 0x80 != 0)
+                .field("sync_counter", event.counter)
+                .field("sync_counter_value", format!("{:?}", event.counter_value))
+        }),
+        _ => {}
+    }
+}
+
+fn trace_window_state(
+    xwm: &Xwm,
+    event: &'static str,
+    handle: X11WindowHandle,
+    fields: TraceFields,
+) {
+    let Some(record) = xwm.windows.get(handle) else {
+        return;
+    };
+    trace::emit(event, || {
+        let association = record.association;
+        fields
+            .field("source", "xwm")
+            .field("xid", handle.xid())
+            .field(
+                "override_redirect_stored",
+                record.kind == DesktopWindowKind::OverrideRedirect,
+            )
+            .field("lifecycle", format!("{:?}", record.lifecycle))
+            .field("property_epoch", record.property_epoch)
+            .field("properties_ready", record.properties_ready)
+            .field("buffer_ready", record.buffer_ready)
+            .field(
+                "window_type",
+                format!("{:?}", record.properties.window_type),
+            )
+            .optional(
+                "transient_for",
+                record.properties.transient_for.map(|parent| parent.xid()),
+            )
+            .optional(
+                "association_serial",
+                association.map(|value| value.serial.get()),
+            )
+            .optional("surface_id", association.map(|value| value.surface_id))
+    });
 }
 
 fn int64_to_u64(value: Int64) -> u64 {
@@ -326,9 +477,21 @@ fn normalize_property_change(
     if !xwm.windows.contains(handle) {
         return Ok(());
     }
+    trace_window_state(
+        xwm,
+        "property_notify_before_refresh",
+        handle,
+        TraceFields::new().field("property_atom", event.atom),
+    );
     if let Some(kind) = property_kind_for_atom(xwm, event.atom) {
         xwm.refresh_window_property(handle, kind)?;
     }
+    trace_window_state(
+        xwm,
+        "property_notify_after_refresh_request",
+        handle,
+        TraceFields::new().field("property_atom", event.atom),
+    );
     Ok(())
 }
 

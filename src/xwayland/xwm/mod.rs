@@ -8,6 +8,7 @@ use std::{
 };
 
 use crate::compositor::{DesktopWindowKind, WindowConstraints, WindowMetadata};
+use crate::xwayland::trace::{self, TraceFields};
 use x11rb::protocol::xproto;
 mod adoption;
 mod association;
@@ -524,6 +525,13 @@ impl Xwm {
         if generation != self.generation {
             return Err(XwmError::StaleGeneration);
         }
+        trace::emit("buffer_ready_level_observed", || {
+            TraceFields::new()
+                .field("source", "compositor")
+                .field("generation", generation.get())
+                .field("surface_id", surface_id)
+                .field("buffer_ready_level", true)
+        });
         self.buffer_ready_surfaces.insert(surface_id);
         let handles = self
             .association
@@ -535,7 +543,23 @@ impl Xwm {
             .collect::<Vec<_>>();
         for handle in handles {
             self.mark_window_buffer_ready(handle)?;
-            match self.resize_sync.note_commit(handle) {
+            let commit_result = self.resize_sync.note_commit(handle);
+            trace::emit("resize_commit_result", || {
+                TraceFields::new()
+                    .field("source", "xwm")
+                    .field("xid", handle.xid())
+                    .field("surface_id", surface_id)
+                    .field("resize_result", format!("{commit_result:?}"))
+                    .field(
+                        "resize_state",
+                        format!("{:?}", self.resize_sync.state(handle)),
+                    )
+                    .optional(
+                        "resize_counter",
+                        self.resize_sync.state(handle).counter_value(),
+                    )
+            });
+            match commit_result {
                 ResizeSyncCommit::Presented | ResizeSyncCommit::FallbackPresented => {
                     if std::env::var_os("TYPHON_XWAYLAND_LOG").is_some() {
                         let geometry = self
@@ -596,7 +620,20 @@ impl Xwm {
     }
 
     fn note_resize_sync_ack(&mut self, handle: X11WindowHandle, value: u64) {
+        let state_before = self.resize_sync.state(handle);
         if self.resize_sync.acknowledge(handle, value) {
+            trace::emit("resize_ack_observed", || {
+                TraceFields::new()
+                    .field("source", "x11")
+                    .field("xid", handle.xid())
+                    .field("resize_counter", value)
+                    .field("resize_state_before", format!("{state_before:?}"))
+                    .field(
+                        "resize_state_after",
+                        format!("{:?}", self.resize_sync.state(handle)),
+                    )
+                    .field("allow_commits", false)
+            });
             if std::env::var_os("TYPHON_XWAYLAND_LOG").is_some() {
                 let geometry = self
                     .resize_sync
@@ -638,6 +675,13 @@ impl Xwm {
                 SurfaceAssociationJoinError::InvalidSerial,
             ));
         };
+        trace::emit("association_x11_serial_observed", || {
+            TraceFields::new()
+                .field("source", "x11")
+                .field("xid", handle.xid())
+                .field("association_serial", serial.get())
+                .field("surface_id", "pending")
+        });
         let deadline = crate::native::event_loop::monotonic_now_ns()
             .unwrap_or_default()
             .saturating_add(adoption::ADOPTION_TIMEOUT_NS);
@@ -666,11 +710,24 @@ impl Xwm {
                 generation,
                 serial,
                 surface_id,
-            } => self
-                .association
-                .commit_wayland(generation, serial, surface_id)
-                .map_err(XwmError::Association)?,
+            } => {
+                trace::emit("association_wayland_committed", || {
+                    TraceFields::new()
+                        .field("source", "wayland")
+                        .field("generation", generation.get())
+                        .field("association_serial", serial.get())
+                        .field("surface_id", surface_id)
+                });
+                self.association
+                    .commit_wayland(generation, serial, surface_id)
+                    .map_err(XwmError::Association)?;
+            }
             XwaylandAssociationEvent::Removed { surface_id, .. } => {
+                trace::emit("association_wayland_removed", || {
+                    TraceFields::new()
+                        .field("source", "wayland")
+                        .field("surface_id", surface_id)
+                });
                 let owner = self
                     .association
                     .completed

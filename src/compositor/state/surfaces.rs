@@ -1,4 +1,5 @@
 use super::*;
+use crate::xwayland::trace::{self, TraceFields};
 impl CompositorState {
     pub(in crate::compositor) fn allocate_surface_commit_sequence(
         &mut self,
@@ -12,6 +13,30 @@ impl CompositorState {
         commit_sequence: SurfaceCommitSequence,
         has_attachment_change: bool,
     ) {
+        if matches!(self.surface_role(surface_id), SurfaceRole::Xwayland) {
+            let current = self.current_surface_buffers.get(&surface_id);
+            let buffer_size =
+                current.and_then(|buffer| buffer.data.width().ok().zip(buffer.data.height().ok()));
+            let buffer_id = (!has_attachment_change)
+                .then(|| current.map(|buffer| buffer.data.buffer_id().get()))
+                .flatten();
+            let association_serial = self
+                .xwayland
+                .associations
+                .serial_for_surface(surface_id)
+                .map(|(_, serial)| serial.get());
+            trace::emit("xwayland_commit_received", || {
+                TraceFields::new()
+                    .field("source", "wayland")
+                    .field("surface_id", surface_id)
+                    .field("commit_sequence", commit_sequence.get())
+                    .field("has_attachment_change", has_attachment_change)
+                    .optional("buffer_id", buffer_id)
+                    .optional("buffer_width", buffer_size.map(|(width, _)| width))
+                    .optional("buffer_height", buffer_size.map(|(_, height)| height))
+                    .optional("association_serial", association_serial)
+            });
+        }
         let state = self.surface_publications.entry(surface_id).or_default();
         state.latest_received = state.latest_received.max(commit_sequence);
         if has_attachment_change {

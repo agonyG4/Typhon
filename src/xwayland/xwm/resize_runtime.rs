@@ -1,4 +1,5 @@
 use super::*;
+use crate::xwayland::trace::{self, TraceFields};
 
 impl Xwm {
     pub(crate) fn handle_resize_sync_deadline(&mut self, now_ns: u64) -> Result<(), XwmError> {
@@ -18,6 +19,25 @@ impl Xwm {
                 self.clear_resize_sync_alarm(handle);
                 self.resize_sync.finish_timeout(handle);
                 allow_result?;
+                trace::emit("resize_timeout", || {
+                    TraceFields::new()
+                        .field("source", "xwm")
+                        .field("xid", handle.xid())
+                        .field("resize_counter", counter_value)
+                        .optional(
+                            "transaction_id",
+                            transaction.map(|(transaction_id, _, _)| transaction_id),
+                        )
+                        .optional(
+                            "geometry",
+                            transaction.map(|(_, geometry, _)| format!("{geometry:?}")),
+                        )
+                        .optional(
+                            "latest_desired",
+                            latest_desired.map(|geometry| format!("{geometry:?}")),
+                        )
+                        .field("allow_commits", true)
+                });
                 if std::env::var_os("TYPHON_XWAYLAND_LOG").is_some() {
                     let (transaction_id, geometry, _) = transaction.unwrap_or_default();
                     eprintln!(
@@ -58,6 +78,15 @@ impl Xwm {
         if !self.resize_sync.complete(handle) {
             return Err(XwmError::InvalidCommand("resize sync is not presented"));
         }
+        trace::emit("resize_presented_completion", || {
+            TraceFields::new()
+                .field("source", "xwm")
+                .field("xid", handle.xid())
+                .field(
+                    "resize_state",
+                    format!("{:?}", self.resize_sync.state(handle)),
+                )
+        });
         self.clear_resize_sync_alarm(handle);
         if let Some(desired) = self.resize_sync.take_desired(handle) {
             let now = crate::native::event_loop::monotonic_now_ns().unwrap_or_default();
@@ -159,6 +188,14 @@ impl Xwm {
                 .is_some_and(|record| record.association.is_none());
             if needs_association {
                 let _ = self.windows.mark_associated(handle, association);
+                trace::emit("association_complete", || {
+                    TraceFields::new()
+                        .field("source", "xwm")
+                        .field("xid", handle.xid())
+                        .field("association_serial", association.serial.get())
+                        .field("surface_id", association.surface_id)
+                        .field("lifecycle", "associated")
+                });
                 let deadline = crate::native::event_loop::monotonic_now_ns()
                     .unwrap_or_default()
                     .saturating_add(adoption::ADOPTION_TIMEOUT_NS);
@@ -171,7 +208,20 @@ impl Xwm {
             if self.buffer_ready_surfaces.contains(&association.surface_id) {
                 self.adoption.complete(handle);
                 let _ = self.windows.mark_buffer_ready(handle);
-                match self.resize_sync.note_commit(handle) {
+                let commit_result = self.resize_sync.note_commit(handle);
+                trace::emit("resize_commit_result", || {
+                    TraceFields::new()
+                        .field("source", "xwm")
+                        .field("xid", handle.xid())
+                        .field("surface_id", association.surface_id)
+                        .field("resize_result", format!("{commit_result:?}"))
+                        .field("readiness_replayed", true)
+                        .field(
+                            "resize_state",
+                            format!("{:?}", self.resize_sync.state(handle)),
+                        )
+                });
+                match commit_result {
                     ResizeSyncCommit::Presented | ResizeSyncCommit::FallbackPresented => {
                         let final_presented = self.resize_sync.transaction(handle).is_some_and(
                             |(_, _, final_pending)| {

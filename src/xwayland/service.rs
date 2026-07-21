@@ -12,6 +12,7 @@ use crate::process::{
     SpawnCommand, SpawnedProcess,
 };
 
+use super::trace::{self, TraceFields};
 use super::{
     XwaylandAppEnvironment, XwaylandAssociationEvent, XwaylandGeneration, XwaylandMode,
     config::XwaylandConfig,
@@ -1020,14 +1021,38 @@ impl XwaylandService {
         }
         for event in events {
             match event {
-                XwaylandAssociationEvent::Committed { .. } => {
+                XwaylandAssociationEvent::Committed {
+                    generation,
+                    serial,
+                    surface_id,
+                } => {
                     self.metrics.association_commits =
                         self.metrics.association_commits.saturating_add(1);
+                    trace::emit("association_wayland_event", || {
+                        TraceFields::new()
+                            .field("source", "wayland")
+                            .field("association_action", "committed")
+                            .field("generation", generation.get())
+                            .field("association_serial", serial.get())
+                            .field("surface_id", surface_id)
+                    });
                     eprintln!("oblivion-one xwayland: event=association_commit detail={event:?}");
                 }
-                XwaylandAssociationEvent::Removed { .. } => {
+                XwaylandAssociationEvent::Removed {
+                    generation,
+                    serial,
+                    surface_id,
+                } => {
                     self.metrics.association_removals =
                         self.metrics.association_removals.saturating_add(1);
+                    trace::emit("association_wayland_event", || {
+                        TraceFields::new()
+                            .field("source", "wayland")
+                            .field("association_action", "removed")
+                            .field("generation", generation.get())
+                            .field("association_serial", serial.get())
+                            .field("surface_id", surface_id)
+                    });
                     eprintln!("oblivion-one xwayland: event=association_remove detail={event:?}");
                 }
             }
@@ -1048,6 +1073,12 @@ impl XwaylandService {
         generation: XwaylandGeneration,
         surface_id: u32,
     ) -> io::Result<()> {
+        trace::emit("buffer_ready_forwarded", || {
+            TraceFields::new()
+                .field("source", "native_runtime")
+                .field("generation", generation.get())
+                .field("surface_id", surface_id)
+        });
         let result = match &mut self.state {
             ServiceState::Running(resources) if resources.generation == generation => resources
                 .xwm
@@ -1066,7 +1097,7 @@ impl XwaylandService {
     }
 
     pub fn take_managed_xwm_events(&mut self) -> Vec<super::xwm::XwmEvent> {
-        match &mut self.state {
+        let events = match &mut self.state {
             ServiceState::Running(resources) => resources
                 .xwm
                 .take_events()
@@ -1095,7 +1126,15 @@ impl XwaylandService {
                 })
                 .collect(),
             _ => Vec::new(),
+        };
+        for event in &events {
+            trace::emit("xwm_event_emitted", || {
+                TraceFields::new()
+                    .field("source", "xwm")
+                    .field("event", format!("{event:?}"))
+            });
         }
+        events
     }
 
     #[allow(dead_code)]

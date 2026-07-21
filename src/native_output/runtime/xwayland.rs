@@ -1,4 +1,5 @@
 use super::*;
+use oblivion_one::xwayland::trace::{self, TraceFields};
 use oblivion_one::xwayland::xwm::XwmCommand;
 
 fn coalesce_client_list_sync(commands: Vec<XwmCommand>) -> Vec<XwmCommand> {
@@ -40,6 +41,11 @@ impl NativeRuntime {
     pub(super) fn dispatch_xwayland_window_events(&mut self) -> NativeResult<()> {
         let mut commands = Vec::new();
         for event in self.xwayland.take_managed_xwm_events() {
+            trace::emit("xwm_event_dispatched", || {
+                TraceFields::new()
+                    .field("source", "native_runtime")
+                    .field("event", format!("{event:?}"))
+            });
             commands.extend(self.server.apply_xwayland_window_event(event));
         }
         let now_ns = monotonic_now_ns()?;
@@ -57,6 +63,12 @@ impl NativeRuntime {
 
     pub(super) fn dispatch_xwayland_buffer_ready(&mut self) {
         for (generation, surface_id) in self.server.take_xwayland_buffer_ready_events() {
+            trace::emit("buffer_ready_event_dispatched", || {
+                TraceFields::new()
+                    .field("source", "native_runtime")
+                    .field("generation", generation.get())
+                    .field("surface_id", surface_id)
+            });
             let _ = self.xwayland.mark_managed_surface_buffer_ready(
                 &mut self.process_supervisor,
                 generation,

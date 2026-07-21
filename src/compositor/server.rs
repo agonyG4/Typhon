@@ -38,6 +38,7 @@ use crate::astrea_shortcuts::server::astrea_shortcuts_manager_v1;
 use crate::render_backend::buffer::BufferId;
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
+use crate::xwayland::trace::{self, TraceFields};
 use crate::xwayland::xwm::{XwmCommand, XwmEvent};
 use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 #[path = "server_gpu_globals.rs"]
@@ -110,6 +111,14 @@ impl Drop for OwnCompositorServer {
 }
 
 impl OwnCompositorServer {
+    fn focused_x11_window_xid(&self) -> Option<u32> {
+        let window_id = self.state.focused_window_id?;
+        match self.state.window(window_id)?.backend {
+            super::WindowBackend::X11(handle) => Some(handle.xid()),
+            _ => None,
+        }
+    }
+
     pub fn core_compliance_metrics(&self) -> CoreComplianceMetrics {
         self.state.compliance_metrics
     }
@@ -452,12 +461,38 @@ impl OwnCompositorServer {
             XwmEvent::WindowReady(snapshot) => {
                 let surface_id = snapshot.surface_id;
                 let handle = snapshot.handle;
+                let snapshot_for_trace = snapshot.clone();
+                let focus_before = self.focused_x11_window_xid();
                 match self.state.insert_x11_window(snapshot) {
                     Ok(window_id) => {
                         let published = self
                             .state
                             .adopt_current_xwayland_surface_content(surface_id);
                         let focused = self.state.focus_desktop_window(window_id);
+                        let focus_after = self.focused_x11_window_xid();
+                        trace::emit("focus_decision", || {
+                            TraceFields::new()
+                                .field("source", "compositor")
+                                .field("xid", handle.xid())
+                                .field("surface_id", surface_id)
+                                .field("focus_decision", "initial_focus")
+                                .field("focus_requested", true)
+                                .field("focus_result", focused)
+                                .optional("focus_before", focus_before)
+                                .optional("focus_after", focus_after)
+                                .field(
+                                    "window_type",
+                                    format!("{:?}", snapshot_for_trace.window_type),
+                                )
+                                .field(
+                                    "override_redirect_stored",
+                                    snapshot_for_trace.override_redirect,
+                                )
+                                .optional(
+                                    "transient_for",
+                                    snapshot_for_trace.transient_for.map(|parent| parent.xid()),
+                                )
+                        });
                         eprintln!(
                             "oblivion-one compositor: event=xwayland_window_admitted surface_id={surface_id} retained_buffer={published} published={published} focused={focused}"
                         );
@@ -477,14 +512,30 @@ impl OwnCompositorServer {
                 }
             }
             XwmEvent::WindowDestroyed(handle) => {
+                let focus_before = self.focused_x11_window_xid();
                 if self.remove_x11_desktop_window(handle) {
+                    trace::emit("window_destroyed", || {
+                        TraceFields::new()
+                            .field("source", "compositor")
+                            .field("xid", handle.xid())
+                            .optional("focus_before", focus_before)
+                            .optional("focus_after", self.focused_x11_window_xid())
+                    });
                     vec![self.sync_xwayland_client_lists()]
                 } else {
                     Vec::new()
                 }
             }
             XwmEvent::WindowWithdrawn(handle) => {
+                let focus_before = self.focused_x11_window_xid();
                 if self.remove_x11_desktop_window(handle) {
+                    trace::emit("window_withdrawn", || {
+                        TraceFields::new()
+                            .field("source", "compositor")
+                            .field("xid", handle.xid())
+                            .optional("focus_before", focus_before)
+                            .optional("focus_after", self.focused_x11_window_xid())
+                    });
                     vec![self.sync_xwayland_client_lists()]
                 } else {
                     Vec::new()
@@ -492,6 +543,8 @@ impl OwnCompositorServer {
             }
             XwmEvent::MetadataChanged { window, delta } => {
                 let prior_id = self.state.window_id_for_x11_handle(window);
+                let delta_debug = format!("{delta:?}");
+                let focus_before = self.focused_x11_window_xid();
                 let prior_focused =
                     prior_id.is_some_and(|id| self.state.focused_window_id == Some(id));
                 let publish_lists = matches!(
@@ -512,6 +565,15 @@ impl OwnCompositorServer {
                     self.state.clear_keyboard_focus();
                     let _ = self.state.focus_topmost_renderable_toplevel();
                 }
+                trace::emit("metadata_changed", || {
+                    TraceFields::new()
+                        .field("source", "compositor")
+                        .field("xid", window.xid())
+                        .field("metadata_delta", delta_debug)
+                        .optional("focus_before", focus_before)
+                        .optional("focus_after", self.focused_x11_window_xid())
+                        .field("focus_repaired", prior_focused)
+                });
                 if !publish_lists {
                     return Vec::new();
                 }
