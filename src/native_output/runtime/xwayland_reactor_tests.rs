@@ -43,6 +43,9 @@ struct ServerEvents {
 #[derive(Debug)]
 enum CompositorEvent {
     Xwayland(XwmEvent),
+    Barrier {
+        reply: mpsc::Sender<()>,
+    },
     BeginResize {
         handle: oblivion_one::xwayland::X11WindowHandle,
         geometry: oblivion_one::xwayland::xwm::X11Geometry,
@@ -285,6 +288,9 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
                     CompositorEvent::Xwayland(event) => {
                         let commands = compositor.apply_xwayland_window_event(event);
                         let _ = compositor_command_sender.send(commands);
+                    }
+                    CompositorEvent::Barrier { reply } => {
+                        let _ = reply.send(());
                     }
                     CompositorEvent::BeginResize {
                         handle,
@@ -889,6 +895,16 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
             .expect("synchronize unrelated reactor sources");
     }
     let unrelated_snapshot = unrelated_snapshot.expect("unrelated WindowReady snapshot");
+    let (barrier_sender, barrier_receiver) = mpsc::channel();
+    compositor_event_sender
+        .send(CompositorEvent::Barrier {
+            reply: barrier_sender,
+        })
+        .expect("send compositor barrier after unrelated WindowReady");
+    barrier_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("wait for unrelated WindowReady processing");
+    apply_compositor_commands(&compositor_command_receiver, &mut service, &mut supervisor);
     service
         .execute_managed_command(
             &mut supervisor,
