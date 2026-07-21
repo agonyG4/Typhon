@@ -119,6 +119,11 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 || matches!(record.lifecycle, X11WindowLifecycle::Renderable);
             if let Some(association) = record.association {
                 xwm.clear_surface_buffer_ready(association.surface_id);
+                xwm.association.remove_x11_window(handle);
+                let _ = xwm
+                    .windows
+                    .clear_association(handle, association.surface_id)
+                    .map_err(XwmError::InvalidCommand)?;
             }
             xwm.cancel_window_properties(handle);
             xwm.windows
@@ -263,6 +268,43 @@ fn normalize_client_message(
     } else if event.type_ == xwm.atoms.get(XwmAtomName::NetCloseWindow) {
         xwm.outgoing_events
             .push_back(XwmEvent::CloseRequestedByClient(handle));
+    } else if event.type_ == xwm.atoms.get(XwmAtomName::NetWmMoveresize) {
+        if let Some(direction) = super::X11MoveResizeDirection::from_ewmh(data[2]) {
+            xwm.outgoing_events
+                .push_back(XwmEvent::MoveResizeRequested {
+                    window: handle,
+                    request: super::X11MoveResizeRequest {
+                        root_x: data[0] as i32,
+                        root_y: data[1] as i32,
+                        direction,
+                        button: data[3],
+                        source: data[4],
+                    },
+                });
+        }
+    } else if event.type_ == xwm.atoms.get(XwmAtomName::NetMoveResizeWindow) {
+        let flags = X11ConfigureFlags {
+            x: data[0] & (1 << 8) != 0,
+            y: data[0] & (1 << 9) != 0,
+            width: data[0] & (1 << 10) != 0,
+            height: data[0] & (1 << 11) != 0,
+            ..X11ConfigureFlags::default()
+        };
+        xwm.outgoing_events.push_back(XwmEvent::ConfigureRequested {
+            window: handle,
+            request: X11ConfigureRequest {
+                requested: X11Geometry {
+                    x: data[1] as i32,
+                    y: data[2] as i32,
+                    width: data[3],
+                    height: data[4],
+                },
+                fields: flags,
+                border_width: 0,
+                sibling: None,
+                stack_mode: None,
+            },
+        });
     } else if event.type_ == xwm.atoms.get(XwmAtomName::WmChangeState) && data[0] == 3 {
         xwm.outgoing_events.push_back(XwmEvent::StateRequested {
             window: handle,
@@ -477,6 +519,16 @@ mod tests {
             event: 1,
             window,
             override_redirect,
+        })
+    }
+
+    fn unmap_event(window: u32) -> Event {
+        Event::UnmapNotify(xproto::UnmapNotifyEvent {
+            response_type: 18,
+            sequence: 0,
+            event: 1,
+            window,
+            from_configure: false,
         })
     }
 
@@ -817,6 +869,187 @@ mod tests {
             !events
                 .iter()
                 .any(|event| matches!(event, super::super::XwmEvent::WindowMapRequested(_)))
+        );
+    }
+
+    #[test]
+    fn override_redirect_unmap_can_remap_with_a_fresh_wayland_surface() {
+        let generation = generation(14);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = X11WindowHandle::new(generation, 111);
+        assert!(xwm.windows.insert_observed_with_kind(
+            handle,
+            DesktopWindowKind::OverrideRedirect,
+            X11Geometry::default()
+        ));
+        xwm.windows
+            .get_mut(handle)
+            .expect("window record")
+            .properties_ready = true;
+
+        xwm.note_x11_surface_serial(handle, 0x1234, 0)
+            .expect("first X11 surface serial");
+        xwm.ingest_wayland_association(XwaylandAssociationEvent::Committed {
+            generation,
+            serial: NonZeroU64::new(0x1234).expect("first serial"),
+            surface_id: 42,
+        })
+        .expect("first Wayland association");
+        xwm.mark_window_buffer_ready(handle)
+            .expect("first buffer readiness");
+        normalize(&mut xwm, map_event(handle.xid(), true)).expect("first MapNotify");
+        assert_eq!(ready_surface_id(&ready_events(&mut xwm)), Some(42));
+
+        normalize(&mut xwm, unmap_event(handle.xid())).expect("popup UnmapNotify");
+        assert!(matches!(
+            ready_events(&mut xwm).as_slice(),
+            [super::super::XwmEvent::WindowWithdrawn(withdrawn)] if *withdrawn == handle
+        ));
+        let record = xwm.windows.get(handle).expect("withdrawn window record");
+        assert!(record.association.is_none());
+        assert!(!record.buffer_ready);
+
+        xwm.windows
+            .get_mut(handle)
+            .expect("reused window record")
+            .properties_ready = true;
+        xwm.note_x11_surface_serial(handle, 0x5678, 0)
+            .expect("replacement X11 surface serial");
+        xwm.ingest_wayland_association(XwaylandAssociationEvent::Committed {
+            generation,
+            serial: NonZeroU64::new(0x5678).expect("replacement serial"),
+            surface_id: 43,
+        })
+        .expect("replacement Wayland association");
+        xwm.mark_window_buffer_ready(handle)
+            .expect("replacement buffer readiness");
+        normalize(&mut xwm, map_event(handle.xid(), true)).expect("replacement MapNotify");
+
+        assert_eq!(ready_surface_id(&ready_events(&mut xwm)), Some(43));
+    }
+
+    #[test]
+    fn wayland_surface_removal_clears_the_mapped_x11_record() {
+        let generation = generation(17);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = X11WindowHandle::new(generation, 114);
+        assert!(xwm.windows.insert_observed_with_kind(
+            handle,
+            DesktopWindowKind::OverrideRedirect,
+            X11Geometry::default()
+        ));
+        xwm.windows
+            .get_mut(handle)
+            .expect("window record")
+            .properties_ready = true;
+        xwm.note_x11_surface_serial(handle, 0x1234, 0)
+            .expect("first X11 serial");
+        xwm.ingest_wayland_association(XwaylandAssociationEvent::Committed {
+            generation,
+            serial: NonZeroU64::new(0x1234).expect("first serial"),
+            surface_id: 42,
+        })
+        .expect("first association");
+        xwm.mark_window_buffer_ready(handle)
+            .expect("first buffer readiness");
+        normalize(&mut xwm, map_event(handle.xid(), true)).expect("first MapNotify");
+        assert_eq!(ready_surface_id(&ready_events(&mut xwm)), Some(42));
+
+        xwm.ingest_wayland_association(XwaylandAssociationEvent::Removed {
+            generation,
+            serial: NonZeroU64::new(0x1234).expect("first serial"),
+            surface_id: 42,
+        })
+        .expect("Wayland surface removal");
+        assert!(matches!(
+            ready_events(&mut xwm).as_slice(),
+            [super::super::XwmEvent::WindowWithdrawn(withdrawn)] if *withdrawn == handle
+        ));
+        let record = xwm.windows.get(handle).expect("dissociated record");
+        assert!(record.association.is_none());
+        assert!(!record.buffer_ready);
+
+        xwm.note_x11_surface_serial(handle, 0x5678, 0)
+            .expect("replacement X11 serial");
+        xwm.ingest_wayland_association(XwaylandAssociationEvent::Committed {
+            generation,
+            serial: NonZeroU64::new(0x5678).expect("replacement serial"),
+            surface_id: 43,
+        })
+        .expect("replacement association");
+        xwm.mark_window_buffer_ready(handle)
+            .expect("replacement buffer readiness");
+
+        assert_eq!(ready_surface_id(&ready_events(&mut xwm)), Some(43));
+    }
+
+    #[test]
+    fn net_wm_moveresize_client_message_is_normalized() {
+        let generation = generation(15);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = X11WindowHandle::new(generation, 112);
+        assert!(xwm.windows.insert_observed(handle));
+        let event = xproto::ClientMessageEvent::new(
+            32,
+            handle.xid(),
+            xwm.atoms.get(XwmAtomName::NetWmMoveresize),
+            xproto::ClientMessageData::from([320, 240, 4, 1, 1]),
+        );
+
+        normalize(&mut xwm, Event::ClientMessage(event)).expect("normalize moveresize request");
+
+        assert_eq!(
+            xwm.take_events().collect::<Vec<_>>(),
+            vec![super::super::XwmEvent::MoveResizeRequested {
+                window: handle,
+                request: super::super::X11MoveResizeRequest {
+                    root_x: 320,
+                    root_y: 240,
+                    direction: super::super::X11MoveResizeDirection::BottomRight,
+                    button: 1,
+                    source: 1,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn net_moveresize_window_client_message_becomes_configure_request() {
+        let generation = generation(16);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = X11WindowHandle::new(generation, 113);
+        assert!(xwm.windows.insert_observed(handle));
+        let event = xproto::ClientMessageEvent::new(
+            32,
+            handle.xid(),
+            xwm.atoms.get(XwmAtomName::NetMoveResizeWindow),
+            xproto::ClientMessageData::from([(1 << 8) | (1 << 10), 50, 60, 700, 500]),
+        );
+
+        normalize(&mut xwm, Event::ClientMessage(event))
+            .expect("normalize one-shot moveresize request");
+
+        assert_eq!(
+            xwm.take_events().collect::<Vec<_>>(),
+            vec![super::super::XwmEvent::ConfigureRequested {
+                window: handle,
+                request: X11ConfigureRequest {
+                    requested: X11Geometry {
+                        x: 50,
+                        y: 60,
+                        width: 700,
+                        height: 500,
+                    },
+                    fields: X11ConfigureFlags {
+                        x: true,
+                        width: true,
+                        ..X11ConfigureFlags::default()
+                    },
+                    border_width: 0,
+                    sibling: None,
+                    stack_mode: None,
+                },
+            }]
         );
     }
 

@@ -101,6 +101,7 @@ pub enum WindowInteractionSource {
     NativeBinding,
     XdgToplevelMove,
     XdgToplevelResize,
+    X11NetWmMoveResize,
 }
 
 #[allow(dead_code)]

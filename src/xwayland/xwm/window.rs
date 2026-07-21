@@ -295,6 +295,25 @@ impl X11WindowRegistry {
         self.update_pending_lifecycle(handle)
     }
 
+    pub(crate) fn clear_association(
+        &mut self,
+        handle: X11WindowHandle,
+        surface_id: u32,
+    ) -> Result<bool, &'static str> {
+        let record = self.record_mut(handle)?;
+        if record
+            .association
+            .is_none_or(|association| association.surface_id != surface_id)
+        {
+            return Ok(false);
+        }
+        record.association = None;
+        record.buffer_ready = false;
+        let was_ready = record.snapshot.take().is_some();
+        self.update_pending_lifecycle(handle)?;
+        Ok(was_ready)
+    }
+
     pub(crate) fn mark_buffer_ready(
         &mut self,
         handle: X11WindowHandle,

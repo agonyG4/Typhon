@@ -214,6 +214,64 @@ impl CompositorState {
         })
     }
 
+    pub(in crate::compositor) fn begin_x11_client_window_interaction(
+        &mut self,
+        handle: X11WindowHandle,
+        x: f64,
+        y: f64,
+        kind: WindowInteractionKind,
+        x11_button: u32,
+    ) -> bool {
+        let Some(window_id) = self.window_id_for_x11_handle(handle) else {
+            return false;
+        };
+        let Some(root_surface_id) = self.window(window_id).map(|window| window.root_surface_id)
+        else {
+            return false;
+        };
+        let requested_button = x11_button_to_evdev(x11_button);
+        let Some(press) = self.held_pointer_buttons.iter().rev().find(|press| {
+            press.root_surface_id == root_surface_id
+                && requested_button.is_none_or(|button| press.button == button)
+        }) else {
+            return false;
+        };
+        let trigger_button = press.button;
+        let pointer_motion_surface_id = compositor_surface_id(&press.surface);
+        self.begin_window_interaction_for_root(BeginWindowInteraction {
+            window_id: Some(window_id),
+            root_surface_id,
+            x,
+            y,
+            kind,
+            source: WindowInteractionSource::X11NetWmMoveResize,
+            trigger_button: Some(trigger_button),
+            trigger_serial: None,
+            pointer_motion_surface_id: Some(pointer_motion_surface_id),
+        })
+    }
+
+    pub(in crate::compositor) fn cancel_x11_client_window_interaction(
+        &mut self,
+        handle: X11WindowHandle,
+    ) -> bool {
+        let Some(window_id) = self.window_id_for_x11_handle(handle) else {
+            return false;
+        };
+        let Some(interaction) = self.window_interaction else {
+            return false;
+        };
+        if interaction.window_id != window_id
+            || interaction.source != WindowInteractionSource::X11NetWmMoveResize
+        {
+            return false;
+        }
+        self.end_window_interaction_by_id_with_reason(
+            interaction.id,
+            WindowInteractionEndReason::ExplicitCancel,
+        )
+    }
+
     pub(in crate::compositor) fn begin_window_interaction_for_root(
         &mut self,
         begin: BeginWindowInteraction,
@@ -784,6 +842,16 @@ impl CompositorState {
     ) -> Option<WindowInteractionDebugSnapshot> {
         self.window_interaction
             .map(WindowInteraction::debug_snapshot)
+    }
+}
+
+const fn x11_button_to_evdev(button: u32) -> Option<u32> {
+    match button {
+        0 => None,
+        1 => Some(0x110),
+        2 => Some(0x112),
+        3 => Some(0x111),
+        _ => Some(u32::MAX),
     }
 }
 

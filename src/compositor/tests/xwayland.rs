@@ -4,7 +4,8 @@ use crate::compositor::{
     DesktopWindowKind, RenderGenerationCause, SurfacePlacement, WindowConstraints, WindowMetadata,
 };
 use crate::xwayland::xwm::{
-    X11Geometry, X11PublishedState, X11WindowLifecycle, X11WindowSnapshot, X11WindowType,
+    X11ConfigureFlags, X11ConfigureRequest, X11Geometry, X11MoveResizeDirection,
+    X11MoveResizeRequest, X11PublishedState, X11WindowLifecycle, X11WindowSnapshot, X11WindowType,
     XwmCommand, XwmEvent,
 };
 use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
@@ -390,6 +391,159 @@ fn x11_window_ready_initial_focus_skips_auxiliary_popup() {
                 } if *window == handle
             ))
     );
+}
+
+#[test]
+fn x11_client_moveresize_requires_held_button_and_starts_move() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 100,
+        y: 100,
+        width: 2,
+        height: 2,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+
+    let request = XwmEvent::MoveResizeRequested {
+        window: handle,
+        request: X11MoveResizeRequest {
+            root_x: 101,
+            root_y: 101,
+            direction: X11MoveResizeDirection::Move,
+            button: 1,
+            source: 1,
+        },
+    };
+    fixture.server.apply_xwayland_window_event(request.clone());
+    assert!(!fixture.server.window_interaction_active());
+
+    fixture.server.send_pointer_motion(101.0, 101.0);
+    fixture.server.send_pointer_button(0x110, true);
+    fixture.server.apply_xwayland_window_event(request);
+
+    let interaction = fixture
+        .server
+        .window_interaction_debug_snapshot()
+        .expect("X11 client move interaction");
+    assert_eq!(
+        interaction.kind,
+        crate::compositor::WindowInteractionKind::Move
+    );
+    assert_eq!(
+        interaction.source,
+        crate::compositor::WindowInteractionSource::X11NetWmMoveResize
+    );
+    assert_eq!(interaction.trigger_button, Some(0x110));
+}
+
+#[test]
+fn x11_client_moveresize_maps_edges_and_accepts_cancel() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 100,
+        y: 100,
+        width: 2,
+        height: 2,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    fixture.server.send_pointer_motion(101.0, 101.0);
+    fixture.server.send_pointer_button(0x110, true);
+
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::MoveResizeRequested {
+            window: handle,
+            request: X11MoveResizeRequest {
+                root_x: 101,
+                root_y: 101,
+                direction: X11MoveResizeDirection::TopLeft,
+                button: 1,
+                source: 1,
+            },
+        });
+    assert_eq!(
+        fixture
+            .server
+            .window_interaction_debug_snapshot()
+            .expect("X11 client resize interaction")
+            .kind,
+        crate::compositor::WindowInteractionKind::Resize(crate::compositor::ResizeEdges::new(
+            true, false, true, false
+        ))
+    );
+
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::MoveResizeRequested {
+            window: handle,
+            request: X11MoveResizeRequest {
+                root_x: 101,
+                root_y: 101,
+                direction: X11MoveResizeDirection::Cancel,
+                button: 1,
+                source: 1,
+            },
+        });
+    assert!(!fixture.server.window_interaction_active());
+}
+
+#[test]
+fn x11_partial_moveresize_preserves_unrequested_geometry() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 100,
+        y: 120,
+        width: 640,
+        height: 480,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+
+    let commands = fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::ConfigureRequested {
+            window: handle,
+            request: X11ConfigureRequest {
+                requested: X11Geometry {
+                    x: 200,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+                fields: X11ConfigureFlags {
+                    x: true,
+                    ..X11ConfigureFlags::default()
+                },
+                border_width: 0,
+                sibling: None,
+                stack_mode: None,
+            },
+        });
+
+    assert!(matches!(
+        commands.as_slice(),
+        [XwmCommand::Configure { geometry, fields, .. }]
+            if *geometry == X11Geometry {
+                x: 200,
+                y: 120,
+                width: 2,
+                height: 2,
+            } && fields.x
+    ));
 }
 
 #[test]

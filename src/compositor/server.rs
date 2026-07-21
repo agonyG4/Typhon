@@ -49,8 +49,9 @@ use super::{
     ExplicitSyncPoint, FrameBatchDiscardReason, FramePresentation, FullscreenRenderPlanMetrics,
     InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PointerAxisFrame,
     PresentationClock, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
-    ResizeFlowMetrics, SelectionProtocolCapabilities, SubsurfaceTransactionMetrics,
-    SurfaceDamagePresentation, WindowInteractionDebugSnapshot, WindowInteractionEndReason, color,
+    ResizeEdges, ResizeFlowMetrics, SelectionProtocolCapabilities, SubsurfaceTransactionMetrics,
+    SurfaceDamagePresentation, WindowInteractionDebugSnapshot, WindowInteractionEndReason,
+    WindowInteractionKind, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 #[derive(Debug)]
@@ -564,8 +565,12 @@ impl OwnCompositorServer {
                     .and_then(|id| self.state.window(id))
                     .map(|window| window.constraints)
                     .unwrap_or_default();
+                let current = self
+                    .state
+                    .x11_authoritative_geometry(window)
+                    .unwrap_or(request.requested);
                 let geometry = crate::xwayland::xwm::icccm::apply_configure_request(
-                    request.requested,
+                    current,
                     request.requested,
                     request.fields,
                     constraints,
@@ -606,6 +611,51 @@ impl OwnCompositorServer {
                     }
                 }
                 commands
+            }
+            XwmEvent::MoveResizeRequested { window, request } => {
+                use crate::xwayland::xwm::X11MoveResizeDirection as Direction;
+                let kind = match request.direction {
+                    Direction::TopLeft => Some(WindowInteractionKind::Resize(ResizeEdges::new(
+                        true, false, true, false,
+                    ))),
+                    Direction::Top => Some(WindowInteractionKind::Resize(ResizeEdges::new(
+                        true, false, false, false,
+                    ))),
+                    Direction::TopRight => Some(WindowInteractionKind::Resize(ResizeEdges::new(
+                        true, false, false, true,
+                    ))),
+                    Direction::Right => Some(WindowInteractionKind::Resize(ResizeEdges::new(
+                        false, false, false, true,
+                    ))),
+                    Direction::BottomRight => {
+                        Some(WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT))
+                    }
+                    Direction::Bottom => Some(WindowInteractionKind::Resize(ResizeEdges::new(
+                        false, true, false, false,
+                    ))),
+                    Direction::BottomLeft => Some(WindowInteractionKind::Resize(ResizeEdges::new(
+                        false, true, true, false,
+                    ))),
+                    Direction::Left => Some(WindowInteractionKind::Resize(ResizeEdges::new(
+                        false, false, true, false,
+                    ))),
+                    Direction::Move => Some(WindowInteractionKind::Move),
+                    Direction::Cancel => {
+                        let _ = self.state.cancel_x11_client_window_interaction(window);
+                        None
+                    }
+                    Direction::KeyboardSize | Direction::KeyboardMove => None,
+                };
+                if let Some(kind) = kind {
+                    let _ = self.state.begin_x11_client_window_interaction(
+                        window,
+                        f64::from(request.root_x),
+                        f64::from(request.root_y),
+                        kind,
+                        request.button,
+                    );
+                }
+                Vec::new()
             }
             XwmEvent::ConfigureNotify { window, geometry } => {
                 let _ = self.state.reconcile_x11_configure_notify(window, geometry);
