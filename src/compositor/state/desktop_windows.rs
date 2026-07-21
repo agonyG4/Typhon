@@ -463,6 +463,16 @@ impl CompositorState {
         let Some(root_surface_id) = root_surface_id else {
             return false;
         };
+        if let Some(window) = self.window_mut(window_id)
+            && let Some(x11_geometry) = window.x11_geometry.as_mut()
+        {
+            x11_geometry.client = filtered;
+            x11_geometry.frame = WindowGeometry::new(
+                SurfacePlacement::absolute_root_at(filtered.x, filtered.y),
+                filtered.width.max(1),
+                filtered.height.max(1),
+            );
+        }
         self.set_surface_placement_with_cause(
             root_surface_id,
             SurfacePlacement::absolute_root_at(filtered.x, filtered.y),
@@ -483,10 +493,17 @@ impl CompositorState {
         else {
             return false;
         };
+        let placement = SurfacePlacement::absolute_root_at(geometry.x, geometry.y);
+        let frame = WindowGeometry::new(placement, geometry.width.max(1), geometry.height.max(1));
+        if let Some(window) = self.window_mut(window_id)
+            && let Some(x11_geometry) = window.x11_geometry.as_mut()
+        {
+            x11_geometry.client = geometry;
+            x11_geometry.frame = frame;
+        }
         if self.active_toplevel_resizes.contains_key(&root_surface_id) {
             return false;
         }
-        let placement = SurfacePlacement::absolute_root_at(geometry.x, geometry.y);
         let changed = self.surface_placement(root_surface_id) != placement
             || self
                 .current_visual_root_window_geometry(root_surface_id)
@@ -519,10 +536,6 @@ impl CompositorState {
                 .find(|surface| surface.surface_id == surface_id)
             {
                 surface.placement = placement;
-                if surface_id == root_surface_id {
-                    surface.width = geometry.width;
-                    surface.height = geometry.height;
-                }
             }
         }
         if changed {
@@ -537,15 +550,7 @@ impl CompositorState {
     ) -> Option<crate::xwayland::xwm::X11Geometry> {
         let window_id = self.window_id_for_x11_handle(handle)?;
         let window = self.window(window_id)?;
-        let geometry = self
-            .current_visual_root_window_geometry(window.root_surface_id)
-            .or_else(|| self.current_root_window_geometry(window.root_surface_id))?;
-        Some(crate::xwayland::xwm::X11Geometry {
-            x: geometry.placement.local_x,
-            y: geometry.placement.local_y,
-            width: geometry.width,
-            height: geometry.height,
-        })
+        window.x11_geometry.map(|geometry| geometry.client)
     }
 
     pub(in crate::compositor) fn apply_x11_published_state(

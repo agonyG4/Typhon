@@ -948,10 +948,38 @@ fn x11_partial_moveresize_preserves_unrequested_geometry() {
             if *geometry == X11Geometry {
                 x: 200,
                 y: 120,
-                width: 2,
-                height: 2,
+                width: 640,
+                height: 480,
             } && fields.x
     ));
+}
+
+#[test]
+fn x11_configure_notify_does_not_mutate_committed_buffer_extent() {
+    let mut fixture = first_buffer_fixture();
+    admit_first_buffer(&mut fixture, 100, 120);
+    let handle = fake_snapshot().handle;
+
+    assert_eq!(
+        fixture.server.renderable_surfaces()[0].width,
+        2,
+        "fixture starts with a 2-pixel committed buffer"
+    );
+    assert_eq!(fixture.server.renderable_surfaces()[0].height, 2);
+
+    fixture.server.state.reconcile_x11_configure_notify(
+        handle,
+        X11Geometry {
+            x: 200,
+            y: 220,
+            width: 1200,
+            height: 900,
+        },
+    );
+
+    let committed = &fixture.server.renderable_surfaces()[0];
+    assert_eq!(committed.width, 2);
+    assert_eq!(committed.height, 2);
 }
 
 #[test]

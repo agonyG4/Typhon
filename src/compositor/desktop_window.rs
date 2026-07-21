@@ -3,9 +3,9 @@
 use std::{io, num::NonZeroU64};
 
 use crate::xwayland::X11WindowHandle;
-use crate::xwayland::xwm::{X11WindowSnapshot, X11WindowType};
+use crate::xwayland::xwm::{X11Geometry, X11WindowSnapshot, X11WindowType};
 
-use super::WindowState;
+use super::{SurfacePlacement, WindowGeometry, WindowState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WindowId(NonZeroU64);
@@ -84,6 +84,12 @@ pub enum WindowBackend {
     X11(X11WindowHandle),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct X11GeometryState {
+    pub(super) client: X11Geometry,
+    pub(super) frame: WindowGeometry,
+}
+
 #[derive(Debug, Clone)]
 pub struct DesktopWindow {
     pub id: WindowId,
@@ -95,6 +101,7 @@ pub struct DesktopWindow {
     pub x11_window_type: Option<X11WindowType>,
     pub x11_accepts_input: Option<bool>,
     pub x11_transient_for: Option<X11WindowHandle>,
+    pub(super) x11_geometry: Option<X11GeometryState>,
     pub metadata: WindowMetadata,
     pub constraints: WindowConstraints,
     pub relationships: WindowRelationships,
@@ -132,6 +139,7 @@ impl DesktopWindow {
             x11_window_type: None,
             x11_accepts_input: None,
             x11_transient_for: None,
+            x11_geometry: None,
             metadata: WindowMetadata::default(),
             constraints: WindowConstraints::default(),
             relationships: WindowRelationships::default(),
@@ -140,6 +148,7 @@ impl DesktopWindow {
     }
 
     pub(crate) fn new_x11(id: WindowId, snapshot: X11WindowSnapshot) -> Self {
+        let geometry = snapshot.geometry;
         Self {
             id,
             root_surface_id: snapshot.surface_id,
@@ -155,6 +164,14 @@ impl DesktopWindow {
             x11_window_type: snapshot.window_type,
             x11_accepts_input: snapshot.accepts_input,
             x11_transient_for: snapshot.transient_for,
+            x11_geometry: Some(X11GeometryState {
+                client: geometry,
+                frame: WindowGeometry::new(
+                    SurfacePlacement::absolute_root_at(geometry.x, geometry.y),
+                    geometry.width.max(1),
+                    geometry.height.max(1),
+                ),
+            }),
             metadata: snapshot.metadata,
             constraints: snapshot.constraints,
             relationships: WindowRelationships::default(),
