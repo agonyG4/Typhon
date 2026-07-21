@@ -1,6 +1,30 @@
 use super::*;
 
 impl CompositorState {
+    pub(in crate::compositor) fn withdraw_xwayland_surface_content(
+        &mut self,
+        root_surface_id: u32,
+    ) -> bool {
+        let withdrawn_ids = self
+            .renderable_surfaces
+            .iter()
+            .filter_map(|surface| {
+                (self.root_surface_id_for_surface(surface.surface_id) == root_surface_id)
+                    .then_some(surface.surface_id)
+            })
+            .collect::<std::collections::HashSet<_>>();
+        if withdrawn_ids.is_empty() {
+            return false;
+        }
+
+        self.renderable_surfaces
+            .retain(|surface| !withdrawn_ids.contains(&surface.surface_id));
+        self.invalidate_surface_origin_cache();
+        self.reconcile_all_surface_output_memberships();
+        self.advance_render_generation(RenderGenerationCause::SurfaceUnmap);
+        true
+    }
+
     pub(in crate::compositor) fn adopt_current_xwayland_surface_content(
         &mut self,
         surface_id: u32,
@@ -117,5 +141,68 @@ impl CompositorState {
         self.set_render_generation(generation, RenderGenerationCause::SurfaceCommit);
         self.note_xwayland_buffer_ready(surface_id);
         self.complete_frame_callbacks(frame_callbacks);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_surface(surface_id: u32, width: u32, height: u32) -> RenderableSurface {
+        let identity = BufferIdAllocator::default()
+            .allocate()
+            .expect("test buffer identity");
+        RenderableSurface {
+            surface_id,
+            x: 0,
+            y: 0,
+            width,
+            height,
+            placement: SurfacePlacement::root(),
+            render_placement: None,
+            visual_clip: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: crate::render_backend::buffer::CommittedSurfaceBuffer::shm_snapshot(
+                identity,
+                BufferSize::new(width, height).expect("test size"),
+                vec![0; width as usize * height as usize],
+            ),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            damage: RenderableSurfaceDamage::Full,
+        }
+    }
+
+    #[test]
+    fn xwayland_withdrawal_unpublishes_render_tree_without_forgetting_placement() {
+        let mut state = CompositorState::default();
+        let root_id = 42;
+        let child_id = 43;
+        state
+            .renderable_surfaces
+            .push(test_surface(root_id, 10, 10));
+        state.renderable_surfaces.push(test_surface(child_id, 1, 1));
+        assert!(state.set_surface_placement(root_id, SurfacePlacement::absolute_root_at(10, 10),));
+        assert!(
+            state.set_surface_placement(child_id, SurfacePlacement::subsurface(root_id, 1, 1),)
+        );
+        let generation = state.render_generation;
+
+        assert!(state.withdraw_xwayland_surface_content(root_id));
+
+        assert!(state.renderable_surfaces.is_empty());
+        assert_eq!(
+            state.surface_placement(root_id),
+            SurfacePlacement::absolute_root_at(10, 10),
+        );
+        assert_eq!(
+            state.surface_placement(child_id),
+            SurfacePlacement::subsurface(root_id, 1, 1),
+        );
+        assert!(state.render_generation > generation);
+        assert!(!state.withdraw_xwayland_surface_content(root_id));
     }
 }

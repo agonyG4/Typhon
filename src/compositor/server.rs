@@ -712,6 +712,15 @@ impl OwnCompositorServer {
             .state
             .window(window_id)
             .and_then(|window| window.relationships.transient_for);
+        let root_surface_id = self
+            .state
+            .window(window_id)
+            .map(|window| window.root_surface_id);
+        if let Some(root_surface_id) = root_surface_id {
+            let _ = self
+                .state
+                .withdraw_xwayland_surface_content(root_surface_id);
+        }
         let removed = self.state.remove_desktop_window(window_id).is_some();
         if removed && was_focused {
             self.state.focused_window_id = None;
