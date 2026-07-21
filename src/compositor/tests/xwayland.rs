@@ -1,8 +1,9 @@
 use std::{fs::File, num::NonZeroU64, os::fd::AsFd, path::PathBuf};
 
 use crate::compositor::{
-    DesktopWindowKind, RenderGenerationCause, SurfacePlacement, WindowConstraints, WindowMetadata,
-    X11MoveResizeBeginResult,
+    DesktopWindowKind, LiveRoleInstance, PermanentSurfaceRole, RenderGenerationCause,
+    SurfacePlacement, SurfacePublicationSource, SurfaceRoleLifecycle, WindowConstraints,
+    WindowMetadata, X11MoveResizeBeginResult, XwaylandSurfaceState,
 };
 use crate::xwayland::xwm::{
     X11ConfigureFlags, X11ConfigureRequest, X11Geometry, X11MoveResizeDirection,
@@ -445,6 +446,156 @@ fn xwayland_association_replacement_keeps_window_id_and_updates_root_surface() {
             .window_id_for_surface(fixture.surface_id),
         None,
         "the old root surface must no longer own the desktop window"
+    );
+}
+
+#[test]
+fn destroyed_minimized_xwayland_surface_is_not_restored_as_stale_content() {
+    let mut fixture = first_buffer_fixture();
+    admit_first_buffer(&mut fixture, 37, 42);
+
+    let handle = fake_snapshot().handle;
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+    assert!(fixture.server.renderable_surfaces().is_empty());
+
+    fixture
+        .server
+        .state
+        .unregister_surface_resource(fixture.surface_id);
+    assert!(
+        fixture
+            .server
+            .state
+            .restore_minimized_desktop_window(window_id)
+    );
+    assert!(
+        fixture
+            .server
+            .renderable_surfaces()
+            .iter()
+            .all(|surface| surface.surface_id != fixture.surface_id)
+    );
+}
+
+#[test]
+fn replacement_surface_commit_stays_hidden_while_x11_window_is_minimized() {
+    let mut fixture = first_buffer_fixture();
+    admit_first_buffer(&mut fixture, 37, 42);
+
+    let handle = fake_snapshot().handle;
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+
+    let replacement_surface_id = fixture.surface_id.saturating_add(1);
+    fixture
+        .server
+        .state
+        .attach_x11_surface(handle, replacement_surface_id)
+        .expect("attach replacement surface");
+    let pending = fixture
+        .server
+        .state
+        .current_surface_buffers
+        .get(&fixture.surface_id)
+        .cloned()
+        .expect("replacement commit buffer");
+    fixture.server.state.commit_xwayland_surface_buffer(
+        replacement_surface_id,
+        pending,
+        Vec::new(),
+        SurfacePublicationSource::Immediate,
+    );
+
+    assert!(fixture.server.renderable_surfaces().is_empty());
+}
+
+#[test]
+fn restore_adopts_active_xwayland_surface_after_old_surface_is_retired() {
+    let mut fixture = first_buffer_fixture();
+    admit_first_buffer(&mut fixture, 37, 42);
+
+    let handle = fake_snapshot().handle;
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+
+    let replacement_surface_id = fixture.surface_id.saturating_add(1);
+    fixture.server.state.surface_role_lifecycles.insert(
+        replacement_surface_id,
+        SurfaceRoleLifecycle {
+            permanent: Some(PermanentSurfaceRole::Xwayland),
+            live_instance: Some(LiveRoleInstance::Xwayland),
+            xdg_association: false,
+        },
+    );
+    fixture.server.state.xwayland.surface_states.insert(
+        replacement_surface_id,
+        XwaylandSurfaceState {
+            generation: handle.generation(),
+            pending_serial: None,
+            committed_serial: None,
+            association_object_alive: true,
+        },
+    );
+    fixture
+        .server
+        .state
+        .withdraw_xwayland_surface_content(fixture.surface_id);
+    fixture
+        .server
+        .state
+        .attach_x11_surface(handle, replacement_surface_id)
+        .expect("attach replacement surface");
+    let pending = fixture
+        .server
+        .state
+        .current_surface_buffers
+        .get(&fixture.surface_id)
+        .cloned()
+        .expect("replacement commit buffer");
+    fixture.server.state.commit_xwayland_surface_buffer(
+        replacement_surface_id,
+        pending,
+        Vec::new(),
+        SurfacePublicationSource::Immediate,
+    );
+
+    assert!(fixture.server.renderable_surfaces().is_empty());
+    assert!(
+        fixture
+            .server
+            .state
+            .restore_minimized_desktop_window(window_id)
+    );
+    assert_eq!(
+        fixture.server.state.window_id_for_x11_handle(handle),
+        Some(window_id)
+    );
+    assert!(
+        fixture
+            .server
+            .renderable_surfaces()
+            .iter()
+            .any(|surface| surface.surface_id == replacement_surface_id)
+    );
+    assert!(
+        fixture
+            .server
+            .renderable_surfaces()
+            .iter()
+            .all(|surface| surface.surface_id != fixture.surface_id)
     );
 }
 

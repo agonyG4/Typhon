@@ -6,24 +6,42 @@ impl CompositorState {
         &mut self,
         root_surface_id: u32,
     ) -> bool {
+        let mut surface_ids = self
+            .surface_placements
+            .keys()
+            .copied()
+            .filter(|surface_id| self.root_surface_id_for_surface(*surface_id) == root_surface_id)
+            .collect::<std::collections::HashSet<_>>();
+        surface_ids.insert(root_surface_id);
+
         let withdrawn_ids = self
             .renderable_surfaces
             .iter()
             .filter_map(|surface| {
-                (self.root_surface_id_for_surface(surface.surface_id) == root_surface_id)
+                surface_ids
+                    .contains(&surface.surface_id)
                     .then_some(surface.surface_id)
             })
             .collect::<std::collections::HashSet<_>>();
-        if withdrawn_ids.is_empty() {
-            return false;
+        let minimized_ids_removed = self
+            .window_id_for_surface(root_surface_id)
+            .and_then(|window_id| self.window_mut(window_id))
+            .map(|window| {
+                let before = window.state.minimized_surfaces_len();
+                window.state.remove_minimized_surface_ids(&surface_ids);
+                before != window.state.minimized_surfaces_len()
+            })
+            .unwrap_or(false);
+
+        if !withdrawn_ids.is_empty() {
+            self.renderable_surfaces
+                .retain(|surface| !withdrawn_ids.contains(&surface.surface_id));
+            self.invalidate_surface_origin_cache();
+            self.reconcile_all_surface_output_memberships();
+            self.advance_render_generation(RenderGenerationCause::SurfaceUnmap);
         }
 
-        self.renderable_surfaces
-            .retain(|surface| !withdrawn_ids.contains(&surface.surface_id));
-        self.invalidate_surface_origin_cache();
-        self.reconcile_all_surface_output_memberships();
-        self.advance_render_generation(RenderGenerationCause::SurfaceUnmap);
-        true
+        !withdrawn_ids.is_empty() || minimized_ids_removed
     }
 
     pub(in crate::compositor) fn adopt_current_xwayland_surface_content(
@@ -104,6 +122,12 @@ impl CompositorState {
             self.commit_unassigned_surface_buffer(surface_id, pending, frame_callbacks, source);
             return;
         }
+        let x11_window_minimized = self
+            .window_id_for_surface(root_surface_id)
+            .and_then(|window_id| self.window(window_id))
+            .is_some_and(|window| {
+                matches!(window.backend, WindowBackend::X11(_)) && window.state.is_minimized()
+            });
         let commit_sequence = pending.commit_sequence;
         let buffer_id = pending.data.buffer_id();
         let association_serial = self
@@ -139,7 +163,9 @@ impl CompositorState {
         });
         self.renderable_surfaces
             .retain(|existing| existing.surface_id != surface_id);
-        self.renderable_surfaces.push(surface);
+        if !x11_window_minimized {
+            self.renderable_surfaces.push(surface);
+        }
         self.record_surface_publication(
             surface_id,
             root_surface_id,
@@ -154,8 +180,10 @@ impl CompositorState {
             buffer_size.width,
             buffer_size.height,
         );
-        self.reorder_renderable_surfaces_by_committed_stack();
-        self.set_render_generation(generation, RenderGenerationCause::SurfaceCommit);
+        if !x11_window_minimized {
+            self.reorder_renderable_surfaces_by_committed_stack();
+            self.set_render_generation(generation, RenderGenerationCause::SurfaceCommit);
+        }
         self.note_xwayland_buffer_ready(surface_id);
         self.note_xwayland_commit_observed(
             surface_id,

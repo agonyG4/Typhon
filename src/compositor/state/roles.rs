@@ -749,6 +749,23 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn scrub_surface_lifecycle(&mut self, surface_id: u32) {
+        let root_surface_id = self.root_surface_id_for_surface(surface_id);
+        if let Some(window_id) = self.window_id_for_surface(root_surface_id)
+            && self
+                .window(window_id)
+                .is_some_and(|window| matches!(window.backend, WindowBackend::X11(_)))
+        {
+            let mut surface_ids = self
+                .surface_placements
+                .keys()
+                .copied()
+                .filter(|candidate| self.root_surface_id_for_surface(*candidate) == root_surface_id)
+                .collect::<std::collections::HashSet<_>>();
+            surface_ids.insert(surface_id);
+            if let Some(window) = self.window_mut(window_id) {
+                window.state.remove_minimized_surface_ids(&surface_ids);
+            }
+        }
         self.detach_x11_surface(surface_id);
         self.surface_role_lifecycles.remove(&surface_id);
         self.xwayland.surface_states.remove(&surface_id);

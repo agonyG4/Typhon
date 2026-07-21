@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 
 use super::{RenderableSurface, SurfacePlacement};
@@ -57,6 +59,15 @@ impl WindowState {
     pub(super) fn push_minimized_surface(&mut self, surface: RenderableSurface) {
         self.minimized = true;
         self.minimized_surfaces.push(surface);
+    }
+
+    pub(super) fn remove_minimized_surface_ids(&mut self, surface_ids: &HashSet<u32>) {
+        self.minimized_surfaces
+            .retain(|surface| !surface_ids.contains(&surface.surface_id));
+    }
+
+    pub(super) fn minimized_surfaces_len(&self) -> usize {
+        self.minimized_surfaces.len()
     }
 
     pub(super) fn capture_restore_geometry(&mut self, geometry: WindowGeometry) {

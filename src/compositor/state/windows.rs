@@ -1086,6 +1086,9 @@ impl CompositorState {
         &mut self,
         window_id: WindowId,
     ) -> bool {
+        let x11_surface_id = self
+            .window(window_id)
+            .and_then(|window| window.x11_surface_id);
         let Some(minimized_surfaces) = self
             .window_mut(window_id)
             .and_then(|window| window.state.restore_minimized())
@@ -1094,6 +1097,9 @@ impl CompositorState {
         };
 
         self.renderable_surfaces.extend(minimized_surfaces);
+        if let Some(surface_id) = x11_surface_id {
+            let _ = self.adopt_current_xwayland_surface_content(surface_id);
+        }
         if let Some(surface_id) = self.window(window_id).map(|window| window.root_surface_id)
             && let Some(surface) = self.surface_resource_by_id(surface_id)
         {
