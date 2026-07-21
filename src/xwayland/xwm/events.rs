@@ -149,7 +149,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 xwm.association.remove_x11_window(handle);
                 let _ = xwm
                     .windows
-                    .clear_association(handle, association.surface_id)
+                    .clear_association(handle, association.surface_id, false)
                     .map_err(XwmError::InvalidCommand)?;
             }
             xwm.cancel_window_properties(handle);
@@ -613,10 +613,9 @@ mod tests {
         rust_connection::RustConnection,
     };
 
-    use super::super::ResizeSyncState;
     use super::*;
 
-    fn test_fixture(generation: super::super::XwaylandGeneration) -> (Xwm, UnixStream) {
+    pub(crate) fn test_fixture(generation: super::super::XwaylandGeneration) -> (Xwm, UnixStream) {
         let (stream, peer) = UnixStream::pair().expect("XWM fixture socket pair");
         let reactor_stream = super::super::connection::ReactorStream::from_unix_stream(stream)
             .expect("XWM fixture reactor stream");
@@ -690,11 +689,11 @@ mod tests {
         (xwm, peer)
     }
 
-    fn generation(value: u64) -> super::super::XwaylandGeneration {
+    pub(crate) fn generation(value: u64) -> super::super::XwaylandGeneration {
         super::super::XwaylandGeneration::new(NonZeroU64::new(value).expect("nonzero"))
     }
 
-    fn map_event(window: u32, override_redirect: bool) -> Event {
+    pub(crate) fn map_event(window: u32, override_redirect: bool) -> Event {
         Event::MapNotify(xproto::MapNotifyEvent {
             response_type: 19,
             sequence: 0,
@@ -720,7 +719,7 @@ mod tests {
         })
     }
 
-    fn unmap_event(window: u32) -> Event {
+    pub(crate) fn unmap_event(window: u32) -> Event {
         Event::UnmapNotify(xproto::UnmapNotifyEvent {
             response_type: 18,
             sequence: 0,
@@ -739,7 +738,7 @@ mod tests {
         })
     }
 
-    fn prepare_managed_window(
+    pub(crate) fn prepare_managed_window(
         xwm: &mut Xwm,
         xid: u32,
         properties_ready: bool,
@@ -791,11 +790,11 @@ mod tests {
         handle
     }
 
-    fn ready_events(xwm: &mut Xwm) -> Vec<super::super::XwmEvent> {
+    pub(crate) fn ready_events(xwm: &mut Xwm) -> Vec<super::super::XwmEvent> {
         xwm.take_events().collect()
     }
 
-    fn ready_surface_id(events: &[super::super::XwmEvent]) -> Option<u32> {
+    pub(crate) fn ready_surface_id(events: &[super::super::XwmEvent]) -> Option<u32> {
         events.iter().find_map(|event| match event {
             super::super::XwmEvent::WindowReady(snapshot) => Some(snapshot.surface_id),
             _ => None,
@@ -889,34 +888,6 @@ mod tests {
         let events = ready_events(&mut xwm);
         assert_eq!(events.len(), 1);
         assert_eq!(ready_surface_id(&events), Some(42));
-    }
-
-    #[test]
-    fn runtime_timeout_records_original_counter_and_matching_late_ack_reenables_future_sync() {
-        let generation = generation(1);
-        let (mut xwm, _peer) = test_fixture(generation);
-        let handle = prepare_managed_window(&mut xwm, 71, true, false, false);
-
-        xwm.resize_sync
-            .begin_transaction(handle, 19, 100, X11Geometry::default(), false)
-            .expect("begin resize transaction");
-        xwm.handle_resize_sync_deadline(100)
-            .expect("handle resize timeout");
-
-        assert_eq!(
-            xwm.timed_out_resize_counters.get(&handle),
-            Some(&19),
-            "timeout recovery must retain the original nonzero counter"
-        );
-        assert!(xwm.resize_sync.sync_disabled(handle));
-
-        xwm.note_resize_sync_ack_for_test(handle, 20);
-        assert!(xwm.resize_sync.sync_disabled(handle));
-
-        xwm.note_resize_sync_ack_for_test(handle, 19);
-        assert!(!xwm.resize_sync.sync_disabled(handle));
-        assert!(!xwm.timed_out_resize_counters.contains_key(&handle));
-        assert_eq!(xwm.resize_sync.state(handle), ResizeSyncState::Idle);
     }
 
     #[test]
@@ -1316,114 +1287,6 @@ mod tests {
     }
 
     #[test]
-    fn iconic_wayland_surface_removal_preserves_window_identity() {
-        let generation = generation(29);
-        let (mut xwm, _peer) = test_fixture(generation);
-        let handle = prepare_managed_window(&mut xwm, 129, true, false, false);
-        xwm.note_x11_surface_serial(handle, 0x1234, 0)
-            .expect("X11 surface serial");
-        xwm.ingest_wayland_association(XwaylandAssociationEvent::Committed {
-            generation,
-            serial: NonZeroU64::new(0x1234).expect("surface serial"),
-            surface_id: 42,
-        })
-        .expect("Wayland association");
-        xwm.mark_window_buffer_ready(handle)
-            .expect("buffer readiness");
-        normalize(&mut xwm, map_event(handle.xid(), false)).expect("MapNotify");
-        assert!(matches!(
-            ready_events(&mut xwm).as_slice(),
-            [super::super::XwmEvent::WindowReady(snapshot)] if snapshot.handle == handle
-        ));
-        let association = xwm
-            .windows
-            .get(handle)
-            .and_then(|record| record.association)
-            .expect("ready window association");
-
-        super::super::commands::execute(&mut xwm, super::super::XwmCommand::Unmap(handle))
-            .expect("WM unmap command");
-        normalize(&mut xwm, unmap_event(handle.xid())).expect("WM UnmapNotify");
-        assert!(ready_events(&mut xwm).is_empty());
-
-        xwm.ingest_wayland_association(XwaylandAssociationEvent::Removed {
-            generation,
-            serial: association.serial,
-            surface_id: association.surface_id,
-        })
-        .expect("old Wayland surface removal");
-
-        assert!(ready_events(&mut xwm).is_empty());
-        let record = xwm.windows.get(handle).expect("iconic window record");
-        assert_eq!(record.lifecycle, X11WindowLifecycle::Iconic);
-        assert!(record.snapshot.is_some());
-        assert!(record.association.is_none());
-        assert!(!record.buffer_ready);
-    }
-
-    #[test]
-    fn old_surface_removal_after_new_map_association_keeps_replacement() {
-        let generation = generation(30);
-        let (mut xwm, _peer) = test_fixture(generation);
-        let handle = prepare_managed_window(&mut xwm, 130, true, false, false);
-        xwm.note_x11_surface_serial(handle, 0x1234, 0)
-            .expect("old X11 surface serial");
-        xwm.ingest_wayland_association(XwaylandAssociationEvent::Committed {
-            generation,
-            serial: NonZeroU64::new(0x1234).expect("old serial"),
-            surface_id: 42,
-        })
-        .expect("old Wayland association");
-        xwm.mark_window_buffer_ready(handle)
-            .expect("old buffer readiness");
-        normalize(&mut xwm, map_event(handle.xid(), false)).expect("first MapNotify");
-        assert_eq!(ready_surface_id(&ready_events(&mut xwm)), Some(42));
-        let old_association = xwm
-            .windows
-            .get(handle)
-            .and_then(|record| record.association)
-            .expect("old association");
-
-        super::super::commands::execute(&mut xwm, super::super::XwmCommand::Unmap(handle))
-            .expect("WM unmap command");
-        normalize(&mut xwm, unmap_event(handle.xid())).expect("WM UnmapNotify");
-        super::super::commands::execute(&mut xwm, super::super::XwmCommand::Map(handle))
-            .expect("restore map command");
-
-        xwm.note_x11_surface_serial(handle, 0x5678, 0)
-            .expect("new X11 surface serial");
-        xwm.ingest_wayland_association(XwaylandAssociationEvent::Committed {
-            generation,
-            serial: NonZeroU64::new(0x5678).expect("new serial"),
-            surface_id: 43,
-        })
-        .expect("new Wayland association");
-        let new_association = xwm
-            .windows
-            .get(handle)
-            .and_then(|record| record.association)
-            .expect("replacement association");
-        assert_eq!(new_association.surface_id, 43);
-        assert!(new_association.map_serial > old_association.map_serial);
-
-        xwm.ingest_wayland_association(XwaylandAssociationEvent::Removed {
-            generation,
-            serial: old_association.serial,
-            surface_id: old_association.surface_id,
-        })
-        .expect("late old Wayland surface removal");
-
-        assert!(ready_events(&mut xwm).is_empty());
-        assert_eq!(
-            xwm.windows
-                .get(handle)
-                .and_then(|record| record.association)
-                .map(|association| association.surface_id),
-            Some(43)
-        );
-    }
-
-    #[test]
     fn wayland_surface_removal_clears_the_mapped_x11_record() {
         let generation = generation(17);
         let (mut xwm, mut peer) = test_fixture(generation);
@@ -1613,3 +1476,7 @@ mod tests {
         assert_eq!(stack_mode(xproto::StackMode::from(99_u32)), None);
     }
 }
+
+#[cfg(test)]
+#[path = "events_regression_tests.rs"]
+mod regression_tests;

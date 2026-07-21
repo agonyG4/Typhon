@@ -353,26 +353,6 @@ impl X11WindowRegistry {
         self.update_pending_lifecycle(handle)
     }
 
-    pub(crate) fn dissociate_surface_preserving_identity(
-        &mut self,
-        handle: X11WindowHandle,
-        surface_id: u32,
-    ) -> Result<bool, &'static str> {
-        let record = self.record_mut(handle)?;
-        if record
-            .association
-            .is_none_or(|association| association.surface_id != surface_id)
-        {
-            return Ok(false);
-        }
-        record.association = None;
-        record.buffer_ready = false;
-        if record.lifecycle != X11WindowLifecycle::Iconic {
-            self.update_pending_lifecycle(handle)?;
-        }
-        Ok(true)
-    }
-
     pub(crate) fn replace_associated(
         &mut self,
         handle: X11WindowHandle,
@@ -391,6 +371,7 @@ impl X11WindowRegistry {
         &mut self,
         handle: X11WindowHandle,
         surface_id: u32,
+        preserve_identity: bool,
     ) -> Result<bool, &'static str> {
         let record = self.record_mut(handle)?;
         if record
@@ -401,8 +382,10 @@ impl X11WindowRegistry {
         }
         record.association = None;
         record.buffer_ready = false;
-        let was_ready = record.snapshot.take().is_some();
-        self.update_pending_lifecycle(handle)?;
+        let was_ready = !preserve_identity && record.snapshot.take().is_some();
+        if !preserve_identity || record.lifecycle != X11WindowLifecycle::Iconic {
+            self.update_pending_lifecycle(handle)?;
+        }
         Ok(was_ready)
     }
 

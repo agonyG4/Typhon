@@ -93,15 +93,10 @@ impl Xwm {
                         .windows
                         .get(handle)
                         .is_some_and(|record| record.lifecycle == X11WindowLifecycle::Iconic);
-                    let cleared = if iconic {
-                        self.windows
-                            .dissociate_surface_preserving_identity(handle, surface_id)
-                            .map_err(XwmError::InvalidCommand)?
-                    } else {
-                        self.windows
-                            .clear_association(handle, surface_id)
-                            .map_err(XwmError::InvalidCommand)?
-                    };
+                    let cleared = self
+                        .windows
+                        .clear_association(handle, surface_id, iconic)
+                        .map_err(XwmError::InvalidCommand)?;
                     if cleared && !iconic {
                         self.outgoing_events
                             .push_back(XwmEvent::WindowWithdrawn(handle));
