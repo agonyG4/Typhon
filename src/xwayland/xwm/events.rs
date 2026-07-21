@@ -130,7 +130,21 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             };
             let was_ready = record.snapshot.is_some()
                 || matches!(record.lifecycle, X11WindowLifecycle::Renderable);
-            if let Some(association) = record.association {
+            let association = record.association;
+            if xwm
+                .windows
+                .consume_wm_unmap(handle)
+                .map_err(XwmError::InvalidCommand)?
+            {
+                trace_window_state(
+                    xwm,
+                    "wm_unmap_confirmation_consumed",
+                    handle,
+                    TraceFields::new().field("lifecycle", "Iconic"),
+                );
+                return Ok(());
+            }
+            if let Some(association) = association {
                 xwm.clear_surface_buffer_ready(association.surface_id);
                 xwm.association.remove_x11_window(handle);
                 let _ = xwm
@@ -352,6 +366,8 @@ fn trace_window_state(
             .field("property_epoch", record.property_epoch)
             .field("properties_ready", record.properties_ready)
             .field("buffer_ready", record.buffer_ready)
+            .field("map_serial", record.map_serial)
+            .field("inflight_wm_unmaps", record.inflight_wm_unmaps)
             .field(
                 "window_type",
                 format!("{:?}", record.properties.window_type),
@@ -756,6 +772,20 @@ mod tests {
                 .mark_buffer_ready(handle)
                 .expect("buffer readiness");
         }
+        handle
+    }
+
+    fn prepare_ready_managed_window(xwm: &mut Xwm, xid: u32) -> X11WindowHandle {
+        let handle = prepare_managed_window(xwm, xid, true, true, true);
+        xwm.windows
+            .confirm_map_notify(handle)
+            .expect("MapNotify confirmation");
+        xwm.emit_ready_if_complete(handle)
+            .expect("ready event emission");
+        assert!(matches!(
+            ready_events(xwm).as_slice(),
+            [super::super::XwmEvent::WindowReady(snapshot)] if snapshot.handle == handle
+        ));
         handle
     }
 
@@ -1172,6 +1202,84 @@ mod tests {
         complete_property_refresh(&mut xwm, &mut peer);
 
         assert_eq!(ready_surface_id(&ready_events(&mut xwm)), Some(43));
+    }
+
+    #[test]
+    fn wm_unmap_confirmation_is_iconic_and_restore_needs_a_new_buffer() {
+        let generation = generation(27);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = prepare_ready_managed_window(&mut xwm, 127);
+        let first_map_serial = xwm.windows.get(handle).expect("window record").map_serial;
+
+        super::super::commands::execute(&mut xwm, super::super::XwmCommand::Unmap(handle))
+            .expect("WM unmap command");
+        assert_eq!(
+            xwm.windows.get(handle).expect("window record").lifecycle,
+            X11WindowLifecycle::Iconic
+        );
+
+        normalize(&mut xwm, unmap_event(handle.xid())).expect("WM UnmapNotify");
+        assert!(ready_events(&mut xwm).is_empty());
+        let record = xwm.windows.get(handle).expect("iconic window record");
+        assert_eq!(record.inflight_wm_unmaps, 0);
+        assert!(record.snapshot.is_some());
+        assert!(record.association.is_some());
+        assert!(!record.buffer_ready);
+
+        super::super::commands::execute(&mut xwm, super::super::XwmCommand::Map(handle))
+            .expect("restore map command");
+        assert!(
+            xwm.windows
+                .get(handle)
+                .expect("restoring window record")
+                .map_serial
+                > first_map_serial
+        );
+        normalize(&mut xwm, map_event(handle.xid(), false)).expect("restore MapNotify");
+        assert!(ready_events(&mut xwm).is_empty());
+        assert_eq!(
+            xwm.windows
+                .get(handle)
+                .expect("restoring window record")
+                .lifecycle,
+            X11WindowLifecycle::AssociatedAwaitingBuffer
+        );
+
+        xwm.mark_window_buffer_ready(handle)
+            .expect("new buffer readiness");
+        assert!(ready_events(&mut xwm).is_empty());
+        assert_eq!(
+            xwm.windows
+                .get(handle)
+                .expect("restored window record")
+                .lifecycle,
+            X11WindowLifecycle::Renderable
+        );
+    }
+
+    #[test]
+    fn wm_unmap_confirmation_is_consumed_exactly_once() {
+        let generation = generation(28);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = prepare_ready_managed_window(&mut xwm, 128);
+
+        super::super::commands::execute(&mut xwm, super::super::XwmCommand::Unmap(handle))
+            .expect("WM unmap command");
+        normalize(&mut xwm, unmap_event(handle.xid())).expect("WM UnmapNotify");
+        assert!(ready_events(&mut xwm).is_empty());
+
+        normalize(&mut xwm, unmap_event(handle.xid())).expect("client UnmapNotify");
+        assert!(matches!(
+            ready_events(&mut xwm).as_slice(),
+            [super::super::XwmEvent::WindowWithdrawn(withdrawn)] if *withdrawn == handle
+        ));
+        assert_eq!(
+            xwm.windows
+                .get(handle)
+                .expect("withdrawn window record")
+                .lifecycle,
+            X11WindowLifecycle::Withdrawn
+        );
     }
 
     #[test]

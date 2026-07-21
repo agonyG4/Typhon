@@ -85,11 +85,20 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             set_lifecycle_map_commanded(xwm, handle);
         }
         XwmCommand::Unmap(handle) => {
+            let surface_id = xwm
+                .windows
+                .get(handle)
+                .and_then(|record| record.association.map(|association| association.surface_id));
             xwm.connection
                 .unmap_window(handle.xid())
                 .map_err(XwmError::Connection)?;
             xwm.clear_resize_sync(handle);
-            set_lifecycle_withdrawn(xwm, handle);
+            if let Some(surface_id) = surface_id {
+                xwm.clear_surface_buffer_ready(surface_id);
+            }
+            xwm.windows
+                .mark_wm_unmap_requested(handle)
+                .map_err(XwmError::InvalidCommand)?;
         }
         XwmCommand::Configure {
             window,
@@ -841,8 +850,4 @@ fn publish_state(
 
 fn set_lifecycle_map_commanded(xwm: &mut Xwm, handle: super::X11WindowHandle) {
     let _ = xwm.windows.mark_map_commanded(handle);
-}
-
-fn set_lifecycle_withdrawn(xwm: &mut Xwm, handle: super::X11WindowHandle) {
-    let _ = xwm.windows.mark_unmapped(handle);
 }

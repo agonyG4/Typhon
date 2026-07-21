@@ -16,6 +16,7 @@ pub enum X11WindowLifecycle {
     MappedAwaitingAssociation,
     AssociatedAwaitingBuffer,
     Renderable,
+    Iconic,
     Withdrawn,
     Destroyed,
 }
@@ -41,6 +42,8 @@ pub(crate) struct X11WindowRecord {
     pub(crate) refresh_properties: u16,
     pub(crate) refresh_all: bool,
     pub(crate) property_epoch: u64,
+    pub(crate) map_serial: u64,
+    pub(crate) inflight_wm_unmaps: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -128,6 +131,8 @@ impl X11WindowRegistry {
                 refresh_properties: 0,
                 refresh_all: false,
                 property_epoch: 0,
+                map_serial: 0,
+                inflight_wm_unmaps: 0,
             },
         );
         true
@@ -164,6 +169,8 @@ impl X11WindowRegistry {
                 refresh_properties: 0,
                 refresh_all: false,
                 property_epoch: 0,
+                map_serial: 0,
+                inflight_wm_unmaps: 0,
             },
         );
         true
@@ -215,6 +222,8 @@ impl X11WindowRegistry {
                 refresh_properties: 0,
                 refresh_all: false,
                 property_epoch: 0,
+                map_serial: 0,
+                inflight_wm_unmaps: 0,
             },
         );
         true
@@ -282,14 +291,27 @@ impl X11WindowRegistry {
         if matches!(record.lifecycle, X11WindowLifecycle::Destroyed) {
             return Err("window was destroyed");
         }
-        if record.map_requested && !matches!(record.lifecycle, X11WindowLifecycle::Withdrawn) {
+        if record.map_requested
+            && !matches!(
+                record.lifecycle,
+                X11WindowLifecycle::Withdrawn | X11WindowLifecycle::Iconic
+            )
+        {
             return Ok(());
         }
+        let remapping_iconic = matches!(record.lifecycle, X11WindowLifecycle::Iconic);
+        record.map_serial = record.map_serial.saturating_add(1).max(1);
         record.map_requested = true;
         record.map_authorized = false;
         record.mapped_notified = false;
-        record.snapshot = None;
-        record.properties_ready = false;
+        record.inflight_wm_unmaps = 0;
+        if !remapping_iconic {
+            record.snapshot = None;
+            record.properties_ready = false;
+        }
+        if remapping_iconic {
+            record.buffer_ready = false;
+        }
         self.update_pending_lifecycle(handle)
     }
 
@@ -437,9 +459,14 @@ impl X11WindowRegistry {
         if !record.map_requested {
             return Err("window was not requested for mapping");
         }
+        if matches!(record.lifecycle, X11WindowLifecycle::Iconic) {
+            record.map_serial = record.map_serial.saturating_add(1).max(1);
+            record.mapped_notified = false;
+            record.buffer_ready = false;
+        }
         record.map_operation_pending = true;
         record.map_authorized = true;
-        if record.snapshot.is_none() {
+        if record.snapshot.is_none() || !record.buffer_ready {
             record.lifecycle = X11WindowLifecycle::MapCommanded;
         }
         Ok(())
@@ -447,6 +474,9 @@ impl X11WindowRegistry {
 
     pub(crate) fn adopt_mapped(&mut self, handle: X11WindowHandle) -> Result<(), &'static str> {
         let record = self.record_mut(handle)?;
+        if !record.mapped_notified {
+            record.map_serial = record.map_serial.saturating_add(1).max(1);
+        }
         record.map_requested = true;
         record.map_authorized = true;
         record.mapped_notified = true;
@@ -461,7 +491,7 @@ impl X11WindowRegistry {
 
     pub(crate) fn map_command_is_new(&self, handle: X11WindowHandle) -> Result<bool, &'static str> {
         let record = self.records.get(&handle).ok_or("unknown X11 window")?;
-        Ok(!record.map_operation_pending && !record.mapped_notified && record.snapshot.is_none())
+        Ok(!record.map_operation_pending && !record.mapped_notified && record.map_requested)
     }
 
     pub(crate) fn confirm_map_notify(
@@ -475,7 +505,7 @@ impl X11WindowRegistry {
         record.map_operation_pending = false;
         record.map_authorized = true;
         record.mapped_notified = true;
-        record.lifecycle = if record.snapshot.is_some() {
+        record.lifecycle = if record.snapshot.is_some() && record.buffer_ready {
             X11WindowLifecycle::Renderable
         } else if record.association.is_some() {
             X11WindowLifecycle::AssociatedAwaitingBuffer
@@ -490,11 +520,14 @@ impl X11WindowRegistry {
         handle: X11WindowHandle,
     ) -> Result<bool, &'static str> {
         let record = self.record_mut(handle)?;
+        if !record.mapped_notified {
+            record.map_serial = record.map_serial.saturating_add(1).max(1);
+        }
         record.map_requested = true;
         record.map_operation_pending = false;
         record.map_authorized = true;
         record.mapped_notified = true;
-        record.lifecycle = if record.snapshot.is_some() {
+        record.lifecycle = if record.snapshot.is_some() && record.buffer_ready {
             X11WindowLifecycle::Renderable
         } else if record.association.is_some() {
             X11WindowLifecycle::AssociatedAwaitingBuffer
@@ -508,6 +541,7 @@ impl X11WindowRegistry {
         let record = self.record_mut(handle)?;
         let was_mapped = matches!(record.lifecycle, X11WindowLifecycle::Renderable);
         record.lifecycle = X11WindowLifecycle::Withdrawn;
+        record.inflight_wm_unmaps = 0;
         record.map_requested = false;
         record.map_authorized = false;
         record.mapped_notified = false;
@@ -516,6 +550,40 @@ impl X11WindowRegistry {
         record.snapshot = None;
         record.properties_ready = false;
         Ok(was_mapped)
+    }
+
+    pub(crate) fn mark_wm_unmap_requested(
+        &mut self,
+        handle: X11WindowHandle,
+    ) -> Result<(), &'static str> {
+        let record = self.record_mut(handle)?;
+        if matches!(record.lifecycle, X11WindowLifecycle::Destroyed) {
+            return Err("window was destroyed");
+        }
+        record.inflight_wm_unmaps = record.inflight_wm_unmaps.saturating_add(1);
+        record.lifecycle = X11WindowLifecycle::Iconic;
+        record.map_authorized = false;
+        record.mapped_notified = false;
+        record.map_operation_pending = false;
+        record.buffer_ready = false;
+        Ok(())
+    }
+
+    pub(crate) fn consume_wm_unmap(
+        &mut self,
+        handle: X11WindowHandle,
+    ) -> Result<bool, &'static str> {
+        let record = self.record_mut(handle)?;
+        if record.inflight_wm_unmaps == 0 {
+            return Ok(false);
+        }
+        let restore_in_progress =
+            record.map_authorized || record.map_operation_pending || record.mapped_notified;
+        record.inflight_wm_unmaps -= 1;
+        if !restore_in_progress {
+            record.lifecycle = X11WindowLifecycle::Iconic;
+        }
+        Ok(true)
     }
 
     pub(crate) fn destroy(
@@ -537,7 +605,7 @@ impl X11WindowRegistry {
 
     fn update_pending_lifecycle(&mut self, handle: X11WindowHandle) -> Result<(), &'static str> {
         let record = self.record_mut(handle)?;
-        if record.snapshot.is_some() {
+        if record.snapshot.is_some() && record.buffer_ready && record.mapped_notified {
             record.lifecycle = X11WindowLifecycle::Renderable;
             return Ok(());
         }
@@ -1013,6 +1081,146 @@ mod tests {
             Some(X11WindowLifecycle::Withdrawn)
         );
         assert!(registry.try_ready(window).expect("known window").is_none());
+    }
+
+    #[test]
+    fn wm_unmap_confirmation_enters_iconic_without_withdrawing_identity() {
+        let generation = generation(1);
+        let window = handle(generation, 30);
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::Managed,
+            X11Geometry::default(),
+        );
+        registry.mark_map_requested(window).expect("map request");
+        complete_properties(&mut registry, window);
+        registry
+            .mark_associated(window, associated(generation, 1, 50))
+            .expect("association");
+        registry.mark_buffer_ready(window).expect("buffer");
+        registry.mark_map_commanded(window).expect("map command");
+        registry.confirm_map_notify(window).expect("map notify");
+        assert!(registry.try_ready(window).expect("ready").is_some());
+
+        registry.mark_wm_unmap_requested(window).expect("WM unmap");
+        let record = registry.get(window).expect("known window");
+        assert_eq!(record.lifecycle, X11WindowLifecycle::Iconic);
+        assert!(record.snapshot.is_some());
+        assert!(record.association.is_some());
+        assert_eq!(record.inflight_wm_unmaps, 1);
+        assert!(registry.consume_wm_unmap(window).expect("confirmation"));
+        assert_eq!(
+            registry.get(window).expect("known window").lifecycle,
+            X11WindowLifecycle::Iconic
+        );
+        assert_eq!(
+            registry
+                .get(window)
+                .expect("known window")
+                .inflight_wm_unmaps,
+            0
+        );
+    }
+
+    #[test]
+    fn iconic_restore_keeps_identity_but_waits_for_a_new_buffer() {
+        let generation = generation(1);
+        let window = handle(generation, 31);
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::Managed,
+            X11Geometry::default(),
+        );
+        registry.mark_map_requested(window).expect("map request");
+        complete_properties(&mut registry, window);
+        registry
+            .mark_associated(window, associated(generation, 1, 51))
+            .expect("association");
+        registry.mark_buffer_ready(window).expect("buffer");
+        registry.mark_map_commanded(window).expect("map command");
+        registry.confirm_map_notify(window).expect("map notify");
+        assert!(registry.try_ready(window).expect("ready").is_some());
+        let first_map_serial = registry.get(window).expect("known window").map_serial;
+
+        registry.mark_wm_unmap_requested(window).expect("WM unmap");
+        registry.consume_wm_unmap(window).expect("confirmation");
+        registry.mark_map_commanded(window).expect("restore map");
+        let record = registry.get(window).expect("known window");
+        assert!(record.map_serial > first_map_serial);
+        assert!(record.snapshot.is_some());
+        assert!(!record.buffer_ready);
+        registry.confirm_map_notify(window).expect("restore notify");
+        assert_eq!(
+            registry.get(window).expect("known window").lifecycle,
+            X11WindowLifecycle::AssociatedAwaitingBuffer
+        );
+        registry.mark_buffer_ready(window).expect("new buffer");
+        assert_eq!(
+            registry.get(window).expect("known window").lifecycle,
+            X11WindowLifecycle::Renderable
+        );
+    }
+
+    #[test]
+    fn iconic_restore_accepts_a_new_map_command() {
+        let generation = generation(1);
+        let window = handle(generation, 32);
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::Managed,
+            X11Geometry::default(),
+        );
+        registry.mark_map_requested(window).expect("map request");
+        complete_properties(&mut registry, window);
+        registry
+            .mark_associated(window, associated(generation, 1, 52))
+            .expect("association");
+        registry.mark_buffer_ready(window).expect("buffer");
+        registry.mark_map_commanded(window).expect("map command");
+        registry.confirm_map_notify(window).expect("map notify");
+        registry
+            .try_ready(window)
+            .expect("known window")
+            .expect("ready");
+
+        registry.mark_wm_unmap_requested(window).expect("WM unmap");
+        registry.consume_wm_unmap(window).expect("confirmation");
+        assert!(registry.map_command_is_new(window).expect("known window"));
+    }
+
+    #[test]
+    fn late_wm_unmap_confirmation_does_not_cancel_a_restore_map() {
+        let generation = generation(1);
+        let window = handle(generation, 33);
+        let mut registry = X11WindowRegistry::default();
+        registry.insert_observed_with_kind(
+            window,
+            DesktopWindowKind::Managed,
+            X11Geometry::default(),
+        );
+        registry.mark_map_requested(window).expect("map request");
+        complete_properties(&mut registry, window);
+        registry
+            .mark_associated(window, associated(generation, 1, 53))
+            .expect("association");
+        registry.mark_buffer_ready(window).expect("buffer");
+        registry.mark_map_commanded(window).expect("map command");
+        registry.confirm_map_notify(window).expect("map notify");
+        registry
+            .try_ready(window)
+            .expect("known window")
+            .expect("ready");
+
+        registry.mark_wm_unmap_requested(window).expect("WM unmap");
+        registry.mark_map_commanded(window).expect("restore map");
+        assert!(registry.consume_wm_unmap(window).expect("confirmation"));
+        assert_eq!(
+            registry.get(window).expect("restoring window").lifecycle,
+            X11WindowLifecycle::MapCommanded
+        );
     }
 
     #[test]
