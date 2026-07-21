@@ -58,7 +58,7 @@ impl CompositorState {
             matches!(
                 window.backend,
                 WindowBackend::X11(handle) if handle.generation() == surface_generation
-            )
+            ) && !window.state.is_minimized()
         }) {
             return false;
         }

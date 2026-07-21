@@ -89,6 +89,7 @@ pub struct DesktopWindow {
     pub id: WindowId,
     pub root_surface_id: u32,
     pub backend: WindowBackend,
+    pub(crate) x11_surface_id: Option<u32>,
     pub kind: DesktopWindowKind,
     pub x11_role: Option<X11DesktopRole>,
     pub x11_window_type: Option<X11WindowType>,
@@ -125,6 +126,7 @@ impl DesktopWindow {
             id,
             root_surface_id,
             backend: WindowBackend::Xdg(XdgWindowHandle::new(root_surface_id)),
+            x11_surface_id: None,
             kind: DesktopWindowKind::Managed,
             x11_role: None,
             x11_window_type: None,
@@ -142,6 +144,7 @@ impl DesktopWindow {
             id,
             root_surface_id: snapshot.surface_id,
             backend: WindowBackend::X11(snapshot.handle),
+            x11_surface_id: Some(snapshot.surface_id),
             kind: snapshot.kind,
             x11_role: Some(classify_x11_role(
                 snapshot.kind,

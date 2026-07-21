@@ -77,13 +77,68 @@ impl CompositorState {
         id: WindowId,
     ) -> Option<DesktopWindow> {
         let window = self.desktop_windows.remove(&id)?;
-        self.window_by_root_surface.remove(&window.root_surface_id);
+        if self.window_by_root_surface.get(&window.root_surface_id) == Some(&id) {
+            self.window_by_root_surface.remove(&window.root_surface_id);
+        }
         if let WindowBackend::X11(handle) = window.backend {
             self.window_by_x11_handle.remove(&handle);
         }
         self.window_stacking.retain(|window_id| *window_id != id);
         self.rebuild_x11_transient_relationships();
         Some(window)
+    }
+
+    pub(in crate::compositor) fn detach_x11_surface(&mut self, surface_id: u32) -> bool {
+        let Some(window_id) = self.window_by_root_surface.get(&surface_id).copied() else {
+            return false;
+        };
+        let should_detach = self.window(window_id).is_some_and(|window| {
+            matches!(window.backend, WindowBackend::X11(_))
+                && window.x11_surface_id == Some(surface_id)
+        });
+        if !should_detach {
+            return false;
+        }
+        self.window_by_root_surface.remove(&surface_id);
+        if let Some(window) = self.window_mut(window_id) {
+            window.x11_surface_id = None;
+        }
+        true
+    }
+
+    pub(in crate::compositor) fn attach_x11_surface(
+        &mut self,
+        handle: X11WindowHandle,
+        surface_id: u32,
+    ) -> Result<Option<u32>, X11SurfaceAttachmentError> {
+        let window_id = self
+            .window_by_x11_handle
+            .get(&handle)
+            .copied()
+            .ok_or(X11SurfaceAttachmentError::UnknownWindow)?;
+        if let Some(owner) = self.window_by_root_surface.get(&surface_id)
+            && *owner != window_id
+        {
+            return Err(X11SurfaceAttachmentError::DuplicateSurface);
+        }
+        let old_surface_id = self
+            .window(window_id)
+            .and_then(|window| window.x11_surface_id);
+        if old_surface_id == Some(surface_id) {
+            return Ok(None);
+        }
+        if let Some(old_surface_id) = old_surface_id
+            && self.window_by_root_surface.get(&old_surface_id) == Some(&window_id)
+        {
+            self.window_by_root_surface.remove(&old_surface_id);
+        }
+        self.window_by_root_surface.insert(surface_id, window_id);
+        let window = self
+            .window_mut(window_id)
+            .ok_or(X11SurfaceAttachmentError::UnknownWindow)?;
+        window.root_surface_id = surface_id;
+        window.x11_surface_id = Some(surface_id);
+        Ok(old_surface_id)
     }
 
     pub(in crate::compositor) fn insert_x11_window(
@@ -948,6 +1003,12 @@ fn relationship_cycle(
         }
     }
     true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) enum X11SurfaceAttachmentError {
+    UnknownWindow,
+    DuplicateSurface,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

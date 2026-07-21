@@ -90,6 +90,17 @@ impl NativeRuntime {
         }
     }
 
+    pub(super) fn dispatch_xwayland_association_events(&mut self) {
+        for event in self.xwayland.take_managed_association_events() {
+            trace::emit("xwm_association_event_dispatched", || {
+                TraceFields::new()
+                    .field("source", "native_runtime")
+                    .field("event", format!("{event:?}"))
+            });
+            self.server.apply_xwayland_association_event(event);
+        }
+    }
+
     pub(super) fn reap_supervised_children(
         &mut self,
         cycle: &NativeCycleState,

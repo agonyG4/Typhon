@@ -1,4 +1,6 @@
 use super::*;
+use crate::xwayland::trace::{self, TraceFields};
+use crate::xwayland::xwm::XwmAssociationEvent;
 
 impl OwnCompositorServer {
     pub fn insert_xwayland_client(
@@ -67,6 +69,67 @@ impl OwnCompositorServer {
 
     pub fn take_xwayland_association_events(&mut self) -> Vec<XwaylandAssociationEvent> {
         self.state.take_xwayland_association_events()
+    }
+
+    pub fn apply_xwayland_association_event(&mut self, event: XwmAssociationEvent) {
+        match event {
+            XwmAssociationEvent::Associated {
+                generation,
+                window,
+                surface_id,
+            } => {
+                if window.generation() != generation {
+                    return;
+                }
+                let old_surface_id = self
+                    .state
+                    .window_id_for_x11_handle(window)
+                    .and_then(|window_id| self.state.window(window_id))
+                    .and_then(|desktop_window| desktop_window.x11_surface_id);
+                if let Some(old_surface_id) = old_surface_id
+                    && old_surface_id != surface_id
+                {
+                    self.state.withdraw_xwayland_surface_content(old_surface_id);
+                }
+                let Ok(replaced_surface_id) = self.state.attach_x11_surface(window, surface_id)
+                else {
+                    return;
+                };
+                trace::emit("xwayland_surface_attached", || {
+                    TraceFields::new()
+                        .field("source", "compositor")
+                        .field("xid", window.xid())
+                        .field("generation", generation.get())
+                        .optional("old_surface_id", replaced_surface_id)
+                        .field("surface_id", surface_id)
+                        .field("replacement", replaced_surface_id.is_some())
+                });
+                let _ = self
+                    .state
+                    .adopt_current_xwayland_surface_content(surface_id);
+            }
+            XwmAssociationEvent::Removed {
+                generation,
+                window,
+                surface_id,
+            } => {
+                if window.generation() != generation
+                    || self.state.window_id_for_surface(surface_id).is_none()
+                {
+                    return;
+                }
+                self.state.withdraw_xwayland_surface_content(surface_id);
+                self.state.detach_x11_surface(surface_id);
+                trace::emit("xwayland_surface_detached", || {
+                    TraceFields::new()
+                        .field("source", "compositor")
+                        .field("xid", window.xid())
+                        .field("generation", generation.get())
+                        .field("surface_id", surface_id)
+                        .field("replacement", false)
+                });
+            }
+        }
     }
 
     pub fn take_xwayland_buffer_ready_events(

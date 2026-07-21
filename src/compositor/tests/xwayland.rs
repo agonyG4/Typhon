@@ -7,7 +7,7 @@ use crate::compositor::{
 use crate::xwayland::xwm::{
     X11ConfigureFlags, X11ConfigureRequest, X11Geometry, X11MoveResizeDirection,
     X11MoveResizeRequest, X11PublishedState, X11WindowLifecycle, X11WindowSnapshot, X11WindowType,
-    XwmCommand, XwmEvent,
+    XwmAssociationEvent, XwmCommand, XwmEvent,
 };
 use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 use wayland_client::protocol::{
@@ -380,6 +380,72 @@ fn window_ready_publishes_retained_xwayland_buffer() {
         RenderGenerationCause::SurfaceCommit
     );
     assert_eq!(fixture.server.take_xwayland_buffer_ready_events().len(), 0);
+}
+
+#[test]
+fn destroying_xwayland_surface_preserves_x11_window_identity() {
+    let mut fixture = first_buffer_fixture();
+    admit_first_buffer(&mut fixture, 37, 42);
+
+    let handle = fake_snapshot().handle;
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+
+    fixture
+        .server
+        .state
+        .scrub_surface_lifecycle(fixture.surface_id);
+
+    assert_eq!(
+        fixture.server.state.window_id_for_x11_handle(handle),
+        Some(window_id),
+        "destroying a map-local Xwayland surface must not withdraw the X11 window"
+    );
+}
+
+#[test]
+fn xwayland_association_replacement_keeps_window_id_and_updates_root_surface() {
+    let mut fixture = first_buffer_fixture();
+    admit_first_buffer(&mut fixture, 37, 42);
+
+    let snapshot = fake_snapshot();
+    let handle = snapshot.handle;
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+
+    fixture
+        .server
+        .apply_xwayland_association_event(XwmAssociationEvent::Associated {
+            generation: handle.generation(),
+            window: handle,
+            surface_id: fixture.surface_id.saturating_add(1),
+        });
+
+    assert_eq!(
+        fixture.server.state.window_id_for_x11_handle(handle),
+        Some(window_id)
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .window_id_for_surface(fixture.surface_id.saturating_add(1)),
+        Some(window_id)
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .window_id_for_surface(fixture.surface_id),
+        None,
+        "the old root surface must no longer own the desktop window"
+    );
 }
 
 #[test]
