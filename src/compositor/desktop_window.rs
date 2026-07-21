@@ -36,6 +36,14 @@ pub enum X11DesktopRole {
     AuxiliarySupport,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum X11PlacementPolicy {
+    CompositorManaged,
+    ClientPositioned,
+    ParentRelative,
+    OverrideRedirect,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WindowMetadata {
     pub app_id: Option<String>,
@@ -98,6 +106,7 @@ pub struct DesktopWindow {
     pub(crate) x11_surface_id: Option<u32>,
     pub kind: DesktopWindowKind,
     pub x11_role: Option<X11DesktopRole>,
+    pub x11_placement_policy: Option<X11PlacementPolicy>,
     pub x11_window_types: X11WindowTypes,
     pub x11_accepts_input: Option<bool>,
     pub x11_transient_for: Option<X11WindowHandle>,
@@ -136,6 +145,7 @@ impl DesktopWindow {
             x11_surface_id: None,
             kind: DesktopWindowKind::Managed,
             x11_role: None,
+            x11_placement_policy: None,
             x11_window_types: X11WindowTypes::default(),
             x11_accepts_input: None,
             x11_transient_for: None,
@@ -149,18 +159,20 @@ impl DesktopWindow {
 
     pub(crate) fn new_x11(id: WindowId, snapshot: X11WindowSnapshot) -> Self {
         let geometry = snapshot.geometry;
+        let role = classify_x11_role(
+            snapshot.kind,
+            &snapshot.window_types,
+            snapshot.transient_for.is_some(),
+            snapshot.override_redirect,
+        );
         Self {
             id,
             root_surface_id: snapshot.surface_id,
             backend: WindowBackend::X11(snapshot.handle),
             x11_surface_id: Some(snapshot.surface_id),
             kind: snapshot.kind,
-            x11_role: Some(classify_x11_role(
-                snapshot.kind,
-                &snapshot.window_types,
-                snapshot.transient_for.is_some(),
-                snapshot.override_redirect,
-            )),
+            x11_role: Some(role),
+            x11_placement_policy: Some(x11_placement_policy(role)),
             x11_window_types: snapshot.window_types,
             x11_accepts_input: snapshot.accepts_input,
             x11_transient_for: snapshot.transient_for,
@@ -177,6 +189,18 @@ impl DesktopWindow {
             relationships: WindowRelationships::default(),
             state: WindowState::default(),
         }
+    }
+}
+
+pub(crate) const fn x11_placement_policy(role: X11DesktopRole) -> X11PlacementPolicy {
+    match role {
+        X11DesktopRole::Toplevel => X11PlacementPolicy::CompositorManaged,
+        X11DesktopRole::Dialog => X11PlacementPolicy::ParentRelative,
+        X11DesktopRole::AuxiliaryPopup | X11DesktopRole::Notification => {
+            X11PlacementPolicy::ClientPositioned
+        }
+        X11DesktopRole::OverrideRedirect => X11PlacementPolicy::OverrideRedirect,
+        X11DesktopRole::AuxiliarySupport => X11PlacementPolicy::ClientPositioned,
     }
 }
 

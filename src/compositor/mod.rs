@@ -100,6 +100,7 @@ pub(crate) use desktop_window::{
 };
 pub use desktop_window::{
     DesktopWindowKind, WindowConstraints, WindowId, WindowMetadata, X11DesktopRole,
+    X11PlacementPolicy,
 };
 use dmabuf::{
     DmabufBufferData, DmabufFeedbackData, DmabufParamsData, PendingDmabufPlane,

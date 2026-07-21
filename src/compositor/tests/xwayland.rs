@@ -995,13 +995,13 @@ fn single_frame_x11_client_becomes_renderable_without_second_commit() {
 }
 
 #[test]
-fn retained_buffer_uses_admitted_window_placement() {
+fn retained_buffer_uses_compositor_placement_for_managed_window() {
     let mut fixture = first_buffer_fixture();
     admit_first_buffer(&mut fixture, 123, 456);
 
     assert_eq!(
         fixture.server.renderable_surfaces()[0].placement,
-        SurfacePlacement::absolute_root_at(123, 456)
+        SurfacePlacement::root()
     );
 }
 

@@ -339,6 +339,49 @@ fn unsupported_leading_window_type_does_not_hide_popup_semantics() {
 }
 
 #[test]
+fn normal_x11_windows_use_compositor_placement_but_popups_keep_client_position() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let first = x11_snapshot(generation, 213, 213);
+    let second = x11_snapshot(generation, 214, 214);
+    let first_id = insert_x11(&mut state, first.clone());
+    let second_id = insert_x11(&mut state, second.clone());
+    assert!(state.set_x11_geometry(first.handle, first.geometry));
+    assert!(state.set_x11_geometry(second.handle, second.geometry));
+
+    assert_eq!(
+        state.window(first_id).unwrap().x11_placement_policy,
+        Some(X11PlacementPolicy::CompositorManaged)
+    );
+    assert_eq!(
+        state.window(second_id).unwrap().x11_placement_policy,
+        Some(X11PlacementPolicy::CompositorManaged)
+    );
+    assert_eq!(
+        state.surface_placement(first.surface_id),
+        SurfacePlacement::root()
+    );
+    assert_eq!(
+        state.surface_placement(second.surface_id),
+        SurfacePlacement::root()
+    );
+
+    let mut popup = x11_snapshot(generation, 215, 215);
+    popup.window_types = X11WindowTypes::new(vec![X11WindowType::PopupMenu]);
+    popup.transient_for = Some(first.handle);
+    let popup_id = insert_x11(&mut state, popup.clone());
+    assert!(state.set_x11_geometry(popup.handle, popup.geometry));
+    assert_eq!(
+        state.window(popup_id).unwrap().x11_placement_policy,
+        Some(X11PlacementPolicy::ClientPositioned)
+    );
+    assert_eq!(
+        state.surface_placement(popup.surface_id),
+        SurfacePlacement::absolute_root_at(popup.geometry.x, popup.geometry.y)
+    );
+}
+
+#[test]
 fn dialog_remains_a_managed_client() {
     let mut state = CompositorState::new(None);
     let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());

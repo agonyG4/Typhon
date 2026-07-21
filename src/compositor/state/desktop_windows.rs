@@ -204,8 +204,21 @@ impl CompositorState {
         let Some(root_surface_id) = root_surface_id else {
             return false;
         };
+        let placement_policy = self
+            .window(window_id)
+            .and_then(|window| window.x11_placement_policy);
+        let current_placement = self.surface_placement(root_surface_id);
+        let floating_placement = match placement_policy {
+            Some(X11PlacementPolicy::CompositorManaged) => current_placement,
+            Some(
+                X11PlacementPolicy::ClientPositioned
+                | X11PlacementPolicy::ParentRelative
+                | X11PlacementPolicy::OverrideRedirect,
+            )
+            | None => SurfacePlacement::absolute_root_at(geometry.x, geometry.y),
+        };
         let restore_geometry = WindowGeometry::new(
-            SurfacePlacement::absolute_root_at(geometry.x, geometry.y),
+            floating_placement,
             geometry.width.max(1),
             geometry.height.max(1),
         );
@@ -226,12 +239,21 @@ impl CompositorState {
         self.set_surface_placement_with_cause(
             root_surface_id,
             if mode == ToplevelMode::Floating {
-                restore_geometry.placement
+                floating_placement
             } else {
                 target_geometry.placement
             },
             RenderGenerationCause::WindowMode,
         );
+        if let Some(window) = self.window_mut(window_id)
+            && let Some(x11_geometry) = window.x11_geometry.as_mut()
+        {
+            x11_geometry.frame = if mode == ToplevelMode::Floating {
+                restore_geometry
+            } else {
+                target_geometry
+            };
+        }
         if state.hidden {
             if !self.minimize_desktop_window(window_id)
                 && let Some(window) = self.window_mut(window_id)
@@ -304,6 +326,9 @@ impl CompositorState {
                     accepted_transient_handle.is_some(),
                     window.kind == DesktopWindowKind::OverrideRedirect,
                 ));
+                window.x11_placement_policy = window
+                    .x11_role
+                    .map(crate::compositor::desktop_window::x11_placement_policy);
             }
             crate::xwayland::xwm::X11MetadataDelta::WindowTypes(window_types) => {
                 window.x11_window_types = window_types;
@@ -313,6 +338,9 @@ impl CompositorState {
                     window.x11_transient_for.is_some(),
                     window.kind == DesktopWindowKind::OverrideRedirect,
                 ));
+                window.x11_placement_policy = window
+                    .x11_role
+                    .map(crate::compositor::desktop_window::x11_placement_policy);
             }
             crate::xwayland::xwm::X11MetadataDelta::Kind(kind) => {
                 window.kind = kind;
@@ -322,6 +350,9 @@ impl CompositorState {
                     window.x11_transient_for.is_some(),
                     window.kind == DesktopWindowKind::OverrideRedirect,
                 ));
+                window.x11_placement_policy = window
+                    .x11_role
+                    .map(crate::compositor::desktop_window::x11_placement_policy);
             }
             crate::xwayland::xwm::X11MetadataDelta::AcceptsInput(accepts_input) => {
                 window.x11_accepts_input = accepts_input;
@@ -459,23 +490,31 @@ impl CompositorState {
         let Some(filtered) = self.filter_x11_geometry(handle, geometry) else {
             return false;
         };
-        let root_surface_id = self.window(window_id).map(|window| window.root_surface_id);
-        let Some(root_surface_id) = root_surface_id else {
+        let Some((root_surface_id, placement_policy)) = self
+            .window(window_id)
+            .map(|window| (window.root_surface_id, window.x11_placement_policy))
+        else {
             return false;
+        };
+        let placement = match placement_policy {
+            Some(X11PlacementPolicy::CompositorManaged) => self.surface_placement(root_surface_id),
+            Some(
+                X11PlacementPolicy::ClientPositioned
+                | X11PlacementPolicy::ParentRelative
+                | X11PlacementPolicy::OverrideRedirect,
+            )
+            | None => SurfacePlacement::absolute_root_at(filtered.x, filtered.y),
         };
         if let Some(window) = self.window_mut(window_id)
             && let Some(x11_geometry) = window.x11_geometry.as_mut()
         {
             x11_geometry.client = filtered;
-            x11_geometry.frame = WindowGeometry::new(
-                SurfacePlacement::absolute_root_at(filtered.x, filtered.y),
-                filtered.width.max(1),
-                filtered.height.max(1),
-            );
+            x11_geometry.frame =
+                WindowGeometry::new(placement, filtered.width.max(1), filtered.height.max(1));
         }
         self.set_surface_placement_with_cause(
             root_surface_id,
-            SurfacePlacement::absolute_root_at(filtered.x, filtered.y),
+            placement,
             RenderGenerationCause::WindowMove,
         );
         true
@@ -489,11 +528,21 @@ impl CompositorState {
         let Some(window_id) = self.window_id_for_x11_handle(handle) else {
             return false;
         };
-        let Some(root_surface_id) = self.window(window_id).map(|window| window.root_surface_id)
+        let Some((root_surface_id, placement_policy)) = self
+            .window(window_id)
+            .map(|window| (window.root_surface_id, window.x11_placement_policy))
         else {
             return false;
         };
-        let placement = SurfacePlacement::absolute_root_at(geometry.x, geometry.y);
+        let placement = match placement_policy {
+            Some(X11PlacementPolicy::CompositorManaged) => self.surface_placement(root_surface_id),
+            Some(
+                X11PlacementPolicy::ClientPositioned
+                | X11PlacementPolicy::ParentRelative
+                | X11PlacementPolicy::OverrideRedirect,
+            )
+            | None => SurfacePlacement::absolute_root_at(geometry.x, geometry.y),
+        };
         let frame = WindowGeometry::new(placement, geometry.width.max(1), geometry.height.max(1));
         if let Some(window) = self.window_mut(window_id)
             && let Some(x11_geometry) = window.x11_geometry.as_mut()
