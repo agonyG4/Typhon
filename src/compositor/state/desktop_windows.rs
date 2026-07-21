@@ -877,7 +877,7 @@ impl CompositorState {
         let old_window_id = self.focused_window_id;
         let new_window_id =
             self.window_id_for_surface(self.root_surface_id_for_surface(new_surface_id));
-        if changed {
+        if changed || old_window_id != new_window_id {
             if let Some(window_id) = old_window_id {
                 self.queue_backend_activation(window_id, false);
             }

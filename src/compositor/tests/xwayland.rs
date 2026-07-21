@@ -4,7 +4,8 @@ use crate::compositor::{
     DesktopWindowKind, RenderGenerationCause, SurfacePlacement, WindowConstraints, WindowMetadata,
 };
 use crate::xwayland::xwm::{
-    X11Geometry, X11PublishedState, X11WindowLifecycle, X11WindowSnapshot, XwmCommand, XwmEvent,
+    X11Geometry, X11PublishedState, X11WindowLifecycle, X11WindowSnapshot, X11WindowType,
+    XwmCommand, XwmEvent,
 };
 use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 use wayland_client::protocol::{
@@ -336,6 +337,59 @@ fn window_ready_publishes_retained_xwayland_buffer() {
         RenderGenerationCause::SurfaceCommit
     );
     assert_eq!(fixture.server.take_xwayland_buffer_ready_events().len(), 0);
+}
+
+#[test]
+fn x11_window_ready_initial_focus_activates_normal_toplevel() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    let handle = snapshot.handle;
+
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+
+    assert!(
+        fixture
+            .server
+            .take_xwayland_backend_commands(0)
+            .iter()
+            .any(|command| matches!(
+                command,
+                XwmCommand::Focus {
+                    window: Some(window),
+                    ..
+                } if *window == handle
+            ))
+    );
+}
+
+#[test]
+fn x11_window_ready_initial_focus_skips_auxiliary_popup() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.window_type = Some(X11WindowType::PopupMenu);
+    let handle = snapshot.handle;
+
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+
+    assert!(
+        fixture
+            .server
+            .take_xwayland_backend_commands(0)
+            .iter()
+            .all(|command| !matches!(
+                command,
+                XwmCommand::Focus {
+                    window: Some(window),
+                    ..
+                } if *window == handle
+            ))
+    );
 }
 
 #[test]

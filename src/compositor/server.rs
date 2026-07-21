@@ -453,12 +453,13 @@ impl OwnCompositorServer {
                 let surface_id = snapshot.surface_id;
                 let handle = snapshot.handle;
                 match self.state.insert_x11_window(snapshot) {
-                    Ok(_) => {
+                    Ok(window_id) => {
                         let published = self
                             .state
                             .adopt_current_xwayland_surface_content(surface_id);
+                        let focused = self.state.focus_desktop_window(window_id);
                         eprintln!(
-                            "oblivion-one compositor: event=xwayland_window_admitted surface_id={surface_id} retained_buffer={published} published={published}"
+                            "oblivion-one compositor: event=xwayland_window_admitted surface_id={surface_id} retained_buffer={published} published={published} focused={focused}"
                         );
                         let family = self.state.x11_family_handles(handle);
                         let mut commands = vec![self.sync_xwayland_client_lists()];
