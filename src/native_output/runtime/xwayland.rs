@@ -1,4 +1,18 @@
 use super::*;
+use oblivion_one::xwayland::xwm::XwmCommand;
+
+fn coalesce_client_list_sync(commands: Vec<XwmCommand>) -> Vec<XwmCommand> {
+    let mut normalized = Vec::with_capacity(commands.len());
+    let mut latest_snapshot = None;
+    for command in commands {
+        match command {
+            command @ XwmCommand::SyncClientLists { .. } => latest_snapshot = Some(command),
+            command => normalized.push(command),
+        }
+    }
+    normalized.extend(latest_snapshot);
+    normalized
+}
 
 impl NativeRuntime {
     pub(super) fn initialize_managed_xwayland(&mut self) -> NativeResult<()> {
@@ -30,7 +44,7 @@ impl NativeRuntime {
         }
         let now_ns = monotonic_now_ns()?;
         commands.extend(self.server.take_xwayland_backend_commands(now_ns));
-        for command in commands {
+        for command in coalesce_client_list_sync(commands) {
             let _ = self
                 .xwayland
                 .execute_managed_command(&mut self.process_supervisor, command);
@@ -167,5 +181,51 @@ impl NativeRuntime {
             self.sync_xwayland_reactor_sources()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coalesce_client_list_sync_keeps_only_final_snapshot_after_other_commands() {
+        let final_snapshot = XwmCommand::SyncClientLists {
+            client_list: Vec::new(),
+            stacking: Vec::new(),
+        };
+
+        let commands = coalesce_client_list_sync(vec![
+            XwmCommand::SyncClientLists {
+                client_list: Vec::new(),
+                stacking: Vec::new(),
+            },
+            XwmCommand::Focus {
+                window: None,
+                timestamp: 42,
+            },
+            final_snapshot.clone(),
+        ]);
+
+        assert_eq!(
+            commands,
+            vec![
+                XwmCommand::Focus {
+                    window: None,
+                    timestamp: 42,
+                },
+                final_snapshot,
+            ]
+        );
+    }
+
+    #[test]
+    fn coalesce_client_list_sync_leaves_non_snapshot_batch_unchanged() {
+        let commands = vec![XwmCommand::Focus {
+            window: None,
+            timestamp: 7,
+        }];
+
+        assert_eq!(coalesce_client_list_sync(commands.clone()), commands,);
     }
 }
