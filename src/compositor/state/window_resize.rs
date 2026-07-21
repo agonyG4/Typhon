@@ -17,7 +17,7 @@ impl CompositorState {
             root_surface_id,
             geometry.width,
             geometry.height,
-            SurfacePlacement::root_at(geometry.x, geometry.y),
+            SurfacePlacement::absolute_root_at(geometry.x, geometry.y),
             ResizeEdges::BOTTOM_RIGHT,
             ResizeInteractionId::new(0x7fff_ffff),
         )
@@ -37,7 +37,7 @@ impl CompositorState {
         self.queue_backend_finalize_resize(
             window_id,
             WindowGeometry::new(
-                SurfacePlacement::root_at(geometry.x, geometry.y),
+                SurfacePlacement::absolute_root_at(geometry.x, geometry.y),
                 geometry.width,
                 geometry.height,
             ),

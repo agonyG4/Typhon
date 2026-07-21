@@ -575,6 +575,78 @@ fn x11_resize_release_finalizes_preview_without_xdg_commit() {
 }
 
 #[test]
+fn absolute_x11_move_preserves_root_placement_mode() {
+    let surface_id = 42;
+    let snapshot = test_x11_snapshot(surface_id);
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
+        .expect("X11 desktop window");
+    state
+        .renderable_surfaces
+        .push(test_renderable_surface(surface_id, 300, 200));
+    state.set_surface_placement(surface_id, SurfacePlacement::absolute_root_at(10, 20));
+    let mut interaction = test_window_interaction(1, WindowInteractionKind::Move, None);
+    interaction.window_id = window_id;
+    interaction.start_placement = SurfacePlacement::absolute_root_at(10, 20);
+    state.window_interaction = Some(interaction);
+
+    assert!(state.update_window_interaction_by_id(interaction.id, 125.0, 135.0));
+
+    let expected = SurfacePlacement::absolute_root_at(35, 55);
+    assert_eq!(state.surface_placement(surface_id), expected);
+    assert!(matches!(
+        state.take_backend_commands().as_slice(),
+        [crate::compositor::window_backend::WindowBackendCommand::Configure {
+            geometry,
+            resizing: false,
+            ..
+        }] if geometry.placement == expected
+    ));
+}
+
+#[test]
+fn absolute_x11_resize_preserves_root_placement_mode() {
+    let surface_id = 42;
+    let snapshot = test_x11_snapshot(surface_id);
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
+        .expect("X11 desktop window");
+    state
+        .renderable_surfaces
+        .push(test_renderable_surface(surface_id, 300, 200));
+    state.set_surface_placement(surface_id, SurfacePlacement::absolute_root_at(10, 20));
+    let mut interaction = test_window_interaction(
+        1,
+        WindowInteractionKind::Resize(ResizeEdges::new(true, false, true, false)),
+        None,
+    );
+    interaction.window_id = window_id;
+    interaction.start_placement = SurfacePlacement::absolute_root_at(10, 20);
+    state.window_interaction = Some(interaction);
+
+    assert!(state.update_window_interaction_by_id(interaction.id, 120.0, 130.0));
+    assert!(state.apply_pending_interactive_resize_update());
+
+    let expected = SurfacePlacement::absolute_root_at(30, 50);
+    assert_eq!(
+        state.toplevel_visual_geometries[&surface_id].placement,
+        expected
+    );
+    assert!(matches!(
+        state.take_backend_commands().as_slice(),
+        [crate::compositor::window_backend::WindowBackendCommand::Configure {
+            geometry,
+            resizing: true,
+            ..
+        }] if geometry.placement == expected
+    ));
+}
+
+#[test]
 fn left_and_top_resize_preserve_fixed_opposite_edges() {
     let surface_id = 42;
     let snapshot = test_x11_snapshot(surface_id);

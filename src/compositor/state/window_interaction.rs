@@ -555,10 +555,11 @@ impl CompositorState {
 
         match interaction.kind {
             WindowInteractionKind::Move => {
-                let placement = SurfacePlacement::root_at(
-                    interaction.start_placement.local_x + dx,
-                    interaction.start_placement.local_y + dy,
-                );
+                let placement = SurfacePlacement {
+                    local_x: interaction.start_placement.local_x + dx,
+                    local_y: interaction.start_placement.local_y + dy,
+                    ..interaction.start_placement
+                };
                 let moved = self.set_surface_placement_with_cause(
                     interaction.root_surface_id,
                     placement,
@@ -592,7 +593,11 @@ impl CompositorState {
                     root_surface_id: interaction.root_surface_id,
                     width: resize.width,
                     height: resize.height,
-                    placement: SurfacePlacement::root_at(resize.x, resize.y),
+                    placement: SurfacePlacement {
+                        local_x: resize.x,
+                        local_y: resize.y,
+                        ..interaction.start_placement
+                    },
                     edges,
                     interaction_id: interaction
                         .resize_interaction_id
