@@ -594,6 +594,33 @@ mod tests {
     }
 
     #[test]
+    fn release_after_intermediate_completion_starts_final_transaction() {
+        let window = handle(1, 27);
+        let mut tracker = ResizeSyncTracker::default();
+        tracker
+            .begin_transaction(window, 7, 100, X11Geometry::default(), false)
+            .expect("intermediate transaction");
+        assert!(tracker.acknowledge(window, 7));
+        assert_eq!(tracker.note_commit(window), ResizeSyncCommit::Presented);
+        assert!(tracker.complete(window));
+        assert_eq!(tracker.state(window), ResizeSyncState::Idle);
+
+        let final_geometry = X11Geometry {
+            width: 1200,
+            height: 800,
+            ..X11Geometry::default()
+        };
+        tracker
+            .begin_transaction(window, 8, 200, final_geometry, true)
+            .expect("final transaction after idle gap");
+        assert!(tracker.transaction(window).unwrap().2);
+        assert!(tracker.acknowledge(window, 8));
+        assert_eq!(tracker.note_commit(window), ResizeSyncCommit::Presented);
+        assert!(tracker.complete(window));
+        assert_eq!(tracker.state(window), ResizeSyncState::Idle);
+    }
+
+    #[test]
     fn timeout_restores_allow_commits() {
         let window = handle(1, 24);
         let mut tracker = ResizeSyncTracker::default();

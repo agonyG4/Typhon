@@ -10,6 +10,11 @@ pub(crate) enum WindowBackendCommand {
         mode: ToplevelMode,
         resizing: bool,
     },
+    FinalizeResize {
+        window: WindowId,
+        geometry: WindowGeometry,
+        mode: ToplevelMode,
+    },
     Close {
         window: WindowId,
     },

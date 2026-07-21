@@ -1,6 +1,51 @@
 use super::*;
 
 impl CompositorState {
+    pub(in crate::compositor) fn begin_x11_resize_for_test(
+        &mut self,
+        handle: crate::xwayland::X11WindowHandle,
+        geometry: crate::xwayland::xwm::X11Geometry,
+    ) -> bool {
+        let Some(window_id) = self.window_id_for_x11_handle(handle) else {
+            return false;
+        };
+        let Some(root_surface_id) = self.window(window_id).map(|window| window.root_surface_id)
+        else {
+            return false;
+        };
+        self.queue_resize_root_window_to(
+            root_surface_id,
+            geometry.width,
+            geometry.height,
+            SurfacePlacement::root_at(geometry.x, geometry.y),
+            ResizeEdges::BOTTOM_RIGHT,
+            ResizeInteractionId::new(0x7fff_ffff),
+        )
+    }
+
+    pub(in crate::compositor) fn finalize_x11_resize_for_test(
+        &mut self,
+        handle: crate::xwayland::X11WindowHandle,
+        geometry: crate::xwayland::xwm::X11Geometry,
+    ) -> bool {
+        let Some(window_id) = self.window_id_for_x11_handle(handle) else {
+            return false;
+        };
+        let Some(mode) = self.window(window_id).map(|window| window.state.mode()) else {
+            return false;
+        };
+        self.queue_backend_finalize_resize(
+            window_id,
+            WindowGeometry::new(
+                SurfacePlacement::root_at(geometry.x, geometry.y),
+                geometry.width,
+                geometry.height,
+            ),
+            mode,
+        );
+        true
+    }
+
     pub(in crate::compositor) fn queue_resize_root_window_to(
         &mut self,
         surface_id: u32,
@@ -375,13 +420,12 @@ impl CompositorState {
             else {
                 return false;
             };
-            self.queue_backend_configure(
+            self.queue_backend_finalize_resize(
                 window_id,
                 geometry,
                 self.window(window_id)
                     .map(|window| window.state.mode())
                     .unwrap_or(ToplevelMode::Floating),
-                false,
             );
             return true;
         }

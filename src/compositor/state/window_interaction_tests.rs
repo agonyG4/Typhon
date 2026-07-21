@@ -548,7 +548,11 @@ fn x11_resize_release_finalizes_preview_without_xdg_commit() {
         state.surface_placement(surface_id),
         SurfacePlacement::root_at(10, 20)
     );
-    assert_eq!(state.take_backend_commands().len(), 1);
+    let backend_commands = state.take_backend_commands();
+    assert!(matches!(
+        backend_commands.as_slice(),
+        [crate::compositor::window_backend::WindowBackendCommand::FinalizeResize { .. }]
+    ));
 
     let handle = match state.window(window_id).expect("window").backend {
         WindowBackend::X11(handle) => handle,

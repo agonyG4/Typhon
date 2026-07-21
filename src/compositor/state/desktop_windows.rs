@@ -585,13 +585,19 @@ impl CompositorState {
             .iter()
             .copied()
             .collect::<std::collections::HashSet<_>>();
-        let insertion = self
+        let highest_family_index = self
             .window_stacking
             .iter()
             .enumerate()
             .filter_map(|(index, id)| family_set.contains(id).then_some(index))
-            .min()
-            .unwrap_or(self.window_stacking.len());
+            .max();
+        let insertion = highest_family_index.map_or(self.window_stacking.len(), |highest| {
+            self.window_stacking
+                .iter()
+                .take(highest)
+                .filter(|id| !family_set.contains(id))
+                .count()
+        });
         let original_stack = self.window_stacking.clone();
         self.window_stacking.retain(|id| !family_set.contains(id));
         let insertion = insertion.min(self.window_stacking.len());
@@ -618,14 +624,14 @@ impl CompositorState {
             .collect::<Vec<_>>();
         let mut family_surfaces = Vec::new();
         let mut lower = Vec::with_capacity(original.len());
-        let mut first_family_index = None;
+        let mut family_insertion = lower.len();
         for (index, surface) in original.into_iter().enumerate() {
             let root_surface = root_surface_id_for_surface_in_placements(
                 &self.surface_placements,
                 surface.surface_id,
             );
             if root_rank.contains_key(&root_surface) {
-                first_family_index.get_or_insert(index);
+                family_insertion = lower.len();
                 family_surfaces.push((index, surface, root_surface));
             } else {
                 lower.push(surface);
@@ -636,7 +642,7 @@ impl CompositorState {
             .into_iter()
             .map(|(_, surface, _)| surface)
             .collect::<Vec<_>>();
-        let insertion = first_family_index.unwrap_or(lower.len()).min(lower.len());
+        let insertion = family_insertion.min(lower.len());
         lower.splice(insertion..insertion, family_surfaces);
         let surfaces_changed = original_surface_order
             != lower
@@ -759,6 +765,23 @@ impl CompositorState {
         depth
     }
 
+    pub(in crate::compositor) fn x11_family_handles(
+        &self,
+        handle: X11WindowHandle,
+    ) -> Vec<X11WindowHandle> {
+        let Some(id) = self.window_id_for_x11_handle(handle) else {
+            return Vec::new();
+        };
+        let root = self.x11_family_root(id);
+        self.x11_family_order(root)
+            .into_iter()
+            .filter_map(|id| match self.window(id).map(|window| window.backend) {
+                Some(WindowBackend::X11(handle)) => Some(handle),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(in crate::compositor) fn x11_client_lists(
         &self,
     ) -> (
@@ -809,6 +832,21 @@ impl CompositorState {
                 geometry,
                 mode,
                 resizing,
+            },
+        );
+    }
+
+    pub(in crate::compositor) fn queue_backend_finalize_resize(
+        &mut self,
+        window_id: WindowId,
+        geometry: WindowGeometry,
+        mode: ToplevelMode,
+    ) {
+        self.backend_commands.push(
+            crate::compositor::window_backend::WindowBackendCommand::FinalizeResize {
+                window: window_id,
+                geometry,
+                mode,
             },
         );
     }

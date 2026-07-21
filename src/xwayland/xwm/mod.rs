@@ -242,6 +242,13 @@ pub enum XwmCommand {
         timestamp: u32,
     },
     Raise(X11WindowHandle),
+    RaiseFamily {
+        family: Vec<X11WindowHandle>,
+    },
+    StackFamily {
+        family: Vec<X11WindowHandle>,
+        mode: X11StackMode,
+    },
     Close(X11WindowHandle),
     SetState {
         window: X11WindowHandle,
@@ -343,6 +350,8 @@ pub struct Xwm {
     pub(crate) sync_alarms: HashMap<X11WindowHandle, u32>,
     pub(crate) sync_handles_by_counter: HashMap<u32, X11WindowHandle>,
     pub(crate) next_resize_counter_values: HashMap<X11WindowHandle, u64>,
+    pub(crate) family_order: HashMap<X11WindowHandle, u64>,
+    pub(crate) next_family_order: u64,
     pub(crate) expected_configures: HashMap<X11WindowHandle, X11Geometry>,
     pub(crate) immediate_resize_windows: HashSet<X11WindowHandle>,
     pub(crate) fallback_resize_windows: HashSet<X11WindowHandle>,
@@ -566,6 +575,21 @@ impl Xwm {
         let Some(handle) = self.sync_handles_by_counter.get(&counter).copied() else {
             return;
         };
+        self.note_resize_sync_ack(handle, value);
+    }
+
+    pub(crate) fn note_resize_sync_ack_for_test(&mut self, handle: X11WindowHandle, value: u64) {
+        self.note_resize_sync_ack(handle, value);
+    }
+
+    pub(crate) fn note_family_order(&mut self, family: &[X11WindowHandle]) {
+        for handle in family {
+            self.family_order.insert(*handle, self.next_family_order);
+            self.next_family_order = self.next_family_order.saturating_add(1);
+        }
+    }
+
+    fn note_resize_sync_ack(&mut self, handle: X11WindowHandle, value: u64) {
         if self.resize_sync.acknowledge(handle, value) {
             if std::env::var_os("TYPHON_XWAYLAND_LOG").is_some() {
                 let geometry = self

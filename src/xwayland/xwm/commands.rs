@@ -39,6 +39,11 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
     {
         validate_handle(xwm, *sibling)?;
     }
+    if let XwmCommand::RaiseFamily { family } | XwmCommand::StackFamily { family, .. } = &command {
+        for handle in family {
+            validate_handle(xwm, *handle)?;
+        }
+    }
 
     match command {
         XwmCommand::Map(handle) => {
@@ -70,6 +75,7 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
                     &[0, 0, 0, 0],
                 )
                 .map_err(XwmError::Connection)?;
+            xwm.note_family_order(&[handle]);
             set_lifecycle_map_commanded(xwm, handle);
         }
         XwmCommand::Unmap(handle) => {
@@ -130,6 +136,7 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             sibling,
             mode,
         } => {
+            xwm.note_family_order(&[window]);
             if sibling.is_none() && matches!(mode, X11StackMode::Above) {
                 for family_handle in transient_family_handles(xwm, window) {
                     xwm.connection
@@ -146,6 +153,17 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
                 }
                 xwm.connection
                     .configure_window(window.xid(), &aux)
+                    .map_err(XwmError::Connection)?;
+            }
+        }
+        XwmCommand::StackFamily { family, mode } => {
+            xwm.note_family_order(&family);
+            for handle in family {
+                xwm.connection
+                    .configure_window(
+                        handle.xid(),
+                        &ConfigureWindowAux::new().stack_mode(to_x11_stack_mode(mode)),
+                    )
                     .map_err(XwmError::Connection)?;
             }
         }
@@ -207,10 +225,23 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             }
         }
         XwmCommand::Raise(handle) => {
-            for family_handle in transient_family_handles(xwm, handle) {
+            let family = transient_family_handles(xwm, handle);
+            xwm.note_family_order(&family);
+            for family_handle in family {
                 xwm.connection
                     .configure_window(
                         family_handle.xid(),
+                        &ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE),
+                    )
+                    .map_err(XwmError::Connection)?;
+            }
+        }
+        XwmCommand::RaiseFamily { family } => {
+            xwm.note_family_order(&family);
+            for handle in family {
+                xwm.connection
+                    .configure_window(
+                        handle.xid(),
                         &ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE),
                     )
                     .map_err(XwmError::Connection)?;
@@ -290,6 +321,9 @@ fn command_handle(command: &XwmCommand) -> Option<super::X11WindowHandle> {
         | XwmCommand::Unmap(handle)
         | XwmCommand::Raise(handle)
         | XwmCommand::Close(handle) => Some(*handle),
+        XwmCommand::RaiseFamily { family } | XwmCommand::StackFamily { family, .. } => {
+            family.first().copied()
+        }
         XwmCommand::Configure { window, .. }
         | XwmCommand::ConfigureNotify { window, .. }
         | XwmCommand::SetState { window, .. } => Some(*window),
@@ -347,7 +381,10 @@ fn transient_family_handles(
             current = *parent;
             depth += 1;
         }
-        (depth, handle.xid())
+        (
+            depth,
+            xwm.family_order.get(handle).copied().unwrap_or(u64::MAX),
+        )
     });
     family
 }
@@ -389,6 +426,11 @@ pub(crate) fn begin_resize_sync(
         .and_then(|snapshot| snapshot.sync_counter)
     else {
         if xwm.last_resize_geometries.get(&window).copied() == Some(geometry) {
+            if final_pending {
+                xwm.immediate_resize_windows.remove(&window);
+                xwm.outgoing_events
+                    .push_back(XwmEvent::ResizeSyncImmediate(window));
+            }
             return Ok(());
         }
         xwm.connection
@@ -397,13 +439,24 @@ pub(crate) fn begin_resize_sync(
                 &configure_aux(geometry, X11ConfigureFlags::all(), 0),
             )
             .map_err(XwmError::Connection)?;
-        xwm.immediate_resize_windows.insert(window);
+        if final_pending {
+            xwm.immediate_resize_windows.remove(&window);
+            xwm.outgoing_events
+                .push_back(XwmEvent::ResizeSyncImmediate(window));
+        } else {
+            xwm.immediate_resize_windows.insert(window);
+        }
         xwm.last_resize_geometries.insert(window, geometry);
         xwm.note_expected_configure(window, geometry);
         return Ok(());
     };
     if !xwm.capabilities.sync {
         if xwm.last_resize_geometries.get(&window).copied() == Some(geometry) {
+            if final_pending {
+                xwm.immediate_resize_windows.remove(&window);
+                xwm.outgoing_events
+                    .push_back(XwmEvent::ResizeSyncImmediate(window));
+            }
             return Ok(());
         }
         xwm.connection
@@ -412,14 +465,33 @@ pub(crate) fn begin_resize_sync(
                 &configure_aux(geometry, X11ConfigureFlags::all(), 0),
             )
             .map_err(XwmError::Connection)?;
-        xwm.immediate_resize_windows.insert(window);
+        if final_pending {
+            xwm.immediate_resize_windows.remove(&window);
+            xwm.outgoing_events
+                .push_back(XwmEvent::ResizeSyncImmediate(window));
+        } else {
+            xwm.immediate_resize_windows.insert(window);
+        }
         xwm.last_resize_geometries.insert(window, geometry);
         xwm.note_expected_configure(window, geometry);
         return Ok(());
     }
     if xwm.resize_sync.is_pending(window) {
-        if xwm.resize_sync.queue_desired(window, geometry, false) {
-            log_resize_event("x11_resize_coalesced", xwm, window, Some(geometry), None);
+        if xwm
+            .resize_sync
+            .queue_desired(window, geometry, final_pending)
+        {
+            log_resize_event(
+                if final_pending {
+                    "x11_resize_final_pending"
+                } else {
+                    "x11_resize_coalesced"
+                },
+                xwm,
+                window,
+                Some(geometry),
+                None,
+            );
         }
         return Ok(());
     }

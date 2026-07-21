@@ -38,7 +38,7 @@ use crate::astrea_shortcuts::server::astrea_shortcuts_manager_v1;
 use crate::render_backend::buffer::BufferId;
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
-use crate::xwayland::xwm::{RESIZE_SYNC_TIMEOUT_NS, XwmCommand, XwmEvent};
+use crate::xwayland::xwm::{XwmCommand, XwmEvent};
 use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 #[path = "server_gpu_globals.rs"]
 mod server_gpu_globals;
@@ -50,8 +50,7 @@ use super::{
     InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PointerAxisFrame,
     PresentationClock, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
     ResizeFlowMetrics, SelectionProtocolCapabilities, SubsurfaceTransactionMetrics,
-    SurfaceDamagePresentation, ToplevelMode, WindowInteractionDebugSnapshot,
-    WindowInteractionEndReason, color,
+    SurfaceDamagePresentation, WindowInteractionDebugSnapshot, WindowInteractionEndReason, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 #[derive(Debug)]
@@ -447,93 +446,12 @@ impl OwnCompositorServer {
             .map(|pending| pending.data.buffer_id())
     }
 
-    pub fn take_xwayland_backend_commands(&mut self, now_ns: u64) -> Vec<XwmCommand> {
-        self.state
-            .take_backend_commands()
-            .into_iter()
-            .filter_map(|command| match command {
-                crate::compositor::window_backend::WindowBackendCommand::Configure {
-                    window,
-                    geometry,
-                    mode: _,
-                    resizing,
-                } => {
-                    let handle = match self.state.window(window)?.backend {
-                        super::WindowBackend::X11(handle) => handle,
-                        super::WindowBackend::Xdg(_) => return None,
-                    };
-                    let x11_geometry = crate::xwayland::xwm::X11Geometry {
-                        x: geometry.placement.local_x,
-                        y: geometry.placement.local_y,
-                        width: geometry.width,
-                        height: geometry.height,
-                    };
-                    if resizing {
-                        Some(XwmCommand::BeginResizeSync {
-                            window: handle,
-                            geometry: x11_geometry,
-                            counter_value: 0,
-                            deadline_ns: now_ns.saturating_add(RESIZE_SYNC_TIMEOUT_NS),
-                            final_pending: false,
-                        })
-                    } else {
-                        Some(XwmCommand::Configure {
-                            window: handle,
-                            geometry: x11_geometry,
-                            fields: crate::xwayland::xwm::X11ConfigureFlags::all(),
-                            border_width: 0,
-                        })
-                    }
-                }
-                crate::compositor::window_backend::WindowBackendCommand::Close { window } => {
-                    let handle = match self.state.window(window)?.backend {
-                        super::WindowBackend::X11(handle) => handle,
-                        super::WindowBackend::Xdg(_) => return None,
-                    };
-                    Some(XwmCommand::Close(handle))
-                }
-                crate::compositor::window_backend::WindowBackendCommand::SetActivated {
-                    window,
-                    activated,
-                } => {
-                    let handle = match self.state.window(window)?.backend {
-                        super::WindowBackend::X11(handle) => handle,
-                        super::WindowBackend::Xdg(_) => return None,
-                    };
-                    Some(XwmCommand::Focus {
-                        window: activated.then_some(handle),
-                        timestamp: 0,
-                    })
-                }
-                crate::compositor::window_backend::WindowBackendCommand::PublishState {
-                    window,
-                    mode,
-                    minimized,
-                    activated,
-                } => {
-                    let handle = match self.state.window(window)?.backend {
-                        super::WindowBackend::X11(handle) => handle,
-                        super::WindowBackend::Xdg(_) => return None,
-                    };
-                    Some(XwmCommand::SetState {
-                        window: handle,
-                        state: crate::xwayland::xwm::X11PublishedState {
-                            fullscreen: mode == ToplevelMode::Fullscreen,
-                            maximized: mode == ToplevelMode::Maximized,
-                            hidden: minimized,
-                            activated,
-                        },
-                    })
-                }
-            })
-            .collect()
-    }
-
     pub fn apply_xwayland_window_event(&mut self, event: XwmEvent) -> Vec<XwmCommand> {
         match event {
             XwmEvent::WindowMapRequested(handle) => vec![XwmCommand::Map(handle)],
             XwmEvent::WindowReady(snapshot) => {
                 let surface_id = snapshot.surface_id;
+                let handle = snapshot.handle;
                 match self.state.insert_x11_window(snapshot) {
                     Ok(_) => {
                         let published = self
@@ -542,7 +460,12 @@ impl OwnCompositorServer {
                         eprintln!(
                             "oblivion-one compositor: event=xwayland_window_admitted surface_id={surface_id} retained_buffer={published} published={published}"
                         );
-                        vec![self.sync_xwayland_client_lists()]
+                        let family = self.state.x11_family_handles(handle);
+                        let mut commands = vec![self.sync_xwayland_client_lists()];
+                        if family.len() > 1 {
+                            commands.push(XwmCommand::RaiseFamily { family });
+                        }
+                        commands
                     }
                     Err(error) => {
                         eprintln!(
@@ -588,20 +511,40 @@ impl OwnCompositorServer {
                     self.state.clear_keyboard_focus();
                     let _ = self.state.focus_topmost_renderable_toplevel();
                 }
-                publish_lists
-                    .then(|| self.sync_xwayland_client_lists())
-                    .into_iter()
-                    .collect()
+                if !publish_lists {
+                    return Vec::new();
+                }
+                let family = self.state.x11_family_handles(window);
+                let mut commands = vec![self.sync_xwayland_client_lists()];
+                if family.len() > 1 {
+                    commands.push(XwmCommand::RaiseFamily { family });
+                }
+                commands
             }
             XwmEvent::ConfigureRequested { window, request } => {
                 if self.state.x11_resize_active(window) {
                     let mut commands = Vec::with_capacity(2);
                     if let Some(mode) = request.stack_mode {
-                        commands.push(XwmCommand::Stack {
-                            window,
-                            sibling: request.sibling,
-                            mode,
-                        });
+                        if request.sibling.is_none()
+                            && matches!(mode, crate::xwayland::xwm::X11StackMode::Above)
+                        {
+                            let family = self.state.x11_family_handles(window);
+                            if family.len() > 1 {
+                                commands.push(XwmCommand::StackFamily { family, mode });
+                            } else {
+                                commands.push(XwmCommand::Stack {
+                                    window,
+                                    sibling: request.sibling,
+                                    mode,
+                                });
+                            }
+                        } else {
+                            commands.push(XwmCommand::Stack {
+                                window,
+                                sibling: request.sibling,
+                                mode,
+                            });
+                        }
                     }
                     if (request.fields.x
                         || request.fields.y
@@ -640,11 +583,26 @@ impl OwnCompositorServer {
                     border_width: request.border_width,
                 }];
                 if let Some(mode) = request.stack_mode {
-                    commands.push(XwmCommand::Stack {
-                        window,
-                        sibling: request.sibling,
-                        mode,
-                    });
+                    if request.sibling.is_none()
+                        && matches!(mode, crate::xwayland::xwm::X11StackMode::Above)
+                    {
+                        let family = self.state.x11_family_handles(window);
+                        if family.len() > 1 {
+                            commands.push(XwmCommand::StackFamily { family, mode });
+                        } else {
+                            commands.push(XwmCommand::Stack {
+                                window,
+                                sibling: request.sibling,
+                                mode,
+                            });
+                        }
+                    } else {
+                        commands.push(XwmCommand::Stack {
+                            window,
+                            sibling: request.sibling,
+                            mode,
+                        });
+                    }
                 }
                 commands
             }
@@ -693,12 +651,18 @@ impl OwnCompositorServer {
                     .window_id_for_x11_handle(window)
                     .is_some_and(|window_id| self.state.focus_desktop_window(window_id))
                 {
+                    let family = self.state.x11_family_handles(window);
+                    let raise = if family.len() > 1 {
+                        XwmCommand::RaiseFamily { family }
+                    } else {
+                        XwmCommand::Raise(window)
+                    };
                     vec![
                         XwmCommand::Focus {
                             window: Some(window),
                             timestamp,
                         },
-                        XwmCommand::Raise(window),
+                        raise,
                         self.sync_xwayland_client_lists(),
                     ]
                 } else {
@@ -1060,6 +1024,29 @@ impl OwnCompositorServer {
             .begin_window_resize_at_with_trigger(x, y, trigger_button);
         let _ = self.display.flush_clients();
         started
+    }
+
+    #[doc(hidden)]
+    pub fn x11_resize_active(&self, handle: X11WindowHandle) -> bool {
+        self.state.x11_resize_active(handle)
+    }
+
+    #[doc(hidden)]
+    pub fn begin_x11_resize_for_test(
+        &mut self,
+        handle: X11WindowHandle,
+        geometry: crate::xwayland::xwm::X11Geometry,
+    ) -> bool {
+        self.state.begin_x11_resize_for_test(handle, geometry)
+    }
+
+    #[doc(hidden)]
+    pub fn finalize_x11_resize_for_test(
+        &mut self,
+        handle: X11WindowHandle,
+        geometry: crate::xwayland::xwm::X11Geometry,
+    ) -> bool {
+        self.state.finalize_x11_resize_for_test(handle, geometry)
     }
 
     pub fn begin_window_frame_action_at(&mut self, x: f64, y: f64) -> bool {

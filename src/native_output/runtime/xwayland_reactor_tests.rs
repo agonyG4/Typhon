@@ -13,7 +13,10 @@ use std::{
 use x11rb::{
     connection::Connection,
     protocol::sync::{ConnectionExt as SyncConnectionExt, Int64},
-    protocol::xproto::{AtomEnum, ConnectionExt, CreateWindowAux, PropMode, WindowClass},
+    protocol::xproto::{
+        AtomEnum, ChangeWindowAttributesAux, ConnectionExt, CreateGCAux, CreateWindowAux,
+        EventMask, PropMode, Rectangle, WindowClass,
+    },
     wrapper::ConnectionExt as WrapperConnectionExt,
 };
 
@@ -36,9 +39,27 @@ struct ServerEvents {
     buffers: Vec<(XwaylandGeneration, u32)>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum CompositorEvent {
     Xwayland(XwmEvent),
+    BeginResize {
+        handle: oblivion_one::xwayland::X11WindowHandle,
+        geometry: oblivion_one::xwayland::xwm::X11Geometry,
+        reply: mpsc::Sender<bool>,
+    },
+    UpdateResize {
+        handle: oblivion_one::xwayland::X11WindowHandle,
+        geometry: oblivion_one::xwayland::xwm::X11Geometry,
+    },
+    EndResize {
+        handle: oblivion_one::xwayland::X11WindowHandle,
+        geometry: oblivion_one::xwayland::xwm::X11Geometry,
+    },
+    ResizeActive {
+        handle: oblivion_one::xwayland::X11WindowHandle,
+        reply: mpsc::Sender<bool>,
+    },
 }
 
 fn test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -154,6 +175,65 @@ fn apply_compositor_commands(
     }
 }
 
+fn answer_x11_sync_requests(
+    client: &impl Connection,
+    window: u32,
+    sync_counter: u32,
+    wm_protocols_atom: u32,
+    sync_request_atom: u32,
+    gc: u32,
+    requested_values: &mut Vec<u64>,
+) {
+    loop {
+        let event = match client.poll_for_event() {
+            Ok(Some(event)) => event,
+            Ok(None) | Err(_) => return,
+        };
+        let x11rb::protocol::Event::ClientMessage(message) = event else {
+            continue;
+        };
+        let data = message.data.as_data32();
+        if message.window != window
+            || message.type_ != wm_protocols_atom
+            || message.format != 32
+            || data[0] != sync_request_atom
+        {
+            continue;
+        }
+        let value = ((u64::from(data[3])) << 32) | u64::from(data[2]);
+        requested_values.push(value);
+        client
+            .sync_set_counter(
+                sync_counter,
+                Int64 {
+                    hi: data[3] as i32,
+                    lo: data[2],
+                },
+            )
+            .expect("update XSync counter from client message");
+        let counter = client
+            .sync_query_counter(sync_counter)
+            .expect("query XSync counter after acknowledgement")
+            .reply()
+            .expect("XSync counter reply")
+            .counter_value;
+        assert_eq!(counter.lo, data[2]);
+        client
+            .poly_fill_rectangle(
+                window,
+                gc,
+                &[Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                }],
+            )
+            .expect("damage X11 window after XSync acknowledgement");
+        client.flush().expect("flush XSync acknowledgement");
+    }
+}
+
 #[test]
 fn x11_window_reaches_window_ready_without_direct_fd_polling() {
     let _lock = test_lock();
@@ -199,9 +279,35 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
     let server_thread = thread::spawn(move || {
         while server_running.load(Ordering::Relaxed) {
             let _ = compositor.tick();
-            while let Ok(CompositorEvent::Xwayland(event)) = compositor_event_receiver.try_recv() {
-                let commands = compositor.apply_xwayland_window_event(event);
-                let _ = compositor_command_sender.send(commands);
+            compositor.prepare_frame();
+            while let Ok(event) = compositor_event_receiver.try_recv() {
+                match event {
+                    CompositorEvent::Xwayland(event) => {
+                        let commands = compositor.apply_xwayland_window_event(event);
+                        let _ = compositor_command_sender.send(commands);
+                    }
+                    CompositorEvent::BeginResize {
+                        handle,
+                        geometry,
+                        reply,
+                    } => {
+                        let _ = reply.send(compositor.begin_x11_resize_for_test(handle, geometry));
+                    }
+                    CompositorEvent::UpdateResize { handle, geometry } => {
+                        let _ = compositor.begin_x11_resize_for_test(handle, geometry);
+                    }
+                    CompositorEvent::EndResize { handle, geometry } => {
+                        let _ = compositor.finalize_x11_resize_for_test(handle, geometry);
+                    }
+                    CompositorEvent::ResizeActive { handle, reply } => {
+                        let _ = reply.send(compositor.x11_resize_active(handle));
+                    }
+                }
+            }
+            let backend_commands =
+                compositor.take_xwayland_backend_commands(monotonic_now_ns().unwrap_or_default());
+            if !backend_commands.is_empty() {
+                let _ = compositor_command_sender.send(backend_commands);
             }
             let events = ServerEvents {
                 binds: compositor.take_xwayland_shell_bind_events(),
@@ -308,6 +414,7 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
     let root_window = client.setup().roots[screen].root;
     let window = client.generate_id().expect("allocate X11 window");
     let sync_counter = client.generate_id().expect("allocate XSync counter");
+    let gc = client.generate_id().expect("allocate X11 drawing context");
     client
         .sync_create_counter(sync_counter, Int64 { hi: 0, lo: 0 })
         .expect("create XSync counter");
@@ -316,6 +423,18 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
         .expect("intern XSync counter atom")
         .reply()
         .expect("XSync counter atom reply")
+        .atom;
+    let sync_request_atom = client
+        .intern_atom(false, b"_NET_WM_SYNC_REQUEST")
+        .expect("intern XSync request atom")
+        .reply()
+        .expect("XSync request atom reply")
+        .atom;
+    let wm_protocols_atom = client
+        .intern_atom(false, b"WM_PROTOCOLS")
+        .expect("intern WM_PROTOCOLS atom")
+        .reply()
+        .expect("WM_PROTOCOLS atom reply")
         .atom;
     client
         .create_window(
@@ -332,6 +451,15 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
             &CreateWindowAux::new(),
         )
         .expect("create X11 managed window");
+    client
+        .create_gc(gc, window, &CreateGCAux::new().foreground(0xffff_ffff))
+        .expect("create X11 drawing context");
+    client
+        .change_window_attributes(
+            window,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+        )
+        .expect("select X11 window events");
     client
         .change_property8(
             PropMode::REPLACE,
@@ -350,6 +478,27 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
             &[sync_counter],
         )
         .expect("set X11 sync counter");
+    client
+        .change_property32(
+            PropMode::REPLACE,
+            window,
+            wm_protocols_atom,
+            AtomEnum::ATOM,
+            &[sync_request_atom],
+        )
+        .expect("advertise XSync request protocol");
+    client
+        .poly_fill_rectangle(
+            window,
+            gc,
+            &[Rectangle {
+                x: 0,
+                y: 0,
+                width: 420,
+                height: 180,
+            }],
+        )
+        .expect("draw initial X11 window contents");
     client.map_window(window).expect("map X11 managed window");
     client.flush().expect("flush X11 managed window");
     client
@@ -426,34 +575,185 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
     );
     let snapshot = ready_snapshot.expect("WindowReady snapshot");
     assert_eq!(snapshot.sync_counter, Some(sync_counter as u64));
-    for (width, height) in [(460, 220), (520, 260), (580, 300)] {
-        service
-            .execute_managed_command(
-                &mut supervisor,
-                XwmCommand::BeginResizeSync {
-                    window: snapshot.handle,
-                    geometry: oblivion_one::xwayland::xwm::X11Geometry {
-                        x: 120,
-                        y: 120,
-                        width,
-                        height,
-                    },
-                    counter_value: 0,
-                    deadline_ns: monotonic_now_ns()
-                        .expect("native reactor resize clock")
-                        .saturating_add(500_000_000),
-                    final_pending: false,
+    let (resize_started_sender, resize_started_receiver) = mpsc::channel();
+    compositor_event_sender
+        .send(CompositorEvent::BeginResize {
+            handle: snapshot.handle,
+            geometry: oblivion_one::xwayland::xwm::X11Geometry {
+                x: 120,
+                y: 120,
+                width: 460,
+                height: 220,
+            },
+            reply: resize_started_sender,
+        })
+        .expect("request native compositor resize start");
+    assert!(
+        resize_started_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("receive native compositor resize start"),
+        "native compositor resize hit the managed X11 surface"
+    );
+    for (x, y) in [(350.0, 230.0), (380.0, 250.0), (410.0, 270.0)] {
+        compositor_event_sender
+            .send(CompositorEvent::UpdateResize {
+                handle: snapshot.handle,
+                geometry: oblivion_one::xwayland::xwm::X11Geometry {
+                    x: 120,
+                    y: 120,
+                    width: x as u32 + 110,
+                    height: y as u32 + 10,
                 },
-            )
-            .expect("issue native reactor synchronized resize");
+            })
+            .expect("send native compositor pointer geometry");
     }
-    service
-        .flush_managed_commands(&mut supervisor)
-        .expect("flush native reactor synchronized resize");
-    assert_eq!(
-        service.resize_sync_snapshot(snapshot.handle),
-        Some((1, false)),
-        "rapid pointer geometries keep one outstanding XSync transaction"
+    // Let the compositor present the first coalesced pointer geometry. The
+    // release is deliberately sent only after that transaction is presented,
+    // which exercises the idle-tracker final-transaction path.
+    let mut requested_values = Vec::new();
+    let mut intermediate_presented = false;
+    let mut final_presented = false;
+    let mut release_sent = false;
+    let mut committed_resize_buffers = 0;
+    let resize_deadline = Instant::now() + Duration::from_secs(15);
+    while !final_presented {
+        assert!(
+            Instant::now() < resize_deadline,
+            "native synchronized resize did not reach final presentation"
+        );
+        answer_x11_sync_requests(
+            &client,
+            window,
+            sync_counter,
+            wm_protocols_atom,
+            sync_request_atom,
+            gc,
+            &mut requested_values,
+        );
+        while committed_resize_buffers < requested_values.len() {
+            let counter_value = requested_values[committed_resize_buffers];
+            service.acknowledge_resize_sync_for_test(snapshot.handle, counter_value);
+            service
+                .mark_managed_surface_buffer_ready(&mut supervisor, generation, snapshot.surface_id)
+                .expect("publish native XSync resize buffer commit");
+            committed_resize_buffers += 1;
+        }
+        let wakeup = event_loop.wait().expect("wait for resize reactor event");
+        if wakeup.reasons.timer() {
+            service
+                .handle_deadline(
+                    monotonic_now_ns().expect("native resize deadline clock"),
+                    &mut supervisor,
+                )
+                .expect("handle native resize deadline");
+        }
+        dispatch_wakeup(
+            &wakeup,
+            &mut event_loop,
+            &tokens,
+            &mut service,
+            &mut supervisor,
+        );
+        process_server_events(
+            &events_receiver,
+            &mut service,
+            &mut supervisor,
+            &mut binds_seen,
+        );
+        for event in service.take_managed_xwm_events() {
+            match event {
+                event @ XwmEvent::ResizeSyncPresentedIntermediate(handle)
+                    if handle == snapshot.handle =>
+                {
+                    intermediate_presented = true;
+                    let (active_sender, active_receiver) = mpsc::channel();
+                    compositor_event_sender
+                        .send(CompositorEvent::ResizeActive {
+                            handle,
+                            reply: active_sender,
+                        })
+                        .expect("query intermediate resize preview");
+                    assert!(
+                        active_receiver
+                            .recv_timeout(Duration::from_secs(2))
+                            .expect("receive intermediate resize preview"),
+                        "preview remains active after intermediate presentation"
+                    );
+                    if !release_sent {
+                        compositor_event_sender
+                            .send(CompositorEvent::EndResize {
+                                handle: snapshot.handle,
+                                geometry: oblivion_one::xwayland::xwm::X11Geometry {
+                                    x: 120,
+                                    y: 120,
+                                    width: 580,
+                                    height: 300,
+                                },
+                            })
+                            .expect("release native compositor resize");
+                        release_sent = true;
+                    }
+                    compositor_event_sender
+                        .send(CompositorEvent::Xwayland(event))
+                        .expect("send intermediate presentation to compositor");
+                }
+                event @ XwmEvent::ResizeSyncPresented(handle) if handle == snapshot.handle => {
+                    final_presented = true;
+                    compositor_event_sender
+                        .send(CompositorEvent::Xwayland(event))
+                        .expect("send final presentation to compositor");
+                }
+                _ => {}
+            }
+        }
+        apply_compositor_commands(&compositor_command_receiver, &mut service, &mut supervisor);
+        sync_sources(&mut event_loop, &mut service, &mut tokens)
+            .expect("synchronize resize reactor sources");
+    }
+    answer_x11_sync_requests(
+        &client,
+        window,
+        sync_counter,
+        wm_protocols_atom,
+        sync_request_atom,
+        gc,
+        &mut requested_values,
+    );
+    while committed_resize_buffers < requested_values.len() {
+        let counter_value = requested_values[committed_resize_buffers];
+        service.acknowledge_resize_sync_for_test(snapshot.handle, counter_value);
+        service
+            .mark_managed_surface_buffer_ready(&mut supervisor, generation, snapshot.surface_id)
+            .expect("publish final native XSync resize buffer commit");
+        committed_resize_buffers += 1;
+    }
+    assert!(
+        intermediate_presented,
+        "resize emitted an intermediate presentation"
+    );
+    assert!(release_sent, "resize release became final_pending");
+    assert!(
+        requested_values.len() >= 2,
+        "rapid pointer geometries and release produce multiple serialized requests"
+    );
+    assert!(
+        requested_values
+            .windows(2)
+            .all(|values| values[0] < values[1]),
+        "XSync request counters advance monotonically with one outstanding request"
+    );
+    let (active_sender, active_receiver) = mpsc::channel();
+    compositor_event_sender
+        .send(CompositorEvent::ResizeActive {
+            handle: snapshot.handle,
+            reply: active_sender,
+        })
+        .expect("query final resize preview");
+    assert!(
+        !active_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("receive final resize preview"),
+        "preview clears only after final presentation"
     );
     service
         .execute_managed_command(
@@ -473,6 +773,18 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
         .reply()
         .expect("client-list atom reply")
         .atom;
+    let stacking_atom = client
+        .intern_atom(false, b"_NET_CLIENT_LIST_STACKING")
+        .expect("intern client-stacking atom")
+        .reply()
+        .expect("client-stacking atom reply")
+        .atom;
+    let active_window_atom = client
+        .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+        .expect("intern active-window atom")
+        .reply()
+        .expect("active-window atom reply")
+        .atom;
     let client_list = client
         .get_property(
             false,
@@ -490,6 +802,105 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
             .value32()
             .is_some_and(|mut values| values.any(|xid| xid == window))
     );
+
+    // Keep an unrelated normal client below the parent so popup-family
+    // insertion can prove that raising the family never lowers the parent.
+    let unrelated = client.generate_id().expect("allocate unrelated X11 window");
+    client
+        .create_window(
+            client.setup().roots[screen].root_depth,
+            unrelated,
+            root_window,
+            700,
+            120,
+            180,
+            90,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            client.setup().roots[screen].root_visual,
+            &CreateWindowAux::new(),
+        )
+        .expect("create unrelated X11 window");
+    client
+        .change_property8(
+            PropMode::REPLACE,
+            unrelated,
+            AtomEnum::WM_NAME,
+            AtomEnum::STRING,
+            b"native reactor unrelated window",
+        )
+        .expect("set unrelated X11 window title");
+    client
+        .map_window(unrelated)
+        .expect("map unrelated X11 window");
+    client.flush().expect("flush unrelated X11 window");
+    let unrelated_deadline = Instant::now() + Duration::from_secs(15);
+    let mut unrelated_snapshot = None;
+    while unrelated_snapshot.is_none() {
+        assert!(
+            Instant::now() < unrelated_deadline,
+            "unrelated X11 window did not reach WindowReady"
+        );
+        let wakeup = event_loop.wait().expect("wait for unrelated reactor event");
+        if wakeup.reasons.timer() {
+            service
+                .handle_deadline(
+                    monotonic_now_ns().expect("native unrelated deadline clock"),
+                    &mut supervisor,
+                )
+                .expect("handle unrelated deadline");
+        }
+        dispatch_wakeup(
+            &wakeup,
+            &mut event_loop,
+            &tokens,
+            &mut service,
+            &mut supervisor,
+        );
+        process_server_events(
+            &events_receiver,
+            &mut service,
+            &mut supervisor,
+            &mut binds_seen,
+        );
+        for event in service.take_managed_xwm_events() {
+            match event {
+                XwmEvent::WindowMapRequested(handle) => {
+                    service
+                        .execute_managed_command(&mut supervisor, XwmCommand::Map(handle))
+                        .expect("execute unrelated map command");
+                    service
+                        .flush_managed_commands(&mut supervisor)
+                        .expect("flush unrelated map command");
+                }
+                XwmEvent::WindowReady(snapshot) if snapshot.handle.xid() == unrelated => {
+                    compositor_event_sender
+                        .send(CompositorEvent::Xwayland(XwmEvent::WindowReady(
+                            snapshot.clone(),
+                        )))
+                        .expect("send unrelated WindowReady to compositor");
+                    unrelated_snapshot = Some(snapshot);
+                }
+                _ => {}
+            }
+        }
+        apply_compositor_commands(&compositor_command_receiver, &mut service, &mut supervisor);
+        sync_sources(&mut event_loop, &mut service, &mut tokens)
+            .expect("synchronize unrelated reactor sources");
+    }
+    let unrelated_snapshot = unrelated_snapshot.expect("unrelated WindowReady snapshot");
+    service
+        .execute_managed_command(
+            &mut supervisor,
+            XwmCommand::Focus {
+                window: Some(snapshot.handle),
+                timestamp: 0,
+            },
+        )
+        .expect("focus parent before popup");
+    service
+        .flush_managed_commands(&mut supervisor)
+        .expect("flush parent focus before popup");
 
     // Map a real X11 popup through the same NativeEventLoop path. The
     // compositor thread receives WindowReady and publishes the semantic
@@ -657,8 +1068,138 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
             parent_geometry_after.height
         ),
     );
+
+    thread::sleep(Duration::from_millis(25));
+    apply_compositor_commands(&compositor_command_receiver, &mut service, &mut supervisor);
+    let stacking = client
+        .get_property(false, root_window, stacking_atom, AtomEnum::WINDOW, 0, 1024)
+        .expect("query stacking after popup")
+        .reply()
+        .expect("stacking after popup reply")
+        .value32()
+        .map(|values| values.collect::<Vec<_>>())
+        .unwrap_or_default();
+    let unrelated_position = stacking
+        .iter()
+        .position(|xid| *xid == unrelated_snapshot.handle.xid())
+        .expect("unrelated window remains in EWMH stacking");
+    let parent_position = stacking
+        .iter()
+        .position(|xid| *xid == window)
+        .expect("parent remains in EWMH stacking");
+    let popup_position = stacking.iter().position(|xid| *xid == popup);
+    assert!(
+        unrelated_position < parent_position && popup_position.is_none(),
+        "normal EWMH stacking excludes popup and keeps parent above unrelated: {stacking:?}"
+    );
+    let physical_stacking = client
+        .query_tree(root_window)
+        .expect("query physical X11 stacking after popup")
+        .reply()
+        .expect("physical X11 stacking after popup reply")
+        .children;
+    let physical_unrelated_position = physical_stacking
+        .iter()
+        .position(|xid| *xid == unrelated)
+        .expect("unrelated window remains physically stacked");
+    let physical_parent_position = physical_stacking
+        .iter()
+        .position(|xid| *xid == window)
+        .expect("parent remains physically stacked");
+    let physical_popup_position = physical_stacking
+        .iter()
+        .position(|xid| *xid == popup)
+        .expect("popup remains physically stacked");
+    assert!(
+        physical_unrelated_position < physical_parent_position
+            && physical_parent_position < physical_popup_position,
+        "unrelated below parent below popup physically: {physical_stacking:?}"
+    );
     client.unmap_window(popup).expect("unmap X11 popup window");
     client.flush().expect("flush X11 popup unmap");
+
+    let popup_close_deadline = Instant::now() + Duration::from_secs(15);
+    let mut popup_closed = false;
+    while !popup_closed {
+        assert!(
+            Instant::now() < popup_close_deadline,
+            "popup unmap did not reach NativeEventLoop"
+        );
+        let wakeup = event_loop
+            .wait()
+            .expect("wait for popup unmap reactor event");
+        if wakeup.reasons.timer() {
+            service
+                .handle_deadline(
+                    monotonic_now_ns().expect("native popup unmap deadline clock"),
+                    &mut supervisor,
+                )
+                .expect("handle popup unmap deadline");
+        }
+        dispatch_wakeup(
+            &wakeup,
+            &mut event_loop,
+            &tokens,
+            &mut service,
+            &mut supervisor,
+        );
+        process_server_events(
+            &events_receiver,
+            &mut service,
+            &mut supervisor,
+            &mut binds_seen,
+        );
+        for event in service.take_managed_xwm_events() {
+            match event {
+                event @ (XwmEvent::WindowWithdrawn(handle) | XwmEvent::WindowDestroyed(handle))
+                    if handle.xid() == popup =>
+                {
+                    compositor_event_sender
+                        .send(CompositorEvent::Xwayland(event))
+                        .expect("send popup unmap to compositor");
+                    popup_closed = true;
+                }
+                _ => {}
+            }
+        }
+        apply_compositor_commands(&compositor_command_receiver, &mut service, &mut supervisor);
+        sync_sources(&mut event_loop, &mut service, &mut tokens)
+            .expect("synchronize popup unmap reactor sources");
+    }
+    apply_compositor_commands(&compositor_command_receiver, &mut service, &mut supervisor);
+    let active_window = client
+        .get_property(
+            false,
+            root_window,
+            active_window_atom,
+            AtomEnum::WINDOW,
+            0,
+            1,
+        )
+        .expect("query active window after popup close")
+        .reply()
+        .expect("active window after popup close reply")
+        .value32()
+        .and_then(|mut values| values.next());
+    assert_eq!(active_window, Some(window));
+    let stacking_after_close = client
+        .get_property(false, root_window, stacking_atom, AtomEnum::WINDOW, 0, 1024)
+        .expect("query stacking after popup close")
+        .reply()
+        .expect("stacking after popup close reply")
+        .value32()
+        .map(|values| values.collect::<Vec<_>>())
+        .unwrap_or_default();
+    assert!(
+        stacking_after_close
+            .iter()
+            .position(|xid| *xid == unrelated)
+            .zip(stacking_after_close.iter().position(|xid| *xid == window))
+            .is_some_and(|(unrelated_position, parent_position)| {
+                unrelated_position < parent_position
+            }),
+        "parent remains above unrelated after popup close: {stacking_after_close:?}"
+    );
 
     service
         .emergency_cleanup(&mut supervisor)

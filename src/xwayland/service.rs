@@ -1110,6 +1110,13 @@ impl XwaylandService {
         }
     }
 
+    #[doc(hidden)]
+    pub fn acknowledge_resize_sync_for_test(&mut self, handle: super::X11WindowHandle, value: u64) {
+        if let ServiceState::Running(resources) = &mut self.state {
+            resources.xwm.note_resize_sync_ack_for_test(handle, value);
+        }
+    }
+
     pub fn execute_managed_command(
         &mut self,
         supervisor: &mut ChildSupervisor,

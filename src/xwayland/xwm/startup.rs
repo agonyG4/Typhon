@@ -1337,6 +1337,8 @@ impl XwmStartup {
             sync_alarms: Default::default(),
             sync_handles_by_counter: Default::default(),
             next_resize_counter_values: Default::default(),
+            family_order: Default::default(),
+            next_family_order: 0,
             expected_configures: Default::default(),
             immediate_resize_windows: Default::default(),
             fallback_resize_windows: Default::default(),
