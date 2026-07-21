@@ -10,6 +10,7 @@ mod hit_testing;
 mod input_dispatch;
 mod input_resources;
 mod output_membership;
+mod output_state;
 mod pointer_constraints;
 mod resize;
 mod roles;
@@ -17,6 +18,7 @@ mod shortcuts;
 mod shutdown;
 mod subsurfaces;
 mod support_types;
+mod surface_commit_placement;
 mod surface_commits;
 mod surface_transactions;
 mod surfaces;
@@ -47,6 +49,8 @@ pub(in crate::compositor) use input_resources::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use output_membership::*;
 #[allow(unused_imports)]
+pub(in crate::compositor) use output_state::*;
+#[allow(unused_imports)]
 pub(in crate::compositor) use pointer_constraints::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use resize::*;
@@ -60,6 +64,8 @@ pub(in crate::compositor) use shutdown::*;
 pub(in crate::compositor) use subsurfaces::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use support_types::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use surface_commit_placement::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use surface_commits::*;
 #[allow(unused_imports)]

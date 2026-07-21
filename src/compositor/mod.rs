@@ -355,13 +355,11 @@ enum SurfacePublicationDecision {
     StaleAlreadyPublished,
     SupersededByNewerAttachment,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SurfacePublicationContext {
     ImmediateLatestAttachment,
     OrderedExplicitSyncQueue,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 enum SurfacePublicationSource {
@@ -370,7 +368,6 @@ enum SurfacePublicationSource {
     SurfaceTree,
     RemoveContent,
 }
-
 impl SurfacePublicationSource {
     const fn as_str(self) -> &'static str {
         match self {
@@ -392,12 +389,10 @@ impl SurfacePublicationSource {
         }
     }
 }
-
 struct ReleasedSurfaceTreeState {
     callbacks: Vec<wl_callback::WlCallback>,
     resize_commit: Option<ResizeCommitSnapshot>,
 }
-
 #[derive(Debug, Default)]
 struct SurfaceTreeMergeStats {
     incoming_nodes: usize,
@@ -718,7 +713,6 @@ struct PendingLockedPointerReveal {
     fallback_position: Option<OutputPosition>,
     created_dispatch_epoch: u64,
 }
-
 #[derive(Debug, Clone)]
 struct ImplicitPointerGrab {
     surface: wl_surface::WlSurface,
