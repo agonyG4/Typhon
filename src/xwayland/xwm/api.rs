@@ -82,14 +82,24 @@ impl Xwm {
                     });
                 self.association.remove_wayland_surface(surface_id);
                 self.clear_surface_buffer_ready(surface_id);
-                if let Some(handle) = owner
-                    && self
+                if let Some(handle) = owner {
+                    let iconic = self
                         .windows
-                        .clear_association(handle, surface_id)
-                        .map_err(XwmError::InvalidCommand)?
-                {
-                    self.outgoing_events
-                        .push_back(XwmEvent::WindowWithdrawn(handle));
+                        .get(handle)
+                        .is_some_and(|record| record.lifecycle == X11WindowLifecycle::Iconic);
+                    let cleared = if iconic {
+                        self.windows
+                            .dissociate_surface_preserving_identity(handle, surface_id)
+                            .map_err(XwmError::InvalidCommand)?
+                    } else {
+                        self.windows
+                            .clear_association(handle, surface_id)
+                            .map_err(XwmError::InvalidCommand)?
+                    };
+                    if cleared && !iconic {
+                        self.outgoing_events
+                            .push_back(XwmEvent::WindowWithdrawn(handle));
+                    }
                 }
             }
         }

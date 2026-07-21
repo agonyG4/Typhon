@@ -1312,6 +1312,52 @@ mod tests {
     }
 
     #[test]
+    fn iconic_wayland_surface_removal_preserves_window_identity() {
+        let generation = generation(29);
+        let (mut xwm, _peer) = test_fixture(generation);
+        let handle = prepare_managed_window(&mut xwm, 129, true, false, false);
+        xwm.note_x11_surface_serial(handle, 0x1234, 0)
+            .expect("X11 surface serial");
+        xwm.ingest_wayland_association(XwaylandAssociationEvent::Committed {
+            generation,
+            serial: NonZeroU64::new(0x1234).expect("surface serial"),
+            surface_id: 42,
+        })
+        .expect("Wayland association");
+        xwm.mark_window_buffer_ready(handle)
+            .expect("buffer readiness");
+        normalize(&mut xwm, map_event(handle.xid(), false)).expect("MapNotify");
+        assert!(matches!(
+            ready_events(&mut xwm).as_slice(),
+            [super::super::XwmEvent::WindowReady(snapshot)] if snapshot.handle == handle
+        ));
+        let association = xwm
+            .windows
+            .get(handle)
+            .and_then(|record| record.association)
+            .expect("ready window association");
+
+        super::super::commands::execute(&mut xwm, super::super::XwmCommand::Unmap(handle))
+            .expect("WM unmap command");
+        normalize(&mut xwm, unmap_event(handle.xid())).expect("WM UnmapNotify");
+        assert!(ready_events(&mut xwm).is_empty());
+
+        xwm.ingest_wayland_association(XwaylandAssociationEvent::Removed {
+            generation,
+            serial: association.serial,
+            surface_id: association.surface_id,
+        })
+        .expect("old Wayland surface removal");
+
+        assert!(ready_events(&mut xwm).is_empty());
+        let record = xwm.windows.get(handle).expect("iconic window record");
+        assert_eq!(record.lifecycle, X11WindowLifecycle::Iconic);
+        assert!(record.snapshot.is_some());
+        assert!(record.association.is_none());
+        assert!(!record.buffer_ready);
+    }
+
+    #[test]
     fn wayland_surface_removal_clears_the_mapped_x11_record() {
         let generation = generation(17);
         let (mut xwm, mut peer) = test_fixture(generation);

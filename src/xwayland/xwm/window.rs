@@ -337,11 +337,40 @@ impl X11WindowRegistry {
         if record.association.is_some() {
             return Err("window is already associated");
         }
-        if record.snapshot.is_some() {
+        let remapping = record.map_requested
+            && !record.buffer_ready
+            && matches!(
+                record.lifecycle,
+                X11WindowLifecycle::Iconic
+                    | X11WindowLifecycle::MapCommanded
+                    | X11WindowLifecycle::MappedAwaitingAssociation
+                    | X11WindowLifecycle::AssociatedAwaitingBuffer
+            );
+        if record.snapshot.is_some() && !remapping {
             return Err("window is already ready");
         }
         record.association = Some(association);
         self.update_pending_lifecycle(handle)
+    }
+
+    pub(crate) fn dissociate_surface_preserving_identity(
+        &mut self,
+        handle: X11WindowHandle,
+        surface_id: u32,
+    ) -> Result<bool, &'static str> {
+        let record = self.record_mut(handle)?;
+        if record
+            .association
+            .is_none_or(|association| association.surface_id != surface_id)
+        {
+            return Ok(false);
+        }
+        record.association = None;
+        record.buffer_ready = false;
+        if record.lifecycle != X11WindowLifecycle::Iconic {
+            self.update_pending_lifecycle(handle)?;
+        }
+        Ok(true)
     }
 
     pub(crate) fn clear_association(
