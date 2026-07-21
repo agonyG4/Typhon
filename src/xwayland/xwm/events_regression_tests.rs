@@ -188,3 +188,48 @@ fn iconic_client_map_request_starts_a_new_map_epoch() {
     .expect("duplicate client MapRequest");
     assert!(ready_events(&mut xwm).is_empty());
 }
+
+#[test]
+fn restore_before_old_surface_removed_preserves_the_new_map_epoch() {
+    let generation = generation(32);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 132, true, false, false);
+    xwm.note_x11_surface_serial(handle, 0x1234, 0)
+        .expect("old X11 surface serial");
+    xwm.ingest_wayland_association(XwaylandAssociationEvent::Committed {
+        generation,
+        serial: NonZeroU64::new(0x1234).expect("old serial"),
+        surface_id: 42,
+    })
+    .expect("old Wayland association");
+    xwm.mark_window_buffer_ready(handle)
+        .expect("old buffer readiness");
+    normalize(&mut xwm, map_event(handle.xid(), false)).expect("MapNotify");
+    let _ = ready_events(&mut xwm);
+    let association = xwm
+        .windows
+        .get(handle)
+        .and_then(|record| record.association)
+        .expect("old association");
+
+    super::super::commands::execute(&mut xwm, XwmCommand::Unmap(handle)).expect("WM unmap command");
+    normalize(&mut xwm, unmap_event(handle.xid())).expect("WM UnmapNotify");
+    let _ = ready_events(&mut xwm);
+    super::super::commands::execute(&mut xwm, XwmCommand::Map(handle))
+        .expect("restore map command");
+
+    xwm.ingest_wayland_association(XwaylandAssociationEvent::Removed {
+        generation,
+        serial: association.serial,
+        surface_id: association.surface_id,
+    })
+    .expect("old surface removal during restore");
+
+    assert!(ready_events(&mut xwm).is_empty());
+    let record = xwm.windows.get(handle).expect("restoring window record");
+    assert!(record.snapshot.is_some());
+    assert_eq!(
+        record.lifecycle,
+        super::super::X11WindowLifecycle::MapCommanded
+    );
+}

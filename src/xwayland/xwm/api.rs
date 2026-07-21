@@ -86,18 +86,22 @@ impl Xwm {
                     .find_map(|(handle, association)| {
                         (association.surface_id == surface_id).then_some(*handle)
                     });
+                let removed_association =
+                    owner.and_then(|handle| self.association.completed.get(&handle).copied());
                 self.association.remove_wayland_surface(surface_id);
                 self.clear_surface_buffer_ready(surface_id);
                 if let Some(handle) = owner {
-                    let iconic = self
-                        .windows
-                        .get(handle)
-                        .is_some_and(|record| record.lifecycle == X11WindowLifecycle::Iconic);
+                    let preserve_identity = self.windows.get(handle).is_some_and(|record| {
+                        record.lifecycle == X11WindowLifecycle::Iconic
+                            || removed_association.is_some_and(|association| {
+                                record.map_serial > association.map_serial
+                            })
+                    });
                     let cleared = self
                         .windows
-                        .clear_association(handle, surface_id, iconic)
+                        .clear_association(handle, surface_id, preserve_identity)
                         .map_err(XwmError::InvalidCommand)?;
-                    if cleared && !iconic {
+                    if cleared && !preserve_identity {
                         self.outgoing_events
                             .push_back(XwmEvent::WindowWithdrawn(handle));
                     }
