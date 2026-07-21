@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 
 use super::{X11Geometry, X11WindowHandle, XwaylandGeneration};
 use crate::compositor::SurfaceCommitSequence;
 
-pub const RESIZE_SYNC_TIMEOUT_NS: u64 = 500_000_000;
+pub const RESIZE_SYNC_TIMEOUT_NS: u64 = 10_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeSyncState {
@@ -85,6 +85,7 @@ pub(crate) struct ResizeSyncTracker {
     transactions: HashMap<X11WindowHandle, ResizeSyncTransaction>,
     desired: HashMap<X11WindowHandle, ResizeSyncDesired>,
     next_transaction_ids: HashMap<X11WindowHandle, u64>,
+    sync_disabled: HashSet<X11WindowHandle>,
 }
 
 impl ResizeSyncTracker {
@@ -267,6 +268,7 @@ impl ResizeSyncTracker {
         if timed_out {
             self.states
                 .insert(handle, ResizeSyncState::FallbackUnsynchronized);
+            self.sync_disabled.insert(handle);
         }
         timed_out
     }
@@ -312,6 +314,19 @@ impl ResizeSyncTracker {
         self.states.remove(&handle);
         self.transactions.remove(&handle);
         self.desired.remove(&handle);
+        self.sync_disabled.remove(&handle);
+    }
+
+    pub(crate) fn disable_after_timeout(&mut self, handle: X11WindowHandle) {
+        self.sync_disabled.insert(handle);
+    }
+
+    pub(crate) fn sync_disabled(&self, handle: X11WindowHandle) -> bool {
+        self.sync_disabled.contains(&handle)
+    }
+
+    pub(crate) fn reenable_sync(&mut self, handle: X11WindowHandle) {
+        self.sync_disabled.remove(&handle);
     }
 
     pub(crate) fn clear_generation(&mut self, generation: XwaylandGeneration) {
@@ -323,6 +338,8 @@ impl ResizeSyncTracker {
             .retain(|handle, _| handle.generation() != generation);
         self.next_transaction_ids
             .retain(|handle, _| handle.generation() != generation);
+        self.sync_disabled
+            .retain(|handle| handle.generation() != generation);
     }
 
     pub(crate) fn finish_timeout(&mut self, handle: X11WindowHandle) -> bool {
@@ -855,5 +872,25 @@ mod tests {
         assert!(tracker.timeout(window, 100));
         assert!(tracker.finish_timeout(window));
         assert_eq!(tracker.state(window), ResizeSyncState::Idle);
+    }
+
+    #[test]
+    fn slow_client_watchdog_allows_ten_seconds() {
+        assert_eq!(RESIZE_SYNC_TIMEOUT_NS, 10_000_000_000);
+    }
+
+    #[test]
+    fn timeout_disables_sync_until_a_matching_late_ack() {
+        let window = handle(1, 28);
+        let mut tracker = ResizeSyncTracker::default();
+        tracker
+            .begin_transaction(window, 7, 100, X11Geometry::default(), false)
+            .expect("transaction");
+        assert!(tracker.timeout(window, 100));
+        tracker.disable_after_timeout(window);
+        assert!(tracker.sync_disabled(window));
+        assert!(!tracker.acknowledge(window, 7));
+        tracker.reenable_sync(window);
+        assert!(!tracker.sync_disabled(window));
     }
 }

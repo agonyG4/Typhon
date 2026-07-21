@@ -57,6 +57,10 @@ impl FocusTracker {
         self.pending_focus = None;
     }
 
+    pub(crate) fn current_server_time(&self) -> u32 {
+        self.current_time.unwrap_or(1)
+    }
+
     pub(crate) fn note_focus_in(&mut self, xid: u32) {
         self.server_focus = Some(xid);
         if self.pending_focus == Some(xid) {
@@ -148,6 +152,11 @@ mod tests {
         assert_eq!(focus_model(Some(false), true), FocusModel::TakeFocusOnly);
         assert_eq!(focus_model(Some(false), false), FocusModel::NoFocus);
         assert!(should_send_take_focus(Some(false), true));
+    }
+
+    #[test]
+    fn sync_request_fallback_time_is_nonzero() {
+        assert_ne!(FocusTracker::default().current_server_time(), 0);
     }
 
     #[test]

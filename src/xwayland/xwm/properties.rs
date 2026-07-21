@@ -489,6 +489,7 @@ fn complete_property(
     let bit = pending.kind.bit();
     let mut requery = false;
     let mut delta = None;
+    let mut sync_counter_changed = false;
     {
         let Some(record) = xwm.windows.get_mut(pending.handle) else {
             xwm.property_metrics.stale = xwm.property_metrics.stale.saturating_add(1);
@@ -512,7 +513,10 @@ fn complete_property(
         } else {
             record.resolved_properties |= bit;
             if !record.refresh_all {
+                let previous_sync_counter = record.properties.sync_counter;
                 delta = commit_property(record, pending.kind);
+                sync_counter_changed = pending.kind == PropertyKind::NetWmSyncRequestCounter
+                    && previous_sync_counter != record.properties.sync_counter;
                 record.refresh_properties &= !bit;
             }
         }
@@ -520,6 +524,9 @@ fn complete_property(
     if requery {
         issue_property(xwm, pending.handle, pending.kind, pending.epoch)?;
     } else {
+        if sync_counter_changed {
+            xwm.clear_resize_sync(pending.handle);
+        }
         maybe_finish_refresh(xwm, pending.handle)?;
         match xwm
             .windows
@@ -586,30 +593,44 @@ fn maybe_finish_refresh(xwm: &mut Xwm, handle: X11WindowHandle) -> Result<(), Xw
         record.refresh_all
     };
     if publish_all {
-        let Some(record) = xwm.windows.get_mut(handle) else {
+        let Some((
+            sync_counter_changed,
+            property_epoch,
+            properties_ready,
+            window_type,
+            transient_for,
+        )) = xwm.windows.get_mut(handle).map(|record| {
+            let sync_counter_changed =
+                record.properties.sync_counter != record.staging_properties.sync_counter;
+            record.properties = record.staging_properties.clone();
+            update_snapshot(record);
+            record.properties_ready = true;
+            record.refresh_properties = 0;
+            record.refresh_all = false;
+            record.resolved_properties = all_mask();
+            (
+                sync_counter_changed,
+                record.property_epoch,
+                record.properties_ready,
+                record.properties.window_type,
+                record.properties.transient_for,
+            )
+        })
+        else {
             return Ok(());
         };
-        record.properties = record.staging_properties.clone();
-        update_snapshot(record);
-        record.properties_ready = true;
-        record.refresh_properties = 0;
-        record.refresh_all = false;
-        record.resolved_properties = all_mask();
         trace::emit("property_refresh_complete", || {
             TraceFields::new()
                 .field("source", "xwm")
                 .field("xid", handle.xid())
-                .field("property_epoch", record.property_epoch)
-                .field("properties_ready", record.properties_ready)
-                .field(
-                    "window_type",
-                    format!("{:?}", record.properties.window_type),
-                )
-                .optional(
-                    "transient_for",
-                    record.properties.transient_for.map(|parent| parent.xid()),
-                )
+                .field("property_epoch", property_epoch)
+                .field("properties_ready", properties_ready)
+                .field("window_type", format!("{:?}", window_type))
+                .optional("transient_for", transient_for.map(|parent| parent.xid()))
         });
+        if sync_counter_changed {
+            xwm.clear_resize_sync(handle);
+        }
     } else if let Some(record) = xwm.windows.get_mut(handle) {
         record.refresh_properties = 0;
         record.staging_properties = record.properties.clone();

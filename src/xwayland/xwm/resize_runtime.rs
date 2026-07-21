@@ -1,10 +1,12 @@
 use super::*;
 use crate::xwayland::trace::{self, TraceFields};
+use x11rb::connection::Connection;
 
 impl Xwm {
     pub(crate) fn handle_resize_sync_deadline(&mut self, now_ns: u64) -> Result<(), XwmError> {
         for handle in self.resize_sync.expired_handles(now_ns) {
             if self.resize_sync.timeout(handle, now_ns) {
+                self.resize_sync.disable_after_timeout(handle);
                 let transaction = self.resize_sync.transaction(handle);
                 let counter_value = self
                     .resize_sync
@@ -15,8 +17,14 @@ impl Xwm {
                     .resize_sync
                     .desired(handle)
                     .map(|desired| desired.geometry);
-                let allow_result = commands::set_allow_commits(self, handle, true);
-                self.clear_resize_sync_alarm(handle);
+                let desired = self.resize_sync.take_desired(handle);
+                let has_followup = desired.is_some();
+                let fallback_geometry = desired
+                    .map(|desired| desired.geometry)
+                    .or_else(|| transaction.map(|(_, geometry, _)| geometry));
+                let allow_result = commands::set_allow_commits(self, handle, true)
+                    .and_then(|()| self.connection.flush().map_err(XwmError::Connection));
+                self.timed_out_resize_counters.insert(handle, counter_value);
                 self.resize_sync.finish_timeout(handle);
                 allow_result?;
                 trace::emit("resize_timeout", || {
@@ -49,20 +57,8 @@ impl Xwm {
                         latest_desired,
                     );
                 }
-                let has_followup = self.resize_sync.desired(handle).is_some();
-                if !has_followup {
-                    self.fallback_resize_windows.insert(handle);
-                }
-                if let Some(desired) = self.resize_sync.take_desired(handle) {
-                    let now = crate::native::event_loop::monotonic_now_ns().unwrap_or(now_ns);
-                    commands::begin_resize_sync(
-                        self,
-                        handle,
-                        desired.geometry,
-                        0,
-                        now.saturating_add(RESIZE_SYNC_TIMEOUT_NS),
-                        desired.final_pending,
-                    )?;
+                if let Some(geometry) = fallback_geometry {
+                    commands::configure_immediate(self, handle, geometry, false)?;
                 }
                 self.outgoing_events.push_back(if has_followup {
                     XwmEvent::ResizeSyncTimedOutWithFollowup(handle)
@@ -105,6 +101,7 @@ impl Xwm {
     pub(crate) fn clear_resize_sync(&mut self, handle: X11WindowHandle) {
         self.resize_sync.clear(handle);
         self.clear_resize_sync_alarm(handle);
+        self.timed_out_resize_counters.remove(&handle);
         self.expected_configures.remove(&handle);
         self.immediate_resize_windows.remove(&handle);
         self.fallback_resize_windows.remove(&handle);
@@ -119,6 +116,8 @@ impl Xwm {
             .copied()
             .collect::<Vec<_>>();
         self.resize_sync.clear_generation(generation);
+        self.timed_out_resize_counters
+            .retain(|handle, _| handle.generation() != generation);
         self.next_resize_counter_values
             .retain(|handle, _| handle.generation() != generation);
         self.expected_configures

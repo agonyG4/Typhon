@@ -778,11 +778,11 @@ impl OwnCompositorServer {
                 let _ = self.state.finalize_x11_resize(window);
                 Vec::new()
             }
-            XwmEvent::ResizeSyncTimedOut(window) => {
+            XwmEvent::ResizeSyncTimedOut(window)
+            | XwmEvent::ResizeSyncTimedOutWithFollowup(window) => {
                 let _ = self.state.finalize_x11_resize_if_interaction_ended(window);
                 Vec::new()
             }
-            XwmEvent::ResizeSyncTimedOutWithFollowup(_) => Vec::new(),
             XwmEvent::CloseRequestedByClient(window) => {
                 if let Some(window_id) = self.state.window_id_for_x11_handle(window) {
                     self.state.backend_commands.push(

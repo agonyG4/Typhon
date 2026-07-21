@@ -365,6 +365,7 @@ pub struct Xwm {
     pub(crate) focus: focus::FocusTracker,
     pub(crate) sync_alarms: HashMap<X11WindowHandle, u32>,
     pub(crate) sync_handles_by_counter: HashMap<u32, X11WindowHandle>,
+    pub(crate) timed_out_resize_counters: HashMap<X11WindowHandle, u64>,
     pub(crate) next_resize_counter_values: HashMap<X11WindowHandle, u64>,
     pub(crate) family_order: HashMap<X11WindowHandle, u64>,
     pub(crate) next_family_order: u64,
@@ -726,6 +727,22 @@ impl Xwm {
                     window: handle,
                     counter_value: value,
                 });
+        } else if self.resize_sync.sync_disabled(handle)
+            && self.timed_out_resize_counters.get(&handle) == Some(&value)
+        {
+            self.timed_out_resize_counters.remove(&handle);
+            self.resize_sync.reenable_sync(handle);
+            self.clear_resize_sync_alarm(handle);
+            trace::emit("resize_sync_recovered", || {
+                TraceFields::new()
+                    .field("source", "x11")
+                    .field("xid", handle.xid())
+                    .field("resize_counter", value)
+                    .field(
+                        "resize_state",
+                        format!("{:?}", self.resize_sync.state(handle)),
+                    )
+            });
         }
     }
 

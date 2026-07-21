@@ -456,6 +456,38 @@ fn publish_client_list(
     Ok(())
 }
 
+pub(crate) fn configure_immediate(
+    xwm: &mut Xwm,
+    window: super::X11WindowHandle,
+    geometry: X11Geometry,
+    final_pending: bool,
+) -> Result<(), XwmError> {
+    if xwm.last_resize_geometries.get(&window).copied() == Some(geometry) {
+        if final_pending {
+            xwm.immediate_resize_windows.remove(&window);
+            xwm.outgoing_events
+                .push_back(XwmEvent::ResizeSyncImmediate(window));
+        }
+        return Ok(());
+    }
+    xwm.connection
+        .configure_window(
+            window.xid(),
+            &configure_aux(geometry, X11ConfigureFlags::all(), 0),
+        )
+        .map_err(XwmError::Connection)?;
+    if final_pending {
+        xwm.immediate_resize_windows.remove(&window);
+        xwm.outgoing_events
+            .push_back(XwmEvent::ResizeSyncImmediate(window));
+    } else {
+        xwm.immediate_resize_windows.insert(window);
+    }
+    xwm.last_resize_geometries.insert(window, geometry);
+    xwm.note_expected_configure(window, geometry);
+    Ok(())
+}
+
 pub(crate) fn begin_resize_sync(
     xwm: &mut Xwm,
     window: super::X11WindowHandle,
@@ -471,56 +503,13 @@ pub(crate) fn begin_resize_sync(
         .and_then(|record| record.snapshot.as_ref())
         .and_then(|snapshot| snapshot.sync_counter)
     else {
-        if xwm.last_resize_geometries.get(&window).copied() == Some(geometry) {
-            if final_pending {
-                xwm.immediate_resize_windows.remove(&window);
-                xwm.outgoing_events
-                    .push_back(XwmEvent::ResizeSyncImmediate(window));
-            }
-            return Ok(());
-        }
-        xwm.connection
-            .configure_window(
-                window.xid(),
-                &configure_aux(geometry, X11ConfigureFlags::all(), 0),
-            )
-            .map_err(XwmError::Connection)?;
-        if final_pending {
-            xwm.immediate_resize_windows.remove(&window);
-            xwm.outgoing_events
-                .push_back(XwmEvent::ResizeSyncImmediate(window));
-        } else {
-            xwm.immediate_resize_windows.insert(window);
-        }
-        xwm.last_resize_geometries.insert(window, geometry);
-        xwm.note_expected_configure(window, geometry);
-        return Ok(());
+        return configure_immediate(xwm, window, geometry, final_pending);
     };
     if !xwm.capabilities.sync {
-        if xwm.last_resize_geometries.get(&window).copied() == Some(geometry) {
-            if final_pending {
-                xwm.immediate_resize_windows.remove(&window);
-                xwm.outgoing_events
-                    .push_back(XwmEvent::ResizeSyncImmediate(window));
-            }
-            return Ok(());
-        }
-        xwm.connection
-            .configure_window(
-                window.xid(),
-                &configure_aux(geometry, X11ConfigureFlags::all(), 0),
-            )
-            .map_err(XwmError::Connection)?;
-        if final_pending {
-            xwm.immediate_resize_windows.remove(&window);
-            xwm.outgoing_events
-                .push_back(XwmEvent::ResizeSyncImmediate(window));
-        } else {
-            xwm.immediate_resize_windows.insert(window);
-        }
-        xwm.last_resize_geometries.insert(window, geometry);
-        xwm.note_expected_configure(window, geometry);
-        return Ok(());
+        return configure_immediate(xwm, window, geometry, final_pending);
+    }
+    if xwm.resize_sync.sync_disabled(window) {
+        return configure_immediate(xwm, window, geometry, final_pending);
     }
     if xwm.resize_sync.is_pending(window) {
         if xwm
@@ -749,7 +738,7 @@ fn send_sync_request(
         type_: xwm.atoms.get(XwmAtomName::WmProtocols),
         data: xproto::ClientMessageData::from([
             xwm.atoms.get(XwmAtomName::NetWmSyncRequest),
-            0,
+            xwm.focus.current_server_time(),
             counter_value.lo,
             counter_value.hi as u32,
             0,

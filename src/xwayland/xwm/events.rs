@@ -649,6 +649,7 @@ mod tests {
             focus: super::super::focus::FocusTracker::default(),
             sync_alarms: Default::default(),
             sync_handles_by_counter: Default::default(),
+            timed_out_resize_counters: Default::default(),
             next_resize_counter_values: Default::default(),
             family_order: Default::default(),
             next_family_order: 0,
