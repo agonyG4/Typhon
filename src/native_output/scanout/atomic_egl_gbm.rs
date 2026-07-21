@@ -583,11 +583,17 @@ impl AtomicEglGbmScanout {
             .map_err(native_egl_io_error)?;
         let (framebuffer, buffer_age) = {
             let slot = self.slot(slot)?;
-            let serial = self
-                .swapchain
-                .as_ref()
-                .map_or(0, AtomicOutputSwapchain::presentation_serial);
-            (slot.gl_framebuffer, slot.buffer_age(serial))
+            let (presentation_serial, presentation_pending) =
+                self.swapchain.as_ref().map_or((0, false), |swapchain| {
+                    (
+                        swapchain.presentation_serial(),
+                        swapchain.pending_slot().is_some(),
+                    )
+                });
+            (
+                slot.gl_framebuffer,
+                slot.buffer_age(presentation_serial, presentation_pending),
+            )
         };
         let request = renderer.egl_scene_draw_request(
             self.width,

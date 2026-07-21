@@ -297,6 +297,18 @@ pub(crate) fn software_buffer_age(
     BufferAge::Value(age)
 }
 
+pub(crate) fn render_target_buffer_age(
+    presentation_serial: u64,
+    last_presented_serial: Option<u64>,
+    presentation_pending: bool,
+) -> BufferAge {
+    if presentation_pending {
+        BufferAge::Value(0)
+    } else {
+        software_buffer_age(presentation_serial, last_presented_serial)
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RepaintMode {
     Skip,
@@ -965,6 +977,18 @@ mod partial_repaint_tests {
         assert_eq!(software_buffer_age(10, Some(8)), BufferAge::Value(3));
         assert_eq!(software_buffer_age(10, Some(10)), BufferAge::Value(1));
         assert_eq!(software_buffer_age(10, Some(11)), BufferAge::Value(-1));
+    }
+
+    #[test]
+    fn pending_presentation_invalidates_reused_render_target_age() {
+        assert_eq!(
+            render_target_buffer_age(10, Some(8), false),
+            BufferAge::Value(3)
+        );
+        assert_eq!(
+            render_target_buffer_age(10, Some(8), true),
+            BufferAge::Value(0)
+        );
     }
 
     #[test]

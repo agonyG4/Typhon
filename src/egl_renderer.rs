@@ -17,7 +17,9 @@ mod geometry;
 pub(crate) mod native_fence;
 mod program;
 
-pub(crate) use damage::{BufferAge, OutputDamage, OutputRect, RepaintMode, software_buffer_age};
+pub(crate) use damage::{
+    BufferAge, OutputDamage, OutputRect, RepaintMode, render_target_buffer_age,
+};
 use damage::{
     ClientCursorDamageState, EglOutputDamage, EglOutputDamageTracker,
     EglPartialRepaintCapabilities, EglPresentedDamageState, FullRepaintReason,
