@@ -1302,6 +1302,8 @@ mod tests {
             .get_mut(handle)
             .expect("window record")
             .properties_ready = true;
+        normalize(&mut xwm, map_event(handle.xid(), true)).expect("first MapNotify");
+        complete_property_refresh(&mut xwm, &mut peer);
         xwm.note_x11_surface_serial(handle, 0x1234, 0)
             .expect("first X11 serial");
         xwm.ingest_wayland_association(XwaylandAssociationEvent::Committed {
@@ -1312,8 +1314,6 @@ mod tests {
         .expect("first association");
         xwm.mark_window_buffer_ready(handle)
             .expect("first buffer readiness");
-        normalize(&mut xwm, map_event(handle.xid(), true)).expect("first MapNotify");
-        complete_property_refresh(&mut xwm, &mut peer);
         assert_eq!(ready_surface_id(&ready_events(&mut xwm)), Some(42));
 
         xwm.ingest_wayland_association(XwaylandAssociationEvent::Removed {
