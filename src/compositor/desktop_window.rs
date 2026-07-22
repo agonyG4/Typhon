@@ -236,31 +236,29 @@ pub(crate) fn classify_x11_role(
     if override_redirect || kind == DesktopWindowKind::OverrideRedirect {
         return X11DesktopRole::OverrideRedirect;
     }
-    match (window_types.preferred_supported_type(), transient_for) {
-        (Some(X11WindowType::Dialog), true) => X11DesktopRole::Dialog,
-        (Some(X11WindowType::Utility), true) => X11DesktopRole::Dialog,
-        (
-            Some(
-                X11WindowType::Menu
-                | X11WindowType::PopupMenu
-                | X11WindowType::DropdownMenu
-                | X11WindowType::Tooltip
-                | X11WindowType::Combo,
-            ),
-            _,
+    match window_types.preferred_supported_type() {
+        Some(
+            X11WindowType::Menu
+            | X11WindowType::PopupMenu
+            | X11WindowType::DropdownMenu
+            | X11WindowType::Tooltip
+            | X11WindowType::Combo
+            | X11WindowType::Dnd,
         ) => X11DesktopRole::AuxiliaryPopup,
-        (
-            Some(
-                X11WindowType::Splash
-                | X11WindowType::Toolbar
-                | X11WindowType::Dnd
-                | X11WindowType::Dock
-                | X11WindowType::Desktop,
-            ),
-            _,
-        ) => X11DesktopRole::AuxiliarySupport,
-        (Some(X11WindowType::Notification), _) => X11DesktopRole::Notification,
-        _ => X11DesktopRole::Toplevel,
+        Some(X11WindowType::Notification) => X11DesktopRole::Notification,
+        Some(
+            X11WindowType::Dialog
+            | X11WindowType::Utility
+            | X11WindowType::Splash
+            | X11WindowType::Toolbar,
+        ) => X11DesktopRole::Dialog,
+        Some(X11WindowType::Dock | X11WindowType::Desktop) => X11DesktopRole::AuxiliarySupport,
+        Some(X11WindowType::Normal) | Some(X11WindowType::Other(_)) | None if transient_for => {
+            X11DesktopRole::Dialog
+        }
+        Some(X11WindowType::Normal) | Some(X11WindowType::Other(_)) | None => {
+            X11DesktopRole::Toplevel
+        }
     }
 }
 

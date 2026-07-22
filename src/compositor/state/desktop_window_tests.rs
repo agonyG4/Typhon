@@ -445,6 +445,65 @@ fn dialog_remains_a_managed_client() {
 }
 
 #[test]
+fn generic_transient_is_parent_relative_floating() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let parent = x11_snapshot(generation, 221, 221);
+    insert_x11(&mut state, parent.clone());
+    let mut transient = x11_snapshot(generation, 222, 222);
+    transient.transient_for = Some(parent.handle);
+    let transient_id = insert_x11(&mut state, transient);
+
+    assert_eq!(
+        state.window(transient_id).unwrap().x11_role,
+        Some(X11DesktopRole::Dialog)
+    );
+    assert_eq!(
+        state.window(transient_id).unwrap().x11_placement_policy,
+        Some(X11PlacementPolicy::ParentRelative)
+    );
+}
+
+#[test]
+fn normal_type_with_transient_parent_is_parent_relative_floating() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let parent = x11_snapshot(generation, 223, 223);
+    insert_x11(&mut state, parent.clone());
+    let mut transient = x11_snapshot(generation, 224, 224);
+    transient.window_types = X11WindowTypes::new(vec![X11WindowType::Normal]);
+    transient.transient_for = Some(parent.handle);
+    let transient_id = insert_x11(&mut state, transient);
+
+    assert_eq!(
+        state.window(transient_id).unwrap().x11_role,
+        Some(X11DesktopRole::Dialog)
+    );
+    assert_eq!(
+        state.window(transient_id).unwrap().x11_placement_policy,
+        Some(X11PlacementPolicy::ParentRelative)
+    );
+}
+
+#[test]
+fn dialog_without_transient_is_floating_before_parent_metadata_arrives() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let mut dialog = x11_snapshot(generation, 225, 225);
+    dialog.window_types = X11WindowTypes::new(vec![X11WindowType::Dialog]);
+    let dialog_id = insert_x11(&mut state, dialog);
+
+    assert_eq!(
+        state.window(dialog_id).unwrap().x11_role,
+        Some(X11DesktopRole::Dialog)
+    );
+    assert_eq!(
+        state.window(dialog_id).unwrap().x11_placement_policy,
+        Some(X11PlacementPolicy::ParentRelative)
+    );
+}
+
+#[test]
 fn transient_family_raise_preserves_parent_below_child() {
     let mut state = CompositorState::new(None);
     let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
