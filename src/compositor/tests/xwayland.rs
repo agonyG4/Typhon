@@ -742,11 +742,15 @@ fn destroying_xwayland_surface_preserves_x11_window_identity() {
 
 #[test]
 fn xwayland_association_replacement_keeps_window_id_and_updates_root_surface() {
-    let mut fixture = first_buffer_fixture();
-    admit_first_buffer(&mut fixture, 37, 42);
-
-    let snapshot = fake_snapshot();
+    let mut fixture = stationary_pointer_xwayland_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.parent_surface_id;
+    snapshot.geometry.x = 37;
+    snapshot.geometry.y = 42;
     let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
     let window_id = fixture
         .server
         .state
@@ -758,7 +762,7 @@ fn xwayland_association_replacement_keeps_window_id_and_updates_root_surface() {
         .apply_xwayland_association_event(XwmAssociationEvent::Associated {
             generation: handle.generation(),
             window: handle,
-            surface_id: fixture.surface_id.saturating_add(1),
+            surface_id: fixture.popup_surface_id,
         });
 
     assert_eq!(
@@ -769,14 +773,14 @@ fn xwayland_association_replacement_keeps_window_id_and_updates_root_surface() {
         fixture
             .server
             .state
-            .window_id_for_surface(fixture.surface_id.saturating_add(1)),
+            .window_id_for_surface(fixture.popup_surface_id),
         Some(window_id)
     );
     assert_eq!(
         fixture
             .server
             .state
-            .window_id_for_surface(fixture.surface_id),
+            .window_id_for_surface(fixture.parent_surface_id),
         None,
         "the old root surface must no longer own the desktop window"
     );
