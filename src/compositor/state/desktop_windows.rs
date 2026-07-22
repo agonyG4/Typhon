@@ -173,6 +173,10 @@ impl CompositorState {
         let old_surface_id = self
             .window(window_id)
             .and_then(|window| window.x11_surface_id);
+        let replacement_placement = self
+            .window(window_id)
+            .and_then(|window| window.x11_geometry)
+            .map(|geometry| geometry.frame.placement);
         if old_surface_id == Some(surface_id) {
             return Ok(None);
         }
@@ -187,7 +191,42 @@ impl CompositorState {
             .ok_or(X11SurfaceAttachmentError::UnknownWindow)?;
         window.root_surface_id = surface_id;
         window.x11_surface_id = Some(surface_id);
+        if let Some(placement) = replacement_placement {
+            self.set_surface_placement_with_cause(
+                surface_id,
+                placement,
+                RenderGenerationCause::WindowMove,
+            );
+        }
         Ok(old_surface_id)
+    }
+
+    pub(in crate::compositor) fn can_attach_x11_surface(
+        &self,
+        handle: X11WindowHandle,
+        surface_id: u32,
+    ) -> bool {
+        let Some(window_id) = self.window_by_x11_handle.get(&handle).copied() else {
+            return false;
+        };
+        if self
+            .window_by_root_surface
+            .get(&surface_id)
+            .is_some_and(|owner| *owner != window_id)
+        {
+            return false;
+        }
+        self.surface_role(surface_id) == SurfaceRole::Xwayland
+            && self
+                .xwayland
+                .surface_states
+                .get(&surface_id)
+                .is_some_and(|state| {
+                    state.generation == handle.generation()
+                        && state.committed_serial.is_some()
+                        && state.association_object_alive
+                })
+            && self.surface_resource_by_id(surface_id).is_some()
     }
 
     pub(in crate::compositor) fn insert_x11_window(

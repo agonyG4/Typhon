@@ -783,6 +783,136 @@ fn xwayland_association_replacement_keeps_window_id_and_updates_root_surface() {
 }
 
 #[test]
+fn xwayland_attachment_replacement_preserves_frame_and_keyboard_focus() {
+    let mut fixture = stationary_pointer_xwayland_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.parent_surface_id;
+    snapshot.geometry.x = 37;
+    snapshot.geometry.y = 42;
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+    let frame_placement = fixture
+        .server
+        .state
+        .window(window_id)
+        .and_then(|window| window.x11_geometry)
+        .expect("persistent X11 frame geometry")
+        .frame
+        .placement;
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .focused_surface
+            .as_ref()
+            .map(|surface| crate::compositor::compositor_surface_id(surface)),
+        Some(fixture.parent_surface_id)
+    );
+
+    fixture
+        .server
+        .apply_xwayland_association_event(XwmAssociationEvent::Associated {
+            generation: handle.generation(),
+            window: handle,
+            surface_id: fixture.popup_surface_id,
+        });
+
+    assert_eq!(
+        fixture.server.state.window_id_for_x11_handle(handle),
+        Some(window_id)
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .surface_placement(fixture.popup_surface_id),
+        frame_placement,
+        "replacement must inherit the persistent frame placement"
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .focused_surface
+            .as_ref()
+            .map(|surface| crate::compositor::compositor_surface_id(surface)),
+        Some(fixture.popup_surface_id),
+        "keyboard focus must transfer to the replacement surface"
+    );
+    assert_eq!(fixture.server.state.focused_window_id, Some(window_id));
+
+    fixture
+        .server
+        .apply_xwayland_association_event(XwmAssociationEvent::Removed {
+            generation: handle.generation(),
+            window: handle,
+            surface_id: fixture.parent_surface_id,
+        });
+    assert_eq!(
+        fixture.server.state.window_id_for_x11_handle(handle),
+        Some(window_id)
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .focused_surface
+            .as_ref()
+            .map(|surface| crate::compositor::compositor_surface_id(surface)),
+        Some(fixture.popup_surface_id),
+        "late removal of the old attachment must not clear replacement focus"
+    );
+}
+
+#[test]
+fn invalid_xwayland_attachment_does_not_withdraw_the_current_surface() {
+    let mut fixture = first_buffer_fixture();
+    admit_first_buffer(&mut fixture, 37, 42);
+    let handle = fake_snapshot().handle;
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+
+    fixture
+        .server
+        .apply_xwayland_association_event(XwmAssociationEvent::Associated {
+            generation: handle.generation(),
+            window: handle,
+            surface_id: 9999,
+        });
+
+    assert_eq!(
+        fixture.server.state.window_id_for_x11_handle(handle),
+        Some(window_id)
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .map(|window| window.root_surface_id),
+        Some(fixture.surface_id),
+        "invalid replacement must leave the existing attachment active"
+    );
+    assert!(
+        fixture
+            .server
+            .renderable_surfaces()
+            .iter()
+            .any(|surface| surface.surface_id == fixture.surface_id)
+    );
+}
+
+#[test]
 fn destroyed_minimized_xwayland_surface_is_not_restored_as_stale_content() {
     let mut fixture = first_buffer_fixture();
     admit_first_buffer(&mut fixture, 37, 42);

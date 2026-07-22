@@ -81,11 +81,18 @@ impl OwnCompositorServer {
                 if window.generation() != generation {
                     return;
                 }
+                if !self.state.can_attach_x11_surface(window, surface_id) {
+                    return;
+                }
                 let old_surface_id = self
                     .state
                     .window_id_for_x11_handle(window)
                     .and_then(|window_id| self.state.window(window_id))
                     .and_then(|desktop_window| desktop_window.x11_surface_id);
+                let was_focused = self
+                    .state
+                    .window_id_for_x11_handle(window)
+                    .is_some_and(|window_id| self.state.focused_window_id == Some(window_id));
                 if let Some(old_surface_id) = old_surface_id
                     && old_surface_id != surface_id
                 {
@@ -107,6 +114,10 @@ impl OwnCompositorServer {
                 let _ = self
                     .state
                     .adopt_current_xwayland_surface_content(surface_id);
+                if was_focused && let Some(surface) = self.state.surface_resource_by_id(surface_id)
+                {
+                    self.state.focus_surface(surface);
+                }
                 self.state.refresh_pointer_focus_at_last_position();
             }
             XwmAssociationEvent::Removed {
