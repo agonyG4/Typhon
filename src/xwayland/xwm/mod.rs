@@ -241,6 +241,10 @@ pub enum XwmCommand {
         fields: X11ConfigureFlags,
         border_width: u32,
     },
+    ConfigureFrame {
+        window: X11WindowHandle,
+        geometry: X11Geometry,
+    },
     ConfigureNotify {
         window: X11WindowHandle,
         geometry: X11Geometry,

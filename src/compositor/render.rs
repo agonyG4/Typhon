@@ -24,6 +24,14 @@ pub const SERVER_FRAME_SEPARATOR_COLOR: u32 = 0xff2e_3644;
 pub const OUTPUT_SCALE_DENOMINATOR: u32 = 120;
 pub const MAX_BUFFER_AGE: u32 = 4;
 
+pub const fn cascaded_root_position(root_index: usize) -> (i32, i32) {
+    let cascade = root_index as i32 * SURFACE_CASCADE_STEP;
+    (
+        FIRST_SURFACE_OFFSET.0 + cascade,
+        FIRST_SURFACE_OFFSET.1 + cascade,
+    )
+}
+
 const WALLPAPER_TOP_LEFT: Rgb = Rgb::new(18, 21, 28);
 const WALLPAPER_TOP_RIGHT: Rgb = Rgb::new(20, 58, 54);
 const WALLPAPER_BOTTOM_LEFT: Rgb = Rgb::new(58, 34, 49);
@@ -1647,10 +1655,10 @@ fn root_surface_origin_for_ordinal(root_index: usize, surface: &RenderableSurfac
     let placement = surface.render_placement.unwrap_or(surface.placement);
     match placement.root_mode {
         RootPlacementMode::CascadedWindow => {
-            let cascade = root_index as i32 * SURFACE_CASCADE_STEP;
+            let (root_x, root_y) = cascaded_root_position(root_index);
             (
-                FIRST_SURFACE_OFFSET.0 + cascade + placement.local_x + surface.x,
-                FIRST_SURFACE_OFFSET.1 + cascade + placement.local_y + surface.y,
+                root_x + placement.local_x + surface.x,
+                root_y + placement.local_y + surface.y,
             )
         }
         RootPlacementMode::Absolute => (

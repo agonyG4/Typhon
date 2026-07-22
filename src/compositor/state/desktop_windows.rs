@@ -45,7 +45,7 @@ impl CompositorState {
 
     pub(in crate::compositor) fn insert_desktop_window(
         &mut self,
-        window: DesktopWindow,
+        mut window: DesktopWindow,
     ) -> Result<(), DesktopWindowError> {
         if self.desktop_windows.contains_key(&window.id) {
             return Err(DesktopWindowError::DuplicateWindowId);
@@ -61,16 +61,46 @@ impl CompositorState {
         {
             return Err(DesktopWindowError::DuplicateRootSurface);
         }
+        let managed_placement = (window.x11_placement_policy
+            == Some(X11PlacementPolicy::CompositorManaged))
+        .then(|| self.next_managed_x11_frame_placement());
+        if let Some(placement) = managed_placement {
+            if let Some(geometry) = window.x11_geometry.as_mut() {
+                geometry.client.x = placement.local_x;
+                geometry.client.y = placement.local_y;
+                geometry.frame.placement = placement;
+            }
+        }
+        let root_surface_id = window.root_surface_id;
         self.window_by_root_surface
-            .insert(window.root_surface_id, window.id);
+            .insert(root_surface_id, window.id);
         if let WindowBackend::X11(handle) = window.backend {
             self.window_by_x11_handle.insert(handle, window.id);
         }
         self.window_stacking.push(window.id);
         self.desktop_windows.insert(window.id, window);
+        if let Some(placement) = managed_placement {
+            self.set_surface_placement_with_cause(
+                root_surface_id,
+                placement,
+                RenderGenerationCause::WindowMove,
+            );
+        }
         self.rebuild_x11_transient_relationships();
         self.normalize_window_stacking();
         Ok(())
+    }
+
+    fn next_managed_x11_frame_placement(&self) -> SurfacePlacement {
+        let ordinal = self
+            .desktop_windows
+            .values()
+            .filter(|window| {
+                window.x11_placement_policy == Some(X11PlacementPolicy::CompositorManaged)
+            })
+            .count();
+        let (x, y) = crate::compositor::render::cascaded_root_position(ordinal);
+        SurfacePlacement::absolute_root_at(x, y)
     }
 
     pub(in crate::compositor) fn remove_desktop_window(
@@ -186,7 +216,16 @@ impl CompositorState {
         let requested_state = snapshot.state;
         self.insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
             .map_err(|_| X11WindowAdmissionError::DuplicateRootSurface)?;
-        let _ = self.set_x11_geometry(handle, geometry);
+        let initial_geometry = self
+            .window(window_id)
+            .and_then(|window| window.x11_geometry)
+            .map(|state| crate::xwayland::xwm::X11Geometry {
+                x: state.frame.placement.local_x,
+                y: state.frame.placement.local_y,
+                ..geometry
+            })
+            .unwrap_or(geometry);
+        let _ = self.set_x11_geometry(handle, initial_geometry);
         self.rebuild_x11_transient_relationships();
         self.apply_initial_x11_state(handle, requested_state, geometry);
         Ok(window_id)
@@ -526,7 +565,9 @@ impl CompositorState {
             return false;
         };
         let placement = match placement_policy {
-            Some(X11PlacementPolicy::CompositorManaged) => self.surface_placement(root_surface_id),
+            Some(X11PlacementPolicy::CompositorManaged) => {
+                SurfacePlacement::absolute_root_at(filtered.x, filtered.y)
+            }
             Some(
                 X11PlacementPolicy::ClientPositioned
                 | X11PlacementPolicy::ParentRelative
@@ -537,7 +578,16 @@ impl CompositorState {
         if let Some(window) = self.window_mut(window_id)
             && let Some(x11_geometry) = window.x11_geometry.as_mut()
         {
-            x11_geometry.client = filtered;
+            x11_geometry.client = if placement_policy == Some(X11PlacementPolicy::CompositorManaged)
+            {
+                crate::xwayland::xwm::X11Geometry {
+                    x: placement.local_x,
+                    y: placement.local_y,
+                    ..filtered
+                }
+            } else {
+                filtered
+            };
             x11_geometry.frame =
                 WindowGeometry::new(placement, filtered.width.max(1), filtered.height.max(1));
         }
@@ -557,14 +607,21 @@ impl CompositorState {
         let Some(window_id) = self.window_id_for_x11_handle(handle) else {
             return false;
         };
-        let Some((root_surface_id, placement_policy)) = self
-            .window(window_id)
-            .map(|window| (window.root_surface_id, window.x11_placement_policy))
+        let Some((root_surface_id, placement_policy, persisted_placement)) =
+            self.window(window_id).map(|window| {
+                (
+                    window.root_surface_id,
+                    window.x11_placement_policy,
+                    window.x11_geometry.map(|geometry| geometry.frame.placement),
+                )
+            })
         else {
             return false;
         };
         let placement = match placement_policy {
-            Some(X11PlacementPolicy::CompositorManaged) => self.surface_placement(root_surface_id),
+            Some(X11PlacementPolicy::CompositorManaged) => {
+                persisted_placement.unwrap_or_else(|| self.next_managed_x11_frame_placement())
+            }
             Some(
                 X11PlacementPolicy::ClientPositioned
                 | X11PlacementPolicy::ParentRelative
@@ -576,7 +633,16 @@ impl CompositorState {
         if let Some(window) = self.window_mut(window_id)
             && let Some(x11_geometry) = window.x11_geometry.as_mut()
         {
-            x11_geometry.client = geometry;
+            x11_geometry.client = if placement_policy == Some(X11PlacementPolicy::CompositorManaged)
+            {
+                crate::xwayland::xwm::X11Geometry {
+                    x: placement.local_x,
+                    y: placement.local_y,
+                    ..geometry
+                }
+            } else {
+                geometry
+            };
             x11_geometry.frame = frame;
         }
         if self.active_toplevel_resizes.contains_key(&root_surface_id) {

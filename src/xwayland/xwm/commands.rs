@@ -123,6 +123,15 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
                     .push_back(XwmEvent::ResizeSyncImmediate(window));
             }
         }
+        XwmCommand::ConfigureFrame { window, geometry } => {
+            xwm.connection
+                .configure_window(
+                    window.xid(),
+                    &configure_aux(geometry, X11ConfigureFlags::all(), 0),
+                )
+                .map_err(XwmError::Connection)?;
+            xwm.note_expected_configure(window, geometry);
+        }
         XwmCommand::ConfigureNotify { window, geometry } => {
             let event = xproto::ConfigureNotifyEvent {
                 response_type: xproto::CONFIGURE_NOTIFY_EVENT,
@@ -365,6 +374,7 @@ fn command_handle(command: &XwmCommand) -> Option<super::X11WindowHandle> {
             family.first().copied()
         }
         XwmCommand::Configure { window, .. }
+        | XwmCommand::ConfigureFrame { window, .. }
         | XwmCommand::ConfigureNotify { window, .. }
         | XwmCommand::SetState { window, .. } => Some(*window),
         XwmCommand::Stack { window, .. } => Some(*window),

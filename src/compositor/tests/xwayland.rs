@@ -234,6 +234,34 @@ fn xwayland_first_buffer_before_window_is_retained() {
 }
 
 #[test]
+fn admitted_x11_window_configures_x_to_its_persisted_frame_geometry() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry.x = 0;
+    snapshot.geometry.y = 0;
+
+    let commands = fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot.clone()));
+    let frame = fixture
+        .server
+        .state
+        .x11_authoritative_geometry(snapshot.handle)
+        .expect("admitted X11 geometry");
+
+    assert!(commands.iter().any(|command| matches!(
+        command,
+        XwmCommand::ConfigureFrame {
+            window,
+            geometry,
+            ..
+        } if *window == snapshot.handle
+            && geometry == &frame
+    )));
+}
+
+#[test]
 fn multiple_xwayland_commits_preserve_ordered_edges_without_deduplication() {
     let mut fixture = first_buffer_fixture();
     let _ = fixture.server.take_xwayland_buffer_level_events();
@@ -348,11 +376,11 @@ fn xwayland_buffer_committed_before_serial_becomes_ready() {
     snapshot.surface_id = surface_id;
     snapshot.geometry.x = 37;
     snapshot.geometry.y = 42;
-    assert_eq!(
-        server
-            .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot))
-            .len(),
-        1
+    let commands = server.apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    assert!(
+        commands
+            .iter()
+            .any(|command| matches!(command, XwmCommand::ConfigureFrame { .. }))
     );
     assert_eq!(server.renderable_surfaces().len(), 1);
     assert_eq!(
@@ -361,7 +389,10 @@ fn xwayland_buffer_committed_before_serial_becomes_ready() {
     );
     assert_eq!(
         server.renderable_surfaces()[0].placement,
-        SurfacePlacement::root()
+        SurfacePlacement::absolute_root_at(
+            crate::compositor::render::FIRST_SURFACE_OFFSET.0,
+            crate::compositor::render::FIRST_SURFACE_OFFSET.1,
+        )
     );
 }
 
@@ -376,7 +407,13 @@ fn window_ready_publishes_retained_xwayland_buffer() {
     let surface = &fixture.server.renderable_surfaces()[0];
     assert_eq!(surface.surface_id, fixture.surface_id);
     assert_eq!(surface.buffer_id().get(), fixture.initial_buffer_id);
-    assert_eq!(surface.placement, SurfacePlacement::root());
+    assert_eq!(
+        surface.placement,
+        SurfacePlacement::absolute_root_at(
+            crate::compositor::render::FIRST_SURFACE_OFFSET.0,
+            crate::compositor::render::FIRST_SURFACE_OFFSET.1,
+        )
+    );
     assert_eq!(
         fixture.server.render_generation_cause(),
         RenderGenerationCause::SurfaceCommit
@@ -948,7 +985,7 @@ fn x11_partial_moveresize_preserves_unrequested_geometry() {
         [XwmCommand::Configure { geometry, fields, .. }]
             if *geometry == X11Geometry {
                 x: 200,
-                y: 120,
+                y: crate::compositor::render::FIRST_SURFACE_OFFSET.1,
                 width: 640,
                 height: 480,
             } && fields.x
@@ -1002,7 +1039,10 @@ fn retained_buffer_uses_compositor_placement_for_managed_window() {
 
     assert_eq!(
         fixture.server.renderable_surfaces()[0].placement,
-        SurfacePlacement::root()
+        SurfacePlacement::absolute_root_at(
+            crate::compositor::render::FIRST_SURFACE_OFFSET.0,
+            crate::compositor::render::FIRST_SURFACE_OFFSET.1,
+        )
     );
 }
 

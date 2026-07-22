@@ -346,8 +346,6 @@ fn normal_x11_windows_use_compositor_placement_but_popups_keep_client_position()
     let second = x11_snapshot(generation, 214, 214);
     let first_id = insert_x11(&mut state, first.clone());
     let second_id = insert_x11(&mut state, second.clone());
-    assert!(state.set_x11_geometry(first.handle, first.geometry));
-    assert!(state.set_x11_geometry(second.handle, second.geometry));
 
     assert_eq!(
         state.window(first_id).unwrap().x11_placement_policy,
@@ -359,11 +357,19 @@ fn normal_x11_windows_use_compositor_placement_but_popups_keep_client_position()
     );
     assert_eq!(
         state.surface_placement(first.surface_id),
-        SurfacePlacement::root()
+        SurfacePlacement::absolute_root_at(
+            crate::compositor::render::FIRST_SURFACE_OFFSET.0,
+            crate::compositor::render::FIRST_SURFACE_OFFSET.1,
+        )
     );
     assert_eq!(
         state.surface_placement(second.surface_id),
-        SurfacePlacement::root()
+        SurfacePlacement::absolute_root_at(
+            crate::compositor::render::FIRST_SURFACE_OFFSET.0
+                + crate::compositor::render::SURFACE_CASCADE_STEP,
+            crate::compositor::render::FIRST_SURFACE_OFFSET.1
+                + crate::compositor::render::SURFACE_CASCADE_STEP,
+        )
     );
 
     let mut popup = x11_snapshot(generation, 215, 215);
@@ -378,6 +384,46 @@ fn normal_x11_windows_use_compositor_placement_but_popups_keep_client_position()
     assert_eq!(
         state.surface_placement(popup.surface_id),
         SurfacePlacement::absolute_root_at(popup.geometry.x, popup.geometry.y)
+    );
+}
+
+#[test]
+fn normal_x11_windows_have_distinct_stable_absolute_frame_geometry() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let first = x11_snapshot(generation, 219, 219);
+    let second = x11_snapshot(generation, 220, 220);
+    let first_id = insert_x11(&mut state, first.clone());
+    let second_id = insert_x11(&mut state, second.clone());
+
+    let first_frame = state.window(first_id).unwrap().x11_geometry.unwrap().frame;
+    let second_frame = state.window(second_id).unwrap().x11_geometry.unwrap().frame;
+    assert_eq!(
+        first_frame.placement.root_mode,
+        crate::compositor::RootPlacementMode::Absolute
+    );
+    assert_eq!(
+        second_frame.placement.root_mode,
+        crate::compositor::RootPlacementMode::Absolute
+    );
+    assert_ne!(first_frame.placement, second_frame.placement);
+    assert_eq!(
+        state.surface_placement(first.surface_id),
+        first_frame.placement
+    );
+    assert_eq!(
+        state.surface_placement(second.surface_id),
+        second_frame.placement
+    );
+
+    assert!(state.raise_window_id(first_id));
+    assert_eq!(
+        state.window(first_id).unwrap().x11_geometry.unwrap().frame,
+        first_frame
+    );
+    assert_eq!(
+        state.window(second_id).unwrap().x11_geometry.unwrap().frame,
+        second_frame
     );
 }
 
@@ -646,7 +692,10 @@ fn pre_map_fullscreen_snapshot_enters_fullscreen_on_admission() {
     );
     assert_eq!(
         state.surface_placement(snapshot.surface_id),
-        SurfacePlacement::root()
+        SurfacePlacement::absolute_root_at(
+            crate::compositor::render::FIRST_SURFACE_OFFSET.0,
+            crate::compositor::render::FIRST_SURFACE_OFFSET.1,
+        )
     );
 }
 

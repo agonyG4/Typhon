@@ -422,7 +422,18 @@ impl OwnCompositorServer {
                         eprintln!(
                             "oblivion-one compositor: event=xwayland_window_admitted surface_id={surface_id} retained_buffer={published} published={published} focused={focused}"
                         );
-                        vec![self.sync_xwayland_client_lists()]
+                        let mut commands = Vec::with_capacity(2);
+                        if self
+                            .state
+                            .window(window_id)
+                            .and_then(|window| window.x11_placement_policy)
+                            == Some(crate::compositor::desktop_window::X11PlacementPolicy::CompositorManaged)
+                            && let Some(geometry) = self.state.x11_authoritative_geometry(handle)
+                        {
+                            commands.push(XwmCommand::ConfigureFrame { window: handle, geometry });
+                        }
+                        commands.push(self.sync_xwayland_client_lists());
+                        commands
                     }
                     Err(error) => {
                         eprintln!(
