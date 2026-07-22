@@ -913,6 +913,93 @@ fn invalid_xwayland_attachment_does_not_withdraw_the_current_surface() {
 }
 
 #[test]
+fn xwayland_minimize_replace_restore_keeps_one_window_and_current_attachment() {
+    let mut fixture = stationary_pointer_xwayland_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.parent_surface_id;
+    snapshot.geometry.x = 37;
+    snapshot.geometry.y = 42;
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+    let frame_placement = fixture
+        .server
+        .state
+        .window(window_id)
+        .and_then(|window| window.x11_geometry)
+        .expect("persistent X11 frame geometry")
+        .frame
+        .placement;
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+    assert!(fixture.server.renderable_surfaces().is_empty());
+
+    fixture
+        .server
+        .apply_xwayland_association_event(XwmAssociationEvent::Associated {
+            generation: handle.generation(),
+            window: handle,
+            surface_id: fixture.popup_surface_id,
+        });
+    assert_eq!(
+        fixture.server.state.window_id_for_x11_handle(handle),
+        Some(window_id)
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .map(|window| window.root_surface_id),
+        Some(fixture.popup_surface_id)
+    );
+    assert!(
+        fixture.server.renderable_surfaces().is_empty(),
+        "replacement commits must remain hidden while minimized"
+    );
+
+    assert!(
+        fixture
+            .server
+            .state
+            .restore_minimized_desktop_window(window_id)
+    );
+    assert_eq!(
+        fixture.server.state.window_id_for_x11_handle(handle),
+        Some(window_id)
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .surface_placement(fixture.popup_surface_id),
+        frame_placement
+    );
+    assert_eq!(
+        fixture
+            .server
+            .renderable_surfaces()
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>(),
+        vec![fixture.popup_surface_id]
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .window_id_for_surface(fixture.parent_surface_id),
+        None,
+        "the old map-local surface must not retain root ownership"
+    );
+}
+
+#[test]
 fn destroyed_minimized_xwayland_surface_is_not_restored_as_stale_content() {
     let mut fixture = first_buffer_fixture();
     admit_first_buffer(&mut fixture, 37, 42);
