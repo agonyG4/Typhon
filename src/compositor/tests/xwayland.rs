@@ -702,7 +702,7 @@ fn late_kind_change_removes_normal_membership_without_focus_flash() {
         .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
     let _ = fixture.server.take_xwayland_backend_commands(0);
 
-    fixture
+    let metadata_commands = fixture
         .server
         .apply_xwayland_window_event(XwmEvent::MetadataChanged {
             window: handle,
@@ -710,6 +710,12 @@ fn late_kind_change_removes_normal_membership_without_focus_flash() {
                 DesktopWindowKind::OverrideRedirect,
             ),
         });
+
+    assert!(
+        metadata_commands
+            .iter()
+            .all(|command| !matches!(command, XwmCommand::Raise(_)))
+    );
 
     assert!(fixture.server.state.x11_client_lists().0.is_empty());
     assert!(

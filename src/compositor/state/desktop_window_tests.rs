@@ -452,7 +452,7 @@ fn generic_transient_is_parent_relative_floating() {
     insert_x11(&mut state, parent.clone());
     let mut transient = x11_snapshot(generation, 222, 222);
     transient.transient_for = Some(parent.handle);
-    let transient_id = insert_x11(&mut state, transient);
+    let transient_id = insert_x11(&mut state, transient.clone());
 
     assert_eq!(
         state.window(transient_id).unwrap().x11_role,
@@ -461,6 +461,10 @@ fn generic_transient_is_parent_relative_floating() {
     assert_eq!(
         state.window(transient_id).unwrap().x11_placement_policy,
         Some(X11PlacementPolicy::ParentRelative)
+    );
+    assert_eq!(
+        state.surface_placement(transient.surface_id),
+        SurfacePlacement::absolute_root_at(transient.geometry.x, transient.geometry.y)
     );
 }
 
@@ -500,6 +504,38 @@ fn dialog_without_transient_is_floating_before_parent_metadata_arrives() {
     assert_eq!(
         state.window(dialog_id).unwrap().x11_placement_policy,
         Some(X11PlacementPolicy::ParentRelative)
+    );
+}
+
+#[test]
+fn late_popup_to_toplevel_reclassification_migrates_to_managed_placement() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let mut popup = x11_snapshot(generation, 226, 226);
+    popup.window_types = X11WindowTypes::new(vec![X11WindowType::PopupMenu]);
+    popup.geometry.x = 300;
+    popup.geometry.y = 400;
+    let popup_id = insert_x11(&mut state, popup.clone());
+    assert!(state.set_x11_geometry(popup.handle, popup.geometry));
+    assert_eq!(
+        state.surface_placement(popup.surface_id),
+        SurfacePlacement::absolute_root_at(300, 400)
+    );
+
+    assert!(state.apply_x11_metadata_delta(
+        popup.handle,
+        X11MetadataDelta::WindowTypes(X11WindowTypes::new(vec![X11WindowType::Normal]))
+    ));
+    assert_eq!(
+        state.window(popup_id).unwrap().x11_placement_policy,
+        Some(X11PlacementPolicy::CompositorManaged)
+    );
+    assert_eq!(
+        state.surface_placement(popup.surface_id),
+        SurfacePlacement::absolute_root_at(
+            crate::compositor::render::FIRST_SURFACE_OFFSET.0,
+            crate::compositor::render::FIRST_SURFACE_OFFSET.1,
+        )
     );
 }
 

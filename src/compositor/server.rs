@@ -510,10 +510,7 @@ impl OwnCompositorServer {
                 if !publish_lists {
                     return Vec::new();
                 }
-                if let Some(window_id) = prior_id {
-                    let _ = self.state.raise_window_id(window_id);
-                }
-                vec![XwmCommand::Raise(window), self.sync_xwayland_client_lists()]
+                vec![self.sync_xwayland_client_lists()]
             }
             XwmEvent::ConfigureRequested { window, request } => {
                 if self.state.x11_resize_active(window) {

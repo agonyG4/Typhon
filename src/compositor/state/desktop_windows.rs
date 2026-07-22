@@ -61,13 +61,23 @@ impl CompositorState {
         {
             return Err(DesktopWindowError::DuplicateRootSurface);
         }
-        let managed_placement = (window.x11_placement_policy
-            == Some(X11PlacementPolicy::CompositorManaged))
-        .then(|| self.next_managed_x11_frame_placement());
-        if let Some(placement) = managed_placement {
+        let initial_placement = match window.x11_placement_policy {
+            Some(X11PlacementPolicy::CompositorManaged) => {
+                Some(self.next_managed_x11_frame_placement())
+            }
+            Some(
+                X11PlacementPolicy::ClientPositioned
+                | X11PlacementPolicy::ParentRelative
+                | X11PlacementPolicy::OverrideRedirect,
+            ) => window.x11_geometry.map(|geometry| geometry.frame.placement),
+            None => None,
+        };
+        if let Some(placement) = initial_placement {
             if let Some(geometry) = window.x11_geometry.as_mut() {
-                geometry.client.x = placement.local_x;
-                geometry.client.y = placement.local_y;
+                if window.x11_placement_policy == Some(X11PlacementPolicy::CompositorManaged) {
+                    geometry.client.x = placement.local_x;
+                    geometry.client.y = placement.local_y;
+                }
                 geometry.frame.placement = placement;
             }
         }
@@ -79,7 +89,7 @@ impl CompositorState {
         }
         self.window_stacking.push(window.id);
         self.desktop_windows.insert(window.id, window);
-        if let Some(placement) = managed_placement {
+        if let Some(placement) = initial_placement {
             self.set_surface_placement_with_cause(
                 root_surface_id,
                 placement,
@@ -92,11 +102,19 @@ impl CompositorState {
     }
 
     fn next_managed_x11_frame_placement(&self) -> SurfacePlacement {
+        self.next_managed_x11_frame_placement_excluding(None)
+    }
+
+    fn next_managed_x11_frame_placement_excluding(
+        &self,
+        excluded: Option<WindowId>,
+    ) -> SurfacePlacement {
         let ordinal = self
             .desktop_windows
             .values()
             .filter(|window| {
-                window.x11_placement_policy == Some(X11PlacementPolicy::CompositorManaged)
+                Some(window.id) != excluded
+                    && window.x11_placement_policy == Some(X11PlacementPolicy::CompositorManaged)
             })
             .count();
         let (x, y) = crate::compositor::render::cascaded_root_position(ordinal);
@@ -341,6 +359,9 @@ impl CompositorState {
             .filter(|parent| !self.x11_transient_would_cycle(window_id, Some(*parent)));
         let transient_parent_id =
             accepted_transient_handle.and_then(|parent| self.window_id_for_x11_handle(parent));
+        let old_policy = self
+            .window(window_id)
+            .and_then(|window| window.x11_placement_policy);
         let Some(window) = self.window_mut(window_id) else {
             return false;
         };
@@ -412,7 +433,67 @@ impl CompositorState {
             crate::xwayland::xwm::X11MetadataDelta::Protocols { .. } => {}
         }
         self.rebuild_x11_transient_relationships();
+        let new_policy = self
+            .window(window_id)
+            .and_then(|window| window.x11_placement_policy);
+        if old_policy != new_policy {
+            self.migrate_x11_placement_policy(window_id, old_policy, new_policy);
+        }
         true
+    }
+
+    fn migrate_x11_placement_policy(
+        &mut self,
+        window_id: WindowId,
+        old_policy: Option<X11PlacementPolicy>,
+        new_policy: Option<X11PlacementPolicy>,
+    ) {
+        let Some((surface_id, client, current_frame)) = self.window(window_id).map(|window| {
+            (
+                window.root_surface_id,
+                window.x11_geometry.map(|geometry| geometry.client),
+                window.x11_geometry.map(|geometry| geometry.frame),
+            )
+        }) else {
+            return;
+        };
+        let Some(client) = client else {
+            return;
+        };
+        let placement = match new_policy {
+            Some(X11PlacementPolicy::CompositorManaged) => {
+                if old_policy == Some(X11PlacementPolicy::CompositorManaged) {
+                    current_frame
+                        .map(|geometry| geometry.placement)
+                        .unwrap_or_else(|| {
+                            self.next_managed_x11_frame_placement_excluding(Some(window_id))
+                        })
+                } else {
+                    self.next_managed_x11_frame_placement_excluding(Some(window_id))
+                }
+            }
+            Some(
+                X11PlacementPolicy::ClientPositioned
+                | X11PlacementPolicy::ParentRelative
+                | X11PlacementPolicy::OverrideRedirect,
+            )
+            | None => SurfacePlacement::absolute_root_at(client.x, client.y),
+        };
+        if let Some(window) = self.window_mut(window_id)
+            && let Some(geometry) = window.x11_geometry.as_mut()
+        {
+            if new_policy == Some(X11PlacementPolicy::CompositorManaged) {
+                geometry.client.x = placement.local_x;
+                geometry.client.y = placement.local_y;
+            }
+            geometry.frame =
+                WindowGeometry::new(placement, client.width.max(1), client.height.max(1));
+        }
+        self.set_surface_placement_with_cause(
+            surface_id,
+            placement,
+            RenderGenerationCause::WindowMove,
+        );
     }
 
     fn x11_transient_would_cycle(
