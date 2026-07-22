@@ -117,11 +117,6 @@ fn admit_first_buffer(fixture: &mut FirstBufferFixture, x: i32, y: i32) {
     assert!(
         commands
             .iter()
-            .any(|command| matches!(command, XwmCommand::Raise(_)))
-    );
-    assert!(
-        commands
-            .iter()
             .any(|command| matches!(command, XwmCommand::SyncClientLists { .. }))
     );
 }
@@ -357,7 +352,7 @@ fn xwayland_buffer_committed_before_serial_becomes_ready() {
         server
             .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot))
             .len(),
-        2
+        1
     );
     assert_eq!(server.renderable_surfaces().len(), 1);
     assert_eq!(

@@ -933,18 +933,25 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
         .recv_timeout(Duration::from_secs(2))
         .expect("wait for unrelated WindowReady processing");
     apply_compositor_commands(&compositor_command_receiver, &mut service, &mut supervisor);
-    service
-        .execute_managed_command(
-            &mut supervisor,
-            XwmCommand::Focus {
-                window: Some(snapshot.handle),
-                timestamp: 0,
-            },
-        )
-        .expect("focus parent before popup");
-    service
-        .flush_managed_commands(&mut supervisor)
-        .expect("flush parent focus before popup");
+    compositor_event_sender
+        .send(CompositorEvent::Xwayland(XwmEvent::FocusRequested {
+            window: snapshot.handle,
+            source: 2,
+            timestamp: 1,
+            current_time: 1,
+            user_time: None,
+        }))
+        .expect("send parent focus before popup");
+    let (focus_barrier_sender, focus_barrier_receiver) = mpsc::channel();
+    compositor_event_sender
+        .send(CompositorEvent::Barrier {
+            reply: focus_barrier_sender,
+        })
+        .expect("send parent focus barrier before popup");
+    focus_barrier_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("wait for parent focus before popup");
+    apply_compositor_commands(&compositor_command_receiver, &mut service, &mut supervisor);
 
     // Map a real X11 popup through the same NativeEventLoop path. The
     // compositor thread receives WindowReady and publishes the semantic

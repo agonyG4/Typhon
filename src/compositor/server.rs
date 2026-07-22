@@ -422,8 +422,7 @@ impl OwnCompositorServer {
                         eprintln!(
                             "oblivion-one compositor: event=xwayland_window_admitted surface_id={surface_id} retained_buffer={published} published={published} focused={focused}"
                         );
-                        let _ = self.state.raise_window_id(window_id);
-                        vec![XwmCommand::Raise(handle), self.sync_xwayland_client_lists()]
+                        vec![self.sync_xwayland_client_lists()]
                     }
                     Err(error) => {
                         eprintln!(
