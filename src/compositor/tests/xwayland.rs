@@ -262,6 +262,129 @@ fn admitted_x11_window_configures_x_to_its_persisted_frame_geometry() {
 }
 
 #[test]
+fn x11_stack_request_publishes_final_client_list_order() {
+    let socket = super::unique_socket_name();
+    let mut server = super::OwnCompositorServer::bind_cpu_composition(&socket)
+        .expect("bind fake compositor server");
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let first = fake_snapshot();
+    let mut second = fake_snapshot();
+    second.handle = X11WindowHandle::new(generation, 101);
+    second.surface_id = 8;
+    let first_id = server.state.allocate_window_id().expect("first window id");
+    let second_id = server.state.allocate_window_id().expect("second window id");
+    server
+        .state
+        .insert_desktop_window(crate::compositor::DesktopWindow::new_x11(
+            first_id,
+            first.clone(),
+        ))
+        .expect("insert first X11 window");
+    server
+        .state
+        .insert_desktop_window(crate::compositor::DesktopWindow::new_x11(
+            second_id,
+            second.clone(),
+        ))
+        .expect("insert second X11 window");
+
+    let commands = server.apply_xwayland_window_event(XwmEvent::ConfigureRequested {
+        window: first.handle,
+        request: X11ConfigureRequest {
+            requested: first.geometry,
+            fields: X11ConfigureFlags::default(),
+            border_width: 0,
+            sibling: Some(second.handle),
+            stack_mode: Some(crate::xwayland::xwm::X11StackMode::Above),
+        },
+    });
+
+    assert!(commands.iter().any(|command| matches!(
+        command,
+        XwmCommand::SyncClientLists { stacking, .. }
+            if stacking == &vec![second.handle, first.handle]
+    )));
+}
+
+#[test]
+fn compositor_x11_raise_emits_restacks_and_client_list_sync() {
+    let socket = super::unique_socket_name();
+    let mut server = super::OwnCompositorServer::bind_cpu_composition(&socket)
+        .expect("bind fake compositor server");
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let first = fake_snapshot();
+    let mut second = fake_snapshot();
+    second.handle = X11WindowHandle::new(generation, 102);
+    second.surface_id = 9;
+    let first_id = server.state.allocate_window_id().expect("first window id");
+    let second_id = server.state.allocate_window_id().expect("second window id");
+    server
+        .state
+        .insert_desktop_window(crate::compositor::DesktopWindow::new_x11(
+            first_id,
+            first.clone(),
+        ))
+        .expect("insert first X11 window");
+    server
+        .state
+        .insert_desktop_window(crate::compositor::DesktopWindow::new_x11(
+            second_id,
+            second.clone(),
+        ))
+        .expect("insert second X11 window");
+    let _ = server.state.take_backend_commands();
+
+    assert!(server.state.raise_window_id(first_id));
+    assert!(server
+        .take_xwayland_backend_commands(0)
+        .iter()
+        .any(|command| matches!(command, XwmCommand::RaiseAndSync { window, .. } if *window == first.handle)));
+}
+
+#[test]
+fn override_redirect_configure_notify_reconciles_x_stack_order() {
+    let socket = super::unique_socket_name();
+    let mut server = super::OwnCompositorServer::bind_cpu_composition(&socket)
+        .expect("bind fake compositor server");
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let mut first = fake_snapshot();
+    first.kind = DesktopWindowKind::OverrideRedirect;
+    first.override_redirect = true;
+    let mut second = first.clone();
+    second.handle = X11WindowHandle::new(generation, 103);
+    second.surface_id = 10;
+    let first_id = server.state.allocate_window_id().expect("first window id");
+    let second_id = server.state.allocate_window_id().expect("second window id");
+    server
+        .state
+        .insert_desktop_window(crate::compositor::DesktopWindow::new_x11(
+            first_id,
+            first.clone(),
+        ))
+        .expect("insert first OR window");
+    server
+        .state
+        .insert_desktop_window(crate::compositor::DesktopWindow::new_x11(
+            second_id,
+            second.clone(),
+        ))
+        .expect("insert second OR window");
+
+    let commands = server.apply_xwayland_window_event(XwmEvent::ConfigureNotify {
+        window: first.handle,
+        geometry: first.geometry,
+        above_sibling: Some(second.handle),
+    });
+
+    assert_eq!(server.state.window_stacking, vec![second_id, first_id]);
+    assert!(
+        commands
+            .iter()
+            .any(|command| matches!(command, XwmCommand::SyncClientLists { .. }))
+    );
+}
+
+#[test]
 fn multiple_xwayland_commits_preserve_ordered_edges_without_deduplication() {
     let mut fixture = first_buffer_fixture();
     let _ = fixture.server.take_xwayland_buffer_level_events();

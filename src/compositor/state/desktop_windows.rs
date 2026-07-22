@@ -859,6 +859,9 @@ impl CompositorState {
         if !self.desktop_windows.contains_key(&id) {
             return false;
         }
+        let x11_window = self
+            .window(id)
+            .is_some_and(|window| matches!(window.backend, WindowBackend::X11(_)));
         let raised = self.x11_subtree_order(id);
         if raised.is_empty() {
             return false;
@@ -867,6 +870,11 @@ impl CompositorState {
             .retain(|window_id| !raised.contains(window_id));
         self.window_stacking.extend(raised);
         self.normalize_window_stacking();
+        if x11_window {
+            self.backend_commands.push(
+                crate::compositor::window_backend::WindowBackendCommand::Restack { window: id },
+            );
+        }
         true
     }
 
@@ -906,7 +914,7 @@ impl CompositorState {
                 reordered.extend(std::mem::take(&mut self.window_stacking));
                 self.window_stacking = reordered;
             }
-            self.normalize_window_stacking();
+            self.rebuild_x11_transient_relationships();
             return self.window_stacking != original;
         };
         let original_window_index = original
@@ -945,7 +953,7 @@ impl CompositorState {
             .then_some(sibling_index.saturating_add(1))
             .unwrap_or(sibling_index);
         self.window_stacking.splice(insertion..insertion, raised);
-        self.normalize_window_stacking();
+        self.rebuild_x11_transient_relationships();
         self.window_stacking != original
     }
 

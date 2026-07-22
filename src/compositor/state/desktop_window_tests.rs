@@ -606,6 +606,38 @@ fn x11_stack_request_moves_one_window_without_reordering_siblings() {
 }
 
 #[test]
+fn raising_x11_window_queues_backend_restack() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let first = x11_snapshot(generation, 227, 227);
+    let second = x11_snapshot(generation, 228, 228);
+    let first_id = insert_x11(&mut state, first);
+    let _second_id = insert_x11(&mut state, second);
+    let _ = state.take_backend_commands();
+
+    assert!(state.raise_window_id(first_id));
+    assert!(state.take_backend_commands().iter().any(|command| matches!(
+        command,
+        crate::compositor::window_backend::WindowBackendCommand::Restack { window }
+            if *window == first_id
+    )));
+}
+
+#[test]
+fn transient_child_cannot_be_stacked_below_parent() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let parent = x11_snapshot(generation, 229, 229);
+    let parent_id = insert_x11(&mut state, parent.clone());
+    let mut child = x11_snapshot(generation, 230, 230);
+    child.transient_for = Some(parent.handle);
+    let child_id = insert_x11(&mut state, child.clone());
+
+    let _ = state.apply_x11_stack_request(child.handle, Some(parent.handle), X11StackMode::Below);
+    assert_eq!(state.window_stacking, vec![parent_id, child_id]);
+}
+
+#[test]
 fn dynamic_transient_for_rebuilds_family_and_rejects_cycles() {
     let mut state = CompositorState::new(None);
     let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());

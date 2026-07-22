@@ -203,6 +203,7 @@ pub enum XwmEvent {
     ConfigureNotify {
         window: X11WindowHandle,
         geometry: X11Geometry,
+        above_sibling: Option<X11WindowHandle>,
     },
     StateRequested {
         window: X11WindowHandle,
@@ -259,6 +260,11 @@ pub enum XwmCommand {
         timestamp: u32,
     },
     Raise(X11WindowHandle),
+    RaiseAndSync {
+        window: X11WindowHandle,
+        client_list: Vec<X11WindowHandle>,
+        stacking: Vec<X11WindowHandle>,
+    },
     RaiseFamily {
         family: Vec<X11WindowHandle>,
     },

@@ -21,7 +21,6 @@ impl CompositorState {
             return false;
         };
         self.focus_surface(surface);
-        let _ = self.raise_root_window(surface_id);
         true
     }
 

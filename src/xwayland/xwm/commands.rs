@@ -34,6 +34,16 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             validate_handle(xwm, *handle)?;
         }
     }
+    if let XwmCommand::RaiseAndSync {
+        client_list,
+        stacking,
+        ..
+    } = &command
+    {
+        for handle in client_list.iter().chain(stacking.iter()) {
+            validate_handle(xwm, *handle)?;
+        }
+    }
     let handle = command_handle(&command);
     if let Some(handle) = handle {
         validate_handle(xwm, handle)?;
@@ -246,6 +256,21 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
                 )
                 .map_err(XwmError::Connection)?;
         }
+        XwmCommand::RaiseAndSync {
+            window,
+            client_list,
+            stacking,
+        } => {
+            xwm.note_family_order(&[window]);
+            xwm.connection
+                .configure_window(
+                    window.xid(),
+                    &ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE),
+                )
+                .map_err(XwmError::Connection)?;
+            publish_client_list(xwm, XwmAtomName::NetClientList, &client_list)?;
+            publish_client_list(xwm, XwmAtomName::NetClientListStacking, &stacking)?;
+        }
         XwmCommand::RaiseFamily { family } => {
             xwm.note_family_order(&family);
             for handle in family {
@@ -370,6 +395,7 @@ fn command_handle(command: &XwmCommand) -> Option<super::X11WindowHandle> {
         | XwmCommand::Unmap(handle)
         | XwmCommand::Raise(handle)
         | XwmCommand::Close(handle) => Some(*handle),
+        XwmCommand::RaiseAndSync { window, .. } => Some(*window),
         XwmCommand::RaiseFamily { family } | XwmCommand::StackFamily { family, .. } => {
             family.first().copied()
         }

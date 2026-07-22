@@ -22,6 +22,9 @@ pub(crate) enum WindowBackendCommand {
         window: WindowId,
         activated: bool,
     },
+    Restack {
+        window: WindowId,
+    },
     PublishState {
         window: WindowId,
         mode: ToplevelMode,

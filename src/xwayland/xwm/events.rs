@@ -237,6 +237,8 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 xwm.outgoing_events.push_back(XwmEvent::ConfigureNotify {
                     window: handle,
                     geometry,
+                    above_sibling: (event.above_sibling != 0)
+                        .then(|| X11WindowHandle::new(xwm.generation, event.above_sibling)),
                 });
             }
         }
