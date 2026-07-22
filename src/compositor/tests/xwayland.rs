@@ -114,7 +114,16 @@ fn admit_first_buffer(fixture: &mut FirstBufferFixture, x: i32, y: i32) {
     let commands = fixture
         .server
         .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
-    assert_eq!(commands.len(), 1);
+    assert!(
+        commands
+            .iter()
+            .any(|command| matches!(command, XwmCommand::Raise(_)))
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|command| matches!(command, XwmCommand::SyncClientLists { .. }))
+    );
 }
 
 fn fake_snapshot() -> X11WindowSnapshot {
@@ -348,7 +357,7 @@ fn xwayland_buffer_committed_before_serial_becomes_ready() {
         server
             .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot))
             .len(),
-        1
+        2
     );
     assert_eq!(server.renderable_surfaces().len(), 1);
     assert_eq!(
@@ -357,7 +366,7 @@ fn xwayland_buffer_committed_before_serial_becomes_ready() {
     );
     assert_eq!(
         server.renderable_surfaces()[0].placement,
-        SurfacePlacement::absolute_root_at(37, 42)
+        SurfacePlacement::root()
     );
 }
 
@@ -372,10 +381,7 @@ fn window_ready_publishes_retained_xwayland_buffer() {
     let surface = &fixture.server.renderable_surfaces()[0];
     assert_eq!(surface.surface_id, fixture.surface_id);
     assert_eq!(surface.buffer_id().get(), fixture.initial_buffer_id);
-    assert_eq!(
-        surface.placement,
-        SurfacePlacement::absolute_root_at(37, 42)
-    );
+    assert_eq!(surface.placement, SurfacePlacement::root());
     assert_eq!(
         fixture.server.render_generation_cause(),
         RenderGenerationCause::SurfaceCommit

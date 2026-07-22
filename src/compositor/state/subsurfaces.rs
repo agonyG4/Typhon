@@ -1233,10 +1233,18 @@ impl CompositorState {
                 roots_with_trees.push((root_id, tree_ids));
             }
         }
+        let original_positions = roots_with_trees
+            .iter()
+            .enumerate()
+            .map(|(position, (root_id, _))| (*root_id, position))
+            .collect::<HashMap<_, _>>();
         roots_with_trees.sort_by_key(|(root_id, _)| {
-            (
-                self.surface_scene_rank(*root_id),
-                self.surface_scene_order(*root_id),
+            self.renderable_root_stack_key(
+                *root_id,
+                original_positions
+                    .get(root_id)
+                    .copied()
+                    .unwrap_or(usize::MAX),
             )
         });
         let ordered_ids = roots_with_trees
@@ -1257,6 +1265,45 @@ impl CompositorState {
             self.invalidate_surface_origin_cache();
         }
         changed
+    }
+
+    fn renderable_root_stack_key(
+        &self,
+        root_id: u32,
+        original_position: usize,
+    ) -> (u8, u64, usize) {
+        if let Some(role) = self.layer_surfaces.get(&root_id) {
+            return (
+                role.committed.layer.scene_rank(),
+                role.order,
+                original_position,
+            );
+        }
+
+        if let Some(window_id) = self
+            .desktop_windows
+            .values()
+            .find(|window| window.root_surface_id == root_id)
+            .map(|window| window.id)
+        {
+            let window = self
+                .window(window_id)
+                .expect("desktop window root must remain registered");
+            let layer_rank = match window.stack_layer {
+                DesktopStackLayer::Normal | DesktopStackLayer::Above => 2,
+                DesktopStackLayer::Popup => 3,
+                DesktopStackLayer::Notification => 3,
+                DesktopStackLayer::Overlay => 4,
+            };
+            let stack_position = self
+                .window_stacking
+                .iter()
+                .position(|id| *id == window_id)
+                .unwrap_or(usize::MAX) as u64;
+            return (layer_rank, stack_position, original_position);
+        }
+
+        (2, 0, original_position)
     }
 
     pub(in crate::compositor) fn append_surface_tree_order(
@@ -1294,6 +1341,14 @@ impl CompositorState {
         for child_id in children {
             self.append_surface_tree_order(child_id, visible_ids, ordered_ids);
         }
+    }
+
+    pub(in crate::compositor) fn reorder_renderable_surfaces_by_window_stack(&mut self) -> bool {
+        let changed = self.reorder_renderable_surfaces_by_committed_stack();
+        if changed {
+            self.advance_render_generation(RenderGenerationCause::WindowStack);
+        }
+        changed
     }
 
     pub(in crate::compositor) fn set_surface_placement(

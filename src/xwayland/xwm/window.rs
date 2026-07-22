@@ -261,12 +261,6 @@ impl X11WindowRegistry {
         self.records.get(&handle)
     }
 
-    pub(crate) fn snapshots(&self) -> impl Iterator<Item = (X11WindowHandle, &X11WindowSnapshot)> {
-        self.records.iter().filter_map(|(handle, record)| {
-            record.snapshot.as_ref().map(|snapshot| (*handle, snapshot))
-        })
-    }
-
     pub(crate) fn get_mut(&mut self, handle: X11WindowHandle) -> Option<&mut X11WindowRecord> {
         self.records.get_mut(&handle)
     }

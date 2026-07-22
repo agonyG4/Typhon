@@ -422,12 +422,8 @@ impl OwnCompositorServer {
                         eprintln!(
                             "oblivion-one compositor: event=xwayland_window_admitted surface_id={surface_id} retained_buffer={published} published={published} focused={focused}"
                         );
-                        let family = self.state.x11_family_handles(handle);
-                        let mut commands = vec![self.sync_xwayland_client_lists()];
-                        if family.len() > 1 {
-                            commands.push(XwmCommand::RaiseFamily { family });
-                        }
-                        commands
+                        let _ = self.state.raise_window_id(window_id);
+                        vec![XwmCommand::Raise(handle), self.sync_xwayland_client_lists()]
                     }
                     Err(error) => {
                         eprintln!(
@@ -504,37 +500,24 @@ impl OwnCompositorServer {
                 if !publish_lists {
                     return Vec::new();
                 }
-                let family = self.state.x11_family_handles(window);
-                let mut commands = vec![self.sync_xwayland_client_lists()];
-                if family.len() > 1 {
-                    commands.push(XwmCommand::RaiseFamily { family });
+                if let Some(window_id) = prior_id {
+                    let _ = self.state.raise_window_id(window_id);
                 }
-                commands
+                vec![XwmCommand::Raise(window), self.sync_xwayland_client_lists()]
             }
             XwmEvent::ConfigureRequested { window, request } => {
                 if self.state.x11_resize_active(window) {
                     let mut commands = Vec::with_capacity(2);
-                    if let Some(mode) = request.stack_mode {
-                        if request.sibling.is_none()
-                            && matches!(mode, crate::xwayland::xwm::X11StackMode::Above)
-                        {
-                            let family = self.state.x11_family_handles(window);
-                            if family.len() > 1 {
-                                commands.push(XwmCommand::StackFamily { family, mode });
-                            } else {
-                                commands.push(XwmCommand::Stack {
-                                    window,
-                                    sibling: request.sibling,
-                                    mode,
-                                });
-                            }
-                        } else {
-                            commands.push(XwmCommand::Stack {
-                                window,
-                                sibling: request.sibling,
-                                mode,
-                            });
-                        }
+                    if let Some(mode) = request.stack_mode
+                        && self
+                            .state
+                            .apply_x11_stack_request(window, request.sibling, mode)
+                    {
+                        commands.push(XwmCommand::Stack {
+                            window,
+                            sibling: request.sibling,
+                            mode,
+                        });
                     }
                     if (request.fields.x
                         || request.fields.y
@@ -567,27 +550,16 @@ impl OwnCompositorServer {
                     fields: request.fields,
                     border_width: request.border_width,
                 }];
-                if let Some(mode) = request.stack_mode {
-                    if request.sibling.is_none()
-                        && matches!(mode, crate::xwayland::xwm::X11StackMode::Above)
-                    {
-                        let family = self.state.x11_family_handles(window);
-                        if family.len() > 1 {
-                            commands.push(XwmCommand::StackFamily { family, mode });
-                        } else {
-                            commands.push(XwmCommand::Stack {
-                                window,
-                                sibling: request.sibling,
-                                mode,
-                            });
-                        }
-                    } else {
-                        commands.push(XwmCommand::Stack {
-                            window,
-                            sibling: request.sibling,
-                            mode,
-                        });
-                    }
+                if let Some(mode) = request.stack_mode
+                    && self
+                        .state
+                        .apply_x11_stack_request(window, request.sibling, mode)
+                {
+                    commands.push(XwmCommand::Stack {
+                        window,
+                        sibling: request.sibling,
+                        mode,
+                    });
                 }
                 commands
             }
@@ -640,18 +612,15 @@ impl OwnCompositorServer {
                     .window_id_for_x11_handle(window)
                     .is_some_and(|window_id| self.state.focus_desktop_window(window_id))
                 {
-                    let family = self.state.x11_family_handles(window);
-                    let raise = if family.len() > 1 {
-                        XwmCommand::RaiseFamily { family }
-                    } else {
-                        XwmCommand::Raise(window)
-                    };
+                    if let Some(window_id) = self.state.window_id_for_x11_handle(window) {
+                        let _ = self.state.raise_window_id(window_id);
+                    }
                     vec![
                         XwmCommand::Focus {
                             window: Some(window),
                             timestamp,
                         },
-                        raise,
+                        XwmCommand::Raise(window),
                         self.sync_xwayland_client_lists(),
                     ]
                 } else {

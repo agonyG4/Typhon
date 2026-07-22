@@ -94,13 +94,13 @@ mod surface;
 mod window_backend;
 mod window_state;
 use commit_debug::*;
+pub use desktop_window::{
+    DesktopStackLayer, DesktopWindowKind, WindowConstraints, WindowId, WindowMetadata,
+    X11DesktopRole, X11PlacementPolicy,
+};
 #[allow(unused_imports)]
 pub(crate) use desktop_window::{
     DesktopWindow, DesktopWindowError, WindowBackend, WindowRelationships, XdgWindowHandle,
-};
-pub use desktop_window::{
-    DesktopWindowKind, WindowConstraints, WindowId, WindowMetadata, X11DesktopRole,
-    X11PlacementPolicy,
 };
 use dmabuf::{
     DmabufBufferData, DmabufFeedbackData, DmabufParamsData, PendingDmabufPlane,

@@ -44,6 +44,15 @@ pub enum X11PlacementPolicy {
     OverrideRedirect,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DesktopStackLayer {
+    Normal,
+    Above,
+    Popup,
+    Notification,
+    Overlay,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WindowMetadata {
     pub app_id: Option<String>,
@@ -107,6 +116,7 @@ pub struct DesktopWindow {
     pub kind: DesktopWindowKind,
     pub x11_role: Option<X11DesktopRole>,
     pub x11_placement_policy: Option<X11PlacementPolicy>,
+    pub(crate) stack_layer: DesktopStackLayer,
     pub x11_window_types: X11WindowTypes,
     pub x11_accepts_input: Option<bool>,
     pub x11_transient_for: Option<X11WindowHandle>,
@@ -146,6 +156,7 @@ impl DesktopWindow {
             kind: DesktopWindowKind::Managed,
             x11_role: None,
             x11_placement_policy: None,
+            stack_layer: DesktopStackLayer::Normal,
             x11_window_types: X11WindowTypes::default(),
             x11_accepts_input: None,
             x11_transient_for: None,
@@ -173,6 +184,7 @@ impl DesktopWindow {
             kind: snapshot.kind,
             x11_role: Some(role),
             x11_placement_policy: Some(x11_placement_policy(role)),
+            stack_layer: x11_stack_layer(role),
             x11_window_types: snapshot.window_types,
             x11_accepts_input: snapshot.accepts_input,
             x11_transient_for: snapshot.transient_for,
@@ -201,6 +213,17 @@ pub(crate) const fn x11_placement_policy(role: X11DesktopRole) -> X11PlacementPo
         }
         X11DesktopRole::OverrideRedirect => X11PlacementPolicy::OverrideRedirect,
         X11DesktopRole::AuxiliarySupport => X11PlacementPolicy::ClientPositioned,
+    }
+}
+
+pub(crate) const fn x11_stack_layer(role: X11DesktopRole) -> DesktopStackLayer {
+    match role {
+        X11DesktopRole::Toplevel | X11DesktopRole::Dialog => DesktopStackLayer::Normal,
+        X11DesktopRole::AuxiliaryPopup => DesktopStackLayer::Popup,
+        X11DesktopRole::Notification => DesktopStackLayer::Notification,
+        X11DesktopRole::OverrideRedirect | X11DesktopRole::AuxiliarySupport => {
+            DesktopStackLayer::Overlay
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 use super::*;
 use crate::xwayland::xwm::{
-    X11Geometry, X11MetadataDelta, X11PublishedState, X11WindowSnapshot, X11WindowType,
-    X11WindowTypes,
+    X11Geometry, X11MetadataDelta, X11PublishedState, X11StackMode, X11WindowSnapshot,
+    X11WindowType, X11WindowTypes,
 };
 use crate::xwayland::{X11WindowHandle, XwaylandGeneration};
 use std::num::NonZeroU64;
@@ -417,6 +417,54 @@ fn transient_family_raise_preserves_parent_below_child() {
 }
 
 #[test]
+fn raising_one_transient_sibling_does_not_raise_the_other_sibling() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let parent = x11_snapshot(generation, 216, 216);
+    let parent_id = insert_x11(&mut state, parent.clone());
+    let mut first = x11_snapshot(generation, 217, 217);
+    first.window_types = X11WindowTypes::new(vec![X11WindowType::PopupMenu]);
+    first.transient_for = Some(parent.handle);
+    let first_id = insert_x11(&mut state, first);
+    let mut second = x11_snapshot(generation, 218, 218);
+    second.window_types = X11WindowTypes::new(vec![X11WindowType::PopupMenu]);
+    second.transient_for = Some(parent.handle);
+    let second_id = insert_x11(&mut state, second);
+
+    assert_eq!(state.window_stacking, vec![parent_id, first_id, second_id]);
+    assert!(state.raise_window_id(first_id));
+    assert_eq!(state.window_stacking, vec![parent_id, second_id, first_id]);
+}
+
+#[test]
+fn popup_layer_stays_above_normal_window_when_normal_window_is_raised() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let mut popup = x11_snapshot(generation, 219, 219);
+    popup.window_types = X11WindowTypes::new(vec![X11WindowType::PopupMenu]);
+    let popup_id = insert_x11(&mut state, popup);
+    let normal_id = insert_x11(&mut state, x11_snapshot(generation, 220, 220));
+
+    assert_eq!(state.window_stacking, vec![normal_id, popup_id]);
+    assert!(state.raise_window_id(normal_id));
+    assert_eq!(state.window_stacking, vec![normal_id, popup_id]);
+}
+
+#[test]
+fn x11_stack_request_moves_one_window_without_reordering_siblings() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let first = x11_snapshot(generation, 221, 221);
+    let second = x11_snapshot(generation, 222, 222);
+    let first_id = insert_x11(&mut state, first.clone());
+    let second_id = insert_x11(&mut state, second.clone());
+
+    assert!(state.apply_x11_stack_request(first.handle, Some(second.handle), X11StackMode::Above,));
+    assert_eq!(state.window_stacking, vec![second_id, first_id]);
+    assert!(!state.apply_x11_stack_request(first.handle, None, X11StackMode::Above,));
+}
+
+#[test]
 fn dynamic_transient_for_rebuilds_family_and_rejects_cycles() {
     let mut state = CompositorState::new(None);
     let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
@@ -598,7 +646,7 @@ fn pre_map_fullscreen_snapshot_enters_fullscreen_on_admission() {
     );
     assert_eq!(
         state.surface_placement(snapshot.surface_id),
-        SurfacePlacement::absolute_root_at(snapshot.geometry.x, snapshot.geometry.y)
+        SurfacePlacement::root()
     );
 }
 

@@ -941,26 +941,6 @@ impl CompositorState {
         self.activate_ondemand_layer_surface(root_surface_id)
     }
 
-    pub(in crate::compositor) fn surface_scene_rank(&self, surface_id: u32) -> u8 {
-        let root_id = self.root_surface_id_for_surface(surface_id);
-        if let Some(layer) = self
-            .layer_surfaces
-            .get(&root_id)
-            .map(|role| role.committed.layer.scene_rank())
-        {
-            return layer;
-        }
-        2
-    }
-
-    pub(in crate::compositor) fn surface_scene_order(&self, surface_id: u32) -> u64 {
-        let root_id = self.root_surface_id_for_surface(surface_id);
-        self.layer_surfaces
-            .get(&root_id)
-            .map(|role| role.order)
-            .unwrap_or(0)
-    }
-
     pub(in crate::compositor) fn external_overlay_surface_ids(&self) -> Vec<u32> {
         self.renderable_surfaces
             .iter()

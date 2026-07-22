@@ -152,24 +152,13 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             mode,
         } => {
             xwm.note_family_order(&[window]);
-            if sibling.is_none() && matches!(mode, X11StackMode::Above) {
-                for family_handle in transient_family_handles(xwm, window) {
-                    xwm.connection
-                        .configure_window(
-                            family_handle.xid(),
-                            &ConfigureWindowAux::new().stack_mode(to_x11_stack_mode(mode)),
-                        )
-                        .map_err(XwmError::Connection)?;
-                }
-            } else {
-                let mut aux = ConfigureWindowAux::new().stack_mode(to_x11_stack_mode(mode));
-                if let Some(sibling) = sibling {
-                    aux = aux.sibling(sibling.xid());
-                }
-                xwm.connection
-                    .configure_window(window.xid(), &aux)
-                    .map_err(XwmError::Connection)?;
+            let mut aux = ConfigureWindowAux::new().stack_mode(to_x11_stack_mode(mode));
+            if let Some(sibling) = sibling {
+                aux = aux.sibling(sibling.xid());
             }
+            xwm.connection
+                .configure_window(window.xid(), &aux)
+                .map_err(XwmError::Connection)?;
         }
         XwmCommand::StackFamily { family, mode } => {
             xwm.note_family_order(&family);
@@ -240,16 +229,13 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             }
         }
         XwmCommand::Raise(handle) => {
-            let family = transient_family_handles(xwm, handle);
-            xwm.note_family_order(&family);
-            for family_handle in family {
-                xwm.connection
-                    .configure_window(
-                        family_handle.xid(),
-                        &ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE),
-                    )
-                    .map_err(XwmError::Connection)?;
-            }
+            xwm.note_family_order(&[handle]);
+            xwm.connection
+                .configure_window(
+                    handle.xid(),
+                    &ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE),
+                )
+                .map_err(XwmError::Connection)?;
         }
         XwmCommand::RaiseFamily { family } => {
             xwm.note_family_order(&family);
@@ -389,59 +375,6 @@ fn command_handle(command: &XwmCommand) -> Option<super::X11WindowHandle> {
         | XwmCommand::ReleaseResizeCommits { window, .. }
         | XwmCommand::CompleteResizeSync(window) => Some(*window),
     }
-}
-
-fn transient_family_handles(
-    xwm: &Xwm,
-    requested: super::X11WindowHandle,
-) -> Vec<super::X11WindowHandle> {
-    let mut parent_by_handle = std::collections::HashMap::new();
-    for (handle, snapshot) in xwm.windows.snapshots() {
-        parent_by_handle.insert(handle, snapshot.transient_for);
-    }
-    let mut root = requested;
-    let mut seen = std::collections::HashSet::new();
-    while seen.insert(root) {
-        let Some(Some(parent)) = parent_by_handle.get(&root) else {
-            break;
-        };
-        root = *parent;
-    }
-    let mut family = parent_by_handle
-        .keys()
-        .copied()
-        .filter(|handle| {
-            let mut current = *handle;
-            let mut seen = std::collections::HashSet::new();
-            while seen.insert(current) {
-                if current == root {
-                    return true;
-                }
-                let Some(Some(parent)) = parent_by_handle.get(&current) else {
-                    break;
-                };
-                current = *parent;
-            }
-            false
-        })
-        .collect::<Vec<_>>();
-    family.sort_by_key(|handle| {
-        let mut depth = 0usize;
-        let mut current = *handle;
-        let mut seen = std::collections::HashSet::new();
-        while current != root && seen.insert(current) {
-            let Some(Some(parent)) = parent_by_handle.get(&current) else {
-                break;
-            };
-            current = *parent;
-            depth += 1;
-        }
-        (
-            depth,
-            xwm.family_order.get(handle).copied().unwrap_or(u64::MAX),
-        )
-    });
-    family
 }
 
 fn publish_client_list(

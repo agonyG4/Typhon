@@ -69,6 +69,7 @@ impl CompositorState {
         self.window_stacking.push(window.id);
         self.desktop_windows.insert(window.id, window);
         self.rebuild_x11_transient_relationships();
+        self.normalize_window_stacking();
         Ok(())
     }
 
@@ -329,6 +330,10 @@ impl CompositorState {
                 window.x11_placement_policy = window
                     .x11_role
                     .map(crate::compositor::desktop_window::x11_placement_policy);
+                window.stack_layer = window
+                    .x11_role
+                    .map(crate::compositor::desktop_window::x11_stack_layer)
+                    .unwrap_or(DesktopStackLayer::Normal);
             }
             crate::xwayland::xwm::X11MetadataDelta::WindowTypes(window_types) => {
                 window.x11_window_types = window_types;
@@ -341,6 +346,10 @@ impl CompositorState {
                 window.x11_placement_policy = window
                     .x11_role
                     .map(crate::compositor::desktop_window::x11_placement_policy);
+                window.stack_layer = window
+                    .x11_role
+                    .map(crate::compositor::desktop_window::x11_stack_layer)
+                    .unwrap_or(DesktopStackLayer::Normal);
             }
             crate::xwayland::xwm::X11MetadataDelta::Kind(kind) => {
                 window.kind = kind;
@@ -353,6 +362,10 @@ impl CompositorState {
                 window.x11_placement_policy = window
                     .x11_role
                     .map(crate::compositor::desktop_window::x11_placement_policy);
+                window.stack_layer = window
+                    .x11_role
+                    .map(crate::compositor::desktop_window::x11_stack_layer)
+                    .unwrap_or(DesktopStackLayer::Normal);
             }
             crate::xwayland::xwm::X11MetadataDelta::AcceptsInput(accepts_input) => {
                 window.x11_accepts_input = accepts_input;
@@ -453,6 +466,22 @@ impl CompositorState {
         for root in roots {
             self.reorder_x11_family(root);
         }
+        self.normalize_window_stacking();
+    }
+
+    fn normalize_window_stacking(&mut self) {
+        let layers = self
+            .desktop_windows
+            .values()
+            .map(|window| (window.id, window.stack_layer))
+            .collect::<std::collections::HashMap<_, _>>();
+        self.window_stacking.sort_by_key(|window_id| {
+            layers
+                .get(window_id)
+                .copied()
+                .unwrap_or(DesktopStackLayer::Normal)
+        });
+        self.reorder_renderable_surfaces_by_window_stack();
     }
 
     pub(in crate::compositor) fn filter_x11_geometry(
@@ -683,155 +712,163 @@ impl CompositorState {
         if !self.desktop_windows.contains_key(&id) {
             return false;
         }
-        let root = self.x11_family_root(id);
-        let family = self.x11_family_order(root);
-        if family.is_empty() {
+        let raised = self.x11_subtree_order(id);
+        if raised.is_empty() {
             return false;
         }
         self.window_stacking
-            .retain(|window_id| !family.contains(window_id));
-        self.window_stacking.extend(family);
+            .retain(|window_id| !raised.contains(window_id));
+        self.window_stacking.extend(raised);
+        self.normalize_window_stacking();
         true
     }
 
-    fn reorder_x11_family(&mut self, root: WindowId) -> bool {
-        let family = self.x11_family_order(root);
-        if family.len() < 2 {
+    pub(in crate::compositor) fn apply_x11_stack_request(
+        &mut self,
+        handle: X11WindowHandle,
+        sibling: Option<X11WindowHandle>,
+        mode: crate::xwayland::xwm::X11StackMode,
+    ) -> bool {
+        let Some(window_id) = self.window_id_for_x11_handle(handle) else {
             return false;
-        }
-        let family_set = family
+        };
+        let sibling_id = sibling.and_then(|handle| self.window_id_for_x11_handle(handle));
+        let original = self.window_stacking.clone();
+        let raised = self.x11_subtree_order(window_id);
+        let raised_set = raised
             .iter()
             .copied()
             .collect::<std::collections::HashSet<_>>();
-        let highest_family_index = self
+        let Some(sibling_id) = sibling_id.filter(|id| !raised_set.contains(id)) else {
+            if sibling.is_some() {
+                return false;
+            }
+            if !matches!(
+                mode,
+                crate::xwayland::xwm::X11StackMode::Above
+                    | crate::xwayland::xwm::X11StackMode::Below
+            ) {
+                return false;
+            }
+            self.window_stacking
+                .retain(|candidate| !raised_set.contains(candidate));
+            if matches!(mode, crate::xwayland::xwm::X11StackMode::Above) {
+                self.window_stacking.extend(raised);
+            } else {
+                let mut reordered = raised;
+                reordered.extend(std::mem::take(&mut self.window_stacking));
+                self.window_stacking = reordered;
+            }
+            self.normalize_window_stacking();
+            return self.window_stacking != original;
+        };
+        let original_window_index = original
+            .iter()
+            .position(|candidate| *candidate == window_id)
+            .unwrap_or(0);
+        let sibling_index = original
+            .iter()
+            .position(|candidate| *candidate == sibling_id)
+            .unwrap_or(0);
+        let effective_mode = match mode {
+            crate::xwayland::xwm::X11StackMode::TopIf => (original_window_index < sibling_index)
+                .then_some(crate::xwayland::xwm::X11StackMode::Above),
+            crate::xwayland::xwm::X11StackMode::BottomIf => (original_window_index > sibling_index)
+                .then_some(crate::xwayland::xwm::X11StackMode::Below),
+            crate::xwayland::xwm::X11StackMode::Opposite => {
+                Some(if original_window_index < sibling_index {
+                    crate::xwayland::xwm::X11StackMode::Above
+                } else {
+                    crate::xwayland::xwm::X11StackMode::Below
+                })
+            }
+            mode => Some(mode),
+        };
+        let Some(effective_mode) = effective_mode else {
+            return false;
+        };
+        self.window_stacking
+            .retain(|candidate| !raised_set.contains(candidate));
+        let sibling_index = self
             .window_stacking
             .iter()
-            .enumerate()
-            .filter_map(|(index, id)| family_set.contains(id).then_some(index))
-            .max();
-        let insertion = highest_family_index.map_or(self.window_stacking.len(), |highest| {
-            self.window_stacking
-                .iter()
-                .take(highest)
-                .filter(|id| !family_set.contains(id))
-                .count()
-        });
-        let original_stack = self.window_stacking.clone();
-        self.window_stacking.retain(|id| !family_set.contains(id));
-        let insertion = insertion.min(self.window_stacking.len());
-        self.window_stacking
-            .splice(insertion..insertion, family.iter().copied());
-        let stack_changed = self.window_stacking != original_stack;
+            .position(|candidate| *candidate == sibling_id)
+            .unwrap_or(self.window_stacking.len());
+        let insertion = matches!(effective_mode, crate::xwayland::xwm::X11StackMode::Above)
+            .then_some(sibling_index.saturating_add(1))
+            .unwrap_or(sibling_index);
+        self.window_stacking.splice(insertion..insertion, raised);
+        self.normalize_window_stacking();
+        self.window_stacking != original
+    }
 
-        let family_roots = family
-            .iter()
-            .filter_map(|id| {
-                self.window(*id)
-                    .map(|window| (window.id, window.root_surface_id))
-            })
-            .collect::<Vec<_>>();
-        let root_rank = family_roots
-            .iter()
-            .enumerate()
-            .map(|(rank, (_, surface_id))| (*surface_id, rank))
-            .collect::<std::collections::HashMap<_, _>>();
-        let original = std::mem::take(&mut self.renderable_surfaces);
-        let original_surface_order = original
-            .iter()
-            .map(|surface| surface.surface_id)
-            .collect::<Vec<_>>();
-        let mut family_surfaces = Vec::new();
-        let mut lower = Vec::with_capacity(original.len());
-        let mut family_insertion = lower.len();
-        for (index, surface) in original.into_iter().enumerate() {
-            let root_surface = root_surface_id_for_surface_in_placements(
-                &self.surface_placements,
-                surface.surface_id,
-            );
-            if root_rank.contains_key(&root_surface) {
-                family_insertion = lower.len();
-                family_surfaces.push((index, surface, root_surface));
-            } else {
-                lower.push(surface);
+    fn reorder_x11_family(&mut self, root: WindowId) -> bool {
+        let family = self.x11_subtree_order(root);
+        if family.len() < 2 {
+            return false;
+        }
+        let original_stack = self.window_stacking.clone();
+        let mut ordered = family;
+        ordered.sort_by_key(|id| {
+            let mut depth = 0usize;
+            let mut current = *id;
+            let mut seen = std::collections::HashSet::new();
+            while current != root && seen.insert(current) {
+                let Some(parent) = self
+                    .window(current)
+                    .and_then(|window| window.relationships.transient_for)
+                else {
+                    break;
+                };
+                current = parent;
+                depth += 1;
+            }
+            (
+                depth,
+                self.window_stacking
+                    .iter()
+                    .position(|candidate| candidate == id),
+            )
+        });
+        for child in ordered.into_iter().filter(|id| *id != root) {
+            let Some(parent) = self
+                .window(child)
+                .and_then(|window| window.relationships.transient_for)
+            else {
+                continue;
+            };
+            let Some(parent_index) = self.window_stacking.iter().position(|id| *id == parent)
+            else {
+                continue;
+            };
+            let Some(child_index) = self.window_stacking.iter().position(|id| *id == child) else {
+                continue;
+            };
+            if child_index < parent_index {
+                let child = self.window_stacking.remove(child_index);
+                let parent_index = self
+                    .window_stacking
+                    .iter()
+                    .position(|id| *id == parent)
+                    .unwrap_or(self.window_stacking.len());
+                self.window_stacking.insert(parent_index + 1, child);
             }
         }
-        family_surfaces.sort_by_key(|(index, _, root_surface)| (root_rank[root_surface], *index));
-        let family_surfaces = family_surfaces
-            .into_iter()
-            .map(|(_, surface, _)| surface)
-            .collect::<Vec<_>>();
-        let insertion = family_insertion.min(lower.len());
-        lower.splice(insertion..insertion, family_surfaces);
-        let surfaces_changed = original_surface_order
-            != lower
-                .iter()
-                .map(|surface| surface.surface_id)
-                .collect::<Vec<_>>();
-        self.renderable_surfaces = lower;
-        if surfaces_changed {
-            self.invalidate_surface_origin_cache();
-            self.advance_render_generation(RenderGenerationCause::WindowStack);
+        let stack_changed = self.window_stacking != original_stack;
+        if stack_changed {
+            self.reorder_renderable_surfaces_by_window_stack();
         }
-        stack_changed || surfaces_changed
+        stack_changed
     }
 
     pub(in crate::compositor) fn raise_x11_family_for_surface(&mut self, surface_id: u32) -> bool {
         let Some(id) = self.window_id_for_surface(surface_id) else {
             return false;
         };
-        let root = self.x11_family_root(id);
-        let family = self.x11_family_order(root);
-        let changed_stack = self.raise_window_id(id);
-        let family_roots = family
-            .iter()
-            .filter_map(|id| self.window(*id).map(|window| window.root_surface_id))
-            .collect::<std::collections::HashSet<_>>();
-        let original_order = self
-            .renderable_surfaces
-            .iter()
-            .map(|surface| surface.surface_id)
-            .collect::<Vec<_>>();
-        let placements = &self.surface_placements;
-        let mut raised = Vec::new();
-        let mut lower = Vec::with_capacity(self.renderable_surfaces.len());
-        for surface in self.renderable_surfaces.drain(..) {
-            if family_roots.contains(&root_surface_id_for_surface_in_placements(
-                placements,
-                surface.surface_id,
-            )) {
-                raised.push(surface);
-            } else {
-                lower.push(surface);
-            }
-        }
-        lower.extend(raised);
-        let changed_surfaces = lower
-            .iter()
-            .map(|surface| surface.surface_id)
-            .ne(original_order);
-        self.renderable_surfaces = lower;
-        if changed_surfaces {
-            self.invalidate_surface_origin_cache();
-            self.advance_render_generation(RenderGenerationCause::WindowStack);
-        }
-        changed_stack || changed_surfaces
+        self.raise_window_id(id)
     }
 
-    fn x11_family_root(&self, mut id: WindowId) -> WindowId {
-        let mut seen = std::collections::HashSet::new();
-        while seen.insert(id) {
-            let Some(parent) = self
-                .window(id)
-                .and_then(|window| window.relationships.transient_for)
-            else {
-                break;
-            };
-            id = parent;
-        }
-        id
-    }
-
-    fn x11_family_order(&self, root: WindowId) -> Vec<WindowId> {
+    fn x11_subtree_order(&self, id: WindowId) -> Vec<WindowId> {
         let members = self
             .desktop_windows
             .values()
@@ -839,7 +876,7 @@ impl CompositorState {
                 let mut current = window.id;
                 let mut seen = std::collections::HashSet::new();
                 while seen.insert(current) {
-                    if current == root {
+                    if current == id {
                         return true;
                     }
                     let Some(parent) = self
@@ -854,49 +891,10 @@ impl CompositorState {
             })
             .map(|window| window.id)
             .collect::<std::collections::HashSet<_>>();
-        let mut ordered = members.into_iter().collect::<Vec<_>>();
-        ordered.sort_by_key(|id| {
-            let depth = self.x11_family_depth(*id, root);
-            let map_order = self
-                .window_stacking
-                .iter()
-                .position(|candidate| candidate == id)
-                .unwrap_or(usize::MAX);
-            (depth, map_order)
-        });
-        ordered
-    }
-
-    fn x11_family_depth(&self, mut id: WindowId, root: WindowId) -> usize {
-        let mut depth = 0;
-        let mut seen = std::collections::HashSet::new();
-        while id != root && seen.insert(id) {
-            let Some(parent) = self
-                .window(id)
-                .and_then(|window| window.relationships.transient_for)
-            else {
-                break;
-            };
-            id = parent;
-            depth += 1;
-        }
-        depth
-    }
-
-    pub(in crate::compositor) fn x11_family_handles(
-        &self,
-        handle: X11WindowHandle,
-    ) -> Vec<X11WindowHandle> {
-        let Some(id) = self.window_id_for_x11_handle(handle) else {
-            return Vec::new();
-        };
-        let root = self.x11_family_root(id);
-        self.x11_family_order(root)
-            .into_iter()
-            .filter_map(|id| match self.window(id).map(|window| window.backend) {
-                Some(WindowBackend::X11(handle)) => Some(handle),
-                _ => None,
-            })
+        self.window_stacking
+            .iter()
+            .copied()
+            .filter(|candidate| members.contains(candidate))
             .collect()
     }
 
