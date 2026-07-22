@@ -72,14 +72,14 @@ impl CompositorState {
             ) => window.x11_geometry.map(|geometry| geometry.frame.placement),
             None => None,
         };
-        if let Some(placement) = initial_placement {
-            if let Some(geometry) = window.x11_geometry.as_mut() {
-                if window.x11_placement_policy == Some(X11PlacementPolicy::CompositorManaged) {
-                    geometry.client.x = placement.local_x;
-                    geometry.client.y = placement.local_y;
-                }
-                geometry.frame.placement = placement;
+        if let Some(placement) = initial_placement
+            && let Some(geometry) = window.x11_geometry.as_mut()
+        {
+            if window.x11_placement_policy == Some(X11PlacementPolicy::CompositorManaged) {
+                geometry.client.x = placement.local_x;
+                geometry.client.y = placement.local_y;
             }
+            geometry.frame.placement = placement;
         }
         let root_surface_id = window.root_surface_id;
         self.window_by_root_surface

@@ -812,7 +812,7 @@ fn xwayland_attachment_replacement_preserves_frame_and_keyboard_focus() {
             .state
             .focused_surface
             .as_ref()
-            .map(|surface| crate::compositor::compositor_surface_id(surface)),
+            .map(crate::compositor::compositor_surface_id),
         Some(fixture.parent_surface_id)
     );
 
@@ -842,7 +842,7 @@ fn xwayland_attachment_replacement_preserves_frame_and_keyboard_focus() {
             .state
             .focused_surface
             .as_ref()
-            .map(|surface| crate::compositor::compositor_surface_id(surface)),
+            .map(crate::compositor::compositor_surface_id),
         Some(fixture.popup_surface_id),
         "keyboard focus must transfer to the replacement surface"
     );
@@ -865,7 +865,7 @@ fn xwayland_attachment_replacement_preserves_frame_and_keyboard_focus() {
             .state
             .focused_surface
             .as_ref()
-            .map(|surface| crate::compositor::compositor_surface_id(surface)),
+            .map(crate::compositor::compositor_surface_id),
         Some(fixture.popup_surface_id),
         "late removal of the old attachment must not clear replacement focus"
     );
