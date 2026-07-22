@@ -36,6 +36,7 @@ mod resize_sync;
 pub(crate) mod shape;
 pub(crate) mod startup;
 mod window;
+mod window_types;
 
 #[cfg(test)]
 mod tests;
@@ -48,8 +49,9 @@ use capabilities::XwmCapabilities;
 pub use moveresize::{X11MoveResizeDirection, X11MoveResizeRequest};
 pub use resize_sync::{RESIZE_SYNC_TIMEOUT_NS, ResizeSyncError, ResizeSyncState};
 pub(crate) use resize_sync::{ResizeSyncCommit, ResizeSyncTracker};
+pub use window::X11WindowLifecycle;
 use window::{KindReconciliation, X11WindowRegistry};
-pub use window::{X11WindowLifecycle, X11WindowType, X11WindowTypes};
+pub use window_types::{X11WindowType, X11WindowTypes};
 
 use super::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 

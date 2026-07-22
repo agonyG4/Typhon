@@ -193,7 +193,6 @@ pub use surface::{
     SurfaceCommitCounter, SurfaceCommitSequence, SurfaceDamageJournal, SurfaceDamageRect,
     SurfacePlacement,
 };
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XwaylandSurfaceCommitObserved {
     pub generation: XwaylandGeneration,
