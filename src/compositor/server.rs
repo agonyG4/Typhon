@@ -395,6 +395,7 @@ impl OwnCompositorServer {
                             self.state.x11_window_wants_initial_focus(window_id);
                         let focused =
                             wants_initial_focus && self.state.focus_desktop_window(window_id);
+                        self.state.refresh_pointer_focus_at_last_position();
                         let focus_after = self.focused_x11_window_xid();
                         trace::emit("focus_decision", || {
                             TraceFields::new()
@@ -446,6 +447,7 @@ impl OwnCompositorServer {
             XwmEvent::WindowDestroyed(handle) => {
                 let focus_before = self.focused_x11_window_xid();
                 if self.remove_x11_desktop_window(handle) {
+                    self.state.refresh_pointer_focus_at_last_position();
                     trace::emit("window_destroyed", || {
                         TraceFields::new()
                             .field("source", "compositor")
@@ -461,6 +463,7 @@ impl OwnCompositorServer {
             XwmEvent::WindowWithdrawn(handle) => {
                 let focus_before = self.focused_x11_window_xid();
                 if self.remove_x11_desktop_window(handle) {
+                    self.state.refresh_pointer_focus_at_last_position();
                     trace::emit("window_withdrawn", || {
                         TraceFields::new()
                             .field("source", "compositor")
@@ -498,6 +501,7 @@ impl OwnCompositorServer {
                     self.state.clear_keyboard_focus();
                     let _ = self.state.focus_topmost_renderable_toplevel();
                 }
+                self.state.refresh_pointer_focus_at_last_position();
                 trace::emit("metadata_changed", || {
                     TraceFields::new()
                         .field("source", "compositor")
@@ -540,6 +544,7 @@ impl OwnCompositorServer {
                     if stack_changed {
                         commands.push(self.sync_xwayland_client_lists());
                     }
+                    self.state.refresh_pointer_focus_at_last_position();
                     return commands;
                 }
                 let constraints = self
@@ -578,6 +583,7 @@ impl OwnCompositorServer {
                 if stack_changed {
                     commands.push(self.sync_xwayland_client_lists());
                 }
+                self.state.refresh_pointer_focus_at_last_position();
                 commands
             }
             XwmEvent::MoveResizeRequested { window, request } => {
@@ -608,8 +614,10 @@ impl OwnCompositorServer {
                         crate::xwayland::xwm::X11StackMode::Above,
                     )
                 {
+                    self.state.refresh_pointer_focus_at_last_position();
                     vec![self.sync_xwayland_client_lists()]
                 } else {
+                    self.state.refresh_pointer_focus_at_last_position();
                     Vec::new()
                 }
             }

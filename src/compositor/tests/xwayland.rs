@@ -106,6 +106,108 @@ fn first_buffer_fixture() -> FirstBufferFixture {
     }
 }
 
+struct StationaryPointerXwaylandFixture {
+    server: super::OwnCompositorServer,
+    connection: Connection,
+    queue: EventQueue<super::RegistryTestState>,
+    _parent_surface: client_wl_surface::WlSurface,
+    _popup_surface: client_wl_surface::WlSurface,
+    _pool: client_wl_shm_pool::WlShmPool,
+    _file: File,
+    _parent_buffer: client_wl_buffer::WlBuffer,
+    _popup_buffer: client_wl_buffer::WlBuffer,
+    parent_surface_id: u32,
+    popup_surface_id: u32,
+}
+
+fn stationary_pointer_xwayland_fixture() -> StationaryPointerXwaylandFixture {
+    let socket_name = super::unique_socket_name();
+    let mut server = super::OwnCompositorServer::bind_cpu_composition(&socket_name)
+        .expect("bind compositor server");
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).expect("nonzero generation"));
+    let (server_stream, client_stream) = std::os::unix::net::UnixStream::pair().unwrap();
+    server
+        .insert_xwayland_client(server_stream, generation)
+        .expect("insert private XWayland client");
+    let (running, server_thread) = super::spawn_test_server(server);
+
+    let connection = Connection::from_socket(client_stream).expect("create Wayland client");
+    let (globals, mut queue) = registry_queue_init::<super::RegistryTestState>(&connection)
+        .expect("read compositor globals");
+    let qh = queue.handle();
+    let shell: client_xwayland_shell_v1::XwaylandShellV1 =
+        globals.bind(&qh, 1..=1, ()).expect("bind XWayland shell");
+    let compositor: client_wl_compositor::WlCompositor =
+        globals.bind(&qh, 1..=6, ()).expect("bind compositor");
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).expect("bind shm");
+    let parent_surface = compositor.create_surface(&qh, ());
+    let parent_shell_surface = shell.get_xwayland_surface(&parent_surface, &qh, ());
+    parent_shell_surface.set_serial(0x1111_2222, 0x3333_4444);
+    parent_surface.commit();
+    let popup_surface = compositor.create_surface(&qh, ());
+    let popup_shell_surface = shell.get_xwayland_surface(&popup_surface, &qh, ());
+    popup_shell_surface.set_serial(0x5555_6666, 0x7777_8888);
+    popup_surface.commit();
+
+    let file = super::create_test_shm_file(&[
+        0xffff_0000,
+        0xff00_ff00,
+        0xff00_00ff,
+        0xffff_ffff,
+        0xff10_1010,
+        0xff20_2020,
+        0xff30_3030,
+        0xff40_4040,
+    ])
+    .expect("create shm buffer");
+    let pool = shm.create_pool(file.as_fd(), 32, &qh, ());
+    let parent_buffer = pool.create_buffer(0, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
+    parent_surface.attach(Some(&parent_buffer), 0, 0);
+    parent_surface.damage_buffer(0, 0, 2, 2);
+    parent_surface.commit();
+    let popup_buffer = pool.create_buffer(16, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
+    popup_surface.attach(Some(&popup_buffer), 0, 0);
+    popup_surface.damage_buffer(0, 0, 2, 2);
+    popup_surface.commit();
+    connection.flush().expect("flush XWayland surfaces");
+    queue
+        .roundtrip(&mut super::RegistryTestState::default())
+        .expect("complete XWayland surface commits");
+
+    let mut server = super::stop_test_server(running, server_thread);
+    let parent_serial =
+        crate::xwayland::serial_from_parts(0x1111_2222, 0x3333_4444).expect("parent serial");
+    let popup_serial =
+        crate::xwayland::serial_from_parts(0x5555_6666, 0x7777_8888).expect("popup serial");
+    let associations = server.take_xwayland_association_events();
+    let surface_for_serial = |serial| {
+        associations.iter().find_map(|event| match event {
+            XwaylandAssociationEvent::Committed {
+                serial: event_serial,
+                surface_id,
+                ..
+            } if *event_serial == serial => Some(*surface_id),
+            _ => None,
+        })
+    };
+    let parent_surface_id = surface_for_serial(parent_serial).expect("parent association");
+    let popup_surface_id = surface_for_serial(popup_serial).expect("popup association");
+
+    StationaryPointerXwaylandFixture {
+        server,
+        connection,
+        queue,
+        _parent_surface: parent_surface,
+        _popup_surface: popup_surface,
+        _pool: pool,
+        _file: file,
+        _parent_buffer: parent_buffer,
+        _popup_buffer: popup_buffer,
+        parent_surface_id,
+        popup_surface_id,
+    }
+}
+
 fn admit_first_buffer(fixture: &mut FirstBufferFixture, x: i32, y: i32) {
     let mut snapshot = fake_snapshot();
     snapshot.surface_id = fixture.surface_id;
@@ -165,6 +267,76 @@ fn xwayland_map_lifecycle_keeps_rendering_after_x11_map() {
     assert_ne!(
         X11WindowLifecycle::MappedAwaitingAssociation,
         X11WindowLifecycle::Renderable
+    );
+}
+
+#[test]
+fn xwayland_popup_map_refreshes_pointer_focus_without_pointer_motion() {
+    let mut fixture = stationary_pointer_xwayland_fixture();
+    let mut parent = fake_snapshot();
+    parent.surface_id = fixture.parent_surface_id;
+    parent.geometry.x = 40;
+    parent.geometry.y = 40;
+    parent.geometry.width = 2;
+    parent.geometry.height = 2;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(parent));
+
+    let parent_placement = fixture.server.renderable_surfaces()[0].placement;
+    let pointer_x = f64::from(parent_placement.local_x + 1);
+    let pointer_y = f64::from(parent_placement.local_y + 1);
+    fixture.server.send_pointer_motion(pointer_x, pointer_y);
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .pointer_surface
+            .as_ref()
+            .map(|surface| { crate::compositor::compositor_surface_id(surface) }),
+        Some(fixture.parent_surface_id)
+    );
+
+    let mut popup = fake_snapshot();
+    popup.handle = X11WindowHandle::new(
+        XwaylandGeneration::new(NonZeroU64::new(1).expect("generation")),
+        101,
+    );
+    popup.surface_id = fixture.popup_surface_id;
+    popup.kind = DesktopWindowKind::OverrideRedirect;
+    popup.override_redirect = true;
+    popup.geometry = X11Geometry {
+        x: parent_placement.local_x,
+        y: parent_placement.local_y,
+        width: 2,
+        height: 2,
+    };
+    let popup_handle = popup.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(popup));
+
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .pointer_surface
+            .as_ref()
+            .map(|surface| { crate::compositor::compositor_surface_id(surface) }),
+        Some(fixture.popup_surface_id)
+    );
+
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowWithdrawn(popup_handle));
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .pointer_surface
+            .as_ref()
+            .map(|surface| { crate::compositor::compositor_surface_id(surface) }),
+        Some(fixture.parent_surface_id)
     );
 }
 

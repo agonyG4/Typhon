@@ -107,6 +107,7 @@ impl OwnCompositorServer {
                 let _ = self
                     .state
                     .adopt_current_xwayland_surface_content(surface_id);
+                self.state.refresh_pointer_focus_at_last_position();
             }
             XwmAssociationEvent::Removed {
                 generation,
@@ -120,6 +121,7 @@ impl OwnCompositorServer {
                 }
                 self.state.withdraw_xwayland_surface_content(surface_id);
                 self.state.detach_x11_surface(surface_id);
+                self.state.refresh_pointer_focus_at_last_position();
                 trace::emit("xwayland_surface_detached", || {
                     TraceFields::new()
                         .field("source", "compositor")
