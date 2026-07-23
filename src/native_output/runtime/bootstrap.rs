@@ -186,6 +186,7 @@ struct NativeRuntimeBootstrapTail {
     frame_renderer: NativeFrameRenderer,
     input_state: NativeInputState,
     cursor_preference: NativeCursorPreference,
+    cursor_scheduling_policy: NativeCursorSchedulingPolicy,
     direct_scanout_preference: NativeDirectScanoutPreference,
     pre_kms_atomic_cursor: Option<NativeAtomicCursor>,
     pre_kms_legacy_cursor: Option<NativeLegacyHardwareCursor>,
@@ -215,6 +216,7 @@ impl NativeRuntime {
             mut frame_renderer,
             input_state,
             cursor_preference,
+            cursor_scheduling_policy,
             direct_scanout_preference,
             pre_kms_atomic_cursor,
             pre_kms_legacy_cursor,
@@ -449,8 +451,14 @@ impl NativeRuntime {
             ),
             xwayland.next_deadline_ns(),
         ))?;
-        let last_render_generation = server.render_generation();
+        let last_rendered_scene_generation = server.scene_render_generation();
+        let last_submitted_cursor_generation = server.cursor_generation();
+        let last_primary_presented_at_ns = None;
+        let cursor_output_arbitration = NativeCursorOutputArbitration::default();
         let last_renderable_surfaces = server.renderable_surfaces().to_vec();
+        let last_client_cursor_damage = None;
+        let last_software_cursor_damage = None;
+        let last_client_cursor_path = None;
         let queued_redraw_requested = false;
         let frame_index = 0u64;
         let known_toplevels = server.xdg_toplevels();
@@ -512,7 +520,10 @@ impl NativeRuntime {
             frame_renderer,
             input_state,
             cursor_preference,
+            cursor_scheduling_policy,
+            cursor_output_arbitration,
             direct_scanout_preference,
+            direct_scanout_qualification: DirectScanoutQualificationState::default(),
             cursor_render_mode,
             atomic_cursor,
             legacy_cursor,
@@ -540,8 +551,14 @@ impl NativeRuntime {
             triple_buffer_policy,
             pending_proven_deadline_miss: None,
             effective_app_gpu_policy,
-            last_render_generation,
+            last_rendered_scene_generation,
+            last_direct_candidate_key: None,
+            last_submitted_cursor_generation,
+            last_primary_presented_at_ns,
             last_renderable_surfaces,
+            last_client_cursor_damage,
+            last_software_cursor_damage,
+            last_client_cursor_path,
             queued_redraw_requested,
             frame_index,
             known_toplevels,
@@ -556,6 +573,10 @@ impl NativeRuntime {
             process_supervisor,
             astrea_launch_tracker: AstreaLaunchLifecycleTracker::default(),
             shutdown: NativeShutdownLifecycle::new(),
+            presentation_trace: PresentationTransactionTraceRing::from_env(),
+            presentation_trace_path: std::env::var_os("OBLIVION_ONE_PRESENTATION_TRACE_FILE")
+                .map(std::path::PathBuf::from),
+            timing_scopes: std::collections::BTreeMap::new(),
         };
         runtime.attach_xwayland_private_client()?;
         Ok(runtime)
@@ -805,6 +826,7 @@ impl NativeRuntime {
         let mut frame_renderer = NativeFrameRenderer::default();
         let input_state = NativeInputState::new(target.width, target.height);
         let cursor_preference = NativeCursorPreference::from_env();
+        let cursor_scheduling_policy = NativeCursorSchedulingPolicy::from_env();
         let direct_scanout_preference = NativeDirectScanoutPreference::from_env();
         println!(
             "native cursor backend target: {}",
@@ -914,14 +936,9 @@ impl NativeRuntime {
         );
         let initial_damage = NativeOutputDamage::full_output(target.width, target.height);
         let initial_cursor_state = pre_kms_atomic_cursor.as_ref().and_then(|cursor| {
-            effective_atomic_cursor_state(
-                cursor,
-                cursor_render_mode,
-                input_state.cursor_visible(),
-                server.client_cursor_render_state().is_some(),
-            )
-            .kms_state()
-            .cloned()
+            effective_atomic_cursor_state(cursor, cursor_render_mode, input_state.cursor_visible())
+                .kms_state()
+                .cloned()
         });
         let mut initial_atomic_parts = None;
         let mut initial_surface_damage = None;
@@ -941,7 +958,7 @@ impl NativeRuntime {
             )?;
             initial_surface_damage = Some(server.capture_surface_damage_presentation());
             let mut initial_gpu_sampling_started = false;
-            let parts = explicit.render_to_slot(
+            let parts = match explicit.render_to_slot(
                 slot,
                 &mut frame_renderer,
                 &server,
@@ -949,7 +966,16 @@ impl NativeRuntime {
                 cursor_render_mode,
                 &initial_damage,
                 &mut initial_gpu_sampling_started,
-            )?;
+            )? {
+                AtomicSlotRenderOutcome::Rendered(parts) => *parts,
+                AtomicSlotRenderOutcome::Skipped { slot, reason, .. } => {
+                    explicit.swapchain_mut()?.cancel_render_before_gpu(slot)?;
+                    return Err(io::Error::other(format!(
+                        "native initial modeset frame skipped: {reason:?}"
+                    ))
+                    .into());
+                }
+            };
             let stats = parts.paint_stats(
                 explicit.format_modifier.fourcc,
                 target.width,
@@ -1209,6 +1235,7 @@ impl NativeRuntime {
             frame_renderer,
             input_state,
             cursor_preference,
+            cursor_scheduling_policy,
             direct_scanout_preference,
             pre_kms_atomic_cursor,
             pre_kms_legacy_cursor,

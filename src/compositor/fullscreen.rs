@@ -13,6 +13,7 @@ pub struct FullscreenPresentationState {
 pub struct DirectScanoutSceneCandidate {
     pub surface_id: u32,
     pub root_surface_id: u32,
+    pub content_epoch: u64,
     pub generation: u64,
     pub commit_sequence: SurfaceCommitSequence,
     pub buffer_identity: BufferIdentity,
@@ -38,7 +39,6 @@ pub enum DirectScanoutSceneRejection {
     OwnerTreeHasAdditionalSurface,
     OverlayVisible,
     PopupVisible,
-    ClientCursorUnsupported,
     NonDmabuf,
     FormatNotOpaqueXrgb8888,
     BufferSizeMismatch,
@@ -63,7 +63,6 @@ impl DirectScanoutSceneRejection {
             Self::OwnerTreeHasAdditionalSurface => "owner_tree_has_additional_surface",
             Self::OverlayVisible => "overlay_visible",
             Self::PopupVisible => "popup_visible",
-            Self::ClientCursorUnsupported => "client_cursor_unsupported",
             Self::NonDmabuf => "non_dmabuf",
             Self::FormatNotOpaqueXrgb8888 => "format_not_opaque_xrgb8888",
             Self::BufferSizeMismatch => "buffer_size_mismatch",

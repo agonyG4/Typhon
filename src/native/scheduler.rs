@@ -253,6 +253,13 @@ impl NativeFrameScheduler {
         self.refresh_interval_ns
     }
 
+    /// Return the next refresh boundary used by the output scheduler.  Cursor
+    /// arbitration uses this clock rather than an input-relative delay, so a
+    /// cursor request cannot win a race merely because it arrived first.
+    pub fn next_refresh_deadline_ns(&self, now_ns: u64) -> u64 {
+        self.first_boundary_after(now_ns)
+    }
+
     pub fn queue_visual_work(&mut self) {
         self.visual_work_queued = true;
         self.protocol_work_queued = false;

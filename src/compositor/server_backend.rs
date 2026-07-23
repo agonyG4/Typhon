@@ -92,6 +92,7 @@ impl OwnCompositorServer {
                         width: geometry.width,
                         height: geometry.height,
                     };
+                    let position_only = !resizing && self.state.x11_resize_active(handle);
                     if resizing {
                         Some(XwmCommand::BeginResizeSync {
                             window: handle,
@@ -104,7 +105,15 @@ impl OwnCompositorServer {
                         Some(XwmCommand::Configure {
                             window: handle,
                             geometry: x11_geometry,
-                            fields: crate::xwayland::xwm::X11ConfigureFlags::all(),
+                            fields: if position_only {
+                                crate::xwayland::xwm::X11ConfigureFlags {
+                                    x: true,
+                                    y: true,
+                                    ..Default::default()
+                                }
+                            } else {
+                                crate::xwayland::xwm::X11ConfigureFlags::all()
+                            },
                             border_width: 0,
                         })
                     }
@@ -159,6 +168,23 @@ impl OwnCompositorServer {
                     let (client_list, stacking) = self.state.x11_client_lists();
                     Some(XwmCommand::RaiseAndSync {
                         window: handle,
+                        client_list,
+                        stacking,
+                    })
+                }
+                crate::compositor::window_backend::WindowBackendCommand::RestackExact {
+                    windows,
+                } => {
+                    let order = windows
+                        .into_iter()
+                        .filter_map(|window| match self.state.window(window)?.backend {
+                            super::WindowBackend::X11(handle) => Some(handle),
+                            super::WindowBackend::Xdg(_) => None,
+                        })
+                        .collect();
+                    let (client_list, stacking) = self.state.x11_client_lists();
+                    Some(XwmCommand::RestackExact {
+                        order,
                         client_list,
                         stacking,
                     })

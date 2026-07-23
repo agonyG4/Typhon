@@ -2,11 +2,13 @@ use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeRepaintInputs {
+    // Retained for cycle diagnostics only; accepting a socket is not visual work.
     pub(crate) accepted_clients: bool,
     pub(crate) render_generation_changed: bool,
     pub(crate) pending_frame_work: bool,
     pub(crate) only_pending_surface_frame_callbacks: bool,
     pub(crate) redraw_requested: bool,
+    pub(crate) cursor_work_pending: bool,
     pub(crate) page_flip_pending: bool,
 }
 
@@ -34,13 +36,16 @@ pub(crate) fn native_repaint_decision(inputs: NativeRepaintInputs) -> NativeRepa
 
     let protocol_only_present = inputs.pending_frame_work
         && inputs.only_pending_surface_frame_callbacks
-        && !inputs.accepted_clients
         && !inputs.render_generation_changed
         && !inputs.redraw_requested;
     NativeRepaintDecision {
-        repaint: inputs.accepted_clients
-            || inputs.render_generation_changed
+        // Accepting a socket is protocol progress, not visual work.  The
+        // accepted-client bit is retained in the input for diagnostics, but
+        // a client must create visible scene or protocol-owned output work
+        // before the primary renderer is scheduled.
+        repaint: inputs.render_generation_changed
             || inputs.redraw_requested
+            || inputs.cursor_work_pending
             || (inputs.pending_frame_work && !protocol_only_present),
         protocol_only_present,
     }
@@ -64,6 +69,7 @@ pub(crate) struct NativeFrameRenderer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeCursorRenderMode {
     Software,
+    SoftwareClient,
     Hardware,
 }
 
@@ -71,8 +77,13 @@ impl NativeCursorRenderMode {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Software => "software",
+            Self::SoftwareClient => "software_client",
             Self::Hardware => "hardware",
         }
+    }
+
+    pub(crate) const fn is_software(self) -> bool {
+        matches!(self, Self::Software | Self::SoftwareClient)
     }
 }
 
@@ -81,6 +92,244 @@ pub(crate) enum NativeCursorPreference {
     Auto,
     Hardware,
     Software,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeCursorSchedulingPolicy {
+    Auto,
+    Piggyback,
+    Software,
+}
+
+impl NativeCursorSchedulingPolicy {
+    pub(crate) fn from_env() -> Self {
+        match std::env::var("OBLIVION_ONE_CURSOR_SCHEDULING") {
+            Ok(value) if value == "piggyback" => Self::Piggyback,
+            Ok(value) if value == "software" => Self::Software,
+            Ok(value) if value == "auto" => Self::Auto,
+            Ok(value) => {
+                eprintln!(
+                    "native cursor: unknown OBLIVION_ONE_CURSOR_SCHEDULING={value:?}; using auto"
+                );
+                Self::Auto
+            }
+            Err(_) => Self::Auto,
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Piggyback => "piggyback",
+            Self::Software => "software",
+        }
+    }
+}
+
+/// Cursor output is lower-priority work than a primary scene transaction.  A
+/// request opens one output opportunity for the client to respond; it does
+/// not reserve the Atomic commit arbiter.  The desired generation is replaced
+/// by newer input while that opportunity is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeCursorOutputDisposition {
+    PiggybackPrimary,
+    DeferForPrimary,
+    SubmitCursorOnly,
+    SoftwareOverlay,
+    Noop,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeCursorOutputArbitration {
+    pending_since_ns: Option<u64>,
+    deadline_ns: Option<u64>,
+    desired_generation: u64,
+    primary_response_window_open: bool,
+    software_overlay_pending: bool,
+    pub(crate) response_windows_opened: u64,
+    pub(crate) changes_coalesced: u64,
+    pub(crate) cursor_only_plans: u64,
+    pub(crate) cursor_only_submissions: u64,
+    pub(crate) cursor_only_deferred_for_primary: u64,
+    pub(crate) cursor_state_piggybacked: u64,
+    pub(crate) idle_hardware_updates: u64,
+    pub(crate) idle_software_updates: u64,
+}
+
+impl NativeCursorOutputArbitration {
+    pub(crate) fn request(&mut self, generation: u64, now_ns: u64, deadline_ns: u64) {
+        if self.pending_since_ns.is_none() {
+            self.pending_since_ns = Some(now_ns);
+            self.deadline_ns = Some(deadline_ns);
+            self.primary_response_window_open = true;
+            self.response_windows_opened = self.response_windows_opened.saturating_add(1);
+        } else if generation > self.desired_generation {
+            self.changes_coalesced = self.changes_coalesced.saturating_add(1);
+        }
+        self.desired_generation = self.desired_generation.max(generation);
+    }
+
+    pub(crate) const fn deadline_ns(&self) -> Option<u64> {
+        self.deadline_ns
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn desired_generation(&self) -> u64 {
+        self.desired_generation
+    }
+
+    pub(crate) const fn pending(&self) -> bool {
+        self.deadline_ns.is_some()
+    }
+
+    pub(crate) fn due(&self, now_ns: u64) -> bool {
+        self.deadline_ns.is_some_and(|deadline| now_ns >= deadline)
+    }
+
+    pub(crate) fn set_software_overlay_pending(&mut self, pending: bool) {
+        self.software_overlay_pending = pending;
+    }
+
+    pub(crate) fn note_disposition(&mut self, disposition: NativeCursorOutputDisposition) {
+        match disposition {
+            NativeCursorOutputDisposition::PiggybackPrimary => {
+                self.cursor_state_piggybacked = self.cursor_state_piggybacked.saturating_add(1);
+            }
+            NativeCursorOutputDisposition::DeferForPrimary => {
+                self.cursor_only_deferred_for_primary =
+                    self.cursor_only_deferred_for_primary.saturating_add(1);
+            }
+            NativeCursorOutputDisposition::SubmitCursorOnly => {
+                self.cursor_only_plans = self.cursor_only_plans.saturating_add(1);
+                self.idle_hardware_updates = self.idle_hardware_updates.saturating_add(1);
+            }
+            NativeCursorOutputDisposition::SoftwareOverlay => {
+                self.idle_software_updates = self.idle_software_updates.saturating_add(1);
+            }
+            NativeCursorOutputDisposition::Noop => {}
+        }
+    }
+
+    pub(crate) fn note_cursor_only_submission(&mut self) {
+        self.cursor_only_submissions = self.cursor_only_submissions.saturating_add(1);
+    }
+
+    pub(crate) const fn response_windows_opened(&self) -> u64 {
+        self.response_windows_opened
+    }
+
+    pub(crate) const fn changes_coalesced(&self) -> u64 {
+        self.changes_coalesced
+    }
+
+    pub(crate) const fn cursor_only_plans(&self) -> u64 {
+        self.cursor_only_plans
+    }
+
+    pub(crate) const fn cursor_only_submissions(&self) -> u64 {
+        self.cursor_only_submissions
+    }
+
+    pub(crate) const fn cursor_only_deferred_for_primary(&self) -> u64 {
+        self.cursor_only_deferred_for_primary
+    }
+
+    pub(crate) const fn cursor_state_piggybacked(&self) -> u64 {
+        self.cursor_state_piggybacked
+    }
+
+    pub(crate) const fn idle_hardware_updates(&self) -> u64 {
+        self.idle_hardware_updates
+    }
+
+    pub(crate) const fn idle_software_updates(&self) -> u64 {
+        self.idle_software_updates
+    }
+
+    pub(crate) fn disposition(
+        &self,
+        now_ns: u64,
+        primary_work_pending: bool,
+        hardware_usable: bool,
+    ) -> NativeCursorOutputDisposition {
+        if !self.pending() {
+            return NativeCursorOutputDisposition::Noop;
+        }
+        if primary_work_pending {
+            return NativeCursorOutputDisposition::PiggybackPrimary;
+        }
+        if !self.due(now_ns) {
+            return if self.primary_response_window_open {
+                NativeCursorOutputDisposition::DeferForPrimary
+            } else {
+                NativeCursorOutputDisposition::Noop
+            };
+        }
+        if hardware_usable && !self.software_overlay_pending {
+            NativeCursorOutputDisposition::SubmitCursorOnly
+        } else {
+            NativeCursorOutputDisposition::SoftwareOverlay
+        }
+    }
+
+    pub(crate) fn consume(&mut self, generation: u64) {
+        if self.pending() && generation >= self.desired_generation {
+            *self = Self::default();
+        }
+    }
+
+    pub(crate) fn defer_after_busy(&mut self, now_ns: u64, next_deadline_ns: u64) {
+        if self.pending() {
+            self.deadline_ns = Some(next_deadline_ns.max(now_ns.saturating_add(1)));
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+pub(crate) fn update_cursor_output_arbitration(
+    arbitration: &mut NativeCursorOutputArbitration,
+    cursor_generation: u64,
+    last_submitted_cursor_generation: u64,
+    now_ns: u64,
+    frame_scheduler: &NativeFrameScheduler,
+    software_overlay_pending: bool,
+) -> (bool, bool, bool) {
+    arbitration.set_software_overlay_pending(software_overlay_pending);
+    let generation_changed = cursor_generation != last_submitted_cursor_generation;
+    if generation_changed {
+        arbitration.request(
+            cursor_generation,
+            now_ns,
+            frame_scheduler.next_refresh_deadline_ns(now_ns),
+        );
+    }
+    let deadline_due = arbitration.due(now_ns);
+    (
+        generation_changed,
+        deadline_due,
+        deadline_due && generation_changed,
+    )
+}
+
+pub(crate) fn cursor_only_allowed_at_deadline(
+    arbitration: &mut NativeCursorOutputArbitration,
+    _policy: NativeCursorSchedulingPolicy,
+    now_ns: u64,
+    primary_work_pending: bool,
+    cursor_state_changed: bool,
+    hardware_usable: bool,
+) -> bool {
+    let disposition = arbitration.disposition(now_ns, primary_work_pending, hardware_usable);
+    arbitration.note_disposition(disposition);
+    // Piggyback is a primary-priority policy, not a permanent prohibition on
+    // idle cursor updates.  `disposition` has already selected
+    // `PiggybackPrimary` whenever primary work is ready.  Once the output
+    // opportunity matures with no primary work, allowing the one queued cursor
+    // update prevents a permanently armed deadline in the diagnostic mode.
+    cursor_state_changed && disposition == NativeCursorOutputDisposition::SubmitCursorOnly
 }
 
 impl NativeCursorPreference {
@@ -332,7 +581,10 @@ impl NativeFrameRenderer {
             external_overlay_surface_ids: server.external_overlay_surface_ids(),
             visual_state: input_state.desktop_visual_state(cursor_mode),
             render_generation: server.scene_render_generation(),
-            client_cursor: server.client_cursor_render_state(),
+            client_cursor: cursor_mode
+                .is_software()
+                .then(|| server.client_cursor_render_state())
+                .flatten(),
         })
     }
 
@@ -390,7 +642,10 @@ impl NativeFrameRenderer {
             content_generation: native_scene_content_generation(server.scene_render_generation()),
             visual_state: input_state.desktop_visual_state(cursor_mode),
             output_scale: 1.0,
-            client_cursor: server.client_cursor_render_state(),
+            client_cursor: cursor_mode
+                .is_software()
+                .then(|| server.client_cursor_render_state())
+                .flatten(),
             current_damage,
         }
     }

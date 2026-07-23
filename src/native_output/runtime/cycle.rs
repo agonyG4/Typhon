@@ -1,6 +1,5 @@
 use super::cursor_cycle::{
     apply_cursor_position, complete_cursor_only_pageflip, complete_primary_cursor_pageflip,
-    schedule_coalesced_cursor_update, synchronize_cursor_state,
 };
 use super::*;
 pub fn run(
@@ -15,7 +14,6 @@ pub fn run(
     })?;
     runtime.run()
 }
-
 impl NativeRuntime {
     pub(super) fn run_native_cycle(&mut self) -> NativeResult<()> {
         while !self.shutdown.is_complete() {
@@ -31,7 +29,9 @@ impl NativeRuntime {
             self.scanout.page_flip_pending() || self.atomic_commit_arbiter.atomic_commit_pending(),
         );
         self.reap_supervised_children(&cycle)?;
+        let xwm_drain_started = Instant::now();
         self.dispatch_xwayland_events(&cycle.wakeup)?;
+        self.note_timing_scope("xwm_dispatch", xwm_drain_started.elapsed());
         if self.xwayland.generation().is_some() {
             self.attach_xwayland_private_client()?;
         } else {
@@ -54,7 +54,9 @@ impl NativeRuntime {
         if !self.shutdown.is_running() {
             return Ok(());
         }
+        let wayland_dispatch_started = Instant::now();
         self.dispatch_wayland_and_input(&mut cycle)?;
+        self.note_timing_scope("wayland_dispatch", wayland_dispatch_started.elapsed());
         self.dispatch_xwayland_client_disconnects()?;
         self.dispatch_xwayland_shell_binds()?;
         self.initialize_managed_xwayland()?;
@@ -79,11 +81,27 @@ impl NativeRuntime {
             &mut self.pending_launches,
             self.xwayland.normal_app_environment(),
         );
+        let prepare_started = Instant::now();
         self.process_acquire_and_prepare(&cycle)?;
+        self.note_timing_scope("prepare_frame", prepare_started.elapsed());
         if !self.shutdown.is_running() || !self.session.permits_output() {
             return Ok(());
         }
+        let render_started = Instant::now();
         self.render_present_and_update_metrics(&mut cycle)?;
+        self.note_timing_scope("egl_draw", render_started.elapsed());
+        self.flush_presentation_trace()?;
+        Ok(())
+    }
+
+    fn flush_presentation_trace(&self) -> NativeResult<()> {
+        let Some(path) = self.presentation_trace_path.as_ref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, self.presentation_trace.export_jsonl())?;
         Ok(())
     }
 
@@ -238,7 +256,7 @@ impl NativeRuntime {
             adaptive_buffering,
             pending_proven_deadline_miss,
             effective_app_gpu_policy,
-            last_render_generation,
+            last_primary_presented_at_ns,
             last_renderable_surfaces,
             queued_redraw_requested,
             frame_index,
@@ -453,34 +471,16 @@ impl NativeRuntime {
                     AtomicCommitCompletion::Completed(AtomicCommitKind::CursorOnly { .. })
                 )
             });
-            if cursor_commit
-                && complete_cursor_only_pageflip(
+            if cursor_commit {
+                // Cursor-only completion is not a complete compositor cycle.
+                // Continue through protocol and input dispatch so a primary
+                // producer can be observed and scheduled immediately.
+                let _ = complete_cursor_only_pageflip(
                     atomic_cursor,
                     pageflip.user_data,
                     *drm_file_generation,
                     perf,
-                )?
-            {
-                schedule_coalesced_cursor_update(atomic_cursor, event_loop)?;
-                return Ok(NativeCycleState {
-                    wakeup,
-                    pageflip_drain_us,
-                    pageflip_completed: true,
-                    completed_pageflip_token,
-                    frame_completed: false,
-                    frame_rendered: false,
-                    frame_submitted: false,
-                    present_us: 0,
-                    pageflip_pending_at_tick: scanout.page_flip_pending(),
-                    tick_us: 0,
-                    accepted: 0,
-                    redraw_requested: false,
-                    skipped_input_repaints: 0,
-                    input_drain_us: 0,
-                    raw_input_events: 0,
-                    coalesced_input_events: 0,
-                    shutdown_requested: false,
-                });
+                )?;
             }
             let compositor_receive_ns = monotonic_now_ns()?;
             let scheduler_state_at_completion = frame_scheduler.state();
@@ -519,6 +519,7 @@ impl NativeRuntime {
                 let receive_delay_us = compositor_receive_us.saturating_sub(kernel_timestamp_us);
                 let presented_at_ns =
                     compositor_receive_ns.saturating_sub(receive_delay_us.saturating_mul(1_000));
+                *last_primary_presented_at_ns = Some(presented_at_ns);
                 if direct_pending {
                     let completed = scanout.complete_direct_pageflip(
                         PageFlipToken::new(pageflip.user_data)
@@ -526,6 +527,11 @@ impl NativeRuntime {
                         presentation,
                         server,
                     )?;
+                    self.presentation_trace
+                        .push(PresentationTransactionEvent::PageflipPresented {
+                            transaction_id: completed.prepared.transaction_id,
+                            timestamp_ns: compositor_receive_ns,
+                        });
                     complete_primary_cursor_pageflip(
                         atomic_cursor,
                         pageflip.user_data,
@@ -614,7 +620,7 @@ impl NativeRuntime {
                             proven_miss,
                             completed.target.sequence,
                             presented_at,
-                            server.has_pending_frame_work() || frame_scheduler.visual_work_queued(),
+                            server.has_unowned_frame_work() || frame_scheduler.visual_work_queued(),
                         );
                         frame_pacing.note_adaptive_transition(
                             buffering_mode_before,
@@ -664,7 +670,7 @@ impl NativeRuntime {
                     refresh_interval_us,
                 );
                 let finish_frame_start = Instant::now();
-                if !server.has_pending_frame_work() {
+                if !server.has_unowned_frame_work() {
                     frame_scheduler.complete_protocol_only();
                 }
                 frame_completed = true;
@@ -907,7 +913,6 @@ impl NativeRuntime {
             drm_reactor_token: _,
             frame_scheduler,
             effective_app_gpu_policy,
-            last_render_generation,
             last_renderable_surfaces,
             queued_redraw_requested,
             frame_index,
@@ -936,7 +941,7 @@ impl NativeRuntime {
             input_state,
             *cursor_render_mode,
         )?;
-        synchronize_cursor_state(atomic_cursor, legacy_cursor, input_state)?;
+        synchronize_cursor_state_for_server(server, atomic_cursor, legacy_cursor, input_state)?;
         let current_toplevels = server.xdg_toplevels();
         if current_toplevels > *known_toplevels {
             for _ in *known_toplevels..current_toplevels {
@@ -995,11 +1000,14 @@ impl NativeRuntime {
             let may_change_pointer_constraints = event.may_change_pointer_constraints();
             let effect = input_state.handle_hardware_input_event(event);
             let effect_requested_redraw = effect.redraw_requested;
+            let cursor_visible = server.client_cursor_render_state().is_some()
+                || server.interaction_cursor_override_active()
+                || input_state.cursor_visible();
             if let Err(error) = apply_cursor_position(
                 atomic_cursor,
                 legacy_cursor,
                 effect.cursor_position,
-                input_state.cursor_visible(),
+                cursor_visible,
                 *cursor_preference,
                 cursor_render_mode,
                 perf,
@@ -1048,7 +1056,12 @@ impl NativeRuntime {
                     input_state,
                     *cursor_render_mode,
                 )?;
-                synchronize_cursor_state(atomic_cursor, legacy_cursor, input_state)?;
+                synchronize_cursor_state_for_server(
+                    server,
+                    atomic_cursor,
+                    legacy_cursor,
+                    input_state,
+                )?;
             }
         }
         let interaction_reconciled = reconcile_trigger_liveness(server, input_state, "batch_end");
@@ -1059,7 +1072,7 @@ impl NativeRuntime {
             input_state,
             *cursor_render_mode,
         )?;
-        synchronize_cursor_state(atomic_cursor, legacy_cursor, input_state)?;
+        synchronize_cursor_state_for_server(server, atomic_cursor, legacy_cursor, input_state)?;
         if let Some(event_timestamp_us) = input_event_timestamp_usec {
             let dispatch_latency_us = monotonic_now_ns()?
                 .saturating_div(1_000)
@@ -1114,7 +1127,6 @@ impl NativeRuntime {
             drm_reactor_token: _,
             frame_scheduler,
             effective_app_gpu_policy,
-            last_render_generation,
             last_renderable_surfaces,
             queued_redraw_requested,
             frame_index,
@@ -1278,7 +1290,7 @@ impl NativeRuntime {
                     NativePerfField::u64("elapsed_us", elapsed_micros(prepare_frame_start)),
                     NativePerfField::u64("render_generation", after_generation),
                     NativePerfField::bool("render_changed", after_generation != before_generation),
-                    NativePerfField::bool("pending_frame_work", server.has_pending_frame_work()),
+                    NativePerfField::bool("pending_frame_work", server.has_unowned_frame_work()),
                     NativePerfField::u64(
                         "resize_configures_requested",
                         resize.configures_requested,
@@ -1469,7 +1481,6 @@ impl NativeRuntime {
         Ok(())
     }
 }
-
 fn reconcile_trigger_liveness(
     server: &mut OwnCompositorServer,
     input_state: &NativeInputState,

@@ -15,19 +15,21 @@ use crate::process::{
 use super::trace::{self, TraceFields};
 use super::{
     XwaylandAppEnvironment, XwaylandAssociationEvent, XwaylandGeneration, XwaylandMode,
-    config::XwaylandConfig,
+    config::{XwaylandConfig, xwm_reactor_hot_path_logging_enabled},
     diagnostics::{StderrRing, XwaylandFailure, XwaylandFailureStage},
     display::DisplayLease,
     displayfd,
     launch::{ChildFdTarget, build_command},
     metrics::XwaylandMetrics,
     readiness::XwaylandReadinessSnapshot,
-    xwm::{Xwm, startup::XwmStartup},
+    xwm::{Xwm, XwmCommand, XwmCommandOutcome, startup::XwmStartup},
 };
 use crate::compositor::{SurfaceCommitSequence, XwaylandSurfaceCommitObserved};
 
 #[path = "displayfd_service.rs"]
 mod displayfd_service;
+#[path = "service_runtime.rs"]
+mod service_runtime;
 #[path = "service_state.rs"]
 mod service_state;
 #[path = "service_support.rs"]
@@ -307,6 +309,7 @@ impl XwaylandService {
     }
 
     fn drain_managed_xwm(&mut self, supervisor: &mut ChildSupervisor) -> bool {
+        let started = std::time::Instant::now();
         let drain = match &mut self.state {
             ServiceState::Running(resources) => resources.xwm.drain_events(256),
             _ => return false,
@@ -321,10 +324,12 @@ impl XwaylandService {
                     ),
                     _ => return false,
                 };
-                eprintln!(
-                    "oblivion-one xwayland: event=xwm_reactor_drain generation={generation:?} processed={} budget_exhausted={} pending_events={pending_events}",
-                    drain.processed, drain.budget_exhausted,
-                );
+                if xwm_reactor_hot_path_logging_enabled(self.config.log_stderr, trace::enabled()) {
+                    eprintln!(
+                        "oblivion-one xwayland: event=xwm_reactor_drain generation={generation:?} processed={} budget_exhausted={} pending_events={pending_events}",
+                        drain.processed, drain.budget_exhausted,
+                    );
+                }
                 self.metrics.property_refresh_requested = property_metrics.requested;
                 self.metrics.property_refresh_completed = property_metrics.completed;
                 self.metrics.property_refresh_coalesced = property_metrics.coalesced;
@@ -334,6 +339,14 @@ impl XwaylandService {
                     .metrics
                     .xwm_events_received
                     .saturating_add(drain.processed as u64);
+                self.metrics.xwm_drain_max_us = self
+                    .metrics
+                    .xwm_drain_max_us
+                    .max(started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+                self.metrics.xwm_events_per_cycle_max = self
+                    .metrics
+                    .xwm_events_per_cycle_max
+                    .max(drain.processed as u64);
                 if drain.budget_exhausted {
                     self.metrics.xwm_drain_budget_exhaustions =
                         self.metrics.xwm_drain_budget_exhaustions.saturating_add(1);
@@ -525,9 +538,11 @@ impl XwaylandService {
                 let fd = generation
                     .and_then(|generation| self.managed_xwm_fd(generation))
                     .unwrap_or(-1);
-                eprintln!(
-                    "oblivion-one xwayland: event=xwm_reactor_ready state={state} generation={generation:?} fd={fd} token={reactor_token} flags=0x{flags:x}",
-                );
+                if xwm_reactor_hot_path_logging_enabled(self.config.log_stderr, trace::enabled()) {
+                    eprintln!(
+                        "oblivion-one xwayland: event=xwm_reactor_ready state={state} generation={generation:?} fd={fd} token={reactor_token} flags=0x{flags:x}",
+                    );
+                }
                 if generation != self.generation() {
                     self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
                     eprintln!(
@@ -1075,11 +1090,11 @@ impl XwaylandService {
                         self.metrics.resize_sync_acks =
                             self.metrics.resize_sync_acks.saturating_add(1);
                     }
-                    super::xwm::XwmEvent::ResizeSyncPresented(_) => {
+                    super::xwm::XwmEvent::ResizeSyncPresented { .. } => {
                         self.metrics.resize_sync_presented =
                             self.metrics.resize_sync_presented.saturating_add(1);
                     }
-                    super::xwm::XwmEvent::ResizeSyncPresentedIntermediate(_) => {
+                    super::xwm::XwmEvent::ResizeSyncPresentedIntermediate { .. } => {
                         self.metrics.resize_sync_presented =
                             self.metrics.resize_sync_presented.saturating_add(1);
                     }
@@ -1125,29 +1140,6 @@ impl XwaylandService {
         }
     }
 
-    pub fn execute_managed_command(
-        &mut self,
-        supervisor: &mut ChildSupervisor,
-        command: super::xwm::XwmCommand,
-    ) -> io::Result<()> {
-        if matches!(command, super::xwm::XwmCommand::BeginResizeSync { .. }) {
-            self.metrics.resize_sync_started = self.metrics.resize_sync_started.saturating_add(1);
-        }
-        let result = match &mut self.state {
-            ServiceState::Running(resources) => match resources.xwm.execute(command) {
-                Ok(()) => None,
-                Err(error) => Some(io::Error::other(error)),
-            },
-            _ => None,
-        };
-        if let Some(error) = result {
-            self.metrics.resize_sync_command_failures =
-                self.metrics.resize_sync_command_failures.saturating_add(1);
-            self.fail_managed_xwm(supervisor, XwaylandFailureStage::CommandWrite, error);
-        }
-        Ok(())
-    }
-
     pub fn flush_managed_commands(&mut self, supervisor: &mut ChildSupervisor) -> io::Result<()> {
         let result = match &mut self.state {
             ServiceState::Running(resources) => resources.xwm.flush().err().map(io::Error::other),
@@ -1159,101 +1151,63 @@ impl XwaylandService {
         Ok(())
     }
 
-    pub fn handle_deadline(
+    pub fn note_runtime_xwayland_timing(
         &mut self,
-        now_ns: u64,
-        supervisor: &mut ChildSupervisor,
-    ) -> io::Result<()> {
-        if let Some(pending) = self.pending_termination {
-            if !supervisor.contains_id(pending.process_id) {
-                self.pending_termination = None;
-            } else if !pending.escalated && now_ns >= pending.deadline_ns {
-                self.kill_process_now(supervisor, pending.process_id)?;
-                self.pending_termination = Some(PendingTermination {
-                    escalated: true,
-                    ..pending
-                });
-            }
-        }
-        let resize_sync_error = if let ServiceState::Running(resources) = &mut self.state {
-            resources.xwm.collect_adoption_expirations(now_ns);
-            resources
-                .xwm
-                .handle_resize_sync_deadline(now_ns)
-                .err()
-                .map(io::Error::other)
-        } else {
-            None
-        };
-        if let Some(error) = resize_sync_error {
-            self.fail_managed_xwm(supervisor, XwaylandFailureStage::CommandFlush, error);
-        }
-        let startup_timed_out = matches!(
-            &self.state,
-            ServiceState::Starting(resources) if now_ns >= resources.deadline_ns
-        );
-        if startup_timed_out {
-            let (generation, process_id) = match &self.state {
-                ServiceState::Starting(resources) => (resources.generation, resources.process.id),
-                _ => unreachable!("startup timeout state changed before diagnostics"),
-            };
-            let process_alive = supervisor.contains_id(process_id);
-            self.log_displayfd_event(
-                "displayfd_probe",
-                Some("timeout_final"),
-                Some(generation),
-                Some(process_id),
-                self.displayfd_parent_fd(generation),
-                self.displayfd_child_source_fd(generation),
-                self.displayfd_reactor_token(generation),
-                None,
-                None,
-            );
-            if process_alive && let Err(error) = self.probe_displayfd(generation, supervisor) {
-                eprintln!(
-                    "oblivion-one xwayland: event=displayfd_final_probe_failed generation={generation:?} error={error}"
-                );
-            }
-            if !matches!(
-                &self.state,
-                ServiceState::Starting(resources) if resources.generation == generation
-            ) {
-                return Ok(());
-            }
-            let mut readiness = match &self.state {
-                ServiceState::Starting(resources) => self.snapshot_for_starting(resources),
-                _ => unreachable!("startup timeout state changed after final probe"),
-            };
-            readiness.process_alive = process_alive;
-            self.last_readiness = Some(readiness);
-            eprintln!(
-                "oblivion-one xwayland: event=readiness_timeout generation={:?} display={} process_id={} elapsed_ns={} process_alive={} displayfd_registered={} displayfd_readable={} display_number_validated={} private_wayland_endpoint_transferred={} private_client_attached={} private_client_authorized={} xwayland_shell_bound={} xwm_connected={} xwm_capabilities_validated={} root_initialized={} readiness_complete=false missing={:?}",
-                readiness.generation,
-                readiness.display,
-                readiness.process_id.get(),
-                readiness.elapsed_ns,
-                readiness.process_alive,
-                readiness.displayfd_registered,
-                readiness.displayfd_readable,
-                readiness.display_number_validated,
-                readiness.private_wayland_endpoint_transferred,
-                readiness.private_client_attached,
-                readiness.private_client_authorized,
-                readiness.xwayland_shell_bound,
-                readiness.xwm_connected,
-                readiness.xwm_capabilities_validated,
-                readiness.root_initialized,
-                readiness.missing_conditions(),
-            );
-            self.metrics.readiness_failures = self.metrics.readiness_failures.saturating_add(1);
-            self.request_process_termination(supervisor, process_id)?;
-            self.mark_stderr_failure();
-            self.enter_failure_backoff(now_ns);
-        } else if matches!(&self.state, ServiceState::Backoff { deadline_ns, .. } if now_ns >= *deadline_ns)
-        {
-            self.rearm(false);
-        }
-        Ok(())
+        events: usize,
+        commands: usize,
+        translation_us: u64,
+        execution_us: u64,
+    ) {
+        self.metrics.xwm_translation_max_us =
+            self.metrics.xwm_translation_max_us.max(translation_us);
+        self.metrics.xwm_command_execution_max_us =
+            self.metrics.xwm_command_execution_max_us.max(execution_us);
+        self.metrics.xwm_events_per_cycle_max =
+            self.metrics.xwm_events_per_cycle_max.max(events as u64);
+        self.metrics.xwm_commands_per_cycle_max =
+            self.metrics.xwm_commands_per_cycle_max.max(commands as u64);
+    }
+
+    pub fn note_runtime_xwayland_same_batch_pruning(
+        &mut self,
+        terminal_handles: usize,
+        sample_xid: Option<u32>,
+        generation: Option<u64>,
+        pruned_commands: usize,
+        pruned_handles: usize,
+    ) {
+        self.metrics.xwm_same_batch_pruning_cycles =
+            self.metrics.xwm_same_batch_pruning_cycles.saturating_add(1);
+        self.metrics.xwm_same_batch_commands_pruned = self
+            .metrics
+            .xwm_same_batch_commands_pruned
+            .saturating_add(pruned_commands as u64);
+        self.metrics.xwm_same_batch_handles_pruned = self
+            .metrics
+            .xwm_same_batch_handles_pruned
+            .saturating_add(pruned_handles as u64);
+        trace::emit("xwm_same_batch_pruning", || {
+            TraceFields::new()
+                .field("command_kind", "same_batch_normalization")
+                .field("primary_xid", sample_xid.unwrap_or(0))
+                .field("generation", generation.unwrap_or(0))
+                .field("outcome", "dropped_target_gone_same_batch")
+                .field("terminal_handle_count", terminal_handles)
+                .field("pruned_command_count", pruned_commands)
+                .field("pruned_handle_count", pruned_handles)
+                .field("same_batch_terminal", true)
+        });
+    }
+
+    pub fn xwayland_timing_snapshot(&self) -> (u64, u64, u64, u64, u64, u64) {
+        (
+            self.metrics.xwm_drain_max_us,
+            self.metrics.xwm_translation_max_us,
+            self.metrics.xwm_command_execution_max_us,
+            self.metrics.adoption_deadline_max_us,
+            self.metrics.xwm_events_per_cycle_max,
+            self.metrics.xwm_commands_per_cycle_max,
+        )
     }
 
     pub fn begin_shutdown(&mut self, supervisor: &mut ChildSupervisor) -> io::Result<()> {

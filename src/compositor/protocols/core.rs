@@ -154,6 +154,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                     _ => damage.explicit(),
                 };
                 let frame_callbacks = data.take_frame_callbacks();
+                state.note_frame_callbacks_committed(frame_callbacks.len());
                 if explicit_sync.is_some() {
                     let buffer_id = attachment.as_ref().and_then(|attachment| match attachment {
                         PendingSurfaceAttachment::Buffer(buffer) => {

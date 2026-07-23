@@ -112,9 +112,9 @@ impl NativeInputState {
                 let (x, y) = self.cursor_position();
                 DesktopVisualState::with_cursor(x, y)
             }
-            NativeCursorRenderMode::Software | NativeCursorRenderMode::Hardware => {
-                DesktopVisualState::wallpaper_only()
-            }
+            NativeCursorRenderMode::Software
+            | NativeCursorRenderMode::SoftwareClient
+            | NativeCursorRenderMode::Hardware => DesktopVisualState::wallpaper_only(),
         }
     }
 

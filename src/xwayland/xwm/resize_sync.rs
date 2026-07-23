@@ -153,6 +153,20 @@ impl ResizeSyncTracker {
         self.desired.get(&handle).copied()
     }
 
+    pub(crate) fn merge_desired_position(
+        &mut self,
+        handle: X11WindowHandle,
+        x: i32,
+        y: i32,
+    ) -> bool {
+        let Some(desired) = self.desired.get_mut(&handle) else {
+            return false;
+        };
+        desired.geometry.x = x;
+        desired.geometry.y = y;
+        true
+    }
+
     pub(crate) fn is_pending(&self, handle: X11WindowHandle) -> bool {
         !matches!(self.state(handle), ResizeSyncState::Idle)
     }

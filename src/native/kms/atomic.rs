@@ -492,6 +492,20 @@ impl AtomicRequest {
         Ok(request)
     }
 
+    pub fn primary_flip_with_cursor_and_out_fence(
+        pipeline: &AtomicPipelineProperties,
+        framebuffer: FramebufferId,
+        cursor: Option<&AtomicCursorVisualState>,
+        out_fence_ptr: Option<*mut i32>,
+    ) -> Result<Self, AtomicKmsError> {
+        let mut request = Self::primary_flip_with_cursor(pipeline, framebuffer, cursor)?;
+        if let (Some(property), Some(pointer)) = (pipeline.crtc_props.out_fence_ptr, out_fence_ptr)
+        {
+            request.set_crtc(pipeline.crtc, property, pointer as u64)?;
+        }
+        Ok(request)
+    }
+
     pub fn cursor_only(
         pipeline: &AtomicPipelineProperties,
         cursor: Option<&AtomicCursorVisualState>,

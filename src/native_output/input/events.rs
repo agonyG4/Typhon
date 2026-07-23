@@ -340,7 +340,6 @@ impl NativeInputEffect {
         if !self.redraw_requested {
             return false;
         }
-        self.visual_redraw_requested
-            || (cursor_mode == NativeCursorRenderMode::Software && self.cursor_moved)
+        self.visual_redraw_requested || (cursor_mode.is_software() && self.cursor_moved)
     }
 }

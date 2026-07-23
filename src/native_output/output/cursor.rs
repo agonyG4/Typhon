@@ -4,6 +4,41 @@ use std::sync::Arc;
 
 pub(crate) const NATIVE_HARDWARE_CURSOR_SIZE: u32 = 64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeCursorImageKey {
+    pub(crate) surface_id: u32,
+    pub(crate) buffer_id: u64,
+    pub(crate) commit_sequence: u64,
+    pub(crate) hotspot_x: i32,
+    pub(crate) hotspot_y: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) buffer_scale: u32,
+    pub(crate) buffer_transform: u32,
+}
+
+impl NativeCursorImageKey {
+    pub(crate) fn for_surface(surface: &RenderableSurface, hotspot_x: i32, hotspot_y: i32) -> Self {
+        Self {
+            surface_id: surface.surface_id,
+            buffer_id: surface.buffer_id().get(),
+            commit_sequence: surface.commit_sequence.0,
+            hotspot_x,
+            hotspot_y,
+            width: surface.width,
+            height: surface.height,
+            buffer_scale: surface.buffer_scale,
+            buffer_transform: cursor_transform_key(surface.buffer_transform),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeCursorSourceKey {
+    Theme,
+    Client(NativeCursorImageKey),
+}
+
 #[derive(Debug)]
 struct AtomicCursorBuffer {
     fd: RawFd,
@@ -121,9 +156,50 @@ impl Drop for AtomicCursorBuffer {
 struct AtomicCursorResources {
     current: Option<AtomicCursorBuffer>,
     retired: Vec<AtomicCursorBuffer>,
+    theme_cache: Option<AtomicCursorBuffer>,
+    client_cache: Option<(NativeCursorImageKey, AtomicCursorBuffer)>,
 }
 
 impl AtomicCursorResources {
+    fn take_cached(&mut self, source_key: NativeCursorSourceKey) -> Option<AtomicCursorBuffer> {
+        match source_key {
+            NativeCursorSourceKey::Theme => self.theme_cache.take(),
+            NativeCursorSourceKey::Client(key) => self
+                .client_cache
+                .take()
+                .and_then(|(cached_key, buffer)| (cached_key == key).then_some(buffer)),
+        }
+    }
+
+    fn cache_current(&mut self, source_key: NativeCursorSourceKey, buffer: AtomicCursorBuffer) {
+        match source_key {
+            NativeCursorSourceKey::Theme => {
+                if let Some(previous) = self.theme_cache.replace(buffer) {
+                    self.retired.push(previous);
+                }
+            }
+            NativeCursorSourceKey::Client(key) => {
+                if let Some((previous_key, previous)) = self.client_cache.replace((key, buffer))
+                    && previous_key != key
+                {
+                    self.retired.push(previous);
+                }
+            }
+        }
+    }
+
+    fn retire_cached_mismatch(&mut self, source_key: NativeCursorSourceKey) {
+        if let NativeCursorSourceKey::Client(key) = source_key
+            && self
+                .client_cache
+                .as_ref()
+                .is_some_and(|(cached_key, _)| *cached_key != key)
+            && let Some((_, buffer)) = self.client_cache.take()
+        {
+            self.retired.push(buffer);
+        }
+    }
+
     fn retire_safe(&mut self, keep: &[Option<u32>]) {
         self.retired.retain(|buffer| {
             keep.iter()
@@ -135,6 +211,12 @@ impl AtomicCursorResources {
     fn disarm_drm_cleanup(&mut self) {
         if let Some(current) = self.current.as_mut() {
             current.disarm_drm_cleanup();
+        }
+        if let Some(theme) = self.theme_cache.as_mut() {
+            theme.disarm_drm_cleanup();
+        }
+        if let Some((_, client)) = self.client_cache.as_mut() {
+            client.disarm_drm_cleanup();
         }
         for retired in &mut self.retired {
             retired.disarm_drm_cleanup();
@@ -151,6 +233,11 @@ pub(crate) struct AtomicCursorDirty {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct AtomicCursorCounters {
+    pub(crate) image_uploads: u64,
+    pub(crate) client_image_uploads: u64,
+    pub(crate) image_cache_hits: u64,
+    pub(crate) position_submissions: u64,
+    pub(crate) primary_submissions: u64,
     pub(crate) updates_requested: u64,
     pub(crate) updates_submitted: u64,
     pub(crate) updates_completed: u64,
@@ -164,6 +251,8 @@ pub(crate) struct AtomicCursorCounters {
 #[derive(Debug)]
 pub(crate) struct NativeAtomicCursor {
     pub(crate) image: Arc<CompositorCursorImage>,
+    theme_image: Arc<CompositorCursorImage>,
+    source_key: NativeCursorSourceKey,
     desired: AtomicCursorVisualState,
     submitted: AtomicCursorVisualState,
     current: AtomicCursorVisualState,
@@ -173,6 +262,7 @@ pub(crate) struct NativeAtomicCursor {
     pub(crate) dirty: AtomicCursorDirty,
     pub(crate) counters: AtomicCursorCounters,
     failure_latched: bool,
+    client_image_failure: Option<NativeCursorImageKey>,
     pending_token: Option<PageFlipToken>,
     pending_is_primary: bool,
     suspended_desired: Option<AtomicCursorVisualState>,
@@ -201,19 +291,24 @@ impl NativeAtomicCursor {
         }
         let state = atomic_cursor_state_for_image(&image, Some(buffer.framebuffer.get()));
         Ok(Self {
-            image,
+            image: image.clone(),
+            theme_image: image,
+            source_key: NativeCursorSourceKey::Theme,
             desired: state.clone(),
             submitted: state.clone(),
             current: state,
             resources: AtomicCursorResources {
                 current: Some(buffer),
                 retired: Vec::new(),
+                theme_cache: None,
+                client_cache: None,
             },
             plane,
             generation,
             dirty: AtomicCursorDirty::default(),
             counters: AtomicCursorCounters::default(),
             failure_latched: false,
+            client_image_failure: None,
             pending_token: None,
             pending_is_primary: false,
             suspended_desired: None,
@@ -269,8 +364,9 @@ impl NativeAtomicCursor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn needs_submission(&self) -> bool {
-        !self.desired.kms_equivalent(&self.current) && self.pending_token.is_none()
+        self.needs_submission_for(Some(&self.desired))
     }
 
     pub(crate) fn needs_submission_for(&self, desired: Option<&AtomicCursorVisualState>) -> bool {
@@ -288,6 +384,10 @@ impl NativeAtomicCursor {
         token: PageFlipToken,
         state: AtomicCursorVisualState,
     ) -> AtomicCursorVisualState {
+        if self.dirty.position {
+            self.counters.position_submissions =
+                self.counters.position_submissions.saturating_add(1);
+        }
         self.submitted = state.clone();
         self.pending_token = Some(token);
         self.pending_is_primary = false;
@@ -333,6 +433,7 @@ impl NativeAtomicCursor {
         token: PageFlipToken,
         state: AtomicCursorVisualState,
     ) {
+        self.counters.primary_submissions = self.counters.primary_submissions.saturating_add(1);
         self.submitted = state;
         self.pending_token = Some(token);
         self.pending_is_primary = true;
@@ -358,32 +459,103 @@ impl NativeAtomicCursor {
         self.counters.software_fallbacks = self.counters.software_fallbacks.saturating_add(1);
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn replace_default_image(&mut self, file: &fs::File) -> io::Result<()> {
-        let mut replacement = AtomicCursorBuffer::create(
-            file,
-            self.resources
-                .current
-                .as_ref()
-                .map_or(self.image.width, |buffer| buffer.width),
-            self.resources
-                .current
-                .as_ref()
-                .map_or(self.image.height, |buffer| buffer.height),
-        )?;
-        if let Err(error) = replacement.upload_image(&self.image) {
-            drop(replacement);
-            return Err(error);
+    pub(crate) fn replace_image(
+        &mut self,
+        file: &fs::File,
+        image: Arc<CompositorCursorImage>,
+        source_key: NativeCursorImageKey,
+    ) -> io::Result<()> {
+        if self.source_key == NativeCursorSourceKey::Client(source_key) {
+            return Ok(());
         }
-        if let Some(previous) = self.resources.current.replace(replacement) {
-            self.resources.retired.push(previous);
+        self.replace_image_with_source(file, image, NativeCursorSourceKey::Client(source_key))
+    }
+
+    pub(crate) fn restore_theme_image(&mut self, file: &fs::File) -> io::Result<()> {
+        if self.source_key == NativeCursorSourceKey::Theme {
+            return Ok(());
         }
+        self.replace_image_with_source(file, self.theme_image.clone(), NativeCursorSourceKey::Theme)
+    }
+
+    pub(crate) const fn using_theme_image(&self) -> bool {
+        matches!(self.source_key, NativeCursorSourceKey::Theme)
+    }
+
+    pub(crate) fn client_image_matches(&self, key: NativeCursorImageKey) -> bool {
+        self.source_key == NativeCursorSourceKey::Client(key)
+    }
+
+    pub(crate) fn client_image_failure_matches(&self, key: NativeCursorImageKey) -> bool {
+        self.client_image_failure == Some(key)
+    }
+
+    pub(crate) fn note_client_image_failure(&mut self, key: NativeCursorImageKey) {
+        self.client_image_failure = Some(key);
+    }
+
+    fn replace_image_with_source(
+        &mut self,
+        file: &fs::File,
+        image: Arc<CompositorCursorImage>,
+        source_key: NativeCursorSourceKey,
+    ) -> io::Result<()> {
+        self.resources.retire_cached_mismatch(source_key);
+        let mut replacement = self.resources.take_cached(source_key);
+        let cache_hit = replacement.is_some();
+        if replacement.is_none() {
+            replacement = Some(AtomicCursorBuffer::create(
+                file,
+                self.resources
+                    .current
+                    .as_ref()
+                    .map_or(self.image.width, |buffer| buffer.width),
+                self.resources
+                    .current
+                    .as_ref()
+                    .map_or(self.image.height, |buffer| buffer.height),
+            )?);
+            if let Err(error) = replacement
+                .as_mut()
+                .expect("new cursor buffer is present")
+                .upload_image(&image)
+            {
+                drop(replacement);
+                return Err(error);
+            }
+        }
+        if let Some(previous) = self.resources.current.take() {
+            self.resources.cache_current(self.source_key, previous);
+        }
+        self.resources.current = replacement;
         let framebuffer_id = self
             .resources
             .current
             .as_ref()
             .map(|buffer| buffer.framebuffer.get());
+        self.image = image;
+        if cache_hit {
+            self.counters.image_cache_hits = self.counters.image_cache_hits.saturating_add(1);
+        } else {
+            self.counters.image_uploads = self.counters.image_uploads.saturating_add(1);
+            if matches!(source_key, NativeCursorSourceKey::Client(_)) {
+                self.counters.client_image_uploads =
+                    self.counters.client_image_uploads.saturating_add(1);
+            }
+        }
+        if matches!(source_key, NativeCursorSourceKey::Client(_)) {
+            // A new image is a meaningful retry point after a cursor-plane
+            // TEST_ONLY failure.  Pointer motion alone never clears this
+            // latch, so a rejected plane cannot create a retry storm.
+            self.failure_latched = false;
+        }
+        self.source_key = source_key;
+        self.client_image_failure = None;
         self.desired.framebuffer_id = framebuffer_id;
+        self.desired.hotspot_x = self.image.hotspot_x;
+        self.desired.hotspot_y = self.image.hotspot_y;
+        self.desired.width = self.image.width;
+        self.desired.height = self.image.height;
         self.desired.image_generation = self.desired.image_generation.saturating_add(1);
         self.dirty.image = true;
         if !self.desired.visible && !self.current.visible {
@@ -442,6 +614,7 @@ impl NativeAtomicCursor {
         self.pending_is_primary = false;
         self.dirty = AtomicCursorDirty::default();
         self.failure_latched = false;
+        self.client_image_failure = None;
         Ok(restored)
     }
 
@@ -454,11 +627,221 @@ impl NativeAtomicCursor {
         self.pending_token = None;
         self.pending_is_primary = false;
         self.failure_latched = false;
+        self.client_image_failure = None;
     }
 
     pub(crate) fn disarm_drm_cleanup(&mut self) {
         self.drm_cleanup_armed = false;
         self.resources.disarm_drm_cleanup();
+    }
+}
+
+pub(crate) fn client_cursor_image(
+    surface: &RenderableSurface,
+    hotspot_x: i32,
+    hotspot_y: i32,
+) -> Option<Arc<CompositorCursorImage>> {
+    // A viewport can crop or scale a cursor buffer. Until that transformation
+    // is represented in the native image conversion, use software composition
+    // rather than uploading an image with the wrong dimensions or hotspot.
+    if surface.viewport_source.is_some() || surface.viewport_destination.is_some() {
+        return None;
+    }
+    let pixels = surface.cpu_pixels()?;
+    let source_size = surface.buffer_size();
+    if source_size.width == 0
+        || source_size.height == 0
+        || surface.width == 0
+        || surface.height == 0
+    {
+        return None;
+    }
+    let (pixels, (source_width, source_height)) = transform_cursor_pixels(
+        pixels,
+        source_size.width,
+        source_size.height,
+        surface.buffer_transform,
+    )?;
+    let target_width = usize::try_from(surface.width).ok()?;
+    let target_height = usize::try_from(surface.height).ok()?;
+    let mut normalized = vec![0; target_width.checked_mul(target_height)?];
+    for y in 0..target_height {
+        let source_y = y.saturating_mul(source_height) / target_height;
+        for x in 0..target_width {
+            let source_x = x.saturating_mul(source_width) / target_width;
+            normalized[y * target_width + x] = pixels[source_y * source_width + source_x];
+        }
+    }
+    let hotspot = normalize_cursor_hotspot(
+        hotspot_x,
+        hotspot_y,
+        source_size.width,
+        source_size.height,
+        source_width as u32,
+        source_height as u32,
+        surface.width,
+        surface.height,
+        surface.buffer_transform,
+    )?;
+    CompositorCursorImage::from_argb8888(
+        normalized,
+        surface.width,
+        surface.height,
+        hotspot.0,
+        hotspot.1,
+    )
+    .ok()
+    .map(Arc::new)
+}
+
+fn transform_cursor_pixels(
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    transform: wayland_server::protocol::wl_output::Transform,
+) -> Option<(Vec<u32>, (usize, usize))> {
+    let width = usize::try_from(width).ok()?;
+    let height = usize::try_from(height).ok()?;
+    let count = width.checked_mul(height)?;
+    if pixels.len() < count {
+        return None;
+    }
+    let rotated = matches!(
+        transform,
+        wayland_server::protocol::wl_output::Transform::_90
+            | wayland_server::protocol::wl_output::Transform::_270
+            | wayland_server::protocol::wl_output::Transform::Flipped90
+            | wayland_server::protocol::wl_output::Transform::Flipped270
+    );
+    let output_width = if rotated { height } else { width };
+    let output_height = if rotated { width } else { height };
+    let mut output = vec![0; output_width.checked_mul(output_height)?];
+    for y in 0..output_height {
+        for x in 0..output_width {
+            let (source_x, source_y) = cursor_source_coordinate(x, y, width, height, transform);
+            output[y * output_width + x] = pixels[source_y * width + source_x];
+        }
+    }
+    Some((output, (output_width, output_height)))
+}
+
+fn cursor_source_coordinate(
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    transform: wayland_server::protocol::wl_output::Transform,
+) -> (usize, usize) {
+    use wayland_server::protocol::wl_output::Transform;
+    match transform {
+        Transform::Normal => (x, y),
+        Transform::_90 => (y, height - 1 - x),
+        Transform::_180 => (width - 1 - x, height - 1 - y),
+        Transform::_270 => (height - 1 - y, x),
+        Transform::Flipped => (width - 1 - x, y),
+        Transform::Flipped90 => (y, x),
+        Transform::Flipped180 => (x, height - 1 - y),
+        Transform::Flipped270 => (height - 1 - y, width - 1 - x),
+        _ => (x.min(width - 1), y.min(height - 1)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_cursor_hotspot(
+    hotspot_x: i32,
+    hotspot_y: i32,
+    source_width: u32,
+    source_height: u32,
+    transformed_width: u32,
+    transformed_height: u32,
+    target_width: u32,
+    target_height: u32,
+    transform: wayland_server::protocol::wl_output::Transform,
+) -> Option<(i32, i32)> {
+    if hotspot_x < 0
+        || hotspot_y < 0
+        || source_width == 0
+        || source_height == 0
+        || hotspot_x >= i32::try_from(source_width).ok()?
+        || hotspot_y >= i32::try_from(source_height).ok()?
+        || transformed_width == 0
+        || transformed_height == 0
+    {
+        return None;
+    }
+    let (x, y) = match transform {
+        wayland_server::protocol::wl_output::Transform::Normal => (hotspot_x, hotspot_y),
+        wayland_server::protocol::wl_output::Transform::_90 => (
+            i32::try_from(source_height)
+                .ok()?
+                .saturating_sub(1 + hotspot_y),
+            hotspot_x,
+        ),
+        wayland_server::protocol::wl_output::Transform::_180 => (
+            i32::try_from(source_width)
+                .ok()?
+                .saturating_sub(1 + hotspot_x),
+            i32::try_from(source_height)
+                .ok()?
+                .saturating_sub(1 + hotspot_y),
+        ),
+        wayland_server::protocol::wl_output::Transform::_270 => (
+            hotspot_y,
+            i32::try_from(source_width)
+                .ok()?
+                .saturating_sub(1 + hotspot_x),
+        ),
+        wayland_server::protocol::wl_output::Transform::Flipped => (
+            i32::try_from(source_width)
+                .ok()?
+                .saturating_sub(1 + hotspot_x),
+            hotspot_y,
+        ),
+        wayland_server::protocol::wl_output::Transform::Flipped90 => (hotspot_y, hotspot_x),
+        wayland_server::protocol::wl_output::Transform::Flipped180 => (
+            hotspot_x,
+            i32::try_from(source_height)
+                .ok()?
+                .saturating_sub(1 + hotspot_y),
+        ),
+        wayland_server::protocol::wl_output::Transform::Flipped270 => (
+            i32::try_from(source_width)
+                .ok()?
+                .saturating_sub(1 + hotspot_y),
+            i32::try_from(source_height)
+                .ok()?
+                .saturating_sub(1 + hotspot_x),
+        ),
+        _ => return None,
+    };
+    let x = i64::from(x)
+        .saturating_mul(i64::from(target_width))
+        .checked_div(i64::from(transformed_width))?;
+    let y = i64::from(y)
+        .saturating_mul(i64::from(target_height))
+        .checked_div(i64::from(transformed_height))?;
+    Some((
+        i32::try_from(x)
+            .ok()?
+            .clamp(0, i32::try_from(target_width).ok()?.saturating_sub(1)),
+        i32::try_from(y)
+            .ok()?
+            .clamp(0, i32::try_from(target_height).ok()?.saturating_sub(1)),
+    ))
+}
+
+fn cursor_transform_key(transform: wayland_server::protocol::wl_output::Transform) -> u32 {
+    use wayland_server::protocol::wl_output::Transform;
+    match transform {
+        Transform::Normal => 0,
+        Transform::_90 => 1,
+        Transform::_180 => 2,
+        Transform::_270 => 3,
+        Transform::Flipped => 4,
+        Transform::Flipped90 => 5,
+        Transform::Flipped180 => 6,
+        Transform::Flipped270 => 7,
+        _ => u32::MAX,
     }
 }
 
@@ -517,6 +900,8 @@ mod tests {
         let state = AtomicCursorVisualState::hidden(64, 64);
         NativeAtomicCursor {
             image: Arc::new(CompositorCursorImage::builtin_fallback()),
+            theme_image: Arc::new(CompositorCursorImage::builtin_fallback()),
+            source_key: NativeCursorSourceKey::Theme,
             desired: state.clone(),
             submitted: state.clone(),
             current: state,
@@ -567,6 +952,7 @@ mod tests {
             dirty: AtomicCursorDirty::default(),
             counters: AtomicCursorCounters::default(),
             failure_latched: false,
+            client_image_failure: None,
             pending_token: None,
             pending_is_primary: false,
             suspended_desired: None,
@@ -610,6 +996,51 @@ mod tests {
         let image =
             CompositorCursorImage::from_argb8888(vec![0xffff_ffff; 65 * 64], 65, 64, 0, 0).unwrap();
         assert!(validate_atomic_cursor_image(&image, NATIVE_HARDWARE_CURSOR_SIZE, 64).is_err());
+    }
+
+    #[test]
+    fn client_cursor_transform_preserves_pixel_orientation_and_hotspot() {
+        use wayland_server::protocol::wl_output::Transform;
+
+        let (pixels, (width, height)) =
+            transform_cursor_pixels(&[0, 1, 2, 3, 4, 5], 2, 3, Transform::_90).unwrap();
+        assert_eq!((width, height), (3, 2));
+        assert_eq!(pixels, vec![4, 2, 0, 5, 3, 1]);
+        assert_eq!(
+            normalize_cursor_hotspot(1, 2, 2, 3, 3, 2, 3, 2, Transform::_90),
+            Some((0, 1))
+        );
+    }
+
+    #[test]
+    fn client_cursor_hotspot_outside_source_is_rejected() {
+        use wayland_server::protocol::wl_output::Transform;
+
+        assert_eq!(
+            normalize_cursor_hotspot(2, 0, 2, 2, 2, 2, 2, 2, Transform::Normal),
+            None
+        );
+    }
+
+    #[test]
+    fn client_cursor_image_key_changes_for_commit_and_hotspot() {
+        let first = NativeCursorImageKey {
+            surface_id: 7,
+            buffer_id: 11,
+            commit_sequence: 3,
+            hotspot_x: 1,
+            hotspot_y: 2,
+            width: 32,
+            height: 32,
+            buffer_scale: 1,
+            buffer_transform: 0,
+        };
+        let mut next = first;
+        next.commit_sequence += 1;
+        assert_ne!(first, next);
+        next = first;
+        next.hotspot_x += 1;
+        assert_ne!(first, next);
     }
 
     #[test]

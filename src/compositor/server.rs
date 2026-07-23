@@ -50,11 +50,12 @@ use super::{
     AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, BufferReleaseMetrics,
     ClientCursorRenderState, CompositorError, CompositorFrameBatchId, CompositorState,
     CoreComplianceMetrics, DirectScanoutSceneCandidate, DirectScanoutSceneRejection,
-    ExplicitSyncPoint, FrameBatchDiscardReason, FramePresentation, FullscreenRenderPlanMetrics,
-    InputProtocolCapabilities, OutputRect, PendingProcessLaunch, PointerAxisFrame,
-    PresentationClock, RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities,
-    ResizeFlowMetrics, SelectionProtocolCapabilities, SubsurfaceTransactionMetrics,
-    SurfaceDamagePresentation, WindowInteractionDebugSnapshot, WindowInteractionEndReason, color,
+    ExplicitSyncPoint, FrameBatchDiscardReason, FrameCallbackMetrics, FrameCallbackTime,
+    FramePresentation, FullscreenRenderPlanMetrics, InputProtocolCapabilities, OutputRect,
+    PendingProcessLaunch, PointerAxisFrame, PresentationClock, ProtocolOnlyCompletion,
+    RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
+    SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
+    WindowInteractionDebugSnapshot, WindowInteractionEndReason, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 #[derive(Debug)]
@@ -488,7 +489,15 @@ impl OwnCompositorServer {
                         | crate::xwayland::xwm::X11MetadataDelta::WindowTypes(_)
                         | crate::xwayland::xwm::X11MetadataDelta::Kind(_)
                 );
+                let old_policy = self.state.x11_placement_policy(window);
                 self.state.apply_x11_metadata_delta(window, delta);
+                let new_policy = self.state.x11_placement_policy(window);
+                let mut commands = Vec::new();
+                if old_policy != new_policy
+                    && let Some(geometry) = self.state.x11_authoritative_geometry(window)
+                {
+                    commands.push(XwmCommand::ConfigureFrame { window, geometry });
+                }
                 if prior_focused
                     && prior_id.is_some_and(|id| {
                         self.state
@@ -512,25 +521,20 @@ impl OwnCompositorServer {
                         .field("focus_repaired", prior_focused)
                 });
                 if !publish_lists {
-                    return Vec::new();
+                    return commands;
                 }
-                vec![self.sync_xwayland_client_lists()]
+                commands.push(self.sync_xwayland_client_lists());
+                commands
             }
             XwmEvent::ConfigureRequested { window, request } => {
                 if self.state.x11_resize_active(window) {
                     let mut commands = Vec::with_capacity(2);
-                    let mut stack_changed = false;
                     if let Some(mode) = request.stack_mode
                         && self
                             .state
                             .apply_x11_stack_request(window, request.sibling, mode)
                     {
-                        stack_changed = true;
-                        commands.push(XwmCommand::Stack {
-                            window,
-                            sibling: request.sibling,
-                            mode,
-                        });
+                        commands.push(self.restack_xwayland_windows());
                     }
                     if (request.fields.x
                         || request.fields.y
@@ -540,9 +544,6 @@ impl OwnCompositorServer {
                         && let Some(geometry) = self.state.x11_authoritative_geometry(window)
                     {
                         commands.push(XwmCommand::ConfigureNotify { window, geometry });
-                    }
-                    if stack_changed {
-                        commands.push(self.sync_xwayland_client_lists());
                     }
                     self.state.refresh_pointer_focus_at_last_position();
                     return commands;
@@ -567,21 +568,12 @@ impl OwnCompositorServer {
                     fields: request.fields,
                     border_width: request.border_width,
                 }];
-                let mut stack_changed = false;
                 if let Some(mode) = request.stack_mode
                     && self
                         .state
                         .apply_x11_stack_request(window, request.sibling, mode)
                 {
-                    stack_changed = true;
-                    commands.push(XwmCommand::Stack {
-                        window,
-                        sibling: request.sibling,
-                        mode,
-                    });
-                }
-                if stack_changed {
-                    commands.push(self.sync_xwayland_client_lists());
+                    commands.push(self.restack_xwayland_windows());
                 }
                 self.state.refresh_pointer_focus_at_last_position();
                 commands
@@ -606,20 +598,18 @@ impl OwnCompositorServer {
                                 crate::compositor::desktop_window::X11DesktopRole::OverrideRedirect,
                             )
                     });
-                if is_override_redirect
-                    && let Some(sibling) = above_sibling
-                    && self.state.apply_x11_stack_request(
-                        window,
-                        Some(sibling),
-                        crate::xwayland::xwm::X11StackMode::Above,
-                    )
-                {
-                    self.state.refresh_pointer_focus_at_last_position();
-                    vec![self.sync_xwayland_client_lists()]
-                } else {
-                    self.state.refresh_pointer_focus_at_last_position();
-                    Vec::new()
+                if is_override_redirect {
+                    let (sibling, mode) = match above_sibling {
+                        Some(sibling) => (Some(sibling), crate::xwayland::xwm::X11StackMode::Above),
+                        None => (None, crate::xwayland::xwm::X11StackMode::Below),
+                    };
+                    if self.state.apply_x11_stack_request(window, sibling, mode) {
+                        self.state.refresh_pointer_focus_at_last_position();
+                        return vec![self.restack_xwayland_windows()];
+                    }
                 }
+                self.state.refresh_pointer_focus_at_last_position();
+                Vec::new()
             }
             XwmEvent::StateRequested { window, request } => {
                 let was_hidden = self
@@ -630,7 +620,7 @@ impl OwnCompositorServer {
                 let Some(state) = self.state.apply_x11_state_request(window, request) else {
                     return Vec::new();
                 };
-                let mut commands = Vec::with_capacity(2);
+                let mut commands = Vec::with_capacity(1);
                 if state.hidden != was_hidden {
                     commands.push(if state.hidden {
                         XwmCommand::Unmap(window)
@@ -638,7 +628,6 @@ impl OwnCompositorServer {
                         XwmCommand::Map(window)
                     });
                 }
-                commands.push(XwmCommand::SetState { window, state });
                 commands
             }
             XwmEvent::FocusRequested {
@@ -689,15 +678,55 @@ impl OwnCompositorServer {
                     commit_floor,
                 }]
             }
-            XwmEvent::ResizeSyncPresented(window) => {
-                let _ = self.state.finalize_x11_resize(window);
+            XwmEvent::ResizeSyncPresented {
+                window,
+                transaction_id,
+                geometry,
+            } => {
+                let accepted = self
+                    .state
+                    .finalize_x11_resize_with_geometry(window, Some(geometry));
+                trace::emit("xwayland_resize_presentation", || {
+                    TraceFields::new()
+                        .field("source", "compositor")
+                        .field("xid", window.xid())
+                        .field("transaction_id", transaction_id)
+                        .field("geometry", format!("{geometry:?}"))
+                        .field("accepted", accepted)
+                        .field(
+                            "reason",
+                            if accepted {
+                                "current_content_epoch"
+                            } else {
+                                "older_content_epoch"
+                            },
+                        )
+                });
                 vec![XwmCommand::CompleteResizeSync(window)]
             }
-            XwmEvent::ResizeSyncPresentedIntermediate(window) => {
+            XwmEvent::ResizeSyncPresentedIntermediate { window, .. } => {
                 vec![XwmCommand::CompleteResizeSync(window)]
             }
-            XwmEvent::ResizeSyncImmediate(window) => {
-                let _ = self.state.finalize_x11_resize(window);
+            XwmEvent::ResizeSyncImmediate { window, geometry } => {
+                let accepted = self
+                    .state
+                    .finalize_x11_resize_with_geometry(window, Some(geometry));
+                trace::emit("xwayland_resize_presentation", || {
+                    TraceFields::new()
+                        .field("source", "compositor")
+                        .field("xid", window.xid())
+                        .field("transaction_id", 0)
+                        .field("geometry", format!("{geometry:?}"))
+                        .field("accepted", accepted)
+                        .field(
+                            "reason",
+                            if accepted {
+                                "immediate_content_epoch"
+                            } else {
+                                "older_content_epoch"
+                            },
+                        )
+                });
                 Vec::new()
             }
             XwmEvent::ResizeSyncTimedOut(window)
@@ -792,6 +821,10 @@ impl OwnCompositorServer {
         self.state.render_generation
     }
 
+    pub fn cursor_generation(&self) -> u64 {
+        self.state.cursor_generation
+    }
+
     pub fn scene_render_generation(&self) -> u64 {
         self.state.scene_render_generation
     }
@@ -822,8 +855,29 @@ impl OwnCompositorServer {
         self.state.direct_scanout_scene_candidate()
     }
 
+    /// Returns the immutable publication epoch for the currently published
+    /// buffer. Bufferless and metadata-only commits do not advance it.
+    pub fn surface_content_epoch(&self, surface_id: u32) -> Option<u64> {
+        self.state
+            .surface_content_epoch(surface_id)
+            .map(|sequence| sequence.get())
+    }
+
     pub fn has_pending_frame_callbacks(&self) -> bool {
         self.state.has_pending_frame_callbacks()
+    }
+
+    pub fn frame_callback_time_for_output(&mut self) -> FrameCallbackTime {
+        FrameCallbackTime::new(self.state.frame_callback_time_ms())
+    }
+
+    pub fn complete_protocol_only_frame_tick(
+        &mut self,
+        output_time: FrameCallbackTime,
+    ) -> ProtocolOnlyCompletion {
+        let completion = self.state.complete_protocol_only_frame_tick(output_time);
+        let _ = self.display.flush_clients();
+        completion
     }
 
     pub fn has_only_pending_surface_frame_callbacks(&self) -> bool {
@@ -838,8 +892,8 @@ impl OwnCompositorServer {
         self.state.has_pending_explicit_sync_work()
     }
 
-    pub fn has_pending_frame_work(&self) -> bool {
-        self.state.has_pending_frame_work()
+    pub fn has_unowned_frame_work(&self) -> bool {
+        self.state.has_unowned_frame_work()
     }
 
     pub fn set_dmabuf_feedback(
@@ -1066,11 +1120,9 @@ impl OwnCompositorServer {
     pub fn window_interaction_active(&self) -> bool {
         self.state.window_interaction_active()
     }
-
     pub fn active_window_interaction_trigger_button(&self) -> Option<u32> {
         self.state.active_window_interaction_trigger_button()
     }
-
     pub fn reconcile_window_interaction_trigger(&mut self, trigger_pressed: bool) -> bool {
         let reconciled = self
             .state
@@ -1154,15 +1206,6 @@ impl OwnCompositorServer {
         self.state.apply_pending_interactive_resize_update();
         self.state.flush_pending_resize_configure();
         let _ = self.display.flush_clients();
-    }
-
-    pub fn capture_frame_callbacks_for_render(&mut self) {
-        self.state.capture_frame_callbacks_for_render();
-    }
-
-    #[doc(hidden)]
-    pub fn take_frame_batch_for_render(&mut self, frame_id: u64) -> CompositorFrameBatchId {
-        self.state.take_frame_batch_for_render(frame_id)
     }
 
     #[doc(hidden)]
@@ -1249,6 +1292,9 @@ impl OwnCompositorServer {
             let _ = self.display.flush_clients();
             return;
         };
+        if let Some(batch_id) = self.state.legacy_prepared_frame_batch {
+            self.state.complete_rendered_frame_callbacks(batch_id);
+        }
         self.finish_frame_with_presentation(presentation);
     }
 
@@ -1264,6 +1310,11 @@ impl OwnCompositorServer {
     #[doc(hidden)]
     pub fn buffer_release_metrics(&self) -> BufferReleaseMetrics {
         self.state.buffer_release_metrics()
+    }
+
+    #[doc(hidden)]
+    pub fn frame_callback_metrics(&self) -> FrameCallbackMetrics {
+        self.state.frame_callback_metrics()
     }
 
     pub fn verbose_trace_dropped_entries(&self) -> u64 {

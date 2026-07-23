@@ -1,4 +1,5 @@
 use super::*;
+use std::os::fd::AsRawFd;
 
 #[test]
 fn wayland_client_can_create_xdg_toplevel_on_oblivion_server() {
@@ -28,6 +29,57 @@ fn wayland_client_receives_xdg_toplevel_and_surface_configure() {
     let state = state.unwrap();
     assert!(state.toplevel_configured);
     assert!(state.surface_configured);
+}
+
+#[test]
+fn invalid_activation_serial_still_completes_gtk_toplevel_startup() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let fractional_scale_manager: client_wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let viewporter: client_wp_viewporter::WpViewporter = globals.bind(&qh, 1..=1, ()).unwrap();
+    let activation: client_xdg_activation_v1::XdgActivationV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let _fractional_scale = fractional_scale_manager.get_fractional_scale(&surface, &qh, ());
+    let _viewport = viewporter.get_viewport(&surface, &qh, ());
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+
+    surface.commit();
+    let token = activation.get_activation_token(&qh, ());
+    token.set_serial(0, &seat);
+    token.commit();
+    connection.flush().unwrap();
+
+    let mut pollfd = libc::pollfd {
+        fd: connection.backend().poll_fd().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut pollfd, 1, 1_000) };
+    assert_eq!(
+        ready, 1,
+        "initial configure was not delivered without wl_display.sync"
+    );
+
+    let mut state = RegistryTestState::default();
+    queue.blocking_dispatch(&mut state).unwrap();
+    let _server = stop_test_server(running, server_thread);
+
+    assert!(state.toplevel_configured);
+    assert!(state.surface_configured);
+    assert_eq!(state.activation_token_done.as_deref(), Some(""));
 }
 
 #[test]

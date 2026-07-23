@@ -4,7 +4,7 @@ use std::num::NonZeroU64;
 pub struct XwaylandGeneration(NonZeroU64);
 
 impl XwaylandGeneration {
-    pub(crate) const fn new(value: NonZeroU64) -> Self {
+    pub const fn new(value: NonZeroU64) -> Self {
         Self(value)
     }
 

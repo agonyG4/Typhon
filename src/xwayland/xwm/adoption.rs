@@ -18,6 +18,22 @@ pub(crate) enum AdoptionWait {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdoptionCancelReason {
+    Unmap,
+    Destroy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AdoptionMetrics {
+    pub(crate) waits_started: u64,
+    pub(crate) waits_completed: u64,
+    pub(crate) waits_cancelled_unmap: u64,
+    pub(crate) waits_cancelled_destroy: u64,
+    pub(crate) waits_expired: u64,
+    pub(crate) peak_pending: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingAdoption {
     generation: super::XwaylandGeneration,
     deadline_ns: u64,
@@ -27,6 +43,7 @@ struct PendingAdoption {
 #[derive(Debug, Default)]
 pub(crate) struct AdoptionTracker {
     pending: HashMap<X11WindowHandle, PendingAdoption>,
+    metrics: AdoptionMetrics,
 }
 
 impl AdoptionTracker {
@@ -36,6 +53,7 @@ impl AdoptionTracker {
         wait: AdoptionWait,
         deadline_ns: u64,
     ) {
+        self.metrics.waits_started = self.metrics.waits_started.saturating_add(1);
         self.pending.insert(
             handle,
             PendingAdoption {
@@ -44,10 +62,29 @@ impl AdoptionTracker {
                 wait,
             },
         );
+        self.metrics.peak_pending = self.metrics.peak_pending.max(self.pending.len() as u64);
     }
 
     pub(crate) fn complete(&mut self, handle: X11WindowHandle) {
-        self.pending.remove(&handle);
+        if self.pending.remove(&handle).is_some() {
+            self.metrics.waits_completed = self.metrics.waits_completed.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn cancel(&mut self, handle: X11WindowHandle, reason: AdoptionCancelReason) {
+        if self.pending.remove(&handle).is_none() {
+            return;
+        }
+        match reason {
+            AdoptionCancelReason::Unmap => {
+                self.metrics.waits_cancelled_unmap =
+                    self.metrics.waits_cancelled_unmap.saturating_add(1);
+            }
+            AdoptionCancelReason::Destroy => {
+                self.metrics.waits_cancelled_destroy =
+                    self.metrics.waits_cancelled_destroy.saturating_add(1);
+            }
+        }
     }
 
     pub(crate) fn clear_generation(&mut self, generation: super::XwaylandGeneration) {
@@ -67,7 +104,20 @@ impl AdoptionTracker {
         for (handle, _) in &expired {
             self.pending.remove(handle);
         }
+        self.metrics.waits_expired = self
+            .metrics
+            .waits_expired
+            .saturating_add(expired.len() as u64);
         expired
+    }
+
+    pub(crate) fn metrics(&self) -> AdoptionMetrics {
+        self.metrics
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.len()
     }
 
     pub(crate) fn next_deadline_ns(&self) -> Option<u64> {
@@ -95,6 +145,7 @@ mod tests {
             tracker.expired(10),
             [(handle, AdoptionWait::MapToAssociation)]
         );
+        assert_eq!(tracker.metrics().waits_expired, 1);
     }
 
     #[test]

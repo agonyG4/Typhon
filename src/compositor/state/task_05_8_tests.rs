@@ -23,6 +23,7 @@ mod task_05_8_tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: crate::render_backend::buffer::CommittedSurfaceBuffer::shm_snapshot(

@@ -96,7 +96,12 @@ impl OwnCompositorServer {
                 if let Some(old_surface_id) = old_surface_id
                     && old_surface_id != surface_id
                 {
-                    self.state.withdraw_xwayland_surface_content(old_surface_id);
+                    self.state
+                        .transfer_xwayland_visual_state_for_attachment_replacement(
+                            old_surface_id,
+                            surface_id,
+                        );
+                    self.state.retire_xwayland_attachment(old_surface_id);
                 }
                 let Ok(replaced_surface_id) = self.state.attach_x11_surface(window, surface_id)
                 else {
@@ -130,7 +135,7 @@ impl OwnCompositorServer {
                 {
                     return;
                 }
-                self.state.withdraw_xwayland_surface_content(surface_id);
+                self.state.retire_xwayland_attachment(surface_id);
                 self.state.detach_x11_surface(surface_id);
                 self.state.refresh_pointer_focus_at_last_position();
                 trace::emit("xwayland_surface_detached", || {
@@ -210,6 +215,15 @@ impl OwnCompositorServer {
     pub(super) fn sync_xwayland_client_lists(&self) -> XwmCommand {
         let (client_list, stacking) = self.state.x11_client_lists();
         XwmCommand::SyncClientLists {
+            client_list,
+            stacking,
+        }
+    }
+
+    pub(super) fn restack_xwayland_windows(&self) -> XwmCommand {
+        let (client_list, stacking) = self.state.x11_client_lists();
+        XwmCommand::RestackExact {
+            order: self.state.x11_stack_handles(),
             client_list,
             stacking,
         }

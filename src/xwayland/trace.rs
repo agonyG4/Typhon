@@ -5,6 +5,8 @@ use std::{
 };
 
 static TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const MAX_TRACE_RECORDS_PER_PROCESS: u64 = 20_000;
+static TRACE_RECORDS_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 static TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 
 #[derive(Debug, Default)]
@@ -43,8 +45,16 @@ where
         return;
     }
     let trace_seq = TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    if trace_seq > MAX_TRACE_RECORDS_PER_PROCESS {
+        TRACE_RECORDS_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     let monotonic_ns = crate::native::event_loop::monotonic_now_ns().unwrap_or_default();
     eprintln!("{}", render_line(trace_seq, monotonic_ns, event, &fields()));
+}
+
+pub fn suppressed_records() -> u64 {
+    TRACE_RECORDS_SUPPRESSED.load(Ordering::Relaxed)
 }
 
 pub fn render_line(trace_seq: u64, monotonic_ns: u64, event: &str, fields: &TraceFields) -> String {

@@ -79,6 +79,13 @@ pub struct XwaylandConfig {
     pub test_root: Option<PathBuf>,
 }
 
+pub(crate) const fn xwm_reactor_hot_path_logging_enabled(
+    _log_stderr: bool,
+    trace_enabled: bool,
+) -> bool {
+    trace_enabled
+}
+
 impl XwaylandConfig {
     pub fn from_environment() -> Self {
         let mode = XwaylandMode::parse(env::var("TYPHON_XWAYLAND").ok().as_deref());
@@ -120,5 +127,14 @@ impl XwaylandConfig {
             display_max: 63,
             test_root: Some(root),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ordinary_xwayland_stderr_logging_does_not_enable_xwm_reactor_hot_path_logs() {
+        assert!(!super::xwm_reactor_hot_path_logging_enabled(true, false));
+        assert!(super::xwm_reactor_hot_path_logging_enabled(false, true));
     }
 }

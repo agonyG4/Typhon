@@ -67,6 +67,8 @@ impl Xwm {
     }
 
     pub(crate) fn complete_resize_sync(&mut self, handle: X11WindowHandle) -> Result<(), XwmError> {
+        let presented_transaction = self.resize_sync.transaction(handle);
+        let presented_geometry = presented_transaction.map(|(_, geometry, _)| geometry);
         if !self.resize_sync.complete(handle) {
             return Err(XwmError::InvalidCommand("resize sync is not presented"));
         }
@@ -81,6 +83,27 @@ impl Xwm {
         });
         self.clear_resize_sync_alarm(handle);
         if let Some(desired) = self.resize_sync.take_desired(handle) {
+            if presented_geometry == Some(desired.geometry) {
+                trace::emit("resize_same_geometry_completed", || {
+                    TraceFields::new()
+                        .field("source", "xwm")
+                        .field("xid", handle.xid())
+                        .field("geometry", format!("{:?}", desired.geometry))
+                        .field("final_pending", desired.final_pending)
+                        .field("roundtrip", false)
+                });
+                if desired.final_pending {
+                    self.outgoing_events
+                        .push_back(XwmEvent::ResizeSyncPresented {
+                            window: handle,
+                            transaction_id: presented_transaction
+                                .map(|(transaction_id, _, _)| transaction_id)
+                                .unwrap_or_default(),
+                            geometry: desired.geometry,
+                        });
+                }
+                return Ok(());
+            }
             let now = crate::native::event_loop::monotonic_now_ns().unwrap_or_default();
             commands::begin_resize_sync(
                 self,
@@ -104,6 +127,11 @@ impl Xwm {
         self.last_resize_geometries.remove(&handle);
     }
 
+    pub(crate) fn reset_sync_counter_initialization(&mut self, handle: X11WindowHandle) {
+        self.sync_counter_initializations.remove(&handle);
+        self.next_resize_counter_values.remove(&handle);
+    }
+
     pub(crate) fn clear_resize_sync_generation(&mut self, generation: XwaylandGeneration) {
         let handles = self
             .sync_alarms
@@ -115,6 +143,8 @@ impl Xwm {
         self.timed_out_resize_counters
             .retain(|handle, _| handle.generation() != generation);
         self.next_resize_counter_values
+            .retain(|handle, _| handle.generation() != generation);
+        self.sync_counter_initializations
             .retain(|handle, _| handle.generation() != generation);
         self.expected_configures
             .retain(|handle, _| handle.generation() != generation);
@@ -157,13 +187,42 @@ impl Xwm {
         let _ = self.connection.sync_destroy_alarm(alarm);
     }
 
-    pub(crate) fn collect_adoption_expirations(&mut self, now_ns: u64) {
-        for (handle, wait) in self.adoption.expired(now_ns) {
-            eprintln!(
-                "oblivion-one xwayland: event=adoption_timeout window={} wait={wait:?}",
-                handle.xid()
-            );
+    pub(crate) fn collect_adoption_expirations(&mut self, now_ns: u64) -> bool {
+        let expired = self.adoption.expired(now_ns);
+        if expired.is_empty() {
+            return false;
         }
+        let mut map_to_association = 0;
+        let mut association_to_buffer = 0;
+        let mut serial_pair = 0;
+        let mut sample_xids = Vec::with_capacity(8);
+        for (handle, wait) in expired.iter().copied() {
+            match wait {
+                adoption::AdoptionWait::MapToAssociation => map_to_association += 1,
+                adoption::AdoptionWait::AssociationToBuffer => association_to_buffer += 1,
+                adoption::AdoptionWait::SerialPair => serial_pair += 1,
+            }
+            if sample_xids.len() < 8 {
+                sample_xids.push(handle.xid());
+            }
+        }
+        trace::emit("adoption_timeout_summary", || {
+            TraceFields::new()
+                .field("total", expired.len())
+                .field("map_to_association", map_to_association)
+                .field("association_to_buffer", association_to_buffer)
+                .field("serial_pair", serial_pair)
+                .field("sample_xids", format!("{sample_xids:?}"))
+                .field(
+                    "dropped_samples",
+                    expired.len().saturating_sub(sample_xids.len()),
+                )
+        });
+        true
+    }
+
+    pub(crate) fn adoption_metrics(&self) -> adoption::AdoptionMetrics {
+        self.adoption.metrics()
     }
 
     pub(crate) fn sync_completed_associations(&mut self) {

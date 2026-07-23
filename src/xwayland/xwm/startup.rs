@@ -1336,6 +1336,7 @@ impl XwmStartup {
             focus: super::focus::FocusTracker::default(),
             sync_alarms: Default::default(),
             sync_handles_by_counter: Default::default(),
+            sync_counter_initializations: Default::default(),
             timed_out_resize_counters: Default::default(),
             next_resize_counter_values: Default::default(),
             family_order: Default::default(),
@@ -1365,6 +1366,7 @@ impl XwmStartup {
                 && adopted.mapped
             {
                 let _ = xwm.windows.adopt_mapped(handle);
+                let _ = xwm.begin_map_to_association_wait(handle);
             }
         }
         self.state = XwmStartupState::Running;

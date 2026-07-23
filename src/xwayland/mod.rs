@@ -38,7 +38,7 @@ pub struct X11WindowHandle {
 
 impl X11WindowHandle {
     #[allow(dead_code)]
-    pub(crate) const fn new(generation: XwaylandGeneration, xid: u32) -> Self {
+    pub const fn new(generation: XwaylandGeneration, xid: u32) -> Self {
         Self { generation, xid }
     }
 

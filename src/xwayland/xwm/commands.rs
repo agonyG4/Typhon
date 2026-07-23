@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::xwayland::trace::{self, TraceFields};
 use x11rb::{
     connection::Connection,
@@ -19,47 +21,84 @@ use super::{
     focus::{FocusModel, focus_model, should_send_take_focus},
 };
 
-pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XwmCommandOutcome {
+    Applied,
+    DroppedTargetGone {
+        window: super::X11WindowHandle,
+    },
+    DroppedStaleGeneration {
+        window: Option<super::X11WindowHandle>,
+    },
+    AppliedAfterPruning {
+        dropped_handles: usize,
+    },
+}
+
+impl XwmCommand {
+    pub(crate) fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Map(_) => "Map",
+            Self::Unmap(_) => "Unmap",
+            Self::Configure { .. } => "Configure",
+            Self::ConfigureFrame { .. } => "ConfigureFrame",
+            Self::ConfigureNotify { .. } => "ConfigureNotify",
+            Self::Stack { .. } => "Stack",
+            Self::Focus { .. } => "Focus",
+            Self::Raise(_) => "Raise",
+            Self::RaiseAndSync { .. } => "RaiseAndSync",
+            Self::RestackExact { .. } => "RestackExact",
+            Self::RaiseFamily { .. } => "RaiseFamily",
+            Self::StackFamily { .. } => "StackFamily",
+            Self::Close(_) => "Close",
+            Self::SetState { .. } => "SetState",
+            Self::SyncClientLists { .. } => "SyncClientLists",
+            Self::BeginResizeSync { .. } => "BeginResizeSync",
+            Self::SetAllowCommits { .. } => "SetAllowCommits",
+            Self::ReleaseResizeCommits { .. } => "ReleaseResizeCommits",
+            Self::CompleteResizeSync(_) => "CompleteResizeSync",
+        }
+    }
+
+    pub(crate) fn primary_handle(&self) -> Option<super::X11WindowHandle> {
+        match self {
+            Self::Map(handle)
+            | Self::Unmap(handle)
+            | Self::Raise(handle)
+            | Self::Close(handle)
+            | Self::CompleteResizeSync(handle) => Some(*handle),
+            Self::RaiseAndSync { window, .. }
+            | Self::Configure { window, .. }
+            | Self::ConfigureFrame { window, .. }
+            | Self::ConfigureNotify { window, .. }
+            | Self::Stack { window, .. }
+            | Self::SetState { window, .. }
+            | Self::BeginResizeSync { window, .. }
+            | Self::SetAllowCommits { window, .. }
+            | Self::ReleaseResizeCommits { window, .. } => Some(*window),
+            Self::RaiseFamily { family } | Self::StackFamily { family, .. } => {
+                family.first().copied()
+            }
+            Self::RestackExact { order, .. } => order.first().copied(),
+            Self::Focus { window, .. } => *window,
+            Self::SyncClientLists { .. } => None,
+        }
+    }
+}
+
+pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOutcome, XwmError> {
     trace::emit("xwm_command", || {
         TraceFields::new()
             .field("source", "xwm")
             .field("command", format!("{command:?}"))
     });
-    if let XwmCommand::SyncClientLists {
-        client_list,
-        stacking,
-    } = &command
-    {
-        for handle in client_list.iter().chain(stacking.iter()) {
-            validate_handle(xwm, *handle)?;
-        }
-    }
-    if let XwmCommand::RaiseAndSync {
-        client_list,
-        stacking,
-        ..
-    } = &command
-    {
-        for handle in client_list.iter().chain(stacking.iter()) {
-            validate_handle(xwm, *handle)?;
-        }
-    }
-    let handle = command_handle(&command);
-    if let Some(handle) = handle {
-        validate_handle(xwm, handle)?;
-    }
-    if let XwmCommand::Stack {
-        sibling: Some(sibling),
-        ..
-    } = &command
-    {
-        validate_handle(xwm, *sibling)?;
-    }
-    if let XwmCommand::RaiseFamily { family } | XwmCommand::StackFamily { family, .. } = &command {
-        for handle in family {
-            validate_handle(xwm, *handle)?;
-        }
-    }
+    let (command, pruned_handles) = match normalize_command(xwm, command)? {
+        NormalizedCommand::Drop(outcome) => return Ok(outcome),
+        NormalizedCommand::Execute {
+            command,
+            pruned_handles,
+        } => (command, pruned_handles),
+    };
 
     match command {
         XwmCommand::Map(handle) => {
@@ -68,7 +107,7 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
                 .map_command_is_new(handle)
                 .map_err(XwmError::InvalidCommand)?
             {
-                return Ok(());
+                return Ok(command_outcome(pruned_handles));
             }
             xwm.connection
                 .map_window(handle.xid())
@@ -116,10 +155,19 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             fields,
             border_width,
         } => {
-            if (fields.x || fields.y || fields.width || fields.height || fields.border_width)
+            if (fields.width || fields.height || fields.border_width)
                 && queue_resize_desired(xwm, window, geometry, true)?
             {
-                return Ok(());
+                return Ok(command_outcome(pruned_handles));
+            }
+            if !fields.width
+                && !fields.height
+                && !fields.border_width
+                && xwm.resize_sync.is_pending(window)
+            {
+                let _ = xwm
+                    .resize_sync
+                    .merge_desired_position(window, geometry.x, geometry.y);
             }
             xwm.connection
                 .configure_window(window.xid(), &configure_aux(geometry, fields, border_width))
@@ -130,7 +178,7 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             {
                 xwm.last_resize_geometries.remove(&window);
                 xwm.outgoing_events
-                    .push_back(XwmEvent::ResizeSyncImmediate(window));
+                    .push_back(XwmEvent::ResizeSyncImmediate { window, geometry });
             }
         }
         XwmCommand::ConfigureFrame { window, geometry } => {
@@ -271,6 +319,28 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             publish_client_list(xwm, XwmAtomName::NetClientList, &client_list)?;
             publish_client_list(xwm, XwmAtomName::NetClientListStacking, &stacking)?;
         }
+        XwmCommand::RestackExact {
+            order,
+            client_list,
+            stacking,
+        } => {
+            if order.len() >= 2 {
+                xwm.note_family_order(&order);
+                let mut previous: Option<super::X11WindowHandle> = None;
+                for handle in order {
+                    let mut aux = ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE);
+                    if let Some(sibling) = previous {
+                        aux = aux.sibling(sibling.xid());
+                    }
+                    xwm.connection
+                        .configure_window(handle.xid(), &aux)
+                        .map_err(XwmError::Connection)?;
+                    previous = Some(handle);
+                }
+            }
+            publish_client_list(xwm, XwmAtomName::NetClientList, &client_list)?;
+            publish_client_list(xwm, XwmAtomName::NetClientListStacking, &stacking)?;
+        }
         XwmCommand::RaiseFamily { family } => {
             xwm.note_family_order(&family);
             for handle in family {
@@ -382,35 +452,183 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<(), XwmError
             xwm.complete_resize_sync(window)?;
         }
     }
-    Ok(())
+    Ok(command_outcome(pruned_handles))
+}
+
+enum NormalizedCommand {
+    Drop(XwmCommandOutcome),
+    Execute {
+        command: XwmCommand,
+        pruned_handles: usize,
+    },
+}
+
+fn command_outcome(pruned_handles: usize) -> XwmCommandOutcome {
+    if pruned_handles == 0 {
+        XwmCommandOutcome::Applied
+    } else {
+        XwmCommandOutcome::AppliedAfterPruning {
+            dropped_handles: pruned_handles,
+        }
+    }
+}
+
+fn normalize_command(xwm: &Xwm, command: XwmCommand) -> Result<NormalizedCommand, XwmError> {
+    let primary = command.primary_handle();
+    let single_target = !matches!(
+        command,
+        XwmCommand::RaiseAndSync { .. }
+            | XwmCommand::RestackExact { .. }
+            | XwmCommand::RaiseFamily { .. }
+            | XwmCommand::StackFamily { .. }
+            | XwmCommand::SyncClientLists { .. }
+    );
+    if single_target && let Some(handle) = primary {
+        if handle.generation() != xwm.generation {
+            return Ok(NormalizedCommand::Drop(
+                XwmCommandOutcome::DroppedStaleGeneration {
+                    window: Some(handle),
+                },
+            ));
+        }
+        if !xwm.windows.contains(handle) {
+            return Ok(NormalizedCommand::Drop(
+                XwmCommandOutcome::DroppedTargetGone { window: handle },
+            ));
+        }
+    }
+
+    match command {
+        XwmCommand::Stack {
+            window,
+            sibling,
+            mode,
+        } => {
+            let (sibling, pruned_handles) = match sibling {
+                Some(sibling)
+                    if sibling.generation() != xwm.generation || !xwm.windows.contains(sibling) =>
+                {
+                    (None, 1)
+                }
+                sibling => (sibling, 0),
+            };
+            Ok(NormalizedCommand::Execute {
+                command: XwmCommand::Stack {
+                    window,
+                    sibling,
+                    mode,
+                },
+                pruned_handles,
+            })
+        }
+        XwmCommand::RaiseAndSync {
+            window,
+            client_list,
+            stacking,
+        } => {
+            let (client_list, client_pruned) = prune_handles(xwm, client_list);
+            let (stacking, stacking_pruned) = prune_handles(xwm, stacking);
+            let pruned_handles = client_pruned.saturating_add(stacking_pruned);
+            if window.generation() != xwm.generation || !xwm.windows.contains(window) {
+                return Ok(NormalizedCommand::Execute {
+                    command: XwmCommand::SyncClientLists {
+                        client_list,
+                        stacking,
+                    },
+                    pruned_handles: pruned_handles.saturating_add(1),
+                });
+            }
+            Ok(NormalizedCommand::Execute {
+                command: XwmCommand::RaiseAndSync {
+                    window,
+                    client_list,
+                    stacking,
+                },
+                pruned_handles,
+            })
+        }
+        XwmCommand::RestackExact {
+            order,
+            client_list,
+            stacking,
+        } => {
+            let (order, order_pruned) = prune_handles(xwm, order);
+            let (client_list, client_pruned) = prune_handles(xwm, client_list);
+            let (stacking, stacking_pruned) = prune_handles(xwm, stacking);
+            Ok(NormalizedCommand::Execute {
+                command: XwmCommand::RestackExact {
+                    order,
+                    client_list,
+                    stacking,
+                },
+                pruned_handles: order_pruned
+                    .saturating_add(client_pruned)
+                    .saturating_add(stacking_pruned),
+            })
+        }
+        XwmCommand::RaiseFamily { family } => {
+            let (family, pruned_handles) = prune_handles(xwm, family);
+            Ok(NormalizedCommand::Execute {
+                command: XwmCommand::RaiseFamily { family },
+                pruned_handles,
+            })
+        }
+        XwmCommand::StackFamily { family, mode } => {
+            let (family, pruned_handles) = prune_handles(xwm, family);
+            Ok(NormalizedCommand::Execute {
+                command: XwmCommand::StackFamily { family, mode },
+                pruned_handles,
+            })
+        }
+        XwmCommand::SyncClientLists {
+            client_list,
+            stacking,
+        } => {
+            let (client_list, client_pruned) = prune_handles(xwm, client_list);
+            let (stacking, stacking_pruned) = prune_handles(xwm, stacking);
+            Ok(NormalizedCommand::Execute {
+                command: XwmCommand::SyncClientLists {
+                    client_list,
+                    stacking,
+                },
+                pruned_handles: client_pruned.saturating_add(stacking_pruned),
+            })
+        }
+        command => Ok(NormalizedCommand::Execute {
+            command,
+            pruned_handles: 0,
+        }),
+    }
+}
+
+fn prune_handles(
+    xwm: &Xwm,
+    handles: Vec<super::X11WindowHandle>,
+) -> (Vec<super::X11WindowHandle>, usize) {
+    let mut seen = HashSet::new();
+    let mut dropped_handles: usize = 0;
+    let live = handles
+        .into_iter()
+        .filter(|handle| {
+            let valid = handle.generation() == xwm.generation && xwm.windows.contains(*handle);
+            if !valid || !seen.insert(*handle) {
+                dropped_handles = dropped_handles.saturating_add(1);
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    (live, dropped_handles)
 }
 
 pub(crate) fn flush(xwm: &Xwm) -> Result<(), XwmError> {
+    trace::emit("x11_resize_command_order", || {
+        TraceFields::new()
+            .field("source", "xwm")
+            .field("command_order", "flush")
+    });
     xwm.connection.flush().map_err(XwmError::Connection)
-}
-
-fn command_handle(command: &XwmCommand) -> Option<super::X11WindowHandle> {
-    match command {
-        XwmCommand::Map(handle)
-        | XwmCommand::Unmap(handle)
-        | XwmCommand::Raise(handle)
-        | XwmCommand::Close(handle) => Some(*handle),
-        XwmCommand::RaiseAndSync { window, .. } => Some(*window),
-        XwmCommand::RaiseFamily { family } | XwmCommand::StackFamily { family, .. } => {
-            family.first().copied()
-        }
-        XwmCommand::Configure { window, .. }
-        | XwmCommand::ConfigureFrame { window, .. }
-        | XwmCommand::ConfigureNotify { window, .. }
-        | XwmCommand::SetState { window, .. } => Some(*window),
-        XwmCommand::Stack { window, .. } => Some(*window),
-        XwmCommand::Focus { window, .. } => *window,
-        XwmCommand::SyncClientLists { .. } => None,
-        XwmCommand::BeginResizeSync { window, .. }
-        | XwmCommand::SetAllowCommits { window, .. }
-        | XwmCommand::ReleaseResizeCommits { window, .. }
-        | XwmCommand::CompleteResizeSync(window) => Some(*window),
-    }
 }
 
 fn publish_client_list(
@@ -444,7 +662,7 @@ pub(crate) fn configure_immediate(
         if final_pending {
             xwm.immediate_resize_windows.remove(&window);
             xwm.outgoing_events
-                .push_back(XwmEvent::ResizeSyncImmediate(window));
+                .push_back(XwmEvent::ResizeSyncImmediate { window, geometry });
         }
         return Ok(());
     }
@@ -457,7 +675,7 @@ pub(crate) fn configure_immediate(
     if final_pending {
         xwm.immediate_resize_windows.remove(&window);
         xwm.outgoing_events
-            .push_back(XwmEvent::ResizeSyncImmediate(window));
+            .push_back(XwmEvent::ResizeSyncImmediate { window, geometry });
     } else {
         xwm.immediate_resize_windows.insert(window);
     }
@@ -479,6 +697,7 @@ pub(crate) fn begin_resize_sync(
         .windows
         .get(window)
         .and_then(|record| record.snapshot.as_ref())
+        .filter(|snapshot| snapshot.supports_sync_request)
         .and_then(|snapshot| snapshot.sync_counter)
     else {
         return configure_immediate(xwm, window, geometry, final_pending);
@@ -508,9 +727,17 @@ pub(crate) fn begin_resize_sync(
         }
         return Ok(());
     }
+    if xwm.last_resize_geometries.get(&window).copied() == Some(geometry) {
+        if final_pending {
+            xwm.outgoing_events
+                .push_back(XwmEvent::ResizeSyncImmediate { window, geometry });
+        }
+        return Ok(());
+    }
     let desired = geometry;
     let sync_counter = u32::try_from(sync_counter)
         .map_err(|_| XwmError::InvalidCommand("XSync counter ID exceeds X11 width"))?;
+    initialize_sync_counter(xwm, window, sync_counter)?;
     let alarm = xwm
         .connection
         .generate_id()
@@ -550,21 +777,60 @@ pub(crate) fn begin_resize_sync(
     xwm.sync_alarms.insert(window, alarm);
     xwm.sync_handles_by_counter.insert(sync_counter, window);
 
-    if let Err(error) = set_allow_commits(xwm, window, false)
-        .and_then(|_| {
+    let command_error = set_allow_commits(xwm, window, false)
+        .map(|()| {
+            trace::emit("x11_resize_command_order", || {
+                TraceFields::new()
+                    .field("source", "xwm")
+                    .field("xid", window.xid())
+                    .field(
+                        "transaction_id",
+                        xwm.resize_sync.transaction_id(window).unwrap_or_default(),
+                    )
+                    .field("command_order", "allow_off")
+            });
+        })
+        .and_then(|()| {
+            send_sync_request(xwm, window, counter_value).map(|()| {
+                trace::emit("x11_resize_command_order", || {
+                    TraceFields::new()
+                        .field("source", "xwm")
+                        .field("xid", window.xid())
+                        .field(
+                            "transaction_id",
+                            xwm.resize_sync.transaction_id(window).unwrap_or_default(),
+                        )
+                        .field("command_order", "sync_message")
+                });
+            })
+        })
+        .and_then(|()| {
             xwm.connection
                 .configure_window(
                     window.xid(),
                     &configure_aux(geometry, X11ConfigureFlags::all(), 0),
                 )
                 .map_err(XwmError::Connection)
+                .map(|_| {
+                    trace::emit("x11_resize_command_order", || {
+                        TraceFields::new()
+                            .field("source", "xwm")
+                            .field("xid", window.xid())
+                            .field(
+                                "transaction_id",
+                                xwm.resize_sync.transaction_id(window).unwrap_or_default(),
+                            )
+                            .field("command_order", "configure")
+                    });
+                })
         })
-        .and_then(|_| send_sync_request(xwm, window, counter_value))
-    {
+        .err();
+    if let Some(error) = command_error {
         let _ = set_allow_commits(xwm, window, true);
         xwm.clear_resize_sync(window);
         return Err(error);
     }
+    xwm.last_resize_geometries.insert(window, geometry);
     xwm.note_expected_configure(window, geometry);
     log_resize_event(
         "x11_resize_sync_started",
@@ -573,6 +839,33 @@ pub(crate) fn begin_resize_sync(
         Some(geometry),
         Some(requested_counter_value),
     );
+    Ok(())
+}
+
+pub(crate) fn initialize_sync_counter(
+    xwm: &mut Xwm,
+    window: super::X11WindowHandle,
+    sync_counter: u32,
+) -> Result<(), XwmError> {
+    if xwm.sync_counter_initializations.get(&window) == Some(&sync_counter) {
+        return Ok(());
+    }
+    // The client may have created and advanced this counter before the WM
+    // admitted the window. Establish a known baseline before creating the
+    // first alarm; generated request serials start strictly above it.
+    xwm.connection
+        .sync_set_counter(sync_counter, Int64 { hi: 0, lo: 0 })
+        .map_err(XwmError::Connection)?;
+    xwm.sync_counter_initializations
+        .insert(window, sync_counter);
+    xwm.next_resize_counter_values.insert(window, 0);
+    trace::emit("sync_counter_initialized", || {
+        TraceFields::new()
+            .field("source", "xwm")
+            .field("xid", window.xid())
+            .field("sync_counter", sync_counter)
+            .field("baseline", 0)
+    });
     Ok(())
 }
 
@@ -733,16 +1026,6 @@ fn int64(value: u64) -> Int64 {
         hi: (value >> 32) as i32,
         lo: value as u32,
     }
-}
-
-fn validate_handle(xwm: &Xwm, handle: super::X11WindowHandle) -> Result<(), XwmError> {
-    if handle.generation() != xwm.generation {
-        return Err(XwmError::StaleGeneration);
-    }
-    if !xwm.windows.contains(handle) {
-        return Err(XwmError::InvalidCommand("unknown X11 window"));
-    }
-    Ok(())
 }
 
 fn configure_aux(

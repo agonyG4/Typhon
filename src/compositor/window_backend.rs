@@ -2,7 +2,7 @@
 
 use super::{ToplevelMode, WindowBackend, WindowGeometry, WindowId};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WindowBackendCommand {
     Configure {
         window: WindowId,
@@ -24,6 +24,9 @@ pub(crate) enum WindowBackendCommand {
     },
     Restack {
         window: WindowId,
+    },
+    RestackExact {
+        windows: Vec<WindowId>,
     },
     PublishState {
         window: WindowId,

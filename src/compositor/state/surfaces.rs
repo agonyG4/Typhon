@@ -1,6 +1,16 @@
 use super::*;
 use crate::xwayland::trace::{self, TraceFields};
 impl CompositorState {
+    pub(in crate::compositor) fn surface_content_epoch(
+        &self,
+        surface_id: u32,
+    ) -> Option<SurfaceCommitSequence> {
+        let publication = self.surface_publications.get(&surface_id)?;
+        publication
+            .latest_published_buffer_id
+            .and(publication.latest_published)
+    }
+
     pub(in crate::compositor) fn allocate_surface_commit_sequence(
         &mut self,
     ) -> SurfaceCommitSequence {
@@ -446,6 +456,7 @@ impl CompositorState {
     ) {
         self.render_generation = generation;
         self.render_generation_cause = cause;
+        self.note_cursor_generation(cause);
         if !matches!(
             cause,
             RenderGenerationCause::CursorCommit
@@ -1240,6 +1251,7 @@ impl CompositorState {
         }
         self.unregister_fractional_scale_resources_for_surface(surface_id);
         self.surface_placements.remove(&surface_id);
+        self.xwayland.retired_surface_ids.remove(&surface_id);
         self.current_surface_buffers.remove(&surface_id);
         self.surface_window_geometries.remove(&surface_id);
         self.pending_surface_window_geometries.remove(&surface_id);

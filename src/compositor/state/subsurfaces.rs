@@ -1374,9 +1374,7 @@ impl CompositorState {
         }
 
         self.store_surface_placement(surface_id, placement);
-        if let Some(visual) = self.toplevel_visual_geometries.get_mut(&surface_id)
-            && visual.active_resize.is_none()
-        {
+        if let Some(visual) = self.toplevel_visual_geometries.get_mut(&surface_id) {
             visual.placement = placement;
         }
 

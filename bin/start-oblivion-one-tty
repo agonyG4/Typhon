@@ -16,5 +16,6 @@ script_dir="$(CDPATH= cd -- "$(dirname -- "$script_path")" && pwd)"
 export OBLIVION_ONE_PROFILE="${OBLIVION_ONE_PROFILE:-release}"
 export OBLIVION_ONE_SOCKET="${OBLIVION_ONE_SOCKET:-oblivion-one-tty}"
 export OBLIVION_ONE_MODE="${OBLIVION_ONE_MODE:-1920x1080@165}"
+export OBLIVION_ONE_DIRECT_SCANOUT="${OBLIVION_ONE_DIRECT_SCANOUT:-off}"
 
 exec "$script_dir/start-oblivion-one" "$@"

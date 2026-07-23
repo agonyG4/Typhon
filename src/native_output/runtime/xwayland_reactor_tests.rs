@@ -14,8 +14,8 @@ use x11rb::{
     connection::Connection,
     protocol::sync::{ConnectionExt as SyncConnectionExt, Int64},
     protocol::xproto::{
-        AtomEnum, ChangeWindowAttributesAux, ConnectionExt, CreateGCAux, CreateWindowAux,
-        EventMask, PropMode, Rectangle, WindowClass,
+        AtomEnum, ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, CreateGCAux,
+        CreateWindowAux, EventMask, PropMode, Rectangle, WindowClass,
     },
     wrapper::ConnectionExt as WrapperConnectionExt,
 };
@@ -244,7 +244,7 @@ fn answer_x11_sync_requests(
 }
 
 #[test]
-fn x11_window_reaches_window_ready_without_direct_fd_polling() {
+fn xwayland_reactor_x11_window_reaches_window_ready_without_direct_fd_polling() {
     let _lock = test_lock();
     if std::env::var_os("WAYLAND_DISPLAY").is_none()
         || std::env::var_os("XDG_RUNTIME_DIR").is_none()
@@ -686,7 +686,7 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
         );
         for event in service.take_managed_xwm_events() {
             match event {
-                event @ XwmEvent::ResizeSyncPresentedIntermediate(handle)
+                event @ XwmEvent::ResizeSyncPresentedIntermediate { window: handle, .. }
                     if handle == snapshot.handle =>
                 {
                     intermediate_presented = true;
@@ -721,7 +721,9 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
                         .send(CompositorEvent::Xwayland(event))
                         .expect("send intermediate presentation to compositor");
                 }
-                event @ XwmEvent::ResizeSyncPresented(handle) if handle == snapshot.handle => {
+                event @ XwmEvent::ResizeSyncPresented { window: handle, .. }
+                    if handle == snapshot.handle =>
+                {
                     final_presented = true;
                     compositor_event_sender
                         .send(CompositorEvent::Xwayland(event))
@@ -1166,8 +1168,15 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
             && physical_parent_position < physical_popup_position,
         "unrelated below parent below popup physically: {physical_stacking:?}"
     );
-    client.unmap_window(popup).expect("unmap X11 popup window");
-    client.flush().expect("flush X11 popup unmap");
+    client
+        .configure_window(popup, &ConfigureWindowAux::new().x(420))
+        .expect("configure X11 popup before destroy");
+    client
+        .destroy_window(popup)
+        .expect("destroy X11 popup after configure");
+    client
+        .flush()
+        .expect("flush X11 popup configure and destroy");
 
     let popup_close_deadline = Instant::now() + Duration::from_secs(15);
     let mut popup_closed = false;
@@ -1202,6 +1211,13 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
         );
         for event in service.take_managed_xwm_events() {
             match event {
+                event @ XwmEvent::ConfigureRequested { window: handle, .. }
+                    if handle.xid() == popup =>
+                {
+                    compositor_event_sender
+                        .send(CompositorEvent::Xwayland(event))
+                        .expect("send popup configure-before-destroy to compositor");
+                }
                 event @ (XwmEvent::WindowWithdrawn(handle) | XwmEvent::WindowDestroyed(handle))
                     if handle.xid() == popup =>
                 {
@@ -1218,6 +1234,8 @@ fn x11_window_reaches_window_ready_without_direct_fd_polling() {
             .expect("synchronize popup unmap reactor sources");
     }
     apply_compositor_commands(&compositor_command_receiver, &mut service, &mut supervisor);
+    assert_eq!(service.state_kind(), XwaylandStateKind::Running);
+    assert_eq!(service.generation(), Some(generation));
     let active_window = client
         .get_property(
             false,

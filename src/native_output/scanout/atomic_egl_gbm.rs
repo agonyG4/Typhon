@@ -3,6 +3,7 @@ use std::{
     os::fd::{AsFd, AsRawFd, OwnedFd},
     ptr,
     sync::Arc,
+    time::Instant,
 };
 
 use gbm::AsRaw as _;
@@ -24,8 +25,8 @@ use oblivion_one::render_backend::{
 use crate::egl_renderer::dmabuf::{query_egl_main_device, query_egl_renderable_dmabuf_formats};
 use crate::egl_renderer::native_fence::{NativeFenceFunctions, NativeRenderFence};
 use crate::egl_renderer::{
-    EglFrameOutcome, EglInstance, EglOutputRenderTarget, EglSceneFrameCommit, GlesSceneRenderer,
-    OutputFramebufferOrigin, choose_surfaceless_egl_config, create_gles_context,
+    EglFrameOutcome, EglInstance, EglOutputRenderTarget, EglSceneFrameCommit, FrameSkipReason,
+    GlesSceneRenderer, OutputFramebufferOrigin, choose_surfaceless_egl_config, create_gles_context,
     detect_partial_repaint_capabilities, load_egl_image_target_texture_2d,
 };
 
@@ -34,6 +35,8 @@ use super::*;
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedDirectFrame {
     pub(crate) frame_id: u64,
+    pub(crate) transaction_id: PresentationTransactionId,
+    pub(crate) key: DirectScanoutCandidateKey,
     pub(crate) candidate: DirectScanoutSceneCandidate,
     pub(crate) framebuffer: Arc<ImportedDirectFramebuffer>,
     pub(crate) target: PresentationTarget,
@@ -68,7 +71,11 @@ struct SuspendedDirectFrame {
 pub(crate) enum DirectScanoutAttempt {
     Rejected(DirectScanoutSceneRejection),
     Fallback(&'static str),
-    Submitted { token: u64 },
+    Unchanged,
+    Submitted {
+        transaction_id: PresentationTransactionId,
+        token: u64,
+    },
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -85,10 +92,30 @@ pub(crate) struct DirectScanoutCounters {
     pub(crate) entries: u64,
     pub(crate) exits: u64,
     pub(crate) same_buffer_resubmissions: u64,
+    pub(crate) same_buffer_suppressed: u64,
+    pub(crate) out_fences_received: u64,
+    pub(crate) out_fence_missing: u64,
+    pub(crate) test_only_timing: TimingSummary,
+    pub(crate) real_submit_timing: TimingSummary,
     pub(crate) composited_fallbacks: u64,
     pub(crate) stale_candidate_rejections: u64,
     pub(crate) cleanup_failures: u64,
     pub(crate) composited_render_ahead_suppressed: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct DirectPlanePlanKey {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) format: u32,
+    pub(crate) modifier: u64,
+    pub(crate) cursor_plan_key: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TestedDirectPlanePlan {
+    pub(crate) key: DirectPlanePlanKey,
+    pub(crate) drm_generation: u64,
 }
 
 pub(crate) struct DirectScanoutState {
@@ -99,21 +126,23 @@ pub(crate) struct DirectScanoutState {
     pub(crate) inhibit_until_composited_present: bool,
     pub(crate) counters: DirectScanoutCounters,
     pub(crate) drm_generation: u64,
+    pub(crate) transaction_ids: PresentationTransactionAllocator,
+    pub(crate) tested_plane_plan: Option<TestedDirectPlanePlan>,
     identity_viewport_metadata_logged: bool,
     last_debug_candidate: Option<(u32, u64, u64, u64)>,
 }
 
-fn direct_candidate_matches(
-    captured: &DirectScanoutSceneCandidate,
-    current: &DirectScanoutSceneCandidate,
-) -> bool {
-    captured.surface_id == current.surface_id
-        && captured.root_surface_id == current.root_surface_id
-        && captured.generation == current.generation
-        && captured.commit_sequence == current.commit_sequence
-        && captured.buffer_identity.id() == current.buffer_identity.id()
-        && captured.buffer_size == current.buffer_size
-        && captured.output_size == current.output_size
+fn direct_candidate_key(
+    candidate: &DirectScanoutSceneCandidate,
+    drm_generation: u64,
+    cursor: Option<&AtomicCursorVisualState>,
+) -> Option<DirectScanoutCandidateKey> {
+    DirectScanoutCandidateKey::from_candidate(
+        candidate,
+        drm_generation,
+        direct_cursor_plan_key(cursor, true),
+        0,
+    )
 }
 
 fn direct_scanout_debug(message: impl std::fmt::Display) {
@@ -132,6 +161,8 @@ impl DirectScanoutState {
             inhibit_until_composited_present: true,
             counters: DirectScanoutCounters::default(),
             drm_generation: generation,
+            transaction_ids: PresentationTransactionAllocator::default(),
+            tested_plane_plan: None,
             identity_viewport_metadata_logged: false,
             last_debug_candidate: None,
         }
@@ -319,6 +350,7 @@ impl AtomicEglGbmScanout {
         }
         self.direct.cache.clear_for_generation(generation);
         self.direct.drm_generation = generation;
+        self.direct.tested_plane_plan = None;
         self.direct.current = None;
         self.direct.pending = None;
         self.direct.inhibit_until_composited_present = true;
@@ -577,7 +609,7 @@ impl AtomicEglGbmScanout {
         cursor_mode: NativeCursorRenderMode,
         damage: &NativeOutputDamage,
         gpu_sampling_started: &mut bool,
-    ) -> io::Result<AtomicRenderedFrameParts> {
+    ) -> io::Result<AtomicSlotRenderOutcome> {
         self.egl
             .make_current(self.egl_display, None, None, Some(self.egl_context))
             .map_err(native_egl_io_error)?;
@@ -620,19 +652,31 @@ impl AtomicEglGbmScanout {
                 request,
             )
             .map_err(native_egl_io_error)?;
-        let EglFrameOutcome::Rendered { commit, stats } = outcome else {
-            return Err(io::Error::other(
-                "explicit Atomic output render unexpectedly produced no frame",
-            ));
-        };
-        let fence = self.create_render_fence()?;
-        Ok(AtomicRenderedFrameParts {
-            slot,
-            scene_commit: commit,
-            render_fence: fence,
-            stats,
-            render_us: elapsed_micros(started),
-        })
+        match outcome {
+            EglFrameOutcome::Rendered { commit, stats } => {
+                let fence = self.create_render_fence()?;
+                Ok(AtomicSlotRenderOutcome::Rendered(Box::new(
+                    AtomicRenderedFrameParts {
+                        slot,
+                        scene_commit: commit,
+                        render_fence: fence,
+                        stats,
+                        render_us: elapsed_micros(started),
+                    },
+                )))
+            }
+            EglFrameOutcome::Skipped { reason, .. } => {
+                // The renderer did not sample scene content.  Keep the slot
+                // on the pre-GPU cancellation path and do not classify this
+                // normal no-damage result as a post-draw failure.
+                *gpu_sampling_started = false;
+                Ok(AtomicSlotRenderOutcome::Skipped {
+                    slot,
+                    reason,
+                    render_us: elapsed_micros(started),
+                })
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -646,7 +690,7 @@ impl AtomicEglGbmScanout {
         render_generation: u64,
         target: PresentationTarget,
         pacing_mode: NativeOutputPacingMode,
-    ) -> io::Result<u64> {
+    ) -> io::Result<AtomicFrameRenderOutcome> {
         let (slot, frame_id, pool_generation) = {
             let swapchain = self.swapchain_mut()?;
             let slot = swapchain.acquire_render_slot_for(pacing_mode)?;
@@ -668,7 +712,16 @@ impl AtomicEglGbmScanout {
             damage,
             &mut gpu_sampling_started,
         ) {
-            Ok(parts) => parts,
+            Ok(AtomicSlotRenderOutcome::Rendered(parts)) => *parts,
+            Ok(AtomicSlotRenderOutcome::Skipped {
+                slot,
+                reason,
+                render_us,
+            }) => {
+                server.restore_frame_batch_after_render_failure(protocol_batch_id);
+                self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
+                return Ok(AtomicFrameRenderOutcome::Skipped { reason, render_us });
+            }
             Err(error) => {
                 if gpu_sampling_started {
                     server.discard_frame_batch(
@@ -702,7 +755,19 @@ impl AtomicEglGbmScanout {
             cpu_prepass_duration_ns: 0,
             cpu_encode_duration_ns: parts.render_us.saturating_mul(1_000),
         };
-        self.swapchain_mut()?.finish_render_owned(frame)
+        match self.swapchain_mut()?.finish_render_owned(frame) {
+            Ok(frame_id) => {
+                server.complete_rendered_frame_callbacks(protocol_batch_id);
+                Ok(AtomicFrameRenderOutcome::Rendered { frame_id })
+            }
+            Err(error) => {
+                server.discard_frame_batch(
+                    protocol_batch_id,
+                    FrameBatchDiscardReason::FatalOutputFailure,
+                );
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn try_direct_scanout(
@@ -713,6 +778,35 @@ impl AtomicEglGbmScanout {
         cursor: Option<&AtomicCursorVisualState>,
     ) -> io::Result<DirectScanoutAttempt> {
         self.direct.counters.candidate_checks += 1;
+        let sync_readiness = DirectSyncReadiness::from_capabilities(
+            // direct_scanout_scene_candidate() only exposes published
+            // attachments, which means unresolved acquire work has already
+            // been withheld by compositor publication ordering.
+            true,
+            true,
+            kms.atomic().is_some(),
+            kms.atomic()
+                .is_some_and(|atomic| atomic.discovery().optional.in_fence_fd),
+            kms.atomic()
+                .is_some_and(|atomic| atomic.discovery().optional.out_fence_ptr),
+            false,
+        );
+        match &sync_readiness {
+            DirectSyncReadiness::Qualified {
+                in_fence,
+                release_mode,
+            } => {
+                debug_assert!(in_fence.is_none());
+                direct_scanout_debug(format_args!(
+                    "synchronization qualified release_mode={release_mode:?}"
+                ));
+            }
+            DirectSyncReadiness::Unsupported(reason) => {
+                self.direct.counters.composited_fallbacks += 1;
+                direct_scanout_debug(format_args!("synchronization rejected: {reason}"));
+                return Ok(DirectScanoutAttempt::Fallback(reason));
+            }
+        }
         let candidate = match server.direct_scanout_scene_candidate() {
             Ok(candidate) => {
                 let debug_key = (
@@ -740,6 +834,41 @@ impl AtomicEglGbmScanout {
             }
         };
         self.direct.counters.candidates_accepted += 1;
+        let Some(candidate_key) =
+            direct_candidate_key(&candidate, self.direct.drm_generation, cursor)
+        else {
+            self.direct.counters.composited_fallbacks += 1;
+            return Ok(DirectScanoutAttempt::Fallback("candidate_key_invalid"));
+        };
+        let Some(first_plane) = candidate.buffer.planes().first() else {
+            self.direct.counters.composited_fallbacks += 1;
+            return Ok(DirectScanoutAttempt::Fallback("candidate_plane_missing"));
+        };
+        let plane_plan_key = DirectPlanePlanKey {
+            width: candidate.buffer_size.width,
+            height: candidate.buffer_size.height,
+            format: candidate.buffer.format().as_fourcc(),
+            modifier: first_plane.descriptor().modifier.0,
+            cursor_plan_key: direct_cursor_plan_key(cursor, true),
+        };
+        let unchanged = self
+            .direct
+            .pending
+            .as_ref()
+            .is_some_and(|frame| frame.prepared.key == candidate_key)
+            || self
+                .direct
+                .current
+                .as_ref()
+                .is_some_and(|frame| frame.prepared.key == candidate_key);
+        if unchanged {
+            self.direct.counters.same_buffer_suppressed = self
+                .direct
+                .counters
+                .same_buffer_suppressed
+                .saturating_add(1);
+            return Ok(DirectScanoutAttempt::Unchanged);
+        }
         if candidate.viewport_identity_metadata_present
             && !self.direct.identity_viewport_metadata_logged
         {
@@ -776,35 +905,53 @@ impl AtomicEglGbmScanout {
             "imported dma-buf framebuffer".to_string()
         });
 
-        self.direct.counters.test_only_attempts += 1;
-        if let Err(error) =
-            kms.test_atomic_primary_flip_with_cursor(framebuffer.framebuffer, cursor)
-        {
-            self.direct.counters.test_only_rejections += 1;
-            self.direct.counters.composited_fallbacks += 1;
-            direct_scanout_debug(format_args!("TEST_ONLY rejected: {error}"));
-            eprintln!("direct scanout: Atomic TEST_ONLY rejected: {error}");
-            return Ok(DirectScanoutAttempt::Fallback(
-                if cursor.is_some_and(|cursor| cursor.visible) {
-                    "cursor_test_only_rejected"
-                } else {
-                    "test_only_rejected"
-                },
-            ));
+        let tested_plan = TestedDirectPlanePlan {
+            key: plane_plan_key,
+            drm_generation: self.direct.drm_generation,
+        };
+        if self.direct.tested_plane_plan != Some(tested_plan) {
+            self.direct.counters.test_only_attempts += 1;
+            let test_only_started = Instant::now();
+            let test_only_result =
+                kms.test_atomic_primary_flip_with_cursor(framebuffer.framebuffer, cursor);
+            self.direct.counters.test_only_timing.record(
+                test_only_started
+                    .elapsed()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64,
+            );
+            if let Err(error) = test_only_result {
+                self.direct.tested_plane_plan = None;
+                self.direct.counters.test_only_rejections += 1;
+                self.direct.counters.composited_fallbacks += 1;
+                direct_scanout_debug(format_args!("TEST_ONLY rejected: {error}"));
+                eprintln!("direct scanout: Atomic TEST_ONLY rejected: {error}");
+                return Ok(DirectScanoutAttempt::Fallback(
+                    if cursor.is_some_and(|cursor| cursor.visible) {
+                        "cursor_test_only_rejected"
+                    } else {
+                        "test_only_rejected"
+                    },
+                ));
+            }
+            self.direct.tested_plane_plan = Some(tested_plan);
+        } else {
+            direct_scanout_debug("TEST_ONLY plan cache hit");
         }
         direct_scanout_debug("TEST_ONLY accepted");
 
-        let current = server.direct_scanout_scene_candidate();
-        if !current
-            .as_ref()
-            .is_ok_and(|current| direct_candidate_matches(&candidate, current))
-        {
+        let current_key = server
+            .direct_scanout_scene_candidate()
+            .ok()
+            .and_then(|current| direct_candidate_key(&current, self.direct.drm_generation, cursor));
+        if current_key != Some(candidate_key) {
             self.direct.counters.stale_candidate_rejections += 1;
             self.direct.counters.composited_fallbacks += 1;
             direct_scanout_debug("candidate became stale before submit");
             return Ok(DirectScanoutAttempt::Fallback("stale_candidate"));
         }
 
+        let transaction_id = self.direct.transaction_ids.allocate();
         let frame_id = self.swapchain()?.next_frame_id();
         let protocol_batch_id = server.take_frame_batch_for_render(frame_id);
         let surface_damage =
@@ -812,23 +959,43 @@ impl AtomicEglGbmScanout {
         let token = PageFlipToken::new(allocate_native_page_flip_token())
             .expect("allocated native pageflip token is nonzero");
         let submit_started_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
+        let real_submit_started = Instant::now();
         let submission = kms.submit_direct_flip_with_cursor(framebuffer.framebuffer, token, cursor);
+        self.direct.counters.real_submit_timing.record(
+            real_submit_started
+                .elapsed()
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64,
+        );
         let submit_returned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
-        if let Err(error) = submission {
-            server.restore_frame_batch_after_render_failure(protocol_batch_id);
-            self.direct.counters.composited_fallbacks += 1;
-            direct_scanout_debug(format_args!("real submit rejected: {error}"));
-            eprintln!("direct scanout: real Atomic submit rejected: {error}");
-            return Ok(DirectScanoutAttempt::Fallback("submit_rejected"));
-        }
+        let out_fence = match submission {
+            Ok(submission) => {
+                if submission.out_fence.is_some() {
+                    self.direct.counters.out_fences_received =
+                        self.direct.counters.out_fences_received.saturating_add(1);
+                } else {
+                    self.direct.counters.out_fence_missing =
+                        self.direct.counters.out_fence_missing.saturating_add(1);
+                }
+                submission.out_fence
+            }
+            Err(error) => {
+                self.direct.tested_plane_plan = None;
+                server.restore_frame_batch_after_render_failure(protocol_batch_id);
+                self.direct.counters.composited_fallbacks += 1;
+                direct_scanout_debug(format_args!("real submit rejected: {error}"));
+                eprintln!("direct scanout: real Atomic submit rejected: {error}");
+                return Ok(DirectScanoutAttempt::Fallback("submit_rejected"));
+            }
+        };
+        server.complete_rendered_frame_callbacks(protocol_batch_id);
         self.swapchain_mut()?.advance_external_frame_id(frame_id)?;
         let was_direct = self.direct.current.is_some();
-        let same_buffer = self.direct.current.as_ref().is_some_and(|current| {
-            current.prepared.candidate.buffer_identity.id() == candidate.buffer_identity.id()
-        });
         self.direct.pending = Some(SubmittedDirectFrame {
             prepared: PreparedDirectFrame {
                 frame_id,
+                transaction_id,
+                key: candidate_key,
                 candidate,
                 framebuffer,
                 target,
@@ -838,12 +1005,9 @@ impl AtomicEglGbmScanout {
             surface_damage,
             submit_started_at,
             submit_returned_at,
-            out_fence: None,
+            out_fence,
         });
         self.direct.counters.submissions += 1;
-        if same_buffer {
-            self.direct.counters.same_buffer_resubmissions += 1;
-        }
         if !was_direct {
             self.direct.counters.entries += 1;
         }
@@ -853,7 +1017,10 @@ impl AtomicEglGbmScanout {
         } else {
             "entered direct scanout"
         });
-        Ok(DirectScanoutAttempt::Submitted { token: token.get() })
+        Ok(DirectScanoutAttempt::Submitted {
+            transaction_id,
+            token: token.get(),
+        })
     }
 
     pub(crate) fn complete_direct_pageflip(
@@ -876,7 +1043,9 @@ impl AtomicEglGbmScanout {
                 "direct pageflip token does not match pending frame",
             ));
         }
-        let pending = self.direct.pending.take().expect("pending direct frame");
+        let mut pending = self.direct.pending.take().expect("pending direct frame");
+        let out_fence = pending.out_fence.take();
+        drop(out_fence);
         let presented_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         server.commit_surface_damage_presented(pending.surface_damage);
         server.complete_direct_presented_frame_batch(
@@ -1272,6 +1441,25 @@ fn complete_confirmed_pageflip_with_timing<T>(
         Ok(timing) => (timing, None),
         Err(error) => (None, Some(error)),
     }
+}
+
+pub(crate) enum AtomicSlotRenderOutcome {
+    Rendered(Box<AtomicRenderedFrameParts>),
+    Skipped {
+        slot: OutputSlotId,
+        reason: FrameSkipReason,
+        render_us: u64,
+    },
+}
+
+pub(crate) enum AtomicFrameRenderOutcome {
+    Rendered {
+        frame_id: u64,
+    },
+    Skipped {
+        reason: FrameSkipReason,
+        render_us: u64,
+    },
 }
 
 pub(crate) struct AtomicRenderedFrameParts {

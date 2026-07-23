@@ -18,6 +18,7 @@ mod association;
 mod atoms;
 mod capabilities;
 mod commands;
+pub use commands::XwmCommandOutcome;
 mod connection;
 pub mod data_bridge;
 mod events;
@@ -36,6 +37,7 @@ mod resize_sync;
 pub(crate) mod shape;
 pub(crate) mod startup;
 mod window;
+mod window_runtime;
 mod window_types;
 
 #[cfg(test)]
@@ -157,6 +159,7 @@ pub struct X11WindowSnapshot {
     pub startup_id: Option<String>,
     pub user_time: Option<u32>,
     pub urgency: bool,
+    pub supports_sync_request: bool,
     pub sync_counter: Option<u64>,
 }
 
@@ -221,13 +224,24 @@ pub enum XwmEvent {
         window: X11WindowHandle,
         counter_value: u64,
     },
-    ResizeSyncPresented(X11WindowHandle),
+    ResizeSyncPresented {
+        window: X11WindowHandle,
+        transaction_id: u64,
+        geometry: X11Geometry,
+    },
     /// A transaction presented while another desired geometry still belongs to
     /// the same interactive resize chain, or while the transaction is not the
     /// final release configure.  The compositor must keep its preview active
     /// and only advance the XSync state machine.
-    ResizeSyncPresentedIntermediate(X11WindowHandle),
-    ResizeSyncImmediate(X11WindowHandle),
+    ResizeSyncPresentedIntermediate {
+        window: X11WindowHandle,
+        transaction_id: u64,
+        geometry: X11Geometry,
+    },
+    ResizeSyncImmediate {
+        window: X11WindowHandle,
+        geometry: X11Geometry,
+    },
     ResizeSyncTimedOut(X11WindowHandle),
     ResizeSyncTimedOutWithFollowup(X11WindowHandle),
 }
@@ -262,6 +276,11 @@ pub enum XwmCommand {
     Raise(X11WindowHandle),
     RaiseAndSync {
         window: X11WindowHandle,
+        client_list: Vec<X11WindowHandle>,
+        stacking: Vec<X11WindowHandle>,
+    },
+    RestackExact {
+        order: Vec<X11WindowHandle>,
         client_list: Vec<X11WindowHandle>,
         stacking: Vec<X11WindowHandle>,
     },
@@ -378,6 +397,7 @@ pub struct Xwm {
     pub(crate) focus: focus::FocusTracker,
     pub(crate) sync_alarms: HashMap<X11WindowHandle, u32>,
     pub(crate) sync_handles_by_counter: HashMap<u32, X11WindowHandle>,
+    pub(crate) sync_counter_initializations: HashMap<X11WindowHandle, u32>,
     pub(crate) timed_out_resize_counters: HashMap<X11WindowHandle, u64>,
     pub(crate) next_resize_counter_values: HashMap<X11WindowHandle, u64>,
     pub(crate) family_order: HashMap<X11WindowHandle, u64>,
@@ -450,33 +470,6 @@ impl Xwm {
         self.property_metrics
     }
 
-    pub fn observe_window(&mut self, handle: X11WindowHandle) -> Result<bool, XwmError> {
-        self.observe_window_with_kind(handle, DesktopWindowKind::Managed, X11Geometry::default())
-    }
-
-    pub(crate) fn observe_window_with_kind(
-        &mut self,
-        handle: X11WindowHandle,
-        kind: DesktopWindowKind,
-        geometry: X11Geometry,
-    ) -> Result<bool, XwmError> {
-        if handle.generation() != self.generation {
-            return Err(XwmError::StaleGeneration);
-        }
-        let inserted = self
-            .windows
-            .insert_observed_with_kind(handle, kind, geometry);
-        if inserted {
-            let deadline = crate::native::event_loop::monotonic_now_ns()
-                .unwrap_or_default()
-                .saturating_add(adoption::ADOPTION_TIMEOUT_NS);
-            self.adoption
-                .observe(handle, adoption::AdoptionWait::MapToAssociation, deadline);
-            properties::begin_initial(self, handle)?;
-        }
-        Ok(inserted)
-    }
-
     pub(crate) fn reconcile_window_kind(
         &mut self,
         handle: X11WindowHandle,
@@ -512,6 +505,9 @@ impl Xwm {
             return Err(XwmError::StaleGeneration);
         }
         self.clear_resize_sync(handle);
+        self.reset_sync_counter_initialization(handle);
+        self.adoption
+            .cancel(handle, adoption::AdoptionCancelReason::Destroy);
         properties::cancel(self, handle);
         Ok(self.windows.remove(handle).is_some())
     }
@@ -659,15 +655,25 @@ impl Xwm {
                 match commit_result {
                     ResizeSyncCommit::Presented | ResizeSyncCommit::FallbackPresented => {
                         retain = false;
-                        let final_presented = self.resize_sync.transaction(handle).is_some_and(
-                            |(_, _, final_pending)| {
-                                final_pending && self.resize_sync.desired(handle).is_none()
-                            },
-                        );
+                        let Some((transaction_id, geometry, final_pending)) =
+                            self.resize_sync.transaction(handle)
+                        else {
+                            continue;
+                        };
+                        let final_presented =
+                            final_pending && self.resize_sync.desired(handle).is_none();
                         self.outgoing_events.push_back(if final_presented {
-                            XwmEvent::ResizeSyncPresented(handle)
+                            XwmEvent::ResizeSyncPresented {
+                                window: handle,
+                                transaction_id,
+                                geometry,
+                            }
                         } else {
-                            XwmEvent::ResizeSyncPresentedIntermediate(handle)
+                            XwmEvent::ResizeSyncPresentedIntermediate {
+                                window: handle,
+                                transaction_id,
+                                geometry,
+                            }
                         });
                     }
                     ResizeSyncCommit::Deferred => retain = true,

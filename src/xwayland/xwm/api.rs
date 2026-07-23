@@ -164,7 +164,7 @@ impl Xwm {
         })
     }
 
-    pub fn execute(&mut self, command: XwmCommand) -> Result<(), XwmError> {
+    pub fn execute(&mut self, command: XwmCommand) -> Result<XwmCommandOutcome, XwmError> {
         commands::execute(self, command)
     }
 

@@ -34,6 +34,7 @@ fn x11_snapshot(generation: XwaylandGeneration, xid: u32, surface_id: u32) -> X1
         startup_id: None,
         user_time: None,
         urgency: false,
+        supports_sync_request: false,
         sync_counter: None,
     }
 }
@@ -363,13 +364,12 @@ fn normal_x11_windows_use_compositor_placement_but_popups_keep_client_position()
         )
     );
     assert_eq!(
+        state.surface_placement(second.surface_id).root_mode,
+        crate::compositor::RootPlacementMode::Absolute
+    );
+    assert_ne!(
         state.surface_placement(second.surface_id),
-        SurfacePlacement::absolute_root_at(
-            crate::compositor::render::FIRST_SURFACE_OFFSET.0
-                + crate::compositor::render::SURFACE_CASCADE_STEP,
-            crate::compositor::render::FIRST_SURFACE_OFFSET.1
-                + crate::compositor::render::SURFACE_CASCADE_STEP,
-        )
+        state.surface_placement(first.surface_id)
     );
 
     let mut popup = x11_snapshot(generation, 215, 215);
@@ -424,6 +424,93 @@ fn normal_x11_windows_have_distinct_stable_absolute_frame_geometry() {
     assert_eq!(
         state.window(second_id).unwrap().x11_geometry.unwrap().frame,
         second_frame
+    );
+}
+
+#[test]
+fn managed_x11_placement_avoids_existing_xdg_frames() {
+    let mut state = CompositorState::new(None);
+    let xdg_a = state.allocate_window_id().expect("xdg window id");
+    let xdg_b = state.allocate_window_id().expect("xdg window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(xdg_a, 301))
+        .expect("insert xdg A");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(xdg_b, 302))
+        .expect("insert xdg B");
+
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let x11 = x11_snapshot(generation, 303, 303);
+    let x11_id = insert_x11(&mut state, x11.clone());
+    let frame = state.window(x11_id).unwrap().x11_geometry.unwrap().frame;
+
+    assert_ne!(
+        frame.placement,
+        SurfacePlacement::absolute_root_at(
+            crate::compositor::render::FIRST_SURFACE_OFFSET.0,
+            crate::compositor::render::FIRST_SURFACE_OFFSET.1,
+        )
+    );
+    assert_ne!(
+        frame.placement,
+        SurfacePlacement::absolute_root_at(
+            crate::compositor::render::FIRST_SURFACE_OFFSET.0
+                + crate::compositor::render::SURFACE_CASCADE_STEP,
+            crate::compositor::render::FIRST_SURFACE_OFFSET.1
+                + crate::compositor::render::SURFACE_CASCADE_STEP,
+        )
+    );
+}
+
+#[test]
+fn managed_x11_placement_stays_visible_when_overlap_is_unavoidable() {
+    let mut state = CompositorState::new(None);
+    assert!(state.set_output_size(1_920, 1_080));
+    let xdg = state.allocate_window_id().expect("xdg window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(xdg, 304))
+        .expect("insert occupying xdg window");
+
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let mut steam = x11_snapshot(generation, 305, 305);
+    steam.geometry.width = 1_898;
+    steam.geometry.height = 1_013;
+    let steam_id = insert_x11(&mut state, steam);
+    let frame = state.window(steam_id).unwrap().x11_geometry.unwrap().frame;
+    let usable = state.usable_output_geometry();
+
+    assert!(frame.placement.local_x >= usable.x as i32);
+    assert!(frame.placement.local_y >= usable.y as i32);
+    assert!(
+        i64::from(frame.placement.local_x) + i64::from(frame.width)
+            <= (usable.x + usable.width) as i64
+    );
+    assert!(
+        i64::from(frame.placement.local_y) + i64::from(frame.height)
+            <= (usable.y + usable.height) as i64
+    );
+
+    assert!(state.set_root_window_mode(305, ToplevelMode::Fullscreen));
+    assert!(state.restore_floating_root_window(305));
+    assert_eq!(state.surface_placement(305), frame.placement);
+}
+
+#[test]
+fn managed_x11_placement_reuses_a_free_hole_not_an_occupied_slot() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let _first = insert_x11(&mut state, x11_snapshot(generation, 304, 304));
+    let middle = insert_x11(&mut state, x11_snapshot(generation, 305, 305));
+    let third = insert_x11(&mut state, x11_snapshot(generation, 306, 306));
+    let third_frame = state.window(third).unwrap().x11_geometry.unwrap().frame;
+
+    state.remove_desktop_window(middle);
+    let fourth = insert_x11(&mut state, x11_snapshot(generation, 307, 307));
+    let fourth_frame = state.window(fourth).unwrap().x11_geometry.unwrap().frame;
+
+    assert_ne!(
+        fourth_frame.placement, third_frame.placement,
+        "new managed windows must not reuse a rectangle still occupied by a survivor"
     );
 }
 
@@ -618,8 +705,8 @@ fn raising_x11_window_queues_backend_restack() {
     assert!(state.raise_window_id(first_id));
     assert!(state.take_backend_commands().iter().any(|command| matches!(
         command,
-        crate::compositor::window_backend::WindowBackendCommand::Restack { window }
-            if *window == first_id
+        crate::compositor::window_backend::WindowBackendCommand::RestackExact { windows }
+            if windows.contains(&first_id)
     )));
 }
 
@@ -781,6 +868,16 @@ fn x11_fullscreen_uses_output_geometry_and_maximize_publishes_both_axes() {
         state.surface_placement(62),
         state.fullscreen_window_geometry().placement
     );
+    let fullscreen_geometry = state.fullscreen_window_geometry();
+    assert!(state.take_backend_commands().iter().any(|command| matches!(
+        command,
+        crate::compositor::window_backend::WindowBackendCommand::Configure {
+            window,
+            geometry,
+            mode: ToplevelMode::Fullscreen,
+            resizing: false,
+        } if *window == id && *geometry == fullscreen_geometry
+    )));
 }
 
 #[test]

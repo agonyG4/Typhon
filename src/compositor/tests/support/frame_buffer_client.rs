@@ -132,6 +132,31 @@ pub(in crate::compositor::tests) fn create_surface_with_unpresented_buffer_frame
     Ok(())
 }
 
+pub(in crate::compositor::tests) fn create_live_surface_with_unpresented_buffer_frame_callback(
+    socket_path: &PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let file = create_test_shm_file(&[0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff])?;
+    let pool = shm.create_pool(file.as_fd(), 16, &qh, ());
+    let buffer = pool.create_buffer(0, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
+    let surface = compositor.create_surface(&qh, ());
+    assign_test_toplevel(&globals, &qh, &surface)?;
+    commit_initial_xdg_handshake(&surface, &connection, &mut queue)?;
+    let _callback = surface.frame(&qh, ());
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage_buffer(0, 0, 2, 2);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut RegistryTestState::default())?;
+    retain_live_test_connection(connection);
+    Ok(())
+}
+
 pub(in crate::compositor::tests) fn exercise_uncommitted_frame_callback_ownership(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,
@@ -204,6 +229,74 @@ pub(in crate::compositor::tests) fn exercise_committed_frame_callback_order(
     Ok((
         vec![expected_a, expected_b, expected_c],
         state.frame_done_callbacks,
+    ))
+}
+
+pub(in crate::compositor::tests) fn exercise_legacy_skipped_frame_late_callback(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<
+    (
+        RegistryTestState,
+        FrameCallbackMetrics,
+        FrameCallbackMetrics,
+        FrameCallbackMetrics,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 32, 32)?;
+    surface.commit();
+    connection.flush()?;
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    let file = create_test_shm_file(&[0xffff_0000; 32 * 32])?;
+    let pool = shm.create_pool(file.as_fd(), 32 * 32 * 4, &qh, ());
+    let buffer = pool.create_buffer(0, 32, 32, 32 * 4, client_wl_shm::Format::Argb8888, &qh, ());
+
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage_buffer(0, 0, 32, 32);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+
+    commands.send(ServerCommand::CaptureLegacyPreparedFrame)?;
+    wait_for_server_commands(commands);
+
+    let callback = surface.frame(&qh, ());
+    let callback_id = callback.id().protocol_id();
+    surface.damage_buffer(0, 0, 1, 1);
+    surface.commit();
+    connection.flush()?;
+    queue.roundtrip(&mut state)?;
+    let before_first_settlement = capture_frame_callback_metrics(commands);
+
+    commands.send(ServerCommand::FinishPreparedFrame)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let after_first_settlement = capture_frame_callback_metrics(commands);
+    assert!(!state.frame_done_callbacks.contains(&callback_id));
+
+    commands.send(ServerCommand::CaptureLegacyPreparedFrame)?;
+    wait_for_server_commands(commands);
+    commands.send(ServerCommand::FinishPreparedFrame)?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    assert!(state.frame_done_callbacks.contains(&callback_id));
+    let after_second_settlement = capture_frame_callback_metrics(commands);
+
+    Ok((
+        state,
+        before_first_settlement,
+        after_first_settlement,
+        after_second_settlement,
     ))
 }
 

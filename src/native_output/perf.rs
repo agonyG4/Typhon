@@ -1,5 +1,13 @@
 use super::*;
 
+const MAX_PERF_RECORDS_PER_PROCESS: u64 = 50_000;
+static PERF_RECORDS_EMITTED: AtomicU64 = AtomicU64::new(0);
+static PERF_RECORDS_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+
+const fn perf_record_allowed(record: u64) -> bool {
+    record < MAX_PERF_RECORDS_PER_PROCESS
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativePerfLogger {
     pub(crate) enabled: bool,
@@ -22,8 +30,17 @@ impl NativePerfLogger {
         F: FnOnce() -> Vec<NativePerfField>,
     {
         if self.enabled {
-            println!("{}", native_perf_line(event, &fields()));
+            let record = PERF_RECORDS_EMITTED.fetch_add(1, Ordering::Relaxed);
+            if perf_record_allowed(record) {
+                println!("{}", native_perf_line(event, &fields()));
+            } else {
+                PERF_RECORDS_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+            }
         }
+    }
+
+    pub(crate) fn suppressed_records() -> u64 {
+        PERF_RECORDS_SUPPRESSED.load(Ordering::Relaxed)
     }
 }
 
@@ -313,4 +330,17 @@ pub(crate) fn parse_proc_stat_cpu_ticks(stat: &str) -> Option<NativeProcessCpuSa
         user_ticks: fields.get(11)?.parse().ok()?,
         system_ticks: fields.get(12)?.parse().ok()?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::perf_record_allowed;
+
+    #[test]
+    fn perf_output_budget_is_bounded_for_high_rate_events() {
+        let allowed = (0..100_000)
+            .filter(|record| perf_record_allowed(*record))
+            .count();
+        assert_eq!(allowed, 50_000);
+    }
 }

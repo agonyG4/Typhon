@@ -37,12 +37,214 @@ fn server_reports_pending_frame_callbacks_until_present_frame() {
     wait_for_server_commands(&commands);
 
     assert!(capture_pending_frame_callbacks(&commands));
-    assert!(!capture_only_pending_surface_frame_callbacks(&commands));
+    assert!(capture_only_pending_surface_frame_callbacks(&commands));
     commands.send(ServerCommand::PresentFrame).unwrap();
     wait_for_server_commands(&commands);
     assert!(!capture_pending_frame_callbacks(&commands));
 
     let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn protocol_only_frame_tick_completes_callbacks_without_creating_a_visual_batch() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    create_live_surface_with_unpresented_buffer_frame_callback(&socket_path).unwrap();
+    wait_for_server_commands(&commands);
+    let (reply, receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::CompleteProtocolOnlyFrameTick(reply))
+        .unwrap();
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+        ProtocolOnlyCompletion::Completed { callback_count: 1 }
+    );
+    assert!(!capture_pending_frame_callbacks(&commands));
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn captured_presentation_feedback_is_not_new_frame_work() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = create_surface_with_unpresented_presentation_feedback(&socket_path).unwrap();
+    retain_live_test_connection(connection);
+    wait_for_server_commands(&commands);
+    assert!(capture_pending_frame_work(&commands));
+
+    let (batch_reply, batch_receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFrameBatch {
+            frame_id: 1,
+            reply: batch_reply,
+        })
+        .unwrap();
+    let batch_id = batch_receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    assert!(
+        !capture_pending_frame_work(&commands),
+        "feedback owned by a captured frame must not request another frame"
+    );
+
+    commands
+        .send(ServerCommand::CompleteFrameBatchNow {
+            frame_id: 1,
+            batch_id,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn legacy_prepared_batch_is_settled_after_a_skipped_frame_without_unowned_work() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    commands
+        .send(ServerCommand::CaptureLegacyPreparedFrame)
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(!capture_pending_frame_work(&commands));
+
+    let (prepared_reply, prepared_receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePreparedFrame(prepared_reply))
+        .unwrap();
+    assert!(prepared_receiver.recv().unwrap());
+
+    // This is the legacy NativePaintOutcome::Skipped terminal path: the batch was
+    // captured before paint, and no new unowned work remains after that capture.
+    commands.send(ServerCommand::FinishPreparedFrame).unwrap();
+    wait_for_server_commands(&commands);
+
+    let (prepared_reply, prepared_receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePreparedFrame(prepared_reply))
+        .unwrap();
+    assert!(!prepared_receiver.recv().unwrap());
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn legacy_skipped_frame_completes_a_captured_callback_once() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    create_surface_with_unpresented_buffer_frame_callback(&socket_path).unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::CaptureLegacyPreparedFrame)
+        .unwrap();
+    commands.send(ServerCommand::FinishPreparedFrame).unwrap();
+    wait_for_server_commands(&commands);
+
+    let server = stop_controllable_test_server(commands, server_thread);
+    let metrics = server.frame_callback_metrics();
+    assert_eq!(metrics.callbacks_captured, 1);
+    assert_eq!(metrics.callbacks_completed_after_render, 1);
+    assert_eq!(metrics.callbacks_completed_after_abandonment, 0);
+}
+
+#[test]
+fn callback_committed_after_skipped_batch_is_captured_by_the_next_frame() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (_state, before_first_settlement, after_first_settlement, after_second_settlement) =
+        exercise_legacy_skipped_frame_late_callback(&socket_path, &commands).unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(before_first_settlement.callbacks_captured, 0);
+    assert_eq!(after_first_settlement.callbacks_captured, 0);
+    assert_eq!(after_second_settlement.callbacks_captured, 1);
+    assert_eq!(after_second_settlement.callbacks_completed_after_render, 1);
+}
+
+#[test]
+fn legacy_immediate_present_settles_feedback_and_release_once_without_new_work() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_surface_with_presentation_feedback_and_present(
+        &socket_path,
+        &commands,
+        ServerCommand::CaptureAndCompleteRenderedLegacyPreparedFrame,
+    )
+    .unwrap();
+    let server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(state.presentation_presented_count, 1);
+    assert_eq!(state.presentation_discarded_count, 0);
+    assert_eq!(
+        state
+            .presentation_feedback_event_log
+            .iter()
+            .filter(|(_, outcome)| *outcome == "presented")
+            .count(),
+        1
+    );
+    assert_eq!(
+        state
+            .frame_completion_event_log
+            .iter()
+            .filter(|event| **event == "buffer_release")
+            .count(),
+        1
+    );
+    assert!(!server.has_prepared_frame_batch());
+    assert_eq!(server.frame_batch_count(), 0);
+}
+
+#[test]
+fn one_hundred_legacy_skipped_cycles_do_not_retain_frame_batches() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    for _ in 0..100 {
+        commands
+            .send(ServerCommand::CaptureAndFinishLegacyPreparedFrame)
+            .unwrap();
+    }
+    wait_for_server_commands(&commands);
+    let server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(!server.has_prepared_frame_batch());
+    assert_eq!(server.frame_batch_count(), 0);
+}
+
+#[test]
+fn prepared_terminal_settlement_does_not_consume_an_older_submitted_batch() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    commands
+        .send(ServerCommand::CaptureLegacySubmittedAndPreparedFrames)
+        .unwrap();
+    commands.send(ServerCommand::FinishPreparedFrame).unwrap();
+    wait_for_server_commands(&commands);
+    let server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(!server.has_prepared_frame_batch());
+    assert!(server.has_submitted_frame_batch());
+    assert_eq!(server.frame_batch_count(), 1);
 }
 
 #[test]
@@ -202,7 +404,7 @@ fn wayland_client_dmabuf_release_is_sent_on_matching_present_after_replacement()
     assert_eq!(state.buffer_release_count, 1);
     assert_eq!(
         state.frame_completion_event_log,
-        vec!["buffer_release", "frame_callback"]
+        vec!["frame_callback", "buffer_release"]
     );
 }
 

@@ -66,6 +66,27 @@ impl NativeOutputDamage {
         }
     }
 
+    pub(crate) fn union_surface_rects(
+        mut self,
+        rects: impl IntoIterator<Item = NativeDamageRect>,
+    ) -> Self {
+        if self.kind == NativeDamageKind::FullOutput {
+            return self;
+        }
+        self.rects.extend(rects);
+        let rects = coalesce_native_damage_rects(self.rects);
+        self.pixels = rects
+            .iter()
+            .fold(0u64, |pixels, rect| pixels.saturating_add(rect.pixels()));
+        self.rects = rects;
+        self.kind = if self.rects.is_empty() {
+            NativeDamageKind::Empty
+        } else {
+            NativeDamageKind::SurfaceDamage
+        };
+        self
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.kind == NativeDamageKind::Empty || self.rects.is_empty() || self.pixels == 0
     }
@@ -118,6 +139,80 @@ impl NativeOutputDamage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeClientCursorDamageState {
+    pub(crate) surface_id: u32,
+    pub(crate) generation: u64,
+    pub(crate) hotspot_x: i32,
+    pub(crate) hotspot_y: i32,
+    pub(crate) rect: Option<NativeDamageRect>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct NativeCursorDamageBounds {
+    pub(crate) previous_client: Option<NativeClientCursorDamageState>,
+    pub(crate) client: Option<NativeClientCursorDamageState>,
+    pub(crate) previous_software: Option<NativeDamageRect>,
+    pub(crate) software: Option<NativeDamageRect>,
+}
+
+impl NativeClientCursorDamageState {
+    pub(crate) fn from_cursor(
+        width: u32,
+        height: u32,
+        cursor: oblivion_one::compositor::ClientCursorRenderState<'_>,
+    ) -> Self {
+        Self {
+            surface_id: cursor.surface.surface_id,
+            generation: cursor.surface.generation,
+            hotspot_x: cursor.hotspot_x,
+            hotspot_y: cursor.hotspot_y,
+            rect: native_cursor_rect(
+                width,
+                height,
+                cursor.logical_x.saturating_add(cursor.surface.x),
+                cursor.logical_y.saturating_add(cursor.surface.y),
+                cursor.surface.width,
+                cursor.surface.height,
+            ),
+        }
+    }
+}
+
+pub(crate) fn native_cursor_rect(
+    output_width: u32,
+    output_height: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Option<NativeDamageRect> {
+    (width > 0 && height > 0)
+        .then_some(NativeDamageRect {
+            x,
+            y,
+            width,
+            height,
+        })?
+        .clipped_to_output(output_width, output_height)
+}
+
+pub(crate) fn native_theme_cursor_rect(
+    output_width: u32,
+    output_height: u32,
+    position: (i32, i32),
+    image: &oblivion_one::cursor_theme::CompositorCursorImage,
+) -> Option<NativeDamageRect> {
+    native_cursor_rect(
+        output_width,
+        output_height,
+        position.0.saturating_sub(image.hotspot_x),
+        position.1.saturating_sub(image.hotspot_y),
+        image.width,
+        image.height,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeDamageKind {
     Empty,
     SurfaceDamage,
@@ -145,12 +240,23 @@ pub(crate) struct NativeDamageRect {
 impl NativeDamageRect {
     pub(crate) fn from_render_element_bounds(element: &RenderSceneElement) -> Option<Self> {
         let target = element.visible_target();
-        (target.width() > 0 && target.height() > 0).then_some(Self {
+        let visible = (target.width() > 0 && target.height() > 0).then_some(Self {
             x: target.x(),
             y: target.y(),
             width: target.width(),
             height: target.height(),
-        })
+        });
+        element
+            .backing_target()
+            .and_then(|backing| {
+                (backing.width() > 0 && backing.height() > 0).then_some(Self {
+                    x: backing.x(),
+                    y: backing.y(),
+                    width: backing.width(),
+                    height: backing.height(),
+                })
+            })
+            .or(visible)
     }
 
     #[cfg(test)]
@@ -467,6 +573,7 @@ pub(crate) fn native_element_bounds_by_id(
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn native_output_damage_for_repaint(
     width: u32,
     height: u32,
@@ -475,7 +582,34 @@ pub(crate) fn native_output_damage_for_repaint(
     cause: RenderGenerationCause,
     render_generation_changed: bool,
 ) -> NativeOutputDamage {
-    if render_generation_changed && cause.uses_surface_damage() {
+    native_output_damage_for_repaint_with_cursor(
+        width,
+        height,
+        previous_surfaces,
+        surfaces,
+        cause,
+        render_generation_changed,
+        NativeCursorDamageBounds::default(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn native_output_damage_for_repaint_with_cursor(
+    width: u32,
+    height: u32,
+    previous_surfaces: &[RenderableSurface],
+    surfaces: &[RenderableSurface],
+    cause: RenderGenerationCause,
+    render_generation_changed: bool,
+    cursor_damage: NativeCursorDamageBounds,
+) -> NativeOutputDamage {
+    let cursor_only_cause = matches!(
+        cause,
+        RenderGenerationCause::CursorCommit
+            | RenderGenerationCause::CursorMotion
+            | RenderGenerationCause::CursorState
+    );
+    let mut damage = if render_generation_changed {
         let mut damage = NativeDamageAccumulator::from_surfaces(width, height, surfaces);
         damage.extend(NativeDamageAccumulator::from_surface_bounds_changes(
             width,
@@ -483,30 +617,89 @@ pub(crate) fn native_output_damage_for_repaint(
             previous_surfaces,
             surfaces,
         ));
-        damage.into_output_damage()
-    } else if render_generation_changed
-        && matches!(
-            cause,
-            RenderGenerationCause::WindowMove
-                | RenderGenerationCause::WindowResize
-                | RenderGenerationCause::SurfacePlacement
-        )
+        let damage = damage.into_output_damage();
+        if damage.rects.is_empty() {
+            if cursor_only_cause {
+                NativeOutputDamage::empty()
+            } else if cause.uses_surface_damage()
+                || matches!(
+                    cause,
+                    RenderGenerationCause::WindowMove
+                        | RenderGenerationCause::WindowResize
+                        | RenderGenerationCause::SurfacePlacement
+                )
+            {
+                NativeOutputDamage::full_output(width, height)
+            } else {
+                damage
+            }
+        } else {
+            damage
+        }
+    } else if cursor_only_cause {
+        // Cursor overlays are tracked independently by the renderer.  Returning
+        // full-output damage here defeats that tracker and turns pointer motion
+        // into a primary repaint.  Native callers add the old/new cursor bounds
+        // when a software cursor needs a copied framebuffer region.
+        NativeOutputDamage::empty()
+    } else {
+        NativeOutputDamage::full_output(width, height)
+    };
+    if cursor_damage.previous_client != cursor_damage.client
+        || cursor_damage.previous_software != cursor_damage.software
     {
-        let damage = NativeDamageAccumulator::from_surface_bounds_changes(
+        damage = damage.union_surface_rects(
+            cursor_damage
+                .previous_client
+                .and_then(|state| state.rect)
+                .into_iter()
+                .chain(cursor_damage.client.and_then(|state| state.rect))
+                .chain(cursor_damage.previous_software)
+                .chain(cursor_damage.software),
+        );
+    }
+    damage
+}
+
+pub(crate) fn native_output_damage_for_scene_and_cursor(
+    width: u32,
+    height: u32,
+    previous_surfaces: &[RenderableSurface],
+    surfaces: &[RenderableSurface],
+    scene_changed: bool,
+    cursor_damage: NativeCursorDamageBounds,
+) -> NativeOutputDamage {
+    let mut damage = if scene_changed {
+        let mut scene = NativeDamageAccumulator::from_surfaces(width, height, surfaces);
+        scene.extend(NativeDamageAccumulator::from_surface_bounds_changes(
             width,
             height,
             previous_surfaces,
             surfaces,
-        )
-        .into_output_damage();
-        if damage.rects.is_empty() {
+        ));
+        let damage = scene.into_output_damage();
+        if damage.is_empty() {
             NativeOutputDamage::full_output(width, height)
         } else {
             damage
         }
     } else {
-        NativeOutputDamage::full_output(width, height)
+        NativeOutputDamage::empty()
+    };
+    if cursor_damage.previous_client != cursor_damage.client
+        || cursor_damage.previous_software != cursor_damage.software
+    {
+        damage = damage.union_surface_rects(
+            cursor_damage
+                .previous_client
+                .and_then(|state| state.rect)
+                .into_iter()
+                .chain(cursor_damage.client.and_then(|state| state.rect))
+                .chain(cursor_damage.previous_software)
+                .chain(cursor_damage.software),
+        );
     }
+    damage
 }
 
 pub(crate) fn native_repaint_cause_label(

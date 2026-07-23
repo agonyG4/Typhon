@@ -564,7 +564,7 @@ fn active_client_cursor_motion_advances_overlay_generation_without_mapping_surfa
 
     let result = result.unwrap();
     assert_eq!(result.renderable_count, 1);
-    assert_eq!(result.cause, RenderGenerationCause::CursorMotion);
+    assert_eq!(result.cause, RenderGenerationCause::CursorCommit);
     assert_eq!(result.cursor.unwrap().logical_x, x.round() as i32 - 1);
 }
 
@@ -606,8 +606,11 @@ fn compositor_only_pointer_motion_updates_client_cursor_position_and_generation(
     assert_eq!(cursor.logical_x, x.round() as i32 - 3);
     assert_eq!(cursor.logical_y, y.round() as i32 - 4);
     assert!(snapshot.visual_changed);
-    assert!(snapshot.render_generation_after > snapshot.render_generation_before);
-    assert_eq!(snapshot.cause, RenderGenerationCause::CursorMotion);
+    assert_eq!(
+        snapshot.render_generation_after,
+        snapshot.render_generation_before
+    );
+    assert_eq!(snapshot.cause, RenderGenerationCause::CursorCommit);
     assert_eq!(
         snapshot.scene_generation_after,
         snapshot.scene_generation_before
@@ -675,14 +678,17 @@ fn compositor_only_interaction_motion_prevents_post_grab_cursor_teleport() {
     assert!(compositor_only_cursor.is_none());
     assert!(normal_motion_cursor.is_none());
     assert!(snapshots.compositor_only.visual_changed);
-    assert!(snapshots.compositor_only.render_generation > snapshots.initial.render_generation);
+    assert_eq!(
+        snapshots.compositor_only.render_generation,
+        snapshots.initial.render_generation
+    );
     assert_eq!(
         snapshots.compositor_only.scene_generation,
         snapshots.initial.scene_generation
     );
     assert_eq!(
         snapshots.compositor_only.cause,
-        RenderGenerationCause::CursorMotion
+        RenderGenerationCause::CursorState
     );
     assert_eq!(
         snapshots.compositor_only.pointer_event_log,

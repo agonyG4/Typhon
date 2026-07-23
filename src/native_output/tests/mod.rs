@@ -20,8 +20,10 @@ fn test_buffer_identity() -> BufferIdentity {
 }
 
 mod frame;
+mod fullscreen_cadence;
 mod input;
 mod input_interaction_liveness;
 mod output;
+mod presentation_transactions;
 mod scanout;
 mod shell_control;

@@ -1235,6 +1235,7 @@ impl PendingSurfaceBuffer {
             placement,
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation,
             commit_sequence: self.commit_sequence,
             buffer: self.data.to_committed_buffer_for_size(size)?,

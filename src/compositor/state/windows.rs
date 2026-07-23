@@ -1163,38 +1163,7 @@ impl CompositorState {
                 Some(WindowBackend::X11(_))
             )
         {
-            let restore_geometry = self
-                .current_visual_root_window_geometry(surface_id)
-                .or_else(|| self.current_root_window_geometry(surface_id))
-                .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(surface_id), 0, 0));
-            self.clear_resize_state_for_surfaces_with_reason(
-                &[surface_id],
-                WindowInteractionEndReason::ModeTransition,
-            );
-            if self
-                .window(window_id)
-                .is_some_and(|window| window.state.is_minimized())
-            {
-                self.restore_minimized_desktop_window(window_id);
-            }
-            if let Some(window) = self.window_mut(window_id) {
-                window.state.capture_restore_geometry(restore_geometry);
-                window.state.set_mode(mode);
-            }
-            let geometry = self.window_geometry_for_mode(mode);
-            self.set_surface_placement_with_cause(
-                surface_id,
-                geometry.placement,
-                RenderGenerationCause::WindowMode,
-            );
-            self.queue_backend_configure(window_id, geometry, mode, false);
-            self.queue_backend_state(window_id);
-            if mode == ToplevelMode::Fullscreen {
-                self.set_fullscreen_presentation_owner(surface_id);
-            } else {
-                self.clear_fullscreen_presentation_owner(surface_id);
-            }
-            return true;
+            return self.transition_x11_window_mode(window_id, mode, false);
         }
         if !self.toplevel_surfaces.contains_key(&surface_id) {
             return false;
@@ -1248,28 +1217,7 @@ impl CompositorState {
                 Some(WindowBackend::X11(_))
             )
         {
-            let restore_geometry = self
-                .window_mut(window_id)
-                .and_then(|window| window.state.take_restore_geometry())
-                .or_else(|| self.current_root_window_geometry(surface_id))
-                .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(surface_id), 0, 0));
-            if let Some(window) = self.window_mut(window_id) {
-                window.state.set_mode(ToplevelMode::Floating);
-            }
-            self.clear_fullscreen_presentation_owner(surface_id);
-            self.set_surface_placement_with_cause(
-                surface_id,
-                restore_geometry.placement,
-                RenderGenerationCause::WindowMode,
-            );
-            self.queue_backend_configure(
-                window_id,
-                restore_geometry,
-                ToplevelMode::Floating,
-                false,
-            );
-            self.queue_backend_state(window_id);
-            return true;
+            return self.transition_x11_window_mode(window_id, ToplevelMode::Floating, false);
         }
         self.clear_resize_state_for_surfaces_with_reason(
             &[surface_id],

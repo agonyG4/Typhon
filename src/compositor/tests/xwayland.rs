@@ -2,8 +2,9 @@ use std::{fs::File, num::NonZeroU64, os::fd::AsFd, path::PathBuf};
 
 use crate::compositor::{
     DesktopWindowKind, LiveRoleInstance, PermanentSurfaceRole, RenderGenerationCause,
-    SurfacePlacement, SurfacePublicationSource, SurfaceRoleLifecycle, WindowConstraints,
-    WindowMetadata, X11MoveResizeBeginResult, XwaylandSurfaceState,
+    ResizeInteractionId, SurfacePlacement, SurfacePublicationSource, SurfaceRoleLifecycle,
+    SurfaceTargetRect, WindowConstraints, WindowMetadata, X11MoveResizeBeginResult,
+    XwaylandSurfaceState,
 };
 use crate::xwayland::xwm::{
     X11ConfigureFlags, X11ConfigureRequest, X11Geometry, X11MoveResizeDirection,
@@ -17,6 +18,9 @@ use wayland_client::protocol::{
 };
 use wayland_client::{Connection, EventQueue, globals::registry_queue_init};
 use wayland_protocols::xwayland::shell::v1::client::xwayland_shell_v1 as client_xwayland_shell_v1;
+
+#[path = "xwayland_resize_visual.rs"]
+mod xwayland_resize_visual;
 
 struct FirstBufferFixture {
     server: super::OwnCompositorServer,
@@ -254,6 +258,7 @@ fn fake_snapshot() -> X11WindowSnapshot {
         startup_id: None,
         user_time: None,
         urgency: false,
+        supports_sync_request: false,
         sync_counter: None,
     }
 }
@@ -473,8 +478,9 @@ fn x11_stack_request_publishes_final_client_list_order() {
 
     assert!(commands.iter().any(|command| matches!(
         command,
-        XwmCommand::SyncClientLists { stacking, .. }
-            if stacking == &vec![second.handle, first.handle]
+        XwmCommand::RestackExact { order, stacking, .. }
+            if order == &vec![second.handle, first.handle]
+                && stacking == &vec![second.handle, first.handle]
     )));
 }
 
@@ -510,7 +516,7 @@ fn compositor_x11_raise_emits_restacks_and_client_list_sync() {
     assert!(server
         .take_xwayland_backend_commands(0)
         .iter()
-        .any(|command| matches!(command, XwmCommand::RaiseAndSync { window, .. } if *window == first.handle)));
+        .any(|command| matches!(command, XwmCommand::RestackExact { order, .. } if order.contains(&first.handle))));
 }
 
 #[test]
@@ -552,8 +558,50 @@ fn override_redirect_configure_notify_reconciles_x_stack_order() {
     assert!(
         commands
             .iter()
-            .any(|command| matches!(command, XwmCommand::SyncClientLists { .. }))
+            .any(|command| matches!(command, XwmCommand::RestackExact { order, .. } if order == &vec![second.handle, first.handle]))
     );
+}
+
+#[test]
+fn override_redirect_configure_notify_without_sibling_moves_to_bottom() {
+    let socket = super::unique_socket_name();
+    let mut server = super::OwnCompositorServer::bind_cpu_composition(&socket)
+        .expect("bind fake compositor server");
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let mut first = fake_snapshot();
+    first.kind = DesktopWindowKind::OverrideRedirect;
+    first.override_redirect = true;
+    let mut second = first.clone();
+    second.handle = X11WindowHandle::new(generation, 104);
+    second.surface_id = 11;
+    let first_id = server.state.allocate_window_id().expect("first window id");
+    let second_id = server.state.allocate_window_id().expect("second window id");
+    server
+        .state
+        .insert_desktop_window(crate::compositor::DesktopWindow::new_x11(
+            first_id,
+            first.clone(),
+        ))
+        .expect("insert first OR window");
+    server
+        .state
+        .insert_desktop_window(crate::compositor::DesktopWindow::new_x11(
+            second_id,
+            second.clone(),
+        ))
+        .expect("insert second OR window");
+
+    let commands = server.apply_xwayland_window_event(XwmEvent::ConfigureNotify {
+        window: second.handle,
+        geometry: second.geometry,
+        above_sibling: None,
+    });
+
+    assert_eq!(server.state.window_stacking, vec![second_id, first_id]);
+    assert!(commands.iter().any(|command| matches!(
+        command,
+        XwmCommand::RestackExact { order, .. } if order == &vec![second.handle, first.handle]
+    )));
 }
 
 #[test]
@@ -872,6 +920,53 @@ fn xwayland_attachment_replacement_preserves_frame_and_keyboard_focus() {
             .map(crate::compositor::compositor_surface_id),
         Some(fixture.popup_surface_id),
         "late removal of the old attachment must not clear replacement focus"
+    );
+}
+
+#[test]
+fn replaced_xwayland_surface_commits_are_retired_before_resize_events() {
+    let mut fixture = stationary_pointer_xwayland_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.parent_surface_id;
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let old_pending = fixture
+        .server
+        .state
+        .current_surface_buffers
+        .get(&fixture.parent_surface_id)
+        .cloned()
+        .expect("old attachment buffer");
+    let _ = fixture.server.take_xwayland_buffer_ready_events();
+
+    fixture
+        .server
+        .apply_xwayland_association_event(XwmAssociationEvent::Associated {
+            generation: handle.generation(),
+            window: handle,
+            surface_id: fixture.popup_surface_id,
+        });
+    fixture.server.state.commit_xwayland_surface_buffer(
+        fixture.parent_surface_id,
+        old_pending,
+        Vec::new(),
+        SurfacePublicationSource::Immediate,
+    );
+
+    assert!(
+        fixture
+            .server
+            .take_xwayland_buffer_ready_events()
+            .is_empty()
+    );
+    assert!(
+        !fixture
+            .server
+            .state
+            .current_surface_buffers
+            .contains_key(&fixture.parent_surface_id)
     );
 }
 
@@ -1232,6 +1327,11 @@ fn late_kind_change_removes_normal_membership_without_focus_flash() {
             .iter()
             .all(|command| !matches!(command, XwmCommand::Raise(_)))
     );
+    assert!(metadata_commands.iter().any(|command| matches!(
+        command,
+        XwmCommand::ConfigureFrame { window, geometry }
+            if *window == handle && *geometry == handle_geometry(&fixture.server, handle)
+    )));
 
     assert!(fixture.server.state.x11_client_lists().0.is_empty());
     assert!(
@@ -1247,6 +1347,13 @@ fn late_kind_change_removes_normal_membership_without_focus_flash() {
                 } if *window == handle
             ))
     );
+}
+
+fn handle_geometry(server: &super::OwnCompositorServer, handle: X11WindowHandle) -> X11Geometry {
+    server
+        .state
+        .x11_authoritative_geometry(handle)
+        .expect("X11 geometry")
 }
 
 #[test]
@@ -1515,6 +1622,94 @@ fn x11_partial_moveresize_preserves_unrequested_geometry() {
 }
 
 #[test]
+fn x11_client_configure_left_resize_preserves_right_edge() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 100,
+        y: 120,
+        width: 640,
+        height: 480,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let managed_y = handle_geometry(&fixture.server, handle).y;
+
+    let commands = fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::ConfigureRequested {
+            window: handle,
+            request: X11ConfigureRequest {
+                requested: X11Geometry {
+                    x: 120,
+                    y: 0,
+                    width: 620,
+                    height: 0,
+                },
+                fields: X11ConfigureFlags {
+                    x: true,
+                    width: true,
+                    ..X11ConfigureFlags::default()
+                },
+                border_width: 0,
+                sibling: None,
+                stack_mode: None,
+            },
+        });
+
+    let expected = X11Geometry {
+        x: 120,
+        y: managed_y,
+        width: 620,
+        height: 480,
+    };
+    assert!(matches!(
+        commands.as_slice(),
+        [XwmCommand::Configure { geometry, .. }] if *geometry == expected
+    ));
+    assert_eq!(handle_geometry(&fixture.server, handle), expected);
+    assert_eq!(expected.x + i32::try_from(expected.width).unwrap(), 740);
+
+    let surface = &fixture.server.renderable_surfaces()[0];
+    assert_eq!(
+        (surface.width, surface.height),
+        (2, 2),
+        "client geometry must not replace the committed wl_surface extent"
+    );
+    assert_eq!(
+        surface.render_target_size, None,
+        "an Xwayland geometry update must not scale stale client content"
+    );
+
+    let server = fixture.server;
+    let (running, server_thread) = super::spawn_test_server(server);
+    let qh = fixture.queue.handle();
+    let next_buffer =
+        fixture
+            ._pool
+            .create_buffer(16, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
+    fixture.surface.attach(Some(&next_buffer), 0, 0);
+    fixture.surface.damage_buffer(0, 0, 2, 2);
+    fixture.surface.commit();
+    fixture.connection.flush().expect("flush resize buffer");
+    fixture
+        .queue
+        .roundtrip(&mut super::RegistryTestState::default())
+        .expect("complete resize buffer commit");
+    fixture.server = super::stop_test_server(running, server_thread);
+
+    let surface = &fixture.server.renderable_surfaces()[0];
+    assert_eq!((surface.width, surface.height), (2, 2));
+    assert_eq!(
+        surface.render_target_size, None,
+        "an Xwayland publication must keep stale content at its committed extent"
+    );
+}
+
+#[test]
 fn x11_configure_notify_does_not_mutate_committed_buffer_extent() {
     let mut fixture = first_buffer_fixture();
     admit_first_buffer(&mut fixture, 100, 120);
@@ -1607,6 +1802,57 @@ fn future_buffer_replaces_adopted_initial_buffer() {
         replacement_id
     );
     assert_eq!(fixture.server.take_xwayland_buffer_ready_events().len(), 1);
+}
+
+#[test]
+fn mapped_xwayland_frame_callback_completes_after_output_sample_before_present() {
+    let mut fixture = first_buffer_fixture();
+    admit_first_buffer(&mut fixture, 100, 120);
+
+    let server = fixture.server;
+    let (running, server_thread) = super::spawn_test_server(server);
+    let qh = fixture.queue.handle();
+    let next_buffer =
+        fixture
+            ._pool
+            .create_buffer(16, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
+    let _frame_callback = fixture.surface.frame(&qh, ());
+    fixture.surface.attach(Some(&next_buffer), 0, 0);
+    fixture.surface.damage_buffer(0, 0, 2, 2);
+    fixture.surface.commit();
+    fixture
+        .connection
+        .flush()
+        .expect("flush paced Xwayland commit");
+    fixture
+        .queue
+        .roundtrip(&mut super::RegistryTestState::default())
+        .expect("complete paced Xwayland commit");
+    fixture.server = super::stop_test_server(running, server_thread);
+
+    assert!(
+        fixture.server.has_only_pending_surface_frame_callbacks(),
+        "a lone frame callback must not be reported as visual work"
+    );
+    fixture.server.capture_frame_callbacks_for_render();
+    fixture
+        .server
+        .complete_rendered_frame_callbacks_for_prepared();
+    assert!(
+        !fixture.server.has_pending_frame_callbacks(),
+        "a sampled output frame must release wl_surface.frame before pageflip"
+    );
+    let metrics = fixture.server.frame_callback_metrics();
+    assert_eq!(metrics.callbacks_requested, 1);
+    assert_eq!(metrics.callbacks_captured, 1);
+    assert_eq!(metrics.callbacks_completed_after_render, 1);
+    assert_eq!(metrics.callbacks_found_at_pageflip, 0);
+
+    fixture.server.finish_frame();
+    assert!(
+        !fixture.server.has_pending_frame_callbacks(),
+        "pageflip completion must not send the callback a second time"
+    );
 }
 
 #[test]

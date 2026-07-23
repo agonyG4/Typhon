@@ -201,6 +201,8 @@ impl CompositorState {
             surface,
             logical_x: (self.last_pointer_x.round() as i32).saturating_sub(active.hotspot_x),
             logical_y: (self.last_pointer_y.round() as i32).saturating_sub(active.hotspot_y),
+            hotspot_x: active.hotspot_x,
+            hotspot_y: active.hotspot_y,
         })
     }
 
@@ -491,7 +493,7 @@ impl CompositorState {
         self.last_pointer_x = x;
         self.last_pointer_y = y;
         if moves_visible_cursor {
-            self.advance_render_generation(RenderGenerationCause::CursorMotion);
+            self.advance_cursor_generation();
         }
     }
 
@@ -500,9 +502,12 @@ impl CompositorState {
         x: f64,
         y: f64,
     ) -> bool {
-        let before = self.render_generation;
+        let changed = self.last_pointer_x != x || self.last_pointer_y != y;
+        let moves_visible_cursor = changed
+            && (self.interaction_cursor_override.is_some()
+                || self.client_cursor_render_state().is_some());
         self.update_pointer_position(x, y);
-        self.render_generation != before
+        moves_visible_cursor
     }
 
     pub(in crate::compositor) fn send_pointer_motion_sample(

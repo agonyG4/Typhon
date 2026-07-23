@@ -1,4 +1,4 @@
-use super::presentation::visual_target_deadline_for_mode;
+use super::planner::visual_target_deadline_for_mode;
 use super::*;
 
 impl NativeRuntime {
@@ -9,9 +9,25 @@ impl NativeRuntime {
     ) -> NativeResult<()> {
         let perf = self.perf;
         perf.log("native.scheduler", || {
+            let (
+                xwm_drain_max_us,
+                xwm_translation_max_us,
+                xwm_command_execution_max_us,
+                adoption_deadline_max_us,
+                xwm_events_per_cycle_max,
+                xwm_commands_per_cycle_max,
+            ) = self.xwayland.xwayland_timing_snapshot();
             let fullscreen = self.server.fullscreen_render_plan_metrics();
             let mut fields = vec![
                 NativePerfField::str("decision", format!("{scheduler_decision:?}")),
+                NativePerfField::str(
+                    "cursor_scheduling_policy",
+                    self.cursor_scheduling_policy.as_str(),
+                ),
+                NativePerfField::u64(
+                    "perf_records_suppressed",
+                    NativePerfLogger::suppressed_records(),
+                ),
                 NativePerfField::str("state_after", format!("{:?}", self.frame_scheduler.state())),
                 NativePerfField::bool("pageflip_pending", self.frame_scheduler.page_flip_pending()),
                 NativePerfField::bool(
@@ -55,6 +71,48 @@ impl NativeRuntime {
                     "atomic_primary_watchdog_timeouts",
                     self.atomic_commit_arbiter.primary_watchdog_timeouts(),
                 ),
+                NativePerfField::u64("cursor_pageflip_early_returns", 0),
+                NativePerfField::u64(
+                    "cursor_response_windows_opened",
+                    self.cursor_output_arbitration.response_windows_opened(),
+                ),
+                NativePerfField::u64(
+                    "cursor_changes_coalesced",
+                    self.cursor_output_arbitration.changes_coalesced(),
+                ),
+                NativePerfField::u64(
+                    "cursor_only_plans",
+                    self.cursor_output_arbitration.cursor_only_plans(),
+                ),
+                NativePerfField::u64(
+                    "cursor_only_submissions",
+                    self.cursor_output_arbitration.cursor_only_submissions(),
+                ),
+                NativePerfField::u64(
+                    "cursor_only_deferred_for_primary",
+                    self.cursor_output_arbitration
+                        .cursor_only_deferred_for_primary(),
+                ),
+                NativePerfField::u64(
+                    "cursor_state_piggybacked",
+                    self.cursor_output_arbitration.cursor_state_piggybacked(),
+                ),
+                NativePerfField::u64(
+                    "cursor_idle_hardware_updates",
+                    self.cursor_output_arbitration.idle_hardware_updates(),
+                ),
+                NativePerfField::u64(
+                    "cursor_idle_software_updates",
+                    self.cursor_output_arbitration.idle_software_updates(),
+                ),
+                NativePerfField::bool(
+                    "cursor_response_window_open",
+                    self.cursor_output_arbitration.pending(),
+                ),
+                NativePerfField::u64(
+                    "cursor_response_deadline_ns",
+                    self.cursor_output_arbitration.deadline_ns().unwrap_or(0),
+                ),
                 NativePerfField::str(
                     "atomic_pending_commit_kind",
                     self.atomic_commit_arbiter
@@ -68,6 +126,17 @@ impl NativeRuntime {
                 ),
                 NativePerfField::u64("stale_pageflip_events", self.stale_pageflip_events),
                 NativePerfField::u64("presentations", self.presentation_cadence.presentations()),
+                NativePerfField::usize("presentation_trace_events", self.presentation_trace.len()),
+                NativePerfField::u64(
+                    "presentation_trace_dropped",
+                    self.presentation_trace.dropped(),
+                ),
+                NativePerfField::u64("xwm_drain_max_us", xwm_drain_max_us),
+                NativePerfField::u64("xwm_translation_max_us", xwm_translation_max_us),
+                NativePerfField::u64("xwm_command_execution_max_us", xwm_command_execution_max_us),
+                NativePerfField::u64("adoption_deadline_max_us", adoption_deadline_max_us),
+                NativePerfField::u64("xwm_events_per_cycle_max", xwm_events_per_cycle_max),
+                NativePerfField::u64("xwm_commands_per_cycle_max", xwm_commands_per_cycle_max),
                 NativePerfField::u64(
                     "presentation_sequence_gaps",
                     self.presentation_cadence.sequence_gaps(),
@@ -98,6 +167,30 @@ impl NativeRuntime {
                         .unwrap_or("none"),
                 ),
             ];
+            if let Some(summary) = self.timing_scopes.get("wayland_dispatch") {
+                fields.extend([
+                    NativePerfField::u64("wayland_dispatch_count", summary.count),
+                    NativePerfField::u64("wayland_dispatch_max_us", summary.max_ns / 1_000),
+                ]);
+            }
+            if let Some(summary) = self.timing_scopes.get("xwm_dispatch") {
+                fields.extend([
+                    NativePerfField::u64("xwm_dispatch_count", summary.count),
+                    NativePerfField::u64("xwm_dispatch_max_us", summary.max_ns / 1_000),
+                ]);
+            }
+            if let Some(summary) = self.timing_scopes.get("prepare_frame") {
+                fields.extend([
+                    NativePerfField::u64("prepare_frame_count", summary.count),
+                    NativePerfField::u64("prepare_frame_max_us", summary.max_ns / 1_000),
+                ]);
+            }
+            if let Some(summary) = self.timing_scopes.get("egl_draw") {
+                fields.extend([
+                    NativePerfField::u64("egl_draw_count", summary.count),
+                    NativePerfField::u64("egl_draw_max_us", summary.max_ns / 1_000),
+                ]);
+            }
             fields.extend([
                 NativePerfField::bool(
                     "atomic_cursor_plane_available",
@@ -113,6 +206,14 @@ impl NativeRuntime {
                 NativePerfField::bool(
                     "direct_scanout_active",
                     self.scanout.direct_scanout_active(),
+                ),
+                NativePerfField::bool(
+                    "direct_scanout_qualified",
+                    self.direct_scanout_qualification.is_qualified(),
+                ),
+                NativePerfField::str(
+                    "direct_scanout_qualification",
+                    self.direct_scanout_qualification.status_str(),
                 ),
                 NativePerfField::bool(
                     "direct_scanout_pending",
@@ -184,6 +285,50 @@ impl NativeRuntime {
                         counters.same_buffer_resubmissions,
                     ),
                     NativePerfField::u64(
+                        "direct_scanout_same_buffer_suppressed",
+                        counters.same_buffer_suppressed,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_out_fences_received",
+                        counters.out_fences_received,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_out_fence_missing",
+                        counters.out_fence_missing,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_test_only_p50_us",
+                        counters.test_only_timing.percentile_ns(50) / 1_000,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_test_only_p95_us",
+                        counters.test_only_timing.percentile_ns(95) / 1_000,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_test_only_p99_us",
+                        counters.test_only_timing.percentile_ns(99) / 1_000,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_test_only_max_us",
+                        counters.test_only_timing.max_ns / 1_000,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_real_submit_p50_us",
+                        counters.real_submit_timing.percentile_ns(50) / 1_000,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_real_submit_p95_us",
+                        counters.real_submit_timing.percentile_ns(95) / 1_000,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_real_submit_p99_us",
+                        counters.real_submit_timing.percentile_ns(99) / 1_000,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_real_submit_max_us",
+                        counters.real_submit_timing.max_ns / 1_000,
+                    ),
+                    NativePerfField::u64(
                         "direct_scanout_composited_fallbacks",
                         counters.composited_fallbacks,
                     ),
@@ -203,6 +348,26 @@ impl NativeRuntime {
             }
             if let Some(cursor) = self.atomic_cursor.as_ref() {
                 fields.extend([
+                    NativePerfField::u64(
+                        "atomic_cursor_image_uploads",
+                        cursor.counters.image_uploads,
+                    ),
+                    NativePerfField::u64(
+                        "client_cursor_hw_image_uploads",
+                        cursor.counters.client_image_uploads,
+                    ),
+                    NativePerfField::u64(
+                        "client_cursor_image_cache_hits",
+                        cursor.counters.image_cache_hits,
+                    ),
+                    NativePerfField::u64(
+                        "client_cursor_hw_position_submissions",
+                        cursor.counters.position_submissions,
+                    ),
+                    NativePerfField::u64(
+                        "client_cursor_hw_primary_submissions",
+                        cursor.counters.primary_submissions,
+                    ),
                     NativePerfField::u64(
                         "atomic_cursor_updates_requested",
                         cursor.counters.updates_requested,
@@ -260,7 +425,10 @@ impl NativeRuntime {
             ),
             earliest_native_deadline(
                 self.acquire_watches.next_fallback_deadline_ns(),
-                self.xwayland.next_deadline_ns(),
+                earliest_native_deadline(
+                    self.xwayland.next_deadline_ns(),
+                    self.cursor_output_arbitration.deadline_ns(),
+                ),
             ),
         ))?;
         Ok(())

@@ -195,10 +195,6 @@ impl CompositorState {
         ) {
             return Err(rejection);
         }
-        if self.client_cursor_render_state().is_some() {
-            return Err(DirectScanoutSceneRejection::ClientCursorUnsupported);
-        }
-
         let geometry = self
             .current_visual_root_window_geometry(owner.owner_root_surface_id)
             .ok_or(DirectScanoutSceneRejection::OwnerDoesNotCoverOutput)?;
@@ -252,6 +248,7 @@ impl CompositorState {
             .active_toplevel_resizes
             .contains_key(&owner.owner_root_surface_id)
             || root.render_placement.is_some()
+            || root.render_target_size.is_some()
         {
             return Err(DirectScanoutSceneRejection::ResizePreviewActive);
         }
@@ -270,6 +267,9 @@ impl CompositorState {
         Ok(DirectScanoutSceneCandidate {
             surface_id: root.surface_id,
             root_surface_id: owner.owner_root_surface_id,
+            content_epoch: self
+                .surface_content_epoch(root.surface_id)
+                .map_or(root.commit_sequence.get(), SurfaceCommitSequence::get),
             generation: root.generation,
             commit_sequence: root.commit_sequence,
             buffer_identity: root.buffer_identity().clone(),

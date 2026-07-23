@@ -34,6 +34,21 @@ impl CompositorState {
         let Some(mode) = self.window(window_id).map(|window| window.state.mode()) else {
             return false;
         };
+        if let Some(root_surface_id) = self.window(window_id).map(|window| window.root_surface_id)
+            && let Some(active) = self.active_toplevel_resizes.get(&root_surface_id).copied()
+        {
+            // Keep this test-only native entry point equivalent to a pointer
+            // release: the final compositor visual geometry is sealed before
+            // the XWM content transaction is allowed to present.
+            let _ = self.preview_resize_root_window_to(
+                root_surface_id,
+                geometry.width,
+                geometry.height,
+                SurfacePlacement::absolute_root_at(geometry.x, geometry.y),
+                active.edges,
+                active.interaction_id,
+            );
+        }
         self.queue_backend_finalize_resize(
             window_id,
             WindowGeometry::new(
@@ -225,12 +240,19 @@ impl CompositorState {
                         active_resize: None,
                     })
             });
+        let render_target_cleared = self
+            .renderable_surfaces
+            .iter_mut()
+            .find(|surface| surface.surface_id == surface_id)
+            .and_then(|surface| surface.render_target_size.take())
+            .is_some();
         if previous.is_some_and(|visual| {
             visual.width == width
                 && visual.height == height
                 && visual.placement == placement
                 && visual.active_resize == Some(interaction_id)
-        }) {
+        }) && !render_target_cleared
+        {
             return false;
         }
 
@@ -352,7 +374,10 @@ impl CompositorState {
             visual_width,
             visual_height,
         );
-        let visual_clip = active_resize.is_some().then_some(clip);
+        let content_pending = self
+            .pending_xwayland_visual_content
+            .contains(&root_surface_id);
+        let visual_clip = (active_resize.is_some() || content_pending).then_some(clip);
         let placements = &self.surface_placements;
         for surface in &mut self.renderable_surfaces {
             if root_surface_id_for_surface_in_placements(placements, surface.surface_id)
@@ -579,26 +604,63 @@ impl CompositorState {
         &mut self,
         handle: crate::xwayland::X11WindowHandle,
     ) -> bool {
+        self.finalize_x11_resize_with_geometry(handle, None)
+    }
+
+    pub(in crate::compositor) fn finalize_x11_resize_with_geometry(
+        &mut self,
+        handle: crate::xwayland::X11WindowHandle,
+        presented_geometry: Option<crate::xwayland::xwm::X11Geometry>,
+    ) -> bool {
         let Some(window_id) = self.window_id_for_x11_handle(handle) else {
             return false;
         };
         let Some(surface_id) = self.window(window_id).map(|window| window.root_surface_id) else {
             return false;
         };
-        let Some(active) = self.active_toplevel_resizes.remove(&surface_id) else {
+        let Some(active) = self.active_toplevel_resizes.get(&surface_id).copied() else {
             return false;
         };
-        if let Some(visual) = self.toplevel_visual_geometries.get_mut(&surface_id)
-            && visual.active_resize == Some(active.interaction_id)
-        {
-            let placement = visual.placement;
-            visual.active_resize = None;
-            let _ = self.set_surface_placement_with_cause(
-                surface_id,
-                placement,
-                RenderGenerationCause::WindowResize,
-            );
+        let Some(visual) = self.toplevel_visual_geometries.get(&surface_id).copied() else {
+            self.active_toplevel_resizes.remove(&surface_id);
+            return true;
+        };
+        // A completion event identifies content, not pointer ownership.  If a
+        // newer resize has already replaced the interaction ID, this event is
+        // for an older content epoch and must not retire the newer preview.
+        if visual.active_resize != Some(active.interaction_id) {
+            return false;
         }
+        if let Some(presented_geometry) = presented_geometry
+            && (visual.width != presented_geometry.width
+                || visual.height != presented_geometry.height)
+        {
+            // The XWM event belongs to an older content transaction.  A
+            // newer pointer-owned resize has changed the expected content
+            // size, so that completion cannot retire the newer preview.
+            return false;
+        }
+        if presented_geometry.is_some_and(|_| {
+            self.window_interaction.as_ref().is_some_and(|interaction| {
+                interaction.root_surface_id == surface_id
+                    && matches!(interaction.kind, WindowInteractionKind::Resize(_))
+            })
+        }) {
+            // A newer pointer-owned resize is still active.  Its visual
+            // geometry is a newer epoch than this presentation event.
+            return false;
+        }
+        self.active_toplevel_resizes.remove(&surface_id);
+        let placement = visual.placement;
+        if let Some(visual) = self.toplevel_visual_geometries.get_mut(&surface_id) {
+            visual.active_resize = None;
+        }
+        self.set_surface_placement_with_cause(
+            surface_id,
+            placement,
+            RenderGenerationCause::WindowResize,
+        );
+        self.update_pending_xwayland_visual_content(surface_id);
         self.update_toplevel_visual_render_assignment(surface_id);
         true
     }

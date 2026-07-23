@@ -1257,7 +1257,7 @@ pub(crate) fn process_native_pointer_constraint_backend_requests(
             if let Some(visible) = action.cursor_visibility_changed {
                 native_pointer_debug_log(format!("cursor visibility native visible={}", visible));
                 let changed = input_state.set_cursor_visible(visible);
-                if cursor_mode == NativeCursorRenderMode::Software && changed {
+                if cursor_mode.is_software() && changed {
                     redraw_requested = true;
                 }
             }

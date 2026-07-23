@@ -98,6 +98,7 @@ mod launch;
 mod output;
 mod pacing;
 mod perf;
+mod presentation;
 mod runtime;
 mod scanout;
 
@@ -106,6 +107,9 @@ pub(crate) use launch::*;
 pub(crate) use output::*;
 use pacing::*;
 pub(crate) use perf::*;
+pub(crate) use presentation::qualification::*;
+pub(crate) use presentation::trace::*;
+pub(crate) use presentation::transaction::*;
 pub(crate) use runtime::{
     NativeCursorRenderMode, NativeFrameRenderer, NativePointerConstraintBackend,
     native_pointer_debug_log, run,

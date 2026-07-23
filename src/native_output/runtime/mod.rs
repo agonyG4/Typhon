@@ -22,12 +22,17 @@ pub(super) use atomic_commit::{
     AtomicCommitArbiter, AtomicCommitCompletion, AtomicCommitKind,
     register_atomic_primary_submission,
 };
-pub(super) use cursor_cycle::{atomic_cursor_visibility_policy, effective_atomic_cursor_state};
+pub(super) use cursor_cycle::{
+    atomic_cursor_visibility_policy, effective_atomic_cursor_state, log_client_cursor_path,
+    resolve_client_cursor_path, synchronize_cursor_state_for_server,
+};
 pub(crate) use cycle::run;
+#[cfg(test)]
+pub(crate) use frame::NativeCursorOutputDisposition;
 pub(crate) use frame::{
-    NativeCursorPreference, NativeCursorRenderMode, NativeFrameRenderer,
-    NativePointerConstraintBackend, earliest_native_deadline, native_pointer_debug_log,
-    normalize_refresh_hz,
+    NativeCursorOutputArbitration, NativeCursorPreference, NativeCursorRenderMode,
+    NativeCursorSchedulingPolicy, NativeFrameRenderer, NativePointerConstraintBackend,
+    earliest_native_deadline, native_pointer_debug_log, normalize_refresh_hz,
 };
 #[cfg(test)]
 pub(crate) use frame::{
@@ -76,6 +81,13 @@ pub(crate) struct NativeRuntimeConfig {
     pub(crate) app_gpu_preference: CompositorAppGpuPreference,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeClientCursorPath {
+    Hidden,
+    Hardware,
+    Software,
+}
+
 pub(crate) struct NativeRuntime {
     server: OwnCompositorServer,
     cursor_image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
@@ -91,7 +103,10 @@ pub(crate) struct NativeRuntime {
     frame_renderer: NativeFrameRenderer,
     input_state: NativeInputState,
     cursor_preference: NativeCursorPreference,
+    cursor_scheduling_policy: NativeCursorSchedulingPolicy,
+    cursor_output_arbitration: NativeCursorOutputArbitration,
     direct_scanout_preference: NativeDirectScanoutPreference,
+    direct_scanout_qualification: DirectScanoutQualificationState,
     cursor_render_mode: NativeCursorRenderMode,
     atomic_cursor: Option<NativeAtomicCursor>,
     legacy_cursor: Option<NativeLegacyHardwareCursor>,
@@ -120,8 +135,14 @@ pub(crate) struct NativeRuntime {
     triple_buffer_policy: AdaptiveTripleBufferPolicy,
     pending_proven_deadline_miss: Option<ProvenDeadlineMiss>,
     effective_app_gpu_policy: EffectiveCompositorAppGpuPolicy,
-    last_render_generation: u64,
+    last_rendered_scene_generation: u64,
+    last_direct_candidate_key: Option<DirectScanoutCandidateKey>,
+    last_submitted_cursor_generation: u64,
+    last_primary_presented_at_ns: Option<u64>,
     last_renderable_surfaces: Vec<RenderableSurface>,
+    last_client_cursor_damage: Option<NativeClientCursorDamageState>,
+    last_software_cursor_damage: Option<NativeDamageRect>,
+    last_client_cursor_path: Option<NativeClientCursorPath>,
     queued_redraw_requested: bool,
     frame_index: u64,
     known_toplevels: usize,
@@ -136,6 +157,9 @@ pub(crate) struct NativeRuntime {
     process_supervisor: ChildSupervisor,
     astrea_launch_tracker: AstreaLaunchLifecycleTracker,
     shutdown: NativeShutdownLifecycle,
+    presentation_trace: PresentationTransactionTraceRing,
+    presentation_trace_path: Option<std::path::PathBuf>,
+    timing_scopes: std::collections::BTreeMap<&'static str, TimingSummary>,
 }
 
 impl NativeRuntime {
@@ -190,6 +214,13 @@ impl NativeRuntime {
         if let Some(identity) = self.xwayland_client_identity.take() {
             self.server.revoke_xwayland_generation(identity.generation);
         }
+    }
+
+    pub(super) fn note_timing_scope(&mut self, name: &'static str, elapsed: Duration) {
+        self.timing_scopes
+            .entry(name)
+            .or_default()
+            .record(elapsed.as_nanos().min(u128::from(u64::MAX)) as u64);
     }
 }
 

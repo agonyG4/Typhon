@@ -13,6 +13,31 @@ pub(in crate::compositor) struct BeginWindowInteraction {
     pub(super) pointer_motion_surface_id: Option<u32>,
 }
 
+#[cfg(test)]
+impl BeginWindowInteraction {
+    pub(in crate::compositor) const fn for_test(
+        window_id: Option<WindowId>,
+        root_surface_id: u32,
+        x: f64,
+        y: f64,
+        kind: WindowInteractionKind,
+        source: WindowInteractionSource,
+        pointer_motion_surface_id: Option<u32>,
+    ) -> Self {
+        Self {
+            window_id,
+            root_surface_id,
+            x,
+            y,
+            kind,
+            source,
+            trigger_button: None,
+            trigger_serial: None,
+            pointer_motion_surface_id,
+        }
+    }
+}
+
 impl CompositorState {
     pub(in crate::compositor) fn begin_window_move_at(&mut self, x: f64, y: f64) -> bool {
         self.begin_window_interaction_at(
@@ -427,7 +452,8 @@ impl CompositorState {
                 .current_visual_root_window_geometry(root_surface_id)
                 .unwrap_or(fallback_geometry),
             WindowInteractionKind::Move => self
-                .current_root_window_geometry(root_surface_id)
+                .current_visual_root_window_geometry(root_surface_id)
+                .or_else(|| self.current_root_window_geometry(root_surface_id))
                 .unwrap_or(fallback_geometry),
         };
         let Some(root_resource) = self.surface_resource_by_id(root_surface_id) else {
@@ -824,6 +850,15 @@ impl CompositorState {
             && let WindowInteractionKind::Resize(edges) = interaction.kind
         {
             self.apply_pending_interactive_resize_update();
+            if let Some(final_visual) =
+                self.current_visual_root_window_geometry(interaction.root_surface_id)
+            {
+                self.set_surface_placement_with_cause(
+                    interaction.root_surface_id,
+                    final_visual.placement,
+                    RenderGenerationCause::WindowResize,
+                );
+            }
             self.send_resize_end_configure(
                 interaction.root_surface_id,
                 edges,

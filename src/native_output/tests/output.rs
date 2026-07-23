@@ -1,6 +1,32 @@
 use super::*;
 
 #[test]
+fn direct_plane_plan_cache_key_changes_for_modifier_and_generation() {
+    let first = DirectPlanePlanKey {
+        width: 1920,
+        height: 1080,
+        format: 0x3432_5241,
+        modifier: 0,
+        cursor_plan_key: Some(1),
+    };
+    let modifier_changed = DirectPlanePlanKey {
+        modifier: 7,
+        ..first
+    };
+    assert_ne!(first, modifier_changed);
+    assert_ne!(
+        TestedDirectPlanePlan {
+            key: first,
+            drm_generation: 1,
+        },
+        TestedDirectPlanePlan {
+            key: first,
+            drm_generation: 2,
+        }
+    );
+}
+
+#[test]
 fn connected_connector_for_card_prefers_connected_matching_card_output() {
     let root = std::env::current_dir()
         .unwrap()
@@ -362,6 +388,99 @@ fn native_damage_summary_full_output_fallback_counts_output_pixels() {
 }
 
 #[test]
+fn native_output_damage_for_cursor_motion_is_not_full_output() {
+    let damage = native_output_damage_for_repaint(
+        1920,
+        1080,
+        &[],
+        &[],
+        RenderGenerationCause::CursorMotion,
+        true,
+    );
+
+    assert_ne!(damage.kind, NativeDamageKind::FullOutput);
+}
+
+#[test]
+fn native_output_damage_for_client_cursor_motion_covers_old_and_new_bounds() {
+    let previous = NativeClientCursorDamageState {
+        surface_id: 9,
+        generation: 1,
+        hotspot_x: 0,
+        hotspot_y: 0,
+        rect: Some(NativeDamageRect {
+            x: 100,
+            y: 100,
+            width: 32,
+            height: 32,
+        }),
+    };
+    let current = NativeClientCursorDamageState {
+        rect: Some(NativeDamageRect {
+            x: 200,
+            y: 100,
+            width: 32,
+            height: 32,
+        }),
+        ..previous
+    };
+
+    let damage = native_output_damage_for_repaint_with_cursor(
+        1920,
+        1080,
+        &[],
+        &[],
+        RenderGenerationCause::CursorMotion,
+        false,
+        NativeCursorDamageBounds {
+            previous_client: Some(previous),
+            client: Some(current),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(damage.kind, NativeDamageKind::SurfaceDamage);
+    assert_eq!(damage.rects.len(), 2);
+    assert!(damage.rects.contains(&previous.rect.unwrap()));
+    assert!(damage.rects.contains(&current.rect.unwrap()));
+}
+
+#[test]
+fn native_output_damage_for_software_theme_cursor_motion_is_bounded() {
+    let old = NativeDamageRect {
+        x: 10,
+        y: 20,
+        width: 24,
+        height: 24,
+    };
+    let new = NativeDamageRect {
+        x: 40,
+        y: 20,
+        width: 24,
+        height: 24,
+    };
+    let damage = native_output_damage_for_repaint_with_cursor(
+        1920,
+        1080,
+        &[],
+        &[],
+        RenderGenerationCause::CursorMotion,
+        false,
+        NativeCursorDamageBounds {
+            previous_software: Some(old),
+            software: Some(new),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(damage.kind, NativeDamageKind::SurfaceDamage);
+    assert_eq!(damage.rects.len(), 2);
+    assert!(damage.rects.contains(&old));
+    assert!(damage.rects.contains(&new));
+    assert!(damage.pixels < 1920 * 1080);
+}
+
+#[test]
 fn native_output_damage_for_window_move_covers_old_and_new_surface_bounds() {
     let previous = test_renderable_surface(7, 0, 0, 120, 80, RenderableSurfaceDamage::Full);
     let current = test_renderable_surface(7, 200, 100, 120, 80, RenderableSurfaceDamage::Full);
@@ -395,6 +514,37 @@ fn native_output_damage_for_window_move_covers_old_and_new_surface_bounds() {
             },
         ]
     );
+}
+
+#[test]
+fn native_output_damage_for_scene_change_survives_later_cursor_state_cause() {
+    let previous = test_renderable_surface(8, 0, 0, 120, 80, RenderableSurfaceDamage::Empty);
+    let current = test_renderable_surface(8, 200, 100, 120, 80, RenderableSurfaceDamage::Empty);
+    let previous_origin = surface_origins(std::slice::from_ref(&previous))[0];
+    let current_origin = surface_origins(std::slice::from_ref(&current))[0];
+
+    let damage = native_output_damage_for_scene_and_cursor(
+        400,
+        300,
+        std::slice::from_ref(&previous),
+        std::slice::from_ref(&current),
+        true,
+        NativeCursorDamageBounds::default(),
+    );
+
+    assert_eq!(damage.kind, NativeDamageKind::SurfaceDamage);
+    assert!(damage.rects.contains(&NativeDamageRect {
+        x: previous_origin.0,
+        y: previous_origin.1,
+        width: 120,
+        height: 80,
+    }));
+    assert!(damage.rects.contains(&NativeDamageRect {
+        x: current_origin.0,
+        y: current_origin.1,
+        width: 120,
+        height: 80,
+    }));
 }
 
 #[test]
@@ -435,8 +585,7 @@ fn native_damage_accumulator_render_element_bounds_changes_cover_old_and_new_tar
 fn native_output_damage_for_window_resize_covers_rescaled_bounds() {
     let previous = test_renderable_surface(7, 0, 0, 300, 200, RenderableSurfaceDamage::Full);
     let current = RenderableSurface {
-        width: 340,
-        height: 230,
+        render_target_size: Some(BufferSize::new(340, 230).unwrap()),
         render_placement: None,
         visual_clip: None,
         ..test_renderable_surface(7, 0, 0, 300, 200, RenderableSurfaceDamage::Full)
@@ -580,6 +729,7 @@ pub(super) fn test_renderable_surface(
         placement: SurfacePlacement::root(),
         render_placement: None,
         visual_clip: None,
+        render_target_size: None,
         commit_sequence: SurfaceCommitSequence::initial(),
         generation: 0,
         buffer: CommittedSurfaceBuffer::shm_snapshot(

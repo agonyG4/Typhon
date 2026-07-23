@@ -2,6 +2,20 @@ use std::num::NonZeroU64;
 
 use super::*;
 
+fn rectangles_overlap(
+    (left_x, left_y, left_width, left_height): (i32, i32, u32, u32),
+    (right_x, right_y, right_width, right_height): (i32, i32, u32, u32),
+) -> bool {
+    let left_right = i64::from(left_x) + i64::from(left_width);
+    let right_right = i64::from(right_x) + i64::from(right_width);
+    let left_bottom = i64::from(left_y) + i64::from(left_height);
+    let right_bottom = i64::from(right_y) + i64::from(right_height);
+    i64::from(left_x) < right_right
+        && i64::from(right_x) < left_right
+        && i64::from(left_y) < right_bottom
+        && i64::from(right_y) < left_bottom
+}
+
 impl CompositorState {
     pub(in crate::compositor) fn toplevel_window_id(&self, surface_id: u32) -> Option<WindowId> {
         self.toplevel_surfaces
@@ -63,7 +77,11 @@ impl CompositorState {
         }
         let initial_placement = match window.x11_placement_policy {
             Some(X11PlacementPolicy::CompositorManaged) => {
-                Some(self.next_managed_x11_frame_placement())
+                let size = window
+                    .x11_geometry
+                    .map(|geometry| (geometry.frame.width.max(1), geometry.frame.height.max(1)))
+                    .unwrap_or((1, 1));
+                Some(self.allocate_managed_frame(None, size))
             }
             Some(
                 X11PlacementPolicy::ClientPositioned
@@ -101,24 +119,89 @@ impl CompositorState {
         Ok(())
     }
 
-    fn next_managed_x11_frame_placement(&self) -> SurfacePlacement {
-        self.next_managed_x11_frame_placement_excluding(None)
-    }
-
-    fn next_managed_x11_frame_placement_excluding(
+    fn allocate_managed_frame(
         &self,
         excluded: Option<WindowId>,
+        (width, height): (u32, u32),
     ) -> SurfacePlacement {
-        let ordinal = self
+        let width = width.max(1);
+        let height = height.max(1);
+        let occupied = self
             .desktop_windows
             .values()
-            .filter(|window| {
-                Some(window.id) != excluded
-                    && window.x11_placement_policy == Some(X11PlacementPolicy::CompositorManaged)
-            })
-            .count();
-        let (x, y) = crate::compositor::render::cascaded_root_position(ordinal);
+            .filter(|window| Some(window.id) != excluded && !window.state.is_minimized())
+            .filter_map(|window| self.desktop_window_frame(window.id))
+            .collect::<Vec<_>>();
+
+        let candidate_count = self
+            .desktop_windows
+            .len()
+            .saturating_add(occupied.len())
+            .saturating_add(64);
+        let usable = self.usable_output_geometry();
+        let min_x = usable.x as i32;
+        let min_y = usable.y as i32;
+        let max_x = (usable.x + (usable.width - f64::from(width)).max(0.0)) as i32;
+        let max_y = (usable.y + (usable.height - f64::from(height)).max(0.0)) as i32;
+        let mut visible_fallback = None;
+        let mut distinct_visible_fallback = None;
+        for ordinal in 0..=candidate_count {
+            let (x, y) = crate::compositor::render::cascaded_root_position(ordinal);
+            let x = x.clamp(min_x, max_x);
+            let y = y.clamp(min_y, max_y);
+            let candidate = (x, y, width, height);
+            visible_fallback.get_or_insert(candidate);
+            if distinct_visible_fallback.is_none()
+                && occupied
+                    .iter()
+                    .all(|(existing_x, existing_y, _, _)| *existing_x != x || *existing_y != y)
+            {
+                distinct_visible_fallback = Some(candidate);
+            }
+            if !occupied
+                .iter()
+                .any(|existing| rectangles_overlap(candidate, *existing))
+            {
+                return SurfacePlacement::absolute_root_at(x, y);
+            }
+        }
+
+        let (x, y, _, _) = distinct_visible_fallback
+            .or(visible_fallback)
+            .unwrap_or((min_x, min_y, width, height));
         SurfacePlacement::absolute_root_at(x, y)
+    }
+
+    fn desktop_window_frame(&self, window_id: WindowId) -> Option<(i32, i32, u32, u32)> {
+        let window = self.window(window_id)?;
+        if let Some(geometry) = window.x11_geometry {
+            return Some((
+                geometry.frame.placement.local_x,
+                geometry.frame.placement.local_y,
+                geometry.frame.width.max(1),
+                geometry.frame.height.max(1),
+            ));
+        }
+
+        let ordinal = self
+            .window_stacking
+            .iter()
+            .position(|candidate| *candidate == window_id)
+            .unwrap_or(0);
+        let geometry = self
+            .current_root_window_geometry(window.root_surface_id)
+            .unwrap_or_else(|| WindowGeometry::new(SurfacePlacement::root(), 800, 600));
+        let (cascade_x, cascade_y) = crate::compositor::render::cascaded_root_position(ordinal);
+        let (x, y) = match geometry.placement.root_mode {
+            crate::compositor::RootPlacementMode::CascadedWindow => (
+                cascade_x + geometry.placement.local_x,
+                cascade_y + geometry.placement.local_y,
+            ),
+            crate::compositor::RootPlacementMode::Absolute => {
+                (geometry.placement.local_x, geometry.placement.local_y)
+            }
+        };
+        Some((x, y, geometry.width.max(1), geometry.height.max(1)))
     }
 
     pub(in crate::compositor) fn remove_desktop_window(
@@ -170,6 +253,7 @@ impl CompositorState {
         {
             return Err(X11SurfaceAttachmentError::DuplicateSurface);
         }
+        self.xwayland.retired_surface_ids.remove(&surface_id);
         let old_surface_id = self
             .window(window_id)
             .and_then(|window| window.x11_surface_id);
@@ -192,11 +276,22 @@ impl CompositorState {
         window.root_surface_id = surface_id;
         window.x11_surface_id = Some(surface_id);
         if let Some(placement) = replacement_placement {
+            let active_visual_placement = self
+                .toplevel_visual_geometries
+                .get(&surface_id)
+                .filter(|visual| visual.active_resize.is_some())
+                .map(|visual| visual.placement);
             self.set_surface_placement_with_cause(
                 surface_id,
                 placement,
                 RenderGenerationCause::WindowMove,
             );
+            if let Some(visual_placement) = active_visual_placement {
+                if let Some(visual) = self.toplevel_visual_geometries.get_mut(&surface_id) {
+                    visual.placement = visual_placement;
+                }
+                self.update_toplevel_visual_render_assignment(surface_id);
+            }
         }
         Ok(old_surface_id)
     }
@@ -326,52 +421,28 @@ impl CompositorState {
         } else {
             ToplevelMode::Floating
         };
-        if let Some(window) = self.window_mut(window_id) {
-            if mode != ToplevelMode::Floating {
-                window.state.capture_restore_geometry(restore_geometry);
+        if mode == ToplevelMode::Floating {
+            if let Some(window) = self.window_mut(window_id) {
+                window.state.set_mode(mode);
             }
-            window.state.set_mode(mode);
-        }
-        let target_geometry = self.window_geometry_for_mode(mode);
-        self.set_surface_placement_with_cause(
-            root_surface_id,
-            if mode == ToplevelMode::Floating {
-                floating_placement
-            } else {
-                target_geometry.placement
-            },
-            RenderGenerationCause::WindowMode,
-        );
-        if let Some(window) = self.window_mut(window_id)
-            && let Some(x11_geometry) = window.x11_geometry.as_mut()
-        {
-            x11_geometry.frame = if mode == ToplevelMode::Floating {
-                restore_geometry
-            } else {
-                target_geometry
-            };
-        }
-        if state.hidden {
-            if !self.minimize_desktop_window(window_id)
+            let _ = self.set_x11_frame_geometry(window_id, restore_geometry);
+            self.set_surface_placement_with_cause(
+                root_surface_id,
+                floating_placement,
+                RenderGenerationCause::WindowMode,
+            );
+            self.install_x11_visual_geometry(root_surface_id, restore_geometry);
+            if state.hidden
+                && !self.minimize_desktop_window(window_id)
                 && let Some(window) = self.window_mut(window_id)
             {
                 window.state.mark_minimized_without_surfaces();
             }
-        } else if self
-            .window(window_id)
-            .is_some_and(|window| window.state.is_minimized())
-        {
-            self.restore_minimized_desktop_window(window_id);
-        }
-        if mode == ToplevelMode::Fullscreen && !state.hidden {
-            self.set_fullscreen_presentation_owner(root_surface_id);
-        } else {
             self.clear_fullscreen_presentation_owner(root_surface_id);
+            self.queue_backend_state(window_id);
+        } else {
+            self.transition_x11_window_mode(window_id, mode, state.hidden);
         }
-        if mode != ToplevelMode::Floating {
-            self.queue_backend_configure(window_id, target_geometry, mode, false);
-        }
-        self.queue_backend_state(window_id);
         true
     }
 
@@ -505,10 +576,16 @@ impl CompositorState {
                     current_frame
                         .map(|geometry| geometry.placement)
                         .unwrap_or_else(|| {
-                            self.next_managed_x11_frame_placement_excluding(Some(window_id))
+                            self.allocate_managed_frame(
+                                Some(window_id),
+                                (client.width.max(1), client.height.max(1)),
+                            )
                         })
                 } else {
-                    self.next_managed_x11_frame_placement_excluding(Some(window_id))
+                    self.allocate_managed_frame(
+                        Some(window_id),
+                        (client.width.max(1), client.height.max(1)),
+                    )
                 }
             }
             Some(
@@ -667,6 +744,29 @@ impl CompositorState {
         })
     }
 
+    #[cfg(test)]
+    pub(in crate::compositor) fn x11_client_render_target_size(
+        &self,
+        surface_id: u32,
+        committed_size: BufferSize,
+    ) -> Option<BufferSize> {
+        let window_id = self.window_id_for_surface(surface_id)?;
+        let window = self.window(window_id)?;
+        if window.root_surface_id != surface_id
+            || window.kind != DesktopWindowKind::Managed
+            || !window.is_normal_x11_role()
+            || window.x11_placement_policy != Some(X11PlacementPolicy::CompositorManaged)
+            || self
+                .active_toplevel_resizes
+                .contains_key(&window.root_surface_id)
+        {
+            return None;
+        }
+        let geometry = window.x11_geometry?.frame;
+        let target_size = BufferSize::new(geometry.width, geometry.height)?;
+        (target_size != committed_size).then_some(target_size)
+    }
+
     pub(in crate::compositor) fn set_x11_geometry(
         &mut self,
         handle: X11WindowHandle,
@@ -678,9 +778,19 @@ impl CompositorState {
         let Some(filtered) = self.filter_x11_geometry(handle, geometry) else {
             return false;
         };
-        let Some((root_surface_id, placement_policy)) = self
-            .window(window_id)
-            .map(|window| (window.root_surface_id, window.x11_placement_policy))
+        let Some((root_surface_id, placement_policy, normal_managed, resize_active)) =
+            self.window(window_id).map(|window| {
+                (
+                    window.root_surface_id,
+                    window.x11_placement_policy,
+                    window.kind == DesktopWindowKind::Managed
+                        && window.is_normal_x11_role()
+                        && window.x11_placement_policy
+                            == Some(X11PlacementPolicy::CompositorManaged),
+                    self.active_toplevel_resizes
+                        .contains_key(&window.root_surface_id),
+                )
+            })
         else {
             return false;
         };
@@ -711,11 +821,25 @@ impl CompositorState {
             x11_geometry.frame =
                 WindowGeometry::new(placement, filtered.width.max(1), filtered.height.max(1));
         }
-        self.set_surface_placement_with_cause(
+
+        let frame = WindowGeometry::new(placement, filtered.width.max(1), filtered.height.max(1));
+        let visual_changed = normal_managed
+            && !resize_active
+            && self.current_visual_root_window_geometry(root_surface_id) != Some(frame);
+        let placement_changed = self.set_surface_placement_with_cause(
             root_surface_id,
             placement,
-            RenderGenerationCause::WindowMove,
+            if visual_changed {
+                RenderGenerationCause::WindowResize
+            } else {
+                RenderGenerationCause::WindowMove
+            },
         );
+        if visual_changed {
+            self.install_x11_visual_geometry(root_surface_id, frame);
+        } else if placement_changed {
+            self.update_toplevel_visual_render_assignment(root_surface_id);
+        }
         true
     }
 
@@ -740,7 +864,12 @@ impl CompositorState {
         };
         let placement = match placement_policy {
             Some(X11PlacementPolicy::CompositorManaged) => {
-                persisted_placement.unwrap_or_else(|| self.next_managed_x11_frame_placement())
+                persisted_placement.unwrap_or_else(|| {
+                    self.allocate_managed_frame(
+                        None,
+                        (geometry.width.max(1), geometry.height.max(1)),
+                    )
+                })
             }
             Some(
                 X11PlacementPolicy::ClientPositioned
@@ -817,6 +946,15 @@ impl CompositorState {
         window.x11_geometry.map(|geometry| geometry.client)
     }
 
+    pub(in crate::compositor) fn x11_placement_policy(
+        &self,
+        handle: X11WindowHandle,
+    ) -> Option<X11PlacementPolicy> {
+        self.window_id_for_x11_handle(handle)
+            .and_then(|window_id| self.window(window_id))
+            .and_then(|window| window.x11_placement_policy)
+    }
+
     pub(in crate::compositor) fn apply_x11_published_state(
         &mut self,
         handle: X11WindowHandle,
@@ -832,31 +970,7 @@ impl CompositorState {
         } else {
             ToplevelMode::Floating
         };
-        let Some(root_surface_id) = self.window(window_id).map(|window| window.root_surface_id)
-        else {
-            return false;
-        };
-        let minimized = self
-            .window(window_id)
-            .is_some_and(|window| window.state.is_minimized());
-        if let Some(window) = self.window_mut(window_id) {
-            window.state.set_mode(mode);
-        }
-        if state.hidden && !minimized {
-            let _ = self.minimize_desktop_window(window_id);
-        } else if !state.hidden && minimized {
-            let _ = self.restore_minimized_desktop_window(window_id);
-        }
-        let placement = match mode {
-            ToplevelMode::Fullscreen => self.fullscreen_window_geometry().placement,
-            ToplevelMode::Maximized => self.maximized_window_geometry().placement,
-            ToplevelMode::Floating => self.surface_placement(root_surface_id),
-        };
-        self.set_surface_placement_with_cause(
-            root_surface_id,
-            placement,
-            RenderGenerationCause::WindowMode,
-        );
+        self.transition_x11_window_mode(window_id, mode, state.hidden);
         true
     }
 
@@ -911,7 +1025,9 @@ impl CompositorState {
         self.normalize_window_stacking();
         if x11_window {
             self.backend_commands.push(
-                crate::compositor::window_backend::WindowBackendCommand::Restack { window: id },
+                crate::compositor::window_backend::WindowBackendCommand::RestackExact {
+                    windows: self.x11_stack_window_ids(),
+                },
             );
         }
         true
@@ -1127,6 +1243,26 @@ impl CompositorState {
             })
             .collect::<Vec<_>>();
         (client_list, stacking)
+    }
+
+    pub(in crate::compositor) fn x11_stack_window_ids(&self) -> Vec<WindowId> {
+        self.window_stacking
+            .iter()
+            .filter_map(|id| self.window(*id))
+            .filter(|window| matches!(window.backend, WindowBackend::X11(_)))
+            .map(|window| window.id)
+            .collect()
+    }
+
+    pub(in crate::compositor) fn x11_stack_handles(&self) -> Vec<X11WindowHandle> {
+        self.window_stacking
+            .iter()
+            .filter_map(|id| self.window(*id))
+            .filter_map(|window| match window.backend {
+                WindowBackend::X11(handle) => Some(handle),
+                WindowBackend::Xdg(_) => None,
+            })
+            .collect()
     }
 
     pub(in crate::compositor) fn queue_backend_configure(

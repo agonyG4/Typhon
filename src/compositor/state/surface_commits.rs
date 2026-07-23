@@ -11,6 +11,9 @@ impl CompositorState {
         window_geometry: Option<XdgWindowGeometry>,
         source: SurfacePublicationSource,
     ) {
+        // Every call carries a wl_surface buffer attachment, even when the
+        // client reattaches the same wl_buffer. Native presentation therefore
+        // treats this boundary as new content rather than metadata-only work.
         let resize_commit = pending.resize_commit.as_deref().copied();
         let commit_sequence = pending.commit_sequence;
         let generation = self.next_render_generation_value();
@@ -315,6 +318,8 @@ impl CompositorState {
         buffer_scale: u32,
         window_geometry: Option<XdgWindowGeometry>,
     ) -> bool {
+        // This path updates committed surface metadata and damage without a
+        // wl_surface buffer attachment, so it retains the current content.
         let Some(current) = self.current_surface_buffers.get(&surface_id).cloned() else {
             return false;
         };
@@ -435,7 +440,6 @@ impl CompositorState {
             journal_size.width,
             journal_size.height,
         );
-        self.set_render_generation(generation, RenderGenerationCause::SurfaceDamage);
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
         if self
             .toplevel_visual_geometries
@@ -443,6 +447,7 @@ impl CompositorState {
         {
             self.update_toplevel_visual_render_assignment(root_surface_id);
         }
+        self.set_render_generation(generation, RenderGenerationCause::SurfaceDamage);
         if matches!(self.surface_role(surface_id), SurfaceRole::Xwayland) {
             self.note_xwayland_commit_observed(
                 surface_id,
@@ -941,7 +946,6 @@ impl CompositorState {
         );
         self.complete_frame_callbacks(callbacks);
     }
-
     pub(in crate::compositor) fn unmap_surface_content(&mut self, surface_id: u32) -> bool {
         let renderable_ids = self
             .renderable_surfaces
@@ -1005,7 +1009,6 @@ impl CompositorState {
             }
             let _ = self.focus_topmost_renderable_toplevel();
         }
-
         self.invalidate_surface_origin_cache();
         self.advance_render_generation(RenderGenerationCause::SurfaceUnmap);
         true
@@ -1124,6 +1127,8 @@ impl CompositorState {
         let before_previews = self.active_toplevel_resizes.len();
         self.active_toplevel_resizes
             .retain(|surface_id, _| !surface_ids.contains(surface_id));
+        self.pending_xwayland_visual_content
+            .retain(|id| !surface_ids.contains(id));
         let removed_previews = before_previews.saturating_sub(self.active_toplevel_resizes.len());
         let visual_ids = self
             .toplevel_visual_geometries

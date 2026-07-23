@@ -147,6 +147,7 @@ enum ParsedProperty {
     Protocols {
         supports_delete: bool,
         supports_take_focus: bool,
+        supports_sync_request: bool,
     },
     SyncCounter(Option<u64>),
     State(crate::xwayland::xwm::X11PublishedState),
@@ -493,6 +494,7 @@ fn complete_property(
     let mut requery = false;
     let mut delta = None;
     let mut sync_counter_changed = false;
+    let mut sync_request_support_changed = false;
     {
         let Some(record) = xwm.windows.get_mut(pending.handle) else {
             xwm.property_metrics.stale = xwm.property_metrics.stale.saturating_add(1);
@@ -517,9 +519,12 @@ fn complete_property(
             record.resolved_properties |= bit;
             if !record.refresh_all {
                 let previous_sync_counter = record.properties.sync_counter;
+                let previous_sync_request_support = record.properties.supports_sync_request;
                 delta = commit_property(record, pending.kind);
                 sync_counter_changed = pending.kind == PropertyKind::NetWmSyncRequestCounter
                     && previous_sync_counter != record.properties.sync_counter;
+                sync_request_support_changed = pending.kind == PropertyKind::WmProtocols
+                    && previous_sync_request_support != record.properties.supports_sync_request;
                 record.refresh_properties &= !bit;
             }
         }
@@ -527,10 +532,12 @@ fn complete_property(
     if requery {
         issue_property(xwm, pending.handle, pending.kind, pending.epoch)?;
     } else {
-        if sync_counter_changed {
+        if sync_counter_changed || sync_request_support_changed {
+            xwm.reset_sync_counter_initialization(pending.handle);
             xwm.clear_resize_sync(pending.handle);
         }
         maybe_finish_refresh(xwm, pending.handle)?;
+        initialize_sync_counter_from_properties(xwm, pending.handle)?;
         match xwm
             .windows
             .reconcile_auxiliary(pending.handle)
@@ -564,6 +571,27 @@ fn complete_property(
             .field("property_epoch", pending.epoch)
             .field("requery", requery)
     });
+    Ok(())
+}
+
+fn initialize_sync_counter_from_properties(
+    xwm: &mut Xwm,
+    handle: X11WindowHandle,
+) -> Result<(), XwmError> {
+    let Some((supports_sync_request, sync_counter)) = xwm.windows.get(handle).map(|record| {
+        (
+            record.properties.supports_sync_request,
+            record.properties.sync_counter,
+        )
+    }) else {
+        return Ok(());
+    };
+    if !xwm.capabilities.sync || !supports_sync_request {
+        return Ok(());
+    }
+    if let Some(sync_counter) = sync_counter.and_then(|value| u32::try_from(value).ok()) {
+        super::commands::initialize_sync_counter(xwm, handle, sync_counter)?;
+    }
     Ok(())
 }
 
@@ -602,6 +630,8 @@ fn maybe_finish_refresh(xwm: &mut Xwm, handle: X11WindowHandle) -> Result<(), Xw
             properties_ready,
             window_types,
             transient_for,
+            supports_sync_request,
+            sync_counter,
         )) = xwm.windows.get_mut(handle).map(|record| {
             let sync_counter_changed =
                 record.properties.sync_counter != record.staging_properties.sync_counter;
@@ -617,6 +647,8 @@ fn maybe_finish_refresh(xwm: &mut Xwm, handle: X11WindowHandle) -> Result<(), Xw
                 record.properties_ready,
                 record.properties.window_types.clone(),
                 record.properties.transient_for,
+                record.properties.supports_sync_request,
+                record.properties.sync_counter,
             )
         })
         else {
@@ -632,7 +664,14 @@ fn maybe_finish_refresh(xwm: &mut Xwm, handle: X11WindowHandle) -> Result<(), Xw
                 .optional("transient_for", transient_for.map(|parent| parent.xid()))
         });
         if sync_counter_changed {
+            xwm.reset_sync_counter_initialization(handle);
             xwm.clear_resize_sync(handle);
+        }
+        if xwm.capabilities.sync
+            && supports_sync_request
+            && let Some(sync_counter) = sync_counter.and_then(|value| u32::try_from(value).ok())
+        {
+            super::commands::initialize_sync_counter(xwm, handle, sync_counter)?;
         }
     } else if let Some(record) = xwm.windows.get_mut(handle) {
         record.refresh_properties = 0;
@@ -682,6 +721,8 @@ fn commit_property(
         PropertyKind::WmProtocols => {
             record.properties.supports_delete = record.staging_properties.supports_delete;
             record.properties.supports_take_focus = record.staging_properties.supports_take_focus;
+            record.properties.supports_sync_request =
+                record.staging_properties.supports_sync_request;
         }
         PropertyKind::NetWmSyncRequestCounter => {
             record.properties.sync_counter = record.staging_properties.sync_counter;
@@ -744,6 +785,7 @@ fn update_snapshot(record: &mut X11WindowRecord) {
         record.kind == crate::compositor::DesktopWindowKind::OverrideRedirect;
     snapshot.supports_delete = record.properties.supports_delete;
     snapshot.supports_take_focus = record.properties.supports_take_focus;
+    snapshot.supports_sync_request = record.properties.supports_sync_request;
     snapshot.accepts_input = record.properties.accepts_input;
     snapshot.sync_counter = record.properties.sync_counter;
     snapshot.state = record.properties.state;
@@ -783,9 +825,11 @@ fn apply_parsed(
         ParsedProperty::Protocols {
             supports_delete,
             supports_take_focus,
+            supports_sync_request,
         } => {
             properties.supports_delete = supports_delete;
             properties.supports_take_focus = supports_take_focus;
+            properties.supports_sync_request = supports_sync_request;
         }
         ParsedProperty::SyncCounter(value) => properties.sync_counter = value,
         ParsedProperty::State(value) => properties.state = value,
@@ -824,6 +868,7 @@ fn fallback_for(kind: PropertyKind) -> ParsedProperty {
         PropertyKind::WmProtocols => ParsedProperty::Protocols {
             supports_delete: false,
             supports_take_focus: false,
+            supports_sync_request: false,
         },
         PropertyKind::NetWmSyncRequestCounter => ParsedProperty::SyncCounter(None),
         PropertyKind::NetWmState => ParsedProperty::State(Default::default()),
@@ -1037,6 +1082,7 @@ fn parse_protocols(reply: &xproto::GetPropertyReply, xwm: &Xwm) -> Option<Parsed
     Some(ParsedProperty::Protocols {
         supports_delete: values.contains(&xwm.atoms.get(XwmAtomName::WmDeleteWindow)),
         supports_take_focus: values.contains(&xwm.atoms.get(XwmAtomName::WmTakeFocus)),
+        supports_sync_request: values.contains(&xwm.atoms.get(XwmAtomName::NetWmSyncRequest)),
     })
 }
 
@@ -1222,6 +1268,7 @@ mod tests {
             startup_id: None,
             user_time: None,
             urgency: false,
+            supports_sync_request: false,
             sync_counter: Some(9),
         });
         let record = registry.get_mut(handle).expect("snapshot record");
@@ -1259,6 +1306,7 @@ mod tests {
             startup_id: None,
             user_time: None,
             urgency: false,
+            supports_sync_request: false,
             sync_counter: Some(11),
         });
         let record = registry.get_mut(handle).expect("snapshot record");

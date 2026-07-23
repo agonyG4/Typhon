@@ -68,6 +68,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             xwm.windows
                 .mark_map_requested(handle)
                 .map_err(XwmError::InvalidCommand)?;
+            xwm.begin_map_to_association_wait(handle)?;
             xwm.refresh_window_properties(handle)?;
             xwm.emit_ready_if_complete(handle)?;
             trace_window_state(xwm, "map_request_processed", handle, TraceFields::new());
@@ -84,17 +85,20 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 xwm.windows
                     .confirm_map_notify(handle)
                     .map_err(XwmError::InvalidCommand)?;
+                xwm.begin_map_to_association_wait(handle)?;
                 let ready_emitted = xwm.emit_ready_if_complete(handle)?;
                 let lifecycle = xwm
                     .windows
                     .get(handle)
                     .map(|record| format!("{:?}", record.lifecycle))
                     .unwrap_or_else(|| "Unknown".to_owned());
-                eprintln!(
-                    "oblivion-one xwayland: event=xwm_map_notify window={} pending_map=true ready_emitted={} lifecycle={lifecycle}",
-                    handle.xid(),
-                    ready_emitted,
-                );
+                trace::emit("xwm_map_notify", || {
+                    TraceFields::new()
+                        .field("window", handle.xid())
+                        .field("pending_map", true)
+                        .field("ready_emitted", ready_emitted)
+                        .field("lifecycle", lifecycle)
+                });
                 trace_window_state(
                     xwm,
                     "map_notify_processed",
@@ -106,6 +110,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             xwm.windows
                 .confirm_external_map_notify(handle)
                 .map_err(XwmError::InvalidCommand)?;
+            xwm.begin_map_to_association_wait(handle)?;
             xwm.refresh_window_properties(handle)?;
             let ready_emitted = xwm.emit_ready_if_complete(handle)?;
             let lifecycle = xwm
@@ -113,11 +118,13 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 .get(handle)
                 .map(|record| format!("{:?}", record.lifecycle))
                 .unwrap_or_else(|| "Unknown".to_owned());
-            eprintln!(
-                "oblivion-one xwayland: event=xwm_map_notify window={} pending_map=false ready_emitted={} lifecycle={lifecycle}",
-                handle.xid(),
-                ready_emitted,
-            );
+            trace::emit("xwm_map_notify", || {
+                TraceFields::new()
+                    .field("window", handle.xid())
+                    .field("pending_map", false)
+                    .field("ready_emitted", ready_emitted)
+                    .field("lifecycle", lifecycle)
+            });
             trace_window_state(
                 xwm,
                 "map_notify_processed",
@@ -130,6 +137,8 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             let Some(record) = xwm.windows.get(handle) else {
                 return Ok(());
             };
+            xwm.adoption
+                .cancel(handle, super::adoption::AdoptionCancelReason::Unmap);
             let was_ready = record.snapshot.is_some()
                 || matches!(record.lifecycle, X11WindowLifecycle::Renderable);
             let association = record.association;
@@ -167,7 +176,10 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         Event::DestroyNotify(event) => {
             let handle = X11WindowHandle::new(xwm.generation, event.window);
             xwm.note_focus_destroyed(event.window);
+            xwm.adoption
+                .cancel(handle, super::adoption::AdoptionCancelReason::Destroy);
             xwm.clear_resize_sync(handle);
+            xwm.reset_sync_counter_initialization(handle);
             xwm.association.remove_x11_window(handle);
             let Some(_record) = xwm
                 .windows
@@ -669,6 +681,7 @@ mod tests {
             focus: super::super::focus::FocusTracker::default(),
             sync_alarms: Default::default(),
             sync_handles_by_counter: Default::default(),
+            sync_counter_initializations: Default::default(),
             timed_out_resize_counters: Default::default(),
             next_resize_counter_values: Default::default(),
             family_order: Default::default(),

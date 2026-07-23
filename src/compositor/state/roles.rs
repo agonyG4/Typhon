@@ -68,6 +68,7 @@ pub(in crate::compositor) struct XwaylandCompositorState {
     pub(in crate::compositor) client_identity: Option<XwaylandClientIdentity>,
     pub(in crate::compositor) buffer_ready_events: Vec<super::XwaylandSurfaceCommitObserved>,
     pub(in crate::compositor) buffer_level_events: Vec<(XwaylandGeneration, u32)>,
+    pub(in crate::compositor) retired_surface_ids: HashSet<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

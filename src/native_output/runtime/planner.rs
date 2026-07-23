@@ -1,4 +1,32 @@
 use oblivion_one::native::kms::{AtomicKmsError, AtomicKmsErrorKind, KmsPolicy};
+use oblivion_one::native::presentation_deadline::{
+    MonotonicTimestampNs, PresentationDeadlinePlanner, PresentationTarget, PresentationTargetReason,
+};
+use oblivion_one::native::scheduler::NativeOutputPacingMode;
+use std::time::Duration;
+
+pub(super) fn plan_scheduled_target_for_mode(
+    planner: &mut PresentationDeadlinePlanner,
+    pacing_mode: NativeOutputPacingMode,
+    pending_target: Option<PresentationTarget>,
+    now: MonotonicTimestampNs,
+    predicted_total_cost: Duration,
+    reason: PresentationTargetReason,
+) -> Option<PresentationTarget> {
+    if pacing_mode != NativeOutputPacingMode::PredictiveTriple {
+        return None;
+    }
+    planner.plan_render_ahead(pending_target?, now, predicted_total_cost, reason)
+}
+
+pub(super) fn visual_target_deadline_for_mode(
+    pacing_mode: NativeOutputPacingMode,
+    scheduled_target: Option<PresentationTarget>,
+) -> Option<u64> {
+    (pacing_mode == NativeOutputPacingMode::PredictiveTriple)
+        .then(|| scheduled_target.map(|target| target.render_start_deadline.get()))
+        .flatten()
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum NativeKmsStartupDecision {
@@ -119,6 +147,10 @@ pub(crate) struct NativePresentationPlanInput {
     pub(crate) cursor_hardware_usable: bool,
     pub(crate) cursor_visible: bool,
     pub(crate) atomic_commit_pending: bool,
+    /// Whether a cursor-only transaction may use the primary presentation
+    /// lane in this scheduling cycle.  A queued cursor state is harmless;
+    /// submitting it while a primary producer is active is not.
+    pub(crate) cursor_only_allowed: bool,
     pub(crate) render_ahead_requested: bool,
 }
 
@@ -140,7 +172,10 @@ pub(crate) fn plan_native_presentation_path(
         if input.direct_candidate_changed {
             return NativePresentationPath::DirectPrimary;
         }
-        if input.cursor_changed && (!input.cursor_visible || input.cursor_hardware_usable) {
+        if input.cursor_changed
+            && input.cursor_only_allowed
+            && (!input.cursor_visible || input.cursor_hardware_usable)
+        {
             return NativePresentationPath::CursorOnly;
         }
         return NativePresentationPath::IdleDirect;
@@ -152,7 +187,10 @@ pub(crate) fn plan_native_presentation_path(
     if input.direct_candidate_changed {
         return NativePresentationPath::DirectPrimary;
     }
-    if input.cursor_changed && (!input.cursor_visible || input.cursor_hardware_usable) {
+    if input.cursor_changed
+        && input.cursor_only_allowed
+        && (!input.cursor_visible || input.cursor_hardware_usable)
+    {
         return NativePresentationPath::CursorOnly;
     }
     let _ = input.render_ahead_requested;
@@ -161,6 +199,7 @@ pub(crate) fn plan_native_presentation_path(
 
 #[cfg(test)]
 mod tests {
+    use super::super::{NativeCursorOutputArbitration, NativeCursorOutputDisposition};
     use crate::native_output::{NativeScanoutKind, runtime::NativeCursorPreference};
     use oblivion_one::native::kms::{
         AtomicKmsError, AtomicKmsErrorKind, KmsBackendKind, KmsPolicy,
@@ -388,6 +427,7 @@ mod tests {
             cursor_hardware_usable: true,
             cursor_visible: true,
             atomic_commit_pending: false,
+            cursor_only_allowed: true,
             render_ahead_requested: false,
         }
     }
@@ -406,6 +446,57 @@ mod tests {
             plan_native_presentation_path(NativePresentationPlanInput {
                 cursor_changed: true,
                 ..direct_input()
+            }),
+            NativePresentationPath::CursorOnly
+        );
+    }
+
+    #[test]
+    fn active_primary_can_defer_cursor_motion_without_reordering_primary_work() {
+        assert_eq!(
+            plan_native_presentation_path(NativePresentationPlanInput {
+                cursor_changed: true,
+                cursor_only_allowed: false,
+                ..direct_input()
+            }),
+            NativePresentationPath::IdleDirect
+        );
+    }
+
+    #[test]
+    fn event_order_primary_response_preempts_queued_cursor_plan() {
+        let mut arbitration = NativeCursorOutputArbitration::default();
+        arbitration.request(1, 0, 6_060_606);
+
+        // The pointer response is observed first.  The client buffer arrives
+        // later in the same output opportunity and consumes the cursor state.
+        assert_eq!(
+            arbitration.disposition(100_000, false, true),
+            NativeCursorOutputDisposition::DeferForPrimary
+        );
+        assert_eq!(
+            arbitration.disposition(3_000_000, true, true),
+            NativeCursorOutputDisposition::PiggybackPrimary
+        );
+        arbitration.consume(1);
+        assert!(!arbitration.pending());
+    }
+
+    #[test]
+    fn idle_output_still_allows_one_coalesced_cursor_only_update() {
+        assert_eq!(
+            plan_native_presentation_path(NativePresentationPlanInput {
+                direct_active: true,
+                direct_candidate_changed: false,
+                direct_candidate_eligible: true,
+                primary_visual_work_pending: false,
+                composition_required: false,
+                cursor_changed: true,
+                cursor_hardware_usable: true,
+                cursor_visible: true,
+                atomic_commit_pending: false,
+                cursor_only_allowed: true,
+                render_ahead_requested: false,
             }),
             NativePresentationPath::CursorOnly
         );

@@ -1,5 +1,6 @@
 use super::output::test_renderable_surface;
 use super::*;
+use crate::native_output::runtime::{NativeCursorOutputArbitration, NativeCursorOutputDisposition};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReactiveHandoffOperation {
@@ -396,11 +397,31 @@ fn native_repaint_decision_skips_visible_frame_callback_without_damage() {
             pending_frame_work: true,
             only_pending_surface_frame_callbacks: true,
             redraw_requested: false,
+            cursor_work_pending: false,
             page_flip_pending: false,
         }),
         NativeRepaintDecision {
             repaint: false,
             protocol_only_present: true,
+        }
+    );
+}
+
+#[test]
+fn accepting_client_without_visual_work_does_not_request_repaint() {
+    assert_eq!(
+        native_repaint_decision(NativeRepaintInputs {
+            accepted_clients: true,
+            render_generation_changed: false,
+            pending_frame_work: false,
+            only_pending_surface_frame_callbacks: false,
+            redraw_requested: false,
+            cursor_work_pending: false,
+            page_flip_pending: false,
+        }),
+        NativeRepaintDecision {
+            repaint: false,
+            protocol_only_present: false,
         }
     );
 }
@@ -414,6 +435,7 @@ fn native_repaint_decision_paints_non_callback_pending_frame_work() {
             pending_frame_work: true,
             only_pending_surface_frame_callbacks: false,
             redraw_requested: false,
+            cursor_work_pending: false,
             page_flip_pending: false,
         }),
         NativeRepaintDecision {
@@ -432,6 +454,26 @@ fn native_repaint_decision_paints_visual_changes_even_with_frame_callback() {
             pending_frame_work: true,
             only_pending_surface_frame_callbacks: true,
             redraw_requested: false,
+            cursor_work_pending: false,
+            page_flip_pending: false,
+        }),
+        NativeRepaintDecision {
+            repaint: true,
+            protocol_only_present: false,
+        }
+    );
+}
+
+#[test]
+fn native_repaint_decision_paints_cursor_work_without_primary_work() {
+    assert_eq!(
+        native_repaint_decision(NativeRepaintInputs {
+            accepted_clients: false,
+            render_generation_changed: false,
+            pending_frame_work: false,
+            only_pending_surface_frame_callbacks: false,
+            redraw_requested: false,
+            cursor_work_pending: true,
             page_flip_pending: false,
         }),
         NativeRepaintDecision {
@@ -450,11 +492,114 @@ fn native_repaint_decision_waits_for_pending_pageflip_before_repaint() {
             pending_frame_work: true,
             only_pending_surface_frame_callbacks: false,
             redraw_requested: true,
+            cursor_work_pending: false,
             page_flip_pending: true,
         }),
         NativeRepaintDecision {
             repaint: false,
             protocol_only_present: false,
         }
+    );
+}
+
+#[test]
+fn cursor_output_work_waits_for_the_next_output_deadline() {
+    let mut arbitration = NativeCursorOutputArbitration::default();
+
+    arbitration.request(1, 1_000, 2_000);
+
+    assert_eq!(arbitration.deadline_ns(), Some(2_000));
+    assert_eq!(
+        arbitration.disposition(1_999, false, true),
+        NativeCursorOutputDisposition::DeferForPrimary
+    );
+    assert_eq!(
+        arbitration.disposition(2_000, false, true),
+        NativeCursorOutputDisposition::SubmitCursorOnly
+    );
+}
+
+#[test]
+fn primary_work_has_right_of_first_refusal_at_the_cursor_deadline() {
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    arbitration.request(7, 1_000, 2_000);
+
+    assert_eq!(
+        arbitration.disposition(1_100, true, true),
+        NativeCursorOutputDisposition::PiggybackPrimary
+    );
+    assert_eq!(
+        arbitration.disposition(2_000, true, true),
+        NativeCursorOutputDisposition::PiggybackPrimary
+    );
+}
+
+#[test]
+fn cursor_requests_coalesce_and_software_uses_the_same_deadline() {
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    arbitration.request(1, 1_000, 2_000);
+    arbitration.request(2, 1_100, 3_000);
+
+    assert_eq!(arbitration.desired_generation(), 2);
+    assert_eq!(arbitration.deadline_ns(), Some(2_000));
+    assert_eq!(
+        arbitration.disposition(2_000, false, false),
+        NativeCursorOutputDisposition::SoftwareOverlay
+    );
+}
+
+#[test]
+fn input_without_a_cursor_or_primary_response_produces_no_output_transaction() {
+    let arbitration = NativeCursorOutputArbitration::default();
+
+    assert_eq!(
+        arbitration.disposition(3_000, false, true),
+        NativeCursorOutputDisposition::Noop
+    );
+}
+
+#[test]
+fn button_cursor_and_later_primary_response_share_one_output_opportunity() {
+    let mut arbitration = NativeCursorOutputArbitration::default();
+
+    // Input delivery is immediate; only output submission is arbitrated.
+    let button_delivered = true;
+    arbitration.request(11, 100, 6_060_606);
+    assert!(button_delivered);
+    assert_eq!(
+        arbitration.disposition(200, false, true),
+        NativeCursorOutputDisposition::DeferForPrimary
+    );
+    assert_eq!(
+        arbitration.disposition(3_000_000, true, true),
+        NativeCursorOutputDisposition::PiggybackPrimary
+    );
+}
+
+#[test]
+fn one_thousand_pointer_updates_coalesce_before_the_primary_deadline() {
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    for generation in 1..=1_000 {
+        arbitration.request(generation, generation, 6_060_606);
+    }
+
+    assert_eq!(arbitration.desired_generation(), 1_000);
+    assert_eq!(arbitration.changes_coalesced(), 999);
+    assert_eq!(
+        arbitration.disposition(3_000_000, true, true),
+        NativeCursorOutputDisposition::PiggybackPrimary
+    );
+}
+
+#[test]
+fn busy_cursor_submission_moves_to_the_next_output_deadline() {
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    arbitration.request(1, 1_000, 2_000);
+    arbitration.defer_after_busy(2_000, 3_000);
+
+    assert_eq!(arbitration.deadline_ns(), Some(3_000));
+    assert_eq!(
+        arbitration.disposition(2_001, false, true),
+        NativeCursorOutputDisposition::DeferForPrimary
     );
 }

@@ -166,6 +166,7 @@ impl NativeSessionIo for NativeRuntime {
     fn quarantine_pageflip(&mut self) -> NativeResult<()> {
         self.frame_scheduler.abandon_for_session_suspend();
         self.atomic_commit_arbiter.abandon_for_recovery();
+        self.cursor_output_arbitration.clear();
         if let Some(token) = self.output_render_fence_token.take() {
             self.event_loop.unregister(token)?;
         }
@@ -237,7 +238,6 @@ impl NativeSessionIo for NativeRuntime {
                 cursor,
                 self.cursor_render_mode,
                 self.input_state.cursor_visible(),
-                self.server.client_cursor_render_state().is_some(),
             )
             .kms_state()
             .cloned()

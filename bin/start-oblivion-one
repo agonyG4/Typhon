@@ -32,6 +32,9 @@ Environment:
   OBLIVION_ONE_SOCKET    Wayland socket name (default: oblivion-one-sddm)
   OBLIVION_ONE_MODE      native KMS mode: auto, preferred, highres, highrr, or WIDTHxHEIGHT@HZ
   OBLIVION_ONE_CURSOR    native cursor backend: auto, hardware, or software
+  OBLIVION_ONE_DIRECT_SCANOUT direct policy: off (default) or experimental-auto
+  OBLIVION_ONE_TRIPLE_BUFFERING explicit output buffering: off, auto, or force
+  OBLIVION_ONE_CURSOR_SCHEDULING cursor output scheduling: auto, piggyback, or software
   OBLIVION_ONE_SCANOUT_BACKEND native scanout: auto, gpu/native-egl-gbm (explicit Atomic), native-egl-gbm-opaque (rollback), gbm-cpu-write/cpu, or dumb
   OBLIVION_ONE_NATIVE_APP_GPU  native apps: auto, gpu, or cpu
   OBLIVION_ONE_PROFILE   auto, debug, or release (default: auto; native uses release)

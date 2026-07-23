@@ -104,7 +104,15 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn has_only_pending_surface_frame_callbacks(&self) -> bool {
-        false
+        if self.pending_frame_callbacks.is_empty() {
+            return false;
+        }
+        self.pending_interactive_resize_update.is_none()
+            && !self.pending_resize_configure_is_flushable()
+            && self.pending_explicit_sync_commits.is_empty()
+            && self.pending_surface_tree_transactions.is_empty()
+            && self.pending_color_info.is_empty()
+            && self.pending_presentation_feedbacks.is_empty()
     }
 
     pub(in crate::compositor) fn has_pending_frame_prepare_work(&self) -> bool {
@@ -126,15 +134,22 @@ impl CompositorState {
             || !self.pending_surface_tree_transactions.is_empty()
     }
 
-    pub(in crate::compositor) fn has_pending_frame_work(&self) -> bool {
-        self.pending_interactive_resize_update.is_some()
-            || self.pending_resize_configure_is_flushable()
-            || self.has_pending_frame_callbacks()
+    pub(in crate::compositor) fn has_unowned_frame_work(&self) -> bool {
+        self.has_pending_frame_prepare_work()
+            || self.has_unowned_frame_callbacks()
             || !self.pending_presentation_feedbacks.is_empty()
+    }
+
+    pub(in crate::compositor) fn has_unowned_frame_callbacks(&self) -> bool {
+        !self.pending_frame_callbacks.is_empty()
+            || self.pending_explicit_sync_commits.iter().any(|commit| {
+                !self.external_acquire_readiness && !commit.frame_callbacks.is_empty()
+            })
             || self
-                .frame_batches
-                .values()
-                .any(|batch| !batch.presentation_feedbacks.is_empty())
+                .pending_surface_tree_transactions
+                .iter()
+                .flat_map(|transaction| &transaction.nodes)
+                .any(|(_, commit)| !commit.frame_callbacks.is_empty())
     }
 
     pub(in crate::compositor) fn complete_pending_presentation_feedbacks(
@@ -259,6 +274,32 @@ impl CompositorState {
         let shm_buffer_releases = std::mem::take(&mut self.pending_buffer_releases);
         let dmabuf_releases_to_complete_on_present =
             std::mem::take(&mut self.pending_dmabuf_buffer_releases);
+        let callbacks = std::mem::take(&mut self.pending_frame_callbacks);
+        let callback_count = callbacks.len();
+        let callback_commit_ns = (callback_count > 0).then_some(
+            self.frame_callback_metrics
+                .last_callback_commit_ns
+                .unwrap_or_else(client_pacing_now_ns),
+        );
+        if callback_count > 0 {
+            self.frame_callback_metrics.callbacks_captured = self
+                .frame_callback_metrics
+                .callbacks_captured
+                .saturating_add(callback_count as u64);
+            self.frame_callback_metrics.last_callback_capture_batch_id = Some(batch_id.get());
+            client_pacing_log(
+                "frame_callbacks_captured",
+                &[
+                    ("frame_batch_id", batch_id.get().to_string()),
+                    ("frame_id", frame_id.to_string()),
+                    ("count", callback_count.to_string()),
+                    (
+                        "callback_commit_ns",
+                        callback_commit_ns.unwrap_or_default().to_string(),
+                    ),
+                ],
+            );
+        }
         let captured_releases =
             shm_buffer_releases.len() + dmabuf_releases_to_complete_on_present.len();
         self.buffer_release_metrics.buffer_releases_captured = self
@@ -282,7 +323,9 @@ impl CompositorState {
             batch_id,
             CompositorFrameBatch {
                 frame_id,
-                callbacks: std::mem::take(&mut self.pending_frame_callbacks),
+                callbacks,
+                callback_commit_ns,
+                callback_render_completed_ns: None,
                 presentation_feedbacks: std::mem::take(&mut self.pending_presentation_feedbacks),
                 shm_buffer_releases,
                 dmabuf_releases_to_complete_on_present,
@@ -331,6 +374,21 @@ impl CompositorState {
             .remove(&batch_id)
             .expect("missing compositor frame batch on discard");
         let mut batch = batch;
+        let callback_count = batch.callbacks.len();
+        if callback_count > 0 {
+            self.frame_callback_metrics
+                .callbacks_completed_after_abandonment = self
+                .frame_callback_metrics
+                .callbacks_completed_after_abandonment
+                .saturating_add(callback_count as u64);
+            if batch.callback_render_completed_ns.is_some() {
+                self.frame_callback_metrics
+                    .callbacks_in_discarded_rendered_batches = self
+                    .frame_callback_metrics
+                    .callbacks_in_discarded_rendered_batches
+                    .saturating_add(callback_count as u64);
+            }
+        }
         for pending in std::mem::take(&mut batch.presentation_feedbacks) {
             pending.feedback.discarded();
         }
@@ -362,6 +420,14 @@ impl CompositorState {
             .or_else(|| self.retired_frame_batches.remove(&batch_id))
             .expect("missing compositor frame batch after safe abandonment");
         let frame_id = batch.frame_id;
+        let callback_count = batch.callbacks.len();
+        if callback_count > 0 {
+            self.frame_callback_metrics
+                .callbacks_completed_after_abandonment = self
+                .frame_callback_metrics
+                .callbacks_completed_after_abandonment
+                .saturating_add(callback_count as u64);
+        }
         let batch = self.complete_frame_batch_releases(batch_id, batch);
         for pending in batch.presentation_feedbacks {
             pending.feedback.discarded();
@@ -385,9 +451,9 @@ impl CompositorState {
         presentation: FramePresentation,
     ) {
         let batch = self.take_presented_frame_batch(frame_id, batch_id);
+        self.note_frame_callbacks_at_pageflip(batch_id, &batch);
         let batch = self.complete_frame_batch_releases(batch_id, batch);
         self.clear_legacy_batch_reference(batch_id);
-        self.complete_frame_callbacks(batch.callbacks);
         self.complete_presentation_feedbacks(batch.presentation_feedbacks, presentation);
     }
 
@@ -399,9 +465,9 @@ impl CompositorState {
         presentation: FramePresentation,
     ) {
         let batch = self.take_presented_frame_batch(frame_id, batch_id);
+        self.note_frame_callbacks_at_pageflip(batch_id, &batch);
         let batch = self.complete_frame_batch_releases(batch_id, batch);
         self.clear_legacy_batch_reference(batch_id);
-        self.complete_frame_callbacks(batch.callbacks);
         self.complete_direct_presentation_feedbacks(
             batch.presentation_feedbacks,
             direct_surface_id,
@@ -781,6 +847,14 @@ impl CompositorState {
             .filter(|callback| callback.is_alive())
             .collect();
         let time = self.frame_callback_time_ms();
+        self.complete_frame_callbacks_at_time(callbacks, time);
+    }
+
+    pub(in crate::compositor) fn complete_frame_callbacks_at_time(
+        &mut self,
+        callbacks: Vec<wl_callback::WlCallback>,
+        time: u32,
+    ) {
         self.note_callbacks_completed(&callbacks);
         for callback in callbacks {
             client_pacing_log(

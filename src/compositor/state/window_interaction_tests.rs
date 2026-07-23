@@ -74,6 +74,7 @@ fn test_renderable_surface(surface_id: u32, width: u32, height: u32) -> Renderab
         placement: SurfacePlacement::root(),
         render_placement: None,
         visual_clip: None,
+        render_target_size: None,
         generation: 1,
         commit_sequence: SurfaceCommitSequence::initial(),
         buffer: crate::render_backend::buffer::CommittedSurfaceBuffer::shm_snapshot(
@@ -115,6 +116,7 @@ fn test_x11_snapshot(surface_id: u32) -> crate::xwayland::xwm::X11WindowSnapshot
         startup_id: None,
         user_time: None,
         urgency: false,
+        supports_sync_request: false,
         sync_counter: None,
     }
 }
@@ -546,7 +548,8 @@ fn x11_resize_release_finalizes_preview_without_xdg_commit() {
     assert!(state.renderable_surfaces[0].visual_clip.is_some());
     assert_eq!(
         state.surface_placement(surface_id),
-        SurfacePlacement::root_at(10, 20)
+        final_placement,
+        "release seals compositor placement before the XWayland content response"
     );
     let backend_commands = state.take_backend_commands();
     assert!(matches!(
@@ -558,9 +561,8 @@ fn x11_resize_release_finalizes_preview_without_xdg_commit() {
         WindowBackend::X11(handle) => handle,
         WindowBackend::Xdg(_) => panic!("expected X11 backend"),
     };
-    // Transaction 1 may have presented while the final release target is
-    // already queued. The compositor preview and clip remain owned by the
-    // chained resize until that final transaction presents.
+    // Pointer ownership has ended, but resize-specific visual clipping remains
+    // until the pending XWayland content transaction presents matching pixels.
     assert!(state.x11_resize_active(handle));
     assert!(state.renderable_surfaces[0].visual_clip.is_some());
     assert!(state.finalize_x11_resize(handle));
@@ -570,8 +572,98 @@ fn x11_resize_release_finalizes_preview_without_xdg_commit() {
         state.toplevel_visual_geometries[&surface_id].active_resize,
         None
     );
-    assert_eq!(state.renderable_surfaces[0].visual_clip, None);
+    assert_eq!(
+        state.renderable_surfaces[0].visual_clip,
+        Some(crate::compositor::SurfaceTargetRect::new(30, 40, 360, 240))
+    );
     assert_eq!(state.surface_placement(surface_id), final_placement);
+}
+
+#[test]
+fn active_x11_resize_keeps_stale_surface_at_committed_size() {
+    let surface_id = 42;
+    let interaction_id = ResizeInteractionId::new(1);
+    let snapshot = test_x11_snapshot(surface_id);
+    let handle = snapshot.handle;
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
+        .expect("X11 desktop window");
+    state
+        .renderable_surfaces
+        .push(test_renderable_surface(surface_id, 300, 200));
+    state.active_toplevel_resizes.insert(
+        surface_id,
+        ActiveToplevelResize {
+            interaction_id,
+            flow_sequence: 1,
+            edges: ResizeEdges::BOTTOM_RIGHT,
+            activated_at: Instant::now(),
+        },
+    );
+
+    assert!(state.set_x11_geometry(
+        handle,
+        crate::xwayland::xwm::X11Geometry {
+            x: 10,
+            y: 20,
+            width: 600,
+            height: 400,
+        },
+    ));
+
+    assert_eq!(state.renderable_surfaces[0].render_target_size, None);
+    assert_eq!(
+        state.x11_client_render_target_size(
+            surface_id,
+            BufferSize::new(300, 200).expect("committed size"),
+        ),
+        None,
+        "Hyprland keeps stale Xwayland content at its committed size during an interactive resize",
+    );
+}
+
+#[test]
+fn finished_x11_resize_keeps_stale_surface_at_one_to_one() {
+    let surface_id = 42;
+    let interaction_id = ResizeInteractionId::new(1);
+    let snapshot = test_x11_snapshot(surface_id);
+    let handle = snapshot.handle;
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
+        .expect("X11 desktop window");
+    state
+        .renderable_surfaces
+        .push(test_renderable_surface(surface_id, 300, 200));
+    state.active_toplevel_resizes.insert(
+        surface_id,
+        ActiveToplevelResize {
+            interaction_id,
+            flow_sequence: 1,
+            edges: ResizeEdges::BOTTOM_RIGHT,
+            activated_at: Instant::now(),
+        },
+    );
+    assert!(state.set_x11_geometry(
+        handle,
+        crate::xwayland::xwm::X11Geometry {
+            x: 10,
+            y: 20,
+            width: 600,
+            height: 400,
+        },
+    ));
+    assert_eq!(state.renderable_surfaces[0].render_target_size, None);
+
+    assert!(state.finalize_x11_resize(handle));
+
+    assert_eq!(
+        state.renderable_surfaces[0].render_target_size, None,
+        "final interactive resize must not stretch stale XWayland content",
+    );
 }
 
 #[test]
@@ -915,16 +1007,14 @@ fn interaction_cursor_motion_advances_cursor_generation_only() {
         ..Default::default()
     };
     let before_render_generation = state.render_generation;
+    let before_cursor_generation = state.cursor_generation;
     let before_scene_generation = state.scene_render_generation;
 
     assert!(state.update_pointer_position_without_client_dispatch(150.0, 125.0));
 
-    assert!(state.render_generation > before_render_generation);
+    assert_eq!(state.render_generation, before_render_generation);
+    assert!(state.cursor_generation > before_cursor_generation);
     assert_eq!(state.scene_render_generation, before_scene_generation);
-    assert_eq!(
-        state.render_generation_cause,
-        RenderGenerationCause::CursorMotion
-    );
 }
 
 #[test]

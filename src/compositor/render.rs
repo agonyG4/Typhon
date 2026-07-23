@@ -204,6 +204,7 @@ struct SceneSurfaceSnapshot {
     generation: u64,
     target: SurfaceTargetRect,
     visible_target: SurfaceTargetRect,
+    backing_target: Option<SurfaceTargetRect>,
     buffer_width: u32,
     buffer_height: u32,
 }
@@ -214,6 +215,7 @@ pub struct RenderSceneElement {
     kind: RenderSceneElementKind,
     target: SurfaceTargetRect,
     visible_target: SurfaceTargetRect,
+    backing_target: Option<SurfaceTargetRect>,
     content_uv: SurfaceUvRect,
     generation: u64,
     buffer_size: BufferSize,
@@ -237,6 +239,7 @@ impl RenderSceneElement {
             kind: RenderSceneElementKind::ClientSurface,
             target,
             visible_target: plan.content_target,
+            backing_target: xwayland_visual_backing_target(surface, target, visual_clip),
             content_uv: plan.content_uv,
             generation: surface.generation,
             buffer_size: surface.buffer_size(),
@@ -259,6 +262,10 @@ impl RenderSceneElement {
 
     pub const fn visible_target(&self) -> SurfaceTargetRect {
         self.visible_target
+    }
+
+    pub const fn backing_target(&self) -> Option<SurfaceTargetRect> {
+        self.backing_target
     }
 
     pub const fn content_uv(&self) -> SurfaceUvRect {
@@ -973,6 +980,7 @@ fn scene_surface_snapshots_from_elements(
                 generation: element.generation,
                 target: element.target,
                 visible_target: element.visible_target,
+                backing_target: element.backing_target,
                 buffer_width: element.buffer_size.width,
                 buffer_height: element.buffer_size.height,
             }
@@ -1009,11 +1017,19 @@ pub fn surface_render_space_assignments(
                 root_origin.0.saturating_sub(root_placement.local_x),
                 root_origin.1.saturating_sub(root_placement.local_y),
             );
+            // An explicit target is a compositor policy override used by
+            // ordinary client-driven X11 geometry. Interactive XWayland
+            // previews clear it so stale content remains at its committed
+            // extent and the backing rectangle supplies only uncovered space.
+            let (target_width, target_height) = surface
+                .render_target_size
+                .map(|size| (size.width, size.height))
+                .unwrap_or((surface.width, surface.height));
             SurfaceRenderSpaceAssignment {
                 target: render_space_rect_from_logical(
                     (origin_x, origin_y),
-                    surface.width,
-                    surface.height,
+                    target_width,
+                    target_height,
                     output_scale,
                 ),
                 visual_clip: surface.visual_clip.map(|clip| {
@@ -1068,7 +1084,9 @@ fn partial_scene_damage_rects(
             return None;
         }
 
-        if previous.target != snapshot.target || previous.visible_target != snapshot.visible_target
+        if previous.target != snapshot.target
+            || previous.visible_target != snapshot.visible_target
+            || previous.backing_target != snapshot.backing_target
         {
             if let Some(rect) = previous
                 .visible_target
@@ -1082,6 +1100,20 @@ fn partial_scene_damage_rects(
                 .output_rect()
                 .clipped_to_output(frame_width, frame_height)
             {
+                damage_rects.push(rect);
+            }
+            if let Some(rect) = previous.backing_target.and_then(|target| {
+                target
+                    .output_rect()
+                    .clipped_to_output(frame_width, frame_height)
+            }) {
+                damage_rects.push(rect);
+            }
+            if let Some(rect) = snapshot.backing_target.and_then(|target| {
+                target
+                    .output_rect()
+                    .clipped_to_output(frame_width, frame_height)
+            }) {
                 damage_rects.push(rect);
             }
             continue;
@@ -1171,21 +1203,41 @@ fn output_damage_rect_for_element(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ServerFrameColor {
+    XwaylandBacking,
     Border,
     Titlebar,
     Separator,
 }
 
 impl ServerFrameColor {
-    pub const ALL: [Self; 3] = [Self::Border, Self::Titlebar, Self::Separator];
+    pub const ALL: [Self; 4] = [
+        Self::XwaylandBacking,
+        Self::Border,
+        Self::Titlebar,
+        Self::Separator,
+    ];
 
     pub const fn pixel(self) -> u32 {
         match self {
+            Self::XwaylandBacking => 0xff00_0000,
             Self::Border => SERVER_FRAME_BORDER_COLOR,
             Self::Titlebar => SERVER_FRAME_TITLEBAR_COLOR,
             Self::Separator => SERVER_FRAME_SEPARATOR_COLOR,
         }
     }
+}
+
+fn xwayland_visual_backing_target(
+    surface: &RenderableSurface,
+    target: SurfaceTargetRect,
+    visual_clip: Option<SurfaceTargetRect>,
+) -> Option<SurfaceTargetRect> {
+    let placement = surface.render_placement.unwrap_or(surface.placement);
+    (surface.placement.parent_surface_id.is_none()
+        && placement.root_mode == RootPlacementMode::Absolute)
+        .then_some(())
+        .and(visual_clip)
+        .map(|clip| SurfaceTargetRect::new(target.x(), target.y(), clip.width(), clip.height()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1470,7 +1522,23 @@ pub fn server_frame_rects_by_surface(surfaces: &[RenderableSurface]) -> Vec<Vec<
         .collect()
 }
 
-pub fn server_frame_rects_for_surface(_surface: &RenderableSurface) -> Vec<ServerFrameRect> {
+pub fn server_frame_rects_for_surface(surface: &RenderableSurface) -> Vec<ServerFrameRect> {
+    if surface.placement.parent_surface_id.is_none()
+        && surface
+            .render_placement
+            .unwrap_or(surface.placement)
+            .root_mode
+            == RootPlacementMode::Absolute
+        && let Some(clip) = surface.visual_clip
+    {
+        return vec![ServerFrameRect {
+            color: ServerFrameColor::XwaylandBacking,
+            x: 0,
+            y: 0,
+            width: clip.width(),
+            height: clip.height(),
+        }];
+    }
     Vec::new()
 }
 
@@ -2182,6 +2250,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(
@@ -2231,6 +2300,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: Some(SurfaceTargetRect::new(0, 0, 1000, 700)),
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(800, 600, vec![0xffff_0000; 800 * 600]),
@@ -2250,6 +2320,54 @@ mod tests {
     }
 
     #[test]
+    fn xwayland_grow_preview_renders_black_backing_without_scaling() {
+        let surface = RenderableSurface {
+            surface_id: 7,
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+            placement: SurfacePlacement::absolute_root_at(100, 100),
+            render_placement: Some(SurfacePlacement::absolute_root_at(100, 100)),
+            visual_clip: Some(SurfaceTargetRect::new(100, 100, 1100, 760)),
+            render_target_size: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(800, 600, vec![0xffff_0000; 800 * 600]),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+
+        let element = render_scene_elements_for_surfaces(std::slice::from_ref(&surface), 1.0)
+            .pop()
+            .expect("XWayland scene element");
+        assert_eq!(
+            element.backing_target(),
+            Some(SurfaceTargetRect::new(100, 100, 1100, 760))
+        );
+        assert_eq!(
+            element.target(),
+            SurfaceTargetRect::new(100, 100, 800, 600),
+            "the stale client texture remains at its committed size"
+        );
+
+        let mut frame = vec![0; 1300 * 900];
+        compose_output(
+            &mut frame,
+            1300,
+            900,
+            std::slice::from_ref(&surface),
+            DesktopVisualState::wallpaper_only(),
+        );
+        assert_eq!(frame[(100 * 1300 + 100) as usize], 0xffff_0000);
+        assert_eq!(frame[(100 * 1300 + 100 + 800) as usize], 0xff00_0000);
+        assert_eq!(frame[(100 + 600) * 1300 + 100], 0xff00_0000);
+    }
+
+    #[test]
     fn viewport_source_selects_source_uv_without_changing_target() {
         let surface = RenderableSurface {
             surface_id: 7,
@@ -2260,6 +2378,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(200, 100, vec![0xffff_0000; 200 * 100]),
@@ -2296,6 +2415,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: Some(SurfaceTargetRect::new(0, 0, 800, 600)),
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(1000, 700, vec![0xffff_0000; 1000 * 700]),
@@ -2317,6 +2437,7 @@ mod tests {
 
         let far_surface = RenderableSurface {
             visual_clip: Some(SurfaceTargetRect::new(200, 100, 800, 600)),
+            render_target_size: None,
             ..near_surface
         };
         let far = surface_render_plan(&far_surface, SurfaceTargetRect::new(0, 0, 1000, 700));
@@ -2342,6 +2463,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: Some(SurfaceTargetRect::new(0, 0, 340, 230)),
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(300, 200, vec![0xffff_0000; 300 * 200]),
@@ -2377,6 +2499,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(120, 80, vec![0xffff_0000; 120 * 80]),
@@ -2391,6 +2514,7 @@ mod tests {
             width: 300,
             height: 200,
             visual_clip: Some(SurfaceTargetRect::new(0, 0, 340, 230)),
+            render_target_size: None,
             buffer: shm_buffer(300, 200, vec![0xffff_0000; 300 * 200]),
             ..first.clone()
         };
@@ -2419,6 +2543,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: Some(SurfacePlacement::root_at(-16, -10)),
             visual_clip: Some(SurfaceTargetRect::new(0, 0, 340, 230)),
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(372, 272, vec![0xffff_0000; 372 * 272]),
@@ -2459,6 +2584,7 @@ mod tests {
             placement: SurfacePlacement::root_at(1, 1),
             render_placement: None,
             visual_clip: Some(SurfaceTargetRect::new(1, 1, 301, 201)),
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(301, 201, vec![0xffff_0000; 301 * 201]),
@@ -2494,6 +2620,7 @@ mod tests {
                 placement: SurfacePlacement::root(),
                 render_placement: None,
                 visual_clip: Some(clip),
+                render_target_size: None,
                 generation: 1,
                 commit_sequence: SurfaceCommitSequence::initial(),
                 buffer: shm_buffer(300, 200, vec![0xffff_0000; 300 * 200]),
@@ -2531,6 +2658,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: Some(SurfaceTargetRect::new(0, 0, 320, 220)),
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(300, 200, vec![0xffff_0000; 300 * 200]),
@@ -2549,6 +2677,7 @@ mod tests {
             placement: SurfacePlacement::subsurface(7, 260, 20),
             render_placement: None,
             visual_clip: Some(SurfaceTargetRect::new(0, 0, 280, 220)),
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(40, 30, vec![0xffff_0000; 40 * 30]),
@@ -2584,6 +2713,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: Some(SurfaceTargetRect::new(0, 0, 1000, 700)),
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(1000, 700, vec![0xffff_0000; 1000 * 700]),
@@ -2622,6 +2752,55 @@ mod tests {
     }
 
     #[test]
+    fn xwayland_visual_backing_damage_covers_grow_preview_bounds() {
+        let previous = RenderableSurface {
+            surface_id: 17,
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+            placement: SurfacePlacement::absolute_root_at(100, 100),
+            render_placement: Some(SurfacePlacement::absolute_root_at(100, 100)),
+            visual_clip: Some(SurfaceTargetRect::new(100, 100, 800, 600)),
+            render_target_size: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(800, 600, vec![0xffff_0000; 800 * 600]),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+        let mut current = previous.clone();
+        current.visual_clip = Some(SurfaceTargetRect::new(100, 100, 1100, 760));
+        current.generation = 2;
+
+        let previous_snapshots = scene_surface_snapshots(std::slice::from_ref(&previous), 1.0);
+        let current_elements =
+            render_scene_elements_for_surfaces(std::slice::from_ref(&current), 1.0);
+        let current_snapshots = scene_surface_snapshots(std::slice::from_ref(&current), 1.0);
+        let damage = partial_scene_damage_rects(
+            &previous_snapshots,
+            &current_elements,
+            &current_snapshots,
+            1600,
+            1000,
+        )
+        .expect("same surface can produce partial damage");
+
+        assert!(
+            damage.contains(&OutputRect {
+                x: 100,
+                y: 100,
+                width: 1100,
+                height: 760,
+            }),
+            "grow preview must damage the complete new black backing box: {damage:?}"
+        );
+    }
+
+    #[test]
     fn desktop_scene_renderer_resize_growth_repairs_rescaled_bounds() {
         let mut renderer = DesktopSceneRenderer::default();
         let mut frame = vec![0; 96 * 96];
@@ -2634,6 +2813,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
@@ -2662,6 +2842,7 @@ mod tests {
             generation: 2,
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             ..initial_surface
         };
         renderer.compose_reusing_frame(DesktopComposeRequest {
@@ -2709,6 +2890,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
@@ -2739,6 +2921,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 2,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, updated_pixels),
@@ -2787,6 +2970,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
@@ -2821,6 +3005,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 2,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, updated_pixels),
@@ -2882,6 +3067,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: Some(BufferSize::new(6, 3).unwrap()),
             generation: 3,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(8, 4, vec![0xffff_0000; 8 * 4]),
@@ -2908,11 +3094,13 @@ mod tests {
                 SurfaceTargetRect {
                     x: FIRST_SURFACE_OFFSET.0,
                     y: FIRST_SURFACE_OFFSET.1,
-                    width: 4,
-                    height: 2,
+                    width: 6,
+                    height: 3,
                 },
             )]
         );
+        assert_eq!(elements[0].content_uv(), SurfaceUvRect::FULL);
+        assert_eq!(elements[0].buffer_size(), BufferSize::new(8, 4).unwrap());
     }
 
     #[test]
@@ -2968,6 +3156,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
@@ -3037,6 +3226,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
@@ -3055,6 +3245,7 @@ mod tests {
             placement: SurfacePlacement::subsurface(7, 1, 1),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(2, 2, vec![0xff00_ff00; 2 * 2]),
@@ -3085,6 +3276,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 2,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, updated_pixels),
@@ -3127,6 +3319,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xffff_0000; 4 * 4]),
@@ -3155,6 +3348,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 2,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(4, 4, vec![0xff00_00ff; 4 * 4]),
@@ -3264,6 +3458,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(
@@ -3305,6 +3500,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(
@@ -3339,6 +3535,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(12, 8, vec![0xffff_ffff; 12 * 8]),
@@ -3375,6 +3572,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(1, 1, vec![0x0000_0000]),
@@ -3417,6 +3615,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(1, 1, vec![0x8080_0000]),
@@ -3451,6 +3650,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(2, 2, vec![0xff00_ff00; 4]),
@@ -3476,6 +3676,8 @@ mod tests {
                 surface: &cursor_surface,
                 logical_x: 2,
                 logical_y: 3,
+                hotspot_x: 0,
+                hotspot_y: 0,
             }),
         });
         assert_ne!(frame[0], CURSOR_OUTLINE);
@@ -3494,6 +3696,8 @@ mod tests {
                 surface: &cursor_surface,
                 logical_x: 8,
                 logical_y: 9,
+                hotspot_x: 0,
+                hotspot_y: 0,
             }),
         });
 
@@ -3532,6 +3736,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(100, 80, vec![0; 100 * 80]),
@@ -3564,6 +3769,7 @@ mod tests {
             placement: SurfacePlacement::root(),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(100, 80, vec![0; 100 * 80]),
@@ -3582,6 +3788,7 @@ mod tests {
             placement: SurfacePlacement::subsurface(1, 10, 12),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(20, 10, vec![0; 20 * 10]),
@@ -3608,6 +3815,7 @@ mod tests {
             placement: SurfacePlacement::root_at(5, 6),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(100, 80, vec![0; 100 * 80]),
@@ -3626,6 +3834,7 @@ mod tests {
             placement: SurfacePlacement::root_at(9, 10),
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: shm_buffer(20, 10, vec![0; 20 * 10]),

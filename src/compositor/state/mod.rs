@@ -1,8 +1,10 @@
 use super::*;
 
 mod client_lifecycle;
+mod cursor;
 mod data_device;
 mod desktop_windows;
+mod frame_callbacks;
 mod frames;
 mod fullscreen;
 mod helpers;
@@ -26,14 +28,19 @@ mod window_interaction;
 mod window_resize;
 mod windows;
 mod xdg_lifecycle;
+mod xwayland_mode;
 mod xwayland_windows;
 
 #[allow(unused_imports)]
 pub(in crate::compositor) use client_lifecycle::*;
 #[allow(unused_imports)]
+pub(in crate::compositor) use cursor::*;
+#[allow(unused_imports)]
 pub(in crate::compositor) use data_device::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use desktop_windows::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use frame_callbacks::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use frames::*;
 #[allow(unused_imports)]
@@ -80,6 +87,8 @@ pub(in crate::compositor) use window_resize::*;
 pub(in crate::compositor) use windows::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use xdg_lifecycle::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use xwayland_mode::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use xwayland_windows::*;
 

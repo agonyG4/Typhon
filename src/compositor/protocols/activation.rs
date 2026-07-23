@@ -128,9 +128,10 @@ impl CompositorState {
         if let Some(serial) = pending.serial
             && !self.validate_activation_token_serial(&client_id, serial)
         {
+            resource.done(String::new());
             activation_debug_log(|| {
                 format!(
-                    "activation_reject resource={resource_id} reason=stale_serial serial={serial}"
+                    "activation_reject resource={resource_id} reason=stale_serial serial={serial} invalid_token_sent=true"
                 )
             });
             return;

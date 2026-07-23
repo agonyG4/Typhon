@@ -731,7 +731,7 @@ impl DrmAtomicBackend {
         &self,
         framebuffer: FramebufferId,
         token: PageFlipToken,
-    ) -> Result<(), AtomicKmsError> {
+    ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
         self.submit_direct_flip_with_cursor(framebuffer, token, None)
     }
 
@@ -740,17 +740,37 @@ impl DrmAtomicBackend {
         framebuffer: FramebufferId,
         token: PageFlipToken,
         cursor: Option<&AtomicCursorVisualState>,
-    ) -> Result<(), AtomicKmsError> {
-        let request =
-            AtomicRequest::primary_flip_with_cursor(&self.discovery.pipeline, framebuffer, cursor)?;
+    ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
+        let mut out_fence_storage = -1i32;
+        let out_fence_ptr = self
+            .discovery
+            .pipeline
+            .crtc_props
+            .out_fence_ptr
+            .map(|_| std::ptr::addr_of_mut!(out_fence_storage));
+        let request = AtomicRequest::primary_flip_with_cursor_and_out_fence(
+            &self.discovery.pipeline,
+            framebuffer,
+            cursor,
+            out_fence_ptr,
+        )?;
         let submission = AtomicSubmission::page_flip(request, token);
         let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        submit_atomic(
+        let result = submit_atomic(
             fd,
             &submission,
             AtomicKmsErrorKind::FlipRejected,
             "direct-scanout atomic primary flip",
-        )
+        );
+        match result {
+            Ok(()) => Ok(AtomicFlipSubmission {
+                out_fence: adopt_out_fence(out_fence_storage),
+            }),
+            Err(error) => {
+                drop(adopt_out_fence(out_fence_storage));
+                Err(error)
+            }
+        }
     }
 
     pub fn submit_atomic_flip(
@@ -1328,7 +1348,7 @@ impl KmsBackendSelection {
         &self,
         framebuffer: FramebufferId,
         token: PageFlipToken,
-    ) -> Result<(), AtomicKmsError> {
+    ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
         match &self.backend {
             KmsDisplayBackend::Atomic(backend) => backend.submit_direct_flip(framebuffer, token),
             KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
@@ -1386,7 +1406,7 @@ impl KmsBackendSelection {
         framebuffer: FramebufferId,
         token: PageFlipToken,
         cursor: Option<&AtomicCursorVisualState>,
-    ) -> Result<(), AtomicKmsError> {
+    ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
         match &self.backend {
             KmsDisplayBackend::Atomic(backend) => {
                 backend.submit_direct_flip_with_cursor(framebuffer, token, cursor)

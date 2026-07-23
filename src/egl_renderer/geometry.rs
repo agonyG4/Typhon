@@ -139,21 +139,27 @@ pub(super) fn push_draw_command_with_uv(
 pub(super) fn surface_sampling_for_plan(
     source_width: u32,
     source_height: u32,
-    target_x: i32,
-    target_y: i32,
+    _target_x: i32,
+    _target_y: i32,
     target_width: u32,
     target_height: u32,
     uv: EglUvRect,
 ) -> SurfaceSampling {
-    if source_width == target_width
-        && source_height == target_height
-        && target_x >= 0
-        && target_y >= 0
-        && uv.left == 0.0
-        && uv.top == 0.0
-        && uv.right == 1.0
-        && uv.bottom == 1.0
-    {
+    let source_left = f64::from(source_width) * f64::from(uv.left);
+    let source_top = f64::from(source_height) * f64::from(uv.top);
+    let source_right = f64::from(source_width) * f64::from(uv.right);
+    let source_bottom = f64::from(source_height) * f64::from(uv.bottom);
+    const PIXEL_TOLERANCE: f64 = 0.0001;
+    let pixel_aligned = |value: f64| (value - value.round()).abs() <= PIXEL_TOLERANCE;
+    let one_to_one_crop = pixel_aligned(source_left)
+        && pixel_aligned(source_top)
+        && pixel_aligned(source_right)
+        && pixel_aligned(source_bottom)
+        && (source_right - source_left - f64::from(target_width)).abs() <= PIXEL_TOLERANCE
+        && (source_bottom - source_top - f64::from(target_height)).abs() <= PIXEL_TOLERANCE
+        && target_width > 0
+        && target_height > 0;
+    if one_to_one_crop {
         SurfaceSampling::ExactNearest
     } else {
         SurfaceSampling::ScaledLinear
@@ -270,6 +276,50 @@ mod tests {
         );
 
         assert_y_bounds(&vertices, 0.8, 1.0);
+    }
+
+    #[test]
+    fn full_buffer_uses_nearest_sampling() {
+        assert_eq!(
+            surface_sampling_for_plan(800, 600, 0, 0, 800, 600, EglUvRect::FULL),
+            SurfaceSampling::ExactNearest
+        );
+    }
+
+    #[test]
+    fn integer_aligned_crop_uses_nearest_sampling() {
+        assert_eq!(
+            surface_sampling_for_plan(
+                800,
+                600,
+                120,
+                100,
+                620,
+                480,
+                EglUvRect::new(0.15, 1.0 / 6.0, 0.925, 0.9666667),
+            ),
+            SurfaceSampling::ExactNearest
+        );
+    }
+
+    #[test]
+    fn actual_scaling_and_fractional_crops_use_linear_sampling() {
+        assert_eq!(
+            surface_sampling_for_plan(800, 600, 0, 0, 801, 600, EglUvRect::FULL),
+            SurfaceSampling::ScaledLinear
+        );
+        assert_eq!(
+            surface_sampling_for_plan(
+                800,
+                600,
+                0,
+                0,
+                620,
+                480,
+                EglUvRect::new(0.1505, 1.0 / 6.0, 0.925, 0.9666667),
+            ),
+            SurfaceSampling::ScaledLinear
+        );
     }
 
     #[test]

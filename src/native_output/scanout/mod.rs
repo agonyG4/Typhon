@@ -213,6 +213,23 @@ pub(crate) enum NativeScanoutBackend {
     Dumb(DumbFramebuffer),
 }
 
+pub(crate) fn direct_cursor_plan_key(
+    cursor: Option<&AtomicCursorVisualState>,
+    compatible: bool,
+) -> Option<u64> {
+    compatible.then_some(match cursor {
+        None => 0,
+        Some(cursor) => {
+            let framebuffer = u64::from(cursor.framebuffer_id.unwrap_or_default());
+            cursor
+                .image_generation
+                .rotate_left(17)
+                .wrapping_add(framebuffer.rotate_left(31))
+                .wrapping_add(u64::from(cursor.visible))
+        }
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeScanoutRecovery {
     AtomicEglGbm(AtomicExplicitRecovery),

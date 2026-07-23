@@ -130,6 +130,7 @@ impl CompositorState {
             placement,
             render_placement: None,
             visual_clip: None,
+            render_target_size: None,
             generation: 0,
             commit_sequence: SurfaceCommitSequence::initial(),
             buffer: CommittedSurfaceBuffer::shm_snapshot(

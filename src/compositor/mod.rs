@@ -87,6 +87,7 @@ mod selection;
 mod server;
 mod server_backend;
 mod server_error;
+mod server_frames;
 mod shm;
 mod state_data;
 mod subsurface;
@@ -120,7 +121,7 @@ use explicit_sync::{
     SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER, SyncobjSurfaceState, SyncobjTimelineData,
 };
 pub(crate) use frame_batch::CompositorFrameBatch;
-pub use frame_batch::{BufferReleaseMetrics, CompositorFrameBatchId};
+pub use frame_batch::{BufferReleaseMetrics, CompositorFrameBatchId, FrameCallbackMetrics};
 pub(crate) use fullscreen::direct_scanout_scene_rejection_for_flags;
 pub use fullscreen::{
     DirectScanoutSceneCandidate, DirectScanoutSceneRejection, FullscreenPresentationEligibility,
@@ -193,6 +194,25 @@ pub use surface::{
     SurfaceCommitCounter, SurfaceCommitSequence, SurfaceDamageJournal, SurfaceDamageRect,
     SurfacePlacement,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameCallbackTime(u32);
+
+impl FrameCallbackTime {
+    pub const fn new(milliseconds: u32) -> Self {
+        Self(milliseconds)
+    }
+
+    pub const fn milliseconds(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolOnlyCompletion {
+    Completed { callback_count: usize },
+    NoCallbacks,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XwaylandSurfaceCommitObserved {
     pub generation: XwaylandGeneration,
@@ -377,7 +397,6 @@ impl SurfacePublicationSource {
             Self::RemoveContent => "remove_content",
         }
     }
-
     const fn publication_context(self) -> SurfacePublicationContext {
         match self {
             Self::ExplicitSync | Self::SurfaceTree => {
@@ -407,7 +426,6 @@ struct SurfaceTreeMergeStats {
     resize_snapshots_preserved: usize,
     resize_snapshots_replaced: usize,
 }
-
 struct BufferlessSurfaceCommitState {
     commit_sequence: SurfaceCommitSequence,
     damage: Option<RenderableSurfaceDamage>,
@@ -418,7 +436,6 @@ struct BufferlessSurfaceCommitState {
     resize_capture_finalized: bool,
     window_geometry: Option<XdgWindowGeometry>,
 }
-
 impl PendingSurfaceTreeTransaction {
     fn is_ready(&self) -> bool {
         self.dependencies
@@ -426,7 +443,6 @@ impl PendingSurfaceTreeTransaction {
             .all(|dependency| dependency.state == PendingAcquireState::Ready)
     }
 }
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum RenderGenerationCause {
     #[default]
@@ -478,6 +494,8 @@ pub struct ClientCursorRenderState<'a> {
     pub surface: &'a RenderableSurface,
     pub logical_x: i32,
     pub logical_y: i32,
+    pub hotspot_x: i32,
+    pub hotspot_y: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -582,6 +600,7 @@ pub struct CompositorState {
     resize_configure_flows: HashMap<u32, ResizeConfigureFlow>,
     toplevel_visual_geometries: HashMap<u32, ToplevelVisualGeometry>,
     active_toplevel_resizes: HashMap<u32, ActiveToplevelResize>,
+    pending_xwayland_visual_content: HashSet<u32>,
     next_window_interaction_id: u64,
     next_resize_interaction_id: u64,
     next_resize_configure_sequence: u64,
@@ -601,6 +620,7 @@ pub struct CompositorState {
     pending_buffer_releases: Vec<wl_buffer::WlBuffer>,
     pending_dmabuf_buffer_releases: Vec<SurfaceBufferRelease>,
     buffer_release_metrics: BufferReleaseMetrics,
+    frame_callback_metrics: FrameCallbackMetrics,
     pending_explicit_sync_commits: Vec<PendingExplicitSyncCommit>,
     pending_surface_tree_transactions: Vec<PendingSurfaceTreeTransaction>,
     acquire_commit_ids: AcquireCommitIdAllocator,
@@ -618,6 +638,7 @@ pub struct CompositorState {
     frame_clock_start: Option<Instant>,
     next_configure_serial: u32,
     render_generation: u64,
+    cursor_generation: u64,
     surface_tree_generation: Option<u64>,
     scene_render_generation: u64,
     render_generation_cause: RenderGenerationCause,
@@ -665,7 +686,6 @@ pub(crate) struct SurfacePresentationKey {
     surface_id: u32,
     generation: u64,
 }
-
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurfaceDamagePresentation {
@@ -790,7 +810,6 @@ struct ClipboardDataSource {
     actions: u32,
     actions_set: bool,
 }
-
 mod clipboard_state;
 use clipboard_state::*;
 use clipboard_state::{DataDeviceData, DataSourceData};

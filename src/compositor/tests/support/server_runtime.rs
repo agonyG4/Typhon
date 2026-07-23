@@ -142,6 +142,8 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CapturePendingFrameCallbacks(Sender<bool>),
     CaptureOnlyPendingSurfaceFrameCallbacks(Sender<bool>),
     CapturePendingFrameWork(Sender<bool>),
+    CaptureFrameCallbackMetrics(Sender<FrameCallbackMetrics>),
+    CompleteProtocolOnlyFrameTick(Sender<ProtocolOnlyCompletion>),
     CaptureIdleInhibited(Sender<bool>),
     CapturePointerConstraintBackendRequests(Sender<Vec<PointerConstraintBackendRequest>>),
     CapturePointerConstraintIds(Sender<Vec<u64>>),
@@ -170,6 +172,12 @@ pub(in crate::compositor::tests) enum ServerCommand {
     ClearPointerEnterTracking,
     Barrier(Sender<()>),
     PrepareFrame,
+    CaptureLegacyPreparedFrame,
+    CaptureAndFinishLegacyPreparedFrame,
+    CaptureAndCompleteRenderedLegacyPreparedFrame,
+    CaptureLegacySubmittedAndPreparedFrames,
+    CapturePreparedFrame(Sender<bool>),
+    FinishPreparedFrame,
     FinishFrame,
     FinishFrameWithPresentation(FramePresentation),
     CaptureFrameBatch {
@@ -607,7 +615,14 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                         let _ = reply.send(server.has_only_pending_surface_frame_callbacks());
                     }
                     ServerCommand::CapturePendingFrameWork(reply) => {
-                        let _ = reply.send(server.has_pending_frame_work());
+                        let _ = reply.send(server.has_unowned_frame_work());
+                    }
+                    ServerCommand::CaptureFrameCallbackMetrics(reply) => {
+                        let _ = reply.send(server.frame_callback_metrics());
+                    }
+                    ServerCommand::CompleteProtocolOnlyFrameTick(reply) => {
+                        let output_time = server.frame_callback_time_for_output();
+                        let _ = reply.send(server.complete_protocol_only_frame_tick(output_time));
                     }
                     ServerCommand::CaptureIdleInhibited(reply) => {
                         let _ = reply.send(server.state.idle_inhibited());
@@ -680,8 +695,31 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::PrepareFrame => {
                         server.prepare_frame();
                     }
+                    ServerCommand::CaptureLegacyPreparedFrame => {
+                        server.capture_frame_callbacks_for_render();
+                    }
+                    ServerCommand::CaptureAndFinishLegacyPreparedFrame => {
+                        server.capture_frame_callbacks_for_render();
+                        server.finish_prepared_frame();
+                    }
+                    ServerCommand::CaptureAndCompleteRenderedLegacyPreparedFrame => {
+                        server.capture_frame_callbacks_for_render();
+                        server.complete_rendered_frame_callbacks_for_prepared();
+                        server.finish_prepared_frame();
+                    }
+                    ServerCommand::CaptureLegacySubmittedAndPreparedFrames => {
+                        server.capture_frame_callbacks_for_render();
+                        server.mark_prepared_frame_submitted();
+                        server.capture_frame_callbacks_for_render();
+                    }
+                    ServerCommand::CapturePreparedFrame(reply) => {
+                        let _ = reply.send(server.has_prepared_frame_batch());
+                    }
                     ServerCommand::FinishFrame => {
                         server.finish_frame();
+                    }
+                    ServerCommand::FinishPreparedFrame => {
+                        server.finish_prepared_frame();
                     }
                     ServerCommand::FinishFrameWithPresentation(presentation) => {
                         server.finish_frame_with_presentation(presentation);
@@ -1035,6 +1073,18 @@ pub(in crate::compositor::tests) fn capture_pending_frame_work(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report pending frame work")
+}
+
+pub(in crate::compositor::tests) fn capture_frame_callback_metrics(
+    commands: &Sender<ServerCommand>,
+) -> FrameCallbackMetrics {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFrameCallbackMetrics(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report frame callback metrics")
 }
 
 pub(in crate::compositor::tests) fn update_interaction_and_report(
