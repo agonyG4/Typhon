@@ -1,6 +1,8 @@
 use super::*;
 use oblivion_one::native::kms::KmsBackendKind;
 
+#[allow(dead_code)] // Direct-path state is consumed by runtime integration and diagnostics.
+mod atomic_direct;
 #[allow(dead_code)] // Runtime attachment is completed after frame-owned rendering is available.
 mod atomic_egl_gbm;
 mod backend;
@@ -8,6 +10,7 @@ mod direct;
 mod direct_policy;
 mod dumb;
 mod egl_gbm;
+mod feedback;
 #[allow(dead_code)] // Negotiation is wired into explicit slot allocation in Task 4.
 mod format_negotiation;
 mod gbm_cpu;
@@ -16,6 +19,7 @@ mod output_slot;
 #[allow(dead_code)] // Ownership primitives are wired into the explicit backend in Tasks 4 and 8.
 mod output_swapchain;
 
+pub(crate) use atomic_direct::*;
 #[allow(unused_imports)]
 pub(crate) use atomic_egl_gbm::*;
 pub(crate) use backend::*;
@@ -23,6 +27,7 @@ pub(crate) use direct::*;
 pub(crate) use direct_policy::*;
 pub(crate) use dumb::*;
 pub(crate) use egl_gbm::*;
+pub(crate) use feedback::*;
 #[allow(unused_imports)]
 pub(crate) use format_negotiation::*;
 pub(crate) use gbm_cpu::*;
@@ -767,51 +772,4 @@ impl NativeScanoutBackend {
             Self::Gbm(_) | Self::Dumb(_) => None,
         }
     }
-}
-
-pub(crate) fn apply_native_scanout_feedback(
-    server: &mut OwnCompositorServer,
-    scanout: &NativeScanoutBackend,
-) {
-    server.set_dmabuf_feedback(
-        scanout.dmabuf_feedback(),
-        scanout.dmabuf_main_device(),
-        scanout.dmabuf_main_device_path(),
-    );
-}
-
-pub(crate) static NEXT_NATIVE_PAGE_FLIP_TOKEN: AtomicU64 = AtomicU64::new(1);
-pub(crate) static NEXT_NATIVE_DRM_FILE_GENERATION: AtomicU64 = AtomicU64::new(1);
-
-pub(crate) fn allocate_native_page_flip_token() -> u64 {
-    loop {
-        let current = NEXT_NATIVE_PAGE_FLIP_TOKEN.load(Ordering::Relaxed);
-        let token = current.max(1);
-        let next = next_nonzero_page_flip_token(token);
-        if NEXT_NATIVE_PAGE_FLIP_TOKEN
-            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return token;
-        }
-    }
-}
-
-pub(crate) fn allocate_native_drm_file_generation() -> u64 {
-    loop {
-        let current = NEXT_NATIVE_DRM_FILE_GENERATION.load(Ordering::Relaxed);
-        let generation = current.max(1);
-        let next = generation.checked_add(1).unwrap_or(1);
-        if NEXT_NATIVE_DRM_FILE_GENERATION
-            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return generation;
-        }
-    }
-}
-
-pub(crate) const fn next_nonzero_page_flip_token(token: u64) -> u64 {
-    let next = token.wrapping_add(1);
-    if next == 0 { 1 } else { next }
 }

@@ -20,8 +20,10 @@ mod shortcuts;
 mod shutdown;
 mod subsurfaces;
 mod support_types;
+mod surface_commit_cursor;
 mod surface_commit_placement;
 mod surface_commits;
+mod surface_focus;
 mod surface_transactions;
 mod surfaces;
 mod window_interaction;
@@ -72,9 +74,13 @@ pub(in crate::compositor) use subsurfaces::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use support_types::*;
 #[allow(unused_imports)]
+pub(in crate::compositor) use surface_commit_cursor::*;
+#[allow(unused_imports)]
 pub(in crate::compositor) use surface_commit_placement::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use surface_commits::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use surface_focus::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use surface_transactions::*;
 #[allow(unused_imports)]

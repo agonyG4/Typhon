@@ -9,6 +9,13 @@ use super::planner::{
     NativePresentationPath, NativePresentationPlanInput, plan_native_presentation_path,
     plan_scheduled_target_for_mode,
 };
+use super::presentation_direct::{
+    DirectPresentationInputs, inspect_direct_presentation, suppress_direct_render_ahead,
+};
+use super::presentation_protocol::{
+    ProtocolCycleMetrics, complete_protocol_only_tick, log_no_visual_work,
+    log_wait_for_presentation,
+};
 use super::*;
 use oblivion_one::native::kms::{AtomicKmsErrorKind, KmsBackendKind};
 impl NativeRuntime {
@@ -370,50 +377,31 @@ impl NativeRuntime {
         if client_cursor_active {
             cursor_hardware_usable = client_cursor_hardware_usable;
         }
-        let cursor_direct_compatible = if kms_backend.effective_kind() == KmsBackendKind::Atomic {
-            if client_cursor_active {
-                !cursor_visible || cursor_hardware_usable
-            } else {
-                atomic_cursor.as_ref().is_some_and(|cursor| {
-                    atomic_cursor_visibility_policy(
-                        cursor.desired().visible,
-                        cursor.failure_latched(),
-                        *cursor_render_mode,
-                        cursor_visible,
-                    )
-                    .direct_compatible(cursor_visible)
-                }) || !cursor_visible
-            }
-        } else {
-            true
-        };
-        let atomic_primary_commit_pending =
-            scanout.page_flip_pending() || atomic_commit_arbiter.atomic_commit_pending();
-        let direct_candidate = server.direct_scanout_scene_candidate().ok();
-        let direct_candidate_eligible = direct_candidate.is_some();
-        let direct_candidate_key = direct_candidate.as_ref().and_then(|candidate| {
-            DirectScanoutCandidateKey::from_candidate(
-                candidate,
-                *drm_file_generation,
-                super::scanout::direct_cursor_plan_key(
-                    effective_cursor.as_ref(),
-                    cursor_direct_compatible,
-                ),
-                0,
-            )
+        let direct_inspection = inspect_direct_presentation(DirectPresentationInputs {
+            server,
+            kms_kind: kms_backend.effective_kind(),
+            atomic_cursor: atomic_cursor.as_ref(),
+            cursor_render_mode: *cursor_render_mode,
+            cursor_visible,
+            client_cursor_active,
+            client_cursor_hardware_usable,
+            legacy_cursor_available: legacy_cursor.is_some(),
+            page_flip_pending: scanout.page_flip_pending(),
+            atomic_commit_pending: atomic_commit_arbiter.atomic_commit_pending(),
+            drm_file_generation: *drm_file_generation,
+            effective_cursor: effective_cursor.as_ref(),
+            last_direct_candidate_key,
+            scene_changed,
+            pending_frame_work,
+            primary_redraw_requested,
+            direct_active: scanout.direct_scanout_active(),
         });
-        let direct_candidate_changed = direct_candidate_key != *last_direct_candidate_key;
-        *last_direct_candidate_key = direct_candidate_key;
-        let primary_visual_work_pending =
-            scene_changed || pending_frame_work || primary_redraw_requested;
-        let composition_required = (client_cursor_active && !client_cursor_hardware_usable)
-            || (cursor_render_mode.is_software() && cursor_visible)
-            || (cursor_visible
-                && *cursor_render_mode == NativeCursorRenderMode::Hardware
-                && atomic_cursor.is_none()
-                && legacy_cursor.is_none())
-            || !cursor_direct_compatible
-            || (scanout.direct_scanout_active() && !direct_candidate_eligible);
+        let cursor_direct_compatible = direct_inspection.cursor_direct_compatible;
+        let atomic_primary_commit_pending = direct_inspection.atomic_primary_commit_pending;
+        let direct_candidate_changed = direct_inspection.direct_candidate_changed;
+        let direct_candidate_eligible = direct_inspection.direct_candidate_eligible;
+        let primary_visual_work_pending = direct_inspection.primary_visual_work_pending;
+        let composition_required = direct_inspection.composition_required;
         if scanout.ready_frame_queued()
             && direct_scanout_preference.enabled()
             && cursor_direct_compatible
@@ -470,33 +458,7 @@ impl NativeRuntime {
             frame_scheduler.note_immediate_completion();
             scheduler_decision = SchedulerDecision::Idle;
         }
-        if presentation_path == NativePresentationPath::DirectPrimary
-            && scheduler_decision == SchedulerDecision::RenderAhead
-        {
-            scheduler_decision = SchedulerDecision::Render;
-            scanout.note_direct_composited_render_ahead_suppressed();
-            perf.log("direct_scanout", || {
-                vec![NativePerfField::str(
-                    "event",
-                    "suppressed_composited_render_ahead",
-                )]
-            });
-        }
-        if presentation_path == NativePresentationPath::IdleDirect
-            && matches!(
-                scheduler_decision,
-                SchedulerDecision::Render | SchedulerDecision::RenderAhead
-            )
-        {
-            scheduler_decision = SchedulerDecision::WaitForPageFlip;
-            scanout.note_direct_composited_render_ahead_suppressed();
-            perf.log("direct_scanout", || {
-                vec![NativePerfField::str(
-                    "event",
-                    "suppressed_composited_render_ahead",
-                )]
-            });
-        }
+        suppress_direct_render_ahead(presentation_path, &mut scheduler_decision, scanout, perf);
         if presentation_path == NativePresentationPath::CursorOnly
             && let Some(cursor) = atomic_cursor.as_mut()
             && !cursor.failure_latched()
@@ -1419,110 +1381,70 @@ impl NativeRuntime {
                 }
             }
         } else if scheduler_decision == SchedulerDecision::CompleteProtocolOnly {
-            perf.log("native.frame_skip", || {
-                vec![
-                    NativePerfField::str("reason", "frame_callback_no_damage"),
-                    NativePerfField::usize("skipped_input_repaints", skipped_input_repaints),
-                    NativePerfField::u64("tick_us", tick_us),
-                    NativePerfField::bool("pageflip_pending_at_tick", pageflip_pending_at_tick),
-                    NativePerfField::u64("input_drain_us", input_drain_us),
-                    NativePerfField::usize("raw_input_events", raw_input_events),
-                    NativePerfField::usize("coalesced_input_events", coalesced_input_events),
-                    NativePerfField::u64("pageflip_drain_us", pageflip_drain_us),
-                    NativePerfField::bool("pageflip_completed", pageflip_completed),
-                    NativePerfField::u64("present_us", present_us),
-                    NativePerfField::u64("render_generation", render_generation),
-                ]
-            });
-            let finish_frame_start = Instant::now();
-            let output_time = server.frame_callback_time_for_output();
-            let protocol_completion = server.complete_protocol_only_frame_tick(output_time);
-            frame_scheduler.complete_protocol_only();
+            let protocol_metrics = ProtocolCycleMetrics {
+                skipped_input_repaints,
+                tick_us,
+                pageflip_pending_at_tick,
+                input_drain_us,
+                raw_input_events,
+                coalesced_input_events,
+                pageflip_drain_us,
+                pageflip_completed,
+                present_us,
+                render_generation,
+                effective_render_target_available,
+                scene_changed,
+                pending_frame_work,
+                redraw_requested,
+            };
+            complete_protocol_only_tick(server, frame_scheduler, perf, protocol_metrics);
             frame_completed = true;
-            perf.log("native.finish_frame", || {
-                vec![
-                    NativePerfField::str("reason", "frame_callback_no_damage"),
-                    NativePerfField::str("completion", format!("{protocol_completion:?}")),
-                    NativePerfField::u64("elapsed_us", elapsed_micros(finish_frame_start)),
-                    NativePerfField::usize("surfaces", server.renderable_surfaces().len()),
-                    NativePerfField::u64("render_generation", server.render_generation()),
-                ]
-            });
         } else if matches!(
             scheduler_decision,
             SchedulerDecision::WaitForPageFlip | SchedulerDecision::WaitForBuffer
         ) {
-            let snapshot = scanout.buffer_snapshot();
-            let event = if scheduler_decision == SchedulerDecision::WaitForBuffer {
-                frame_pacing.wait_for_buffer_count += 1;
-                "wait_for_buffer"
-            } else {
-                "wait_for_pageflip"
-            };
-            let now_ns = monotonic_now_ns()?;
-            let mut fields = vec![
-                frame_id_field(frame_pacing.active),
-                PacingField::bool("pageflip_pending", scanout.page_flip_pending()),
-                PacingField::u64(
-                    "time_since_last_pageflip_us",
-                    frame_pacing
-                        .last_pageflip_ns()
-                        .map_or(0, |last| now_ns.saturating_sub(last) / 1_000),
-                ),
-                PacingField::u64(
-                    "time_since_visual_queued_us",
-                    frame_pacing
-                        .active_queued_ns
-                        .map_or(0, |queued| now_ns.saturating_sub(queued) / 1_000),
-                ),
-            ];
-            fields.extend(snapshot_fields(snapshot));
-            frame_pacing.log(event, fields);
-            perf.log("native.frame_skip", || {
-                vec![
-                    NativePerfField::str(
-                        "reason",
-                        if scheduler_decision == SchedulerDecision::WaitForBuffer {
-                            "render_target_unavailable"
-                        } else {
-                            "pageflip_pending"
-                        },
-                    ),
-                    NativePerfField::usize("skipped_input_repaints", skipped_input_repaints),
-                    NativePerfField::u64("tick_us", tick_us),
-                    NativePerfField::bool("pageflip_pending_at_tick", pageflip_pending_at_tick),
-                    NativePerfField::bool(
-                        "render_target_available",
-                        effective_render_target_available,
-                    ),
-                    NativePerfField::u64("input_drain_us", input_drain_us),
-                    NativePerfField::usize("raw_input_events", raw_input_events),
-                    NativePerfField::usize("coalesced_input_events", coalesced_input_events),
-                    NativePerfField::u64("pageflip_drain_us", pageflip_drain_us),
-                    NativePerfField::bool("pageflip_completed", pageflip_completed),
-                    NativePerfField::u64("present_us", present_us),
-                    NativePerfField::u64("render_generation", render_generation),
-                    NativePerfField::bool("render_changed", scene_changed),
-                    NativePerfField::bool("pending_frame_work", pending_frame_work),
-                    NativePerfField::bool("redraw_requested", redraw_requested),
-                ]
-            });
+            log_wait_for_presentation(
+                frame_pacing,
+                scanout,
+                perf,
+                scheduler_decision,
+                ProtocolCycleMetrics {
+                    skipped_input_repaints,
+                    tick_us,
+                    pageflip_pending_at_tick,
+                    input_drain_us,
+                    raw_input_events,
+                    coalesced_input_events,
+                    pageflip_drain_us,
+                    pageflip_completed,
+                    present_us,
+                    render_generation,
+                    effective_render_target_available,
+                    scene_changed,
+                    pending_frame_work,
+                    redraw_requested,
+                },
+            )?;
         } else if skipped_input_repaints > 0 {
-            perf.log("native.frame_skip", || {
-                vec![
-                    NativePerfField::str("reason", "input_forwarded_no_visual"),
-                    NativePerfField::usize("skipped_input_repaints", skipped_input_repaints),
-                    NativePerfField::u64("tick_us", tick_us),
-                    NativePerfField::bool("pageflip_pending_at_tick", pageflip_pending_at_tick),
-                    NativePerfField::u64("input_drain_us", input_drain_us),
-                    NativePerfField::usize("raw_input_events", raw_input_events),
-                    NativePerfField::usize("coalesced_input_events", coalesced_input_events),
-                    NativePerfField::u64("pageflip_drain_us", pageflip_drain_us),
-                    NativePerfField::bool("pageflip_completed", pageflip_completed),
-                    NativePerfField::u64("present_us", present_us),
-                    NativePerfField::u64("render_generation", render_generation),
-                ]
-            });
+            log_no_visual_work(
+                perf,
+                ProtocolCycleMetrics {
+                    skipped_input_repaints,
+                    tick_us,
+                    pageflip_pending_at_tick,
+                    input_drain_us,
+                    raw_input_events,
+                    coalesced_input_events,
+                    pageflip_drain_us,
+                    pageflip_completed,
+                    present_us,
+                    render_generation,
+                    effective_render_target_available,
+                    scene_changed,
+                    pending_frame_work,
+                    redraw_requested,
+                },
+            );
         }
         cycle.frame_completed = frame_completed;
         cycle.frame_rendered = frame_rendered;

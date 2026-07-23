@@ -1,5 +1,5 @@
 use std::{
-    os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd},
     time::Instant,
 };
 
@@ -619,7 +619,7 @@ impl DrmAtomicBackend {
             AtomicKmsErrorKind::TestOnlyRejected,
             "initial atomic TEST_ONLY commit",
         )?;
-        let test_only_us = elapsed_micros(test_started);
+        let test_only_us = super::submission::elapsed_micros(test_started);
         let initial_property_count = request.assignment_count();
         if let Some(in_fence) = initial_in_fence.as_ref() {
             request.set_initial_input_fence(&discovery.pipeline, in_fence.as_raw_fd())?;
@@ -639,7 +639,7 @@ impl DrmAtomicBackend {
             rollback_pipeline(fd, &discovery);
             return Err(error);
         }
-        let initial_commit_us = elapsed_micros(initial_commit_started);
+        let initial_commit_us = super::submission::elapsed_micros(initial_commit_started);
         Ok(Self {
             fd: fd.as_raw_fd(),
             discovery,
@@ -764,10 +764,10 @@ impl DrmAtomicBackend {
         );
         match result {
             Ok(()) => Ok(AtomicFlipSubmission {
-                out_fence: adopt_out_fence(out_fence_storage),
+                out_fence: super::submission::adopt_out_fence(out_fence_storage),
             }),
             Err(error) => {
-                drop(adopt_out_fence(out_fence_storage));
+                drop(super::submission::adopt_out_fence(out_fence_storage));
                 Err(error)
             }
         }
@@ -778,14 +778,18 @@ impl DrmAtomicBackend {
         request: AtomicFlipRequest,
     ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
         let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        submit_atomic_flip_with(&self.discovery.pipeline, request, |submission| {
-            submit_atomic(
-                fd,
-                submission,
-                AtomicKmsErrorKind::FlipRejected,
-                "atomic primary-plane flip with explicit fence",
-            )
-        })
+        super::submission::submit_atomic_flip_with(
+            &self.discovery.pipeline,
+            request,
+            |submission| {
+                submit_atomic(
+                    fd,
+                    submission,
+                    AtomicKmsErrorKind::FlipRejected,
+                    "atomic primary-plane flip with explicit fence",
+                )
+            },
+        )
     }
 
     pub fn recover(&self, framebuffer: FramebufferId) -> Result<(), AtomicKmsError> {
@@ -879,57 +883,6 @@ impl DrmAtomicBackend {
     }
 }
 
-pub(crate) fn submit_atomic_flip_with(
-    pipeline: &AtomicPipelineProperties,
-    request: AtomicFlipRequest,
-    submit: impl FnOnce(&AtomicSubmission) -> Result<(), AtomicKmsError>,
-) -> Result<AtomicFlipSubmission, AtomicKmsError> {
-    let mut out_fence_storage = -1i32;
-    let out_fence_ptr = pipeline
-        .crtc_props
-        .out_fence_ptr
-        .map(|_| std::ptr::addr_of_mut!(out_fence_storage));
-    let in_fence_property = pipeline.plane_props.in_fence_fd.ok_or_else(|| {
-        AtomicKmsError::new(
-            AtomicKmsErrorKind::MissingProperty,
-            "primary plane is missing required IN_FENCE_FD",
-        )
-    })?;
-    let mut atomic_request = AtomicRequest::primary_flip_with_cursor(
-        pipeline,
-        request.framebuffer,
-        request.cursor.as_ref(),
-    )?;
-    atomic_request.set_plane(
-        pipeline.plane,
-        in_fence_property,
-        u64::try_from(request.in_fence.as_raw_fd()).map_err(|_| {
-            AtomicKmsError::new(
-                AtomicKmsErrorKind::MissingProperty,
-                "Atomic input fence FD is negative",
-            )
-        })?,
-    )?;
-    if let (Some(property), Some(pointer)) = (pipeline.crtc_props.out_fence_ptr, out_fence_ptr) {
-        atomic_request.set_crtc(pipeline.crtc, property, pointer as u64)?;
-    }
-    let submission = AtomicSubmission::page_flip(atomic_request, request.token);
-    let result = submit(&submission);
-    match result {
-        Ok(()) => Ok(AtomicFlipSubmission {
-            out_fence: adopt_out_fence(out_fence_storage),
-        }),
-        Err(error) => {
-            drop(adopt_out_fence(out_fence_storage));
-            Err(error)
-        }
-    }
-}
-
-fn adopt_out_fence(raw_fd: i32) -> Option<OwnedFd> {
-    (raw_fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(raw_fd) })
-}
-
 pub fn initial_modeset_request_from_discovery(
     discovery: &AtomicDiscovery,
     mode_blob: BlobId,
@@ -954,10 +907,6 @@ pub fn initial_modeset_request_from_discovery_with_cursor(
 ) -> Result<AtomicRequest, AtomicKmsError> {
     let pipeline = &discovery.pipeline;
     AtomicRequest::initial_modeset_for_pipeline(pipeline, mode_blob, framebuffer, geometry, cursor)
-}
-
-fn elapsed_micros(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 impl Drop for DrmAtomicBackend {

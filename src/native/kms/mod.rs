@@ -4,6 +4,7 @@ mod ioctl;
 mod legacy;
 mod properties;
 mod state;
+mod submission;
 
 pub use atomic::*;
 pub use backend::*;
@@ -11,6 +12,8 @@ pub use ioctl::*;
 pub use legacy::*;
 pub use properties::*;
 pub use state::*;
+#[allow(unused_imports)]
+pub(crate) use submission::submit_atomic_flip_with;
 
 use std::{error::Error, fmt};
 
