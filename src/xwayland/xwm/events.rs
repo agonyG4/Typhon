@@ -134,6 +134,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         }
         Event::UnmapNotify(event) => {
             let handle = X11WindowHandle::new(xwm.generation, event.window);
+            xwm.note_focus_unmapped(event.window);
             let Some(record) = xwm.windows.get(handle) else {
                 return Ok(());
             };
@@ -264,10 +265,10 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             }
         }
         Event::FocusIn(event) => {
-            xwm.note_focus_in(event.event);
+            xwm.note_focus_in(&event);
         }
         Event::FocusOut(event) => {
-            xwm.note_focus_out(event.event);
+            xwm.note_focus_out(&event);
         }
         Event::ShapeNotify(event) => {
             // Shape is negotiated only for version diagnostics.  Until the

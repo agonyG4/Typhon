@@ -262,6 +262,13 @@ impl X11WindowRegistry {
         self.records.contains_key(&handle)
     }
 
+    pub(crate) fn handle_by_xid(&self, xid: u32) -> Option<X11WindowHandle> {
+        self.records
+            .keys()
+            .find(|handle| handle.xid() == xid)
+            .copied()
+    }
+
     #[cfg(test)]
     pub(crate) fn lifecycle(&self, handle: X11WindowHandle) -> Option<X11WindowLifecycle> {
         self.records.get(&handle).map(|record| record.lifecycle)

@@ -29,6 +29,13 @@ impl CompositorState {
         self.focused_surface = Some(surface.clone());
         self.focused_window_id = self.update_desktop_focus_window(new_surface_id, changed);
         self.ensure_keyboard_focus(&surface);
+        crate::xwayland::trace::emit("focus_wayland_keyboard", || {
+            crate::xwayland::trace::TraceFields::new()
+                .field("source", "compositor")
+                .field("surface_id", new_surface_id)
+                .field("focus_generation", self.focus_generation)
+                .field("changed", changed)
+        });
         self.apply_pending_pointer_constraint_state_for_surface(new_surface_id);
         if !self
             .layer_surfaces

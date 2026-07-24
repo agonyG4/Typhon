@@ -6,6 +6,10 @@ impl Xwm {
         self.resize_sync.next_deadline_ns()
     }
 
+    pub(crate) fn next_focus_deadline_ns(&self) -> Option<u64> {
+        self.focus.next_focus_deadline_ns()
+    }
+
     pub fn note_x11_surface_serial(
         &mut self,
         handle: X11WindowHandle,

@@ -508,6 +508,15 @@ impl CompositorState {
         ));
         self.pending_pointer_constraint_backend_requests
             .push(request);
+        crate::xwayland::trace::emit("focus_pointer_constraint", || {
+            crate::xwayland::trace::TraceFields::new()
+                .field("source", "compositor")
+                .field("constraint_id", constraint_id)
+                .field("surface_id", compositor_surface_id(&surface))
+                .field("requested", true)
+                .field("active", false)
+                .field("focus_generation", self.focus_generation)
+        });
     }
 
     pub(in crate::compositor) fn pointer_constraint_activation_anchor(
@@ -675,6 +684,15 @@ impl CompositorState {
             return;
         };
         self.pointer_constraint.activate(mode, surface_id);
+        crate::xwayland::trace::emit("focus_pointer_constraint", || {
+            crate::xwayland::trace::TraceFields::new()
+                .field("source", "backend")
+                .field("constraint_id", constraint_id)
+                .field("surface_id", surface_id)
+                .field("requested", true)
+                .field("active", true)
+                .field("generation", generation)
+        });
         if mode == PointerConstraintMode::Locked {
             if let Some(pending) = self.pending_locked_pointer_reveal.take() {
                 pointer_debug_log(format!(

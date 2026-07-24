@@ -26,6 +26,7 @@ impl XwaylandService {
                 .xwm
                 .next_resize_sync_deadline_ns()
                 .into_iter()
+                .chain(resources.xwm.next_focus_deadline_ns())
                 .chain(resources.xwm.next_adoption_deadline_ns())
                 .min(),
             ServiceState::Disabled

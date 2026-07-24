@@ -9,6 +9,7 @@ use x11rb::{
     protocol::xproto::{self, AtomEnum, ConnectionExt as XprotoConnectionExt},
 };
 
+use super::focus::{FocusModel, focus_model};
 use super::{
     X11PublishedState, X11WindowHandle, Xwm, XwmError,
     atoms::XwmAtomName,
@@ -495,6 +496,8 @@ fn complete_property(
     let mut delta = None;
     let mut sync_counter_changed = false;
     let mut sync_request_support_changed = false;
+    let mut old_focus_model = None;
+    let mut focus_model_changed = false;
     {
         let Some(record) = xwm.windows.get_mut(pending.handle) else {
             xwm.property_metrics.stale = xwm.property_metrics.stale.saturating_add(1);
@@ -503,6 +506,15 @@ fn complete_property(
         if record.property_epoch != pending.epoch {
             xwm.property_metrics.stale = xwm.property_metrics.stale.saturating_add(1);
             return Ok(());
+        }
+        if matches!(
+            pending.kind,
+            PropertyKind::WmHints | PropertyKind::WmProtocols
+        ) {
+            old_focus_model = record
+                .snapshot
+                .as_ref()
+                .map(|snapshot| focus_model(snapshot.accepts_input, snapshot.supports_take_focus));
         }
         record.pending_properties &= !bit;
         apply_parsed(
@@ -526,6 +538,15 @@ fn complete_property(
                 sync_request_support_changed = pending.kind == PropertyKind::WmProtocols
                     && previous_sync_request_support != record.properties.supports_sync_request;
                 record.refresh_properties &= !bit;
+                if matches!(
+                    pending.kind,
+                    PropertyKind::WmHints | PropertyKind::WmProtocols
+                ) {
+                    focus_model_changed = old_focus_model
+                        != record.snapshot.as_ref().map(|snapshot| {
+                            focus_model(snapshot.accepts_input, snapshot.supports_take_focus)
+                        });
+                }
             }
         }
     }
@@ -561,6 +582,34 @@ fn complete_property(
                     window: pending.handle,
                     delta,
                 });
+        }
+        if focus_model_changed {
+            let new_focus_model = xwm
+                .windows
+                .get(pending.handle)
+                .and_then(|record| record.snapshot.as_ref())
+                .map(|snapshot| focus_model(snapshot.accepts_input, snapshot.supports_take_focus));
+            let pending_transition = xwm.focus.pending_focus().and_then(|pending_focus| {
+                (pending_focus.target == Some(pending.handle.xid())).then_some(pending_focus.id)
+            });
+            if let (Some(new_focus_model), Some(transition)) = (new_focus_model, pending_transition)
+            {
+                xwm.focus
+                    .update_pending_focus_model(transition, new_focus_model);
+                if !matches!(new_focus_model, FocusModel::NoFocus)
+                    && xwm.focus.confirmed_focus() != Some(pending.handle.xid())
+                {
+                    let timestamp = xwm.focus.current_focus_timestamp();
+                    xwm.outgoing_events
+                        .push_back(super::XwmEvent::FocusRequested {
+                            window: pending.handle,
+                            source: 2,
+                            timestamp,
+                            current_time: timestamp,
+                            user_time: None,
+                        });
+                }
+            }
         }
     }
     trace::emit("property_refresh_property_complete", || {

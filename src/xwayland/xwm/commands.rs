@@ -18,7 +18,7 @@ use super::{
     XwmEvent,
     atoms::XwmAtomName,
     ewmh::publishable_state,
-    focus::{FocusModel, focus_model, should_send_take_focus},
+    focus::{FocusModel, FocusRepair, FocusTransitionId, focus_model, should_send_take_focus},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +84,117 @@ impl XwmCommand {
             Self::SyncClientLists { .. } => None,
         }
     }
+}
+
+pub(crate) fn execute_focus_repair(
+    xwm: &mut Xwm,
+    repair: FocusRepair,
+    window: super::X11WindowHandle,
+) -> Result<(), XwmError> {
+    if repair.target != Some(window.xid()) {
+        return Err(XwmError::InvalidCommand("focus repair target mismatch"));
+    }
+    execute_focus(xwm, Some(window), repair.timestamp, Some(repair.id))
+}
+
+fn execute_focus(
+    xwm: &mut Xwm,
+    window: Option<super::X11WindowHandle>,
+    timestamp: u32,
+    existing_transition: Option<FocusTransitionId>,
+) -> Result<(), XwmError> {
+    let focus = window.map_or(x11rb::NONE, |handle| handle.xid());
+    let (accepts_input, supports_take_focus) = window
+        .and_then(|handle| xwm.windows.get(handle))
+        .and_then(|record| record.snapshot.as_ref())
+        .map(|snapshot| (snapshot.accepts_input, snapshot.supports_take_focus))
+        .unwrap_or((None, false));
+    let model = focus_model(accepts_input, supports_take_focus);
+    let timestamp = if timestamp != 0 {
+        timestamp
+    } else {
+        xwm.focus.current_focus_timestamp()
+    };
+    let transition = if let Some(transition) = existing_transition {
+        if !xwm.focus.update_pending_focus_model(transition, model) {
+            return Err(XwmError::InvalidCommand(
+                "focus repair transition is no longer pending",
+            ));
+        }
+        transition
+    } else {
+        xwm.note_focus_command(window, model, timestamp)
+    };
+    let mut request_sequence = None;
+    let mut sent_set_input_focus = false;
+    if matches!(model, FocusModel::Input) {
+        let cookie = xwm
+            .connection
+            .set_input_focus(InputFocus::POINTER_ROOT, focus, timestamp)
+            .map_err(|error| {
+                xwm.focus.note_focus_request_failed(transition);
+                XwmError::Connection(error)
+            })?;
+        request_sequence = Some(cookie.sequence_number());
+        sent_set_input_focus = true;
+    }
+    let mut sent_take_focus = false;
+    if let Some(handle) = window
+        && should_send_take_focus(accepts_input, supports_take_focus)
+    {
+        let event = xproto::ClientMessageEvent {
+            response_type: xproto::CLIENT_MESSAGE_EVENT,
+            format: 32,
+            sequence: 0,
+            window: handle.xid(),
+            type_: xwm.atoms.get(XwmAtomName::WmProtocols),
+            data: xproto::ClientMessageData::from([
+                xwm.atoms.get(XwmAtomName::WmTakeFocus),
+                timestamp,
+                0,
+                0,
+                0,
+            ]),
+        };
+        xwm.connection
+            .send_event(false, handle.xid(), xproto::EventMask::NO_EVENT, event)
+            .map_err(|error| {
+                xwm.focus.note_focus_request_failed(transition);
+                XwmError::Connection(error)
+            })?;
+        sent_take_focus = true;
+    }
+    xwm.focus.note_focus_request_issued(
+        transition,
+        request_sequence,
+        sent_set_input_focus,
+        sent_take_focus,
+    );
+    let value = window.map_or_else(Vec::new, |handle| vec![handle.xid()]);
+    if value.is_empty() {
+        xwm.connection
+            .delete_property(xwm.root, xwm.atoms.get(XwmAtomName::NetActiveWindow))
+            .map_err(|error| {
+                xwm.focus.note_focus_request_failed(transition);
+                XwmError::Connection(error)
+            })?;
+    } else {
+        xwm.connection
+            .change_property32(
+                PropMode::REPLACE,
+                xwm.root,
+                xwm.atoms.get(XwmAtomName::NetActiveWindow),
+                AtomEnum::WINDOW,
+                &value,
+            )
+            .map_err(|error| {
+                xwm.focus.note_focus_request_failed(transition);
+                XwmError::Connection(error)
+            })?;
+    }
+    xwm.focus
+        .note_active_property_published(transition, window.map(|handle| handle.xid()));
+    Ok(())
 }
 
 pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOutcome, XwmError> {
@@ -239,61 +350,7 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
             }
         }
         XwmCommand::Focus { window, timestamp } => {
-            xwm.note_focus_command(window, timestamp);
-            let focus = window.map_or(x11rb::NONE, |handle| handle.xid());
-            let model = window
-                .and_then(|handle| xwm.windows.get(handle))
-                .and_then(|record| record.snapshot.as_ref())
-                .map(|snapshot| focus_model(snapshot.accepts_input, snapshot.supports_take_focus))
-                .unwrap_or(FocusModel::Input);
-            if matches!(model, FocusModel::Input) {
-                xwm.connection
-                    .set_input_focus(InputFocus::NONE, focus, timestamp)
-                    .map_err(XwmError::Connection)?;
-            }
-            if let Some(handle) = window
-                && xwm
-                    .windows
-                    .get(handle)
-                    .and_then(|record| record.snapshot.as_ref())
-                    .is_some_and(|snapshot| {
-                        should_send_take_focus(snapshot.accepts_input, snapshot.supports_take_focus)
-                    })
-            {
-                let event = xproto::ClientMessageEvent {
-                    response_type: xproto::CLIENT_MESSAGE_EVENT,
-                    format: 32,
-                    sequence: 0,
-                    window: handle.xid(),
-                    type_: xwm.atoms.get(XwmAtomName::WmProtocols),
-                    data: xproto::ClientMessageData::from([
-                        xwm.atoms.get(XwmAtomName::WmTakeFocus),
-                        timestamp,
-                        0,
-                        0,
-                        0,
-                    ]),
-                };
-                xwm.connection
-                    .send_event(false, handle.xid(), xproto::EventMask::NO_EVENT, event)
-                    .map_err(XwmError::Connection)?;
-            }
-            let value = window.map_or_else(Vec::new, |handle| vec![handle.xid()]);
-            if value.is_empty() {
-                xwm.connection
-                    .delete_property(xwm.root, xwm.atoms.get(XwmAtomName::NetActiveWindow))
-                    .map_err(XwmError::Connection)?;
-            } else {
-                xwm.connection
-                    .change_property32(
-                        PropMode::REPLACE,
-                        xwm.root,
-                        xwm.atoms.get(XwmAtomName::NetActiveWindow),
-                        AtomEnum::WINDOW,
-                        &value,
-                    )
-                    .map_err(XwmError::Connection)?;
-            }
+            execute_focus(xwm, window, timestamp, None)?;
         }
         XwmCommand::Raise(handle) => {
             xwm.note_family_order(&[handle]);

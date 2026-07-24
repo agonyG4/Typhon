@@ -3,6 +3,48 @@ use crate::xwayland::trace::{self, TraceFields};
 use x11rb::connection::Connection;
 
 impl Xwm {
+    pub(crate) fn handle_focus_deadline(&mut self, now_ns: u64) -> Result<(), XwmError> {
+        let Some(pending) = self.focus.pending_focus().copied() else {
+            return Ok(());
+        };
+        if pending.target.is_none()
+            || pending.repair_attempted
+            || self
+                .focus
+                .next_focus_deadline_ns()
+                .is_none_or(|deadline| now_ns < deadline)
+        {
+            return Ok(());
+        }
+        let Some(handle) = pending
+            .target
+            .and_then(|xid| self.windows.handle_by_xid(xid))
+        else {
+            self.focus.cancel_focus_transition(pending.id);
+            return Ok(());
+        };
+        if handle.generation() != self.generation
+            || !self.windows.get(handle).is_some_and(|record| {
+                record.snapshot.is_some()
+                    && !matches!(
+                        record.lifecycle,
+                        X11WindowLifecycle::Iconic
+                            | X11WindowLifecycle::Withdrawn
+                            | X11WindowLifecycle::Destroyed
+                    )
+            })
+        {
+            self.focus.cancel_focus_transition(pending.id);
+            return Ok(());
+        }
+        let Some(repair) = self.focus.take_focus_repair(now_ns) else {
+            return Ok(());
+        };
+        commands::execute_focus_repair(self, repair, handle)?;
+        self.connection.flush().map_err(XwmError::Connection)?;
+        Ok(())
+    }
+
     pub(crate) fn handle_resize_sync_deadline(&mut self, now_ns: u64) -> Result<(), XwmError> {
         for handle in self.resize_sync.expired_handles(now_ns) {
             if let Some(timed_out) = self.resize_sync.timeout(handle, now_ns) {

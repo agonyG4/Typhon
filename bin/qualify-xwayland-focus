@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "--dry-run" ]]; then
+    printf '%s\n' \
+        'focus qualification is opt-in and consumes TYPHON_XWAYLAND_TRACE=1 output' \
+        'usage: bin/qualify-xwayland-focus [trace-file|-]' \
+        'stdin is used when no trace file is supplied'
+    exit 0
+fi
+
+trace_input="${1:--}"
+if [[ "$trace_input" != "-" && ! -r "$trace_input" ]]; then
+    printf 'trace input is not readable: %s\n' "$trace_input" >&2
+    exit 2
+fi
+
+awk '
+BEGIN {
+    transitions = 0
+    confirmed = 0
+    confirmed_before_click = 0
+    timeouts = 0
+    mismatches = 0
+    repairs = 0
+    constraints_requested = 0
+    constraints_active = 0
+    buttons = 0
+    first_button_line = 0
+}
+/x_event_type=focus_lifecycle/ {
+    if ($0 ~ /XwmCommand/) transitions++
+    if ($0 ~ /Confirmed/) {
+        confirmed++
+        if (first_button_line == 0) confirmed_before_click++
+    }
+    if ($0 ~ /Timeout/) timeouts++
+    if ($0 ~ /Mismatch/) mismatches++
+    if ($0 ~ /Repair/) repairs++
+}
+/x_event_type=focus_pointer_constraint/ {
+    if ($0 ~ /requested=true/) constraints_requested++
+    if ($0 ~ /active=true/) constraints_active++
+}
+/x_event_type=focus_pointer_button/ && /pressed=true/ {
+    buttons++
+    if (first_button_line == 0) first_button_line = NR
+}
+END {
+    printf "focus transitions:                  %d\n", transitions
+    printf "confirmed without pointer click:    %d\n", confirmed_before_click
+    printf "pending timeouts:                   %d\n", timeouts
+    printf "focus mismatches:                   %d\n", mismatches
+    printf "bounded repairs:                    %d\n", repairs
+    printf "constraint requests:                %d\n", constraints_requested
+    printf "constraint activations:             %d\n", constraints_active
+    printf "first pointer button events:        %d\n", buttons
+    if (buttons > 0 && confirmed_before_click < confirmed) {
+        printf "FAIL: focus confirmation depended on a pointer button\n" > "/dev/stderr"
+        failed = 1
+    }
+    if (repairs > transitions || mismatches < 0) {
+        printf "FAIL: focus repair accounting is invalid\n" > "/dev/stderr"
+        failed = 1
+    }
+    exit failed
+}
+' "$trace_input"

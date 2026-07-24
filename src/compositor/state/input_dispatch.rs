@@ -528,6 +528,13 @@ impl CompositorState {
 
     pub(in crate::compositor) fn send_pointer_button(&mut self, button: u32, pressed: bool) {
         if let Some(locked_surface) = self.locked_pointer_input_surface() {
+            crate::xwayland::trace::emit("focus_pointer_button", || {
+                crate::xwayland::trace::TraceFields::new()
+                    .field("source", "compositor")
+                    .field("button", button)
+                    .field("pressed", pressed)
+                    .field("surface_id", compositor_surface_id(&locked_surface))
+            });
             self.ensure_pointer_focus(&locked_surface);
             if let Some(active) = self.active_locked_pointer_binding() {
                 self.pin_locked_pointer_focus(&active);

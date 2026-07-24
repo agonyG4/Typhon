@@ -121,6 +121,26 @@ impl XwaylandService {
         Ok(())
     }
 
+    pub fn handle_focus_deadline(
+        &mut self,
+        now_ns: u64,
+        supervisor: &mut ChildSupervisor,
+    ) -> io::Result<()> {
+        let focus_error = if let ServiceState::Running(resources) = &mut self.state {
+            resources
+                .xwm
+                .handle_focus_deadline(now_ns)
+                .err()
+                .map(io::Error::other)
+        } else {
+            None
+        };
+        if let Some(error) = focus_error {
+            self.fail_managed_xwm(supervisor, XwaylandFailureStage::CommandFlush, error);
+        }
+        Ok(())
+    }
+
     pub fn handle_deadline(
         &mut self,
         now_ns: u64,

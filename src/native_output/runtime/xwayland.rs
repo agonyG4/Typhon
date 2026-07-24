@@ -207,6 +207,13 @@ impl NativeRuntime {
         }
         let now_ns = monotonic_now_ns()?;
         commands.extend(self.server.take_xwayland_backend_commands(now_ns));
+        let has_focus_command = commands
+            .iter()
+            .any(|command| matches!(command, XwmCommand::Focus { .. }));
+        if !has_focus_command {
+            self.xwayland
+                .handle_focus_deadline(now_ns, &mut self.process_supervisor)?;
+        }
         let normalization = normalize_destroyed_xwayland_commands(commands, &destroyed);
         if normalization.pruned_commands > 0 || normalization.pruned_handles > 0 {
             let sample_terminal = destroyed.iter().next().copied();

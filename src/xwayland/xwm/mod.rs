@@ -430,16 +430,33 @@ impl Xwm {
         self.windows.len()
     }
 
-    pub(crate) fn note_focus_in(&mut self, xid: u32) {
-        self.focus.note_focus_in(xid);
+    pub(crate) fn note_focus_in(&mut self, event: &xproto::FocusInEvent) {
+        self.focus.note_focus_in_event_with_root(
+            self.generation,
+            Some(self.root),
+            event.event,
+            event.sequence,
+            event.mode.into(),
+            event.detail.into(),
+        );
     }
 
-    pub(crate) fn note_focus_out(&mut self, xid: u32) {
-        self.focus.note_focus_out(xid);
+    pub(crate) fn note_focus_out(&mut self, event: &xproto::FocusOutEvent) {
+        self.focus.note_focus_out_event(
+            self.generation,
+            event.event,
+            event.sequence,
+            event.mode.into(),
+            event.detail.into(),
+        );
     }
 
     pub(crate) fn note_focus_destroyed(&mut self, xid: u32) {
         self.focus.note_destroyed(xid);
+    }
+
+    pub(crate) fn note_focus_unmapped(&mut self, xid: u32) {
+        self.focus.note_unmapped(xid);
     }
 
     pub(crate) fn note_active_window_request(
@@ -457,9 +474,18 @@ impl Xwm {
         (current_time, last_user_time.or(user_time))
     }
 
-    pub(crate) fn note_focus_command(&mut self, handle: Option<X11WindowHandle>, timestamp: u32) {
-        self.focus
-            .note_focus_command(handle.map(X11WindowHandle::xid), timestamp);
+    pub(crate) fn note_focus_command(
+        &mut self,
+        handle: Option<X11WindowHandle>,
+        model: focus::FocusModel,
+        timestamp: u32,
+    ) -> focus::FocusTransitionId {
+        self.focus.note_focus_command(
+            self.generation,
+            handle.map(X11WindowHandle::xid),
+            model,
+            timestamp,
+        )
     }
 
     pub fn required_extensions_available(&self) -> bool {
@@ -544,6 +570,9 @@ impl Xwm {
             .retain(|handle, _| handle.generation() != generation);
         self.data_bridge
             .clear_generation(data_bridge::BridgeGeneration::from(generation));
+        if generation == self.generation {
+            self.focus.reset_generation(generation);
+        }
         properties::cancel_generation(self, generation);
         if generation == self.generation {
             self.buffer_ready_surfaces.clear();

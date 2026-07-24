@@ -506,6 +506,99 @@ fn xsync_request_precedes_configure() {
 }
 
 #[test]
+fn focus_command_uses_pointer_root_and_remains_pending_until_focus_in() {
+    let generation = generation(219);
+    let (mut xwm, mut peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 219, true, false, false);
+
+    assert!(matches!(
+        super::super::commands::execute(
+            &mut xwm,
+            XwmCommand::Focus {
+                window: Some(handle),
+                timestamp: 55,
+            },
+        ),
+        Ok(super::super::XwmCommandOutcome::Applied)
+    ));
+    xwm.flush().expect("flush focus request");
+    let requests = read_fixture_requests(&mut peer);
+    assert_eq!(request_opcodes(&requests).first().copied(), Some(42));
+    assert_eq!(
+        requests.get(1).copied(),
+        Some(1),
+        "POINTER_ROOT revert mode"
+    );
+    assert_eq!(xwm.focus.desired_focus(), Some(handle.xid()));
+    assert_eq!(xwm.focus.confirmed_focus(), None);
+    assert!(xwm.focus.pending_focus().is_some());
+}
+
+#[test]
+fn focus_command_respects_each_icccm_focus_model() {
+    let cases = [
+        (
+            Some(true),
+            false,
+            super::super::focus::FocusModel::Input,
+            vec![42, 18],
+        ),
+        (
+            Some(false),
+            true,
+            super::super::focus::FocusModel::TakeFocusOnly,
+            vec![25, 18],
+        ),
+        (
+            Some(false),
+            false,
+            super::super::focus::FocusModel::NoFocus,
+            vec![18],
+        ),
+    ];
+    for (offset, (accepts_input, supports_take_focus, model, expected_opcodes)) in
+        cases.into_iter().enumerate()
+    {
+        let generation = generation(220 + offset as u64);
+        let (mut xwm, mut peer) = test_fixture(generation);
+        let handle = prepare_managed_window(&mut xwm, 220 + offset as u32, true, false, false);
+        let mut snapshot = sync_snapshot(handle, 0);
+        snapshot.accepts_input = accepts_input;
+        snapshot.supports_take_focus = supports_take_focus;
+        xwm.windows
+            .get_mut(handle)
+            .expect("managed window")
+            .snapshot = Some(snapshot);
+
+        assert!(matches!(
+            super::super::commands::execute(
+                &mut xwm,
+                XwmCommand::Focus {
+                    window: Some(handle),
+                    timestamp: 55,
+                },
+            ),
+            Ok(super::super::XwmCommandOutcome::Applied)
+        ));
+        xwm.flush().expect("flush focus request");
+        assert_eq!(
+            request_opcodes(&read_fixture_requests(&mut peer)),
+            expected_opcodes
+        );
+        let pending = xwm.focus.pending_focus().expect("focus remains pending");
+        assert_eq!(pending.model, model);
+        assert_eq!(
+            pending.sent_set_input_focus,
+            matches!(model, super::super::focus::FocusModel::Input)
+        );
+        assert_eq!(
+            pending.sent_take_focus,
+            matches!(model, super::super::focus::FocusModel::TakeFocusOnly)
+        );
+    }
+}
+
+#[test]
 fn sync_counter_initialized_once_on_manage() {
     let generation = generation(202);
     let (mut xwm, mut peer) = test_fixture(generation);
