@@ -13,6 +13,8 @@ pub(crate) enum NativeIoOperation {
     RawInputDiscard,
     RawInputAction,
     ExplicitSyncPark,
+    KmsWorkerQuiesce,
+    KmsWorkerJoin,
     ExplicitSyncRearm,
     ExplicitSyncNotifier,
     PageflipQuarantine,
@@ -55,6 +57,12 @@ pub(crate) trait NativeSessionIo {
 
     fn suspend_input(&mut self) -> NativeResult<()>;
     fn park_explicit_sync(&mut self) -> NativeResult<()>;
+    fn quiesce_kms_worker(&mut self) -> NativeResult<()> {
+        Ok(())
+    }
+    fn join_kms_worker(&mut self) -> NativeResult<()> {
+        Ok(())
+    }
     fn quarantine_pageflip(&mut self) -> NativeResult<()>;
     fn unregister_drm_source(&mut self) -> NativeResult<()>;
     fn disable_hardware_cursor(&mut self) -> NativeResult<()>;
@@ -79,6 +87,10 @@ pub(crate) fn quiesce_and_acknowledge<I: NativeSessionIo>(
     io.suspend_input()?;
     io.observe(NativeIoOperation::ExplicitSyncPark);
     io.park_explicit_sync()?;
+    io.observe(NativeIoOperation::KmsWorkerQuiesce);
+    io.quiesce_kms_worker()?;
+    io.observe(NativeIoOperation::KmsWorkerJoin);
+    io.join_kms_worker()?;
     io.observe(NativeIoOperation::PageflipQuarantine);
     io.quarantine_pageflip()?;
     io.observe(NativeIoOperation::DrmSourceUnregister);
@@ -165,9 +177,35 @@ impl NativeSessionIo for NativeRuntime {
         Ok(())
     }
 
+    fn quiesce_kms_worker(&mut self) -> NativeResult<()> {
+        if let Some(worker) = self.kms_commit_worker.as_ref() {
+            worker.request_quiesce();
+        }
+        Ok(())
+    }
+
+    fn join_kms_worker(&mut self) -> NativeResult<()> {
+        let Some(worker) = self.kms_commit_worker.take() else {
+            return Ok(());
+        };
+        if let Some(token) = self.kms_commit_worker_reactor_token.take() {
+            self.event_loop.unregister(token)?;
+        }
+        worker.join().map_err(|error| {
+            io::Error::other(format!("KMS commit worker join failed: {error:?}"))
+        })?;
+        worker.drain_eventfd()?;
+        for event in worker.drain_events() {
+            self.process_kms_worker_event_after_join(event)?;
+        }
+        Ok(())
+    }
+
     fn quarantine_pageflip(&mut self) -> NativeResult<()> {
         self.frame_scheduler.abandon_for_session_suspend();
         self.atomic_commit_arbiter.abandon_for_recovery();
+        self.deferred_worker_pageflip = None;
+        self.deferred_worker_completion = None;
         self.cursor_output_arbitration.clear_pending();
         if let Some(token) = self.output_render_fence_token.take() {
             self.event_loop.unregister(token)?;
@@ -293,6 +331,7 @@ impl NativeSessionIo for NativeRuntime {
             .rebind_session_generation(self.drm_file_generation);
         self.acquire_watches
             .set_drm_file_generation(self.drm_file_generation);
+        self.restart_kms_commit_worker_after_recovery()?;
         self.rearm_parked_acquire_watches()
     }
 
@@ -342,6 +381,12 @@ impl NativeSessionIo for NativeRuntime {
             self.event_loop
                 .register(self.kms.file().as_raw_fd(), NativeEventSource::Drm)?,
         );
+        if let Some(worker) = self.kms_commit_worker.as_ref() {
+            self.kms_commit_worker_reactor_token = Some(
+                self.event_loop
+                    .register(worker.event_fd(), NativeEventSource::KmsCommitWorker)?,
+            );
+        }
         Ok(())
     }
 
@@ -404,6 +449,8 @@ mod tests {
         SeatDispatch,
         InputSuspend,
         ExplicitSyncPark,
+        KmsWorkerQuiesce,
+        KmsWorkerJoin,
         PageflipQuarantine,
         DrmUnregister,
         CursorDisable,
@@ -547,6 +594,14 @@ mod tests {
             self.push(Operation::ExplicitSyncPark);
             Ok(())
         }
+        fn quiesce_kms_worker(&mut self) -> NativeResult<()> {
+            self.push(Operation::KmsWorkerQuiesce);
+            Ok(())
+        }
+        fn join_kms_worker(&mut self) -> NativeResult<()> {
+            self.push(Operation::KmsWorkerJoin);
+            Ok(())
+        }
         fn quarantine_pageflip(&mut self) -> NativeResult<()> {
             self.push(Operation::PageflipQuarantine);
             Ok(())
@@ -625,6 +680,8 @@ mod tests {
                 Operation::SeatDispatch,
                 Operation::InputSuspend,
                 Operation::ExplicitSyncPark,
+                Operation::KmsWorkerQuiesce,
+                Operation::KmsWorkerJoin,
                 Operation::PageflipQuarantine,
                 Operation::DrmUnregister,
                 Operation::CursorDisable,

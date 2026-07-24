@@ -1,4 +1,5 @@
 use super::*;
+use oblivion_one::compositor::CompositorFrameBatchId;
 use oblivion_one::native::kms::KmsBackendKind;
 
 #[allow(dead_code)] // Direct-path state is consumed by runtime integration and diagnostics.
@@ -18,6 +19,7 @@ mod gbm_cpu;
 mod output_slot;
 #[allow(dead_code)] // Ownership primitives are wired into the explicit backend in Tasks 4 and 8.
 mod output_swapchain;
+mod worker;
 
 pub(crate) use atomic_direct::*;
 #[allow(unused_imports)]
@@ -500,22 +502,6 @@ impl NativeScanoutBackend {
         }
     }
 
-    pub(crate) fn page_flip_pending(&self) -> bool {
-        match self {
-            Self::AtomicEglGbm(scanout) => {
-                let composited_pending = scanout
-                    .swapchain()
-                    .is_ok_and(|swapchain| swapchain.pending_slot().is_some());
-                let direct_pending = scanout.direct_scanout_pending();
-                debug_assert!(!(composited_pending && direct_pending));
-                composited_pending || direct_pending
-            }
-            Self::NativeEglGbm(scanout) => scanout.page_flip_pending(),
-            Self::Gbm(scanout) => scanout.page_flip_pending(),
-            Self::Dumb(_) => false,
-        }
-    }
-
     pub(crate) fn suspend_page_flip(&mut self) -> io::Result<()> {
         match self {
             Self::AtomicEglGbm(scanout) => scanout.suspend_for_session()?,
@@ -639,6 +625,7 @@ impl NativeScanoutBackend {
             Self::Gbm(scanout) => {
                 let occupied = [
                     Some(scanout.current_index),
+                    scanout.worker_queued_index.map(|(_, index)| index),
                     scanout.pending_index,
                     scanout.ready_index,
                 ]
@@ -671,18 +658,24 @@ impl NativeScanoutBackend {
     pub(crate) fn pending_page_flip_token(&self) -> Option<u64> {
         match self {
             Self::AtomicEglGbm(scanout) => {
-                let composited = scanout
-                    .swapchain()
-                    .ok()
-                    .and_then(AtomicOutputSwapchain::pending_token);
+                let composited = scanout.swapchain().ok().and_then(|swapchain| {
+                    AtomicOutputSwapchain::pending_token(swapchain)
+                        .or_else(|| AtomicOutputSwapchain::worker_queued_token(swapchain))
+                });
                 let direct = scanout.direct_scanout_pending_token();
                 debug_assert!(!(composited.is_some() && direct.is_some()));
                 composited.or(direct).map(PageFlipToken::get)
             }
-            Self::NativeEglGbm(scanout) => {
-                scanout.page_flip.pending_token().map(PageFlipToken::get)
-            }
-            Self::Gbm(scanout) => scanout.page_flip.pending_token().map(PageFlipToken::get),
+            Self::NativeEglGbm(scanout) => scanout
+                .page_flip
+                .pending_token()
+                .or_else(|| scanout.worker_queued.as_ref().map(|(token, _)| *token))
+                .map(PageFlipToken::get),
+            Self::Gbm(scanout) => scanout
+                .page_flip
+                .pending_token()
+                .or_else(|| scanout.worker_queued_index.map(|(token, _)| token))
+                .map(PageFlipToken::get),
             Self::Dumb(_) => None,
         }
     }
@@ -745,6 +738,7 @@ impl NativeScanoutBackend {
         cursor: Option<&AtomicCursorVisualState>,
         cursor_epoch: u64,
         pacing_mode: NativeOutputPacingMode,
+        worker_admission: Option<crate::native_output::kms_worker::KmsCommitAdmissionPermit>,
     ) -> io::Result<DirectScanoutAttempt> {
         match self {
             Self::AtomicEglGbm(scanout) => scanout.try_direct_scanout(
@@ -755,6 +749,7 @@ impl NativeScanoutBackend {
                 cursor,
                 cursor_epoch,
                 pacing_mode,
+                worker_admission,
             ),
             Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
                 "direct scanout is unsupported by this backend",

@@ -28,6 +28,13 @@ pub(crate) struct SubmittedDirectFrame {
     pub(crate) out_fence: Option<OwnedFd>,
 }
 
+pub(crate) struct WorkerQueuedDirectFrame {
+    pub(crate) prepared: PreparedDirectFrame,
+    pub(crate) token: PageFlipToken,
+    pub(crate) protocol_batch_id: CompositorFrameBatchId,
+    pub(crate) surface_damage: SurfaceDamagePresentation,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PresentedDirectFrame {
     pub(crate) prepared: PreparedDirectFrame,
@@ -50,7 +57,7 @@ struct SuspendedDirectFrame {
     abandoned_batch: Option<(CompositorFrameBatchId, SurfaceDamagePresentation)>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum DirectScanoutAttempt {
     Rejected(DirectScanoutSceneRejection),
     Fallback(&'static str),
@@ -59,6 +66,12 @@ pub(crate) enum DirectScanoutAttempt {
         transaction_id: OutputTransactionId,
         token: u64,
         framebuffer_id: u32,
+    },
+    WorkerQueued {
+        transaction_id: OutputTransactionId,
+        token: u64,
+        framebuffer_id: u32,
+        admission: crate::native_output::kms_worker::KmsCommitAdmissionPermit,
     },
 }
 
@@ -104,6 +117,7 @@ pub(crate) struct TestedDirectPlanePlan {
 
 pub(crate) struct DirectScanoutState {
     pub(crate) current: Option<PresentedDirectFrame>,
+    pub(crate) worker_queued: Option<WorkerQueuedDirectFrame>,
     pub(crate) pending: Option<SubmittedDirectFrame>,
     suspended: Vec<SuspendedDirectFrame>,
     pub(crate) cache: DirectFramebufferCache,
@@ -138,6 +152,7 @@ impl DirectScanoutState {
     pub(super) fn new(drm: std::os::fd::BorrowedFd<'_>, generation: u64) -> Self {
         Self {
             current: None,
+            worker_queued: None,
             pending: None,
             suspended: Vec::new(),
             cache: DirectFramebufferCache::new(drm, generation),
@@ -151,17 +166,95 @@ impl DirectScanoutState {
     }
 
     pub(crate) fn pending_token(&self) -> Option<PageFlipToken> {
-        self.pending.as_ref().map(|frame| frame.token)
+        self.pending
+            .as_ref()
+            .map(|frame| frame.token)
+            .or_else(|| self.worker_queued.as_ref().map(|frame| frame.token))
     }
 
     pub(crate) fn pending_transaction_id(&self) -> Option<OutputTransactionId> {
         self.pending
             .as_ref()
             .map(|frame| frame.prepared.transaction_id)
+            .or_else(|| {
+                self.worker_queued
+                    .as_ref()
+                    .map(|frame| frame.prepared.transaction_id)
+            })
+    }
+
+    pub(crate) fn suspend_worker_queued(&mut self, token: PageFlipToken) -> io::Result<()> {
+        let Some(frame) = self.worker_queued.take() else {
+            return Ok(());
+        };
+        if frame.token != token {
+            self.worker_queued = Some(frame);
+            return Err(io::Error::other(
+                "suspended direct worker token does not match queued ownership",
+            ));
+        }
+        self.suspended.push(SuspendedDirectFrame {
+            buffer: frame.prepared.candidate.buffer,
+            framebuffer: frame.prepared.framebuffer,
+            abandoned_batch: Some((frame.protocol_batch_id, frame.surface_damage)),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn worker_queued_token(&self) -> Option<PageFlipToken> {
+        self.worker_queued.as_ref().map(|frame| frame.token)
     }
 
     pub(crate) fn page_flip_pending(&self) -> bool {
-        self.pending.is_some()
+        self.pending.is_some() || self.worker_queued.is_some()
+    }
+
+    pub(crate) fn promote_worker_submission(
+        &mut self,
+        token: PageFlipToken,
+        out_fence: Option<OwnedFd>,
+        submit_started_at: MonotonicTimestampNs,
+        submit_returned_at: MonotonicTimestampNs,
+    ) -> io::Result<CompositorFrameBatchId> {
+        let queued = self
+            .worker_queued
+            .take()
+            .ok_or_else(|| io::Error::other("direct worker success has no queued frame"))?;
+        if queued.token != token {
+            self.worker_queued = Some(queued);
+            return Err(io::Error::other(
+                "direct worker success token mismatches queued frame",
+            ));
+        }
+        let protocol_batch_id = queued.protocol_batch_id;
+        self.pending = Some(SubmittedDirectFrame {
+            prepared: queued.prepared,
+            token,
+            protocol_batch_id,
+            surface_damage: queued.surface_damage,
+            submit_started_at,
+            submit_returned_at,
+            out_fence,
+        });
+        Ok(protocol_batch_id)
+    }
+
+    pub(crate) fn fail_worker_submission(
+        &mut self,
+        token: PageFlipToken,
+    ) -> io::Result<CompositorFrameBatchId> {
+        let queued = self
+            .worker_queued
+            .take()
+            .ok_or_else(|| io::Error::other("direct worker failure has no queued frame"))?;
+        if queued.token != token {
+            self.worker_queued = Some(queued);
+            return Err(io::Error::other(
+                "direct worker failure token mismatches queued frame",
+            ));
+        }
+        drop(queued.surface_damage);
+        Ok(queued.protocol_batch_id)
     }
 
     pub(crate) fn active_surface(&self) -> Option<u32> {
@@ -183,6 +276,9 @@ impl DirectScanoutState {
         if let Some(frame) = &self.pending {
             frame.prepared.framebuffer.disarm_drm_cleanup();
         }
+        if let Some(frame) = &self.worker_queued {
+            frame.prepared.framebuffer.disarm_drm_cleanup();
+        }
         for frame in &self.suspended {
             frame.framebuffer.disarm_drm_cleanup();
         }
@@ -199,6 +295,13 @@ impl DirectScanoutState {
     }
 
     pub(super) fn suspend(&mut self) {
+        if let Some(frame) = self.worker_queued.take() {
+            self.suspended.push(SuspendedDirectFrame {
+                buffer: frame.prepared.candidate.buffer,
+                framebuffer: frame.prepared.framebuffer,
+                abandoned_batch: Some((frame.protocol_batch_id, frame.surface_damage)),
+            });
+        }
         if let Some(frame) = self.pending.take() {
             self.suspended.push(SuspendedDirectFrame {
                 buffer: frame.prepared.candidate.buffer,

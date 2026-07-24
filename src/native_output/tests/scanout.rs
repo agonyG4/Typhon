@@ -330,6 +330,39 @@ fn explicit_output_swapchain_valid_current_pending_ready_transition() {
 }
 
 #[test]
+fn explicit_output_swapchain_tracks_one_worker_queued_frame_before_pending() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        72,
+    )
+    .unwrap();
+    let slot = swapchain.acquire_render_slot().unwrap();
+    swapchain
+        .finish_render(slot, 1, test_render_fence())
+        .unwrap();
+    let token = PageFlipToken::new(720).unwrap();
+    let fence = swapchain
+        .take_ready_for_worker(token, MonotonicTimestampNs::new(10))
+        .unwrap();
+
+    assert_eq!(swapchain.worker_queued_slot(), Some(slot));
+    assert_eq!(swapchain.pending_slot(), None);
+    assert!(swapchain.ready_slot().is_none());
+    swapchain
+        .promote_worker_queued(
+            token,
+            Some(fence),
+            MonotonicTimestampNs::new(11),
+            MonotonicTimestampNs::new(12),
+        )
+        .unwrap();
+    assert_eq!(swapchain.worker_queued_slot(), None);
+    assert_eq!(swapchain.pending_slot(), Some(slot));
+    swapchain.validate_invariants().unwrap();
+}
+
+#[test]
 fn reactive_double_exposes_no_third_render_slot_while_pageflip_is_pending() {
     let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
         explicit_slot_set(),

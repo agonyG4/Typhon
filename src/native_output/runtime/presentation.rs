@@ -18,9 +18,14 @@ use super::presentation_protocol::{
 use super::presentation_transactions::complete_immediate_output_transaction_with;
 use super::presentation_transactions::{
     complete_immediate_output_transaction, present_compatibility_frame,
-    register_primary_transaction, settle_failed_output_transaction, submit_cursor_only,
+    register_primary_transaction, settle_failed_output_transaction,
+};
+use super::presentation_worker::{
+    direct_worker_admission, finish_direct_worker_queued, present_cursor_for_presentation,
+    submit_explicit_ready_for_presentation,
 };
 use super::*;
+use crate::native_output::kms_worker::KmsCommitWorkerTransport;
 use oblivion_one::native::kms::KmsBackendKind;
 
 impl NativeRuntime {
@@ -59,6 +64,8 @@ impl NativeRuntime {
             event_loop,
             drm_reactor_token: _,
             output_render_fence_token,
+            kms_commit_worker,
+            kms_commit_worker_transport,
             frame_scheduler,
             atomic_commit_arbiter,
             output_transactions,
@@ -97,6 +104,7 @@ impl NativeRuntime {
             ..
         } = self;
         let wakeup = &cycle.wakeup;
+        let worker_mode = *kms_commit_worker_transport == KmsCommitWorkerTransport::Worker;
         let mut frame_completed = cycle.frame_completed;
         let mut frame_rendered = cycle.frame_rendered;
         let mut frame_submitted = cycle.frame_submitted;
@@ -492,7 +500,9 @@ impl NativeRuntime {
                 .ok_or_else(|| {
                     io::Error::other("cursor-only Atomic output has no presentation target")
                 })?;
-            scheduler_decision = submit_cursor_only(
+            let Some(decision) = present_cursor_for_presentation(
+                worker_mode,
+                kms_commit_worker.as_ref(),
                 kms_backend,
                 cursor,
                 desired,
@@ -516,7 +526,12 @@ impl NativeRuntime {
                 last_software_cursor_damage,
                 current_client_cursor_damage,
                 current_software_cursor_damage,
-            )?;
+            )?
+            else {
+                *queued_redraw_requested = true;
+                return Ok(());
+            };
+            scheduler_decision = decision;
             if scheduler_decision == SchedulerDecision::WaitForPageFlip {
                 *last_submitted_cursor_epoch = cursor_epoch;
             }
@@ -528,153 +543,45 @@ impl NativeRuntime {
             scheduler_decision,
             SchedulerDecision::SubmitReady | SchedulerDecision::SubmitReadyLate
         ) {
-            let repaint_present_start = Instant::now();
-            let explicit_submission = matches!(&**scanout, NativeScanoutBackend::AtomicEglGbm(_));
-            let (present_result, compatibility_transaction_id) =
-                if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
-                    let (token, framebuffer_id, transaction_id) = explicit.submit_ready_frame(
-                        kms_backend,
-                        server,
-                        output_transactions,
-                        effective_cursor.as_ref(),
-                    )?;
-                    explicit.mark_composited_submission();
-                    (
-                        NativePresentResult::AsyncSubmitted {
-                            token,
-                            framebuffer_id,
-                            transaction_id: Some(transaction_id),
-                        },
-                        None,
-                    )
-                } else {
-                    let compatibility_target = (*scheduled_presentation_target)
-                        .or_else(|| presentation_deadline.reactive_target(scheduler_now))
-                        .ok_or_else(|| {
-                            io::Error::other(
-                                "compatibility pageflip started without a presentation target",
-                            )
-                        })?;
-                    present_compatibility_frame(
-                        scanout,
-                        server,
-                        output_transactions,
-                        *drm_file_generation,
-                        target.crtc_id,
-                        compatibility_target,
-                        pacing_mode,
-                        render_generation,
-                        effective_cursor.as_ref(),
-                        cursor_epoch,
-                        *frame_index,
-                        |scanout| scanout.present(kms_backend, effective_cursor.as_ref()),
-                    )?
-                };
-            #[cfg(test)]
-            native_io_recorder.record(NativeIoOperation::ScanoutPresent);
-            let repaint_present_us = elapsed_micros(repaint_present_start);
-            match present_result {
-                NativePresentResult::AsyncSubmitted {
-                    token,
-                    framebuffer_id,
-                    transaction_id,
-                } => {
-                    let atomic_primary_registered = register_primary_transaction(
-                        atomic_commit_arbiter,
-                        server,
-                        kms_backend.effective_kind(),
-                        token,
-                        *drm_file_generation,
-                        target.crtc_id,
-                        transaction_id,
-                        *frame_index,
-                        framebuffer_id,
-                        monotonic_now_ns()?,
-                        output_transactions,
-                        presentation_trace,
-                    )?;
-                    if let Some(cursor) = atomic_cursor.as_mut()
-                        && cursor.needs_submission_for(effective_cursor.as_ref())
-                        && let Some(cursor_token) = PageFlipToken::new(token)
-                    {
-                        let state = effective_cursor.clone().unwrap_or_else(|| {
-                            let mut hidden = cursor.desired().clone();
-                            hidden.visible = false;
-                            hidden.framebuffer_id = None;
-                            hidden
-                        });
-                        cursor.begin_primary_submission(cursor_token, state);
-                    }
-                    *last_submitted_cursor_epoch = cursor_epoch;
-                    cursor_output_arbitration.consume(cursor_epoch);
-                    if !explicit_submission {
-                        server.mark_prepared_frame_submitted();
-                    }
-                    #[cfg(test)]
-                    native_io_recorder.record(NativeIoOperation::PageflipSubmit);
-                    #[cfg(test)]
-                    native_io_recorder.record(match kms_backend.effective_kind() {
-                        KmsBackendKind::Atomic => NativeIoOperation::AtomicCommit,
-                        KmsBackendKind::Legacy => NativeIoOperation::LegacyCommit,
-                    });
-                    frame_scheduler
-                        .note_ready_submission(token, monotonic_now_ns()?)
-                        .map_err(io::Error::other)?;
-                    if atomic_primary_registered {
-                        frame_scheduler.defer_page_flip_watchdog_to_atomic_arbiter();
-                    }
-                    frame_pacing.note_submit(token, monotonic_now_ns()?, true, pacing_mode);
-                    if explicit_submission
-                        && output_render_fence_token.is_none()
-                        && let NativeScanoutBackend::AtomicEglGbm(explicit) = &**scanout
-                        && let Some(fd) = explicit.pending_timing_fd()
-                    {
-                        *output_render_fence_token =
-                            Some(event_loop.register(fd, NativeEventSource::OutputRenderFence)?);
-                    }
-                    frame_submitted = true;
-                    if !explicit_submission {
-                        server.mark_render_damage_presented();
-                    }
-                    *frame_index = frame_index.saturating_add(1);
-                    perf.log("native.frame", || {
-                        vec![
-                            NativePerfField::u64("index", *frame_index),
-                            NativePerfField::str("phase", "ready-submit"),
-                            NativePerfField::str("mode", mode_label.clone()),
-                            NativePerfField::str("cursor", cursor_render_mode.as_str()),
-                            NativePerfField::u64("refresh_hz", u64::from(*refresh_hz)),
-                            NativePerfField::u64("repaint_present_us", repaint_present_us),
-                            NativePerfField::u64("pageflip_token", token),
-                            NativePerfField::bool(
-                                "render_ahead_ready",
-                                scheduler_decision == SchedulerDecision::SubmitReady,
-                            ),
-                        ]
-                    });
-                }
-                NativePresentResult::Immediate => {
-                    let transaction_id = compatibility_transaction_id.ok_or_else(|| {
-                        io::Error::other("immediate compatibility presentation has no transaction")
-                    })?;
-                    complete_immediate_output_transaction(
-                        output_transactions,
-                        presentation_trace,
-                        server,
-                        transaction_id,
-                        MonotonicTimestampNs::new(monotonic_now_ns()?),
-                    )?;
-                    frame_scheduler.note_immediate_completion();
-                }
-                NativePresentResult::Noop => {
-                    debug_assert!(compatibility_transaction_id.is_none());
-                    perf.log("native.frame_skip", || {
-                        vec![
-                            NativePerfField::str("reason", "ready_submit_without_ready_frame"),
-                            NativePerfField::bool("scanout_ready", scanout.ready_frame_queued()),
-                        ]
-                    });
-                    frame_scheduler.note_immediate_completion();
+            let compatibility_target = (*scheduled_presentation_target)
+                .or_else(|| presentation_deadline.reactive_target(scheduler_now));
+            match super::presentation_ready::submit_ready_frame(
+                scheduler_decision,
+                worker_mode,
+                kms_commit_worker.as_ref(),
+                server,
+                kms_backend,
+                scanout,
+                target.crtc_id,
+                *drm_file_generation,
+                mode_label,
+                *refresh_hz,
+                compatibility_target,
+                render_generation,
+                effective_cursor.as_ref(),
+                cursor_epoch,
+                *cursor_render_mode,
+                atomic_cursor,
+                cursor_output_arbitration,
+                last_submitted_cursor_epoch,
+                frame_scheduler,
+                frame_pacing,
+                output_render_fence_token,
+                event_loop,
+                atomic_commit_arbiter,
+                output_transactions,
+                presentation_trace,
+                pacing_mode,
+                frame_index,
+                &mut frame_submitted,
+                perf,
+                #[cfg(test)]
+                native_io_recorder,
+            )? {
+                super::presentation_ready::ReadySubmissionResult::Submitted => {}
+                super::presentation_ready::ReadySubmissionResult::Unavailable => {
+                    *queued_redraw_requested = true;
+                    return Ok(());
                 }
             }
         } else if matches!(
@@ -704,49 +611,58 @@ impl NativeRuntime {
                         }),
                 };
                 if let Some(direct_target) = direct_target {
-                    match scanout.try_direct_scanout(
-                        kms_backend,
-                        server,
-                        output_transactions,
-                        direct_target,
-                        effective_cursor.as_ref(),
-                        cursor_epoch,
-                        pacing_mode,
-                    )? {
-                        DirectScanoutAttempt::Submitted {
-                            transaction_id,
-                            token,
-                            framebuffer_id,
-                        } => {
-                            let trace_timestamp_ns = monotonic_now_ns()?;
-                            presentation_trace.push(
-                                PresentationTransactionEvent::TransactionBuilt {
-                                    transaction_id,
-                                    timestamp_ns: trace_timestamp_ns,
-                                },
-                            );
-                            presentation_trace.push(
-                                PresentationTransactionEvent::KmsSubmitReturned {
-                                    transaction_id,
-                                    timestamp_ns: trace_timestamp_ns,
-                                },
-                            );
-                            if kms_backend.effective_kind() == KmsBackendKind::Atomic {
-                                let commit_token = PageFlipToken::new(token).ok_or_else(|| {
-                                    io::Error::other("Direct Atomic token is zero")
-                                })?;
-                                if let Err(error) = atomic_commit_arbiter.reserve(
-                                    commit_token,
-                                    *drm_file_generation,
-                                    target.crtc_id,
-                                    AtomicCommitKind::DirectPrimary {
+                    let worker_admission =
+                        direct_worker_admission(worker_mode, kms_commit_worker.as_ref())?;
+                    if worker_mode && worker_admission.is_none() {
+                        // Admission is deliberately nonblocking. Keep the
+                        // direct candidate available for a later cycle and
+                        // continue through normal composition.
+                    } else {
+                        match scanout.try_direct_scanout(
+                            kms_backend,
+                            server,
+                            output_transactions,
+                            direct_target,
+                            effective_cursor.as_ref(),
+                            cursor_epoch,
+                            pacing_mode,
+                            worker_admission,
+                        )? {
+                            DirectScanoutAttempt::Submitted {
+                                transaction_id,
+                                token,
+                                framebuffer_id,
+                            } => {
+                                let trace_timestamp_ns = monotonic_now_ns()?;
+                                presentation_trace.push(
+                                    PresentationTransactionEvent::TransactionBuilt {
                                         transaction_id,
-                                        direct_token: commit_token,
-                                        framebuffer_id,
+                                        timestamp_ns: trace_timestamp_ns,
                                     },
-                                    monotonic_now_ns()?,
-                                ) {
-                                    settle_failed_output_transaction(
+                                );
+                                presentation_trace.push(
+                                    PresentationTransactionEvent::KmsSubmitReturned {
+                                        transaction_id,
+                                        timestamp_ns: trace_timestamp_ns,
+                                    },
+                                );
+                                if kms_backend.effective_kind() == KmsBackendKind::Atomic {
+                                    let commit_token =
+                                        PageFlipToken::new(token).ok_or_else(|| {
+                                            io::Error::other("Direct Atomic token is zero")
+                                        })?;
+                                    if let Err(error) = atomic_commit_arbiter.reserve(
+                                        commit_token,
+                                        *drm_file_generation,
+                                        target.crtc_id,
+                                        AtomicCommitKind::DirectPrimary {
+                                            transaction_id,
+                                            direct_token: commit_token,
+                                            framebuffer_id,
+                                        },
+                                        monotonic_now_ns()?,
+                                    ) {
+                                        settle_failed_output_transaction(
                                         output_transactions,
                                         transaction_id,
                                         OutputTransactionFailureStage::BackendCompletion,
@@ -767,87 +683,125 @@ impl NativeRuntime {
                                         },
                                     )
                                     .map_err(|error| io::Error::other(error.to_string()))?;
-                                    return Err(io::Error::other(error).into());
+                                        return Err(io::Error::other(error).into());
+                                    }
                                 }
-                            }
-                            if let Some(cursor) = atomic_cursor.as_mut()
-                                && cursor.needs_submission_for(effective_cursor.as_ref())
-                                && let Some(cursor_token) = PageFlipToken::new(token)
-                            {
-                                let state = effective_cursor.clone().unwrap_or_else(|| {
-                                    let mut hidden = cursor.desired().clone();
-                                    hidden.visible = false;
-                                    hidden.framebuffer_id = None;
-                                    hidden
+                                if let Some(cursor) = atomic_cursor.as_mut()
+                                    && cursor.needs_submission_for(effective_cursor.as_ref())
+                                    && let Some(cursor_token) = PageFlipToken::new(token)
+                                {
+                                    let state = effective_cursor.clone().unwrap_or_else(|| {
+                                        let mut hidden = cursor.desired().clone();
+                                        hidden.visible = false;
+                                        hidden.framebuffer_id = None;
+                                        hidden
+                                    });
+                                    cursor.begin_primary_submission(cursor_token, state);
+                                }
+                                frame_scheduler
+                                    .note_async_submission(token, monotonic_now_ns()?)
+                                    .map_err(io::Error::other)?;
+                                if kms_backend.effective_kind() == KmsBackendKind::Atomic {
+                                    frame_scheduler.defer_page_flip_watchdog_to_atomic_arbiter();
+                                }
+                                frame_pacing.note_submit(
+                                    token,
+                                    monotonic_now_ns()?,
+                                    false,
+                                    pacing_mode,
+                                );
+                                presentation_deadline.clear_scheduled_target();
+                                *scheduled_presentation_target = None;
+                                *last_rendered_scene_generation = scene_generation;
+                                *last_submitted_cursor_epoch = cursor_epoch;
+                                cursor_output_arbitration.consume(cursor_epoch);
+                                *last_renderable_surfaces = server.renderable_surfaces().to_vec();
+                                *last_software_cursor_damage = current_software_cursor_damage;
+                                *frame_index = frame_index.saturating_add(1);
+                                frame_submitted = true;
+                                direct_submitted = true;
+                                perf.log("native.direct_scanout", || {
+                                    vec![
+                                        NativePerfField::str("transition", "submit"),
+                                        NativePerfField::u64("token", token),
+                                        NativePerfField::u64("gpu_draw_us", 0),
+                                    ]
                                 });
-                                cursor.begin_primary_submission(cursor_token, state);
                             }
-                            frame_scheduler
-                                .note_async_submission(token, monotonic_now_ns()?)
-                                .map_err(io::Error::other)?;
-                            if kms_backend.effective_kind() == KmsBackendKind::Atomic {
-                                frame_scheduler.defer_page_flip_watchdog_to_atomic_arbiter();
+                            DirectScanoutAttempt::Unchanged => {
+                                presentation_deadline.clear_scheduled_target();
+                                *scheduled_presentation_target = None;
+                                perf.log("native.direct_scanout", || {
+                                    vec![NativePerfField::str(
+                                        "transition",
+                                        "same_buffer_suppressed",
+                                    )]
+                                });
                             }
-                            frame_pacing.note_submit(
+                            DirectScanoutAttempt::WorkerQueued {
+                                transaction_id,
                                 token,
-                                monotonic_now_ns()?,
-                                false,
-                                pacing_mode,
-                            );
-                            presentation_deadline.clear_scheduled_target();
-                            *scheduled_presentation_target = None;
-                            *last_rendered_scene_generation = scene_generation;
-                            *last_submitted_cursor_epoch = cursor_epoch;
-                            cursor_output_arbitration.consume(cursor_epoch);
-                            *last_renderable_surfaces = server.renderable_surfaces().to_vec();
-                            *last_software_cursor_damage = current_software_cursor_damage;
-                            *frame_index = frame_index.saturating_add(1);
-                            frame_submitted = true;
-                            direct_submitted = true;
-                            perf.log("native.direct_scanout", || {
-                                vec![
-                                    NativePerfField::str("transition", "submit"),
-                                    NativePerfField::u64("token", token),
-                                    NativePerfField::u64("gpu_draw_us", 0),
-                                ]
-                            });
-                        }
-                        DirectScanoutAttempt::Unchanged => {
-                            presentation_deadline.clear_scheduled_target();
-                            *scheduled_presentation_target = None;
-                            perf.log("native.direct_scanout", || {
-                                vec![NativePerfField::str("transition", "same_buffer_suppressed")]
-                            });
-                        }
-                        DirectScanoutAttempt::Rejected(rejection) => {
-                            perf.log("native.direct_scanout", || {
-                                vec![
-                                    NativePerfField::str("transition", "fallback"),
-                                    NativePerfField::str("rejection", rejection.as_str()),
-                                ]
-                            });
-                        }
-                        DirectScanoutAttempt::Fallback(reason) => {
-                            if reason == "cursor_test_only_rejected"
-                                && let Some(cursor) = atomic_cursor.as_mut()
-                            {
-                                cursor.note_test_failure();
-                                cursor.note_software_fallback();
-                                cursor.set_visible(false);
-                                *cursor_render_mode = if client_cursor_active {
-                                    NativeCursorRenderMode::SoftwareClient
-                                } else {
-                                    NativeCursorRenderMode::Software
-                                };
-                                effective_cursor = None;
-                                *queued_redraw_requested = true;
+                                framebuffer_id,
+                                admission,
+                            } => {
+                                finish_direct_worker_queued(
+                                    scanout,
+                                    server,
+                                    output_transactions,
+                                    atomic_commit_arbiter,
+                                    presentation_trace,
+                                    frame_scheduler,
+                                    cursor_output_arbitration,
+                                    effective_cursor.as_ref(),
+                                    *drm_file_generation,
+                                    target.crtc_id,
+                                    scene_generation,
+                                    cursor_epoch,
+                                    current_software_cursor_damage,
+                                    last_rendered_scene_generation,
+                                    last_submitted_cursor_epoch,
+                                    last_renderable_surfaces,
+                                    last_software_cursor_damage,
+                                    frame_index,
+                                    &mut frame_submitted,
+                                    transaction_id,
+                                    token,
+                                    framebuffer_id,
+                                    direct_target,
+                                    admission,
+                                )?;
+                                direct_submitted = true;
                             }
-                            perf.log("native.direct_scanout", || {
-                                vec![
-                                    NativePerfField::str("transition", "fallback"),
-                                    NativePerfField::str("reason", reason),
-                                ]
-                            });
+                            DirectScanoutAttempt::Rejected(rejection) => {
+                                perf.log("native.direct_scanout", || {
+                                    vec![
+                                        NativePerfField::str("transition", "fallback"),
+                                        NativePerfField::str("rejection", rejection.as_str()),
+                                    ]
+                                });
+                            }
+                            DirectScanoutAttempt::Fallback(reason) => {
+                                if reason == "cursor_test_only_rejected"
+                                    && let Some(cursor) = atomic_cursor.as_mut()
+                                {
+                                    cursor.note_test_failure();
+                                    cursor.note_software_fallback();
+                                    cursor.set_visible(false);
+                                    *cursor_render_mode = if client_cursor_active {
+                                        NativeCursorRenderMode::SoftwareClient
+                                    } else {
+                                        NativeCursorRenderMode::Software
+                                    };
+                                    effective_cursor = None;
+                                    *queued_redraw_requested = true;
+                                }
+                                perf.log("native.direct_scanout", || {
+                                    vec![
+                                        NativePerfField::str("transition", "fallback"),
+                                        NativePerfField::str("reason", reason),
+                                    ]
+                                });
+                            }
                         }
                     }
                 }
@@ -1056,28 +1010,49 @@ impl NativeRuntime {
                                     frame_scheduler.note_ready_frame(Some(frame_target));
                                     frame_pacing.note_ready_frame(ready_at_ns, render_ahead);
                                 } else {
-                                    let (token, framebuffer_id, transaction_id) = explicit
-                                        .submit_ready_frame(
-                                            kms_backend,
-                                            server,
-                                            output_transactions,
-                                            effective_cursor.as_ref(),
-                                        )?;
-                                    let atomic_primary_registered = register_primary_transaction(
-                                        atomic_commit_arbiter,
-                                        server,
-                                        kms_backend.effective_kind(),
+                                    let Some((
                                         token,
+                                        framebuffer_id,
+                                        transaction_id,
+                                        worker_queued,
+                                    )) = submit_explicit_ready_for_presentation(
+                                        worker_mode,
+                                        kms_commit_worker.as_ref(),
+                                        explicit,
+                                        kms_backend,
+                                        server,
+                                        output_transactions,
+                                        atomic_commit_arbiter,
+                                        presentation_trace,
+                                        transaction_id,
                                         *drm_file_generation,
                                         target.crtc_id,
-                                        Some(transaction_id),
-                                        *frame_index,
-                                        framebuffer_id,
-                                        monotonic_now_ns()?,
-                                        output_transactions,
-                                        presentation_trace,
-                                    )?;
-                                    if let Some(cursor) = atomic_cursor.as_mut()
+                                        effective_cursor.as_ref(),
+                                    )?
+                                    else {
+                                        *queued_redraw_requested = true;
+                                        return Ok(());
+                                    };
+                                    let atomic_primary_registered = if worker_queued {
+                                        true
+                                    } else {
+                                        register_primary_transaction(
+                                            atomic_commit_arbiter,
+                                            server,
+                                            kms_backend.effective_kind(),
+                                            token,
+                                            *drm_file_generation,
+                                            target.crtc_id,
+                                            Some(transaction_id),
+                                            *frame_index,
+                                            framebuffer_id,
+                                            monotonic_now_ns()?,
+                                            output_transactions,
+                                            presentation_trace,
+                                        )?
+                                    };
+                                    if !worker_queued
+                                        && let Some(cursor) = atomic_cursor.as_mut()
                                         && cursor.needs_submission_for(effective_cursor.as_ref())
                                         && let Some(cursor_token) = PageFlipToken::new(token)
                                     {
@@ -1102,7 +1077,8 @@ impl NativeRuntime {
                                         false,
                                         pacing_mode,
                                     );
-                                    if output_render_fence_token.is_none()
+                                    if !worker_queued
+                                        && output_render_fence_token.is_none()
                                         && let Some(fd) = explicit.pending_timing_fd()
                                     {
                                         *output_render_fence_token =

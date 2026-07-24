@@ -10,6 +10,7 @@ const MAX_READY_EVENTS: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeEventSource {
     Drm,
+    KmsCommitWorker,
     Seat,
     WaylandListener,
     WaylandClients,
@@ -64,6 +65,7 @@ pub struct WakeReasons(u32);
 
 impl WakeReasons {
     const DRM: u32 = 1 << 0;
+    const KMS_COMMIT_WORKER: u32 = 1 << 13;
     const SEAT: u32 = 1 << 7;
     const WAYLAND_LISTENER: u32 = 1 << 1;
     const WAYLAND_CLIENTS: u32 = 1 << 2;
@@ -79,6 +81,10 @@ impl WakeReasons {
 
     pub const fn drm(self) -> bool {
         self.0 & Self::DRM != 0
+    }
+
+    pub const fn kms_commit_worker(self) -> bool {
+        self.0 & Self::KMS_COMMIT_WORKER != 0
     }
 
     pub const fn seat(self) -> bool {
@@ -136,6 +142,7 @@ impl WakeReasons {
     fn insert(&mut self, source: NativeEventSource) {
         self.0 |= match source {
             NativeEventSource::Drm => Self::DRM,
+            NativeEventSource::KmsCommitWorker => Self::KMS_COMMIT_WORKER,
             NativeEventSource::Seat => Self::SEAT,
             NativeEventSource::WaylandListener => Self::WAYLAND_LISTENER,
             NativeEventSource::WaylandClients => Self::WAYLAND_CLIENTS,
@@ -740,6 +747,25 @@ mod tests {
 
         assert!(wakeup.reasons.input());
         assert!(!wakeup.reasons.timer());
+    }
+
+    #[test]
+    fn kms_worker_eventfd_sets_dedicated_wakeup_reason() {
+        let worker = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let token = event_loop
+            .register(worker.as_raw_fd(), NativeEventSource::KmsCommitWorker)
+            .unwrap();
+        assert_eq!(
+            event_loop.source_for_token(token),
+            Some(NativeEventSource::KmsCommitWorker)
+        );
+
+        signal(worker.as_raw_fd());
+        let wakeup = event_loop.wait().unwrap();
+
+        assert!(wakeup.reasons.kms_commit_worker());
+        assert!(!wakeup.reasons.drm());
     }
 
     #[test]

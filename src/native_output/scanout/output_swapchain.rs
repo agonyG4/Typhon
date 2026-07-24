@@ -181,6 +181,13 @@ pub(crate) struct SubmittedOutputFrame {
 }
 
 #[derive(Debug)]
+pub(crate) struct WorkerQueuedOutputFrame {
+    pub(crate) frame: RenderedOutputFrame,
+    pub(crate) token: PageFlipToken,
+    pub(crate) queued_at: MonotonicTimestampNs,
+}
+
+#[derive(Debug)]
 pub(crate) struct CompletedOutputFrame {
     pub(crate) frame: RenderedOutputFrame,
     pub(crate) submit_started_at: MonotonicTimestampNs,
@@ -195,6 +202,7 @@ pub(crate) struct AtomicOutputSwapchain {
     slots: OutputSlotSet,
     pool_generation: u64,
     current: OutputSlotId,
+    worker_queued: Option<WorkerQueuedOutputFrame>,
     pending: Option<SubmittedOutputFrame>,
     ready: Option<RenderedOutputFrame>,
     rendering: Option<OutputSlotId>,
@@ -214,6 +222,7 @@ impl AtomicOutputSwapchain {
             slots,
             pool_generation,
             current,
+            worker_queued: None,
             pending: None,
             ready: None,
             rendering: None,
@@ -402,10 +411,122 @@ impl AtomicOutputSwapchain {
         )
     }
 
-    pub(crate) fn take_ready_for_submission(&mut self) -> io::Result<RenderedOutputFrame> {
+    pub(crate) fn take_ready_for_worker(
+        &mut self,
+        token: PageFlipToken,
+        queued_at: MonotonicTimestampNs,
+    ) -> io::Result<OwnedFd> {
+        self.ensure_operational()?;
+        if self.pending.is_some() || self.worker_queued.is_some() {
+            return Err(io::Error::other(
+                "an output Atomic commit is already owned by the worker or kernel",
+            ));
+        }
+        let mut frame = self
+            .ready
+            .take()
+            .ok_or_else(|| io::Error::other("no rendered output frame is ready"))?;
+        let fence = match frame.render_fence.take_submission_fd() {
+            Ok(fence) => fence,
+            Err(error) => {
+                self.ready = Some(frame);
+                return Err(error);
+            }
+        };
+        self.worker_queued = Some(WorkerQueuedOutputFrame {
+            frame,
+            token,
+            queued_at,
+        });
+        // The FD is returned separately so the caller can move it into the
+        // cross-thread job while this holder retains all EGL/GBM ownership.
+        Ok(fence)
+    }
+
+    pub(crate) fn store_worker_queued(
+        &mut self,
+        queued: WorkerQueuedOutputFrame,
+    ) -> io::Result<()> {
+        self.ensure_operational()?;
+        if self.worker_queued.is_some() || self.pending.is_some() {
+            return Err(io::Error::other(
+                "an output Atomic commit is already owned by the worker or kernel",
+            ));
+        }
+        self.worker_queued = Some(queued);
+        Ok(())
+    }
+
+    pub(crate) fn promote_worker_queued(
+        &mut self,
+        token: PageFlipToken,
+        out_fence: Option<OwnedFd>,
+        submit_started_at: MonotonicTimestampNs,
+        submit_returned_at: MonotonicTimestampNs,
+    ) -> io::Result<()> {
         self.ensure_operational()?;
         if self.pending.is_some() {
-            return Err(io::Error::other("an output pageflip is already pending"));
+            return Err(io::Error::other(
+                "worker success arrived while an output pageflip is already pending",
+            ));
+        }
+        let queued = self
+            .worker_queued
+            .take()
+            .ok_or_else(|| io::Error::other("worker success arrived without queued output"))?;
+        if queued.token != token {
+            self.worker_queued = Some(queued);
+            return Err(io::Error::other(
+                "worker success token mismatches queued output",
+            ));
+        }
+        if queued.frame.pool_generation != self.pool_generation {
+            self.worker_queued = Some(queued);
+            return Err(io::Error::other(
+                "worker success output frame belongs to an old pool generation",
+            ));
+        }
+        self.pending = Some(SubmittedOutputFrame {
+            frame: queued.frame,
+            token,
+            submit_started_at,
+            submit_returned_at,
+            out_fence,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn fail_worker_queued(
+        &mut self,
+        token: PageFlipToken,
+    ) -> io::Result<RenderedOutputFrame> {
+        let queued = self
+            .worker_queued
+            .take()
+            .ok_or_else(|| io::Error::other("worker failure arrived without queued output"))?;
+        if queued.token != token {
+            self.worker_queued = Some(queued);
+            return Err(io::Error::other(
+                "worker failure token mismatches queued output",
+            ));
+        }
+        let mut frame = queued.frame;
+        let timing_fence = frame.render_fence.take_timing_fd();
+        self.quarantine_slot(
+            frame.slot,
+            timing_fence,
+            OutputQuarantineReason::AtomicSubmitFailure,
+            None,
+        )?;
+        Ok(frame)
+    }
+
+    pub(crate) fn take_ready_for_submission(&mut self) -> io::Result<RenderedOutputFrame> {
+        self.ensure_operational()?;
+        if self.pending.is_some() || self.worker_queued.is_some() {
+            return Err(io::Error::other(
+                "an output Atomic commit is already owned by the worker or kernel",
+            ));
         }
         self.ready
             .take()
@@ -421,7 +542,10 @@ impl AtomicOutputSwapchain {
         submit_returned_at: MonotonicTimestampNs,
     ) -> io::Result<()> {
         self.ensure_operational()?;
-        if self.pending.is_some() || frame.pool_generation != self.pool_generation {
+        if self.pending.is_some()
+            || self.worker_queued.is_some()
+            || frame.pool_generation != self.pool_generation
+        {
             return Err(io::Error::other(
                 "submitted output frame does not match available pending ownership",
             ));
@@ -506,6 +630,32 @@ impl AtomicOutputSwapchain {
         Ok(true)
     }
 
+    pub(crate) fn suspend_abandon_worker_queued(
+        &mut self,
+        token: PageFlipToken,
+    ) -> io::Result<bool> {
+        if self.quarantine.is_some() {
+            return Err(io::Error::other("an output slot is already quarantined"));
+        }
+        let Some(mut queued) = self.worker_queued.take() else {
+            return Ok(false);
+        };
+        if queued.token != token {
+            self.worker_queued = Some(queued);
+            return Err(io::Error::other(
+                "suspended worker output token does not match queued ownership",
+            ));
+        }
+        let timing_fence = queued.frame.render_fence.take_timing_fd();
+        self.quarantine_slot(
+            queued.frame.slot,
+            timing_fence,
+            OutputQuarantineReason::SuspendAbandonment,
+            Some(queued.frame),
+        )?;
+        Ok(true)
+    }
+
     pub(crate) fn suspended_ready_fence_signaled(&self) -> io::Result<bool> {
         let Some(quarantine) = self.quarantine.as_ref() else {
             return Ok(true);
@@ -546,7 +696,8 @@ impl AtomicOutputSwapchain {
     }
 
     pub(crate) fn rebind_pool_generation(&mut self, pool_generation: u64) -> io::Result<()> {
-        if self.pending.is_some()
+        if self.worker_queued.is_some()
+            || self.pending.is_some()
             || self.ready.is_some()
             || self.rendering.is_some()
             || self.quarantine.is_some()
@@ -627,6 +778,14 @@ impl AtomicOutputSwapchain {
         self.pending.as_ref().map(|pending| pending.frame.slot)
     }
 
+    pub(crate) fn worker_queued_slot(&self) -> Option<OutputSlotId> {
+        self.worker_queued.as_ref().map(|queued| queued.frame.slot)
+    }
+
+    pub(crate) fn worker_queued_token(&self) -> Option<PageFlipToken> {
+        self.worker_queued.as_ref().map(|queued| queued.token)
+    }
+
     pub(crate) fn pending_token(&self) -> Option<PageFlipToken> {
         self.pending.as_ref().map(|pending| pending.token)
     }
@@ -650,6 +809,10 @@ impl AtomicOutputSwapchain {
 
     pub(crate) fn ready_slot(&self) -> Option<OutputSlotId> {
         self.ready.as_ref().map(|ready| ready.slot)
+    }
+
+    pub(crate) fn ready_transaction_id(&self) -> Option<OutputTransactionId> {
+        self.ready.as_ref().map(|ready| ready.transaction_id)
     }
 
     pub(crate) const fn rendering_slot(&self) -> Option<OutputSlotId> {
@@ -676,6 +839,7 @@ impl AtomicOutputSwapchain {
     pub(crate) fn validate_invariants(&self) -> io::Result<()> {
         let roles = [
             Some(self.current),
+            self.worker_queued_slot(),
             self.pending_slot(),
             self.ready_slot(),
             self.rendering,
@@ -706,7 +870,7 @@ impl AtomicOutputSwapchain {
     ) -> io::Result<()> {
         self.validate_invariants()?;
         if pacing_mode == NativeOutputPacingMode::ReactiveDouble
-            && self.pending.is_some()
+            && (self.pending.is_some() || self.worker_queued.is_some())
             && (self.ready.is_some() || self.rendering.is_some())
         {
             return Err(io::Error::other(
@@ -747,6 +911,7 @@ impl AtomicOutputSwapchain {
 
     fn slot_is_free(&self, slot: OutputSlotId) -> bool {
         slot != self.current
+            && self.worker_queued_slot() != Some(slot)
             && self.pending_slot() != Some(slot)
             && self.ready_slot() != Some(slot)
             && self.rendering != Some(slot)

@@ -71,6 +71,35 @@ impl NativeRuntime {
                     "atomic_primary_watchdog_timeouts",
                     self.atomic_commit_arbiter.primary_watchdog_timeouts(),
                 ),
+                NativePerfField::str(
+                    "kms_commit_transport",
+                    match self.kms_commit_worker_transport {
+                        crate::native_output::kms_worker::KmsCommitWorkerTransport::Synchronous => {
+                            "sync"
+                        }
+                        crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker => {
+                            "worker"
+                        }
+                    },
+                ),
+                NativePerfField::usize(
+                    "worker_queue_depth",
+                    self.kms_commit_worker
+                        .as_ref()
+                        .map_or(0, |worker| worker.queue_depth()),
+                ),
+                NativePerfField::bool(
+                    "worker_inflight",
+                    self.kms_commit_worker
+                        .as_ref()
+                        .is_some_and(|worker| worker.inflight()),
+                ),
+                NativePerfField::bool(
+                    "worker_submit_active",
+                    self.kms_commit_worker
+                        .as_ref()
+                        .is_some_and(|worker| worker.submission_active()),
+                ),
                 NativePerfField::u64("cursor_pageflip_early_returns", 0),
                 NativePerfField::u64(
                     "cursor_response_windows_opened",
@@ -167,6 +196,45 @@ impl NativeRuntime {
                         .unwrap_or("none"),
                 ),
             ];
+            if let Some(worker) = self.kms_commit_worker.as_ref() {
+                let metrics = worker.metrics_snapshot();
+                fields.extend([
+                    NativePerfField::u64("worker_jobs_enqueued", metrics.jobs_enqueued),
+                    NativePerfField::u64("worker_jobs_submitted", metrics.jobs_submitted),
+                    NativePerfField::u64("worker_jobs_rejected", metrics.jobs_rejected),
+                    NativePerfField::u64("worker_queue_full", metrics.queue_full),
+                    NativePerfField::u64(
+                        "worker_admission_contention",
+                        metrics.admission_contention,
+                    ),
+                    NativePerfField::u64("worker_busy_deferrals", metrics.busy_deferrals),
+                    NativePerfField::u64("worker_busy_retries", metrics.busy_retries),
+                    NativePerfField::u64("worker_busy_exhausted", metrics.busy_exhausted),
+                    NativePerfField::u64("worker_late_wakeups", metrics.late_wakeups),
+                    NativePerfField::u64(
+                        "worker_submit_duration_ns_total",
+                        metrics.submit_duration_ns_total,
+                    ),
+                    NativePerfField::u64(
+                        "worker_submit_duration_ns_max",
+                        metrics.submit_duration_ns_max,
+                    ),
+                    NativePerfField::u64("worker_queue_wait_ns_total", metrics.queue_wait_ns_total),
+                    NativePerfField::u64("worker_queue_wait_ns_max", metrics.queue_wait_ns_max),
+                    NativePerfField::u64("worker_pageflip_timeouts", metrics.pageflip_timeouts),
+                    NativePerfField::u64("worker_main_thread_stalls", metrics.main_thread_stalls),
+                    NativePerfField::u64(
+                        "worker_driver_timeout_suspicions",
+                        metrics.driver_timeout_suspicions,
+                    ),
+                    NativePerfField::u64("worker_result_mismatches", metrics.result_mismatches),
+                    NativePerfField::u64("worker_fatal_events", metrics.fatal_events),
+                    NativePerfField::u64("worker_quiesce_count", metrics.quiesce_count),
+                    NativePerfField::u64("worker_quiesce_ns_total", metrics.quiesce_ns_total),
+                    NativePerfField::u64("worker_join_ns_total", metrics.join_ns_total),
+                    NativePerfField::bool("worker_active", worker.submission_active()),
+                ]);
+            }
             if let Some(summary) = self.timing_scopes.get("wayland_dispatch") {
                 fields.extend([
                     NativePerfField::u64("wayland_dispatch_count", summary.count),

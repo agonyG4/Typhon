@@ -5,6 +5,7 @@ mod legacy;
 mod properties;
 mod state;
 mod submission;
+mod submitter;
 
 pub use atomic::*;
 pub use backend::*;
@@ -14,6 +15,7 @@ pub use properties::*;
 pub use state::*;
 #[allow(unused_imports)]
 pub(crate) use submission::submit_atomic_flip_with;
+pub use submitter::*;
 
 use std::{error::Error, fmt};
 

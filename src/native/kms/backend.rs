@@ -4,7 +4,7 @@ use std::{
 };
 
 use super::{
-    AtomicCommitFlags, AtomicConnectorProperties, AtomicCrtcProperties,
+    AtomicCommitFlags, AtomicCommitSubmitter, AtomicConnectorProperties, AtomicCrtcProperties,
     AtomicCursorPlaneProperties, AtomicCursorPlaneSnapshot, AtomicCursorVisualState,
     AtomicFailureAction, AtomicFailurePhase, AtomicKmsError, AtomicKmsErrorKind,
     AtomicPipelineProperties, AtomicPipelineSnapshot, AtomicPlaneGeometry, AtomicPlaneProperties,
@@ -473,6 +473,10 @@ pub struct DrmAtomicBackend {
 }
 
 impl DrmAtomicBackend {
+    pub fn commit_submitter(&self) -> AtomicCommitSubmitter {
+        AtomicCommitSubmitter::new(self.fd, self.discovery.pipeline.clone())
+    }
+
     pub fn test_initial_from_discovery(
         fd: BorrowedFd<'_>,
         discovery: &AtomicDiscovery,

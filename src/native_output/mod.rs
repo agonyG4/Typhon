@@ -94,6 +94,7 @@ type NativeResult<T> = Result<T, Box<dyn Error>>;
 pub(crate) static ASTREA_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 mod input;
+mod kms_worker;
 mod launch;
 mod output;
 mod pacing;

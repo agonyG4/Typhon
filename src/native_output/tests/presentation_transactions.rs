@@ -188,6 +188,17 @@ fn immediate_trace_uses_distinct_presented_event_and_summary() {
 }
 
 #[test]
+fn worker_queued_trace_has_a_bounded_event_name() {
+    let mut ring = PresentationTransactionTraceRing::new(4);
+    ring.push(PresentationTransactionEvent::WorkerQueued {
+        transaction_id: tx(3),
+        timestamp_ns: 40,
+    });
+
+    assert!(ring.export_jsonl().contains("\"event\":\"worker_queued\""));
+}
+
+#[test]
 fn direct_sync_rejects_unresolved_acquire_and_unproven_buffer() {
     assert!(matches!(
         DirectSyncReadiness::from_capabilities(true, true, true, true, false, true),
@@ -325,6 +336,72 @@ fn test_composited_transaction(
         batch_id,
     )
     .expect("composited transaction")
+}
+
+#[test]
+fn ready_transaction_can_be_worker_queued() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let batch = test_batch(101);
+    let transaction = test_composited_transaction(&mut ledger, batch, 1);
+    let id = transaction.id();
+    ledger.insert(transaction).unwrap();
+    ledger
+        .mark_ready(id, MonotonicTimestampNs::new(20))
+        .unwrap();
+    ledger
+        .mark_queued(id, 4, MonotonicTimestampNs::new(21))
+        .unwrap();
+    assert!(matches!(
+        ledger.transaction(id).unwrap().state(),
+        super::OutputTransactionState::Queued {
+            worker_generation: 4,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn queued_transaction_can_be_submitted() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let batch = test_batch(102);
+    let transaction = test_composited_transaction(&mut ledger, batch, 1);
+    let id = transaction.id();
+    ledger.insert(transaction).unwrap();
+    ledger
+        .mark_queued(id, 4, MonotonicTimestampNs::new(21))
+        .unwrap();
+    let token = oblivion_one::native::kms::PageFlipToken::new(9).unwrap();
+    ledger
+        .mark_submitted(id, token, MonotonicTimestampNs::new(30))
+        .unwrap();
+    assert!(matches!(
+        ledger.transaction(id).unwrap().state(),
+        super::OutputTransactionState::Submitted { token: actual, .. } if actual == token
+    ));
+    assert_eq!(ledger.counters().queued, 1);
+    assert_eq!(ledger.counters().queue_wait_ns_total, 9);
+}
+
+#[test]
+fn queued_transaction_rejects_presented() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let transaction = test_composited_transaction(&mut ledger, test_batch(103), 1);
+    let id = transaction.id();
+    ledger.insert(transaction).unwrap();
+    ledger
+        .mark_queued(id, 4, MonotonicTimestampNs::new(21))
+        .unwrap();
+    let result = ledger.mark_presented(
+        id,
+        oblivion_one::native::kms::PageFlipToken::new(9).unwrap(),
+        1,
+        MonotonicTimestampNs::new(30),
+        None,
+    );
+    assert!(matches!(
+        result,
+        Err(super::OutputTransactionError::InvalidTransition { .. })
+    ));
 }
 
 #[test]

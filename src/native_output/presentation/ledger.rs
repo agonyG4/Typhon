@@ -15,6 +15,10 @@ pub(crate) enum OutputTransactionState {
     Ready {
         ready_at: MonotonicTimestampNs,
     },
+    Queued {
+        queued_at: MonotonicTimestampNs,
+        worker_generation: u64,
+    },
     Submitted {
         token: PageFlipToken,
         submitted_at: MonotonicTimestampNs,
@@ -80,6 +84,7 @@ pub(crate) enum OutputTransactionFailureStage {
 pub(crate) enum OutputTransactionStateKind {
     Built,
     Ready,
+    Queued,
     Submitted,
     Settling,
     Terminal,
@@ -90,6 +95,7 @@ impl OutputTransactionState {
         match self {
             Self::Built => OutputTransactionStateKind::Built,
             Self::Ready { .. } => OutputTransactionStateKind::Ready,
+            Self::Queued { .. } => OutputTransactionStateKind::Queued,
             Self::Submitted { .. } => OutputTransactionStateKind::Submitted,
             Self::Settling { .. } => OutputTransactionStateKind::Settling,
             Self::Terminal(_) => OutputTransactionStateKind::Terminal,
@@ -100,6 +106,7 @@ impl OutputTransactionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputTransactionTransitionKind {
     Ready,
+    Queued,
     Submitted,
     Presented,
     Dropped,
@@ -195,6 +202,13 @@ pub(crate) struct OutputTransactionCounters {
     pub(crate) immediate_presentations_finalized: u64,
     pub(crate) compatibility_noops: u64,
     pub(crate) compatibility_failures: u64,
+    pub(crate) queued: u64,
+    pub(crate) queued_composited: u64,
+    pub(crate) queued_direct: u64,
+    pub(crate) queued_cursor_only: u64,
+    pub(crate) queued_compatibility: u64,
+    pub(crate) queue_wait_ns_total: u64,
+    pub(crate) queue_wait_ns_max: u64,
     pub(crate) built_composited: u64,
     pub(crate) built_direct: u64,
     pub(crate) built_cursor_only: u64,
@@ -325,6 +339,44 @@ impl OutputTransactionLedger {
         Ok(())
     }
 
+    pub(crate) fn mark_queued(
+        &mut self,
+        id: OutputTransactionId,
+        worker_generation: u64,
+        queued_at: MonotonicTimestampNs,
+    ) -> Result<(), OutputTransactionError> {
+        let state = self.state(id)?;
+        if !matches!(
+            state,
+            OutputTransactionState::Built | OutputTransactionState::Ready { .. }
+        ) {
+            return Err(self.invalid_transition(state, OutputTransactionTransitionKind::Queued));
+        }
+        self.transition(id, OutputTransactionTransitionKind::Queued, |state| {
+            *state = OutputTransactionState::Queued {
+                queued_at,
+                worker_generation,
+            };
+            Ok(())
+        })?;
+        self.counters.queued = self.counters.queued.saturating_add(1);
+        self.note_path_counter(id, |counters, content| match content {
+            OutputTransactionContent::Composited { .. } => {
+                counters.queued_composited = counters.queued_composited.saturating_add(1)
+            }
+            OutputTransactionContent::Direct { .. } => {
+                counters.queued_direct = counters.queued_direct.saturating_add(1)
+            }
+            OutputTransactionContent::CursorOnly { .. } => {
+                counters.queued_cursor_only = counters.queued_cursor_only.saturating_add(1)
+            }
+            OutputTransactionContent::CompatibilityImmediate { .. } => {
+                counters.queued_compatibility = counters.queued_compatibility.saturating_add(1)
+            }
+        });
+        Ok(())
+    }
+
     pub(crate) fn mark_submitted(
         &mut self,
         id: OutputTransactionId,
@@ -332,9 +384,26 @@ impl OutputTransactionLedger {
         submitted_at: MonotonicTimestampNs,
     ) -> Result<(), OutputTransactionError> {
         let state = self.state(id)?;
+        let queued_at = match state {
+            OutputTransactionState::Built | OutputTransactionState::Ready { .. } => None,
+            OutputTransactionState::Queued { queued_at, .. } => Some(queued_at),
+            _ => {
+                return Err(
+                    self.invalid_transition(state, OutputTransactionTransitionKind::Submitted)
+                );
+            }
+        };
+        if let Some(queued_at) = queued_at {
+            let wait_ns = submitted_at.get().saturating_sub(queued_at.get());
+            self.counters.queue_wait_ns_total =
+                self.counters.queue_wait_ns_total.saturating_add(wait_ns);
+            self.counters.queue_wait_ns_max = self.counters.queue_wait_ns_max.max(wait_ns);
+        }
         if !matches!(
             state,
-            OutputTransactionState::Built | OutputTransactionState::Ready { .. }
+            OutputTransactionState::Built
+                | OutputTransactionState::Ready { .. }
+                | OutputTransactionState::Queued { .. }
         ) {
             return Err(self.invalid_transition(state, OutputTransactionTransitionKind::Submitted));
         }
@@ -903,6 +972,14 @@ const fn failure_stage_is_compatible(
             stage,
             OutputTransactionFailureStage::KmsSubmit
                 | OutputTransactionFailureStage::BackendOwnershipTransfer
+        ),
+        OutputTransactionStateKind::Queued => matches!(
+            stage,
+            OutputTransactionFailureStage::KmsSubmit
+                | OutputTransactionFailureStage::BackendOwnershipTransfer
+                | OutputTransactionFailureStage::OutputLost
+                | OutputTransactionFailureStage::SessionLost
+                | OutputTransactionFailureStage::ShutdownAbandonment
         ),
         OutputTransactionStateKind::Submitted => matches!(
             stage,

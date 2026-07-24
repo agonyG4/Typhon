@@ -33,6 +33,10 @@ use crate::native_output::runtime::{
 use super::atomic_direct::{direct_candidate_key, direct_scanout_debug};
 use super::*;
 
+#[cfg(test)]
+mod confirmed_pageflip_tests;
+mod worker;
+
 #[path = "atomic_egl_gbm_transactions.rs"]
 mod atomic_egl_gbm_transactions;
 
@@ -104,7 +108,13 @@ impl AtomicEglGbmScanout {
     }
 
     pub(crate) fn suspend_for_session(&mut self) -> io::Result<()> {
+        if let Some(token) = self.direct.worker_queued_token() {
+            self.direct.suspend_worker_queued(token)?;
+        }
         self.direct_scanout_suspend()?;
+        if let Some(token) = self.swapchain()?.worker_queued_token() {
+            self.swapchain_mut()?.suspend_abandon_worker_queued(token)?;
+        }
         self.swapchain_mut()?.suspend_abandon_ready()?;
         Ok(())
     }
@@ -683,6 +693,7 @@ impl AtomicEglGbmScanout {
         cursor: Option<&AtomicCursorVisualState>,
         cursor_epoch: u64,
         pacing_mode: NativeOutputPacingMode,
+        worker_admission: Option<crate::native_output::kms_worker::KmsCommitAdmissionPermit>,
     ) -> io::Result<DirectScanoutAttempt> {
         self.direct.counters.candidate_checks += 1;
         let sync_readiness = DirectSyncReadiness::from_capabilities(
@@ -909,6 +920,34 @@ impl AtomicEglGbmScanout {
         }
         let token = PageFlipToken::new(allocate_native_page_flip_token())
             .expect("allocated native pageflip token is nonzero");
+        if let Some(permit) = worker_admission {
+            let framebuffer_id = framebuffer.framebuffer.get();
+            let was_direct = self.direct.current.is_some();
+            self.swapchain_mut()?.advance_external_frame_id(frame_id)?;
+            self.direct.worker_queued = Some(WorkerQueuedDirectFrame {
+                prepared: PreparedDirectFrame {
+                    frame_id,
+                    transaction_id,
+                    key: candidate_key,
+                    candidate,
+                    framebuffer,
+                    target,
+                },
+                token,
+                protocol_batch_id,
+                surface_damage,
+            });
+            if !was_direct {
+                self.direct.counters.entries += 1;
+            }
+            self.scene.invalidate_presented_damage_history();
+            return Ok(DirectScanoutAttempt::WorkerQueued {
+                transaction_id,
+                token: token.get(),
+                framebuffer_id,
+                admission: permit,
+            });
+        }
         let submit_started_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         let real_submit_started = Instant::now();
         let submission = kms.submit_direct_flip_with_cursor(framebuffer.framebuffer, token, cursor);
@@ -1059,7 +1098,7 @@ impl AtomicEglGbmScanout {
     }
 
     pub(crate) fn direct_scanout_pending(&self) -> bool {
-        self.direct.pending.is_some()
+        self.direct.page_flip_pending()
     }
 
     pub(crate) fn direct_scanout_pending_token(&self) -> Option<PageFlipToken> {
@@ -1076,7 +1115,7 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn direct_scanout_info(&self) -> Option<(u64, u32, u32, u64)> {
         self.direct
-            .pending
+            .worker_queued
             .as_ref()
             .map(|frame| {
                 (
@@ -1085,6 +1124,16 @@ impl AtomicEglGbmScanout {
                     frame.prepared.framebuffer.format,
                     frame.prepared.framebuffer.modifier,
                 )
+            })
+            .or_else(|| {
+                self.direct.pending.as_ref().map(|frame| {
+                    (
+                        frame.prepared.candidate.buffer_identity.id().get(),
+                        frame.prepared.framebuffer.framebuffer.get(),
+                        frame.prepared.framebuffer.format,
+                        frame.prepared.framebuffer.modifier,
+                    )
+                })
             })
             .or_else(|| {
                 self.direct.current.as_ref().map(|frame| {
@@ -1443,39 +1492,5 @@ impl Drop for AtomicEglGbmScanout {
         let _ = self.egl.make_current(self.egl_display, None, None, None);
         let _ = self.egl.destroy_context(self.egl_display, self.egl_context);
         let _ = self.egl.terminate(self.egl_display);
-    }
-}
-
-#[cfg(test)]
-mod confirmed_pageflip_tests {
-    use std::{cell::Cell, io};
-
-    use super::complete_confirmed_pageflip_with_timing;
-
-    #[test]
-    fn timing_failure_after_confirmed_pageflip_still_completes_frame_ownership() {
-        let scene_damage_committed = Cell::new(false);
-        let surface_damage_committed = Cell::new(false);
-        let callbacks_completed = Cell::new(false);
-        let presentation_feedback_completed = Cell::new(false);
-        let slot_ownership_completed = Cell::new(false);
-        let (timing, timing_error) = complete_confirmed_pageflip_with_timing::<u64>(
-            Err(io::Error::from_raw_os_error(libc::EIO)),
-            || {
-                scene_damage_committed.set(true);
-                surface_damage_committed.set(true);
-                callbacks_completed.set(true);
-                presentation_feedback_completed.set(true);
-                slot_ownership_completed.set(true);
-            },
-        );
-
-        assert!(scene_damage_committed.get());
-        assert!(surface_damage_committed.get());
-        assert!(callbacks_completed.get());
-        assert!(presentation_feedback_completed.get());
-        assert!(slot_ownership_completed.get());
-        assert_eq!(timing, None);
-        assert_eq!(timing_error.unwrap().raw_os_error(), Some(libc::EIO));
     }
 }

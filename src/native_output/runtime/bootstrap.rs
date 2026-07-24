@@ -1,4 +1,8 @@
 use super::*;
+use crate::native_output::kms_worker::{
+    KmsCommitWorkerHandle, KmsCommitWorkerPolicy, KmsCommitWorkerStartupError,
+    KmsCommitWorkerTransport,
+};
 use oblivion_one::cursor_theme::{
     CompositorCursorImage, install_shared_compositor_cursor,
     load_compositor_cursor_from_environment,
@@ -344,6 +348,67 @@ impl NativeRuntime {
             ]
         });
         set_fd_nonblocking(kms.file().as_raw_fd())?;
+        let requested_worker_policy = KmsCommitWorkerPolicy::parse(
+            std::env::var("OBLIVION_ONE_KMS_COMMIT_WORKER")
+                .ok()
+                .as_deref(),
+        )
+        .map_err(io::Error::other)?;
+        let mut kms_commit_worker = None;
+        let kms_commit_worker_transport = match (
+            requested_worker_policy,
+            kms_backend.effective_kind(),
+        ) {
+            (KmsCommitWorkerPolicy::Off, _) => KmsCommitWorkerTransport::Synchronous,
+            (KmsCommitWorkerPolicy::Force, KmsBackendKind::Legacy) => {
+                return Err(
+                    io::Error::other(KmsCommitWorkerStartupError::UnsupportedBackend).into(),
+                );
+            }
+            (_, KmsBackendKind::Legacy) => KmsCommitWorkerTransport::Synchronous,
+            (policy, KmsBackendKind::Atomic) => {
+                let submitter = kms_backend
+                    .atomic()
+                    .expect("Atomic backend kind has an Atomic implementation")
+                    .commit_submitter();
+                match KmsCommitWorkerHandle::start_atomic(submitter) {
+                    Ok(worker) => {
+                        kms_commit_worker = Some(worker);
+                        KmsCommitWorkerTransport::Worker
+                    }
+                    Err(error) if policy == KmsCommitWorkerPolicy::Auto => {
+                        eprintln!(
+                            "native KMS commit worker: requested={} startup failed ({error:?}); using synchronous transport",
+                            requested_worker_policy.as_str()
+                        );
+                        KmsCommitWorkerTransport::Synchronous
+                    }
+                    Err(error) => {
+                        return Err(io::Error::other(format!(
+                            "native KMS commit worker startup failed in force mode: {error:?}"
+                        ))
+                        .into());
+                    }
+                }
+            }
+        };
+        println!(
+            "native KMS commit worker: requested={} effective={:?}",
+            requested_worker_policy.as_str(),
+            kms_commit_worker_transport
+        );
+        perf.log("native.kms_commit_worker", || {
+            vec![
+                NativePerfField::str("requested", requested_worker_policy.as_str()),
+                NativePerfField::str(
+                    "effective",
+                    match kms_commit_worker_transport {
+                        KmsCommitWorkerTransport::Synchronous => "sync",
+                        KmsCommitWorkerTransport::Worker => "worker",
+                    },
+                ),
+            ]
+        });
         let acquire_notifier = DrmAcquirePointNotifier;
         let acquire_watches =
             ExplicitSyncWatchRegistry::new(refresh_interval_ns, drm_file_generation);
@@ -379,6 +444,12 @@ impl NativeRuntime {
         }
         let drm_reactor_token =
             event_loop.register(kms.file().as_raw_fd(), NativeEventSource::Drm)?;
+        let kms_commit_worker_reactor_token = kms_commit_worker
+            .as_ref()
+            .map(|worker| {
+                event_loop.register(worker.event_fd(), NativeEventSource::KmsCommitWorker)
+            })
+            .transpose()?;
         if let Some(session) = seat_session.as_ref() {
             event_loop.register(session.event_fd()?, NativeEventSource::Seat)?;
         }
@@ -544,6 +615,13 @@ impl NativeRuntime {
             xwayland_client_identity: None,
             drm_reactor_token: Some(drm_reactor_token),
             output_render_fence_token: None,
+            kms_commit_worker,
+            kms_commit_worker_reactor_token,
+            kms_commit_worker_policy: requested_worker_policy,
+            kms_commit_worker_transport,
+            deferred_worker_pageflip: None,
+            deferred_worker_completion: None,
+            worker_timeout_pending: None,
             frame_scheduler,
             atomic_commit_arbiter: AtomicCommitArbiter::new(),
             output_transactions: OutputTransactionLedger::new(),

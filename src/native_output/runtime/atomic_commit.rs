@@ -23,11 +23,26 @@ pub(crate) enum AtomicCommitKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicCommitPhase {
+    WorkerQueued {
+        queued_at_ns: u64,
+    },
+    KernelSubmitted {
+        submitted_at_ns: u64,
+        submit_returned_at_ns: u64,
+        watchdog_deadline_ns: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PendingAtomicCommit {
     pub(crate) token: PageFlipToken,
     pub(crate) generation: u64,
     pub(crate) crtc_id: u32,
     pub(crate) kind: AtomicCommitKind,
+    pub(crate) phase: AtomicCommitPhase,
+    // Kept as compatibility accessors for existing metrics and synchronous
+    // callers. Worker-queued commits expose zero until submit acknowledgment.
     pub(crate) submitted_at_ns: u64,
     pub(crate) watchdog_deadline_ns: u64,
     watchdog_reported: bool,
@@ -36,6 +51,8 @@ pub(crate) struct PendingAtomicCommit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AtomicCommitCompletion {
     Completed(AtomicCommitKind),
+    DeferredUntilSubmitAck,
+    DuplicateEarlyPageflip,
     Mismatched,
     WrongCrtc,
     WrongGeneration,
@@ -45,6 +62,7 @@ pub(crate) enum AtomicCommitCompletion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AtomicCommitArbiter {
     pending: Option<PendingAtomicCommit>,
+    early_pageflip: Option<DrmPresentationEvent>,
     watchdog_interval_ns: u64,
     atomic_commit_watchdog_timeouts_total: u64,
     atomic_cursor_watchdog_timeouts: u64,
@@ -97,6 +115,7 @@ impl AtomicCommitArbiter {
     pub(crate) fn with_watchdog(watchdog_interval_ns: u64, _anchor_ns: u64) -> Self {
         Self {
             pending: None,
+            early_pageflip: None,
             watchdog_interval_ns: if watchdog_interval_ns == 0 {
                 1
             } else {
@@ -126,6 +145,11 @@ impl AtomicCommitArbiter {
             generation,
             crtc_id,
             kind,
+            phase: AtomicCommitPhase::KernelSubmitted {
+                submitted_at_ns,
+                submit_returned_at_ns: submitted_at_ns,
+                watchdog_deadline_ns: submitted_at_ns.saturating_add(self.watchdog_interval_ns),
+            },
             submitted_at_ns,
             watchdog_deadline_ns: submitted_at_ns.saturating_add(self.watchdog_interval_ns),
             watchdog_reported: false,
@@ -134,12 +158,103 @@ impl AtomicCommitArbiter {
         Ok(())
     }
 
+    pub(crate) fn reserve_worker_queued(
+        &mut self,
+        token: PageFlipToken,
+        generation: u64,
+        crtc_id: u32,
+        kind: AtomicCommitKind,
+        queued_at_ns: u64,
+    ) -> Result<(), &'static str> {
+        if self.pending.is_some() {
+            return Err("an Atomic commit is already pending");
+        }
+        self.early_pageflip = None;
+        self.pending = Some(PendingAtomicCommit {
+            token,
+            generation,
+            crtc_id,
+            kind,
+            phase: AtomicCommitPhase::WorkerQueued { queued_at_ns },
+            submitted_at_ns: 0,
+            watchdog_deadline_ns: 0,
+            watchdog_reported: false,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn mark_kernel_submitted(
+        &mut self,
+        token: PageFlipToken,
+        submitted_at_ns: u64,
+        submit_returned_at_ns: u64,
+    ) -> Result<(), &'static str> {
+        let Some(pending) = self.pending.as_mut() else {
+            return Err("no queued Atomic commit");
+        };
+        if pending.token != token {
+            return Err("Atomic submit token does not match queued commit");
+        }
+        if !matches!(pending.phase, AtomicCommitPhase::WorkerQueued { .. }) {
+            return Err("Atomic commit is not worker queued");
+        }
+        let watchdog_deadline_ns = submitted_at_ns.saturating_add(self.watchdog_interval_ns);
+        pending.phase = AtomicCommitPhase::KernelSubmitted {
+            submitted_at_ns,
+            submit_returned_at_ns,
+            watchdog_deadline_ns,
+        };
+        pending.submitted_at_ns = submitted_at_ns;
+        pending.watchdog_deadline_ns = watchdog_deadline_ns;
+        self.atomic_commits_submitted_total = self.atomic_commits_submitted_total.saturating_add(1);
+        Ok(())
+    }
+
+    pub(crate) fn reject_worker_queued(
+        &mut self,
+        token: PageFlipToken,
+    ) -> Option<PendingAtomicCommit> {
+        if self.pending.is_some_and(|pending| {
+            pending.token == token
+                && matches!(pending.phase, AtomicCommitPhase::WorkerQueued { .. })
+        }) {
+            self.early_pageflip = None;
+            self.pending.take()
+        } else {
+            None
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn complete(
         &mut self,
         token: PageFlipToken,
         generation: u64,
         crtc_id: u32,
     ) -> AtomicCommitCompletion {
+        self.complete_pageflip(
+            DrmPresentationEvent {
+                user_data: token.get(),
+                sequence: 0,
+                timestamp: oblivion_one::native::drm::DrmPresentationTimestamp {
+                    seconds: 0,
+                    microseconds: 0,
+                },
+                crtc_id,
+            },
+            generation,
+        )
+    }
+
+    pub(crate) fn complete_pageflip(
+        &mut self,
+        pageflip: DrmPresentationEvent,
+        generation: u64,
+    ) -> AtomicCommitCompletion {
+        let token = match PageFlipToken::new(pageflip.user_data) {
+            Some(token) => token,
+            None => return AtomicCommitCompletion::Stale,
+        };
         let Some(pending) = self.pending else {
             return AtomicCommitCompletion::Stale;
         };
@@ -149,12 +264,34 @@ impl AtomicCommitArbiter {
         if generation != pending.generation {
             return AtomicCommitCompletion::WrongGeneration;
         }
-        if crtc_id != pending.crtc_id {
+        if pageflip.crtc_id != pending.crtc_id {
             return AtomicCommitCompletion::WrongCrtc;
+        }
+        if matches!(pending.phase, AtomicCommitPhase::WorkerQueued { .. }) {
+            if self.early_pageflip.is_some() {
+                return AtomicCommitCompletion::DuplicateEarlyPageflip;
+            }
+            self.early_pageflip = Some(DrmPresentationEvent { ..pageflip });
+            return AtomicCommitCompletion::DeferredUntilSubmitAck;
         }
         self.pending = None;
         self.atomic_commits_completed_total = self.atomic_commits_completed_total.saturating_add(1);
         AtomicCommitCompletion::Completed(pending.kind)
+    }
+
+    pub(crate) fn replay_deferred_pageflip(&mut self) -> Option<AtomicCommitCompletion> {
+        let pending = self.pending?;
+        self.early_pageflip.take()?;
+        if !matches!(pending.phase, AtomicCommitPhase::KernelSubmitted { .. }) {
+            return None;
+        }
+        self.pending = None;
+        self.atomic_commits_completed_total = self.atomic_commits_completed_total.saturating_add(1);
+        Some(AtomicCommitCompletion::Completed(pending.kind))
+    }
+
+    pub(crate) fn deferred_pageflip(&self) -> Option<DrmPresentationEvent> {
+        self.early_pageflip
     }
 
     pub(crate) fn cancel(&mut self, token: PageFlipToken) -> Option<PendingAtomicCommit> {
@@ -167,6 +304,18 @@ impl AtomicCommitArbiter {
 
     pub(crate) const fn atomic_commit_pending(&self) -> bool {
         self.pending.is_some()
+    }
+
+    pub(crate) fn worker_job_queued(&self) -> bool {
+        self.pending
+            .is_some_and(|pending| matches!(pending.phase, AtomicCommitPhase::WorkerQueued { .. }))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn kernel_commit_submitted(&self) -> bool {
+        self.pending.is_some_and(|pending| {
+            matches!(pending.phase, AtomicCommitPhase::KernelSubmitted { .. })
+        })
     }
 
     pub(crate) fn pending_atomic_token(&self) -> Option<PageFlipToken> {
@@ -182,12 +331,25 @@ impl AtomicCommitArbiter {
     }
 
     pub(crate) fn watchdog_deadline_ns(&self) -> Option<u64> {
-        self.pending.map(|pending| pending.watchdog_deadline_ns)
+        self.pending.and_then(|pending| match pending.phase {
+            AtomicCommitPhase::WorkerQueued { .. } => None,
+            AtomicCommitPhase::KernelSubmitted {
+                watchdog_deadline_ns,
+                ..
+            } => Some(watchdog_deadline_ns),
+        })
     }
 
     pub(crate) fn watchdog_expired(&mut self, now_ns: u64) -> Option<AtomicCommitKind> {
         let pending = self.pending.as_mut()?;
-        if pending.watchdog_reported || now_ns < pending.watchdog_deadline_ns {
+        let AtomicCommitPhase::KernelSubmitted {
+            watchdog_deadline_ns,
+            ..
+        } = pending.phase
+        else {
+            return None;
+        };
+        if pending.watchdog_reported || now_ns < watchdog_deadline_ns {
             return None;
         }
         pending.watchdog_reported = true;
@@ -205,6 +367,7 @@ impl AtomicCommitArbiter {
 
     pub(crate) fn abandon_for_recovery(&mut self) {
         self.pending = None;
+        self.early_pageflip = None;
     }
 
     pub(crate) const fn atomic_commit_watchdog_timeouts_total(&self) -> u64 {
@@ -228,6 +391,7 @@ impl AtomicCommitArbiter {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_atomic_pageflip(
     arbiter: &mut AtomicCommitArbiter,
     backend_kind: KmsBackendKind,
@@ -236,6 +400,7 @@ pub(crate) fn validate_atomic_pageflip(
     now_ns: u64,
     mismatched_events: &mut u64,
     stale_events: &mut u64,
+    worker_watchdog: bool,
 ) -> io::Result<(
     Option<DrmPresentationEvent>,
     Option<AtomicCommitCompletion>,
@@ -245,13 +410,7 @@ pub(crate) fn validate_atomic_pageflip(
         return Ok((event, None, None));
     }
     let mut event = event;
-    let completion = if let Some(pageflip) = event {
-        let token = PageFlipToken::new(pageflip.user_data)
-            .ok_or_else(|| io::Error::other("Atomic pageflip token is zero"))?;
-        Some(arbiter.complete(token, generation, pageflip.crtc_id))
-    } else {
-        None
-    };
+    let completion = event.map(|pageflip| arbiter.complete_pageflip(pageflip, generation));
     if let Some(completion) = completion
         && !matches!(completion, AtomicCommitCompletion::Completed(_))
     {
@@ -262,12 +421,18 @@ pub(crate) fn validate_atomic_pageflip(
             AtomicCommitCompletion::WrongGeneration | AtomicCommitCompletion::Stale => {
                 *stale_events = stale_events.saturating_add(1);
             }
+            AtomicCommitCompletion::DeferredUntilSubmitAck => {
+                // The pageflip is retained by the arbiter until the worker
+                // success event transfers physical ownership.
+            }
+            AtomicCommitCompletion::DuplicateEarlyPageflip => {
+                *mismatched_events = mismatched_events.saturating_add(1);
+            }
             AtomicCommitCompletion::Completed(_) => unreachable!(),
         }
         event = None;
     }
-    let timeout = event
-        .is_none()
+    let timeout = (!worker_watchdog && event.is_none())
         .then(|| arbiter.watchdog_expired(now_ns))
         .flatten();
     Ok((event, completion, timeout))
@@ -547,6 +712,57 @@ mod tests {
     }
 
     #[test]
+    fn worker_queued_commit_does_not_arm_watchdog() {
+        let mut arbiter = AtomicCommitArbiter::with_watchdog(25, 100);
+        arbiter
+            .reserve_worker_queued(token(1), 3, 42, cursor_kind(), 100)
+            .unwrap();
+
+        assert!(arbiter.atomic_commit_pending());
+        assert!(arbiter.worker_job_queued());
+        assert!(!arbiter.kernel_commit_submitted());
+        assert_eq!(arbiter.watchdog_deadline_ns(), None);
+        assert_eq!(arbiter.watchdog_expired(1_000), None);
+    }
+
+    #[test]
+    fn early_pageflip_is_deferred_until_worker_submit_ack() {
+        let mut arbiter = AtomicCommitArbiter::with_watchdog(25, 100);
+        arbiter
+            .reserve_worker_queued(token(1), 3, 42, cursor_kind(), 100)
+            .unwrap();
+
+        assert_eq!(
+            arbiter.complete(token(1), 3, 42),
+            AtomicCommitCompletion::DeferredUntilSubmitAck
+        );
+        assert!(arbiter.atomic_commit_pending());
+        assert!(arbiter.mark_kernel_submitted(token(1), 150, 155).is_ok());
+        assert!(arbiter.kernel_commit_submitted());
+        assert_eq!(
+            arbiter.replay_deferred_pageflip(),
+            Some(AtomicCommitCompletion::Completed(cursor_kind()))
+        );
+        assert!(!arbiter.atomic_commit_pending());
+    }
+
+    #[test]
+    fn second_early_pageflip_is_rejected() {
+        let mut arbiter = AtomicCommitArbiter::new();
+        arbiter
+            .reserve_worker_queued(token(1), 3, 42, cursor_kind(), 100)
+            .unwrap();
+        assert_eq!(
+            arbiter.complete(token(1), 3, 42),
+            AtomicCommitCompletion::DeferredUntilSubmitAck
+        );
+        assert_eq!(
+            arbiter.complete(token(1), 3, 42),
+            AtomicCommitCompletion::DuplicateEarlyPageflip
+        );
+    }
+
+    #[test]
     fn cursor_only_pageflip_clears_atomic_watchdog() {
         let mut arbiter = AtomicCommitArbiter::with_watchdog(25, 100);
         arbiter
@@ -663,6 +879,7 @@ mod tests {
             101,
             &mut mismatched,
             &mut stale,
+            false,
         )
         .unwrap();
 

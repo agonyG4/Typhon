@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+    echo "usage: $0 <log-path>" >&2
+    exit 2
+fi
+
+log_path=$1
+if [[ ! -r "$log_path" ]]; then
+    echo "qualify-kms-worker: log is not readable: $log_path" >&2
+    exit 2
+fi
+
+extract_last() {
+    local key=$1
+    awk -v key="$key" '
+        index($0, key "=") {
+            value = substr($0, index($0, key "=") + length(key) + 1)
+            sub(/[ ,}].*/, "", value)
+        }
+        END { print value == "" ? "0" : value }
+    ' "$log_path"
+}
+
+jobs_enqueued=$(extract_last worker_jobs_enqueued)
+jobs_submitted=$(extract_last worker_jobs_submitted)
+queue_full=$(extract_last worker_queue_full)
+busy_deferrals=$(extract_last worker_busy_deferrals)
+busy_exhausted=$(extract_last worker_busy_exhausted)
+mismatches=$(extract_last worker_result_mismatches)
+timeouts=$(extract_last worker_pageflip_timeouts)
+fatal=$(extract_last worker_fatal_events)
+active=$(extract_last worker_active)
+queue_depth=$(extract_last worker_queue_depth)
+inflight=$(extract_last worker_inflight)
+max_input_drain=$(extract_last max_input_drain_us)
+max_submit=$(extract_last worker_submit_duration_ns_max)
+
+printf 'kms-worker jobs=%s/%s queue_full=%s busy=%s/%s mismatches=%s timeouts=%s fatal=%s active=%s queue_depth=%s inflight=%s max_input_drain_us=%s max_submit_ns=%s\n' \
+    "$jobs_enqueued" "$jobs_submitted" "$queue_full" "$busy_deferrals" "$busy_exhausted" \
+    "$mismatches" "$timeouts" "$fatal" "$active" "$queue_depth" "$inflight" \
+    "$max_input_drain" "$max_submit"
+
+failed=0
+for value in "$mismatches" "$timeouts" "$fatal" "$queue_depth" "$inflight"; do
+    if [[ "$value" =~ ^[0-9]+$ ]] && (( value != 0 )); then
+        failed=1
+    fi
+done
+if [[ "$active" == "true" ]]; then
+    failed=1
+fi
+
+if (( failed != 0 )); then
+    echo 'kms-worker qualification: FAIL'
+    exit 1
+fi
+
+echo 'kms-worker qualification: PASS'

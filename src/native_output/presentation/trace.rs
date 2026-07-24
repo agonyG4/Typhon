@@ -51,6 +51,10 @@ pub(crate) enum PresentationTransactionEvent {
         transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
+    WorkerQueued {
+        transaction_id: OutputTransactionId,
+        timestamp_ns: u64,
+    },
     PageflipPresented {
         transaction_id: OutputTransactionId,
         timestamp_ns: u64,
@@ -93,6 +97,7 @@ impl PresentationTransactionEvent {
             Self::TestOnlyCompleted { .. } => "test_only_completed",
             Self::KmsSubmitStarted { .. } => "kms_submit_started",
             Self::KmsSubmitReturned { .. } => "kms_submit_returned",
+            Self::WorkerQueued { .. } => "worker_queued",
             Self::PageflipPresented { .. } => "pageflip_presented",
             Self::ImmediatePresented { .. } => "immediate_presented",
             Self::Superseded { .. } => "superseded",
@@ -115,6 +120,7 @@ impl PresentationTransactionEvent {
             | Self::TestOnlyCompleted { transaction_id, .. }
             | Self::KmsSubmitStarted { transaction_id, .. }
             | Self::KmsSubmitReturned { transaction_id, .. }
+            | Self::WorkerQueued { transaction_id, .. }
             | Self::PageflipPresented { transaction_id, .. }
             | Self::ImmediatePresented { transaction_id, .. }
             | Self::Superseded { transaction_id, .. }
@@ -137,6 +143,7 @@ impl PresentationTransactionEvent {
             | Self::TestOnlyCompleted { timestamp_ns, .. }
             | Self::KmsSubmitStarted { timestamp_ns, .. }
             | Self::KmsSubmitReturned { timestamp_ns, .. }
+            | Self::WorkerQueued { timestamp_ns, .. }
             | Self::PageflipPresented { timestamp_ns, .. }
             | Self::ImmediatePresented { timestamp_ns, .. }
             | Self::Superseded { timestamp_ns, .. }

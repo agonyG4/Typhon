@@ -65,6 +65,10 @@ impl NativeRuntime {
             return Ok(());
         };
         native_shutdown_debug_log("input_backend_stop");
+        NativeSessionIo::observe(self, NativeIoOperation::KmsWorkerQuiesce);
+        NativeSessionIo::quiesce_kms_worker(self)?;
+        NativeSessionIo::observe(self, NativeIoOperation::KmsWorkerJoin);
+        NativeSessionIo::join_kms_worker(self)?;
         self.acquire_watches.shutdown(&mut self.event_loop)?;
         if !self.session.permits_output() {
             teardown_without_drm_io(self);

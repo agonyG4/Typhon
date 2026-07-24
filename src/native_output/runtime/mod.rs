@@ -7,12 +7,15 @@ mod cursor_cycle;
 mod cycle;
 mod cycle_dispatch;
 mod frame;
+mod kms_worker;
 mod metrics;
 mod planner;
 mod presentation;
 mod presentation_direct;
 mod presentation_protocol;
+mod presentation_ready;
 mod presentation_transactions;
+mod presentation_worker;
 mod session;
 mod session_io;
 mod shutdown;
@@ -137,6 +140,13 @@ pub(crate) struct NativeRuntime {
     xwayland_client_identity: Option<oblivion_one::compositor::XwaylandClientIdentity>,
     drm_reactor_token: Option<ReactorToken>,
     output_render_fence_token: Option<ReactorToken>,
+    kms_commit_worker: Option<super::kms_worker::KmsCommitWorkerHandle>,
+    kms_commit_worker_reactor_token: Option<ReactorToken>,
+    kms_commit_worker_policy: super::kms_worker::KmsCommitWorkerPolicy,
+    kms_commit_worker_transport: super::kms_worker::KmsCommitWorkerTransport,
+    deferred_worker_pageflip: Option<DrmPresentationEvent>,
+    deferred_worker_completion: Option<AtomicCommitCompletion>,
+    worker_timeout_pending: Option<(PageFlipToken, u64)>,
     frame_scheduler: NativeFrameScheduler,
     atomic_commit_arbiter: AtomicCommitArbiter,
     output_transactions: OutputTransactionLedger,
@@ -238,6 +248,13 @@ impl NativeRuntime {
 
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
+        if let Some(worker) = self.kms_commit_worker.take() {
+            if let Some(token) = self.kms_commit_worker_reactor_token.take() {
+                let _ = self.event_loop.unregister(token);
+            }
+            worker.request_quiesce();
+            let _ = worker.join();
+        }
         let abandoned_at = MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(0));
         let transaction_ids = self.output_transactions.active_transaction_ids();
         for transaction_id in transaction_ids {

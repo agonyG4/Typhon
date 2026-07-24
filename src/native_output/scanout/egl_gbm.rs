@@ -245,6 +245,7 @@ pub(crate) struct NativeEglGbmScanout {
     pub(crate) dmabuf_main_device_path: Option<String>,
     pub(crate) framebuffer_cache: NativeGbmFramebufferCache,
     pub(crate) buffers: NativePageFlipBuffers<NativePresentedGbmBuffer>,
+    pub(crate) worker_queued: Option<(PageFlipToken, NativePresentedGbmBuffer)>,
     pub(crate) page_flip: AtomicCommitState,
     pub(crate) deferred_promotion_token: Option<u64>,
     pub(crate) backend_generation: u64,
@@ -487,6 +488,7 @@ impl NativeEglGbmScanout {
             dmabuf_main_device_path,
             framebuffer_cache: NativeGbmFramebufferCache::default(),
             buffers: NativePageFlipBuffers::default(),
+            worker_queued: None,
             page_flip: AtomicCommitState::default(),
             deferred_promotion_token: None,
             backend_generation,
@@ -623,7 +625,7 @@ impl NativeEglGbmScanout {
         kms: &KmsBackendSelection,
         cursor: Option<&AtomicCursorVisualState>,
     ) -> io::Result<Option<(u64, u32)>> {
-        if self.page_flip.is_pending() {
+        if self.page_flip.is_pending() || self.worker_queued.is_some() {
             return Ok(None);
         }
         let Some(buffer) = self.buffers.take_ready() else {
@@ -647,6 +649,75 @@ impl NativeEglGbmScanout {
                 Err(io::Error::other(error))
             }
         }
+    }
+
+    pub(crate) fn queue_worker_submission(&mut self, token: PageFlipToken) -> io::Result<u32> {
+        if self.page_flip.is_pending() || self.worker_queued.is_some() {
+            return Err(io::Error::other(
+                "compatibility output already has an Atomic commit in flight",
+            ));
+        }
+        let buffer = self
+            .buffers
+            .take_ready()
+            .ok_or_else(|| io::Error::other("compatibility output has no ready buffer"))?;
+        let framebuffer_id = buffer.fb_id;
+        self.worker_queued = Some((token, buffer));
+        Ok(framebuffer_id)
+    }
+
+    pub(crate) fn promote_worker_submission(&mut self, token: PageFlipToken) -> io::Result<()> {
+        let Some((queued_token, buffer)) = self.worker_queued.take() else {
+            return Err(io::Error::other(
+                "compatibility worker success has no queued buffer",
+            ));
+        };
+        if queued_token != token {
+            self.worker_queued = Some((queued_token, buffer));
+            return Err(io::Error::other(
+                "compatibility worker success token mismatches queued buffer",
+            ));
+        }
+        let framebuffer = FramebufferId::new(buffer.fb_id)
+            .ok_or_else(|| io::Error::other("compatibility worker framebuffer ID is zero"))?;
+        self.page_flip
+            .begin(token, framebuffer, self.backend_generation, Instant::now())
+            .map_err(io::Error::other)?;
+        self.buffers.set_pending(buffer);
+        Ok(())
+    }
+
+    pub(crate) fn fail_worker_submission(&mut self, token: PageFlipToken) -> io::Result<()> {
+        let Some((queued_token, buffer)) = self.worker_queued.take() else {
+            return Err(io::Error::other(
+                "compatibility worker failure has no queued buffer",
+            ));
+        };
+        if queued_token != token {
+            self.worker_queued = Some((queued_token, buffer));
+            return Err(io::Error::other(
+                "compatibility worker failure token mismatches queued buffer",
+            ));
+        }
+        self.buffers.restore_ready(buffer);
+        Ok(())
+    }
+
+    pub(crate) fn suspend_abandon_worker_submission(
+        &mut self,
+        token: PageFlipToken,
+    ) -> io::Result<()> {
+        let Some((queued_token, buffer)) = self.worker_queued.take() else {
+            return Ok(());
+        };
+        if queued_token != token {
+            self.worker_queued = Some((queued_token, buffer));
+            return Err(io::Error::other(
+                "compatibility suspended worker token mismatches queued buffer",
+            ));
+        }
+        self.buffers.restore_ready(buffer);
+        Ok(())
     }
 
     pub(crate) fn drain_page_flip_events(
@@ -695,7 +766,9 @@ impl NativeEglGbmScanout {
     }
 
     pub(crate) fn page_flip_pending(&self) -> bool {
-        self.page_flip.is_pending() || self.deferred_promotion_token.is_some()
+        self.page_flip.is_pending()
+            || self.worker_queued.is_some()
+            || self.deferred_promotion_token.is_some()
     }
 
     pub(crate) fn promote_page_flip(&mut self, token: PageFlipToken) -> io::Result<()> {
@@ -713,7 +786,38 @@ impl NativeEglGbmScanout {
         Ok(())
     }
 
+    pub(crate) fn promote_worker_early_page_flip(
+        &mut self,
+        token: PageFlipToken,
+    ) -> io::Result<()> {
+        if self.deferred_promotion_token == Some(token.get()) {
+            return self.promote_page_flip(token);
+        }
+        if self.page_flip.pending_token() != Some(token) {
+            return Err(io::Error::other(
+                "early worker pageflip token does not match EGL/GBM pending state",
+            ));
+        }
+        if !matches!(
+            self.page_flip.complete(token, self.backend_generation),
+            AtomicCompletion::Completed { .. }
+        ) {
+            return Err(io::Error::other(
+                "early worker pageflip did not complete EGL/GBM pending state",
+            ));
+        }
+        if !self.buffers.complete_page_flip() {
+            return Err(io::Error::other(
+                "early worker pageflip has no EGL/GBM pending buffer",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn suspend_page_flip(&mut self) {
+        if let Some((_, buffer)) = self.worker_queued.take() {
+            self.buffers.restore_ready(buffer);
+        }
         self.page_flip.abandon();
         self.buffers.quarantine_pending_for_session_suspend();
     }

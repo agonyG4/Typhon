@@ -9,6 +9,7 @@ pub(crate) struct NativeGbmScanout {
     pub(crate) buffers: Vec<NativeGbmScanoutBuffer>,
     pub(crate) current_index: usize,
     pub(crate) ready_index: Option<usize>,
+    pub(crate) worker_queued_index: Option<(PageFlipToken, usize)>,
     pub(crate) pending_index: Option<usize>,
     pub(crate) page_flip: AtomicCommitState,
     pub(crate) deferred_promotion_token: Option<u64>,
@@ -118,6 +119,7 @@ impl NativeGbmScanout {
             buffers,
             current_index: 0,
             ready_index: None,
+            worker_queued_index: None,
             pending_index: None,
             page_flip: AtomicCommitState::default(),
             deferred_promotion_token: None,
@@ -245,6 +247,86 @@ impl NativeGbmScanout {
         }
     }
 
+    pub(crate) fn queue_worker_submission(&mut self, token: PageFlipToken) -> io::Result<u32> {
+        if self.page_flip.is_pending() || self.worker_queued_index.is_some() {
+            return Err(io::Error::other(
+                "GBM compatibility output already has an Atomic commit in flight",
+            ));
+        }
+        let Some(index) = self.ready_index.take() else {
+            return Err(io::Error::other(
+                "GBM compatibility output has no ready buffer",
+            ));
+        };
+        if index == self.current_index {
+            self.ready_index = Some(index);
+            return Err(io::Error::other(
+                "GBM compatibility output ready buffer is already current",
+            ));
+        }
+        self.worker_queued_index = Some((token, index));
+        Ok(self.buffers[index].fb_id)
+    }
+
+    pub(crate) fn promote_worker_submission(&mut self, token: PageFlipToken) -> io::Result<()> {
+        let Some((queued_token, index)) = self.worker_queued_index.take() else {
+            return Err(io::Error::other(
+                "GBM compatibility worker success has no queued buffer",
+            ));
+        };
+        if queued_token != token {
+            self.worker_queued_index = Some((queued_token, index));
+            return Err(io::Error::other(
+                "GBM compatibility worker success token mismatches queued buffer",
+            ));
+        }
+        let framebuffer = FramebufferId::new(self.buffers[index].fb_id)
+            .ok_or_else(|| io::Error::other("GBM compatibility worker framebuffer ID is zero"))?;
+        if let Err(error) = self
+            .page_flip
+            .begin(token, framebuffer, self.backend_generation, Instant::now())
+            .map_err(io::Error::other)
+        {
+            self.worker_queued_index = Some((queued_token, index));
+            return Err(error);
+        }
+        self.pending_index = Some(index);
+        Ok(())
+    }
+
+    pub(crate) fn fail_worker_submission(&mut self, token: PageFlipToken) -> io::Result<()> {
+        let Some((queued_token, index)) = self.worker_queued_index.take() else {
+            return Err(io::Error::other(
+                "GBM compatibility worker failure has no queued buffer",
+            ));
+        };
+        if queued_token != token {
+            self.worker_queued_index = Some((queued_token, index));
+            return Err(io::Error::other(
+                "GBM compatibility worker failure token mismatches queued buffer",
+            ));
+        }
+        self.ready_index = Some(index);
+        Ok(())
+    }
+
+    pub(crate) fn suspend_abandon_worker_submission(
+        &mut self,
+        token: PageFlipToken,
+    ) -> io::Result<()> {
+        let Some((queued_token, index)) = self.worker_queued_index.take() else {
+            return Ok(());
+        };
+        if queued_token != token {
+            self.worker_queued_index = Some((queued_token, index));
+            return Err(io::Error::other(
+                "suspended GBM worker token does not match queued buffer",
+            ));
+        }
+        self.ready_index = Some(index);
+        Ok(())
+    }
+
     pub(crate) fn drain_page_flip_events(
         &mut self,
         fd: RawFd,
@@ -291,7 +373,9 @@ impl NativeGbmScanout {
     }
 
     pub(crate) fn page_flip_pending(&self) -> bool {
-        self.page_flip.is_pending() || self.deferred_promotion_token.is_some()
+        self.page_flip.is_pending()
+            || self.worker_queued_index.is_some()
+            || self.deferred_promotion_token.is_some()
     }
 
     pub(crate) fn promote_page_flip(&mut self, token: PageFlipToken) -> io::Result<()> {
@@ -310,7 +394,39 @@ impl NativeGbmScanout {
         Ok(())
     }
 
+    pub(crate) fn promote_worker_early_page_flip(
+        &mut self,
+        token: PageFlipToken,
+    ) -> io::Result<()> {
+        if self.deferred_promotion_token == Some(token.get()) {
+            return self.promote_page_flip(token);
+        }
+        if self.page_flip.pending_token() != Some(token) {
+            return Err(io::Error::other(
+                "early worker pageflip token does not match GBM pending state",
+            ));
+        }
+        if !matches!(
+            self.page_flip.complete(token, self.backend_generation),
+            AtomicCompletion::Completed { .. }
+        ) {
+            return Err(io::Error::other(
+                "early worker pageflip did not complete GBM pending state",
+            ));
+        }
+        let Some(index) = self.pending_index.take() else {
+            return Err(io::Error::other(
+                "early worker pageflip has no GBM pending buffer",
+            ));
+        };
+        self.current_index = index;
+        Ok(())
+    }
+
     pub(crate) fn suspend_page_flip(&mut self) {
+        if let Some((_, index)) = self.worker_queued_index.take() {
+            self.ready_index = Some(index);
+        }
         self.page_flip.abandon();
         // pending_index remains quarantined and is excluded from rendering until
         // a synchronous recovery modeset retires the old scanout generation.
@@ -359,7 +475,8 @@ impl NativeGbmScanout {
             self.buffers.len(),
             self.current_index,
             self.ready_index,
-            self.pending_index,
+            self.pending_index
+                .or_else(|| self.worker_queued_index.map(|(_, index)| index)),
         )
         .ok_or_else(|| io::Error::other("no free GBM scanout buffer is available"))
     }

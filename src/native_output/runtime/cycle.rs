@@ -210,6 +210,14 @@ impl NativeRuntime {
     #[allow(unused_variables)]
     fn wait_for_events_and_pageflips(&mut self) -> NativeResult<NativeCycleState> {
         let wakeup = self.event_loop.wait()?;
+        if wakeup.reasons.kms_commit_worker() || wakeup.reasons.drm() {
+            // Submit acknowledgments establish physical pending ownership
+            // before the DRM pageflip validation below runs.
+            self.process_kms_worker_events()?;
+        }
+        let deferred_worker_pageflip = self.deferred_worker_pageflip.take();
+        let deferred_worker_completion = self.deferred_worker_completion.take();
+        let worker_timeout_pending = self.worker_timeout_pending.take();
         self.dispatch_runtime_seat_events(&wakeup)?;
         if self.session.permits_output()
             && (wakeup.reasons.drm()
@@ -247,6 +255,11 @@ impl NativeRuntime {
             event_loop,
             drm_reactor_token: _,
             output_render_fence_token,
+            kms_commit_worker,
+            kms_commit_worker_transport,
+            deferred_worker_pageflip: _,
+            deferred_worker_completion: _,
+            worker_timeout_pending: _,
             frame_scheduler,
             atomic_commit_arbiter,
             output_transactions,
@@ -425,18 +438,25 @@ impl NativeRuntime {
         if wrong_crtc_pageflip {
             *mismatched_pageflip_events = mismatched_pageflip_events.saturating_add(1);
         }
-        let pageflip_event = pageflip_drain
+        let pageflip_event = deferred_worker_pageflip.or(pageflip_drain
             .completion
-            .filter(|event| event.crtc_id == target.crtc_id);
-        let (pageflip_event, atomic_completion, atomic_watchdog_kind) = validate_atomic_pageflip(
-            atomic_commit_arbiter,
-            kms_backend.effective_kind(),
-            pageflip_event,
-            *drm_file_generation,
-            monotonic_now_ns()?,
-            mismatched_pageflip_events,
-            stale_pageflip_events,
-        )?;
+            .filter(|event| event.crtc_id == target.crtc_id));
+        let (pageflip_event, atomic_completion, atomic_watchdog_kind) =
+            if deferred_worker_completion.is_some() {
+                (pageflip_event, deferred_worker_completion, None)
+            } else {
+                validate_atomic_pageflip(
+                    atomic_commit_arbiter,
+                    kms_backend.effective_kind(),
+                    pageflip_event,
+                    *drm_file_generation,
+                    monotonic_now_ns()?,
+                    mismatched_pageflip_events,
+                    stale_pageflip_events,
+                    *kms_commit_worker_transport
+                        == crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker,
+                )?
+            };
         if let Some(kind) = atomic_watchdog_kind {
             perf.log("native.atomic_commit_watchdog", || {
                 vec![
@@ -457,6 +477,32 @@ impl NativeRuntime {
                 "native Atomic commit watchdog expired; final DRM drain found no completion",
             )
             .into());
+        }
+        if let Some((token, detected_at)) = worker_timeout_pending {
+            let handled_at = monotonic_now_ns().unwrap_or(0);
+            if pageflip_event.is_some() {
+                if let Some(worker) = kms_commit_worker.as_ref()
+                    && handled_at.saturating_sub(detected_at) > 2_000_000
+                {
+                    worker.record_main_thread_stall();
+                }
+            } else {
+                if let Some(worker) = kms_commit_worker.as_ref() {
+                    worker.record_driver_timeout_suspicion();
+                }
+                perf.log("native.kms_commit_worker_timeout", || {
+                    vec![
+                        NativePerfField::u64("token", token.get()),
+                        NativePerfField::u64("detected_at_ns", detected_at),
+                        NativePerfField::u64("handled_at_ns", handled_at),
+                    ]
+                });
+                acquire_watches.shutdown(event_loop)?;
+                return Err(io::Error::other(
+                    "native Atomic worker pageflip timeout; DRM drain found no completion",
+                )
+                .into());
+            }
         }
         let pageflip_completed = pageflip_event.is_some();
         let mut completed_pageflip_token = None;
@@ -517,13 +563,18 @@ impl NativeRuntime {
             let direct_pending = scanout.direct_scanout_pending();
             let completion = frame_scheduler
                 .note_page_flip_completion(pageflip.user_data, compositor_receive_ns);
-            if matches!(completion, PageFlipCompletionResult::Completed { .. })
-                && let Some(token) = pageflip_drain.deferred_promotion_token
-            {
-                scanout.promote_page_flip(
-                    PageFlipToken::new(token)
-                        .ok_or_else(|| io::Error::other("pageflip promotion token is zero"))?,
-                )?;
+            if matches!(completion, PageFlipCompletionResult::Completed { .. }) {
+                if let Some(token) = pageflip_drain.deferred_promotion_token {
+                    scanout
+                        .promote_page_flip(PageFlipToken::new(token).ok_or_else(|| {
+                            io::Error::other("pageflip promotion token is zero")
+                        })?)?;
+                } else if deferred_worker_completion.is_some() {
+                    scanout.promote_worker_early_page_flip(
+                        PageFlipToken::new(pageflip.user_data)
+                            .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
+                    )?;
+                }
             }
             if let PageFlipCompletionResult::Completed { submitted_at_ns } = completion {
                 let completed_frame_id = frame_pacing.pending;
@@ -857,6 +908,22 @@ impl NativeRuntime {
                         ),
                     ]
                 });
+                if *kms_commit_worker_transport
+                    == crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
+                    && atomic_completion.is_some_and(|completion| {
+                        matches!(completion, AtomicCommitCompletion::Completed(_))
+                    })
+                    && let Some(worker) = kms_commit_worker.as_ref()
+                {
+                    worker
+                        .ack_pageflip(
+                            PageFlipToken::new(pageflip.user_data)
+                                .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
+                        )
+                        .map_err(|error| {
+                            io::Error::other(format!("worker pageflip ack: {error:?}"))
+                        })?;
+                }
             }
         }
         Ok(NativeCycleState {
