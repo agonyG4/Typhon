@@ -8,7 +8,9 @@ use std::{
 use gbm::AsRaw as _;
 use glow::HasContext;
 use khronos_egl as egl;
-use oblivion_one::compositor::{FrameBatchDiscardReason, FramePresentation, OwnCompositorServer};
+use oblivion_one::compositor::{
+    CompositorFrameBatchId, FrameBatchDiscardReason, OwnCompositorServer, SurfaceDamagePresentation,
+};
 use oblivion_one::native::kms::{AtomicDiscovery, DrmFormatModifierPair};
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
 use oblivion_one::render_backend::{
@@ -97,11 +99,8 @@ impl AtomicEglGbmScanout {
         })
     }
 
-    pub(crate) fn suspend_for_session(
-        &mut self,
-        server: &mut OwnCompositorServer,
-    ) -> io::Result<()> {
-        self.direct_scanout_suspend(server)?;
+    pub(crate) fn suspend_for_session(&mut self) -> io::Result<()> {
+        self.direct_scanout_suspend()?;
         self.swapchain_mut()?.suspend_abandon_ready()?;
         Ok(())
     }
@@ -109,7 +108,6 @@ impl AtomicEglGbmScanout {
     pub(crate) fn complete_session_recovery(
         &mut self,
         recovery: AtomicExplicitRecovery,
-        server: &mut OwnCompositorServer,
     ) -> io::Result<()> {
         let swapchain = self.swapchain()?;
         if swapchain.pool_generation() != recovery.pool_generation
@@ -127,26 +125,16 @@ impl AtomicEglGbmScanout {
             ));
         }
         let abandoned_ready = self.swapchain_mut()?.take_suspended_ready_frame();
-        if let Some(frame) = abandoned_ready.as_ref() {
-            server.complete_frame_batch_after_safe_abandonment(
-                frame.protocol_batch_id,
-                FrameBatchDiscardReason::SuspendAbandonment,
-            );
-        }
         self.swapchain_mut()?.recover_suspended_slot(true)?;
         if let Some(frame) = abandoned_ready {
             self.scene.discard_rendered(frame.scene_commit);
             drop(frame.surface_damage);
         }
         if let Some(frame) = self.swapchain_mut()?.retire_pending_after_recovery() {
-            server.complete_frame_batch_after_safe_abandonment(
-                frame.protocol_batch_id,
-                FrameBatchDiscardReason::SuspendAbandonment,
-            );
             self.scene.discard_rendered(frame.scene_commit);
             drop(frame.surface_damage);
         }
-        self.direct.complete_suspended(server);
+        self.direct.complete_suspended();
         Ok(())
     }
 
@@ -977,9 +965,7 @@ impl AtomicEglGbmScanout {
     pub(crate) fn complete_direct_pageflip(
         &mut self,
         token: PageFlipToken,
-        presentation: FramePresentation,
-        server: &mut OwnCompositorServer,
-    ) -> io::Result<PresentedDirectFrame> {
+    ) -> io::Result<DirectPageflipCompletion> {
         let pending =
             self.direct.pending.as_ref().ok_or_else(|| {
                 io::Error::other("direct pageflip completed with no pending frame")
@@ -998,13 +984,8 @@ impl AtomicEglGbmScanout {
         let out_fence = pending.out_fence.take();
         drop(out_fence);
         let presented_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
-        server.commit_surface_damage_presented(pending.surface_damage);
-        server.complete_direct_presented_frame_batch(
-            pending.prepared.frame_id,
-            pending.protocol_batch_id,
-            pending.prepared.candidate.surface_id,
-            presentation,
-        );
+        let protocol_batch_id = pending.protocol_batch_id;
+        let surface_damage = pending.surface_damage;
         let current = PresentedDirectFrame {
             prepared: pending.prepared,
             token,
@@ -1016,12 +997,16 @@ impl AtomicEglGbmScanout {
         drop(old);
         self.direct.counters.presentations += 1;
         direct_scanout_debug("direct pageflip presented");
-        Ok(self
-            .direct
-            .current
-            .as_ref()
-            .expect("direct frame was promoted")
-            .clone())
+        Ok(DirectPageflipCompletion {
+            presented: self
+                .direct
+                .current
+                .as_ref()
+                .expect("direct frame was promoted")
+                .clone(),
+            protocol_batch_id,
+            surface_damage,
+        })
     }
 
     pub(crate) fn mark_composited_submission(&mut self) {
@@ -1049,6 +1034,10 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn direct_scanout_pending_token(&self) -> Option<PageFlipToken> {
         self.direct.pending_token()
+    }
+
+    pub(crate) fn direct_scanout_pending_transaction_id(&self) -> Option<OutputTransactionId> {
+        self.direct.pending_transaction_id()
     }
 
     pub(crate) fn direct_scanout_surface(&self) -> Option<u32> {
@@ -1097,10 +1086,7 @@ impl AtomicEglGbmScanout {
             .saturating_add(1);
     }
 
-    pub(crate) fn direct_scanout_suspend(
-        &mut self,
-        _server: &mut OwnCompositorServer,
-    ) -> io::Result<()> {
+    pub(crate) fn direct_scanout_suspend(&mut self) -> io::Result<()> {
         self.direct.suspend();
         self.scene.invalidate_presented_damage_history();
         Ok(())
@@ -1131,9 +1117,7 @@ impl AtomicEglGbmScanout {
     pub(crate) fn complete_pageflip(
         &mut self,
         token: PageFlipToken,
-        presentation: FramePresentation,
-        server: &mut OwnCompositorServer,
-    ) -> io::Result<PresentedOutputFrame> {
+    ) -> io::Result<CompositedPageflipCompletion> {
         let generation = self.swapchain()?.pool_generation();
         let completed = self.swapchain_mut()?.complete_pageflip(token, generation)?;
         let timing_result = monotonic_now_ns().and_then(|observed_at| {
@@ -1159,8 +1143,6 @@ impl AtomicEglGbmScanout {
             }),
             || {
                 self.scene.commit_presented(scene_commit);
-                server.commit_surface_damage_presented(surface_damage);
-                server.complete_presented_frame_batch(id, protocol_batch_id, presentation);
                 if let Some(pool) = self.pool.as_mut() {
                     pool.slots[usize::from(completed.new_current.get())].last_presented_serial =
                         Some(completed.presentation_serial);
@@ -1174,15 +1156,19 @@ impl AtomicEglGbmScanout {
             );
         }
         self.complete_composited_transition();
-        Ok(PresentedOutputFrame {
-            frame_id: id,
-            transaction_id,
-            target,
-            composite_started_at,
-            rendered_at,
-            submit_started_at: completed.submit_started_at,
-            submit_returned_at: completed.submit_returned_at,
-            fence_signal,
+        Ok(CompositedPageflipCompletion {
+            presented: PresentedOutputFrame {
+                frame_id: id,
+                transaction_id,
+                target,
+                composite_started_at,
+                rendered_at,
+                submit_started_at: completed.submit_started_at,
+                submit_returned_at: completed.submit_returned_at,
+                fence_signal,
+            },
+            protocol_batch_id,
+            surface_damage,
         })
     }
 
@@ -1345,7 +1331,14 @@ pub(crate) struct PendingFenceTiming {
     pub(crate) quality: FenceTimestampQuality,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
+pub(crate) struct CompositedPageflipCompletion {
+    pub(crate) presented: PresentedOutputFrame,
+    pub(crate) protocol_batch_id: CompositorFrameBatchId,
+    pub(crate) surface_damage: SurfaceDamagePresentation,
+}
+
+#[derive(Debug)]
 pub(crate) struct PresentedOutputFrame {
     pub(crate) frame_id: u64,
     pub(crate) transaction_id: OutputTransactionId,

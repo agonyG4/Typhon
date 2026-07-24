@@ -2,7 +2,7 @@ use std::{os::fd::OwnedFd, sync::Arc};
 
 use oblivion_one::compositor::{
     CompositorFrameBatchId, DirectScanoutSceneCandidate, DirectScanoutSceneRejection,
-    FrameBatchDiscardReason, OwnCompositorServer, SurfaceDamagePresentation,
+    SurfaceDamagePresentation,
 };
 use oblivion_one::render_backend::buffer::DmabufBufferHandle;
 
@@ -35,6 +35,13 @@ pub(crate) struct PresentedDirectFrame {
     pub(crate) presented_at: MonotonicTimestampNs,
     pub(crate) submit_started_at: MonotonicTimestampNs,
     pub(crate) submit_returned_at: MonotonicTimestampNs,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DirectPageflipCompletion {
+    pub(crate) presented: PresentedDirectFrame,
+    pub(crate) protocol_batch_id: CompositorFrameBatchId,
+    pub(crate) surface_damage: SurfaceDamagePresentation,
 }
 
 struct SuspendedDirectFrame {
@@ -147,6 +154,12 @@ impl DirectScanoutState {
         self.pending.as_ref().map(|frame| frame.token)
     }
 
+    pub(crate) fn pending_transaction_id(&self) -> Option<OutputTransactionId> {
+        self.pending
+            .as_ref()
+            .map(|frame| frame.prepared.transaction_id)
+    }
+
     pub(crate) fn page_flip_pending(&self) -> bool {
         self.pending.is_some()
     }
@@ -175,13 +188,9 @@ impl DirectScanoutState {
         }
     }
 
-    pub(super) fn complete_suspended(&mut self, server: &mut OwnCompositorServer) {
+    pub(super) fn complete_suspended(&mut self) {
         for frame in self.suspended.drain(..) {
-            if let Some((batch_id, surface_damage)) = frame.abandoned_batch {
-                server.complete_frame_batch_after_safe_abandonment(
-                    batch_id,
-                    FrameBatchDiscardReason::SuspendAbandonment,
-                );
+            if let Some((_batch_id, surface_damage)) = frame.abandoned_batch {
                 drop(surface_damage);
             }
             drop(frame.framebuffer);

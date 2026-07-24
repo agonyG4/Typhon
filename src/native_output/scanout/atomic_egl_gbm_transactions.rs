@@ -35,7 +35,7 @@ impl AtomicEglGbmScanout {
                     output_transactions
                         .mark_failed(
                             transaction_id,
-                            OutputTransactionFailureStage::FenceExport,
+                            OutputTransactionFailureStage::BackendOwnershipTransfer,
                             MonotonicTimestampNs::new(monotonic_now_ns()?),
                         )
                         .map_err(io::Error::other)?;
@@ -58,7 +58,7 @@ impl AtomicEglGbmScanout {
                 output_transactions
                     .mark_failed(
                         transaction_id,
-                        OutputTransactionFailureStage::FenceExport,
+                        OutputTransactionFailureStage::BackendOwnershipTransfer,
                         MonotonicTimestampNs::new(monotonic_now_ns()?),
                     )
                     .map_err(io::Error::other)?;

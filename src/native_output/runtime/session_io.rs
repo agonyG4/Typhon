@@ -1,4 +1,6 @@
+use super::presentation_transactions::complete_dropped_output_transaction;
 use super::*;
+use oblivion_one::compositor::FrameBatchDiscardReason;
 use oblivion_one::native::kms::KmsBackendKind;
 
 #[allow(dead_code)]
@@ -166,18 +168,11 @@ impl NativeSessionIo for NativeRuntime {
     fn quarantine_pageflip(&mut self) -> NativeResult<()> {
         self.frame_scheduler.abandon_for_session_suspend();
         self.atomic_commit_arbiter.abandon_for_recovery();
-        self.output_transactions
-            .cleanup_generation(
-                self.drm_file_generation,
-                OutputTransactionDropReason::SessionSuspended,
-                MonotonicTimestampNs::new(monotonic_now_ns()?),
-            )
-            .map_err(io::Error::other)?;
         self.cursor_output_arbitration.clear_pending();
         if let Some(token) = self.output_render_fence_token.take() {
             self.event_loop.unregister(token)?;
         }
-        self.scanout.suspend_page_flip(&mut self.server)?;
+        self.scanout.suspend_page_flip()?;
         Ok(())
     }
 
@@ -266,8 +261,28 @@ impl NativeSessionIo for NativeRuntime {
         let recovery = self.pending_session_recovery.as_ref().ok_or_else(|| {
             io::Error::other("session recovery completion has no prepared framebuffer")
         })?;
-        self.scanout
-            .complete_session_recovery(*recovery, &mut self.server)?;
+        self.scanout.complete_session_recovery(*recovery)?;
+        let abandoned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
+        let transaction_ids = self.output_transactions.active_transaction_ids();
+        let output_transactions = &mut self.output_transactions;
+        let server = &mut self.server;
+        for transaction_id in transaction_ids {
+            complete_dropped_output_transaction(
+                output_transactions,
+                transaction_id,
+                OutputTransactionDropReason::SessionSuspended,
+                abandoned_at,
+                |obligations| {
+                    if let Some(batch_id) = obligations.frame_batch_id() {
+                        server.complete_frame_batch_after_safe_abandonment(
+                            batch_id,
+                            FrameBatchDiscardReason::SuspendAbandonment,
+                        );
+                    }
+                    Ok(())
+                },
+            )?;
+        }
         self.pending_session_recovery = None;
         Ok(())
     }

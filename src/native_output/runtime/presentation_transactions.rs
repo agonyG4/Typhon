@@ -3,6 +3,107 @@ use super::*;
 use oblivion_one::native::kms::KmsBackendKind;
 
 #[allow(clippy::too_many_arguments)]
+pub(super) fn complete_presented_output_transaction<F>(
+    output_transactions: &mut OutputTransactionLedger,
+    presentation_trace: &mut PresentationTransactionTraceRing,
+    transaction_id: OutputTransactionId,
+    token: PageFlipToken,
+    output_generation: u64,
+    presented_at: MonotonicTimestampNs,
+    actual_sequence: Option<u64>,
+    settle_protocol_obligations: F,
+) -> NativeResult<()>
+where
+    F: FnOnce(OutputProtocolObligations) -> NativeResult<()>,
+{
+    let accepted = output_transactions
+        .accept_presented(
+            transaction_id,
+            token,
+            output_generation,
+            presented_at,
+            actual_sequence,
+        )
+        .map_err(io::Error::other)?;
+    let obligations = accepted.obligations();
+    if let Err(error) = settle_protocol_obligations(obligations) {
+        let _ = output_transactions.fail_settlement(
+            accepted,
+            MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(presented_at.get())),
+        );
+        return Err(error);
+    }
+    if let Err(error) = output_transactions.finalize_terminal(accepted) {
+        let _ = output_transactions.fail_settlement(
+            accepted,
+            MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(presented_at.get())),
+        );
+        return Err(io::Error::other(error).into());
+    }
+    presentation_trace.push(PresentationTransactionEvent::PageflipPresented {
+        transaction_id,
+        timestamp_ns: presented_at.get(),
+    });
+    Ok(())
+}
+
+pub(super) fn complete_dropped_output_transaction<F>(
+    output_transactions: &mut OutputTransactionLedger,
+    transaction_id: OutputTransactionId,
+    reason: OutputTransactionDropReason,
+    at: MonotonicTimestampNs,
+    settle_protocol_obligations: F,
+) -> NativeResult<()>
+where
+    F: FnOnce(OutputProtocolObligations) -> NativeResult<()>,
+{
+    let accepted = output_transactions
+        .accept_dropped(transaction_id, reason, at)
+        .map_err(io::Error::other)?;
+    let obligations = accepted.obligations();
+    if let Err(error) = settle_protocol_obligations(obligations) {
+        let _ = output_transactions.fail_settlement(
+            accepted,
+            MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(at.get())),
+        );
+        return Err(error);
+    }
+    if let Err(error) = output_transactions.finalize_terminal(accepted) {
+        let _ = output_transactions.fail_settlement(
+            accepted,
+            MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(at.get())),
+        );
+        return Err(io::Error::other(error).into());
+    }
+    Ok(())
+}
+
+pub(super) fn complete_immediate_output_transaction(
+    output_transactions: &mut OutputTransactionLedger,
+    presentation_trace: &mut PresentationTransactionTraceRing,
+    server: &mut OwnCompositorServer,
+    transaction_id: OutputTransactionId,
+    presented_at: MonotonicTimestampNs,
+) -> NativeResult<()> {
+    let accepted = output_transactions
+        .accept_immediate_presented(transaction_id, presented_at)
+        .map_err(io::Error::other)?;
+    server.finish_prepared_frame();
+    if let Err(error) = output_transactions.finalize_terminal(accepted) {
+        let _ = output_transactions.fail_settlement(
+            accepted,
+            MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(presented_at.get())),
+        );
+        return Err(io::Error::other(error).into());
+    }
+    presentation_trace.push(PresentationTransactionEvent::PageflipPresented {
+        transaction_id,
+        timestamp_ns: presented_at.get(),
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_compatibility_transaction(
     output_transactions: &mut OutputTransactionLedger,
     server: &OwnCompositorServer,
@@ -14,9 +115,6 @@ pub(super) fn build_compatibility_transaction(
     cursor: Option<&AtomicCursorVisualState>,
     cursor_epoch: u64,
 ) -> NativeResult<Option<OutputTransactionId>> {
-    let Some(framebuffer_id) = scanout.compatibility_framebuffer_id() else {
-        return Ok(None);
-    };
     let frame_batch_id = server
         .prepared_frame_batch_id()
         .ok_or_else(|| io::Error::other("compatibility pageflip has no prepared frame batch"))?;
@@ -26,22 +124,36 @@ pub(super) fn build_compatibility_transaction(
     let transaction_id = output_transactions
         .allocate_id()
         .map_err(io::Error::other)?;
-    let transaction = OutputTransaction::compatibility_composited(
-        transaction_id,
-        output_generation,
-        MonotonicTimestampNs::new(monotonic_now_ns()?),
-        target,
-        pacing_mode,
-        frame_id,
-        render_generation,
-        framebuffer_id,
-        cursor.map(|state| CursorPlaneAssignment::Atomic {
-            desired_epoch: cursor_epoch,
-            framebuffer_id: state.framebuffer_id,
-            visible: state.visible,
-        }),
-        frame_batch_id,
-    )
+    let transaction = match scanout.compatibility_framebuffer_id() {
+        Some(framebuffer_id) => OutputTransaction::compatibility_composited(
+            transaction_id,
+            output_generation,
+            MonotonicTimestampNs::new(monotonic_now_ns()?),
+            target,
+            pacing_mode,
+            frame_id,
+            render_generation,
+            framebuffer_id,
+            cursor.map(|state| CursorPlaneAssignment::Atomic {
+                desired_epoch: cursor_epoch,
+                framebuffer_id: state.framebuffer_id,
+                visible: state.visible,
+            }),
+            frame_batch_id,
+        ),
+        None if scanout.kind() == NativeScanoutKind::DumbFramebuffer => {
+            OutputTransaction::compatibility_immediate(
+                transaction_id,
+                output_generation,
+                MonotonicTimestampNs::new(monotonic_now_ns()?),
+                target,
+                pacing_mode,
+                frame_id,
+                frame_batch_id,
+            )
+        }
+        None => return Ok(None),
+    }
     .map_err(io::Error::other)?;
     output_transactions
         .insert(transaction)
@@ -152,6 +264,7 @@ pub(super) fn register_primary_transaction(
         .and_then(|record| match record.descriptor().content() {
             OutputTransactionContent::Composited { frame_id, .. }
             | OutputTransactionContent::Direct { frame_id, .. } => Some(frame_id),
+            OutputTransactionContent::CompatibilityImmediate { frame_id } => Some(frame_id),
             OutputTransactionContent::CursorOnly { .. } => None,
         })
         .unwrap_or(frame_index);
@@ -171,7 +284,7 @@ pub(super) fn register_primary_transaction(
             fail_transaction(
                 output_transactions,
                 transaction_id,
-                OutputTransactionFailureStage::OutputTeardown,
+                OutputTransactionFailureStage::BackendCompletion,
             )?;
             return Err(error.into());
         }

@@ -1,4 +1,5 @@
 use super::*;
+use oblivion_one::compositor::FrameBatchDiscardReason;
 
 mod atomic_commit;
 mod bootstrap;
@@ -233,10 +234,25 @@ impl NativeRuntime {
 
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
-        let _ = self.output_transactions.terminate_all(
-            OutputTransactionDropReason::OutputDestroyed,
-            MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(0)),
-        );
+        let abandoned_at = MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(0));
+        let transaction_ids = self.output_transactions.active_transaction_ids();
+        for transaction_id in transaction_ids {
+            let _ = presentation_transactions::complete_dropped_output_transaction(
+                &mut self.output_transactions,
+                transaction_id,
+                OutputTransactionDropReason::OutputDestroyed,
+                abandoned_at,
+                |obligations| {
+                    if let Some(batch_id) = obligations.frame_batch_id() {
+                        self.server.complete_frame_batch_after_safe_abandonment(
+                            batch_id,
+                            FrameBatchDiscardReason::OutputDestroyed,
+                        );
+                    }
+                    Ok(())
+                },
+            );
+        }
         self.revoke_xwayland_private_client();
         let _ = self
             .xwayland
@@ -250,7 +266,7 @@ impl Drop for NativeRuntime {
             );
             let transaction_counters = self.output_transactions.counters();
             println!(
-                "typhon presentation: event=output_transaction_summary active={} built={} ready={} submitted={} presented={} dropped={} superseded={} failed={} invalid_transitions={} duplicate_obligations={} active_peak={} history_overwrites={} built_composited={} built_direct={} built_cursor_only={} submitted_composited={} submitted_direct={} submitted_cursor_only={} presented_composited={} presented_direct={} presented_cursor_only={}",
+                "typhon presentation: event=output_transaction_summary active={} built={} ready={} submitted={} presented={} dropped={} superseded={} failed={} invalid_transitions={} duplicate_obligations={} active_peak={} history_overwrites={} accepted_terminals={} finalized_terminals={} rejected_terminals={} settlement_failures={} failure_stage_mismatches={} active_settling={} immediate_presentations={} immediate_presentation_failures={} built_composited={} built_direct={} built_cursor_only={} submitted_composited={} submitted_direct={} submitted_cursor_only={} presented_composited={} presented_direct={} presented_cursor_only={}",
                 self.output_transactions.active_count(),
                 transaction_counters.built,
                 transaction_counters.ready,
@@ -263,6 +279,14 @@ impl Drop for NativeRuntime {
                 transaction_counters.duplicate_obligation_attempts,
                 transaction_counters.active_peak,
                 transaction_counters.terminal_history_overwrites,
+                transaction_counters.terminal_transitions_accepted,
+                transaction_counters.terminal_transitions_finalized,
+                transaction_counters.terminal_transitions_rejected,
+                transaction_counters.settlement_failures,
+                transaction_counters.failure_stage_mismatches,
+                transaction_counters.active_settling_transactions,
+                transaction_counters.immediate_presentations,
+                transaction_counters.immediate_presentation_failures,
                 transaction_counters.built_composited,
                 transaction_counters.built_direct,
                 transaction_counters.built_cursor_only,

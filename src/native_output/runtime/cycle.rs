@@ -1,4 +1,5 @@
 use super::cursor_cycle::{complete_cursor_only_pageflip, complete_primary_cursor_pageflip};
+use super::presentation_transactions::complete_presented_output_transaction;
 use super::*;
 pub fn run(
     server: OwnCompositorServer,
@@ -482,28 +483,34 @@ impl NativeRuntime {
                 // Cursor-only completion is not a complete compositor cycle.
                 // Continue through protocol and input dispatch so a primary
                 // producer can be observed and scheduled immediately.
-                let _ = complete_cursor_only_pageflip(
-                    atomic_cursor,
-                    pageflip.user_data,
-                    *drm_file_generation,
-                    perf,
-                )?;
                 if let Some(transaction_id) = cursor_transaction_id {
-                    self.presentation_trace
-                        .push(PresentationTransactionEvent::PageflipPresented {
-                            transaction_id,
-                            timestamp_ns: compositor_receive_ns,
-                        });
-                    output_transactions
-                        .mark_presented(
-                            transaction_id,
-                            PageFlipToken::new(pageflip.user_data)
-                                .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
-                            *drm_file_generation,
-                            MonotonicTimestampNs::new(compositor_receive_ns),
-                            None,
-                        )
-                        .map_err(io::Error::other)?;
+                    complete_presented_output_transaction(
+                        output_transactions,
+                        &mut self.presentation_trace,
+                        transaction_id,
+                        PageFlipToken::new(pageflip.user_data)
+                            .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
+                        *drm_file_generation,
+                        MonotonicTimestampNs::new(compositor_receive_ns),
+                        None,
+                        |obligations| {
+                            debug_assert!(obligations.frame_batch_id().is_none());
+                            let _ = complete_cursor_only_pageflip(
+                                atomic_cursor,
+                                pageflip.user_data,
+                                *drm_file_generation,
+                                perf,
+                            )?;
+                            Ok(())
+                        },
+                    )?;
+                } else {
+                    let _ = complete_cursor_only_pageflip(
+                        atomic_cursor,
+                        pageflip.user_data,
+                        *drm_file_generation,
+                        perf,
+                    )?;
                 }
             }
             let scheduler_state_at_completion = frame_scheduler.state();
@@ -544,35 +551,55 @@ impl NativeRuntime {
                     compositor_receive_ns.saturating_sub(receive_delay_us.saturating_mul(1_000));
                 *last_primary_presented_at_ns = Some(presented_at_ns);
                 if direct_pending {
-                    let completed = scanout.complete_direct_pageflip(
-                        PageFlipToken::new(pageflip.user_data)
-                            .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
-                        presentation,
-                        server,
-                    )?;
-                    self.presentation_trace
-                        .push(PresentationTransactionEvent::PageflipPresented {
-                            transaction_id: completed.prepared.transaction_id,
-                            timestamp_ns: compositor_receive_ns,
-                        });
-                    complete_primary_cursor_pageflip(
-                        atomic_cursor,
-                        pageflip.user_data,
-                        *drm_file_generation,
-                    )?;
                     let presented_at = MonotonicTimestampNs::new(presented_at_ns);
                     let actual_logical_sequence =
                         presentation_deadline.note_presented(presented_at);
-                    output_transactions
-                        .mark_presented(
-                            completed.prepared.transaction_id,
-                            PageFlipToken::new(pageflip.user_data)
-                                .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
-                            *drm_file_generation,
-                            presented_at,
-                            Some(actual_logical_sequence),
-                        )
-                        .map_err(io::Error::other)?;
+                    let transaction_id = scanout
+                        .direct_scanout_pending_transaction_id()
+                        .ok_or_else(|| io::Error::other("direct pageflip has no transaction"))?;
+                    let mut completed = None;
+                    complete_presented_output_transaction(
+                        output_transactions,
+                        &mut self.presentation_trace,
+                        transaction_id,
+                        PageFlipToken::new(pageflip.user_data)
+                            .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
+                        *drm_file_generation,
+                        presented_at,
+                        Some(actual_logical_sequence),
+                        |obligations| {
+                            debug_assert_eq!(
+                                obligations.direct_surface_id(),
+                                scanout.direct_scanout_surface()
+                            );
+                            let completion = scanout.complete_direct_pageflip(
+                                PageFlipToken::new(pageflip.user_data).ok_or_else(|| {
+                                    io::Error::other("direct pageflip token is zero")
+                                })?,
+                            )?;
+                            let DirectPageflipCompletion {
+                                presented,
+                                protocol_batch_id,
+                                surface_damage,
+                            } = completion;
+                            complete_primary_cursor_pageflip(
+                                atomic_cursor,
+                                pageflip.user_data,
+                                *drm_file_generation,
+                            )?;
+                            server.commit_surface_damage_presented(surface_damage);
+                            server.complete_direct_presented_frame_batch(
+                                presented.prepared.frame_id,
+                                protocol_batch_id,
+                                presented.prepared.candidate.surface_id,
+                                presentation,
+                            );
+                            completed = Some(presented);
+                            Ok(())
+                        },
+                    )?;
+                    let completed = completed
+                        .ok_or_else(|| io::Error::other("direct pageflip did not complete"))?;
                     render_journal.note_matching_presentation(presented_at);
                     frame_pacing.note_explicit_present(ExplicitPresentationObservation {
                         planned_sequence: completed.prepared.target.sequence,
@@ -591,35 +618,58 @@ impl NativeRuntime {
                     if let Some(token) = output_render_fence_token.take() {
                         event_loop.unregister(token)?;
                     }
-                    let completed = explicit.complete_pageflip(
-                        PageFlipToken::new(pageflip.user_data)
-                            .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
-                        presentation,
-                        server,
-                    )?;
-                    self.presentation_trace
-                        .push(PresentationTransactionEvent::PageflipPresented {
-                            transaction_id: completed.transaction_id,
-                            timestamp_ns: compositor_receive_ns,
-                        });
-                    complete_primary_cursor_pageflip(
-                        atomic_cursor,
-                        pageflip.user_data,
-                        *drm_file_generation,
-                    )?;
                     let presented_at = MonotonicTimestampNs::new(presented_at_ns);
                     let actual_logical_sequence =
                         presentation_deadline.note_presented(presented_at);
-                    output_transactions
-                        .mark_presented(
-                            completed.transaction_id,
-                            PageFlipToken::new(pageflip.user_data)
-                                .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
-                            *drm_file_generation,
-                            presented_at,
-                            Some(actual_logical_sequence),
-                        )
-                        .map_err(io::Error::other)?;
+                    let transaction_id = match atomic_completion {
+                        Some(AtomicCommitCompletion::Completed(
+                            AtomicCommitKind::CompositedPrimary { transaction_id, .. },
+                        )) => transaction_id,
+                        _ => {
+                            return Err(
+                                io::Error::other("composited pageflip has no transaction").into()
+                            );
+                        }
+                    };
+                    let mut completed = None;
+                    complete_presented_output_transaction(
+                        output_transactions,
+                        &mut self.presentation_trace,
+                        transaction_id,
+                        PageFlipToken::new(pageflip.user_data)
+                            .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
+                        *drm_file_generation,
+                        presented_at,
+                        Some(actual_logical_sequence),
+                        |obligations| {
+                            debug_assert!(obligations.direct_surface_id().is_none());
+                            let completion = explicit.complete_pageflip(
+                                PageFlipToken::new(pageflip.user_data).ok_or_else(|| {
+                                    io::Error::other("composited pageflip token is zero")
+                                })?,
+                            )?;
+                            let CompositedPageflipCompletion {
+                                presented: frame,
+                                protocol_batch_id,
+                                surface_damage,
+                            } = completion;
+                            server.commit_surface_damage_presented(surface_damage);
+                            server.complete_presented_frame_batch(
+                                frame.frame_id,
+                                protocol_batch_id,
+                                presentation,
+                            );
+                            complete_primary_cursor_pageflip(
+                                atomic_cursor,
+                                pageflip.user_data,
+                                *drm_file_generation,
+                            )?;
+                            completed = Some(frame);
+                            Ok(())
+                        },
+                    )?;
+                    let completed = completed
+                        .ok_or_else(|| io::Error::other("composited pageflip did not complete"))?;
                     render_journal.note_matching_presentation(presented_at);
                     render_journal.record_atomic_submit(
                         completed
@@ -705,24 +755,23 @@ impl NativeRuntime {
                             .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
                         *drm_file_generation,
                     );
-                    server.finish_frame_with_presentation(presentation);
                     if let Some(transaction_id) = compatibility_transaction_id {
-                        self.presentation_trace.push(
-                            PresentationTransactionEvent::PageflipPresented {
-                                transaction_id,
-                                timestamp_ns: compositor_receive_ns,
+                        complete_presented_output_transaction(
+                            output_transactions,
+                            &mut self.presentation_trace,
+                            transaction_id,
+                            PageFlipToken::new(pageflip.user_data)
+                                .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
+                            *drm_file_generation,
+                            MonotonicTimestampNs::new(presented_at_ns),
+                            None,
+                            |_| {
+                                server.finish_frame_with_presentation(presentation);
+                                Ok(())
                             },
-                        );
-                        output_transactions
-                            .mark_presented(
-                                transaction_id,
-                                PageFlipToken::new(pageflip.user_data)
-                                    .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
-                                *drm_file_generation,
-                                MonotonicTimestampNs::new(presented_at_ns),
-                                None,
-                            )
-                            .map_err(io::Error::other)?;
+                        )?;
+                    } else {
+                        server.finish_frame_with_presentation(presentation);
                     }
                 }
                 frame_pacing.note_pageflip(

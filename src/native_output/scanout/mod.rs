@@ -409,11 +409,10 @@ impl NativeScanoutBackend {
     pub(crate) fn complete_session_recovery(
         &mut self,
         recovery: NativeScanoutRecovery,
-        server: &mut OwnCompositorServer,
     ) -> io::Result<()> {
         match (self, recovery) {
             (Self::AtomicEglGbm(scanout), NativeScanoutRecovery::AtomicEglGbm(recovery)) => {
-                scanout.complete_session_recovery(recovery, server)
+                scanout.complete_session_recovery(recovery)
             }
             (Self::NativeEglGbm(scanout), NativeScanoutRecovery::NativeEglGbm(recovery)) => {
                 scanout.complete_session_recovery(recovery)
@@ -517,9 +516,9 @@ impl NativeScanoutBackend {
         }
     }
 
-    pub(crate) fn suspend_page_flip(&mut self, server: &mut OwnCompositorServer) -> io::Result<()> {
+    pub(crate) fn suspend_page_flip(&mut self) -> io::Result<()> {
         match self {
-            Self::AtomicEglGbm(scanout) => scanout.suspend_for_session(server)?,
+            Self::AtomicEglGbm(scanout) => scanout.suspend_for_session()?,
             Self::NativeEglGbm(scanout) => scanout.suspend_page_flip(),
             Self::Gbm(scanout) => scanout.suspend_page_flip(),
             Self::Dumb(_) => {}
@@ -691,9 +690,15 @@ impl NativeScanoutBackend {
     pub(crate) fn direct_scanout_active(&self) -> bool {
         matches!(self, Self::AtomicEglGbm(scanout) if scanout.direct_scanout_active())
     }
-
     pub(crate) fn direct_scanout_pending(&self) -> bool {
         matches!(self, Self::AtomicEglGbm(scanout) if scanout.direct_scanout_pending())
+    }
+
+    pub(crate) fn direct_scanout_pending_transaction_id(&self) -> Option<OutputTransactionId> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.direct_scanout_pending_transaction_id(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => None,
+        }
     }
 
     pub(crate) fn direct_scanout_surface(&self) -> Option<u32> {
@@ -760,13 +765,9 @@ impl NativeScanoutBackend {
     pub(crate) fn complete_direct_pageflip(
         &mut self,
         token: PageFlipToken,
-        presentation: FramePresentation,
-        server: &mut OwnCompositorServer,
-    ) -> io::Result<PresentedDirectFrame> {
+    ) -> io::Result<DirectPageflipCompletion> {
         match self {
-            Self::AtomicEglGbm(scanout) => {
-                scanout.complete_direct_pageflip(token, presentation, server)
-            }
+            Self::AtomicEglGbm(scanout) => scanout.complete_direct_pageflip(token),
             Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
                 "direct pageflip is unsupported by this backend",
             )),

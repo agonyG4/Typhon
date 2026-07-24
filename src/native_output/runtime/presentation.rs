@@ -15,7 +15,8 @@ use super::presentation_protocol::{
     log_wait_for_presentation,
 };
 use super::presentation_transactions::{
-    fail_transaction, present_compatibility_frame, register_primary_transaction, submit_cursor_only,
+    complete_immediate_output_transaction, fail_transaction, present_compatibility_frame,
+    register_primary_transaction, submit_cursor_only,
 };
 use super::*;
 use oblivion_one::native::kms::KmsBackendKind;
@@ -650,10 +651,15 @@ impl NativeRuntime {
                     });
                 }
                 NativePresentResult::Immediate => {
-                    fail_transaction(
+                    let transaction_id = compatibility_transaction_id.ok_or_else(|| {
+                        io::Error::other("immediate compatibility presentation has no transaction")
+                    })?;
+                    complete_immediate_output_transaction(
                         output_transactions,
-                        compatibility_transaction_id,
-                        OutputTransactionFailureStage::KmsSubmit,
+                        presentation_trace,
+                        server,
+                        transaction_id,
+                        MonotonicTimestampNs::new(monotonic_now_ns()?),
                     )?;
                     frame_scheduler.note_immediate_completion();
                 }
@@ -744,7 +750,7 @@ impl NativeRuntime {
                                     output_transactions
                                         .mark_failed(
                                             transaction_id,
-                                            OutputTransactionFailureStage::OutputTeardown,
+                                            OutputTransactionFailureStage::BackendCompletion,
                                             MonotonicTimestampNs::new(monotonic_now_ns()?),
                                         )
                                         .map_err(io::Error::other)?;
@@ -1290,15 +1296,20 @@ impl NativeRuntime {
                                     frame_submitted = true;
                                 }
                                 NativePresentResult::Immediate => {
-                                    fail_transaction(
-                                        output_transactions,
-                                        compatibility_transaction_id,
-                                        OutputTransactionFailureStage::KmsSubmit,
-                                    )?;
+                                    let transaction_id = compatibility_transaction_id.ok_or_else(|| {
+                                        io::Error::other(
+                                            "immediate compatibility presentation has no transaction",
+                                        )
+                                    })?;
                                     frame_scheduler.note_immediate_completion();
-                                    // Immediate presentation settles the owned batch exactly once.
                                     let finish_frame_start = Instant::now();
-                                    server.finish_prepared_frame();
+                                    complete_immediate_output_transaction(
+                                        output_transactions,
+                                        presentation_trace,
+                                        server,
+                                        transaction_id,
+                                        MonotonicTimestampNs::new(monotonic_now_ns()?),
+                                    )?;
                                     frame_completed = true;
                                     perf.log("native.finish_frame", || {
                                         vec![

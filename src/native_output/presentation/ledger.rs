@@ -19,6 +19,9 @@ pub(crate) enum OutputTransactionState {
         token: PageFlipToken,
         submitted_at: MonotonicTimestampNs,
     },
+    Settling {
+        terminal: OutputTransactionTerminal,
+    },
     Terminal(OutputTransactionTerminal),
 }
 
@@ -64,7 +67,13 @@ pub(crate) enum OutputTransactionFailureStage {
     RenderExecution,
     FenceExport,
     KmsSubmit,
-    OutputTeardown,
+    BackendOwnershipTransfer,
+    PageflipValidation,
+    OutputLost,
+    SessionLost,
+    ShutdownAbandonment,
+    BackendCompletion,
+    ProtocolSettlement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +81,7 @@ pub(crate) enum OutputTransactionStateKind {
     Built,
     Ready,
     Submitted,
+    Settling,
     Terminal,
 }
 
@@ -81,6 +91,7 @@ impl OutputTransactionState {
             Self::Built => OutputTransactionStateKind::Built,
             Self::Ready { .. } => OutputTransactionStateKind::Ready,
             Self::Submitted { .. } => OutputTransactionStateKind::Submitted,
+            Self::Settling { .. } => OutputTransactionStateKind::Settling,
             Self::Terminal(_) => OutputTransactionStateKind::Terminal,
         }
     }
@@ -108,6 +119,10 @@ pub(crate) enum OutputTransactionError {
     },
     TokenMismatch,
     GenerationMismatch,
+    FailureStageMismatch {
+        state: OutputTransactionStateKind,
+        stage: OutputTransactionFailureStage,
+    },
 }
 
 impl std::fmt::Display for OutputTransactionError {
@@ -134,6 +149,27 @@ impl OutputTransactionRecord {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AcceptedTerminalTransition {
+    transaction_id: OutputTransactionId,
+    obligations: super::transaction::OutputProtocolObligations,
+    terminal: OutputTransactionTerminal,
+}
+
+impl AcceptedTerminalTransition {
+    pub(crate) const fn transaction_id(self) -> OutputTransactionId {
+        self.transaction_id
+    }
+
+    pub(crate) const fn obligations(self) -> super::transaction::OutputProtocolObligations {
+        self.obligations
+    }
+
+    pub(crate) const fn terminal(self) -> OutputTransactionTerminal {
+        self.terminal
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OutputTransactionCounters {
     pub(crate) built: u64,
@@ -147,6 +183,14 @@ pub(crate) struct OutputTransactionCounters {
     pub(crate) duplicate_obligation_attempts: u64,
     pub(crate) active_peak: u64,
     pub(crate) terminal_history_overwrites: u64,
+    pub(crate) terminal_transitions_accepted: u64,
+    pub(crate) terminal_transitions_finalized: u64,
+    pub(crate) terminal_transitions_rejected: u64,
+    pub(crate) settlement_failures: u64,
+    pub(crate) failure_stage_mismatches: u64,
+    pub(crate) active_settling_transactions: u64,
+    pub(crate) immediate_presentations: u64,
+    pub(crate) immediate_presentation_failures: u64,
     pub(crate) built_composited: u64,
     pub(crate) built_direct: u64,
     pub(crate) built_cursor_only: u64,
@@ -251,6 +295,7 @@ impl OutputTransactionLedger {
             OutputTransactionContent::Direct { .. } => {
                 self.counters.built_direct = self.counters.built_direct.saturating_add(1);
             }
+            OutputTransactionContent::CompatibilityImmediate { .. } => {}
             OutputTransactionContent::CursorOnly { .. } => {
                 self.counters.built_cursor_only = self.counters.built_cursor_only.saturating_add(1);
             }
@@ -307,8 +352,75 @@ impl OutputTransactionLedger {
             OutputTransactionContent::CursorOnly { .. } => {
                 counters.submitted_cursor_only = counters.submitted_cursor_only.saturating_add(1)
             }
+            OutputTransactionContent::CompatibilityImmediate { .. } => {}
         });
         Ok(())
+    }
+
+    pub(crate) fn accept_presented(
+        &mut self,
+        id: OutputTransactionId,
+        token: PageFlipToken,
+        output_generation: u64,
+        presented_at: MonotonicTimestampNs,
+        actual_sequence: Option<u64>,
+    ) -> Result<AcceptedTerminalTransition, OutputTransactionError> {
+        let (descriptor_generation, state) = self
+            .active
+            .get(&id)
+            .map(|record| (record.descriptor.output_generation(), record.state))
+            .ok_or_else(|| self.reject_terminal(OutputTransactionError::UnknownTransaction))?;
+        if descriptor_generation != output_generation {
+            return Err(self.reject_terminal(OutputTransactionError::GenerationMismatch));
+        }
+        match state {
+            OutputTransactionState::Submitted {
+                token: expected, ..
+            } if expected == token => {}
+            OutputTransactionState::Submitted { .. } => {
+                return Err(self.reject_terminal(OutputTransactionError::TokenMismatch));
+            }
+            state => {
+                return Err(self
+                    .reject_invalid_transition(state, OutputTransactionTransitionKind::Presented));
+            }
+        }
+        self.accept_state(
+            id,
+            OutputTransactionTerminal::Presented {
+                presented_at,
+                actual_sequence,
+            },
+        )
+    }
+
+    pub(crate) fn accept_immediate_presented(
+        &mut self,
+        id: OutputTransactionId,
+        presented_at: MonotonicTimestampNs,
+    ) -> Result<AcceptedTerminalTransition, OutputTransactionError> {
+        let Some(record) = self.active.get(&id) else {
+            return Err(self.reject_terminal(OutputTransactionError::UnknownTransaction));
+        };
+        if !matches!(record.state, OutputTransactionState::Built)
+            || !matches!(
+                record.descriptor.content(),
+                OutputTransactionContent::CompatibilityImmediate { .. }
+            )
+        {
+            return Err(self.reject_invalid_transition(
+                record.state,
+                OutputTransactionTransitionKind::Presented,
+            ));
+        }
+        let accepted = self.accept_state(
+            id,
+            OutputTransactionTerminal::Presented {
+                presented_at,
+                actual_sequence: None,
+            },
+        )?;
+        Ok(accepted)
     }
 
     pub(crate) fn mark_presented(
@@ -319,55 +431,9 @@ impl OutputTransactionLedger {
         presented_at: MonotonicTimestampNs,
         actual_sequence: Option<u64>,
     ) -> Result<(), OutputTransactionError> {
-        let (content, descriptor_generation, state) = self
-            .active
-            .get(&id)
-            .map(|record| {
-                (
-                    record.descriptor.content(),
-                    record.descriptor.output_generation(),
-                    record.state,
-                )
-            })
-            .ok_or(OutputTransactionError::UnknownTransaction)?;
-        if descriptor_generation != output_generation {
-            return Err(OutputTransactionError::GenerationMismatch);
-        }
-        match state {
-            OutputTransactionState::Submitted {
-                token: expected, ..
-            } if expected == token => {}
-            OutputTransactionState::Submitted { .. } => {
-                return Err(OutputTransactionError::TokenMismatch);
-            }
-            state => {
-                return Err(
-                    self.invalid_transition(state, OutputTransactionTransitionKind::Presented)
-                );
-            }
-        }
-        self.terminalize(
-            id,
-            OutputTransactionTerminal::Presented {
-                presented_at,
-                actual_sequence,
-            },
-        )?;
-        self.counters.presented = self.counters.presented.saturating_add(1);
-        match content {
-            OutputTransactionContent::Composited { .. } => {
-                self.counters.presented_composited =
-                    self.counters.presented_composited.saturating_add(1)
-            }
-            OutputTransactionContent::Direct { .. } => {
-                self.counters.presented_direct = self.counters.presented_direct.saturating_add(1)
-            }
-            OutputTransactionContent::CursorOnly { .. } => {
-                self.counters.presented_cursor_only =
-                    self.counters.presented_cursor_only.saturating_add(1)
-            }
-        }
-        Ok(())
+        let accepted =
+            self.accept_presented(id, token, output_generation, presented_at, actual_sequence)?;
+        self.finalize_terminal(accepted)
     }
 
     pub(crate) fn mark_dropped(
@@ -376,6 +442,16 @@ impl OutputTransactionLedger {
         reason: OutputTransactionDropReason,
         at: MonotonicTimestampNs,
     ) -> Result<(), OutputTransactionError> {
+        let accepted = self.accept_dropped(id, reason, at)?;
+        self.finalize_terminal(accepted)
+    }
+
+    pub(crate) fn accept_dropped(
+        &mut self,
+        id: OutputTransactionId,
+        reason: OutputTransactionDropReason,
+        at: MonotonicTimestampNs,
+    ) -> Result<AcceptedTerminalTransition, OutputTransactionError> {
         let state = self.state(id)?;
         if matches!(state, OutputTransactionState::Submitted { .. })
             && !matches!(
@@ -385,11 +461,11 @@ impl OutputTransactionLedger {
                     | OutputTransactionDropReason::SafeAbandonment
             )
         {
-            return Err(self.invalid_transition(state, OutputTransactionTransitionKind::Dropped));
+            return Err(
+                self.reject_invalid_transition(state, OutputTransactionTransitionKind::Dropped)
+            );
         }
-        self.terminalize(id, OutputTransactionTerminal::Dropped { reason, at })?;
-        self.counters.dropped = self.counters.dropped.saturating_add(1);
-        Ok(())
+        self.accept_state(id, OutputTransactionTerminal::Dropped { reason, at })
     }
 
     pub(crate) fn mark_superseded(
@@ -401,11 +477,13 @@ impl OutputTransactionLedger {
     ) -> Result<(), OutputTransactionError> {
         let state = self.state(id)?;
         if matches!(state, OutputTransactionState::Submitted { .. }) {
-            return Err(self.invalid_transition(state, OutputTransactionTransitionKind::Superseded));
+            return Err(
+                self.reject_invalid_transition(state, OutputTransactionTransitionKind::Superseded)
+            );
         }
-        self.terminalize(id, OutputTransactionTerminal::Superseded { by, reason, at })?;
-        self.counters.superseded = self.counters.superseded.saturating_add(1);
-        Ok(())
+        let accepted =
+            self.accept_state(id, OutputTransactionTerminal::Superseded { by, reason, at })?;
+        self.finalize_terminal(accepted)
     }
 
     pub(crate) fn mark_failed(
@@ -414,9 +492,87 @@ impl OutputTransactionLedger {
         stage: OutputTransactionFailureStage,
         at: MonotonicTimestampNs,
     ) -> Result<(), OutputTransactionError> {
-        self.terminalize(id, OutputTransactionTerminal::Failed { stage, at })?;
-        self.counters.failed = self.counters.failed.saturating_add(1);
-        Ok(())
+        let accepted = self.accept_failed(id, stage, at)?;
+        self.finalize_terminal(accepted)
+    }
+
+    pub(crate) fn accept_failed(
+        &mut self,
+        id: OutputTransactionId,
+        stage: OutputTransactionFailureStage,
+        at: MonotonicTimestampNs,
+    ) -> Result<AcceptedTerminalTransition, OutputTransactionError> {
+        let state = self.state(id)?;
+        if !failure_stage_is_compatible(state.kind(), stage) {
+            self.counters.failure_stage_mismatches =
+                self.counters.failure_stage_mismatches.saturating_add(1);
+            return Err(
+                self.reject_terminal(OutputTransactionError::FailureStageMismatch {
+                    state: state.kind(),
+                    stage,
+                }),
+            );
+        }
+        if self.active.get(&id).is_some_and(|record| {
+            matches!(
+                record.descriptor.content(),
+                OutputTransactionContent::CompatibilityImmediate { .. }
+            )
+        }) {
+            self.counters.immediate_presentation_failures = self
+                .counters
+                .immediate_presentation_failures
+                .saturating_add(1);
+        }
+        self.accept_state(id, OutputTransactionTerminal::Failed { stage, at })
+    }
+
+    pub(crate) fn finalize_terminal(
+        &mut self,
+        accepted: AcceptedTerminalTransition,
+    ) -> Result<(), OutputTransactionError> {
+        let Some(record) = self.active.get(&accepted.transaction_id) else {
+            return Err(self.reject_terminal(OutputTransactionError::UnknownTransaction));
+        };
+        if record.state
+            != (OutputTransactionState::Settling {
+                terminal: accepted.terminal,
+            })
+        {
+            return Err(self.reject_invalid_transition(
+                record.state,
+                transition_for_terminal(accepted.terminal),
+            ));
+        }
+        self.finish_settling(accepted.transaction_id, accepted.terminal)
+    }
+
+    pub(crate) fn fail_settlement(
+        &mut self,
+        accepted: AcceptedTerminalTransition,
+        at: MonotonicTimestampNs,
+    ) -> Result<(), OutputTransactionError> {
+        let Some(record) = self.active.get(&accepted.transaction_id) else {
+            return Err(self.reject_terminal(OutputTransactionError::UnknownTransaction));
+        };
+        if record.state
+            != (OutputTransactionState::Settling {
+                terminal: accepted.terminal,
+            })
+        {
+            return Err(self
+                .reject_invalid_transition(record.state, OutputTransactionTransitionKind::Failed));
+        }
+        self.counters.settlement_failures = self.counters.settlement_failures.saturating_add(1);
+        let failure = OutputTransactionTerminal::Failed {
+            stage: OutputTransactionFailureStage::ProtocolSettlement,
+            at,
+        };
+        self.active
+            .get_mut(&accepted.transaction_id)
+            .expect("settling transaction was observed above")
+            .state = OutputTransactionState::Settling { terminal: failure };
+        self.finish_settling_inner(accepted.transaction_id, failure, false)
     }
 
     pub(crate) fn cleanup_generation(
@@ -453,6 +609,12 @@ impl OutputTransactionLedger {
         self.active.get(&id)
     }
 
+    pub(crate) fn active_transaction_ids(&self) -> Vec<OutputTransactionId> {
+        let mut ids: Vec<_> = self.active.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
     pub(crate) fn active_count(&self) -> usize {
         self.active.len()
     }
@@ -462,6 +624,11 @@ impl OutputTransactionLedger {
         batch_id: CompositorFrameBatchId,
     ) -> Option<OutputTransactionId> {
         self.obligation_owner.get(&batch_id).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forget_obligation_owner_for_test(&mut self, batch_id: CompositorFrameBatchId) {
+        self.obligation_owner.remove(&batch_id);
     }
 
     pub(crate) fn submitted_transaction(
@@ -504,6 +671,155 @@ impl OutputTransactionLedger {
             .ok_or(OutputTransactionError::UnknownTransaction)
     }
 
+    fn accept_state(
+        &mut self,
+        id: OutputTransactionId,
+        terminal: OutputTransactionTerminal,
+    ) -> Result<AcceptedTerminalTransition, OutputTransactionError> {
+        let Some(state) = self.active.get(&id).map(|record| record.state) else {
+            return Err(self.reject_terminal(OutputTransactionError::UnknownTransaction));
+        };
+        if matches!(state, OutputTransactionState::Settling { .. })
+            || matches!(state, OutputTransactionState::Terminal(_))
+        {
+            return Err(self.reject_invalid_transition(state, transition_for_terminal(terminal)));
+        }
+        let obligations = self
+            .active
+            .get(&id)
+            .expect("transaction state was observed above")
+            .descriptor
+            .obligations();
+        if let Some(batch_id) = obligations.frame_batch_id()
+            && self.obligation_owner.get(&batch_id).copied() != Some(id)
+        {
+            return Err(self.reject_terminal(OutputTransactionError::DuplicateObligationOwner));
+        }
+        let accepted = AcceptedTerminalTransition {
+            transaction_id: id,
+            obligations,
+            terminal,
+        };
+        self.active
+            .get_mut(&id)
+            .expect("transaction state was observed above")
+            .state = OutputTransactionState::Settling { terminal };
+        self.counters.terminal_transitions_accepted = self
+            .counters
+            .terminal_transitions_accepted
+            .saturating_add(1);
+        self.counters.active_settling_transactions =
+            self.counters.active_settling_transactions.saturating_add(1);
+        Ok(accepted)
+    }
+
+    fn finish_settling(
+        &mut self,
+        id: OutputTransactionId,
+        terminal: OutputTransactionTerminal,
+    ) -> Result<(), OutputTransactionError> {
+        self.finish_settling_inner(id, terminal, true)
+    }
+
+    fn finish_settling_inner(
+        &mut self,
+        id: OutputTransactionId,
+        terminal: OutputTransactionTerminal,
+        validate_obligation_owner: bool,
+    ) -> Result<(), OutputTransactionError> {
+        let Some(record) = self.active.get(&id) else {
+            return Err(self.reject_terminal(OutputTransactionError::UnknownTransaction));
+        };
+        if record.state != (OutputTransactionState::Settling { terminal }) {
+            return Err(
+                self.reject_invalid_transition(record.state, transition_for_terminal(terminal))
+            );
+        }
+        if validate_obligation_owner
+            && let Some(batch_id) = record.descriptor.obligations().frame_batch_id()
+            && self.obligation_owner.get(&batch_id).copied() != Some(id)
+        {
+            return Err(self.reject_terminal(OutputTransactionError::DuplicateObligationOwner));
+        }
+        let mut record = self
+            .active
+            .remove(&id)
+            .ok_or_else(|| self.reject_terminal(OutputTransactionError::UnknownTransaction))?;
+        if let Some(batch_id) = record.descriptor.obligations().frame_batch_id()
+            && self.obligation_owner.get(&batch_id).copied() == Some(id)
+        {
+            self.obligation_owner.remove(&batch_id);
+        }
+        record.state = OutputTransactionState::Terminal(terminal);
+        if self.recent_terminal.len() == self.history_capacity {
+            self.recent_terminal.pop_front();
+            self.counters.terminal_history_overwrites =
+                self.counters.terminal_history_overwrites.saturating_add(1);
+        }
+        self.recent_terminal.push_back(record);
+        self.counters.active_settling_transactions =
+            self.counters.active_settling_transactions.saturating_sub(1);
+        self.counters.terminal_transitions_finalized = self
+            .counters
+            .terminal_transitions_finalized
+            .saturating_add(1);
+        match terminal {
+            OutputTransactionTerminal::Presented { .. } => {
+                self.counters.presented = self.counters.presented.saturating_add(1);
+                match self
+                    .recent_terminal
+                    .back()
+                    .map(|record| record.descriptor.content())
+                {
+                    Some(OutputTransactionContent::Composited { .. }) => {
+                        self.counters.presented_composited =
+                            self.counters.presented_composited.saturating_add(1)
+                    }
+                    Some(OutputTransactionContent::Direct { .. }) => {
+                        self.counters.presented_direct =
+                            self.counters.presented_direct.saturating_add(1)
+                    }
+                    Some(OutputTransactionContent::CursorOnly { .. }) => {
+                        self.counters.presented_cursor_only =
+                            self.counters.presented_cursor_only.saturating_add(1)
+                    }
+                    Some(OutputTransactionContent::CompatibilityImmediate { .. }) => {
+                        self.counters.immediate_presentations =
+                            self.counters.immediate_presentations.saturating_add(1)
+                    }
+                    None => {}
+                }
+            }
+            OutputTransactionTerminal::Dropped { .. } => {
+                self.counters.dropped = self.counters.dropped.saturating_add(1)
+            }
+            OutputTransactionTerminal::Superseded { .. } => {
+                self.counters.superseded = self.counters.superseded.saturating_add(1)
+            }
+            OutputTransactionTerminal::Failed { .. } => {
+                self.counters.failed = self.counters.failed.saturating_add(1)
+            }
+        }
+        Ok(())
+    }
+
+    fn reject_terminal(&mut self, error: OutputTransactionError) -> OutputTransactionError {
+        self.counters.terminal_transitions_rejected = self
+            .counters
+            .terminal_transitions_rejected
+            .saturating_add(1);
+        error
+    }
+
+    fn reject_invalid_transition(
+        &mut self,
+        state: OutputTransactionState,
+        requested: OutputTransactionTransitionKind,
+    ) -> OutputTransactionError {
+        let error = self.invalid_transition(state, requested);
+        self.reject_terminal(error)
+    }
+
     fn note_path_counter(
         &mut self,
         id: OutputTransactionId,
@@ -543,30 +859,44 @@ impl OutputTransactionLedger {
             .ok_or(OutputTransactionError::UnknownTransaction)?;
         apply(&mut record.state)
     }
+}
 
-    fn terminalize(
-        &mut self,
-        id: OutputTransactionId,
-        terminal: OutputTransactionTerminal,
-    ) -> Result<(), OutputTransactionError> {
-        let mut record = self
-            .active
-            .remove(&id)
-            .ok_or(OutputTransactionError::UnknownTransaction)?;
-        if let Some(batch_id) = record.descriptor.obligations().frame_batch_id() {
-            if self.obligation_owner.get(&batch_id).copied() != Some(id) {
-                self.active.insert(id, record);
-                return Err(OutputTransactionError::DuplicateObligationOwner);
-            }
-            self.obligation_owner.remove(&batch_id);
-        }
-        record.state = OutputTransactionState::Terminal(terminal);
-        if self.recent_terminal.len() == self.history_capacity {
-            self.recent_terminal.pop_front();
-            self.counters.terminal_history_overwrites =
-                self.counters.terminal_history_overwrites.saturating_add(1);
-        }
-        self.recent_terminal.push_back(record);
-        Ok(())
+const fn failure_stage_is_compatible(
+    state: OutputTransactionStateKind,
+    stage: OutputTransactionFailureStage,
+) -> bool {
+    match state {
+        OutputTransactionStateKind::Built => matches!(
+            stage,
+            OutputTransactionFailureStage::RenderPreparation
+                | OutputTransactionFailureStage::RenderExecution
+                | OutputTransactionFailureStage::FenceExport
+                | OutputTransactionFailureStage::KmsSubmit
+        ),
+        OutputTransactionStateKind::Ready => matches!(
+            stage,
+            OutputTransactionFailureStage::KmsSubmit
+                | OutputTransactionFailureStage::BackendOwnershipTransfer
+        ),
+        OutputTransactionStateKind::Submitted => matches!(
+            stage,
+            OutputTransactionFailureStage::PageflipValidation
+                | OutputTransactionFailureStage::OutputLost
+                | OutputTransactionFailureStage::SessionLost
+                | OutputTransactionFailureStage::ShutdownAbandonment
+                | OutputTransactionFailureStage::BackendCompletion
+        ),
+        OutputTransactionStateKind::Settling | OutputTransactionStateKind::Terminal => false,
+    }
+}
+
+const fn transition_for_terminal(
+    terminal: OutputTransactionTerminal,
+) -> OutputTransactionTransitionKind {
+    match terminal {
+        OutputTransactionTerminal::Presented { .. } => OutputTransactionTransitionKind::Presented,
+        OutputTransactionTerminal::Dropped { .. } => OutputTransactionTransitionKind::Dropped,
+        OutputTransactionTerminal::Superseded { .. } => OutputTransactionTransitionKind::Superseded,
+        OutputTransactionTerminal::Failed { .. } => OutputTransactionTransitionKind::Failed,
     }
 }

@@ -122,6 +122,9 @@ pub(crate) enum OutputTransactionContent {
         frame_id: u64,
         key: DirectScanoutCandidateKey,
     },
+    CompatibilityImmediate {
+        frame_id: u64,
+    },
     CursorOnly {
         cursor_epoch: u64,
     },
@@ -397,6 +400,33 @@ impl OutputTransaction {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compatibility_immediate(
+        id: OutputTransactionId,
+        output_generation: u64,
+        created_at: MonotonicTimestampNs,
+        target: PresentationTarget,
+        pacing_mode: NativeOutputPacingMode,
+        frame_id: u64,
+        frame_batch_id: CompositorFrameBatchId,
+    ) -> Result<Self, OutputTransactionBuildError> {
+        Self::build(
+            id,
+            output_generation,
+            created_at,
+            target,
+            pacing_mode,
+            OutputTransactionContent::CompatibilityImmediate { frame_id },
+            OutputPlanePlan::new(
+                PrimaryPlaneAssignment::Disabled,
+                CursorPlaneAssignment::Unchanged,
+                Vec::new(),
+            )?,
+            OutputSynchronizationPlan::new(OutputAcquirePlan::None, OutputReleasePlan::None),
+            OutputProtocolObligations::composited(frame_batch_id),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn cursor_only(
         id: OutputTransactionId,
         output_generation: u64,
@@ -460,6 +490,17 @@ impl OutputTransaction {
                     PrimaryPlaneAssignment::CompositorFramebuffer { .. }
                 ) {
                     return Err(OutputTransactionBuildError::CompositorPrimaryForDirectContent);
+                }
+            }
+            OutputTransactionContent::CompatibilityImmediate { .. } => {
+                if obligations.frame_batch_id.is_none() {
+                    return Err(OutputTransactionBuildError::MissingFrameBatch);
+                }
+                if obligations.direct_surface_id.is_some() {
+                    return Err(OutputTransactionBuildError::DirectSurfaceForCompositedContent);
+                }
+                if !matches!(planes.primary, PrimaryPlaneAssignment::Disabled) {
+                    return Err(OutputTransactionBuildError::DirectPrimaryForCompositedContent);
                 }
             }
             OutputTransactionContent::CursorOnly { .. } => {

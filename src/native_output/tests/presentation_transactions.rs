@@ -343,6 +343,394 @@ fn built_transaction_can_become_ready() {
 }
 
 #[test]
+fn built_transaction_accepts_render_failure() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let transaction = test_composited_transaction(&mut ledger, test_batch(101), 1);
+    let id = transaction.id();
+    ledger.insert(transaction).unwrap();
+
+    ledger
+        .mark_failed(
+            id,
+            super::OutputTransactionFailureStage::RenderExecution,
+            MonotonicTimestampNs::new(20),
+        )
+        .expect("render failure is valid from Built");
+}
+
+#[test]
+fn ready_transaction_accepts_kms_submit_failure() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let transaction = test_composited_transaction(&mut ledger, test_batch(102), 1);
+    let id = transaction.id();
+    ledger.insert(transaction).unwrap();
+    ledger
+        .mark_ready(id, MonotonicTimestampNs::new(20))
+        .unwrap();
+
+    ledger
+        .mark_failed(
+            id,
+            super::OutputTransactionFailureStage::KmsSubmit,
+            MonotonicTimestampNs::new(30),
+        )
+        .expect("KMS submit failure is valid from Ready");
+}
+
+#[test]
+fn submitted_transaction_rejects_kms_submit_failure() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let transaction = test_composited_transaction(&mut ledger, test_batch(103), 1);
+    let id = transaction.id();
+    ledger.insert(transaction).unwrap();
+    let token = super::PageFlipToken::new(103).unwrap();
+    ledger
+        .mark_submitted(id, token, MonotonicTimestampNs::new(20))
+        .unwrap();
+
+    assert_eq!(
+        ledger
+            .mark_failed(
+                id,
+                super::OutputTransactionFailureStage::KmsSubmit,
+                MonotonicTimestampNs::new(30),
+            )
+            .expect_err("submitted transaction must reject a KMS submit failure"),
+        super::OutputTransactionError::FailureStageMismatch {
+            state: super::OutputTransactionStateKind::Submitted,
+            stage: super::OutputTransactionFailureStage::KmsSubmit,
+        }
+    );
+    assert!(ledger.transaction(id).is_some());
+}
+
+#[test]
+fn submitted_transaction_accepts_pageflip_failure() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let transaction = test_composited_transaction(&mut ledger, test_batch(104), 1);
+    let id = transaction.id();
+    ledger.insert(transaction).unwrap();
+    let token = super::PageFlipToken::new(104).unwrap();
+    ledger
+        .mark_submitted(id, token, MonotonicTimestampNs::new(20))
+        .unwrap();
+
+    ledger
+        .mark_failed(
+            id,
+            super::OutputTransactionFailureStage::PageflipValidation,
+            MonotonicTimestampNs::new(30),
+        )
+        .expect("submitted output may fail during teardown");
+}
+
+#[test]
+fn accepted_presented_transition_settles_then_finalizes() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let batch_id = test_batch(107);
+    let transaction = test_composited_transaction(&mut ledger, batch_id, 1);
+    let id = transaction.id();
+    let token = super::PageFlipToken::new(107).unwrap();
+    ledger.insert(transaction).unwrap();
+    ledger
+        .mark_submitted(id, token, MonotonicTimestampNs::new(20))
+        .unwrap();
+
+    let accepted = ledger
+        .accept_presented(id, token, 1, MonotonicTimestampNs::new(30), Some(2))
+        .expect("pageflip terminal transition is accepted");
+    assert_eq!(accepted.obligations().frame_batch_id(), Some(batch_id));
+    assert!(matches!(
+        ledger
+            .transaction(id)
+            .expect("settling transaction")
+            .state(),
+        super::OutputTransactionState::Settling { .. }
+    ));
+    assert_eq!(ledger.obligation_owner(batch_id), Some(id));
+    assert_eq!(ledger.counters().terminal_transitions_finalized, 0);
+    assert_eq!(ledger.counters().active_settling_transactions, 1);
+
+    ledger
+        .finalize_terminal(accepted)
+        .expect("settlement finalizes");
+    assert_eq!(ledger.active_count(), 0);
+    assert_eq!(ledger.obligation_owner(batch_id), None);
+    assert_eq!(ledger.counters().terminal_transitions_finalized, 1);
+    assert_eq!(ledger.counters().active_settling_transactions, 0);
+}
+
+#[test]
+fn ledger_rejection_prevents_protocol_settlement() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let batch_id = test_batch(108);
+    let transaction = test_composited_transaction(&mut ledger, batch_id, 1);
+    let id = transaction.id();
+    ledger.insert(transaction).unwrap();
+    ledger
+        .mark_submitted(
+            id,
+            super::PageFlipToken::new(108).unwrap(),
+            MonotonicTimestampNs::new(20),
+        )
+        .unwrap();
+
+    assert!(
+        ledger
+            .accept_presented(
+                id,
+                super::PageFlipToken::new(109).unwrap(),
+                1,
+                MonotonicTimestampNs::new(30),
+                Some(2),
+            )
+            .is_err()
+    );
+    assert!(matches!(
+        ledger
+            .transaction(id)
+            .expect("submitted transaction")
+            .state(),
+        super::OutputTransactionState::Submitted { .. }
+    ));
+    assert_eq!(ledger.obligation_owner(batch_id), Some(id));
+}
+
+#[test]
+fn missing_obligation_owner_rejects_terminal_acceptance() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let batch_id = test_batch(111);
+    let transaction = test_composited_transaction(&mut ledger, batch_id, 1);
+    let id = transaction.id();
+    let token = super::PageFlipToken::new(111).unwrap();
+    ledger.insert(transaction).unwrap();
+    ledger
+        .mark_submitted(id, token, MonotonicTimestampNs::new(20))
+        .unwrap();
+
+    assert_eq!(ledger.obligation_owner(batch_id), Some(id));
+    ledger.forget_obligation_owner_for_test(batch_id);
+
+    assert_eq!(
+        ledger
+            .accept_presented(id, token, 1, MonotonicTimestampNs::new(30), Some(2))
+            .expect_err("missing obligation owner must reject before settlement"),
+        super::OutputTransactionError::DuplicateObligationOwner
+    );
+    assert!(matches!(
+        ledger.transaction(id).unwrap().state(),
+        super::OutputTransactionState::Submitted { .. }
+    ));
+}
+
+#[test]
+fn settlement_failure_leaves_no_active_obligation_owner() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let batch_id = test_batch(109);
+    let transaction = test_composited_transaction(&mut ledger, batch_id, 1);
+    let id = transaction.id();
+    let token = super::PageFlipToken::new(109).unwrap();
+    ledger.insert(transaction).unwrap();
+    ledger
+        .mark_submitted(id, token, MonotonicTimestampNs::new(20))
+        .unwrap();
+    let accepted = ledger
+        .accept_presented(id, token, 1, MonotonicTimestampNs::new(30), Some(2))
+        .unwrap();
+
+    ledger
+        .fail_settlement(accepted, MonotonicTimestampNs::new(31))
+        .expect("injected settlement failure is terminal");
+    assert_eq!(ledger.active_count(), 0);
+    assert_eq!(ledger.obligation_owner(batch_id), None);
+    assert_eq!(ledger.counters().settlement_failures, 1);
+    assert!(matches!(
+        ledger.recent_terminal().back().unwrap().state(),
+        super::OutputTransactionState::Terminal(super::OutputTransactionTerminal::Failed {
+            stage: super::OutputTransactionFailureStage::ProtocolSettlement,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn second_terminal_attempt_during_settlement_is_rejected() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let transaction = test_composited_transaction(&mut ledger, test_batch(110), 1);
+    let id = transaction.id();
+    let token = super::PageFlipToken::new(110).unwrap();
+    ledger.insert(transaction).unwrap();
+    ledger
+        .mark_submitted(id, token, MonotonicTimestampNs::new(20))
+        .unwrap();
+    let accepted = ledger
+        .accept_presented(id, token, 1, MonotonicTimestampNs::new(30), Some(2))
+        .unwrap();
+
+    assert!(
+        ledger
+            .accept_presented(id, token, 1, MonotonicTimestampNs::new(31), Some(3))
+            .is_err()
+    );
+    assert!(matches!(
+        ledger.transaction(id).unwrap().state(),
+        super::OutputTransactionState::Settling { .. }
+    ));
+    ledger.finalize_terminal(accepted).unwrap();
+}
+
+#[test]
+fn immediate_compatibility_presentation_creates_transaction_and_transitions_built_to_presented() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let id = ledger.allocate_id().unwrap();
+    let transaction = super::OutputTransaction::compatibility_immediate(
+        id,
+        1,
+        MonotonicTimestampNs::new(10),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        111,
+        test_batch(111),
+    )
+    .unwrap();
+    ledger.insert(transaction).unwrap();
+
+    let accepted = ledger
+        .accept_immediate_presented(id, MonotonicTimestampNs::new(20))
+        .expect("immediate presentation is accepted");
+    assert!(matches!(
+        ledger.transaction(id).unwrap().state(),
+        super::OutputTransactionState::Settling { .. }
+    ));
+    ledger.finalize_terminal(accepted).unwrap();
+    assert_eq!(ledger.active_count(), 0);
+    assert_eq!(ledger.counters().immediate_presentations, 1);
+    assert_eq!(ledger.counters().failed, 0);
+}
+
+#[test]
+fn immediate_compatibility_path_never_waits_for_pageflip() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let id = ledger.allocate_id().unwrap();
+    let transaction = super::OutputTransaction::compatibility_immediate(
+        id,
+        1,
+        MonotonicTimestampNs::new(10),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        113,
+        test_batch(113),
+    )
+    .unwrap();
+    ledger.insert(transaction).unwrap();
+
+    assert!(
+        ledger
+            .mark_presented(
+                id,
+                super::PageFlipToken::new(113).unwrap(),
+                1,
+                MonotonicTimestampNs::new(20),
+                None,
+            )
+            .is_err()
+    );
+    assert!(matches!(
+        ledger.transaction(id).unwrap().state(),
+        super::OutputTransactionState::Built
+    ));
+}
+
+#[test]
+fn immediate_compatibility_failure_marks_typed_failure() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let id = ledger.allocate_id().unwrap();
+    let transaction = super::OutputTransaction::compatibility_immediate(
+        id,
+        1,
+        MonotonicTimestampNs::new(10),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        112,
+        test_batch(112),
+    )
+    .unwrap();
+    ledger.insert(transaction).unwrap();
+    ledger
+        .mark_failed(
+            id,
+            super::OutputTransactionFailureStage::KmsSubmit,
+            MonotonicTimestampNs::new(20),
+        )
+        .unwrap();
+
+    assert_eq!(ledger.counters().immediate_presentation_failures, 1);
+    assert!(matches!(
+        ledger.recent_terminal().back().unwrap().state(),
+        super::OutputTransactionState::Terminal(super::OutputTransactionTerminal::Failed {
+            stage: super::OutputTransactionFailureStage::KmsSubmit,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn terminal_transaction_rejects_failure() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let transaction = test_composited_transaction(&mut ledger, test_batch(105), 1);
+    let id = transaction.id();
+    ledger.insert(transaction).unwrap();
+    ledger
+        .mark_failed(
+            id,
+            super::OutputTransactionFailureStage::RenderPreparation,
+            MonotonicTimestampNs::new(20),
+        )
+        .unwrap();
+
+    assert!(
+        ledger
+            .mark_failed(
+                id,
+                super::OutputTransactionFailureStage::RenderPreparation,
+                MonotonicTimestampNs::new(30),
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn failure_stage_mismatch_does_not_release_obligation_owner() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let batch_id = test_batch(106);
+    let transaction = test_composited_transaction(&mut ledger, batch_id, 1);
+    let id = transaction.id();
+    ledger.insert(transaction).unwrap();
+    ledger
+        .mark_submitted(
+            id,
+            super::PageFlipToken::new(106).unwrap(),
+            MonotonicTimestampNs::new(20),
+        )
+        .unwrap();
+
+    assert_eq!(
+        ledger
+            .mark_failed(
+                id,
+                super::OutputTransactionFailureStage::KmsSubmit,
+                MonotonicTimestampNs::new(30),
+            )
+            .expect_err("failure-stage mismatch must be rejected"),
+        super::OutputTransactionError::FailureStageMismatch {
+            state: super::OutputTransactionStateKind::Submitted,
+            stage: super::OutputTransactionFailureStage::KmsSubmit,
+        }
+    );
+    assert_eq!(ledger.obligation_owner(batch_id), Some(id));
+}
+
+#[test]
 fn active_capacity_is_not_silently_evicted() {
     let mut ledger = super::OutputTransactionLedger::with_capacities(1, 64);
     let first = test_composited_transaction(&mut ledger, test_batch(1), 1);
@@ -516,6 +904,88 @@ fn wrong_pageflip_token_cannot_present_transaction() {
         ledger.mark_presented(id, wrong, 1, MonotonicTimestampNs::new(30), Some(2)),
         Err(super::OutputTransactionError::TokenMismatch)
     );
+    assert!(ledger.transaction(id).is_some());
+}
+
+#[test]
+fn direct_pageflip_rejection_settles_nothing() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let id = ledger.allocate_id().unwrap();
+    let batch_id = test_batch(114);
+    let transaction = super::OutputTransaction::direct(
+        id,
+        1,
+        MonotonicTimestampNs::new(10),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        114,
+        test_direct_key(),
+        92,
+        None,
+        batch_id,
+        7,
+        super::OutputReleasePlan::Pageflip,
+    )
+    .unwrap();
+    ledger.insert(transaction).unwrap();
+    ledger
+        .mark_submitted(
+            id,
+            super::PageFlipToken::new(114).unwrap(),
+            MonotonicTimestampNs::new(20),
+        )
+        .unwrap();
+
+    assert_eq!(
+        ledger.mark_presented(
+            id,
+            super::PageFlipToken::new(115).unwrap(),
+            1,
+            MonotonicTimestampNs::new(30),
+            Some(2),
+        ),
+        Err(super::OutputTransactionError::TokenMismatch)
+    );
+    assert_eq!(ledger.obligation_owner(batch_id), Some(id));
+    assert!(ledger.transaction(id).is_some());
+}
+
+#[test]
+fn cursor_pageflip_rejection_terminalizes_nothing() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let id = ledger.allocate_id().unwrap();
+    let transaction = super::OutputTransaction::cursor_only(
+        id,
+        1,
+        MonotonicTimestampNs::new(10),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        115,
+        Some(93),
+        true,
+        super::OutputReleasePlan::Pageflip,
+    )
+    .unwrap();
+    ledger.insert(transaction).unwrap();
+    ledger
+        .mark_submitted(
+            id,
+            super::PageFlipToken::new(115).unwrap(),
+            MonotonicTimestampNs::new(20),
+        )
+        .unwrap();
+
+    assert_eq!(
+        ledger.mark_presented(
+            id,
+            super::PageFlipToken::new(116).unwrap(),
+            1,
+            MonotonicTimestampNs::new(30),
+            None,
+        ),
+        Err(super::OutputTransactionError::TokenMismatch)
+    );
+    assert_eq!(ledger.active_count(), 1);
     assert!(ledger.transaction(id).is_some());
 }
 
