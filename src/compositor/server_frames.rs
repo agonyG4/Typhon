@@ -7,6 +7,19 @@ impl OwnCompositorServer {
     }
 
     #[doc(hidden)]
+    pub fn prepared_frame_batch_id(&self) -> Option<CompositorFrameBatchId> {
+        self.state.legacy_prepared_frame_batch
+    }
+
+    #[doc(hidden)]
+    pub fn prepared_frame_id(&self) -> Option<u64> {
+        self.state
+            .legacy_prepared_frame_batch
+            .and_then(|batch_id| self.state.frame_batches.get(&batch_id))
+            .map(|batch| batch.frame_id)
+    }
+
+    #[doc(hidden)]
     pub fn frame_batch_count(&self) -> usize {
         self.state.frame_batches.len()
     }

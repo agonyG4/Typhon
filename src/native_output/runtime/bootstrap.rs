@@ -546,6 +546,7 @@ impl NativeRuntime {
             output_render_fence_token: None,
             frame_scheduler,
             atomic_commit_arbiter: AtomicCommitArbiter::new(),
+            output_transactions: OutputTransactionLedger::new(),
             presentation_deadline,
             scheduled_presentation_target,
             render_journal,

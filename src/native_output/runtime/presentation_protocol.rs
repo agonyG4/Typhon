@@ -18,6 +18,34 @@ pub(super) struct ProtocolCycleMetrics {
     pub(super) redraw_requested: bool,
 }
 
+impl ProtocolCycleMetrics {
+    pub(super) const fn from_cycle(
+        cycle: &NativeCycleState,
+        render_generation: u64,
+        effective_render_target_available: bool,
+        scene_changed: bool,
+        pending_frame_work: bool,
+        redraw_requested: bool,
+    ) -> Self {
+        Self {
+            skipped_input_repaints: cycle.skipped_input_repaints,
+            tick_us: cycle.tick_us,
+            pageflip_pending_at_tick: cycle.pageflip_pending_at_tick,
+            input_drain_us: cycle.input_drain_us,
+            raw_input_events: cycle.raw_input_events,
+            coalesced_input_events: cycle.coalesced_input_events,
+            pageflip_drain_us: cycle.pageflip_drain_us,
+            pageflip_completed: cycle.pageflip_completed,
+            present_us: cycle.present_us,
+            render_generation,
+            effective_render_target_available,
+            scene_changed,
+            pending_frame_work,
+            redraw_requested,
+        }
+    }
+}
+
 pub(super) fn complete_protocol_only_tick(
     server: &mut OwnCompositorServer,
     frame_scheduler: &mut NativeFrameScheduler,

@@ -166,6 +166,13 @@ impl NativeSessionIo for NativeRuntime {
     fn quarantine_pageflip(&mut self) -> NativeResult<()> {
         self.frame_scheduler.abandon_for_session_suspend();
         self.atomic_commit_arbiter.abandon_for_recovery();
+        self.output_transactions
+            .cleanup_generation(
+                self.drm_file_generation,
+                OutputTransactionDropReason::SessionSuspended,
+                MonotonicTimestampNs::new(monotonic_now_ns()?),
+            )
+            .map_err(io::Error::other)?;
         self.cursor_output_arbitration.clear_pending();
         if let Some(token) = self.output_render_fence_token.take() {
             self.event_loop.unregister(token)?;

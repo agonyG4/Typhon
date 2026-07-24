@@ -3,7 +3,11 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativePresentResult {
     Noop,
-    AsyncSubmitted { token: u64, framebuffer_id: u32 },
+    AsyncSubmitted {
+        token: u64,
+        framebuffer_id: u32,
+        transaction_id: Option<OutputTransactionId>,
+    },
     Immediate,
 }
 

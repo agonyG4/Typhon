@@ -468,6 +468,7 @@ impl NativeScanoutBackend {
             Some((token, framebuffer_id)) => Ok(NativePresentResult::AsyncSubmitted {
                 token,
                 framebuffer_id,
+                transaction_id: None,
             }),
             None => Ok(NativePresentResult::Noop),
         }
@@ -555,12 +556,23 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn compatibility_framebuffer_id(&self) -> Option<u32> {
+        match self {
+            Self::NativeEglGbm(scanout) if scanout.ready_frame_queued() => Some(scanout.fb_id()),
+            Self::Gbm(scanout) if scanout.ready_frame_queued() => Some(scanout.fb_id()),
+            Self::AtomicEglGbm(_) | Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => None,
+        }
+    }
+
     pub(crate) fn discard_ready_frame_before_direct(
         &mut self,
         server: &mut OwnCompositorServer,
+        output_transactions: &mut OutputTransactionLedger,
     ) -> io::Result<bool> {
         match self {
-            Self::AtomicEglGbm(scanout) => scanout.discard_ready_frame_before_direct(server),
+            Self::AtomicEglGbm(scanout) => {
+                scanout.discard_ready_frame_before_direct(server, output_transactions)
+            }
             Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Ok(false),
         }
     }
@@ -718,15 +730,27 @@ impl NativeScanoutBackend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_direct_scanout(
         &mut self,
         kms: &KmsBackendSelection,
         server: &mut OwnCompositorServer,
+        output_transactions: &mut OutputTransactionLedger,
         target: oblivion_one::native::presentation_deadline::PresentationTarget,
         cursor: Option<&AtomicCursorVisualState>,
+        cursor_epoch: u64,
+        pacing_mode: NativeOutputPacingMode,
     ) -> io::Result<DirectScanoutAttempt> {
         match self {
-            Self::AtomicEglGbm(scanout) => scanout.try_direct_scanout(kms, server, target, cursor),
+            Self::AtomicEglGbm(scanout) => scanout.try_direct_scanout(
+                kms,
+                server,
+                output_transactions,
+                target,
+                cursor,
+                cursor_epoch,
+                pacing_mode,
+            ),
             Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
                 "direct scanout is unsupported by this backend",
             )),

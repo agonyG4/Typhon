@@ -1,6 +1,4 @@
-use super::cursor_cycle::{
-    NativeResolvedCursorSource, defer_cursor_after_busy, resolve_native_cursor_source,
-};
+use super::cursor_cycle::{NativeResolvedCursorSource, resolve_native_cursor_source};
 use super::frame::{
     NativeRepaintInputs, cursor_only_allowed_at_deadline, native_repaint_decision,
     update_cursor_output_arbitration,
@@ -16,8 +14,12 @@ use super::presentation_protocol::{
     ProtocolCycleMetrics, complete_protocol_only_tick, log_no_visual_work,
     log_wait_for_presentation,
 };
+use super::presentation_transactions::{
+    fail_transaction, present_compatibility_frame, register_primary_transaction, submit_cursor_only,
+};
 use super::*;
-use oblivion_one::native::kms::{AtomicKmsErrorKind, KmsBackendKind};
+use oblivion_one::native::kms::KmsBackendKind;
+
 impl NativeRuntime {
     #[allow(unused_variables)]
     pub(super) fn render_present_and_update_metrics(
@@ -56,6 +58,7 @@ impl NativeRuntime {
             output_render_fence_token,
             frame_scheduler,
             atomic_commit_arbiter,
+            output_transactions,
             presentation_deadline,
             scheduled_presentation_target,
             render_journal,
@@ -425,7 +428,7 @@ impl NativeRuntime {
             && cursor_direct_compatible
             && direct_candidate_eligible
             && !composition_required
-            && scanout.discard_ready_frame_before_direct(server)?
+            && scanout.discard_ready_frame_before_direct(server, output_transactions)?
         {
             frame_scheduler.discard_ready_frame();
             scheduler_decision = SchedulerDecision::Render;
@@ -481,118 +484,38 @@ impl NativeRuntime {
             && !scanout.ready_frame_queued()
         {
             let desired = effective_cursor.clone();
-            match kms_backend.test_atomic_cursor_flip(desired.as_ref()) {
-                Ok(()) => {
-                    let token = PageFlipToken::new(allocate_native_page_flip_token())
-                        .expect("allocated native pageflip token is nonzero");
-                    atomic_commit_arbiter
-                        .reserve(
-                            token,
-                            *drm_file_generation,
-                            target.crtc_id,
-                            AtomicCommitKind::CursorOnly {
-                                cursor_generation: cursor.generation,
-                                framebuffer_id: desired
-                                    .as_ref()
-                                    .and_then(|state| state.framebuffer_id),
-                            },
-                            monotonic_now_ns()?,
-                        )
-                        .map_err(io::Error::other)?;
-                    match kms_backend.submit_cursor_flip(desired.as_ref(), token) {
-                        Ok(()) => {
-                            let submitted_state = desired.unwrap_or_else(|| {
-                                let mut hidden = cursor.desired().clone();
-                                hidden.visible = false;
-                                hidden.framebuffer_id = None;
-                                hidden
-                            });
-                            cursor.begin_submission(token, submitted_state);
-                            cursor_output_arbitration.note_cursor_only_submission();
-                            *last_submitted_cursor_epoch = cursor_epoch;
-                            cursor_output_arbitration.consume(cursor_epoch);
-                            *last_client_cursor_damage = current_client_cursor_damage;
-                            *last_software_cursor_damage = current_software_cursor_damage;
-                            scheduler_decision = SchedulerDecision::WaitForPageFlip;
-                            perf.log("native.cursor", || {
-                                vec![
-                                    NativePerfField::str("event", "submit"),
-                                    NativePerfField::str("kind", "cursor_only"),
-                                    NativePerfField::u64("generation", cursor.generation),
-                                    NativePerfField::bool("visible", effective_cursor.is_some()),
-                                    NativePerfField::str(
-                                        "position",
-                                        format!("{},{}", cursor.desired().x, cursor.desired().y),
-                                    ),
-                                ]
-                            });
-                        }
-                        Err(error) if error.kind == AtomicKmsErrorKind::Busy => {
-                            atomic_commit_arbiter.cancel(token);
-                            defer_cursor_after_busy(
-                                cursor_output_arbitration,
-                                frame_scheduler,
-                                pacing_now_ns,
-                                perf,
-                                "atomic_busy",
-                            );
-                            scheduler_decision = SchedulerDecision::Idle;
-                        }
-                        Err(error) => {
-                            atomic_commit_arbiter.cancel(token);
-                            cursor.note_submit_failure();
-                            cursor.note_software_fallback();
-                            cursor.set_visible(false);
-                            *cursor_render_mode = if client_cursor_active {
-                                NativeCursorRenderMode::SoftwareClient
-                            } else {
-                                NativeCursorRenderMode::Software
-                            };
-                            *last_client_cursor_damage = None;
-                            effective_cursor = None;
-                            *queued_redraw_requested = true;
-                            scheduler_decision = SchedulerDecision::Render;
-                            perf.log("native.cursor", || {
-                                vec![
-                                    NativePerfField::str("event", "fallback"),
-                                    NativePerfField::str("reason", "cursor_submit_failed"),
-                                    NativePerfField::str("error", error.to_string()),
-                                ]
-                            });
-                        }
-                    }
-                }
-                Err(error) if error.kind == AtomicKmsErrorKind::Busy => {
-                    defer_cursor_after_busy(
-                        cursor_output_arbitration,
-                        frame_scheduler,
-                        pacing_now_ns,
-                        perf,
-                        "cursor_test_busy",
-                    );
-                    scheduler_decision = SchedulerDecision::Idle;
-                }
-                Err(error) => {
-                    cursor.note_test_failure();
-                    cursor.note_software_fallback();
-                    cursor.set_visible(false);
-                    *cursor_render_mode = if client_cursor_active {
-                        NativeCursorRenderMode::SoftwareClient
-                    } else {
-                        NativeCursorRenderMode::Software
-                    };
-                    *last_client_cursor_damage = None;
-                    effective_cursor = None;
-                    *queued_redraw_requested = true;
-                    scheduler_decision = SchedulerDecision::Render;
-                    perf.log("native.cursor", || {
-                        vec![
-                            NativePerfField::str("event", "fallback"),
-                            NativePerfField::str("reason", "cursor_test_only_rejected"),
-                            NativePerfField::str("error", error.to_string()),
-                        ]
-                    });
-                }
+            let cursor_target = (*scheduled_presentation_target)
+                .or_else(|| presentation_deadline.reactive_target(scheduler_now))
+                .ok_or_else(|| {
+                    io::Error::other("cursor-only Atomic output has no presentation target")
+                })?;
+            scheduler_decision = submit_cursor_only(
+                kms_backend,
+                cursor,
+                desired,
+                atomic_commit_arbiter,
+                output_transactions,
+                presentation_trace,
+                cursor_target,
+                target.crtc_id,
+                *drm_file_generation,
+                pacing_mode,
+                cursor_epoch,
+                cursor_output_arbitration,
+                frame_scheduler,
+                pacing_now_ns,
+                perf,
+                client_cursor_active,
+                cursor_render_mode,
+                &mut effective_cursor,
+                queued_redraw_requested,
+                last_client_cursor_damage,
+                last_software_cursor_damage,
+                current_client_cursor_damage,
+                current_software_cursor_damage,
+            )?;
+            if scheduler_decision == SchedulerDecision::WaitForPageFlip {
+                *last_submitted_cursor_epoch = cursor_epoch;
             }
         }
         if atomic_commit_arbiter.atomic_commit_pending() {
@@ -604,29 +527,46 @@ impl NativeRuntime {
         ) {
             let repaint_present_start = Instant::now();
             let explicit_submission = matches!(&**scanout, NativeScanoutBackend::AtomicEglGbm(_));
-            let present_result = if let NativeScanoutBackend::AtomicEglGbm(explicit) =
-                &mut **scanout
-            {
-                let (token, framebuffer_id) =
-                    explicit.submit_ready_frame(kms_backend, server, effective_cursor.as_ref())?;
-                explicit.mark_composited_submission();
-                NativePresentResult::AsyncSubmitted {
-                    token,
-                    framebuffer_id,
-                }
-            } else {
-                scanout
-                    .present(kms_backend, effective_cursor.as_ref())
-                    .map_err(|error| {
-                        native_runtime_error(
-                            NativeRuntimeStage::Present,
-                            scanout.kind(),
-                            target.crtc_id,
-                            *frame_index,
-                            error,
-                        )
-                    })?
-            };
+            let (present_result, compatibility_transaction_id) =
+                if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
+                    let (token, framebuffer_id, transaction_id) = explicit.submit_ready_frame(
+                        kms_backend,
+                        server,
+                        output_transactions,
+                        effective_cursor.as_ref(),
+                    )?;
+                    explicit.mark_composited_submission();
+                    (
+                        NativePresentResult::AsyncSubmitted {
+                            token,
+                            framebuffer_id,
+                            transaction_id: Some(transaction_id),
+                        },
+                        None,
+                    )
+                } else {
+                    let compatibility_target = (*scheduled_presentation_target)
+                        .or_else(|| presentation_deadline.reactive_target(scheduler_now))
+                        .ok_or_else(|| {
+                            io::Error::other(
+                                "compatibility pageflip started without a presentation target",
+                            )
+                        })?;
+                    present_compatibility_frame(
+                        scanout,
+                        kms_backend,
+                        server,
+                        output_transactions,
+                        *drm_file_generation,
+                        target.crtc_id,
+                        compatibility_target,
+                        pacing_mode,
+                        render_generation,
+                        effective_cursor.as_ref(),
+                        cursor_epoch,
+                        *frame_index,
+                    )?
+                };
             #[cfg(test)]
             native_io_recorder.record(NativeIoOperation::ScanoutPresent);
             let repaint_present_us = elapsed_micros(repaint_present_start);
@@ -634,16 +574,20 @@ impl NativeRuntime {
                 NativePresentResult::AsyncSubmitted {
                     token,
                     framebuffer_id,
+                    transaction_id,
                 } => {
-                    let atomic_primary_registered = register_atomic_primary_submission(
+                    let atomic_primary_registered = register_primary_transaction(
                         atomic_commit_arbiter,
                         kms_backend.effective_kind(),
                         token,
                         *drm_file_generation,
                         target.crtc_id,
+                        transaction_id,
                         *frame_index,
                         framebuffer_id,
                         monotonic_now_ns()?,
+                        output_transactions,
+                        presentation_trace,
                     )?;
                     if let Some(cursor) = atomic_cursor.as_mut()
                         && cursor.needs_submission_for(effective_cursor.as_ref())
@@ -706,9 +650,19 @@ impl NativeRuntime {
                     });
                 }
                 NativePresentResult::Immediate => {
+                    fail_transaction(
+                        output_transactions,
+                        compatibility_transaction_id,
+                        OutputTransactionFailureStage::KmsSubmit,
+                    )?;
                     frame_scheduler.note_immediate_completion();
                 }
                 NativePresentResult::Noop => {
+                    fail_transaction(
+                        output_transactions,
+                        compatibility_transaction_id,
+                        OutputTransactionFailureStage::KmsSubmit,
+                    )?;
                     perf.log("native.frame_skip", || {
                         vec![
                             NativePerfField::str("reason", "ready_submit_without_ready_frame"),
@@ -748,12 +702,16 @@ impl NativeRuntime {
                     match scanout.try_direct_scanout(
                         kms_backend,
                         server,
+                        output_transactions,
                         direct_target,
                         effective_cursor.as_ref(),
+                        cursor_epoch,
+                        pacing_mode,
                     )? {
                         DirectScanoutAttempt::Submitted {
                             transaction_id,
                             token,
+                            framebuffer_id,
                         } => {
                             let trace_timestamp_ns = monotonic_now_ns()?;
                             presentation_trace.push(
@@ -772,18 +730,26 @@ impl NativeRuntime {
                                 let commit_token = PageFlipToken::new(token).ok_or_else(|| {
                                     io::Error::other("Direct Atomic token is zero")
                                 })?;
-                                atomic_commit_arbiter
-                                    .reserve(
-                                        commit_token,
-                                        *drm_file_generation,
-                                        target.crtc_id,
-                                        AtomicCommitKind::DirectPrimary {
-                                            direct_token: commit_token,
-                                            framebuffer_id: 0,
-                                        },
-                                        monotonic_now_ns()?,
-                                    )
-                                    .map_err(io::Error::other)?;
+                                if let Err(error) = atomic_commit_arbiter.reserve(
+                                    commit_token,
+                                    *drm_file_generation,
+                                    target.crtc_id,
+                                    AtomicCommitKind::DirectPrimary {
+                                        transaction_id,
+                                        direct_token: commit_token,
+                                        framebuffer_id,
+                                    },
+                                    monotonic_now_ns()?,
+                                ) {
+                                    output_transactions
+                                        .mark_failed(
+                                            transaction_id,
+                                            OutputTransactionFailureStage::OutputTeardown,
+                                            MonotonicTimestampNs::new(monotonic_now_ns()?),
+                                        )
+                                        .map_err(io::Error::other)?;
+                                    return Err(io::Error::other(error).into());
+                                }
                             }
                             if let Some(cursor) = atomic_cursor.as_mut()
                                 && cursor.needs_submission_for(effective_cursor.as_ref())
@@ -1010,12 +976,21 @@ impl NativeRuntime {
                         let render_outcome = explicit.render_frame(
                             frame_renderer,
                             server,
+                            output_transactions,
                             input_state,
                             *cursor_render_mode,
                             &output_damage,
                             render_generation,
+                            *drm_file_generation,
                             frame_target,
                             pacing_mode,
+                            effective_cursor
+                                .as_ref()
+                                .map(|state| CursorPlaneAssignment::Atomic {
+                                    desired_epoch: cursor_epoch,
+                                    framebuffer_id: state.framebuffer_id,
+                                    visible: state.visible,
+                                }),
                         )?;
                         match render_outcome {
                             AtomicFrameRenderOutcome::Skipped { reason, render_us } => {
@@ -1038,30 +1013,50 @@ impl NativeRuntime {
                                     ]
                                 });
                             }
-                            AtomicFrameRenderOutcome::Rendered { frame_id } => {
+                            AtomicFrameRenderOutcome::Rendered {
+                                frame_id,
+                                transaction_id,
+                            } => {
                                 frame_rendered = true;
+                                let trace_timestamp_ns = monotonic_now_ns()?;
+                                presentation_trace.push(
+                                    PresentationTransactionEvent::TransactionBuilt {
+                                        transaction_id,
+                                        timestamp_ns: trace_timestamp_ns,
+                                    },
+                                );
+                                presentation_trace.push(
+                                    PresentationTransactionEvent::AcquireReady {
+                                        transaction_id,
+                                        timestamp_ns: trace_timestamp_ns,
+                                    },
+                                );
                                 let ready_at_ns = monotonic_now_ns()?;
                                 let waits_for_target = render_ahead;
                                 if waits_for_target {
                                     frame_scheduler.note_ready_frame(Some(frame_target));
                                     frame_pacing.note_ready_frame(ready_at_ns, render_ahead);
                                 } else {
-                                    let (token, framebuffer_id) = explicit.submit_ready_frame(
-                                        kms_backend,
-                                        server,
-                                        effective_cursor.as_ref(),
-                                    )?;
-                                    let atomic_primary_registered =
-                                        register_atomic_primary_submission(
-                                            atomic_commit_arbiter,
-                                            kms_backend.effective_kind(),
-                                            token,
-                                            *drm_file_generation,
-                                            target.crtc_id,
-                                            *frame_index,
-                                            framebuffer_id,
-                                            monotonic_now_ns()?,
+                                    let (token, framebuffer_id, transaction_id) = explicit
+                                        .submit_ready_frame(
+                                            kms_backend,
+                                            server,
+                                            output_transactions,
+                                            effective_cursor.as_ref(),
                                         )?;
+                                    let atomic_primary_registered = register_primary_transaction(
+                                        atomic_commit_arbiter,
+                                        kms_backend.effective_kind(),
+                                        token,
+                                        *drm_file_generation,
+                                        target.crtc_id,
+                                        Some(transaction_id),
+                                        *frame_index,
+                                        framebuffer_id,
+                                        monotonic_now_ns()?,
+                                        output_transactions,
+                                        presentation_trace,
+                                    )?;
                                     if let Some(cursor) = atomic_cursor.as_mut()
                                         && cursor.needs_submission_for(effective_cursor.as_ref())
                                         && let Some(cursor_token) = PageFlipToken::new(token)
@@ -1200,20 +1195,32 @@ impl NativeRuntime {
                                 .map(|(before, after)| after.delta_us_since(before))
                                 .unwrap_or((0, 0));
                             let repaint_present_start = Instant::now();
-                            let present_result = if render_ahead {
-                                NativePresentResult::Noop
+                            let (present_result, compatibility_transaction_id) = if render_ahead {
+                                (NativePresentResult::Noop, None)
                             } else {
-                                scanout
-                                    .present(kms_backend, effective_cursor.as_ref())
-                                    .map_err(|error| {
-                                        native_runtime_error(
-                                            NativeRuntimeStage::Present,
-                                            scanout.kind(),
-                                            target.crtc_id,
-                                            *frame_index,
-                                            error,
+                                let compatibility_target = (*scheduled_presentation_target)
+                                    .or_else(|| {
+                                        presentation_deadline.reactive_target(scheduler_now)
+                                    })
+                                    .ok_or_else(|| {
+                                        io::Error::other(
+                                            "compatibility pageflip started without a presentation target",
                                         )
-                                    })?
+                                    })?;
+                                present_compatibility_frame(
+                                    scanout,
+                                    kms_backend,
+                                    server,
+                                    output_transactions,
+                                    *drm_file_generation,
+                                    target.crtc_id,
+                                    compatibility_target,
+                                    pacing_mode,
+                                    render_generation,
+                                    effective_cursor.as_ref(),
+                                    cursor_epoch,
+                                    *frame_index,
+                                )?
                             };
                             #[cfg(test)]
                             if !render_ahead {
@@ -1231,6 +1238,7 @@ impl NativeRuntime {
                                 NativePresentResult::AsyncSubmitted {
                                     token,
                                     framebuffer_id,
+                                    transaction_id,
                                 } => {
                                     server.mark_prepared_frame_submitted();
                                     #[cfg(test)]
@@ -1240,17 +1248,19 @@ impl NativeRuntime {
                                         KmsBackendKind::Atomic => NativeIoOperation::AtomicCommit,
                                         KmsBackendKind::Legacy => NativeIoOperation::LegacyCommit,
                                     });
-                                    let atomic_primary_registered =
-                                        register_atomic_primary_submission(
-                                            atomic_commit_arbiter,
-                                            kms_backend.effective_kind(),
-                                            token,
-                                            *drm_file_generation,
-                                            target.crtc_id,
-                                            *frame_index,
-                                            framebuffer_id,
-                                            monotonic_now_ns()?,
-                                        )?;
+                                    let atomic_primary_registered = register_primary_transaction(
+                                        atomic_commit_arbiter,
+                                        kms_backend.effective_kind(),
+                                        token,
+                                        *drm_file_generation,
+                                        target.crtc_id,
+                                        transaction_id,
+                                        *frame_index,
+                                        framebuffer_id,
+                                        monotonic_now_ns()?,
+                                        output_transactions,
+                                        presentation_trace,
+                                    )?;
                                     if let Some(cursor) = atomic_cursor.as_mut()
                                         && atomic_primary_registered
                                         && cursor.needs_submission_for(effective_cursor.as_ref())
@@ -1280,6 +1290,11 @@ impl NativeRuntime {
                                     frame_submitted = true;
                                 }
                                 NativePresentResult::Immediate => {
+                                    fail_transaction(
+                                        output_transactions,
+                                        compatibility_transaction_id,
+                                        OutputTransactionFailureStage::KmsSubmit,
+                                    )?;
                                     frame_scheduler.note_immediate_completion();
                                     // Immediate presentation settles the owned batch exactly once.
                                     let finish_frame_start = Instant::now();
@@ -1304,6 +1319,11 @@ impl NativeRuntime {
                                     });
                                 }
                                 NativePresentResult::Noop => {
+                                    fail_transaction(
+                                        output_transactions,
+                                        compatibility_transaction_id,
+                                        OutputTransactionFailureStage::KmsSubmit,
+                                    )?;
                                     if render_ahead {
                                         frame_scheduler.note_render_ahead_ready();
                                         frame_pacing.note_render_ahead_ready(monotonic_now_ns()?);
@@ -1393,23 +1413,19 @@ impl NativeRuntime {
                 }
             }
         } else if scheduler_decision == SchedulerDecision::CompleteProtocolOnly {
-            let protocol_metrics = ProtocolCycleMetrics {
-                skipped_input_repaints,
-                tick_us,
-                pageflip_pending_at_tick,
-                input_drain_us,
-                raw_input_events,
-                coalesced_input_events,
-                pageflip_drain_us,
-                pageflip_completed,
-                present_us,
-                render_generation,
-                effective_render_target_available,
-                scene_changed,
-                pending_frame_work,
-                redraw_requested,
-            };
-            complete_protocol_only_tick(server, frame_scheduler, perf, protocol_metrics);
+            complete_protocol_only_tick(
+                server,
+                frame_scheduler,
+                perf,
+                ProtocolCycleMetrics::from_cycle(
+                    cycle,
+                    render_generation,
+                    effective_render_target_available,
+                    scene_changed,
+                    pending_frame_work,
+                    redraw_requested,
+                ),
+            );
             frame_completed = true;
         } else if matches!(
             scheduler_decision,
@@ -1420,42 +1436,26 @@ impl NativeRuntime {
                 scanout,
                 perf,
                 scheduler_decision,
-                ProtocolCycleMetrics {
-                    skipped_input_repaints,
-                    tick_us,
-                    pageflip_pending_at_tick,
-                    input_drain_us,
-                    raw_input_events,
-                    coalesced_input_events,
-                    pageflip_drain_us,
-                    pageflip_completed,
-                    present_us,
+                ProtocolCycleMetrics::from_cycle(
+                    cycle,
                     render_generation,
                     effective_render_target_available,
                     scene_changed,
                     pending_frame_work,
                     redraw_requested,
-                },
+                ),
             )?;
         } else if skipped_input_repaints > 0 {
             log_no_visual_work(
                 perf,
-                ProtocolCycleMetrics {
-                    skipped_input_repaints,
-                    tick_us,
-                    pageflip_pending_at_tick,
-                    input_drain_us,
-                    raw_input_events,
-                    coalesced_input_events,
-                    pageflip_drain_us,
-                    pageflip_completed,
-                    present_us,
+                ProtocolCycleMetrics::from_cycle(
+                    cycle,
                     render_generation,
                     effective_render_target_available,
                     scene_changed,
                     pending_frame_work,
                     redraw_requested,
-                },
+                ),
             );
         }
         cycle.frame_completed = frame_completed;

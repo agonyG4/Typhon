@@ -3,6 +3,9 @@ use std::{
     os::fd::{AsRawFd, OwnedFd, RawFd},
 };
 
+#[cfg(test)]
+use std::num::NonZeroU64;
+
 use oblivion_one::compositor::{CompositorFrameBatchId, SurfaceDamagePresentation};
 use oblivion_one::native::kms::PageFlipToken;
 #[cfg(test)]
@@ -11,6 +14,7 @@ use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, Presenta
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
 
 use crate::egl_renderer::{EglSceneFrameCommit, native_fence::NativeRenderFence};
+use crate::native_output::OutputTransactionId;
 
 pub(crate) const EXPLICIT_OUTPUT_SLOT_CAPACITY: usize = 3;
 
@@ -151,6 +155,7 @@ pub(crate) struct QuarantinedOutputSlot {
 #[derive(Debug)]
 pub(crate) struct RenderedOutputFrame {
     pub(crate) id: u64,
+    pub(crate) transaction_id: OutputTransactionId,
     pub(crate) slot: OutputSlotId,
     pub(crate) render_generation: u64,
     pub(crate) pool_generation: u64,
@@ -318,6 +323,9 @@ impl AtomicOutputSwapchain {
         let surface_damage = server.capture_surface_damage_presentation();
         self.finish_render_owned(RenderedOutputFrame {
             id: self.next_frame_id,
+            transaction_id: OutputTransactionId::new(
+                NonZeroU64::new(self.next_frame_id).expect("test transaction ID is nonzero"),
+            ),
             slot,
             render_generation,
             pool_generation: self.pool_generation,

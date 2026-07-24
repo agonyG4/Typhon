@@ -9,7 +9,8 @@ use super::{PendingPresentationFeedback, SurfaceBufferRelease};
 pub struct CompositorFrameBatchId(NonZeroU64);
 
 impl CompositorFrameBatchId {
-    pub(super) const fn new(value: NonZeroU64) -> Self {
+    #[doc(hidden)]
+    pub const fn new(value: NonZeroU64) -> Self {
         Self(value)
     }
 

@@ -9,10 +9,8 @@ use gbm::AsRaw as _;
 use glow::HasContext;
 use khronos_egl as egl;
 use oblivion_one::compositor::{FrameBatchDiscardReason, FramePresentation, OwnCompositorServer};
-use oblivion_one::native::kms::AtomicFlipRequest;
 use oblivion_one::native::kms::{AtomicDiscovery, DrmFormatModifierPair};
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
-use oblivion_one::native::sync_file::SyncFileDeadlineHint;
 use oblivion_one::render_backend::{
     buffer::{DrmFormat, DrmModifier},
     egl_gles::EglGlesDmabufFormat,
@@ -28,6 +26,9 @@ use crate::egl_renderer::{
 
 use super::atomic_direct::{direct_candidate_key, direct_scanout_debug};
 use super::*;
+
+#[path = "atomic_egl_gbm_transactions.rs"]
+mod atomic_egl_gbm_transactions;
 
 pub(crate) struct AtomicEglGbmScanout {
     _device: gbm::Device<std::os::fd::OwnedFd>,
@@ -498,20 +499,64 @@ impl AtomicEglGbmScanout {
         &mut self,
         renderer: &mut NativeFrameRenderer,
         server: &mut OwnCompositorServer,
+        output_transactions: &mut OutputTransactionLedger,
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
         damage: &NativeOutputDamage,
         render_generation: u64,
+        output_generation: u64,
         target: PresentationTarget,
         pacing_mode: NativeOutputPacingMode,
+        cursor: Option<CursorPlaneAssignment>,
     ) -> io::Result<AtomicFrameRenderOutcome> {
         let (slot, frame_id, pool_generation) = {
             let swapchain = self.swapchain_mut()?;
             let slot = swapchain.acquire_render_slot_for(pacing_mode)?;
             (slot, swapchain.next_frame_id(), swapchain.pool_generation())
         };
+        let framebuffer_id = match self.framebuffer(slot) {
+            Ok(framebuffer) => framebuffer.get(),
+            Err(error) => {
+                self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
+                return Err(error);
+            }
+        };
         let protocol_batch_id = server.take_frame_batch_for_render(frame_id);
         let surface_damage = server.capture_surface_damage_presentation();
+        let transaction_id = match output_transactions.allocate_id() {
+            Ok(transaction_id) => transaction_id,
+            Err(error) => {
+                server.restore_frame_batch_after_render_failure(protocol_batch_id);
+                self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
+                return Err(io::Error::other(error));
+            }
+        };
+        let transaction = match OutputTransaction::composited(
+            transaction_id,
+            output_generation,
+            MonotonicTimestampNs::new(monotonic_now_ns()?),
+            target,
+            pacing_mode,
+            frame_id,
+            render_generation,
+            pool_generation,
+            slot,
+            framebuffer_id,
+            cursor,
+            protocol_batch_id,
+        ) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                server.restore_frame_batch_after_render_failure(protocol_batch_id);
+                self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
+                return Err(io::Error::other(error));
+            }
+        };
+        if let Err(error) = output_transactions.insert(transaction) {
+            server.restore_frame_batch_after_render_failure(protocol_batch_id);
+            self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
+            return Err(io::Error::other(error));
+        }
         // This is the estimator's production render boundary. Everything before it may
         // include protocol bookkeeping or diagnostics; everything after it is explicit
         // scene encoding, fence export, and GPU work owned by this output frame.
@@ -534,6 +579,13 @@ impl AtomicEglGbmScanout {
             }) => {
                 server.restore_frame_batch_after_render_failure(protocol_batch_id);
                 self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
+                output_transactions
+                    .mark_dropped(
+                        transaction_id,
+                        OutputTransactionDropReason::NoVisualChange,
+                        MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    )
+                    .map_err(io::Error::other)?;
                 return Ok(AtomicFrameRenderOutcome::Skipped { reason, render_us });
             }
             Err(error) => {
@@ -549,12 +601,24 @@ impl AtomicEglGbmScanout {
                     server.restore_frame_batch_after_render_failure(protocol_batch_id);
                     self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
                 }
+                output_transactions
+                    .mark_failed(
+                        transaction_id,
+                        if gpu_sampling_started {
+                            OutputTransactionFailureStage::RenderExecution
+                        } else {
+                            OutputTransactionFailureStage::RenderPreparation
+                        },
+                        MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    )
+                    .map_err(io::Error::other)?;
                 return Err(error);
             }
         };
         let rendered_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         let frame = RenderedOutputFrame {
             id: frame_id,
+            transaction_id,
             slot,
             render_generation,
             pool_generation,
@@ -571,25 +635,42 @@ impl AtomicEglGbmScanout {
         };
         match self.swapchain_mut()?.finish_render_owned(frame) {
             Ok(frame_id) => {
+                output_transactions
+                    .mark_ready(transaction_id, rendered_at)
+                    .map_err(io::Error::other)?;
                 server.complete_rendered_frame_callbacks(protocol_batch_id);
-                Ok(AtomicFrameRenderOutcome::Rendered { frame_id })
+                Ok(AtomicFrameRenderOutcome::Rendered {
+                    frame_id,
+                    transaction_id,
+                })
             }
             Err(error) => {
                 server.discard_frame_batch(
                     protocol_batch_id,
                     FrameBatchDiscardReason::FatalOutputFailure,
                 );
+                output_transactions
+                    .mark_failed(
+                        transaction_id,
+                        OutputTransactionFailureStage::RenderExecution,
+                        MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    )
+                    .map_err(io::Error::other)?;
                 Err(error)
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_direct_scanout(
         &mut self,
         kms: &KmsBackendSelection,
         server: &mut OwnCompositorServer,
+        output_transactions: &mut OutputTransactionLedger,
         target: PresentationTarget,
         cursor: Option<&AtomicCursorVisualState>,
+        cursor_epoch: u64,
+        pacing_mode: NativeOutputPacingMode,
     ) -> io::Result<DirectScanoutAttempt> {
         self.direct.counters.candidate_checks += 1;
         let sync_readiness = DirectSyncReadiness::from_capabilities(
@@ -765,11 +846,55 @@ impl AtomicEglGbmScanout {
             return Ok(DirectScanoutAttempt::Fallback("stale_candidate"));
         }
 
-        let transaction_id = self.direct.transaction_ids.allocate();
         let frame_id = self.swapchain()?.next_frame_id();
         let protocol_batch_id = server.take_frame_batch_for_render(frame_id);
         let surface_damage =
             server.capture_surface_damage_presentation_for_surface(candidate.surface_id);
+        let transaction_id = match output_transactions.allocate_id() {
+            Ok(transaction_id) => transaction_id,
+            Err(error) => {
+                server.restore_frame_batch_after_render_failure(protocol_batch_id);
+                drop(surface_damage);
+                return Err(io::Error::other(error));
+            }
+        };
+        let release = match &sync_readiness {
+            DirectSyncReadiness::Qualified { release_mode, .. } => match release_mode {
+                DirectReleaseMode::Pageflip => OutputReleasePlan::Pageflip,
+                DirectReleaseMode::OutFence => OutputReleasePlan::OutFenceThenPageflip,
+            },
+            DirectSyncReadiness::Unsupported(_) => unreachable!("checked above"),
+        };
+        let transaction = match OutputTransaction::direct(
+            transaction_id,
+            self.direct.drm_generation,
+            MonotonicTimestampNs::new(monotonic_now_ns()?),
+            target,
+            pacing_mode,
+            frame_id,
+            candidate_key,
+            framebuffer.framebuffer.get(),
+            cursor.map(|state| CursorPlaneAssignment::Atomic {
+                desired_epoch: cursor_epoch,
+                framebuffer_id: state.framebuffer_id,
+                visible: state.visible,
+            }),
+            protocol_batch_id,
+            candidate.surface_id,
+            release,
+        ) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                server.restore_frame_batch_after_render_failure(protocol_batch_id);
+                drop(surface_damage);
+                return Err(io::Error::other(error));
+            }
+        };
+        if let Err(error) = output_transactions.insert(transaction) {
+            server.restore_frame_batch_after_render_failure(protocol_batch_id);
+            drop(surface_damage);
+            return Err(io::Error::other(error));
+        }
         let token = PageFlipToken::new(allocate_native_page_flip_token())
             .expect("allocated native pageflip token is nonzero");
         let submit_started_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
@@ -782,6 +907,7 @@ impl AtomicEglGbmScanout {
                 .min(u128::from(u64::MAX)) as u64,
         );
         let submit_returned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
+        let framebuffer_id = framebuffer.framebuffer.get();
         let out_fence = match submission {
             Ok(submission) => {
                 if submission.out_fence.is_some() {
@@ -796,6 +922,13 @@ impl AtomicEglGbmScanout {
             Err(error) => {
                 self.direct.tested_plane_plan = None;
                 server.restore_frame_batch_after_render_failure(protocol_batch_id);
+                output_transactions
+                    .mark_failed(
+                        transaction_id,
+                        OutputTransactionFailureStage::KmsSubmit,
+                        MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    )
+                    .map_err(io::Error::other)?;
                 self.direct.counters.composited_fallbacks += 1;
                 direct_scanout_debug(format_args!("real submit rejected: {error}"));
                 eprintln!("direct scanout: real Atomic submit rejected: {error}");
@@ -821,6 +954,9 @@ impl AtomicEglGbmScanout {
             submit_returned_at,
             out_fence,
         });
+        output_transactions
+            .mark_submitted(transaction_id, token, submit_returned_at)
+            .map_err(io::Error::other)?;
         self.direct.counters.submissions += 1;
         if !was_direct {
             self.direct.counters.entries += 1;
@@ -834,6 +970,7 @@ impl AtomicEglGbmScanout {
         Ok(DirectScanoutAttempt::Submitted {
             transaction_id,
             token: token.get(),
+            framebuffer_id,
         })
     }
 
@@ -969,97 +1106,24 @@ impl AtomicEglGbmScanout {
         Ok(())
     }
 
-    pub(crate) fn submit_ready_frame(
-        &mut self,
-        kms: &KmsBackendSelection,
-        server: &mut OwnCompositorServer,
-        cursor: Option<&AtomicCursorVisualState>,
-    ) -> io::Result<(u64, u32)> {
-        let mut frame = self.swapchain_mut()?.take_ready_for_submission()?;
-        let framebuffer = self.framebuffer(frame.slot)?;
-        let token = PageFlipToken::new(allocate_native_page_flip_token())
-            .expect("allocated native pageflip token is nonzero");
-        if self.deadline_hints_enabled {
-            match frame
-                .render_fence
-                .apply_deadline_hint(frame.target.presentation_time.get(), monotonic_now_ns()?)
-            {
-                Ok(Some(SyncFileDeadlineHint::Applied)) => {
-                    self.counters.sync_file_deadline_hints_applied += 1;
-                }
-                Ok(None) => {}
-                Ok(Some(SyncFileDeadlineHint::Unsupported)) => {
-                    self.counters.sync_file_deadline_hints_unsupported += 1;
-                    self.deadline_hints_enabled = false;
-                }
-                Err(error)
-                    if matches!(error.raw_os_error(), Some(libc::EBADF) | Some(libc::EFAULT)) =>
-                {
-                    let frame = self.swapchain_mut()?.submission_failed(frame)?;
-                    self.discard_failed_frame(server, frame);
-                    return Err(io::Error::other(format!(
-                        "invalid native fence deadline-hint contract: {error}"
-                    )));
-                }
-                Err(error) => {
-                    self.counters.sync_file_deadline_hints_failed += 1;
-                    eprintln!("native sync-file deadline hints disabled: {error}");
-                    self.deadline_hints_enabled = false;
-                }
-            }
-        }
-        let in_fence = match frame.render_fence.take_submission_fd() {
-            Ok(fence) => fence,
-            Err(error) => {
-                let frame = self.swapchain_mut()?.submission_failed(frame)?;
-                self.discard_failed_frame(server, frame);
-                return Err(error);
-            }
-        };
-        let submit_started_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
-        let submission = kms.submit_atomic_flip(AtomicFlipRequest {
-            framebuffer,
-            token,
-            in_fence,
-            cursor: cursor.cloned(),
-        });
-        let submit_returned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
-        match submission {
-            Ok(submission) => {
-                self.counters.atomic_in_fence_submissions += 1;
-                if submission.out_fence.is_some() {
-                    self.counters.atomic_out_fences_received += 1;
-                } else {
-                    self.counters.atomic_out_fence_missing += 1;
-                }
-                self.swapchain_mut()?.submission_succeeded(
-                    frame,
-                    token,
-                    submission.out_fence,
-                    submit_started_at,
-                    submit_returned_at,
-                )?;
-                Ok((token.get(), framebuffer.get()))
-            }
-            Err(error) => {
-                let frame = self.swapchain_mut()?.submission_failed(frame)?;
-                self.discard_failed_frame(server, frame);
-                Err(io::Error::other(format!(
-                    "explicit Atomic output submission failed: {error}"
-                )))
-            }
-        }
-    }
-
     pub(crate) fn discard_ready_frame_before_direct(
         &mut self,
         server: &mut OwnCompositorServer,
+        output_transactions: &mut OutputTransactionLedger,
     ) -> io::Result<bool> {
         let Some(frame) = self.swapchain_mut()?.take_ready_for_submission().ok() else {
             return Ok(false);
         };
         server.restore_frame_batch_after_render_failure(frame.protocol_batch_id);
         self.scene.discard_rendered(frame.scene_commit);
+        output_transactions
+            .mark_superseded(
+                frame.transaction_id,
+                None,
+                OutputTransactionSupersedeReason::DirectTransition,
+                MonotonicTimestampNs::new(monotonic_now_ns()?),
+            )
+            .map_err(io::Error::other)?;
         drop(frame.surface_damage);
         Ok(true)
     }
@@ -1080,6 +1144,7 @@ impl AtomicEglGbmScanout {
         });
         let RenderedOutputFrame {
             id,
+            transaction_id,
             target,
             scene_commit,
             surface_damage,
@@ -1111,6 +1176,7 @@ impl AtomicEglGbmScanout {
         self.complete_composited_transition();
         Ok(PresentedOutputFrame {
             frame_id: id,
+            transaction_id,
             target,
             composite_started_at,
             rendered_at,
@@ -1254,6 +1320,7 @@ pub(crate) enum AtomicSlotRenderOutcome {
 pub(crate) enum AtomicFrameRenderOutcome {
     Rendered {
         frame_id: u64,
+        transaction_id: OutputTransactionId,
     },
     Skipped {
         reason: FrameSkipReason,
@@ -1281,6 +1348,7 @@ pub(crate) struct PendingFenceTiming {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PresentedOutputFrame {
     pub(crate) frame_id: u64,
+    pub(crate) transaction_id: OutputTransactionId,
     pub(crate) target: PresentationTarget,
     pub(crate) composite_started_at: MonotonicTimestampNs,
     pub(crate) rendered_at: MonotonicTimestampNs,

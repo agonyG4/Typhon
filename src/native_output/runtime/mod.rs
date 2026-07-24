@@ -11,6 +11,7 @@ mod planner;
 mod presentation;
 mod presentation_direct;
 mod presentation_protocol;
+mod presentation_transactions;
 mod session;
 mod session_io;
 mod shutdown;
@@ -133,6 +134,7 @@ pub(crate) struct NativeRuntime {
     output_render_fence_token: Option<ReactorToken>,
     frame_scheduler: NativeFrameScheduler,
     atomic_commit_arbiter: AtomicCommitArbiter,
+    output_transactions: OutputTransactionLedger,
     presentation_deadline: PresentationDeadlinePlanner,
     scheduled_presentation_target: Option<PresentationTarget>,
     render_journal: AdaptiveRenderJournal,
@@ -231,6 +233,10 @@ impl NativeRuntime {
 
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
+        let _ = self.output_transactions.terminate_all(
+            OutputTransactionDropReason::OutputDestroyed,
+            MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(0)),
+        );
         self.revoke_xwayland_private_client();
         let _ = self
             .xwayland
@@ -241,6 +247,31 @@ impl Drop for NativeRuntime {
                 "{}",
                 self.frame_pacing
                     .summary_line(self.server.verbose_trace_dropped_entries())
+            );
+            let transaction_counters = self.output_transactions.counters();
+            println!(
+                "typhon presentation: event=output_transaction_summary active={} built={} ready={} submitted={} presented={} dropped={} superseded={} failed={} invalid_transitions={} duplicate_obligations={} active_peak={} history_overwrites={} built_composited={} built_direct={} built_cursor_only={} submitted_composited={} submitted_direct={} submitted_cursor_only={} presented_composited={} presented_direct={} presented_cursor_only={}",
+                self.output_transactions.active_count(),
+                transaction_counters.built,
+                transaction_counters.ready,
+                transaction_counters.submitted,
+                transaction_counters.presented,
+                transaction_counters.dropped,
+                transaction_counters.superseded,
+                transaction_counters.failed,
+                transaction_counters.invalid_transitions,
+                transaction_counters.duplicate_obligation_attempts,
+                transaction_counters.active_peak,
+                transaction_counters.terminal_history_overwrites,
+                transaction_counters.built_composited,
+                transaction_counters.built_direct,
+                transaction_counters.built_cursor_only,
+                transaction_counters.submitted_composited,
+                transaction_counters.submitted_direct,
+                transaction_counters.submitted_cursor_only,
+                transaction_counters.presented_composited,
+                transaction_counters.presented_direct,
+                transaction_counters.presented_cursor_only,
             );
             if let Some(counters) = self.scanout.explicit_output_counters() {
                 println!(

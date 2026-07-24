@@ -1,4 +1,4 @@
-use super::transaction::PresentationTransactionId;
+use super::transaction::OutputTransactionId;
 use std::{collections::VecDeque, fmt::Write as _};
 
 const HISTOGRAM_BUCKETS_NS: [u64; 8] = [
@@ -16,63 +16,63 @@ const HISTOGRAM_BUCKETS_NS: [u64; 8] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PresentationTransactionEvent {
     ContentObserved {
-        transaction_id: PresentationTransactionId,
+        transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
     AcquireReady {
-        transaction_id: PresentationTransactionId,
+        transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
     TransactionBuilt {
-        transaction_id: PresentationTransactionId,
+        transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
     RenderStarted {
-        transaction_id: PresentationTransactionId,
+        transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
     RenderCompleted {
-        transaction_id: PresentationTransactionId,
+        transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
     TestOnlyStarted {
-        transaction_id: PresentationTransactionId,
+        transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
     TestOnlyCompleted {
-        transaction_id: PresentationTransactionId,
+        transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
     KmsSubmitStarted {
-        transaction_id: PresentationTransactionId,
+        transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
     KmsSubmitReturned {
-        transaction_id: PresentationTransactionId,
+        transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
     PageflipPresented {
-        transaction_id: PresentationTransactionId,
+        transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
     Superseded {
-        transaction_id: PresentationTransactionId,
+        transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
     SameBufferSuppressed {
-        transaction_id: PresentationTransactionId,
+        transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
     Rejected {
-        transaction_id: PresentationTransactionId,
+        transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
     FeedbackCompleted {
-        transaction_id: PresentationTransactionId,
+        transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
     BufferReleased {
-        transaction_id: PresentationTransactionId,
+        transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
 }
@@ -99,7 +99,7 @@ impl PresentationTransactionEvent {
     }
 
     #[allow(dead_code)]
-    pub(crate) const fn transaction_id(self) -> PresentationTransactionId {
+    pub(crate) const fn transaction_id(self) -> OutputTransactionId {
         match self {
             Self::ContentObserved { transaction_id, .. }
             | Self::AcquireReady { transaction_id, .. }
@@ -212,7 +212,7 @@ impl PresentationTransactionTraceRing {
     #[allow(dead_code)]
     pub(crate) fn summarize(
         &self,
-        transaction_id: PresentationTransactionId,
+        transaction_id: OutputTransactionId,
     ) -> Option<PresentationTransactionSummary> {
         let mut observed = None;
         let mut submitted = None;

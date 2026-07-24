@@ -1,6 +1,6 @@
 use super::{
-    ContentEpochId, DirectScanoutCandidateKey, OutputContentKey, PresentationTransactionEvent,
-    PresentationTransactionId, PresentationTransactionTraceRing,
+    ContentEpochId, DirectScanoutCandidateKey, OutputContentKey, OutputTransactionId,
+    PresentationTransactionEvent, PresentationTransactionTraceRing,
 };
 use std::num::NonZeroU64;
 
@@ -74,7 +74,7 @@ fn simulate(client_fps: u64, _direct: bool) -> CadenceResult {
             continue;
         }
 
-        let transaction_id = PresentationTransactionId::new(
+        let transaction_id = OutputTransactionId::new(
             NonZeroU64::new(result.transactions.saturating_add(1))
                 .expect("test transaction id must be nonzero"),
         );

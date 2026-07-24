@@ -6,15 +6,18 @@ use oblivion_one::native::kms::{KmsBackendKind, PageFlipToken};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AtomicCommitKind {
     CompositedPrimary {
+        transaction_id: OutputTransactionId,
         frame_id: u64,
         framebuffer_id: u32,
     },
     DirectPrimary {
+        transaction_id: OutputTransactionId,
         direct_token: PageFlipToken,
         framebuffer_id: u32,
     },
     CursorOnly {
-        cursor_generation: u64,
+        transaction_id: OutputTransactionId,
+        cursor_epoch: u64,
         framebuffer_id: Option<u32>,
     },
 }
@@ -57,6 +60,7 @@ pub(crate) fn register_atomic_primary_submission(
     token: u64,
     generation: u64,
     crtc_id: u32,
+    transaction_id: Option<OutputTransactionId>,
     frame_id: u64,
     framebuffer_id: u32,
     submitted_at_ns: u64,
@@ -64,6 +68,8 @@ pub(crate) fn register_atomic_primary_submission(
     if kms_kind != KmsBackendKind::Atomic {
         return Ok(false);
     }
+    let transaction_id = transaction_id
+        .ok_or_else(|| io::Error::other("Atomic primary submission has no output transaction"))?;
     let token = PageFlipToken::new(token)
         .ok_or_else(|| io::Error::other("Atomic primary pageflip token is zero"))?;
     arbiter
@@ -72,6 +78,7 @@ pub(crate) fn register_atomic_primary_submission(
             generation,
             crtc_id,
             AtomicCommitKind::CompositedPrimary {
+                transaction_id,
                 frame_id,
                 framebuffer_id,
             },
@@ -150,12 +157,11 @@ impl AtomicCommitArbiter {
         AtomicCommitCompletion::Completed(pending.kind)
     }
 
-    pub(crate) fn cancel(&mut self, token: PageFlipToken) -> bool {
+    pub(crate) fn cancel(&mut self, token: PageFlipToken) -> Option<PendingAtomicCommit> {
         if self.pending.is_some_and(|pending| pending.token == token) {
-            self.pending = None;
-            true
+            self.pending.take()
         } else {
-            false
+            None
         }
     }
 
@@ -269,6 +275,8 @@ pub(crate) fn validate_atomic_pageflip(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+
     use super::*;
     use oblivion_one::native::drm::DrmPresentationTimestamp;
 
@@ -276,15 +284,21 @@ mod tests {
         PageFlipToken::new(value).expect("test token is nonzero")
     }
 
+    fn transaction_id(value: u64) -> OutputTransactionId {
+        OutputTransactionId::new(NonZeroU64::new(value).expect("test transaction ID is nonzero"))
+    }
+
     fn cursor_kind() -> AtomicCommitKind {
         AtomicCommitKind::CursorOnly {
-            cursor_generation: 4,
+            transaction_id: transaction_id(4),
+            cursor_epoch: 4,
             framebuffer_id: Some(91),
         }
     }
 
     fn primary_kind() -> AtomicCommitKind {
         AtomicCommitKind::CompositedPrimary {
+            transaction_id: transaction_id(7),
             frame_id: 7,
             framebuffer_id: 81,
         }
@@ -300,6 +314,7 @@ mod tests {
                 41,
                 7,
                 3,
+                Some(transaction_id(9)),
                 9,
                 81,
                 100,
@@ -309,6 +324,7 @@ mod tests {
         assert_eq!(
             arbiter.pending_atomic_kind(),
             Some(AtomicCommitKind::CompositedPrimary {
+                transaction_id: transaction_id(9),
                 frame_id: 9,
                 framebuffer_id: 81,
             })
@@ -325,6 +341,7 @@ mod tests {
                 41,
                 7,
                 3,
+                Some(transaction_id(10)),
                 9,
                 81,
                 100,
@@ -344,6 +361,7 @@ mod tests {
                 43,
                 8,
                 3,
+                Some(transaction_id(10)),
                 10,
                 82,
                 100,
@@ -353,6 +371,7 @@ mod tests {
         assert_eq!(
             arbiter.watchdog_expired(110),
             Some(AtomicCommitKind::CompositedPrimary {
+                transaction_id: transaction_id(10),
                 frame_id: 10,
                 framebuffer_id: 82
             })
@@ -366,6 +385,7 @@ mod tests {
                 43,
                 8,
                 3,
+                Some(transaction_id(10)),
                 10,
                 82,
                 100,
@@ -435,6 +455,7 @@ mod tests {
     #[test]
     fn pageflip_routes_direct_primary_by_commit_kind() {
         let direct = AtomicCommitKind::DirectPrimary {
+            transaction_id: transaction_id(17),
             direct_token: token(17),
             framebuffer_id: 82,
         };
@@ -459,6 +480,18 @@ mod tests {
             AtomicCommitCompletion::Mismatched
         );
         assert!(arbiter.atomic_commit_pending());
+    }
+
+    #[test]
+    fn cancel_returns_the_owned_transaction_identity() {
+        let mut arbiter = AtomicCommitArbiter::new();
+        arbiter
+            .reserve(token(1), 3, 42, cursor_kind(), 100)
+            .unwrap();
+
+        let canceled = arbiter.cancel(token(1)).expect("pending commit");
+        assert_eq!(canceled.kind, cursor_kind());
+        assert!(!arbiter.atomic_commit_pending());
     }
 
     #[test]
@@ -604,6 +637,7 @@ mod tests {
             23,
             7,
             42,
+            Some(transaction_id(11)),
             11,
             81,
             100,
@@ -637,6 +671,7 @@ mod tests {
             completion,
             Some(AtomicCommitCompletion::Completed(
                 AtomicCommitKind::CompositedPrimary {
+                    transaction_id: transaction_id(11),
                     frame_id: 11,
                     framebuffer_id: 81,
                 },

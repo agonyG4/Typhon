@@ -11,7 +11,7 @@ use super::*;
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedDirectFrame {
     pub(crate) frame_id: u64,
-    pub(crate) transaction_id: PresentationTransactionId,
+    pub(crate) transaction_id: OutputTransactionId,
     pub(crate) key: DirectScanoutCandidateKey,
     pub(crate) candidate: DirectScanoutSceneCandidate,
     pub(crate) framebuffer: Arc<ImportedDirectFramebuffer>,
@@ -49,8 +49,9 @@ pub(crate) enum DirectScanoutAttempt {
     Fallback(&'static str),
     Unchanged,
     Submitted {
-        transaction_id: PresentationTransactionId,
+        transaction_id: OutputTransactionId,
         token: u64,
+        framebuffer_id: u32,
     },
 }
 
@@ -102,7 +103,6 @@ pub(crate) struct DirectScanoutState {
     pub(crate) inhibit_until_composited_present: bool,
     pub(crate) counters: DirectScanoutCounters,
     pub(crate) drm_generation: u64,
-    pub(crate) transaction_ids: PresentationTransactionAllocator,
     pub(crate) tested_plane_plan: Option<TestedDirectPlanePlan>,
     pub(super) identity_viewport_metadata_logged: bool,
     pub(super) last_debug_candidate: Option<(u32, u64, u64, u64)>,
@@ -137,7 +137,6 @@ impl DirectScanoutState {
             inhibit_until_composited_present: true,
             counters: DirectScanoutCounters::default(),
             drm_generation: generation,
-            transaction_ids: PresentationTransactionAllocator::default(),
             tested_plane_plan: None,
             identity_viewport_metadata_logged: false,
             last_debug_candidate: None,
