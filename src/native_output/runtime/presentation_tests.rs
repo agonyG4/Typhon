@@ -144,6 +144,130 @@ fn present_compatibility_frame_immediate_reaches_presented_without_failure() {
 }
 
 #[test]
+fn immediate_software_presentation_failure_is_not_finalized_as_presented() {
+    let mut harness = CompatibilityPresentationHarness::new();
+    let (_, transaction_id) = harness
+        .present(Ok(NativePresentResult::Immediate))
+        .expect("compatibility present");
+    harness.fail_next_immediate_presentation();
+
+    let error = harness
+        .complete_immediate(transaction_id.expect("Immediate transaction"))
+        .expect_err("software presentation failure must propagate");
+
+    assert!(
+        error
+            .to_string()
+            .contains("injected software presentation failure")
+    );
+    assert!(matches!(
+        harness
+            .output_transactions
+            .recent_terminal()
+            .back()
+            .unwrap()
+            .state(),
+        OutputTransactionState::Terminal(OutputTransactionTerminal::Failed {
+            stage: OutputTransactionFailureStage::ProtocolSettlement,
+            ..
+        })
+    ));
+    assert_eq!(harness.output_transactions.active_count(), 0);
+}
+
+#[test]
+fn immediate_settlement_failure_becomes_protocol_settlement_failure() {
+    let mut harness = CompatibilityPresentationHarness::new();
+    let (_, transaction_id) = harness
+        .present(Ok(NativePresentResult::Immediate))
+        .expect("compatibility present");
+    harness.fail_next_immediate_presentation();
+
+    harness
+        .complete_immediate(transaction_id.expect("Immediate transaction"))
+        .expect_err("settlement must fail");
+
+    assert_eq!(
+        harness.output_transactions.counters().settlement_failures,
+        1
+    );
+    assert!(matches!(
+        harness
+            .output_transactions
+            .recent_terminal()
+            .back()
+            .unwrap()
+            .state(),
+        OutputTransactionState::Terminal(OutputTransactionTerminal::Failed {
+            stage: OutputTransactionFailureStage::ProtocolSettlement,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn immediate_settlement_failure_releases_obligation_owner_once() {
+    let mut harness = CompatibilityPresentationHarness::new();
+    let batch_id = harness.batch_id;
+    let (_, transaction_id) = harness
+        .present(Ok(NativePresentResult::Immediate))
+        .expect("compatibility present");
+    harness.fail_next_immediate_presentation();
+
+    harness
+        .complete_immediate(transaction_id.expect("Immediate transaction"))
+        .expect_err("settlement must fail");
+
+    assert_eq!(harness.output_transactions.obligation_owner(batch_id), None);
+    assert_eq!(harness.output_transactions.active_count(), 0);
+    assert_eq!(
+        harness
+            .output_transactions
+            .counters()
+            .terminal_transitions_finalized,
+        1
+    );
+}
+
+#[test]
+fn successful_immediate_presentation_emits_immediate_presented_trace() {
+    let mut harness = CompatibilityPresentationHarness::new();
+    let (_, transaction_id) = harness
+        .present(Ok(NativePresentResult::Immediate))
+        .expect("compatibility present");
+    super::complete_immediate_output_transaction(
+        &mut harness.output_transactions,
+        &mut harness.presentation_trace,
+        &mut harness.server,
+        transaction_id.expect("Immediate transaction"),
+        MonotonicTimestampNs::new(20),
+    )
+    .expect("Immediate settles successfully");
+
+    let trace = harness.presentation_trace.export_jsonl();
+    assert!(trace.contains("\"event\":\"immediate_presented\""));
+}
+
+#[test]
+fn immediate_presentation_never_emits_pageflip_presented() {
+    let mut harness = CompatibilityPresentationHarness::new();
+    let (_, transaction_id) = harness
+        .present(Ok(NativePresentResult::Immediate))
+        .expect("compatibility present");
+    super::complete_immediate_output_transaction(
+        &mut harness.output_transactions,
+        &mut harness.presentation_trace,
+        &mut harness.server,
+        transaction_id.expect("Immediate transaction"),
+        MonotonicTimestampNs::new(20),
+    )
+    .expect("Immediate settles successfully");
+
+    let trace = harness.presentation_trace.export_jsonl();
+    assert!(!trace.contains("\"event\":\"pageflip_presented\""));
+}
+
+#[test]
 fn compatibility_noop_has_one_typed_terminal() {
     let mut harness = CompatibilityPresentationHarness::new();
     let (result, transaction_id) = harness
@@ -428,6 +552,7 @@ struct CompatibilityPresentationHarness {
     output_transactions: OutputTransactionLedger,
     presentation_trace: PresentationTransactionTraceRing,
     batch_id: CompositorFrameBatchId,
+    fail_immediate_presentation: bool,
 }
 
 impl CompatibilityPresentationHarness {
@@ -459,6 +584,7 @@ impl CompatibilityPresentationHarness {
             output_transactions: OutputTransactionLedger::with_capacities(8, 64),
             presentation_trace: PresentationTransactionTraceRing::new(16),
             batch_id,
+            fail_immediate_presentation: false,
         }
     }
 
@@ -480,6 +606,36 @@ impl CompatibilityPresentationHarness {
             1,
             |_| result,
         )
+    }
+
+    fn fail_next_immediate_presentation(&mut self) {
+        self.fail_immediate_presentation = true;
+    }
+
+    fn complete_immediate(&mut self, transaction_id: OutputTransactionId) -> NativeResult<()> {
+        let fail_immediate_presentation = self.fail_immediate_presentation;
+        if fail_immediate_presentation {
+            super::complete_immediate_output_transaction_with(
+                &mut self.output_transactions,
+                &mut self.presentation_trace,
+                &mut self.server,
+                transaction_id,
+                MonotonicTimestampNs::new(20),
+                |server, batch_id| {
+                    server.finish_immediate_frame_batch_with(batch_id, |_| {
+                        Err(io::Error::other("injected software presentation failure"))
+                    })
+                },
+            )
+        } else {
+            super::complete_immediate_output_transaction(
+                &mut self.output_transactions,
+                &mut self.presentation_trace,
+                &mut self.server,
+                transaction_id,
+                MonotonicTimestampNs::new(20),
+            )
+        }
     }
 }
 

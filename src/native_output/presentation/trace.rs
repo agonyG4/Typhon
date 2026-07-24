@@ -55,6 +55,10 @@ pub(crate) enum PresentationTransactionEvent {
         transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
+    ImmediatePresented {
+        transaction_id: OutputTransactionId,
+        timestamp_ns: u64,
+    },
     Superseded {
         transaction_id: OutputTransactionId,
         timestamp_ns: u64,
@@ -90,6 +94,7 @@ impl PresentationTransactionEvent {
             Self::KmsSubmitStarted { .. } => "kms_submit_started",
             Self::KmsSubmitReturned { .. } => "kms_submit_returned",
             Self::PageflipPresented { .. } => "pageflip_presented",
+            Self::ImmediatePresented { .. } => "immediate_presented",
             Self::Superseded { .. } => "superseded",
             Self::SameBufferSuppressed { .. } => "same_buffer_suppressed",
             Self::Rejected { .. } => "rejected",
@@ -111,6 +116,7 @@ impl PresentationTransactionEvent {
             | Self::KmsSubmitStarted { transaction_id, .. }
             | Self::KmsSubmitReturned { transaction_id, .. }
             | Self::PageflipPresented { transaction_id, .. }
+            | Self::ImmediatePresented { transaction_id, .. }
             | Self::Superseded { transaction_id, .. }
             | Self::SameBufferSuppressed { transaction_id, .. }
             | Self::Rejected { transaction_id, .. }
@@ -132,6 +138,7 @@ impl PresentationTransactionEvent {
             | Self::KmsSubmitStarted { timestamp_ns, .. }
             | Self::KmsSubmitReturned { timestamp_ns, .. }
             | Self::PageflipPresented { timestamp_ns, .. }
+            | Self::ImmediatePresented { timestamp_ns, .. }
             | Self::Superseded { timestamp_ns, .. }
             | Self::SameBufferSuppressed { timestamp_ns, .. }
             | Self::Rejected { timestamp_ns, .. }
@@ -229,6 +236,9 @@ impl PresentationTransactionTraceRing {
                     submitted.get_or_insert(timestamp_ns);
                 }
                 PresentationTransactionEvent::PageflipPresented { timestamp_ns, .. } => {
+                    presented.get_or_insert(timestamp_ns);
+                }
+                PresentationTransactionEvent::ImmediatePresented { timestamp_ns, .. } => {
                     presented.get_or_insert(timestamp_ns);
                 }
                 _ => {}

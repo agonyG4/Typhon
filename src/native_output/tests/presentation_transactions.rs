@@ -38,6 +38,13 @@ fn presented(id: OutputTransactionId, timestamp_ns: u64) -> PresentationTransact
     }
 }
 
+fn immediate_presented(id: OutputTransactionId, timestamp_ns: u64) -> PresentationTransactionEvent {
+    PresentationTransactionEvent::ImmediatePresented {
+        transaction_id: id,
+        timestamp_ns,
+    }
+}
+
 #[test]
 fn same_buffer_reattachment_advances_content_epoch_but_metadata_commits_retain_it() {
     let mut tracker = ContentEpochTracker::default();
@@ -164,6 +171,20 @@ fn transaction_records_buffer_to_pageflip_timestamps() {
     let export = ring.export_jsonl();
     assert!(export.contains("\"event\":\"content_observed\""));
     assert!(export.contains("\"transaction_id\":1"));
+}
+
+#[test]
+fn immediate_trace_uses_distinct_presented_event_and_summary() {
+    let mut ring = PresentationTransactionTraceRing::new(4);
+    let id = tx(2);
+    ring.push(observed(id, 10));
+    ring.push(immediate_presented(id, 30));
+
+    let summary = ring.summarize(id).expect("transaction summary");
+    assert_eq!(summary.submit_to_pageflip_ns, None);
+    let export = ring.export_jsonl();
+    assert!(export.contains("\"event\":\"immediate_presented\""));
+    assert!(!export.contains("\"event\":\"pageflip_presented\""));
 }
 
 #[test]

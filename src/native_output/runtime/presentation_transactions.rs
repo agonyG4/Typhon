@@ -1,5 +1,6 @@
 use super::cursor_cycle::defer_cursor_after_busy;
 use super::*;
+use oblivion_one::compositor::CompositorFrameBatchId;
 use oblivion_one::native::kms::KmsBackendKind;
 
 fn settle_accepted_output_transaction<F>(
@@ -131,6 +132,27 @@ pub(super) fn complete_immediate_output_transaction(
     transaction_id: OutputTransactionId,
     presented_at: MonotonicTimestampNs,
 ) -> NativeResult<()> {
+    complete_immediate_output_transaction_with(
+        output_transactions,
+        presentation_trace,
+        server,
+        transaction_id,
+        presented_at,
+        |server, batch_id| server.finish_immediate_frame_batch(batch_id),
+    )
+}
+
+pub(super) fn complete_immediate_output_transaction_with<F>(
+    output_transactions: &mut OutputTransactionLedger,
+    presentation_trace: &mut PresentationTransactionTraceRing,
+    server: &mut OwnCompositorServer,
+    transaction_id: OutputTransactionId,
+    presented_at: MonotonicTimestampNs,
+    finish_immediate_frame_batch: F,
+) -> NativeResult<()>
+where
+    F: FnOnce(&mut OwnCompositorServer, CompositorFrameBatchId) -> io::Result<()>,
+{
     let accepted = output_transactions
         .accept_immediate_presented(transaction_id, presented_at)
         .map_err(io::Error::other)?;
@@ -138,10 +160,10 @@ pub(super) fn complete_immediate_output_transaction(
         let batch_id = obligations
             .frame_batch_id()
             .ok_or_else(|| io::Error::other("Immediate transaction has no frame batch"))?;
-        server.finish_immediate_frame_batch(batch_id)?;
+        finish_immediate_frame_batch(server, batch_id)?;
         Ok(())
     })?;
-    presentation_trace.push(PresentationTransactionEvent::PageflipPresented {
+    presentation_trace.push(PresentationTransactionEvent::ImmediatePresented {
         transaction_id,
         timestamp_ns: presented_at.get(),
     });

@@ -14,6 +14,8 @@ use super::presentation_protocol::{
     ProtocolCycleMetrics, complete_protocol_only_tick, log_no_visual_work,
     log_wait_for_presentation,
 };
+#[cfg(test)]
+use super::presentation_transactions::complete_immediate_output_transaction_with;
 use super::presentation_transactions::{
     complete_immediate_output_transaction, present_compatibility_frame,
     register_primary_transaction, settle_failed_output_transaction, submit_cursor_only,

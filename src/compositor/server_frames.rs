@@ -62,20 +62,32 @@ impl OwnCompositorServer {
         &mut self,
         batch_id: CompositorFrameBatchId,
     ) -> io::Result<()> {
+        self.finish_immediate_frame_batch_with(batch_id, FramePresentation::software_now)
+    }
+
+    #[doc(hidden)]
+    pub fn finish_immediate_frame_batch_with<F>(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+        software_now: F,
+    ) -> io::Result<()>
+    where
+        F: FnOnce(PresentationClock) -> io::Result<FramePresentation>,
+    {
         if self.state.legacy_prepared_frame_batch != Some(batch_id) {
             return Err(io::Error::other(
                 "immediate presentation batch is not the prepared output batch",
             ));
         }
-        let presentation = match FramePresentation::software_now(self.state.presentation_clock) {
+        let presentation = match software_now(self.state.presentation_clock) {
             Ok(presentation) => presentation,
-            Err(_) => {
+            Err(error) => {
                 self.state.complete_frame_batch_after_safe_abandonment(
                     batch_id,
                     FrameBatchDiscardReason::OutputDestroyed,
                 );
                 let _ = self.display.flush_clients();
-                return Ok(());
+                return Err(error);
             }
         };
         self.state.complete_rendered_frame_callbacks(batch_id);
