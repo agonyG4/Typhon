@@ -452,7 +452,9 @@ impl NativeRuntime {
             xwayland.next_deadline_ns(),
         ))?;
         let last_rendered_scene_generation = server.scene_render_generation();
-        let last_submitted_cursor_generation = server.cursor_generation();
+        let last_submitted_cursor_epoch = atomic_cursor
+            .as_ref()
+            .map_or(0, NativeAtomicCursor::desired_epoch);
         let last_primary_presented_at_ns = None;
         let cursor_output_arbitration = NativeCursorOutputArbitration::default();
         let last_renderable_surfaces = server.renderable_surfaces().to_vec();
@@ -553,7 +555,7 @@ impl NativeRuntime {
             effective_app_gpu_policy,
             last_rendered_scene_generation,
             last_direct_candidate_key: None,
-            last_submitted_cursor_generation,
+            last_submitted_cursor_epoch,
             last_primary_presented_at_ns,
             last_renderable_surfaces,
             last_client_cursor_damage,

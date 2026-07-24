@@ -65,7 +65,7 @@ impl NativeRuntime {
             effective_app_gpu_policy,
             last_rendered_scene_generation,
             last_direct_candidate_key,
-            last_submitted_cursor_generation,
+            last_submitted_cursor_epoch,
             last_renderable_surfaces,
             last_client_cursor_damage,
             last_software_cursor_damage,
@@ -108,7 +108,6 @@ impl NativeRuntime {
         let render_generation = server.render_generation();
         let scene_generation = server.scene_render_generation();
         let scene_changed = scene_generation != *last_rendered_scene_generation;
-        let cursor_generation = server.cursor_generation();
         let pending_frame_work = server.has_unowned_frame_work();
         let pacing_now_ns = monotonic_now_ns()?;
         let theme_cursor_visible = input_state.cursor_visible();
@@ -206,6 +205,12 @@ impl NativeRuntime {
         } else {
             *cursor_render_mode = NativeCursorRenderMode::Hardware;
         }
+        if let Some(cursor) = atomic_cursor.as_mut() {
+            cursor.set_hardware_path_active(
+                *cursor_render_mode == NativeCursorRenderMode::Hardware
+                    && !cursor.failure_latched(),
+            );
+        }
         let current_client_cursor_damage = client_cursor.map(|cursor| {
             NativeClientCursorDamageState::from_cursor(target.width, target.height, cursor)
         });
@@ -225,6 +230,25 @@ impl NativeRuntime {
         let client_cursor_software_work = !client_cursor_hardware_usable
             && (*last_client_cursor_damage != current_client_cursor_damage)
             && (client_cursor_active || last_client_cursor_damage.is_some());
+        let mut effective_cursor = atomic_cursor
+            .as_ref()
+            .and_then(|cursor| {
+                effective_atomic_cursor_state(cursor, *cursor_render_mode, cursor_visible)
+                    .kms_state()
+            })
+            .cloned();
+        let cursor_state_changed = atomic_cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.needs_submission_for(effective_cursor.as_ref()));
+        let cursor_epoch = atomic_cursor.as_ref().map_or(
+            *last_submitted_cursor_epoch,
+            NativeAtomicCursor::desired_epoch,
+        );
+        let hardware_cursor_work_pending = cursor_state_changed
+            && *cursor_render_mode == NativeCursorRenderMode::Hardware
+            && atomic_cursor
+                .as_ref()
+                .is_some_and(|cursor| !cursor.failure_latched());
         let resolved_client_cursor_path =
             resolve_client_cursor_path(client_cursor_active, client_cursor_hardware_usable);
         if *last_client_cursor_path != Some(resolved_client_cursor_path) {
@@ -237,14 +261,15 @@ impl NativeRuntime {
                 client_cursor,
             );
         }
-        let (cursor_generation_changed, cursor_deadline_due, cursor_work_pending) =
+        let (_cursor_epoch_changed, cursor_deadline_due, cursor_work_pending) =
             update_cursor_output_arbitration(
                 cursor_output_arbitration,
-                cursor_generation,
-                *last_submitted_cursor_generation,
+                cursor_epoch,
+                *last_submitted_cursor_epoch,
                 pacing_now_ns,
                 frame_scheduler,
                 client_cursor_software_work,
+                hardware_cursor_work_pending,
             );
         let primary_redraw_requested =
             redraw_requested || (cursor_deadline_due && client_cursor_software_work);
@@ -363,13 +388,6 @@ impl NativeRuntime {
             )
             .into());
         }
-        let mut effective_cursor = atomic_cursor
-            .as_ref()
-            .and_then(|cursor| {
-                effective_atomic_cursor_state(cursor, *cursor_render_mode, cursor_visible)
-                    .kms_state()
-            })
-            .cloned();
         let mut cursor_hardware_usable = atomic_cursor.as_ref().is_some_and(|cursor| {
             effective_atomic_cursor_state(cursor, *cursor_render_mode, cursor_visible)
                 .hardware_usable()
@@ -420,9 +438,6 @@ impl NativeRuntime {
                 )]
             });
         }
-        let cursor_state_changed = atomic_cursor
-            .as_ref()
-            .is_some_and(|cursor| cursor.needs_submission_for(effective_cursor.as_ref()));
         let primary_work_for_cursor = primary_visual_work_pending
             || direct_candidate_changed
             || atomic_primary_commit_pending
@@ -494,8 +509,8 @@ impl NativeRuntime {
                             });
                             cursor.begin_submission(token, submitted_state);
                             cursor_output_arbitration.note_cursor_only_submission();
-                            *last_submitted_cursor_generation = cursor_generation;
-                            cursor_output_arbitration.consume(cursor_generation);
+                            *last_submitted_cursor_epoch = cursor_epoch;
+                            cursor_output_arbitration.consume(cursor_epoch);
                             *last_client_cursor_damage = current_client_cursor_damage;
                             *last_software_cursor_damage = current_software_cursor_damage;
                             scheduler_decision = SchedulerDecision::WaitForPageFlip;
@@ -642,8 +657,8 @@ impl NativeRuntime {
                         });
                         cursor.begin_primary_submission(cursor_token, state);
                     }
-                    *last_submitted_cursor_generation = cursor_generation;
-                    cursor_output_arbitration.consume(cursor_generation);
+                    *last_submitted_cursor_epoch = cursor_epoch;
+                    cursor_output_arbitration.consume(cursor_epoch);
                     if !explicit_submission {
                         server.mark_prepared_frame_submitted();
                     }
@@ -797,8 +812,8 @@ impl NativeRuntime {
                             presentation_deadline.clear_scheduled_target();
                             *scheduled_presentation_target = None;
                             *last_rendered_scene_generation = scene_generation;
-                            *last_submitted_cursor_generation = cursor_generation;
-                            cursor_output_arbitration.consume(cursor_generation);
+                            *last_submitted_cursor_epoch = cursor_epoch;
+                            cursor_output_arbitration.consume(cursor_epoch);
                             *last_renderable_surfaces = server.renderable_surfaces().to_vec();
                             *last_software_cursor_damage = current_software_cursor_damage;
                             *frame_index = frame_index.saturating_add(1);
@@ -1013,10 +1028,7 @@ impl NativeRuntime {
                                         NativePerfField::str("reason", format!("{reason:?}")),
                                         NativePerfField::u64("render_us", render_us),
                                         NativePerfField::u64("scene_generation", scene_generation),
-                                        NativePerfField::u64(
-                                            "cursor_generation",
-                                            cursor_generation,
-                                        ),
+                                        NativePerfField::u64("cursor_epoch", cursor_epoch),
                                         NativePerfField::usize("accepted_clients", accepted),
                                         NativePerfField::bool(
                                             "pending_frame_work",
@@ -1111,8 +1123,8 @@ impl NativeRuntime {
                                 *queued_redraw_requested = false;
                                 *last_rendered_scene_generation = scene_generation;
                                 if !waits_for_target {
-                                    *last_submitted_cursor_generation = cursor_generation;
-                                    cursor_output_arbitration.consume(cursor_generation);
+                                    *last_submitted_cursor_epoch = cursor_epoch;
+                                    cursor_output_arbitration.consume(cursor_epoch);
                                 }
                                 *last_renderable_surfaces = server.renderable_surfaces().to_vec();
                             }
@@ -1373,8 +1385,8 @@ impl NativeRuntime {
                             });
                             *queued_redraw_requested = false;
                             *last_rendered_scene_generation = scene_generation;
-                            *last_submitted_cursor_generation = cursor_generation;
-                            cursor_output_arbitration.consume(cursor_generation);
+                            *last_submitted_cursor_epoch = cursor_epoch;
+                            cursor_output_arbitration.consume(cursor_epoch);
                             *last_renderable_surfaces = server.renderable_surfaces().to_vec();
                         }
                     }

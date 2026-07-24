@@ -3,6 +3,7 @@ use oblivion_one::cursor_theme::CompositorCursorImage;
 use std::sync::Arc;
 
 pub(crate) const NATIVE_HARDWARE_CURSOR_SIZE: u32 = 64;
+const INITIAL_CURSOR_EPOCH: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeCursorImageKey {
@@ -259,6 +260,11 @@ pub(crate) struct NativeAtomicCursor {
     resources: AtomicCursorResources,
     pub(crate) plane: AtomicCursorPlaneProperties,
     pub(crate) generation: u64,
+    /// Output-local identity for the desired KMS cursor state. This is
+    /// intentionally independent of compositor scene/cursor generations.
+    desired_epoch: u64,
+    submitted_epoch: u64,
+    hardware_path_active: bool,
     pub(crate) dirty: AtomicCursorDirty,
     pub(crate) counters: AtomicCursorCounters,
     failure_latched: bool,
@@ -305,6 +311,9 @@ impl NativeAtomicCursor {
             },
             plane,
             generation,
+            desired_epoch: INITIAL_CURSOR_EPOCH,
+            submitted_epoch: INITIAL_CURSOR_EPOCH,
+            hardware_path_active: false,
             dirty: AtomicCursorDirty::default(),
             counters: AtomicCursorCounters::default(),
             failure_latched: false,
@@ -324,6 +333,21 @@ impl NativeAtomicCursor {
         &self.current
     }
 
+    pub(crate) const fn desired_epoch(&self) -> u64 {
+        self.desired_epoch
+    }
+
+    fn advance_desired_epoch(&mut self) {
+        self.desired_epoch = next_cursor_epoch(self.desired_epoch, self.submitted_epoch);
+    }
+
+    pub(crate) fn set_hardware_path_active(&mut self, active: bool) {
+        if self.hardware_path_active != active {
+            self.hardware_path_active = active;
+            self.advance_desired_epoch();
+        }
+    }
+
     /// The initial modeset has already made `state` the kernel-owned state.
     /// Promote it without manufacturing a redundant cursor-only pageflip.
     pub(crate) fn mark_initial_submitted(&mut self, state: Option<&AtomicCursorVisualState>) {
@@ -333,6 +357,7 @@ impl NativeAtomicCursor {
             ..self.desired.clone()
         });
         self.submitted = state.clone();
+        self.submitted_epoch = self.desired_epoch;
         self.current = state;
         self.dirty = AtomicCursorDirty::default();
     }
@@ -341,6 +366,7 @@ impl NativeAtomicCursor {
         if self.desired.x != x || self.desired.y != y {
             self.desired.x = x;
             self.desired.y = y;
+            self.advance_desired_epoch();
             self.dirty.position = true;
             self.counters.updates_requested = self.counters.updates_requested.saturating_add(1);
             if !self.desired.visible && !self.current.visible {
@@ -356,6 +382,7 @@ impl NativeAtomicCursor {
         let visible = visible && !self.failure_latched;
         if self.desired.visible != visible {
             self.desired.visible = visible;
+            self.advance_desired_epoch();
             self.dirty.visibility = true;
             self.counters.updates_requested = self.counters.updates_requested.saturating_add(1);
             if self.pending_token.is_some() {
@@ -389,6 +416,7 @@ impl NativeAtomicCursor {
                 self.counters.position_submissions.saturating_add(1);
         }
         self.submitted = state.clone();
+        self.submitted_epoch = self.desired_epoch;
         self.pending_token = Some(token);
         self.pending_is_primary = false;
         self.dirty = AtomicCursorDirty::default();
@@ -435,6 +463,7 @@ impl NativeAtomicCursor {
     ) {
         self.counters.primary_submissions = self.counters.primary_submissions.saturating_add(1);
         self.submitted = state;
+        self.submitted_epoch = self.desired_epoch;
         self.pending_token = Some(token);
         self.pending_is_primary = true;
         self.dirty = AtomicCursorDirty::default();
@@ -557,6 +586,7 @@ impl NativeAtomicCursor {
         self.desired.width = self.image.width;
         self.desired.height = self.image.height;
         self.desired.image_generation = self.desired.image_generation.saturating_add(1);
+        self.advance_desired_epoch();
         self.dirty.image = true;
         if !self.desired.visible && !self.current.visible {
             self.counters.hidden_updates_suppressed =
@@ -569,8 +599,7 @@ impl NativeAtomicCursor {
         self.suspended_desired = Some(self.desired.clone());
         self.pending_token = None;
         self.pending_is_primary = false;
-        self.desired.visible = false;
-        self.dirty.visibility = true;
+        self.set_visible(false);
     }
 
     pub(crate) fn prepare_for_recovery(
@@ -606,9 +635,13 @@ impl NativeAtomicCursor {
         restored.width = self.image.width;
         restored.height = self.image.height;
         restored.framebuffer_id = framebuffer_id;
+        if !restored.kms_equivalent(&self.desired) {
+            self.advance_desired_epoch();
+        }
         self.desired = restored.clone();
         self.submitted = AtomicCursorVisualState::hidden(self.image.width, self.image.height);
         self.submitted.framebuffer_id = framebuffer_id;
+        self.submitted_epoch = 0;
         self.current = self.submitted.clone();
         self.pending_token = None;
         self.pending_is_primary = false;
@@ -884,13 +917,31 @@ fn atomic_cursor_state_for_image(
     }
 }
 
+fn next_cursor_epoch(current: u64, submitted: u64) -> u64 {
+    let mut next = current.wrapping_add(1);
+    if next == 0 {
+        next = INITIAL_CURSOR_EPOCH;
+    }
+    if next == submitted {
+        next = next.wrapping_add(1);
+        if next == 0 {
+            next = INITIAL_CURSOR_EPOCH;
+        }
+    }
+    next
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use crate::native_output::runtime::{
+        NativeCursorOutputArbitration, update_cursor_output_arbitration,
+    };
     use oblivion_one::native::kms::{
         AtomicPlaneProperties, DrmFormatModifierPair, PlanePropertyId, PropertyId,
     };
+    use oblivion_one::native::scheduler::NativeFrameScheduler;
 
     fn property(id: u32) -> PlanePropertyId {
         PlanePropertyId(PropertyId::new(id).expect("test property id is nonzero"))
@@ -949,6 +1000,9 @@ mod tests {
                 pixel_blend_mode_premultiplied: None,
             },
             generation: 1,
+            desired_epoch: INITIAL_CURSOR_EPOCH,
+            submitted_epoch: INITIAL_CURSOR_EPOCH,
+            hardware_path_active: false,
             dirty: AtomicCursorDirty::default(),
             counters: AtomicCursorCounters::default(),
             failure_latched: false,
@@ -966,6 +1020,108 @@ mod tests {
         cursor.set_position(100, 200);
 
         assert!(!cursor.needs_submission());
+    }
+
+    #[test]
+    fn redundant_position_does_not_advance_cursor_epoch() {
+        let mut cursor = test_cursor();
+        let initial_epoch = cursor.desired_epoch();
+
+        cursor.set_position(0, 0);
+
+        assert_eq!(cursor.desired_epoch(), initial_epoch);
+    }
+
+    #[test]
+    fn new_position_advances_cursor_epoch_once() {
+        let mut cursor = test_cursor();
+        let initial_epoch = cursor.desired_epoch();
+
+        cursor.set_position(100, 200);
+        assert_ne!(cursor.desired_epoch(), initial_epoch);
+        let moved_epoch = cursor.desired_epoch();
+
+        cursor.set_position(100, 200);
+
+        assert_eq!(cursor.desired_epoch(), moved_epoch);
+    }
+
+    #[test]
+    fn visibility_change_advances_cursor_epoch_once() {
+        let mut cursor = test_cursor();
+        let initial_epoch = cursor.desired_epoch();
+
+        cursor.set_visible(true);
+        assert_ne!(cursor.desired_epoch(), initial_epoch);
+        let visible_epoch = cursor.desired_epoch();
+
+        cursor.set_visible(true);
+
+        assert_eq!(cursor.desired_epoch(), visible_epoch);
+    }
+
+    #[test]
+    fn hardware_path_transition_advances_cursor_epoch_once() {
+        let mut cursor = test_cursor();
+        let initial_epoch = cursor.desired_epoch();
+
+        cursor.set_hardware_path_active(true);
+        assert_ne!(cursor.desired_epoch(), initial_epoch);
+        let active_epoch = cursor.desired_epoch();
+
+        cursor.set_hardware_path_active(true);
+        assert_eq!(cursor.desired_epoch(), active_epoch);
+
+        cursor.set_hardware_path_active(false);
+        assert_ne!(cursor.desired_epoch(), active_epoch);
+    }
+
+    #[test]
+    fn cursor_epoch_wrap_skips_zero_and_submitted_epoch() {
+        let mut cursor = test_cursor();
+        cursor.desired_epoch = u64::MAX;
+        cursor.submitted_epoch = 1;
+
+        cursor.set_position(100, 200);
+
+        assert_eq!(cursor.desired_epoch(), 2);
+    }
+
+    #[test]
+    fn idle_theme_cursor_motion_opens_cursor_only_deadline_without_scene_damage() {
+        let mut cursor = test_cursor();
+        cursor.desired.visible = true;
+        cursor.current.visible = true;
+        cursor.set_position(100, 200);
+        assert!(cursor.needs_submission());
+
+        let mut arbitration = NativeCursorOutputArbitration::default();
+        let scheduler = NativeFrameScheduler::new(165, 0);
+        let (cursor_changed, deadline_due, cursor_work_pending) = update_cursor_output_arbitration(
+            &mut arbitration,
+            cursor.desired_epoch(),
+            INITIAL_CURSOR_EPOCH,
+            1_000,
+            &scheduler,
+            false,
+            true,
+        );
+
+        assert!(cursor_changed);
+        assert!(!deadline_due);
+        assert!(!cursor_work_pending);
+        let deadline = arbitration.deadline_ns().expect("cursor deadline is armed");
+        let (_, deadline_due, cursor_work_pending) = update_cursor_output_arbitration(
+            &mut arbitration,
+            cursor.desired_epoch(),
+            INITIAL_CURSOR_EPOCH,
+            deadline,
+            &scheduler,
+            false,
+            true,
+        );
+        assert!(deadline_due);
+        assert!(cursor_work_pending);
     }
 
     #[test]

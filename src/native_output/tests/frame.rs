@@ -1,6 +1,9 @@
 use super::output::test_renderable_surface;
 use super::*;
-use crate::native_output::runtime::{NativeCursorOutputArbitration, NativeCursorOutputDisposition};
+use crate::native_output::runtime::{
+    NativeCursorOutputArbitration, NativeCursorOutputDisposition, earliest_native_deadline,
+    update_cursor_output_arbitration,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReactiveHandoffOperation {
@@ -520,6 +523,34 @@ fn cursor_output_work_waits_for_the_next_output_deadline() {
 }
 
 #[test]
+fn software_cursor_work_does_not_open_a_hardware_cursor_deadline() {
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    let scheduler = NativeFrameScheduler::new(165, 0);
+
+    let (changed, deadline_due, cursor_work_pending) =
+        update_cursor_output_arbitration(&mut arbitration, 2, 1, 1_000, &scheduler, false, false);
+
+    assert!(!changed);
+    assert!(!deadline_due);
+    assert!(!cursor_work_pending);
+    assert!(!arbitration.pending());
+}
+
+#[test]
+fn software_client_cursor_work_keeps_the_existing_deadline_path() {
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    let scheduler = NativeFrameScheduler::new(165, 0);
+
+    let (changed, deadline_due, cursor_work_pending) =
+        update_cursor_output_arbitration(&mut arbitration, 0, 0, 1_000, &scheduler, true, false);
+
+    assert!(changed);
+    assert!(!deadline_due);
+    assert!(!cursor_work_pending);
+    assert!(arbitration.pending());
+}
+
+#[test]
 fn primary_work_has_right_of_first_refusal_at_the_cursor_deadline() {
     let mut arbitration = NativeCursorOutputArbitration::default();
     arbitration.request(7, 1_000, 2_000);
@@ -540,11 +571,42 @@ fn cursor_requests_coalesce_and_software_uses_the_same_deadline() {
     arbitration.request(1, 1_000, 2_000);
     arbitration.request(2, 1_100, 3_000);
 
-    assert_eq!(arbitration.desired_generation(), 2);
+    assert_eq!(arbitration.desired_epoch(), 2);
     assert_eq!(arbitration.deadline_ns(), Some(2_000));
     assert_eq!(
         arbitration.disposition(2_000, false, false),
         NativeCursorOutputDisposition::SoftwareOverlay
+    );
+}
+
+#[test]
+fn consume_clears_pending_cursor_work_but_preserves_cumulative_metrics() {
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    arbitration.request(1, 1_000, 2_000);
+    arbitration.request(2, 1_100, 2_000);
+    arbitration.note_disposition(NativeCursorOutputDisposition::SubmitCursorOnly);
+    arbitration.note_cursor_only_submission();
+
+    arbitration.consume(2);
+
+    assert!(!arbitration.pending());
+    assert_eq!(arbitration.deadline_ns(), None);
+    assert_eq!(arbitration.desired_epoch(), 0);
+    assert_eq!(arbitration.response_windows_opened(), 1);
+    assert_eq!(arbitration.changes_coalesced(), 1);
+    assert_eq!(arbitration.cursor_only_plans(), 1);
+    assert_eq!(arbitration.cursor_only_submissions(), 1);
+    assert_eq!(arbitration.idle_hardware_updates(), 1);
+}
+
+#[test]
+fn cursor_deadline_is_selected_for_an_idle_reactor_wakeup() {
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    arbitration.request(1, 1_000, 2_000);
+
+    assert_eq!(
+        earliest_native_deadline(Some(10_000), arbitration.deadline_ns()),
+        Some(2_000)
     );
 }
 
@@ -583,12 +645,34 @@ fn one_thousand_pointer_updates_coalesce_before_the_primary_deadline() {
         arbitration.request(generation, generation, 6_060_606);
     }
 
-    assert_eq!(arbitration.desired_generation(), 1_000);
+    assert_eq!(arbitration.desired_epoch(), 1_000);
     assert_eq!(arbitration.changes_coalesced(), 999);
     assert_eq!(
         arbitration.disposition(3_000_000, true, true),
         NativeCursorOutputDisposition::PiggybackPrimary
     );
+}
+
+#[test]
+fn one_hundred_cursor_changes_produce_one_cursor_only_plan() {
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    for epoch in 1..=100 {
+        arbitration.request(epoch, epoch, 6_060_606);
+    }
+
+    assert_eq!(arbitration.response_windows_opened(), 1);
+    assert_eq!(arbitration.changes_coalesced(), 99);
+    assert_eq!(
+        arbitration.disposition(6_060_606, false, true),
+        NativeCursorOutputDisposition::SubmitCursorOnly
+    );
+    arbitration.note_disposition(NativeCursorOutputDisposition::SubmitCursorOnly);
+    arbitration.note_cursor_only_submission();
+    arbitration.consume(100);
+
+    assert_eq!(arbitration.cursor_only_plans(), 1);
+    assert_eq!(arbitration.cursor_only_submissions(), 1);
+    assert!(!arbitration.pending());
 }
 
 #[test]

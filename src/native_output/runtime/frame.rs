@@ -128,8 +128,8 @@ impl NativeCursorSchedulingPolicy {
 
 /// Cursor output is lower-priority work than a primary scene transaction.  A
 /// request opens one output opportunity for the client to respond; it does
-/// not reserve the Atomic commit arbiter.  The desired generation is replaced
-/// by newer input while that opportunity is open.
+/// not reserve the Atomic commit arbiter.  The desired epoch is replaced by
+/// newer input while that opportunity is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeCursorOutputDisposition {
     PiggybackPrimary,
@@ -143,7 +143,7 @@ pub(crate) enum NativeCursorOutputDisposition {
 pub(crate) struct NativeCursorOutputArbitration {
     pending_since_ns: Option<u64>,
     deadline_ns: Option<u64>,
-    desired_generation: u64,
+    desired_epoch: u64,
     primary_response_window_open: bool,
     software_overlay_pending: bool,
     pub(crate) response_windows_opened: u64,
@@ -157,16 +157,16 @@ pub(crate) struct NativeCursorOutputArbitration {
 }
 
 impl NativeCursorOutputArbitration {
-    pub(crate) fn request(&mut self, generation: u64, now_ns: u64, deadline_ns: u64) {
+    pub(crate) fn request(&mut self, epoch: u64, now_ns: u64, deadline_ns: u64) {
         if self.pending_since_ns.is_none() {
             self.pending_since_ns = Some(now_ns);
             self.deadline_ns = Some(deadline_ns);
             self.primary_response_window_open = true;
             self.response_windows_opened = self.response_windows_opened.saturating_add(1);
-        } else if generation > self.desired_generation {
+        } else if epoch != self.desired_epoch {
             self.changes_coalesced = self.changes_coalesced.saturating_add(1);
         }
-        self.desired_generation = self.desired_generation.max(generation);
+        self.desired_epoch = epoch;
     }
 
     pub(crate) const fn deadline_ns(&self) -> Option<u64> {
@@ -174,8 +174,8 @@ impl NativeCursorOutputArbitration {
     }
 
     #[cfg(test)]
-    pub(crate) const fn desired_generation(&self) -> u64 {
-        self.desired_generation
+    pub(crate) const fn desired_epoch(&self) -> u64 {
+        self.desired_epoch
     }
 
     pub(crate) const fn pending(&self) -> bool {
@@ -272,9 +272,9 @@ impl NativeCursorOutputArbitration {
         }
     }
 
-    pub(crate) fn consume(&mut self, generation: u64) {
-        if self.pending() && generation >= self.desired_generation {
-            *self = Self::default();
+    pub(crate) fn consume(&mut self, epoch: u64) {
+        if self.pending() && epoch == self.desired_epoch {
+            self.clear_pending();
         }
     }
 
@@ -284,33 +284,40 @@ impl NativeCursorOutputArbitration {
         }
     }
 
-    pub(crate) fn clear(&mut self) {
-        *self = Self::default();
+    pub(crate) fn clear_pending(&mut self) {
+        self.pending_since_ns = None;
+        self.deadline_ns = None;
+        self.desired_epoch = 0;
+        self.primary_response_window_open = false;
+        self.software_overlay_pending = false;
     }
 }
 
 pub(crate) fn update_cursor_output_arbitration(
     arbitration: &mut NativeCursorOutputArbitration,
-    cursor_generation: u64,
-    last_submitted_cursor_generation: u64,
+    cursor_epoch: u64,
+    last_submitted_cursor_epoch: u64,
     now_ns: u64,
     frame_scheduler: &NativeFrameScheduler,
     software_overlay_pending: bool,
+    hardware_cursor_work_pending: bool,
 ) -> (bool, bool, bool) {
     arbitration.set_software_overlay_pending(software_overlay_pending);
-    let generation_changed = cursor_generation != last_submitted_cursor_generation;
-    if generation_changed {
+    let hardware_cursor_changed =
+        hardware_cursor_work_pending && cursor_epoch != last_submitted_cursor_epoch;
+    let output_cursor_work_changed = hardware_cursor_changed || software_overlay_pending;
+    if output_cursor_work_changed {
         arbitration.request(
-            cursor_generation,
+            cursor_epoch,
             now_ns,
             frame_scheduler.next_refresh_deadline_ns(now_ns),
         );
     }
     let deadline_due = arbitration.due(now_ns);
     (
-        generation_changed,
+        output_cursor_work_changed,
         deadline_due,
-        deadline_due && generation_changed,
+        deadline_due && output_cursor_work_changed,
     )
 }
 

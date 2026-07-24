@@ -32,6 +32,8 @@ pub(super) use cursor_cycle::{
 pub(crate) use cycle::run;
 #[cfg(test)]
 pub(crate) use frame::NativeCursorOutputDisposition;
+#[cfg(test)]
+pub(crate) use frame::update_cursor_output_arbitration;
 pub(crate) use frame::{
     NativeCursorOutputArbitration, NativeCursorPreference, NativeCursorRenderMode,
     NativeCursorSchedulingPolicy, NativeFrameRenderer, NativePointerConstraintBackend,
@@ -140,7 +142,7 @@ pub(crate) struct NativeRuntime {
     effective_app_gpu_policy: EffectiveCompositorAppGpuPolicy,
     last_rendered_scene_generation: u64,
     last_direct_candidate_key: Option<DirectScanoutCandidateKey>,
-    last_submitted_cursor_generation: u64,
+    last_submitted_cursor_epoch: u64,
     last_primary_presented_at_ns: Option<u64>,
     last_renderable_surfaces: Vec<RenderableSurface>,
     last_client_cursor_damage: Option<NativeClientCursorDamageState>,
