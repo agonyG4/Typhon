@@ -2,6 +2,80 @@ use super::cursor_cycle::defer_cursor_after_busy;
 use super::*;
 use oblivion_one::native::kms::KmsBackendKind;
 
+fn settle_accepted_output_transaction<F>(
+    output_transactions: &mut OutputTransactionLedger,
+    accepted: AcceptedTerminalTransition,
+    settle_protocol_obligations: F,
+) -> NativeResult<()>
+where
+    F: FnOnce(OutputProtocolObligations) -> NativeResult<()>,
+{
+    if let Err(error) = settle_protocol_obligations(accepted.obligations()) {
+        let _ = output_transactions.fail_settlement(
+            accepted,
+            MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(0)),
+        );
+        return Err(error);
+    }
+    if let Err(error) = output_transactions.finalize_terminal(accepted) {
+        let _ = output_transactions.fail_settlement(
+            accepted,
+            MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(0)),
+        );
+        return Err(io::Error::other(error).into());
+    }
+    Ok(())
+}
+
+pub(crate) fn settle_failed_output_transaction<F>(
+    output_transactions: &mut OutputTransactionLedger,
+    transaction_id: OutputTransactionId,
+    stage: OutputTransactionFailureStage,
+    at: MonotonicTimestampNs,
+    settle_protocol_obligations: F,
+) -> NativeResult<()>
+where
+    F: FnOnce(OutputProtocolObligations) -> NativeResult<()>,
+{
+    let accepted = output_transactions
+        .accept_failed(transaction_id, stage, at)
+        .map_err(io::Error::other)?;
+    settle_accepted_output_transaction(output_transactions, accepted, settle_protocol_obligations)
+}
+
+pub(crate) fn settle_dropped_output_transaction<F>(
+    output_transactions: &mut OutputTransactionLedger,
+    transaction_id: OutputTransactionId,
+    reason: OutputTransactionDropReason,
+    at: MonotonicTimestampNs,
+    settle_protocol_obligations: F,
+) -> NativeResult<()>
+where
+    F: FnOnce(OutputProtocolObligations) -> NativeResult<()>,
+{
+    let accepted = output_transactions
+        .accept_dropped(transaction_id, reason, at)
+        .map_err(io::Error::other)?;
+    settle_accepted_output_transaction(output_transactions, accepted, settle_protocol_obligations)
+}
+
+pub(crate) fn settle_superseded_output_transaction<F>(
+    output_transactions: &mut OutputTransactionLedger,
+    transaction_id: OutputTransactionId,
+    by: Option<OutputTransactionId>,
+    reason: OutputTransactionSupersedeReason,
+    at: MonotonicTimestampNs,
+    settle_protocol_obligations: F,
+) -> NativeResult<()>
+where
+    F: FnOnce(OutputProtocolObligations) -> NativeResult<()>,
+{
+    let accepted = output_transactions
+        .accept_superseded(transaction_id, by, reason, at)
+        .map_err(io::Error::other)?;
+    settle_accepted_output_transaction(output_transactions, accepted, settle_protocol_obligations)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn complete_presented_output_transaction<F>(
     output_transactions: &mut OutputTransactionLedger,
@@ -25,21 +99,7 @@ where
             actual_sequence,
         )
         .map_err(io::Error::other)?;
-    let obligations = accepted.obligations();
-    if let Err(error) = settle_protocol_obligations(obligations) {
-        let _ = output_transactions.fail_settlement(
-            accepted,
-            MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(presented_at.get())),
-        );
-        return Err(error);
-    }
-    if let Err(error) = output_transactions.finalize_terminal(accepted) {
-        let _ = output_transactions.fail_settlement(
-            accepted,
-            MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(presented_at.get())),
-        );
-        return Err(io::Error::other(error).into());
-    }
+    settle_accepted_output_transaction(output_transactions, accepted, settle_protocol_obligations)?;
     presentation_trace.push(PresentationTransactionEvent::PageflipPresented {
         transaction_id,
         timestamp_ns: presented_at.get(),
@@ -60,21 +120,7 @@ where
     let accepted = output_transactions
         .accept_dropped(transaction_id, reason, at)
         .map_err(io::Error::other)?;
-    let obligations = accepted.obligations();
-    if let Err(error) = settle_protocol_obligations(obligations) {
-        let _ = output_transactions.fail_settlement(
-            accepted,
-            MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(at.get())),
-        );
-        return Err(error);
-    }
-    if let Err(error) = output_transactions.finalize_terminal(accepted) {
-        let _ = output_transactions.fail_settlement(
-            accepted,
-            MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(at.get())),
-        );
-        return Err(io::Error::other(error).into());
-    }
+    settle_accepted_output_transaction(output_transactions, accepted, settle_protocol_obligations)?;
     Ok(())
 }
 
@@ -88,14 +134,13 @@ pub(super) fn complete_immediate_output_transaction(
     let accepted = output_transactions
         .accept_immediate_presented(transaction_id, presented_at)
         .map_err(io::Error::other)?;
-    server.finish_prepared_frame();
-    if let Err(error) = output_transactions.finalize_terminal(accepted) {
-        let _ = output_transactions.fail_settlement(
-            accepted,
-            MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(presented_at.get())),
-        );
-        return Err(io::Error::other(error).into());
-    }
+    settle_accepted_output_transaction(output_transactions, accepted, |obligations| {
+        let batch_id = obligations
+            .frame_batch_id()
+            .ok_or_else(|| io::Error::other("Immediate transaction has no frame batch"))?;
+        server.finish_immediate_frame_batch(batch_id)?;
+        Ok(())
+    })?;
     presentation_trace.push(PresentationTransactionEvent::PageflipPresented {
         transaction_id,
         timestamp_ns: presented_at.get(),
@@ -161,28 +206,10 @@ pub(super) fn build_compatibility_transaction(
     Ok(Some(transaction_id))
 }
 
-pub(super) fn fail_transaction(
-    output_transactions: &mut OutputTransactionLedger,
-    transaction_id: Option<OutputTransactionId>,
-    stage: OutputTransactionFailureStage,
-) -> NativeResult<()> {
-    if let Some(transaction_id) = transaction_id {
-        output_transactions
-            .mark_failed(
-                transaction_id,
-                stage,
-                MonotonicTimestampNs::new(monotonic_now_ns()?),
-            )
-            .map_err(io::Error::other)?;
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn present_compatibility_frame(
     scanout: &mut NativeScanoutBackend,
-    kms_backend: &KmsBackendSelection,
-    server: &OwnCompositorServer,
+    server: &mut OwnCompositorServer,
     output_transactions: &mut OutputTransactionLedger,
     output_generation: u64,
     crtc_id: u32,
@@ -192,6 +219,7 @@ pub(super) fn present_compatibility_frame(
     cursor: Option<&AtomicCursorVisualState>,
     cursor_epoch: u64,
     frame_index: u64,
+    present: impl FnOnce(&mut NativeScanoutBackend) -> io::Result<NativePresentResult>,
 ) -> NativeResult<(NativePresentResult, Option<OutputTransactionId>)> {
     let transaction_id = build_compatibility_transaction(
         output_transactions,
@@ -204,7 +232,7 @@ pub(super) fn present_compatibility_frame(
         cursor,
         cursor_epoch,
     )?;
-    let result = scanout.present(kms_backend, cursor).map_err(|error| {
+    let result = present(scanout).map_err(|error| {
         native_runtime_error(
             NativeRuntimeStage::Present,
             scanout.kind(),
@@ -226,20 +254,43 @@ pub(super) fn present_compatibility_frame(
             },
             transaction_id,
         )),
-        Ok(result) => {
-            fail_transaction(
-                output_transactions,
-                transaction_id,
-                OutputTransactionFailureStage::KmsSubmit,
-            )?;
-            Ok((result, transaction_id))
+        Ok(NativePresentResult::Immediate) => Ok((NativePresentResult::Immediate, transaction_id)),
+        Ok(NativePresentResult::Noop) => {
+            if let Some(transaction_id) = transaction_id {
+                settle_dropped_output_transaction(
+                    output_transactions,
+                    transaction_id,
+                    OutputTransactionDropReason::NoVisualChange,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    |obligations| {
+                        let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                            io::Error::other("compatibility Noop transaction has no frame batch")
+                        })?;
+                        server.restore_frame_batch_after_render_failure(batch_id);
+                        Ok(())
+                    },
+                )?;
+            }
+            Ok((NativePresentResult::Noop, None))
         }
         Err(error) => {
-            fail_transaction(
-                output_transactions,
-                transaction_id,
-                OutputTransactionFailureStage::KmsSubmit,
-            )?;
+            if let Some(transaction_id) = transaction_id {
+                settle_failed_output_transaction(
+                    output_transactions,
+                    transaction_id,
+                    OutputTransactionFailureStage::KmsSubmit,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    |obligations| {
+                        let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                            io::Error::other(
+                                "compatibility backend error transaction has no frame batch",
+                            )
+                        })?;
+                        server.restore_frame_batch_after_render_failure(batch_id);
+                        Ok(())
+                    },
+                )?;
+            }
             Err(Box::new(error))
         }
     }
@@ -248,6 +299,7 @@ pub(super) fn present_compatibility_frame(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn register_primary_transaction(
     atomic_commit_arbiter: &mut AtomicCommitArbiter,
+    server: &mut OwnCompositorServer,
     kms_kind: KmsBackendKind,
     token: u64,
     generation: u64,
@@ -281,11 +333,24 @@ pub(super) fn register_primary_transaction(
     ) {
         Ok(registered) => registered,
         Err(error) => {
-            fail_transaction(
-                output_transactions,
-                transaction_id,
-                OutputTransactionFailureStage::BackendCompletion,
-            )?;
+            if let Some(transaction_id) = transaction_id {
+                settle_failed_output_transaction(
+                    output_transactions,
+                    transaction_id,
+                    OutputTransactionFailureStage::BackendCompletion,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    |obligations| {
+                        let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                            io::Error::other("primary registration failure has no frame batch")
+                        })?;
+                        server.discard_frame_batch(
+                            batch_id,
+                            FrameBatchDiscardReason::FatalOutputFailure,
+                        );
+                        Ok(())
+                    },
+                )?;
+            }
             return Err(error.into());
         }
     };
@@ -398,10 +463,12 @@ pub(super) fn submit_cursor_only(
                 },
                 monotonic_now_ns()?,
             ) {
-                fail_transaction(
+                settle_failed_output_transaction(
                     output_transactions,
-                    Some(transaction_id),
+                    transaction_id,
                     OutputTransactionFailureStage::KmsSubmit,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    |_| Ok(()),
                 )?;
                 return Err(Box::new(io::Error::other(error)));
             }
@@ -445,10 +512,12 @@ pub(super) fn submit_cursor_only(
                 }
                 Err(error) if error.kind == AtomicKmsErrorKind::Busy => {
                     atomic_commit_arbiter.cancel(token);
-                    fail_transaction(
+                    settle_failed_output_transaction(
                         output_transactions,
-                        Some(transaction_id),
+                        transaction_id,
                         OutputTransactionFailureStage::KmsSubmit,
+                        MonotonicTimestampNs::new(monotonic_now_ns()?),
+                        |_| Ok(()),
                     )?;
                     defer_cursor_after_busy(
                         cursor_output_arbitration,
@@ -461,10 +530,12 @@ pub(super) fn submit_cursor_only(
                 }
                 Err(error) => {
                     atomic_commit_arbiter.cancel(token);
-                    fail_transaction(
+                    settle_failed_output_transaction(
                         output_transactions,
-                        Some(transaction_id),
+                        transaction_id,
                         OutputTransactionFailureStage::KmsSubmit,
+                        MonotonicTimestampNs::new(monotonic_now_ns()?),
+                        |_| Ok(()),
                     )?;
                     cursor.note_submit_failure();
                     cursor.note_software_fallback();

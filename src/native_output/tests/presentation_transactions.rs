@@ -642,6 +642,43 @@ fn immediate_compatibility_path_never_waits_for_pageflip() {
 }
 
 #[test]
+fn stale_pageflip_cannot_recomplete_immediate_transaction() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let id = ledger.allocate_id().unwrap();
+    let transaction = super::OutputTransaction::compatibility_immediate(
+        id,
+        1,
+        MonotonicTimestampNs::new(10),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        114,
+        test_batch(114),
+    )
+    .unwrap();
+    ledger.insert(transaction).unwrap();
+    let accepted = ledger
+        .accept_immediate_presented(id, MonotonicTimestampNs::new(20))
+        .unwrap();
+    ledger.finalize_terminal(accepted).unwrap();
+
+    assert_eq!(ledger.counters().immediate_presentations, 1);
+    assert_eq!(
+        ledger
+            .accept_presented(
+                id,
+                super::PageFlipToken::new(114).unwrap(),
+                1,
+                MonotonicTimestampNs::new(30),
+                None,
+            )
+            .expect_err("stale pageflip must be rejected"),
+        super::OutputTransactionError::UnknownTransaction
+    );
+    assert_eq!(ledger.counters().immediate_presentations, 1);
+    assert_eq!(ledger.counters().terminal_transitions_finalized, 1);
+}
+
+#[test]
 fn immediate_compatibility_failure_marks_typed_failure() {
     let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
     let id = ledger.allocate_id().unwrap();

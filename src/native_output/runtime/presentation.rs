@@ -15,8 +15,8 @@ use super::presentation_protocol::{
     log_wait_for_presentation,
 };
 use super::presentation_transactions::{
-    complete_immediate_output_transaction, fail_transaction, present_compatibility_frame,
-    register_primary_transaction, submit_cursor_only,
+    complete_immediate_output_transaction, present_compatibility_frame,
+    register_primary_transaction, settle_failed_output_transaction, submit_cursor_only,
 };
 use super::*;
 use oblivion_one::native::kms::KmsBackendKind;
@@ -555,7 +555,6 @@ impl NativeRuntime {
                         })?;
                     present_compatibility_frame(
                         scanout,
-                        kms_backend,
                         server,
                         output_transactions,
                         *drm_file_generation,
@@ -566,6 +565,7 @@ impl NativeRuntime {
                         effective_cursor.as_ref(),
                         cursor_epoch,
                         *frame_index,
+                        |scanout| scanout.present(kms_backend, effective_cursor.as_ref()),
                     )?
                 };
             #[cfg(test)]
@@ -579,6 +579,7 @@ impl NativeRuntime {
                 } => {
                     let atomic_primary_registered = register_primary_transaction(
                         atomic_commit_arbiter,
+                        server,
                         kms_backend.effective_kind(),
                         token,
                         *drm_file_generation,
@@ -664,11 +665,7 @@ impl NativeRuntime {
                     frame_scheduler.note_immediate_completion();
                 }
                 NativePresentResult::Noop => {
-                    fail_transaction(
-                        output_transactions,
-                        compatibility_transaction_id,
-                        OutputTransactionFailureStage::KmsSubmit,
-                    )?;
+                    debug_assert!(compatibility_transaction_id.is_none());
                     perf.log("native.frame_skip", || {
                         vec![
                             NativePerfField::str("reason", "ready_submit_without_ready_frame"),
@@ -747,13 +744,27 @@ impl NativeRuntime {
                                     },
                                     monotonic_now_ns()?,
                                 ) {
-                                    output_transactions
-                                        .mark_failed(
-                                            transaction_id,
-                                            OutputTransactionFailureStage::BackendCompletion,
-                                            MonotonicTimestampNs::new(monotonic_now_ns()?),
-                                        )
-                                        .map_err(io::Error::other)?;
+                                    settle_failed_output_transaction(
+                                        output_transactions,
+                                        transaction_id,
+                                        OutputTransactionFailureStage::BackendCompletion,
+                                        MonotonicTimestampNs::new(monotonic_now_ns()?),
+                                        |obligations| {
+                                            let batch_id = obligations.frame_batch_id().ok_or_else(
+                                                || {
+                                                    io::Error::other(
+                                                        "direct primary registration failure has no frame batch",
+                                                    )
+                                                },
+                                            )?;
+                                            server.discard_frame_batch(
+                                                batch_id,
+                                                FrameBatchDiscardReason::FatalOutputFailure,
+                                            );
+                                            Ok(())
+                                        },
+                                    )
+                                    .map_err(|error| io::Error::other(error.to_string()))?;
                                     return Err(io::Error::other(error).into());
                                 }
                             }
@@ -1052,6 +1063,7 @@ impl NativeRuntime {
                                         )?;
                                     let atomic_primary_registered = register_primary_transaction(
                                         atomic_commit_arbiter,
+                                        server,
                                         kms_backend.effective_kind(),
                                         token,
                                         *drm_file_generation,
@@ -1215,7 +1227,6 @@ impl NativeRuntime {
                                     })?;
                                 present_compatibility_frame(
                                     scanout,
-                                    kms_backend,
                                     server,
                                     output_transactions,
                                     *drm_file_generation,
@@ -1226,6 +1237,9 @@ impl NativeRuntime {
                                     effective_cursor.as_ref(),
                                     cursor_epoch,
                                     *frame_index,
+                                    |scanout| {
+                                        scanout.present(kms_backend, effective_cursor.as_ref())
+                                    },
                                 )?
                             };
                             #[cfg(test)]
@@ -1256,6 +1270,7 @@ impl NativeRuntime {
                                     });
                                     let atomic_primary_registered = register_primary_transaction(
                                         atomic_commit_arbiter,
+                                        server,
                                         kms_backend.effective_kind(),
                                         token,
                                         *drm_file_generation,
@@ -1330,11 +1345,7 @@ impl NativeRuntime {
                                     });
                                 }
                                 NativePresentResult::Noop => {
-                                    fail_transaction(
-                                        output_transactions,
-                                        compatibility_transaction_id,
-                                        OutputTransactionFailureStage::KmsSubmit,
-                                    )?;
+                                    debug_assert!(compatibility_transaction_id.is_none());
                                     if render_ahead {
                                         frame_scheduler.note_render_ahead_ready();
                                         frame_pacing.note_render_ahead_ready(monotonic_now_ns()?);

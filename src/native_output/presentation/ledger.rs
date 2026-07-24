@@ -191,6 +191,10 @@ pub(crate) struct OutputTransactionCounters {
     pub(crate) active_settling_transactions: u64,
     pub(crate) immediate_presentations: u64,
     pub(crate) immediate_presentation_failures: u64,
+    pub(crate) immediate_presentations_accepted: u64,
+    pub(crate) immediate_presentations_finalized: u64,
+    pub(crate) compatibility_noops: u64,
+    pub(crate) compatibility_failures: u64,
     pub(crate) built_composited: u64,
     pub(crate) built_direct: u64,
     pub(crate) built_cursor_only: u64,
@@ -420,6 +424,10 @@ impl OutputTransactionLedger {
                 actual_sequence: None,
             },
         )?;
+        self.counters.immediate_presentations_accepted = self
+            .counters
+            .immediate_presentations_accepted
+            .saturating_add(1);
         Ok(accepted)
     }
 
@@ -475,15 +483,24 @@ impl OutputTransactionLedger {
         reason: OutputTransactionSupersedeReason,
         at: MonotonicTimestampNs,
     ) -> Result<(), OutputTransactionError> {
+        let accepted = self.accept_superseded(id, by, reason, at)?;
+        self.finalize_terminal(accepted)
+    }
+
+    pub(crate) fn accept_superseded(
+        &mut self,
+        id: OutputTransactionId,
+        by: Option<OutputTransactionId>,
+        reason: OutputTransactionSupersedeReason,
+        at: MonotonicTimestampNs,
+    ) -> Result<AcceptedTerminalTransition, OutputTransactionError> {
         let state = self.state(id)?;
         if matches!(state, OutputTransactionState::Submitted { .. }) {
             return Err(
                 self.reject_invalid_transition(state, OutputTransactionTransitionKind::Superseded)
             );
         }
-        let accepted =
-            self.accept_state(id, OutputTransactionTerminal::Superseded { by, reason, at })?;
-        self.finalize_terminal(accepted)
+        self.accept_state(id, OutputTransactionTerminal::Superseded { by, reason, at })
     }
 
     pub(crate) fn mark_failed(
@@ -512,17 +529,6 @@ impl OutputTransactionLedger {
                     stage,
                 }),
             );
-        }
-        if self.active.get(&id).is_some_and(|record| {
-            matches!(
-                record.descriptor.content(),
-                OutputTransactionContent::CompatibilityImmediate { .. }
-            )
-        }) {
-            self.counters.immediate_presentation_failures = self
-                .counters
-                .immediate_presentation_failures
-                .saturating_add(1);
         }
         self.accept_state(id, OutputTransactionTerminal::Failed { stage, at })
     }
@@ -745,6 +751,7 @@ impl OutputTransactionLedger {
             .active
             .remove(&id)
             .ok_or_else(|| self.reject_terminal(OutputTransactionError::UnknownTransaction))?;
+        let content = record.descriptor.content();
         if let Some(batch_id) = record.descriptor.obligations().frame_batch_id()
             && self.obligation_owner.get(&batch_id).copied() == Some(id)
         {
@@ -766,38 +773,57 @@ impl OutputTransactionLedger {
         match terminal {
             OutputTransactionTerminal::Presented { .. } => {
                 self.counters.presented = self.counters.presented.saturating_add(1);
-                match self
-                    .recent_terminal
-                    .back()
-                    .map(|record| record.descriptor.content())
-                {
-                    Some(OutputTransactionContent::Composited { .. }) => {
+                match content {
+                    OutputTransactionContent::Composited { .. } => {
                         self.counters.presented_composited =
                             self.counters.presented_composited.saturating_add(1)
                     }
-                    Some(OutputTransactionContent::Direct { .. }) => {
+                    OutputTransactionContent::Direct { .. } => {
                         self.counters.presented_direct =
                             self.counters.presented_direct.saturating_add(1)
                     }
-                    Some(OutputTransactionContent::CursorOnly { .. }) => {
+                    OutputTransactionContent::CursorOnly { .. } => {
                         self.counters.presented_cursor_only =
                             self.counters.presented_cursor_only.saturating_add(1)
                     }
-                    Some(OutputTransactionContent::CompatibilityImmediate { .. }) => {
+                    OutputTransactionContent::CompatibilityImmediate { .. } => {
                         self.counters.immediate_presentations =
-                            self.counters.immediate_presentations.saturating_add(1)
+                            self.counters.immediate_presentations.saturating_add(1);
+                        self.counters.immediate_presentations_finalized = self
+                            .counters
+                            .immediate_presentations_finalized
+                            .saturating_add(1)
                     }
-                    None => {}
                 }
             }
-            OutputTransactionTerminal::Dropped { .. } => {
-                self.counters.dropped = self.counters.dropped.saturating_add(1)
+            OutputTransactionTerminal::Dropped { reason, .. } => {
+                self.counters.dropped = self.counters.dropped.saturating_add(1);
+                if matches!(reason, OutputTransactionDropReason::NoVisualChange)
+                    && matches!(
+                        content,
+                        OutputTransactionContent::CompatibilityImmediate { .. }
+                    )
+                {
+                    self.counters.compatibility_noops =
+                        self.counters.compatibility_noops.saturating_add(1);
+                }
             }
             OutputTransactionTerminal::Superseded { .. } => {
                 self.counters.superseded = self.counters.superseded.saturating_add(1)
             }
             OutputTransactionTerminal::Failed { .. } => {
-                self.counters.failed = self.counters.failed.saturating_add(1)
+                self.counters.failed = self.counters.failed.saturating_add(1);
+                if matches!(
+                    content,
+                    OutputTransactionContent::CompatibilityImmediate { .. }
+                ) {
+                    self.counters.immediate_presentation_failures = self
+                        .counters
+                        .immediate_presentation_failures
+                        .saturating_add(1);
+                    self.counters.compatibility_failures =
+                        self.counters.compatibility_failures.saturating_add(1);
+                }
             }
         }
         Ok(())

@@ -765,8 +765,13 @@ impl NativeRuntime {
                             *drm_file_generation,
                             MonotonicTimestampNs::new(presented_at_ns),
                             None,
-                            |_| {
-                                server.finish_frame_with_presentation(presentation);
+                            |obligations| {
+                                let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                                    io::Error::other(
+                                        "compatibility pageflip transaction has no frame batch",
+                                    )
+                                })?;
+                                server.finish_presented_frame_batch(batch_id, presentation)?;
                                 Ok(())
                             },
                         )?;

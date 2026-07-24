@@ -50,6 +50,10 @@ pub(super) use planner::{
     NativeCursorOwnerPlan, NativeKmsStartupDecision, decide_native_cursor_owner,
     decide_native_kms_startup,
 };
+pub(crate) use presentation_transactions::{
+    settle_dropped_output_transaction, settle_failed_output_transaction,
+    settle_superseded_output_transaction,
+};
 pub(crate) use session::{NativeSessionLifecycle, NativeSessionTransition};
 #[cfg(test)]
 pub(crate) use session_io::NativeIoRecorder;
@@ -266,7 +270,7 @@ impl Drop for NativeRuntime {
             );
             let transaction_counters = self.output_transactions.counters();
             println!(
-                "typhon presentation: event=output_transaction_summary active={} built={} ready={} submitted={} presented={} dropped={} superseded={} failed={} invalid_transitions={} duplicate_obligations={} active_peak={} history_overwrites={} accepted_terminals={} finalized_terminals={} rejected_terminals={} settlement_failures={} failure_stage_mismatches={} active_settling={} immediate_presentations={} immediate_presentation_failures={} built_composited={} built_direct={} built_cursor_only={} submitted_composited={} submitted_direct={} submitted_cursor_only={} presented_composited={} presented_direct={} presented_cursor_only={}",
+                "typhon presentation: event=output_transaction_summary active={} built={} ready={} submitted={} presented={} dropped={} superseded={} failed={} invalid_transitions={} duplicate_obligations={} active_peak={} history_overwrites={} accepted_terminals={} finalized_terminals={} rejected_terminals={} settlement_failures={} failure_stage_mismatches={} active_settling={} immediate_presentations={} immediate_presentation_failures={} immediate_presentations_accepted={} immediate_presentations_finalized={} compatibility_noops={} compatibility_failures={} built_composited={} built_direct={} built_cursor_only={} submitted_composited={} submitted_direct={} submitted_cursor_only={} presented_composited={} presented_direct={} presented_cursor_only={}",
                 self.output_transactions.active_count(),
                 transaction_counters.built,
                 transaction_counters.ready,
@@ -287,6 +291,10 @@ impl Drop for NativeRuntime {
                 transaction_counters.active_settling_transactions,
                 transaction_counters.immediate_presentations,
                 transaction_counters.immediate_presentation_failures,
+                transaction_counters.immediate_presentations_accepted,
+                transaction_counters.immediate_presentations_finalized,
+                transaction_counters.compatibility_noops,
+                transaction_counters.compatibility_failures,
                 transaction_counters.built_composited,
                 transaction_counters.built_direct,
                 transaction_counters.built_cursor_only,

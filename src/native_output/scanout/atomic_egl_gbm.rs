@@ -25,6 +25,10 @@ use crate::egl_renderer::{
     GlesSceneRenderer, OutputFramebufferOrigin, choose_surfaceless_egl_config, create_gles_context,
     detect_partial_repaint_capabilities, load_egl_image_target_texture_2d,
 };
+use crate::native_output::runtime::{
+    settle_dropped_output_transaction, settle_failed_output_transaction,
+    settle_superseded_output_transaction,
+};
 
 use super::atomic_direct::{direct_candidate_key, direct_scanout_debug};
 use super::*;
@@ -565,41 +569,55 @@ impl AtomicEglGbmScanout {
                 reason,
                 render_us,
             }) => {
-                server.restore_frame_batch_after_render_failure(protocol_batch_id);
-                self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
-                output_transactions
-                    .mark_dropped(
-                        transaction_id,
-                        OutputTransactionDropReason::NoVisualChange,
-                        MonotonicTimestampNs::new(monotonic_now_ns()?),
-                    )
-                    .map_err(io::Error::other)?;
+                settle_dropped_output_transaction(
+                    output_transactions,
+                    transaction_id,
+                    OutputTransactionDropReason::NoVisualChange,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    |obligations| {
+                        let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                            io::Error::other("skipped render transaction has no frame batch")
+                        })?;
+                        server.restore_frame_batch_after_render_failure(batch_id);
+                        self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
+                        Ok(())
+                    },
+                )
+                .map_err(|error| io::Error::other(error.to_string()))?;
                 return Ok(AtomicFrameRenderOutcome::Skipped { reason, render_us });
             }
             Err(error) => {
-                if gpu_sampling_started {
-                    server.discard_frame_batch(
-                        protocol_batch_id,
-                        FrameBatchDiscardReason::FatalOutputFailure,
-                    );
-                    let _ = self
-                        .swapchain_mut()?
-                        .quarantine_rendering(None, OutputQuarantineReason::PostDrawRenderFailure);
+                let failure_stage = if gpu_sampling_started {
+                    OutputTransactionFailureStage::RenderExecution
                 } else {
-                    server.restore_frame_batch_after_render_failure(protocol_batch_id);
-                    self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
-                }
-                output_transactions
-                    .mark_failed(
-                        transaction_id,
+                    OutputTransactionFailureStage::RenderPreparation
+                };
+                settle_failed_output_transaction(
+                    output_transactions,
+                    transaction_id,
+                    failure_stage,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    |obligations| {
+                        let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                            io::Error::other("render failure transaction has no frame batch")
+                        })?;
                         if gpu_sampling_started {
-                            OutputTransactionFailureStage::RenderExecution
+                            server.discard_frame_batch(
+                                batch_id,
+                                FrameBatchDiscardReason::FatalOutputFailure,
+                            );
+                            let _ = self.swapchain_mut()?.quarantine_rendering(
+                                None,
+                                OutputQuarantineReason::PostDrawRenderFailure,
+                            );
                         } else {
-                            OutputTransactionFailureStage::RenderPreparation
-                        },
-                        MonotonicTimestampNs::new(monotonic_now_ns()?),
-                    )
-                    .map_err(io::Error::other)?;
+                            server.restore_frame_batch_after_render_failure(batch_id);
+                            self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
+                        }
+                        Ok(())
+                    },
+                )
+                .map_err(|error| io::Error::other(error.to_string()))?;
                 return Err(error);
             }
         };
@@ -633,17 +651,23 @@ impl AtomicEglGbmScanout {
                 })
             }
             Err(error) => {
-                server.discard_frame_batch(
-                    protocol_batch_id,
-                    FrameBatchDiscardReason::FatalOutputFailure,
-                );
-                output_transactions
-                    .mark_failed(
-                        transaction_id,
-                        OutputTransactionFailureStage::RenderExecution,
-                        MonotonicTimestampNs::new(monotonic_now_ns()?),
-                    )
-                    .map_err(io::Error::other)?;
+                settle_failed_output_transaction(
+                    output_transactions,
+                    transaction_id,
+                    OutputTransactionFailureStage::RenderExecution,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    |obligations| {
+                        let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                            io::Error::other("ready ownership failure has no frame batch")
+                        })?;
+                        server.discard_frame_batch(
+                            batch_id,
+                            FrameBatchDiscardReason::FatalOutputFailure,
+                        );
+                        Ok(())
+                    },
+                )
+                .map_err(|error| io::Error::other(error.to_string()))?;
                 Err(error)
             }
         }
@@ -909,14 +933,20 @@ impl AtomicEglGbmScanout {
             }
             Err(error) => {
                 self.direct.tested_plane_plan = None;
-                server.restore_frame_batch_after_render_failure(protocol_batch_id);
-                output_transactions
-                    .mark_failed(
-                        transaction_id,
-                        OutputTransactionFailureStage::KmsSubmit,
-                        MonotonicTimestampNs::new(monotonic_now_ns()?),
-                    )
-                    .map_err(io::Error::other)?;
+                settle_failed_output_transaction(
+                    output_transactions,
+                    transaction_id,
+                    OutputTransactionFailureStage::KmsSubmit,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    |obligations| {
+                        let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                            io::Error::other("direct submit failure has no frame batch")
+                        })?;
+                        server.restore_frame_batch_after_render_failure(batch_id);
+                        Ok(())
+                    },
+                )
+                .map_err(|error| io::Error::other(error.to_string()))?;
                 self.direct.counters.composited_fallbacks += 1;
                 direct_scanout_debug(format_args!("real submit rejected: {error}"));
                 eprintln!("direct scanout: real Atomic submit rejected: {error}");
@@ -1100,16 +1130,22 @@ impl AtomicEglGbmScanout {
         let Some(frame) = self.swapchain_mut()?.take_ready_for_submission().ok() else {
             return Ok(false);
         };
-        server.restore_frame_batch_after_render_failure(frame.protocol_batch_id);
+        settle_superseded_output_transaction(
+            output_transactions,
+            frame.transaction_id,
+            None,
+            OutputTransactionSupersedeReason::DirectTransition,
+            MonotonicTimestampNs::new(monotonic_now_ns()?),
+            |obligations| {
+                let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                    io::Error::other("direct transition transaction has no frame batch")
+                })?;
+                server.restore_frame_batch_after_render_failure(batch_id);
+                Ok(())
+            },
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
         self.scene.discard_rendered(frame.scene_commit);
-        output_transactions
-            .mark_superseded(
-                frame.transaction_id,
-                None,
-                OutputTransactionSupersedeReason::DirectTransition,
-                MonotonicTimestampNs::new(monotonic_now_ns()?),
-            )
-            .map_err(io::Error::other)?;
         drop(frame.surface_damage);
         Ok(true)
     }
@@ -1204,15 +1240,7 @@ impl AtomicEglGbmScanout {
         Ok(Some(timing))
     }
 
-    fn discard_failed_frame(
-        &mut self,
-        server: &mut OwnCompositorServer,
-        frame: RenderedOutputFrame,
-    ) {
-        server.discard_frame_batch(
-            frame.protocol_batch_id,
-            FrameBatchDiscardReason::FatalOutputFailure,
-        );
+    fn discard_failed_frame_resources(&mut self, frame: RenderedOutputFrame) {
         self.scene.discard_rendered(frame.scene_commit);
         drop(frame.surface_damage);
     }

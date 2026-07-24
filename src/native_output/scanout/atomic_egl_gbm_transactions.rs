@@ -1,4 +1,5 @@
 use super::*;
+use crate::native_output::runtime::settle_failed_output_transaction;
 use oblivion_one::native::kms::AtomicFlipRequest;
 use oblivion_one::native::sync_file::SyncFileDeadlineHint;
 
@@ -31,18 +32,31 @@ impl AtomicEglGbmScanout {
                 Err(error)
                     if matches!(error.raw_os_error(), Some(libc::EBADF) | Some(libc::EFAULT)) =>
                 {
-                    let frame = self.swapchain_mut()?.submission_failed(frame)?;
-                    output_transactions
-                        .mark_failed(
-                            transaction_id,
-                            OutputTransactionFailureStage::BackendOwnershipTransfer,
-                            MonotonicTimestampNs::new(monotonic_now_ns()?),
-                        )
-                        .map_err(io::Error::other)?;
-                    self.discard_failed_frame(server, frame);
-                    return Err(io::Error::other(format!(
+                    let failure = io::Error::other(format!(
                         "invalid native fence deadline-hint contract: {error}"
-                    )));
+                    ));
+                    settle_failed_output_transaction(
+                        output_transactions,
+                        transaction_id,
+                        OutputTransactionFailureStage::BackendOwnershipTransfer,
+                        MonotonicTimestampNs::new(monotonic_now_ns()?),
+                        |obligations| {
+                            let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                                io::Error::other(
+                                    "fence deadline-hint failure transaction has no frame batch",
+                                )
+                            })?;
+                            let frame = self.swapchain_mut()?.submission_failed(frame)?;
+                            server.discard_frame_batch(
+                                batch_id,
+                                FrameBatchDiscardReason::FatalOutputFailure,
+                            );
+                            self.discard_failed_frame_resources(frame);
+                            Ok(())
+                        },
+                    )
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                    return Err(failure);
                 }
                 Err(error) => {
                     self.counters.sync_file_deadline_hints_failed += 1;
@@ -54,15 +68,25 @@ impl AtomicEglGbmScanout {
         let in_fence = match frame.render_fence.take_submission_fd() {
             Ok(fence) => fence,
             Err(error) => {
-                let frame = self.swapchain_mut()?.submission_failed(frame)?;
-                output_transactions
-                    .mark_failed(
-                        transaction_id,
-                        OutputTransactionFailureStage::BackendOwnershipTransfer,
-                        MonotonicTimestampNs::new(monotonic_now_ns()?),
-                    )
-                    .map_err(io::Error::other)?;
-                self.discard_failed_frame(server, frame);
+                settle_failed_output_transaction(
+                    output_transactions,
+                    transaction_id,
+                    OutputTransactionFailureStage::BackendOwnershipTransfer,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    |obligations| {
+                        let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                            io::Error::other("fence export failure transaction has no frame batch")
+                        })?;
+                        let frame = self.swapchain_mut()?.submission_failed(frame)?;
+                        server.discard_frame_batch(
+                            batch_id,
+                            FrameBatchDiscardReason::FatalOutputFailure,
+                        );
+                        self.discard_failed_frame_resources(frame);
+                        Ok(())
+                    },
+                )
+                .map_err(|error| io::Error::other(error.to_string()))?;
                 return Err(error);
             }
         };
@@ -82,31 +106,43 @@ impl AtomicEglGbmScanout {
                 } else {
                     self.counters.atomic_out_fence_missing += 1;
                 }
-                self.swapchain_mut()?.submission_succeeded(
-                    frame,
-                    token,
-                    submission.out_fence,
-                    submit_started_at,
-                    submit_returned_at,
-                )?;
+                self.swapchain_mut()?
+                    .submission_succeeded(
+                        frame,
+                        token,
+                        submission.out_fence,
+                        submit_started_at,
+                        submit_returned_at,
+                    )
+                    .map_err(|error| io::Error::other(error.to_string()))?;
                 output_transactions
                     .mark_submitted(transaction_id, token, submit_returned_at)
                     .map_err(io::Error::other)?;
                 Ok((token.get(), framebuffer.get(), transaction_id))
             }
             Err(error) => {
-                let frame = self.swapchain_mut()?.submission_failed(frame)?;
-                output_transactions
-                    .mark_failed(
-                        transaction_id,
-                        OutputTransactionFailureStage::KmsSubmit,
-                        MonotonicTimestampNs::new(monotonic_now_ns()?),
-                    )
-                    .map_err(io::Error::other)?;
-                self.discard_failed_frame(server, frame);
-                Err(io::Error::other(format!(
-                    "explicit Atomic output submission failed: {error}"
-                )))
+                let failure =
+                    io::Error::other(format!("explicit Atomic output submission failed: {error}"));
+                settle_failed_output_transaction(
+                    output_transactions,
+                    transaction_id,
+                    OutputTransactionFailureStage::KmsSubmit,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    |obligations| {
+                        let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                            io::Error::other("Atomic submit failure transaction has no frame batch")
+                        })?;
+                        let frame = self.swapchain_mut()?.submission_failed(frame)?;
+                        server.discard_frame_batch(
+                            batch_id,
+                            FrameBatchDiscardReason::FatalOutputFailure,
+                        );
+                        self.discard_failed_frame_resources(frame);
+                        Ok(())
+                    },
+                )
+                .map_err(|error| io::Error::other(error.to_string()))?;
+                Err(failure)
             }
         }
     }
