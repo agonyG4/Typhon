@@ -1,4 +1,4 @@
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 
 use super::{
     AtomicCursorVisualState, AtomicFlipSubmission, AtomicKmsError, AtomicKmsErrorKind,
@@ -36,7 +36,7 @@ impl AtomicCommitSubmitter {
         framebuffer: FramebufferId,
         token: PageFlipToken,
         cursor: Option<&AtomicCursorVisualState>,
-        in_fence: Option<OwnedFd>,
+        in_fence: Option<BorrowedFd<'_>>,
         request_out_fence: bool,
         test_only: bool,
     ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
@@ -55,7 +55,7 @@ impl AtomicCommitSubmitter {
         &self,
         framebuffer: FramebufferId,
         token: PageFlipToken,
-        in_fence: Option<OwnedFd>,
+        in_fence: Option<BorrowedFd<'_>>,
         request_out_fence: bool,
         test_only: bool,
     ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
@@ -77,7 +77,7 @@ impl AtomicCommitSubmitter {
         token: PageFlipToken,
         cursor: Option<&AtomicCursorVisualState>,
         touch_cursor: bool,
-        in_fence: Option<OwnedFd>,
+        in_fence: Option<BorrowedFd<'_>>,
         request_out_fence: bool,
         test_only: bool,
     ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
@@ -105,7 +105,7 @@ impl AtomicCommitSubmitter {
             }
             request
         };
-        if let Some(in_fence) = in_fence.as_ref() {
+        if let Some(in_fence) = in_fence {
             let property = self.pipeline.plane_props.in_fence_fd.ok_or_else(|| {
                 AtomicKmsError::new(
                     AtomicKmsErrorKind::MissingProperty,
@@ -147,7 +147,6 @@ impl AtomicCommitSubmitter {
                 "runtime atomic primary update"
             },
         );
-        drop(in_fence);
         match result {
             Ok(()) if !test_only => Ok(AtomicFlipSubmission {
                 out_fence: super::submission::adopt_out_fence(out_fence_storage),

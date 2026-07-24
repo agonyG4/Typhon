@@ -361,9 +361,8 @@ pub(super) fn finish_direct_worker_queued(
         timestamp_ns: queued_at_ns,
     });
     frame_scheduler
-        .note_async_submission(token, queued_at_ns)
+        .reserve_worker_submission(token, transaction_id.get())
         .map_err(io::Error::other)?;
-    frame_scheduler.defer_page_flip_watchdog_to_atomic_arbiter();
     *last_rendered_scene_generation = scene_generation;
     *last_submitted_cursor_epoch = cursor_epoch;
     cursor_output_arbitration.consume(cursor_epoch);
@@ -384,4 +383,18 @@ pub(super) fn direct_worker_admission(
     let worker = worker
         .ok_or_else(|| io::Error::other("worker transport is active without a worker handle"))?;
     Ok(worker.try_reserve_admission_slot().ok())
+}
+
+pub(super) fn worker_cursor_queue_available(
+    worker_mode: bool,
+    worker: Option<&KmsCommitWorkerHandle>,
+    arbiter: &AtomicCommitArbiter,
+) -> bool {
+    worker_mode
+        && arbiter.kernel_commit_submitted()
+        && arbiter.worker_slot_available()
+        && arbiter
+            .kernel_submitted_kind()
+            .is_some_and(|kind| !matches!(kind, AtomicCommitKind::CursorOnly { .. }))
+        && worker.is_some_and(|worker| worker.admission_available())
 }

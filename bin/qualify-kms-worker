@@ -34,20 +34,30 @@ fatal=$(extract_last worker_fatal_events)
 active=$(extract_last worker_active)
 queue_depth=$(extract_last worker_queue_depth)
 inflight=$(extract_last worker_inflight)
+runtime_queue_depth=$(extract_last worker_runtime_queue_depth)
+runtime_queue_depth_max=$(extract_last worker_runtime_queue_depth_max)
+kernel_inflight=$(extract_last worker_kernel_inflight)
+core_capacity=1
 max_input_drain=$(extract_last max_input_drain_us)
 max_submit=$(extract_last worker_submit_duration_ns_max)
 
-printf 'kms-worker jobs=%s/%s queue_full=%s busy=%s/%s mismatches=%s timeouts=%s fatal=%s active=%s queue_depth=%s inflight=%s max_input_drain_us=%s max_submit_ns=%s\n' \
+printf 'kms-worker core_capacity=%s jobs=%s/%s queue_full=%s busy=%s/%s mismatches=%s timeouts=%s fatal=%s active=%s queue_depth=%s runtime_queue_depth=%s runtime_queue_depth_max=%s inflight=%s kernel_inflight=%s max_input_drain_us=%s max_submit_ns=%s\n' \
+    "$core_capacity" \
     "$jobs_enqueued" "$jobs_submitted" "$queue_full" "$busy_deferrals" "$busy_exhausted" \
-    "$mismatches" "$timeouts" "$fatal" "$active" "$queue_depth" "$inflight" \
+    "$mismatches" "$timeouts" "$fatal" "$active" "$queue_depth" "$runtime_queue_depth" \
+    "$runtime_queue_depth_max" "$inflight" "$kernel_inflight" \
     "$max_input_drain" "$max_submit"
 
 failed=0
-for value in "$mismatches" "$timeouts" "$fatal" "$queue_depth" "$inflight"; do
+for value in "$mismatches" "$timeouts" "$fatal" "$queue_depth" "$runtime_queue_depth" \
+    "$kernel_inflight" "$inflight"; do
     if [[ "$value" =~ ^[0-9]+$ ]] && (( value != 0 )); then
         failed=1
     fi
 done
+if [[ "$runtime_queue_depth_max" =~ ^[0-9]+$ ]] && (( runtime_queue_depth_max > core_capacity )); then
+    failed=1
+fi
 if [[ "$active" == "true" ]]; then
     failed=1
 fi

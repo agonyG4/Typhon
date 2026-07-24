@@ -22,7 +22,7 @@ use super::presentation_transactions::{
 };
 use super::presentation_worker::{
     direct_worker_admission, finish_direct_worker_queued, present_cursor_for_presentation,
-    submit_explicit_ready_for_presentation,
+    submit_explicit_ready_for_presentation, worker_cursor_queue_available,
 };
 use super::*;
 use crate::native_output::kms_worker::KmsCommitWorkerTransport;
@@ -365,6 +365,11 @@ impl NativeRuntime {
                 ready_target_current: frame_scheduler
                     .ready_target()
                     .is_none_or(|target| presentation_deadline.is_current(target)),
+                worker_queue_available: worker_mode
+                    && atomic_commit_arbiter.worker_slot_available()
+                    && kms_commit_worker
+                        .as_ref()
+                        .is_some_and(|worker| worker.admission_available()),
             })
         } else {
             frame_scheduler
@@ -452,9 +457,15 @@ impl NativeRuntime {
                 )]
             });
         }
+        let can_queue_worker_cursor = worker_cursor_queue_available(
+            worker_mode,
+            kms_commit_worker.as_ref(),
+            atomic_commit_arbiter,
+        );
+        let atomic_commit_blocks_cursor = atomic_primary_commit_pending && !can_queue_worker_cursor;
         let primary_work_for_cursor = primary_visual_work_pending
             || direct_candidate_changed
-            || atomic_primary_commit_pending
+            || atomic_commit_blocks_cursor
             || scanout.ready_frame_queued()
             || frame_scheduler.ready_frame_queued();
         let cursor_only_allowed = cursor_only_allowed_at_deadline(
@@ -474,7 +485,7 @@ impl NativeRuntime {
             cursor_hardware_usable,
             cursor_visible,
             composition_required,
-            atomic_commit_pending: atomic_primary_commit_pending,
+            atomic_commit_pending: atomic_commit_blocks_cursor,
             cursor_only_allowed,
             render_ahead_requested: scheduler_decision == SchedulerDecision::RenderAhead,
         });
@@ -491,7 +502,7 @@ impl NativeRuntime {
         if presentation_path == NativePresentationPath::CursorOnly
             && let Some(cursor) = atomic_cursor.as_mut()
             && !cursor.failure_latched()
-            && !atomic_primary_commit_pending
+            && (!atomic_commit_arbiter.atomic_commit_pending() || can_queue_worker_cursor)
             && !scanout.ready_frame_queued()
         {
             let desired = effective_cursor.clone();
@@ -536,7 +547,20 @@ impl NativeRuntime {
                 *last_submitted_cursor_epoch = cursor_epoch;
             }
         }
-        if atomic_commit_arbiter.atomic_commit_pending() {
+        let can_queue_worker_next = worker_mode
+            && matches!(
+                scheduler_decision,
+                SchedulerDecision::SubmitReady | SchedulerDecision::SubmitReadyLate
+            )
+            && atomic_commit_arbiter.kernel_commit_submitted()
+            && atomic_commit_arbiter.worker_slot_available()
+            && atomic_commit_arbiter
+                .kernel_submitted_kind()
+                .is_some_and(|kind| !matches!(kind, AtomicCommitKind::CursorOnly { .. }))
+            && kms_commit_worker
+                .as_ref()
+                .is_some_and(|worker| worker.admission_available());
+        if atomic_commit_arbiter.atomic_commit_pending() && !can_queue_worker_next {
             scheduler_decision = SchedulerDecision::WaitForPageFlip;
         }
         if matches!(
@@ -594,7 +618,7 @@ impl NativeRuntime {
                 && direct_scanout_preference.enabled()
                 && (!cursor_visible || *cursor_render_mode == NativeCursorRenderMode::Hardware)
                 && cursor_direct_compatible
-                && !atomic_primary_commit_pending
+                && !atomic_commit_arbiter.atomic_commit_pending()
                 && !scanout.ready_frame_queued()
                 && !scanout.output_render_in_progress()
                 && !scanout.direct_scanout_inhibited()
@@ -1064,12 +1088,18 @@ impl NativeRuntime {
                                         });
                                         cursor.begin_primary_submission(cursor_token, state);
                                     }
-                                    frame_scheduler
-                                        .note_async_submission(token, monotonic_now_ns()?)
-                                        .map_err(io::Error::other)?;
-                                    if atomic_primary_registered {
+                                    if worker_queued {
                                         frame_scheduler
-                                            .defer_page_flip_watchdog_to_atomic_arbiter();
+                                            .reserve_worker_submission(token, transaction_id.get())
+                                            .map_err(io::Error::other)?;
+                                    } else {
+                                        frame_scheduler
+                                            .note_async_submission(token, monotonic_now_ns()?)
+                                            .map_err(io::Error::other)?;
+                                        if atomic_primary_registered {
+                                            frame_scheduler
+                                                .defer_page_flip_watchdog_to_atomic_arbiter();
+                                        }
                                     }
                                     frame_pacing.note_submit(
                                         token,

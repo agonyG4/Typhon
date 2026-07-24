@@ -2,8 +2,8 @@
 
 use super::payload::{KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy};
 use super::queue::{
-    KmsWorkerLifecycle, RESULT_EVENT_CAPACITY, WorkerInFlight, WorkerMetricsSnapshot, WorkerShared,
-    create_eventfd, drain_eventfd, notify_eventfd,
+    KmsWorkerFatalJob, KmsWorkerLifecycle, RESULT_EVENT_CAPACITY, WorkerInFlight,
+    WorkerMetricsSnapshot, WorkerShared, create_eventfd, drain_eventfd, notify_eventfd,
 };
 use super::{
     KmsCommitAdmissionPermit, KmsCommitJob, KmsCommitTimingModel, KmsWorkerAdmissionError,
@@ -13,7 +13,7 @@ use oblivion_one::native::kms::AtomicCommitSubmitter;
 use oblivion_one::native::kms::{AtomicKmsError, AtomicKmsErrorKind, PageFlipToken};
 use std::{
     io,
-    os::fd::{AsRawFd, OwnedFd},
+    os::fd::{AsRawFd, BorrowedFd, OwnedFd},
     sync::{Arc, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -25,8 +25,7 @@ pub(crate) struct KmsWorkerSubmission {
 }
 
 pub(crate) trait KmsCommitExecutor: Send + Sync {
-    fn submit(&self, job: &mut KmsCommitJob)
-    -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure>;
+    fn submit(&self, job: &KmsCommitJob) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure>;
 }
 
 #[derive(Debug)]
@@ -107,6 +106,8 @@ pub(crate) enum KmsCommitWorkerStartError {
 pub(crate) enum KmsWorkerAckError {
     NoInFlightCommit,
     TokenMismatch,
+    TransactionMismatch,
+    GenerationMismatch,
 }
 
 #[derive(Debug)]
@@ -162,6 +163,35 @@ impl KmsCommitWorkerHandle {
         self.shared.result_fd.as_raw_fd()
     }
 
+    pub(crate) fn fatal_reason(&self) -> Option<KmsWorkerFatalReason> {
+        match self
+            .shared
+            .fatal_reason_code
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            1 => Some(KmsWorkerFatalReason::Panic),
+            2 => Some(KmsWorkerFatalReason::EventNotification),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn admission_available(&self) -> bool {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !matches!(state.lifecycle, KmsWorkerLifecycle::Running) {
+            return false;
+        }
+        let occupied = state.queued.len()
+            + state.reserved
+            + usize::from(state.executing)
+            + usize::from(state.inflight.is_some());
+        let active = usize::from(state.executing || state.inflight.is_some());
+        occupied < active.saturating_add(super::queue::QUEUED_JOB_CAPACITY)
+    }
+
     pub(crate) fn drain_eventfd(&self) -> io::Result<()> {
         drain_eventfd(&self.shared.result_fd)
     }
@@ -175,6 +205,16 @@ impl KmsCommitWorkerHandle {
         let events = results.drain(..).collect();
         self.shared.result_space.notify_all();
         events
+    }
+
+    pub(crate) fn take_fatal_jobs(&self) -> Vec<KmsWorkerFatalJob> {
+        std::mem::take(
+            &mut *self
+                .shared
+                .fatal_jobs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
     }
 
     pub(crate) fn metrics_snapshot(&self) -> WorkerMetricsSnapshot {
@@ -202,21 +242,96 @@ impl KmsCommitWorkerHandle {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub(crate) fn record_scheduler_queued_cancellation(&self) {
+        self.shared
+            .metrics
+            .scheduler_queued_cancellations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_scheduler_cancel_mismatch(&self) {
+        self.shared
+            .metrics
+            .scheduler_cancel_mismatches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_unnotified_fatal_health_check(&self) {
+        self.shared
+            .metrics
+            .unnotified_fatal_health_checks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_runtime_queue_state(&self, queue_depth: usize, kernel_inflight: bool) {
+        let depth = u64::try_from(queue_depth).unwrap_or(u64::MAX);
+        self.shared
+            .metrics
+            .runtime_queue_depth
+            .store(depth, std::sync::atomic::Ordering::Relaxed);
+        self.shared
+            .metrics
+            .runtime_queue_depth_max
+            .fetch_max(depth, std::sync::atomic::Ordering::Relaxed);
+        self.shared.metrics.runtime_kernel_inflight.store(
+            u64::from(kernel_inflight),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     pub(crate) fn request_quiesce(&self) {
         self.shared.request_quiesce();
     }
 
-    pub(crate) fn ack_pageflip(&self, token: PageFlipToken) -> Result<(), KmsWorkerAckError> {
+    pub(crate) fn ack_pageflip(
+        &self,
+        token: PageFlipToken,
+        transaction_id: OutputTransactionId,
+        output_generation: u64,
+    ) -> Result<(), KmsWorkerAckError> {
         let mut state = self
             .shared
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(inflight) = state.inflight else {
+            self.shared
+                .metrics
+                .duplicate_pageflip_acks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(KmsWorkerAckError::NoInFlightCommit);
         };
         if inflight.token != token {
+            self.shared
+                .metrics
+                .result_mismatches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(KmsWorkerAckError::TokenMismatch);
+        }
+        if inflight.transaction_id != transaction_id {
+            self.shared
+                .metrics
+                .result_mismatches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(KmsWorkerAckError::TransactionMismatch);
+        }
+        if inflight.output_generation != output_generation {
+            self.shared
+                .metrics
+                .result_mismatches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(KmsWorkerAckError::GenerationMismatch);
+        }
+        if matches!(inflight.kind, AtomicCommitKind::CursorOnly { .. }) {
+            self.shared
+                .metrics
+                .cursor_pageflip_acks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.shared
+                .metrics
+                .primary_pageflip_acks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         state.inflight = None;
         drop(state);
@@ -275,10 +390,7 @@ pub(crate) struct AtomicKmsWorkerExecutor {
 }
 
 impl KmsCommitExecutor for AtomicKmsWorkerExecutor {
-    fn submit(
-        &self,
-        job: &mut KmsCommitJob,
-    ) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure> {
+    fn submit(&self, job: &KmsCommitJob) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure> {
         let touch_cursor = !matches!(&job.cursor, KmsCursorUpdate::Unchanged);
         let cursor = match &job.cursor {
             KmsCursorUpdate::Set(state) => Some(state),
@@ -316,19 +428,28 @@ impl KmsCommitExecutor for AtomicKmsWorkerExecutor {
             }
         }
 
-        let submission = match &mut job.primary {
+        let input_fence = match &job.primary {
+            KmsPrimaryUpdate::Framebuffer { in_fence, .. } => in_fence.as_ref().map(|fence| {
+                // SAFETY: the job-owned OwnedFd remains alive through the
+                // complete ioctl and is released only after the executor
+                // returns, including every EBUSY retry.
+                unsafe { BorrowedFd::borrow_raw(fence.as_raw_fd()) }
+            }),
+            KmsPrimaryUpdate::Unchanged => None,
+        };
+        let submission = match &job.primary {
             KmsPrimaryUpdate::Framebuffer {
                 framebuffer,
-                in_fence,
+                in_fence: _,
                 request_out_fence,
+                ..
             } => {
-                let in_fence = in_fence.take();
                 if touch_cursor {
                     self.submitter.submit_primary(
                         *framebuffer,
                         job.token,
                         cursor,
-                        in_fence,
+                        input_fence,
                         *request_out_fence,
                         false,
                     )
@@ -336,7 +457,7 @@ impl KmsCommitExecutor for AtomicKmsWorkerExecutor {
                     self.submitter.submit_primary_without_cursor(
                         *framebuffer,
                         job.token,
-                        in_fence,
+                        input_fence,
                         *request_out_fence,
                         false,
                     )
@@ -382,14 +503,17 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                 .metrics
                 .late_wakeups
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            publish_event(
+            if !publish_event(
                 &shared,
                 KmsWorkerEvent::SubmitLate {
                     transaction_id: job.transaction_id,
                     token: job.token,
                     late_by_ns: decision.late_by_ns,
                 },
-            );
+            ) {
+                retain_fatal_job(&shared, job, false);
+                return;
+            }
         }
 
         let mut retries = 0u8;
@@ -402,8 +526,13 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                 state.executing = true;
             }
             let submit_started_at = monotonic_now_ns();
-            match executor.submit(&mut job) {
-                Ok(submission) => {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.submit(&job))) {
+                Ok(Ok(submission)) => {
+                    if let KmsPrimaryUpdate::Framebuffer { in_fence, .. } = &mut job.primary {
+                        // The ioctl has consumed the input-fence contract. The
+                        // fence must not remain owned while waiting for the pageflip.
+                        let _ = in_fence.take();
+                    }
                     let mut state = shared
                         .state
                         .lock()
@@ -436,7 +565,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     // The executor's success is associated with the job before
                     // the result is published, so admission cannot advance
                     // past one kernel commit in flight.
-                    set_inflight(&shared, job.token);
+                    set_inflight(&shared, &job);
                     let event = KmsWorkerEvent::Submitted {
                         transaction_id: job.transaction_id,
                         token: job.token,
@@ -448,7 +577,9 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         out_fence: submission.out_fence,
                         cursor: job.cursor.clone(),
                     };
-                    publish_event(&shared, event);
+                    if !publish_event(&shared, event) {
+                        return;
+                    }
                     if !wait_for_pageflip_or_quiesce(&shared, job.transaction_id, job.token) {
                         return;
                     }
@@ -464,7 +595,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         );
                     break;
                 }
-                Err(failure) if failure.error.kind == AtomicKmsErrorKind::Busy => {
+                Ok(Err(failure)) if failure.error.kind == AtomicKmsErrorKind::Busy => {
                     let mut state = shared
                         .state
                         .lock()
@@ -476,13 +607,15 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         .busy_deferrals
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if retries >= 2 {
-                        publish_event(
+                        if !publish_event(
                             &shared,
                             KmsWorkerEvent::BusyExhausted {
                                 job,
                                 error: failure.error,
                             },
-                        );
+                        ) {
+                            return;
+                        }
                         shared
                             .metrics
                             .busy_exhausted
@@ -494,18 +627,37 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         break;
                     }
                     retries += 1;
+                    if matches!(
+                        &job.primary,
+                        KmsPrimaryUpdate::Framebuffer {
+                            in_fence: Some(_),
+                            ..
+                        }
+                    ) {
+                        shared
+                            .metrics
+                            .input_fence_retry_attempts
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        shared
+                            .metrics
+                            .input_fence_retry_preserved
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     shared
                         .metrics
                         .busy_retries
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    publish_event(
+                    if !publish_event(
                         &shared,
                         KmsWorkerEvent::BusyDeferred {
                             transaction_id: job.transaction_id,
                             token: job.token,
                             retry: retries,
                         },
-                    );
+                    ) {
+                        retain_fatal_job(&shared, job, false);
+                        return;
+                    }
                     let delay = if retries == 1 {
                         Duration::from_micros(100)
                     } else {
@@ -518,7 +670,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         return;
                     }
                 }
-                Err(failure) if failure.error.kind == AtomicKmsErrorKind::TestOnlyRejected => {
+                Ok(Err(failure)) if failure.error.kind == AtomicKmsErrorKind::TestOnlyRejected => {
                     let mut state = shared
                         .state
                         .lock()
@@ -529,16 +681,18 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         .metrics
                         .jobs_rejected
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    publish_event(
+                    if !publish_event(
                         &shared,
                         KmsWorkerEvent::TestRejected {
                             job,
                             error: failure.error,
                         },
-                    );
+                    ) {
+                        return;
+                    }
                     break;
                 }
-                Err(failure) => {
+                Ok(Err(failure)) => {
                     let mut state = shared
                         .state
                         .lock()
@@ -549,14 +703,27 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         .metrics
                         .jobs_rejected
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    publish_event(
+                    if !publish_event(
                         &shared,
                         KmsWorkerEvent::SubmitRejected {
                             job,
                             error: failure.error,
                         },
-                    );
+                    ) {
+                        return;
+                    }
                     break;
+                }
+                Err(_) => {
+                    let mut state = shared
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.executing = false;
+                    drop(state);
+                    retain_fatal_job(&shared, job, true);
+                    mark_fatal(&shared, KmsWorkerFatalReason::Panic, true);
+                    return;
                 }
             }
         }
@@ -594,12 +761,17 @@ fn take_next_job(shared: &Arc<WorkerShared>) -> Option<KmsCommitJob> {
     }
 }
 
-fn set_inflight(shared: &Arc<WorkerShared>, token: PageFlipToken) {
+fn set_inflight(shared: &Arc<WorkerShared>, job: &KmsCommitJob) {
     let mut state = shared
         .state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.inflight = Some(WorkerInFlight { token });
+    state.inflight = Some(WorkerInFlight {
+        token: job.token,
+        transaction_id: job.transaction_id,
+        output_generation: job.output_generation,
+        kind: job.kind,
+    });
 }
 
 fn wait_for_pageflip_or_quiesce(
@@ -636,14 +808,16 @@ fn wait_for_pageflip_or_quiesce(
         {
             timeout_reported = true;
             drop(state);
-            publish_event(
+            if !publish_event(
                 shared,
                 KmsWorkerEvent::PageflipTimeout {
                     transaction_id,
                     token,
                     detected_at: monotonic_now_ns(),
                 },
-            );
+            ) {
+                return false;
+            }
             shared
                 .metrics
                 .pageflip_timeouts
@@ -689,7 +863,8 @@ fn quiesce_with_jobs(shared: &Arc<WorkerShared>, mut returned_jobs: Vec<KmsCommi
     publish_event(shared, KmsWorkerEvent::Quiesced { returned_jobs });
 }
 
-fn publish_event(shared: &Arc<WorkerShared>, event: KmsWorkerEvent) {
+fn publish_event(shared: &Arc<WorkerShared>, event: KmsWorkerEvent) -> bool {
+    let uncertain_submit = matches!(&event, KmsWorkerEvent::Submitted { .. });
     let mut results = shared
         .results
         .lock()
@@ -702,7 +877,30 @@ fn publish_event(shared: &Arc<WorkerShared>, event: KmsWorkerEvent) {
     }
     results.push_back(event);
     drop(results);
-    let _ = notify_eventfd(&shared.result_fd);
+    if notify_eventfd(&shared.result_fd).is_ok() {
+        return true;
+    }
+    shared
+        .metrics
+        .eventfd_notification_failures
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    mark_fatal(
+        shared,
+        KmsWorkerFatalReason::EventNotification,
+        uncertain_submit,
+    );
+    false
+}
+
+fn retain_fatal_job(shared: &Arc<WorkerShared>, job: KmsCommitJob, uncertain_submit: bool) {
+    shared
+        .fatal_jobs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(KmsWorkerFatalJob {
+            job,
+            uncertain_submit,
+        });
 }
 
 fn mark_fatal(shared: &Arc<WorkerShared>, reason: KmsWorkerFatalReason, uncertain_submit: bool) {
@@ -710,19 +908,53 @@ fn mark_fatal(shared: &Arc<WorkerShared>, reason: KmsWorkerFatalReason, uncertai
         .state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if matches!(state.lifecycle, KmsWorkerLifecycle::Fatal) {
+        return;
+    }
+    let queued_jobs = state.queued.drain(..).collect::<Vec<_>>();
     state.lifecycle = KmsWorkerLifecycle::Fatal;
     drop(state);
+    if !queued_jobs.is_empty() {
+        let mut fatal_jobs = shared
+            .fatal_jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        fatal_jobs.extend(queued_jobs.into_iter().map(|job| KmsWorkerFatalJob {
+            job,
+            uncertain_submit: false,
+        }));
+    }
+    shared.fatal_reason_code.store(
+        match reason {
+            KmsWorkerFatalReason::Panic => 1,
+            KmsWorkerFatalReason::EventNotification => 2,
+        },
+        std::sync::atomic::Ordering::Release,
+    );
     shared
         .metrics
         .fatal_events
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    publish_event(
-        shared,
-        KmsWorkerEvent::Fatal {
-            reason,
-            uncertain_submit,
-        },
-    );
+    let mut results = shared
+        .results
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while results.len() >= RESULT_EVENT_CAPACITY {
+        results = shared
+            .result_space
+            .wait(results)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    results.push_back(KmsWorkerEvent::Fatal {
+        reason,
+        uncertain_submit,
+    });
+    drop(results);
+    if let Err(error) = notify_eventfd(&shared.result_fd) {
+        // The shared fatal state is authoritative when the notification fd
+        // itself is unavailable; this write is only a best-effort wake.
+        eprintln!("native KMS worker: fatal-state notification failed: {error}");
+    }
 }
 
 fn monotonic_now_ns() -> u64 {

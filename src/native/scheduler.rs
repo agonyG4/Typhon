@@ -18,6 +18,7 @@ pub enum SchedulerDecision {
     WaitForRefresh,
     WaitForBuffer,
     WaitForPageFlip,
+    WaitForWorkerQueue,
     PageFlipWatchdogExpired,
 }
 
@@ -28,6 +29,7 @@ pub enum SchedulerState {
     ProtocolWorkQueued,
     RefreshDeadlineArmed,
     PageFlipPending,
+    WorkerQueued,
     ReadyFrameQueued,
 }
 
@@ -56,6 +58,7 @@ pub struct SchedulerFrameContext {
     pub render_ahead_allowed: bool,
     pub ready_frame_present: bool,
     pub ready_target_current: bool,
+    pub worker_queue_available: bool,
 }
 
 impl SchedulerCapabilities {
@@ -112,6 +115,8 @@ pub struct NativeFrameScheduler {
     protocol_work_queued: bool,
     pending_page_flip_token: Option<u64>,
     pending_page_flip_submitted_at_ns: Option<u64>,
+    pending_page_flip_transaction_id: Option<u64>,
+    worker_queued: Option<WorkerSubmissionReservation>,
     ready_frame_queued: bool,
     ready_target: Option<PresentationTarget>,
     refresh_deadline_ns: Option<u64>,
@@ -119,6 +124,19 @@ pub struct NativeFrameScheduler {
     watchdog_interval_ns: u64,
     watchdog_timeout_count: u64,
     watchdog_reported: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkerSubmissionReservation {
+    token: u64,
+    transaction_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionReservationState {
+    None,
+    WorkerQueued { token: u64, transaction_id: u64 },
+    KernelSubmitted { token: u64, transaction_id: u64 },
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +257,8 @@ impl NativeFrameScheduler {
             protocol_work_queued: false,
             pending_page_flip_token: None,
             pending_page_flip_submitted_at_ns: None,
+            pending_page_flip_transaction_id: None,
+            worker_queued: None,
             ready_frame_queued: false,
             ready_target: None,
             refresh_deadline_ns: None,
@@ -295,12 +315,16 @@ impl NativeFrameScheduler {
             render_ahead_allowed: false,
             ready_frame_present: self.ready_frame_queued,
             ready_target_current: true,
+            worker_queue_available: false,
         })
     }
 
     pub fn decision_with_context(&mut self, context: SchedulerFrameContext) -> SchedulerDecision {
         let now_ns = context.now.get();
         let _predicted_total_cost = context.predicted_total_cost;
+        if self.worker_queued.is_some() {
+            return SchedulerDecision::WaitForWorkerQueue;
+        }
         if context.pacing_mode == NativeOutputPacingMode::ReactiveDouble {
             if self.pending_page_flip_token.is_some() {
                 if self.visual_work_queued {
@@ -327,6 +351,25 @@ impl NativeFrameScheduler {
         }
         if self.pending_page_flip_token.is_some() {
             if self.visual_work_queued {
+                if (context.ready_frame_present || self.ready_frame_queued)
+                    && context.worker_queue_available
+                    && context.render_ahead_allowed
+                    && context.capabilities.render_ahead_allowed()
+                {
+                    if context
+                        .presentation_target
+                        .is_some_and(|target| now_ns < target.submit_not_before().get())
+                    {
+                        return SchedulerDecision::WaitForRefresh;
+                    }
+                    if context
+                        .presentation_target
+                        .is_some_and(|target| now_ns >= target.presentation_time.get())
+                    {
+                        return SchedulerDecision::SubmitReadyLate;
+                    }
+                    return SchedulerDecision::SubmitReady;
+                }
                 if context.ready_frame_present || self.ready_frame_queued {
                     return SchedulerDecision::WaitForPageFlip;
                 }
@@ -411,7 +454,7 @@ impl NativeFrameScheduler {
         if token == 0 {
             return Err("page flip token must be nonzero");
         }
-        if self.pending_page_flip_token.is_some() {
+        if self.pending_page_flip_token.is_some() || self.worker_queued.is_some() {
             return Err("page flip already pending");
         }
         self.visual_work_queued = false;
@@ -419,6 +462,7 @@ impl NativeFrameScheduler {
         self.refresh_deadline_ns = None;
         self.pending_page_flip_token = Some(token);
         self.pending_page_flip_submitted_at_ns = Some(now_ns);
+        self.pending_page_flip_transaction_id = Some(0);
         self.watchdog_deadline_ns = Some(now_ns.saturating_add(self.watchdog_interval_ns));
         self.watchdog_reported = false;
         Ok(())
@@ -443,6 +487,78 @@ impl NativeFrameScheduler {
         Ok(())
     }
 
+    pub fn reserve_worker_submission(
+        &mut self,
+        token: u64,
+        transaction_id: u64,
+    ) -> Result<(), &'static str> {
+        if token == 0 || transaction_id == 0 {
+            return Err("worker submission identity must be nonzero");
+        }
+        if self.worker_queued.is_some() {
+            return Err("worker submission already queued");
+        }
+        self.worker_queued = Some(WorkerSubmissionReservation {
+            token,
+            transaction_id,
+        });
+        self.visual_work_queued = false;
+        self.protocol_work_queued = false;
+        self.ready_frame_queued = false;
+        self.ready_target = None;
+        self.refresh_deadline_ns = None;
+        Ok(())
+    }
+
+    pub fn confirm_kernel_submission(
+        &mut self,
+        token: u64,
+        submitted_at_ns: u64,
+    ) -> Result<(), &'static str> {
+        let Some(reservation) = self.worker_queued else {
+            return Err("no worker submission is queued");
+        };
+        if reservation.token != token {
+            return Err("worker submission token does not match reservation");
+        }
+        if self.pending_page_flip_token.is_some() {
+            return Err("a kernel page flip is already pending");
+        }
+        self.worker_queued = None;
+        self.pending_page_flip_token = Some(token);
+        self.pending_page_flip_submitted_at_ns = Some(submitted_at_ns);
+        self.pending_page_flip_transaction_id = Some(reservation.transaction_id);
+        self.watchdog_deadline_ns = Some(submitted_at_ns.saturating_add(self.watchdog_interval_ns));
+        self.watchdog_reported = false;
+        Ok(())
+    }
+
+    pub fn cancel_worker_submission(
+        &mut self,
+        token: u64,
+        transaction_id: u64,
+    ) -> Result<(), &'static str> {
+        let Some(reservation) = self.worker_queued else {
+            return Err("worker reservation is not queued");
+        };
+        if reservation.token != token || reservation.transaction_id != transaction_id {
+            return Err("worker reservation identity does not match");
+        }
+        self.worker_queued = None;
+        self.visual_work_queued = true;
+        self.protocol_work_queued = false;
+        self.refresh_deadline_ns = None;
+        Ok(())
+    }
+
+    pub fn complete_kernel_pageflip(
+        &mut self,
+        token: u64,
+        observed_ns: u64,
+    ) -> PageFlipCompletionResult {
+        self.note_page_flip_completion(token, observed_ns)
+    }
+
     pub fn discard_ready_frame(&mut self) {
         self.ready_frame_queued = false;
         self.ready_target = None;
@@ -464,6 +580,7 @@ impl NativeFrameScheduler {
             .pending_page_flip_submitted_at_ns
             .take()
             .unwrap_or(observed_ns);
+        self.pending_page_flip_transaction_id = None;
         self.watchdog_deadline_ns = None;
         self.watchdog_reported = false;
         self.anchor_ns = observed_ns;
@@ -491,6 +608,8 @@ impl NativeFrameScheduler {
     pub fn abandon_for_session_suspend(&mut self) {
         self.pending_page_flip_token = None;
         self.pending_page_flip_submitted_at_ns = None;
+        self.pending_page_flip_transaction_id = None;
+        self.worker_queued = None;
         self.ready_frame_queued = false;
         self.ready_target = None;
         self.refresh_deadline_ns = None;
@@ -523,6 +642,30 @@ impl NativeFrameScheduler {
         self.pending_page_flip_token.is_some()
     }
 
+    pub fn worker_submission_queued(&self) -> bool {
+        self.worker_queued.is_some()
+    }
+
+    pub fn worker_submission_available(&self) -> bool {
+        self.worker_queued.is_none()
+    }
+
+    pub fn submission_reservation_state(&self) -> SubmissionReservationState {
+        if let Some(reservation) = self.worker_queued {
+            return SubmissionReservationState::WorkerQueued {
+                token: reservation.token,
+                transaction_id: reservation.transaction_id,
+            };
+        }
+        if let Some(token) = self.pending_page_flip_token {
+            return SubmissionReservationState::KernelSubmitted {
+                token,
+                transaction_id: self.pending_page_flip_transaction_id.unwrap_or(0),
+            };
+        }
+        SubmissionReservationState::None
+    }
+
     pub fn ready_frame_queued(&self) -> bool {
         self.ready_frame_queued
     }
@@ -550,6 +693,8 @@ impl NativeFrameScheduler {
     pub fn state(&self) -> SchedulerState {
         if self.pending_page_flip_token.is_some() {
             SchedulerState::PageFlipPending
+        } else if self.worker_queued.is_some() {
+            SchedulerState::WorkerQueued
         } else if self.ready_frame_queued {
             SchedulerState::ReadyFrameQueued
         } else if self.visual_work_queued {
@@ -601,6 +746,7 @@ mod tests {
             render_ahead_allowed: true,
             ready_frame_present,
             ready_target_current: true,
+            worker_queue_available: false,
         }
     }
 

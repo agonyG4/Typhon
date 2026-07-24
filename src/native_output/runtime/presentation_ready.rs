@@ -181,11 +181,20 @@ pub(super) fn submit_ready_frame(
                 KmsBackendKind::Atomic => NativeIoOperation::AtomicCommit,
                 KmsBackendKind::Legacy => NativeIoOperation::LegacyCommit,
             });
-            frame_scheduler
-                .note_ready_submission(token, monotonic_now_ns()?)
-                .map_err(io::Error::other)?;
-            if atomic_primary_registered {
-                frame_scheduler.defer_page_flip_watchdog_to_atomic_arbiter();
+            if worker_mode {
+                let transaction_id = transaction_id.ok_or_else(|| {
+                    io::Error::other("worker Atomic submission has no transaction ID")
+                })?;
+                frame_scheduler
+                    .reserve_worker_submission(token, transaction_id.get())
+                    .map_err(io::Error::other)?;
+            } else {
+                frame_scheduler
+                    .note_ready_submission(token, monotonic_now_ns()?)
+                    .map_err(io::Error::other)?;
+                if atomic_primary_registered {
+                    frame_scheduler.defer_page_flip_watchdog_to_atomic_arbiter();
+                }
             }
             frame_pacing.note_submit(token, monotonic_now_ns()?, true, pacing_mode);
             if explicit_submission

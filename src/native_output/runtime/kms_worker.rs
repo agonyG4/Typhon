@@ -78,11 +78,13 @@ pub(super) fn queue_cursor_only(
         output_generation,
         MonotonicTimestampNs::new(queued_at_ns),
     ) {
-        let _ = output_transactions.mark_failed(
+        settle_failed_output_transaction(
+            output_transactions,
             transaction_id,
             OutputTransactionFailureStage::KmsSubmit,
             MonotonicTimestampNs::new(queued_at_ns),
-        );
+            |_| Ok(()),
+        )?;
         return Err(io::Error::other(error).into());
     }
     if let Err(error) = atomic_commit_arbiter.reserve_worker_queued(
@@ -130,13 +132,13 @@ pub(super) fn queue_cursor_only(
     if let Err(error) = permit.enqueue(job) {
         drop(error.job);
         atomic_commit_arbiter.reject_worker_queued(token);
-        output_transactions
-            .mark_failed(
-                transaction_id,
-                OutputTransactionFailureStage::KmsSubmit,
-                MonotonicTimestampNs::new(monotonic_now_ns()?),
-            )
-            .map_err(io::Error::other)?;
+        settle_failed_output_transaction(
+            output_transactions,
+            transaction_id,
+            OutputTransactionFailureStage::KmsSubmit,
+            MonotonicTimestampNs::new(monotonic_now_ns()?),
+            |_| Ok(()),
+        )?;
         return Err(io::Error::other(format!(
             "cursor Atomic worker enqueue failed: {:?}",
             error.reason
@@ -508,6 +510,67 @@ pub(super) fn drain_worker_eventfd(
 }
 
 impl NativeRuntime {
+    pub(super) fn check_kms_commit_worker_health(&mut self) -> NativeResult<()> {
+        let Some(reason) = self
+            .kms_commit_worker
+            .as_ref()
+            .and_then(KmsCommitWorkerHandle::fatal_reason)
+        else {
+            return Ok(());
+        };
+        let events = self
+            .kms_commit_worker
+            .as_ref()
+            .map(KmsCommitWorkerHandle::drain_events)
+            .unwrap_or_default();
+        if let Some(worker) = self.kms_commit_worker.as_ref() {
+            worker.record_unnotified_fatal_health_check();
+        }
+        let mut event_error = None;
+        for event in events {
+            if let Err(error) = self.process_kms_worker_event(event) {
+                event_error = Some(error.to_string());
+            }
+        }
+        let fatal_jobs = self
+            .kms_commit_worker
+            .as_ref()
+            .map(KmsCommitWorkerHandle::take_fatal_jobs)
+            .unwrap_or_default();
+        for fatal_job in fatal_jobs {
+            if !fatal_job.uncertain_submit {
+                self.fail_queued_worker_job(
+                    fatal_job.job,
+                    AtomicKmsError::new(
+                        oblivion_one::native::kms::AtomicKmsErrorKind::FlipRejected,
+                        "KMS worker result notification failed before submit completion",
+                    ),
+                )?;
+            }
+        }
+        self.quarantine_after_worker_fatal()?;
+        if let Some(error) = event_error {
+            return Err(io::Error::other(error).into());
+        }
+        Err(io::Error::other(format!(
+            "Atomic KMS worker health check observed fatal state: {reason:?}"
+        ))
+        .into())
+    }
+
+    pub(super) fn quarantine_after_worker_fatal(&mut self) -> NativeResult<()> {
+        self.frame_scheduler.abandon_for_session_suspend();
+        self.atomic_commit_arbiter.abandon_for_recovery();
+        self.deferred_worker_pageflip = None;
+        self.deferred_worker_completion = None;
+        self.worker_timeout_pending = None;
+        if let Some(token) = self.output_render_fence_token.take() {
+            self.event_loop.unregister(token)?;
+        }
+        self.scanout.suspend_page_flip()?;
+        Ok(())
+    }
+
     pub(super) fn restart_kms_commit_worker_after_recovery(&mut self) -> NativeResult<()> {
         if self.kms_commit_worker_transport
             != crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
@@ -579,8 +642,8 @@ impl NativeRuntime {
                 cursor,
             } => {
                 if output_generation != self.drm_file_generation
-                    || self.atomic_commit_arbiter.pending_atomic_token() != Some(token)
-                    || self.atomic_commit_arbiter.pending_atomic_kind() != Some(kind)
+                    || self.atomic_commit_arbiter.worker_queued_token() != Some(token)
+                    || self.atomic_commit_arbiter.worker_queued_kind() != Some(kind)
                     || !self.atomic_commit_arbiter.worker_job_queued()
                 {
                     if let Some(worker) = self.kms_commit_worker.as_ref() {
@@ -648,6 +711,11 @@ impl NativeRuntime {
                 self.atomic_commit_arbiter
                     .mark_kernel_submitted(token, submit_started_at, submit_returned_at)
                     .map_err(io::Error::other)?;
+                if !matches!(kind, AtomicCommitKind::CursorOnly { .. }) {
+                    self.frame_scheduler
+                        .confirm_kernel_submission(token.get(), submit_returned_at)
+                        .map_err(io::Error::other)?;
+                }
                 let deferred_pageflip = self.atomic_commit_arbiter.deferred_pageflip();
                 let deferred_completion = self.atomic_commit_arbiter.replay_deferred_pageflip();
                 if let Some(pageflip) = deferred_pageflip {
@@ -768,6 +836,20 @@ impl NativeRuntime {
         job: KmsCommitJob,
         error: AtomicKmsError,
     ) -> NativeResult<()> {
+        if !matches!(job.kind, AtomicCommitKind::CursorOnly { .. }) {
+            if let Err(error) = self
+                .frame_scheduler
+                .cancel_worker_submission(job.token.get(), job.transaction_id.get())
+            {
+                if let Some(worker) = self.kms_commit_worker.as_ref() {
+                    worker.record_scheduler_cancel_mismatch();
+                }
+                return Err(io::Error::other(error).into());
+            }
+            if let Some(worker) = self.kms_commit_worker.as_ref() {
+                worker.record_scheduler_queued_cancellation();
+            }
+        }
         self.atomic_commit_arbiter.reject_worker_queued(job.token);
         let direct_batch = if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
             Some(self.scanout.fail_worker_direct_submission(job.token)?)
@@ -816,7 +898,21 @@ impl NativeRuntime {
         Ok(())
     }
 
-    fn drop_queued_worker_job(&mut self, job: KmsCommitJob) -> NativeResult<()> {
+    pub(super) fn drop_queued_worker_job(&mut self, job: KmsCommitJob) -> NativeResult<()> {
+        if !matches!(job.kind, AtomicCommitKind::CursorOnly { .. }) {
+            if let Err(error) = self
+                .frame_scheduler
+                .cancel_worker_submission(job.token.get(), job.transaction_id.get())
+            {
+                if let Some(worker) = self.kms_commit_worker.as_ref() {
+                    worker.record_scheduler_cancel_mismatch();
+                }
+                return Err(io::Error::other(error).into());
+            }
+            if let Some(worker) = self.kms_commit_worker.as_ref() {
+                worker.record_scheduler_queued_cancellation();
+            }
+        }
         self.atomic_commit_arbiter.reject_worker_queued(job.token);
         if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. }) {
             let compatibility_primary = self

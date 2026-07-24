@@ -61,7 +61,8 @@ pub(crate) enum AtomicCommitCompletion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AtomicCommitArbiter {
-    pending: Option<PendingAtomicCommit>,
+    kernel_submitted: Option<PendingAtomicCommit>,
+    worker_queued: Option<PendingAtomicCommit>,
     early_pageflip: Option<DrmPresentationEvent>,
     watchdog_interval_ns: u64,
     atomic_commit_watchdog_timeouts_total: u64,
@@ -114,7 +115,8 @@ impl AtomicCommitArbiter {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_watchdog(watchdog_interval_ns: u64, _anchor_ns: u64) -> Self {
         Self {
-            pending: None,
+            kernel_submitted: None,
+            worker_queued: None,
             early_pageflip: None,
             watchdog_interval_ns: if watchdog_interval_ns == 0 {
                 1
@@ -137,10 +139,10 @@ impl AtomicCommitArbiter {
         kind: AtomicCommitKind,
         submitted_at_ns: u64,
     ) -> Result<(), &'static str> {
-        if self.pending.is_some() {
+        if self.kernel_submitted.is_some() || self.worker_queued.is_some() {
             return Err("an Atomic commit is already pending");
         }
-        self.pending = Some(PendingAtomicCommit {
+        self.kernel_submitted = Some(PendingAtomicCommit {
             token,
             generation,
             crtc_id,
@@ -166,11 +168,11 @@ impl AtomicCommitArbiter {
         kind: AtomicCommitKind,
         queued_at_ns: u64,
     ) -> Result<(), &'static str> {
-        if self.pending.is_some() {
-            return Err("an Atomic commit is already pending");
+        if self.worker_queued.is_some() {
+            return Err("an Atomic worker commit is already queued");
         }
         self.early_pageflip = None;
-        self.pending = Some(PendingAtomicCommit {
+        self.worker_queued = Some(PendingAtomicCommit {
             token,
             generation,
             crtc_id,
@@ -189,12 +191,18 @@ impl AtomicCommitArbiter {
         submitted_at_ns: u64,
         submit_returned_at_ns: u64,
     ) -> Result<(), &'static str> {
-        let Some(pending) = self.pending.as_mut() else {
-            return Err("no queued Atomic commit");
-        };
-        if pending.token != token {
+        if self.kernel_submitted.is_some() {
+            return Err("an Atomic commit is already kernel submitted");
+        }
+        if self
+            .worker_queued
+            .is_none_or(|pending| pending.token != token)
+        {
             return Err("Atomic submit token does not match queued commit");
         }
+        let Some(mut pending) = self.worker_queued.take() else {
+            return Err("no queued Atomic commit");
+        };
         if !matches!(pending.phase, AtomicCommitPhase::WorkerQueued { .. }) {
             return Err("Atomic commit is not worker queued");
         }
@@ -206,6 +214,7 @@ impl AtomicCommitArbiter {
         };
         pending.submitted_at_ns = submitted_at_ns;
         pending.watchdog_deadline_ns = watchdog_deadline_ns;
+        self.kernel_submitted = Some(pending);
         self.atomic_commits_submitted_total = self.atomic_commits_submitted_total.saturating_add(1);
         Ok(())
     }
@@ -214,12 +223,12 @@ impl AtomicCommitArbiter {
         &mut self,
         token: PageFlipToken,
     ) -> Option<PendingAtomicCommit> {
-        if self.pending.is_some_and(|pending| {
+        if self.worker_queued.is_some_and(|pending| {
             pending.token == token
                 && matches!(pending.phase, AtomicCommitPhase::WorkerQueued { .. })
         }) {
             self.early_pageflip = None;
-            self.pending.take()
+            self.worker_queued.take()
         } else {
             None
         }
@@ -255,8 +264,9 @@ impl AtomicCommitArbiter {
             Some(token) => token,
             None => return AtomicCommitCompletion::Stale,
         };
-        let Some(pending) = self.pending else {
-            return AtomicCommitCompletion::Stale;
+        let pending = match (self.kernel_submitted, self.worker_queued) {
+            (Some(pending), _) | (None, Some(pending)) => pending,
+            (None, None) => return AtomicCommitCompletion::Stale,
         };
         if token != pending.token {
             return AtomicCommitCompletion::Mismatched;
@@ -274,18 +284,18 @@ impl AtomicCommitArbiter {
             self.early_pageflip = Some(DrmPresentationEvent { ..pageflip });
             return AtomicCommitCompletion::DeferredUntilSubmitAck;
         }
-        self.pending = None;
+        self.kernel_submitted = None;
         self.atomic_commits_completed_total = self.atomic_commits_completed_total.saturating_add(1);
         AtomicCommitCompletion::Completed(pending.kind)
     }
 
     pub(crate) fn replay_deferred_pageflip(&mut self) -> Option<AtomicCommitCompletion> {
-        let pending = self.pending?;
+        let pending = self.kernel_submitted?;
         self.early_pageflip.take()?;
         if !matches!(pending.phase, AtomicCommitPhase::KernelSubmitted { .. }) {
             return None;
         }
-        self.pending = None;
+        self.kernel_submitted = None;
         self.atomic_commits_completed_total = self.atomic_commits_completed_total.saturating_add(1);
         Some(AtomicCommitCompletion::Completed(pending.kind))
     }
@@ -295,53 +305,91 @@ impl AtomicCommitArbiter {
     }
 
     pub(crate) fn cancel(&mut self, token: PageFlipToken) -> Option<PendingAtomicCommit> {
-        if self.pending.is_some_and(|pending| pending.token == token) {
-            self.pending.take()
+        if self
+            .kernel_submitted
+            .is_some_and(|pending| pending.token == token)
+        {
+            self.kernel_submitted.take()
+        } else if self
+            .worker_queued
+            .is_some_and(|pending| pending.token == token)
+        {
+            self.worker_queued.take()
         } else {
             None
         }
     }
 
     pub(crate) const fn atomic_commit_pending(&self) -> bool {
-        self.pending.is_some()
+        self.kernel_submitted.is_some() || self.worker_queued.is_some()
     }
 
     pub(crate) fn worker_job_queued(&self) -> bool {
-        self.pending
+        self.worker_queued
             .is_some_and(|pending| matches!(pending.phase, AtomicCommitPhase::WorkerQueued { .. }))
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn kernel_commit_submitted(&self) -> bool {
-        self.pending.is_some_and(|pending| {
+        self.kernel_submitted.is_some_and(|pending| {
             matches!(pending.phase, AtomicCommitPhase::KernelSubmitted { .. })
         })
     }
 
+    pub(crate) fn worker_slot_available(&self) -> bool {
+        self.worker_queued.is_none()
+    }
+
+    pub(crate) fn worker_queued_token(&self) -> Option<PageFlipToken> {
+        self.worker_queued.map(|pending| pending.token)
+    }
+
+    pub(crate) fn worker_queued_kind(&self) -> Option<AtomicCommitKind> {
+        self.worker_queued.map(|pending| pending.kind)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn kernel_submitted_token(&self) -> Option<PageFlipToken> {
+        self.kernel_submitted.map(|pending| pending.token)
+    }
+
+    pub(crate) fn kernel_submitted_kind(&self) -> Option<AtomicCommitKind> {
+        self.kernel_submitted.map(|pending| pending.kind)
+    }
+
     pub(crate) fn pending_atomic_token(&self) -> Option<PageFlipToken> {
-        self.pending.map(|pending| pending.token)
+        self.kernel_submitted
+            .or(self.worker_queued)
+            .map(|pending| pending.token)
     }
 
     pub(crate) fn pending_atomic_kind(&self) -> Option<AtomicCommitKind> {
-        self.pending.map(|pending| pending.kind)
+        self.kernel_submitted
+            .or(self.worker_queued)
+            .map(|pending| pending.kind)
     }
 
-    pub(crate) const fn pending_atomic_commit(&self) -> Option<PendingAtomicCommit> {
-        self.pending
+    pub(crate) fn pending_atomic_commit(&self) -> Option<PendingAtomicCommit> {
+        if self.kernel_submitted.is_some() {
+            self.kernel_submitted
+        } else {
+            self.worker_queued
+        }
     }
 
     pub(crate) fn watchdog_deadline_ns(&self) -> Option<u64> {
-        self.pending.and_then(|pending| match pending.phase {
-            AtomicCommitPhase::WorkerQueued { .. } => None,
-            AtomicCommitPhase::KernelSubmitted {
-                watchdog_deadline_ns,
-                ..
-            } => Some(watchdog_deadline_ns),
-        })
+        self.kernel_submitted
+            .and_then(|pending| match pending.phase {
+                AtomicCommitPhase::WorkerQueued { .. } => None,
+                AtomicCommitPhase::KernelSubmitted {
+                    watchdog_deadline_ns,
+                    ..
+                } => Some(watchdog_deadline_ns),
+            })
     }
 
     pub(crate) fn watchdog_expired(&mut self, now_ns: u64) -> Option<AtomicCommitKind> {
-        let pending = self.pending.as_mut()?;
+        let pending = self.kernel_submitted.as_mut()?;
         let AtomicCommitPhase::KernelSubmitted {
             watchdog_deadline_ns,
             ..
@@ -366,7 +414,8 @@ impl AtomicCommitArbiter {
     }
 
     pub(crate) fn abandon_for_recovery(&mut self) {
-        self.pending = None;
+        self.kernel_submitted = None;
+        self.worker_queued = None;
         self.early_pageflip = None;
     }
 
@@ -898,5 +947,46 @@ mod tests {
         assert_eq!(mismatched, 0);
         assert_eq!(stale, 0);
         assert_eq!(arbiter.atomic_commits_completed_total(), 1);
+    }
+
+    #[test]
+    fn runtime_tracks_one_kernel_submitted_plus_one_worker_queued() {
+        let mut arbiter = AtomicCommitArbiter::new();
+        arbiter
+            .reserve(token(1), 3, 42, primary_kind(), 100)
+            .unwrap();
+        arbiter
+            .reserve_worker_queued(token(2), 3, 42, primary_kind(), 110)
+            .unwrap();
+
+        assert!(arbiter.kernel_commit_submitted());
+        assert!(arbiter.worker_job_queued());
+        assert_eq!(arbiter.worker_queued_token(), Some(token(2)));
+        assert_eq!(arbiter.kernel_submitted_token(), Some(token(1)));
+        assert!(
+            arbiter
+                .reserve_worker_queued(token(3), 3, 42, primary_kind(), 120)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pageflip_ack_promotes_queued_next_job() {
+        let mut arbiter = AtomicCommitArbiter::new();
+        arbiter
+            .reserve(token(1), 3, 42, primary_kind(), 100)
+            .unwrap();
+        arbiter
+            .reserve_worker_queued(token(2), 3, 42, primary_kind(), 110)
+            .unwrap();
+        assert_eq!(
+            arbiter.complete(token(1), 3, 42),
+            AtomicCommitCompletion::Completed(primary_kind())
+        );
+        arbiter
+            .mark_kernel_submitted(token(2), 130, 135)
+            .expect("queued next job should become kernel submitted");
+        assert_eq!(arbiter.kernel_submitted_token(), Some(token(2)));
+        assert!(!arbiter.worker_job_queued());
     }
 }

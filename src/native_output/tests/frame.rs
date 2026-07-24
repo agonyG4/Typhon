@@ -34,6 +34,7 @@ fn matching_pageflip_and_queued_reactive_work_render_and_submit_in_one_cycle() {
         render_ahead_allowed: false,
         ready_frame_present: false,
         ready_target_current: true,
+        worker_queue_available: false,
     });
     assert_eq!(decision, SchedulerDecision::Render);
     operations.push(ReactiveHandoffOperation::Render);
@@ -66,6 +67,79 @@ fn render_ahead_requires_atomic_in_fence_support() {
     assert!(!missing_in_fence.render_ahead_allowed());
     assert!(!opaque_output.render_ahead_allowed());
     assert!(!legacy.render_ahead_allowed());
+}
+
+#[test]
+fn worker_queued_reservation_is_not_kernel_pageflip_pending() {
+    let mut scheduler = oblivion_one::native::scheduler::NativeFrameScheduler::new(60, 0);
+    scheduler
+        .reserve_worker_submission(41, 1001)
+        .expect("worker reservation should be accepted");
+
+    assert!(!scheduler.page_flip_pending());
+    assert!(scheduler.worker_submission_queued());
+    assert_eq!(scheduler.pending_page_flip_token(), None);
+    assert_eq!(
+        scheduler.state(),
+        oblivion_one::native::scheduler::SchedulerState::WorkerQueued
+    );
+    assert_eq!(
+        scheduler.decision(1),
+        oblivion_one::native::scheduler::SchedulerDecision::WaitForWorkerQueue
+    );
+}
+
+#[test]
+fn worker_success_confirms_kernel_submission() {
+    let mut scheduler = oblivion_one::native::scheduler::NativeFrameScheduler::new(60, 0);
+    scheduler.reserve_worker_submission(42, 1002).unwrap();
+    scheduler
+        .confirm_kernel_submission(42, 20)
+        .expect("worker success should confirm kernel submission");
+
+    assert!(!scheduler.worker_submission_queued());
+    assert!(scheduler.page_flip_pending());
+    assert_eq!(scheduler.pending_page_flip_token(), Some(42));
+    assert_eq!(
+        scheduler.state(),
+        oblivion_one::native::scheduler::SchedulerState::PageFlipPending
+    );
+}
+
+#[test]
+fn worker_rejection_cancels_only_queued_reservation() {
+    let mut scheduler = oblivion_one::native::scheduler::NativeFrameScheduler::new(60, 0);
+    scheduler.reserve_worker_submission(43, 1003).unwrap();
+    scheduler.cancel_worker_submission(43, 1003).unwrap();
+
+    assert!(!scheduler.worker_submission_queued());
+    assert!(!scheduler.page_flip_pending());
+}
+
+#[test]
+fn queued_cancellation_restores_visual_work() {
+    let mut scheduler = oblivion_one::native::scheduler::NativeFrameScheduler::new(60, 0);
+    scheduler.reserve_worker_submission(44, 1004).unwrap();
+    scheduler.cancel_worker_submission(44, 1004).unwrap();
+
+    assert!(scheduler.visual_work_queued());
+    assert_eq!(
+        scheduler.decision(1),
+        oblivion_one::native::scheduler::SchedulerDecision::Render
+    );
+}
+
+#[test]
+fn kernel_submitted_token_cannot_be_canceled_as_queued() {
+    let mut scheduler = oblivion_one::native::scheduler::NativeFrameScheduler::new(60, 0);
+    scheduler.reserve_worker_submission(45, 1005).unwrap();
+    scheduler.confirm_kernel_submission(45, 20).unwrap();
+
+    assert_eq!(
+        scheduler.cancel_worker_submission(45, 1005),
+        Err("worker reservation is not queued")
+    );
+    assert!(scheduler.page_flip_pending());
 }
 
 #[test]

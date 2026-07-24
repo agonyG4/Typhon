@@ -37,6 +37,18 @@ pub(crate) struct WorkerMetrics {
     pub(crate) quiesce_count: AtomicU64,
     pub(crate) quiesce_ns_total: AtomicU64,
     pub(crate) join_ns_total: AtomicU64,
+    pub(crate) input_fence_retry_attempts: AtomicU64,
+    pub(crate) input_fence_retry_preserved: AtomicU64,
+    pub(crate) scheduler_queued_cancellations: AtomicU64,
+    pub(crate) scheduler_cancel_mismatches: AtomicU64,
+    pub(crate) cursor_pageflip_acks: AtomicU64,
+    pub(crate) primary_pageflip_acks: AtomicU64,
+    pub(crate) duplicate_pageflip_acks: AtomicU64,
+    pub(crate) eventfd_notification_failures: AtomicU64,
+    pub(crate) unnotified_fatal_health_checks: AtomicU64,
+    pub(crate) runtime_queue_depth: AtomicU64,
+    pub(crate) runtime_queue_depth_max: AtomicU64,
+    pub(crate) runtime_kernel_inflight: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -62,6 +74,18 @@ pub(crate) struct WorkerMetricsSnapshot {
     pub(crate) quiesce_count: u64,
     pub(crate) quiesce_ns_total: u64,
     pub(crate) join_ns_total: u64,
+    pub(crate) input_fence_retry_attempts: u64,
+    pub(crate) input_fence_retry_preserved: u64,
+    pub(crate) scheduler_queued_cancellations: u64,
+    pub(crate) scheduler_cancel_mismatches: u64,
+    pub(crate) cursor_pageflip_acks: u64,
+    pub(crate) primary_pageflip_acks: u64,
+    pub(crate) duplicate_pageflip_acks: u64,
+    pub(crate) eventfd_notification_failures: u64,
+    pub(crate) unnotified_fatal_health_checks: u64,
+    pub(crate) runtime_queue_depth: u64,
+    pub(crate) runtime_queue_depth_max: u64,
+    pub(crate) runtime_kernel_inflight: u64,
 }
 
 impl WorkerMetrics {
@@ -93,6 +117,18 @@ impl WorkerMetrics {
             quiesce_count: read!(quiesce_count),
             quiesce_ns_total: read!(quiesce_ns_total),
             join_ns_total: read!(join_ns_total),
+            input_fence_retry_attempts: read!(input_fence_retry_attempts),
+            input_fence_retry_preserved: read!(input_fence_retry_preserved),
+            scheduler_queued_cancellations: read!(scheduler_queued_cancellations),
+            scheduler_cancel_mismatches: read!(scheduler_cancel_mismatches),
+            cursor_pageflip_acks: read!(cursor_pageflip_acks),
+            primary_pageflip_acks: read!(primary_pageflip_acks),
+            duplicate_pageflip_acks: read!(duplicate_pageflip_acks),
+            eventfd_notification_failures: read!(eventfd_notification_failures),
+            unnotified_fatal_health_checks: read!(unnotified_fatal_health_checks),
+            runtime_queue_depth: read!(runtime_queue_depth),
+            runtime_queue_depth_max: read!(runtime_queue_depth_max),
+            runtime_kernel_inflight: read!(runtime_kernel_inflight),
         }
     }
 }
@@ -120,9 +156,18 @@ pub(crate) struct KmsCommitEnqueueError {
     pub(crate) reason: KmsWorkerAdmissionError,
 }
 
+#[derive(Debug)]
+pub(crate) struct KmsWorkerFatalJob {
+    pub(crate) job: KmsCommitJob,
+    pub(crate) uncertain_submit: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkerInFlight {
     pub(crate) token: oblivion_one::native::kms::PageFlipToken,
+    pub(crate) transaction_id: crate::native_output::OutputTransactionId,
+    pub(crate) output_generation: u64,
+    pub(crate) kind: crate::native_output::runtime::AtomicCommitKind,
 }
 
 #[derive(Debug)]
@@ -130,9 +175,11 @@ pub(crate) struct WorkerShared {
     pub(crate) state: Mutex<WorkerState>,
     pub(crate) work_wakeup: Condvar,
     pub(crate) results: Mutex<VecDeque<KmsWorkerEvent>>,
+    pub(crate) fatal_jobs: Mutex<Vec<KmsWorkerFatalJob>>,
     pub(crate) result_space: Condvar,
     pub(crate) result_fd: OwnedFd,
     pub(crate) metrics: WorkerMetrics,
+    pub(crate) fatal_reason_code: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -156,9 +203,11 @@ impl WorkerShared {
             }),
             work_wakeup: Condvar::new(),
             results: Mutex::new(VecDeque::with_capacity(RESULT_EVENT_CAPACITY)),
+            fatal_jobs: Mutex::new(Vec::new()),
             result_space: Condvar::new(),
             result_fd,
             metrics: WorkerMetrics::default(),
+            fatal_reason_code: AtomicU64::new(0),
         }
     }
 
@@ -298,7 +347,7 @@ pub(crate) fn notify_eventfd(fd: &OwnedFd) -> std::io::Result<()> {
                 continue;
             }
             if error.kind() == std::io::ErrorKind::WouldBlock {
-                return Ok(());
+                return Err(error);
             }
             return Err(error);
         }

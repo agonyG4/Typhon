@@ -7,6 +7,12 @@ impl NativeRuntime {
         cycle: &NativeCycleState,
         scheduler_decision: SchedulerDecision,
     ) -> NativeResult<()> {
+        if let Some(worker) = self.kms_commit_worker.as_ref() {
+            worker.record_runtime_queue_state(
+                usize::from(self.atomic_commit_arbiter.worker_job_queued()),
+                self.atomic_commit_arbiter.kernel_commit_submitted(),
+            );
+        }
         let perf = self.perf;
         perf.log("native.scheduler", || {
             let (
@@ -232,6 +238,48 @@ impl NativeRuntime {
                     NativePerfField::u64("worker_quiesce_count", metrics.quiesce_count),
                     NativePerfField::u64("worker_quiesce_ns_total", metrics.quiesce_ns_total),
                     NativePerfField::u64("worker_join_ns_total", metrics.join_ns_total),
+                    NativePerfField::u64(
+                        "worker_input_fence_retry_attempts",
+                        metrics.input_fence_retry_attempts,
+                    ),
+                    NativePerfField::u64(
+                        "worker_input_fence_retry_preserved",
+                        metrics.input_fence_retry_preserved,
+                    ),
+                    NativePerfField::u64(
+                        "worker_scheduler_queued_cancellations",
+                        metrics.scheduler_queued_cancellations,
+                    ),
+                    NativePerfField::u64(
+                        "worker_scheduler_cancel_mismatches",
+                        metrics.scheduler_cancel_mismatches,
+                    ),
+                    NativePerfField::u64(
+                        "worker_cursor_pageflip_acks",
+                        metrics.cursor_pageflip_acks,
+                    ),
+                    NativePerfField::u64(
+                        "worker_primary_pageflip_acks",
+                        metrics.primary_pageflip_acks,
+                    ),
+                    NativePerfField::u64(
+                        "worker_duplicate_pageflip_acks",
+                        metrics.duplicate_pageflip_acks,
+                    ),
+                    NativePerfField::u64(
+                        "worker_eventfd_notification_failures",
+                        metrics.eventfd_notification_failures,
+                    ),
+                    NativePerfField::u64(
+                        "worker_unnotified_fatal_health_checks",
+                        metrics.unnotified_fatal_health_checks,
+                    ),
+                    NativePerfField::u64("worker_runtime_queue_depth", metrics.runtime_queue_depth),
+                    NativePerfField::u64(
+                        "worker_runtime_queue_depth_max",
+                        metrics.runtime_queue_depth_max,
+                    ),
+                    NativePerfField::u64("worker_kernel_inflight", metrics.runtime_kernel_inflight),
                     NativePerfField::bool("worker_active", worker.submission_active()),
                 ]);
             }

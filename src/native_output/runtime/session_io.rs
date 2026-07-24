@@ -178,6 +178,7 @@ impl NativeSessionIo for NativeRuntime {
     }
 
     fn quiesce_kms_worker(&mut self) -> NativeResult<()> {
+        let _ = self.check_kms_commit_worker_health();
         if let Some(worker) = self.kms_commit_worker.as_ref() {
             worker.request_quiesce();
         }
@@ -195,8 +196,25 @@ impl NativeSessionIo for NativeRuntime {
             io::Error::other(format!("KMS commit worker join failed: {error:?}"))
         })?;
         worker.drain_eventfd()?;
+        let mut event_error = None;
         for event in worker.drain_events() {
-            self.process_kms_worker_event_after_join(event)?;
+            if let Err(error) = self.process_kms_worker_event_after_join(event) {
+                event_error = Some(error.to_string());
+            }
+        }
+        let mut uncertain_submit = false;
+        for fatal_job in worker.take_fatal_jobs() {
+            if fatal_job.uncertain_submit {
+                uncertain_submit = true;
+            } else {
+                self.drop_queued_worker_job(fatal_job.job)?;
+            }
+        }
+        if uncertain_submit {
+            self.quarantine_after_worker_fatal()?;
+        }
+        if let Some(error) = event_error {
+            return Err(io::Error::other(error).into());
         }
         Ok(())
     }

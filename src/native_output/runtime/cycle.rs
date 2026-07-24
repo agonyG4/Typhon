@@ -210,6 +210,7 @@ impl NativeRuntime {
     #[allow(unused_variables)]
     fn wait_for_events_and_pageflips(&mut self) -> NativeResult<NativeCycleState> {
         let wakeup = self.event_loop.wait()?;
+        self.check_kms_commit_worker_health()?;
         if wakeup.reasons.kms_commit_worker() || wakeup.reasons.drm() {
             // Submit acknowledgments establish physical pending ownership
             // before the DRM pageflip validation below runs.
@@ -561,8 +562,13 @@ impl NativeRuntime {
             }
             let scheduler_state_at_completion = frame_scheduler.state();
             let direct_pending = scanout.direct_scanout_pending();
-            let completion = frame_scheduler
-                .note_page_flip_completion(pageflip.user_data, compositor_receive_ns);
+            let completion = if cursor_commit {
+                // Cursor-only Atomic commits are validated and completed by
+                // the Atomic arbiter, not by the primary frame scheduler.
+                PageFlipCompletionResult::Stale
+            } else {
+                frame_scheduler.complete_kernel_pageflip(pageflip.user_data, compositor_receive_ns)
+            };
             if matches!(completion, PageFlipCompletionResult::Completed { .. }) {
                 if let Some(token) = pageflip_drain.deferred_promotion_token {
                     scanout
@@ -908,17 +914,30 @@ impl NativeRuntime {
                         ),
                     ]
                 });
-                if *kms_commit_worker_transport
-                    == crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
-                    && atomic_completion.is_some_and(|completion| {
-                        matches!(completion, AtomicCommitCompletion::Completed(_))
-                    })
-                    && let Some(worker) = kms_commit_worker.as_ref()
-                {
+            }
+            if *kms_commit_worker_transport
+                == crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
+                && let Some(AtomicCommitCompletion::Completed(kind)) = atomic_completion
+            {
+                let path_completed = match kind {
+                    AtomicCommitKind::CursorOnly { .. } => cursor_commit,
+                    AtomicCommitKind::CompositedPrimary { .. }
+                    | AtomicCommitKind::DirectPrimary { .. } => {
+                        matches!(completion, PageFlipCompletionResult::Completed { .. })
+                    }
+                };
+                if path_completed && let Some(worker) = kms_commit_worker.as_ref() {
+                    let transaction_id = match kind {
+                        AtomicCommitKind::CompositedPrimary { transaction_id, .. }
+                        | AtomicCommitKind::DirectPrimary { transaction_id, .. }
+                        | AtomicCommitKind::CursorOnly { transaction_id, .. } => transaction_id,
+                    };
                     worker
                         .ack_pageflip(
                             PageFlipToken::new(pageflip.user_data)
                                 .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
+                            transaction_id,
+                            *drm_file_generation,
                         )
                         .map_err(|error| {
                             io::Error::other(format!("worker pageflip ack: {error:?}"))

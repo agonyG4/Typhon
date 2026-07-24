@@ -1,0 +1,941 @@
+use super::thread::{
+    KmsCommitExecutor, KmsWorkerFatalReason, KmsWorkerSubmission, KmsWorkerSubmitFailure,
+};
+use super::timing::KmsTimingDecision;
+use super::*;
+use crate::native_output::{OutputTransactionId, runtime::AtomicCommitKind};
+use oblivion_one::native::kms::KmsBackendKind;
+use oblivion_one::native::presentation_deadline::{
+    MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
+};
+use std::{
+    collections::VecDeque,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    sync::{Arc, Barrier, Mutex},
+    time::Duration,
+};
+
+#[test]
+fn worker_policy_defaults_to_off() {
+    assert_eq!(
+        KmsCommitWorkerPolicy::from_env_value(None),
+        KmsCommitWorkerPolicy::Off
+    );
+}
+
+#[test]
+fn worker_policy_accepts_all_rollout_values() {
+    assert_eq!(
+        KmsCommitWorkerPolicy::parse(Some("off")).unwrap(),
+        KmsCommitWorkerPolicy::Off
+    );
+    assert_eq!(
+        KmsCommitWorkerPolicy::parse(Some("auto")).unwrap(),
+        KmsCommitWorkerPolicy::Auto
+    );
+    assert_eq!(
+        KmsCommitWorkerPolicy::parse(Some("force")).unwrap(),
+        KmsCommitWorkerPolicy::Force
+    );
+}
+
+#[test]
+fn auto_atomic_uses_worker_when_startup_succeeds() {
+    assert_eq!(
+        KmsCommitWorkerPolicy::Auto
+            .effective(KmsBackendKind::Atomic, true)
+            .unwrap(),
+        KmsCommitWorkerTransport::Worker
+    );
+}
+
+#[test]
+fn auto_atomic_falls_back_to_sync_when_startup_fails() {
+    assert_eq!(
+        KmsCommitWorkerPolicy::Auto
+            .effective(KmsBackendKind::Atomic, false)
+            .unwrap(),
+        KmsCommitWorkerTransport::Synchronous
+    );
+}
+
+#[test]
+fn force_legacy_is_unsupported() {
+    assert_eq!(
+        KmsCommitWorkerPolicy::Force.effective(KmsBackendKind::Legacy, true),
+        Err(KmsCommitWorkerStartupError::UnsupportedBackend)
+    );
+}
+
+#[test]
+fn reactive_double_submits_at_not_before() {
+    use oblivion_one::native::presentation_deadline::{
+        MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
+    };
+    use std::time::Duration;
+
+    let target = PresentationTarget {
+        sequence: 1,
+        presentation_time: MonotonicTimestampNs::new(20_000_000),
+        submit_not_before: MonotonicTimestampNs::new(10_000_000),
+        render_start_deadline: MonotonicTimestampNs::new(0),
+        refresh_interval: Duration::from_millis(16),
+        reason: PresentationTargetReason::ReactiveDouble,
+        clock_generation: 1,
+        estimated: false,
+        predicted_unreachable: false,
+    };
+
+    let model = KmsCommitTimingModel::new(target.refresh_interval);
+    assert_eq!(
+        model.submit_at(target, 1_000_000),
+        KmsTimingDecision {
+            submit_at_ns: 10_000_000,
+            late: false,
+            late_by_ns: 0,
+        }
+    );
+}
+
+#[test]
+fn predictive_job_uses_bounded_safety_margin() {
+    use oblivion_one::native::presentation_deadline::{
+        MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
+    };
+    use std::time::Duration;
+
+    let target = PresentationTarget {
+        sequence: 1,
+        presentation_time: MonotonicTimestampNs::new(20_000_000),
+        submit_not_before: MonotonicTimestampNs::new(2_000_000),
+        render_start_deadline: MonotonicTimestampNs::new(0),
+        refresh_interval: Duration::from_millis(16),
+        reason: PresentationTargetReason::Normal,
+        clock_generation: 1,
+        estimated: false,
+        predicted_unreachable: false,
+    };
+
+    let model = KmsCommitTimingModel::new(target.refresh_interval);
+    assert_eq!(model.submit_at(target, 1_000_000).submit_at_ns, 19_000_000);
+}
+
+#[test]
+fn timing_model_never_violates_submit_not_before_when_late() {
+    use oblivion_one::native::presentation_deadline::{
+        MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
+    };
+    use std::time::Duration;
+
+    let target = PresentationTarget {
+        sequence: 1,
+        presentation_time: MonotonicTimestampNs::new(20_000_000),
+        submit_not_before: MonotonicTimestampNs::new(10_000_000),
+        render_start_deadline: MonotonicTimestampNs::new(0),
+        refresh_interval: Duration::from_millis(16),
+        reason: PresentationTargetReason::Normal,
+        clock_generation: 1,
+        estimated: false,
+        predicted_unreachable: false,
+    };
+
+    let model = KmsCommitTimingModel::new(target.refresh_interval);
+    assert_eq!(model.submit_at(target, 30_000_000).submit_at_ns, 30_000_000);
+}
+
+#[test]
+fn late_sample_increases_margin_immediately() {
+    use std::time::Duration;
+    let mut model = KmsCommitTimingModel::new(Duration::from_millis(16));
+    model.observe_submit_delta_ns(2_000_000);
+    assert_eq!(model.safety_margin_ns(), 2_100_000);
+}
+
+#[test]
+fn early_samples_decay_margin_gradually() {
+    use std::time::Duration;
+    let mut model = KmsCommitTimingModel::new(Duration::from_millis(16));
+    model.observe_submit_delta_ns(2_000_000);
+    let before = model.safety_margin_ns();
+    model.observe_submit_delta_ns(-1_000_000);
+    assert!(model.safety_margin_ns() < before);
+    assert_eq!(model.safety_margin_ns(), before - (before - 100_000) / 16);
+}
+
+#[test]
+fn margin_is_bounded_by_half_refresh() {
+    use std::time::Duration;
+    let mut model = KmsCommitTimingModel::new(Duration::from_micros(100));
+    model.observe_submit_delta_ns(10_000_000);
+    assert_eq!(model.safety_margin_ns(), 50_000);
+}
+
+fn test_job(token: u64) -> KmsCommitJob {
+    let transaction_id = OutputTransactionId::new(
+        std::num::NonZeroU64::new(token).expect("test transaction ID is nonzero"),
+    );
+    KmsCommitJob {
+        transaction_id,
+        token: oblivion_one::native::kms::PageFlipToken::new(token).unwrap(),
+        output_generation: 1,
+        crtc_id: 7,
+        kind: AtomicCommitKind::DirectPrimary {
+            transaction_id,
+            direct_token: oblivion_one::native::kms::PageFlipToken::new(token).unwrap(),
+            framebuffer_id: 42,
+        },
+        target: PresentationTarget {
+            sequence: token,
+            presentation_time: MonotonicTimestampNs::new(0),
+            submit_not_before: MonotonicTimestampNs::new(0),
+            render_start_deadline: MonotonicTimestampNs::new(0),
+            refresh_interval: Duration::from_millis(16),
+            reason: PresentationTargetReason::ReactiveDouble,
+            clock_generation: 1,
+            estimated: true,
+            predicted_unreachable: false,
+        },
+        queued_at: MonotonicTimestampNs::new(0),
+        primary: KmsPrimaryUpdate::Framebuffer {
+            framebuffer: oblivion_one::native::kms::FramebufferId::new(42).unwrap(),
+            in_fence: None,
+            request_out_fence: false,
+        },
+        cursor: KmsCursorUpdate::Unchanged,
+        test_only: KmsTestOnlyPolicy::Skip,
+    }
+}
+
+fn test_job_with_input_fence(token: u64, fence: OwnedFd) -> KmsCommitJob {
+    let mut job = test_job(token);
+    job.primary = KmsPrimaryUpdate::Framebuffer {
+        framebuffer: oblivion_one::native::kms::FramebufferId::new(42).unwrap(),
+        in_fence: Some(fence),
+        request_out_fence: false,
+    };
+    job
+}
+
+fn test_cursor_job(token: u64) -> KmsCommitJob {
+    let mut job = test_job(token);
+    job.kind = AtomicCommitKind::CursorOnly {
+        transaction_id: job.transaction_id,
+        cursor_epoch: token,
+        framebuffer_id: Some(42),
+    };
+    job.primary = KmsPrimaryUpdate::Unchanged;
+    job.cursor = KmsCursorUpdate::Disable;
+    job.test_only = KmsTestOnlyPolicy::Required;
+    job
+}
+
+fn test_input_fence() -> OwnedFd {
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    assert!(fd >= 0, "test eventfd should be created");
+    // SAFETY: eventfd returned a new owned descriptor for this test.
+    unsafe { OwnedFd::from_raw_fd(fd) }
+}
+
+fn fd_is_closed(raw_fd: i32) -> bool {
+    unsafe { libc::fcntl(raw_fd, libc::F_GETFD) == -1 }
+}
+
+fn fd_identity(raw_fd: i32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/self/fdinfo/{raw_fd}"))
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("eventfd-id:")
+                .map(str::trim)
+                .map(str::to_owned)
+        })
+}
+
+fn fd_is_closed_or_reused(raw_fd: i32, original_identity: Option<&str>) -> bool {
+    original_identity.is_some_and(|identity| fd_identity(raw_fd).as_deref() != Some(identity))
+        || (original_identity.is_none() && fd_is_closed(raw_fd))
+}
+
+#[derive(Debug)]
+struct FenceRecordingExecutor {
+    outcomes: Mutex<VecDeque<Result<(), oblivion_one::native::kms::AtomicKmsErrorKind>>>,
+    attempts: Mutex<Vec<i32>>,
+}
+
+impl KmsCommitExecutor for FenceRecordingExecutor {
+    fn submit(&self, job: &KmsCommitJob) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure> {
+        let raw_fd = match &job.primary {
+            KmsPrimaryUpdate::Framebuffer { in_fence, .. } => {
+                in_fence.as_ref().map(AsRawFd::as_raw_fd)
+            }
+            KmsPrimaryUpdate::Unchanged => None,
+        };
+        self.attempts.lock().unwrap().push(raw_fd.unwrap_or(-1));
+        let result = self.outcomes.lock().unwrap().pop_front().unwrap_or(Ok(()));
+        match result {
+            Ok(()) => Ok(KmsWorkerSubmission { out_fence: None }),
+            Err(kind) => Err(KmsWorkerSubmitFailure::new(kind, "fake Atomic ioctl")),
+        }
+    }
+}
+
+fn wait_for_fence_event(
+    handle: &KmsCommitWorkerHandle,
+    token: u64,
+    predicate: impl Fn(&KmsWorkerEvent) -> bool,
+) -> Vec<KmsWorkerEvent> {
+    let mut events = Vec::new();
+    for _ in 0..200 {
+        std::thread::sleep(Duration::from_millis(1));
+        events.extend(collect_events(handle));
+        if events.iter().any(&predicate) {
+            assert!(events.iter().any(|event| match event {
+                KmsWorkerEvent::Submitted {
+                    token: event_token, ..
+                }
+                | KmsWorkerEvent::BusyDeferred {
+                    token: event_token, ..
+                }
+                | KmsWorkerEvent::SubmitLate {
+                    token: event_token, ..
+                }
+                | KmsWorkerEvent::PageflipTimeout {
+                    token: event_token, ..
+                } => event_token.get() == token,
+                KmsWorkerEvent::TestRejected { job, .. }
+                | KmsWorkerEvent::SubmitRejected { job, .. }
+                | KmsWorkerEvent::BusyExhausted { job, .. } => job.token.get() == token,
+                KmsWorkerEvent::Quiesced { .. } | KmsWorkerEvent::Fatal { .. } => true,
+            }));
+            return events;
+        }
+    }
+    panic!("worker did not produce the expected event for token {token}");
+}
+
+#[test]
+fn busy_retry_preserves_input_fence_for_every_attempt() {
+    let executor = Arc::new(FenceRecordingExecutor {
+        outcomes: Mutex::new(VecDeque::from([
+            Err(oblivion_one::native::kms::AtomicKmsErrorKind::Busy),
+            Ok(()),
+        ])),
+        attempts: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let fence = test_input_fence();
+    let raw_fd = fence.as_raw_fd();
+    reserve_for_test(&handle, test_job(30).kind)
+        .enqueue(test_job_with_input_fence(30, fence))
+        .unwrap();
+
+    let events = wait_for_fence_event(
+        &handle,
+        30,
+        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 30),
+    );
+    assert_eq!(*executor.attempts.lock().unwrap(), vec![raw_fd, raw_fd]);
+    handle
+        .ack_pageflip(test_job(30).token, test_job(30).transaction_id, 1)
+        .unwrap();
+    drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn successful_retry_releases_input_fence_after_submit() {
+    let executor = Arc::new(FenceRecordingExecutor {
+        outcomes: Mutex::new(VecDeque::from([
+            Err(oblivion_one::native::kms::AtomicKmsErrorKind::Busy),
+            Ok(()),
+        ])),
+        attempts: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let fence = test_input_fence();
+    let raw_fd = fence.as_raw_fd();
+    let original_identity = fd_identity(raw_fd);
+    reserve_for_test(&handle, test_job(31).kind)
+        .enqueue(test_job_with_input_fence(31, fence))
+        .unwrap();
+    let events = wait_for_fence_event(
+        &handle,
+        31,
+        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 31),
+    );
+    assert!(fd_is_closed_or_reused(raw_fd, original_identity.as_deref()));
+    handle
+        .ack_pageflip(test_job(31).token, test_job(31).transaction_id, 1)
+        .unwrap();
+    drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn busy_exhaustion_releases_input_fence_once() {
+    let executor = Arc::new(FenceRecordingExecutor {
+        outcomes: Mutex::new(VecDeque::from([
+            Err(oblivion_one::native::kms::AtomicKmsErrorKind::Busy),
+            Err(oblivion_one::native::kms::AtomicKmsErrorKind::Busy),
+            Err(oblivion_one::native::kms::AtomicKmsErrorKind::Busy),
+        ])),
+        attempts: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let fence = test_input_fence();
+    let raw_fd = fence.as_raw_fd();
+    reserve_for_test(&handle, test_job(32).kind)
+        .enqueue(test_job_with_input_fence(32, fence))
+        .unwrap();
+    let events = wait_for_fence_event(
+        &handle,
+        32,
+        |event| matches!(event, KmsWorkerEvent::BusyExhausted { job, .. } if job.token.get() == 32),
+    );
+    assert_eq!(
+        *executor.attempts.lock().unwrap(),
+        vec![raw_fd, raw_fd, raw_fd]
+    );
+    drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn submit_rejection_releases_input_fence_once() {
+    let executor = Arc::new(FenceRecordingExecutor {
+        outcomes: Mutex::new(VecDeque::from([Err(
+            oblivion_one::native::kms::AtomicKmsErrorKind::FlipRejected,
+        )])),
+        attempts: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let fence = test_input_fence();
+    let raw_fd = fence.as_raw_fd();
+    reserve_for_test(&handle, test_job(33).kind)
+        .enqueue(test_job_with_input_fence(33, fence))
+        .unwrap();
+    let events = wait_for_fence_event(
+        &handle,
+        33,
+        |event| matches!(event, KmsWorkerEvent::SubmitRejected { job, .. } if job.token.get() == 33),
+    );
+    assert_eq!(*executor.attempts.lock().unwrap(), vec![raw_fd]);
+    drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[derive(Debug)]
+struct BarrierExecutor {
+    started: Barrier,
+    release: Barrier,
+    submitted: Mutex<Vec<u64>>,
+}
+
+impl KmsCommitExecutor for BarrierExecutor {
+    fn submit(&self, job: &KmsCommitJob) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure> {
+        self.started.wait();
+        self.release.wait();
+        self.submitted.lock().unwrap().push(job.token.get());
+        Ok(KmsWorkerSubmission { out_fence: None })
+    }
+}
+
+#[derive(Debug)]
+struct ScriptedExecutor {
+    outcomes: Mutex<VecDeque<Result<(), oblivion_one::native::kms::AtomicKmsErrorKind>>>,
+    submitted: Mutex<Vec<u64>>,
+}
+
+impl KmsCommitExecutor for ScriptedExecutor {
+    fn submit(&self, job: &KmsCommitJob) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure> {
+        self.submitted.lock().unwrap().push(job.token.get());
+        let result = self.outcomes.lock().unwrap().pop_front().unwrap_or(Ok(()));
+        match result {
+            Ok(()) => Ok(KmsWorkerSubmission { out_fence: None }),
+            Err(kind) => Err(KmsWorkerSubmitFailure::new(kind, "fake Atomic ioctl")),
+        }
+    }
+}
+
+fn collect_events(handle: &KmsCommitWorkerHandle) -> Vec<KmsWorkerEvent> {
+    handle.drain_eventfd().unwrap();
+    handle.drain_events()
+}
+
+fn reserve_for_test(
+    handle: &KmsCommitWorkerHandle,
+    kind: AtomicCommitKind,
+) -> KmsCommitAdmissionPermit {
+    loop {
+        match handle.try_reserve_admission(kind) {
+            Ok(permit) => return permit,
+            Err(KmsWorkerAdmissionError::AdmissionContention) => std::thread::yield_now(),
+            Err(error) => panic!("test admission failed unexpectedly: {error:?}"),
+        }
+    }
+}
+
+#[test]
+fn runtime_queue_depth_metrics_match_real_runtime_state() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::new()),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+
+    handle.record_runtime_queue_state(1, true);
+    let metrics = handle.metrics_snapshot();
+    assert_eq!(metrics.runtime_queue_depth, 1);
+    assert_eq!(metrics.runtime_queue_depth_max, 1);
+    assert_eq!(metrics.runtime_kernel_inflight, 1);
+
+    handle.record_runtime_queue_state(0, false);
+    let metrics = handle.metrics_snapshot();
+    assert_eq!(metrics.runtime_queue_depth, 0);
+    assert_eq!(metrics.runtime_queue_depth_max, 1);
+    assert_eq!(metrics.runtime_kernel_inflight, 0);
+
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn main_thread_admission_returns_immediately_when_full() {
+    let executor = Arc::new(BarrierExecutor {
+        started: Barrier::new(2),
+        release: Barrier::new(2),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    reserve_for_test(
+        &handle,
+        AtomicCommitKind::DirectPrimary {
+            transaction_id: test_job(1).transaction_id,
+            direct_token: test_job(1).token,
+            framebuffer_id: 42,
+        },
+    )
+    .enqueue(test_job(1))
+    .unwrap();
+    executor.started.wait();
+
+    reserve_for_test(
+        &handle,
+        AtomicCommitKind::DirectPrimary {
+            transaction_id: test_job(2).transaction_id,
+            direct_token: test_job(2).token,
+            framebuffer_id: 42,
+        },
+    )
+    .enqueue(test_job(2))
+    .unwrap();
+    assert!(matches!(
+        handle.try_reserve_admission(test_job(3).kind),
+        Err(KmsWorkerAdmissionError::QueueFull)
+    ));
+
+    executor.release.wait();
+    for _ in 0..100 {
+        if handle.inflight() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    handle
+        .ack_pageflip(test_job(1).token, test_job(1).transaction_id, 1)
+        .unwrap();
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn idle_worker_has_only_one_reserved_ready_slot() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::new()),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let permit = reserve_for_test(&handle, test_job(20).kind);
+    assert!(matches!(
+        handle.try_reserve_admission(test_job(21).kind),
+        Err(KmsWorkerAdmissionError::QueueFull)
+    ));
+    drop(permit);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn fifo_order_is_preserved_and_second_submit_waits_for_ack() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Ok(()), Ok(())])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    reserve_for_test(&handle, test_job(1).kind)
+        .enqueue(test_job(1))
+        .unwrap();
+    for _ in 0..100 {
+        if handle.submission_active() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    reserve_for_test(&handle, test_job(2).kind)
+        .enqueue(test_job(2))
+        .unwrap();
+
+    std::thread::sleep(Duration::from_millis(10));
+    assert_eq!(*executor.submitted.lock().unwrap(), vec![1]);
+    handle
+        .ack_pageflip(test_job(1).token, test_job(1).transaction_id, 1)
+        .unwrap();
+    for _ in 0..100 {
+        if executor.submitted.lock().unwrap().len() == 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(*executor.submitted.lock().unwrap(), vec![1, 2]);
+    handle
+        .ack_pageflip(test_job(2).token, test_job(2).transaction_id, 1)
+        .unwrap();
+    handle.request_quiesce();
+    let _ = collect_events(&handle);
+    handle.join().unwrap();
+}
+
+#[test]
+fn quiesce_rejects_new_admission() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::new()),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    handle.request_quiesce();
+    assert!(matches!(
+        handle.try_reserve_admission(test_job(1).kind),
+        Err(KmsWorkerAdmissionError::Quiescing)
+    ));
+    handle.join().unwrap();
+}
+
+#[test]
+fn busy_retry_budget_is_bounded_and_returns_one_terminal_event() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([
+            Err(oblivion_one::native::kms::AtomicKmsErrorKind::Busy),
+            Err(oblivion_one::native::kms::AtomicKmsErrorKind::Busy),
+            Err(oblivion_one::native::kms::AtomicKmsErrorKind::Busy),
+        ])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    reserve_for_test(&handle, test_job(9).kind)
+        .enqueue(test_job(9))
+        .unwrap();
+
+    let mut events = Vec::new();
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(1));
+        events.extend(collect_events(&handle));
+        if events
+            .iter()
+            .any(|event| matches!(event, KmsWorkerEvent::BusyExhausted { .. }))
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, KmsWorkerEvent::BusyDeferred { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, KmsWorkerEvent::BusyExhausted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(*executor.submitted.lock().unwrap(), vec![9, 9, 9]);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn one_eventfd_wakeup_drains_all_available_worker_results() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([
+            Err(oblivion_one::native::kms::AtomicKmsErrorKind::FlipRejected),
+            Err(oblivion_one::native::kms::AtomicKmsErrorKind::FlipRejected),
+        ])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    reserve_for_test(&handle, test_job(10).kind)
+        .enqueue(test_job(10))
+        .unwrap();
+    let mut first_events = Vec::new();
+    for _ in 0..100 {
+        first_events.extend(collect_events(&handle));
+        if first_events.iter().any(|event| {
+                matches!(event, KmsWorkerEvent::SubmitRejected { job, .. } if job.token.get() == 10)
+            }) {
+                break;
+            }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    reserve_for_test(&handle, test_job(11).kind)
+        .enqueue(test_job(11))
+        .unwrap();
+    let mut events = first_events;
+    for _ in 0..100 {
+        events.extend(collect_events(&handle));
+        if events.iter().any(|event| {
+                matches!(event, KmsWorkerEvent::SubmitRejected { job, .. } if job.token.get() == 11)
+            }) {
+                break;
+            }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(events.iter().any(|event| {
+        matches!(event, KmsWorkerEvent::SubmitRejected { job, .. } if job.token.get() == 11)
+    }));
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn worker_emits_one_pageflip_timeout_for_inflight_commit() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Ok(())])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    reserve_for_test(&handle, test_job(13).kind)
+        .enqueue(test_job(13))
+        .unwrap();
+    let mut events = Vec::new();
+    for _ in 0..1_200 {
+        events.extend(collect_events(&handle));
+        if events
+            .iter()
+            .any(|event| matches!(event, KmsWorkerEvent::PageflipTimeout { .. }))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, KmsWorkerEvent::PageflipTimeout { .. }))
+            .count(),
+        1
+    );
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+struct PanicExecutor;
+
+impl KmsCommitExecutor for PanicExecutor {
+    fn submit(&self, _job: &KmsCommitJob) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure> {
+        panic!("fake worker panic");
+    }
+}
+
+#[test]
+fn worker_panic_becomes_fatal_event() {
+    let handle = KmsCommitWorkerHandle::start(Arc::new(PanicExecutor)).unwrap();
+    reserve_for_test(&handle, test_job(12).kind)
+        .enqueue(test_job(12))
+        .unwrap();
+    let mut events = Vec::new();
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(1));
+        events.extend(collect_events(&handle));
+        if events
+            .iter()
+            .any(|event| matches!(event, KmsWorkerEvent::Fatal { .. }))
+        {
+            break;
+        }
+    }
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            KmsWorkerEvent::Fatal {
+                reason: KmsWorkerFatalReason::Panic,
+                uncertain_submit: true,
+            }
+        )
+    }));
+    handle.join().unwrap();
+}
+
+#[test]
+fn cursor_only_pageflip_ack_releases_worker_inflight() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Ok(())])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let job = test_cursor_job(14);
+    let token = job.token;
+    let transaction_id = job.transaction_id;
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    let events = wait_for_fence_event(
+        &handle,
+        14,
+        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 14),
+    );
+    handle.ack_pageflip(token, transaction_id, 1).unwrap();
+    assert!(!handle.inflight());
+    drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn duplicate_worker_pageflip_ack_is_rejected() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Ok(())])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let job = test_job(15);
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    let events = wait_for_fence_event(
+        &handle,
+        15,
+        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 15),
+    );
+    handle
+        .ack_pageflip(test_job(15).token, test_job(15).transaction_id, 1)
+        .unwrap();
+    assert_eq!(
+        handle.ack_pageflip(test_job(15).token, test_job(15).transaction_id, 1),
+        Err(super::thread::KmsWorkerAckError::NoInFlightCommit)
+    );
+    drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn wrong_worker_ack_preserves_inflight() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Ok(()), Ok(())])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let job = test_job(16);
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    let events = wait_for_fence_event(
+        &handle,
+        16,
+        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 16),
+    );
+    assert_eq!(
+        handle.ack_pageflip(test_job(17).token, test_job(16).transaction_id, 1),
+        Err(super::thread::KmsWorkerAckError::TokenMismatch)
+    );
+    assert!(handle.inflight());
+    handle
+        .ack_pageflip(test_job(16).token, test_job(16).transaction_id, 1)
+        .unwrap();
+    drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn eventfd_notification_failure_marks_worker_fatal() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Err(
+            oblivion_one::native::kms::AtomicKmsErrorKind::FlipRejected,
+        )])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let value = u64::MAX - 1;
+    let written = unsafe {
+        libc::write(
+            handle.event_fd(),
+            (&value as *const u64).cast(),
+            std::mem::size_of::<u64>(),
+        )
+    };
+    assert_eq!(written, std::mem::size_of::<u64>() as isize);
+    reserve_for_test(&handle, test_job(17).kind)
+        .enqueue(test_job(17))
+        .unwrap();
+
+    for _ in 0..200 {
+        if handle.fatal_reason().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        handle.fatal_reason(),
+        Some(KmsWorkerFatalReason::EventNotification)
+    );
+    assert!(matches!(
+        handle.try_reserve_admission(test_job(18).kind),
+        Err(KmsWorkerAdmissionError::Fatal)
+    ));
+    handle.drain_events();
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn notification_failure_does_not_drop_owned_queued_job() {
+    let executor = Arc::new(FenceRecordingExecutor {
+        outcomes: Mutex::new(VecDeque::from([Err(
+            oblivion_one::native::kms::AtomicKmsErrorKind::Busy,
+        )])),
+        attempts: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let value = u64::MAX - 1;
+    let written = unsafe {
+        libc::write(
+            handle.event_fd(),
+            (&value as *const u64).cast(),
+            std::mem::size_of::<u64>(),
+        )
+    };
+    assert_eq!(written, std::mem::size_of::<u64>() as isize);
+    let fence = test_input_fence();
+    let raw_fd = fence.as_raw_fd();
+    let original_identity = fd_identity(raw_fd);
+    let job = test_job_with_input_fence(19, fence);
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    for _ in 0..200 {
+        if handle.fatal_reason().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        handle.fatal_reason(),
+        Some(KmsWorkerFatalReason::EventNotification)
+    );
+    let fatal_jobs = handle.take_fatal_jobs();
+    assert_eq!(fatal_jobs.len(), 1);
+    assert_eq!(fd_identity(raw_fd).as_deref(), original_identity.as_deref());
+    drop(fatal_jobs);
+    assert!(fd_is_closed_or_reused(raw_fd, original_identity.as_deref()));
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
