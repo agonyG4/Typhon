@@ -128,9 +128,27 @@ mod tests {
             "expired_deadline_wait_count=0",
             "repeated_immediate_timer_wake_count=0",
             "multiple_deadline_owner_violation_count=0",
+            "adaptive_triple_entries_proven_presentation_miss=0",
         ] {
             assert!(summary.contains(field), "missing summary field {field}");
         }
+    }
+
+    #[test]
+    fn presentation_miss_entry_has_a_dedicated_adaptive_metric() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+
+        pacing.note_adaptive_transition(
+            AdaptiveBufferingMode::Double,
+            AdaptiveBufferingMode::Triple,
+            Some(ProvenDeadlineMiss::Presentation),
+        );
+
+        assert_eq!(pacing.adaptive_triple_entries_predicted, 0);
+        assert_eq!(pacing.adaptive_triple_entries_proven_render_miss, 0);
+        assert_eq!(pacing.adaptive_triple_entries_proven_submit_miss, 0);
+        assert_eq!(pacing.adaptive_triple_entries_proven_presentation_miss, 1);
     }
 
     #[test]
@@ -456,6 +474,7 @@ pub(crate) struct NativeFramePacing {
     pub(crate) adaptive_triple_entries_predicted: u64,
     pub(crate) adaptive_triple_entries_proven_render_miss: u64,
     pub(crate) adaptive_triple_entries_proven_submit_miss: u64,
+    pub(crate) adaptive_triple_entries_proven_presentation_miss: u64,
     pub(crate) adaptive_triple_exits: u64,
     pub(crate) sync_file_info_exact: u64,
     pub(crate) sync_file_info_approximate: u64,
@@ -526,6 +545,7 @@ impl NativeFramePacing {
             adaptive_triple_entries_predicted: 0,
             adaptive_triple_entries_proven_render_miss: 0,
             adaptive_triple_entries_proven_submit_miss: 0,
+            adaptive_triple_entries_proven_presentation_miss: 0,
             adaptive_triple_exits: 0,
             sync_file_info_exact: 0,
             sync_file_info_approximate: 0,
@@ -814,6 +834,11 @@ impl NativeFramePacing {
                 AdaptiveBufferingMode::Triple,
                 Some(ProvenDeadlineMiss::AtomicSubmit),
             ) => self.adaptive_triple_entries_proven_submit_miss += 1,
+            (
+                AdaptiveBufferingMode::Double,
+                AdaptiveBufferingMode::Triple,
+                Some(ProvenDeadlineMiss::Presentation),
+            ) => self.adaptive_triple_entries_proven_presentation_miss += 1,
             (AdaptiveBufferingMode::Double, AdaptiveBufferingMode::Triple, Some(_)) => {
                 self.adaptive_triple_entries_proven_render_miss += 1;
             }
@@ -899,6 +924,10 @@ impl NativeFramePacing {
                 PacingField::u64(
                     "adaptive_triple_entries_proven_submit_miss",
                     self.adaptive_triple_entries_proven_submit_miss,
+                ),
+                PacingField::u64(
+                    "adaptive_triple_entries_proven_presentation_miss",
+                    self.adaptive_triple_entries_proven_presentation_miss,
                 ),
                 PacingField::u64("adaptive_triple_exits", self.adaptive_triple_exits),
                 PacingField::u64("sync_file_info_exact", self.sync_file_info_exact),

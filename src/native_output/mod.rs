@@ -49,7 +49,7 @@ use oblivion_one::native::{
     adaptive_buffering::{
         AdaptiveBufferingController, AdaptiveBufferingMode, AdaptiveRenderJournal,
         AdaptiveTripleBufferPolicy, FenceTimestampQuality, ProvenDeadlineMiss,
-        approximate_observation_is_late, render_sample_duration_ns,
+        approximate_observation_is_late, merge_presentation_miss, render_sample_duration_ns,
     },
     drm::{
         DrmPresentationEvent, DrmTimestampClock, drain_drm_page_flip_events,

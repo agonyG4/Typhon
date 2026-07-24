@@ -609,6 +609,11 @@ impl NativeRuntime {
                     {
                         proven_miss = Some(ProvenDeadlineMiss::AtomicSubmit);
                     }
+                    proven_miss = merge_presentation_miss(
+                        proven_miss,
+                        completed.target.sequence,
+                        actual_logical_sequence,
+                    );
                     let prediction = render_journal.prediction(refresh);
                     if !scanout.third_slot_owned() {
                         let buffering_mode_before = adaptive_buffering.mode();
@@ -616,7 +621,7 @@ impl NativeRuntime {
                             prediction.total_cost_ns,
                             refresh,
                             proven_miss,
-                            completed.target.sequence,
+                            actual_logical_sequence,
                             presented_at,
                             server.has_unowned_frame_work() || frame_scheduler.visual_work_queued(),
                         );

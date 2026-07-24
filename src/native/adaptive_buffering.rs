@@ -52,6 +52,7 @@ pub enum TripleEntryReason {
     PredictedDeadlinePressure,
     ProvenReadinessMiss,
     ProvenSubmitMiss,
+    ProvenPresentationMiss,
     ForcedValidation,
 }
 
@@ -61,6 +62,18 @@ pub enum ProvenDeadlineMiss {
     ExactRender,
     GuardedApproximateRender,
     AtomicSubmit,
+    Presentation,
+}
+
+#[doc(hidden)]
+pub fn merge_presentation_miss(
+    existing: Option<ProvenDeadlineMiss>,
+    planned_sequence: u64,
+    actual_sequence: u64,
+) -> Option<ProvenDeadlineMiss> {
+    existing.or_else(|| {
+        (actual_sequence > planned_sequence).then_some(ProvenDeadlineMiss::Presentation)
+    })
 }
 
 #[doc(hidden)]
@@ -295,17 +308,20 @@ impl AdaptiveBufferingController {
             return;
         }
         let refresh_ns = duration_ns(refresh_interval).max(1);
-        if self.mode == AdaptiveBufferingMode::Double && visual_work {
-            let reason = match (self.policy, proven_miss) {
-                (AdaptiveTripleBufferPolicy::Force, _) => Some(TripleEntryReason::ForcedValidation),
-                (_, Some(ProvenDeadlineMiss::AtomicSubmit)) => {
-                    Some(TripleEntryReason::ProvenSubmitMiss)
+        if self.mode == AdaptiveBufferingMode::Double {
+            let proven_entry = proven_miss.is_some();
+            let predictive_entry =
+                visual_work && proven_miss.is_none() && predicted_total_cost_ns >= refresh_ns;
+            let forced_entry =
+                self.policy == AdaptiveTripleBufferPolicy::Force && (visual_work || proven_entry);
+            let reason = match self.policy {
+                AdaptiveTripleBufferPolicy::Force if forced_entry => {
+                    Some(TripleEntryReason::ForcedValidation)
                 }
-                (_, Some(_)) => Some(TripleEntryReason::ProvenReadinessMiss),
-                (AdaptiveTripleBufferPolicy::Auto, None)
-                    if predicted_total_cost_ns >= refresh_ns =>
-                {
-                    Some(TripleEntryReason::PredictedDeadlinePressure)
+                AdaptiveTripleBufferPolicy::Auto => {
+                    proven_miss.map(triple_entry_reason_for_miss).or_else(|| {
+                        predictive_entry.then_some(TripleEntryReason::PredictedDeadlinePressure)
+                    })
                 }
                 _ => None,
             };
@@ -372,6 +388,16 @@ impl AdaptiveBufferingController {
 
     pub fn reset(&mut self) {
         *self = Self::new(self.policy);
+    }
+}
+
+const fn triple_entry_reason_for_miss(miss: ProvenDeadlineMiss) -> TripleEntryReason {
+    match miss {
+        ProvenDeadlineMiss::AtomicSubmit => TripleEntryReason::ProvenSubmitMiss,
+        ProvenDeadlineMiss::ExactRender | ProvenDeadlineMiss::GuardedApproximateRender => {
+            TripleEntryReason::ProvenReadinessMiss
+        }
+        ProvenDeadlineMiss::Presentation => TripleEntryReason::ProvenPresentationMiss,
     }
 }
 
@@ -446,6 +472,7 @@ fn duration_ns(duration: Duration) -> u64 {
 mod tests {
     use super::*;
     use crate::native::presentation_deadline::MonotonicTimestampNs;
+    use crate::native::scheduler::NativeFrameScheduler;
     use std::time::Duration;
 
     #[test]
@@ -586,6 +613,15 @@ mod tests {
             true,
         );
         assert_eq!(off.mode(), AdaptiveBufferingMode::Double);
+        off.observe(
+            0,
+            refresh,
+            Some(ProvenDeadlineMiss::Presentation),
+            2,
+            MonotonicTimestampNs::new(2),
+            false,
+        );
+        assert_eq!(off.mode(), AdaptiveBufferingMode::Double);
 
         let mut force = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Force);
         force.observe(0, refresh, None, 1, MonotonicTimestampNs::new(1), true);
@@ -594,6 +630,249 @@ mod tests {
             force.entry_reason(),
             Some(TripleEntryReason::ForcedValidation)
         );
+    }
+
+    #[test]
+    fn presentation_sequence_slip_becomes_proven_miss() {
+        assert_eq!(
+            merge_presentation_miss(None, 40, 41),
+            Some(ProvenDeadlineMiss::Presentation)
+        );
+    }
+
+    #[test]
+    fn specific_deadline_miss_has_precedence_over_presentation_slip() {
+        assert_eq!(
+            merge_presentation_miss(Some(ProvenDeadlineMiss::ExactRender), 40, 41,),
+            Some(ProvenDeadlineMiss::ExactRender)
+        );
+        assert_eq!(
+            merge_presentation_miss(Some(ProvenDeadlineMiss::AtomicSubmit), 40, 42,),
+            Some(ProvenDeadlineMiss::AtomicSubmit)
+        );
+    }
+
+    #[test]
+    fn on_time_presentation_does_not_create_miss() {
+        assert_eq!(merge_presentation_miss(None, 40, 40), None);
+        assert_eq!(merge_presentation_miss(None, 41, 40), None);
+    }
+
+    #[test]
+    fn proven_presentation_miss_enters_triple_without_next_frame_already_queued() {
+        let mut policy = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+        let proven_miss = merge_presentation_miss(None, 100, 101);
+
+        policy.observe(
+            0,
+            Duration::from_millis(10),
+            proven_miss,
+            101,
+            MonotonicTimestampNs::new(10_000_000),
+            false,
+        );
+
+        assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
+        assert_eq!(
+            policy.entry_reason(),
+            Some(TripleEntryReason::ProvenPresentationMiss)
+        );
+    }
+
+    #[test]
+    fn predicted_pressure_still_requires_visual_work() {
+        let refresh = Duration::from_millis(10);
+        let mut policy = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+
+        policy.observe(
+            20_000_000,
+            refresh,
+            None,
+            100,
+            MonotonicTimestampNs::new(1_000_000_000),
+            false,
+        );
+
+        assert_eq!(policy.mode(), AdaptiveBufferingMode::Double);
+
+        policy.observe(
+            20_000_000,
+            refresh,
+            None,
+            101,
+            MonotonicTimestampNs::new(1_010_000_000),
+            true,
+        );
+
+        assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
+        assert_eq!(
+            policy.entry_reason(),
+            Some(TripleEntryReason::PredictedDeadlinePressure)
+        );
+    }
+
+    #[test]
+    fn adaptive_hysteresis_uses_actual_presentation_sequence() {
+        let refresh = Duration::from_millis(10);
+        let mut policy = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+        policy.observe(
+            0,
+            refresh,
+            Some(ProvenDeadlineMiss::Presentation),
+            100,
+            MonotonicTimestampNs::new(0),
+            false,
+        );
+
+        // Ten planned targets may have elapsed, but the output has not
+        // presented another logical sequence yet.
+        policy.observe(
+            7_000_000,
+            refresh,
+            None,
+            100,
+            MonotonicTimestampNs::new(100_000_000),
+            true,
+        );
+        assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
+
+        for sequence in 101..=109 {
+            policy.observe(
+                7_000_000,
+                refresh,
+                None,
+                sequence,
+                MonotonicTimestampNs::new(sequence * 1_000_000),
+                true,
+            );
+        }
+        assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
+
+        policy.observe(
+            7_000_000,
+            refresh,
+            None,
+            110,
+            MonotonicTimestampNs::new(110_000_000),
+            true,
+        );
+        assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
+
+        for sequence in 111..=119 {
+            policy.observe(
+                7_000_000,
+                refresh,
+                None,
+                sequence,
+                MonotonicTimestampNs::new(sequence * 1_000_000),
+                true,
+            );
+        }
+        assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
+
+        policy.observe(
+            7_000_000,
+            refresh,
+            None,
+            120,
+            MonotonicTimestampNs::new(210_000_000),
+            true,
+        );
+        assert_eq!(policy.mode(), AdaptiveBufferingMode::Double);
+    }
+
+    #[test]
+    fn proven_miss_entry_reasons_preserve_specific_precedence() {
+        let refresh = Duration::from_millis(10);
+        for (miss, reason) in [
+            (
+                ProvenDeadlineMiss::AtomicSubmit,
+                TripleEntryReason::ProvenSubmitMiss,
+            ),
+            (
+                ProvenDeadlineMiss::ExactRender,
+                TripleEntryReason::ProvenReadinessMiss,
+            ),
+            (
+                ProvenDeadlineMiss::GuardedApproximateRender,
+                TripleEntryReason::ProvenReadinessMiss,
+            ),
+            (
+                ProvenDeadlineMiss::Presentation,
+                TripleEntryReason::ProvenPresentationMiss,
+            ),
+        ] {
+            let mut policy = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+            policy.observe(
+                0,
+                refresh,
+                Some(miss),
+                100,
+                MonotonicTimestampNs::new(100_000_000),
+                false,
+            );
+            assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
+            assert_eq!(policy.entry_reason(), Some(reason));
+        }
+    }
+
+    #[test]
+    fn presentation_miss_does_not_exit_existing_triple_hold() {
+        let refresh = Duration::from_millis(10);
+        let mut policy = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+        policy.observe(
+            0,
+            refresh,
+            Some(ProvenDeadlineMiss::Presentation),
+            100,
+            MonotonicTimestampNs::new(0),
+            false,
+        );
+        policy.observe(
+            7_000_000,
+            refresh,
+            Some(ProvenDeadlineMiss::Presentation),
+            120,
+            MonotonicTimestampNs::new(200_000_000),
+            true,
+        );
+
+        assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
+    }
+
+    #[test]
+    fn no_miss_and_no_visual_work_does_not_transition() {
+        let mut policy = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+        policy.observe(
+            0,
+            Duration::from_millis(10),
+            None,
+            100,
+            MonotonicTimestampNs::new(100_000_000),
+            false,
+        );
+
+        assert_eq!(policy.mode(), AdaptiveBufferingMode::Double);
+        assert_eq!(policy.entry_reason(), None);
+    }
+
+    #[test]
+    fn presentation_miss_does_not_queue_scheduler_work_by_itself() {
+        let mut policy = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+        let scheduler = NativeFrameScheduler::new(165, 0);
+
+        policy.observe(
+            0,
+            Duration::from_millis(10),
+            merge_presentation_miss(None, 100, 101),
+            101,
+            MonotonicTimestampNs::new(10_000_000),
+            false,
+        );
+
+        assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
+        assert!(!scheduler.visual_work_queued());
+        assert_eq!(scheduler.next_deadline_ns(), None);
     }
 
     #[test]
