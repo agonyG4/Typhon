@@ -38,6 +38,18 @@ impl DirectPrimaryLease {
         self.surface_id
     }
 
+    pub(crate) fn validate_against(
+        &self,
+        expected_key: DirectScanoutCandidateKey,
+        expected_surface_id: u32,
+        expected_framebuffer_id: u32,
+    ) -> bool {
+        self.key == expected_key
+            && self.key.content.surface_id == self.surface_id
+            && self.surface_id == expected_surface_id
+            && self.framebuffer_id() == expected_framebuffer_id
+    }
+
     pub(crate) fn framebuffer_id(&self) -> u32 {
         self.framebuffer.framebuffer.get()
     }

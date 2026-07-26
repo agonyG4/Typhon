@@ -145,6 +145,7 @@ pub(crate) struct NativeRuntime {
     kms_commit_worker_reactor_token: Option<ReactorToken>,
     kms_commit_worker_policy: super::kms_worker::KmsCommitWorkerPolicy,
     kms_commit_worker_transport: super::kms_worker::KmsCommitWorkerTransport,
+    quarantined_worker_jobs: Vec<super::kms_worker::KmsCommitJob>,
     deferred_worker_pageflip: Option<DrmPresentationEvent>,
     deferred_worker_completion: Option<AtomicCommitCompletion>,
     worker_timeout_pending: Option<(PageFlipToken, u64)>,

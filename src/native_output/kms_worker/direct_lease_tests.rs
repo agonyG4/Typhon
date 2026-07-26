@@ -61,6 +61,15 @@ fn test_direct_transaction(
     key: DirectScanoutCandidateKey,
     framebuffer_id: u32,
 ) -> OutputTransaction {
+    test_direct_transaction_with_surface_id(token, key, framebuffer_id, key.content.surface_id)
+}
+
+fn test_direct_transaction_with_surface_id(
+    token: u64,
+    key: DirectScanoutCandidateKey,
+    framebuffer_id: u32,
+    direct_surface_id: u32,
+) -> OutputTransaction {
     OutputTransaction::direct(
         OutputTransactionId::new(std::num::NonZeroU64::new(token).expect("transaction id")),
         1,
@@ -74,7 +83,7 @@ fn test_direct_transaction(
         oblivion_one::compositor::CompositorFrameBatchId::new(
             std::num::NonZeroU64::new(token).expect("frame batch id"),
         ),
-        key.content.surface_id,
+        direct_surface_id,
         OutputReleasePlan::Pageflip,
     )
     .expect("direct transaction")
@@ -114,6 +123,31 @@ fn direct_job_requires_matching_owned_primary_resource() {
         job.validate_against(&transaction),
         Err(KmsCommitPayloadError::DirectPrimaryResourceMismatch)
     );
+}
+
+#[test]
+fn direct_job_accepts_matching_owned_primary_resource() {
+    let key = test_direct_key(3);
+    let transaction = test_direct_transaction(600, key, 42);
+    let lease = DirectPrimaryLease::test_fixture(key, 42);
+    let job = test_direct_job(600, key, 42, Some(lease));
+
+    assert_eq!(job.validate_against(&transaction), Ok(()));
+}
+
+#[test]
+fn direct_job_rejects_lease_with_wrong_surface_identity() {
+    let key = test_direct_key(3);
+    let transaction = test_direct_transaction_with_surface_id(601, key, 42, 8);
+    let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
+    let job = test_direct_job(601, key, 42, Some(lease));
+
+    assert_eq!(
+        job.validate_against(&transaction),
+        Err(KmsCommitPayloadError::DirectPrimaryResourceMismatch)
+    );
+    drop(job);
+    assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 1);
 }
 
 #[test]

@@ -619,6 +619,7 @@ impl NativeRuntime {
             kms_commit_worker_reactor_token,
             kms_commit_worker_policy: requested_worker_policy,
             kms_commit_worker_transport,
+            quarantined_worker_jobs: Vec::new(),
             deferred_worker_pageflip: None,
             deferred_worker_completion: None,
             worker_timeout_pending: None,

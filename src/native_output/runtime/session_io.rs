@@ -1,3 +1,4 @@
+use super::kms_worker::{FatalWorkerJobDisposition, handle_fatal_worker_jobs};
 use super::presentation_transactions::complete_dropped_output_transaction;
 use super::*;
 use oblivion_one::compositor::FrameBatchDiscardReason;
@@ -204,22 +205,11 @@ impl NativeSessionIo for NativeRuntime {
                 event_error = Some(error.to_string());
             }
         }
-        let mut uncertain_submit = false;
-        for fatal_job in worker.take_fatal_jobs() {
-            if fatal_job.uncertain_submit {
-                let mut job = fatal_job.job;
-                if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
-                    let lease = job.direct_primary_lease.take().ok_or_else(|| {
-                        io::Error::other("uncertain direct worker job has no primary lease")
-                    })?;
-                    self.scanout
-                        .suspend_worker_direct_submission(job.token, lease)?;
-                }
-                uncertain_submit = true;
-            } else {
-                self.drop_queued_worker_job(fatal_job.job)?;
-            }
-        }
+        let uncertain_submit = handle_fatal_worker_jobs(
+            worker.take_fatal_jobs(),
+            self,
+            FatalWorkerJobDisposition::Drop,
+        )?;
         if uncertain_submit {
             self.quarantine_after_worker_fatal()?;
         }
@@ -331,6 +321,7 @@ impl NativeSessionIo for NativeRuntime {
             io::Error::other("session recovery completion has no prepared framebuffer")
         })?;
         self.scanout.complete_session_recovery(*recovery)?;
+        self.quarantined_worker_jobs.clear();
         let abandoned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         let transaction_ids = self.output_transactions.active_transaction_ids();
         let output_transactions = &mut self.output_transactions;

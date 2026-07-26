@@ -91,13 +91,29 @@ impl KmsCommitJob {
         }
 
         match (self.kind, self.direct_primary_lease.as_ref()) {
-            (AtomicCommitKind::DirectPrimary { framebuffer_id, .. }, Some(lease))
-                if lease.framebuffer_id() == framebuffer_id
-                    && matches!(
-                        transaction.content(),
-                        OutputTransactionContent::Direct { key: expected, .. }
-                            if expected == lease.key()
-                    ) => {}
+            (AtomicCommitKind::DirectPrimary { framebuffer_id, .. }, Some(lease)) => {
+                let OutputTransactionContent::Direct {
+                    key: expected_key, ..
+                } = transaction.content()
+                else {
+                    return Err(KmsCommitPayloadError::DirectPrimaryResourceMismatch);
+                };
+                let Some(expected_surface_id) = transaction.obligations().direct_surface_id()
+                else {
+                    return Err(KmsCommitPayloadError::DirectPrimaryResourceMismatch);
+                };
+                if !lease.validate_against(expected_key, expected_surface_id, framebuffer_id)
+                    || !matches!(
+                        transaction.planes().primary(),
+                        PrimaryPlaneAssignment::ClientFramebuffer {
+                            key: primary_key,
+                            framebuffer_id: expected_framebuffer,
+                        } if primary_key == expected_key && expected_framebuffer == framebuffer_id
+                    )
+                {
+                    return Err(KmsCommitPayloadError::DirectPrimaryResourceMismatch);
+                }
+            }
             (AtomicCommitKind::DirectPrimary { .. }, _) => {
                 return Err(KmsCommitPayloadError::DirectPrimaryResourceMismatch);
             }
