@@ -1,0 +1,56 @@
+# KMS Commit Worker Stage 3 qualification evidence
+# This capture records the Task 0 gate from the agent environment.
+# Native qualification was not executed because this process has no real TTY
+# or logind session. No application, shutdown, recovery, or worker counter
+# result below is presented as a hardware observation.
+
+$ git rev-parse HEAD
+3fcb18f0c004197ba6baa5d875bd02bba0dbe53c
+
+$ tty
+not a tty
+
+$ loginctl show-session self -p Type -p Class -p Remote -p State -p Seat -p Leader
+Failed to get path for session 'self': Caller does not belong to any known session.
+
+$ lspci -nnk | awk '/VGA compatible controller|3D controller/{print; capture=1; next} capture && /Kernel driver in use/{print; exit}'
+01:00.0 VGA compatible controller [0300]: NVIDIA Corporation GA104 [GeForce RTX 3060 Ti Lite Hash Rate] [10de:2489] (rev a1)
+    Kernel driver in use: nvidia
+
+$ connected DRM path and mode
+/sys/class/drm/card1-DP-1=connected
+/sys/class/drm/card1-DP-1/modes=1920x1080
+
+$ cargo fmt --check
+exit 0
+
+$ cargo test --locked
+test result: ok. 536 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+
+$ cargo check --locked --all-targets
+Finished `dev` profile [unoptimized + debuginfo]
+
+$ cargo clippy --locked --all-targets -- -D warnings
+Finished `dev` profile [unoptimized + debuginfo]
+
+$ cargo build --locked --release
+Finished `release` profile [optimized]
+
+$ ./bin/check-source-layout
+exit 0
+
+$ git diff --check
+exit 0
+
+$ bash -n bin/qualify-kms-worker
+exit 0
+
+$ OBLIVION_ONE_DRY_RUN=1 ./bin/start-oblivion-one-tty
+/home/agony/GitHub/Typhon/target/release/oblivion-one compositor --socket oblivion-one-tty
+
+NATIVE_TTY_GATE=FAIL
+REASON=no real TTY or logind session is available to this process
+APPLICATION_MATRIX=NOT RUN
+SHUTDOWN_RECOVERY_MATRIX=NOT RUN
+QUALIFICATION_COUNTERS=NOT MEASURED
+QUALIFIER_EXECUTION=BLOCKED: no valid worker perf log was produced
