@@ -19,6 +19,7 @@ fn test_buffer_identity() -> BufferIdentity {
         .expect("test buffer identity")
 }
 
+mod direct_scanout_stage4;
 mod frame;
 mod fullscreen_cadence;
 mod input;
