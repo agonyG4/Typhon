@@ -10,7 +10,9 @@ pub(crate) use payload::{KmsCommitJob, KmsCursorUpdate, KmsPrimaryUpdate, KmsTes
 pub(crate) use policy::{
     KmsCommitWorkerPolicy, KmsCommitWorkerStartupError, KmsCommitWorkerTransport,
 };
-pub(crate) use queue::{KmsCommitAdmissionPermit, KmsWorkerAdmissionError};
+#[cfg(test)]
+pub(crate) use queue::KmsWorkerForcedShutdownDisposition;
+pub(crate) use queue::{KmsCommitAdmissionPermit, KmsWorkerAdmissionError, WorkerInFlight};
 pub(crate) use thread::{KmsCommitWorkerHandle, KmsWorkerEvent};
 pub(crate) use timing::KmsCommitTimingModel;
 

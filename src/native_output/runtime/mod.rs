@@ -27,7 +27,7 @@ mod xwayland_reactor_tests;
 
 pub(super) use atomic_commit::validate_atomic_pageflip;
 pub(super) use atomic_commit::{
-    AtomicCommitArbiter, AtomicCommitCompletion, AtomicCommitKind,
+    AtomicCommitArbiter, AtomicCommitCompletion, AtomicCommitKind, AtomicCommitPhase,
     register_atomic_primary_submission,
 };
 pub(super) use cursor_cycle::{
@@ -147,7 +147,7 @@ pub(crate) struct NativeRuntime {
     deferred_worker_pageflip: Option<DrmPresentationEvent>,
     deferred_worker_completion: Option<AtomicCommitCompletion>,
     worker_timeout_pending: Option<(PageFlipToken, u64)>,
-    forced_shutdown_inflight: Option<PageFlipToken>,
+    forced_shutdown_inflight: Option<super::kms_worker::WorkerInFlight>,
     frame_scheduler: NativeFrameScheduler,
     atomic_commit_arbiter: AtomicCommitArbiter,
     output_transactions: OutputTransactionLedger,

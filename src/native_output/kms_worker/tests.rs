@@ -3,7 +3,10 @@ use super::thread::{
 };
 use super::timing::KmsTimingDecision;
 use super::*;
+use crate::native_output::output::test_cursor_for_worker;
+use crate::native_output::runtime::NativeCursorOutputArbitration;
 use crate::native_output::{OutputTransactionId, runtime::AtomicCommitKind};
+use oblivion_one::native::kms::AtomicCursorVisualState;
 use oblivion_one::native::kms::KmsBackendKind;
 use oblivion_one::native::presentation_deadline::{
     MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
@@ -229,6 +232,35 @@ fn test_cursor_job(token: u64) -> KmsCommitJob {
     job.primary = KmsPrimaryUpdate::Unchanged;
     job.cursor = KmsCursorUpdate::Disable;
     job.test_only = KmsTestOnlyPolicy::Required;
+    job
+}
+
+fn test_primary_job_with_cursor(
+    token: u64,
+    framebuffer_id: u32,
+    cursor_pin: crate::native_output::output::CursorFramebufferPin,
+) -> KmsCommitJob {
+    let mut job = test_job(token);
+    job.cursor = KmsCursorUpdate::Set(AtomicCursorVisualState {
+        framebuffer_id: Some(framebuffer_id),
+        visible: true,
+        ..AtomicCursorVisualState::hidden(64, 64)
+    });
+    job.cursor_pin = Some(cursor_pin);
+    job
+}
+
+fn test_composited_primary_job_with_cursor(
+    token: u64,
+    framebuffer_id: u32,
+    cursor_pin: crate::native_output::output::CursorFramebufferPin,
+) -> KmsCommitJob {
+    let mut job = test_primary_job_with_cursor(token, framebuffer_id, cursor_pin);
+    job.kind = AtomicCommitKind::CompositedPrimary {
+        transaction_id: job.transaction_id,
+        frame_id: token,
+        framebuffer_id,
+    };
     job
 }
 
@@ -1085,9 +1117,293 @@ fn forced_shutdown_abandonment_wakes_inflight_worker_without_next_submit() {
 
     let abandoned = handle.force_shutdown_abandon().unwrap();
     assert_eq!(
-        abandoned.inflight.map(|inflight| inflight.token.get()),
-        Some(47)
+        abandoned.disposition,
+        KmsWorkerForcedShutdownDisposition::InFlightAbandoned
     );
+    assert_eq!(
+        abandoned.inflight.map(|inflight| (
+            inflight.token.get(),
+            inflight.transaction_id.get(),
+            inflight.kind
+        )),
+        Some((47, 47, test_job(47).kind))
+    );
+    let repeated = handle.force_shutdown_abandon().unwrap();
+    assert!(matches!(
+        repeated.disposition,
+        KmsWorkerForcedShutdownDisposition::AlreadyAbandoned
+            | KmsWorkerForcedShutdownDisposition::AlreadyStopped
+    ));
+    assert!(repeated.inflight.is_none());
     handle.join().unwrap();
     assert_eq!(*executor.submitted.lock().unwrap(), vec![47]);
+}
+
+#[test]
+fn forced_shutdown_abandonment_is_idempotent_after_late_ack_stops_worker() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Ok(())])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let job = test_job(49);
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    wait_for_fence_event(
+        &handle,
+        49,
+        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 49),
+    );
+
+    let snapshot = handle.begin_shutdown_quiesce().unwrap();
+    assert_eq!(
+        snapshot.inflight.map(|inflight| inflight.token.get()),
+        Some(49)
+    );
+    handle
+        .ack_pageflip(test_job(49).token, test_job(49).transaction_id, 1)
+        .unwrap();
+    for _ in 0..100 {
+        if matches!(
+            handle.try_reserve_admission(test_job(50).kind),
+            Err(KmsWorkerAdmissionError::Stopped)
+        ) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let forced = handle.force_shutdown_abandon().unwrap();
+    assert_eq!(
+        forced.disposition,
+        KmsWorkerForcedShutdownDisposition::AlreadyStopped
+    );
+    assert!(forced.inflight.is_none());
+    let repeated = handle.force_shutdown_abandon().unwrap();
+    assert_eq!(
+        repeated.disposition,
+        KmsWorkerForcedShutdownDisposition::AlreadyStopped
+    );
+    handle
+        .ack_pageflip(test_job(49).token, test_job(49).transaction_id, 1)
+        .unwrap();
+    handle.join().unwrap();
+    assert_eq!(handle.metrics_snapshot().duplicate_pageflip_acks, 0);
+}
+
+#[test]
+fn primary_job_keeps_queued_cursor_pin_until_submission_completes() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Ok(()), Ok(())])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let cursor = test_cursor_for_worker();
+    let state = AtomicCursorVisualState {
+        framebuffer_id: Some(91),
+        visible: true,
+        ..AtomicCursorVisualState::hidden(64, 64)
+    };
+    let pin = cursor.pin_framebuffer_for(&state).unwrap();
+    let pin_observer = pin.clone();
+    let mut arbitration = NativeCursorOutputArbitration::default();
+    arbitration.request(10, 1, 100);
+    arbitration.request(11, 2, 100);
+    reserve_for_test(&handle, test_job(51).kind)
+        .enqueue(test_job(51))
+        .unwrap();
+    wait_for_fence_event(
+        &handle,
+        51,
+        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 51),
+    );
+
+    reserve_for_test(
+        &handle,
+        AtomicCommitKind::CompositedPrimary {
+            transaction_id: test_job(52).transaction_id,
+            frame_id: 52,
+            framebuffer_id: 91,
+        },
+    )
+    .enqueue(test_composited_primary_job_with_cursor(52, 91, pin))
+    .unwrap();
+    assert!(pin_observer.is_job_owned());
+    drop(cursor);
+    assert!(pin_observer.is_job_owned());
+
+    handle
+        .ack_pageflip(test_job(51).token, test_job(51).transaction_id, 1)
+        .unwrap();
+    wait_for_fence_event(
+        &handle,
+        52,
+        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 52),
+    );
+    arbitration.consume_submitted_epoch(10, 120, 200);
+    assert!(arbitration.pending());
+    assert_eq!(arbitration.desired_epoch(), 11);
+    assert!(pin_observer.is_job_owned());
+    handle
+        .ack_pageflip(test_job(52).token, test_job(52).transaction_id, 1)
+        .unwrap();
+    for _ in 0..100 {
+        if !pin_observer.is_job_owned() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!pin_observer.is_job_owned());
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn primary_job_preserves_exact_cursor_pin_across_busy_retry() {
+    let executor = Arc::new(CursorRecordingExecutor {
+        outcomes: Mutex::new(VecDeque::from([
+            Err(oblivion_one::native::kms::AtomicKmsErrorKind::Busy),
+            Ok(()),
+        ])),
+        attempts: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let cursor = test_cursor_for_worker();
+    let state = AtomicCursorVisualState {
+        framebuffer_id: Some(91),
+        visible: true,
+        ..AtomicCursorVisualState::hidden(64, 64)
+    };
+    let pin = cursor.pin_framebuffer_for(&state).unwrap();
+    let pin_observer = pin.clone();
+    reserve_for_test(&handle, test_job(53).kind)
+        .enqueue(test_primary_job_with_cursor(53, 91, pin))
+        .unwrap();
+    wait_for_fence_event(
+        &handle,
+        53,
+        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 53),
+    );
+    assert_eq!(*executor.attempts.lock().unwrap(), vec![(91, 91), (91, 91)]);
+    assert!(pin_observer.is_job_owned());
+    handle
+        .ack_pageflip(test_job(53).token, test_job(53).transaction_id, 1)
+        .unwrap();
+    drop(cursor);
+    drop(pin_observer);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn rejected_primary_job_releases_cursor_pin_once() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Err(
+            oblivion_one::native::kms::AtomicKmsErrorKind::FlipRejected,
+        )])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let cursor = test_cursor_for_worker();
+    let state = AtomicCursorVisualState {
+        framebuffer_id: Some(91),
+        visible: true,
+        ..AtomicCursorVisualState::hidden(64, 64)
+    };
+    let pin = cursor.pin_framebuffer_for(&state).unwrap();
+    let pin_observer = pin.clone();
+    reserve_for_test(
+        &handle,
+        AtomicCommitKind::CompositedPrimary {
+            transaction_id: test_job(54).transaction_id,
+            frame_id: 54,
+            framebuffer_id: 91,
+        },
+    )
+    .enqueue(test_composited_primary_job_with_cursor(54, 91, pin))
+    .unwrap();
+    let events = wait_for_fence_event(
+        &handle,
+        54,
+        |event| matches!(event, KmsWorkerEvent::SubmitRejected { job, .. } if job.token.get() == 54),
+    );
+    drop(events);
+    drop(cursor);
+    assert!(!pin_observer.is_job_owned());
+    drop(pin_observer);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn shutdown_detaches_queued_primary_cursor_pin_once() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Ok(())])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let cursor = test_cursor_for_worker();
+    let state = AtomicCursorVisualState {
+        framebuffer_id: Some(91),
+        visible: true,
+        ..AtomicCursorVisualState::hidden(64, 64)
+    };
+    let pin = cursor.pin_framebuffer_for(&state).unwrap();
+    let pin_observer = pin.clone();
+    reserve_for_test(&handle, test_job(55).kind)
+        .enqueue(test_job(55))
+        .unwrap();
+    wait_for_fence_event(
+        &handle,
+        55,
+        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 55),
+    );
+    reserve_for_test(
+        &handle,
+        AtomicCommitKind::CompositedPrimary {
+            transaction_id: test_job(56).transaction_id,
+            frame_id: 56,
+            framebuffer_id: 91,
+        },
+    )
+    .enqueue(test_composited_primary_job_with_cursor(56, 91, pin))
+    .unwrap();
+    let snapshot = handle.begin_shutdown_quiesce().unwrap();
+    drop(snapshot.queued_job);
+    drop(cursor);
+    assert!(!pin_observer.is_job_owned());
+    handle
+        .ack_pageflip(test_job(55).token, test_job(55).transaction_id, 1)
+        .unwrap();
+    handle.join().unwrap();
+    drop(pin_observer);
+}
+
+#[derive(Debug)]
+struct CursorRecordingExecutor {
+    outcomes: Mutex<VecDeque<Result<(), oblivion_one::native::kms::AtomicKmsErrorKind>>>,
+    attempts: Mutex<Vec<(u32, u32)>>,
+}
+
+impl KmsCommitExecutor for CursorRecordingExecutor {
+    fn submit(&self, job: &KmsCommitJob) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure> {
+        let state = match &job.cursor {
+            KmsCursorUpdate::Set(state) => state,
+            KmsCursorUpdate::Disable | KmsCursorUpdate::Unchanged => {
+                panic!("cursor recording executor requires a cursor assignment")
+            }
+        };
+        self.attempts.lock().unwrap().push((
+            state.framebuffer_id.expect("cursor framebuffer is present"),
+            job.cursor_pin
+                .as_ref()
+                .expect("primary cursor job has a pin")
+                .framebuffer_id()
+                .get(),
+        ));
+        let result = self.outcomes.lock().unwrap().pop_front().unwrap_or(Ok(()));
+        match result {
+            Ok(()) => Ok(KmsWorkerSubmission { out_fence: None }),
+            Err(kind) => Err(KmsWorkerSubmitFailure::new(kind, "fake Atomic ioctl")),
+        }
+    }
 }

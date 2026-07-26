@@ -107,6 +107,10 @@ fn test_cursor() -> NativeAtomicCursor {
     }
 }
 
+pub(super) fn test_cursor_for_worker() -> NativeAtomicCursor {
+    test_cursor()
+}
+
 #[test]
 fn queueing_cursor_job_does_not_advance_last_submitted_epoch() {
     let mut cursor = test_cursor();

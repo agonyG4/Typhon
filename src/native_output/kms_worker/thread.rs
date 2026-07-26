@@ -2,9 +2,9 @@
 
 use super::payload::{KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy};
 use super::queue::{
-    KmsWorkerFatalJob, KmsWorkerLifecycle, KmsWorkerShutdownSnapshot, RESULT_EVENT_CAPACITY,
-    WorkerInFlight, WorkerMetricsSnapshot, WorkerShared, create_eventfd, drain_eventfd,
-    notify_eventfd,
+    KmsWorkerFatalJob, KmsWorkerForcedShutdown, KmsWorkerLifecycle, KmsWorkerShutdownSnapshot,
+    RESULT_EVENT_CAPACITY, WorkerInFlight, WorkerMetricsSnapshot, WorkerShared, create_eventfd,
+    drain_eventfd, notify_eventfd,
 };
 use super::{
     KmsCommitAdmissionPermit, KmsCommitJob, KmsCommitTimingModel, KmsWorkerAdmissionError,
@@ -357,7 +357,7 @@ impl KmsCommitWorkerHandle {
 
     pub(crate) fn force_shutdown_abandon(
         &self,
-    ) -> Result<KmsWorkerShutdownSnapshot, KmsWorkerAdmissionError> {
+    ) -> Result<KmsWorkerForcedShutdown, KmsWorkerAdmissionError> {
         self.shared.force_shutdown_abandon()
     }
 
@@ -373,6 +373,14 @@ impl KmsCommitWorkerHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(inflight) = state.inflight else {
+            if matches!(
+                state.lifecycle,
+                KmsWorkerLifecycle::ShutdownQuiescing
+                    | KmsWorkerLifecycle::ShutdownAbandoning
+                    | KmsWorkerLifecycle::Stopped
+            ) {
+                return Ok(());
+            }
             self.shared
                 .metrics
                 .duplicate_pageflip_acks

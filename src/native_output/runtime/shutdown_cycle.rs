@@ -5,44 +5,70 @@ impl NativeRuntime {
     pub(super) fn request_native_shutdown(&mut self) -> NativeResult<()> {
         let now_ns = monotonic_now_ns()?;
         let first_request = self.shutdown.is_running();
-        let worker_inflight_token = if first_request {
+        let worker_inflight = if first_request {
             NativeSessionIo::observe(self, NativeIoOperation::KmsWorkerStopAdmission);
             self.stop_kms_worker_admission_for_shutdown()?
         } else {
             None
         };
+        if first_request {
+            self.forced_shutdown_inflight = worker_inflight.or_else(|| {
+                self.atomic_commit_arbiter
+                    .pending_atomic_commit()
+                    .and_then(|pending| {
+                        matches!(pending.phase, AtomicCommitPhase::KernelSubmitted { .. }).then(
+                            || super::super::kms_worker::WorkerInFlight {
+                                token: pending.token,
+                                transaction_id: match pending.kind {
+                                    AtomicCommitKind::CompositedPrimary {
+                                        transaction_id, ..
+                                    }
+                                    | AtomicCommitKind::DirectPrimary { transaction_id, .. }
+                                    | AtomicCommitKind::CursorOnly { transaction_id, .. } => {
+                                        transaction_id
+                                    }
+                                },
+                                output_generation: pending.generation,
+                                kind: pending.kind,
+                            },
+                        )
+                    })
+            });
+        }
         let worker_transport = self.kms_commit_worker_transport
             == crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker;
-        let pending_pageflip_token = worker_inflight_token.map(PageFlipToken::get).or_else(|| {
-            if worker_transport {
-                self.atomic_commit_arbiter
-                    .kernel_submitted_token()
-                    .map(PageFlipToken::get)
-                    .or_else(|| {
-                        self.atomic_commit_arbiter
-                            .deferred_pageflip()
-                            .and_then(|_| self.atomic_commit_arbiter.worker_queued_token())
-                            .map(PageFlipToken::get)
-                    })
-                    .or_else(|| self.frame_scheduler.pending_page_flip_token())
-                    .or_else(|| {
-                        self.atomic_cursor
-                            .as_ref()
-                            .and_then(|cursor| cursor.pending_token().map(PageFlipToken::get))
-                    })
-            } else {
-                self.atomic_commit_arbiter
-                    .pending_atomic_token()
-                    .map(PageFlipToken::get)
-                    .or_else(|| self.scanout.pending_page_flip_token())
-                    .or_else(|| self.frame_scheduler.pending_page_flip_token())
-                    .or_else(|| {
-                        self.atomic_cursor
-                            .as_ref()
-                            .and_then(|cursor| cursor.pending_token().map(PageFlipToken::get))
-                    })
-            }
-        });
+        let pending_pageflip_token = worker_inflight
+            .map(|inflight| inflight.token.get())
+            .or_else(|| {
+                if worker_transport {
+                    self.atomic_commit_arbiter
+                        .kernel_submitted_token()
+                        .map(PageFlipToken::get)
+                        .or_else(|| {
+                            self.atomic_commit_arbiter
+                                .deferred_pageflip()
+                                .and_then(|_| self.atomic_commit_arbiter.worker_queued_token())
+                                .map(PageFlipToken::get)
+                        })
+                        .or_else(|| self.frame_scheduler.pending_page_flip_token())
+                        .or_else(|| {
+                            self.atomic_cursor
+                                .as_ref()
+                                .and_then(|cursor| cursor.pending_token().map(PageFlipToken::get))
+                        })
+                } else {
+                    self.atomic_commit_arbiter
+                        .pending_atomic_token()
+                        .map(PageFlipToken::get)
+                        .or_else(|| self.scanout.pending_page_flip_token())
+                        .or_else(|| self.frame_scheduler.pending_page_flip_token())
+                        .or_else(|| {
+                            self.atomic_cursor
+                                .as_ref()
+                                .and_then(|cursor| cursor.pending_token().map(PageFlipToken::get))
+                        })
+                }
+            });
         match self
             .shutdown
             .request_shutdown(now_ns, pending_pageflip_token)
@@ -103,8 +129,11 @@ impl NativeRuntime {
         NativeSessionIo::quiesce_kms_worker(self)?;
         NativeSessionIo::observe(self, NativeIoOperation::KmsWorkerJoin);
         NativeSessionIo::join_kms_worker(self)?;
-        if forced_timeout && let Some(token) = self.forced_shutdown_inflight.take() {
-            let _ = self.frame_pacing.abandon_pending_submission(token.get());
+        let forced_identity = self.forced_shutdown_inflight.take();
+        if let Some(identity) = forced_identity {
+            let _ = self
+                .frame_pacing
+                .abandon_pending_submission(identity.token.get());
         }
         if forced_timeout {
             // The forced path deliberately abandons unresolved kernel
@@ -112,6 +141,9 @@ impl NativeRuntime {
             // the worker has stopped, then restore KMS.
             NativeSessionIo::observe(self, NativeIoOperation::PageflipQuarantine);
             NativeSessionIo::quarantine_pageflip(self)?;
+        }
+        if let Some(identity) = forced_identity {
+            self.settle_forced_shutdown_inflight(identity)?;
         }
         self.acquire_watches.shutdown(&mut self.event_loop)?;
         if !self.session.permits_output() {

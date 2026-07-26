@@ -218,6 +218,32 @@ pub(crate) struct KmsWorkerShutdownSnapshot {
     pub(crate) inflight: Option<WorkerInFlight>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KmsWorkerForcedShutdownDisposition {
+    InFlightAbandoned,
+    CompletedAfterTimeout,
+    AlreadyAbandoned,
+    AlreadyStopped,
+}
+
+impl KmsWorkerForcedShutdownDisposition {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::InFlightAbandoned => "shutdown_inflight_abandoned",
+            Self::CompletedAfterTimeout => "shutdown_inflight_completed_after_timeout",
+            Self::AlreadyAbandoned => "shutdown_inflight_already_abandoned",
+            Self::AlreadyStopped => "shutdown_worker_already_stopped",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct KmsWorkerForcedShutdown {
+    pub(crate) queued_job: Option<KmsCommitJob>,
+    pub(crate) inflight: Option<WorkerInFlight>,
+    pub(crate) disposition: KmsWorkerForcedShutdownDisposition,
+}
+
 #[derive(Debug)]
 pub(crate) struct WorkerShared {
     pub(crate) state: Mutex<WorkerState>,
@@ -373,7 +399,7 @@ impl WorkerShared {
 
     pub(crate) fn force_shutdown_abandon(
         &self,
-    ) -> Result<KmsWorkerShutdownSnapshot, KmsWorkerAdmissionError> {
+    ) -> Result<KmsWorkerForcedShutdown, KmsWorkerAdmissionError> {
         let started = Instant::now();
         // The submit gate makes the forced transition wait for an ioctl that
         // is already executing. Once it is acquired, no later ioctl can begin
@@ -390,14 +416,25 @@ impl WorkerShared {
             return Err(KmsWorkerAdmissionError::Fatal);
         }
         if matches!(state.lifecycle, KmsWorkerLifecycle::Stopped) {
-            return Err(KmsWorkerAdmissionError::Stopped);
+            return Ok(KmsWorkerForcedShutdown {
+                queued_job: None,
+                inflight: None,
+                disposition: KmsWorkerForcedShutdownDisposition::AlreadyStopped,
+            });
         }
-        if !matches!(
-            state.lifecycle,
-            KmsWorkerLifecycle::ShutdownQuiescing | KmsWorkerLifecycle::ShutdownAbandoning
-        ) {
-            return Err(KmsWorkerAdmissionError::Quiescing);
-        }
+        let disposition = match state.lifecycle {
+            KmsWorkerLifecycle::ShutdownQuiescing => {
+                if state.inflight.is_some() {
+                    KmsWorkerForcedShutdownDisposition::InFlightAbandoned
+                } else {
+                    KmsWorkerForcedShutdownDisposition::CompletedAfterTimeout
+                }
+            }
+            KmsWorkerLifecycle::ShutdownAbandoning => {
+                KmsWorkerForcedShutdownDisposition::AlreadyAbandoned
+            }
+            _ => return Err(KmsWorkerAdmissionError::Quiescing),
+        };
         state.lifecycle = KmsWorkerLifecycle::ShutdownAbandoning;
         let queued_job = state.queued.pop_front();
         let inflight = state.inflight.take();
@@ -413,9 +450,10 @@ impl WorkerShared {
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
-        Ok(KmsWorkerShutdownSnapshot {
+        Ok(KmsWorkerForcedShutdown {
             queued_job,
             inflight,
+            disposition,
         })
     }
 }

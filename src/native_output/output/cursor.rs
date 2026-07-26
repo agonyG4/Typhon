@@ -1098,6 +1098,11 @@ fn next_cursor_epoch(current: u64, submitted: u64) -> u64 {
 #[path = "cursor_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+pub(crate) fn test_cursor_for_worker() -> NativeAtomicCursor {
+    tests::test_cursor_for_worker()
+}
+
 pub(crate) fn native_cursor_argb_bytes(
     pixels: &[u32],
     source_width: u32,

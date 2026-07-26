@@ -10,7 +10,7 @@ use super::super::kms_worker::{
 };
 use super::presentation_transactions::{
     build_compatibility_transaction, settle_dropped_output_transaction,
-    settle_failed_output_transaction,
+    settle_failed_output_transaction, settle_forced_shutdown_transaction,
 };
 use super::*;
 use crate::native_output::scanout::AtomicEglGbmScanout;
@@ -554,7 +554,7 @@ pub(super) fn drain_worker_eventfd(
 impl NativeRuntime {
     pub(super) fn stop_kms_worker_admission_for_shutdown(
         &mut self,
-    ) -> NativeResult<Option<PageFlipToken>> {
+    ) -> NativeResult<Option<super::super::kms_worker::WorkerInFlight>> {
         let snapshot = {
             let Some(worker) = self.kms_commit_worker.as_ref() else {
                 return Ok(None);
@@ -569,7 +569,7 @@ impl NativeRuntime {
                 OutputTransactionDropReason::SafeAbandonment,
             )?;
         }
-        Ok(snapshot.inflight.map(|inflight| inflight.token))
+        Ok(snapshot.inflight)
     }
 
     pub(super) fn force_kms_worker_shutdown_abandon(&mut self) -> NativeResult<()> {
@@ -586,19 +586,62 @@ impl NativeRuntime {
             )?;
         }
         if let Some(inflight) = snapshot.inflight {
-            self.forced_shutdown_inflight = Some(inflight.token);
+            self.forced_shutdown_inflight = Some(inflight);
             let pacing_cleared = self
                 .frame_pacing
                 .abandon_pending_submission(inflight.token.get());
             self.perf.log("native.kms_commit_worker", || {
                 vec![
-                    NativePerfField::str("event", "shutdown_inflight_abandoned"),
+                    NativePerfField::str("event", snapshot.disposition.as_str()),
                     NativePerfField::u64("token", inflight.token.get()),
                     NativePerfField::u64("transaction_id", inflight.transaction_id.get()),
                     NativePerfField::bool("pacing_pending_cleared", pacing_cleared),
                 ]
             });
+        } else {
+            self.perf.log("native.kms_commit_worker", || {
+                vec![NativePerfField::str("event", snapshot.disposition.as_str())]
+            });
         }
+        Ok(())
+    }
+
+    pub(super) fn settle_forced_shutdown_inflight(
+        &mut self,
+        identity: super::super::kms_worker::WorkerInFlight,
+    ) -> NativeResult<()> {
+        let transaction_id = identity.transaction_id;
+        let token = identity.token;
+        let settled = settle_forced_shutdown_transaction(
+            &mut self.output_transactions,
+            transaction_id,
+            token,
+            MonotonicTimestampNs::new(monotonic_now_ns()?),
+            |obligations| {
+                if let Some(batch_id) = obligations.frame_batch_id() {
+                    self.server.complete_frame_batch_after_safe_abandonment(
+                        batch_id,
+                        FrameBatchDiscardReason::SuspendAbandonment,
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        self.perf.log("native.kms_commit_worker", || {
+            vec![
+                NativePerfField::str(
+                    "event",
+                    if settled {
+                        "shutdown_transaction_dropped_safe_abandonment"
+                    } else {
+                        "shutdown_transaction_already_terminal"
+                    },
+                ),
+                NativePerfField::u64("token", token.get()),
+                NativePerfField::u64("transaction_id", transaction_id.get()),
+                NativePerfField::str("job_kind", format!("{:?}", identity.kind)),
+            ]
+        });
         Ok(())
     }
 

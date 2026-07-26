@@ -60,6 +60,46 @@ where
     settle_accepted_output_transaction(output_transactions, accepted, settle_protocol_obligations)
 }
 
+pub(crate) fn settle_forced_shutdown_transaction<F>(
+    output_transactions: &mut OutputTransactionLedger,
+    transaction_id: OutputTransactionId,
+    token: PageFlipToken,
+    at: MonotonicTimestampNs,
+    settle_protocol_obligations: F,
+) -> NativeResult<bool>
+where
+    F: FnOnce(OutputProtocolObligations) -> NativeResult<()>,
+{
+    let Some(record) = output_transactions.transaction(transaction_id) else {
+        return Ok(false);
+    };
+    match record.state() {
+        OutputTransactionState::Submitted {
+            token: submitted_token,
+            ..
+        } if submitted_token == token => {}
+        OutputTransactionState::Submitted { .. } => {
+            return Err(io::Error::other(
+                "forced shutdown transaction token mismatches worker identity",
+            )
+            .into());
+        }
+        OutputTransactionState::Built
+        | OutputTransactionState::Ready { .. }
+        | OutputTransactionState::Queued { .. }
+        | OutputTransactionState::Settling { .. }
+        | OutputTransactionState::Terminal(_) => return Ok(false),
+    }
+    settle_dropped_output_transaction(
+        output_transactions,
+        transaction_id,
+        OutputTransactionDropReason::SafeAbandonment,
+        at,
+        settle_protocol_obligations,
+    )?;
+    Ok(true)
+}
+
 pub(crate) fn settle_superseded_output_transaction<F>(
     output_transactions: &mut OutputTransactionLedger,
     transaction_id: OutputTransactionId,
