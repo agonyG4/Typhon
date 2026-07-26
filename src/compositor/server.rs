@@ -51,10 +51,10 @@ mod server_gpu_globals;
 use super::{
     AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, BufferReleaseMetrics,
     ClientCursorRenderState, CompositorError, CompositorFrameBatchId, CompositorState,
-    CoreComplianceMetrics, DirectScanoutSceneCandidate, DirectScanoutSceneRejection,
-    ExplicitSyncPoint, FrameBatchDiscardReason, FrameCallbackMetrics, FrameCallbackTime,
-    FramePresentation, FullscreenRenderPlanMetrics, InputProtocolCapabilities, OutputRect,
-    PendingProcessLaunch, PointerAxisFrame, PresentationClock, ProtocolOnlyCompletion,
+    CoreComplianceMetrics, DirectScanoutSceneBlockers, DirectScanoutSceneCandidate,
+    DirectScanoutSceneRejection, ExplicitSyncPoint, FrameBatchDiscardReason, FrameCallbackMetrics,
+    FrameCallbackTime, FramePresentation, FullscreenRenderPlanMetrics, InputProtocolCapabilities,
+    OutputRect, PendingProcessLaunch, PointerAxisFrame, PresentationClock, ProtocolOnlyCompletion,
     RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
     SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
     WindowInteractionDebugSnapshot, WindowInteractionEndReason, color,
@@ -855,6 +855,10 @@ impl OwnCompositorServer {
         &self,
     ) -> Result<DirectScanoutSceneCandidate, DirectScanoutSceneRejection> {
         self.state.direct_scanout_scene_candidate()
+    }
+
+    pub fn direct_scanout_scene_blockers(&self) -> DirectScanoutSceneBlockers {
+        self.state.direct_scanout_scene_blockers()
     }
 
     /// Returns the immutable publication epoch for the currently published

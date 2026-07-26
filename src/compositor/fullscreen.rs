@@ -78,6 +78,23 @@ impl DirectScanoutSceneRejection {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectScanoutSceneBlockers {
+    reasons: Vec<DirectScanoutSceneRejection>,
+}
+
+impl DirectScanoutSceneBlockers {
+    pub fn reasons(&self) -> &[DirectScanoutSceneRejection] {
+        &self.reasons
+    }
+
+    fn push(&mut self, reason: DirectScanoutSceneRejection) {
+        if !self.reasons.contains(&reason) {
+            self.reasons.push(reason);
+        }
+    }
+}
+
 pub(crate) fn direct_scanout_viewport_compatibility(
     buffer_size: BufferSize,
     output_size: BufferSize,
@@ -132,6 +149,24 @@ pub(crate) const fn direct_scanout_scene_rejection_for_flags(
     } else {
         None
     }
+}
+
+pub(crate) fn direct_scanout_scene_blockers_for_visibility(
+    overlays_visible: bool,
+    popup_visible: bool,
+    resize_preview_active: bool,
+) -> DirectScanoutSceneBlockers {
+    let mut blockers = DirectScanoutSceneBlockers::default();
+    if overlays_visible {
+        blockers.push(DirectScanoutSceneRejection::OverlayVisible);
+    }
+    if popup_visible {
+        blockers.push(DirectScanoutSceneRejection::PopupVisible);
+    }
+    if resize_preview_active {
+        blockers.push(DirectScanoutSceneRejection::ResizePreviewActive);
+    }
+    blockers
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,6 +260,24 @@ mod tests {
         assert_eq!(
             direct_scanout_scene_rejection_for_flags(true, true),
             Some(DirectScanoutSceneRejection::OverlayVisible)
+        );
+    }
+
+    #[test]
+    fn direct_scanout_scene_blockers_collect_unique_reasons_in_order() {
+        let mut blockers = DirectScanoutSceneBlockers::default();
+        blockers.push(DirectScanoutSceneRejection::OverlayVisible);
+        blockers.push(DirectScanoutSceneRejection::PopupVisible);
+        blockers.push(DirectScanoutSceneRejection::ResizePreviewActive);
+        blockers.push(DirectScanoutSceneRejection::OverlayVisible);
+
+        assert_eq!(
+            blockers.reasons(),
+            &[
+                DirectScanoutSceneRejection::OverlayVisible,
+                DirectScanoutSceneRejection::PopupVisible,
+                DirectScanoutSceneRejection::ResizePreviewActive,
+            ]
         );
     }
 

@@ -122,6 +122,7 @@ use explicit_sync::{
 };
 pub(crate) use frame_batch::CompositorFrameBatch;
 pub use frame_batch::{BufferReleaseMetrics, CompositorFrameBatchId, FrameCallbackMetrics};
+pub use fullscreen::DirectScanoutSceneBlockers;
 pub(crate) use fullscreen::direct_scanout_scene_rejection_for_flags;
 pub use fullscreen::{
     DirectScanoutSceneCandidate, DirectScanoutSceneRejection, FullscreenPresentationEligibility,

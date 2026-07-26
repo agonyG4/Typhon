@@ -1,5 +1,7 @@
 use super::*;
-use crate::compositor::fullscreen::direct_scanout_viewport_compatibility;
+use crate::compositor::fullscreen::{
+    direct_scanout_scene_blockers_for_visibility, direct_scanout_viewport_compatibility,
+};
 use crate::render_backend::buffer::SurfaceBufferSource;
 use std::borrow::Cow;
 
@@ -280,6 +282,125 @@ impl CompositorState {
         })
     }
 
+    pub(in crate::compositor) fn direct_scanout_scene_blockers(
+        &self,
+    ) -> DirectScanoutSceneBlockers {
+        let mut blockers = DirectScanoutSceneBlockers::default();
+        let Some(owner) = self.fullscreen_presentation else {
+            blockers.push(DirectScanoutSceneRejection::NoFullscreenOwner);
+            return blockers;
+        };
+
+        if !self
+            .toplevel_surfaces
+            .contains_key(&owner.owner_root_surface_id)
+        {
+            blockers.push(DirectScanoutSceneRejection::OwnerMissing);
+        }
+        if self
+            .toplevel_window_state(owner.owner_root_surface_id)
+            .is_some_and(WindowState::is_minimized)
+        {
+            blockers.push(DirectScanoutSceneRejection::OwnerMinimized);
+        }
+
+        let popup_visible = self
+            .popup_nodes
+            .values()
+            .any(|node| node.lifecycle == PopupLifecycle::Alive && node.mapped);
+        let resize_preview_active = self
+            .active_toplevel_resizes
+            .contains_key(&owner.owner_root_surface_id);
+        for reason in direct_scanout_scene_blockers_for_visibility(
+            self.visible_layer_surface_above_content_count() > 0,
+            popup_visible,
+            resize_preview_active,
+        )
+        .reasons()
+        {
+            blockers.push(*reason);
+        }
+
+        let geometry = self.current_visual_root_window_geometry(owner.owner_root_surface_id);
+        if !geometry.is_some_and(|geometry| {
+            geometry.width == self.output_size.width
+                && geometry.height == self.output_size.height
+                && geometry.placement == SurfacePlacement::absolute_root_at(0, 0)
+        }) {
+            blockers.push(DirectScanoutSceneRejection::OwnerDoesNotCoverOutput);
+        }
+
+        let Some(root) = self
+            .renderable_surfaces
+            .iter()
+            .find(|surface| surface.surface_id == owner.owner_root_surface_id)
+        else {
+            blockers.push(DirectScanoutSceneRejection::OwnerRootBufferMissing);
+            if self.has_pending_frame_prepare_work() {
+                blockers.push(DirectScanoutSceneRejection::PendingOrUnpublishedWork);
+            }
+            return blockers;
+        };
+
+        if self.renderable_surfaces.iter().any(|surface| {
+            surface.surface_id != owner.owner_root_surface_id
+                && self.root_surface_id_for_surface(surface.surface_id)
+                    == owner.owner_root_surface_id
+        }) {
+            blockers.push(DirectScanoutSceneRejection::OwnerTreeHasAdditionalSurface);
+        }
+        if root.buffer_source() != SurfaceBufferSource::Dmabuf {
+            blockers.push(DirectScanoutSceneRejection::NonDmabuf);
+        } else if let Some(buffer) = root.dmabuf_handle() {
+            if buffer.format() != DrmFormat::Xrgb8888 {
+                blockers.push(DirectScanoutSceneRejection::FormatNotOpaqueXrgb8888);
+            }
+            let Some(output_size) =
+                BufferSize::new(self.output_size.width, self.output_size.height)
+            else {
+                blockers.push(DirectScanoutSceneRejection::BufferSizeMismatch);
+                return blockers;
+            };
+            if buffer.size() != output_size {
+                blockers.push(DirectScanoutSceneRejection::BufferSizeMismatch);
+            }
+            if let Err(rejection) = direct_scanout_viewport_compatibility(
+                buffer.size(),
+                output_size,
+                root.buffer_scale,
+                root.buffer_transform,
+                root.viewport_source,
+                root.viewport_destination,
+            ) {
+                blockers.push(rejection);
+            }
+        } else {
+            blockers.push(DirectScanoutSceneRejection::OwnerRootBufferMissing);
+        }
+        if root.visual_clip.is_some() {
+            blockers.push(DirectScanoutSceneRejection::VisualClipPresent);
+        }
+        if resize_preview_active
+            || root.render_placement.is_some()
+            || root.render_target_size.is_some()
+        {
+            blockers.push(DirectScanoutSceneRejection::ResizePreviewActive);
+        }
+        if root.x != 0
+            || root.y != 0
+            || root.width != self.output_size.width
+            || root.height != self.output_size.height
+            || root.placement != SurfacePlacement::absolute_root_at(0, 0)
+        {
+            blockers.push(DirectScanoutSceneRejection::PlacementMismatch);
+        }
+        if self.has_pending_frame_prepare_work() {
+            blockers.push(DirectScanoutSceneRejection::PendingOrUnpublishedWork);
+        }
+
+        blockers
+    }
+
     pub(in crate::compositor) fn fullscreen_render_plan_metrics(
         &self,
     ) -> FullscreenRenderPlanMetrics {
@@ -352,5 +473,24 @@ impl CompositorState {
                 (role.mapped && role.committed.layer == Layer::Overlay).then_some(*surface_id)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_collect_simultaneous_visibility_blockers_in_candidate_order() {
+        let blockers = direct_scanout_scene_blockers_for_visibility(true, true, true);
+
+        assert_eq!(
+            blockers.reasons(),
+            &[
+                DirectScanoutSceneRejection::OverlayVisible,
+                DirectScanoutSceneRejection::PopupVisible,
+                DirectScanoutSceneRejection::ResizePreviewActive,
+            ]
+        );
     }
 }

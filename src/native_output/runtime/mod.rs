@@ -6,6 +6,7 @@ mod bootstrap;
 mod cursor_cycle;
 mod cycle;
 mod cycle_dispatch;
+mod direct_plan;
 mod frame;
 mod kms_worker;
 mod metrics;
