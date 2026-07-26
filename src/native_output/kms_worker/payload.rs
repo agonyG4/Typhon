@@ -23,6 +23,7 @@ pub(crate) struct KmsCommitJob {
     pub(crate) primary: KmsPrimaryUpdate,
     pub(crate) cursor: KmsCursorUpdate,
     pub(crate) test_only: KmsTestOnlyPolicy,
+    pub(crate) ready_submit: bool,
 }
 
 #[derive(Debug)]

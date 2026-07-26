@@ -33,6 +33,7 @@ pub(super) enum WorkerQueueOutcome {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn queue_cursor_only(
     worker: &KmsCommitWorkerHandle,
+    cursor: &mut NativeAtomicCursor,
     desired: Option<AtomicCursorVisualState>,
     atomic_commit_arbiter: &mut AtomicCommitArbiter,
     output_transactions: &mut OutputTransactionLedger,
@@ -112,8 +113,11 @@ pub(super) fn queue_cursor_only(
         target,
         queued_at: MonotonicTimestampNs::new(queued_at_ns),
         primary: KmsPrimaryUpdate::Unchanged,
-        cursor: desired.map_or(KmsCursorUpdate::Disable, KmsCursorUpdate::Set),
+        cursor: desired
+            .clone()
+            .map_or(KmsCursorUpdate::Disable, KmsCursorUpdate::Set),
         test_only: KmsTestOnlyPolicy::Required,
+        ready_submit: false,
     };
     let descriptor = output_transactions
         .transaction(transaction_id)
@@ -129,8 +133,28 @@ pub(super) fn queue_cursor_only(
         )?;
         return Err(io::Error::other(format!("invalid cursor worker payload: {error:?}")).into());
     }
+    let queued_visual_state = desired.clone().unwrap_or_else(|| {
+        let mut hidden = cursor.desired().clone();
+        hidden.visible = false;
+        hidden.framebuffer_id = None;
+        hidden
+    });
+    if let Err(error) =
+        cursor.queue_worker_submission(transaction_id, token, cursor_epoch, queued_visual_state)
+    {
+        atomic_commit_arbiter.reject_worker_queued(token);
+        settle_failed_output_transaction(
+            output_transactions,
+            transaction_id,
+            OutputTransactionFailureStage::BackendOwnershipTransfer,
+            MonotonicTimestampNs::new(queued_at_ns),
+            |_| Ok(()),
+        )?;
+        return Err(error.into());
+    }
     if let Err(error) = permit.enqueue(job) {
         drop(error.job);
+        cursor.cancel_worker_submission(transaction_id, token, cursor_epoch)?;
         atomic_commit_arbiter.reject_worker_queued(token);
         settle_failed_output_transaction(
             output_transactions,
@@ -149,6 +173,7 @@ pub(super) fn queue_cursor_only(
         transaction_id,
         timestamp_ns: monotonic_now_ns()?,
     });
+    worker.record_cursor_worker_queued();
     Ok(WorkerQueueOutcome::CursorQueued {
         transaction_id,
         token,
@@ -167,6 +192,7 @@ pub(super) fn queue_explicit_composited_frame(
     output_generation: u64,
     crtc_id: u32,
     cursor: Option<&AtomicCursorVisualState>,
+    ready_submit: bool,
 ) -> NativeResult<WorkerQueueOutcome> {
     let slot = explicit
         .swapchain()?
@@ -262,6 +288,7 @@ pub(super) fn queue_explicit_composited_frame(
             KmsCursorUpdate::Set(state.clone())
         }),
         test_only: KmsTestOnlyPolicy::Skip,
+        ready_submit,
     };
     let queued_descriptor = output_transactions
         .transaction(transaction_id)
@@ -449,6 +476,7 @@ pub(super) fn queue_atomic_compatibility_frame(
             KmsCursorUpdate::Set(state.clone())
         }),
         test_only: KmsTestOnlyPolicy::Skip,
+        ready_submit: true,
     };
     let descriptor = output_transactions
         .transaction(transaction_id)
@@ -510,6 +538,26 @@ pub(super) fn drain_worker_eventfd(
 }
 
 impl NativeRuntime {
+    pub(super) fn stop_kms_worker_admission_for_shutdown(
+        &mut self,
+    ) -> NativeResult<Option<PageFlipToken>> {
+        let snapshot = {
+            let Some(worker) = self.kms_commit_worker.as_ref() else {
+                return Ok(None);
+            };
+            worker.begin_shutdown_quiesce().map_err(|error| {
+                io::Error::other(format!("KMS worker shutdown quiesce: {error:?}"))
+            })?
+        };
+        if let Some(job) = snapshot.queued_job {
+            self.drop_queued_worker_job_with_reason(
+                job,
+                OutputTransactionDropReason::SafeAbandonment,
+            )?;
+        }
+        Ok(snapshot.inflight.map(|inflight| inflight.token))
+    }
+
     pub(super) fn check_kms_commit_worker_health(&mut self) -> NativeResult<()> {
         let Some(reason) = self
             .kms_commit_worker
@@ -640,6 +688,7 @@ impl NativeRuntime {
                 submit_returned_at,
                 out_fence,
                 cursor,
+                ready_submit,
             } => {
                 if output_generation != self.drm_file_generation
                     || self.atomic_commit_arbiter.worker_queued_token() != Some(token)
@@ -701,6 +750,109 @@ impl NativeRuntime {
                     )
                     .into());
                 }
+                let cursor_epoch = match kind {
+                    AtomicCommitKind::CursorOnly { cursor_epoch, .. } => Some(cursor_epoch),
+                    AtomicCommitKind::CompositedPrimary { .. }
+                    | AtomicCommitKind::DirectPrimary { .. } => match transaction
+                        .descriptor()
+                        .planes()
+                        .cursor()
+                    {
+                        CursorPlaneAssignment::Atomic { desired_epoch, .. } => Some(desired_epoch),
+                        CursorPlaneAssignment::Unchanged | CursorPlaneAssignment::Disabled => None,
+                    },
+                };
+                if let Some(cursor_epoch) = cursor_epoch {
+                    let submitted_state = if matches!(kind, AtomicCommitKind::CursorOnly { .. }) {
+                        let native_cursor = self.atomic_cursor.as_mut().ok_or_else(|| {
+                            io::Error::other("cursor worker submit has no cursor")
+                        })?;
+                        let queued = native_cursor
+                            .take_worker_submission(transaction_id, token, cursor_epoch)
+                            .inspect_err(|_error| {
+                                if let Some(worker) = self.kms_commit_worker.as_ref() {
+                                    worker.record_cursor_worker_epoch_mismatch();
+                                }
+                            })?;
+                        match cursor {
+                            KmsCursorUpdate::Set(state) => {
+                                if state != queued.visual_state {
+                                    if let Some(worker) = self.kms_commit_worker.as_ref() {
+                                        worker.record_cursor_worker_epoch_mismatch();
+                                    }
+                                    return Err(io::Error::other(
+                                        "worker cursor state does not match queued cursor state",
+                                    )
+                                    .into());
+                                }
+                                state.clone()
+                            }
+                            KmsCursorUpdate::Disable => queued.visual_state,
+                            KmsCursorUpdate::Unchanged => {
+                                return Err(io::Error::other(
+                                    "worker cursor submission has no cursor update",
+                                )
+                                .into());
+                            }
+                        }
+                    } else {
+                        match cursor {
+                            KmsCursorUpdate::Set(state) => state.clone(),
+                            KmsCursorUpdate::Disable => {
+                                let native_cursor =
+                                    self.atomic_cursor.as_ref().ok_or_else(|| {
+                                        io::Error::other("primary cursor submit has no cursor")
+                                    })?;
+                                let mut hidden = native_cursor.desired().clone();
+                                hidden.visible = false;
+                                hidden.framebuffer_id = None;
+                                hidden
+                            }
+                            KmsCursorUpdate::Unchanged => {
+                                return Err(io::Error::other(
+                                    "primary cursor submission has no cursor update",
+                                )
+                                .into());
+                            }
+                        }
+                    };
+                    if let Some(native_cursor) = self.atomic_cursor.as_mut() {
+                        if matches!(kind, AtomicCommitKind::CursorOnly { .. }) {
+                            native_cursor.begin_submission_at_epoch(
+                                token,
+                                submitted_state,
+                                cursor_epoch,
+                            );
+                        } else {
+                            native_cursor.begin_primary_submission_at_epoch(
+                                token,
+                                submitted_state,
+                                cursor_epoch,
+                            );
+                        }
+                    }
+                    self.last_submitted_cursor_epoch = cursor_epoch;
+                    if matches!(kind, AtomicCommitKind::CursorOnly { .. }) {
+                        self.cursor_output_arbitration.note_cursor_only_submission();
+                        self.cursor_output_arbitration.consume_submitted_epoch(
+                            cursor_epoch,
+                            submit_returned_at,
+                            self.frame_scheduler
+                                .next_refresh_deadline_ns(submit_returned_at),
+                        );
+                        if let Some(worker) = self.kms_commit_worker.as_ref() {
+                            worker.record_cursor_worker_submit_confirmed();
+                            worker.record_cursor_worker_arbitration_consumed();
+                        }
+                    } else {
+                        self.cursor_output_arbitration.consume_submitted_epoch(
+                            cursor_epoch,
+                            submit_returned_at,
+                            self.frame_scheduler
+                                .next_refresh_deadline_ns(submit_returned_at),
+                        );
+                    }
+                }
                 self.output_transactions
                     .mark_submitted(
                         transaction_id,
@@ -715,6 +867,23 @@ impl NativeRuntime {
                     self.frame_scheduler
                         .confirm_kernel_submission(token.get(), submit_returned_at)
                         .map_err(io::Error::other)?;
+                }
+                if !matches!(kind, AtomicCommitKind::CursorOnly { .. }) {
+                    let pacing_mode = self
+                        .output_transactions
+                        .transaction(transaction_id)
+                        .ok_or_else(|| io::Error::other("worker pacing transaction disappeared"))?
+                        .descriptor()
+                        .pacing_mode();
+                    self.frame_pacing.note_worker_submit(
+                        token.get(),
+                        submit_returned_at,
+                        ready_submit,
+                        pacing_mode,
+                    );
+                    if let Some(worker) = self.kms_commit_worker.as_ref() {
+                        worker.record_worker_pacing_submit_confirmed();
+                    }
                 }
                 let deferred_pageflip = self.atomic_commit_arbiter.deferred_pageflip();
                 let deferred_completion = self.atomic_commit_arbiter.replay_deferred_pageflip();
@@ -750,28 +919,6 @@ impl NativeRuntime {
                         ),
                     ]
                 });
-                if let Some(native_cursor) = self.atomic_cursor.as_mut() {
-                    match cursor {
-                        KmsCursorUpdate::Set(state) => {
-                            if matches!(kind, AtomicCommitKind::CursorOnly { .. }) {
-                                native_cursor.begin_submission(token, state);
-                            } else {
-                                native_cursor.begin_primary_submission(token, state);
-                            }
-                        }
-                        KmsCursorUpdate::Disable => {
-                            let mut hidden = native_cursor.desired().clone();
-                            hidden.visible = false;
-                            hidden.framebuffer_id = None;
-                            if matches!(kind, AtomicCommitKind::CursorOnly { .. }) {
-                                native_cursor.begin_submission(token, hidden);
-                            } else {
-                                native_cursor.begin_primary_submission(token, hidden);
-                            }
-                        }
-                        KmsCursorUpdate::Unchanged => {}
-                    }
-                }
                 if matches!(kind, AtomicCommitKind::CompositedPrimary { .. })
                     && self.output_render_fence_token.is_none()
                     && let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout
@@ -815,7 +962,12 @@ impl NativeRuntime {
             }
             KmsWorkerEvent::Quiesced { returned_jobs } => {
                 for job in returned_jobs {
-                    self.drop_queued_worker_job(job)?;
+                    let reason = if self.shutdown.is_shutting_down() {
+                        OutputTransactionDropReason::SafeAbandonment
+                    } else {
+                        OutputTransactionDropReason::SessionSuspended
+                    };
+                    self.drop_queued_worker_job_with_reason(job, reason)?;
                 }
             }
             KmsWorkerEvent::Fatal {
@@ -836,7 +988,50 @@ impl NativeRuntime {
         job: KmsCommitJob,
         error: AtomicKmsError,
     ) -> NativeResult<()> {
-        if !matches!(job.kind, AtomicCommitKind::CursorOnly { .. }) {
+        if let Some(worker) = self.kms_commit_worker.as_ref() {
+            worker.record_worker_pacing_pre_submit_rejection();
+        }
+        let cursor_epoch = match job.kind {
+            AtomicCommitKind::CursorOnly { cursor_epoch, .. } => Some(cursor_epoch),
+            AtomicCommitKind::CompositedPrimary { .. } | AtomicCommitKind::DirectPrimary { .. } => {
+                None
+            }
+        };
+        if let Some(cursor_epoch) = cursor_epoch {
+            let cursor = self
+                .atomic_cursor
+                .as_mut()
+                .ok_or_else(|| io::Error::other("cursor worker rejection has no cursor"))?;
+            cursor.cancel_worker_submission(job.transaction_id, job.token, cursor_epoch)?;
+            if error.kind == oblivion_one::native::kms::AtomicKmsErrorKind::Busy {
+                let now_ns = monotonic_now_ns()?;
+                self.cursor_output_arbitration.defer_after_busy(
+                    now_ns,
+                    self.frame_scheduler.next_refresh_deadline_ns(now_ns),
+                );
+                if let Some(worker) = self.kms_commit_worker.as_ref() {
+                    worker.record_cursor_worker_rejection_retryable();
+                }
+            } else {
+                let cursor = self
+                    .atomic_cursor
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("cursor worker rejection has no cursor"))?;
+                cursor.note_submit_failure();
+                cursor.note_software_fallback();
+                cursor.set_visible(false);
+                self.cursor_render_mode = if self.server.client_cursor_render_state().is_some() {
+                    NativeCursorRenderMode::SoftwareClient
+                } else {
+                    NativeCursorRenderMode::Software
+                };
+                self.last_client_cursor_damage = None;
+                self.queued_redraw_requested = true;
+                if let Some(worker) = self.kms_commit_worker.as_ref() {
+                    worker.record_cursor_worker_rejection_fallback();
+                }
+            }
+        } else {
             if let Err(error) = self
                 .frame_scheduler
                 .cancel_worker_submission(job.token.get(), job.transaction_id.get())
@@ -899,11 +1094,30 @@ impl NativeRuntime {
     }
 
     pub(super) fn drop_queued_worker_job(&mut self, job: KmsCommitJob) -> NativeResult<()> {
-        if !matches!(job.kind, AtomicCommitKind::CursorOnly { .. }) {
-            if let Err(error) = self
-                .frame_scheduler
-                .cancel_worker_submission(job.token.get(), job.transaction_id.get())
-            {
+        self.drop_queued_worker_job_with_reason(job, OutputTransactionDropReason::SessionSuspended)
+    }
+
+    pub(super) fn drop_queued_worker_job_with_reason(
+        &mut self,
+        job: KmsCommitJob,
+        drop_reason: OutputTransactionDropReason,
+    ) -> NativeResult<()> {
+        if let AtomicCommitKind::CursorOnly { cursor_epoch, .. } = job.kind {
+            let cursor = self
+                .atomic_cursor
+                .as_mut()
+                .ok_or_else(|| io::Error::other("queued cursor job has no cursor"))?;
+            cursor.cancel_worker_submission(job.transaction_id, job.token, cursor_epoch)?;
+            self.cursor_output_arbitration.clear_pending();
+        } else {
+            let scheduler_cancel = if drop_reason == OutputTransactionDropReason::SafeAbandonment {
+                self.frame_scheduler
+                    .abandon_worker_submission(job.token.get(), job.transaction_id.get())
+            } else {
+                self.frame_scheduler
+                    .cancel_worker_submission(job.token.get(), job.transaction_id.get())
+            };
+            if let Err(error) = scheduler_cancel {
                 if let Some(worker) = self.kms_commit_worker.as_ref() {
                     worker.record_scheduler_cancel_mismatch();
                 }
@@ -941,7 +1155,7 @@ impl NativeRuntime {
         settle_dropped_output_transaction(
             &mut self.output_transactions,
             job.transaction_id,
-            OutputTransactionDropReason::SessionSuspended,
+            drop_reason,
             MonotonicTimestampNs::new(monotonic_now_ns()?),
             |obligations| {
                 if let Some(batch_id) = obligations.frame_batch_id() {
@@ -953,6 +1167,11 @@ impl NativeRuntime {
                 Ok(())
             },
         )?;
+        if drop_reason == OutputTransactionDropReason::SafeAbandonment
+            && let Some(worker) = self.kms_commit_worker.as_ref()
+        {
+            worker.record_shutdown_queued_job_settled();
+        }
         Ok(())
     }
 }

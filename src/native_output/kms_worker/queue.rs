@@ -49,6 +49,18 @@ pub(crate) struct WorkerMetrics {
     pub(crate) runtime_queue_depth: AtomicU64,
     pub(crate) runtime_queue_depth_max: AtomicU64,
     pub(crate) runtime_kernel_inflight: AtomicU64,
+    pub(crate) shutdown_admission_stops: AtomicU64,
+    pub(crate) shutdown_queued_jobs_returned: AtomicU64,
+    pub(crate) shutdown_queued_jobs_settled: AtomicU64,
+    pub(crate) shutdown_ack_suppressed_next_submit: AtomicU64,
+    pub(crate) cursor_worker_jobs_queued: AtomicU64,
+    pub(crate) cursor_worker_submits_confirmed: AtomicU64,
+    pub(crate) cursor_worker_rejections_retryable: AtomicU64,
+    pub(crate) cursor_worker_rejections_fallback: AtomicU64,
+    pub(crate) cursor_worker_arbitration_consumed: AtomicU64,
+    pub(crate) cursor_worker_epoch_mismatches: AtomicU64,
+    pub(crate) worker_pacing_submits_confirmed: AtomicU64,
+    pub(crate) worker_pacing_pre_submit_rejections: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -86,6 +98,18 @@ pub(crate) struct WorkerMetricsSnapshot {
     pub(crate) runtime_queue_depth: u64,
     pub(crate) runtime_queue_depth_max: u64,
     pub(crate) runtime_kernel_inflight: u64,
+    pub(crate) shutdown_admission_stops: u64,
+    pub(crate) shutdown_queued_jobs_returned: u64,
+    pub(crate) shutdown_queued_jobs_settled: u64,
+    pub(crate) shutdown_ack_suppressed_next_submit: u64,
+    pub(crate) cursor_worker_jobs_queued: u64,
+    pub(crate) cursor_worker_submits_confirmed: u64,
+    pub(crate) cursor_worker_rejections_retryable: u64,
+    pub(crate) cursor_worker_rejections_fallback: u64,
+    pub(crate) cursor_worker_arbitration_consumed: u64,
+    pub(crate) cursor_worker_epoch_mismatches: u64,
+    pub(crate) worker_pacing_submits_confirmed: u64,
+    pub(crate) worker_pacing_pre_submit_rejections: u64,
 }
 
 impl WorkerMetrics {
@@ -129,6 +153,18 @@ impl WorkerMetrics {
             runtime_queue_depth: read!(runtime_queue_depth),
             runtime_queue_depth_max: read!(runtime_queue_depth_max),
             runtime_kernel_inflight: read!(runtime_kernel_inflight),
+            shutdown_admission_stops: read!(shutdown_admission_stops),
+            shutdown_queued_jobs_returned: read!(shutdown_queued_jobs_returned),
+            shutdown_queued_jobs_settled: read!(shutdown_queued_jobs_settled),
+            shutdown_ack_suppressed_next_submit: read!(shutdown_ack_suppressed_next_submit),
+            cursor_worker_jobs_queued: read!(cursor_worker_jobs_queued),
+            cursor_worker_submits_confirmed: read!(cursor_worker_submits_confirmed),
+            cursor_worker_rejections_retryable: read!(cursor_worker_rejections_retryable),
+            cursor_worker_rejections_fallback: read!(cursor_worker_rejections_fallback),
+            cursor_worker_arbitration_consumed: read!(cursor_worker_arbitration_consumed),
+            cursor_worker_epoch_mismatches: read!(cursor_worker_epoch_mismatches),
+            worker_pacing_submits_confirmed: read!(worker_pacing_submits_confirmed),
+            worker_pacing_pre_submit_rejections: read!(worker_pacing_pre_submit_rejections),
         }
     }
 }
@@ -137,6 +173,7 @@ impl WorkerMetrics {
 pub(crate) enum KmsWorkerLifecycle {
     Running,
     Quiescing,
+    ShutdownQuiescing,
     Stopped,
     Fatal,
 }
@@ -146,6 +183,7 @@ pub(crate) enum KmsWorkerAdmissionError {
     QueueFull,
     AdmissionContention,
     Quiescing,
+    ShutdownQuiescing,
     Stopped,
     Fatal,
 }
@@ -171,8 +209,15 @@ pub(crate) struct WorkerInFlight {
 }
 
 #[derive(Debug)]
+pub(crate) struct KmsWorkerShutdownSnapshot {
+    pub(crate) queued_job: Option<KmsCommitJob>,
+    pub(crate) inflight: Option<WorkerInFlight>,
+}
+
+#[derive(Debug)]
 pub(crate) struct WorkerShared {
     pub(crate) state: Mutex<WorkerState>,
+    pub(crate) submit_gate: Mutex<()>,
     pub(crate) work_wakeup: Condvar,
     pub(crate) results: Mutex<VecDeque<KmsWorkerEvent>>,
     pub(crate) fatal_jobs: Mutex<Vec<KmsWorkerFatalJob>>,
@@ -201,6 +246,7 @@ impl WorkerShared {
                 executing: false,
                 inflight: None,
             }),
+            submit_gate: Mutex::new(()),
             work_wakeup: Condvar::new(),
             results: Mutex::new(VecDeque::with_capacity(RESULT_EVENT_CAPACITY)),
             fatal_jobs: Mutex::new(Vec::new()),
@@ -226,6 +272,9 @@ impl WorkerShared {
         };
         match state.lifecycle {
             KmsWorkerLifecycle::Quiescing => return Err(KmsWorkerAdmissionError::Quiescing),
+            KmsWorkerLifecycle::ShutdownQuiescing => {
+                return Err(KmsWorkerAdmissionError::ShutdownQuiescing);
+            }
             KmsWorkerLifecycle::Stopped => return Err(KmsWorkerAdmissionError::Stopped),
             KmsWorkerLifecycle::Fatal => return Err(KmsWorkerAdmissionError::Fatal),
             KmsWorkerLifecycle::Running => {}
@@ -249,6 +298,10 @@ impl WorkerShared {
 
     pub(crate) fn request_quiesce(&self) {
         let started = Instant::now();
+        let _submit_gate = self
+            .submit_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut state = self
             .state
             .lock()
@@ -262,6 +315,53 @@ impl WorkerShared {
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+    }
+
+    pub(crate) fn begin_shutdown_quiesce(
+        &self,
+    ) -> Result<KmsWorkerShutdownSnapshot, KmsWorkerAdmissionError> {
+        let started = Instant::now();
+        // Serializing admission-stop with the ioctl boundary means that once
+        // this method returns, no worker ioctl can still begin.  The gate is
+        // deliberately distinct from the queue mutex and is held only across
+        // the kernel call itself.
+        let _submit_gate = self
+            .submit_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match state.lifecycle {
+            KmsWorkerLifecycle::Fatal => return Err(KmsWorkerAdmissionError::Fatal),
+            KmsWorkerLifecycle::Stopped => return Err(KmsWorkerAdmissionError::Stopped),
+            KmsWorkerLifecycle::Running | KmsWorkerLifecycle::Quiescing => {
+                state.lifecycle = KmsWorkerLifecycle::ShutdownQuiescing;
+            }
+            KmsWorkerLifecycle::ShutdownQuiescing => {}
+        }
+        let queued_job = state.queued.pop_front();
+        if queued_job.is_some() {
+            self.metrics
+                .shutdown_queued_jobs_returned
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let inflight = state.inflight;
+        drop(state);
+        self.work_wakeup.notify_all();
+        self.metrics
+            .shutdown_admission_stops
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics.quiesce_count.fetch_add(1, Ordering::Relaxed);
+        self.metrics.quiesce_ns_total.fetch_add(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        Ok(KmsWorkerShutdownSnapshot {
+            queued_job,
+            inflight,
+        })
     }
 }
 
@@ -285,6 +385,7 @@ impl KmsCommitAdmissionPermit {
         {
             let reason = match state.lifecycle {
                 KmsWorkerLifecycle::Quiescing => KmsWorkerAdmissionError::Quiescing,
+                KmsWorkerLifecycle::ShutdownQuiescing => KmsWorkerAdmissionError::ShutdownQuiescing,
                 KmsWorkerLifecycle::Stopped => KmsWorkerAdmissionError::Stopped,
                 KmsWorkerLifecycle::Fatal => KmsWorkerAdmissionError::Fatal,
                 KmsWorkerLifecycle::Running => KmsWorkerAdmissionError::QueueFull,

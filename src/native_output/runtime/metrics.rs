@@ -279,6 +279,54 @@ impl NativeRuntime {
                         "worker_runtime_queue_depth_max",
                         metrics.runtime_queue_depth_max,
                     ),
+                    NativePerfField::u64(
+                        "worker_shutdown_admission_stops",
+                        metrics.shutdown_admission_stops,
+                    ),
+                    NativePerfField::u64(
+                        "worker_shutdown_queued_jobs_returned",
+                        metrics.shutdown_queued_jobs_returned,
+                    ),
+                    NativePerfField::u64(
+                        "worker_shutdown_queued_jobs_settled",
+                        metrics.shutdown_queued_jobs_settled,
+                    ),
+                    NativePerfField::u64(
+                        "worker_shutdown_ack_suppressed_next_submit",
+                        metrics.shutdown_ack_suppressed_next_submit,
+                    ),
+                    NativePerfField::u64(
+                        "cursor_worker_jobs_queued",
+                        metrics.cursor_worker_jobs_queued,
+                    ),
+                    NativePerfField::u64(
+                        "cursor_worker_submits_confirmed",
+                        metrics.cursor_worker_submits_confirmed,
+                    ),
+                    NativePerfField::u64(
+                        "cursor_worker_rejections_retryable",
+                        metrics.cursor_worker_rejections_retryable,
+                    ),
+                    NativePerfField::u64(
+                        "cursor_worker_rejections_fallback",
+                        metrics.cursor_worker_rejections_fallback,
+                    ),
+                    NativePerfField::u64(
+                        "cursor_worker_arbitration_consumed",
+                        metrics.cursor_worker_arbitration_consumed,
+                    ),
+                    NativePerfField::u64(
+                        "cursor_worker_epoch_mismatches",
+                        metrics.cursor_worker_epoch_mismatches,
+                    ),
+                    NativePerfField::u64(
+                        "worker_pacing_submits_confirmed",
+                        metrics.worker_pacing_submits_confirmed,
+                    ),
+                    NativePerfField::u64(
+                        "worker_pacing_pre_submit_rejections",
+                        metrics.worker_pacing_pre_submit_rejections,
+                    ),
                     NativePerfField::u64("worker_kernel_inflight", metrics.runtime_kernel_inflight),
                     NativePerfField::bool("worker_active", worker.submission_active()),
                 ]);

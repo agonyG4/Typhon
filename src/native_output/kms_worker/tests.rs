@@ -203,6 +203,7 @@ fn test_job(token: u64) -> KmsCommitJob {
         },
         cursor: KmsCursorUpdate::Unchanged,
         test_only: KmsTestOnlyPolicy::Skip,
+        ready_submit: false,
     }
 }
 
@@ -937,5 +938,89 @@ fn notification_failure_does_not_drop_owned_queued_job() {
     drop(fatal_jobs);
     assert!(fd_is_closed_or_reused(raw_fd, original_identity.as_deref()));
     handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn shutdown_ack_never_releases_queued_next_job() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Ok(()), Ok(())])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    reserve_for_test(&handle, test_job(40).kind)
+        .enqueue(test_job(40))
+        .unwrap();
+    wait_for_fence_event(
+        &handle,
+        40,
+        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 40),
+    );
+    reserve_for_test(&handle, test_job(41).kind)
+        .enqueue(test_job(41))
+        .unwrap();
+
+    let snapshot = handle.begin_shutdown_quiesce().unwrap();
+    assert_eq!(
+        snapshot.queued_job.as_ref().map(|job| job.token.get()),
+        Some(41)
+    );
+    assert_eq!(snapshot.inflight.map(|commit| commit.token.get()), Some(40));
+
+    handle
+        .ack_pageflip(test_job(40).token, test_job(40).transaction_id, 1)
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+    assert_eq!(*executor.submitted.lock().unwrap(), vec![40]);
+    assert!(!handle.inflight());
+    assert_eq!(handle.queue_depth(), 0);
+    handle.join().unwrap();
+}
+
+#[test]
+fn shutdown_admission_waits_for_ioctl_before_returning_inflight_identity() {
+    let executor = Arc::new(BarrierExecutor {
+        started: Barrier::new(2),
+        release: Barrier::new(2),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    reserve_for_test(&handle, test_job(43).kind)
+        .enqueue(test_job(43))
+        .unwrap();
+    executor.started.wait();
+
+    std::thread::scope(|scope| {
+        let shutdown = scope.spawn(|| handle.begin_shutdown_quiesce().unwrap());
+        executor.release.wait();
+        let snapshot = shutdown.join().unwrap();
+        assert!(snapshot.queued_job.is_none());
+        assert_eq!(snapshot.inflight.map(|commit| commit.token.get()), Some(43));
+    });
+
+    handle
+        .ack_pageflip(test_job(43).token, test_job(43).transaction_id, 1)
+        .unwrap();
+    handle.join().unwrap();
+}
+
+#[test]
+fn shutdown_returned_job_is_detached_once() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::new()),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    reserve_for_test(&handle, test_job(42).kind)
+        .enqueue(test_job(42))
+        .unwrap();
+
+    let snapshot = handle.begin_shutdown_quiesce().unwrap();
+    assert_eq!(
+        snapshot.queued_job.as_ref().map(|job| job.token.get()),
+        Some(42)
+    );
+    let second = handle.begin_shutdown_quiesce().unwrap();
+    assert!(second.queued_job.is_none());
     handle.join().unwrap();
 }

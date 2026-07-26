@@ -278,6 +278,28 @@ impl NativeCursorOutputArbitration {
         }
     }
 
+    pub(crate) fn consume_submitted_epoch(
+        &mut self,
+        submitted_epoch: u64,
+        now_ns: u64,
+        next_deadline_ns: u64,
+    ) {
+        if !self.pending() {
+            return;
+        }
+        if submitted_epoch == self.desired_epoch {
+            self.clear_pending();
+            return;
+        }
+        // A newer epoch was coalesced while the submitted job was waiting in
+        // the worker.  The old epoch is consumed, while the newer epoch gets
+        // a fresh response window and refresh-boundary deadline.
+        self.pending_since_ns = Some(now_ns);
+        self.deadline_ns = Some(next_deadline_ns);
+        self.primary_response_window_open = true;
+        self.response_windows_opened = self.response_windows_opened.saturating_add(1);
+    }
+
     pub(crate) fn defer_after_busy(&mut self, now_ns: u64, next_deadline_ns: u64) {
         if self.pending() {
             self.deadline_ns = Some(next_deadline_ns.max(now_ns.saturating_add(1)));
@@ -319,6 +341,27 @@ pub(crate) fn update_cursor_output_arbitration(
         deadline_due,
         deadline_due && output_cursor_work_changed,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NativeCursorOutputArbitration;
+
+    #[test]
+    fn cursor_submit_consumes_only_exact_queued_epoch() {
+        let mut arbitration = NativeCursorOutputArbitration::default();
+        arbitration.request(10, 1, 100);
+        arbitration.request(11, 2, 100);
+
+        arbitration.consume_submitted_epoch(10, 120, 200);
+
+        assert!(arbitration.pending());
+        assert_eq!(arbitration.desired_epoch(), 11);
+        assert_eq!(arbitration.deadline_ns(), Some(200));
+
+        arbitration.consume_submitted_epoch(11, 220, 300);
+        assert!(!arbitration.pending());
+    }
 }
 
 pub(crate) fn cursor_only_allowed_at_deadline(

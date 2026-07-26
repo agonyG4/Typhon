@@ -249,6 +249,14 @@ pub(crate) struct AtomicCursorCounters {
     pub(crate) software_fallbacks: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkerQueuedCursorSubmission {
+    pub(crate) transaction_id: crate::native_output::OutputTransactionId,
+    pub(crate) token: PageFlipToken,
+    pub(crate) cursor_epoch: u64,
+    pub(crate) visual_state: AtomicCursorVisualState,
+}
+
 #[derive(Debug)]
 pub(crate) struct NativeAtomicCursor {
     pub(crate) image: Arc<CompositorCursorImage>,
@@ -271,6 +279,7 @@ pub(crate) struct NativeAtomicCursor {
     client_image_failure: Option<NativeCursorImageKey>,
     pending_token: Option<PageFlipToken>,
     pending_is_primary: bool,
+    worker_queued: Option<WorkerQueuedCursorSubmission>,
     suspended_desired: Option<AtomicCursorVisualState>,
     drm_cleanup_armed: bool,
 }
@@ -320,6 +329,7 @@ impl NativeAtomicCursor {
             client_image_failure: None,
             pending_token: None,
             pending_is_primary: false,
+            worker_queued: None,
             suspended_desired: None,
             drm_cleanup_armed: true,
         })
@@ -335,6 +345,74 @@ impl NativeAtomicCursor {
 
     pub(crate) const fn desired_epoch(&self) -> u64 {
         self.desired_epoch
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn submitted_epoch(&self) -> u64 {
+        self.submitted_epoch
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn worker_queued_epoch(&self) -> Option<u64> {
+        match self.worker_queued.as_ref() {
+            Some(queued) => Some(queued.cursor_epoch),
+            None => None,
+        }
+    }
+
+    pub(crate) fn queue_worker_submission(
+        &mut self,
+        transaction_id: crate::native_output::OutputTransactionId,
+        token: PageFlipToken,
+        cursor_epoch: u64,
+        visual_state: AtomicCursorVisualState,
+    ) -> io::Result<()> {
+        if self.worker_queued.is_some() {
+            return Err(io::Error::other(
+                "Atomic cursor worker submission already queued",
+            ));
+        }
+        self.worker_queued = Some(WorkerQueuedCursorSubmission {
+            transaction_id,
+            token,
+            cursor_epoch,
+            visual_state,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn take_worker_submission(
+        &mut self,
+        transaction_id: crate::native_output::OutputTransactionId,
+        token: PageFlipToken,
+        cursor_epoch: u64,
+    ) -> io::Result<WorkerQueuedCursorSubmission> {
+        let Some(queued) = self.worker_queued.as_ref() else {
+            return Err(io::Error::other(
+                "Atomic cursor worker submission is not queued",
+            ));
+        };
+        if queued.transaction_id != transaction_id
+            || queued.token != token
+            || queued.cursor_epoch != cursor_epoch
+        {
+            return Err(io::Error::other(
+                "Atomic cursor worker submission identity mismatch",
+            ));
+        }
+        self.worker_queued
+            .take()
+            .ok_or_else(|| io::Error::other("Atomic cursor worker submission disappeared"))
+    }
+
+    pub(crate) fn cancel_worker_submission(
+        &mut self,
+        transaction_id: crate::native_output::OutputTransactionId,
+        token: PageFlipToken,
+        cursor_epoch: u64,
+    ) -> io::Result<()> {
+        let _ = self.take_worker_submission(transaction_id, token, cursor_epoch)?;
+        Ok(())
     }
 
     fn advance_desired_epoch(&mut self) {
@@ -411,12 +489,21 @@ impl NativeAtomicCursor {
         token: PageFlipToken,
         state: AtomicCursorVisualState,
     ) -> AtomicCursorVisualState {
+        self.begin_submission_at_epoch(token, state, self.desired_epoch)
+    }
+
+    pub(crate) fn begin_submission_at_epoch(
+        &mut self,
+        token: PageFlipToken,
+        state: AtomicCursorVisualState,
+        cursor_epoch: u64,
+    ) -> AtomicCursorVisualState {
         if self.dirty.position {
             self.counters.position_submissions =
                 self.counters.position_submissions.saturating_add(1);
         }
         self.submitted = state.clone();
-        self.submitted_epoch = self.desired_epoch;
+        self.submitted_epoch = cursor_epoch;
         self.pending_token = Some(token);
         self.pending_is_primary = false;
         self.dirty = AtomicCursorDirty::default();
@@ -461,9 +548,18 @@ impl NativeAtomicCursor {
         token: PageFlipToken,
         state: AtomicCursorVisualState,
     ) {
+        self.begin_primary_submission_at_epoch(token, state, self.desired_epoch);
+    }
+
+    pub(crate) fn begin_primary_submission_at_epoch(
+        &mut self,
+        token: PageFlipToken,
+        state: AtomicCursorVisualState,
+        cursor_epoch: u64,
+    ) {
         self.counters.primary_submissions = self.counters.primary_submissions.saturating_add(1);
         self.submitted = state;
-        self.submitted_epoch = self.desired_epoch;
+        self.submitted_epoch = cursor_epoch;
         self.pending_token = Some(token);
         self.pending_is_primary = true;
         self.dirty = AtomicCursorDirty::default();
@@ -935,6 +1031,7 @@ fn next_cursor_epoch(current: u64, submitted: u64) -> u64 {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use crate::native_output::OutputTransactionId;
     use crate::native_output::runtime::{
         NativeCursorOutputArbitration, update_cursor_output_arbitration,
     };
@@ -1009,9 +1106,58 @@ mod tests {
             client_image_failure: None,
             pending_token: None,
             pending_is_primary: false,
+            worker_queued: None,
             suspended_desired: None,
             drm_cleanup_armed: false,
         }
+    }
+
+    #[test]
+    fn queueing_cursor_job_does_not_advance_last_submitted_epoch() {
+        let mut cursor = test_cursor();
+        cursor.set_hardware_path_active(true);
+        let epoch = cursor.desired_epoch();
+        let transaction_id = OutputTransactionId::new(
+            std::num::NonZeroU64::new(77).expect("test transaction ID is nonzero"),
+        );
+        let token = PageFlipToken::new(77).unwrap();
+
+        cursor
+            .queue_worker_submission(transaction_id, token, epoch, cursor.desired().clone())
+            .unwrap();
+
+        assert_eq!(cursor.submitted_epoch(), INITIAL_CURSOR_EPOCH);
+        assert_eq!(cursor.worker_queued_epoch(), Some(epoch));
+    }
+
+    #[test]
+    fn worker_cursor_success_advances_exact_epoch_once() {
+        let mut cursor = test_cursor();
+        cursor.set_hardware_path_active(true);
+        let queued_epoch = cursor.desired_epoch();
+        let transaction_id = OutputTransactionId::new(
+            std::num::NonZeroU64::new(78).expect("test transaction ID is nonzero"),
+        );
+        let token = PageFlipToken::new(78).unwrap();
+        cursor
+            .queue_worker_submission(
+                transaction_id,
+                token,
+                queued_epoch,
+                cursor.desired().clone(),
+            )
+            .unwrap();
+        cursor.set_position(100, 200);
+        let newer_epoch = cursor.desired_epoch();
+
+        let queued = cursor
+            .take_worker_submission(transaction_id, token, queued_epoch)
+            .unwrap();
+        cursor.begin_submission_at_epoch(token, queued.visual_state, queued.cursor_epoch);
+
+        assert_eq!(cursor.submitted_epoch(), queued_epoch);
+        assert_ne!(cursor.submitted_epoch(), newer_epoch);
+        assert!(cursor.worker_queued_epoch().is_none());
     }
 
     #[test]

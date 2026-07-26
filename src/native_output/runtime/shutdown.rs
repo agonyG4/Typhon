@@ -111,6 +111,10 @@ impl NativeShutdownLifecycle {
         matches!(self.state, ShutdownState::Running)
     }
 
+    pub(crate) const fn is_shutting_down(&self) -> bool {
+        !self.is_running() && !self.is_complete()
+    }
+
     pub(crate) const fn is_complete(&self) -> bool {
         matches!(self.state, ShutdownState::Complete)
     }

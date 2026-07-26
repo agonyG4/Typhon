@@ -525,6 +525,7 @@ impl NativeRuntime {
                 *drm_file_generation,
                 pacing_mode,
                 cursor_epoch,
+                last_submitted_cursor_epoch,
                 cursor_output_arbitration,
                 frame_scheduler,
                 pacing_now_ns,
@@ -543,9 +544,6 @@ impl NativeRuntime {
                 return Ok(());
             };
             scheduler_decision = decision;
-            if scheduler_decision == SchedulerDecision::WaitForPageFlip {
-                *last_submitted_cursor_epoch = cursor_epoch;
-            }
         }
         let can_queue_worker_next = worker_mode
             && matches!(
@@ -1052,6 +1050,7 @@ impl NativeRuntime {
                                         *drm_file_generation,
                                         target.crtc_id,
                                         effective_cursor.as_ref(),
+                                        false,
                                     )?
                                     else {
                                         *queued_redraw_requested = true;
@@ -1100,13 +1099,13 @@ impl NativeRuntime {
                                             frame_scheduler
                                                 .defer_page_flip_watchdog_to_atomic_arbiter();
                                         }
+                                        frame_pacing.note_submit(
+                                            token,
+                                            monotonic_now_ns()?,
+                                            false,
+                                            pacing_mode,
+                                        );
                                     }
-                                    frame_pacing.note_submit(
-                                        token,
-                                        monotonic_now_ns()?,
-                                        false,
-                                        pacing_mode,
-                                    );
                                     if !worker_queued
                                         && output_render_fence_token.is_none()
                                         && let Some(fd) = explicit.pending_timing_fd()
@@ -1143,7 +1142,7 @@ impl NativeRuntime {
                                 );
                                 *queued_redraw_requested = false;
                                 *last_rendered_scene_generation = scene_generation;
-                                if !waits_for_target {
+                                if !waits_for_target && !worker_mode {
                                     *last_submitted_cursor_epoch = cursor_epoch;
                                     cursor_output_arbitration.consume(cursor_epoch);
                                 }

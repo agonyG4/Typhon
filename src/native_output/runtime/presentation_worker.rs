@@ -9,6 +9,7 @@ use oblivion_one::native::kms::FramebufferId;
 #[allow(clippy::too_many_arguments)]
 pub(super) fn queue_cursor_only_for_presentation(
     worker: &KmsCommitWorkerHandle,
+    cursor: &mut NativeAtomicCursor,
     desired: Option<AtomicCursorVisualState>,
     atomic_commit_arbiter: &mut AtomicCommitArbiter,
     output_transactions: &mut OutputTransactionLedger,
@@ -21,6 +22,7 @@ pub(super) fn queue_cursor_only_for_presentation(
 ) -> NativeResult<SchedulerDecision> {
     match queue_cursor_only(
         worker,
+        cursor,
         desired,
         atomic_commit_arbiter,
         output_transactions,
@@ -54,6 +56,7 @@ pub(super) fn present_cursor_for_presentation(
     output_generation: u64,
     pacing_mode: NativeOutputPacingMode,
     cursor_epoch: u64,
+    last_submitted_cursor_epoch: &mut u64,
     cursor_output_arbitration: &mut NativeCursorOutputArbitration,
     frame_scheduler: &mut NativeFrameScheduler,
     pacing_now_ns: u64,
@@ -71,6 +74,7 @@ pub(super) fn present_cursor_for_presentation(
         let worker = worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?;
         let decision = queue_cursor_only_for_presentation(
             worker,
+            cursor,
             desired,
             atomic_commit_arbiter,
             output_transactions,
@@ -83,7 +87,7 @@ pub(super) fn present_cursor_for_presentation(
         )?;
         return Ok((decision != SchedulerDecision::Idle).then_some(decision));
     }
-    Ok(Some(submit_cursor_only(
+    let decision = submit_cursor_only(
         kms_backend,
         cursor,
         desired,
@@ -107,7 +111,11 @@ pub(super) fn present_cursor_for_presentation(
         last_software_cursor_damage,
         current_client_cursor_damage,
         current_software_cursor_damage,
-    )?))
+    )?;
+    if decision == SchedulerDecision::WaitForPageFlip {
+        *last_submitted_cursor_epoch = cursor_epoch;
+    }
+    Ok(Some(decision))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -122,6 +130,7 @@ pub(super) fn queue_explicit_ready_for_presentation(
     output_generation: u64,
     crtc_id: u32,
     cursor: Option<&AtomicCursorVisualState>,
+    ready_submit: bool,
 ) -> NativeResult<Option<(u64, u32, OutputTransactionId)>> {
     match queue_explicit_composited_frame(
         worker,
@@ -134,6 +143,7 @@ pub(super) fn queue_explicit_ready_for_presentation(
         output_generation,
         crtc_id,
         cursor,
+        ready_submit,
     )? {
         WorkerQueueOutcome::Queued {
             transaction_id,
@@ -162,6 +172,7 @@ pub(super) fn submit_explicit_ready_for_presentation(
     output_generation: u64,
     crtc_id: u32,
     cursor: Option<&AtomicCursorVisualState>,
+    ready_submit: bool,
 ) -> NativeResult<Option<(u64, u32, OutputTransactionId, bool)>> {
     if worker_mode {
         let worker = worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?;
@@ -176,6 +187,7 @@ pub(super) fn submit_explicit_ready_for_presentation(
             output_generation,
             crtc_id,
             cursor,
+            ready_submit,
         )?
         .map(|(token, framebuffer_id, transaction_id)| {
             (token, framebuffer_id, transaction_id, true)
@@ -245,15 +257,15 @@ pub(super) fn finish_direct_worker_queued(
     atomic_commit_arbiter: &mut AtomicCommitArbiter,
     presentation_trace: &mut PresentationTransactionTraceRing,
     frame_scheduler: &mut NativeFrameScheduler,
-    cursor_output_arbitration: &mut NativeCursorOutputArbitration,
+    _cursor_output_arbitration: &mut NativeCursorOutputArbitration,
     effective_cursor: Option<&AtomicCursorVisualState>,
     output_generation: u64,
     crtc_id: u32,
     scene_generation: u64,
-    cursor_epoch: u64,
+    _cursor_epoch: u64,
     current_software_cursor_damage: Option<NativeDamageRect>,
     last_rendered_scene_generation: &mut u64,
-    last_submitted_cursor_epoch: &mut u64,
+    _last_submitted_cursor_epoch: &mut u64,
     last_renderable_surfaces: &mut Vec<RenderableSurface>,
     last_software_cursor_damage: &mut Option<NativeDamageRect>,
     frame_index: &mut u64,
@@ -324,6 +336,7 @@ pub(super) fn finish_direct_worker_queued(
             KmsCursorUpdate::Set(state.clone())
         }),
         test_only: KmsTestOnlyPolicy::Skip,
+        ready_submit: false,
     };
     let descriptor = output_transactions
         .transaction(transaction_id)
@@ -364,8 +377,6 @@ pub(super) fn finish_direct_worker_queued(
         .reserve_worker_submission(token, transaction_id.get())
         .map_err(io::Error::other)?;
     *last_rendered_scene_generation = scene_generation;
-    *last_submitted_cursor_epoch = cursor_epoch;
-    cursor_output_arbitration.consume(cursor_epoch);
     *last_renderable_surfaces = server.renderable_surfaces().to_vec();
     *last_software_cursor_damage = current_software_cursor_damage;
     *frame_index = frame_index.saturating_add(1);

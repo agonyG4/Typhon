@@ -114,6 +114,17 @@ mod tests {
     }
 
     #[test]
+    fn worker_pacing_submit_records_pending_only_after_success() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+
+        assert!(pacing.pending.is_none());
+        pacing.note_worker_submit(41, 3, false, NativeOutputPacingMode::ReactiveDouble);
+        assert!(pacing.pending.is_some());
+    }
+
+    #[test]
     fn pacing_summary_exports_reactive_and_deadline_owner_counters() {
         let summary = NativeFramePacing::from_env().summary_line(0);
         for field in [
@@ -658,6 +669,16 @@ impl NativeFramePacing {
                 PacingField::bool("ready_submit", ready_submit),
             ],
         );
+    }
+
+    pub(crate) fn note_worker_submit(
+        &mut self,
+        token: u64,
+        now_ns: u64,
+        ready_submit: bool,
+        pacing_mode: NativeOutputPacingMode,
+    ) {
+        self.note_submit(token, now_ns, ready_submit, pacing_mode);
     }
     pub(crate) fn note_render_ahead_ready(&mut self, now_ns: u64) {
         self.note_ready_frame(now_ns, true);

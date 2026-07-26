@@ -17,6 +17,7 @@ pub(crate) enum NativeIoOperation {
     KmsWorkerJoin,
     ExplicitSyncRearm,
     ExplicitSyncNotifier,
+    KmsWorkerStopAdmission,
     PageflipQuarantine,
     PageflipRetire,
     PageflipDrain,

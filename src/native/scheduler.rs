@@ -538,6 +538,23 @@ impl NativeFrameScheduler {
         token: u64,
         transaction_id: u64,
     ) -> Result<(), &'static str> {
+        self.cancel_worker_submission_with_requeue(token, transaction_id, true)
+    }
+
+    pub fn abandon_worker_submission(
+        &mut self,
+        token: u64,
+        transaction_id: u64,
+    ) -> Result<(), &'static str> {
+        self.cancel_worker_submission_with_requeue(token, transaction_id, false)
+    }
+
+    fn cancel_worker_submission_with_requeue(
+        &mut self,
+        token: u64,
+        transaction_id: u64,
+        requeue_visual_work: bool,
+    ) -> Result<(), &'static str> {
         let Some(reservation) = self.worker_queued else {
             return Err("worker reservation is not queued");
         };
@@ -545,7 +562,7 @@ impl NativeFrameScheduler {
             return Err("worker reservation identity does not match");
         }
         self.worker_queued = None;
-        self.visual_work_queued = true;
+        self.visual_work_queued = requeue_visual_work;
         self.protocol_work_queued = false;
         self.refresh_deadline_ns = None;
         Ok(())

@@ -70,6 +70,7 @@ pub(super) fn submit_ready_frame(
                     output_generation,
                     crtc_id,
                     cursor,
+                    true,
                 )?
             else {
                 return Ok(ReadySubmissionResult::Unavailable);
@@ -169,8 +170,10 @@ pub(super) fn submit_ready_frame(
                 });
                 cursor_state.begin_primary_submission(cursor_token, state);
             }
-            *last_submitted_cursor_epoch = cursor_epoch;
-            cursor_output_arbitration.consume(cursor_epoch);
+            if !worker_mode {
+                *last_submitted_cursor_epoch = cursor_epoch;
+                cursor_output_arbitration.consume(cursor_epoch);
+            }
             if !explicit_submission {
                 server.mark_prepared_frame_submitted();
             }
@@ -196,7 +199,9 @@ pub(super) fn submit_ready_frame(
                     frame_scheduler.defer_page_flip_watchdog_to_atomic_arbiter();
                 }
             }
-            frame_pacing.note_submit(token, monotonic_now_ns()?, true, pacing_mode);
+            if !worker_mode {
+                frame_pacing.note_submit(token, monotonic_now_ns()?, true, pacing_mode);
+            }
             if explicit_submission
                 && !worker_mode
                 && output_render_fence_token.is_none()
