@@ -3,7 +3,7 @@ use super::presentation_transactions::{
     register_primary_transaction,
 };
 use super::presentation_worker::{
-    queue_compatibility_for_presentation, submit_explicit_ready_for_presentation,
+    queue_compatibility_for_presentation, submit_explicit_ready_for_presentation, worker_ctx,
 };
 use super::*;
 use crate::native_output::kms_worker::KmsCommitWorkerHandle;
@@ -70,6 +70,7 @@ pub(super) fn submit_ready_frame(
                     output_generation,
                     crtc_id,
                     cursor,
+                    worker_ctx(atomic_cursor.as_ref(), frame_pacing),
                     true,
                 )?
             else {
@@ -92,6 +93,13 @@ pub(super) fn submit_ready_frame(
         {
             let compatibility_target = compatibility_target
                 .ok_or_else(|| io::Error::other("compatibility worker submission has no target"))?;
+            let cursor_pin = match (atomic_cursor.as_ref(), cursor) {
+                (Some(native_cursor), Some(state)) if state.framebuffer_id.is_some() => {
+                    Some(native_cursor.pin_framebuffer_for(state)?)
+                }
+                _ => None,
+            };
+            let pacing_frame_id = frame_pacing.worker_submission_frame_id(true);
             let Some(result) = queue_compatibility_for_presentation(
                 worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?,
                 scanout,
@@ -105,6 +113,8 @@ pub(super) fn submit_ready_frame(
                 pacing_mode,
                 render_generation,
                 cursor,
+                cursor_pin,
+                pacing_frame_id,
                 cursor_epoch,
             )?
             else {

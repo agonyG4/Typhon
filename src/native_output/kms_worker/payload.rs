@@ -1,6 +1,7 @@
 //! Owned, immutable values that may cross into the Atomic submit thread.
 
 use super::super::runtime::AtomicCommitKind;
+use crate::native_output::output::CursorFramebufferPin;
 use crate::native_output::{
     CursorPlaneAssignment, OutputTransaction, OutputTransactionContent, OutputTransactionId,
     PrimaryPlaneAssignment,
@@ -22,6 +23,12 @@ pub(crate) struct KmsCommitJob {
     pub(crate) queued_at: MonotonicTimestampNs,
     pub(crate) primary: KmsPrimaryUpdate,
     pub(crate) cursor: KmsCursorUpdate,
+    /// A Send-only lease marker for the exact DRM cursor framebuffer named by
+    /// `cursor`. The framebuffer object remains compositor-thread-owned; the
+    /// lease keeps it in the cursor resource registry until this job reaches a
+    /// terminal point.
+    pub(crate) cursor_pin: Option<CursorFramebufferPin>,
+    pub(crate) pacing_frame_id: Option<u64>,
     pub(crate) test_only: KmsTestOnlyPolicy,
     pub(crate) ready_submit: bool,
 }
@@ -60,6 +67,7 @@ pub(crate) enum KmsCommitPayloadError {
     CursorOnlyChangesPrimary,
     CursorOnlyMissingCursorUpdate,
     UnexpectedCompatibilityImmediate,
+    CursorResourceMismatch,
 }
 
 impl KmsCommitJob {
@@ -164,6 +172,21 @@ impl KmsCommitJob {
         if !cursor_matches {
             return Err(KmsCommitPayloadError::CursorAssignmentMismatch);
         }
+        match &self.cursor {
+            KmsCursorUpdate::Set(state) if state.framebuffer_id.is_some() => {
+                let Some(pin) = self.cursor_pin.as_ref() else {
+                    return Err(KmsCommitPayloadError::CursorResourceMismatch);
+                };
+                if Some(pin.framebuffer_id().get()) != state.framebuffer_id {
+                    return Err(KmsCommitPayloadError::CursorResourceMismatch);
+                }
+            }
+            KmsCursorUpdate::Set(_) | KmsCursorUpdate::Disable | KmsCursorUpdate::Unchanged => {
+                if self.cursor_pin.is_some() {
+                    return Err(KmsCommitPayloadError::CursorResourceMismatch);
+                }
+            }
+        }
         if let AtomicCommitKind::CursorOnly { cursor_epoch, .. } = self.kind {
             if !matches!(
                 transaction.planes().primary(),
@@ -205,6 +228,7 @@ mod tests {
         _assert_send::<KmsCommitJob>();
         _assert_send::<KmsPrimaryUpdate>();
         _assert_send::<KmsCursorUpdate>();
+        _assert_send::<CursorFramebufferPin>();
         _assert_send::<KmsTestOnlyPolicy>();
     }
 

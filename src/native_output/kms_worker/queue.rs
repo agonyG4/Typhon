@@ -53,6 +53,7 @@ pub(crate) struct WorkerMetrics {
     pub(crate) shutdown_queued_jobs_returned: AtomicU64,
     pub(crate) shutdown_queued_jobs_settled: AtomicU64,
     pub(crate) shutdown_ack_suppressed_next_submit: AtomicU64,
+    pub(crate) shutdown_inflight_abandons: AtomicU64,
     pub(crate) cursor_worker_jobs_queued: AtomicU64,
     pub(crate) cursor_worker_submits_confirmed: AtomicU64,
     pub(crate) cursor_worker_rejections_retryable: AtomicU64,
@@ -102,6 +103,7 @@ pub(crate) struct WorkerMetricsSnapshot {
     pub(crate) shutdown_queued_jobs_returned: u64,
     pub(crate) shutdown_queued_jobs_settled: u64,
     pub(crate) shutdown_ack_suppressed_next_submit: u64,
+    pub(crate) shutdown_inflight_abandons: u64,
     pub(crate) cursor_worker_jobs_queued: u64,
     pub(crate) cursor_worker_submits_confirmed: u64,
     pub(crate) cursor_worker_rejections_retryable: u64,
@@ -157,6 +159,7 @@ impl WorkerMetrics {
             shutdown_queued_jobs_returned: read!(shutdown_queued_jobs_returned),
             shutdown_queued_jobs_settled: read!(shutdown_queued_jobs_settled),
             shutdown_ack_suppressed_next_submit: read!(shutdown_ack_suppressed_next_submit),
+            shutdown_inflight_abandons: read!(shutdown_inflight_abandons),
             cursor_worker_jobs_queued: read!(cursor_worker_jobs_queued),
             cursor_worker_submits_confirmed: read!(cursor_worker_submits_confirmed),
             cursor_worker_rejections_retryable: read!(cursor_worker_rejections_retryable),
@@ -174,6 +177,7 @@ pub(crate) enum KmsWorkerLifecycle {
     Running,
     Quiescing,
     ShutdownQuiescing,
+    ShutdownAbandoning,
     Stopped,
     Fatal,
 }
@@ -275,6 +279,9 @@ impl WorkerShared {
             KmsWorkerLifecycle::ShutdownQuiescing => {
                 return Err(KmsWorkerAdmissionError::ShutdownQuiescing);
             }
+            KmsWorkerLifecycle::ShutdownAbandoning => {
+                return Err(KmsWorkerAdmissionError::ShutdownQuiescing);
+            }
             KmsWorkerLifecycle::Stopped => return Err(KmsWorkerAdmissionError::Stopped),
             KmsWorkerLifecycle::Fatal => return Err(KmsWorkerAdmissionError::Fatal),
             KmsWorkerLifecycle::Running => {}
@@ -339,7 +346,7 @@ impl WorkerShared {
             KmsWorkerLifecycle::Running | KmsWorkerLifecycle::Quiescing => {
                 state.lifecycle = KmsWorkerLifecycle::ShutdownQuiescing;
             }
-            KmsWorkerLifecycle::ShutdownQuiescing => {}
+            KmsWorkerLifecycle::ShutdownQuiescing | KmsWorkerLifecycle::ShutdownAbandoning => {}
         }
         let queued_job = state.queued.pop_front();
         if queued_job.is_some() {
@@ -353,6 +360,54 @@ impl WorkerShared {
         self.metrics
             .shutdown_admission_stops
             .fetch_add(1, Ordering::Relaxed);
+        self.metrics.quiesce_count.fetch_add(1, Ordering::Relaxed);
+        self.metrics.quiesce_ns_total.fetch_add(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        Ok(KmsWorkerShutdownSnapshot {
+            queued_job,
+            inflight,
+        })
+    }
+
+    pub(crate) fn force_shutdown_abandon(
+        &self,
+    ) -> Result<KmsWorkerShutdownSnapshot, KmsWorkerAdmissionError> {
+        let started = Instant::now();
+        // The submit gate makes the forced transition wait for an ioctl that
+        // is already executing. Once it is acquired, no later ioctl can begin
+        // before the in-flight identity is detached and the worker is woken.
+        let _submit_gate = self
+            .submit_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(state.lifecycle, KmsWorkerLifecycle::Fatal) {
+            return Err(KmsWorkerAdmissionError::Fatal);
+        }
+        if matches!(state.lifecycle, KmsWorkerLifecycle::Stopped) {
+            return Err(KmsWorkerAdmissionError::Stopped);
+        }
+        if !matches!(
+            state.lifecycle,
+            KmsWorkerLifecycle::ShutdownQuiescing | KmsWorkerLifecycle::ShutdownAbandoning
+        ) {
+            return Err(KmsWorkerAdmissionError::Quiescing);
+        }
+        state.lifecycle = KmsWorkerLifecycle::ShutdownAbandoning;
+        let queued_job = state.queued.pop_front();
+        let inflight = state.inflight.take();
+        drop(state);
+        self.work_wakeup.notify_all();
+        if inflight.is_some() {
+            self.metrics
+                .shutdown_inflight_abandons
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.metrics.quiesce_count.fetch_add(1, Ordering::Relaxed);
         self.metrics.quiesce_ns_total.fetch_add(
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -386,6 +441,9 @@ impl KmsCommitAdmissionPermit {
             let reason = match state.lifecycle {
                 KmsWorkerLifecycle::Quiescing => KmsWorkerAdmissionError::Quiescing,
                 KmsWorkerLifecycle::ShutdownQuiescing => KmsWorkerAdmissionError::ShutdownQuiescing,
+                KmsWorkerLifecycle::ShutdownAbandoning => {
+                    KmsWorkerAdmissionError::ShutdownQuiescing
+                }
                 KmsWorkerLifecycle::Stopped => KmsWorkerAdmissionError::Stopped,
                 KmsWorkerLifecycle::Fatal => KmsWorkerAdmissionError::Fatal,
                 KmsWorkerLifecycle::Running => KmsWorkerAdmissionError::QueueFull,

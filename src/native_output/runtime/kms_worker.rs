@@ -116,6 +116,12 @@ pub(super) fn queue_cursor_only(
         cursor: desired
             .clone()
             .map_or(KmsCursorUpdate::Disable, KmsCursorUpdate::Set),
+        cursor_pin: desired
+            .as_ref()
+            .filter(|state| state.framebuffer_id.is_some())
+            .map(|state| cursor.pin_framebuffer_for(state))
+            .transpose()?,
+        pacing_frame_id: None,
         test_only: KmsTestOnlyPolicy::Required,
         ready_submit: false,
     };
@@ -192,6 +198,8 @@ pub(super) fn queue_explicit_composited_frame(
     output_generation: u64,
     crtc_id: u32,
     cursor: Option<&AtomicCursorVisualState>,
+    cursor_pin: Option<CursorFramebufferPin>,
+    pacing_frame_id: Option<u64>,
     ready_submit: bool,
 ) -> NativeResult<WorkerQueueOutcome> {
     let slot = explicit
@@ -287,6 +295,8 @@ pub(super) fn queue_explicit_composited_frame(
         cursor: cursor.map_or(KmsCursorUpdate::Unchanged, |state| {
             KmsCursorUpdate::Set(state.clone())
         }),
+        cursor_pin,
+        pacing_frame_id,
         test_only: KmsTestOnlyPolicy::Skip,
         ready_submit,
     };
@@ -357,6 +367,8 @@ pub(super) fn queue_atomic_compatibility_frame(
     pacing_mode: NativeOutputPacingMode,
     render_generation: u64,
     cursor: Option<&AtomicCursorVisualState>,
+    cursor_pin: Option<CursorFramebufferPin>,
+    pacing_frame_id: Option<u64>,
     cursor_epoch: u64,
 ) -> NativeResult<WorkerQueueOutcome> {
     if scanout.compatibility_framebuffer_id().is_none() {
@@ -475,6 +487,8 @@ pub(super) fn queue_atomic_compatibility_frame(
         cursor: cursor.map_or(KmsCursorUpdate::Unchanged, |state| {
             KmsCursorUpdate::Set(state.clone())
         }),
+        cursor_pin,
+        pacing_frame_id,
         test_only: KmsTestOnlyPolicy::Skip,
         ready_submit: true,
     };
@@ -556,6 +570,36 @@ impl NativeRuntime {
             )?;
         }
         Ok(snapshot.inflight.map(|inflight| inflight.token))
+    }
+
+    pub(super) fn force_kms_worker_shutdown_abandon(&mut self) -> NativeResult<()> {
+        let Some(worker) = self.kms_commit_worker.as_ref() else {
+            return Ok(());
+        };
+        let snapshot = worker.force_shutdown_abandon().map_err(|error| {
+            io::Error::other(format!("KMS worker forced shutdown abandonment: {error:?}"))
+        })?;
+        if let Some(job) = snapshot.queued_job {
+            self.drop_queued_worker_job_with_reason(
+                job,
+                OutputTransactionDropReason::SafeAbandonment,
+            )?;
+        }
+        if let Some(inflight) = snapshot.inflight {
+            self.forced_shutdown_inflight = Some(inflight.token);
+            let pacing_cleared = self
+                .frame_pacing
+                .abandon_pending_submission(inflight.token.get());
+            self.perf.log("native.kms_commit_worker", || {
+                vec![
+                    NativePerfField::str("event", "shutdown_inflight_abandoned"),
+                    NativePerfField::u64("token", inflight.token.get()),
+                    NativePerfField::u64("transaction_id", inflight.transaction_id.get()),
+                    NativePerfField::bool("pacing_pending_cleared", pacing_cleared),
+                ]
+            });
+        }
+        Ok(())
     }
 
     pub(super) fn check_kms_commit_worker_health(&mut self) -> NativeResult<()> {
@@ -688,6 +732,7 @@ impl NativeRuntime {
                 submit_returned_at,
                 out_fence,
                 cursor,
+                pacing_frame_id,
                 ready_submit,
             } => {
                 if output_generation != self.drm_file_generation
@@ -875,12 +920,15 @@ impl NativeRuntime {
                         .ok_or_else(|| io::Error::other("worker pacing transaction disappeared"))?
                         .descriptor()
                         .pacing_mode();
-                    self.frame_pacing.note_worker_submit(
-                        token.get(),
-                        submit_returned_at,
-                        ready_submit,
-                        pacing_mode,
-                    );
+                    self.frame_pacing
+                        .note_worker_submit_exact(
+                            pacing_frame_id,
+                            token.get(),
+                            submit_returned_at,
+                            ready_submit,
+                            pacing_mode,
+                        )
+                        .map_err(io::Error::other)?;
                     if let Some(worker) = self.kms_commit_worker.as_ref() {
                         worker.record_worker_pacing_submit_confirmed();
                     }
@@ -990,6 +1038,12 @@ impl NativeRuntime {
     ) -> NativeResult<()> {
         if let Some(worker) = self.kms_commit_worker.as_ref() {
             worker.record_worker_pacing_pre_submit_rejection();
+        }
+        if !self
+            .frame_pacing
+            .cancel_worker_submission(job.pacing_frame_id, job.ready_submit)
+        {
+            return Err(io::Error::other("worker rejection pacing identity mismatch").into());
         }
         let cursor_epoch = match job.kind {
             AtomicCommitKind::CursorOnly { cursor_epoch, .. } => Some(cursor_epoch),
@@ -1110,6 +1164,12 @@ impl NativeRuntime {
             cursor.cancel_worker_submission(job.transaction_id, job.token, cursor_epoch)?;
             self.cursor_output_arbitration.clear_pending();
         } else {
+            if !self
+                .frame_pacing
+                .cancel_worker_submission(job.pacing_frame_id, job.ready_submit)
+            {
+                return Err(io::Error::other("worker shutdown pacing identity mismatch").into());
+            }
             let scheduler_cancel = if drop_reason == OutputTransactionDropReason::SafeAbandonment {
                 self.frame_scheduler
                     .abandon_worker_submission(job.token.get(), job.transaction_id.get())

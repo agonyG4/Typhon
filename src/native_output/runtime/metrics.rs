@@ -296,6 +296,10 @@ impl NativeRuntime {
                         metrics.shutdown_ack_suppressed_next_submit,
                     ),
                     NativePerfField::u64(
+                        "worker_shutdown_inflight_abandons",
+                        metrics.shutdown_inflight_abandons,
+                    ),
+                    NativePerfField::u64(
                         "cursor_worker_jobs_queued",
                         metrics.cursor_worker_jobs_queued,
                     ),

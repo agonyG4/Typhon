@@ -1,3 +1,4 @@
+use super::shutdown::KmsRestoreReason;
 use super::*;
 
 impl NativeRuntime {
@@ -93,10 +94,25 @@ impl NativeRuntime {
             return Ok(());
         };
         native_shutdown_debug_log("input_backend_stop");
+        let forced_timeout = matches!(reason, KmsRestoreReason::ForcedPageflipTimeout { .. });
+        if forced_timeout {
+            NativeSessionIo::observe(self, NativeIoOperation::KmsWorkerForceShutdownAbandon);
+            self.force_kms_worker_shutdown_abandon()?;
+        }
         NativeSessionIo::observe(self, NativeIoOperation::KmsWorkerQuiesce);
         NativeSessionIo::quiesce_kms_worker(self)?;
         NativeSessionIo::observe(self, NativeIoOperation::KmsWorkerJoin);
         NativeSessionIo::join_kms_worker(self)?;
+        if forced_timeout && let Some(token) = self.forced_shutdown_inflight.take() {
+            let _ = self.frame_pacing.abandon_pending_submission(token.get());
+        }
+        if forced_timeout {
+            // The forced path deliberately abandons unresolved kernel
+            // ownership. Clear the compositor-side pending state only after
+            // the worker has stopped, then restore KMS.
+            NativeSessionIo::observe(self, NativeIoOperation::PageflipQuarantine);
+            NativeSessionIo::quarantine_pageflip(self)?;
+        }
         self.acquire_watches.shutdown(&mut self.event_loop)?;
         if !self.session.permits_output() {
             teardown_without_drm_io(self);

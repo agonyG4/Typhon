@@ -37,14 +37,15 @@ inflight=$(extract_last worker_inflight)
 runtime_queue_depth=$(extract_last worker_runtime_queue_depth)
 runtime_queue_depth_max=$(extract_last worker_runtime_queue_depth_max)
 kernel_inflight=$(extract_last worker_kernel_inflight)
+shutdown_abandons=$(extract_last worker_shutdown_inflight_abandons)
 core_capacity=1
 max_input_drain=$(extract_last max_input_drain_us)
 max_submit=$(extract_last worker_submit_duration_ns_max)
 
-printf 'kms-worker core_capacity=%s jobs=%s/%s queue_full=%s busy=%s/%s mismatches=%s timeouts=%s fatal=%s active=%s queue_depth=%s runtime_queue_depth=%s runtime_queue_depth_max=%s inflight=%s kernel_inflight=%s max_input_drain_us=%s max_submit_ns=%s\n' \
+printf 'kms-worker core_capacity=%s jobs=%s/%s queue_full=%s busy=%s/%s mismatches=%s timeouts=%s fatal=%s shutdown_abandons=%s active=%s queue_depth=%s runtime_queue_depth=%s runtime_queue_depth_max=%s inflight=%s kernel_inflight=%s max_input_drain_us=%s max_submit_ns=%s\n' \
     "$core_capacity" \
     "$jobs_enqueued" "$jobs_submitted" "$queue_full" "$busy_deferrals" "$busy_exhausted" \
-    "$mismatches" "$timeouts" "$fatal" "$active" "$queue_depth" "$runtime_queue_depth" \
+    "$mismatches" "$timeouts" "$fatal" "$shutdown_abandons" "$active" "$queue_depth" "$runtime_queue_depth" \
     "$runtime_queue_depth_max" "$inflight" "$kernel_inflight" \
     "$max_input_drain" "$max_submit"
 

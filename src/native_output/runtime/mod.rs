@@ -147,6 +147,7 @@ pub(crate) struct NativeRuntime {
     deferred_worker_pageflip: Option<DrmPresentationEvent>,
     deferred_worker_completion: Option<AtomicCommitCompletion>,
     worker_timeout_pending: Option<(PageFlipToken, u64)>,
+    forced_shutdown_inflight: Option<PageFlipToken>,
     frame_scheduler: NativeFrameScheduler,
     atomic_commit_arbiter: AtomicCommitArbiter,
     output_transactions: OutputTransactionLedger,
@@ -251,6 +252,9 @@ impl Drop for NativeRuntime {
         if let Some(worker) = self.kms_commit_worker.take() {
             if let Some(token) = self.kms_commit_worker_reactor_token.take() {
                 let _ = self.event_loop.unregister(token);
+            }
+            if self.shutdown.is_shutting_down() {
+                let _ = worker.force_shutdown_abandon();
             }
             worker.request_quiesce();
             let _ = worker.join();

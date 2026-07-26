@@ -202,6 +202,8 @@ fn test_job(token: u64) -> KmsCommitJob {
             request_out_fence: false,
         },
         cursor: KmsCursorUpdate::Unchanged,
+        cursor_pin: None,
+        pacing_frame_id: None,
         test_only: KmsTestOnlyPolicy::Skip,
         ready_submit: false,
     }
@@ -1023,4 +1025,69 @@ fn shutdown_returned_job_is_detached_once() {
     let second = handle.begin_shutdown_quiesce().unwrap();
     assert!(second.queued_job.is_none());
     handle.join().unwrap();
+}
+
+#[test]
+fn shutdown_quiesce_with_normal_ack_terminates_worker() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Ok(())])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    reserve_for_test(&handle, test_job(46).kind)
+        .enqueue(test_job(46))
+        .unwrap();
+    wait_for_fence_event(
+        &handle,
+        46,
+        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 46),
+    );
+
+    let snapshot = handle.begin_shutdown_quiesce().unwrap();
+    assert_eq!(
+        snapshot.inflight.map(|inflight| inflight.token.get()),
+        Some(46)
+    );
+    handle
+        .ack_pageflip(test_job(46).token, test_job(46).transaction_id, 1)
+        .unwrap();
+    handle.join().unwrap();
+}
+
+#[test]
+fn forced_shutdown_abandonment_wakes_inflight_worker_without_next_submit() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Ok(()), Ok(())])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    reserve_for_test(&handle, test_job(47).kind)
+        .enqueue(test_job(47))
+        .unwrap();
+    wait_for_fence_event(
+        &handle,
+        47,
+        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 47),
+    );
+    reserve_for_test(&handle, test_job(48).kind)
+        .enqueue(test_job(48))
+        .unwrap();
+
+    let snapshot = handle.begin_shutdown_quiesce().unwrap();
+    assert_eq!(
+        snapshot.queued_job.as_ref().map(|job| job.token.get()),
+        Some(48)
+    );
+    assert_eq!(
+        snapshot.inflight.map(|inflight| inflight.token.get()),
+        Some(47)
+    );
+
+    let abandoned = handle.force_shutdown_abandon().unwrap();
+    assert_eq!(
+        abandoned.inflight.map(|inflight| inflight.token.get()),
+        Some(47)
+    );
+    handle.join().unwrap();
+    assert_eq!(*executor.submitted.lock().unwrap(), vec![47]);
 }

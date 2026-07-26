@@ -125,6 +125,35 @@ mod tests {
     }
 
     #[test]
+    fn rejected_worker_submission_clears_active_identity_and_ready_timing() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        let active = pacing.worker_submission_frame_id(false).unwrap();
+        assert!(pacing.cancel_worker_submission(Some(active), false));
+        assert!(pacing.active.is_none());
+        assert!(pacing.active_queued_ns.is_none());
+
+        pacing.queue_visual(2, 2);
+        pacing.note_ready_frame(3, false);
+        let ready = pacing.worker_submission_frame_id(true).unwrap();
+        assert!(pacing.cancel_worker_submission(Some(ready), true));
+        assert!(pacing.ready.is_none());
+        assert!(pacing.ready_waiting_started_ns.is_none());
+    }
+
+    #[test]
+    fn rejected_worker_submission_does_not_leave_pending_presentation_state() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        pacing.note_worker_submit(41, 2, false, NativeOutputPacingMode::ReactiveDouble);
+        assert!(pacing.pending.is_some());
+        assert!(pacing.abandon_pending_submission(41));
+        assert!(pacing.pending.is_none());
+    }
+
+    #[test]
     fn pacing_summary_exports_reactive_and_deadline_owner_counters() {
         let summary = NativeFramePacing::from_env().summary_line(0);
         for field in [
@@ -466,6 +495,7 @@ pub(crate) struct NativeFramePacing {
     pub(crate) active: Option<NativeOutputFrameId>,
     pub(crate) active_queued_ns: Option<u64>,
     pub(crate) pending: Option<NativeOutputFrameId>,
+    pending_token: Option<u64>,
     pub(crate) ready: Option<NativeOutputFrameId>,
     pub(crate) render_ahead_attempts: u64,
     pub(crate) render_ahead_successes: u64,
@@ -537,6 +567,7 @@ impl NativeFramePacing {
             active: None,
             active_queued_ns: None,
             pending: None,
+            pending_token: None,
             ready: None,
             render_ahead_attempts: 0,
             render_ahead_successes: 0,
@@ -659,6 +690,7 @@ impl NativeFramePacing {
             self.reactive_double_immediate_submits += 1;
         }
         self.pending = id;
+        self.pending_token = id.map(|_| token);
         self.active_queued_ns = None;
         self.log(
             "submit",
@@ -671,6 +703,7 @@ impl NativeFramePacing {
         );
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn note_worker_submit(
         &mut self,
         token: u64,
@@ -679,6 +712,79 @@ impl NativeFramePacing {
         pacing_mode: NativeOutputPacingMode,
     ) {
         self.note_submit(token, now_ns, ready_submit, pacing_mode);
+    }
+
+    pub(crate) fn worker_submission_frame_id(&self, ready_submit: bool) -> Option<u64> {
+        self.worker_submission_frame(ready_submit)
+            .map(|id| id.get())
+    }
+
+    fn worker_submission_frame(&self, ready_submit: bool) -> Option<NativeOutputFrameId> {
+        if ready_submit {
+            self.ready
+        } else {
+            self.active
+        }
+    }
+
+    pub(crate) fn cancel_worker_submission(
+        &mut self,
+        expected: Option<u64>,
+        ready_submit: bool,
+    ) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        let current = self.worker_submission_frame(ready_submit);
+        if current.map(|id| id.get()) != expected {
+            return false;
+        }
+        if ready_submit {
+            self.ready = None;
+            self.ready_waiting_started_ns = None;
+        } else {
+            self.active = None;
+            self.active_queued_ns = None;
+        }
+        self.log(
+            "worker_submit_cancelled",
+            vec![
+                frame_id_field(current),
+                PacingField::bool("ready_submit", ready_submit),
+            ],
+        );
+        true
+    }
+
+    pub(crate) fn note_worker_submit_exact(
+        &mut self,
+        expected: Option<u64>,
+        token: u64,
+        now_ns: u64,
+        ready_submit: bool,
+        pacing_mode: NativeOutputPacingMode,
+    ) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.worker_submission_frame_id(ready_submit) != expected {
+            return Err("worker pacing frame identity does not match queued state");
+        }
+        self.note_submit(token, now_ns, ready_submit, pacing_mode);
+        Ok(())
+    }
+
+    pub(crate) fn abandon_pending_submission(&mut self, token: u64) -> bool {
+        if self.pending_token != Some(token) {
+            return false;
+        }
+        self.pending = None;
+        self.pending_token = None;
+        self.log(
+            "worker_submit_abandoned",
+            vec![PacingField::u64("pageflip_token", token)],
+        );
+        true
     }
     pub(crate) fn note_render_ahead_ready(&mut self, now_ns: u64) {
         self.note_ready_frame(now_ns, true);
@@ -728,6 +834,7 @@ impl NativeFramePacing {
         let commit_us = now_ns.saturating_sub(submitted_at_ns) / 1_000;
         self.commit_to_present.record(commit_us);
         let id = self.pending.take();
+        self.pending_token = None;
         self.log(
             "pageflip_complete",
             vec![

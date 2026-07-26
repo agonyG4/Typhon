@@ -20,10 +20,7 @@ use super::presentation_transactions::{
     complete_immediate_output_transaction, present_compatibility_frame,
     register_primary_transaction, settle_failed_output_transaction,
 };
-use super::presentation_worker::{
-    direct_worker_admission, finish_direct_worker_queued, present_cursor_for_presentation,
-    submit_explicit_ready_for_presentation, worker_cursor_queue_available,
-};
+use super::presentation_worker::*;
 use super::*;
 use crate::native_output::kms_worker::KmsCommitWorkerTransport;
 use oblivion_one::native::kms::KmsBackendKind;
@@ -775,6 +772,7 @@ impl NativeRuntime {
                                     frame_scheduler,
                                     cursor_output_arbitration,
                                     effective_cursor.as_ref(),
+                                    worker_ctx(atomic_cursor.as_ref(), frame_pacing),
                                     *drm_file_generation,
                                     target.crtc_id,
                                     scene_generation,
@@ -1050,6 +1048,7 @@ impl NativeRuntime {
                                         *drm_file_generation,
                                         target.crtc_id,
                                         effective_cursor.as_ref(),
+                                        worker_ctx(atomic_cursor.as_ref(), frame_pacing),
                                         false,
                                     )?
                                     else {

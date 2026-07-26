@@ -15,6 +15,7 @@ pub(crate) enum NativeIoOperation {
     ExplicitSyncPark,
     KmsWorkerQuiesce,
     KmsWorkerJoin,
+    KmsWorkerForceShutdownAbandon,
     ExplicitSyncRearm,
     ExplicitSyncNotifier,
     KmsWorkerStopAdmission,
@@ -226,6 +227,9 @@ impl NativeSessionIo for NativeRuntime {
         self.deferred_worker_pageflip = None;
         self.deferred_worker_completion = None;
         self.cursor_output_arbitration.clear_pending();
+        if let Some(cursor) = self.atomic_cursor.as_mut() {
+            cursor.abandon_pageflip_for_recovery();
+        }
         if let Some(token) = self.output_render_fence_token.take() {
             self.event_loop.unregister(token)?;
         }

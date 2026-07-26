@@ -60,6 +60,7 @@ pub(crate) enum KmsWorkerEvent {
         submit_returned_at: u64,
         out_fence: Option<OwnedFd>,
         cursor: KmsCursorUpdate,
+        pacing_frame_id: Option<u64>,
         ready_submit: bool,
     },
     TestRejected {
@@ -354,6 +355,12 @@ impl KmsCommitWorkerHandle {
         self.shared.begin_shutdown_quiesce()
     }
 
+    pub(crate) fn force_shutdown_abandon(
+        &self,
+    ) -> Result<KmsWorkerShutdownSnapshot, KmsWorkerAdmissionError> {
+        self.shared.force_shutdown_abandon()
+    }
+
     pub(crate) fn ack_pageflip(
         &self,
         token: PageFlipToken,
@@ -406,7 +413,9 @@ impl KmsCommitWorkerHandle {
         }
         let suppress_next_submit = matches!(
             state.lifecycle,
-            KmsWorkerLifecycle::Quiescing | KmsWorkerLifecycle::ShutdownQuiescing
+            KmsWorkerLifecycle::Quiescing
+                | KmsWorkerLifecycle::ShutdownQuiescing
+                | KmsWorkerLifecycle::ShutdownAbandoning
         );
         state.inflight = None;
         drop(state);
@@ -680,6 +689,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         submit_returned_at,
                         out_fence: submission.out_fence,
                         cursor: job.cursor.clone(),
+                        pacing_frame_id: job.pacing_frame_id,
                         ready_submit: job.ready_submit,
                     };
                     if !publish_event(&shared, event) {
@@ -825,7 +835,9 @@ fn take_next_job(shared: &Arc<WorkerShared>) -> Option<KmsCommitJob> {
         }
         if matches!(
             state.lifecycle,
-            KmsWorkerLifecycle::Quiescing | KmsWorkerLifecycle::ShutdownQuiescing
+            KmsWorkerLifecycle::Quiescing
+                | KmsWorkerLifecycle::ShutdownQuiescing
+                | KmsWorkerLifecycle::ShutdownAbandoning
         ) {
             let returned_jobs = state.queued.drain(..).collect();
             state.lifecycle = KmsWorkerLifecycle::Stopped;
@@ -857,8 +869,10 @@ fn wait_for_pageflip_or_quiesce(
     let mut timeout_reported = false;
     loop {
         if matches!(state.lifecycle, KmsWorkerLifecycle::Quiescing)
-            || (matches!(state.lifecycle, KmsWorkerLifecycle::ShutdownQuiescing)
-                && state.inflight.is_none())
+            || matches!(
+                state.lifecycle,
+                KmsWorkerLifecycle::ShutdownQuiescing | KmsWorkerLifecycle::ShutdownAbandoning
+            ) && state.inflight.is_none()
         {
             let returned_jobs = state.queued.drain(..).collect();
             state.lifecycle = KmsWorkerLifecycle::Stopped;
@@ -912,7 +926,9 @@ fn wait_until_or_quiesce(shared: &Arc<WorkerShared>, deadline_ns: u64) -> bool {
     loop {
         if matches!(
             state.lifecycle,
-            KmsWorkerLifecycle::Quiescing | KmsWorkerLifecycle::ShutdownQuiescing
+            KmsWorkerLifecycle::Quiescing
+                | KmsWorkerLifecycle::ShutdownQuiescing
+                | KmsWorkerLifecycle::ShutdownAbandoning
         ) {
             return false;
         }

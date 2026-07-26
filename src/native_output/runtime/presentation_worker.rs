@@ -6,6 +6,33 @@ use crate::native_output::kms_worker::{
 };
 use oblivion_one::native::kms::FramebufferId;
 
+pub(super) fn worker_cursor_pin(
+    atomic_cursor: Option<&NativeAtomicCursor>,
+    cursor: Option<&AtomicCursorVisualState>,
+) -> NativeResult<Option<CursorFramebufferPin>> {
+    match (atomic_cursor, cursor) {
+        (Some(native_cursor), Some(state)) if state.framebuffer_id.is_some() => {
+            Ok(Some(native_cursor.pin_framebuffer_for(state)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+pub(super) struct WorkerPrimarySubmissionContext<'a> {
+    atomic_cursor: Option<&'a NativeAtomicCursor>,
+    frame_pacing: &'a NativeFramePacing,
+}
+
+pub(super) fn worker_ctx<'a>(
+    atomic_cursor: Option<&'a NativeAtomicCursor>,
+    frame_pacing: &'a NativeFramePacing,
+) -> WorkerPrimarySubmissionContext<'a> {
+    WorkerPrimarySubmissionContext {
+        atomic_cursor,
+        frame_pacing,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn queue_cursor_only_for_presentation(
     worker: &KmsCommitWorkerHandle,
@@ -130,6 +157,8 @@ pub(super) fn queue_explicit_ready_for_presentation(
     output_generation: u64,
     crtc_id: u32,
     cursor: Option<&AtomicCursorVisualState>,
+    cursor_pin: Option<CursorFramebufferPin>,
+    pacing_frame_id: Option<u64>,
     ready_submit: bool,
 ) -> NativeResult<Option<(u64, u32, OutputTransactionId)>> {
     match queue_explicit_composited_frame(
@@ -143,6 +172,8 @@ pub(super) fn queue_explicit_ready_for_presentation(
         output_generation,
         crtc_id,
         cursor,
+        cursor_pin,
+        pacing_frame_id,
         ready_submit,
     )? {
         WorkerQueueOutcome::Queued {
@@ -172,10 +203,15 @@ pub(super) fn submit_explicit_ready_for_presentation(
     output_generation: u64,
     crtc_id: u32,
     cursor: Option<&AtomicCursorVisualState>,
+    context: WorkerPrimarySubmissionContext<'_>,
     ready_submit: bool,
 ) -> NativeResult<Option<(u64, u32, OutputTransactionId, bool)>> {
     if worker_mode {
         let worker = worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?;
+        let cursor_pin = worker_cursor_pin(context.atomic_cursor, cursor)?;
+        let pacing_frame_id = context
+            .frame_pacing
+            .worker_submission_frame_id(ready_submit);
         return Ok(queue_explicit_ready_for_presentation(
             worker,
             explicit,
@@ -187,6 +223,8 @@ pub(super) fn submit_explicit_ready_for_presentation(
             output_generation,
             crtc_id,
             cursor,
+            cursor_pin,
+            pacing_frame_id,
             ready_submit,
         )?
         .map(|(token, framebuffer_id, transaction_id)| {
@@ -212,6 +250,8 @@ pub(super) fn queue_compatibility_for_presentation(
     pacing_mode: NativeOutputPacingMode,
     render_generation: u64,
     cursor: Option<&AtomicCursorVisualState>,
+    cursor_pin: Option<CursorFramebufferPin>,
+    pacing_frame_id: Option<u64>,
     cursor_epoch: u64,
 ) -> NativeResult<Option<(NativePresentResult, Option<OutputTransactionId>)>> {
     match super::kms_worker::queue_atomic_compatibility_frame(
@@ -227,6 +267,8 @@ pub(super) fn queue_compatibility_for_presentation(
         pacing_mode,
         render_generation,
         cursor,
+        cursor_pin,
+        pacing_frame_id,
         cursor_epoch,
     )? {
         WorkerQueueOutcome::Queued {
@@ -259,6 +301,7 @@ pub(super) fn finish_direct_worker_queued(
     frame_scheduler: &mut NativeFrameScheduler,
     _cursor_output_arbitration: &mut NativeCursorOutputArbitration,
     effective_cursor: Option<&AtomicCursorVisualState>,
+    context: WorkerPrimarySubmissionContext<'_>,
     output_generation: u64,
     crtc_id: u32,
     scene_generation: u64,
@@ -335,6 +378,8 @@ pub(super) fn finish_direct_worker_queued(
         cursor: effective_cursor.map_or(KmsCursorUpdate::Unchanged, |state| {
             KmsCursorUpdate::Set(state.clone())
         }),
+        cursor_pin: worker_cursor_pin(context.atomic_cursor, effective_cursor)?,
+        pacing_frame_id: context.frame_pacing.worker_submission_frame_id(false),
         test_only: KmsTestOnlyPolicy::Skip,
         ready_submit: false,
     };
