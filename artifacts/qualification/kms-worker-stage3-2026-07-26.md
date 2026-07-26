@@ -10,8 +10,8 @@
 
 ## Gate status
 
-The software gate passed: `cargo fmt --check`, `cargo test --locked` (536
-passed, 1 ignored), `cargo check --locked --all-targets`,
+The software gate passed: `cargo fmt --check`, `cargo test --locked` (1,843
+passed, 5 ignored, 0 failed across all test binaries), `cargo check --locked --all-targets`,
 `cargo clippy --locked --all-targets -- -D warnings`, `cargo build --locked
 --release`, `./bin/check-source-layout`, `git diff --check`, and
 `bash -n bin/qualify-kms-worker` all exited successfully.

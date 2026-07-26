@@ -25,7 +25,7 @@ $ cargo fmt --check
 exit 0
 
 $ cargo test --locked
-test result: ok. 536 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+aggregate test result: ok. 1843 passed; 0 failed; 5 ignored
 
 $ cargo check --locked --all-targets
 Finished `dev` profile [unoptimized + debuginfo]
