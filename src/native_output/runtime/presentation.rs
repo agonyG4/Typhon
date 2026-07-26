@@ -761,6 +761,7 @@ impl NativeRuntime {
                                 transaction_id,
                                 token,
                                 framebuffer_id,
+                                lease,
                                 admission,
                             } => {
                                 finish_direct_worker_queued(
@@ -788,6 +789,7 @@ impl NativeRuntime {
                                     token,
                                     framebuffer_id,
                                     direct_target,
+                                    lease,
                                     admission,
                                 )?;
                                 direct_submitted = true;

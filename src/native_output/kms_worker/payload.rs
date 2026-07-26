@@ -2,6 +2,7 @@
 
 use super::super::runtime::AtomicCommitKind;
 use crate::native_output::output::CursorFramebufferPin;
+use crate::native_output::scanout::DirectPrimaryLease;
 use crate::native_output::{
     CursorPlaneAssignment, OutputTransaction, OutputTransactionContent, OutputTransactionId,
     PrimaryPlaneAssignment,
@@ -28,6 +29,7 @@ pub(crate) struct KmsCommitJob {
     /// lease keeps it in the cursor resource registry until this job reaches a
     /// terminal point.
     pub(crate) cursor_pin: Option<CursorFramebufferPin>,
+    pub(crate) direct_primary_lease: Option<DirectPrimaryLease>,
     pub(crate) pacing_frame_id: Option<u64>,
     pub(crate) test_only: KmsTestOnlyPolicy,
     pub(crate) ready_submit: bool,
@@ -68,6 +70,7 @@ pub(crate) enum KmsCommitPayloadError {
     CursorOnlyMissingCursorUpdate,
     UnexpectedCompatibilityImmediate,
     CursorResourceMismatch,
+    DirectPrimaryResourceMismatch,
 }
 
 impl KmsCommitJob {
@@ -85,6 +88,23 @@ impl KmsCommitJob {
         }
         if self.target != transaction.target() {
             return Err(KmsCommitPayloadError::TargetMismatch);
+        }
+
+        match (self.kind, self.direct_primary_lease.as_ref()) {
+            (AtomicCommitKind::DirectPrimary { framebuffer_id, .. }, Some(lease))
+                if lease.framebuffer_id() == framebuffer_id
+                    && matches!(
+                        transaction.content(),
+                        OutputTransactionContent::Direct { key: expected, .. }
+                            if expected == lease.key()
+                    ) => {}
+            (AtomicCommitKind::DirectPrimary { .. }, _) => {
+                return Err(KmsCommitPayloadError::DirectPrimaryResourceMismatch);
+            }
+            (_, None) => {}
+            (_, Some(_)) => {
+                return Err(KmsCommitPayloadError::DirectPrimaryResourceMismatch);
+            }
         }
 
         match (self.kind, transaction.content(), &self.primary) {
@@ -230,6 +250,8 @@ mod tests {
         _assert_send::<KmsCursorUpdate>();
         _assert_send::<CursorFramebufferPin>();
         _assert_send::<KmsTestOnlyPolicy>();
+        _assert_send::<DirectPrimaryLease>();
+        _assert_send::<KmsCommitJob>();
     }
 
     #[test]

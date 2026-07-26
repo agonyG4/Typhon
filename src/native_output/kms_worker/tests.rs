@@ -173,7 +173,7 @@ fn margin_is_bounded_by_half_refresh() {
     assert_eq!(model.safety_margin_ns(), 50_000);
 }
 
-fn test_job(token: u64) -> KmsCommitJob {
+pub(super) fn test_job(token: u64) -> KmsCommitJob {
     let transaction_id = OutputTransactionId::new(
         std::num::NonZeroU64::new(token).expect("test transaction ID is nonzero"),
     );
@@ -206,6 +206,7 @@ fn test_job(token: u64) -> KmsCommitJob {
         },
         cursor: KmsCursorUpdate::Unchanged,
         cursor_pin: None,
+        direct_primary_lease: None,
         pacing_frame_id: None,
         test_only: KmsTestOnlyPolicy::Skip,
         ready_submit: false,
@@ -277,12 +278,18 @@ fn fd_is_closed(raw_fd: i32) -> bool {
 
 fn fd_identity(raw_fd: i32) -> Option<String> {
     std::fs::read_to_string(format!("/proc/self/fdinfo/{raw_fd}"))
-        .ok()?
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("eventfd-id:")
-                .map(str::trim)
-                .map(str::to_owned)
+        .ok()
+        .and_then(|info| {
+            info.lines().find_map(|line| {
+                line.strip_prefix("eventfd-id:")
+                    .map(str::trim)
+                    .map(str::to_owned)
+            })
+        })
+        .or_else(|| {
+            std::fs::read_link(format!("/proc/self/fd/{raw_fd}"))
+                .ok()
+                .map(|target| target.to_string_lossy().into_owned())
         })
 }
 
@@ -314,7 +321,7 @@ impl KmsCommitExecutor for FenceRecordingExecutor {
     }
 }
 
-fn wait_for_fence_event(
+pub(super) fn wait_for_fence_event(
     handle: &KmsCommitWorkerHandle,
     token: u64,
     predicate: impl Fn(&KmsWorkerEvent) -> bool,
@@ -501,7 +508,7 @@ fn collect_events(handle: &KmsCommitWorkerHandle) -> Vec<KmsWorkerEvent> {
     handle.drain_events()
 }
 
-fn reserve_for_test(
+pub(super) fn reserve_for_test(
     handle: &KmsCommitWorkerHandle,
     kind: AtomicCommitKind,
 ) -> KmsCommitAdmissionPermit {

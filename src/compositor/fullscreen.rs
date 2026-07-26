@@ -88,7 +88,7 @@ impl DirectScanoutSceneBlockers {
         &self.reasons
     }
 
-    fn push(&mut self, reason: DirectScanoutSceneRejection) {
+    pub(crate) fn push(&mut self, reason: DirectScanoutSceneRejection) {
         if !self.reasons.contains(&reason) {
             self.reasons.push(reason);
         }

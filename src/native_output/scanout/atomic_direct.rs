@@ -13,7 +13,8 @@ pub(crate) struct PreparedDirectFrame {
     pub(crate) frame_id: u64,
     pub(crate) transaction_id: OutputTransactionId,
     pub(crate) key: DirectScanoutCandidateKey,
-    pub(crate) candidate: DirectScanoutSceneCandidate,
+    pub(crate) surface_id: u32,
+    pub(crate) buffer: DmabufBufferHandle,
     pub(crate) framebuffer: Arc<ImportedDirectFramebuffer>,
     pub(crate) target: PresentationTarget,
 }
@@ -28,11 +29,16 @@ pub(crate) struct SubmittedDirectFrame {
     pub(crate) out_fence: Option<OwnedFd>,
 }
 
+#[derive(Debug)]
 pub(crate) struct WorkerQueuedDirectFrame {
-    pub(crate) prepared: PreparedDirectFrame,
+    pub(crate) frame_id: u64,
+    pub(crate) transaction_id: OutputTransactionId,
+    pub(crate) key: DirectScanoutCandidateKey,
+    pub(crate) surface_id: u32,
     pub(crate) token: PageFlipToken,
     pub(crate) protocol_batch_id: CompositorFrameBatchId,
-    pub(crate) surface_damage: SurfaceDamagePresentation,
+    pub(crate) framebuffer_id: u32,
+    pub(crate) target: PresentationTarget,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +77,7 @@ pub(crate) enum DirectScanoutAttempt {
         transaction_id: OutputTransactionId,
         token: u64,
         framebuffer_id: u32,
+        lease: DirectPrimaryLease,
         admission: crate::native_output::kms_worker::KmsCommitAdmissionPermit,
     },
 }
@@ -179,7 +186,7 @@ impl DirectScanoutState {
             .or_else(|| {
                 self.worker_queued
                     .as_ref()
-                    .map(|frame| frame.prepared.transaction_id)
+                    .map(|frame| frame.transaction_id)
             })
     }
 
@@ -193,16 +200,46 @@ impl DirectScanoutState {
                 "suspended direct worker token does not match queued ownership",
             ));
         }
+        Ok(())
+    }
+
+    pub(crate) fn suspend_worker_submission(
+        &mut self,
+        token: PageFlipToken,
+        lease: DirectPrimaryLease,
+    ) -> io::Result<()> {
+        let Some(frame) = self.worker_queued.take() else {
+            return Err(io::Error::other(
+                "suspended direct worker token has no queued metadata",
+            ));
+        };
+        if frame.token != token {
+            self.worker_queued = Some(frame);
+            return Err(io::Error::other(
+                "suspended direct worker token does not match queued ownership",
+            ));
+        }
+        let (_, _, buffer, framebuffer, surface_damage) = lease.into_parts()?;
         self.suspended.push(SuspendedDirectFrame {
-            buffer: frame.prepared.candidate.buffer,
-            framebuffer: frame.prepared.framebuffer,
-            abandoned_batch: Some((frame.protocol_batch_id, frame.surface_damage)),
+            buffer,
+            framebuffer,
+            abandoned_batch: Some((frame.protocol_batch_id, surface_damage)),
         });
         Ok(())
     }
 
     pub(crate) fn worker_queued_token(&self) -> Option<PageFlipToken> {
         self.worker_queued.as_ref().map(|frame| frame.token)
+    }
+
+    pub(crate) fn store_worker_queued(&mut self, frame: WorkerQueuedDirectFrame) -> io::Result<()> {
+        if self.worker_queued.is_some() || self.pending.is_some() {
+            return Err(io::Error::other(
+                "direct worker queue already owns a primary frame",
+            ));
+        }
+        self.worker_queued = Some(frame);
+        Ok(())
     }
 
     pub(crate) fn page_flip_pending(&self) -> bool {
@@ -212,6 +249,7 @@ impl DirectScanoutState {
     pub(crate) fn promote_worker_submission(
         &mut self,
         token: PageFlipToken,
+        lease: DirectPrimaryLease,
         out_fence: Option<OwnedFd>,
         submit_started_at: MonotonicTimestampNs,
         submit_returned_at: MonotonicTimestampNs,
@@ -227,11 +265,25 @@ impl DirectScanoutState {
             ));
         }
         let protocol_batch_id = queued.protocol_batch_id;
+        let (key, surface_id, buffer, framebuffer, surface_damage) = lease.into_parts()?;
+        if key != queued.key || surface_id != queued.surface_id {
+            return Err(io::Error::other(
+                "direct worker success lease does not match queued metadata",
+            ));
+        }
         self.pending = Some(SubmittedDirectFrame {
-            prepared: queued.prepared,
+            prepared: PreparedDirectFrame {
+                frame_id: queued.frame_id,
+                transaction_id: queued.transaction_id,
+                key,
+                surface_id,
+                buffer,
+                framebuffer,
+                target: queued.target,
+            },
             token,
             protocol_batch_id,
-            surface_damage: queued.surface_damage,
+            surface_damage,
             submit_started_at,
             submit_returned_at,
             out_fence,
@@ -253,19 +305,15 @@ impl DirectScanoutState {
                 "direct worker failure token mismatches queued frame",
             ));
         }
-        drop(queued.surface_damage);
         Ok(queued.protocol_batch_id)
     }
 
     pub(crate) fn active_surface(&self) -> Option<u32> {
         self.pending
             .as_ref()
-            .map(|frame| frame.prepared.candidate.surface_id)
-            .or_else(|| {
-                self.current
-                    .as_ref()
-                    .map(|frame| frame.prepared.candidate.surface_id)
-            })
+            .map(|frame| frame.prepared.surface_id)
+            .or_else(|| self.current.as_ref().map(|frame| frame.prepared.surface_id))
+            .or_else(|| self.worker_queued.as_ref().map(|frame| frame.surface_id))
     }
 
     pub(crate) fn disarm_drm_cleanup(&mut self) {
@@ -274,9 +322,6 @@ impl DirectScanoutState {
             frame.prepared.framebuffer.disarm_drm_cleanup();
         }
         if let Some(frame) = &self.pending {
-            frame.prepared.framebuffer.disarm_drm_cleanup();
-        }
-        if let Some(frame) = &self.worker_queued {
             frame.prepared.framebuffer.disarm_drm_cleanup();
         }
         for frame in &self.suspended {
@@ -295,16 +340,10 @@ impl DirectScanoutState {
     }
 
     pub(super) fn suspend(&mut self) {
-        if let Some(frame) = self.worker_queued.take() {
-            self.suspended.push(SuspendedDirectFrame {
-                buffer: frame.prepared.candidate.buffer,
-                framebuffer: frame.prepared.framebuffer,
-                abandoned_batch: Some((frame.protocol_batch_id, frame.surface_damage)),
-            });
-        }
+        self.worker_queued.take();
         if let Some(frame) = self.pending.take() {
             self.suspended.push(SuspendedDirectFrame {
-                buffer: frame.prepared.candidate.buffer,
+                buffer: frame.prepared.buffer,
                 framebuffer: frame.prepared.framebuffer,
                 abandoned_batch: Some((frame.protocol_batch_id, frame.surface_damage)),
             });
@@ -312,7 +351,7 @@ impl DirectScanoutState {
         if let Some(frame) = self.current.take() {
             self.counters.exits += 1;
             self.suspended.push(SuspendedDirectFrame {
-                buffer: frame.prepared.candidate.buffer,
+                buffer: frame.prepared.buffer,
                 framebuffer: frame.prepared.framebuffer,
                 abandoned_batch: None,
             });

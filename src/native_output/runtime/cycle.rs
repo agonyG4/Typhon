@@ -648,7 +648,7 @@ impl NativeRuntime {
                             server.complete_direct_presented_frame_batch(
                                 presented.prepared.frame_id,
                                 protocol_batch_id,
-                                presented.prepared.candidate.surface_id,
+                                presented.prepared.surface_id,
                                 presentation,
                             );
                             completed = Some(presented);

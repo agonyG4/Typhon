@@ -207,6 +207,14 @@ impl NativeSessionIo for NativeRuntime {
         let mut uncertain_submit = false;
         for fatal_job in worker.take_fatal_jobs() {
             if fatal_job.uncertain_submit {
+                let mut job = fatal_job.job;
+                if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
+                    let lease = job.direct_primary_lease.take().ok_or_else(|| {
+                        io::Error::other("uncertain direct worker job has no primary lease")
+                    })?;
+                    self.scanout
+                        .suspend_worker_direct_submission(job.token, lease)?;
+                }
                 uncertain_submit = true;
             } else {
                 self.drop_queued_worker_job(fatal_job.job)?;

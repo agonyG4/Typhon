@@ -45,6 +45,7 @@ impl NativeScanoutBackend {
     pub(crate) fn promote_worker_direct_submission(
         &mut self,
         token: PageFlipToken,
+        lease: DirectPrimaryLease,
         out_fence: Option<OwnedFd>,
         submit_started_at: MonotonicTimestampNs,
         submit_returned_at: MonotonicTimestampNs,
@@ -52,6 +53,7 @@ impl NativeScanoutBackend {
         match self {
             Self::AtomicEglGbm(scanout) => scanout.promote_worker_direct_submission(
                 token,
+                lease,
                 out_fence,
                 submit_started_at,
                 submit_returned_at,
@@ -79,6 +81,31 @@ impl NativeScanoutBackend {
             Self::AtomicEglGbm(scanout) => scanout.suspend_abandon_worker_direct(token),
             _ => Err(io::Error::other(
                 "direct worker suspension requires explicit Atomic scanout",
+            )),
+        }
+    }
+
+    pub(crate) fn suspend_worker_direct_submission(
+        &mut self,
+        token: PageFlipToken,
+        lease: DirectPrimaryLease,
+    ) -> io::Result<()> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.suspend_worker_direct_submission(token, lease),
+            _ => Err(io::Error::other(
+                "direct worker suspension requires explicit Atomic scanout",
+            )),
+        }
+    }
+
+    pub(crate) fn store_worker_direct_submission(
+        &mut self,
+        frame: WorkerQueuedDirectFrame,
+    ) -> io::Result<()> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.store_worker_direct_submission(frame),
+            _ => Err(io::Error::other(
+                "direct worker metadata requires explicit Atomic scanout",
             )),
         }
     }

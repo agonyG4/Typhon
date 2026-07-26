@@ -60,6 +60,8 @@ pub(crate) enum KmsWorkerEvent {
         submit_returned_at: u64,
         out_fence: Option<OwnedFd>,
         cursor: KmsCursorUpdate,
+        direct_primary_lease: Option<crate::native_output::scanout::DirectPrimaryLease>,
+        test_only_policy: KmsTestOnlyPolicy,
         pacing_frame_id: Option<u64>,
         ready_submit: bool,
     },
@@ -659,6 +661,8 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
             };
             match submission {
                 Ok(Ok(submission)) => {
+                    let direct_primary_lease = job.direct_primary_lease.take();
+                    let test_only_policy = job.test_only;
                     if let KmsPrimaryUpdate::Framebuffer { in_fence, .. } = &mut job.primary {
                         // The ioctl has consumed the input-fence contract. The
                         // fence must not remain owned while waiting for the pageflip.
@@ -697,6 +701,8 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         submit_returned_at,
                         out_fence: submission.out_fence,
                         cursor: job.cursor.clone(),
+                        direct_primary_lease,
+                        test_only_policy,
                         pacing_frame_id: job.pacing_frame_id,
                         ready_submit: job.ready_submit,
                     };

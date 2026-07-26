@@ -241,20 +241,9 @@ impl AtomicEglGbmScanout {
         if let Some(permit) = worker_admission {
             let framebuffer_id = framebuffer.framebuffer.get();
             let was_direct = self.direct.current.is_some();
+            let direct_lease =
+                DirectPrimaryLease::new(candidate, candidate_key, framebuffer, surface_damage);
             self.swapchain_mut()?.advance_external_frame_id(frame_id)?;
-            self.direct.worker_queued = Some(WorkerQueuedDirectFrame {
-                prepared: PreparedDirectFrame {
-                    frame_id,
-                    transaction_id,
-                    key: candidate_key,
-                    candidate,
-                    framebuffer,
-                    target,
-                },
-                token,
-                protocol_batch_id,
-                surface_damage,
-            });
             if !was_direct {
                 self.direct.counters.entries += 1;
             }
@@ -263,6 +252,7 @@ impl AtomicEglGbmScanout {
                 transaction_id,
                 token: token.get(),
                 framebuffer_id,
+                lease: direct_lease,
                 admission: permit,
             });
         }
@@ -277,6 +267,8 @@ impl AtomicEglGbmScanout {
         );
         let submit_returned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         let framebuffer_id = framebuffer.framebuffer.get();
+        let surface_id = candidate.surface_id;
+        let buffer = candidate.buffer;
         let out_fence = match submission {
             Ok(submission) => {
                 if submission.out_fence.is_some() {
@@ -318,7 +310,8 @@ impl AtomicEglGbmScanout {
                 frame_id,
                 transaction_id,
                 key: candidate_key,
-                candidate,
+                surface_id,
+                buffer,
                 framebuffer,
                 target,
             },
@@ -437,16 +430,16 @@ impl AtomicEglGbmScanout {
             .as_ref()
             .map(|frame| {
                 (
-                    frame.prepared.candidate.buffer_identity.id().get(),
-                    frame.prepared.framebuffer.framebuffer.get(),
-                    frame.prepared.framebuffer.format,
-                    frame.prepared.framebuffer.modifier,
+                    frame.key.content.buffer_id.get(),
+                    frame.framebuffer_id,
+                    frame.key.content.format,
+                    frame.key.content.modifier,
                 )
             })
             .or_else(|| {
                 self.direct.pending.as_ref().map(|frame| {
                     (
-                        frame.prepared.candidate.buffer_identity.id().get(),
+                        frame.prepared.key.content.buffer_id.get(),
                         frame.prepared.framebuffer.framebuffer.get(),
                         frame.prepared.framebuffer.format,
                         frame.prepared.framebuffer.modifier,
@@ -456,7 +449,7 @@ impl AtomicEglGbmScanout {
             .or_else(|| {
                 self.direct.current.as_ref().map(|frame| {
                     (
-                        frame.prepared.candidate.buffer_identity.id().get(),
+                        frame.prepared.key.content.buffer_id.get(),
                         frame.prepared.framebuffer.framebuffer.get(),
                         frame.prepared.framebuffer.format,
                         frame.prepared.framebuffer.modifier,

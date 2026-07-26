@@ -187,6 +187,69 @@ fn close_gem_handles(io: &Arc<dyn DirectFramebufferIo>, handles: &[u32]) {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_direct_primary_framebuffer(
+    framebuffer_id: u32,
+) -> (
+    Arc<ImportedDirectFramebuffer>,
+    DmabufBufferHandle,
+    Arc<AtomicU64>,
+) {
+    #[derive(Debug)]
+    struct TestIo {
+        framebuffer_id: FramebufferId,
+        cleanup_count: Arc<AtomicU64>,
+    }
+
+    impl DirectFramebufferIo for TestIo {
+        fn prime_fd_to_handle(&self, _dma_buf: BorrowedFd<'_>) -> io::Result<u32> {
+            Ok(1)
+        }
+
+        fn add_framebuffer(
+            &self,
+            _descriptor: &ExplicitFramebufferDescriptor,
+        ) -> io::Result<FramebufferId> {
+            Ok(self.framebuffer_id)
+        }
+
+        fn remove_framebuffer(&self, _framebuffer: FramebufferId) -> io::Result<()> {
+            self.cleanup_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn gem_close(&self, _handle: u32) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut ids = oblivion_one::render_backend::buffer::BufferIdAllocator::default();
+    let identity = ids.allocate().expect("test buffer identity");
+    let buffer = DmabufBufferHandle::new(
+        oblivion_one::render_backend::buffer::BufferSize::new(4, 4).expect("test buffer size"),
+        DrmFormat::Xrgb8888,
+        vec![oblivion_one::render_backend::buffer::DmabufPlane::new(
+            std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").expect("test dma-buf fd")),
+            oblivion_one::render_backend::buffer::DmabufPlaneDescriptor {
+                plane_index: 0,
+                offset: 0,
+                stride: 16,
+                modifier: DrmModifier::LINEAR,
+            },
+        )],
+    )
+    .expect("test dma-buf");
+    let cleanup_count = Arc::new(AtomicU64::new(0));
+    let io = Arc::new(TestIo {
+        framebuffer_id: FramebufferId::new(framebuffer_id).expect("test framebuffer id"),
+        cleanup_count: Arc::clone(&cleanup_count),
+    });
+    let imported =
+        ImportedDirectFramebuffer::import(io, Arc::new(AtomicU64::new(0)), &identity, &buffer)
+            .expect("test imported framebuffer");
+    (Arc::new(imported), buffer, cleanup_count)
+}
+
 pub(crate) fn validate_direct_dma_buf(buffer: &DmabufBufferHandle) -> io::Result<()> {
     let planes = buffer.planes();
     if !(1..=4).contains(&planes.len()) {

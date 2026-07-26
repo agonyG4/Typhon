@@ -25,6 +25,7 @@ impl AtomicEglGbmScanout {
     pub(crate) fn promote_worker_direct_submission(
         &mut self,
         token: PageFlipToken,
+        lease: DirectPrimaryLease,
         out_fence: Option<OwnedFd>,
         submit_started_at: MonotonicTimestampNs,
         submit_returned_at: MonotonicTimestampNs,
@@ -32,6 +33,7 @@ impl AtomicEglGbmScanout {
         let has_out_fence = out_fence.is_some();
         let batch_id = self.direct.promote_worker_submission(
             token,
+            lease,
             out_fence,
             submit_started_at,
             submit_returned_at,
@@ -56,6 +58,21 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn suspend_abandon_worker_direct(&mut self, token: PageFlipToken) -> io::Result<()> {
         self.direct.suspend_worker_queued(token)
+    }
+
+    pub(crate) fn suspend_worker_direct_submission(
+        &mut self,
+        token: PageFlipToken,
+        lease: DirectPrimaryLease,
+    ) -> io::Result<()> {
+        self.direct.suspend_worker_submission(token, lease)
+    }
+
+    pub(crate) fn store_worker_direct_submission(
+        &mut self,
+        frame: WorkerQueuedDirectFrame,
+    ) -> io::Result<()> {
+        self.direct.store_worker_queued(frame)
     }
 
     pub(crate) fn suspend_abandon_worker_submission(

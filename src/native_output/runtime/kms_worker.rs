@@ -121,6 +121,7 @@ pub(super) fn queue_cursor_only(
             .filter(|state| state.framebuffer_id.is_some())
             .map(|state| cursor.pin_framebuffer_for(state))
             .transpose()?,
+        direct_primary_lease: None,
         pacing_frame_id: None,
         test_only: KmsTestOnlyPolicy::Required,
         ready_submit: false,
@@ -296,6 +297,7 @@ pub(super) fn queue_explicit_composited_frame(
             KmsCursorUpdate::Set(state.clone())
         }),
         cursor_pin,
+        direct_primary_lease: None,
         pacing_frame_id,
         test_only: KmsTestOnlyPolicy::Skip,
         ready_submit,
@@ -488,6 +490,7 @@ pub(super) fn queue_atomic_compatibility_frame(
             KmsCursorUpdate::Set(state.clone())
         }),
         cursor_pin,
+        direct_primary_lease: None,
         pacing_frame_id,
         test_only: KmsTestOnlyPolicy::Skip,
         ready_submit: true,
@@ -775,6 +778,8 @@ impl NativeRuntime {
                 submit_returned_at,
                 out_fence,
                 cursor,
+                direct_primary_lease,
+                test_only_policy: _,
                 pacing_frame_id,
                 ready_submit,
             } => {
@@ -825,8 +830,12 @@ impl NativeRuntime {
                         )?;
                     }
                 } else if matches!(kind, AtomicCommitKind::DirectPrimary { .. }) {
+                    let direct_primary_lease = direct_primary_lease.ok_or_else(|| {
+                        io::Error::other("direct worker submission has no primary lease")
+                    })?;
                     let batch_id = self.scanout.promote_worker_direct_submission(
                         token,
+                        direct_primary_lease,
                         out_fence,
                         MonotonicTimestampNs::new(submit_started_at),
                         MonotonicTimestampNs::new(submit_returned_at),

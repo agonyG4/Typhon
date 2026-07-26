@@ -317,6 +317,7 @@ pub(super) fn finish_direct_worker_queued(
     token: u64,
     framebuffer_id: u32,
     direct_target: PresentationTarget,
+    direct_lease: DirectPrimaryLease,
     admission: crate::native_output::kms_worker::KmsCommitAdmissionPermit,
 ) -> NativeResult<()> {
     let commit_token = PageFlipToken::new(token)
@@ -327,6 +328,33 @@ pub(super) fn finish_direct_worker_queued(
         framebuffer_id,
     };
     let queued_at_ns = monotonic_now_ns()?;
+    let (frame_id, protocol_batch_id) = {
+        let transaction = output_transactions
+            .transaction(transaction_id)
+            .ok_or_else(|| io::Error::other("direct worker transaction disappeared"))?;
+        let frame_id = match transaction.descriptor().content() {
+            OutputTransactionContent::Direct { frame_id, .. } => frame_id,
+            _ => return Err(io::Error::other("direct worker transaction is not direct").into()),
+        };
+        let protocol_batch_id = transaction
+            .descriptor()
+            .obligations()
+            .frame_batch_id()
+            .ok_or_else(|| io::Error::other("direct worker transaction has no frame batch"))?;
+        (frame_id, protocol_batch_id)
+    };
+    let direct_key = direct_lease.key();
+    let direct_surface_id = direct_lease.surface_id();
+    scanout.store_worker_direct_submission(WorkerQueuedDirectFrame {
+        frame_id,
+        transaction_id,
+        key: direct_key,
+        surface_id: direct_surface_id,
+        token: commit_token,
+        protocol_batch_id,
+        framebuffer_id,
+        target: direct_target,
+    })?;
     if let Err(error) = output_transactions.mark_queued(
         transaction_id,
         output_generation,
@@ -379,6 +407,7 @@ pub(super) fn finish_direct_worker_queued(
             KmsCursorUpdate::Set(state.clone())
         }),
         cursor_pin: worker_cursor_pin(context.atomic_cursor, effective_cursor)?,
+        direct_primary_lease: Some(direct_lease),
         pacing_frame_id: context.frame_pacing.worker_submission_frame_id(false),
         test_only: KmsTestOnlyPolicy::Skip,
         ready_submit: false,
