@@ -10,6 +10,7 @@ mod backend;
 mod direct;
 mod direct_lease;
 mod direct_policy;
+mod direct_validation;
 mod dumb;
 mod egl_gbm;
 mod feedback;
@@ -29,6 +30,7 @@ pub(crate) use backend::*;
 pub(crate) use direct::*;
 pub(crate) use direct_lease::*;
 pub(crate) use direct_policy::*;
+pub(crate) use direct_validation::*;
 pub(crate) use dumb::*;
 pub(crate) use egl_gbm::*;
 pub(crate) use feedback::*;
@@ -520,6 +522,13 @@ impl NativeScanoutBackend {
             Self::NativeEglGbm(scanout) => scanout.rebind_session_generation(generation),
             Self::Gbm(scanout) => scanout.rebind_session_generation(generation),
             Self::Dumb(_) => {}
+        }
+        self.invalidate_direct_validation_cache();
+    }
+
+    pub(crate) fn invalidate_direct_validation_cache(&mut self) {
+        if let Self::AtomicEglGbm(scanout) = self {
+            scanout.invalidate_direct_validation_cache();
         }
     }
 

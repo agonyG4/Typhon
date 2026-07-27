@@ -3,11 +3,12 @@ use std::{io, sync::Arc};
 use oblivion_one::compositor::{DirectScanoutSceneCandidate, SurfaceDamagePresentation};
 use oblivion_one::render_backend::buffer::DmabufBufferHandle;
 
-use super::{DirectScanoutCandidateKey, ImportedDirectFramebuffer};
+use super::{DirectPlaneValidationKey, DirectScanoutCandidateKey, ImportedDirectFramebuffer};
 
 #[derive(Debug)]
 pub(crate) struct DirectPrimaryLease {
     key: DirectScanoutCandidateKey,
+    validation_key: DirectPlaneValidationKey,
     surface_id: u32,
     _buffer: DmabufBufferHandle,
     framebuffer: Arc<ImportedDirectFramebuffer>,
@@ -27,11 +28,13 @@ impl DirectPrimaryLease {
     pub(crate) fn new(
         candidate: DirectScanoutSceneCandidate,
         key: DirectScanoutCandidateKey,
+        validation_key: DirectPlaneValidationKey,
         framebuffer: Arc<ImportedDirectFramebuffer>,
         surface_damage: SurfaceDamagePresentation,
     ) -> Self {
         Self {
             key,
+            validation_key,
             surface_id: candidate.surface_id,
             _buffer: candidate.buffer,
             framebuffer,
@@ -45,6 +48,10 @@ impl DirectPrimaryLease {
 
     pub(crate) const fn surface_id(&self) -> u32 {
         self.surface_id
+    }
+
+    pub(crate) const fn validation_key(&self) -> DirectPlaneValidationKey {
+        self.validation_key
     }
 
     pub(crate) fn validate_against(
@@ -86,6 +93,7 @@ impl DirectPrimaryLease {
             _buffer,
             framebuffer,
             surface_damage: None,
+            ..
         } = self
         else {
             unreachable!("surface damage was consumed above");
@@ -117,6 +125,7 @@ impl DirectPrimaryLease {
         (
             Self {
                 key,
+                validation_key: super::test_validation_key(key.output_generation),
                 surface_id: key.content.surface_id,
                 _buffer: buffer,
                 framebuffer,

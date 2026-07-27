@@ -168,13 +168,16 @@ impl AtomicEglGbmScanout {
         }
         self.direct.cache.clear_for_generation(generation);
         self.direct.drm_generation = generation;
-        self.direct.tested_plane_plan = None;
         self.direct.current = None;
         self.direct.pending = None;
         self.direct.inhibit_until_composited_present = true;
         self.direct.identity_viewport_metadata_logged = false;
         self.direct.last_debug_candidate = None;
         self.scene.invalidate_presented_damage_history();
+    }
+
+    pub(crate) fn invalidate_direct_validation_cache(&mut self) {
+        self.direct.invalidate_direct_validation_cache();
     }
 
     pub(crate) fn create_unattached_pool(

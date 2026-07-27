@@ -35,6 +35,7 @@ pub(crate) struct WorkerQueuedDirectFrame {
     pub(crate) transaction_id: OutputTransactionId,
     pub(crate) output_generation: u64,
     pub(crate) key: DirectScanoutCandidateKey,
+    pub(crate) validation_key: DirectPlaneValidationKey,
     pub(crate) surface_id: u32,
     pub(crate) token: PageFlipToken,
     pub(crate) protocol_batch_id: CompositorFrameBatchId,
@@ -60,6 +61,7 @@ pub(crate) enum DirectPromotionFailure {
     GenerationMismatch,
     TargetMismatch,
     CandidateKeyMismatch,
+    ValidationKeyMismatch,
     SurfaceMismatch,
     FramebufferMismatch,
     MissingDamage,
@@ -119,8 +121,9 @@ pub(crate) enum DirectScanoutAttempt {
         transaction_id: OutputTransactionId,
         token: u64,
         framebuffer_id: u32,
-        lease: DirectPrimaryLease,
+        lease: Box<DirectPrimaryLease>,
         admission: crate::native_output::kms_worker::KmsCommitAdmissionPermit,
+        test_only: crate::native_output::kms_worker::KmsTestOnlyPolicy,
     },
 }
 
@@ -149,21 +152,6 @@ pub(crate) struct DirectScanoutCounters {
     pub(crate) composited_render_ahead_suppressed: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct DirectPlanePlanKey {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) format: u32,
-    pub(crate) modifier: u64,
-    pub(crate) cursor_plan_key: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TestedDirectPlanePlan {
-    pub(crate) key: DirectPlanePlanKey,
-    pub(crate) drm_generation: u64,
-}
-
 pub(crate) struct DirectScanoutState {
     pub(crate) current: Option<PresentedDirectFrame>,
     pub(crate) worker_queued: Option<WorkerQueuedDirectFrame>,
@@ -173,7 +161,7 @@ pub(crate) struct DirectScanoutState {
     pub(crate) inhibit_until_composited_present: bool,
     pub(crate) counters: DirectScanoutCounters,
     pub(crate) drm_generation: u64,
-    pub(crate) tested_plane_plan: Option<TestedDirectPlanePlan>,
+    pub(crate) validation_cache: DirectPlaneValidationCache,
     pub(super) identity_viewport_metadata_logged: bool,
     pub(super) last_debug_candidate: Option<(u32, u64, u64, u64)>,
 }
@@ -208,7 +196,7 @@ impl DirectScanoutState {
             inhibit_until_composited_present: true,
             counters: DirectScanoutCounters::default(),
             drm_generation: generation,
-            tested_plane_plan: None,
+            validation_cache: DirectPlaneValidationCache::default(),
             identity_viewport_metadata_logged: false,
             last_debug_candidate: None,
         }
@@ -299,6 +287,18 @@ impl DirectScanoutState {
         self.pending.is_some() || self.worker_queued.is_some()
     }
 
+    pub(crate) fn record_direct_validation_success(&mut self, key: DirectPlaneValidationKey) {
+        self.validation_cache.record_success(key);
+    }
+
+    pub(crate) fn invalidate_direct_validation(&mut self, key: DirectPlaneValidationKey) {
+        self.validation_cache.invalidate(key);
+    }
+
+    pub(crate) fn invalidate_direct_validation_cache(&mut self) {
+        self.validation_cache.invalidate_all();
+    }
+
     pub(crate) fn promote_worker_submission(
         &mut self,
         context: DirectPromotionContext,
@@ -349,6 +349,14 @@ impl DirectScanoutState {
             return Err(promotion_error(
                 DirectPromotionFailure::CandidateKeyMismatch,
                 "direct worker success lease key mismatches queued metadata",
+                lease,
+                out_fence,
+            ));
+        }
+        if lease.validation_key() != queued.validation_key {
+            return Err(promotion_error(
+                DirectPromotionFailure::ValidationKeyMismatch,
+                "direct worker success validation key mismatches queued metadata",
                 lease,
                 out_fence,
             ));
@@ -541,6 +549,7 @@ mod tests {
             ),
             output_generation: 1,
             key,
+            validation_key: test_validation_key(key.output_generation),
             surface_id: key.content.surface_id,
             token: PageFlipToken::new(token).expect("test token"),
             protocol_batch_id: CompositorFrameBatchId::new(
@@ -629,6 +638,44 @@ mod tests {
         assert_eq!(state.pending_token(), Some(token));
         assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
         drop(state);
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn worker_promotion_rejects_validation_key_mismatch() {
+        let file = std::fs::File::open("/dev/null").expect("test DRM file");
+        let mut state = DirectScanoutState::new(file.as_fd(), 1);
+        let key = test_key();
+        let token = PageFlipToken::new(77).expect("test token");
+        let mut queued = test_queued_frame(token.get(), key);
+        queued.validation_key = test_validation_key(2);
+        state
+            .store_worker_queued(queued)
+            .expect("store queued frame");
+        let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
+
+        let error = state
+            .promote_worker_submission(
+                DirectPromotionContext {
+                    transaction_id: OutputTransactionId::new(
+                        std::num::NonZeroU64::new(77).unwrap(),
+                    ),
+                    token,
+                    output_generation: 1,
+                    target: test_target(),
+                    submit_started_at: MonotonicTimestampNs::new(11),
+                    submit_returned_at: MonotonicTimestampNs::new(12),
+                },
+                lease,
+                None,
+            )
+            .expect_err("validation key mismatch must reject before promotion");
+        let error = *error;
+
+        assert_eq!(error.reason, DirectPromotionFailure::ValidationKeyMismatch);
+        assert_eq!(state.worker_queued_token(), Some(token));
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
+        drop(error.lease);
         assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
     }
 

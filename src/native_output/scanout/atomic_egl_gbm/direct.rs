@@ -1,4 +1,5 @@
 use super::*;
+use crate::native_output::kms_worker::KmsTestOnlyPolicy;
 
 impl AtomicEglGbmScanout {
     #[allow(clippy::too_many_arguments)]
@@ -84,6 +85,45 @@ impl AtomicEglGbmScanout {
             self.direct.counters.composited_fallbacks += 1;
             return Ok(DirectScanoutAttempt::Fallback("candidate_plane_missing"));
         }
+        let atomic = kms
+            .atomic()
+            .expect("qualified direct scanout requires an Atomic backend");
+        let release_mode = match &sync_readiness {
+            DirectSyncReadiness::Qualified { release_mode, .. } => *release_mode,
+            DirectSyncReadiness::Unsupported(_) => unreachable!("checked above"),
+        };
+        let validation_key = DirectPlaneValidationKey {
+            output_generation: self.direct.drm_generation,
+            crtc_id: atomic.discovery().pipeline.crtc.get(),
+            primary_plane_id: atomic.discovery().pipeline.plane.get(),
+            mode_width: self.width,
+            mode_height: self.height,
+            format: candidate.buffer.format().as_fourcc(),
+            modifier: candidate.buffer.planes()[0].descriptor().modifier.0,
+            buffer_width: candidate.buffer.size().width,
+            buffer_height: candidate.buffer.size().height,
+            plane_layout_hash: plane_layout_hash(&candidate.buffer),
+            cursor_plan_key: candidate_key.cursor_plan_key,
+            synchronization_key: synchronization_contract_key(
+                matches!(
+                    &sync_readiness,
+                    DirectSyncReadiness::Qualified {
+                        in_fence: Some(_),
+                        ..
+                    }
+                ),
+                matches!(release_mode, DirectReleaseMode::OutFence),
+                match release_mode {
+                    DirectReleaseMode::Pageflip => DirectValidationReleaseMode::Pageflip,
+                    DirectReleaseMode::OutFence => DirectValidationReleaseMode::OutFence,
+                },
+            ),
+        };
+        let test_only = if self.direct.validation_cache.contains(validation_key) {
+            KmsTestOnlyPolicy::Skip
+        } else {
+            KmsTestOnlyPolicy::Required
+        };
         let unchanged = self
             .direct
             .pending
@@ -191,8 +231,13 @@ impl AtomicEglGbmScanout {
             .expect("allocated native pageflip token is nonzero");
         let framebuffer_id = framebuffer.framebuffer.get();
         let was_direct = self.direct.current.is_some();
-        let direct_lease =
-            DirectPrimaryLease::new(candidate, candidate_key, framebuffer, surface_damage);
+        let direct_lease = DirectPrimaryLease::new(
+            candidate,
+            candidate_key,
+            validation_key,
+            framebuffer,
+            surface_damage,
+        );
         self.swapchain_mut()?.advance_external_frame_id(frame_id)?;
         if !was_direct {
             self.direct.counters.entries += 1;
@@ -202,8 +247,9 @@ impl AtomicEglGbmScanout {
             transaction_id,
             token: token.get(),
             framebuffer_id,
-            lease: direct_lease,
+            lease: Box::new(direct_lease),
             admission: worker_admission,
+            test_only,
         })
     }
 

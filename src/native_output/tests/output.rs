@@ -1,29 +1,31 @@
 use super::*;
 
 #[test]
-fn direct_plane_plan_cache_key_changes_for_modifier_and_generation() {
-    let first = DirectPlanePlanKey {
-        width: 1920,
-        height: 1080,
+fn direct_plane_validation_key_changes_for_modifier_and_generation() {
+    let first = DirectPlaneValidationKey {
+        output_generation: 1,
+        crtc_id: 7,
+        primary_plane_id: 11,
+        mode_width: 1920,
+        mode_height: 1080,
         format: 0x3432_5241,
         modifier: 0,
+        buffer_width: 1920,
+        buffer_height: 1080,
+        plane_layout_hash: 3,
         cursor_plan_key: Some(1),
+        synchronization_key: 4,
     };
-    let modifier_changed = DirectPlanePlanKey {
+    let modifier_changed = DirectPlaneValidationKey {
         modifier: 7,
         ..first
     };
     assert_ne!(first, modifier_changed);
-    assert_ne!(
-        TestedDirectPlanePlan {
-            key: first,
-            drm_generation: 1,
-        },
-        TestedDirectPlanePlan {
-            key: first,
-            drm_generation: 2,
-        }
-    );
+    let generation_changed = DirectPlaneValidationKey {
+        output_generation: 2,
+        ..first
+    };
+    assert_ne!(first, generation_changed);
 }
 
 #[test]

@@ -656,6 +656,7 @@ impl NativeRuntime {
                 oblivion_one::native::kms::AtomicKmsErrorKind::FlipRejected,
                 "KMS worker result notification failed before submit completion",
             ),
+            false,
         )
     }
 
@@ -963,6 +964,18 @@ impl NativeRuntime {
                     PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
                 );
                 let has_out_fence = out_fence.is_some();
+                let direct_validation_key =
+                    if matches!(kind, AtomicCommitKind::DirectPrimary { .. })
+                        && matches!(ownership.job.test_only, KmsTestOnlyPolicy::Required)
+                    {
+                        ownership
+                            .job
+                            .direct_primary_lease
+                            .as_ref()
+                            .map(|lease| lease.validation_key())
+                    } else {
+                        None
+                    };
                 if matches!(kind, AtomicCommitKind::CompositedPrimary { .. }) {
                     if compatibility_primary {
                         drop(out_fence);
@@ -1027,6 +1040,10 @@ impl NativeRuntime {
                             return Err(error.into());
                         }
                     };
+                    if let Some(validation_key) = direct_validation_key {
+                        self.scanout
+                            .record_direct_validation_success(validation_key);
+                    }
                     self.server.complete_rendered_frame_callbacks(batch_id);
                 } else if has_out_fence {
                     return Err(io::Error::other(
@@ -1217,10 +1234,12 @@ impl NativeRuntime {
                     );
                 }
             }
-            KmsWorkerEvent::TestRejected { job, error }
-            | KmsWorkerEvent::SubmitRejected { job, error }
+            KmsWorkerEvent::TestRejected { job, error } => {
+                self.fail_queued_worker_job(job, error, false)?;
+            }
+            KmsWorkerEvent::SubmitRejected { job, error }
             | KmsWorkerEvent::BusyExhausted { job, error } => {
-                self.fail_queued_worker_job(job, error)?;
+                self.fail_queued_worker_job(job, error, true)?;
             }
             KmsWorkerEvent::BusyDeferred { .. } => {}
             KmsWorkerEvent::SubmitLate {
@@ -1274,6 +1293,7 @@ impl NativeRuntime {
         &mut self,
         job: KmsCommitJob,
         error: AtomicKmsError,
+        invalidate_direct_validation: bool,
     ) -> NativeResult<()> {
         if let Some(worker) = self.kms_commit_worker.as_ref() {
             worker.record_worker_pacing_pre_submit_rejection();
@@ -1337,6 +1357,13 @@ impl NativeRuntime {
             if let Some(worker) = self.kms_commit_worker.as_ref() {
                 worker.record_scheduler_queued_cancellation();
             }
+        }
+        if invalidate_direct_validation
+            && matches!(job.kind, AtomicCommitKind::DirectPrimary { .. })
+            && let Some(lease) = job.direct_primary_lease.as_ref()
+        {
+            self.scanout
+                .invalidate_direct_validation(lease.validation_key());
         }
         self.atomic_commit_arbiter.reject_worker_queued(job.token);
         let direct_batch = if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {

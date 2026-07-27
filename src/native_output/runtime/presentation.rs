@@ -661,6 +661,7 @@ impl NativeRuntime {
                                 framebuffer_id,
                                 lease,
                                 admission,
+                                test_only,
                             } => {
                                 finish_direct_worker_queued(
                                     scanout,
@@ -687,8 +688,9 @@ impl NativeRuntime {
                                     token,
                                     framebuffer_id,
                                     direct_target,
-                                    lease,
+                                    *lease,
                                     admission,
+                                    test_only,
                                 )?;
                                 direct_submitted = true;
                             }

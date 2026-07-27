@@ -108,6 +108,18 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn record_direct_validation_success(&mut self, key: DirectPlaneValidationKey) {
+        if let Self::AtomicEglGbm(scanout) = self {
+            scanout.record_direct_validation_success(key);
+        }
+    }
+
+    pub(crate) fn invalidate_direct_validation(&mut self, key: DirectPlaneValidationKey) {
+        if let Self::AtomicEglGbm(scanout) = self {
+            scanout.invalidate_direct_validation(key);
+        }
+    }
+
     pub(crate) fn queue_worker_compatibility_submission(
         &mut self,
         token: PageFlipToken,

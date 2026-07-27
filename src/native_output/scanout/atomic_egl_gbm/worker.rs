@@ -69,6 +69,14 @@ impl AtomicEglGbmScanout {
         self.direct.store_worker_queued(frame)
     }
 
+    pub(crate) fn record_direct_validation_success(&mut self, key: DirectPlaneValidationKey) {
+        self.direct.record_direct_validation_success(key);
+    }
+
+    pub(crate) fn invalidate_direct_validation(&mut self, key: DirectPlaneValidationKey) {
+        self.direct.invalidate_direct_validation(key);
+    }
+
     pub(crate) fn suspend_abandon_worker_submission(
         &mut self,
         token: PageFlipToken,

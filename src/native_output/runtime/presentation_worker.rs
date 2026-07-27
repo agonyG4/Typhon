@@ -319,6 +319,7 @@ pub(super) fn finish_direct_worker_queued(
     direct_target: PresentationTarget,
     direct_lease: DirectPrimaryLease,
     admission: crate::native_output::kms_worker::KmsCommitAdmissionPermit,
+    test_only: KmsTestOnlyPolicy,
 ) -> NativeResult<()> {
     let commit_token = PageFlipToken::new(token)
         .ok_or_else(|| io::Error::other("Direct Atomic worker token is zero"))?;
@@ -344,12 +345,14 @@ pub(super) fn finish_direct_worker_queued(
         (frame_id, protocol_batch_id)
     };
     let direct_key = direct_lease.key();
+    let validation_key = direct_lease.validation_key();
     let direct_surface_id = direct_lease.surface_id();
     scanout.store_worker_direct_submission(WorkerQueuedDirectFrame {
         frame_id,
         transaction_id,
         output_generation,
         key: direct_key,
+        validation_key,
         surface_id: direct_surface_id,
         token: commit_token,
         protocol_batch_id,
@@ -410,7 +413,7 @@ pub(super) fn finish_direct_worker_queued(
         cursor_pin: worker_cursor_pin(context.atomic_cursor, effective_cursor)?,
         direct_primary_lease: Some(direct_lease),
         pacing_frame_id: context.frame_pacing.worker_submission_frame_id(false),
-        test_only: KmsTestOnlyPolicy::Required,
+        test_only,
         ready_submit: false,
     };
     let descriptor = output_transactions
