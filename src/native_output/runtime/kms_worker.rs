@@ -72,34 +72,13 @@ pub(super) fn handle_fatal_worker_jobs(
 }
 
 pub(super) fn retain_uncertain_job_with_suspension(
-    mut job: KmsCommitJob,
+    job: KmsCommitJob,
     suspended_jobs: &mut Vec<KmsCommitJob>,
     emergency_jobs: &mut Vec<KmsCommitJob>,
-    suspend_direct: impl FnOnce(
-        PageFlipToken,
-        crate::native_output::scanout::DirectPrimaryLease,
-    ) -> Result<
-        (),
-        crate::native_output::scanout::DirectPrimaryLeaseTransferError,
-    >,
 ) -> NativeResult<UncertainJobRetention> {
     if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
-        let Some(lease) = job.direct_primary_lease.take() else {
-            emergency_jobs.push(job);
-            return Ok(UncertainJobRetention::EmergencyQuarantined);
-        };
-        match suspend_direct(job.token, lease) {
-            Ok(()) => {}
-            Err(error) => {
-                let (error, lease) = *error;
-                eprintln!(
-                    "native KMS worker: direct uncertain-job suspension failed; retaining emergency ownership: {error}"
-                );
-                job.direct_primary_lease = Some(lease);
-                emergency_jobs.push(job);
-                return Ok(UncertainJobRetention::EmergencyQuarantined);
-            }
-        }
+        emergency_jobs.push(job);
+        return Ok(UncertainJobRetention::EmergencyQuarantined);
     }
     suspended_jobs.push(job);
     Ok(UncertainJobRetention::Suspended)
@@ -643,13 +622,10 @@ impl NativeRuntime {
     ) -> NativeResult<UncertainJobRetention> {
         let suspended_jobs = &mut self.quarantined_worker_jobs;
         let emergency_jobs = &mut self.emergency_quarantined_worker_jobs;
-        let scanout = &mut self.scanout;
-        retain_uncertain_job_with_suspension(job, suspended_jobs, emergency_jobs, |token, lease| {
-            scanout.suspend_worker_direct_submission(token, lease)
-        })
+        retain_uncertain_job_with_suspension(job, suspended_jobs, emergency_jobs)
     }
 
-    fn fail_known_worker_job(&mut self, job: KmsCommitJob) -> NativeResult<()> {
+    pub(super) fn fail_known_worker_job_impl(&mut self, job: KmsCommitJob) -> NativeResult<()> {
         self.fail_queued_worker_job(
             job,
             AtomicKmsError::new(
@@ -948,22 +924,12 @@ impl NativeRuntime {
                 let queued_at = ownership.job.queued_at.get();
                 let submit_started_at = ownership.submit_started_at.get();
                 let submit_returned_at = ownership.submit_returned_at.get();
-                let output_generation = ownership.job.output_generation;
+                let _output_generation = ownership.job.output_generation;
                 let target = ownership.job.target;
                 let cursor = ownership.job.cursor.clone();
                 let pacing_frame_id = ownership.job.pacing_frame_id;
                 let ready_submit = ownership.job.ready_submit;
                 let out_fence = ownership.out_fence.take();
-                let direct_primary_lease = ownership.job.direct_primary_lease.take();
-                let transaction = self
-                    .output_transactions
-                    .transaction(transaction_id)
-                    .ok_or_else(|| io::Error::other("worker success transaction is missing"))?;
-                let compatibility_primary = matches!(
-                    transaction.descriptor().planes().primary(),
-                    PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
-                );
-                let has_out_fence = out_fence.is_some();
                 let direct_validation_key =
                     if matches!(kind, AtomicCommitKind::DirectPrimary { .. })
                         && matches!(ownership.job.test_only, KmsTestOnlyPolicy::Required)
@@ -976,6 +942,28 @@ impl NativeRuntime {
                     } else {
                         None
                     };
+                let direct_primary_lease = ownership.job.direct_primary_lease.take();
+                let transaction = self
+                    .output_transactions
+                    .transaction(transaction_id)
+                    .ok_or_else(|| io::Error::other("worker success transaction is missing"))?;
+                let compatibility_primary = matches!(
+                    transaction.descriptor().planes().primary(),
+                    PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
+                );
+                let has_out_fence = out_fence.is_some();
+                let direct_metadata = if matches!(kind, AtomicCommitKind::DirectPrimary { .. }) {
+                    match transaction.descriptor().content() {
+                        OutputTransactionContent::Direct { frame_id, .. } => transaction
+                            .descriptor()
+                            .obligations()
+                            .frame_batch_id()
+                            .map(|protocol_batch_id| (frame_id, protocol_batch_id)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 if matches!(kind, AtomicCommitKind::CompositedPrimary { .. }) {
                     if compatibility_primary {
                         drop(out_fence);
@@ -1006,45 +994,55 @@ impl NativeRuntime {
                         )
                         .into());
                     };
-                    let batch_id = match self.scanout.promote_worker_direct_submission(
-                        DirectPromotionContext {
-                            transaction_id,
-                            token,
-                            output_generation,
-                            target,
-                            submit_started_at: MonotonicTimestampNs::new(submit_started_at),
-                            submit_returned_at: MonotonicTimestampNs::new(submit_returned_at),
-                        },
-                        direct_primary_lease,
-                        out_fence,
-                    ) {
-                        Ok(batch_id) => batch_id,
-                        Err(error) => {
-                            let DirectPromotionError {
-                                error,
-                                lease,
-                                out_fence,
-                                ..
-                            } = *error;
-                            let mut ownership = self
-                                .submitted_worker_ownership
-                                .pop()
-                                .expect("submitted ownership was just retained");
-                            ownership.job.direct_primary_lease = Some(lease);
-                            ownership.out_fence = out_fence;
-                            retain_complete_submitted_ownership(
-                                ownership,
-                                &mut self.emergency_quarantined_submitted_ownership,
-                            );
-                            self.quarantine_after_worker_fatal()?;
-                            return Err(error.into());
-                        }
+                    let Some((frame_id, protocol_batch_id)) = direct_metadata else {
+                        let mut ownership = self
+                            .submitted_worker_ownership
+                            .pop()
+                            .expect("submitted ownership was just retained");
+                        ownership.job.direct_primary_lease = Some(direct_primary_lease);
+                        ownership.out_fence = out_fence;
+                        retain_complete_submitted_ownership(
+                            ownership,
+                            &mut self.emergency_quarantined_submitted_ownership,
+                        );
+                        self.quarantine_after_worker_fatal()?;
+                        return Err(io::Error::other(
+                            "direct worker transaction has no direct frame metadata",
+                        )
+                        .into());
                     };
+                    let submitted = SubmittedDirectPrimary {
+                        transaction_id,
+                        token,
+                        lease: direct_primary_lease,
+                        submit_started_at: MonotonicTimestampNs::new(submit_started_at),
+                        submit_returned_at: MonotonicTimestampNs::new(submit_returned_at),
+                        out_fence,
+                        frame_id,
+                        protocol_batch_id,
+                        target,
+                    };
+                    if let Err(error) = self.scanout.accept_direct_submitted(submitted) {
+                        let SubmittedDirectPrimaryError { error, submitted } = *error;
+                        let mut ownership = self
+                            .submitted_worker_ownership
+                            .pop()
+                            .expect("submitted ownership was just retained");
+                        ownership.job.direct_primary_lease = Some(submitted.lease);
+                        ownership.out_fence = submitted.out_fence;
+                        retain_complete_submitted_ownership(
+                            ownership,
+                            &mut self.emergency_quarantined_submitted_ownership,
+                        );
+                        self.quarantine_after_worker_fatal()?;
+                        return Err(error.into());
+                    }
                     if let Some(validation_key) = direct_validation_key {
                         self.scanout
                             .record_direct_validation_success(validation_key);
                     }
-                    self.server.complete_rendered_frame_callbacks(batch_id);
+                    self.server
+                        .complete_rendered_frame_callbacks(protocol_batch_id);
                 } else if has_out_fence {
                     return Err(io::Error::other(
                         "cursor-only worker submission unexpectedly returned an out-fence",
@@ -1366,35 +1364,34 @@ impl NativeRuntime {
                 .invalidate_direct_validation(lease.validation_key());
         }
         self.atomic_commit_arbiter.reject_worker_queued(job.token);
-        let direct_batch = if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
-            Some(self.scanout.fail_worker_direct_submission(job.token)?)
-        } else {
-            if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. }) {
-                let compatibility_primary = self
-                    .output_transactions
-                    .transaction(job.transaction_id)
-                    .is_some_and(|transaction| {
-                        matches!(
-                            transaction.descriptor().planes().primary(),
-                            PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
-                        )
-                    });
-                if compatibility_primary {
-                    self.scanout
-                        .fail_worker_compatibility_submission(job.token)?;
-                } else {
-                    self.scanout.fail_worker_submission(job.token)?;
-                }
+        if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. }) {
+            let compatibility_primary = self
+                .output_transactions
+                .transaction(job.transaction_id)
+                .is_some_and(|transaction| {
+                    matches!(
+                        transaction.descriptor().planes().primary(),
+                        PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
+                    )
+                });
+            if compatibility_primary {
+                self.scanout
+                    .fail_worker_compatibility_submission(job.token)?;
+            } else {
+                self.scanout.fail_worker_submission(job.token)?;
             }
-            None
-        };
+        }
+        let direct_job = matches!(job.kind, AtomicCommitKind::DirectPrimary { .. });
         settle_failed_output_transaction(
             &mut self.output_transactions,
             job.transaction_id,
             OutputTransactionFailureStage::KmsSubmit,
             MonotonicTimestampNs::new(monotonic_now_ns()?),
             |obligations| {
-                if let Some(batch_id) = direct_batch {
+                if direct_job {
+                    let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                        io::Error::other("rejected direct transaction has no frame batch")
+                    })?;
                     self.server
                         .restore_frame_batch_after_render_failure(batch_id);
                 } else if let Some(batch_id) = obligations.frame_batch_id() {
@@ -1473,10 +1470,6 @@ impl NativeRuntime {
                     .suspend_abandon_worker_submission(job.token)
                     .map_err(io::Error::other)?;
             }
-        } else if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
-            self.scanout
-                .suspend_abandon_worker_direct(job.token)
-                .map_err(io::Error::other)?;
         }
         settle_dropped_output_transaction(
             &mut self.output_transactions,
@@ -1499,22 +1492,5 @@ impl NativeRuntime {
             worker.record_shutdown_queued_job_settled();
         }
         Ok(())
-    }
-}
-
-impl FatalWorkerJobHandler for NativeRuntime {
-    fn retain_uncertain_worker_job(
-        &mut self,
-        job: KmsCommitJob,
-    ) -> NativeResult<UncertainJobRetention> {
-        self.retain_uncertain_worker_job(job)
-    }
-
-    fn fail_known_worker_job(&mut self, job: KmsCommitJob) -> NativeResult<()> {
-        self.fail_known_worker_job(job)
-    }
-
-    fn drop_known_worker_job(&mut self, job: KmsCommitJob) -> NativeResult<()> {
-        self.drop_queued_worker_job(job)
     }
 }

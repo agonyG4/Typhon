@@ -664,7 +664,6 @@ impl NativeRuntime {
                                 test_only,
                             } => {
                                 finish_direct_worker_queued(
-                                    scanout,
                                     server,
                                     output_transactions,
                                     atomic_commit_arbiter,

@@ -157,7 +157,7 @@ fn shared_fatal_handler_retains_uncertain_job_resources_once() {
 }
 
 #[test]
-fn runtime_retains_complete_job_when_direct_suspension_fails() {
+fn runtime_quarantines_uncertain_direct_job() {
     let key = test_direct_key();
     let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
     let job = test_uncertain_direct_job(lease);
@@ -165,18 +165,8 @@ fn runtime_retains_complete_job_when_direct_suspension_fails() {
     let mut emergency_jobs = Vec::new();
 
     assert_eq!(
-        retain_uncertain_job_with_suspension(
-            job,
-            &mut suspended_jobs,
-            &mut emergency_jobs,
-            |_token, lease| {
-                Err(Box::new((
-                    std::io::Error::other("injected suspension failure"),
-                    lease,
-                )))
-            },
-        )
-        .unwrap(),
+        retain_uncertain_job_with_suspension(job, &mut suspended_jobs, &mut emergency_jobs,)
+            .unwrap(),
         UncertainJobRetention::EmergencyQuarantined
     );
     assert!(suspended_jobs.is_empty());
@@ -203,29 +193,18 @@ fn runtime_suspension_retains_job_until_normal_recovery_cleanup() {
     let job = test_uncertain_direct_job(lease);
     let mut suspended_jobs = Vec::new();
     let mut emergency_jobs = Vec::new();
-    let mut suspended_lease = None;
 
     assert_eq!(
-        retain_uncertain_job_with_suspension(
-            job,
-            &mut suspended_jobs,
-            &mut emergency_jobs,
-            |_token, lease| {
-                suspended_lease = Some(lease);
-                Ok(())
-            },
-        )
-        .unwrap(),
-        UncertainJobRetention::Suspended
+        retain_uncertain_job_with_suspension(job, &mut suspended_jobs, &mut emergency_jobs,)
+            .unwrap(),
+        UncertainJobRetention::EmergencyQuarantined
     );
-    assert_eq!(suspended_jobs.len(), 1);
-    assert!(suspended_jobs[0].direct_primary_lease.is_none());
-    assert!(emergency_jobs.is_empty());
+    assert!(suspended_jobs.is_empty());
+    assert_eq!(emergency_jobs.len(), 1);
+    assert!(emergency_jobs[0].direct_primary_lease.is_some());
     assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 0);
 
-    suspended_jobs.clear();
-    suspended_jobs.clear();
-    drop(suspended_lease.take());
+    emergency_jobs.clear();
     assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 1);
 }
 

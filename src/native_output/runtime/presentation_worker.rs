@@ -293,7 +293,6 @@ pub(super) fn queue_compatibility_for_presentation(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn finish_direct_worker_queued(
-    scanout: &mut NativeScanoutBackend,
     server: &mut OwnCompositorServer,
     output_transactions: &mut OutputTransactionLedger,
     atomic_commit_arbiter: &mut AtomicCommitArbiter,
@@ -329,43 +328,26 @@ pub(super) fn finish_direct_worker_queued(
         framebuffer_id,
     };
     let queued_at_ns = monotonic_now_ns()?;
-    let (frame_id, protocol_batch_id) = {
+    let protocol_batch_id = {
         let transaction = output_transactions
             .transaction(transaction_id)
             .ok_or_else(|| io::Error::other("direct worker transaction disappeared"))?;
-        let frame_id = match transaction.descriptor().content() {
-            OutputTransactionContent::Direct { frame_id, .. } => frame_id,
+        match transaction.descriptor().content() {
+            OutputTransactionContent::Direct { .. } => {}
             _ => return Err(io::Error::other("direct worker transaction is not direct").into()),
-        };
-        let protocol_batch_id = transaction
+        }
+        transaction
             .descriptor()
             .obligations()
             .frame_batch_id()
-            .ok_or_else(|| io::Error::other("direct worker transaction has no frame batch"))?;
-        (frame_id, protocol_batch_id)
+            .ok_or_else(|| io::Error::other("direct worker transaction has no frame batch"))?
     };
-    let direct_key = direct_lease.key();
-    let validation_key = direct_lease.validation_key();
-    let direct_surface_id = direct_lease.surface_id();
-    scanout.store_worker_direct_submission(WorkerQueuedDirectFrame {
-        frame_id,
-        transaction_id,
-        output_generation,
-        key: direct_key,
-        validation_key,
-        surface_id: direct_surface_id,
-        token: commit_token,
-        protocol_batch_id,
-        framebuffer_id,
-        target: direct_target,
-    })?;
     if let Err(error) = output_transactions.mark_queued(
         transaction_id,
         output_generation,
         MonotonicTimestampNs::new(queued_at_ns),
     ) {
-        let batch_id = scanout.fail_worker_direct_submission(commit_token)?;
-        server.restore_frame_batch_after_render_failure(batch_id);
+        server.restore_frame_batch_after_render_failure(protocol_batch_id);
         settle_failed_output_transaction(
             output_transactions,
             transaction_id,
@@ -382,8 +364,7 @@ pub(super) fn finish_direct_worker_queued(
         kind,
         queued_at_ns,
     ) {
-        let batch_id = scanout.fail_worker_direct_submission(commit_token)?;
-        server.restore_frame_batch_after_render_failure(batch_id);
+        server.restore_frame_batch_after_render_failure(protocol_batch_id);
         settle_failed_output_transaction(
             output_transactions,
             transaction_id,
@@ -421,8 +402,7 @@ pub(super) fn finish_direct_worker_queued(
         .ok_or_else(|| io::Error::other("direct worker transaction disappeared"))?;
     if let Err(error) = job.validate_against(descriptor.descriptor()) {
         let _ = atomic_commit_arbiter.reject_worker_queued(commit_token);
-        let batch_id = scanout.fail_worker_direct_submission(commit_token)?;
-        server.restore_frame_batch_after_render_failure(batch_id);
+        server.restore_frame_batch_after_render_failure(protocol_batch_id);
         settle_failed_output_transaction(
             output_transactions,
             transaction_id,
@@ -430,12 +410,13 @@ pub(super) fn finish_direct_worker_queued(
             MonotonicTimestampNs::new(queued_at_ns),
             |_| Ok(()),
         )?;
+        drop(job);
         return Err(io::Error::other(format!("invalid direct worker payload: {error:?}")).into());
     }
     if let Err(error) = admission.enqueue(job) {
         let _ = atomic_commit_arbiter.reject_worker_queued(commit_token);
-        let batch_id = scanout.fail_worker_direct_submission(commit_token)?;
-        server.restore_frame_batch_after_render_failure(batch_id);
+        let returned_job = error.job;
+        server.restore_frame_batch_after_render_failure(protocol_batch_id);
         settle_failed_output_transaction(
             output_transactions,
             transaction_id,
@@ -443,6 +424,7 @@ pub(super) fn finish_direct_worker_queued(
             MonotonicTimestampNs::new(monotonic_now_ns()?),
             |_| Ok(()),
         )?;
+        drop(returned_job);
         return Err(
             io::Error::other(format!("direct worker enqueue failed: {:?}", error.reason)).into(),
         );

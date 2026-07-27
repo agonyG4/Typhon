@@ -24,6 +24,12 @@ impl NativeRuntime {
                 xwm_commands_per_cycle_max,
             ) = self.xwayland.xwayland_timing_snapshot();
             let fullscreen = self.server.fullscreen_render_plan_metrics();
+            // Queued identity belongs to the Atomic arbiter; physical resources
+            // are reported separately from DirectPrimaryOwnership below.
+            let direct_pending = self
+                .atomic_commit_arbiter
+                .pending_atomic_kind()
+                .is_some_and(|kind| matches!(kind, AtomicCommitKind::DirectPrimary { .. }));
             let mut fields = vec![
                 NativePerfField::str("decision", format!("{scheduler_decision:?}")),
                 NativePerfField::str(
@@ -383,10 +389,7 @@ impl NativeRuntime {
                     "direct_scanout_qualification",
                     self.direct_scanout_qualification.status_str(),
                 ),
-                NativePerfField::bool(
-                    "direct_scanout_pending",
-                    self.scanout.direct_scanout_pending(),
-                ),
+                NativePerfField::bool("direct_scanout_pending", direct_pending),
                 NativePerfField::u64(
                     "direct_scanout_surface",
                     u64::from(self.scanout.direct_scanout_surface().unwrap_or(0)),

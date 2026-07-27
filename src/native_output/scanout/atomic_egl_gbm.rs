@@ -51,7 +51,7 @@ pub(crate) struct AtomicEglGbmScanout {
     native_fence_functions: NativeFenceFunctions,
     pool: Option<AtomicOutputPool>,
     swapchain: Option<AtomicOutputSwapchain>,
-    direct: DirectScanoutState,
+    direct: DirectScanoutControl,
     width: u32,
     height: u32,
     dmabuf_feedback: EglGlesDmabufFeedback,
@@ -109,9 +109,6 @@ impl AtomicEglGbmScanout {
     }
 
     pub(crate) fn suspend_for_session(&mut self) -> io::Result<()> {
-        if let Some(token) = self.direct.worker_queued_token() {
-            self.direct.suspend_worker_queued(token)?;
-        }
         self.direct_scanout_suspend()?;
         if let Some(token) = self.swapchain()?.worker_queued_token() {
             self.swapchain_mut()?.suspend_abandon_worker_queued(token)?;
@@ -166,10 +163,10 @@ impl AtomicEglGbmScanout {
         for slot in &mut pool.slots {
             slot.pool_generation = generation;
         }
-        self.direct.cache.clear_for_generation(generation);
+        self.direct
+            .framebuffer_cache
+            .clear_for_generation(generation);
         self.direct.drm_generation = generation;
-        self.direct.current = None;
-        self.direct.pending = None;
         self.direct.inhibit_until_composited_present = true;
         self.direct.identity_viewport_metadata_logged = false;
         self.direct.last_debug_candidate = None;
@@ -373,7 +370,7 @@ impl AtomicEglGbmScanout {
                 native_fence_functions,
                 pool: Some(pool),
                 swapchain: None,
-                direct: DirectScanoutState::new(kms.as_fd(), pool_generation),
+                direct: DirectScanoutControl::new(kms.as_fd(), pool_generation),
                 width,
                 height,
                 dmabuf_feedback,

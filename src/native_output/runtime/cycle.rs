@@ -562,7 +562,12 @@ impl NativeRuntime {
                 }
             }
             let scheduler_state_at_completion = frame_scheduler.state();
-            let direct_pending = scanout.direct_scanout_pending();
+            let direct_pending = matches!(
+                atomic_completion,
+                Some(AtomicCommitCompletion::Completed(
+                    AtomicCommitKind::DirectPrimary { .. }
+                ))
+            );
             let completion = if cursor_commit {
                 // Cursor-only Atomic commits are validated and completed by
                 // the Atomic arbiter, not by the primary frame scheduler.
@@ -612,9 +617,16 @@ impl NativeRuntime {
                     let presented_at = MonotonicTimestampNs::new(presented_at_ns);
                     let actual_logical_sequence =
                         presentation_deadline.note_presented(presented_at);
-                    let transaction_id = scanout
-                        .direct_scanout_pending_transaction_id()
-                        .ok_or_else(|| io::Error::other("direct pageflip has no transaction"))?;
+                    let transaction_id = match atomic_completion {
+                        Some(AtomicCommitCompletion::Completed(
+                            AtomicCommitKind::DirectPrimary { transaction_id, .. },
+                        )) => transaction_id,
+                        _ => {
+                            return Err(
+                                io::Error::other("direct pageflip has no transaction").into()
+                            );
+                        }
+                    };
                     let mut completed = None;
                     complete_presented_output_transaction(
                         output_transactions,
@@ -631,45 +643,44 @@ impl NativeRuntime {
                                 scanout.direct_scanout_surface()
                             );
                             let completion = scanout.complete_direct_pageflip(
+                                transaction_id,
                                 PageFlipToken::new(pageflip.user_data).ok_or_else(|| {
                                     io::Error::other("direct pageflip token is zero")
                                 })?,
                             )?;
-                            let DirectPageflipCompletion {
-                                presented,
-                                protocol_batch_id,
-                                surface_damage,
-                            } = completion;
                             complete_primary_cursor_pageflip(
                                 atomic_cursor,
                                 pageflip.user_data,
                                 *drm_file_generation,
                             )?;
-                            server.commit_surface_damage_presented(surface_damage);
+                            server.commit_surface_damage_presented(completion.surface_damage);
                             server.complete_direct_presented_frame_batch(
-                                presented.prepared.frame_id,
-                                protocol_batch_id,
-                                presented.prepared.surface_id,
+                                completion.frame_id,
+                                completion.protocol_batch_id,
+                                completion.surface_id,
                                 presentation,
                             );
-                            completed = Some(presented);
+                            completed = Some((
+                                completion.target,
+                                completion.submit_started_at,
+                                completion.submit_returned_at,
+                            ));
                             Ok(())
                         },
                     )?;
-                    let completed = completed
+                    let (target, submit_started_at, submit_returned_at) = completed
                         .ok_or_else(|| io::Error::other("direct pageflip did not complete"))?;
                     render_journal.note_matching_presentation(presented_at);
                     frame_pacing.note_explicit_present(ExplicitPresentationObservation {
-                        planned_sequence: completed.prepared.target.sequence,
+                        planned_sequence: target.sequence,
                         actual_sequence: actual_logical_sequence,
-                        target_ns: completed.prepared.target.presentation_time.get(),
+                        target_ns: target.presentation_time.get(),
                         presented_ns: presented_at_ns,
-                        composite_started_ns: completed.submit_started_at.get(),
-                        rendered_ns: completed.submit_returned_at.get(),
-                        submit_started_ns: completed.submit_started_at.get(),
-                        submit_returned_ns: completed.submit_returned_at.get(),
-                        reactive_double: completed.prepared.target.reason
-                            == PresentationTargetReason::ReactiveDouble,
+                        composite_started_ns: submit_started_at.get(),
+                        rendered_ns: submit_returned_at.get(),
+                        submit_started_ns: submit_started_at.get(),
+                        submit_returned_ns: submit_returned_at.get(),
+                        reactive_double: target.reason == PresentationTargetReason::ReactiveDouble,
                     });
                     *scheduled_presentation_target = None;
                 } else if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {

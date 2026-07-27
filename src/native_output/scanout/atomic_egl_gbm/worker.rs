@@ -22,51 +22,11 @@ impl AtomicEglGbmScanout {
         Ok(())
     }
 
-    pub(crate) fn promote_worker_direct_submission(
+    pub(crate) fn accept_direct_submitted(
         &mut self,
-        context: DirectPromotionContext,
-        lease: DirectPrimaryLease,
-        out_fence: Option<OwnedFd>,
-    ) -> Result<CompositorFrameBatchId, Box<DirectPromotionError>> {
-        let has_out_fence = out_fence.is_some();
-        let batch_id = self
-            .direct
-            .promote_worker_submission(context, lease, out_fence)?;
-        self.direct.counters.submissions = self.direct.counters.submissions.saturating_add(1);
-        if has_out_fence {
-            self.direct.counters.out_fences_received =
-                self.direct.counters.out_fences_received.saturating_add(1);
-        } else {
-            self.direct.counters.out_fence_missing =
-                self.direct.counters.out_fence_missing.saturating_add(1);
-        }
-        Ok(batch_id)
-    }
-
-    pub(crate) fn fail_worker_direct_submission(
-        &mut self,
-        token: PageFlipToken,
-    ) -> io::Result<CompositorFrameBatchId> {
-        self.direct.fail_worker_submission(token)
-    }
-
-    pub(crate) fn suspend_abandon_worker_direct(&mut self, token: PageFlipToken) -> io::Result<()> {
-        self.direct.suspend_worker_queued(token)
-    }
-
-    pub(crate) fn suspend_worker_direct_submission(
-        &mut self,
-        token: PageFlipToken,
-        lease: DirectPrimaryLease,
-    ) -> Result<(), super::super::direct_lease::DirectPrimaryLeaseTransferError> {
-        self.direct.suspend_worker_submission(token, lease)
-    }
-
-    pub(crate) fn store_worker_direct_submission(
-        &mut self,
-        frame: WorkerQueuedDirectFrame,
-    ) -> io::Result<()> {
-        self.direct.store_worker_queued(frame)
+        submitted: SubmittedDirectPrimary,
+    ) -> Result<(), Box<SubmittedDirectPrimaryError>> {
+        self.direct.ownership.accept_submitted(submitted)
     }
 
     pub(crate) fn record_direct_validation_success(&mut self, key: DirectPlaneValidationKey) {

@@ -1,6 +1,26 @@
-use super::super::kms_worker::{KmsCommitWorkerHandle, KmsWorkerEvent, KmsWorkerFatalJob};
+use super::super::kms_worker::{
+    KmsCommitJob, KmsCommitWorkerHandle, KmsWorkerEvent, KmsWorkerFatalJob,
+};
+use super::kms_worker::{FatalWorkerJobHandler, UncertainJobRetention};
 use super::*;
 use oblivion_one::native::kms::RestorationOutcome;
+
+impl FatalWorkerJobHandler for NativeRuntime {
+    fn retain_uncertain_worker_job(
+        &mut self,
+        job: KmsCommitJob,
+    ) -> NativeResult<UncertainJobRetention> {
+        NativeRuntime::retain_uncertain_worker_job(self, job)
+    }
+
+    fn fail_known_worker_job(&mut self, job: KmsCommitJob) -> NativeResult<()> {
+        self.fail_known_worker_job_impl(job)
+    }
+
+    fn drop_known_worker_job(&mut self, job: KmsCommitJob) -> NativeResult<()> {
+        NativeRuntime::drop_queued_worker_job(self, job)
+    }
+}
 
 pub(super) const fn classify_kms_teardown_safety(
     proof: Option<KmsSafeBoundary>,

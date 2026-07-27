@@ -15,15 +15,6 @@ pub(crate) struct DirectPrimaryLease {
     surface_damage: Option<SurfaceDamagePresentation>,
 }
 
-pub(crate) type DirectPrimaryLeaseParts = (
-    DirectScanoutCandidateKey,
-    u32,
-    DmabufBufferHandle,
-    Arc<ImportedDirectFramebuffer>,
-    SurfaceDamagePresentation,
-);
-pub(crate) type DirectPrimaryLeaseTransferError = Box<(io::Error, DirectPrimaryLease)>;
-
 impl DirectPrimaryLease {
     pub(crate) fn new(
         candidate: DirectScanoutSceneCandidate,
@@ -70,35 +61,14 @@ impl DirectPrimaryLease {
         self.framebuffer.framebuffer.get()
     }
 
-    pub(crate) const fn has_surface_damage(&self) -> bool {
-        self.surface_damage.is_some()
+    pub(crate) fn take_surface_damage(&mut self) -> io::Result<SurfaceDamagePresentation> {
+        self.surface_damage
+            .take()
+            .ok_or_else(|| io::Error::other("direct surface damage already settled"))
     }
 
-    pub(crate) fn try_into_parts(
-        mut self,
-    ) -> Result<DirectPrimaryLeaseParts, DirectPrimaryLeaseTransferError> {
-        if !self.has_surface_damage() {
-            return Err(Box::new((
-                io::Error::other("direct surface damage already settled"),
-                self,
-            )));
-        }
-        let surface_damage = self
-            .surface_damage
-            .take()
-            .expect("surface damage checked above");
-        let Self {
-            key,
-            surface_id,
-            _buffer,
-            framebuffer,
-            surface_damage: None,
-            ..
-        } = self
-        else {
-            unreachable!("surface damage was consumed above");
-        };
-        Ok((key, surface_id, _buffer, framebuffer, surface_damage))
+    pub(crate) fn disarm_drm_cleanup(&self) {
+        self.framebuffer.disarm_drm_cleanup();
     }
 
     #[cfg(test)]

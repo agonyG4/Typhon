@@ -126,14 +126,16 @@ impl AtomicEglGbmScanout {
         };
         let unchanged = self
             .direct
-            .pending
+            .ownership
+            .submitted
             .as_ref()
-            .is_some_and(|frame| frame.prepared.key == candidate_key)
+            .is_some_and(|frame| frame.lease.key() == candidate_key)
             || self
                 .direct
-                .current
+                .ownership
+                .presented
                 .as_ref()
-                .is_some_and(|frame| frame.prepared.key == candidate_key);
+                .is_some_and(|frame| frame.lease.key() == candidate_key);
         if unchanged {
             self.direct.counters.same_buffer_suppressed = self
                 .direct
@@ -158,7 +160,7 @@ impl AtomicEglGbmScanout {
         self.direct.counters.import_attempts += 1;
         let (framebuffer, cache_hit) = match self
             .direct
-            .cache
+            .framebuffer_cache
             .get_or_import(&candidate.buffer_identity, &candidate.buffer)
         {
             Ok(imported) => imported,
@@ -230,7 +232,7 @@ impl AtomicEglGbmScanout {
         let token = PageFlipToken::new(allocate_native_page_flip_token())
             .expect("allocated native pageflip token is nonzero");
         let framebuffer_id = framebuffer.framebuffer.get();
-        let was_direct = self.direct.current.is_some();
+        let was_direct = self.direct.ownership.presented.is_some();
         let direct_lease = DirectPrimaryLease::new(
             candidate,
             candidate_key,
@@ -255,59 +257,61 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn complete_direct_pageflip(
         &mut self,
+        transaction_id: OutputTransactionId,
         token: PageFlipToken,
     ) -> io::Result<DirectPageflipCompletion> {
-        let pending =
-            self.direct.pending.as_ref().ok_or_else(|| {
-                io::Error::other("direct pageflip completed with no pending frame")
-            })?;
-        if self.swapchain()?.pool_generation() != self.direct.drm_generation {
-            return Err(io::Error::other(
-                "direct pageflip belongs to an old DRM generation",
-            ));
-        }
-        if pending.token != token {
-            return Err(io::Error::other(
-                "direct pageflip token does not match pending frame",
-            ));
-        }
-        let mut pending = self.direct.pending.take().expect("pending direct frame");
-        let out_fence = pending.out_fence.take();
-        drop(out_fence);
         let presented_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
-        let protocol_batch_id = pending.protocol_batch_id;
-        let surface_damage = pending.surface_damage;
-        let current = PresentedDirectFrame {
-            prepared: pending.prepared,
-            token,
-            presented_at,
-            submit_started_at: pending.submit_started_at,
-            submit_returned_at: pending.submit_returned_at,
+        let (
+            frame_id,
+            presented_transaction_id,
+            presented_token,
+            surface_id,
+            protocol_batch_id,
+            target,
+            submit_started_at,
+            submit_returned_at,
+        ) = {
+            let (presented, _replaced) = self
+                .direct
+                .ownership
+                .complete_pageflip(transaction_id, token, presented_at)
+                .map_err(|error| error.error)?;
+            (
+                presented.frame_id,
+                presented.transaction_id,
+                presented.token,
+                presented.lease.surface_id(),
+                presented.protocol_batch_id,
+                presented.target,
+                presented.submit_started_at,
+                presented.submit_returned_at,
+            )
         };
-        let old = self.direct.current.replace(current);
-        drop(old);
+        let surface_damage = self.direct.ownership.take_presented_surface_damage()?;
         self.direct.counters.presentations += 1;
         direct_scanout_debug("direct pageflip presented");
         Ok(DirectPageflipCompletion {
-            presented: self
-                .direct
-                .current
-                .as_ref()
-                .expect("direct frame was promoted")
-                .clone(),
+            frame_id,
+            transaction_id: presented_transaction_id,
+            token: presented_token,
+            surface_id,
             protocol_batch_id,
+            target,
+            presented_at,
+            submit_started_at,
+            submit_returned_at,
             surface_damage,
         })
     }
 
     pub(crate) fn mark_composited_submission(&mut self) {
-        if self.direct.current.is_some() {
+        if self.direct.ownership.presented.is_some() {
             self.direct.inhibit_until_composited_present = true;
         }
     }
 
     pub(crate) fn complete_composited_transition(&mut self) {
-        if self.direct.current.take().is_some() {
+        if self.direct.ownership.presented.take().is_some() {
             self.direct.counters.exits += 1;
             direct_scanout_debug("exited direct scanout to composition");
             self.scene.invalidate_presented_damage_history();
@@ -316,7 +320,7 @@ impl AtomicEglGbmScanout {
     }
 
     pub(crate) fn direct_scanout_active(&self) -> bool {
-        self.direct.current.is_some()
+        self.direct.ownership.presented.is_some()
     }
 
     pub(crate) fn direct_scanout_pending(&self) -> bool {
@@ -327,43 +331,30 @@ impl AtomicEglGbmScanout {
         self.direct.pending_token()
     }
 
-    pub(crate) fn direct_scanout_pending_transaction_id(&self) -> Option<OutputTransactionId> {
-        self.direct.pending_transaction_id()
-    }
-
     pub(crate) fn direct_scanout_surface(&self) -> Option<u32> {
         self.direct.active_surface()
     }
 
     pub(crate) fn direct_scanout_info(&self) -> Option<(u64, u32, u32, u64)> {
         self.direct
-            .worker_queued
+            .ownership
+            .submitted
             .as_ref()
             .map(|frame| {
                 (
-                    frame.key.content.buffer_id.get(),
-                    frame.framebuffer_id,
-                    frame.key.content.format,
-                    frame.key.content.modifier,
+                    frame.lease.key().content.buffer_id.get(),
+                    frame.lease.framebuffer_id(),
+                    frame.lease.key().content.format,
+                    frame.lease.key().content.modifier,
                 )
             })
             .or_else(|| {
-                self.direct.pending.as_ref().map(|frame| {
+                self.direct.ownership.presented.as_ref().map(|frame| {
                     (
-                        frame.prepared.key.content.buffer_id.get(),
-                        frame.prepared.framebuffer.framebuffer.get(),
-                        frame.prepared.framebuffer.format,
-                        frame.prepared.framebuffer.modifier,
-                    )
-                })
-            })
-            .or_else(|| {
-                self.direct.current.as_ref().map(|frame| {
-                    (
-                        frame.prepared.key.content.buffer_id.get(),
-                        frame.prepared.framebuffer.framebuffer.get(),
-                        frame.prepared.framebuffer.format,
-                        frame.prepared.framebuffer.modifier,
+                        frame.lease.key().content.buffer_id.get(),
+                        frame.lease.framebuffer_id(),
+                        frame.lease.key().content.format,
+                        frame.lease.key().content.modifier,
                     )
                 })
             })
@@ -371,7 +362,7 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn direct_scanout_counters(&self) -> DirectScanoutCounters {
         let mut counters = self.direct.counters;
-        counters.cleanup_failures = self.direct.cache.cleanup_failures();
+        counters.cleanup_failures = self.direct.framebuffer_cache.cleanup_failures();
         counters
     }
 
@@ -388,7 +379,7 @@ impl AtomicEglGbmScanout {
     }
 
     pub(crate) fn direct_scanout_suspend(&mut self) -> io::Result<()> {
-        self.direct.suspend();
+        self.direct.suspend()?;
         self.scene.invalidate_presented_damage_history();
         Ok(())
     }

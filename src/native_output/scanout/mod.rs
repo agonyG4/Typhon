@@ -1,5 +1,4 @@
 use super::*;
-use oblivion_one::compositor::CompositorFrameBatchId;
 use oblivion_one::native::kms::KmsBackendKind;
 
 #[allow(dead_code)] // Direct-path state is consumed by runtime integration and diagnostics.
@@ -694,17 +693,6 @@ impl NativeScanoutBackend {
     pub(crate) fn direct_scanout_active(&self) -> bool {
         matches!(self, Self::AtomicEglGbm(scanout) if scanout.direct_scanout_active())
     }
-    pub(crate) fn direct_scanout_pending(&self) -> bool {
-        matches!(self, Self::AtomicEglGbm(scanout) if scanout.direct_scanout_pending())
-    }
-
-    pub(crate) fn direct_scanout_pending_transaction_id(&self) -> Option<OutputTransactionId> {
-        match self {
-            Self::AtomicEglGbm(scanout) => scanout.direct_scanout_pending_transaction_id(),
-            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => None,
-        }
-    }
-
     pub(crate) fn direct_scanout_surface(&self) -> Option<u32> {
         match self {
             Self::AtomicEglGbm(scanout) => scanout.direct_scanout_surface(),
@@ -770,10 +758,11 @@ impl NativeScanoutBackend {
 
     pub(crate) fn complete_direct_pageflip(
         &mut self,
+        transaction_id: OutputTransactionId,
         token: PageFlipToken,
     ) -> io::Result<DirectPageflipCompletion> {
         match self {
-            Self::AtomicEglGbm(scanout) => scanout.complete_direct_pageflip(token),
+            Self::AtomicEglGbm(scanout) => scanout.complete_direct_pageflip(transaction_id, token),
             Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
                 "direct pageflip is unsupported by this backend",
             )),

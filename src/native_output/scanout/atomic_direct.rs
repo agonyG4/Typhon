@@ -1,115 +1,67 @@
-use std::{os::fd::OwnedFd, sync::Arc};
+use std::os::fd::OwnedFd;
 
 use oblivion_one::compositor::{
     CompositorFrameBatchId, DirectScanoutSceneCandidate, DirectScanoutSceneRejection,
-    SurfaceDamagePresentation,
 };
-use oblivion_one::render_backend::buffer::DmabufBufferHandle;
 
 use super::*;
 
-#[derive(Debug, Clone)]
-pub(crate) struct PreparedDirectFrame {
-    pub(crate) frame_id: u64,
-    pub(crate) transaction_id: OutputTransactionId,
-    pub(crate) key: DirectScanoutCandidateKey,
-    pub(crate) surface_id: u32,
-    pub(crate) buffer: DmabufBufferHandle,
-    pub(crate) framebuffer: Arc<ImportedDirectFramebuffer>,
-    pub(crate) target: PresentationTarget,
-}
-
-pub(crate) struct SubmittedDirectFrame {
-    pub(crate) prepared: PreparedDirectFrame,
-    pub(crate) token: PageFlipToken,
-    pub(crate) protocol_batch_id: CompositorFrameBatchId,
-    pub(crate) surface_damage: SurfaceDamagePresentation,
-    pub(crate) submit_started_at: MonotonicTimestampNs,
-    pub(crate) submit_returned_at: MonotonicTimestampNs,
-    pub(crate) out_fence: Option<OwnedFd>,
-}
-
 #[derive(Debug)]
-pub(crate) struct WorkerQueuedDirectFrame {
-    pub(crate) frame_id: u64,
-    pub(crate) transaction_id: OutputTransactionId,
-    pub(crate) output_generation: u64,
-    pub(crate) key: DirectScanoutCandidateKey,
-    pub(crate) validation_key: DirectPlaneValidationKey,
-    pub(crate) surface_id: u32,
-    pub(crate) token: PageFlipToken,
-    pub(crate) protocol_batch_id: CompositorFrameBatchId,
-    pub(crate) framebuffer_id: u32,
-    pub(crate) target: PresentationTarget,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DirectPromotionContext {
+pub(crate) struct SubmittedDirectPrimary {
     pub(crate) transaction_id: OutputTransactionId,
     pub(crate) token: PageFlipToken,
-    pub(crate) output_generation: u64,
-    pub(crate) target: PresentationTarget,
-    pub(crate) submit_started_at: MonotonicTimestampNs,
-    pub(crate) submit_returned_at: MonotonicTimestampNs,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DirectPromotionFailure {
-    MissingQueued,
-    TokenMismatch,
-    TransactionMismatch,
-    GenerationMismatch,
-    TargetMismatch,
-    CandidateKeyMismatch,
-    ValidationKeyMismatch,
-    SurfaceMismatch,
-    FramebufferMismatch,
-    MissingDamage,
-    LeaseConversion,
-}
-
-#[derive(Debug)]
-pub(crate) struct DirectPromotionError {
-    pub(crate) reason: DirectPromotionFailure,
-    pub(crate) error: io::Error,
     pub(crate) lease: DirectPrimaryLease,
+    pub(crate) submit_started_at: MonotonicTimestampNs,
+    pub(crate) submit_returned_at: MonotonicTimestampNs,
     pub(crate) out_fence: Option<OwnedFd>,
+    pub(crate) frame_id: u64,
+    pub(crate) protocol_batch_id: CompositorFrameBatchId,
+    pub(crate) target: PresentationTarget,
 }
 
-fn promotion_error(
-    reason: DirectPromotionFailure,
-    message: &'static str,
-    lease: DirectPrimaryLease,
-    out_fence: Option<OwnedFd>,
-) -> Box<DirectPromotionError> {
-    Box::new(DirectPromotionError {
-        reason,
-        error: io::Error::other(message),
-        lease,
-        out_fence,
-    })
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PresentedDirectFrame {
-    pub(crate) prepared: PreparedDirectFrame,
+#[derive(Debug)]
+pub(crate) struct PresentedDirectPrimary {
+    pub(crate) transaction_id: OutputTransactionId,
     pub(crate) token: PageFlipToken,
+    pub(crate) lease: DirectPrimaryLease,
+    pub(crate) presented_at: MonotonicTimestampNs,
+    pub(crate) frame_id: u64,
+    pub(crate) protocol_batch_id: CompositorFrameBatchId,
+    pub(crate) target: PresentationTarget,
+    pub(crate) submit_started_at: MonotonicTimestampNs,
+    pub(crate) submit_returned_at: MonotonicTimestampNs,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct DirectPrimaryOwnership {
+    pub(crate) submitted: Option<SubmittedDirectPrimary>,
+    pub(crate) presented: Option<PresentedDirectPrimary>,
+    pub(crate) suspended: Vec<DirectPrimaryLease>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SubmittedDirectPrimaryError {
+    pub(crate) error: io::Error,
+    pub(crate) submitted: SubmittedDirectPrimary,
+}
+
+#[derive(Debug)]
+pub(crate) struct DirectOwnershipError {
+    pub(crate) error: io::Error,
+}
+
+#[derive(Debug)]
+pub(crate) struct DirectPageflipCompletion {
+    pub(crate) frame_id: u64,
+    pub(crate) transaction_id: OutputTransactionId,
+    pub(crate) token: PageFlipToken,
+    pub(crate) surface_id: u32,
+    pub(crate) protocol_batch_id: CompositorFrameBatchId,
+    pub(crate) target: PresentationTarget,
     pub(crate) presented_at: MonotonicTimestampNs,
     pub(crate) submit_started_at: MonotonicTimestampNs,
     pub(crate) submit_returned_at: MonotonicTimestampNs,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct DirectPageflipCompletion {
-    pub(crate) presented: PresentedDirectFrame,
-    pub(crate) protocol_batch_id: CompositorFrameBatchId,
-    pub(crate) surface_damage: SurfaceDamagePresentation,
-}
-
-struct SuspendedDirectFrame {
-    buffer: DmabufBufferHandle,
-    framebuffer: Arc<ImportedDirectFramebuffer>,
-    abandoned_batch: Option<(CompositorFrameBatchId, SurfaceDamagePresentation)>,
+    pub(crate) surface_damage: oblivion_one::compositor::SurfaceDamagePresentation,
 }
 
 #[derive(Debug)]
@@ -152,12 +104,9 @@ pub(crate) struct DirectScanoutCounters {
     pub(crate) composited_render_ahead_suppressed: u64,
 }
 
-pub(crate) struct DirectScanoutState {
-    pub(crate) current: Option<PresentedDirectFrame>,
-    pub(crate) worker_queued: Option<WorkerQueuedDirectFrame>,
-    pub(crate) pending: Option<SubmittedDirectFrame>,
-    suspended: Vec<SuspendedDirectFrame>,
-    pub(crate) cache: DirectFramebufferCache,
+pub(crate) struct DirectScanoutControl {
+    pub(crate) ownership: DirectPrimaryOwnership,
+    pub(crate) framebuffer_cache: DirectFramebufferCache,
     pub(crate) inhibit_until_composited_present: bool,
     pub(crate) counters: DirectScanoutCounters,
     pub(crate) drm_generation: u64,
@@ -185,14 +134,138 @@ pub(super) fn direct_scanout_debug(message: impl std::fmt::Display) {
     }
 }
 
-impl DirectScanoutState {
+impl DirectPrimaryOwnership {
+    pub(crate) fn accept_submitted(
+        &mut self,
+        submitted: SubmittedDirectPrimary,
+    ) -> Result<(), Box<SubmittedDirectPrimaryError>> {
+        if self.submitted.is_some() {
+            return Err(Box::new(SubmittedDirectPrimaryError {
+                error: io::Error::other("direct submitted ownership already exists"),
+                submitted,
+            }));
+        }
+        self.submitted = Some(submitted);
+        Ok(())
+    }
+
+    pub(crate) fn complete_pageflip(
+        &mut self,
+        transaction_id: OutputTransactionId,
+        token: PageFlipToken,
+        presented_at: MonotonicTimestampNs,
+    ) -> Result<(&PresentedDirectPrimary, Option<PresentedDirectPrimary>), DirectOwnershipError>
+    {
+        let Some(submitted) = self.submitted.as_ref() else {
+            return Err(DirectOwnershipError {
+                error: io::Error::other("direct pageflip has no submitted ownership"),
+            });
+        };
+        if submitted.transaction_id != transaction_id {
+            return Err(DirectOwnershipError {
+                error: io::Error::other(
+                    "direct pageflip transaction does not match submitted ownership",
+                ),
+            });
+        }
+        if submitted.token != token {
+            return Err(DirectOwnershipError {
+                error: io::Error::other("direct pageflip token does not match submitted ownership"),
+            });
+        }
+        let submitted = self
+            .submitted
+            .take()
+            .expect("submitted ownership was validated above");
+        drop(submitted.out_fence);
+        let presented = PresentedDirectPrimary {
+            transaction_id: submitted.transaction_id,
+            token: submitted.token,
+            lease: submitted.lease,
+            presented_at,
+            frame_id: submitted.frame_id,
+            protocol_batch_id: submitted.protocol_batch_id,
+            target: submitted.target,
+            submit_started_at: submitted.submit_started_at,
+            submit_returned_at: submitted.submit_returned_at,
+        };
+        let replaced = self.presented.replace(presented);
+        Ok((
+            self.presented
+                .as_ref()
+                .expect("presented ownership was just installed"),
+            replaced,
+        ))
+    }
+
+    pub(crate) fn abandon_submitted_for_restore(
+        &mut self,
+        token: PageFlipToken,
+    ) -> Result<(), DirectOwnershipError> {
+        let Some(submitted) = self.submitted.as_ref() else {
+            return Err(DirectOwnershipError {
+                error: io::Error::other("direct restore has no submitted ownership"),
+            });
+        };
+        if submitted.token != token {
+            return Err(DirectOwnershipError {
+                error: io::Error::other("direct restore token does not match submitted ownership"),
+            });
+        }
+        let submitted = self
+            .submitted
+            .take()
+            .expect("submitted ownership was validated above");
+        drop(submitted.out_fence);
+        self.suspended.push(submitted.lease);
+        Ok(())
+    }
+
+    pub(crate) fn take_presented_surface_damage(
+        &mut self,
+    ) -> io::Result<oblivion_one::compositor::SurfaceDamagePresentation> {
+        self.presented
+            .as_mut()
+            .ok_or_else(|| io::Error::other("direct pageflip has no presented ownership"))?
+            .lease
+            .take_surface_damage()
+    }
+
+    pub(crate) fn suspend_for_restore(&mut self) -> io::Result<()> {
+        if let Some(token) = self.submitted.as_ref().map(|submitted| submitted.token) {
+            self.abandon_submitted_for_restore(token)
+                .map_err(|error| error.error)?;
+        }
+        if let Some(presented) = self.presented.take() {
+            self.suspended.push(presented.lease);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_after_restore(&mut self) {
+        self.submitted.take();
+        self.presented.take();
+        self.suspended.clear();
+    }
+
+    pub(crate) fn disarm_drm_cleanup(&mut self) {
+        if let Some(submitted) = self.submitted.as_ref() {
+            submitted.lease.disarm_drm_cleanup();
+        }
+        if let Some(presented) = self.presented.as_ref() {
+            presented.lease.disarm_drm_cleanup();
+        }
+        for lease in &self.suspended {
+            lease.disarm_drm_cleanup();
+        }
+    }
+}
+
+impl DirectScanoutControl {
     pub(super) fn new(drm: std::os::fd::BorrowedFd<'_>, generation: u64) -> Self {
         Self {
-            current: None,
-            worker_queued: None,
-            pending: None,
-            suspended: Vec::new(),
-            cache: DirectFramebufferCache::new(drm, generation),
+            ownership: DirectPrimaryOwnership::default(),
+            framebuffer_cache: DirectFramebufferCache::new(drm, generation),
             inhibit_until_composited_present: true,
             counters: DirectScanoutCounters::default(),
             drm_generation: generation,
@@ -203,88 +276,11 @@ impl DirectScanoutState {
     }
 
     pub(crate) fn pending_token(&self) -> Option<PageFlipToken> {
-        self.pending
-            .as_ref()
-            .map(|frame| frame.token)
-            .or_else(|| self.worker_queued.as_ref().map(|frame| frame.token))
-    }
-
-    pub(crate) fn pending_transaction_id(&self) -> Option<OutputTransactionId> {
-        self.pending
-            .as_ref()
-            .map(|frame| frame.prepared.transaction_id)
-            .or_else(|| {
-                self.worker_queued
-                    .as_ref()
-                    .map(|frame| frame.transaction_id)
-            })
-    }
-
-    pub(crate) fn suspend_worker_queued(&mut self, token: PageFlipToken) -> io::Result<()> {
-        let Some(frame) = self.worker_queued.take() else {
-            return Ok(());
-        };
-        if frame.token != token {
-            self.worker_queued = Some(frame);
-            return Err(io::Error::other(
-                "suspended direct worker token does not match queued ownership",
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn suspend_worker_submission(
-        &mut self,
-        token: PageFlipToken,
-        lease: DirectPrimaryLease,
-    ) -> Result<(), super::DirectPrimaryLeaseTransferError> {
-        let Some(frame) = self.worker_queued.as_ref() else {
-            return Err(Box::new((
-                io::Error::other("suspended direct worker token has no queued metadata"),
-                lease,
-            )));
-        };
-        if frame.token != token {
-            return Err(Box::new((
-                io::Error::other("suspended direct worker token does not match queued ownership"),
-                lease,
-            )));
-        }
-        if !lease.validate_against(frame.key, frame.surface_id, frame.framebuffer_id) {
-            return Err(Box::new((
-                io::Error::other("suspended direct worker lease does not match queued ownership"),
-                lease,
-            )));
-        }
-        let (_, _, buffer, framebuffer, surface_damage) = lease.try_into_parts()?;
-        let frame = self
-            .worker_queued
-            .take()
-            .expect("queued worker frame was validated above");
-        self.suspended.push(SuspendedDirectFrame {
-            buffer,
-            framebuffer,
-            abandoned_batch: Some((frame.protocol_batch_id, surface_damage)),
-        });
-        Ok(())
-    }
-
-    pub(crate) fn worker_queued_token(&self) -> Option<PageFlipToken> {
-        self.worker_queued.as_ref().map(|frame| frame.token)
-    }
-
-    pub(crate) fn store_worker_queued(&mut self, frame: WorkerQueuedDirectFrame) -> io::Result<()> {
-        if self.worker_queued.is_some() || self.pending.is_some() {
-            return Err(io::Error::other(
-                "direct worker queue already owns a primary frame",
-            ));
-        }
-        self.worker_queued = Some(frame);
-        Ok(())
+        self.ownership.submitted.as_ref().map(|frame| frame.token)
     }
 
     pub(crate) fn page_flip_pending(&self) -> bool {
-        self.pending.is_some() || self.worker_queued.is_some()
+        self.ownership.submitted.is_some()
     }
 
     pub(crate) fn record_direct_validation_success(&mut self, key: DirectPlaneValidationKey) {
@@ -299,204 +295,47 @@ impl DirectScanoutState {
         self.validation_cache.invalidate_all();
     }
 
-    pub(crate) fn promote_worker_submission(
-        &mut self,
-        context: DirectPromotionContext,
-        lease: DirectPrimaryLease,
-        out_fence: Option<OwnedFd>,
-    ) -> Result<CompositorFrameBatchId, Box<DirectPromotionError>> {
-        let Some(queued) = self.worker_queued.as_ref() else {
-            return Err(Box::new(DirectPromotionError {
-                reason: DirectPromotionFailure::MissingQueued,
-                error: io::Error::other("direct worker success has no queued frame"),
-                lease,
-                out_fence,
-            }));
-        };
-        if queued.token != context.token {
-            return Err(promotion_error(
-                DirectPromotionFailure::TokenMismatch,
-                "direct worker success token mismatches queued frame",
-                lease,
-                out_fence,
-            ));
-        }
-        if queued.transaction_id != context.transaction_id {
-            return Err(promotion_error(
-                DirectPromotionFailure::TransactionMismatch,
-                "direct worker success transaction mismatches queued frame",
-                lease,
-                out_fence,
-            ));
-        }
-        if queued.output_generation != context.output_generation {
-            return Err(promotion_error(
-                DirectPromotionFailure::GenerationMismatch,
-                "direct worker success generation mismatches queued frame",
-                lease,
-                out_fence,
-            ));
-        }
-        if queued.target != context.target {
-            return Err(promotion_error(
-                DirectPromotionFailure::TargetMismatch,
-                "direct worker success target mismatches queued frame",
-                lease,
-                out_fence,
-            ));
-        }
-        if lease.key() != queued.key {
-            return Err(promotion_error(
-                DirectPromotionFailure::CandidateKeyMismatch,
-                "direct worker success lease key mismatches queued metadata",
-                lease,
-                out_fence,
-            ));
-        }
-        if lease.validation_key() != queued.validation_key {
-            return Err(promotion_error(
-                DirectPromotionFailure::ValidationKeyMismatch,
-                "direct worker success validation key mismatches queued metadata",
-                lease,
-                out_fence,
-            ));
-        }
-        if lease.surface_id() != queued.surface_id {
-            return Err(promotion_error(
-                DirectPromotionFailure::SurfaceMismatch,
-                "direct worker success lease surface mismatches queued metadata",
-                lease,
-                out_fence,
-            ));
-        }
-        if lease.framebuffer_id() != queued.framebuffer_id {
-            return Err(promotion_error(
-                DirectPromotionFailure::FramebufferMismatch,
-                "direct worker success lease framebuffer mismatches queued metadata",
-                lease,
-                out_fence,
-            ));
-        }
-        if !lease.has_surface_damage() {
-            return Err(promotion_error(
-                DirectPromotionFailure::MissingDamage,
-                "direct worker success lease has no surface damage",
-                lease,
-                out_fence,
-            ));
-        }
-        let (key, surface_id, buffer, framebuffer, surface_damage) = match lease.try_into_parts() {
-            Ok(parts) => parts,
-            Err(error) => {
-                let (error, lease) = *error;
-                return Err(Box::new(DirectPromotionError {
-                    reason: DirectPromotionFailure::LeaseConversion,
-                    error,
-                    lease,
-                    out_fence,
-                }));
-            }
-        };
-        let queued = self
-            .worker_queued
-            .take()
-            .expect("queued worker frame was validated above");
-        let protocol_batch_id = queued.protocol_batch_id;
-        self.pending = Some(SubmittedDirectFrame {
-            prepared: PreparedDirectFrame {
-                frame_id: queued.frame_id,
-                transaction_id: queued.transaction_id,
-                key,
-                surface_id,
-                buffer,
-                framebuffer,
-                target: queued.target,
-            },
-            token: context.token,
-            protocol_batch_id,
-            surface_damage,
-            submit_started_at: context.submit_started_at,
-            submit_returned_at: context.submit_returned_at,
-            out_fence,
-        });
-        Ok(protocol_batch_id)
-    }
-
-    pub(crate) fn fail_worker_submission(
-        &mut self,
-        token: PageFlipToken,
-    ) -> io::Result<CompositorFrameBatchId> {
-        let queued = self
-            .worker_queued
-            .take()
-            .ok_or_else(|| io::Error::other("direct worker failure has no queued frame"))?;
-        if queued.token != token {
-            self.worker_queued = Some(queued);
-            return Err(io::Error::other(
-                "direct worker failure token mismatches queued frame",
-            ));
-        }
-        Ok(queued.protocol_batch_id)
-    }
-
     pub(crate) fn active_surface(&self) -> Option<u32> {
-        self.pending
+        self.ownership
+            .submitted
             .as_ref()
-            .map(|frame| frame.prepared.surface_id)
-            .or_else(|| self.current.as_ref().map(|frame| frame.prepared.surface_id))
-            .or_else(|| self.worker_queued.as_ref().map(|frame| frame.surface_id))
+            .map(|frame| frame.lease.surface_id())
+            .or_else(|| {
+                self.ownership
+                    .presented
+                    .as_ref()
+                    .map(|frame| frame.lease.surface_id())
+            })
     }
 
     pub(crate) fn disarm_drm_cleanup(&mut self) {
-        self.cache.clear_disarmed();
-        if let Some(frame) = &self.current {
-            frame.prepared.framebuffer.disarm_drm_cleanup();
-        }
-        if let Some(frame) = &self.pending {
-            frame.prepared.framebuffer.disarm_drm_cleanup();
-        }
-        for frame in &self.suspended {
-            frame.framebuffer.disarm_drm_cleanup();
-        }
+        self.framebuffer_cache.clear_disarmed();
+        self.ownership.disarm_drm_cleanup();
     }
 
     pub(super) fn complete_suspended(&mut self) {
-        for frame in self.suspended.drain(..) {
-            if let Some((_batch_id, surface_damage)) = frame.abandoned_batch {
-                drop(surface_damage);
-            }
-            drop(frame.framebuffer);
-            drop(frame.buffer);
-        }
+        self.ownership.clear_after_restore();
     }
 
-    pub(super) fn suspend(&mut self) {
-        self.worker_queued.take();
-        if let Some(frame) = self.pending.take() {
-            self.suspended.push(SuspendedDirectFrame {
-                buffer: frame.prepared.buffer,
-                framebuffer: frame.prepared.framebuffer,
-                abandoned_batch: Some((frame.protocol_batch_id, frame.surface_damage)),
-            });
-        }
-        if let Some(frame) = self.current.take() {
+    pub(super) fn suspend(&mut self) -> io::Result<()> {
+        if self.ownership.presented.is_some() {
             self.counters.exits += 1;
-            self.suspended.push(SuspendedDirectFrame {
-                buffer: frame.prepared.buffer,
-                framebuffer: frame.prepared.framebuffer,
-                abandoned_batch: None,
-            });
         }
+        self.ownership.suspend_for_restore()?;
         self.inhibit_until_composited_present = true;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_output::kms_worker::{
+        KmsCommitJob, KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy,
+    };
+    use crate::native_output::runtime::AtomicCommitKind;
     use crate::native_output::scanout::DirectPrimaryLease;
-    use oblivion_one::compositor::{CompositorFrameBatchId, OwnCompositorServer};
-    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+    use oblivion_one::native::kms::FramebufferId;
     use std::sync::atomic::Ordering;
 
     fn test_key() -> DirectScanoutCandidateKey {
@@ -534,249 +373,256 @@ mod tests {
         }
     }
 
-    fn test_eventfd() -> OwnedFd {
-        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        assert!(fd >= 0, "test eventfd should be created");
-        // SAFETY: eventfd returned a new owned descriptor for this test.
-        unsafe { OwnedFd::from_raw_fd(fd) }
-    }
-
-    fn test_queued_frame(token: u64, key: DirectScanoutCandidateKey) -> WorkerQueuedDirectFrame {
-        WorkerQueuedDirectFrame {
-            frame_id: token,
+    fn test_submitted(token: u64, lease: DirectPrimaryLease) -> SubmittedDirectPrimary {
+        SubmittedDirectPrimary {
             transaction_id: OutputTransactionId::new(
                 std::num::NonZeroU64::new(token).expect("test transaction ID"),
             ),
-            output_generation: 1,
-            key,
-            validation_key: test_validation_key(key.output_generation),
-            surface_id: key.content.surface_id,
             token: PageFlipToken::new(token).expect("test token"),
+            lease,
+            submit_started_at: MonotonicTimestampNs::new(11),
+            submit_returned_at: MonotonicTimestampNs::new(12),
+            out_fence: None,
+            frame_id: token,
             protocol_batch_id: CompositorFrameBatchId::new(
                 std::num::NonZeroU64::new(token).expect("test batch ID"),
             ),
-            framebuffer_id: 42,
             target: test_target(),
         }
     }
 
     #[test]
-    fn failed_worker_promotion_preserves_queued_state_and_lease() {
-        let file = std::fs::File::open("/dev/null").expect("test DRM file");
-        let mut state = DirectScanoutState::new(file.as_fd(), 1);
+    fn worker_queue_owns_direct_resource_before_submit() {
         let key = test_key();
-        let token = PageFlipToken::new(73).expect("test token");
-        state
-            .store_worker_queued(test_queued_frame(token.get(), key))
-            .expect("store queued frame");
         let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
+        let job = KmsCommitJob {
+            transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(80).unwrap()),
+            token: PageFlipToken::new(80).unwrap(),
+            output_generation: 1,
+            crtc_id: 7,
+            kind: AtomicCommitKind::DirectPrimary {
+                transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(80).unwrap()),
+                direct_token: PageFlipToken::new(80).unwrap(),
+                framebuffer_id: 42,
+            },
+            target: test_target(),
+            queued_at: MonotonicTimestampNs::new(10),
+            primary: KmsPrimaryUpdate::Framebuffer {
+                framebuffer: FramebufferId::new(42).unwrap(),
+                in_fence: None,
+                request_out_fence: true,
+            },
+            cursor: KmsCursorUpdate::Unchanged,
+            cursor_pin: None,
+            direct_primary_lease: Some(lease),
+            pacing_frame_id: None,
+            test_only: KmsTestOnlyPolicy::Required,
+            ready_submit: false,
+        };
+        let ownership = DirectPrimaryOwnership::default();
 
-        let error = state
-            .promote_worker_submission(
-                DirectPromotionContext {
-                    transaction_id: OutputTransactionId::new(
-                        std::num::NonZeroU64::new(73).unwrap(),
-                    ),
-                    token,
-                    output_generation: 1,
-                    target: test_target(),
-                    submit_started_at: MonotonicTimestampNs::new(11),
-                    submit_returned_at: MonotonicTimestampNs::new(12),
-                },
-                lease,
-                Some(test_eventfd()),
-            )
-            .expect_err("missing damage must reject before promotion");
-
-        let error = *error;
-        assert_eq!(error.reason, DirectPromotionFailure::MissingDamage);
-        assert!(error.out_fence.is_some());
-        assert_eq!(state.worker_queued_token(), Some(token));
-        assert!(state.pending.is_none());
-        assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
-        drop(error.lease);
+        assert!(job.direct_primary_lease.is_some());
+        assert!(ownership.submitted.is_none());
+        assert!(ownership.presented.is_none());
+        drop(job);
         assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
     }
 
     #[test]
-    fn successful_worker_promotion_moves_ownership_to_pending() {
-        let file = std::fs::File::open("/dev/null").expect("test DRM file");
-        let mut state = DirectScanoutState::new(file.as_fd(), 1);
+    fn submitted_event_transfers_direct_resource_to_physical_ownership() {
         let key = test_key();
-        let token = PageFlipToken::new(74).expect("test token");
-        state
-            .store_worker_queued(test_queued_frame(token.get(), key))
-            .expect("store queued frame");
-        let server = OwnCompositorServer::bind_cpu_composition(format!(
-            "typhon-direct-promote-test-{}",
-            std::process::id()
-        ))
-        .expect("bind test compositor");
-        let damage = server.capture_surface_damage_presentation();
-        let (lease, cleanup_count) =
-            DirectPrimaryLease::test_fixture_with_probe_and_damage(key, 42, Some(damage));
+        let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
+        let mut ownership = DirectPrimaryOwnership::default();
+        let submitted = test_submitted(81, lease);
 
-        let batch_id = state
-            .promote_worker_submission(
-                DirectPromotionContext {
-                    transaction_id: OutputTransactionId::new(
-                        std::num::NonZeroU64::new(74).unwrap(),
-                    ),
-                    token,
-                    output_generation: 1,
-                    target: test_target(),
-                    submit_started_at: MonotonicTimestampNs::new(11),
-                    submit_returned_at: MonotonicTimestampNs::new(12),
-                },
-                lease,
-                None,
-            )
-            .expect("promote worker frame");
+        ownership
+            .accept_submitted(submitted)
+            .expect("accept submitted direct resource");
 
-        assert_eq!(batch_id.get(), 74);
-        assert_eq!(state.worker_queued_token(), None);
-        assert_eq!(state.pending_token(), Some(token));
+        let stored = ownership.submitted.as_ref().expect("submitted ownership");
+        assert_eq!(stored.transaction_id.get(), 81);
+        assert_eq!(stored.token.get(), 81);
+        assert_eq!(stored.lease.key(), key);
+        assert_eq!(stored.lease.validation_key(), test_validation_key(1));
+        assert_eq!(stored.lease.surface_id(), key.content.surface_id);
+        assert_eq!(stored.lease.framebuffer_id(), 42);
+        assert_eq!(stored.submit_started_at.get(), 11);
+        assert_eq!(stored.submit_returned_at.get(), 12);
+        assert!(stored.out_fence.is_none());
+        assert!(ownership.presented.is_none());
         assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
-        drop(state);
-        assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
     }
 
     #[test]
-    fn worker_promotion_rejects_validation_key_mismatch() {
-        let file = std::fs::File::open("/dev/null").expect("test DRM file");
-        let mut state = DirectScanoutState::new(file.as_fd(), 1);
+    fn pageflip_promotes_submitted_direct_resource_to_presented() {
         let key = test_key();
-        let token = PageFlipToken::new(77).expect("test token");
-        let mut queued = test_queued_frame(token.get(), key);
-        queued.validation_key = test_validation_key(2);
-        state
-            .store_worker_queued(queued)
-            .expect("store queued frame");
         let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
+        let mut ownership = DirectPrimaryOwnership::default();
+        ownership
+            .accept_submitted(test_submitted(82, lease))
+            .expect("accept submitted direct resource");
 
-        let error = state
-            .promote_worker_submission(
-                DirectPromotionContext {
-                    transaction_id: OutputTransactionId::new(
-                        std::num::NonZeroU64::new(77).unwrap(),
-                    ),
-                    token,
-                    output_generation: 1,
-                    target: test_target(),
-                    submit_started_at: MonotonicTimestampNs::new(11),
-                    submit_returned_at: MonotonicTimestampNs::new(12),
-                },
-                lease,
-                None,
+        let (presented, replaced) = ownership
+            .complete_pageflip(
+                OutputTransactionId::new(std::num::NonZeroU64::new(82).unwrap()),
+                PageFlipToken::new(82).unwrap(),
+                MonotonicTimestampNs::new(13),
             )
-            .expect_err("validation key mismatch must reject before promotion");
-        let error = *error;
+            .expect("complete direct pageflip");
 
-        assert_eq!(error.reason, DirectPromotionFailure::ValidationKeyMismatch);
-        assert_eq!(state.worker_queued_token(), Some(token));
+        assert_eq!(presented.transaction_id.get(), 82);
+        assert_eq!(presented.token.get(), 82);
+        assert_eq!(presented.lease.key(), key);
+        assert_eq!(presented.presented_at.get(), 13);
+        assert!(replaced.is_none());
+        assert!(ownership.submitted.is_none());
+        assert_eq!(
+            ownership
+                .presented
+                .as_ref()
+                .expect("presented ownership")
+                .lease
+                .framebuffer_id(),
+            42
+        );
         assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
-        drop(error.lease);
-        assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
     }
 
     #[test]
-    fn worker_promotion_token_mismatch_keeps_queued_state_and_lease() {
-        let file = std::fs::File::open("/dev/null").expect("test DRM file");
-        let mut state = DirectScanoutState::new(file.as_fd(), 1);
+    fn replacement_pageflip_releases_previous_presented_resource() {
         let key = test_key();
-        let queued_token = PageFlipToken::new(75).expect("queued token");
-        state
-            .store_worker_queued(test_queued_frame(queued_token.get(), key))
-            .expect("store queued frame");
-        let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
-
-        let error = state
-            .promote_worker_submission(
-                DirectPromotionContext {
-                    transaction_id: OutputTransactionId::new(
-                        std::num::NonZeroU64::new(75).unwrap(),
-                    ),
-                    token: PageFlipToken::new(76).expect("submitted token"),
-                    output_generation: 1,
-                    target: test_target(),
-                    submit_started_at: MonotonicTimestampNs::new(11),
-                    submit_returned_at: MonotonicTimestampNs::new(12),
-                },
-                lease,
-                None,
+        let (lease_a, cleanup_a) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
+        let (lease_b, cleanup_b) = DirectPrimaryLease::test_fixture_with_probe(key, 43);
+        let mut ownership = DirectPrimaryOwnership::default();
+        ownership
+            .accept_submitted(test_submitted(83, lease_a))
+            .expect("accept first submitted resource");
+        ownership
+            .complete_pageflip(
+                OutputTransactionId::new(std::num::NonZeroU64::new(83).unwrap()),
+                PageFlipToken::new(83).unwrap(),
+                MonotonicTimestampNs::new(13),
             )
-            .expect_err("token mismatch must reject before promotion");
-        let error = *error;
+            .expect("present first direct resource");
+        ownership
+            .accept_submitted(test_submitted(84, lease_b))
+            .expect("accept replacement resource");
 
-        assert_eq!(error.reason, DirectPromotionFailure::TokenMismatch);
-        assert_eq!(state.worker_queued_token(), Some(queued_token));
-        assert!(state.pending.is_none());
-        assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
-        drop(error.lease);
-        assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+        assert_eq!(cleanup_a.load(Ordering::Acquire), 0);
+        assert_eq!(cleanup_b.load(Ordering::Acquire), 0);
+        let (_presented, replaced) = ownership
+            .complete_pageflip(
+                OutputTransactionId::new(std::num::NonZeroU64::new(84).unwrap()),
+                PageFlipToken::new(84).unwrap(),
+                MonotonicTimestampNs::new(14),
+            )
+            .expect("present replacement direct resource");
+        assert_eq!(cleanup_a.load(Ordering::Acquire), 0);
+        drop(replaced);
+        assert_eq!(cleanup_a.load(Ordering::Acquire), 1);
+        assert_eq!(cleanup_b.load(Ordering::Acquire), 0);
     }
 
     #[test]
-    fn failed_worker_suspension_returns_the_lease_unchanged() {
-        let file = std::fs::File::open("/dev/null").expect("test DRM file");
-        let mut state = DirectScanoutState::new(file.as_fd(), 1);
+    fn rejected_queued_direct_job_never_enters_submitted_ownership() {
         let key = test_key();
         let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
-        let error = state
-            .suspend_worker_submission(PageFlipToken::new(70).expect("test token"), lease)
-            .expect_err("missing queued state should fail");
-        let (_error, lease) = *error;
-
-        assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
+        let ownership = DirectPrimaryOwnership::default();
+        assert!(ownership.submitted.is_none());
+        assert!(ownership.presented.is_none());
         drop(lease);
         assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
     }
 
     #[test]
-    fn failed_lease_conversion_keeps_queued_state_and_returns_the_lease() {
-        let file = std::fs::File::open("/dev/null").expect("test DRM file");
-        let mut state = DirectScanoutState::new(file.as_fd(), 1);
+    fn exact_token_rejection_preserves_submitted_ownership() {
         let key = test_key();
-        let token = PageFlipToken::new(72).expect("test token");
-        state
-            .store_worker_queued(test_queued_frame(token.get(), key))
-            .expect("store queued frame");
         let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
-        let error = state
-            .suspend_worker_submission(token, lease)
-            .expect_err("missing surface damage should fail before ownership mutation");
-        let (_error, lease) = *error;
+        let mut ownership = DirectPrimaryOwnership::default();
+        ownership
+            .accept_submitted(test_submitted(85, lease))
+            .expect("accept submitted direct resource");
 
-        assert_eq!(state.worker_queued_token(), Some(token));
+        let error = ownership
+            .complete_pageflip(
+                OutputTransactionId::new(std::num::NonZeroU64::new(85).unwrap()),
+                PageFlipToken::new(86).unwrap(),
+                MonotonicTimestampNs::new(13),
+            )
+            .expect_err("wrong token must reject");
+
+        assert!(error.error.to_string().contains("token"));
+        assert_eq!(ownership.submitted.as_ref().unwrap().token.get(), 85);
+        assert!(ownership.presented.is_none());
         assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
-        drop(lease);
+    }
+
+    #[test]
+    fn exact_transaction_rejection_preserves_submitted_ownership() {
+        let key = test_key();
+        let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
+        let mut ownership = DirectPrimaryOwnership::default();
+        ownership
+            .accept_submitted(test_submitted(86, lease))
+            .expect("accept submitted direct resource");
+
+        let error = ownership
+            .complete_pageflip(
+                OutputTransactionId::new(std::num::NonZeroU64::new(87).unwrap()),
+                PageFlipToken::new(86).unwrap(),
+                MonotonicTimestampNs::new(13),
+            )
+            .expect_err("wrong transaction must reject");
+
+        assert!(error.error.to_string().contains("transaction"));
+        assert_eq!(
+            ownership.submitted.as_ref().unwrap().transaction_id.get(),
+            86
+        );
+        assert!(ownership.presented.is_none());
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn restore_moves_submitted_direct_resource_to_suspended_ownership() {
+        let key = test_key();
+        let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 88);
+        let mut ownership = DirectPrimaryOwnership::default();
+        ownership
+            .accept_submitted(test_submitted(88, lease))
+            .expect("accept submitted direct resource");
+
+        ownership
+            .abandon_submitted_for_restore(PageFlipToken::new(88).unwrap())
+            .expect("move submitted resource to restore ownership");
+
+        assert!(ownership.submitted.is_none());
+        assert!(ownership.presented.is_none());
+        assert_eq!(ownership.suspended.len(), 1);
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
+        ownership.clear_after_restore();
         assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
     }
 
     #[test]
-    fn successful_worker_suspension_releases_resources_only_after_recovery() {
-        let file = std::fs::File::open("/dev/null").expect("test DRM file");
-        let mut state = DirectScanoutState::new(file.as_fd(), 1);
+    fn second_submitted_direct_resource_is_returned_without_mutating_first() {
         let key = test_key();
-        let token = PageFlipToken::new(71).expect("test token");
-        state
-            .store_worker_queued(test_queued_frame(token.get(), key))
-            .expect("store queued frame");
-        let server = OwnCompositorServer::bind_cpu_composition(format!(
-            "typhon-direct-suspend-test-{}",
-            std::process::id()
-        ))
-        .expect("bind test compositor");
-        let damage = server.capture_surface_damage_presentation();
-        let (lease, cleanup_count) =
-            DirectPrimaryLease::test_fixture_with_probe_and_damage(key, 42, Some(damage));
+        let (lease_a, cleanup_a) = DirectPrimaryLease::test_fixture_with_probe(key, 89);
+        let (lease_b, cleanup_b) = DirectPrimaryLease::test_fixture_with_probe(key, 90);
+        let mut ownership = DirectPrimaryOwnership::default();
+        ownership
+            .accept_submitted(test_submitted(89, lease_a))
+            .expect("accept first submitted resource");
 
-        state
-            .suspend_worker_submission(token, lease)
-            .expect("suspend queued worker frame");
-        assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
-
-        state.complete_suspended();
-        assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+        let error = ownership
+            .accept_submitted(test_submitted(90, lease_b))
+            .expect_err("second submitted resource must be rejected");
+        assert!(error.error.to_string().contains("already exists"));
+        assert_eq!(ownership.submitted.as_ref().unwrap().token.get(), 89);
+        assert_eq!(cleanup_a.load(Ordering::Acquire), 0);
+        drop(error);
+        assert_eq!(cleanup_b.load(Ordering::Acquire), 1);
+        ownership.clear_after_restore();
+        assert_eq!(cleanup_a.load(Ordering::Acquire), 1);
     }
 }

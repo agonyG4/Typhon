@@ -42,69 +42,16 @@ impl NativeScanoutBackend {
         }
     }
 
-    pub(crate) fn promote_worker_direct_submission(
+    pub(crate) fn accept_direct_submitted(
         &mut self,
-        context: DirectPromotionContext,
-        lease: DirectPrimaryLease,
-        out_fence: Option<OwnedFd>,
-    ) -> Result<CompositorFrameBatchId, Box<DirectPromotionError>> {
+        submitted: SubmittedDirectPrimary,
+    ) -> Result<(), Box<SubmittedDirectPrimaryError>> {
         match self {
-            Self::AtomicEglGbm(scanout) => {
-                scanout.promote_worker_direct_submission(context, lease, out_fence)
-            }
-            _ => Err(Box::new(DirectPromotionError {
-                reason: DirectPromotionFailure::MissingQueued,
+            Self::AtomicEglGbm(scanout) => scanout.accept_direct_submitted(submitted),
+            _ => Err(Box::new(SubmittedDirectPrimaryError {
                 error: io::Error::other("direct worker success requires explicit Atomic scanout"),
-                lease,
-                out_fence,
+                submitted,
             })),
-        }
-    }
-
-    pub(crate) fn fail_worker_direct_submission(
-        &mut self,
-        token: PageFlipToken,
-    ) -> io::Result<CompositorFrameBatchId> {
-        match self {
-            Self::AtomicEglGbm(scanout) => scanout.fail_worker_direct_submission(token),
-            _ => Err(io::Error::other(
-                "direct worker failure requires explicit Atomic scanout",
-            )),
-        }
-    }
-
-    pub(crate) fn suspend_abandon_worker_direct(&mut self, token: PageFlipToken) -> io::Result<()> {
-        match self {
-            Self::AtomicEglGbm(scanout) => scanout.suspend_abandon_worker_direct(token),
-            _ => Err(io::Error::other(
-                "direct worker suspension requires explicit Atomic scanout",
-            )),
-        }
-    }
-
-    pub(crate) fn suspend_worker_direct_submission(
-        &mut self,
-        token: PageFlipToken,
-        lease: DirectPrimaryLease,
-    ) -> Result<(), super::DirectPrimaryLeaseTransferError> {
-        match self {
-            Self::AtomicEglGbm(scanout) => scanout.suspend_worker_direct_submission(token, lease),
-            _ => Err(Box::new((
-                io::Error::other("direct worker suspension requires explicit Atomic scanout"),
-                lease,
-            ))),
-        }
-    }
-
-    pub(crate) fn store_worker_direct_submission(
-        &mut self,
-        frame: WorkerQueuedDirectFrame,
-    ) -> io::Result<()> {
-        match self {
-            Self::AtomicEglGbm(scanout) => scanout.store_worker_direct_submission(frame),
-            _ => Err(io::Error::other(
-                "direct worker metadata requires explicit Atomic scanout",
-            )),
         }
     }
 
