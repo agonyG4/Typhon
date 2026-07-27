@@ -36,6 +36,14 @@ pub(crate) struct KmsCommitJob {
 }
 
 #[derive(Debug)]
+pub(crate) struct KmsSubmittedOwnership {
+    pub(crate) job: KmsCommitJob,
+    pub(crate) out_fence: Option<OwnedFd>,
+    pub(crate) submit_started_at: MonotonicTimestampNs,
+    pub(crate) submit_returned_at: MonotonicTimestampNs,
+}
+
+#[derive(Debug)]
 pub(crate) enum KmsPrimaryUpdate {
     Unchanged,
     Framebuffer {
@@ -77,6 +85,21 @@ impl KmsCommitJob {
     pub(crate) fn validate_against(
         &self,
         transaction: &OutputTransaction,
+    ) -> Result<(), KmsCommitPayloadError> {
+        self.validate_against_mode(transaction, false)
+    }
+
+    pub(crate) fn validate_submitted_against(
+        &self,
+        transaction: &OutputTransaction,
+    ) -> Result<(), KmsCommitPayloadError> {
+        self.validate_against_mode(transaction, true)
+    }
+
+    fn validate_against_mode(
+        &self,
+        transaction: &OutputTransaction,
+        submitted: bool,
     ) -> Result<(), KmsCommitPayloadError> {
         if self.transaction_id != transaction.id()
             || kind_transaction_id(self.kind) != self.transaction_id
@@ -138,7 +161,7 @@ impl KmsCommitJob {
                     framebuffer_id: expected,
                     ..
                 } if expected == framebuffer_id && framebuffer.get() == framebuffer_id
-            ) && in_fence.is_some() => {}
+            ) && (in_fence.is_some() || submitted) => {}
             (
                 AtomicCommitKind::CompositedPrimary { framebuffer_id, .. },
                 OutputTransactionContent::Composited { .. },
@@ -262,6 +285,7 @@ mod tests {
     #[test]
     fn all_worker_payload_types_are_send() {
         _assert_send::<KmsCommitJob>();
+        _assert_send::<KmsSubmittedOwnership>();
         _assert_send::<KmsPrimaryUpdate>();
         _assert_send::<KmsCursorUpdate>();
         _assert_send::<CursorFramebufferPin>();

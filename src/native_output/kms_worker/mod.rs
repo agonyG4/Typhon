@@ -8,7 +8,9 @@ mod timing;
 
 #[cfg(test)]
 pub(crate) use payload::KmsCommitPayloadError;
-pub(crate) use payload::{KmsCommitJob, KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy};
+pub(crate) use payload::{
+    KmsCommitJob, KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy,
+};
 pub(crate) use policy::{
     KmsCommitWorkerPolicy, KmsCommitWorkerStartupError, KmsCommitWorkerTransport,
 };

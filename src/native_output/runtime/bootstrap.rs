@@ -621,6 +621,8 @@ impl NativeRuntime {
             kms_commit_worker_transport,
             quarantined_worker_jobs: Vec::new(),
             emergency_quarantined_worker_jobs: Vec::new(),
+            submitted_worker_ownership: Vec::new(),
+            emergency_quarantined_submitted_ownership: Vec::new(),
             deferred_worker_pageflip: None,
             deferred_worker_completion: None,
             worker_timeout_pending: None,

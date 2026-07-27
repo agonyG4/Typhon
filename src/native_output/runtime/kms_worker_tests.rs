@@ -1,9 +1,11 @@
 use super::kms_worker::{
     FatalWorkerJobDisposition, FatalWorkerJobHandler, UncertainJobRetention,
-    handle_fatal_worker_jobs, retain_uncertain_job_with_suspension,
+    handle_fatal_worker_jobs, retain_submitted_ownership_with_suspension,
+    retain_uncertain_job_with_suspension,
 };
 use crate::native_output::kms_worker::{
-    KmsCommitJob, KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsWorkerFatalJob,
+    KmsCommitJob, KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy,
+    KmsWorkerFatalJob,
 };
 use crate::native_output::runtime::AtomicCommitKind;
 use crate::native_output::scanout::DirectPrimaryLease;
@@ -224,5 +226,33 @@ fn runtime_suspension_retains_job_until_normal_recovery_cleanup() {
     suspended_jobs.clear();
     suspended_jobs.clear();
     drop(suspended_lease.take());
+    assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 1);
+}
+
+#[test]
+fn rejected_submitted_ownership_retains_event_resources_until_cleanup() {
+    let key = test_direct_key();
+    let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
+    let ownership = KmsSubmittedOwnership {
+        job: test_uncertain_direct_job(lease),
+        out_fence: Some(test_eventfd()),
+        submit_started_at: MonotonicTimestampNs::new(1),
+        submit_returned_at: MonotonicTimestampNs::new(2),
+    };
+    let mut emergency = Vec::new();
+
+    retain_submitted_ownership_with_suspension(ownership, &mut emergency, |_token, lease| {
+        Err(Box::new((
+            std::io::Error::other("injected submitted suspension failure"),
+            lease,
+        )))
+    })
+    .unwrap();
+
+    assert_eq!(emergency.len(), 1);
+    assert!(emergency[0].job.direct_primary_lease.is_some());
+    assert!(emergency[0].out_fence.is_some());
+    assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 0);
+    emergency.clear();
     assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 1);
 }

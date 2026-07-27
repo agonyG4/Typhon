@@ -5,8 +5,8 @@
 //! remain owned by the compositor thread.
 
 use super::super::kms_worker::{
-    KmsCommitJob, KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy,
-    KmsWorkerAdmissionError, KmsWorkerEvent, KmsWorkerFatalJob,
+    KmsCommitJob, KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership,
+    KmsTestOnlyPolicy, KmsWorkerAdmissionError, KmsWorkerEvent, KmsWorkerFatalJob,
 };
 use super::presentation_transactions::{
     build_compatibility_transaction, settle_dropped_output_transaction,
@@ -102,6 +102,35 @@ pub(super) fn retain_uncertain_job_with_suspension(
     }
     suspended_jobs.push(job);
     Ok(UncertainJobRetention::Suspended)
+}
+
+pub(super) fn retain_submitted_ownership_with_suspension(
+    mut ownership: KmsSubmittedOwnership,
+    emergency_ownership: &mut Vec<KmsSubmittedOwnership>,
+    suspend_direct: impl FnOnce(
+        PageFlipToken,
+        crate::native_output::scanout::DirectPrimaryLease,
+    ) -> Result<
+        (),
+        crate::native_output::scanout::DirectPrimaryLeaseTransferError,
+    >,
+) -> NativeResult<()> {
+    if matches!(ownership.job.kind, AtomicCommitKind::DirectPrimary { .. })
+        && let Some(lease) = ownership.job.direct_primary_lease.take()
+    {
+        match suspend_direct(ownership.job.token, lease) {
+            Ok(()) => {}
+            Err(error) => {
+                let (error, lease) = *error;
+                eprintln!(
+                    "native KMS worker: submitted direct suspension failed; retaining emergency ownership: {error}"
+                );
+                ownership.job.direct_primary_lease = Some(lease);
+            }
+        }
+    }
+    emergency_ownership.push(ownership);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -629,7 +658,7 @@ pub(super) fn drain_worker_eventfd(
 }
 
 impl NativeRuntime {
-    fn retain_uncertain_worker_job(
+    pub(super) fn retain_uncertain_worker_job(
         &mut self,
         job: KmsCommitJob,
     ) -> NativeResult<UncertainJobRetention> {
@@ -852,51 +881,106 @@ impl NativeRuntime {
         Ok(())
     }
 
+    fn validate_submitted_ownership(&self, ownership: &KmsSubmittedOwnership) -> NativeResult<()> {
+        let job = &ownership.job;
+        if job.output_generation != self.drm_file_generation
+            || self.atomic_commit_arbiter.worker_queued_token() != Some(job.token)
+            || self.atomic_commit_arbiter.worker_queued_kind() != Some(job.kind)
+            || !self.atomic_commit_arbiter.worker_job_queued()
+        {
+            return Err(
+                io::Error::other("worker success did not match queued Atomic ownership").into(),
+            );
+        }
+        let transaction = self
+            .output_transactions
+            .transaction(job.transaction_id)
+            .ok_or_else(|| io::Error::other("worker success transaction is missing"))?;
+        if !matches!(transaction.state(), OutputTransactionState::Queued { .. }) {
+            return Err(io::Error::other("worker success transaction is not queued").into());
+        }
+        job.validate_submitted_against(transaction.descriptor())
+            .map_err(|error| {
+                io::Error::other(format!("invalid submitted worker payload: {error:?}"))
+            })?;
+        Ok(())
+    }
+
+    pub(super) fn quarantine_submitted_ownership(
+        &mut self,
+        ownership: KmsSubmittedOwnership,
+    ) -> NativeResult<()> {
+        if matches!(ownership.job.kind, AtomicCommitKind::DirectPrimary { .. }) {
+            let suspended_jobs = &mut self.emergency_quarantined_submitted_ownership;
+            let scanout = &mut self.scanout;
+            retain_submitted_ownership_with_suspension(
+                ownership,
+                suspended_jobs,
+                |token, lease| scanout.suspend_worker_direct_submission(token, lease),
+            )?;
+        } else {
+            if matches!(
+                ownership.job.kind,
+                AtomicCommitKind::CompositedPrimary { .. }
+            ) {
+                let compatibility_primary = self
+                    .output_transactions
+                    .transaction(ownership.job.transaction_id)
+                    .is_some_and(|transaction| {
+                        matches!(
+                            transaction.descriptor().planes().primary(),
+                            PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
+                        )
+                    });
+                let result = if compatibility_primary {
+                    self.scanout
+                        .suspend_abandon_worker_compatibility(ownership.job.token)
+                } else {
+                    self.scanout
+                        .suspend_abandon_worker_submission(ownership.job.token)
+                };
+                if let Err(error) = result {
+                    eprintln!(
+                        "native KMS worker: submitted output suspension failed; retaining emergency ownership: {error}"
+                    );
+                }
+            }
+            self.emergency_quarantined_submitted_ownership
+                .push(ownership);
+        }
+        self.quarantine_after_worker_fatal()
+    }
+
     fn process_kms_worker_event(&mut self, event: KmsWorkerEvent) -> NativeResult<()> {
         match event {
-            KmsWorkerEvent::Submitted {
-                transaction_id,
-                token,
-                kind,
-                output_generation,
-                queued_at,
-                submit_started_at,
-                submit_returned_at,
-                out_fence,
-                cursor,
-                direct_primary_lease,
-                test_only_policy: _,
-                pacing_frame_id,
-                ready_submit,
-            } => {
-                if output_generation != self.drm_file_generation
-                    || self.atomic_commit_arbiter.worker_queued_token() != Some(token)
-                    || self.atomic_commit_arbiter.worker_queued_kind() != Some(kind)
-                    || !self.atomic_commit_arbiter.worker_job_queued()
-                {
+            KmsWorkerEvent::Submitted { ownership } => {
+                if let Err(error) = self.validate_submitted_ownership(&ownership) {
                     if let Some(worker) = self.kms_commit_worker.as_ref() {
                         worker.record_result_mismatch();
                     }
-                    return Err(io::Error::other(
-                        "worker success did not match queued Atomic ownership",
-                    )
-                    .into());
+                    self.quarantine_submitted_ownership(ownership)?;
+                    return Err(error);
                 }
+                self.submitted_worker_ownership.push(ownership);
+                let ownership = self
+                    .submitted_worker_ownership
+                    .last_mut()
+                    .expect("submitted ownership was just retained");
+                let transaction_id = ownership.job.transaction_id;
+                let token = ownership.job.token;
+                let kind = ownership.job.kind;
+                let queued_at = ownership.job.queued_at.get();
+                let submit_started_at = ownership.submit_started_at.get();
+                let submit_returned_at = ownership.submit_returned_at.get();
+                let cursor = ownership.job.cursor.clone();
+                let pacing_frame_id = ownership.job.pacing_frame_id;
+                let ready_submit = ownership.job.ready_submit;
+                let out_fence = ownership.out_fence.take();
+                let direct_primary_lease = ownership.job.direct_primary_lease.take();
                 let transaction = self
                     .output_transactions
                     .transaction(transaction_id)
-                    .ok_or_else(|| {
-                        if let Some(worker) = self.kms_commit_worker.as_ref() {
-                            worker.record_result_mismatch();
-                        }
-                        io::Error::other("worker success transaction is missing")
-                    })?;
-                if !matches!(transaction.state(), OutputTransactionState::Queued { .. }) {
-                    if let Some(worker) = self.kms_commit_worker.as_ref() {
-                        worker.record_result_mismatch();
-                    }
-                    return Err(io::Error::other("worker success transaction is not queued").into());
-                }
+                    .ok_or_else(|| io::Error::other("worker success transaction is missing"))?;
                 let compatibility_primary = matches!(
                     transaction.descriptor().planes().primary(),
                     PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }

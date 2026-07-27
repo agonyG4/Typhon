@@ -1,6 +1,6 @@
 //! Atomic submit worker thread and lifecycle boundary.
 
-use super::payload::{KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy};
+use super::payload::{KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy};
 use super::queue::{
     KmsWorkerFatalJob, KmsWorkerForcedShutdown, KmsWorkerLifecycle, KmsWorkerShutdownSnapshot,
     RESULT_EVENT_CAPACITY, WorkerInFlight, WorkerMetricsSnapshot, WorkerShared, create_eventfd,
@@ -12,6 +12,7 @@ use super::{
 use crate::native_output::{OutputTransactionId, runtime::AtomicCommitKind};
 use oblivion_one::native::kms::AtomicCommitSubmitter;
 use oblivion_one::native::kms::{AtomicKmsError, AtomicKmsErrorKind, PageFlipToken};
+use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
 use std::{
     io,
     os::fd::{AsRawFd, BorrowedFd, OwnedFd},
@@ -51,19 +52,7 @@ pub(crate) enum KmsWorkerFatalReason {
 #[derive(Debug)]
 pub(crate) enum KmsWorkerEvent {
     Submitted {
-        transaction_id: OutputTransactionId,
-        token: PageFlipToken,
-        kind: AtomicCommitKind,
-        output_generation: u64,
-        queued_at: u64,
-        submit_started_at: u64,
-        submit_returned_at: u64,
-        out_fence: Option<OwnedFd>,
-        cursor: KmsCursorUpdate,
-        direct_primary_lease: Option<crate::native_output::scanout::DirectPrimaryLease>,
-        test_only_policy: KmsTestOnlyPolicy,
-        pacing_frame_id: Option<u64>,
-        ready_submit: bool,
+        ownership: KmsSubmittedOwnership,
     },
     TestRejected {
         job: KmsCommitJob,
@@ -661,8 +650,6 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
             };
             match submission {
                 Ok(Ok(submission)) => {
-                    let direct_primary_lease = job.direct_primary_lease.take();
-                    let test_only_policy = job.test_only;
                     if let KmsPrimaryUpdate::Framebuffer { in_fence, .. } = &mut job.primary {
                         // The ioctl has consumed the input-fence contract. The
                         // fence must not remain owned while waiting for the pageflip.
@@ -691,25 +678,20 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         .metrics
                         .queue_wait_ns_max
                         .fetch_max(queue_wait_ns, std::sync::atomic::Ordering::Relaxed);
+                    let transaction_id = job.transaction_id;
+                    let token = job.token;
                     let event = KmsWorkerEvent::Submitted {
-                        transaction_id: job.transaction_id,
-                        token: job.token,
-                        kind: job.kind,
-                        output_generation: job.output_generation,
-                        queued_at: job.queued_at.get(),
-                        submit_started_at,
-                        submit_returned_at,
-                        out_fence: submission.out_fence,
-                        cursor: job.cursor.clone(),
-                        direct_primary_lease,
-                        test_only_policy,
-                        pacing_frame_id: job.pacing_frame_id,
-                        ready_submit: job.ready_submit,
+                        ownership: KmsSubmittedOwnership {
+                            job,
+                            out_fence: submission.out_fence,
+                            submit_started_at: MonotonicTimestampNs::new(submit_started_at),
+                            submit_returned_at: MonotonicTimestampNs::new(submit_returned_at),
+                        },
                     };
                     if !publish_event(&shared, event) {
                         return;
                     }
-                    if !wait_for_pageflip_or_quiesce(&shared, job.transaction_id, job.token) {
+                    if !wait_for_pageflip_or_quiesce(&shared, transaction_id, token) {
                         return;
                     }
                     timing

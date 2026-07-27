@@ -9,6 +9,7 @@ mod cycle_dispatch;
 mod direct_plan;
 mod frame;
 mod kms_worker;
+mod kms_worker_teardown;
 #[cfg(test)]
 mod kms_worker_tests;
 mod metrics;
@@ -149,6 +150,8 @@ pub(crate) struct NativeRuntime {
     kms_commit_worker_transport: super::kms_worker::KmsCommitWorkerTransport,
     quarantined_worker_jobs: Vec<super::kms_worker::KmsCommitJob>,
     emergency_quarantined_worker_jobs: Vec<super::kms_worker::KmsCommitJob>,
+    submitted_worker_ownership: Vec<super::kms_worker::KmsSubmittedOwnership>,
+    emergency_quarantined_submitted_ownership: Vec<super::kms_worker::KmsSubmittedOwnership>,
     deferred_worker_pageflip: Option<DrmPresentationEvent>,
     deferred_worker_completion: Option<AtomicCommitCompletion>,
     worker_timeout_pending: Option<(PageFlipToken, u64)>,
@@ -263,30 +266,8 @@ impl Drop for NativeRuntime {
             }
             worker.request_quiesce();
             let _ = worker.join();
-            let _ = kms_worker::handle_fatal_worker_jobs(
-                worker.take_fatal_jobs(),
-                self,
-                kms_worker::FatalWorkerJobDisposition::Drop,
-            );
-        }
-        let abandoned_at = MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(0));
-        let transaction_ids = self.output_transactions.active_transaction_ids();
-        for transaction_id in transaction_ids {
-            let _ = presentation_transactions::complete_dropped_output_transaction(
-                &mut self.output_transactions,
-                transaction_id,
-                OutputTransactionDropReason::OutputDestroyed,
-                abandoned_at,
-                |obligations| {
-                    if let Some(batch_id) = obligations.frame_batch_id() {
-                        self.server.complete_frame_batch_after_safe_abandonment(
-                            batch_id,
-                            FrameBatchDiscardReason::OutputDestroyed,
-                        );
-                    }
-                    Ok(())
-                },
-            );
+            let _ = self.drain_kms_worker_events_for_teardown(&worker);
+            let _ = self.defer_fatal_worker_jobs_for_teardown(worker.take_fatal_jobs());
         }
         self.revoke_xwayland_private_client();
         let _ = self
@@ -366,8 +347,30 @@ impl Drop for NativeRuntime {
         // Active KMS ownership was restored above; it is dropped exactly once
         // here, while `kms` is still alive.
         unsafe { mem::ManuallyDrop::drop(&mut self.scanout) };
+        self.submitted_worker_ownership.clear();
         self.quarantined_worker_jobs.clear();
         self.emergency_quarantined_worker_jobs.clear();
+        self.emergency_quarantined_submitted_ownership.clear();
+
+        let abandoned_at = MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(0));
+        let transaction_ids = self.output_transactions.active_transaction_ids();
+        for transaction_id in transaction_ids {
+            let _ = presentation_transactions::complete_dropped_output_transaction(
+                &mut self.output_transactions,
+                transaction_id,
+                OutputTransactionDropReason::OutputDestroyed,
+                abandoned_at,
+                |obligations| {
+                    if let Some(batch_id) = obligations.frame_batch_id() {
+                        self.server.complete_frame_batch_after_safe_abandonment(
+                            batch_id,
+                            FrameBatchDiscardReason::OutputDestroyed,
+                        );
+                    }
+                    Ok(())
+                },
+            );
+        }
 
         // Client buffers are released only after KMS ownership has ended and
         // the EGL/GBM renderer has been torn down, so shutdown cannot reuse a

@@ -6,7 +6,7 @@ use super::{
 };
 use crate::native_output::scanout::DirectPrimaryLease;
 use crate::native_output::{
-    ContentEpochId, DirectScanoutCandidateKey, OutputContentKey, OutputReleasePlan,
+    ContentEpochId, DirectScanoutCandidateKey, OutputContentKey, OutputReleasePlan, OutputSlotId,
     OutputTransaction, OutputTransactionId, runtime::AtomicCommitKind,
 };
 use oblivion_one::native::presentation_deadline::{
@@ -87,6 +87,45 @@ fn test_direct_transaction_with_surface_id(
         OutputReleasePlan::Pageflip,
     )
     .expect("direct transaction")
+}
+
+#[test]
+fn submitted_composited_job_accepts_consumed_input_fence() {
+    let token = 602;
+    let transaction_id =
+        OutputTransactionId::new(std::num::NonZeroU64::new(token).expect("transaction id"));
+    let transaction = OutputTransaction::composited(
+        transaction_id,
+        1,
+        MonotonicTimestampNs::new(10),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        token,
+        12,
+        13,
+        OutputSlotId::new(0).expect("output slot"),
+        42,
+        None,
+        oblivion_one::compositor::CompositorFrameBatchId::new(
+            std::num::NonZeroU64::new(token).expect("frame batch id"),
+        ),
+    )
+    .expect("composited transaction");
+    let mut job = test_job(token);
+    job.kind = AtomicCommitKind::CompositedPrimary {
+        transaction_id,
+        frame_id: token,
+        framebuffer_id: 42,
+    };
+    job.target = test_target();
+    job.primary = KmsPrimaryUpdate::Framebuffer {
+        framebuffer: oblivion_one::native::kms::FramebufferId::new(42).expect("framebuffer"),
+        in_fence: None,
+        request_out_fence: false,
+    };
+
+    assert!(job.validate_against(&transaction).is_err());
+    assert_eq!(job.validate_submitted_against(&transaction), Ok(()));
 }
 
 fn test_direct_job(
@@ -269,7 +308,7 @@ fn direct_ebusy_retry_keeps_the_same_lease_identity() {
     let events = wait_for_fence_event(
         &handle,
         65,
-        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 65),
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 65),
     );
     assert_eq!(
         *executor.observations.lock().unwrap(),
@@ -389,15 +428,13 @@ fn successful_direct_submit_transfers_the_lease_to_submitted_event() {
     let events = wait_for_fence_event(
         &handle,
         69,
-        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 69),
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 69),
     );
     assert!(events.iter().any(|event| matches!(
         event,
-        KmsWorkerEvent::Submitted {
-            direct_primary_lease: Some(lease),
-            test_only_policy: KmsTestOnlyPolicy::Skip,
-            ..
-        } if lease.key() == key && lease.framebuffer_id() == 42
+        KmsWorkerEvent::Submitted { ownership } if ownership.job.direct_primary_lease.as_ref()
+            .is_some_and(|lease| lease.key() == key && lease.framebuffer_id() == 42)
+            && ownership.job.test_only == KmsTestOnlyPolicy::Skip
     )));
     assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 0);
     handle

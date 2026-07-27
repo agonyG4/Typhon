@@ -332,10 +332,8 @@ pub(super) fn wait_for_fence_event(
         events.extend(collect_events(handle));
         if events.iter().any(&predicate) {
             assert!(events.iter().any(|event| match event {
-                KmsWorkerEvent::Submitted {
-                    token: event_token, ..
-                }
-                | KmsWorkerEvent::BusyDeferred {
+                KmsWorkerEvent::Submitted { ownership } => ownership.job.token.get() == token,
+                KmsWorkerEvent::BusyDeferred {
                     token: event_token, ..
                 }
                 | KmsWorkerEvent::SubmitLate {
@@ -374,7 +372,7 @@ fn busy_retry_preserves_input_fence_for_every_attempt() {
     let events = wait_for_fence_event(
         &handle,
         30,
-        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 30),
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 30),
     );
     assert_eq!(*executor.attempts.lock().unwrap(), vec![raw_fd, raw_fd]);
     handle
@@ -404,7 +402,7 @@ fn successful_retry_releases_input_fence_after_submit() {
     let events = wait_for_fence_event(
         &handle,
         31,
-        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 31),
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 31),
     );
     assert!(fd_is_closed_or_reused(raw_fd, original_identity.as_deref()));
     handle
@@ -842,7 +840,7 @@ fn cursor_only_pageflip_ack_releases_worker_inflight() {
     let events = wait_for_fence_event(
         &handle,
         14,
-        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 14),
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 14),
     );
     handle.ack_pageflip(token, transaction_id, 1).unwrap();
     assert!(!handle.inflight());
@@ -863,7 +861,7 @@ fn duplicate_worker_pageflip_ack_is_rejected() {
     let events = wait_for_fence_event(
         &handle,
         15,
-        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 15),
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 15),
     );
     handle
         .ack_pageflip(test_job(15).token, test_job(15).transaction_id, 1)
@@ -889,7 +887,7 @@ fn wrong_worker_ack_preserves_inflight() {
     let events = wait_for_fence_event(
         &handle,
         16,
-        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 16),
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 16),
     );
     assert_eq!(
         handle.ack_pageflip(test_job(17).token, test_job(16).transaction_id, 1),
@@ -1000,7 +998,7 @@ fn shutdown_ack_never_releases_queued_next_job() {
     wait_for_fence_event(
         &handle,
         40,
-        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 40),
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 40),
     );
     reserve_for_test(&handle, test_job(41).kind)
         .enqueue(test_job(41))
@@ -1084,7 +1082,7 @@ fn shutdown_quiesce_with_normal_ack_terminates_worker() {
     wait_for_fence_event(
         &handle,
         46,
-        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 46),
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 46),
     );
 
     let snapshot = handle.begin_shutdown_quiesce().unwrap();
@@ -1111,7 +1109,7 @@ fn forced_shutdown_abandonment_wakes_inflight_worker_without_next_submit() {
     wait_for_fence_event(
         &handle,
         47,
-        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 47),
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 47),
     );
     reserve_for_test(&handle, test_job(48).kind)
         .enqueue(test_job(48))
@@ -1163,7 +1161,7 @@ fn forced_shutdown_abandonment_is_idempotent_after_late_ack_stops_worker() {
     wait_for_fence_event(
         &handle,
         49,
-        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 49),
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 49),
     );
 
     let snapshot = handle.begin_shutdown_quiesce().unwrap();
@@ -1223,10 +1221,10 @@ fn primary_job_keeps_queued_cursor_pin_until_submission_completes() {
     reserve_for_test(&handle, test_job(51).kind)
         .enqueue(test_job(51))
         .unwrap();
-    wait_for_fence_event(
+    let first_submission = wait_for_fence_event(
         &handle,
         51,
-        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 51),
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 51),
     );
 
     reserve_for_test(
@@ -1246,10 +1244,11 @@ fn primary_job_keeps_queued_cursor_pin_until_submission_completes() {
     handle
         .ack_pageflip(test_job(51).token, test_job(51).transaction_id, 1)
         .unwrap();
-    wait_for_fence_event(
+    drop(first_submission);
+    let second_submission = wait_for_fence_event(
         &handle,
         52,
-        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 52),
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 52),
     );
     arbitration.consume_submitted_epoch(10, 120, 200);
     assert!(arbitration.pending());
@@ -1258,6 +1257,7 @@ fn primary_job_keeps_queued_cursor_pin_until_submission_completes() {
     handle
         .ack_pageflip(test_job(52).token, test_job(52).transaction_id, 1)
         .unwrap();
+    drop(second_submission);
     for _ in 0..100 {
         if !pin_observer.is_job_owned() {
             break;
@@ -1293,7 +1293,7 @@ fn primary_job_preserves_exact_cursor_pin_across_busy_retry() {
     wait_for_fence_event(
         &handle,
         53,
-        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 53),
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 53),
     );
     assert_eq!(*executor.attempts.lock().unwrap(), vec![(91, 91), (91, 91)]);
     assert!(pin_observer.is_job_owned());
@@ -1367,7 +1367,7 @@ fn shutdown_detaches_queued_primary_cursor_pin_once() {
     wait_for_fence_event(
         &handle,
         55,
-        |event| matches!(event, KmsWorkerEvent::Submitted { token, .. } if token.get() == 55),
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 55),
     );
     reserve_for_test(
         &handle,

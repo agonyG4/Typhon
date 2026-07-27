@@ -258,6 +258,7 @@ impl NativeRuntime {
             output_render_fence_token,
             kms_commit_worker,
             kms_commit_worker_transport,
+            submitted_worker_ownership,
             deferred_worker_pageflip: _,
             deferred_worker_completion: _,
             worker_timeout_pending: _,
@@ -932,16 +933,15 @@ impl NativeRuntime {
                         | AtomicCommitKind::DirectPrimary { transaction_id, .. }
                         | AtomicCommitKind::CursorOnly { transaction_id, .. } => transaction_id,
                     };
+                    let pageflip_token = PageFlipToken::new(pageflip.user_data)
+                        .ok_or_else(|| io::Error::other("pageflip token is zero"))?;
                     worker
-                        .ack_pageflip(
-                            PageFlipToken::new(pageflip.user_data)
-                                .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
-                            transaction_id,
-                            *drm_file_generation,
-                        )
+                        .ack_pageflip(pageflip_token, transaction_id, *drm_file_generation)
                         .map_err(|error| {
                             io::Error::other(format!("worker pageflip ack: {error:?}"))
                         })?;
+                    submitted_worker_ownership
+                        .retain(|ownership| ownership.job.token != pageflip_token);
                 }
             }
         }
