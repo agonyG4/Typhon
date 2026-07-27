@@ -89,12 +89,13 @@ impl NativeScanoutBackend {
         &mut self,
         token: PageFlipToken,
         lease: DirectPrimaryLease,
-    ) -> io::Result<()> {
+    ) -> Result<(), super::DirectPrimaryLeaseTransferError> {
         match self {
             Self::AtomicEglGbm(scanout) => scanout.suspend_worker_direct_submission(token, lease),
-            _ => Err(io::Error::other(
-                "direct worker suspension requires explicit Atomic scanout",
-            )),
+            _ => Err(Box::new((
+                io::Error::other("direct worker suspension requires explicit Atomic scanout"),
+                lease,
+            ))),
         }
     }
 

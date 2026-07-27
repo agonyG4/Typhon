@@ -820,6 +820,11 @@ fn worker_panic_becomes_fatal_event() {
             }
         )
     }));
+    let fatal_jobs = handle.take_fatal_jobs();
+    assert_eq!(fatal_jobs.len(), 1);
+    assert!(fatal_jobs[0].uncertain_submit);
+    assert!(handle.take_fatal_jobs().is_empty());
+    drop(fatal_jobs);
     handle.join().unwrap();
 }
 

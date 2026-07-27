@@ -205,11 +205,12 @@ impl NativeSessionIo for NativeRuntime {
                 event_error = Some(error.to_string());
             }
         }
-        let uncertain_submit = handle_fatal_worker_jobs(
+        let uncertain_submit = !handle_fatal_worker_jobs(
             worker.take_fatal_jobs(),
             self,
             FatalWorkerJobDisposition::Drop,
-        )?;
+        )?
+        .is_empty();
         if uncertain_submit {
             self.quarantine_after_worker_fatal()?;
         }
@@ -322,6 +323,7 @@ impl NativeSessionIo for NativeRuntime {
         })?;
         self.scanout.complete_session_recovery(*recovery)?;
         self.quarantined_worker_jobs.clear();
+        self.emergency_quarantined_worker_jobs.clear();
         let abandoned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         let transaction_ids = self.output_transactions.active_transaction_ids();
         let output_transactions = &mut self.output_transactions;

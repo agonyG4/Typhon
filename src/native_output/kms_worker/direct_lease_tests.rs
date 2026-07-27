@@ -200,6 +200,14 @@ struct DirectLeaseRecordingExecutor {
     observations: Mutex<Vec<(DirectScanoutCandidateKey, u32)>>,
 }
 
+struct PanicDirectLeaseExecutor;
+
+impl KmsCommitExecutor for PanicDirectLeaseExecutor {
+    fn submit(&self, _job: &KmsCommitJob) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure> {
+        panic!("fake direct worker panic");
+    }
+}
+
 impl KmsCommitExecutor for DirectLeaseRecordingExecutor {
     fn submit(&self, job: &KmsCommitJob) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure> {
         if let Some(lease) = job.direct_primary_lease.as_ref() {
@@ -398,5 +406,32 @@ fn successful_direct_submit_transfers_the_lease_to_submitted_event() {
     drop(events);
     assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 1);
     handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn uncertain_worker_fatal_retains_the_complete_direct_job_once() {
+    let handle = KmsCommitWorkerHandle::start(Arc::new(PanicDirectLeaseExecutor)).unwrap();
+    let key = test_direct_key(3);
+    let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
+    reserve_for_test(&handle, test_job(70).kind)
+        .enqueue(test_direct_job(70, key, 42, Some(lease)))
+        .unwrap();
+
+    for _ in 0..200 {
+        if handle.fatal_reason().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(handle.fatal_reason().is_some());
+    let fatal_jobs = handle.take_fatal_jobs();
+    assert_eq!(fatal_jobs.len(), 1);
+    assert!(fatal_jobs[0].uncertain_submit);
+    assert!(fatal_jobs[0].job.direct_primary_lease.is_some());
+    assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 0);
+    assert!(handle.take_fatal_jobs().is_empty());
+    drop(fatal_jobs);
+    assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 1);
     handle.join().unwrap();
 }

@@ -207,19 +207,30 @@ impl DirectScanoutState {
         &mut self,
         token: PageFlipToken,
         lease: DirectPrimaryLease,
-    ) -> io::Result<()> {
-        let Some(frame) = self.worker_queued.take() else {
-            return Err(io::Error::other(
-                "suspended direct worker token has no queued metadata",
-            ));
+    ) -> Result<(), super::DirectPrimaryLeaseTransferError> {
+        let Some(frame) = self.worker_queued.as_ref() else {
+            return Err(Box::new((
+                io::Error::other("suspended direct worker token has no queued metadata"),
+                lease,
+            )));
         };
         if frame.token != token {
-            self.worker_queued = Some(frame);
-            return Err(io::Error::other(
-                "suspended direct worker token does not match queued ownership",
-            ));
+            return Err(Box::new((
+                io::Error::other("suspended direct worker token does not match queued ownership"),
+                lease,
+            )));
         }
-        let (_, _, buffer, framebuffer, surface_damage) = lease.into_parts()?;
+        if !lease.validate_against(frame.key, frame.surface_id, frame.framebuffer_id) {
+            return Err(Box::new((
+                io::Error::other("suspended direct worker lease does not match queued ownership"),
+                lease,
+            )));
+        }
+        let (_, _, buffer, framebuffer, surface_damage) = lease.try_into_parts()?;
+        let frame = self
+            .worker_queued
+            .take()
+            .expect("queued worker frame was validated above");
         self.suspended.push(SuspendedDirectFrame {
             buffer,
             framebuffer,
@@ -357,5 +368,130 @@ impl DirectScanoutState {
             });
         }
         self.inhibit_until_composited_present = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_output::scanout::DirectPrimaryLease;
+    use oblivion_one::compositor::{CompositorFrameBatchId, OwnCompositorServer};
+    use std::os::fd::AsFd;
+    use std::sync::atomic::Ordering;
+
+    fn test_key() -> DirectScanoutCandidateKey {
+        DirectScanoutCandidateKey {
+            content: OutputContentKey::new(
+                7,
+                std::num::NonZeroU64::new(42).expect("test buffer ID"),
+                ContentEpochId::new(std::num::NonZeroU64::new(3).expect("test content epoch")),
+                1920,
+                1080,
+                0x3432_5241,
+                0,
+                0,
+                1_000,
+                0,
+            ),
+            output_generation: 1,
+            cursor_plan_key: None,
+            color_epoch: 0,
+        }
+    }
+
+    fn test_target() -> PresentationTarget {
+        let now = MonotonicTimestampNs::new(10);
+        PresentationTarget {
+            sequence: 2,
+            presentation_time: now,
+            submit_not_before: now,
+            render_start_deadline: now,
+            refresh_interval: std::time::Duration::from_millis(10),
+            reason: PresentationTargetReason::ReactiveDouble,
+            clock_generation: 1,
+            estimated: false,
+            predicted_unreachable: false,
+        }
+    }
+
+    fn test_queued_frame(token: u64, key: DirectScanoutCandidateKey) -> WorkerQueuedDirectFrame {
+        WorkerQueuedDirectFrame {
+            frame_id: token,
+            transaction_id: OutputTransactionId::new(
+                std::num::NonZeroU64::new(token).expect("test transaction ID"),
+            ),
+            key,
+            surface_id: key.content.surface_id,
+            token: PageFlipToken::new(token).expect("test token"),
+            protocol_batch_id: CompositorFrameBatchId::new(
+                std::num::NonZeroU64::new(token).expect("test batch ID"),
+            ),
+            framebuffer_id: 42,
+            target: test_target(),
+        }
+    }
+
+    #[test]
+    fn failed_worker_suspension_returns_the_lease_unchanged() {
+        let file = std::fs::File::open("/dev/null").expect("test DRM file");
+        let mut state = DirectScanoutState::new(file.as_fd(), 1);
+        let key = test_key();
+        let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
+        let error = state
+            .suspend_worker_submission(PageFlipToken::new(70).expect("test token"), lease)
+            .expect_err("missing queued state should fail");
+        let (_error, lease) = *error;
+
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
+        drop(lease);
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn failed_lease_conversion_keeps_queued_state_and_returns_the_lease() {
+        let file = std::fs::File::open("/dev/null").expect("test DRM file");
+        let mut state = DirectScanoutState::new(file.as_fd(), 1);
+        let key = test_key();
+        let token = PageFlipToken::new(72).expect("test token");
+        state
+            .store_worker_queued(test_queued_frame(token.get(), key))
+            .expect("store queued frame");
+        let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
+        let error = state
+            .suspend_worker_submission(token, lease)
+            .expect_err("missing surface damage should fail before ownership mutation");
+        let (_error, lease) = *error;
+
+        assert_eq!(state.worker_queued_token(), Some(token));
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
+        drop(lease);
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn successful_worker_suspension_releases_resources_only_after_recovery() {
+        let file = std::fs::File::open("/dev/null").expect("test DRM file");
+        let mut state = DirectScanoutState::new(file.as_fd(), 1);
+        let key = test_key();
+        let token = PageFlipToken::new(71).expect("test token");
+        state
+            .store_worker_queued(test_queued_frame(token.get(), key))
+            .expect("store queued frame");
+        let server = OwnCompositorServer::bind_cpu_composition(format!(
+            "typhon-direct-suspend-test-{}",
+            std::process::id()
+        ))
+        .expect("bind test compositor");
+        let damage = server.capture_surface_damage_presentation();
+        let (lease, cleanup_count) =
+            DirectPrimaryLease::test_fixture_with_probe_and_damage(key, 42, Some(damage));
+
+        state
+            .suspend_worker_submission(token, lease)
+            .expect("suspend queued worker frame");
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
+
+        state.complete_suspended();
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
     }
 }

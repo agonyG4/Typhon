@@ -9,6 +9,8 @@ mod cycle_dispatch;
 mod direct_plan;
 mod frame;
 mod kms_worker;
+#[cfg(test)]
+mod kms_worker_tests;
 mod metrics;
 mod planner;
 mod presentation;
@@ -146,6 +148,7 @@ pub(crate) struct NativeRuntime {
     kms_commit_worker_policy: super::kms_worker::KmsCommitWorkerPolicy,
     kms_commit_worker_transport: super::kms_worker::KmsCommitWorkerTransport,
     quarantined_worker_jobs: Vec<super::kms_worker::KmsCommitJob>,
+    emergency_quarantined_worker_jobs: Vec<super::kms_worker::KmsCommitJob>,
     deferred_worker_pageflip: Option<DrmPresentationEvent>,
     deferred_worker_completion: Option<AtomicCommitCompletion>,
     worker_timeout_pending: Option<(PageFlipToken, u64)>,
@@ -260,6 +263,11 @@ impl Drop for NativeRuntime {
             }
             worker.request_quiesce();
             let _ = worker.join();
+            let _ = kms_worker::handle_fatal_worker_jobs(
+                worker.take_fatal_jobs(),
+                self,
+                kms_worker::FatalWorkerJobDisposition::Drop,
+            );
         }
         let abandoned_at = MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(0));
         let transaction_ids = self.output_transactions.active_transaction_ids();
@@ -358,6 +366,8 @@ impl Drop for NativeRuntime {
         // Active KMS ownership was restored above; it is dropped exactly once
         // here, while `kms` is still alive.
         unsafe { mem::ManuallyDrop::drop(&mut self.scanout) };
+        self.quarantined_worker_jobs.clear();
+        self.emergency_quarantined_worker_jobs.clear();
 
         // Client buffers are released only after KMS ownership has ended and
         // the EGL/GBM renderer has been torn down, so shutdown cannot reuse a

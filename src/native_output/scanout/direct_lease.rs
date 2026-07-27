@@ -14,6 +14,15 @@ pub(crate) struct DirectPrimaryLease {
     surface_damage: Option<SurfaceDamagePresentation>,
 }
 
+pub(crate) type DirectPrimaryLeaseParts = (
+    DirectScanoutCandidateKey,
+    u32,
+    DmabufBufferHandle,
+    Arc<ImportedDirectFramebuffer>,
+    SurfaceDamagePresentation,
+);
+pub(crate) type DirectPrimaryLeaseTransferError = Box<(io::Error, DirectPrimaryLease)>;
+
 impl DirectPrimaryLease {
     pub(crate) fn new(
         candidate: DirectScanoutSceneCandidate,
@@ -90,6 +99,32 @@ impl DirectPrimaryLease {
         Ok((key, surface_id, _buffer, framebuffer, surface_damage))
     }
 
+    pub(crate) fn try_into_parts(
+        mut self,
+    ) -> Result<DirectPrimaryLeaseParts, DirectPrimaryLeaseTransferError> {
+        if !self.has_surface_damage() {
+            return Err(Box::new((
+                io::Error::other("direct surface damage already settled"),
+                self,
+            )));
+        }
+        let surface_damage = self
+            .surface_damage
+            .take()
+            .expect("surface damage checked above");
+        let Self {
+            key,
+            surface_id,
+            _buffer,
+            framebuffer,
+            surface_damage: None,
+        } = self
+        else {
+            unreachable!("surface damage was consumed above");
+        };
+        Ok((key, surface_id, _buffer, framebuffer, surface_damage))
+    }
+
     #[cfg(test)]
     pub(crate) fn test_fixture(key: DirectScanoutCandidateKey, framebuffer_id: u32) -> Self {
         Self::test_fixture_with_probe(key, framebuffer_id).0
@@ -100,6 +135,15 @@ impl DirectPrimaryLease {
         key: DirectScanoutCandidateKey,
         framebuffer_id: u32,
     ) -> (Self, Arc<std::sync::atomic::AtomicU64>) {
+        Self::test_fixture_with_probe_and_damage(key, framebuffer_id, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fixture_with_probe_and_damage(
+        key: DirectScanoutCandidateKey,
+        framebuffer_id: u32,
+        surface_damage: Option<SurfaceDamagePresentation>,
+    ) -> (Self, Arc<std::sync::atomic::AtomicU64>) {
         let (framebuffer, buffer, cleanup_count) =
             super::test_direct_primary_framebuffer(framebuffer_id);
         (
@@ -108,7 +152,7 @@ impl DirectPrimaryLease {
                 surface_id: key.content.surface_id,
                 _buffer: buffer,
                 framebuffer,
-                surface_damage: None,
+                surface_damage,
             },
             cleanup_count,
         )

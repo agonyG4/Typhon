@@ -64,7 +64,7 @@ impl AtomicEglGbmScanout {
         &mut self,
         token: PageFlipToken,
         lease: DirectPrimaryLease,
-    ) -> io::Result<()> {
+    ) -> Result<(), super::super::direct_lease::DirectPrimaryLeaseTransferError> {
         self.direct.suspend_worker_submission(token, lease)
     }
 
