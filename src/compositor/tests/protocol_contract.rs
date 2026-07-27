@@ -47,6 +47,15 @@ fn normal_clients_do_not_receive_private_xwayland_global() {
 }
 
 #[test]
+fn unproven_kms_teardown_disarms_server_shutdown_releases() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    assert!(server.shutdown_releases_armed_for_test());
+    server.disarm_shutdown_releases();
+    assert!(!server.shutdown_releases_armed_for_test());
+}
+
+#[test]
 fn active_private_xwayland_client_receives_shell_global() {
     let socket_name = unique_socket_name();
     let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();

@@ -71,6 +71,7 @@ pub struct OwnCompositorServer {
     xwayland_global_data: XwaylandShellGlobalData,
     xwayland_disconnects: Vec<XwaylandClientIdentity>,
     gpu_buffer_protocols_enabled: bool,
+    shutdown_releases_armed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +113,9 @@ impl ClientData for TyphonClientData {
 
 impl Drop for OwnCompositorServer {
     fn drop(&mut self) {
-        self.finish_commit_debug_for_shutdown();
+        if self.shutdown_releases_armed {
+            self.finish_commit_debug_for_shutdown();
+        }
     }
 }
 
@@ -130,6 +133,9 @@ impl OwnCompositorServer {
     }
 
     pub fn finish_commit_debug_for_shutdown(&mut self) {
+        if !self.shutdown_releases_armed {
+            return;
+        }
         self.state.release_cached_resources_for_shutdown();
         self.state.discard_all_pending_presentation_feedbacks();
         self.state.release_client_buffers_for_shutdown();
@@ -140,6 +146,15 @@ impl OwnCompositorServer {
         if let Some(summary) = self.state.take_commit_debug_summary_line() {
             println!("{summary}");
         }
+    }
+
+    pub fn disarm_shutdown_releases(&mut self) {
+        self.shutdown_releases_armed = false;
+    }
+
+    #[cfg(test)]
+    pub(super) const fn shutdown_releases_armed_for_test(&self) -> bool {
+        self.shutdown_releases_armed
     }
 
     pub fn bind(socket_name: impl Into<String>) -> Result<Self, CompositorError> {
@@ -297,6 +312,7 @@ impl OwnCompositorServer {
             xwayland_disconnects: Vec::new(),
             gpu_buffer_protocols_enabled: gpu_buffers_enabled
                 && gpu_capabilities.any_global_enabled(),
+            shutdown_releases_armed: true,
         })
     }
 

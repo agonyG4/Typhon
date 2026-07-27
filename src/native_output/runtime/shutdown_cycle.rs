@@ -142,13 +142,13 @@ impl NativeRuntime {
             NativeSessionIo::observe(self, NativeIoOperation::PageflipQuarantine);
             NativeSessionIo::quarantine_pageflip(self)?;
         }
-        if let Some(identity) = forced_identity {
-            self.settle_forced_shutdown_inflight(identity)?;
-        }
         self.acquire_watches.shutdown(&mut self.event_loop)?;
         if !self.session.permits_output() {
             teardown_without_drm_io(self);
             self.parked_acquire_watches.clear();
+            if let Some(identity) = forced_identity {
+                self.settle_forced_shutdown_inflight(identity)?;
+            }
             self.perf.log("native.shutdown_session", || {
                 vec![NativePerfField::str(
                     "action",
@@ -167,6 +167,9 @@ impl NativeRuntime {
         NativeSessionIo::observe(self, NativeIoOperation::KmsRestore);
         let restoration = self.kms_backend.restore()?;
         native_shutdown_debug_log("kms_restore_end");
+        if let Some(identity) = forced_identity {
+            self.settle_forced_shutdown_inflight(identity)?;
+        }
         self.perf.log("native.kms_restore", || {
             vec![
                 NativePerfField::str("backend", self.kms_backend.effective_kind().as_str()),

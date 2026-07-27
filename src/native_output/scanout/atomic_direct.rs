@@ -33,12 +33,59 @@ pub(crate) struct SubmittedDirectFrame {
 pub(crate) struct WorkerQueuedDirectFrame {
     pub(crate) frame_id: u64,
     pub(crate) transaction_id: OutputTransactionId,
+    pub(crate) output_generation: u64,
     pub(crate) key: DirectScanoutCandidateKey,
     pub(crate) surface_id: u32,
     pub(crate) token: PageFlipToken,
     pub(crate) protocol_batch_id: CompositorFrameBatchId,
     pub(crate) framebuffer_id: u32,
     pub(crate) target: PresentationTarget,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DirectPromotionContext {
+    pub(crate) transaction_id: OutputTransactionId,
+    pub(crate) token: PageFlipToken,
+    pub(crate) output_generation: u64,
+    pub(crate) target: PresentationTarget,
+    pub(crate) submit_started_at: MonotonicTimestampNs,
+    pub(crate) submit_returned_at: MonotonicTimestampNs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectPromotionFailure {
+    MissingQueued,
+    TokenMismatch,
+    TransactionMismatch,
+    GenerationMismatch,
+    TargetMismatch,
+    CandidateKeyMismatch,
+    SurfaceMismatch,
+    FramebufferMismatch,
+    MissingDamage,
+    LeaseConversion,
+}
+
+#[derive(Debug)]
+pub(crate) struct DirectPromotionError {
+    pub(crate) reason: DirectPromotionFailure,
+    pub(crate) error: io::Error,
+    pub(crate) lease: DirectPrimaryLease,
+    pub(crate) out_fence: Option<OwnedFd>,
+}
+
+fn promotion_error(
+    reason: DirectPromotionFailure,
+    message: &'static str,
+    lease: DirectPrimaryLease,
+    out_fence: Option<OwnedFd>,
+) -> Box<DirectPromotionError> {
+    Box::new(DirectPromotionError {
+        reason,
+        error: io::Error::other(message),
+        lease,
+        out_fence,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -259,29 +306,99 @@ impl DirectScanoutState {
 
     pub(crate) fn promote_worker_submission(
         &mut self,
-        token: PageFlipToken,
+        context: DirectPromotionContext,
         lease: DirectPrimaryLease,
         out_fence: Option<OwnedFd>,
-        submit_started_at: MonotonicTimestampNs,
-        submit_returned_at: MonotonicTimestampNs,
-    ) -> io::Result<CompositorFrameBatchId> {
+    ) -> Result<CompositorFrameBatchId, Box<DirectPromotionError>> {
+        let Some(queued) = self.worker_queued.as_ref() else {
+            return Err(Box::new(DirectPromotionError {
+                reason: DirectPromotionFailure::MissingQueued,
+                error: io::Error::other("direct worker success has no queued frame"),
+                lease,
+                out_fence,
+            }));
+        };
+        if queued.token != context.token {
+            return Err(promotion_error(
+                DirectPromotionFailure::TokenMismatch,
+                "direct worker success token mismatches queued frame",
+                lease,
+                out_fence,
+            ));
+        }
+        if queued.transaction_id != context.transaction_id {
+            return Err(promotion_error(
+                DirectPromotionFailure::TransactionMismatch,
+                "direct worker success transaction mismatches queued frame",
+                lease,
+                out_fence,
+            ));
+        }
+        if queued.output_generation != context.output_generation {
+            return Err(promotion_error(
+                DirectPromotionFailure::GenerationMismatch,
+                "direct worker success generation mismatches queued frame",
+                lease,
+                out_fence,
+            ));
+        }
+        if queued.target != context.target {
+            return Err(promotion_error(
+                DirectPromotionFailure::TargetMismatch,
+                "direct worker success target mismatches queued frame",
+                lease,
+                out_fence,
+            ));
+        }
+        if lease.key() != queued.key {
+            return Err(promotion_error(
+                DirectPromotionFailure::CandidateKeyMismatch,
+                "direct worker success lease key mismatches queued metadata",
+                lease,
+                out_fence,
+            ));
+        }
+        if lease.surface_id() != queued.surface_id {
+            return Err(promotion_error(
+                DirectPromotionFailure::SurfaceMismatch,
+                "direct worker success lease surface mismatches queued metadata",
+                lease,
+                out_fence,
+            ));
+        }
+        if lease.framebuffer_id() != queued.framebuffer_id {
+            return Err(promotion_error(
+                DirectPromotionFailure::FramebufferMismatch,
+                "direct worker success lease framebuffer mismatches queued metadata",
+                lease,
+                out_fence,
+            ));
+        }
+        if !lease.has_surface_damage() {
+            return Err(promotion_error(
+                DirectPromotionFailure::MissingDamage,
+                "direct worker success lease has no surface damage",
+                lease,
+                out_fence,
+            ));
+        }
+        let (key, surface_id, buffer, framebuffer, surface_damage) = match lease.try_into_parts() {
+            Ok(parts) => parts,
+            Err(error) => {
+                let (error, lease) = *error;
+                return Err(Box::new(DirectPromotionError {
+                    reason: DirectPromotionFailure::LeaseConversion,
+                    error,
+                    lease,
+                    out_fence,
+                }));
+            }
+        };
         let queued = self
             .worker_queued
             .take()
-            .ok_or_else(|| io::Error::other("direct worker success has no queued frame"))?;
-        if queued.token != token {
-            self.worker_queued = Some(queued);
-            return Err(io::Error::other(
-                "direct worker success token mismatches queued frame",
-            ));
-        }
+            .expect("queued worker frame was validated above");
         let protocol_batch_id = queued.protocol_batch_id;
-        let (key, surface_id, buffer, framebuffer, surface_damage) = lease.into_parts()?;
-        if key != queued.key || surface_id != queued.surface_id {
-            return Err(io::Error::other(
-                "direct worker success lease does not match queued metadata",
-            ));
-        }
         self.pending = Some(SubmittedDirectFrame {
             prepared: PreparedDirectFrame {
                 frame_id: queued.frame_id,
@@ -292,11 +409,11 @@ impl DirectScanoutState {
                 framebuffer,
                 target: queued.target,
             },
-            token,
+            token: context.token,
             protocol_batch_id,
             surface_damage,
-            submit_started_at,
-            submit_returned_at,
+            submit_started_at: context.submit_started_at,
+            submit_returned_at: context.submit_returned_at,
             out_fence,
         });
         Ok(protocol_batch_id)
@@ -376,7 +493,7 @@ mod tests {
     use super::*;
     use crate::native_output::scanout::DirectPrimaryLease;
     use oblivion_one::compositor::{CompositorFrameBatchId, OwnCompositorServer};
-    use std::os::fd::AsFd;
+    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
     use std::sync::atomic::Ordering;
 
     fn test_key() -> DirectScanoutCandidateKey {
@@ -414,12 +531,20 @@ mod tests {
         }
     }
 
+    fn test_eventfd() -> OwnedFd {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(fd >= 0, "test eventfd should be created");
+        // SAFETY: eventfd returned a new owned descriptor for this test.
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    }
+
     fn test_queued_frame(token: u64, key: DirectScanoutCandidateKey) -> WorkerQueuedDirectFrame {
         WorkerQueuedDirectFrame {
             frame_id: token,
             transaction_id: OutputTransactionId::new(
                 std::num::NonZeroU64::new(token).expect("test transaction ID"),
             ),
+            output_generation: 1,
             key,
             surface_id: key.content.surface_id,
             token: PageFlipToken::new(token).expect("test token"),
@@ -429,6 +554,124 @@ mod tests {
             framebuffer_id: 42,
             target: test_target(),
         }
+    }
+
+    #[test]
+    fn failed_worker_promotion_preserves_queued_state_and_lease() {
+        let file = std::fs::File::open("/dev/null").expect("test DRM file");
+        let mut state = DirectScanoutState::new(file.as_fd(), 1);
+        let key = test_key();
+        let token = PageFlipToken::new(73).expect("test token");
+        state
+            .store_worker_queued(test_queued_frame(token.get(), key))
+            .expect("store queued frame");
+        let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
+
+        let error = state
+            .promote_worker_submission(
+                DirectPromotionContext {
+                    transaction_id: OutputTransactionId::new(
+                        std::num::NonZeroU64::new(73).unwrap(),
+                    ),
+                    token,
+                    output_generation: 1,
+                    target: test_target(),
+                    submit_started_at: MonotonicTimestampNs::new(11),
+                    submit_returned_at: MonotonicTimestampNs::new(12),
+                },
+                lease,
+                Some(test_eventfd()),
+            )
+            .expect_err("missing damage must reject before promotion");
+
+        let error = *error;
+        assert_eq!(error.reason, DirectPromotionFailure::MissingDamage);
+        assert!(error.out_fence.is_some());
+        assert_eq!(state.worker_queued_token(), Some(token));
+        assert!(state.pending.is_none());
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
+        drop(error.lease);
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn successful_worker_promotion_moves_ownership_to_pending() {
+        let file = std::fs::File::open("/dev/null").expect("test DRM file");
+        let mut state = DirectScanoutState::new(file.as_fd(), 1);
+        let key = test_key();
+        let token = PageFlipToken::new(74).expect("test token");
+        state
+            .store_worker_queued(test_queued_frame(token.get(), key))
+            .expect("store queued frame");
+        let server = OwnCompositorServer::bind_cpu_composition(format!(
+            "typhon-direct-promote-test-{}",
+            std::process::id()
+        ))
+        .expect("bind test compositor");
+        let damage = server.capture_surface_damage_presentation();
+        let (lease, cleanup_count) =
+            DirectPrimaryLease::test_fixture_with_probe_and_damage(key, 42, Some(damage));
+
+        let batch_id = state
+            .promote_worker_submission(
+                DirectPromotionContext {
+                    transaction_id: OutputTransactionId::new(
+                        std::num::NonZeroU64::new(74).unwrap(),
+                    ),
+                    token,
+                    output_generation: 1,
+                    target: test_target(),
+                    submit_started_at: MonotonicTimestampNs::new(11),
+                    submit_returned_at: MonotonicTimestampNs::new(12),
+                },
+                lease,
+                None,
+            )
+            .expect("promote worker frame");
+
+        assert_eq!(batch_id.get(), 74);
+        assert_eq!(state.worker_queued_token(), None);
+        assert_eq!(state.pending_token(), Some(token));
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
+        drop(state);
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn worker_promotion_token_mismatch_keeps_queued_state_and_lease() {
+        let file = std::fs::File::open("/dev/null").expect("test DRM file");
+        let mut state = DirectScanoutState::new(file.as_fd(), 1);
+        let key = test_key();
+        let queued_token = PageFlipToken::new(75).expect("queued token");
+        state
+            .store_worker_queued(test_queued_frame(queued_token.get(), key))
+            .expect("store queued frame");
+        let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
+
+        let error = state
+            .promote_worker_submission(
+                DirectPromotionContext {
+                    transaction_id: OutputTransactionId::new(
+                        std::num::NonZeroU64::new(75).unwrap(),
+                    ),
+                    token: PageFlipToken::new(76).expect("submitted token"),
+                    output_generation: 1,
+                    target: test_target(),
+                    submit_started_at: MonotonicTimestampNs::new(11),
+                    submit_returned_at: MonotonicTimestampNs::new(12),
+                },
+                lease,
+                None,
+            )
+            .expect_err("token mismatch must reject before promotion");
+        let error = *error;
+
+        assert_eq!(error.reason, DirectPromotionFailure::TokenMismatch);
+        assert_eq!(state.worker_queued_token(), Some(queued_token));
+        assert!(state.pending.is_none());
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
+        drop(error.lease);
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
     }
 
     #[test]

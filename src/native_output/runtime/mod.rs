@@ -106,6 +106,19 @@ pub(crate) enum NativeClientCursorPath {
     Software,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum KmsTeardownSafety {
+    Restored,
+    TargetDestroyed,
+    Unproven,
+}
+
+impl KmsTeardownSafety {
+    pub(super) const fn permits_release(self) -> bool {
+        matches!(self, Self::Restored | Self::TargetDestroyed)
+    }
+}
+
 pub(crate) struct NativeRuntime {
     server: OwnCompositorServer,
     cursor_image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
@@ -152,6 +165,7 @@ pub(crate) struct NativeRuntime {
     emergency_quarantined_worker_jobs: Vec<super::kms_worker::KmsCommitJob>,
     submitted_worker_ownership: Vec<super::kms_worker::KmsSubmittedOwnership>,
     emergency_quarantined_submitted_ownership: Vec<super::kms_worker::KmsSubmittedOwnership>,
+    kms_teardown_safety: KmsTeardownSafety,
     deferred_worker_pageflip: Option<DrmPresentationEvent>,
     deferred_worker_completion: Option<AtomicCommitCompletion>,
     worker_timeout_pending: Option<(PageFlipToken, u64)>,
@@ -330,17 +344,9 @@ impl Drop for NativeRuntime {
                 );
             }
         }
-        if !self.session.permits_output() {
-            self.scanout.disarm_drm_cleanup();
-            self.kms_backend.disarm_drm_io();
-            if let Some(cursor) = self.atomic_cursor.as_mut() {
-                cursor.disarm_drm_cleanup();
-            }
-            if let Some(cursor) = self.legacy_cursor.as_mut() {
-                cursor.disarm_drm_cleanup();
-            }
-        } else if let Err(error) = self.kms_backend.restore() {
-            eprintln!("native KMS restore before client-buffer drain failed: {error}");
+        if !self.establish_kms_teardown_safety().permits_release() {
+            self.retain_unproven_teardown_ownership();
+            return;
         }
         // SAFETY: scanout is wrapped solely so inactive managed-session
         // teardown can disarm DRM cleanup before its normal resource drop.

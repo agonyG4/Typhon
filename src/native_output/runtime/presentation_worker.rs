@@ -348,6 +348,7 @@ pub(super) fn finish_direct_worker_queued(
     scanout.store_worker_direct_submission(WorkerQueuedDirectFrame {
         frame_id,
         transaction_id,
+        output_generation,
         key: direct_key,
         surface_id: direct_surface_id,
         token: commit_token,

@@ -44,23 +44,20 @@ impl NativeScanoutBackend {
 
     pub(crate) fn promote_worker_direct_submission(
         &mut self,
-        token: PageFlipToken,
+        context: DirectPromotionContext,
         lease: DirectPrimaryLease,
         out_fence: Option<OwnedFd>,
-        submit_started_at: MonotonicTimestampNs,
-        submit_returned_at: MonotonicTimestampNs,
-    ) -> io::Result<CompositorFrameBatchId> {
+    ) -> Result<CompositorFrameBatchId, Box<DirectPromotionError>> {
         match self {
-            Self::AtomicEglGbm(scanout) => scanout.promote_worker_direct_submission(
-                token,
+            Self::AtomicEglGbm(scanout) => {
+                scanout.promote_worker_direct_submission(context, lease, out_fence)
+            }
+            _ => Err(Box::new(DirectPromotionError {
+                reason: DirectPromotionFailure::MissingQueued,
+                error: io::Error::other("direct worker success requires explicit Atomic scanout"),
                 lease,
                 out_fence,
-                submit_started_at,
-                submit_returned_at,
-            ),
-            _ => Err(io::Error::other(
-                "direct worker success requires explicit Atomic scanout",
-            )),
+            })),
         }
     }
 

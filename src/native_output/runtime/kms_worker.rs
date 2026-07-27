@@ -33,6 +33,7 @@ pub(super) enum WorkerQueueOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FatalWorkerJobDisposition {
     Fail,
+    #[allow(dead_code)]
     Drop,
 }
 
@@ -104,33 +105,11 @@ pub(super) fn retain_uncertain_job_with_suspension(
     Ok(UncertainJobRetention::Suspended)
 }
 
-pub(super) fn retain_submitted_ownership_with_suspension(
-    mut ownership: KmsSubmittedOwnership,
+pub(super) fn retain_complete_submitted_ownership(
+    ownership: KmsSubmittedOwnership,
     emergency_ownership: &mut Vec<KmsSubmittedOwnership>,
-    suspend_direct: impl FnOnce(
-        PageFlipToken,
-        crate::native_output::scanout::DirectPrimaryLease,
-    ) -> Result<
-        (),
-        crate::native_output::scanout::DirectPrimaryLeaseTransferError,
-    >,
-) -> NativeResult<()> {
-    if matches!(ownership.job.kind, AtomicCommitKind::DirectPrimary { .. })
-        && let Some(lease) = ownership.job.direct_primary_lease.take()
-    {
-        match suspend_direct(ownership.job.token, lease) {
-            Ok(()) => {}
-            Err(error) => {
-                let (error, lease) = *error;
-                eprintln!(
-                    "native KMS worker: submitted direct suspension failed; retaining emergency ownership: {error}"
-                );
-                ownership.job.direct_primary_lease = Some(lease);
-            }
-        }
-    }
+) {
     emergency_ownership.push(ownership);
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -863,13 +842,6 @@ impl NativeRuntime {
         }
     }
 
-    pub(super) fn process_kms_worker_event_after_join(
-        &mut self,
-        event: KmsWorkerEvent,
-    ) -> NativeResult<()> {
-        self.process_kms_worker_event(event)
-    }
-
     pub(super) fn process_kms_worker_events(&mut self) -> NativeResult<()> {
         let Some(worker) = self.kms_commit_worker.as_ref() else {
             return Ok(());
@@ -911,13 +883,13 @@ impl NativeRuntime {
         ownership: KmsSubmittedOwnership,
     ) -> NativeResult<()> {
         if matches!(ownership.job.kind, AtomicCommitKind::DirectPrimary { .. }) {
-            let suspended_jobs = &mut self.emergency_quarantined_submitted_ownership;
-            let scanout = &mut self.scanout;
-            retain_submitted_ownership_with_suspension(
+            // The submitted direct lease is the complete physical ownership
+            // record. Keep it intact; suspend_page_flip below only removes
+            // compositor-side queue metadata.
+            retain_complete_submitted_ownership(
                 ownership,
-                suspended_jobs,
-                |token, lease| scanout.suspend_worker_direct_submission(token, lease),
-            )?;
+                &mut self.emergency_quarantined_submitted_ownership,
+            );
         } else {
             if matches!(
                 ownership.job.kind,
@@ -945,13 +917,15 @@ impl NativeRuntime {
                     );
                 }
             }
-            self.emergency_quarantined_submitted_ownership
-                .push(ownership);
+            retain_complete_submitted_ownership(
+                ownership,
+                &mut self.emergency_quarantined_submitted_ownership,
+            );
         }
         self.quarantine_after_worker_fatal()
     }
 
-    fn process_kms_worker_event(&mut self, event: KmsWorkerEvent) -> NativeResult<()> {
+    pub(super) fn process_kms_worker_event(&mut self, event: KmsWorkerEvent) -> NativeResult<()> {
         match event {
             KmsWorkerEvent::Submitted { ownership } => {
                 if let Err(error) = self.validate_submitted_ownership(&ownership) {
@@ -972,6 +946,8 @@ impl NativeRuntime {
                 let queued_at = ownership.job.queued_at.get();
                 let submit_started_at = ownership.submit_started_at.get();
                 let submit_returned_at = ownership.submit_returned_at.get();
+                let output_generation = ownership.job.output_generation;
+                let target = ownership.job.target;
                 let cursor = ownership.job.cursor.clone();
                 let pacing_frame_id = ownership.job.pacing_frame_id;
                 let ready_submit = ownership.job.ready_submit;
@@ -1000,16 +976,56 @@ impl NativeRuntime {
                         )?;
                     }
                 } else if matches!(kind, AtomicCommitKind::DirectPrimary { .. }) {
-                    let direct_primary_lease = direct_primary_lease.ok_or_else(|| {
-                        io::Error::other("direct worker submission has no primary lease")
-                    })?;
-                    let batch_id = self.scanout.promote_worker_direct_submission(
-                        token,
+                    let Some(direct_primary_lease) = direct_primary_lease else {
+                        let mut ownership = self
+                            .submitted_worker_ownership
+                            .pop()
+                            .expect("submitted ownership was just retained");
+                        ownership.out_fence = out_fence;
+                        retain_complete_submitted_ownership(
+                            ownership,
+                            &mut self.emergency_quarantined_submitted_ownership,
+                        );
+                        self.quarantine_after_worker_fatal()?;
+                        return Err(io::Error::other(
+                            "direct worker submission has no primary lease",
+                        )
+                        .into());
+                    };
+                    let batch_id = match self.scanout.promote_worker_direct_submission(
+                        DirectPromotionContext {
+                            transaction_id,
+                            token,
+                            output_generation,
+                            target,
+                            submit_started_at: MonotonicTimestampNs::new(submit_started_at),
+                            submit_returned_at: MonotonicTimestampNs::new(submit_returned_at),
+                        },
                         direct_primary_lease,
                         out_fence,
-                        MonotonicTimestampNs::new(submit_started_at),
-                        MonotonicTimestampNs::new(submit_returned_at),
-                    )?;
+                    ) {
+                        Ok(batch_id) => batch_id,
+                        Err(error) => {
+                            let DirectPromotionError {
+                                error,
+                                lease,
+                                out_fence,
+                                ..
+                            } = *error;
+                            let mut ownership = self
+                                .submitted_worker_ownership
+                                .pop()
+                                .expect("submitted ownership was just retained");
+                            ownership.job.direct_primary_lease = Some(lease);
+                            ownership.out_fence = out_fence;
+                            retain_complete_submitted_ownership(
+                                ownership,
+                                &mut self.emergency_quarantined_submitted_ownership,
+                            );
+                            self.quarantine_after_worker_fatal()?;
+                            return Err(error.into());
+                        }
+                    };
                     self.server.complete_rendered_frame_callbacks(batch_id);
                 } else if has_out_fence {
                     return Err(io::Error::other(

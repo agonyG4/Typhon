@@ -1,6 +1,6 @@
 use super::kms_worker::{
     FatalWorkerJobDisposition, FatalWorkerJobHandler, UncertainJobRetention,
-    handle_fatal_worker_jobs, retain_submitted_ownership_with_suspension,
+    handle_fatal_worker_jobs, retain_complete_submitted_ownership,
     retain_uncertain_job_with_suspension,
 };
 use crate::native_output::kms_worker::{
@@ -230,7 +230,7 @@ fn runtime_suspension_retains_job_until_normal_recovery_cleanup() {
 }
 
 #[test]
-fn rejected_submitted_ownership_retains_event_resources_until_cleanup() {
+fn promotion_failure_quarantine_retains_complete_submitted_ownership() {
     let key = test_direct_key();
     let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
     let ownership = KmsSubmittedOwnership {
@@ -241,13 +241,7 @@ fn rejected_submitted_ownership_retains_event_resources_until_cleanup() {
     };
     let mut emergency = Vec::new();
 
-    retain_submitted_ownership_with_suspension(ownership, &mut emergency, |_token, lease| {
-        Err(Box::new((
-            std::io::Error::other("injected submitted suspension failure"),
-            lease,
-        )))
-    })
-    .unwrap();
+    retain_complete_submitted_ownership(ownership, &mut emergency);
 
     assert_eq!(emergency.len(), 1);
     assert!(emergency[0].job.direct_primary_lease.is_some());
@@ -255,4 +249,27 @@ fn rejected_submitted_ownership_retains_event_resources_until_cleanup() {
     assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 0);
     emergency.clear();
     assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 1);
+}
+
+#[test]
+fn teardown_safety_only_allows_release_after_a_proven_boundary() {
+    assert!(super::KmsTeardownSafety::Restored.permits_release());
+    assert!(super::KmsTeardownSafety::TargetDestroyed.permits_release());
+    assert!(!super::KmsTeardownSafety::Unproven.permits_release());
+}
+
+#[test]
+fn teardown_safety_classifies_restore_and_target_destruction_boundaries() {
+    assert_eq!(
+        super::kms_worker_teardown::classify_kms_teardown_safety(true, true),
+        super::KmsTeardownSafety::Restored
+    );
+    assert_eq!(
+        super::kms_worker_teardown::classify_kms_teardown_safety(false, false),
+        super::KmsTeardownSafety::TargetDestroyed
+    );
+    assert_eq!(
+        super::kms_worker_teardown::classify_kms_teardown_safety(true, false),
+        super::KmsTeardownSafety::Unproven
+    );
 }

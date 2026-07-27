@@ -63,40 +63,8 @@ impl DirectPrimaryLease {
         self.framebuffer.framebuffer.get()
     }
 
-    pub(crate) fn take_surface_damage(&mut self) -> io::Result<SurfaceDamagePresentation> {
-        self.surface_damage
-            .take()
-            .ok_or_else(|| io::Error::other("direct surface damage already settled"))
-    }
-
     pub(crate) const fn has_surface_damage(&self) -> bool {
         self.surface_damage.is_some()
-    }
-
-    pub(crate) fn into_parts(
-        mut self,
-    ) -> io::Result<(
-        DirectScanoutCandidateKey,
-        u32,
-        DmabufBufferHandle,
-        Arc<ImportedDirectFramebuffer>,
-        SurfaceDamagePresentation,
-    )> {
-        if !self.has_surface_damage() {
-            return Err(io::Error::other("direct surface damage already settled"));
-        }
-        let surface_damage = self.take_surface_damage()?;
-        let Self {
-            key,
-            surface_id,
-            _buffer,
-            framebuffer,
-            surface_damage: None,
-        } = self
-        else {
-            unreachable!("surface damage was consumed above");
-        };
-        Ok((key, surface_id, _buffer, framebuffer, surface_damage))
     }
 
     pub(crate) fn try_into_parts(

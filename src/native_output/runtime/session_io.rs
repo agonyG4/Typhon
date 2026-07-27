@@ -1,4 +1,3 @@
-use super::kms_worker::{FatalWorkerJobDisposition, handle_fatal_worker_jobs};
 use super::presentation_transactions::complete_dropped_output_transaction;
 use super::*;
 use oblivion_one::compositor::FrameBatchDiscardReason;
@@ -201,19 +200,11 @@ impl NativeSessionIo for NativeRuntime {
         worker.drain_eventfd()?;
         let mut event_error = None;
         for event in worker.drain_events() {
-            if let Err(error) = self.process_kms_worker_event_after_join(event) {
+            if let Err(error) = self.process_kms_worker_event_after_join_safely(event) {
                 event_error = Some(error.to_string());
             }
         }
-        let uncertain_submit = !handle_fatal_worker_jobs(
-            worker.take_fatal_jobs(),
-            self,
-            FatalWorkerJobDisposition::Drop,
-        )?
-        .is_empty();
-        if uncertain_submit {
-            self.quarantine_after_worker_fatal()?;
-        }
+        self.defer_fatal_worker_jobs_for_teardown(worker.take_fatal_jobs())?;
         if let Some(error) = event_error {
             return Err(io::Error::other(error).into());
         }
@@ -322,8 +313,10 @@ impl NativeSessionIo for NativeRuntime {
             io::Error::other("session recovery completion has no prepared framebuffer")
         })?;
         self.scanout.complete_session_recovery(*recovery)?;
+        self.submitted_worker_ownership.clear();
         self.quarantined_worker_jobs.clear();
         self.emergency_quarantined_worker_jobs.clear();
+        self.emergency_quarantined_submitted_ownership.clear();
         let abandoned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         let transaction_ids = self.output_transactions.active_transaction_ids();
         let output_transactions = &mut self.output_transactions;

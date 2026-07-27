@@ -24,20 +24,14 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn promote_worker_direct_submission(
         &mut self,
-        token: PageFlipToken,
+        context: DirectPromotionContext,
         lease: DirectPrimaryLease,
         out_fence: Option<OwnedFd>,
-        submit_started_at: MonotonicTimestampNs,
-        submit_returned_at: MonotonicTimestampNs,
-    ) -> io::Result<CompositorFrameBatchId> {
+    ) -> Result<CompositorFrameBatchId, Box<DirectPromotionError>> {
         let has_out_fence = out_fence.is_some();
-        let batch_id = self.direct.promote_worker_submission(
-            token,
-            lease,
-            out_fence,
-            submit_started_at,
-            submit_returned_at,
-        )?;
+        let batch_id = self
+            .direct
+            .promote_worker_submission(context, lease, out_fence)?;
         self.direct.counters.submissions = self.direct.counters.submissions.saturating_add(1);
         if has_out_fence {
             self.direct.counters.out_fences_received =
