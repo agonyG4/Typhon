@@ -76,17 +76,14 @@ impl AtomicEglGbmScanout {
             self.direct.counters.composited_fallbacks += 1;
             return Ok(DirectScanoutAttempt::Fallback("candidate_key_invalid"));
         };
-        let Some(first_plane) = candidate.buffer.planes().first() else {
+        let Some(worker_admission) = worker_admission else {
+            self.direct.counters.composited_fallbacks += 1;
+            return Ok(DirectScanoutAttempt::Fallback("worker_unavailable"));
+        };
+        if candidate.buffer.planes().is_empty() {
             self.direct.counters.composited_fallbacks += 1;
             return Ok(DirectScanoutAttempt::Fallback("candidate_plane_missing"));
-        };
-        let plane_plan_key = DirectPlanePlanKey {
-            width: candidate.buffer_size.width,
-            height: candidate.buffer_size.height,
-            format: candidate.buffer.format().as_fourcc(),
-            modifier: first_plane.descriptor().modifier.0,
-            cursor_plan_key: direct_cursor_plan_key(cursor, true),
-        };
+        }
         let unchanged = self
             .direct
             .pending
@@ -141,52 +138,6 @@ impl AtomicEglGbmScanout {
             "imported dma-buf framebuffer".to_string()
         });
 
-        let tested_plan = TestedDirectPlanePlan {
-            key: plane_plan_key,
-            drm_generation: self.direct.drm_generation,
-        };
-        if self.direct.tested_plane_plan != Some(tested_plan) {
-            self.direct.counters.test_only_attempts += 1;
-            let test_only_started = Instant::now();
-            let test_only_result =
-                kms.test_atomic_primary_flip_with_cursor(framebuffer.framebuffer, cursor);
-            self.direct.counters.test_only_timing.record(
-                test_only_started
-                    .elapsed()
-                    .as_nanos()
-                    .min(u128::from(u64::MAX)) as u64,
-            );
-            if let Err(error) = test_only_result {
-                self.direct.tested_plane_plan = None;
-                self.direct.counters.test_only_rejections += 1;
-                self.direct.counters.composited_fallbacks += 1;
-                direct_scanout_debug(format_args!("TEST_ONLY rejected: {error}"));
-                eprintln!("direct scanout: Atomic TEST_ONLY rejected: {error}");
-                return Ok(DirectScanoutAttempt::Fallback(
-                    if cursor.is_some_and(|cursor| cursor.visible) {
-                        "cursor_test_only_rejected"
-                    } else {
-                        "test_only_rejected"
-                    },
-                ));
-            }
-            self.direct.tested_plane_plan = Some(tested_plan);
-        } else {
-            direct_scanout_debug("TEST_ONLY plan cache hit");
-        }
-        direct_scanout_debug("TEST_ONLY accepted");
-
-        let current_key = server
-            .direct_scanout_scene_candidate()
-            .ok()
-            .and_then(|current| direct_candidate_key(&current, self.direct.drm_generation, cursor));
-        if current_key != Some(candidate_key) {
-            self.direct.counters.stale_candidate_rejections += 1;
-            self.direct.counters.composited_fallbacks += 1;
-            direct_scanout_debug("candidate became stale before submit");
-            return Ok(DirectScanoutAttempt::Fallback("stale_candidate"));
-        }
-
         let frame_id = self.swapchain()?.next_frame_id();
         let protocol_batch_id = server.take_frame_batch_for_render(frame_id);
         let surface_damage =
@@ -238,107 +189,21 @@ impl AtomicEglGbmScanout {
         }
         let token = PageFlipToken::new(allocate_native_page_flip_token())
             .expect("allocated native pageflip token is nonzero");
-        if let Some(permit) = worker_admission {
-            let framebuffer_id = framebuffer.framebuffer.get();
-            let was_direct = self.direct.current.is_some();
-            let direct_lease =
-                DirectPrimaryLease::new(candidate, candidate_key, framebuffer, surface_damage);
-            self.swapchain_mut()?.advance_external_frame_id(frame_id)?;
-            if !was_direct {
-                self.direct.counters.entries += 1;
-            }
-            self.scene.invalidate_presented_damage_history();
-            return Ok(DirectScanoutAttempt::WorkerQueued {
-                transaction_id,
-                token: token.get(),
-                framebuffer_id,
-                lease: direct_lease,
-                admission: permit,
-            });
-        }
-        let submit_started_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
-        let real_submit_started = Instant::now();
-        let submission = kms.submit_direct_flip_with_cursor(framebuffer.framebuffer, token, cursor);
-        self.direct.counters.real_submit_timing.record(
-            real_submit_started
-                .elapsed()
-                .as_nanos()
-                .min(u128::from(u64::MAX)) as u64,
-        );
-        let submit_returned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         let framebuffer_id = framebuffer.framebuffer.get();
-        let surface_id = candidate.surface_id;
-        let buffer = candidate.buffer;
-        let out_fence = match submission {
-            Ok(submission) => {
-                if submission.out_fence.is_some() {
-                    self.direct.counters.out_fences_received =
-                        self.direct.counters.out_fences_received.saturating_add(1);
-                } else {
-                    self.direct.counters.out_fence_missing =
-                        self.direct.counters.out_fence_missing.saturating_add(1);
-                }
-                submission.out_fence
-            }
-            Err(error) => {
-                self.direct.tested_plane_plan = None;
-                settle_failed_output_transaction(
-                    output_transactions,
-                    transaction_id,
-                    OutputTransactionFailureStage::KmsSubmit,
-                    MonotonicTimestampNs::new(monotonic_now_ns()?),
-                    |obligations| {
-                        let batch_id = obligations.frame_batch_id().ok_or_else(|| {
-                            io::Error::other("direct submit failure has no frame batch")
-                        })?;
-                        server.restore_frame_batch_after_render_failure(batch_id);
-                        Ok(())
-                    },
-                )
-                .map_err(|error| io::Error::other(error.to_string()))?;
-                self.direct.counters.composited_fallbacks += 1;
-                direct_scanout_debug(format_args!("real submit rejected: {error}"));
-                eprintln!("direct scanout: real Atomic submit rejected: {error}");
-                return Ok(DirectScanoutAttempt::Fallback("submit_rejected"));
-            }
-        };
-        server.complete_rendered_frame_callbacks(protocol_batch_id);
-        self.swapchain_mut()?.advance_external_frame_id(frame_id)?;
         let was_direct = self.direct.current.is_some();
-        self.direct.pending = Some(SubmittedDirectFrame {
-            prepared: PreparedDirectFrame {
-                frame_id,
-                transaction_id,
-                key: candidate_key,
-                surface_id,
-                buffer,
-                framebuffer,
-                target,
-            },
-            token,
-            protocol_batch_id,
-            surface_damage,
-            submit_started_at,
-            submit_returned_at,
-            out_fence,
-        });
-        output_transactions
-            .mark_submitted(transaction_id, token, submit_returned_at)
-            .map_err(io::Error::other)?;
-        self.direct.counters.submissions += 1;
+        let direct_lease =
+            DirectPrimaryLease::new(candidate, candidate_key, framebuffer, surface_damage);
+        self.swapchain_mut()?.advance_external_frame_id(frame_id)?;
         if !was_direct {
             self.direct.counters.entries += 1;
         }
         self.scene.invalidate_presented_damage_history();
-        direct_scanout_debug(if was_direct {
-            "direct frame submitted (steady state)"
-        } else {
-            "entered direct scanout"
-        });
-        Ok(DirectScanoutAttempt::Submitted {
+        Ok(DirectScanoutAttempt::WorkerQueued {
             transaction_id,
             token: token.get(),
             framebuffer_id,
+            lease: direct_lease,
+            admission: worker_admission,
         })
     }
 

@@ -410,7 +410,7 @@ pub(super) fn finish_direct_worker_queued(
         cursor_pin: worker_cursor_pin(context.atomic_cursor, effective_cursor)?,
         direct_primary_lease: Some(direct_lease),
         pacing_frame_id: context.frame_pacing.worker_submission_frame_id(false),
-        test_only: KmsTestOnlyPolicy::Skip,
+        test_only: KmsTestOnlyPolicy::Required,
         ready_submit: false,
     };
     let descriptor = output_transactions

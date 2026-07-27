@@ -18,12 +18,11 @@ use super::presentation_protocol::{
 use super::presentation_transactions::complete_immediate_output_transaction_with;
 use super::presentation_transactions::{
     complete_immediate_output_transaction, present_compatibility_frame,
-    register_primary_transaction, settle_failed_output_transaction,
+    register_primary_transaction,
 };
 use super::presentation_worker::*;
 use super::*;
 use crate::native_output::kms_worker::KmsCommitWorkerTransport;
-use oblivion_one::native::kms::KmsBackendKind;
 
 impl NativeRuntime {
     #[allow(unused_variables)]
@@ -632,10 +631,9 @@ impl NativeRuntime {
                 if let Some(direct_target) = direct_target {
                     let worker_admission =
                         direct_worker_admission(worker_mode, kms_commit_worker.as_ref())?;
-                    if worker_mode && worker_admission.is_none() {
-                        // Admission is deliberately nonblocking. Keep the
-                        // direct candidate available for a later cycle and
-                        // continue through normal composition.
+                    if !worker_mode || worker_admission.is_none() {
+                        // Direct scanout has no synchronous fallback. Keep the
+                        // candidate available for a later worker cycle.
                     } else {
                         match scanout.try_direct_scanout(
                             kms_backend,
@@ -647,106 +645,6 @@ impl NativeRuntime {
                             pacing_mode,
                             worker_admission,
                         )? {
-                            DirectScanoutAttempt::Submitted {
-                                transaction_id,
-                                token,
-                                framebuffer_id,
-                            } => {
-                                let trace_timestamp_ns = monotonic_now_ns()?;
-                                presentation_trace.push(
-                                    PresentationTransactionEvent::TransactionBuilt {
-                                        transaction_id,
-                                        timestamp_ns: trace_timestamp_ns,
-                                    },
-                                );
-                                presentation_trace.push(
-                                    PresentationTransactionEvent::KmsSubmitReturned {
-                                        transaction_id,
-                                        timestamp_ns: trace_timestamp_ns,
-                                    },
-                                );
-                                if kms_backend.effective_kind() == KmsBackendKind::Atomic {
-                                    let commit_token =
-                                        PageFlipToken::new(token).ok_or_else(|| {
-                                            io::Error::other("Direct Atomic token is zero")
-                                        })?;
-                                    if let Err(error) = atomic_commit_arbiter.reserve(
-                                        commit_token,
-                                        *drm_file_generation,
-                                        target.crtc_id,
-                                        AtomicCommitKind::DirectPrimary {
-                                            transaction_id,
-                                            direct_token: commit_token,
-                                            framebuffer_id,
-                                        },
-                                        monotonic_now_ns()?,
-                                    ) {
-                                        settle_failed_output_transaction(
-                                        output_transactions,
-                                        transaction_id,
-                                        OutputTransactionFailureStage::BackendCompletion,
-                                        MonotonicTimestampNs::new(monotonic_now_ns()?),
-                                        |obligations| {
-                                            let batch_id = obligations.frame_batch_id().ok_or_else(
-                                                || {
-                                                    io::Error::other(
-                                                        "direct primary registration failure has no frame batch",
-                                                    )
-                                                },
-                                            )?;
-                                            server.discard_frame_batch(
-                                                batch_id,
-                                                FrameBatchDiscardReason::FatalOutputFailure,
-                                            );
-                                            Ok(())
-                                        },
-                                    )
-                                    .map_err(|error| io::Error::other(error.to_string()))?;
-                                        return Err(io::Error::other(error).into());
-                                    }
-                                }
-                                if let Some(cursor) = atomic_cursor.as_mut()
-                                    && cursor.needs_submission_for(effective_cursor.as_ref())
-                                    && let Some(cursor_token) = PageFlipToken::new(token)
-                                {
-                                    let state = effective_cursor.clone().unwrap_or_else(|| {
-                                        let mut hidden = cursor.desired().clone();
-                                        hidden.visible = false;
-                                        hidden.framebuffer_id = None;
-                                        hidden
-                                    });
-                                    cursor.begin_primary_submission(cursor_token, state);
-                                }
-                                frame_scheduler
-                                    .note_async_submission(token, monotonic_now_ns()?)
-                                    .map_err(io::Error::other)?;
-                                if kms_backend.effective_kind() == KmsBackendKind::Atomic {
-                                    frame_scheduler.defer_page_flip_watchdog_to_atomic_arbiter();
-                                }
-                                frame_pacing.note_submit(
-                                    token,
-                                    monotonic_now_ns()?,
-                                    false,
-                                    pacing_mode,
-                                );
-                                presentation_deadline.clear_scheduled_target();
-                                *scheduled_presentation_target = None;
-                                *last_rendered_scene_generation = scene_generation;
-                                *last_submitted_cursor_epoch = cursor_epoch;
-                                cursor_output_arbitration.consume(cursor_epoch);
-                                *last_renderable_surfaces = server.renderable_surfaces().to_vec();
-                                *last_software_cursor_damage = current_software_cursor_damage;
-                                *frame_index = frame_index.saturating_add(1);
-                                frame_submitted = true;
-                                direct_submitted = true;
-                                perf.log("native.direct_scanout", || {
-                                    vec![
-                                        NativePerfField::str("transition", "submit"),
-                                        NativePerfField::u64("token", token),
-                                        NativePerfField::u64("gpu_draw_us", 0),
-                                    ]
-                                });
-                            }
                             DirectScanoutAttempt::Unchanged => {
                                 presentation_deadline.clear_scheduled_target();
                                 *scheduled_presentation_target = None;
@@ -1273,8 +1171,12 @@ impl NativeRuntime {
                                     native_io_recorder.record(NativeIoOperation::PageflipSubmit);
                                     #[cfg(test)]
                                     native_io_recorder.record(match kms_backend.effective_kind() {
-                                        KmsBackendKind::Atomic => NativeIoOperation::AtomicCommit,
-                                        KmsBackendKind::Legacy => NativeIoOperation::LegacyCommit,
+                                        oblivion_one::native::kms::KmsBackendKind::Atomic => {
+                                            NativeIoOperation::AtomicCommit
+                                        }
+                                        oblivion_one::native::kms::KmsBackendKind::Legacy => {
+                                            NativeIoOperation::LegacyCommit
+                                        }
                                     });
                                     let atomic_primary_registered = register_primary_transaction(
                                         atomic_commit_arbiter,

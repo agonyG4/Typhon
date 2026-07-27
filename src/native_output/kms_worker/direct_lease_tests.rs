@@ -248,6 +248,22 @@ impl KmsCommitExecutor for PanicDirectLeaseExecutor {
 }
 
 impl KmsCommitExecutor for DirectLeaseRecordingExecutor {
+    fn test_only(&self, _job: &KmsCommitJob) -> Result<(), KmsWorkerSubmitFailure> {
+        let mut outcomes = self.outcomes.lock().unwrap();
+        if matches!(
+            outcomes.front(),
+            Some(Err(
+                oblivion_one::native::kms::AtomicKmsErrorKind::TestOnlyRejected
+            ))
+        ) {
+            return match outcomes.pop_front().expect("test-only rejection outcome") {
+                Ok(()) => unreachable!("test-only outcome changed while locked"),
+                Err(kind) => Err(KmsWorkerSubmitFailure::new(kind, "fake Atomic ioctl")),
+            };
+        }
+        Ok(())
+    }
+
     fn submit(&self, job: &KmsCommitJob) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure> {
         if let Some(lease) = job.direct_primary_lease.as_ref() {
             self.observations
@@ -335,9 +351,9 @@ fn direct_test_rejection_returns_the_lease_once() {
     let handle = KmsCommitWorkerHandle::start(executor).unwrap();
     let key = test_direct_key(3);
     let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
-    reserve_for_test(&handle, test_job(66).kind)
-        .enqueue(test_direct_job(66, key, 42, Some(lease)))
-        .unwrap();
+    let mut job = test_direct_job(66, key, 42, Some(lease));
+    job.test_only = KmsTestOnlyPolicy::Required;
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
 
     let events = wait_for_fence_event(
         &handle,

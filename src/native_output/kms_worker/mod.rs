@@ -25,4 +25,6 @@ pub(crate) use timing::KmsCommitTimingModel;
 #[cfg(test)]
 mod direct_lease_tests;
 #[cfg(test)]
+mod task4_tests;
+#[cfg(test)]
 mod tests;

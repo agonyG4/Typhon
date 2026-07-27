@@ -70,6 +70,25 @@ impl AtomicCommitSubmitter {
         )
     }
 
+    pub fn test_primary(
+        &self,
+        framebuffer: FramebufferId,
+        token: PageFlipToken,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<(), AtomicKmsError> {
+        self.submit_primary_inner(framebuffer, token, cursor, true, None, false, true)
+            .map(|_| ())
+    }
+
+    pub fn test_primary_without_cursor(
+        &self,
+        framebuffer: FramebufferId,
+        token: PageFlipToken,
+    ) -> Result<(), AtomicKmsError> {
+        self.submit_primary_inner(framebuffer, token, None, false, None, false, true)
+            .map(|_| ())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn submit_primary_inner(
         &self,
@@ -189,6 +208,23 @@ impl AtomicCommitSubmitter {
             },
         )?;
         Ok(AtomicFlipSubmission { out_fence: None })
+    }
+
+    pub fn test_cursor(
+        &self,
+        cursor: Option<&AtomicCursorVisualState>,
+    ) -> Result<(), AtomicKmsError> {
+        let request = AtomicRequest::cursor_only(&self.pipeline, cursor)?;
+        let submission = AtomicSubmission::test_only(request);
+        // SAFETY: the runtime owns the DRM fd and joins the worker before the
+        // fd can be closed, revoked, restored, or replaced.
+        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        submit_atomic(
+            fd,
+            &submission,
+            AtomicKmsErrorKind::TestOnlyRejected,
+            "runtime atomic TEST_ONLY cursor update",
+        )
     }
 }
 

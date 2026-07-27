@@ -115,11 +115,6 @@ pub(crate) enum DirectScanoutAttempt {
     Rejected(DirectScanoutSceneRejection),
     Fallback(&'static str),
     Unchanged,
-    Submitted {
-        transaction_id: OutputTransactionId,
-        token: u64,
-        framebuffer_id: u32,
-    },
     WorkerQueued {
         transaction_id: OutputTransactionId,
         token: u64,

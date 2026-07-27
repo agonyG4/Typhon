@@ -27,6 +27,10 @@ pub(crate) struct KmsWorkerSubmission {
 }
 
 pub(crate) trait KmsCommitExecutor: Send + Sync {
+    fn test_only(&self, _job: &KmsCommitJob) -> Result<(), KmsWorkerSubmitFailure> {
+        Ok(())
+    }
+
     fn submit(&self, job: &KmsCommitJob) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure>;
 }
 
@@ -481,43 +485,34 @@ pub(crate) struct AtomicKmsWorkerExecutor {
 }
 
 impl KmsCommitExecutor for AtomicKmsWorkerExecutor {
-    fn submit(&self, job: &KmsCommitJob) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure> {
+    fn test_only(&self, job: &KmsCommitJob) -> Result<(), KmsWorkerSubmitFailure> {
         let touch_cursor = !matches!(&job.cursor, KmsCursorUpdate::Unchanged);
         let cursor = match &job.cursor {
             KmsCursorUpdate::Set(state) => Some(state),
             KmsCursorUpdate::Disable | KmsCursorUpdate::Unchanged => None,
         };
 
-        if matches!(job.test_only, KmsTestOnlyPolicy::Required) {
-            let test = match &job.primary {
-                KmsPrimaryUpdate::Framebuffer { framebuffer, .. } => {
-                    if touch_cursor {
-                        self.submitter.submit_primary(
-                            *framebuffer,
-                            job.token,
-                            cursor,
-                            None,
-                            false,
-                            true,
-                        )
-                    } else {
-                        self.submitter.submit_primary_without_cursor(
-                            *framebuffer,
-                            job.token,
-                            None,
-                            false,
-                            true,
-                        )
-                    }
+        let test = match &job.primary {
+            KmsPrimaryUpdate::Framebuffer { framebuffer, .. } => {
+                if touch_cursor {
+                    self.submitter.test_primary(*framebuffer, job.token, cursor)
+                } else {
+                    self.submitter
+                        .test_primary_without_cursor(*framebuffer, job.token)
                 }
-                KmsPrimaryUpdate::Unchanged => {
-                    self.submitter.submit_cursor(cursor, job.token, true)
-                }
-            };
-            if let Err(error) = test {
-                return Err(KmsWorkerSubmitFailure { error });
             }
-        }
+            KmsPrimaryUpdate::Unchanged => self.submitter.test_cursor(cursor),
+        };
+        test.map(|_| ())
+            .map_err(|error| KmsWorkerSubmitFailure { error })
+    }
+
+    fn submit(&self, job: &KmsCommitJob) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure> {
+        let touch_cursor = !matches!(&job.cursor, KmsCursorUpdate::Unchanged);
+        let cursor = match &job.cursor {
+            KmsCursorUpdate::Set(state) => Some(state),
+            KmsCursorUpdate::Disable | KmsCursorUpdate::Unchanged => None,
+        };
 
         let input_fence = match &job.primary {
             KmsPrimaryUpdate::Framebuffer { in_fence, .. } => in_fence.as_ref().map(|fence| {
@@ -608,6 +603,62 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
         }
 
         let mut retries = 0u8;
+        if matches!(job.test_only, KmsTestOnlyPolicy::Required) {
+            let test = {
+                let _submit_gate = shared
+                    .submit_gate
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut state = shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !matches!(state.lifecycle, KmsWorkerLifecycle::Running) {
+                    None
+                } else {
+                    state.executing = true;
+                    drop(state);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        executor.test_only(&job)
+                    }));
+                    let mut state = shared
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.executing = false;
+                    drop(state);
+                    Some(result)
+                }
+            };
+            let Some(test) = test else {
+                quiesce_with_jobs(&shared, vec![job]);
+                return;
+            };
+            match test {
+                Ok(Ok(())) => {}
+                Ok(Err(failure)) => {
+                    shared
+                        .metrics
+                        .jobs_rejected
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if !publish_event(
+                        &shared,
+                        KmsWorkerEvent::TestRejected {
+                            job,
+                            error: failure.error,
+                        },
+                    ) {
+                        return;
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    retain_fatal_job(&shared, job, false);
+                    mark_fatal(&shared, KmsWorkerFatalReason::Panic, false);
+                    return;
+                }
+            }
+        }
         loop {
             let submission = {
                 let _submit_gate = shared
@@ -774,22 +825,6 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         quiesce_with_jobs(&shared, vec![job]);
                         return;
                     }
-                }
-                Ok(Err(failure)) if failure.error.kind == AtomicKmsErrorKind::TestOnlyRejected => {
-                    shared
-                        .metrics
-                        .jobs_rejected
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if !publish_event(
-                        &shared,
-                        KmsWorkerEvent::TestRejected {
-                            job,
-                            error: failure.error,
-                        },
-                    ) {
-                        return;
-                    }
-                    break;
                 }
                 Ok(Err(failure)) => {
                     shared

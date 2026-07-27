@@ -265,18 +265,18 @@ fn test_composited_primary_job_with_cursor(
     job
 }
 
-fn test_input_fence() -> OwnedFd {
+pub(super) fn test_input_fence() -> OwnedFd {
     let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     assert!(fd >= 0, "test eventfd should be created");
     // SAFETY: eventfd returned a new owned descriptor for this test.
     unsafe { OwnedFd::from_raw_fd(fd) }
 }
 
-fn fd_is_closed(raw_fd: i32) -> bool {
+pub(super) fn fd_is_closed(raw_fd: i32) -> bool {
     unsafe { libc::fcntl(raw_fd, libc::F_GETFD) == -1 }
 }
 
-fn fd_identity(raw_fd: i32) -> Option<String> {
+pub(super) fn fd_identity(raw_fd: i32) -> Option<String> {
     std::fs::read_to_string(format!("/proc/self/fdinfo/{raw_fd}"))
         .ok()
         .and_then(|info| {
@@ -293,7 +293,7 @@ fn fd_identity(raw_fd: i32) -> Option<String> {
         })
 }
 
-fn fd_is_closed_or_reused(raw_fd: i32, original_identity: Option<&str>) -> bool {
+pub(super) fn fd_is_closed_or_reused(raw_fd: i32, original_identity: Option<&str>) -> bool {
     original_identity.is_some_and(|identity| fd_identity(raw_fd).as_deref() != Some(identity))
         || (original_identity.is_none() && fd_is_closed(raw_fd))
 }
