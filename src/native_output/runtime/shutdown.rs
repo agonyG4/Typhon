@@ -39,6 +39,8 @@ pub(crate) enum ShutdownTransitionReason {
     PageflipTimeout,
     ChildrenStopped,
     KmsRestored,
+    KmsTargetDestroyed,
+    KmsTeardownUnproven,
 }
 
 impl ShutdownTransitionReason {
@@ -51,6 +53,8 @@ impl ShutdownTransitionReason {
             Self::PageflipTimeout => "pageflip_timeout",
             Self::ChildrenStopped => "children_stopped",
             Self::KmsRestored => "kms_restored",
+            Self::KmsTargetDestroyed => "kms_target_destroyed",
+            Self::KmsTeardownUnproven => "kms_teardown_unproven",
         }
     }
 }
@@ -253,15 +257,21 @@ impl NativeShutdownLifecycle {
         }
     }
 
-    pub(crate) fn note_kms_restore_complete(&mut self) -> Option<ShutdownTransition> {
+    pub(crate) fn note_kms_teardown_complete(
+        &mut self,
+        safety: super::KmsTeardownSafety,
+    ) -> Option<ShutdownTransition> {
         if self.state != ShutdownState::Restoring || !self.kms_restore_started {
             return None;
         }
-        self.transition_to(
-            ShutdownState::Complete,
-            ShutdownTransitionReason::KmsRestored,
-        )
-        .into()
+        let reason = match safety {
+            super::KmsTeardownSafety::Restored => ShutdownTransitionReason::KmsRestored,
+            super::KmsTeardownSafety::TargetDestroyed => {
+                ShutdownTransitionReason::KmsTargetDestroyed
+            }
+            super::KmsTeardownSafety::Unproven => ShutdownTransitionReason::KmsTeardownUnproven,
+        };
+        self.transition_to(ShutdownState::Complete, reason).into()
     }
 
     fn transition_to(
@@ -418,16 +428,54 @@ mod tests {
     fn shutdown_reaches_complete_only_after_real_teardown() {
         let mut shutdown = NativeShutdownLifecycle::new();
 
-        assert!(shutdown.note_kms_restore_complete().is_none());
+        assert!(
+            shutdown
+                .note_kms_teardown_complete(super::super::KmsTeardownSafety::Restored)
+                .is_none()
+        );
         shutdown.request_shutdown(10, None).unwrap();
         shutdown.advance_requested().unwrap();
-        assert!(shutdown.note_kms_restore_complete().is_none());
+        assert!(
+            shutdown
+                .note_kms_teardown_complete(super::super::KmsTeardownSafety::Restored)
+                .is_none()
+        );
         shutdown.note_session_children_stopped().unwrap();
-        assert!(shutdown.note_kms_restore_complete().is_none());
+        assert!(
+            shutdown
+                .note_kms_teardown_complete(super::super::KmsTeardownSafety::Restored)
+                .is_none()
+        );
         shutdown.begin_kms_restore().unwrap();
-        let transition = shutdown.note_kms_restore_complete().unwrap();
+        let transition = shutdown
+            .note_kms_teardown_complete(super::super::KmsTeardownSafety::Restored)
+            .unwrap();
 
         assert_eq!(transition.to, ShutdownState::Complete);
         assert!(shutdown.is_complete());
+        assert!(
+            shutdown
+                .note_kms_teardown_complete(super::super::KmsTeardownSafety::Restored)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unproven_kms_teardown_does_not_claim_a_safe_restore() {
+        let mut shutdown = NativeShutdownLifecycle::new();
+        shutdown.request_shutdown(10, None).unwrap();
+        shutdown.advance_requested().unwrap();
+        shutdown.note_session_children_stopped().unwrap();
+        shutdown.begin_kms_restore().unwrap();
+
+        let transition = shutdown
+            .note_kms_teardown_complete(super::super::KmsTeardownSafety::Unproven)
+            .unwrap();
+
+        assert_eq!(transition.to, ShutdownState::Complete);
+        assert_eq!(
+            transition.reason,
+            ShutdownTransitionReason::KmsTeardownUnproven
+        );
     }
 }

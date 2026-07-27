@@ -106,6 +106,14 @@ pub(crate) enum NativeClientCursorPath {
     Software,
 }
 
+// `TargetDestroyed` means the previous KMS target can no longer reference any
+// submitted framebuffer. Session inactivity or disarmed I/O is not proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum KmsSafeBoundary {
+    Restored,
+    TargetDestroyed,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum KmsTeardownSafety {
     Restored,
@@ -114,8 +122,24 @@ pub(super) enum KmsTeardownSafety {
 }
 
 impl KmsTeardownSafety {
+    pub(super) const fn from_proof(proof: Option<KmsSafeBoundary>) -> Self {
+        match proof {
+            Some(KmsSafeBoundary::Restored) => Self::Restored,
+            Some(KmsSafeBoundary::TargetDestroyed) => Self::TargetDestroyed,
+            None => Self::Unproven,
+        }
+    }
+
     pub(super) const fn permits_release(self) -> bool {
         matches!(self, Self::Restored | Self::TargetDestroyed)
+    }
+
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Restored => "restored",
+            Self::TargetDestroyed => "target_destroyed",
+            Self::Unproven => "unproven",
+        }
     }
 }
 
@@ -166,6 +190,8 @@ pub(crate) struct NativeRuntime {
     submitted_worker_ownership: Vec<super::kms_worker::KmsSubmittedOwnership>,
     emergency_quarantined_submitted_ownership: Vec<super::kms_worker::KmsSubmittedOwnership>,
     kms_teardown_safety: KmsTeardownSafety,
+    kms_teardown_safety_established: bool,
+    scanout_destroyed: bool,
     deferred_worker_pageflip: Option<DrmPresentationEvent>,
     deferred_worker_completion: Option<AtomicCommitCompletion>,
     worker_timeout_pending: Option<(PageFlipToken, u64)>,
@@ -331,7 +357,9 @@ impl Drop for NativeRuntime {
                 transaction_counters.presented_direct,
                 transaction_counters.presented_cursor_only,
             );
-            if let Some(counters) = self.scanout.explicit_output_counters() {
+            if !self.scanout_destroyed
+                && let Some(counters) = self.scanout.explicit_output_counters()
+            {
                 println!(
                     "typhon pacing: event=explicit_output_summary sync_file_deadline_hints_applied={} sync_file_deadline_hints_unsupported={} sync_file_deadline_hints_failed={} atomic_in_fence_submissions={} atomic_out_fences_received={} atomic_out_fence_missing={} render_fence_timing_unavailable={}",
                     counters.sync_file_deadline_hints_applied,
@@ -348,11 +376,13 @@ impl Drop for NativeRuntime {
             self.retain_unproven_teardown_ownership();
             return;
         }
-        // SAFETY: scanout is wrapped solely so inactive managed-session
-        // teardown can disarm DRM cleanup before its normal resource drop.
-        // Active KMS ownership was restored above; it is dropped exactly once
-        // here, while `kms` is still alive.
-        unsafe { mem::ManuallyDrop::drop(&mut self.scanout) };
+        // SAFETY: scanout is wrapped solely so teardown can disarm DRM cleanup
+        // before its normal resource drop. The proven boundary above means
+        // KMS no longer references submitted resources, and scanout is
+        // dropped exactly once while `kms` is still alive.
+        if !self.scanout_destroyed {
+            unsafe { mem::ManuallyDrop::drop(&mut self.scanout) };
+        }
         self.submitted_worker_ownership.clear();
         self.quarantined_worker_jobs.clear();
         self.emergency_quarantined_worker_jobs.clear();

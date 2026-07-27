@@ -58,12 +58,13 @@ fn forced_shutdown_drops_submitted_transaction_once_without_presentation() {
 
     let mut settlement_calls = 0;
     assert!(
-        super::presentation_transactions::settle_forced_shutdown_transaction(
+        super::presentation_transactions::settle_forced_shutdown_transaction_if_safe(
+            KmsTeardownSafety::Restored,
             &mut harness.output_transactions,
             transaction_id,
             token,
             MonotonicTimestampNs::new(13),
-            |obligations| {
+            |obligations: OutputProtocolObligations| {
                 settlement_calls += 1;
                 harness.server.complete_frame_batch_after_safe_abandonment(
                     obligations
@@ -98,7 +99,8 @@ fn forced_shutdown_drops_submitted_transaction_once_without_presentation() {
     ));
 
     assert!(
-        !super::presentation_transactions::settle_forced_shutdown_transaction(
+        !super::presentation_transactions::settle_forced_shutdown_transaction_if_safe(
+            KmsTeardownSafety::Restored,
             &mut harness.output_transactions,
             transaction_id,
             token,
@@ -116,6 +118,150 @@ fn forced_shutdown_drops_submitted_transaction_once_without_presentation() {
         event,
         PresentationTransactionEvent::PageflipPresented { .. }
     )));
+}
+
+#[test]
+fn unproven_teardown_keeps_forced_transaction_and_protocol_batch_owned() -> NativeResult<()> {
+    let mut harness = CompatibilityPresentationHarness::new();
+    let transaction_id = harness
+        .output_transactions
+        .allocate_id()
+        .expect("transaction ID");
+    let transaction = OutputTransaction::compatibility_composited(
+        transaction_id,
+        1,
+        MonotonicTimestampNs::new(10),
+        compatibility_test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        1,
+        1,
+        91,
+        None,
+        harness.batch_id,
+    )
+    .expect("compatibility transaction");
+    harness.output_transactions.insert(transaction).unwrap();
+    harness
+        .output_transactions
+        .mark_queued(transaction_id, 1, MonotonicTimestampNs::new(11))
+        .unwrap();
+    let token = PageFlipToken::new(91).unwrap();
+    harness
+        .output_transactions
+        .mark_submitted(transaction_id, token, MonotonicTimestampNs::new(12))
+        .unwrap();
+
+    let mut settlement_calls = 0;
+    assert!(
+        !super::presentation_transactions::settle_forced_shutdown_transaction_if_safe(
+            KmsTeardownSafety::Unproven,
+            &mut harness.output_transactions,
+            transaction_id,
+            token,
+            MonotonicTimestampNs::new(13),
+            |_| {
+                settlement_calls += 1;
+                Ok(())
+            },
+        )?
+    );
+    assert_eq!(settlement_calls, 0);
+    assert_eq!(harness.output_transactions.active_count(), 1);
+    assert_eq!(harness.server.frame_batch_count(), 1);
+    assert!(!harness.presentation_trace.events().any(|event| matches!(
+        event,
+        PresentationTransactionEvent::PageflipPresented { .. }
+    )));
+    harness.server.disarm_shutdown_releases();
+    harness.server.finish_commit_debug_for_shutdown();
+    assert!(
+        !super::presentation_transactions::settle_forced_shutdown_transaction_if_safe(
+            KmsTeardownSafety::Unproven,
+            &mut harness.output_transactions,
+            transaction_id,
+            token,
+            MonotonicTimestampNs::new(14),
+            |_| {
+                settlement_calls += 1;
+                Ok(())
+            },
+        )?
+    );
+    assert_eq!(settlement_calls, 0);
+    assert_eq!(harness.output_transactions.active_count(), 1);
+    assert_eq!(harness.server.frame_batch_count(), 1);
+    Ok(())
+}
+
+#[test]
+fn target_destruction_safely_settles_forced_transaction_once() -> NativeResult<()> {
+    let mut harness = CompatibilityPresentationHarness::new();
+    let transaction_id = harness
+        .output_transactions
+        .allocate_id()
+        .expect("transaction ID");
+    let transaction = OutputTransaction::compatibility_composited(
+        transaction_id,
+        1,
+        MonotonicTimestampNs::new(10),
+        compatibility_test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        1,
+        1,
+        91,
+        None,
+        harness.batch_id,
+    )
+    .expect("compatibility transaction");
+    harness.output_transactions.insert(transaction).unwrap();
+    harness
+        .output_transactions
+        .mark_queued(transaction_id, 1, MonotonicTimestampNs::new(11))
+        .unwrap();
+    let token = PageFlipToken::new(91).unwrap();
+    harness
+        .output_transactions
+        .mark_submitted(transaction_id, token, MonotonicTimestampNs::new(12))
+        .unwrap();
+
+    let mut settlement_calls = 0;
+    assert!(
+        super::presentation_transactions::settle_forced_shutdown_transaction_if_safe(
+            KmsTeardownSafety::TargetDestroyed,
+            &mut harness.output_transactions,
+            transaction_id,
+            token,
+            MonotonicTimestampNs::new(13),
+            |obligations: OutputProtocolObligations| {
+                settlement_calls += 1;
+                harness.server.complete_frame_batch_after_safe_abandonment(
+                    obligations
+                        .frame_batch_id()
+                        .expect("submitted transaction has a frame batch"),
+                    FrameBatchDiscardReason::SuspendAbandonment,
+                );
+                Ok(())
+            },
+        )?
+    );
+    assert_eq!(settlement_calls, 1);
+    assert_eq!(harness.output_transactions.active_count(), 0);
+    assert_eq!(harness.server.frame_batch_count(), 0);
+    assert!(
+        !super::presentation_transactions::settle_forced_shutdown_transaction_if_safe(
+            KmsTeardownSafety::TargetDestroyed,
+            &mut harness.output_transactions,
+            transaction_id,
+            token,
+            MonotonicTimestampNs::new(14),
+            |_| {
+                settlement_calls += 1;
+                Ok(())
+            },
+        )?
+    );
+    assert_eq!(settlement_calls, 1);
+    Ok(())
 }
 
 #[test]
@@ -161,7 +307,8 @@ fn forced_shutdown_does_not_abandon_late_presented_transaction() {
 
     let mut settlement_calls = 0;
     assert!(
-        !super::presentation_transactions::settle_forced_shutdown_transaction(
+        !super::presentation_transactions::settle_forced_shutdown_transaction_if_safe(
+            KmsTeardownSafety::Restored,
             &mut harness.output_transactions,
             transaction_id,
             token,

@@ -60,7 +60,7 @@ where
     settle_accepted_output_transaction(output_transactions, accepted, settle_protocol_obligations)
 }
 
-pub(crate) fn settle_forced_shutdown_transaction<F>(
+fn settle_forced_shutdown_transaction<F>(
     output_transactions: &mut OutputTransactionLedger,
     transaction_id: OutputTransactionId,
     token: PageFlipToken,
@@ -98,6 +98,29 @@ where
         settle_protocol_obligations,
     )?;
     Ok(true)
+}
+
+pub(crate) fn settle_forced_shutdown_transaction_if_safe<F>(
+    safety: KmsTeardownSafety,
+    output_transactions: &mut OutputTransactionLedger,
+    transaction_id: OutputTransactionId,
+    token: PageFlipToken,
+    at: MonotonicTimestampNs,
+    settle_protocol_obligations: F,
+) -> NativeResult<bool>
+where
+    F: FnOnce(OutputProtocolObligations) -> NativeResult<()>,
+{
+    if !safety.permits_release() {
+        return Ok(false);
+    }
+    settle_forced_shutdown_transaction(
+        output_transactions,
+        transaction_id,
+        token,
+        at,
+        settle_protocol_obligations,
+    )
 }
 
 pub(crate) fn settle_superseded_output_transaction<F>(

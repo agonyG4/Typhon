@@ -146,41 +146,48 @@ impl NativeRuntime {
         if !self.session.permits_output() {
             teardown_without_drm_io(self);
             self.parked_acquire_watches.clear();
-            if let Some(identity) = forced_identity {
-                self.settle_forced_shutdown_inflight(identity)?;
-            }
             self.perf.log("native.shutdown_session", || {
                 vec![NativePerfField::str(
                     "action",
                     "skip_kms_restore_while_seat_inactive",
                 )]
             });
-            if let Some(transition) = self.shutdown.note_kms_restore_complete() {
-                self.log_shutdown_transition(transition);
+        } else {
+            if let Some(cursor) = self.legacy_cursor.as_mut() {
+                let _ = cursor.disable();
             }
-            return Ok(());
+            native_shutdown_debug_log("kms_restore_begin");
+            NativeSessionIo::observe(self, NativeIoOperation::KmsRestore);
+            native_shutdown_debug_log("kms_restore_end");
         }
-        if let Some(cursor) = self.legacy_cursor.as_mut() {
-            let _ = cursor.disable();
-        }
-        native_shutdown_debug_log("kms_restore_begin");
-        NativeSessionIo::observe(self, NativeIoOperation::KmsRestore);
-        let restoration = self.kms_backend.restore()?;
-        native_shutdown_debug_log("kms_restore_end");
+        let pageflip_pending = if self.scanout_destroyed {
+            false
+        } else {
+            self.scanout.page_flip_pending()
+        };
+        let safety = self.establish_kms_teardown_safety();
         if let Some(identity) = forced_identity {
-            self.settle_forced_shutdown_inflight(identity)?;
+            if safety.permits_release() {
+                self.settle_forced_shutdown_inflight(identity)?;
+            } else {
+                self.forced_shutdown_inflight = Some(identity);
+            }
         }
         self.perf.log("native.kms_restore", || {
             vec![
                 NativePerfField::str("backend", self.kms_backend.effective_kind().as_str()),
-                NativePerfField::str("outcome", restoration.as_str()),
+                NativePerfField::str("outcome", safety.as_str()),
                 NativePerfField::str("shutdown_pageflip", reason.as_str()),
-                NativePerfField::bool("pageflip_pending", self.scanout.page_flip_pending()),
+                NativePerfField::bool("pageflip_pending", pageflip_pending),
             ]
         });
-        native_shutdown_debug_log("drm_release");
-        native_shutdown_debug_log("vt_restore");
-        if let Some(transition) = self.shutdown.note_kms_restore_complete() {
+        if safety.permits_release() {
+            native_shutdown_debug_log("drm_release");
+            native_shutdown_debug_log("vt_restore");
+        } else {
+            native_shutdown_debug_log("drm_release_deferred_unproven");
+        }
+        if let Some(transition) = self.shutdown.note_kms_teardown_complete(safety) {
             self.log_shutdown_transition(transition);
         }
         self.event_loop.arm_deadline(None)?;

@@ -624,6 +624,8 @@ impl NativeRuntime {
             submitted_worker_ownership: Vec::new(),
             emergency_quarantined_submitted_ownership: Vec::new(),
             kms_teardown_safety: KmsTeardownSafety::Unproven,
+            kms_teardown_safety_established: false,
+            scanout_destroyed: false,
             deferred_worker_pageflip: None,
             deferred_worker_completion: None,
             worker_timeout_pending: None,

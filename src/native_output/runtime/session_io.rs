@@ -28,6 +28,7 @@ pub(crate) enum NativeIoOperation {
     DrmSourceRegister,
     KmsRecovery,
     KmsRestore,
+    KmsTargetDestroy,
     AtomicCommit,
     LegacyCommit,
     HardwareCursorDrm,

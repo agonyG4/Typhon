@@ -126,7 +126,11 @@ impl NativeDrmBackendPlan {
 pub(crate) enum NativeDrmDeviceStorage {
     SeatManaged(NativeSeatDeviceFile),
     Direct(fs::File),
+    Closed,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeDrmTargetDestroyed;
 
 pub(crate) struct NativeDrmDevice {
     pub(crate) kind: NativeDrmBackendKind,
@@ -191,7 +195,36 @@ impl NativeDrmDevice {
         match &self.storage {
             NativeDrmDeviceStorage::SeatManaged(device) => device.file(),
             NativeDrmDeviceStorage::Direct(file) => file,
+            NativeDrmDeviceStorage::Closed => {
+                panic!("native DRM target was explicitly destroyed")
+            }
         }
+    }
+
+    pub(crate) fn destroy_target(&mut self) -> Option<NativeDrmTargetDestroyed> {
+        if matches!(self.storage, NativeDrmDeviceStorage::Closed) {
+            return None;
+        }
+        let storage = std::mem::replace(&mut self.storage, NativeDrmDeviceStorage::Closed);
+        drop(storage);
+        Some(NativeDrmTargetDestroyed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_target_destruction_produces_one_proof_token() {
+        let file = fs::File::open("/dev/null").expect("test DRM file");
+        let mut device = NativeDrmDevice {
+            kind: NativeDrmBackendKind::Direct,
+            storage: NativeDrmDeviceStorage::Direct(file),
+        };
+
+        assert_eq!(device.destroy_target(), Some(NativeDrmTargetDestroyed));
+        assert_eq!(device.destroy_target(), None);
     }
 }
 

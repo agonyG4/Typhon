@@ -1,16 +1,20 @@
 use super::super::kms_worker::{KmsCommitWorkerHandle, KmsWorkerEvent, KmsWorkerFatalJob};
 use super::*;
+use oblivion_one::native::kms::RestorationOutcome;
 
 pub(super) const fn classify_kms_teardown_safety(
-    output_permitted: bool,
-    restore_succeeded: bool,
+    proof: Option<KmsSafeBoundary>,
 ) -> KmsTeardownSafety {
-    if !output_permitted {
-        KmsTeardownSafety::TargetDestroyed
-    } else if restore_succeeded {
-        KmsTeardownSafety::Restored
-    } else {
-        KmsTeardownSafety::Unproven
+    KmsTeardownSafety::from_proof(proof)
+}
+
+pub(super) const fn proof_from_restoration(outcome: RestorationOutcome) -> Option<KmsSafeBoundary> {
+    match outcome {
+        RestorationOutcome::Exact | RestorationOutcome::AlreadyRestored => {
+            Some(KmsSafeBoundary::Restored)
+        }
+        RestorationOutcome::SafeDisable => Some(KmsSafeBoundary::TargetDestroyed),
+        RestorationOutcome::Unavailable => None,
     }
 }
 
@@ -21,7 +25,7 @@ impl NativeRuntime {
     ) -> NativeResult<()> {
         match event {
             KmsWorkerEvent::Submitted { ownership } => {
-                self.process_kms_worker_event(KmsWorkerEvent::Submitted { ownership })
+                self.quarantine_submitted_ownership(ownership)
             }
             KmsWorkerEvent::TestRejected { job, .. }
             | KmsWorkerEvent::SubmitRejected { job, .. }
@@ -40,25 +44,77 @@ impl NativeRuntime {
         }
     }
 
+    fn destroy_kms_target(&mut self) -> NativeResult<Option<KmsSafeBoundary>> {
+        if !self.session.permits_output() {
+            return Ok(None);
+        }
+        if self.kms_commit_worker.is_some() {
+            return Err(io::Error::other(
+                "cannot destroy KMS target while commit worker is running",
+            )
+            .into());
+        }
+        if let Some(token) = self.drm_reactor_token.take() {
+            self.event_loop.unregister(token)?;
+        }
+        if let Some(token) = self.output_render_fence_token.take() {
+            self.event_loop.unregister(token)?;
+        }
+        self.scanout.disarm_drm_cleanup();
+        if let Some(mut cursor) = self.atomic_cursor.take() {
+            cursor.disarm_drm_cleanup();
+        }
+        if let Some(mut cursor) = self.legacy_cursor.take() {
+            cursor.disarm_drm_cleanup();
+        }
+        if !self.scanout_destroyed {
+            // SAFETY: worker termination has already completed. DRM cleanup
+            // is disarmed before dropping scanout resources, and the target
+            // fd is closed immediately afterward as the destruction proof.
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.scanout) };
+            self.scanout_destroyed = true;
+        }
+        self.kms_backend.disarm_drm_io();
+        Ok(self
+            .kms
+            .destroy_target()
+            .map(|_| KmsSafeBoundary::TargetDestroyed))
+    }
+
     pub(super) fn establish_kms_teardown_safety(&mut self) -> KmsTeardownSafety {
-        let output_permitted = self.session.permits_output();
-        let restoration = if output_permitted {
+        if self.kms_teardown_safety_established {
+            return self.kms_teardown_safety;
+        }
+        self.kms_teardown_safety_established = true;
+        let proof = if self.session.permits_output() {
             match self.kms_backend.restore() {
                 Ok(outcome) => {
                     eprintln!("native KMS teardown reached a safe boundary: {outcome:?}");
-                    true
+                    proof_from_restoration(outcome)
                 }
                 Err(error) => {
                     eprintln!(
-                        "native KMS teardown could not prove a safe boundary; retaining ownership: {error}"
+                        "native KMS restore could not prove a safe boundary; attempting explicit target destruction: {error}"
                     );
-                    false
+                    NativeSessionIo::observe(self, NativeIoOperation::KmsTargetDestroy);
+                    match self.destroy_kms_target() {
+                        Ok(proof) => proof,
+                        Err(error) => {
+                            eprintln!(
+                                "native KMS target destruction could not prove a safe boundary; retaining ownership: {error}"
+                            );
+                            None
+                        }
+                    }
                 }
             }
         } else {
-            false
+            None
         };
-        if !output_permitted {
+        let safety = classify_kms_teardown_safety(proof);
+        self.kms_teardown_safety = safety;
+        if !safety.permits_release() {
+            self.server.disarm_shutdown_releases();
             self.scanout.disarm_drm_cleanup();
             self.kms_backend.disarm_drm_io();
             if let Some(cursor) = self.atomic_cursor.as_mut() {
@@ -68,8 +124,6 @@ impl NativeRuntime {
                 cursor.disarm_drm_cleanup();
             }
         }
-        let safety = classify_kms_teardown_safety(output_permitted, restoration);
-        self.kms_teardown_safety = safety;
         safety
     }
 

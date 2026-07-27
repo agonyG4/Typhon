@@ -10,7 +10,7 @@ use super::super::kms_worker::{
 };
 use super::presentation_transactions::{
     build_compatibility_transaction, settle_dropped_output_transaction,
-    settle_failed_output_transaction, settle_forced_shutdown_transaction,
+    settle_failed_output_transaction, settle_forced_shutdown_transaction_if_safe,
 };
 use super::*;
 use crate::native_output::scanout::AtomicEglGbmScanout;
@@ -719,7 +719,8 @@ impl NativeRuntime {
     ) -> NativeResult<()> {
         let transaction_id = identity.transaction_id;
         let token = identity.token;
-        let settled = settle_forced_shutdown_transaction(
+        let settled = settle_forced_shutdown_transaction_if_safe(
+            self.kms_teardown_safety,
             &mut self.output_transactions,
             transaction_id,
             token,
@@ -735,15 +736,15 @@ impl NativeRuntime {
             },
         )?;
         self.perf.log("native.kms_commit_worker", || {
+            let event = if !self.kms_teardown_safety.permits_release() {
+                "shutdown_transaction_retained_unproven"
+            } else if settled {
+                "shutdown_transaction_dropped_safe_abandonment"
+            } else {
+                "shutdown_transaction_already_terminal"
+            };
             vec![
-                NativePerfField::str(
-                    "event",
-                    if settled {
-                        "shutdown_transaction_dropped_safe_abandonment"
-                    } else {
-                        "shutdown_transaction_already_terminal"
-                    },
-                ),
+                NativePerfField::str("event", event),
                 NativePerfField::u64("token", token.get()),
                 NativePerfField::u64("transaction_id", transaction_id.get()),
                 NativePerfField::str("job_kind", format!("{:?}", identity.kind)),

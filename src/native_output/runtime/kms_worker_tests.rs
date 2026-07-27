@@ -259,17 +259,58 @@ fn teardown_safety_only_allows_release_after_a_proven_boundary() {
 }
 
 #[test]
-fn teardown_safety_classifies_restore_and_target_destruction_boundaries() {
+fn teardown_safety_requires_an_explicit_boundary_proof() {
     assert_eq!(
-        super::kms_worker_teardown::classify_kms_teardown_safety(true, true),
+        super::kms_worker_teardown::classify_kms_teardown_safety(None),
+        super::KmsTeardownSafety::Unproven
+    );
+    assert_eq!(
+        super::kms_worker_teardown::classify_kms_teardown_safety(Some(
+            super::KmsSafeBoundary::Restored,
+        )),
         super::KmsTeardownSafety::Restored
     );
     assert_eq!(
-        super::kms_worker_teardown::classify_kms_teardown_safety(false, false),
+        super::kms_worker_teardown::classify_kms_teardown_safety(Some(
+            super::KmsSafeBoundary::TargetDestroyed,
+        )),
         super::KmsTeardownSafety::TargetDestroyed
     );
+}
+
+#[test]
+fn inactive_seat_without_target_destruction_proof_is_unproven() {
+    let mut session = super::NativeSessionLifecycle::default();
     assert_eq!(
-        super::kms_worker_teardown::classify_kms_teardown_safety(true, false),
+        session.begin_for_event(crate::native_output::NativeSeatEvent::Disabled),
+        Some(super::NativeSessionTransition::BeginSuspend)
+    );
+    session.finish_suspend();
+    assert!(!session.permits_output());
+    assert_eq!(
+        super::kms_worker_teardown::classify_kms_teardown_safety(None),
         super::KmsTeardownSafety::Unproven
+    );
+}
+
+#[test]
+fn restoration_outcomes_only_produce_matching_boundary_proofs() {
+    use oblivion_one::native::kms::RestorationOutcome;
+
+    assert_eq!(
+        super::kms_worker_teardown::proof_from_restoration(RestorationOutcome::Exact),
+        Some(super::KmsSafeBoundary::Restored)
+    );
+    assert_eq!(
+        super::kms_worker_teardown::proof_from_restoration(RestorationOutcome::AlreadyRestored),
+        Some(super::KmsSafeBoundary::Restored)
+    );
+    assert_eq!(
+        super::kms_worker_teardown::proof_from_restoration(RestorationOutcome::SafeDisable),
+        Some(super::KmsSafeBoundary::TargetDestroyed)
+    );
+    assert_eq!(
+        super::kms_worker_teardown::proof_from_restoration(RestorationOutcome::Unavailable),
+        None
     );
 }
