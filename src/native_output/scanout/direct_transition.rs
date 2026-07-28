@@ -76,12 +76,6 @@ impl NativeScanoutBackend {
         }
     }
 
-    pub(crate) fn note_direct_early_release_prevented(&mut self) {
-        if let Self::AtomicEglGbm(scanout) = self {
-            scanout.note_direct_early_release_prevented();
-        }
-    }
-
     pub(crate) fn note_dmabuf_feedback_unchanged_rebuild(&mut self) {
         if let Self::AtomicEglGbm(scanout) = self {
             scanout.note_dmabuf_feedback_unchanged_rebuild();

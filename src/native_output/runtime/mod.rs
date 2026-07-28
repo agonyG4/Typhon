@@ -401,6 +401,34 @@ impl Drop for NativeRuntime {
             return;
         }
         self.confirmed_primary_assignment = None;
+        if !self.scanout_destroyed
+            && let Err(error) = self.scanout.release_direct_for_target_destroyed()
+        {
+            eprintln!("native direct target-destroyed release was not proven safe: {error}");
+            self.retain_unproven_teardown_ownership();
+            return;
+        }
+        let terminal_callback_transactions = self.output_transactions.active_transaction_ids();
+        for transaction_id in terminal_callback_transactions {
+            let Some(transaction) = self.output_transactions.transaction(transaction_id) else {
+                continue;
+            };
+            if !matches!(
+                transaction.descriptor().content(),
+                OutputTransactionContent::Direct { .. }
+            ) {
+                continue;
+            }
+            let callback_owner_leaks = direct_terminal_callback_owner_leaks(
+                &self.server,
+                transaction_id,
+                transaction.descriptor().obligations(),
+                DirectTerminalCallbackDisposition::Abandoned,
+                0,
+            );
+            self.scanout
+                .note_direct_callback_owner_leaks(callback_owner_leaks);
+        }
         // SAFETY: scanout is wrapped solely so teardown can disarm DRM cleanup
         // before its normal resource drop. The proven boundary above means
         // KMS no longer references submitted resources, and scanout is

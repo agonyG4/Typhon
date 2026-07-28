@@ -324,6 +324,69 @@ fn assert_executing_direct_candidate_survives_real_submit(
     handle.join().unwrap();
 }
 
+fn assert_duplicate_candidate_is_rejected_after_atomic_dequeue(
+    test_only: KmsTestOnlyPolicy,
+    token: u64,
+) {
+    let executor = Arc::new(BlockingDirectSubmitExecutor {
+        started: std::sync::Barrier::new(2),
+        release: std::sync::Barrier::new(2),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let pause = handle.pause_after_dequeue_for_test();
+    let key = test_direct_key(3);
+    let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
+    let mut job = test_direct_job(token, key, 42, Some(lease));
+    job.test_only = test_only;
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+
+    pause.wait_until_selected();
+    assert_eq!(handle.direct_content_keys(), (None, Some(key), None));
+    assert!(matches!(
+        handle.try_reserve_direct_admission(key),
+        Err(KmsWorkerAdmissionError::DuplicateCandidate)
+    ));
+    assert_eq!(handle.queue_depth(), 0);
+    assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 0);
+
+    pause.release();
+    executor.started.wait();
+    assert!(matches!(
+        handle.try_reserve_direct_admission(key),
+        Err(KmsWorkerAdmissionError::DuplicateCandidate)
+    ));
+    executor.release.wait();
+    let events = wait_for_fence_event(
+        &handle,
+        token,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == token),
+    );
+    assert_eq!(handle.direct_content_keys().2, Some(key));
+    handle
+        .ack_pageflip(test_job(token).token, test_job(token).transaction_id, 1)
+        .unwrap();
+    drop(events);
+    assert_eq!(handle.direct_content_keys(), (None, None, None));
+    assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 1);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn queued_to_executing_transition_is_atomic() {
+    assert_duplicate_candidate_is_rejected_after_atomic_dequeue(KmsTestOnlyPolicy::Skip, 606);
+}
+
+#[test]
+fn duplicate_candidate_cannot_reserve_during_dequeue() {
+    assert_duplicate_candidate_is_rejected_after_atomic_dequeue(KmsTestOnlyPolicy::Required, 607);
+}
+
+#[test]
+fn duplicate_candidate_cannot_reserve_before_execution_guard_returns() {
+    assert_duplicate_candidate_is_rejected_after_atomic_dequeue(KmsTestOnlyPolicy::Skip, 608);
+}
+
 #[test]
 fn executing_candidate_survives_required_test_only_and_blocked_real_submit() {
     assert_executing_direct_candidate_survives_real_submit(KmsTestOnlyPolicy::Required, 604);
@@ -332,6 +395,26 @@ fn executing_candidate_survives_required_test_only_and_blocked_real_submit() {
 #[test]
 fn executing_candidate_survives_cached_skip_and_blocked_real_submit() {
     assert_executing_direct_candidate_survives_real_submit(KmsTestOnlyPolicy::Skip, 605);
+}
+
+#[test]
+fn duplicate_candidate_rejected_during_required_test_submit() {
+    assert_executing_direct_candidate_survives_real_submit(KmsTestOnlyPolicy::Required, 609);
+}
+
+#[test]
+fn duplicate_candidate_rejected_during_cached_submit() {
+    assert_executing_direct_candidate_survives_real_submit(KmsTestOnlyPolicy::Skip, 610);
+}
+
+#[test]
+fn executing_candidate_survives_ebusy_retry() {
+    direct_ebusy_retry_keeps_the_same_lease_identity();
+}
+
+#[test]
+fn executing_candidate_transfers_to_inflight_after_submit() {
+    successful_direct_submit_transfers_the_lease_to_submitted_event();
 }
 
 impl KmsCommitExecutor for DirectLeaseRecordingExecutor {

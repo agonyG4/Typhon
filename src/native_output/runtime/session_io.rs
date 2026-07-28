@@ -323,6 +323,26 @@ impl NativeSessionIo for NativeRuntime {
         self.emergency_quarantined_submitted_ownership.clear();
         let abandoned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         let transaction_ids = self.output_transactions.active_transaction_ids();
+        for transaction_id in transaction_ids.iter().copied() {
+            let Some(transaction) = self.output_transactions.transaction(transaction_id) else {
+                continue;
+            };
+            if !matches!(
+                transaction.descriptor().content(),
+                OutputTransactionContent::Direct { .. }
+            ) {
+                continue;
+            }
+            let callback_owner_leaks = direct_terminal_callback_owner_leaks(
+                &self.server,
+                transaction_id,
+                transaction.descriptor().obligations(),
+                DirectTerminalCallbackDisposition::Abandoned,
+                0,
+            );
+            self.scanout
+                .note_direct_callback_owner_leaks(callback_owner_leaks);
+        }
         let output_transactions = &mut self.output_transactions;
         let server = &mut self.server;
         for transaction_id in transaction_ids {

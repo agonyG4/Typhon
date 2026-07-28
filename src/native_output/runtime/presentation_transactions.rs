@@ -1,6 +1,7 @@
 use super::cursor_cycle::defer_cursor_after_busy;
 use super::*;
 use oblivion_one::compositor::CompositorFrameBatchId;
+use oblivion_one::compositor::{TerminalCallbackDisposition, TerminalCallbackOwnership};
 use oblivion_one::native::kms::KmsBackendKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,6 +10,7 @@ pub(crate) enum DirectTerminalCallbackDisposition {
     NoVisualChange,
     Abandoned,
     Retryable,
+    Superseded,
 }
 
 pub(crate) fn direct_terminal_callback_owner_leaks(
@@ -21,12 +23,80 @@ pub(crate) fn direct_terminal_callback_owner_leaks(
     debug_assert!(transaction_id.get() > 0);
     debug_assert!(obligations.direct_surface_id().is_some());
     let live_leaks = match disposition {
-        DirectTerminalCallbackDisposition::Retryable => 0,
-        DirectTerminalCallbackDisposition::Presented
-        | DirectTerminalCallbackDisposition::NoVisualChange
-        | DirectTerminalCallbackDisposition::Abandoned => obligations
+        DirectTerminalCallbackDisposition::Presented => obligations
             .frame_batch_id()
-            .map(|batch_id| server.direct_callback_owner_leaks(batch_id))
+            .map(|batch_id| {
+                match server.prepare_terminal_callback_ownership(
+                    batch_id,
+                    TerminalCallbackDisposition::Presented,
+                ) {
+                    TerminalCallbackOwnership::Leaked { pending, .. } => pending as u64,
+                    TerminalCallbackOwnership::None
+                    | TerminalCallbackOwnership::Resolved
+                    | TerminalCallbackOwnership::Transferred(_)
+                    | TerminalCallbackOwnership::Cancelled => 0,
+                }
+            })
+            .unwrap_or(0),
+        DirectTerminalCallbackDisposition::NoVisualChange => obligations
+            .frame_batch_id()
+            .map(|batch_id| {
+                match server.prepare_terminal_callback_ownership(
+                    batch_id,
+                    TerminalCallbackDisposition::NoVisualChange,
+                ) {
+                    TerminalCallbackOwnership::Leaked { pending, .. } => pending as u64,
+                    TerminalCallbackOwnership::None
+                    | TerminalCallbackOwnership::Resolved
+                    | TerminalCallbackOwnership::Transferred(_)
+                    | TerminalCallbackOwnership::Cancelled => 0,
+                }
+            })
+            .unwrap_or(0),
+        DirectTerminalCallbackDisposition::Retryable => obligations
+            .frame_batch_id()
+            .map(|batch_id| {
+                match server.prepare_terminal_callback_ownership(
+                    batch_id,
+                    TerminalCallbackDisposition::Retryable,
+                ) {
+                    TerminalCallbackOwnership::Leaked { pending, .. } => pending as u64,
+                    TerminalCallbackOwnership::None
+                    | TerminalCallbackOwnership::Resolved
+                    | TerminalCallbackOwnership::Transferred(_)
+                    | TerminalCallbackOwnership::Cancelled => 0,
+                }
+            })
+            .unwrap_or(0),
+        DirectTerminalCallbackDisposition::Abandoned => obligations
+            .frame_batch_id()
+            .map(|batch_id| {
+                match server.prepare_terminal_callback_ownership(
+                    batch_id,
+                    TerminalCallbackDisposition::Cancelled,
+                ) {
+                    TerminalCallbackOwnership::Leaked { pending, .. } => pending as u64,
+                    TerminalCallbackOwnership::None
+                    | TerminalCallbackOwnership::Resolved
+                    | TerminalCallbackOwnership::Transferred(_)
+                    | TerminalCallbackOwnership::Cancelled => 0,
+                }
+            })
+            .unwrap_or(0),
+        DirectTerminalCallbackDisposition::Superseded => obligations
+            .frame_batch_id()
+            .map(|batch_id| {
+                match server.prepare_terminal_callback_ownership(
+                    batch_id,
+                    TerminalCallbackDisposition::Superseded,
+                ) {
+                    TerminalCallbackOwnership::Leaked { pending, .. } => pending as u64,
+                    TerminalCallbackOwnership::None
+                    | TerminalCallbackOwnership::Resolved
+                    | TerminalCallbackOwnership::Transferred(_)
+                    | TerminalCallbackOwnership::Cancelled => 0,
+                }
+            })
             .unwrap_or(0),
     };
     observed_leaks.saturating_add(live_leaks)

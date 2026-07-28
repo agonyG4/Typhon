@@ -163,6 +163,13 @@ fn settle_failed_direct_worker_transaction(
         .ok_or_else(|| io::Error::other("direct worker transaction disappeared"))?
         .descriptor()
         .obligations();
+    let callback_owner_leaks = direct_terminal_callback_owner_leaks(
+        server,
+        transaction_id,
+        obligations,
+        DirectTerminalCallbackDisposition::Retryable,
+        0,
+    );
     settle_failed_output_transaction(
         output_transactions,
         transaction_id,
@@ -175,13 +182,7 @@ fn settle_failed_direct_worker_transaction(
             Ok(())
         },
     )?;
-    scanout.note_direct_callback_owner_leaks(direct_terminal_callback_owner_leaks(
-        server,
-        transaction_id,
-        obligations,
-        DirectTerminalCallbackDisposition::Retryable,
-        0,
-    ));
+    scanout.note_direct_callback_owner_leaks(callback_owner_leaks);
     Ok(())
 }
 

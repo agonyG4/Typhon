@@ -719,11 +719,21 @@ impl NativeRuntime {
                             .as_ref()
                             .map(|worker| worker.direct_content_keys())
                             .unwrap_or((None, None, None));
-                        explicit.complete_composited_transition(
-                            DirectReleaseBoundary::ComposedPageflip,
-                            worker_content_keys,
-                        );
-                        debug_assert!(explicit.direct_scanout_presented_info().is_none());
+                        match explicit.complete_composited_transition(worker_content_keys) {
+                            CompositedTransitionResult::Completed { .. } => {
+                                debug_assert!(explicit.direct_scanout_presented_info().is_none());
+                            }
+                            CompositedTransitionResult::Fatal { reason } => {
+                                return cycle_direct::fail_composited_transition(
+                                    kms_commit_worker.as_ref(),
+                                    direct_fallback_tracker,
+                                    scanout,
+                                    frame_scheduler,
+                                    atomic_commit_arbiter,
+                                    reason,
+                                );
+                            }
+                        }
                     }
                     if let Some(mut tracker) = direct_fallback_tracker.take() {
                         tracker.observe_refresh(*last_refresh_sequence);

@@ -1,6 +1,8 @@
 //! Atomic submit worker thread and lifecycle boundary.
 
 use super::payload::{KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy};
+#[cfg(test)]
+use super::queue::DequeuePause;
 use super::queue::{
     KmsWorkerFatalJob, KmsWorkerForcedShutdown, KmsWorkerLifecycle, KmsWorkerShutdownSnapshot,
     RESULT_EVENT_CAPACITY, WorkerInFlight, WorkerMetricsSnapshot, WorkerShared, create_eventfd,
@@ -205,6 +207,11 @@ impl KmsCommitWorkerHandle {
         Option<crate::native_output::DirectScanoutCandidateKey>,
     ) {
         self.shared.direct_content_keys()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_dequeue_for_test(&self) -> Arc<DequeuePause> {
+        self.shared.pause_after_dequeue_for_test()
     }
 
     pub(crate) fn try_reserve_direct_admission(
@@ -512,14 +519,10 @@ struct ExecutingDirectCandidateGuard {
 }
 
 impl ExecutingDirectCandidateGuard {
-    fn new(shared: &Arc<WorkerShared>, job: &KmsCommitJob) -> Self {
-        let candidate = job.direct_primary_lease.as_ref().map(|lease| lease.key());
-        let mut state = shared
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.executing = true;
-        state.executing_direct_content_key = candidate;
+    fn from_dequeued(
+        shared: &Arc<WorkerShared>,
+        candidate: Option<DirectScanoutCandidateKey>,
+    ) -> Self {
         Self {
             shared: Arc::clone(shared),
             candidate,
@@ -650,10 +653,18 @@ impl Drop for KmsCommitWorkerHandle {
 fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
     let mut timing = None;
     loop {
-        let Some(mut job) = take_next_job(&shared) else {
+        let Some(ExecutingKmsJob {
+            mut job,
+            direct_candidate,
+        }) = take_next_job(&shared)
+        else {
             return;
         };
-        let mut executing = ExecutingDirectCandidateGuard::new(&shared, &job);
+        #[cfg(test)]
+        if let Some(pause) = shared.take_dequeue_pause_for_test() {
+            pause.pause();
+        }
+        let mut executing = ExecutingDirectCandidateGuard::from_dequeued(&shared, direct_candidate);
         if timing.is_none() {
             timing = Some(KmsCommitTimingModel::new(job.target.refresh_interval));
         }
@@ -920,7 +931,13 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
     }
 }
 
-fn take_next_job(shared: &Arc<WorkerShared>) -> Option<KmsCommitJob> {
+#[derive(Debug)]
+struct ExecutingKmsJob {
+    job: KmsCommitJob,
+    direct_candidate: Option<DirectScanoutCandidateKey>,
+}
+
+fn take_next_job(shared: &Arc<WorkerShared>) -> Option<ExecutingKmsJob> {
     let mut state = shared
         .state
         .lock()
@@ -947,7 +964,14 @@ fn take_next_job(shared: &Arc<WorkerShared>) -> Option<KmsCommitJob> {
         if state.inflight.is_none()
             && let Some(job) = state.queued.pop_front()
         {
-            return Some(job);
+            let direct_candidate = job.direct_primary_lease.as_ref().map(|lease| lease.key());
+            debug_assert!(!state.executing);
+            state.executing = true;
+            state.executing_direct_content_key = direct_candidate;
+            return Some(ExecutingKmsJob {
+                job,
+                direct_candidate,
+            });
         }
         state = shared
             .work_wakeup

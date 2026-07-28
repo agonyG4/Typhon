@@ -81,6 +81,13 @@ impl NativeRuntime {
             self.scanout.invalidate_direct_validation(validation_key);
         }
         let direct_job = job;
+        let callback_owner_leaks = direct_terminal_callback_owner_leaks(
+            &self.server,
+            direct_job.transaction_id,
+            obligations,
+            DirectTerminalCallbackDisposition::Retryable,
+            0,
+        );
         let settlement = settle_failed_output_transaction(
             &mut self.output_transactions,
             direct_job.transaction_id,
@@ -100,13 +107,7 @@ impl NativeRuntime {
             return Err(error);
         }
         self.scanout
-            .note_direct_callback_owner_leaks(direct_terminal_callback_owner_leaks(
-                &self.server,
-                direct_job.transaction_id,
-                obligations,
-                DirectTerminalCallbackDisposition::Retryable,
-                0,
-            ));
+            .note_direct_callback_owner_leaks(callback_owner_leaks);
         debug_assert!(!self.scanout.direct_scanout_pending());
         self.scanout.note_direct_rejection(
             rejection_kind == WorkerRejectionKind::TestOnly,

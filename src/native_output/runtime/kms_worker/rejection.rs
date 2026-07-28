@@ -206,6 +206,15 @@ impl NativeRuntime {
         } else {
             None
         };
+        let direct_callback_owner_leaks = direct_obligations.map(|obligations| {
+            direct_terminal_callback_owner_leaks(
+                &self.server,
+                job.transaction_id,
+                obligations,
+                DirectTerminalCallbackDisposition::Abandoned,
+                0,
+            )
+        });
         settle_dropped_output_transaction(
             &mut self.output_transactions,
             job.transaction_id,
@@ -221,15 +230,9 @@ impl NativeRuntime {
                 Ok(())
             },
         )?;
-        if let Some(obligations) = direct_obligations {
+        if let Some(callback_owner_leaks) = direct_callback_owner_leaks {
             self.scanout
-                .note_direct_callback_owner_leaks(direct_terminal_callback_owner_leaks(
-                    &self.server,
-                    job.transaction_id,
-                    obligations,
-                    DirectTerminalCallbackDisposition::Abandoned,
-                    0,
-                ));
+                .note_direct_callback_owner_leaks(callback_owner_leaks);
         }
         if drop_reason == OutputTransactionDropReason::SafeAbandonment
             && let Some(worker) = self.kms_commit_worker.as_ref()

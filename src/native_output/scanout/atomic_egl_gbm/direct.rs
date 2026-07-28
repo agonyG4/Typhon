@@ -67,6 +67,13 @@ fn settle_no_visual_change_transaction(
         .expect("direct no-visual-change transaction was just inserted")
         .descriptor()
         .obligations();
+    let callback_owner_leaks = direct_terminal_callback_owner_leaks(
+        server,
+        transaction_id,
+        obligations,
+        DirectTerminalCallbackDisposition::NoVisualChange,
+        0,
+    );
     settle_no_visual_change_output_transaction(
         output_transactions,
         transaction_id,
@@ -81,13 +88,6 @@ fn settle_no_visual_change_transaction(
         },
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
-    let callback_owner_leaks = direct_terminal_callback_owner_leaks(
-        server,
-        transaction_id,
-        obligations,
-        DirectTerminalCallbackDisposition::NoVisualChange,
-        0,
-    );
     scanout.note_direct_callback_owner_leaks(callback_owner_leaks);
     if callback_owner_leaks > 0 {
         direct_scanout_debug(format_args!(
@@ -361,6 +361,13 @@ impl AtomicEglGbmScanout {
             Err(crate::native_output::kms_worker::KmsWorkerAdmissionError::DuplicateCandidate) => {
                 self.note_direct_worker_admission_rejected(false);
                 self.note_direct_same_buffer_resubmission();
+                let callback_owner_leaks = direct_terminal_callback_owner_leaks(
+                    server,
+                    transaction_id,
+                    obligations,
+                    DirectTerminalCallbackDisposition::NoVisualChange,
+                    0,
+                );
                 settle_no_visual_change_output_transaction(
                     output_transactions,
                     transaction_id,
@@ -374,13 +381,7 @@ impl AtomicEglGbmScanout {
                     },
                 )
                 .map_err(|error| io::Error::other(error.to_string()))?;
-                self.note_direct_callback_owner_leaks(direct_terminal_callback_owner_leaks(
-                    server,
-                    transaction_id,
-                    obligations,
-                    DirectTerminalCallbackDisposition::NoVisualChange,
-                    0,
-                ));
+                self.note_direct_callback_owner_leaks(callback_owner_leaks);
                 return Ok(DirectScanoutAttempt::Unchanged);
             }
             Err(error) => {
@@ -388,6 +389,13 @@ impl AtomicEglGbmScanout {
                     error,
                     crate::native_output::kms_worker::KmsWorkerAdmissionError::QueueFull
                 ));
+                let callback_owner_leaks = direct_terminal_callback_owner_leaks(
+                    server,
+                    transaction_id,
+                    obligations,
+                    DirectTerminalCallbackDisposition::Retryable,
+                    0,
+                );
                 settle_failed_output_transaction(
                     output_transactions,
                     transaction_id,
@@ -402,13 +410,7 @@ impl AtomicEglGbmScanout {
                     },
                 )
                 .map_err(|error| io::Error::other(error.to_string()))?;
-                self.note_direct_callback_owner_leaks(direct_terminal_callback_owner_leaks(
-                    server,
-                    transaction_id,
-                    obligations,
-                    DirectTerminalCallbackDisposition::Retryable,
-                    0,
-                ));
+                self.note_direct_callback_owner_leaks(callback_owner_leaks);
                 return Ok(DirectScanoutAttempt::AdmissionRejected {
                     transaction_id,
                     reason: error,
@@ -573,13 +575,12 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn complete_composited_transition(
         &mut self,
-        boundary: DirectReleaseBoundary,
         worker_content_keys: (
             Option<DirectScanoutCandidateKey>,
             Option<DirectScanoutCandidateKey>,
             Option<DirectScanoutCandidateKey>,
         ),
-    ) {
+    ) -> CompositedTransitionResult {
         let worker_owns_current =
             self.direct
                 .ownership
@@ -590,34 +591,14 @@ impl AtomicEglGbmScanout {
                         || worker_content_keys.1 == Some(presented.lease.key())
                         || worker_content_keys.2 == Some(presented.lease.key())
                 });
-        match self
+        let result = self
             .direct
-            .ownership
-            .release_safety(boundary, worker_owns_current)
-        {
-            DirectReleaseSafety::Safe => {}
-            DirectReleaseSafety::Deferred => {
-                self.note_direct_early_release_prevented();
-                return;
-            }
-            DirectReleaseSafety::Violation => {
-                self.note_direct_early_release_violation();
-                return;
-            }
-        }
-        if self
-            .direct
-            .ownership
-            .release_presented_for_composed_pageflip()
-            .is_some()
-        {
-            self.direct.counters.exits += 1;
-            self.direct.counters.fallback_cycles =
-                self.direct.counters.fallback_cycles.saturating_add(1);
+            .complete_composited_transition(worker_owns_current);
+        if let CompositedTransitionResult::Completed { released: Some(_) } = &result {
             direct_scanout_debug("exited direct scanout to composition");
             self.scene.invalidate_presented_damage_history();
         }
-        self.direct.inhibit_until_composited_present = false;
+        result
     }
 
     pub(crate) fn direct_scanout_pending(&self) -> bool {
@@ -761,22 +742,6 @@ impl AtomicEglGbmScanout {
             self.direct.counters.duplicate_feedback.saturating_add(1);
     }
 
-    pub(crate) fn note_direct_early_release_prevented(&mut self) {
-        self.direct.counters.early_release_prevented = self
-            .direct
-            .counters
-            .early_release_prevented
-            .saturating_add(1);
-    }
-
-    pub(crate) fn note_direct_early_release_violation(&mut self) {
-        self.direct.counters.early_release_violations = self
-            .direct
-            .counters
-            .early_release_violations
-            .saturating_add(1);
-    }
-
     pub(crate) fn note_dmabuf_feedback_unchanged_rebuild(&mut self) {
         self.direct.counters.dmabuf_feedback_unchanged_rebuilds = self
             .direct
@@ -810,6 +775,23 @@ impl AtomicEglGbmScanout {
         let Some(frame) = self.swapchain_mut()?.take_ready_for_submission().ok() else {
             return Ok(false);
         };
+        let callback_owner_leaks = output_transactions
+            .transaction(frame.transaction_id)
+            .filter(|transaction| {
+                matches!(
+                    transaction.descriptor().content(),
+                    OutputTransactionContent::Direct { .. }
+                )
+            })
+            .map(|transaction| {
+                direct_terminal_callback_owner_leaks(
+                    server,
+                    frame.transaction_id,
+                    transaction.descriptor().obligations(),
+                    DirectTerminalCallbackDisposition::Superseded,
+                    0,
+                )
+            });
         settle_superseded_output_transaction(
             output_transactions,
             frame.transaction_id,
@@ -825,6 +807,9 @@ impl AtomicEglGbmScanout {
             },
         )
         .map_err(|error| io::Error::other(error.to_string()))?;
+        if let Some(callback_owner_leaks) = callback_owner_leaks {
+            self.note_direct_callback_owner_leaks(callback_owner_leaks);
+        }
         self.scene.discard_rendered(frame.scene_commit);
         drop(frame.surface_damage);
         Ok(true)

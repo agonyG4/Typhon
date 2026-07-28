@@ -3,7 +3,29 @@ use super::super::presentation_transactions::{
     DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
     prepare_presented_output_transaction,
 };
+use super::cycle::direct_fallback::DirectFallbackTracker;
 use super::*;
+
+pub(super) fn fail_composited_transition(
+    worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
+    direct_fallback_tracker: &mut Option<DirectFallbackTracker>,
+    scanout: &mut NativeScanoutBackend,
+    frame_scheduler: &mut NativeFrameScheduler,
+    atomic_commit_arbiter: &mut AtomicCommitArbiter,
+    reason: DirectReleaseViolation,
+) -> NativeResult<NativeCycleState> {
+    if let Some(worker) = worker {
+        worker.mark_admission_fatal();
+    }
+    *direct_fallback_tracker = None;
+    frame_scheduler.abandon_for_session_suspend();
+    atomic_commit_arbiter.abandon_for_recovery();
+    scanout.suspend_page_flip()?;
+    Err(io::Error::other(format!(
+        "direct ownership could not be retired after composed pageflip: {reason:?}"
+    ))
+    .into())
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn settle_direct_pageflip(
@@ -65,6 +87,13 @@ pub(super) fn settle_direct_pageflip(
             return Err(error.into());
         }
     };
+    let callback_owner_leaks = direct_terminal_callback_owner_leaks(
+        server,
+        transaction_id,
+        logical_obligations,
+        DirectTerminalCallbackDisposition::Presented,
+        0,
+    );
     let completion = scanout.commit_prepared_direct_pageflip(prepared_physical);
     output_transactions.commit_prepared_terminal(prepared_logical);
     if prepared_cursor {
@@ -101,15 +130,8 @@ pub(super) fn settle_direct_pageflip(
         transaction_id,
         timestamp_ns: presented_at.get(),
     });
-    let callback_owner_leaks =
-        server.commit_prepared_direct_presented_frame_batch(prepared_frame_batch, presentation);
-    scanout.note_direct_callback_owner_leaks(direct_terminal_callback_owner_leaks(
-        server,
-        transaction_id,
-        logical_obligations,
-        DirectTerminalCallbackDisposition::Presented,
-        callback_owner_leaks,
-    ));
+    server.commit_prepared_direct_presented_frame_batch(prepared_frame_batch, presentation);
+    scanout.note_direct_callback_owner_leaks(callback_owner_leaks);
     drop(completion.replaced);
     let target = direct_info.target;
     let submit_started_at = direct_info.submit_started_at;

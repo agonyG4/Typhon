@@ -45,7 +45,7 @@ pub(in crate::compositor) use desktop_windows::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use dmabuf_feedback::*;
 #[allow(unused_imports)]
-pub(in crate::compositor) use frame_callbacks::*;
+pub(crate) use frame_callbacks::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use frames::*;
 #[allow(unused_imports)]

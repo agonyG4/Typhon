@@ -35,8 +35,13 @@ impl OwnCompositorServer {
         self.state.frame_batches.contains_key(&batch_id)
     }
 
-    pub fn direct_callback_owner_leaks(&self, batch_id: CompositorFrameBatchId) -> u64 {
-        self.state.direct_callback_owner_leaks(batch_id)
+    pub fn prepare_terminal_callback_ownership(
+        &self,
+        batch_id: CompositorFrameBatchId,
+        disposition: TerminalCallbackDisposition,
+    ) -> TerminalCallbackOwnership {
+        self.state
+            .prepare_terminal_callback_ownership(batch_id, disposition)
     }
 
     pub fn prepare_direct_presented_frame_batch(
@@ -66,15 +71,14 @@ impl OwnCompositorServer {
         &mut self,
         prepared: PreparedDirectFrameBatch,
         presentation: FramePresentation,
-    ) -> u64 {
-        let callback_owner_leaks = self.state.complete_direct_presented_frame_batch(
+    ) {
+        self.state.complete_direct_presented_frame_batch(
             prepared.frame_id,
             prepared.batch_id,
             prepared.direct_surface_id,
             presentation,
         );
         let _ = self.display.flush_clients();
-        callback_owner_leaks
     }
 
     #[doc(hidden)]

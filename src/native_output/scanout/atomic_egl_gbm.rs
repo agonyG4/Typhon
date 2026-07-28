@@ -150,8 +150,50 @@ impl AtomicEglGbmScanout {
             self.scene.discard_rendered(frame.scene_commit);
             drop(frame.surface_damage);
         }
-        self.direct.complete_suspended();
-        Ok(())
+        match self.direct.complete_suspended() {
+            DirectReleaseOutcome::Released {
+                presented,
+                suspended,
+            } => {
+                drop(presented);
+                drop(suspended);
+                Ok(())
+            }
+            DirectReleaseOutcome::Deferred { reason } => Err(io::Error::other(format!(
+                "direct ownership release remained deferred after recovery: {reason:?}"
+            ))),
+            DirectReleaseOutcome::Violation { reason } => Err(io::Error::other(format!(
+                "direct ownership release violated after recovery: {reason:?}"
+            ))),
+        }
+    }
+
+    pub(crate) fn release_direct_for_target_destroyed(&mut self) -> io::Result<()> {
+        match self
+            .direct
+            .request_direct_release(DirectReleaseProof::TargetDestroyed, false)
+        {
+            DirectReleaseOutcome::Released {
+                presented,
+                suspended,
+            } => {
+                drop(presented);
+                drop(suspended);
+                Ok(())
+            }
+            DirectReleaseOutcome::Deferred { reason } => Err(io::Error::other(format!(
+                "direct target-destroyed release remained deferred: {reason:?}"
+            ))),
+            DirectReleaseOutcome::Violation { reason } => Err(io::Error::other(format!(
+                "direct target-destroyed release violated ownership: {reason:?}"
+            ))),
+        }
+    }
+
+    pub(crate) fn retain_direct_for_unproven_teardown(&mut self) {
+        let _ = self
+            .direct
+            .request_direct_release(DirectReleaseProof::Unproven, false);
     }
 
     pub(crate) fn rebind_session_generation(&mut self, generation: u64) {

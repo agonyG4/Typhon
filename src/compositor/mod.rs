@@ -123,6 +123,27 @@ use explicit_sync::{
 };
 pub(crate) use frame_batch::CompositorFrameBatch;
 pub use frame_batch::{BufferReleaseMetrics, CompositorFrameBatchId, FrameCallbackMetrics};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalCallbackDisposition {
+    Presented,
+    NoVisualChange,
+    Retryable,
+    Superseded,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalCallbackOwnership {
+    None,
+    Resolved,
+    Transferred(CompositorFrameBatchId),
+    Cancelled,
+    Leaked {
+        owner: CompositorFrameBatchId,
+        pending: usize,
+    },
+}
 pub use fullscreen::DirectScanoutSceneBlockers;
 pub(crate) use fullscreen::direct_scanout_scene_rejection_for_flags;
 pub use fullscreen::{

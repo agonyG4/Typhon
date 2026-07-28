@@ -258,6 +258,64 @@ pub(crate) struct WorkerShared {
     pub(crate) result_fd: OwnedFd,
     pub(crate) metrics: WorkerMetrics,
     pub(crate) fatal_reason_code: AtomicU64,
+    #[cfg(test)]
+    pub(crate) dequeue_pause: Mutex<Option<Arc<DequeuePause>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct DequeuePause {
+    selected: (Mutex<bool>, Condvar),
+    released: (Mutex<bool>, Condvar),
+}
+
+#[cfg(test)]
+impl DequeuePause {
+    pub(crate) fn wait_until_selected(&self) {
+        let (selected, wakeup) = (&self.selected.0, &self.selected.1);
+        let mut selected = selected
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*selected {
+            selected = wakeup
+                .wait(selected)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        let mut released = self
+            .released
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *released = true;
+        self.released.1.notify_all();
+    }
+
+    pub(crate) fn pause(&self) {
+        let mut selected = self
+            .selected
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *selected = true;
+        self.selected.1.notify_all();
+        drop(selected);
+
+        let mut released = self
+            .released
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*released {
+            released = self
+                .released
+                .1
+                .wait(released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -291,7 +349,27 @@ impl WorkerShared {
             result_fd,
             metrics: WorkerMetrics::default(),
             fatal_reason_code: AtomicU64::new(0),
+            #[cfg(test)]
+            dequeue_pause: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_dequeue_for_test(self: &Arc<Self>) -> Arc<DequeuePause> {
+        let pause = Arc::new(DequeuePause::default());
+        *self
+            .dequeue_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&pause));
+        pause
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_dequeue_pause_for_test(&self) -> Option<Arc<DequeuePause>> {
+        self.dequeue_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     pub(crate) fn direct_content_keys(

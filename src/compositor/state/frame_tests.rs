@@ -338,4 +338,139 @@ mod frame_consumption_tests {
         assert!(state.frame_batches.is_empty());
         assert!(state.pending_dmabuf_buffer_releases.is_empty());
     }
+
+    fn terminal_callback_batch() -> (CompositorState, CompositorFrameBatchId) {
+        let mut state = CompositorState::default();
+        let batch = state.take_frame_batch_for_render(900);
+        (state, batch)
+    }
+
+    #[test]
+    fn no_visual_change_checks_callbacks_before_batch_removal() {
+        let (mut state, batch) = terminal_callback_batch();
+
+        assert_eq!(
+            state.prepare_terminal_callback_ownership(
+                batch,
+                TerminalCallbackDisposition::NoVisualChange,
+            ),
+            TerminalCallbackOwnership::None
+        );
+        assert!(state.frame_batches.contains_key(&batch));
+        state.complete_no_visual_change_frame_batch(batch);
+        assert!(!state.frame_batches.contains_key(&batch));
+    }
+
+    #[test]
+    fn retryable_rejection_validates_callback_transfer_target() {
+        let (mut state, batch) = terminal_callback_batch();
+
+        assert_eq!(
+            state.prepare_terminal_callback_ownership(
+                batch,
+                TerminalCallbackDisposition::Retryable,
+            ),
+            TerminalCallbackOwnership::None
+        );
+        state.restore_frame_batch_after_render_failure(batch);
+        assert!(!state.frame_batches.contains_key(&batch));
+    }
+
+    #[test]
+    fn safe_abandonment_checks_callbacks_before_cancellation() {
+        let (mut state, batch) = terminal_callback_batch();
+
+        assert_eq!(
+            state.prepare_terminal_callback_ownership(
+                batch,
+                TerminalCallbackDisposition::Cancelled,
+            ),
+            TerminalCallbackOwnership::None
+        );
+        state.complete_frame_batch_after_safe_abandonment(
+            batch,
+            FrameBatchDiscardReason::OutputDestroyed,
+        );
+    }
+
+    #[test]
+    fn disconnect_checks_callbacks_before_owner_removal() {
+        let (state, batch) = terminal_callback_batch();
+
+        assert_eq!(
+            state.prepare_terminal_callback_ownership(
+                batch,
+                TerminalCallbackDisposition::Cancelled,
+            ),
+            TerminalCallbackOwnership::None
+        );
+    }
+
+    #[test]
+    fn presented_transaction_checks_callbacks_before_completion() {
+        let (state, batch) = terminal_callback_batch();
+
+        assert_eq!(
+            state.prepare_terminal_callback_ownership(
+                batch,
+                TerminalCallbackDisposition::Presented,
+            ),
+            TerminalCallbackOwnership::None
+        );
+    }
+
+    #[test]
+    fn injected_terminal_callback_leak_increments_alarm() {
+        let state = CompositorState::default();
+        let missing_batch =
+            CompositorFrameBatchId::new(std::num::NonZeroU64::new(901).expect("test batch ID"));
+
+        assert!(matches!(
+            state.prepare_terminal_callback_ownership(
+                missing_batch,
+                TerminalCallbackDisposition::Presented,
+            ),
+            TerminalCallbackOwnership::Leaked {
+                owner,
+                pending: 0
+            } if owner == missing_batch
+        ));
+    }
+
+    #[test]
+    fn valid_callback_transfer_does_not_increment_alarm() {
+        let (state, batch) = terminal_callback_batch();
+
+        assert_eq!(
+            state.prepare_terminal_callback_ownership(
+                batch,
+                TerminalCallbackDisposition::Retryable,
+            ),
+            TerminalCallbackOwnership::None
+        );
+    }
+
+    #[test]
+    fn callback_leak_check_runs_exactly_once() {
+        let (state, batch) = terminal_callback_batch();
+
+        let first = state
+            .prepare_terminal_callback_ownership(batch, TerminalCallbackDisposition::Presented);
+        let second = state
+            .prepare_terminal_callback_ownership(batch, TerminalCallbackDisposition::Presented);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn callback_owner_terminal_check_is_prepared_once() {
+        let (state, batch) = terminal_callback_batch();
+
+        assert_eq!(
+            state.prepare_terminal_callback_ownership(
+                batch,
+                TerminalCallbackDisposition::Presented,
+            ),
+            TerminalCallbackOwnership::None
+        );
+    }
 }

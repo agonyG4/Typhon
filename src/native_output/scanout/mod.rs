@@ -420,6 +420,19 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn release_direct_for_target_destroyed(&mut self) -> io::Result<()> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.release_direct_for_target_destroyed(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Ok(()),
+        }
+    }
+
+    pub(crate) fn retain_direct_for_unproven_teardown(&mut self) {
+        if let Self::AtomicEglGbm(scanout) = self {
+            scanout.retain_direct_for_unproven_teardown();
+        }
+    }
+
     pub(crate) fn scanout_format(&self) -> u32 {
         match self {
             Self::AtomicEglGbm(scanout) => scanout.format_modifier.fourcc,
