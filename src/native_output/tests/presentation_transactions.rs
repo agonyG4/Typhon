@@ -1213,6 +1213,95 @@ fn ledger_recent_history_is_bounded() {
     assert_eq!(ledger.counters().terminal_history_overwrites, 1);
 }
 
+#[test]
+fn no_visual_change_does_not_emit_presentation_feedback() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let transaction = test_composited_transaction(&mut ledger, test_batch(71), 1);
+    let id = transaction.id();
+    ledger.insert(transaction).expect("transaction");
+
+    ledger
+        .mark_dropped(
+            id,
+            super::OutputTransactionDropReason::NoVisualChange,
+            MonotonicTimestampNs::new(72),
+        )
+        .expect("no-visual-change settlement");
+
+    assert_eq!(ledger.counters().presented, 0);
+    assert_eq!(ledger.counters().presented_composited, 0);
+    assert!(matches!(
+        ledger
+            .recent_terminal()
+            .back()
+            .expect("terminal record")
+            .state(),
+        super::OutputTransactionState::Terminal(super::OutputTransactionTerminal::Dropped {
+            reason: super::OutputTransactionDropReason::NoVisualChange,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn no_visual_change_callbacks_follow_existing_refresh_contract() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let batch_id = test_batch(73);
+    let transaction = test_composited_transaction(&mut ledger, batch_id, 1);
+    let id = transaction.id();
+    ledger.insert(transaction).expect("transaction");
+
+    ledger
+        .mark_dropped(
+            id,
+            super::OutputTransactionDropReason::NoVisualChange,
+            MonotonicTimestampNs::new(74),
+        )
+        .expect("no-visual-change settlement");
+
+    assert_eq!(ledger.obligation_owner(batch_id), None);
+    assert_eq!(ledger.active_count(), 0);
+    assert_eq!(ledger.counters().terminal_transitions_finalized, 1);
+    assert_eq!(
+        ledger.mark_dropped(
+            id,
+            super::OutputTransactionDropReason::NoVisualChange,
+            MonotonicTimestampNs::new(75),
+        ),
+        Err(super::OutputTransactionError::UnknownTransaction)
+    );
+}
+
+#[test]
+fn no_visual_change_cannot_terminalize_submitted_transaction() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let transaction = test_composited_transaction(&mut ledger, test_batch(76), 1);
+    let id = transaction.id();
+    ledger.insert(transaction).expect("transaction");
+    ledger
+        .mark_submitted(
+            id,
+            super::PageFlipToken::new(77).unwrap(),
+            MonotonicTimestampNs::new(77),
+        )
+        .expect("submit transaction");
+
+    assert_eq!(
+        ledger.mark_no_visual_change(id, MonotonicTimestampNs::new(78)),
+        Err(super::OutputTransactionError::InvalidTransition {
+            from: super::OutputTransactionStateKind::Submitted,
+            requested: super::OutputTransactionTransitionKind::Dropped,
+        })
+    );
+    assert!(matches!(
+        ledger
+            .transaction(id)
+            .expect("submitted transaction")
+            .state(),
+        super::OutputTransactionState::Submitted { .. }
+    ));
+}
+
 fn test_direct_key() -> DirectScanoutCandidateKey {
     let content = OutputContentKey::new(
         7,

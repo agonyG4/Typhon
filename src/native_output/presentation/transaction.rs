@@ -711,3 +711,26 @@ impl DirectScanoutCandidateKey {
         })
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectContentDisposition {
+    NewContent,
+    MatchesPresented,
+    MatchesQueuedOrSubmitted,
+}
+
+pub(crate) fn classify_direct_content(
+    candidate: DirectScanoutCandidateKey,
+    presented: Option<DirectScanoutCandidateKey>,
+    pending: Option<DirectScanoutCandidateKey>,
+) -> DirectContentDisposition {
+    if presented == Some(candidate) {
+        // A confirmed presented assignment is authoritative when it overlaps
+        // with a pending snapshot.
+        DirectContentDisposition::MatchesPresented
+    } else if pending == Some(candidate) {
+        DirectContentDisposition::MatchesQueuedOrSubmitted
+    } else {
+        DirectContentDisposition::NewContent
+    }
+}

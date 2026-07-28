@@ -735,7 +735,7 @@ impl NativeScanoutBackend {
         cursor: Option<&AtomicCursorVisualState>,
         cursor_epoch: u64,
         pacing_mode: NativeOutputPacingMode,
-        worker_admission: Option<crate::native_output::kms_worker::KmsCommitAdmissionPermit>,
+        worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
     ) -> io::Result<DirectScanoutAttempt> {
         match self {
             Self::AtomicEglGbm(scanout) => scanout.try_direct_scanout(
@@ -746,7 +746,7 @@ impl NativeScanoutBackend {
                 cursor,
                 cursor_epoch,
                 pacing_mode,
-                worker_admission,
+                worker,
             ),
             Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
                 "direct scanout is unsupported by this backend",

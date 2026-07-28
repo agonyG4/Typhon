@@ -475,6 +475,28 @@ impl CompositorState {
         );
     }
 
+    pub(in crate::compositor) fn complete_no_visual_change_frame_batch(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+    ) {
+        let mut batch = self
+            .frame_batches
+            .remove(&batch_id)
+            .expect("missing compositor frame batch for no-visual-change settlement");
+        for pending in std::mem::take(&mut batch.presentation_feedbacks) {
+            pending.feedback.discarded();
+        }
+        let callbacks = batch
+            .callbacks
+            .drain(..)
+            .filter(|callback| callback.is_alive())
+            .collect();
+        let callback_time = self.frame_callback_time_ms();
+        self.complete_frame_callbacks_at_time(callbacks, callback_time);
+        let _ = self.complete_frame_batch_releases(batch_id, batch);
+        self.clear_legacy_batch_reference(batch_id);
+    }
+
     #[cfg(test)]
     pub(in crate::compositor) fn test_frame_batch_presentation_surface_ids(
         &self,

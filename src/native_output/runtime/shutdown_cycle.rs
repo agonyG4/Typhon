@@ -30,6 +30,7 @@ impl NativeRuntime {
                                 },
                                 output_generation: pending.generation,
                                 kind: pending.kind,
+                                direct_content_key: None,
                             },
                         )
                     })

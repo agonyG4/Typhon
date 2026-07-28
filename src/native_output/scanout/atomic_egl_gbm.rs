@@ -27,7 +27,7 @@ use crate::egl_renderer::{
 };
 use crate::native_output::runtime::{
     settle_dropped_output_transaction, settle_failed_output_transaction,
-    settle_superseded_output_transaction,
+    settle_no_visual_change_output_transaction, settle_superseded_output_transaction,
 };
 
 use super::atomic_direct::{direct_candidate_key, direct_scanout_debug};

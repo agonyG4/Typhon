@@ -138,6 +138,12 @@ impl OwnCompositorServer {
     }
 
     #[doc(hidden)]
+    pub fn complete_no_visual_change_frame_batch(&mut self, batch_id: CompositorFrameBatchId) {
+        self.state.complete_no_visual_change_frame_batch(batch_id);
+        let _ = self.display.flush_clients();
+    }
+
+    #[doc(hidden)]
     pub fn complete_rendered_frame_callbacks_for_prepared(&mut self) {
         let batch_id = self
             .state

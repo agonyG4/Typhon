@@ -1,6 +1,82 @@
 use super::*;
 use crate::native_output::kms_worker::KmsTestOnlyPolicy;
 
+#[allow(clippy::too_many_arguments)]
+fn settle_no_visual_change_transaction(
+    server: &mut OwnCompositorServer,
+    output_transactions: &mut OutputTransactionLedger,
+    output_generation: u64,
+    target: PresentationTarget,
+    pacing_mode: NativeOutputPacingMode,
+    key: DirectScanoutCandidateKey,
+    framebuffer_id: u32,
+    cursor: Option<&AtomicCursorVisualState>,
+    cursor_epoch: u64,
+    direct_surface_id: u32,
+    release: OutputReleasePlan,
+) -> io::Result<()> {
+    let Some(frame_id) = server.prepared_frame_id() else {
+        return Ok(());
+    };
+    let frame_batch_id = server.take_frame_batch_for_render(frame_id);
+    let created_at = match monotonic_now_ns() {
+        Ok(now) => MonotonicTimestampNs::new(now),
+        Err(error) => {
+            server.restore_frame_batch_after_render_failure(frame_batch_id);
+            return Err(error);
+        }
+    };
+    let transaction_id = match output_transactions.allocate_id() {
+        Ok(transaction_id) => transaction_id,
+        Err(error) => {
+            server.restore_frame_batch_after_render_failure(frame_batch_id);
+            return Err(io::Error::other(error));
+        }
+    };
+    let transaction = match OutputTransaction::direct(
+        transaction_id,
+        output_generation,
+        created_at,
+        target,
+        pacing_mode,
+        frame_id,
+        key,
+        framebuffer_id,
+        cursor.map(|state| CursorPlaneAssignment::Atomic {
+            desired_epoch: cursor_epoch,
+            framebuffer_id: state.framebuffer_id,
+            visible: state.visible,
+        }),
+        frame_batch_id,
+        direct_surface_id,
+        release,
+    ) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            server.restore_frame_batch_after_render_failure(frame_batch_id);
+            return Err(io::Error::other(error));
+        }
+    };
+    if let Err(error) = output_transactions.insert(transaction) {
+        server.restore_frame_batch_after_render_failure(frame_batch_id);
+        return Err(io::Error::other(error));
+    }
+    settle_no_visual_change_output_transaction(
+        output_transactions,
+        transaction_id,
+        created_at,
+        |obligations| {
+            let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                io::Error::other("no-visual-change transaction has no frame batch")
+            })?;
+            debug_assert_eq!(batch_id, frame_batch_id);
+            server.complete_no_visual_change_frame_batch(batch_id);
+            Ok(())
+        },
+    )
+    .map_err(|error| io::Error::other(error.to_string()))
+}
+
 impl AtomicEglGbmScanout {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_direct_scanout(
@@ -12,7 +88,7 @@ impl AtomicEglGbmScanout {
         cursor: Option<&AtomicCursorVisualState>,
         cursor_epoch: u64,
         pacing_mode: NativeOutputPacingMode,
-        worker_admission: Option<crate::native_output::kms_worker::KmsCommitAdmissionPermit>,
+        worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
     ) -> io::Result<DirectScanoutAttempt> {
         self.direct.counters.candidate_checks += 1;
         let sync_readiness = DirectSyncReadiness::from_capabilities(
@@ -77,14 +153,95 @@ impl AtomicEglGbmScanout {
             self.direct.counters.composited_fallbacks += 1;
             return Ok(DirectScanoutAttempt::Fallback("candidate_key_invalid"));
         };
-        let Some(worker_admission) = worker_admission else {
-            self.direct.counters.composited_fallbacks += 1;
-            return Ok(DirectScanoutAttempt::Fallback("worker_unavailable"));
+        let release = match &sync_readiness {
+            DirectSyncReadiness::Qualified { release_mode, .. } => match release_mode {
+                DirectReleaseMode::Pageflip => OutputReleasePlan::Pageflip,
+                DirectReleaseMode::OutFence => OutputReleasePlan::OutFenceThenPageflip,
+            },
+            DirectSyncReadiness::Unsupported(_) => unreachable!("checked above"),
         };
+        let presented_key = self
+            .direct
+            .ownership
+            .presented
+            .as_ref()
+            .map(|frame| frame.lease.key());
+        let submitted_key = self
+            .direct
+            .ownership
+            .submitted
+            .as_ref()
+            .map(|frame| frame.lease.key());
+        let (queued_key, executing_key, inflight_key) = worker
+            .map(crate::native_output::kms_worker::KmsCommitWorkerHandle::direct_content_keys)
+            .unwrap_or((None, None, None));
+        let mut disposition = classify_direct_content(candidate_key, presented_key, submitted_key);
+        if disposition == DirectContentDisposition::NewContent {
+            disposition = classify_direct_content(candidate_key, None, queued_key);
+        }
+        if disposition == DirectContentDisposition::NewContent {
+            disposition = classify_direct_content(candidate_key, None, executing_key);
+        }
+        if disposition == DirectContentDisposition::NewContent {
+            disposition = classify_direct_content(candidate_key, None, inflight_key);
+        }
+        if disposition != DirectContentDisposition::NewContent {
+            self.direct.counters.same_buffer_suppressed = self
+                .direct
+                .counters
+                .same_buffer_suppressed
+                .saturating_add(1);
+            settle_no_visual_change_transaction(
+                server,
+                output_transactions,
+                self.direct.drm_generation,
+                target,
+                pacing_mode,
+                candidate_key,
+                0,
+                cursor,
+                cursor_epoch,
+                candidate.surface_id,
+                release,
+            )?;
+            return Ok(DirectScanoutAttempt::Unchanged);
+        }
         if candidate.buffer.planes().is_empty() {
             self.direct.counters.composited_fallbacks += 1;
             return Ok(DirectScanoutAttempt::Fallback("candidate_plane_missing"));
         }
+        let Some(worker) = worker else {
+            self.direct.counters.composited_fallbacks += 1;
+            return Ok(DirectScanoutAttempt::Fallback("worker_unavailable"));
+        };
+        let worker_admission = match worker.try_reserve_direct_admission(candidate_key) {
+            Ok(Some(admission)) => admission,
+            Ok(None) => {
+                self.direct.counters.same_buffer_suppressed = self
+                    .direct
+                    .counters
+                    .same_buffer_suppressed
+                    .saturating_add(1);
+                settle_no_visual_change_transaction(
+                    server,
+                    output_transactions,
+                    self.direct.drm_generation,
+                    target,
+                    pacing_mode,
+                    candidate_key,
+                    0,
+                    cursor,
+                    cursor_epoch,
+                    candidate.surface_id,
+                    release,
+                )?;
+                return Ok(DirectScanoutAttempt::Unchanged);
+            }
+            Err(_) => {
+                self.direct.counters.composited_fallbacks += 1;
+                return Ok(DirectScanoutAttempt::Fallback("worker_unavailable"));
+            }
+        };
         let atomic = kms
             .atomic()
             .expect("qualified direct scanout requires an Atomic backend");
@@ -124,26 +281,6 @@ impl AtomicEglGbmScanout {
         } else {
             KmsTestOnlyPolicy::Required
         };
-        let unchanged = self
-            .direct
-            .ownership
-            .submitted
-            .as_ref()
-            .is_some_and(|frame| frame.lease.key() == candidate_key)
-            || self
-                .direct
-                .ownership
-                .presented
-                .as_ref()
-                .is_some_and(|frame| frame.lease.key() == candidate_key);
-        if unchanged {
-            self.direct.counters.same_buffer_suppressed = self
-                .direct
-                .counters
-                .same_buffer_suppressed
-                .saturating_add(1);
-            return Ok(DirectScanoutAttempt::Unchanged);
-        }
         if candidate.viewport_identity_metadata_present
             && !self.direct.identity_viewport_metadata_logged
         {
@@ -191,13 +328,6 @@ impl AtomicEglGbmScanout {
                 drop(surface_damage);
                 return Err(io::Error::other(error));
             }
-        };
-        let release = match &sync_readiness {
-            DirectSyncReadiness::Qualified { release_mode, .. } => match release_mode {
-                DirectReleaseMode::Pageflip => OutputReleasePlan::Pageflip,
-                DirectReleaseMode::OutFence => OutputReleasePlan::OutFenceThenPageflip,
-            },
-            DirectSyncReadiness::Unsupported(_) => unreachable!("checked above"),
         };
         let transaction = match OutputTransaction::direct(
             transaction_id,

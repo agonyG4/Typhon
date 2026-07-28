@@ -60,6 +60,21 @@ where
     settle_accepted_output_transaction(output_transactions, accepted, settle_protocol_obligations)
 }
 
+pub(crate) fn settle_no_visual_change_output_transaction<F>(
+    output_transactions: &mut OutputTransactionLedger,
+    transaction_id: OutputTransactionId,
+    at: MonotonicTimestampNs,
+    settle_protocol_obligations: F,
+) -> NativeResult<()>
+where
+    F: FnOnce(OutputProtocolObligations) -> NativeResult<()>,
+{
+    let accepted = output_transactions
+        .accept_no_visual_change(transaction_id, at)
+        .map_err(io::Error::other)?;
+    settle_accepted_output_transaction(output_transactions, accepted, settle_protocol_obligations)
+}
+
 fn settle_forced_shutdown_transaction<F>(
     output_transactions: &mut OutputTransactionLedger,
     transaction_id: OutputTransactionId,

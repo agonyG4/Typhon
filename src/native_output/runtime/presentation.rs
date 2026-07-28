@@ -611,6 +611,7 @@ impl NativeRuntime {
         ) {
             let render_ahead = scheduler_decision == SchedulerDecision::RenderAhead;
             let mut direct_submitted = false;
+            let mut direct_suppressed = false;
             if !render_ahead
                 && direct_scanout_preference.enabled()
                 && (!cursor_visible || *cursor_render_mode == NativeCursorRenderMode::Hardware)
@@ -632,9 +633,7 @@ impl NativeRuntime {
                         }),
                 };
                 if let Some(direct_target) = direct_target {
-                    let worker_admission =
-                        direct_worker_admission(worker_mode, kms_commit_worker.as_ref())?;
-                    if !worker_mode || worker_admission.is_none() {
+                    if !worker_mode || kms_commit_worker.is_none() {
                         // Direct scanout has no synchronous fallback. Keep the
                         // candidate available for a later worker cycle.
                     } else {
@@ -646,9 +645,10 @@ impl NativeRuntime {
                             effective_cursor.as_ref(),
                             cursor_epoch,
                             pacing_mode,
-                            worker_admission,
+                            kms_commit_worker.as_ref(),
                         )? {
                             DirectScanoutAttempt::Unchanged => {
+                                direct_suppressed = true;
                                 presentation_deadline.clear_scheduled_target();
                                 *scheduled_presentation_target = None;
                                 perf.log("native.direct_scanout", || {
@@ -726,6 +726,12 @@ impl NativeRuntime {
                         PacingField::bool("direct_scanout", true),
                     ],
                 );
+            } else if direct_suppressed {
+                frame_scheduler.note_immediate_completion();
+                frame_completed = true;
+                *last_rendered_scene_generation = scene_generation;
+                *last_renderable_surfaces = server.renderable_surfaces().to_vec();
+                *queued_redraw_requested = false;
             } else {
                 frame_pacing.note_render_started(pacing_mode, render_ahead);
                 let render_observed_at_ns = monotonic_now_ns()?;

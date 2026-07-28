@@ -1,8 +1,9 @@
 use super::{
-    ContentEpochId, DirectScanoutCandidateKey, OutputContentKey, OutputReleasePlan,
-    OutputTransaction, OutputTransactionError, OutputTransactionFailureStage, OutputTransactionId,
-    OutputTransactionLedger, OutputTransactionState, OutputTransactionTerminal,
-    PrimaryPlaneAssignment,
+    ContentEpochId, DirectContentDisposition, DirectPlaneValidationKey, DirectScanoutCandidateKey,
+    OutputContentKey, OutputReleasePlan, OutputTransaction, OutputTransactionError,
+    OutputTransactionFailureStage, OutputTransactionId, OutputTransactionLedger,
+    OutputTransactionState, OutputTransactionTerminal, PrimaryPlaneAssignment,
+    classify_direct_content,
 };
 use oblivion_one::compositor::CompositorFrameBatchId;
 use oblivion_one::native::kms::PageFlipToken;
@@ -106,6 +107,66 @@ fn identical_content_epoch_reuses_the_same_candidate_key() {
     let second = test_direct_key(3);
 
     assert_eq!(first, second);
+}
+
+#[test]
+fn same_buffer_and_same_content_epoch_does_not_submit() {
+    let candidate = test_direct_key(3);
+
+    assert_eq!(
+        classify_direct_content(candidate, Some(candidate), None),
+        DirectContentDisposition::MatchesPresented
+    );
+}
+
+#[test]
+fn same_buffer_with_new_content_epoch_submits_new_direct_transaction() {
+    let presented = test_direct_key(3);
+    let candidate = test_direct_key(4);
+
+    assert_ne!(candidate, presented);
+    assert_eq!(
+        classify_direct_content(candidate, Some(presented), None),
+        DirectContentDisposition::NewContent
+    );
+}
+
+#[test]
+fn same_content_matching_queued_or_submitted_job_is_not_admitted_twice() {
+    let candidate = test_direct_key(3);
+
+    assert_eq!(
+        classify_direct_content(candidate, None, Some(candidate)),
+        DirectContentDisposition::MatchesQueuedOrSubmitted
+    );
+}
+
+#[test]
+fn new_content_epoch_can_reuse_validation_key_but_still_submits() {
+    let first = test_direct_key(3);
+    let second = test_direct_key(4);
+    let validation_key = DirectPlaneValidationKey {
+        output_generation: 1,
+        crtc_id: 7,
+        primary_plane_id: 8,
+        mode_width: 1920,
+        mode_height: 1080,
+        format: 0x3432_5241,
+        modifier: 0,
+        buffer_width: 1920,
+        buffer_height: 1080,
+        plane_layout_hash: 9,
+        cursor_plan_key: None,
+        synchronization_key: 10,
+    };
+
+    assert_eq!(first.output_generation, second.output_generation);
+    assert_eq!(validation_key.output_generation, 1);
+    assert_ne!(first, second);
+    assert_eq!(
+        classify_direct_content(second, Some(first), None),
+        DirectContentDisposition::NewContent
+    );
 }
 
 #[test]

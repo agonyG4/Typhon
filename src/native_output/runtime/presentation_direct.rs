@@ -31,6 +31,20 @@ pub(super) struct DirectPresentationInputs<'a> {
     pub(super) direct_active: bool,
 }
 
+fn direct_candidate_changed(
+    direct_candidate_key: Option<DirectScanoutCandidateKey>,
+    last_direct_candidate_key: Option<DirectScanoutCandidateKey>,
+    scene_changed: bool,
+    primary_redraw_requested: bool,
+    direct_active: bool,
+    pending_frame_work: bool,
+) -> bool {
+    direct_candidate_key != last_direct_candidate_key
+        || direct_candidate_key.is_some()
+            && ((scene_changed && !primary_redraw_requested)
+                || (direct_active && pending_frame_work))
+}
+
 pub(super) fn inspect_direct_presentation(
     inputs: DirectPresentationInputs<'_>,
 ) -> DirectPresentationInspection {
@@ -65,7 +79,14 @@ pub(super) fn inspect_direct_presentation(
             0,
         )
     });
-    let direct_candidate_changed = direct_candidate_key != *inputs.last_direct_candidate_key;
+    let direct_candidate_changed = direct_candidate_changed(
+        direct_candidate_key,
+        *inputs.last_direct_candidate_key,
+        inputs.scene_changed,
+        inputs.primary_redraw_requested,
+        inputs.direct_active,
+        inputs.pending_frame_work,
+    );
     *inputs.last_direct_candidate_key = direct_candidate_key;
     let primary_visual_work_pending =
         inputs.scene_changed || inputs.pending_frame_work || inputs.primary_redraw_requested;
@@ -120,5 +141,53 @@ pub(super) fn suppress_direct_render_ahead(
                 "suppressed_composited_render_ahead",
             )]
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU64;
+
+    fn candidate_key() -> DirectScanoutCandidateKey {
+        DirectScanoutCandidateKey {
+            content: OutputContentKey::new(
+                7,
+                NonZeroU64::new(1).expect("buffer id"),
+                ContentEpochId::new(NonZeroU64::new(1).expect("content epoch")),
+                1920,
+                1080,
+                0x3432_5241,
+                0,
+                0,
+                1_000,
+                0,
+            ),
+            output_generation: 1,
+            cursor_plan_key: None,
+            color_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn pending_protocol_work_reenters_an_active_direct_assignment() {
+        let key = candidate_key();
+
+        assert!(direct_candidate_changed(
+            Some(key),
+            Some(key),
+            false,
+            false,
+            true,
+            true,
+        ));
+        assert!(!direct_candidate_changed(
+            Some(key),
+            Some(key),
+            false,
+            false,
+            false,
+            true,
+        ));
     }
 }

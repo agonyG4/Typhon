@@ -444,18 +444,6 @@ pub(super) fn finish_direct_worker_queued(
     Ok(())
 }
 
-pub(super) fn direct_worker_admission(
-    worker_mode: bool,
-    worker: Option<&KmsCommitWorkerHandle>,
-) -> NativeResult<Option<crate::native_output::kms_worker::KmsCommitAdmissionPermit>> {
-    if !worker_mode {
-        return Ok(None);
-    }
-    let worker = worker
-        .ok_or_else(|| io::Error::other("worker transport is active without a worker handle"))?;
-    Ok(worker.try_reserve_admission_slot().ok())
-}
-
 pub(super) fn worker_cursor_queue_available(
     worker_mode: bool,
     worker: Option<&KmsCommitWorkerHandle>,

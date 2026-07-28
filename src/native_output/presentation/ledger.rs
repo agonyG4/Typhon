@@ -523,6 +523,38 @@ impl OutputTransactionLedger {
         self.finalize_terminal(accepted)
     }
 
+    pub(crate) fn accept_no_visual_change(
+        &mut self,
+        id: OutputTransactionId,
+        at: MonotonicTimestampNs,
+    ) -> Result<AcceptedTerminalTransition, OutputTransactionError> {
+        let state = self.state(id)?;
+        if !matches!(
+            state,
+            OutputTransactionState::Built | OutputTransactionState::Ready { .. }
+        ) {
+            return Err(
+                self.reject_invalid_transition(state, OutputTransactionTransitionKind::Dropped)
+            );
+        }
+        self.accept_state(
+            id,
+            OutputTransactionTerminal::Dropped {
+                reason: OutputTransactionDropReason::NoVisualChange,
+                at,
+            },
+        )
+    }
+
+    pub(crate) fn mark_no_visual_change(
+        &mut self,
+        id: OutputTransactionId,
+        at: MonotonicTimestampNs,
+    ) -> Result<(), OutputTransactionError> {
+        let accepted = self.accept_no_visual_change(id, at)?;
+        self.finalize_terminal(accepted)
+    }
+
     pub(crate) fn accept_dropped(
         &mut self,
         id: OutputTransactionId,

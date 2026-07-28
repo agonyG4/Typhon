@@ -433,6 +433,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn direct_content_classifier_prefers_confirmed_presented_content() {
+        let candidate = test_key();
+
+        assert_eq!(
+            classify_direct_content(candidate, Some(candidate), Some(candidate)),
+            DirectContentDisposition::MatchesPresented
+        );
+    }
+
+    #[test]
+    fn direct_content_classifier_treats_output_generation_change_as_new_content() {
+        let presented = test_key();
+        let candidate = DirectScanoutCandidateKey {
+            output_generation: 2,
+            ..presented
+        };
+
+        assert_eq!(
+            classify_direct_content(candidate, Some(presented), None),
+            DirectContentDisposition::NewContent
+        );
+    }
+
     fn test_target() -> PresentationTarget {
         let now = MonotonicTimestampNs::new(10);
         PresentationTarget {

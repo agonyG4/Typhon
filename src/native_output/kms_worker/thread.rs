@@ -190,6 +190,26 @@ impl KmsCommitWorkerHandle {
         occupied < active.saturating_add(super::queue::QUEUED_JOB_CAPACITY)
     }
 
+    pub(crate) fn direct_content_keys(
+        &self,
+    ) -> (
+        Option<crate::native_output::DirectScanoutCandidateKey>,
+        Option<crate::native_output::DirectScanoutCandidateKey>,
+        Option<crate::native_output::DirectScanoutCandidateKey>,
+    ) {
+        self.shared.direct_content_keys()
+    }
+
+    pub(crate) fn try_reserve_direct_admission(
+        &self,
+        candidate_key: crate::native_output::DirectScanoutCandidateKey,
+    ) -> Result<
+        Option<crate::native_output::kms_worker::KmsCommitAdmissionPermit>,
+        KmsWorkerAdmissionError,
+    > {
+        self.shared.try_reserve_direct(candidate_key)
+    }
+
     pub(crate) fn drain_eventfd(&self) -> io::Result<()> {
         drain_eventfd(&self.shared.result_fd)
     }
@@ -617,6 +637,8 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     None
                 } else {
                     state.executing = true;
+                    state.executing_direct_content_key =
+                        job.direct_primary_lease.as_ref().map(|lease| lease.key());
                     drop(state);
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         executor.test_only(&job)
@@ -626,6 +648,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     state.executing = false;
+                    state.executing_direct_content_key = None;
                     drop(state);
                     Some(result)
                 }
@@ -689,6 +712,10 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                             transaction_id: job.transaction_id,
                             output_generation: job.output_generation,
                             kind: job.kind,
+                            direct_content_key: job
+                                .direct_primary_lease
+                                .as_ref()
+                                .map(|lease| lease.key()),
                         });
                     }
                     drop(state);

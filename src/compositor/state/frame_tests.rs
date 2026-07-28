@@ -46,6 +46,17 @@ mod frame_consumption_tests {
     }
 
     #[test]
+    fn no_visual_change_batch_completes_without_presenting() {
+        let mut state = CompositorState::default();
+        let batch_id = state.take_frame_batch_for_render(12);
+
+        state.complete_no_visual_change_frame_batch(batch_id);
+
+        assert!(state.frame_batches.is_empty());
+        assert!(!state.has_submitted_frame_batch());
+    }
+
+    #[test]
     fn unrelated_completion_cannot_consume_ready_frame_batch() {
         let mut state = CompositorState::default();
         let submitted = state.take_frame_batch_for_render(20);

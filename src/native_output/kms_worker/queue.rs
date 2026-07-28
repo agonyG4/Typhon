@@ -1,6 +1,7 @@
 //! Bounded admission and result queues for the Atomic submit worker.
 
 use super::{KmsCommitJob, KmsWorkerEvent};
+use crate::native_output::DirectScanoutCandidateKey;
 use std::{
     collections::VecDeque,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -210,6 +211,7 @@ pub(crate) struct WorkerInFlight {
     pub(crate) transaction_id: crate::native_output::OutputTransactionId,
     pub(crate) output_generation: u64,
     pub(crate) kind: crate::native_output::runtime::AtomicCommitKind,
+    pub(crate) direct_content_key: Option<DirectScanoutCandidateKey>,
 }
 
 #[derive(Debug)]
@@ -263,6 +265,7 @@ pub(crate) struct WorkerState {
     pub(crate) queued: VecDeque<KmsCommitJob>,
     pub(crate) reserved: usize,
     pub(crate) executing: bool,
+    pub(crate) executing_direct_content_key: Option<DirectScanoutCandidateKey>,
     pub(crate) inflight: Option<WorkerInFlight>,
 }
 
@@ -274,6 +277,7 @@ impl WorkerShared {
                 queued: VecDeque::with_capacity(QUEUED_JOB_CAPACITY),
                 reserved: 0,
                 executing: false,
+                executing_direct_content_key: None,
                 inflight: None,
             }),
             submit_gate: Mutex::new(()),
@@ -285,6 +289,28 @@ impl WorkerShared {
             metrics: WorkerMetrics::default(),
             fatal_reason_code: AtomicU64::new(0),
         }
+    }
+
+    pub(crate) fn direct_content_keys(
+        &self,
+    ) -> (
+        Option<DirectScanoutCandidateKey>,
+        Option<DirectScanoutCandidateKey>,
+        Option<DirectScanoutCandidateKey>,
+    ) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let queued = state
+            .queued
+            .iter()
+            .find_map(|job| job.direct_primary_lease.as_ref().map(|lease| lease.key()));
+        let executing = state.executing_direct_content_key;
+        let inflight = state
+            .inflight
+            .and_then(|ownership| ownership.direct_content_key);
+        (queued, executing, inflight)
     }
 
     pub(crate) fn try_reserve(
@@ -327,6 +353,60 @@ impl WorkerShared {
             shared: Arc::clone(self),
             active: true,
         })
+    }
+
+    pub(crate) fn try_reserve_direct(
+        self: &Arc<Self>,
+        candidate_key: DirectScanoutCandidateKey,
+    ) -> Result<Option<KmsCommitAdmissionPermit>, KmsWorkerAdmissionError> {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                self.metrics
+                    .admission_contention
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(KmsWorkerAdmissionError::AdmissionContention);
+            }
+        };
+        match state.lifecycle {
+            KmsWorkerLifecycle::Quiescing => return Err(KmsWorkerAdmissionError::Quiescing),
+            KmsWorkerLifecycle::ShutdownQuiescing => {
+                return Err(KmsWorkerAdmissionError::ShutdownQuiescing);
+            }
+            KmsWorkerLifecycle::ShutdownAbandoning => {
+                return Err(KmsWorkerAdmissionError::ShutdownQuiescing);
+            }
+            KmsWorkerLifecycle::Stopped => return Err(KmsWorkerAdmissionError::Stopped),
+            KmsWorkerLifecycle::Fatal => return Err(KmsWorkerAdmissionError::Fatal),
+            KmsWorkerLifecycle::Running => {}
+        }
+        if state.queued.iter().any(|job| {
+            job.direct_primary_lease
+                .as_ref()
+                .is_some_and(|lease| lease.key() == candidate_key)
+        }) || state.executing_direct_content_key == Some(candidate_key)
+            || state
+                .inflight
+                .is_some_and(|ownership| ownership.direct_content_key == Some(candidate_key))
+        {
+            return Ok(None);
+        }
+        let occupied = state.queued.len()
+            + state.reserved
+            + usize::from(state.executing)
+            + usize::from(state.inflight.is_some());
+        let active = usize::from(state.executing || state.inflight.is_some());
+        let capacity = active.saturating_add(QUEUED_JOB_CAPACITY);
+        if occupied >= capacity {
+            self.metrics.queue_full.fetch_add(1, Ordering::Relaxed);
+            return Err(KmsWorkerAdmissionError::QueueFull);
+        }
+        state.reserved += 1;
+        Ok(Some(KmsCommitAdmissionPermit {
+            shared: Arc::clone(self),
+            active: true,
+        }))
     }
 
     pub(crate) fn request_quiesce(&self) {

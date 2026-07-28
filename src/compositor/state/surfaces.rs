@@ -1338,6 +1338,40 @@ mod ordered_publication_tests {
     }
 
     #[test]
+    fn content_and_metadata_commits_have_distinct_epoch_behavior() {
+        let mut state = CompositorState::default();
+        let buffer_id = state
+            .allocate_buffer_identity()
+            .expect("test buffer identity")
+            .id();
+        state.record_surface_publication(
+            7,
+            7,
+            SurfaceCommitSequence(10),
+            Some(buffer_id),
+            SurfacePublicationSource::Immediate,
+            None,
+        );
+        let content_epoch = state.surface_content_epoch(7);
+
+        state.record_surface_publication(
+            7,
+            7,
+            SurfaceCommitSequence(11),
+            Some(buffer_id),
+            SurfacePublicationSource::Immediate,
+            None,
+        );
+        let metadata_epoch = state.surface_content_epoch(7);
+
+        assert_ne!(metadata_epoch, content_epoch);
+
+        state.record_surface_commit_received(7, SurfaceCommitSequence(12), false);
+
+        assert_eq!(state.surface_content_epoch(7), metadata_epoch);
+    }
+
+    #[test]
     fn old_frame_completion_advances_only_its_sampled_damage_commit() {
         let mut state = CompositorState::default();
         state.surface_presentation_generations.insert(7, 1);

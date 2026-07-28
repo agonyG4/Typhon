@@ -59,7 +59,7 @@ pub(super) use planner::{
 };
 pub(crate) use presentation_transactions::{
     settle_dropped_output_transaction, settle_failed_output_transaction,
-    settle_superseded_output_transaction,
+    settle_no_visual_change_output_transaction, settle_superseded_output_transaction,
 };
 pub(crate) use session::{NativeSessionLifecycle, NativeSessionTransition};
 #[cfg(test)]
