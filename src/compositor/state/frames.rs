@@ -480,6 +480,22 @@ impl CompositorState {
         callback_owner_leaks
     }
 
+    pub(in crate::compositor) fn direct_callback_owner_leaks(
+        &self,
+        batch_id: CompositorFrameBatchId,
+    ) -> u64 {
+        self.frame_batches
+            .get(&batch_id)
+            .map(|batch| {
+                batch
+                    .callbacks
+                    .iter()
+                    .filter(|callback| callback.is_alive())
+                    .count() as u64
+            })
+            .unwrap_or(0)
+    }
+
     pub(in crate::compositor) fn complete_no_visual_change_frame_batch(
         &mut self,
         batch_id: CompositorFrameBatchId,

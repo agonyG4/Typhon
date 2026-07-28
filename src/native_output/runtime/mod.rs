@@ -58,6 +58,7 @@ pub(super) use planner::{
     decide_native_kms_startup,
 };
 pub(crate) use presentation_transactions::{
+    DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
     settle_dropped_output_transaction, settle_failed_output_transaction,
     settle_no_visual_change_output_transaction, settle_superseded_output_transaction,
 };

@@ -52,21 +52,15 @@ impl NativeScanoutBackend {
         }
     }
 
-    pub(crate) fn note_direct_real_submit_attempt(&mut self, rejected: bool) {
-        if let Self::AtomicEglGbm(scanout) = self {
-            scanout.note_direct_real_submit_attempt(rejected);
-        }
-    }
-
-    pub(crate) fn note_direct_same_buffer_resubmission(&mut self) {
-        if let Self::AtomicEglGbm(scanout) = self {
-            scanout.note_direct_same_buffer_resubmission();
-        }
-    }
-
     pub(crate) fn note_direct_worker_admission_rejected(&mut self, queue_overflow: bool) {
         if let Self::AtomicEglGbm(scanout) = self {
             scanout.note_direct_worker_admission_rejected(queue_overflow);
+        }
+    }
+
+    pub(crate) fn note_direct_real_submit_attempt(&mut self, rejected: bool) {
+        if let Self::AtomicEglGbm(scanout) = self {
+            scanout.note_direct_real_submit_attempt(rejected);
         }
     }
 
@@ -85,12 +79,6 @@ impl NativeScanoutBackend {
     pub(crate) fn note_direct_early_release_prevented(&mut self) {
         if let Self::AtomicEglGbm(scanout) = self {
             scanout.note_direct_early_release_prevented();
-        }
-    }
-
-    pub(crate) fn note_direct_release_check(&mut self, safe: bool) {
-        if let Self::AtomicEglGbm(scanout) = self {
-            scanout.note_direct_release_check(safe);
         }
     }
 

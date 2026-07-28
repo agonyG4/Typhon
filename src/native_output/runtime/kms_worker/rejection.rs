@@ -3,6 +3,7 @@ use crate::native_output::kms_worker::KmsCommitJob;
 use oblivion_one::native::kms::AtomicKmsError;
 
 use super::super::presentation_transactions::{
+    DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
     settle_dropped_output_transaction, settle_failed_output_transaction,
 };
 use super::direct_rejection::WorkerRejectionKind;
@@ -194,6 +195,17 @@ impl NativeRuntime {
                     .map_err(io::Error::other)?;
             }
         }
+        let direct_obligations = if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
+            Some(
+                self.output_transactions
+                    .transaction(job.transaction_id)
+                    .ok_or_else(|| io::Error::other("dropped direct transaction is missing"))?
+                    .descriptor()
+                    .obligations(),
+            )
+        } else {
+            None
+        };
         settle_dropped_output_transaction(
             &mut self.output_transactions,
             job.transaction_id,
@@ -209,6 +221,16 @@ impl NativeRuntime {
                 Ok(())
             },
         )?;
+        if let Some(obligations) = direct_obligations {
+            self.scanout
+                .note_direct_callback_owner_leaks(direct_terminal_callback_owner_leaks(
+                    &self.server,
+                    job.transaction_id,
+                    obligations,
+                    DirectTerminalCallbackDisposition::Abandoned,
+                    0,
+                ));
+        }
         if drop_reason == OutputTransactionDropReason::SafeAbandonment
             && let Some(worker) = self.kms_commit_worker.as_ref()
         {

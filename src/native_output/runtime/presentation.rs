@@ -667,6 +667,7 @@ impl NativeRuntime {
                                 token,
                                 framebuffer_id,
                                 lease,
+                                admission,
                                 test_only,
                             } => {
                                 let direct_result = finish_direct_worker_queued(
@@ -700,16 +701,12 @@ impl NativeRuntime {
                                     framebuffer_id,
                                     direct_target,
                                     *lease,
+                                    admission,
                                     test_only,
                                 )?;
                                 match direct_result {
                                     DirectWorkerQueueResult::Queued => {
                                         direct_submitted = true;
-                                    }
-                                    DirectWorkerQueueResult::Suppressed => {
-                                        direct_suppressed = true;
-                                        presentation_deadline.clear_scheduled_target();
-                                        *scheduled_presentation_target = None;
                                     }
                                     DirectWorkerQueueResult::AdmissionRejected => {
                                         let _ = DirectFallbackTracker::start(
@@ -720,6 +717,17 @@ impl NativeRuntime {
                                         );
                                     }
                                 }
+                            }
+                            DirectScanoutAttempt::AdmissionRejected {
+                                transaction_id,
+                                reason: _reason,
+                            } => {
+                                let _ = DirectFallbackTracker::start(
+                                    direct_fallback_tracker,
+                                    transaction_id,
+                                    *last_refresh_sequence,
+                                    DirectFallbackReason::WorkerAdmissionRejected,
+                                );
                             }
                             DirectScanoutAttempt::Rejected(rejection) => {
                                 scanout.note_direct_blocker(rejection.as_str());

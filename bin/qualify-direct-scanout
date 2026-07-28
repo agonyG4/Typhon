@@ -133,16 +133,24 @@ check_log() {
         failures=$((failures + 1))
     fi
     check_nonnegative direct_scanout_fallback_cycles_last
+    check_nonnegative direct_scanout_early_release_prevented
 
-    local active live fallback_active
+    local active live fallback_active fallback_cycles_current
     active="$(metric "$log_path" direct_scanout_active 2>/dev/null || true)"
     live="$(metric "$log_path" direct_scanout_live_leases 2>/dev/null || true)"
     fallback_active="$(metric "$log_path" direct_scanout_fallback_active 2>/dev/null || true)"
+    fallback_cycles_current="$(metric "$log_path" direct_scanout_fallback_cycles_current 2>/dev/null || true)"
     if [[ "$fallback_active" != "false" ]]; then
         printf '%-58s FAIL (%s)\n' "fallback tracker is inactive in final sample" "${fallback_active:-missing}"
         failures=$((failures + 1))
     else
         printf '%-58s PASS\n' "fallback tracker is inactive in final sample"
+    fi
+    if [[ "$fallback_active" == "false" && "$fallback_cycles_current" == "0" ]]; then
+        printf '%-58s PASS\n' "inactive fallback has zero current cycles"
+    else
+        printf '%-58s FAIL (%s)\n' "inactive fallback has zero current cycles" "${fallback_cycles_current:-missing}"
+        failures=$((failures + 1))
     fi
 
     local submitted_surface submitted_buffer submitted_framebuffer submitted_epoch
@@ -204,7 +212,7 @@ self_test() {
     local fixture base active earlier_fail final_fail
     fixture="$(mktemp)"
     trap "rm -f -- \"$fixture\"" EXIT
-    base='perf native.scheduler direct_scanout_active=false direct_scanout_fallback_active=false direct_scanout_live_leases=0 direct_scanout_submitted_surface=none direct_scanout_submitted_buffer=none direct_scanout_submitted_framebuffer=none direct_scanout_submitted_content_epoch=none direct_scanout_presented_surface=none direct_scanout_presented_buffer=none direct_scanout_presented_framebuffer=none direct_scanout_presented_content_epoch=none direct_scanout_candidate_checks=1 direct_scanout_candidates_accepted=1 direct_scanout_test_only_attempts=1 direct_scanout_test_only_duration_ns_last=10 direct_scanout_test_only_duration_ns_max=10 direct_scanout_test_only_duration_ns_total=10 direct_scanout_real_submit_attempts=1 direct_scanout_entries=1 direct_scanout_presentations=1 direct_scanout_replacements=1 direct_scanout_exits=1 direct_scanout_composited_fallbacks=1 direct_scanout_fallback_cycles_last=0 direct_scanout_duplicate_feedback=0 direct_scanout_duplicate_settlement=0 direct_scanout_same_buffer_resubmissions=0 direct_scanout_worker_queue_overflow=0 direct_scanout_callback_owner_leaks=0 direct_scanout_early_release_prevented=0 direct_scanout_early_release_violations=0'
+    base='perf native.scheduler direct_scanout_active=false direct_scanout_fallback_active=false direct_scanout_fallback_cycles_current=0 direct_scanout_live_leases=0 direct_scanout_submitted_surface=none direct_scanout_submitted_buffer=none direct_scanout_submitted_framebuffer=none direct_scanout_submitted_content_epoch=none direct_scanout_presented_surface=none direct_scanout_presented_buffer=none direct_scanout_presented_framebuffer=none direct_scanout_presented_content_epoch=none direct_scanout_candidate_checks=1 direct_scanout_candidates_accepted=1 direct_scanout_test_only_attempts=1 direct_scanout_test_only_duration_ns_last=10 direct_scanout_test_only_duration_ns_max=10 direct_scanout_test_only_duration_ns_total=10 direct_scanout_real_submit_attempts=1 direct_scanout_entries=1 direct_scanout_presentations=1 direct_scanout_replacements=1 direct_scanout_exits=1 direct_scanout_composited_fallbacks=1 direct_scanout_fallback_cycles_last=0 direct_scanout_duplicate_feedback=0 direct_scanout_duplicate_settlement=0 direct_scanout_same_buffer_resubmissions=0 direct_scanout_worker_queue_overflow=0 direct_scanout_callback_owner_leaks=0 direct_scanout_early_release_prevented=0 direct_scanout_early_release_violations=0'
 
     printf '%s\n' "$base" >"$fixture"
     check_log "$fixture" >/dev/null
@@ -242,6 +250,7 @@ self_test() {
     expect_failure "duplicate feedback" "${base/direct_scanout_duplicate_feedback=0/direct_scanout_duplicate_feedback=1}"
     expect_failure "duplicate settlement" "${base/direct_scanout_duplicate_settlement=0/direct_scanout_duplicate_settlement=1}"
     expect_failure "fallback remains active" "${base/direct_scanout_fallback_active=false/direct_scanout_fallback_active=true}"
+    expect_failure "inactive fallback has current cycles" "${base/direct_scanout_fallback_cycles_current=0/direct_scanout_fallback_cycles_current=2}"
     expect_failure "missing required field" "${base/ direct_scanout_presented_framebuffer=none/}"
 
     local prevented

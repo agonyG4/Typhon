@@ -1,4 +1,7 @@
 use super::cycle::direct_fallback::DirectFallbackReason;
+use super::presentation_transactions::{
+    DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
+};
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +41,12 @@ impl NativeRuntime {
             .direct_primary_lease
             .as_ref()
             .map(|lease| lease.validation_key());
+        let obligations = self
+            .output_transactions
+            .transaction(job.transaction_id)
+            .ok_or_else(|| io::Error::other("rejected direct transaction is missing"))?
+            .descriptor()
+            .obligations();
         if !self
             .frame_pacing
             .cancel_worker_submission(job.pacing_frame_id, job.ready_submit)
@@ -90,6 +99,14 @@ impl NativeRuntime {
             self.quarantined_worker_jobs.push(direct_job);
             return Err(error);
         }
+        self.scanout
+            .note_direct_callback_owner_leaks(direct_terminal_callback_owner_leaks(
+                &self.server,
+                direct_job.transaction_id,
+                obligations,
+                DirectTerminalCallbackDisposition::Retryable,
+                0,
+            ));
         debug_assert!(!self.scanout.direct_scanout_pending());
         self.scanout.note_direct_rejection(
             rejection_kind == WorkerRejectionKind::TestOnly,

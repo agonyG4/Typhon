@@ -207,17 +207,11 @@ impl KmsCommitWorkerHandle {
         self.shared.direct_content_keys()
     }
 
-    pub(crate) fn direct_candidate_in_flight(&self, key: DirectScanoutCandidateKey) -> bool {
-        self.shared.direct_candidate_in_flight(key)
-    }
-
     pub(crate) fn try_reserve_direct_admission(
         &self,
         candidate_key: crate::native_output::DirectScanoutCandidateKey,
-    ) -> Result<
-        Option<crate::native_output::kms_worker::KmsCommitAdmissionPermit>,
-        KmsWorkerAdmissionError,
-    > {
+    ) -> Result<crate::native_output::kms_worker::KmsCommitAdmissionPermit, KmsWorkerAdmissionError>
+    {
         self.shared.try_reserve_direct(candidate_key)
     }
 
@@ -511,6 +505,62 @@ impl KmsCommitWorkerHandle {
 }
 
 #[derive(Debug)]
+struct ExecutingDirectCandidateGuard {
+    shared: Arc<WorkerShared>,
+    candidate: Option<DirectScanoutCandidateKey>,
+    transferred: bool,
+}
+
+impl ExecutingDirectCandidateGuard {
+    fn new(shared: &Arc<WorkerShared>, job: &KmsCommitJob) -> Self {
+        let candidate = job.direct_primary_lease.as_ref().map(|lease| lease.key());
+        let mut state = shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.executing = true;
+        state.executing_direct_content_key = candidate;
+        Self {
+            shared: Arc::clone(shared),
+            candidate,
+            transferred: false,
+        }
+    }
+
+    fn transfer_to_inflight(&mut self, job: &KmsCommitJob) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.inflight = Some(WorkerInFlight {
+            token: job.token,
+            transaction_id: job.transaction_id,
+            output_generation: job.output_generation,
+            kind: job.kind,
+            direct_content_key: self.candidate,
+        });
+        state.executing = false;
+        state.executing_direct_content_key = None;
+        self.transferred = true;
+    }
+}
+
+impl Drop for ExecutingDirectCandidateGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.executing = false;
+        if !self.transferred && state.executing_direct_content_key == self.candidate {
+            state.executing_direct_content_key = None;
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct AtomicKmsWorkerExecutor {
     submitter: AtomicCommitSubmitter,
 }
@@ -603,6 +653,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
         let Some(mut job) = take_next_job(&shared) else {
             return;
         };
+        let mut executing = ExecutingDirectCandidateGuard::new(&shared, &job);
         if timing.is_none() {
             timing = Some(KmsCommitTimingModel::new(job.target.refresh_interval));
         }
@@ -612,6 +663,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
         let decision = model.submit_at(job.target, now_ns);
         if decision.submit_at_ns > now_ns && !wait_until_or_quiesce(&shared, decision.submit_at_ns)
         {
+            drop(executing);
             quiesce_with_jobs(&shared, vec![job]);
             return;
         }
@@ -640,29 +692,19 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     .submit_gate
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let mut state = shared
+                let state = shared
                     .state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if !matches!(state.lifecycle, KmsWorkerLifecycle::Running) {
                     None
                 } else {
-                    state.executing = true;
-                    state.executing_direct_content_key =
-                        job.direct_primary_lease.as_ref().map(|lease| lease.key());
                     drop(state);
                     let test_started_ns = monotonic_now_ns();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         executor.test_only(&job)
                     }));
                     let test_duration_ns = monotonic_now_ns().saturating_sub(test_started_ns);
-                    let mut state = shared
-                        .state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    state.executing = false;
-                    state.executing_direct_content_key = None;
-                    drop(state);
                     Some((result, test_duration_ns))
                 }
             };
@@ -705,37 +747,18 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     .submit_gate
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let mut state = shared
+                let state = shared
                     .state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if !matches!(state.lifecycle, KmsWorkerLifecycle::Running) {
                     None
                 } else {
-                    state.executing = true;
                     drop(state);
                     let submit_started_at = monotonic_now_ns();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         executor.submit(&job)
                     }));
-                    let mut state = shared
-                        .state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    state.executing = false;
-                    if matches!(&result, Ok(Ok(_))) {
-                        state.inflight = Some(WorkerInFlight {
-                            token: job.token,
-                            transaction_id: job.transaction_id,
-                            output_generation: job.output_generation,
-                            kind: job.kind,
-                            direct_content_key: job
-                                .direct_primary_lease
-                                .as_ref()
-                                .map(|lease| lease.key()),
-                        });
-                    }
-                    drop(state);
                     Some((submit_started_at, result))
                 }
             };
@@ -745,6 +768,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
             };
             match submission {
                 Ok(Ok(submission)) => {
+                    executing.transfer_to_inflight(&job);
                     if let KmsPrimaryUpdate::Framebuffer { in_fence, .. } = &mut job.primary {
                         // The ioctl has consumed the input-fence contract. The
                         // fence must not remain owned while waiting for the pageflip.

@@ -3,6 +3,7 @@ use crate::native_output::kms_worker::KmsTestOnlyPolicy;
 
 #[allow(clippy::too_many_arguments)]
 fn settle_no_visual_change_transaction(
+    scanout: &mut AtomicEglGbmScanout,
     server: &mut OwnCompositorServer,
     output_transactions: &mut OutputTransactionLedger,
     output_generation: u64,
@@ -61,6 +62,11 @@ fn settle_no_visual_change_transaction(
         server.restore_frame_batch_after_render_failure(frame_batch_id);
         return Err(io::Error::other(error));
     }
+    let obligations = output_transactions
+        .transaction(transaction_id)
+        .expect("direct no-visual-change transaction was just inserted")
+        .descriptor()
+        .obligations();
     settle_no_visual_change_output_transaction(
         output_transactions,
         transaction_id,
@@ -74,7 +80,22 @@ fn settle_no_visual_change_transaction(
             Ok(())
         },
     )
-    .map_err(|error| io::Error::other(error.to_string()))
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    let callback_owner_leaks = direct_terminal_callback_owner_leaks(
+        server,
+        transaction_id,
+        obligations,
+        DirectTerminalCallbackDisposition::NoVisualChange,
+        0,
+    );
+    scanout.note_direct_callback_owner_leaks(callback_owner_leaks);
+    if callback_owner_leaks > 0 {
+        direct_scanout_debug(format_args!(
+            "direct no-visual-change callback-owner leak transaction={} count={callback_owner_leaks}",
+            transaction_id.get()
+        ));
+    }
+    Ok(())
 }
 
 impl AtomicEglGbmScanout {
@@ -169,19 +190,7 @@ impl AtomicEglGbmScanout {
             .submitted
             .as_ref()
             .map(|frame| frame.lease.key());
-        let (queued_key, executing_key, inflight_key) = worker
-            .map(crate::native_output::kms_worker::KmsCommitWorkerHandle::direct_content_keys)
-            .unwrap_or((None, None, None));
-        let mut disposition = classify_direct_content(candidate_key, presented_key, submitted_key);
-        if disposition == DirectContentDisposition::NewContent {
-            disposition = classify_direct_content(candidate_key, None, queued_key);
-        }
-        if disposition == DirectContentDisposition::NewContent {
-            disposition = classify_direct_content(candidate_key, None, executing_key);
-        }
-        if disposition == DirectContentDisposition::NewContent {
-            disposition = classify_direct_content(candidate_key, None, inflight_key);
-        }
+        let disposition = classify_direct_content(candidate_key, presented_key, submitted_key);
         if disposition != DirectContentDisposition::NewContent {
             self.direct.counters.same_buffer_suppressed = self
                 .direct
@@ -189,6 +198,7 @@ impl AtomicEglGbmScanout {
                 .same_buffer_suppressed
                 .saturating_add(1);
             settle_no_visual_change_transaction(
+                self,
                 server,
                 output_transactions,
                 self.direct.drm_generation,
@@ -206,7 +216,7 @@ impl AtomicEglGbmScanout {
         if candidate.buffer.planes().is_empty() {
             return Ok(DirectScanoutAttempt::Fallback("candidate_plane_missing"));
         }
-        let Some(_worker) = worker else {
+        let Some(worker) = worker else {
             self.note_direct_worker_admission_rejected(false);
             return Ok(DirectScanoutAttempt::Fallback("worker_unavailable"));
         };
@@ -341,6 +351,70 @@ impl AtomicEglGbmScanout {
             drop(surface_damage);
             return Err(io::Error::other(error));
         }
+        let obligations = output_transactions
+            .transaction(transaction_id)
+            .expect("direct transaction was just inserted")
+            .descriptor()
+            .obligations();
+        let admission = match worker.try_reserve_direct_admission(candidate_key) {
+            Ok(admission) => admission,
+            Err(crate::native_output::kms_worker::KmsWorkerAdmissionError::DuplicateCandidate) => {
+                self.note_direct_worker_admission_rejected(false);
+                self.note_direct_same_buffer_resubmission();
+                settle_no_visual_change_output_transaction(
+                    output_transactions,
+                    transaction_id,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    |obligations| {
+                        let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                            io::Error::other("duplicate direct transaction has no frame batch")
+                        })?;
+                        server.complete_no_visual_change_frame_batch(batch_id);
+                        Ok(())
+                    },
+                )
+                .map_err(|error| io::Error::other(error.to_string()))?;
+                self.note_direct_callback_owner_leaks(direct_terminal_callback_owner_leaks(
+                    server,
+                    transaction_id,
+                    obligations,
+                    DirectTerminalCallbackDisposition::NoVisualChange,
+                    0,
+                ));
+                return Ok(DirectScanoutAttempt::Unchanged);
+            }
+            Err(error) => {
+                self.note_direct_worker_admission_rejected(matches!(
+                    error,
+                    crate::native_output::kms_worker::KmsWorkerAdmissionError::QueueFull
+                ));
+                settle_failed_output_transaction(
+                    output_transactions,
+                    transaction_id,
+                    OutputTransactionFailureStage::KmsSubmit,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    |obligations| {
+                        let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                            io::Error::other("rejected direct transaction has no frame batch")
+                        })?;
+                        server.restore_frame_batch_after_render_failure(batch_id);
+                        Ok(())
+                    },
+                )
+                .map_err(|error| io::Error::other(error.to_string()))?;
+                self.note_direct_callback_owner_leaks(direct_terminal_callback_owner_leaks(
+                    server,
+                    transaction_id,
+                    obligations,
+                    DirectTerminalCallbackDisposition::Retryable,
+                    0,
+                ));
+                return Ok(DirectScanoutAttempt::AdmissionRejected {
+                    transaction_id,
+                    reason: error,
+                });
+            }
+        };
         let token = PageFlipToken::new(allocate_native_page_flip_token())
             .expect("allocated native pageflip token is nonzero");
         let framebuffer_id = framebuffer.framebuffer.get();
@@ -362,6 +436,7 @@ impl AtomicEglGbmScanout {
             token: token.get(),
             framebuffer_id,
             lease: Box::new(direct_lease),
+            admission,
             test_only,
         })
     }
@@ -496,10 +571,39 @@ impl AtomicEglGbmScanout {
         }
     }
 
-    pub(crate) fn complete_composited_transition(&mut self, release_proven: bool) {
-        if !release_proven && self.direct.ownership.presented.is_some() {
-            self.note_direct_early_release_violation();
-            return;
+    pub(crate) fn complete_composited_transition(
+        &mut self,
+        boundary: DirectReleaseBoundary,
+        worker_content_keys: (
+            Option<DirectScanoutCandidateKey>,
+            Option<DirectScanoutCandidateKey>,
+            Option<DirectScanoutCandidateKey>,
+        ),
+    ) {
+        let worker_owns_current =
+            self.direct
+                .ownership
+                .presented
+                .as_ref()
+                .is_some_and(|presented| {
+                    worker_content_keys.0 == Some(presented.lease.key())
+                        || worker_content_keys.1 == Some(presented.lease.key())
+                        || worker_content_keys.2 == Some(presented.lease.key())
+                });
+        match self
+            .direct
+            .ownership
+            .release_safety(boundary, worker_owns_current)
+        {
+            DirectReleaseSafety::Safe => {}
+            DirectReleaseSafety::Deferred => {
+                self.note_direct_early_release_prevented();
+                return;
+            }
+            DirectReleaseSafety::Violation => {
+                self.note_direct_early_release_violation();
+                return;
+            }
         }
         if self
             .direct
@@ -671,12 +775,6 @@ impl AtomicEglGbmScanout {
             .counters
             .early_release_violations
             .saturating_add(1);
-    }
-
-    pub(crate) fn note_direct_release_check(&mut self, safe: bool) {
-        if !safe {
-            self.note_direct_early_release_violation();
-        }
     }
 
     pub(crate) fn note_dmabuf_feedback_unchanged_rebuild(&mut self) {

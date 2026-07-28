@@ -715,7 +715,14 @@ impl NativeRuntime {
                         },
                     )?;
                     if previous_assignment.is_some_and(|assignment| assignment.is_direct()) {
-                        explicit.complete_composited_transition(true);
+                        let worker_content_keys = kms_commit_worker
+                            .as_ref()
+                            .map(|worker| worker.direct_content_keys())
+                            .unwrap_or((None, None, None));
+                        explicit.complete_composited_transition(
+                            DirectReleaseBoundary::ComposedPageflip,
+                            worker_content_keys,
+                        );
                         debug_assert!(explicit.direct_scanout_presented_info().is_none());
                     }
                     if let Some(mut tracker) = direct_fallback_tracker.take() {

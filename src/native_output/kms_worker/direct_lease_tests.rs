@@ -2,7 +2,7 @@ use super::tests::{reserve_for_test, test_job, wait_for_fence_event};
 use super::thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
 use super::{
     KmsCommitJob, KmsCommitPayloadError, KmsCommitWorkerHandle, KmsPrimaryUpdate,
-    KmsTestOnlyPolicy, KmsWorkerEvent,
+    KmsTestOnlyPolicy, KmsWorkerAdmissionError, KmsWorkerEvent,
 };
 use crate::native_output::scanout::DirectPrimaryLease;
 use crate::native_output::{
@@ -128,6 +128,28 @@ fn submitted_composited_job_accepts_consumed_input_fence() {
     assert_eq!(job.validate_submitted_against(&transaction), Ok(()));
 }
 
+#[test]
+fn direct_candidate_admission_rejects_a_duplicate_reservation_atomically() {
+    let executor = Arc::new(DirectLeaseRecordingExecutor {
+        outcomes: Mutex::new(VecDeque::new()),
+        observations: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let key = test_direct_key(3);
+    let first = handle
+        .try_reserve_direct_admission(key)
+        .expect("first direct reservation should be admitted");
+
+    assert!(matches!(
+        handle.try_reserve_direct_admission(key),
+        Err(KmsWorkerAdmissionError::DuplicateCandidate)
+    ));
+
+    drop(first);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
 fn test_direct_job(
     token: u64,
     key: DirectScanoutCandidateKey,
@@ -242,10 +264,74 @@ struct DirectLeaseRecordingExecutor {
 
 struct PanicDirectLeaseExecutor;
 
+#[derive(Debug)]
+struct BlockingDirectSubmitExecutor {
+    started: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+impl KmsCommitExecutor for BlockingDirectSubmitExecutor {
+    fn submit(&self, _job: &KmsCommitJob) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure> {
+        self.started.wait();
+        self.release.wait();
+        Ok(KmsWorkerSubmission { out_fence: None })
+    }
+}
+
 impl KmsCommitExecutor for PanicDirectLeaseExecutor {
     fn submit(&self, _job: &KmsCommitJob) -> Result<KmsWorkerSubmission, KmsWorkerSubmitFailure> {
         panic!("fake direct worker panic");
     }
+}
+
+fn assert_executing_direct_candidate_survives_real_submit(
+    test_only: KmsTestOnlyPolicy,
+    token: u64,
+) {
+    let executor = Arc::new(BlockingDirectSubmitExecutor {
+        started: std::sync::Barrier::new(2),
+        release: std::sync::Barrier::new(2),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let key = test_direct_key(3);
+    let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
+    let mut job = test_direct_job(token, key, 42, Some(lease));
+    job.test_only = test_only;
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+
+    executor.started.wait();
+    assert_eq!(handle.direct_content_keys().1, Some(key));
+    assert!(matches!(
+        handle.try_reserve_direct_admission(key),
+        Err(KmsWorkerAdmissionError::DuplicateCandidate)
+    ));
+
+    executor.release.wait();
+    let events = wait_for_fence_event(
+        &handle,
+        token,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == token),
+    );
+    assert_eq!(handle.direct_content_keys().2, Some(key));
+    assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 0);
+    handle
+        .ack_pageflip(test_job(token).token, test_job(token).transaction_id, 1)
+        .unwrap();
+    drop(events);
+    assert_eq!(handle.direct_content_keys(), (None, None, None));
+    assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 1);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn executing_candidate_survives_required_test_only_and_blocked_real_submit() {
+    assert_executing_direct_candidate_survives_real_submit(KmsTestOnlyPolicy::Required, 604);
+}
+
+#[test]
+fn executing_candidate_survives_cached_skip_and_blocked_real_submit() {
+    assert_executing_direct_candidate_survives_real_submit(KmsTestOnlyPolicy::Skip, 605);
 }
 
 impl KmsCommitExecutor for DirectLeaseRecordingExecutor {

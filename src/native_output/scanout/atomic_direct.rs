@@ -74,6 +74,22 @@ pub(crate) struct PreparedDirectPageflip {
     pub(crate) surface_damage: oblivion_one::compositor::SurfaceDamagePresentation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectReleaseBoundary {
+    ComposedPageflip,
+    Restored,
+    TargetDestroyed,
+    Unproven,
+    InvalidBypass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectReleaseSafety {
+    Safe,
+    Deferred,
+    Violation,
+}
+
 #[derive(Debug)]
 pub(crate) struct DirectPageflipCompletion {
     pub(crate) frame_id: u64,
@@ -96,11 +112,16 @@ pub(crate) enum DirectScanoutAttempt {
     Rejected(DirectScanoutSceneRejection),
     Fallback(&'static str),
     Unchanged,
+    AdmissionRejected {
+        transaction_id: OutputTransactionId,
+        reason: crate::native_output::kms_worker::KmsWorkerAdmissionError,
+    },
     WorkerQueued {
         transaction_id: OutputTransactionId,
         token: u64,
         framebuffer_id: u32,
         lease: Box<DirectPrimaryLease>,
+        admission: crate::native_output::kms_worker::KmsCommitAdmissionPermit,
         test_only: crate::native_output::kms_worker::KmsTestOnlyPolicy,
     },
 }
@@ -200,6 +221,35 @@ pub(super) fn direct_scanout_debug(message: impl std::fmt::Display) {
 }
 
 impl DirectPrimaryOwnership {
+    pub(crate) fn release_safety(
+        &self,
+        boundary: DirectReleaseBoundary,
+        worker_owns_current: bool,
+    ) -> DirectReleaseSafety {
+        if matches!(boundary, DirectReleaseBoundary::InvalidBypass) {
+            return DirectReleaseSafety::Violation;
+        }
+        if self.submitted.is_some() || worker_owns_current {
+            return DirectReleaseSafety::Deferred;
+        }
+        match boundary {
+            DirectReleaseBoundary::ComposedPageflip if self.presented.is_some() => {
+                DirectReleaseSafety::Safe
+            }
+            DirectReleaseBoundary::Unproven
+                if self.presented.is_some() || !self.suspended.is_empty() =>
+            {
+                DirectReleaseSafety::Deferred
+            }
+            DirectReleaseBoundary::Restored | DirectReleaseBoundary::TargetDestroyed => {
+                DirectReleaseSafety::Safe
+            }
+            DirectReleaseBoundary::ComposedPageflip
+            | DirectReleaseBoundary::Unproven
+            | DirectReleaseBoundary::InvalidBypass => DirectReleaseSafety::Safe,
+        }
+    }
+
     fn validate_submitted_pageflip(
         &self,
         transaction_id: OutputTransactionId,
@@ -577,6 +627,122 @@ mod tests {
             ),
             target: test_target(),
         }
+    }
+
+    fn presented_ownership_for_release_test() -> DirectPrimaryOwnership {
+        let key = test_key();
+        let (lease, _cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 43);
+        let mut ownership = DirectPrimaryOwnership::default();
+        ownership
+            .accept_submitted(test_submitted(143, lease))
+            .expect("accept direct resource");
+        ownership
+            .complete_pageflip(
+                OutputTransactionId::new(std::num::NonZeroU64::new(143).unwrap()),
+                PageFlipToken::new(143).unwrap(),
+                MonotonicTimestampNs::new(14),
+            )
+            .expect("present direct resource");
+        ownership
+    }
+
+    #[test]
+    fn queued_direct_release_is_deferred() {
+        assert_eq!(
+            DirectPrimaryOwnership::default()
+                .release_safety(DirectReleaseBoundary::ComposedPageflip, true),
+            DirectReleaseSafety::Deferred
+        );
+    }
+
+    #[test]
+    fn executing_direct_release_is_deferred() {
+        assert_eq!(
+            DirectPrimaryOwnership::default().release_safety(DirectReleaseBoundary::Unproven, true),
+            DirectReleaseSafety::Deferred
+        );
+    }
+
+    #[test]
+    fn submitted_event_release_is_deferred() {
+        assert_eq!(
+            DirectPrimaryOwnership::default().release_safety(DirectReleaseBoundary::Unproven, true),
+            DirectReleaseSafety::Deferred
+        );
+    }
+
+    #[test]
+    fn physical_submitted_release_is_deferred() {
+        let key = test_key();
+        let (lease, _cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 144);
+        let mut ownership = DirectPrimaryOwnership::default();
+        ownership
+            .accept_submitted(test_submitted(144, lease))
+            .expect("accept direct resource");
+
+        assert_eq!(
+            ownership.release_safety(DirectReleaseBoundary::ComposedPageflip, false),
+            DirectReleaseSafety::Deferred
+        );
+    }
+
+    #[test]
+    fn presented_direct_release_is_deferred_until_replacement() {
+        let ownership = presented_ownership_for_release_test();
+
+        assert_eq!(
+            ownership.release_safety(DirectReleaseBoundary::Unproven, false),
+            DirectReleaseSafety::Deferred
+        );
+        assert_eq!(
+            ownership.release_safety(DirectReleaseBoundary::ComposedPageflip, false),
+            DirectReleaseSafety::Safe
+        );
+    }
+
+    #[test]
+    fn unproven_teardown_release_is_deferred() {
+        let ownership = presented_ownership_for_release_test();
+        assert_eq!(
+            ownership.release_safety(DirectReleaseBoundary::Unproven, false),
+            DirectReleaseSafety::Deferred
+        );
+    }
+
+    #[test]
+    fn restored_release_is_safe() {
+        let ownership = presented_ownership_for_release_test();
+        assert_eq!(
+            ownership.release_safety(DirectReleaseBoundary::Restored, false),
+            DirectReleaseSafety::Safe
+        );
+    }
+
+    #[test]
+    fn target_destroyed_release_is_safe() {
+        let ownership = presented_ownership_for_release_test();
+        assert_eq!(
+            ownership.release_safety(DirectReleaseBoundary::TargetDestroyed, false),
+            DirectReleaseSafety::Safe
+        );
+    }
+
+    #[test]
+    fn invalid_release_bypass_increments_violation() {
+        assert_eq!(
+            DirectPrimaryOwnership::default()
+                .release_safety(DirectReleaseBoundary::InvalidBypass, false),
+            DirectReleaseSafety::Violation
+        );
+    }
+
+    #[test]
+    fn safe_release_increments_no_alarm() {
+        assert_eq!(
+            DirectPrimaryOwnership::default()
+                .release_safety(DirectReleaseBoundary::Restored, false),
+            DirectReleaseSafety::Safe
+        );
     }
 
     #[test]

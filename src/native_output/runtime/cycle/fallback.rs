@@ -61,6 +61,7 @@ impl NativeRuntime {
     }
 
     pub(crate) fn abandon_direct_fallback(&mut self) {
+        self.scanout.note_direct_fallback_cycles(0);
         self.direct_fallback_tracker = None;
     }
 }

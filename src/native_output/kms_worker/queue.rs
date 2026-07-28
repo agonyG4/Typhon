@@ -3,7 +3,7 @@
 use super::{KmsCommitJob, KmsWorkerEvent};
 use crate::native_output::DirectScanoutCandidateKey;
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     sync::{
         Arc, Condvar, Mutex, TryLockError,
@@ -185,6 +185,7 @@ pub(crate) enum KmsWorkerLifecycle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KmsWorkerAdmissionError {
+    DuplicateCandidate,
     QueueFull,
     AdmissionContention,
     Quiescing,
@@ -264,6 +265,7 @@ pub(crate) struct WorkerState {
     pub(crate) lifecycle: KmsWorkerLifecycle,
     pub(crate) queued: VecDeque<KmsCommitJob>,
     pub(crate) reserved: usize,
+    pub(crate) reserved_direct_content_keys: HashSet<DirectScanoutCandidateKey>,
     pub(crate) executing: bool,
     pub(crate) executing_direct_content_key: Option<DirectScanoutCandidateKey>,
     pub(crate) inflight: Option<WorkerInFlight>,
@@ -276,6 +278,7 @@ impl WorkerShared {
                 lifecycle: KmsWorkerLifecycle::Running,
                 queued: VecDeque::with_capacity(QUEUED_JOB_CAPACITY),
                 reserved: 0,
+                reserved_direct_content_keys: HashSet::new(),
                 executing: false,
                 executing_direct_content_key: None,
                 inflight: None,
@@ -311,11 +314,6 @@ impl WorkerShared {
             .inflight
             .and_then(|ownership| ownership.direct_content_key);
         (queued, executing, inflight)
-    }
-
-    pub(crate) fn direct_candidate_in_flight(&self, key: DirectScanoutCandidateKey) -> bool {
-        let (queued, executing, inflight) = self.direct_content_keys();
-        queued == Some(key) || executing == Some(key) || inflight == Some(key)
     }
 
     pub(crate) fn try_reserve(
@@ -357,13 +355,14 @@ impl WorkerShared {
         Ok(KmsCommitAdmissionPermit {
             shared: Arc::clone(self),
             active: true,
+            direct_content_key: None,
         })
     }
 
     pub(crate) fn try_reserve_direct(
         self: &Arc<Self>,
         candidate_key: DirectScanoutCandidateKey,
-    ) -> Result<Option<KmsCommitAdmissionPermit>, KmsWorkerAdmissionError> {
+    ) -> Result<KmsCommitAdmissionPermit, KmsWorkerAdmissionError> {
         let mut state = match self.state.try_lock() {
             Ok(state) => state,
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -394,8 +393,9 @@ impl WorkerShared {
             || state
                 .inflight
                 .is_some_and(|ownership| ownership.direct_content_key == Some(candidate_key))
+            || state.reserved_direct_content_keys.contains(&candidate_key)
         {
-            return Ok(None);
+            return Err(KmsWorkerAdmissionError::DuplicateCandidate);
         }
         let occupied = state.queued.len()
             + state.reserved
@@ -408,10 +408,12 @@ impl WorkerShared {
             return Err(KmsWorkerAdmissionError::QueueFull);
         }
         state.reserved += 1;
-        Ok(Some(KmsCommitAdmissionPermit {
+        state.reserved_direct_content_keys.insert(candidate_key);
+        Ok(KmsCommitAdmissionPermit {
             shared: Arc::clone(self),
             active: true,
-        }))
+            direct_content_key: Some(candidate_key),
+        })
     }
 
     pub(crate) fn request_quiesce(&self) {
@@ -547,6 +549,7 @@ impl WorkerShared {
 pub(crate) struct KmsCommitAdmissionPermit {
     pub(crate) shared: Arc<WorkerShared>,
     active: bool,
+    direct_content_key: Option<DirectScanoutCandidateKey>,
 }
 
 impl KmsCommitAdmissionPermit {
@@ -558,6 +561,9 @@ impl KmsCommitAdmissionPermit {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.active = false;
         state.reserved = state.reserved.saturating_sub(1);
+        if let Some(key) = self.direct_content_key.take() {
+            state.reserved_direct_content_keys.remove(&key);
+        }
         if !matches!(state.lifecycle, KmsWorkerLifecycle::Running)
             || state.queued.len() >= QUEUED_JOB_CAPACITY
         {
@@ -595,6 +601,9 @@ impl Drop for KmsCommitAdmissionPermit {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.reserved = state.reserved.saturating_sub(1);
+        if let Some(key) = self.direct_content_key.take() {
+            state.reserved_direct_content_keys.remove(&key);
+        }
         self.active = false;
         self.shared.work_wakeup.notify_one();
     }

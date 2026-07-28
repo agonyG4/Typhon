@@ -1,5 +1,8 @@
 use super::super::cursor_cycle::{commit_primary_cursor_pageflip, prepare_primary_cursor_pageflip};
-use super::super::presentation_transactions::prepare_presented_output_transaction;
+use super::super::presentation_transactions::{
+    DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
+    prepare_presented_output_transaction,
+};
 use super::*;
 
 #[allow(clippy::too_many_arguments)]
@@ -44,6 +47,7 @@ pub(super) fn settle_direct_pageflip(
             .map_err(io::Error::other)?;
         return Err(io::Error::other("direct pageflip obligation identity mismatch").into());
     }
+    let logical_obligations = prepared_logical.obligations();
     let prepared_frame_batch = match server.prepare_direct_presented_frame_batch(
         direct_info.frame_id,
         direct_info.protocol_batch_id,
@@ -99,8 +103,13 @@ pub(super) fn settle_direct_pageflip(
     });
     let callback_owner_leaks =
         server.commit_prepared_direct_presented_frame_batch(prepared_frame_batch, presentation);
-    scanout.note_direct_callback_owner_leaks(callback_owner_leaks);
-    scanout.note_direct_release_check(true);
+    scanout.note_direct_callback_owner_leaks(direct_terminal_callback_owner_leaks(
+        server,
+        transaction_id,
+        logical_obligations,
+        DirectTerminalCallbackDisposition::Presented,
+        callback_owner_leaks,
+    ));
     drop(completion.replaced);
     let target = direct_info.target;
     let submit_started_at = direct_info.submit_started_at;

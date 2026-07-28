@@ -3,6 +3,35 @@ use super::*;
 use oblivion_one::compositor::CompositorFrameBatchId;
 use oblivion_one::native::kms::KmsBackendKind;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectTerminalCallbackDisposition {
+    Presented,
+    NoVisualChange,
+    Abandoned,
+    Retryable,
+}
+
+pub(crate) fn direct_terminal_callback_owner_leaks(
+    server: &OwnCompositorServer,
+    transaction_id: OutputTransactionId,
+    obligations: OutputProtocolObligations,
+    disposition: DirectTerminalCallbackDisposition,
+    observed_leaks: u64,
+) -> u64 {
+    debug_assert!(transaction_id.get() > 0);
+    debug_assert!(obligations.direct_surface_id().is_some());
+    let live_leaks = match disposition {
+        DirectTerminalCallbackDisposition::Retryable => 0,
+        DirectTerminalCallbackDisposition::Presented
+        | DirectTerminalCallbackDisposition::NoVisualChange
+        | DirectTerminalCallbackDisposition::Abandoned => obligations
+            .frame_batch_id()
+            .map(|batch_id| server.direct_callback_owner_leaks(batch_id))
+            .unwrap_or(0),
+    };
+    observed_leaks.saturating_add(live_leaks)
+}
+
 fn settle_accepted_output_transaction<F>(
     output_transactions: &mut OutputTransactionLedger,
     accepted: AcceptedTerminalTransition,

@@ -1,6 +1,9 @@
 use super::cycle::direct_fallback::DirectFallbackTracker;
 use super::kms_worker::{WorkerQueueOutcome, queue_cursor_only, queue_explicit_composited_frame};
-use super::presentation_transactions::submit_cursor_only;
+use super::presentation_transactions::{
+    DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
+    settle_failed_output_transaction, submit_cursor_only,
+};
 use super::*;
 use crate::native_output::kms_worker::{
     KmsCommitAdmissionPermit, KmsCommitJob, KmsCommitWorkerHandle, KmsCursorUpdate,
@@ -39,7 +42,6 @@ pub(super) fn worker_ctx<'a>(
 pub(super) enum DirectWorkerQueueResult {
     Queued,
     AdmissionRejected,
-    Suppressed,
 }
 
 #[derive(Debug)]
@@ -60,6 +62,7 @@ impl DirectWorkerAdmissionGuard {
         token: PageFlipToken,
         pacing_frame_id: Option<u64>,
         ready_submit: bool,
+        worker_permit: KmsCommitAdmissionPermit,
     ) -> Self {
         Self {
             transaction_id,
@@ -69,7 +72,7 @@ impl DirectWorkerAdmissionGuard {
             transaction_queued: false,
             arbiter_reserved: false,
             scheduler_reserved: false,
-            worker_permit: None,
+            worker_permit: Some(worker_permit),
         }
     }
 
@@ -135,6 +138,7 @@ fn quarantine_direct_admission_failure(
     drop(guard);
     emergency_quarantined_worker_jobs.push(job);
     worker.mark_admission_fatal();
+    scanout.note_direct_fallback_cycles(0);
     *direct_fallback_tracker = None;
     frame_scheduler.abandon_for_session_suspend();
     atomic_commit_arbiter.abandon_for_recovery();
@@ -143,6 +147,42 @@ fn quarantine_direct_admission_failure(
         "direct worker admission rollback could not prove cancellation: {reason}"
     ))
     .into())
+}
+
+fn settle_failed_direct_worker_transaction(
+    scanout: &mut NativeScanoutBackend,
+    server: &mut OwnCompositorServer,
+    output_transactions: &mut OutputTransactionLedger,
+    transaction_id: OutputTransactionId,
+    protocol_batch_id: oblivion_one::compositor::CompositorFrameBatchId,
+    stage: OutputTransactionFailureStage,
+    at: MonotonicTimestampNs,
+) -> NativeResult<()> {
+    let obligations = output_transactions
+        .transaction(transaction_id)
+        .ok_or_else(|| io::Error::other("direct worker transaction disappeared"))?
+        .descriptor()
+        .obligations();
+    settle_failed_output_transaction(
+        output_transactions,
+        transaction_id,
+        stage,
+        at,
+        |obligations| {
+            if obligations.frame_batch_id() == Some(protocol_batch_id) {
+                server.restore_frame_batch_after_render_failure(protocol_batch_id);
+            }
+            Ok(())
+        },
+    )?;
+    scanout.note_direct_callback_owner_leaks(direct_terminal_callback_owner_leaks(
+        server,
+        transaction_id,
+        obligations,
+        DirectTerminalCallbackDisposition::Retryable,
+        0,
+    ));
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -433,6 +473,7 @@ pub(super) fn finish_direct_worker_queued(
     framebuffer_id: u32,
     direct_target: PresentationTarget,
     direct_lease: DirectPrimaryLease,
+    admission: KmsCommitAdmissionPermit,
     test_only: KmsTestOnlyPolicy,
 ) -> NativeResult<DirectWorkerQueueResult> {
     let commit_token = PageFlipToken::new(token)
@@ -488,44 +529,25 @@ pub(super) fn finish_direct_worker_queued(
         .transaction(transaction_id)
         .ok_or_else(|| io::Error::other("direct worker transaction disappeared"))?;
     if let Err(error) = job.validate_against(descriptor.descriptor()) {
-        settle_failed_output_transaction(
+        settle_failed_direct_worker_transaction(
+            scanout,
+            server,
             output_transactions,
             transaction_id,
+            protocol_batch_id,
             OutputTransactionFailureStage::BackendOwnershipTransfer,
             MonotonicTimestampNs::new(queued_at_ns),
-            |obligations| {
-                if obligations.frame_batch_id() == Some(protocol_batch_id) {
-                    server.restore_frame_batch_after_render_failure(protocol_batch_id);
-                }
-                Ok(())
-            },
         )?;
         drop(job);
         return Err(io::Error::other(format!("invalid direct worker payload: {error:?}")).into());
     }
-    let direct_key = job
-        .direct_primary_lease
-        .as_ref()
-        .expect("direct worker job has a direct lease")
-        .key();
-    if worker.direct_candidate_in_flight(direct_key) {
-        scanout.note_direct_same_buffer_resubmission();
-        settle_no_visual_change_output_transaction(
-            output_transactions,
-            transaction_id,
-            MonotonicTimestampNs::new(queued_at_ns),
-            |obligations| {
-                if let Some(batch_id) = obligations.frame_batch_id() {
-                    server.complete_no_visual_change_frame_batch(batch_id);
-                }
-                Ok(())
-            },
-        )?;
-        drop(job);
-        return Ok(DirectWorkerQueueResult::Suppressed);
-    }
-    let mut guard =
-        DirectWorkerAdmissionGuard::new(transaction_id, commit_token, pacing_frame_id, false);
+    let mut guard = DirectWorkerAdmissionGuard::new(
+        transaction_id,
+        commit_token,
+        pacing_frame_id,
+        false,
+        admission,
+    );
     if let Err(error) = output_transactions.mark_queued(
         transaction_id,
         output_generation,
@@ -550,17 +572,14 @@ pub(super) fn finish_direct_worker_queued(
                 reason,
             );
         }
-        settle_failed_output_transaction(
+        settle_failed_direct_worker_transaction(
+            scanout,
+            server,
             output_transactions,
             transaction_id,
+            protocol_batch_id,
             OutputTransactionFailureStage::KmsSubmit,
             MonotonicTimestampNs::new(queued_at_ns),
-            |obligations| {
-                if obligations.frame_batch_id() == Some(protocol_batch_id) {
-                    server.restore_frame_batch_after_render_failure(protocol_batch_id);
-                }
-                Ok(())
-            },
         )?;
         drop(job);
         return Err(io::Error::other(error).into());
@@ -580,22 +599,26 @@ pub(super) fn finish_direct_worker_queued(
             output_transactions,
         );
         if let Err(reason) = rollback {
-            return Err(io::Error::other(format!(
-                "direct worker arbiter admission failed and rollback failed: {reason}"
-            ))
-            .into());
+            return quarantine_direct_admission_failure(
+                emergency_quarantined_worker_jobs,
+                direct_fallback_tracker,
+                worker,
+                guard,
+                job,
+                frame_scheduler,
+                atomic_commit_arbiter,
+                scanout,
+                reason,
+            );
         }
-        settle_failed_output_transaction(
+        settle_failed_direct_worker_transaction(
+            scanout,
+            server,
             output_transactions,
             transaction_id,
+            protocol_batch_id,
             OutputTransactionFailureStage::BackendOwnershipTransfer,
             MonotonicTimestampNs::new(monotonic_now_ns()?),
-            |obligations| {
-                if obligations.frame_batch_id() == Some(protocol_batch_id) {
-                    server.restore_frame_batch_after_render_failure(protocol_batch_id);
-                }
-                Ok(())
-            },
         )?;
         drop(job);
         return Err(io::Error::other(error).into());
@@ -609,74 +632,41 @@ pub(super) fn finish_direct_worker_queued(
             output_transactions,
         );
         if let Err(reason) = rollback {
-            return Err(io::Error::other(format!(
-                "direct worker scheduler admission failed and rollback failed: {reason}"
-            ))
-            .into());
+            return quarantine_direct_admission_failure(
+                emergency_quarantined_worker_jobs,
+                direct_fallback_tracker,
+                worker,
+                guard,
+                job,
+                frame_scheduler,
+                atomic_commit_arbiter,
+                scanout,
+                reason,
+            );
         }
-        settle_failed_output_transaction(
+        settle_failed_direct_worker_transaction(
+            scanout,
+            server,
             output_transactions,
             transaction_id,
+            protocol_batch_id,
             OutputTransactionFailureStage::BackendOwnershipTransfer,
             MonotonicTimestampNs::new(monotonic_now_ns()?),
-            |obligations| {
-                if obligations.frame_batch_id() == Some(protocol_batch_id) {
-                    server.restore_frame_batch_after_render_failure(protocol_batch_id);
-                }
-                Ok(())
-            },
         )?;
         drop(job);
         return Err(io::Error::other(error).into());
     }
     guard.scheduler_reserved = true;
-    let admission = match worker.try_reserve_admission(kind) {
-        Ok(admission) => admission,
-        Err(error) => {
-            let queue_overflow = matches!(error, KmsWorkerAdmissionError::QueueFull);
-            scanout.note_direct_worker_admission_rejected(queue_overflow);
-            let rollback = guard.rollback(
-                context.frame_pacing,
-                frame_scheduler,
-                atomic_commit_arbiter,
-                output_transactions,
-            );
-            if let Err(reason) = rollback {
-                return quarantine_direct_admission_failure(
-                    emergency_quarantined_worker_jobs,
-                    direct_fallback_tracker,
-                    worker,
-                    guard,
-                    job,
-                    frame_scheduler,
-                    atomic_commit_arbiter,
-                    scanout,
-                    reason,
-                );
-            }
-            settle_failed_output_transaction(
-                output_transactions,
-                transaction_id,
-                OutputTransactionFailureStage::KmsSubmit,
-                MonotonicTimestampNs::new(monotonic_now_ns()?),
-                |obligations| {
-                    if obligations.frame_batch_id() == Some(protocol_batch_id) {
-                        server.restore_frame_batch_after_render_failure(protocol_batch_id);
-                    }
-                    Ok(())
-                },
-            )?;
-            drop(job);
-            return Ok(DirectWorkerQueueResult::AdmissionRejected);
-        }
-    };
-    guard.worker_permit = Some(admission);
     let admission = guard
         .worker_permit
         .take()
         .expect("direct worker admission permit was just retained");
     if let Err(error) = admission.enqueue(job) {
         let returned_job = error.job;
+        scanout.note_direct_worker_admission_rejected(matches!(
+            error.reason,
+            KmsWorkerAdmissionError::QueueFull
+        ));
         let rollback = guard.rollback(
             context.frame_pacing,
             frame_scheduler,
@@ -696,17 +686,14 @@ pub(super) fn finish_direct_worker_queued(
                 reason,
             );
         }
-        settle_failed_output_transaction(
+        settle_failed_direct_worker_transaction(
+            scanout,
+            server,
             output_transactions,
             transaction_id,
+            protocol_batch_id,
             OutputTransactionFailureStage::BackendOwnershipTransfer,
             MonotonicTimestampNs::new(monotonic_now_ns()?),
-            |obligations| {
-                if obligations.frame_batch_id() == Some(protocol_batch_id) {
-                    server.restore_frame_batch_after_render_failure(protocol_batch_id);
-                }
-                Ok(())
-            },
         )?;
         drop(returned_job);
         return Ok(DirectWorkerQueueResult::AdmissionRejected);

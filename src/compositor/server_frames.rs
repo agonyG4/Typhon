@@ -35,6 +35,10 @@ impl OwnCompositorServer {
         self.state.frame_batches.contains_key(&batch_id)
     }
 
+    pub fn direct_callback_owner_leaks(&self, batch_id: CompositorFrameBatchId) -> u64 {
+        self.state.direct_callback_owner_leaks(batch_id)
+    }
+
     pub fn prepare_direct_presented_frame_batch(
         &self,
         frame_id: u64,
