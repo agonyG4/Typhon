@@ -1,4 +1,10 @@
-use std::{io, sync::Arc};
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use oblivion_one::compositor::{DirectScanoutSceneCandidate, SurfaceDamagePresentation};
 use oblivion_one::render_backend::buffer::DmabufBufferHandle;
@@ -13,6 +19,7 @@ pub(crate) struct DirectPrimaryLease {
     _buffer: DmabufBufferHandle,
     framebuffer: Arc<ImportedDirectFramebuffer>,
     surface_damage: Option<SurfaceDamagePresentation>,
+    live_lease_count: Arc<AtomicU64>,
 }
 
 impl DirectPrimaryLease {
@@ -22,7 +29,9 @@ impl DirectPrimaryLease {
         validation_key: DirectPlaneValidationKey,
         framebuffer: Arc<ImportedDirectFramebuffer>,
         surface_damage: SurfaceDamagePresentation,
+        live_lease_count: Arc<AtomicU64>,
     ) -> Self {
+        live_lease_count.fetch_add(1, Ordering::AcqRel);
         Self {
             key,
             validation_key,
@@ -30,6 +39,7 @@ impl DirectPrimaryLease {
             _buffer: candidate.buffer,
             framebuffer,
             surface_damage: Some(surface_damage),
+            live_lease_count,
         }
     }
 
@@ -100,8 +110,19 @@ impl DirectPrimaryLease {
                 _buffer: buffer,
                 framebuffer,
                 surface_damage,
+                live_lease_count: Arc::new(AtomicU64::new(1)),
             },
             cleanup_count,
         )
+    }
+}
+
+impl Drop for DirectPrimaryLease {
+    fn drop(&mut self) {
+        let _ = self
+            .live_lease_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                Some(count.saturating_sub(1))
+            });
     }
 }

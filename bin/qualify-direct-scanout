@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: qualify-direct-scanout PERF_LOG
+       qualify-direct-scanout --self-test
+
+Check the final perf native.scheduler record for the Stage 4 direct-scanout
+qualification invariants.
+EOF
+}
+
+metric() {
+    local log_path="$1"
+    local key="$2"
+    awk -v key="$key" '
+        $1 == "perf" && $2 == "native.scheduler" { record = $0 }
+        END {
+            if (record == "") exit 1
+            count = split(record, fields, " ")
+            prefix = key "="
+            for (i = 1; i <= count; i++) {
+                if (index(fields[i], prefix) == 1) {
+                    print substr(fields[i], length(prefix) + 1)
+                    exit 0
+                }
+            }
+            exit 1
+        }
+    ' "$log_path"
+}
+
+check_log() {
+    local log_path="$1"
+    local failures=0
+
+    printf '%-46s %s\n' "direct-scanout invariant" "result"
+    printf '%-46s %s\n' "----------------------------------------------" "------"
+
+    check_at_least() {
+        local key="$1"
+        local minimum="$2"
+        local value
+        value="$(metric "$log_path" "$key" 2>/dev/null || true)"
+        if [[ "$value" =~ ^[0-9]+$ ]] && (( value >= minimum )); then
+            printf '%-46s PASS (%s)\n' "$key >= $minimum" "$value"
+        else
+            printf '%-46s FAIL (%s)\n' "$key >= $minimum" "${value:-missing}"
+            failures=$((failures + 1))
+        fi
+    }
+
+    check_zero() {
+        local key="$1"
+        local value
+        value="$(metric "$log_path" "$key" 2>/dev/null || true)"
+        if [[ "$value" =~ ^[0-9]+$ ]] && (( value == 0 )); then
+            printf '%-46s PASS\n' "$key == 0"
+        else
+            printf '%-46s FAIL (%s)\n' "$key == 0" "${value:-missing}"
+            failures=$((failures + 1))
+        fi
+    }
+
+    check_at_least direct_scanout_entries 1
+    check_at_least direct_scanout_presentations 1
+    check_at_least direct_scanout_replacements 1
+    check_at_least direct_scanout_exits 1
+    check_at_least direct_scanout_composited_fallbacks 1
+
+    check_zero direct_scanout_duplicate_feedback
+    check_zero direct_scanout_duplicate_settlement
+    check_zero direct_scanout_early_release_prevented
+    check_zero direct_scanout_same_buffer_resubmissions
+    check_zero direct_scanout_worker_queue_overflow
+    check_zero direct_scanout_callback_owner_leaks
+
+    (( failures == 0 ))
+}
+
+self_test() {
+    local pass_fixture fail_fixture
+    pass_fixture="$(mktemp)"
+    fail_fixture="$(mktemp)"
+    trap "rm -f '$pass_fixture' '$fail_fixture'" EXIT
+
+    printf '%s\n' \
+        'perf native.scheduler direct_scanout_entries=1 direct_scanout_presentations=1 direct_scanout_replacements=1 direct_scanout_exits=1 direct_scanout_composited_fallbacks=1 direct_scanout_duplicate_feedback=0 direct_scanout_duplicate_settlement=0 direct_scanout_early_release_prevented=0 direct_scanout_same_buffer_resubmissions=0 direct_scanout_worker_queue_overflow=0 direct_scanout_callback_owner_leaks=0' \
+        >"$pass_fixture"
+    printf '%s\n' \
+        'perf native.scheduler direct_scanout_entries=1 direct_scanout_presentations=1 direct_scanout_replacements=0 direct_scanout_exits=1 direct_scanout_composited_fallbacks=1 direct_scanout_duplicate_feedback=0 direct_scanout_duplicate_settlement=0 direct_scanout_early_release_prevented=0 direct_scanout_same_buffer_resubmissions=0 direct_scanout_worker_queue_overflow=0 direct_scanout_callback_owner_leaks=0' \
+        >"$fail_fixture"
+
+    check_log "$pass_fixture"
+    if check_log "$fail_fixture"; then
+        printf '%s\n' "self-test: failing fixture unexpectedly passed" >&2
+        return 1
+    fi
+    printf '%s\n' "self-test: PASS"
+}
+
+case "${1:-}" in
+    --self-test)
+        [[ "$#" -eq 1 ]] || { usage >&2; exit 2; }
+        self_test
+        ;;
+    --help|-h)
+        usage
+        ;;
+    "")
+        usage >&2
+        exit 2
+        ;;
+    *)
+        [[ -f "$1" ]] || { printf 'qualify-direct-scanout: missing perf log: %s\n' "$1" >&2; exit 2; }
+        check_log "$1"
+        ;;
+esac

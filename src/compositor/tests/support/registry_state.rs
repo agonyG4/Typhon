@@ -118,6 +118,9 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) dmabuf_feedback_format_table: bool,
     pub(in crate::compositor::tests) dmabuf_feedback_format_table_size: u32,
     pub(in crate::compositor::tests) dmabuf_feedback_tranche_formats: bool,
+    pub(in crate::compositor::tests) dmabuf_feedback_tranche_targets: Vec<Vec<u8>>,
+    pub(in crate::compositor::tests) dmabuf_feedback_tranche_scanout: Vec<bool>,
+    pub(in crate::compositor::tests) dmabuf_feedback_tranche_indices: Vec<Vec<u8>>,
     pub(in crate::compositor::tests) dmabuf_feedback_done: bool,
     pub(in crate::compositor::tests) wl_drm_device: bool,
     pub(in crate::compositor::tests) wl_drm_capabilities: bool,
@@ -1253,6 +1256,19 @@ impl Dispatch<client_zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, ()>
             }
             client_zwp_linux_dmabuf_feedback_v1::Event::TrancheFormats { indices } => {
                 state.dmabuf_feedback_tranche_formats |= indices.len() >= 2;
+                state.dmabuf_feedback_tranche_indices.push(indices);
+            }
+            client_zwp_linux_dmabuf_feedback_v1::Event::TrancheTargetDevice { device } => {
+                state.dmabuf_feedback_tranche_targets.push(device);
+            }
+            client_zwp_linux_dmabuf_feedback_v1::Event::TrancheFlags { flags } => {
+                state.dmabuf_feedback_tranche_scanout.push(matches!(
+                    flags,
+                    WEnum::Value(value)
+                        if value.contains(
+                            client_zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout,
+                        )
+                ));
             }
             client_zwp_linux_dmabuf_feedback_v1::Event::Done => {
                 state.dmabuf_feedback_done = true;

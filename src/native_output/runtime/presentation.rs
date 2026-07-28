@@ -697,6 +697,7 @@ impl NativeRuntime {
                                 direct_submitted = true;
                             }
                             DirectScanoutAttempt::Rejected(rejection) => {
+                                scanout.note_direct_blocker(rejection.as_str());
                                 perf.log("native.direct_scanout", || {
                                     vec![
                                         NativePerfField::str("transition", "fallback"),
@@ -705,6 +706,7 @@ impl NativeRuntime {
                                 });
                             }
                             DirectScanoutAttempt::Fallback(reason) => {
+                                scanout.note_direct_blocker(reason);
                                 perf.log("native.direct_scanout", || {
                                     vec![
                                         NativePerfField::str("transition", "fallback"),

@@ -58,11 +58,51 @@ pub(super) fn send_dmabuf_format_modifiers(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectScanoutFormatCapability {
+    pub format: u32,
+    pub modifier: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectScanoutFeedbackCapabilities {
+    pub drm_device: u64,
+    pub output_generation: u64,
+    pub primary_plane_id: u32,
+    pub formats: Vec<DirectScanoutFormatCapability>,
+}
+
+impl DirectScanoutFeedbackCapabilities {
+    pub fn new(
+        drm_device: u64,
+        output_generation: u64,
+        primary_plane_id: u32,
+        formats: Vec<DirectScanoutFormatCapability>,
+    ) -> Self {
+        let mut formats = formats;
+        formats.sort_unstable_by_key(|format| (format.format, format.modifier));
+        formats.dedup_by_key(|format| (format.format, format.modifier));
+        Self {
+            drm_device,
+            output_generation,
+            primary_plane_id,
+            formats,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DmabufFeedbackTranche {
+    indices: Vec<u16>,
+    scanout: bool,
+    target_device: u64,
+}
+
 pub(super) struct DmabufFeedbackData {
     format_table: File,
     format_table_size: u32,
     main_device: u64,
-    tranches: Vec<(Vec<u16>, bool)>,
+    tranches: Vec<DmabufFeedbackTranche>,
 }
 
 impl DmabufFeedbackData {
@@ -70,6 +110,7 @@ impl DmabufFeedbackData {
         feedback: &EglGlesDmabufFeedback,
         main_device: u64,
         allowed_formats: &[GpuFormat],
+        scanout_capabilities: Option<&DirectScanoutFeedbackCapabilities>,
     ) -> io::Result<Self> {
         if main_device == 0 || feedback.format_table_formats().is_empty() {
             return Err(io::Error::new(
@@ -77,27 +118,56 @@ impl DmabufFeedbackData {
                 "dmabuf feedback has no valid main device or format table",
             ));
         }
-        let format_table_formats = feedback
-            .format_table_formats()
-            .iter()
-            .copied()
-            .filter(|format| gpu_format_is_allowed(*format, allowed_formats))
-            .collect::<Vec<_>>();
+        let mut format_table_formats = Vec::new();
+        if let Some(capabilities) = scanout_capabilities {
+            for capability in &capabilities.formats {
+                let format = EglGlesDmabufFormat::new(
+                    DrmFormat::from_fourcc(capability.format),
+                    DrmModifier(capability.modifier),
+                );
+                if gpu_format_is_allowed(format, allowed_formats)
+                    && !format_table_formats.contains(&format)
+                {
+                    format_table_formats.push(format);
+                }
+            }
+        }
+        for format in feedback.format_table_formats() {
+            if gpu_format_is_allowed(*format, allowed_formats)
+                && !format_table_formats.contains(format)
+            {
+                format_table_formats.push(*format);
+            }
+        }
         if format_table_formats.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "dmabuf feedback has no format supported by the selected importer",
             ));
         }
-        let scanout = dmabuf_tranche_indices(
-            &format_table_formats,
-            &feedback
-                .scanout_formats()
-                .iter()
-                .copied()
-                .filter(|format| gpu_format_is_allowed(*format, allowed_formats))
-                .collect::<Vec<_>>(),
-        );
+        let scanout_formats = scanout_capabilities
+            .map(|capabilities| {
+                capabilities
+                    .formats
+                    .iter()
+                    .map(|capability| {
+                        EglGlesDmabufFormat::new(
+                            DrmFormat::from_fourcc(capability.format),
+                            DrmModifier(capability.modifier),
+                        )
+                    })
+                    .filter(|format| gpu_format_is_allowed(*format, allowed_formats))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                feedback
+                    .scanout_formats()
+                    .iter()
+                    .copied()
+                    .filter(|format| gpu_format_is_allowed(*format, allowed_formats))
+                    .collect::<Vec<_>>()
+            });
+        let scanout = dmabuf_tranche_indices(&format_table_formats, &scanout_formats);
         let render = dmabuf_tranche_indices(
             &format_table_formats,
             &feedback
@@ -107,10 +177,29 @@ impl DmabufFeedbackData {
                 .filter(|format| gpu_format_is_allowed(*format, allowed_formats))
                 .collect::<Vec<_>>(),
         );
+        let scanout_device = scanout_capabilities
+            .map(|capabilities| capabilities.drm_device)
+            .filter(|device| *device != 0)
+            .unwrap_or(main_device);
         let tranches = if scanout.is_empty() {
-            vec![(render, false)]
+            vec![DmabufFeedbackTranche {
+                indices: render,
+                scanout: false,
+                target_device: main_device,
+            }]
         } else {
-            vec![(scanout, true), (render, false)]
+            vec![
+                DmabufFeedbackTranche {
+                    indices: scanout,
+                    scanout: true,
+                    target_device: scanout_device,
+                },
+                DmabufFeedbackTranche {
+                    indices: render,
+                    scanout: false,
+                    target_device: main_device,
+                },
+            ]
         };
         let (format_table, format_table_size) = dmabuf_format_table_file(&format_table_formats)?;
         Ok(Self {
@@ -171,14 +260,15 @@ pub(super) fn send_dmabuf_feedback(
     let device = data.main_device.to_ne_bytes().to_vec();
     feedback.format_table(data.format_table.as_fd(), data.format_table_size);
     feedback.main_device(device.clone());
-    for (indices, scanout) in &data.tranches {
-        let tranche_indices = indices
+    for tranche in &data.tranches {
+        let tranche_indices = tranche
+            .indices
             .iter()
             .copied()
             .flat_map(u16::to_ne_bytes)
             .collect::<Vec<_>>();
-        feedback.tranche_target_device(device.clone());
-        feedback.tranche_flags(if *scanout {
+        feedback.tranche_target_device(tranche.target_device.to_ne_bytes().to_vec());
+        feedback.tranche_flags(if tranche.scanout {
             zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout
         } else {
             zwp_linux_dmabuf_feedback_v1::TrancheFlags::empty()
@@ -421,12 +511,12 @@ mod tests {
             GpuFormat::new(DrmFormat::Xrgb8888.as_fourcc(), 7),
             GpuFormat::new(DrmFormat::Argb8888.as_fourcc(), DrmModifier::LINEAR.0),
         ];
-        let data = DmabufFeedbackData::new(&feedback, 0x1234, &allowed).unwrap();
+        let data = DmabufFeedbackData::new(&feedback, 0x1234, &allowed, None).unwrap();
 
         assert_eq!(data.tranches.len(), 2);
-        assert!(data.tranches[0].1);
-        assert!(!data.tranches[1].1);
-        assert_eq!(data.tranches[0].0, vec![0]);
-        assert_eq!(data.tranches[1].0, vec![1]);
+        assert!(data.tranches[0].scanout);
+        assert!(!data.tranches[1].scanout);
+        assert_eq!(data.tranches[0].indices, vec![0]);
+        assert_eq!(data.tranches[1].indices, vec![1]);
     }
 }

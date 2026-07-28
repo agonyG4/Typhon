@@ -705,6 +705,36 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn direct_scanout_presented_info(&self) -> Option<(u32, u32, u64)> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.direct_scanout_presented_info(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => None,
+        }
+    }
+
+    pub(crate) fn note_direct_blocker(&mut self, reason: &str) {
+        if let Self::AtomicEglGbm(scanout) = self {
+            scanout.note_direct_blocker(reason);
+        }
+    }
+
+    pub(crate) fn note_direct_worker_submission(
+        &mut self,
+        test_only: bool,
+        submit_started_at: u64,
+        submit_returned_at: u64,
+    ) {
+        if let Self::AtomicEglGbm(scanout) = self {
+            scanout.note_direct_worker_submission(test_only, submit_started_at, submit_returned_at);
+        }
+    }
+
+    pub(crate) fn note_direct_duplicate_feedback(&mut self) {
+        if let Self::AtomicEglGbm(scanout) = self {
+            scanout.note_direct_duplicate_feedback();
+        }
+    }
+
     pub(crate) fn direct_scanout_inhibited(&self) -> bool {
         match self {
             Self::AtomicEglGbm(scanout) => scanout.direct_scanout_inhibited(),
@@ -791,6 +821,13 @@ impl NativeScanoutBackend {
             Self::AtomicEglGbm(scanout) => scanout.dmabuf_main_device_path(),
             Self::NativeEglGbm(scanout) => scanout.dmabuf_main_device_path.clone(),
             Self::Gbm(_) | Self::Dumb(_) => None,
+        }
+    }
+
+    pub(crate) fn dmabuf_scanout_capabilities(&self) -> Option<DirectScanoutFeedbackCapabilities> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.dmabuf_scanout_capabilities(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => None,
         }
     }
 }

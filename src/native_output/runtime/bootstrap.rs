@@ -1347,8 +1347,14 @@ fn native_gpu_protocol_capabilities(
     let importer_formats = feedback
         .formats()
         .iter()
+        .chain(feedback.scanout_formats().iter())
         .map(|format| GpuFormat::new(format.format.as_fourcc(), format.modifier.0))
-        .collect::<Vec<_>>();
+        .fold(Vec::new(), |mut formats, format| {
+            if !formats.contains(&format) {
+                formats.push(format);
+            }
+            formats
+        });
     let feedback_format_table = feedback
         .format_table_formats()
         .iter()

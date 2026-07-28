@@ -51,11 +51,12 @@ mod server_gpu_globals;
 use super::{
     AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, BufferReleaseMetrics,
     ClientCursorRenderState, CompositorError, CompositorFrameBatchId, CompositorState,
-    CoreComplianceMetrics, DirectScanoutSceneBlockers, DirectScanoutSceneCandidate,
-    DirectScanoutSceneRejection, ExplicitSyncPoint, FrameBatchDiscardReason, FrameCallbackMetrics,
-    FrameCallbackTime, FramePresentation, FullscreenRenderPlanMetrics, InputProtocolCapabilities,
-    OutputRect, PendingProcessLaunch, PointerAxisFrame, PresentationClock, ProtocolOnlyCompletion,
-    RenderGenerationCause, RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
+    CoreComplianceMetrics, DirectScanoutFeedbackCapabilities, DirectScanoutSceneBlockers,
+    DirectScanoutSceneCandidate, DirectScanoutSceneRejection, ExplicitSyncPoint,
+    FrameBatchDiscardReason, FrameCallbackMetrics, FrameCallbackTime, FramePresentation,
+    FullscreenRenderPlanMetrics, InputProtocolCapabilities, OutputRect, PendingProcessLaunch,
+    PointerAxisFrame, PresentationClock, ProtocolOnlyCompletion, RenderGenerationCause,
+    RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
     SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
     WindowInteractionDebugSnapshot, WindowInteractionEndReason, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
@@ -923,10 +924,29 @@ impl OwnCompositorServer {
         feedback: EglGlesDmabufFeedback,
         main_device: Option<u64>,
         main_device_path: Option<String>,
-    ) {
-        self.state
+    ) -> bool {
+        let changed = self
+            .state
             .set_dmabuf_feedback(feedback, main_device, main_device_path);
         let _ = self.display.flush_clients();
+        changed
+    }
+
+    pub fn set_dmabuf_feedback_with_scanout_capabilities(
+        &mut self,
+        feedback: EglGlesDmabufFeedback,
+        main_device: Option<u64>,
+        main_device_path: Option<String>,
+        scanout_capabilities: Option<DirectScanoutFeedbackCapabilities>,
+    ) -> bool {
+        let changed = self.state.set_dmabuf_feedback_with_scanout_capabilities(
+            feedback,
+            main_device,
+            main_device_path,
+            scanout_capabilities,
+        );
+        let _ = self.display.flush_clients();
+        changed
     }
 
     pub fn set_output_size(&mut self, width: u32, height: u32) -> bool {

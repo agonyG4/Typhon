@@ -103,6 +103,7 @@ pub use desktop_window::{
 pub(crate) use desktop_window::{
     DesktopWindow, DesktopWindowError, WindowBackend, WindowRelationships, XdgWindowHandle,
 };
+pub use dmabuf::{DirectScanoutFeedbackCapabilities, DirectScanoutFormatCapability};
 use dmabuf::{
     DmabufBufferData, DmabufFeedbackData, DmabufParamsData, PendingDmabufPlane,
     send_dmabuf_feedback, send_dmabuf_format_modifiers, send_wl_drm_capabilities,
@@ -552,6 +553,7 @@ pub struct CompositorState {
     dmabuf_feedback: EglGlesDmabufFeedback,
     dmabuf_main_device: u64,
     dmabuf_main_device_path: Option<String>,
+    dmabuf_scanout_capabilities: Option<DirectScanoutFeedbackCapabilities>,
     syncobj_device: Option<DrmSyncobjDevice>,
     clipboard_bridge: Option<Box<dyn ClipboardBridge>>,
     selection_state: SelectionState,

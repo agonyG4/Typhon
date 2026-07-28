@@ -948,6 +948,13 @@ impl NativeRuntime {
                         None
                     };
                 let direct_primary_lease = ownership.job.direct_primary_lease.take();
+                if matches!(kind, AtomicCommitKind::DirectPrimary { .. }) {
+                    self.scanout.note_direct_worker_submission(
+                        matches!(ownership.job.test_only, KmsTestOnlyPolicy::Required),
+                        submit_started_at,
+                        submit_returned_at,
+                    );
+                }
                 let transaction = self
                     .output_transactions
                     .transaction(transaction_id)

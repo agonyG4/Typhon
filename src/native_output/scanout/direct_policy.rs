@@ -47,6 +47,22 @@ impl NativeDirectScanoutPreference {
     }
 }
 
+pub(crate) fn direct_blocker(reason: &str) -> (&'static str, u64) {
+    match reason {
+        "acquire_not_ready" => ("acquire_not_ready", 1 << 0),
+        "buffer_device_or_modifier_unproven" => ("buffer_device_or_modifier_unproven", 1 << 1),
+        "atomic_backend_unavailable" => ("atomic_backend_unavailable", 1 << 2),
+        "primary_in_fence_property_missing" => ("primary_in_fence_property_missing", 1 << 3),
+        "candidate_plane_missing" => ("candidate_plane_missing", 1 << 4),
+        "worker_unavailable" => ("worker_unavailable", 1 << 5),
+        "import_failed" => ("import_failed", 1 << 6),
+        "candidate_key_invalid" => ("candidate_key_invalid", 1 << 7),
+        "test_only_rejected" => ("test_only_rejected", 1 << 8),
+        "real_submit_rejected" => ("real_submit_rejected", 1 << 10),
+        _ => ("candidate_rejected", 1 << 9),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +95,17 @@ mod tests {
         );
         assert!(NativeDirectScanoutPreference::ExperimentalAuto.enabled());
         assert!(!NativeDirectScanoutPreference::Off.enabled());
+    }
+
+    #[test]
+    fn direct_blockers_have_stable_names_and_distinct_bits() {
+        assert_eq!(
+            direct_blocker("worker_unavailable"),
+            ("worker_unavailable", 1 << 5)
+        );
+        assert_ne!(
+            direct_blocker("test_only_rejected").1,
+            direct_blocker("real_submit_rejected").1
+        );
     }
 }

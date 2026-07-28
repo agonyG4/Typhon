@@ -1,9 +1,10 @@
 use super::{
     ContentEpochId, DirectContentDisposition, DirectPlaneValidationKey, DirectScanoutCandidateKey,
-    OutputContentKey, OutputReleasePlan, OutputTransaction, OutputTransactionError,
-    OutputTransactionFailureStage, OutputTransactionId, OutputTransactionLedger,
-    OutputTransactionState, OutputTransactionTerminal, PrimaryPlaneAssignment,
-    classify_direct_content,
+    DirectScanoutFeedbackCapabilities, DirectScanoutFormatCapability, OutputContentKey,
+    OutputReleasePlan, OutputTransaction, OutputTransactionError, OutputTransactionFailureStage,
+    OutputTransactionId, OutputTransactionLedger, OutputTransactionState,
+    OutputTransactionTerminal, PrimaryPlaneAssignment, classify_direct_content,
+    feedback_capabilities_changed,
 };
 use oblivion_one::compositor::CompositorFrameBatchId;
 use oblivion_one::native::kms::PageFlipToken;
@@ -286,4 +287,59 @@ fn direct_pageflip_is_the_only_presented_transition() {
             actual_sequence: Some(2),
         })
     );
+}
+
+fn test_feedback_capabilities() -> DirectScanoutFeedbackCapabilities {
+    DirectScanoutFeedbackCapabilities::new(
+        7,
+        1,
+        42,
+        vec![DirectScanoutFormatCapability {
+            format: 0x3432_5241,
+            modifier: 7,
+        }],
+    )
+}
+
+#[test]
+fn feedback_identity_unchanged_does_not_rebuild() {
+    let capabilities = test_feedback_capabilities();
+
+    assert!(!feedback_capabilities_changed(
+        Some(&capabilities),
+        &capabilities,
+    ));
+}
+
+#[test]
+fn feedback_rebuilds_after_output_generation_change() {
+    let previous = test_feedback_capabilities();
+    let current = DirectScanoutFeedbackCapabilities {
+        output_generation: 2,
+        ..previous.clone()
+    };
+
+    assert!(feedback_capabilities_changed(Some(&previous), &current));
+}
+
+#[test]
+fn feedback_rebuilds_after_primary_plane_capability_change() {
+    let previous = test_feedback_capabilities();
+    let current = DirectScanoutFeedbackCapabilities {
+        primary_plane_id: 43,
+        ..previous.clone()
+    };
+
+    assert!(feedback_capabilities_changed(Some(&previous), &current));
+}
+
+#[test]
+fn feedback_rebuilds_after_selected_device_change() {
+    let previous = test_feedback_capabilities();
+    let current = DirectScanoutFeedbackCapabilities {
+        drm_device: 8,
+        ..previous.clone()
+    };
+
+    assert!(feedback_capabilities_changed(Some(&previous), &current));
 }

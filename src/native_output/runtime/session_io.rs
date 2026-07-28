@@ -348,6 +348,9 @@ impl NativeSessionIo for NativeRuntime {
         self.drm_file_generation = allocate_native_drm_file_generation();
         self.scanout
             .rebind_session_generation(self.drm_file_generation);
+        if !apply_native_scanout_feedback(&mut self.server, &self.scanout) {
+            self.scanout.note_direct_duplicate_feedback();
+        }
         self.acquire_watches
             .set_drm_file_generation(self.drm_file_generation);
         self.restart_kms_commit_worker_after_recovery()?;

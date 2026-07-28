@@ -2,15 +2,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{NativeScanoutBackend, OwnCompositorServer};
 
+pub(crate) use oblivion_one::compositor::DirectScanoutFeedbackCapabilities;
+
+#[cfg(test)]
+pub(crate) use oblivion_one::compositor::DirectScanoutFormatCapability;
+
+#[cfg(test)]
+pub(crate) fn feedback_capabilities_changed(
+    previous: Option<&DirectScanoutFeedbackCapabilities>,
+    current: &DirectScanoutFeedbackCapabilities,
+) -> bool {
+    previous != Some(current)
+}
+
 pub(crate) fn apply_native_scanout_feedback(
     server: &mut OwnCompositorServer,
     scanout: &NativeScanoutBackend,
-) {
-    server.set_dmabuf_feedback(
+) -> bool {
+    server.set_dmabuf_feedback_with_scanout_capabilities(
         scanout.dmabuf_feedback(),
         scanout.dmabuf_main_device(),
         scanout.dmabuf_main_device_path(),
-    );
+        scanout.dmabuf_scanout_capabilities(),
+    )
 }
 
 pub(crate) static NEXT_NATIVE_PAGE_FLIP_TOKEN: AtomicU64 = AtomicU64::new(1);

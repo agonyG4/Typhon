@@ -1,6 +1,7 @@
 use std::{
     fs, io, iter,
     os::fd::{AsFd, AsRawFd},
+    os::unix::fs::MetadataExt,
     ptr,
     time::Instant,
 };
@@ -9,7 +10,8 @@ use gbm::AsRaw as _;
 use glow::HasContext;
 use khronos_egl as egl;
 use oblivion_one::compositor::{
-    CompositorFrameBatchId, FrameBatchDiscardReason, OwnCompositorServer, SurfaceDamagePresentation,
+    CompositorFrameBatchId, DirectScanoutFeedbackCapabilities, DirectScanoutFormatCapability,
+    FrameBatchDiscardReason, OwnCompositorServer, SurfaceDamagePresentation,
 };
 use oblivion_one::native::kms::{AtomicDiscovery, DrmFormatModifierPair};
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
@@ -57,6 +59,7 @@ pub(crate) struct AtomicEglGbmScanout {
     dmabuf_feedback: EglGlesDmabufFeedback,
     dmabuf_main_device: Option<u64>,
     dmabuf_main_device_path: Option<String>,
+    dmabuf_scanout_capabilities: DirectScanoutFeedbackCapabilities,
     pub(crate) format_modifier: DrmFormatModifierPair,
     drm_cleanup_armed: bool,
     deadline_hints_enabled: bool,
@@ -170,6 +173,7 @@ impl AtomicEglGbmScanout {
         self.direct.inhibit_until_composited_present = true;
         self.direct.identity_viewport_metadata_logged = false;
         self.direct.last_debug_candidate = None;
+        self.dmabuf_scanout_capabilities.output_generation = generation;
         self.scene.invalidate_presented_damage_history();
     }
 
@@ -266,18 +270,37 @@ impl AtomicEglGbmScanout {
             )
             .map_err(native_egl_io_error)?;
             let renderer_dmabuf_feedback = query_egl_dmabuf_feedback(&egl, egl_display);
-            let scanout_formats = discovery
-                .plane_scanout_formats
-                .iter()
-                .filter(|format| {
-                    format.fourcc == DrmFormat::XRGB8888_FOURCC
-                        && format.modifier != DrmModifier::INVALID.0
-                })
-                .map(|format| {
-                    EglGlesDmabufFormat::new(DrmFormat::Xrgb8888, DrmModifier(format.modifier))
+            let mut scanout_capabilities = Vec::new();
+            for format in &discovery.plane_scanout_formats {
+                if format.fourcc != DrmFormat::XRGB8888_FOURCC
+                    || format.modifier == DrmModifier::INVALID.0
+                {
+                    continue;
+                }
+                let modifier = DrmModifier(format.modifier);
+                if !renderer_dmabuf_feedback.supports(DrmFormat::Xrgb8888, modifier)
+                    || !probe.supports(*format)
+                {
+                    continue;
+                }
+                scanout_capabilities.push(DirectScanoutFormatCapability {
+                    format: format.fourcc,
+                    modifier: format.modifier,
                 });
+            }
+            let scanout_capabilities = DirectScanoutFeedbackCapabilities::new(
+                kms.metadata()?.rdev(),
+                pool_generation,
+                discovery.pipeline.plane.get(),
+                scanout_capabilities,
+            );
             let dmabuf_feedback = EglGlesDmabufFeedback::with_scanout_tranche(
-                scanout_formats,
+                scanout_capabilities.formats.iter().map(|format| {
+                    EglGlesDmabufFormat::new(
+                        DrmFormat::from_fourcc(format.format),
+                        DrmModifier(format.modifier),
+                    )
+                }),
                 renderer_dmabuf_feedback.formats().iter().copied(),
             );
             let (dmabuf_main_device_path, dmabuf_main_device) =
@@ -346,6 +369,7 @@ impl AtomicEglGbmScanout {
                 dmabuf_feedback,
                 dmabuf_main_device,
                 dmabuf_main_device_path,
+                scanout_capabilities,
             ))
         })();
 
@@ -360,6 +384,7 @@ impl AtomicEglGbmScanout {
                 dmabuf_feedback,
                 dmabuf_main_device,
                 dmabuf_main_device_path,
+                scanout_capabilities,
             )) => Ok(Self {
                 _device: device,
                 egl,
@@ -376,6 +401,7 @@ impl AtomicEglGbmScanout {
                 dmabuf_feedback,
                 dmabuf_main_device,
                 dmabuf_main_device_path,
+                dmabuf_scanout_capabilities: scanout_capabilities,
                 format_modifier,
                 drm_cleanup_armed: true,
                 deadline_hints_enabled: true,
@@ -825,6 +851,10 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn dmabuf_main_device_path(&self) -> Option<String> {
         self.dmabuf_main_device_path.clone()
+    }
+
+    pub(crate) fn dmabuf_scanout_capabilities(&self) -> Option<DirectScanoutFeedbackCapabilities> {
+        Some(self.dmabuf_scanout_capabilities.clone())
     }
 
     pub(crate) fn disarm_drm_cleanup(&mut self) {

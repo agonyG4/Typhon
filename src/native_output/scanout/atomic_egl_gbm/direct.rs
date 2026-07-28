@@ -1,5 +1,5 @@
 use super::*;
-use crate::native_output::kms_worker::KmsTestOnlyPolicy;
+use crate::native_output::kms_worker::{KmsTestOnlyPolicy, KmsWorkerAdmissionError};
 
 #[allow(clippy::too_many_arguments)]
 fn settle_no_visual_change_transaction(
@@ -237,7 +237,16 @@ impl AtomicEglGbmScanout {
                 )?;
                 return Ok(DirectScanoutAttempt::Unchanged);
             }
-            Err(_) => {
+            Err(error) => {
+                self.direct.counters.worker_admission_rejected = self
+                    .direct
+                    .counters
+                    .worker_admission_rejected
+                    .saturating_add(1);
+                if matches!(error, KmsWorkerAdmissionError::QueueFull) {
+                    self.direct.counters.worker_queue_overflow =
+                        self.direct.counters.worker_queue_overflow.saturating_add(1);
+                }
                 self.direct.counters.composited_fallbacks += 1;
                 return Ok(DirectScanoutAttempt::Fallback("worker_unavailable"));
             }
@@ -277,8 +286,15 @@ impl AtomicEglGbmScanout {
             ),
         };
         let test_only = if self.direct.validation_cache.contains(validation_key) {
+            self.direct.counters.validation_cache_hits =
+                self.direct.counters.validation_cache_hits.saturating_add(1);
             KmsTestOnlyPolicy::Skip
         } else {
+            self.direct.counters.validation_cache_misses = self
+                .direct
+                .counters
+                .validation_cache_misses
+                .saturating_add(1);
             KmsTestOnlyPolicy::Required
         };
         if candidate.viewport_identity_metadata_present
@@ -368,6 +384,7 @@ impl AtomicEglGbmScanout {
             validation_key,
             framebuffer,
             surface_damage,
+            std::sync::Arc::clone(&self.direct.live_lease_count),
         );
         self.swapchain_mut()?.advance_external_frame_id(frame_id)?;
         Ok(DirectScanoutAttempt::WorkerQueued {
@@ -479,6 +496,8 @@ impl AtomicEglGbmScanout {
             .is_some()
         {
             self.direct.counters.exits += 1;
+            self.direct.counters.fallback_cycles =
+                self.direct.counters.fallback_cycles.saturating_add(1);
             direct_scanout_debug("exited direct scanout to composition");
             self.scene.invalidate_presented_damage_history();
         }
@@ -525,6 +544,10 @@ impl AtomicEglGbmScanout {
     pub(crate) fn direct_scanout_counters(&self) -> DirectScanoutCounters {
         let mut counters = self.direct.counters;
         counters.cleanup_failures = self.direct.framebuffer_cache.cleanup_failures();
+        counters.live_leases = self
+            .direct
+            .live_lease_count
+            .load(std::sync::atomic::Ordering::Acquire);
         counters
     }
 
@@ -542,6 +565,13 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn note_direct_rejection(&mut self, test_only: bool, combined_cursor: bool) {
         if test_only {
+            self.direct.counters.test_only_attempts =
+                self.direct.counters.test_only_attempts.saturating_add(1);
+        } else {
+            self.direct.counters.real_submit_attempts =
+                self.direct.counters.real_submit_attempts.saturating_add(1);
+        }
+        if test_only {
             self.direct.counters.test_only_rejections =
                 self.direct.counters.test_only_rejections.saturating_add(1);
         } else {
@@ -555,11 +585,52 @@ impl AtomicEglGbmScanout {
                 .combined_cursor_rejections
                 .saturating_add(1);
         }
+        self.direct.counters.composited_fallbacks =
+            self.direct.counters.composited_fallbacks.saturating_add(1);
     }
 
     pub(crate) fn note_direct_fallback_redraw(&mut self) {
         self.direct.counters.fallback_redraws =
             self.direct.counters.fallback_redraws.saturating_add(1);
+    }
+
+    pub(crate) fn note_direct_worker_submission(
+        &mut self,
+        test_only_was_required: bool,
+        submit_started_at: u64,
+        submit_returned_at: u64,
+    ) {
+        let elapsed_ns = submit_returned_at.saturating_sub(submit_started_at);
+        if test_only_was_required {
+            self.direct.counters.test_only_attempts =
+                self.direct.counters.test_only_attempts.saturating_add(1);
+        }
+        self.direct.counters.real_submit_attempts =
+            self.direct.counters.real_submit_attempts.saturating_add(1);
+        self.direct.counters.real_submit_timing.record(elapsed_ns);
+    }
+
+    pub(crate) fn note_direct_blocker(&mut self, reason: &str) {
+        let (name, bit) = direct_blocker(reason);
+        self.direct.counters.blocker_set |= bit;
+        if self.direct.counters.first_blocker.is_none() {
+            self.direct.counters.first_blocker = Some(name);
+        }
+    }
+
+    pub(crate) fn note_direct_duplicate_feedback(&mut self) {
+        self.direct.counters.duplicate_feedback =
+            self.direct.counters.duplicate_feedback.saturating_add(1);
+    }
+
+    pub(crate) fn direct_scanout_presented_info(&self) -> Option<(u32, u32, u64)> {
+        self.direct.ownership.presented.as_ref().map(|frame| {
+            (
+                frame.lease.surface_id(),
+                frame.lease.framebuffer_id(),
+                frame.lease.key().content.content_epoch.get(),
+            )
+        })
     }
 
     pub(crate) fn direct_scanout_suspend(&mut self) -> io::Result<()> {

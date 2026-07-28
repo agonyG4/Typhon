@@ -93,6 +93,10 @@ impl NativeRuntime {
             rejection_kind == WorkerRejectionKind::TestOnly,
             combined_cursor,
         );
+        self.scanout.note_direct_blocker(match rejection_kind {
+            WorkerRejectionKind::TestOnly => "test_only_rejected",
+            WorkerRejectionKind::RealSubmit => "real_submit_rejected",
+        });
         if rejection_policy.request_composited_redraw {
             self.scanout.note_direct_fallback_redraw();
             self.queued_redraw_requested = true;

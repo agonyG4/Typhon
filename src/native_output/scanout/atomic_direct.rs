@@ -119,6 +119,19 @@ pub(crate) struct DirectScanoutCounters {
     pub(crate) stale_candidate_rejections: u64,
     pub(crate) cleanup_failures: u64,
     pub(crate) composited_render_ahead_suppressed: u64,
+    pub(crate) worker_admission_rejected: u64,
+    pub(crate) live_leases: u64,
+    pub(crate) validation_cache_hits: u64,
+    pub(crate) validation_cache_misses: u64,
+    pub(crate) real_submit_attempts: u64,
+    pub(crate) fallback_cycles: u64,
+    pub(crate) duplicate_feedback: u64,
+    pub(crate) duplicate_settlement: u64,
+    pub(crate) early_release_prevented: u64,
+    pub(crate) worker_queue_overflow: u64,
+    pub(crate) callback_owner_leaks: u64,
+    pub(crate) first_blocker: Option<&'static str>,
+    pub(crate) blocker_set: u64,
 }
 
 pub(crate) struct DirectScanoutControl {
@@ -128,6 +141,7 @@ pub(crate) struct DirectScanoutControl {
     pub(crate) counters: DirectScanoutCounters,
     pub(crate) drm_generation: u64,
     pub(crate) validation_cache: DirectPlaneValidationCache,
+    pub(crate) live_lease_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub(super) identity_viewport_metadata_logged: bool,
     pub(super) last_debug_candidate: Option<(u32, u64, u64, u64)>,
 }
@@ -348,6 +362,7 @@ impl DirectScanoutControl {
             counters: DirectScanoutCounters::default(),
             drm_generation: generation,
             validation_cache: DirectPlaneValidationCache::default(),
+            live_lease_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             identity_viewport_metadata_logged: false,
             last_debug_candidate: None,
         }
