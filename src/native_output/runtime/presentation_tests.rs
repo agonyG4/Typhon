@@ -902,7 +902,7 @@ fn direct_to_direct_retains_old_resource_until_replacement_pageflip() {
 }
 
 #[test]
-fn direct_test_rejection_restores_batch_and_requests_composition() {
+fn legacy_direct_state_is_not_required_for_rejection_cleanup() {
     let policy = direct_rejection_policy(WorkerRejectionKind::TestOnly);
     assert!(!policy.invalidate_validation_key);
     assert!(policy.request_composited_redraw);

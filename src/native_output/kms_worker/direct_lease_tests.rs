@@ -165,12 +165,13 @@ fn direct_job_requires_matching_owned_primary_resource() {
 }
 
 #[test]
-fn direct_job_accepts_matching_owned_primary_resource() {
+fn direct_primary_job_has_exactly_one_direct_lease() {
     let key = test_direct_key(3);
     let transaction = test_direct_transaction(600, key, 42);
     let lease = DirectPrimaryLease::test_fixture(key, 42);
     let job = test_direct_job(600, key, 42, Some(lease));
 
+    assert!(job.direct_primary_lease.is_some());
     assert_eq!(job.validate_against(&transaction), Ok(()));
 }
 
@@ -216,7 +217,7 @@ fn direct_job_rejects_lease_with_wrong_candidate_key() {
 }
 
 #[test]
-fn composited_and_cursor_jobs_reject_direct_leases() {
+fn non_direct_job_cannot_carry_direct_lease() {
     let key = test_direct_key(3);
     let transaction = test_direct_transaction(63, key, 42);
     let lease = DirectPrimaryLease::test_fixture(key, 42);

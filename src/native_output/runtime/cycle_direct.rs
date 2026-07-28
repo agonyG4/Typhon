@@ -77,6 +77,15 @@ pub(super) fn settle_direct_pageflip(
         surface_id: completion.surface_id,
         candidate_key: completion.candidate_key,
     });
+    debug_assert_eq!(
+        scanout.direct_scanout_presented_info(),
+        Some((
+            completion.surface_id,
+            completion.framebuffer_id,
+            completion.candidate_key.content.content_epoch.get(),
+        ))
+    );
+    debug_assert!(output_transactions.transaction(transaction_id).is_none());
     let (target, submit_started_at, submit_returned_at) =
         completed.ok_or_else(|| io::Error::other("direct pageflip did not complete"))?;
     render_journal.note_matching_presentation(presented_at);

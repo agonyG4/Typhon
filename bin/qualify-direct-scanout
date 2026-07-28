@@ -76,27 +76,77 @@ check_log() {
     check_zero direct_scanout_worker_queue_overflow
     check_zero direct_scanout_callback_owner_leaks
 
+    local active surface framebuffer epoch
+    active="$(metric "$log_path" direct_scanout_active 2>/dev/null || true)"
+    surface="$(metric "$log_path" direct_scanout_presented_surface 2>/dev/null || true)"
+    framebuffer="$(metric "$log_path" direct_scanout_presented_framebuffer 2>/dev/null || true)"
+    epoch="$(metric "$log_path" direct_scanout_presented_content_epoch 2>/dev/null || true)"
+    if [[ "$active" == "false" ]] \
+        && [[ "$surface" =~ ^[0-9]+$ && "$framebuffer" =~ ^[0-9]+$ && "$epoch" =~ ^[0-9]+$ ]] \
+        && (( surface == 0 && framebuffer == 0 && epoch == 0 )); then
+        printf '%-46s PASS\n' "inactive presented identity is empty"
+    elif [[ "$active" == "true" ]] \
+        && [[ "$surface" =~ ^[0-9]+$ && "$framebuffer" =~ ^[0-9]+$ && "$epoch" =~ ^[0-9]+$ ]] \
+        && (( surface > 0 && framebuffer > 0 && epoch > 0 )); then
+        printf '%-46s PASS\n' "active presented identity is complete"
+    else
+        printf '%-46s FAIL (%s,%s,%s,%s)\n' \
+            "presented identity matches active state" \
+            "${active:-missing}" "${surface:-missing}" "${framebuffer:-missing}" "${epoch:-missing}"
+        failures=$((failures + 1))
+    fi
+
     (( failures == 0 ))
 }
 
 self_test() {
-    local pass_fixture fail_fixture
-    pass_fixture="$(mktemp)"
-    fail_fixture="$(mktemp)"
-    trap "rm -f '$pass_fixture' '$fail_fixture'" EXIT
+    local fixture base active_line missing_field missing_positive
+    fixture="$(mktemp)"
+    trap "rm -f '$fixture'" EXIT
+    base='perf native.scheduler direct_scanout_active=false direct_scanout_presented_surface=0 direct_scanout_presented_framebuffer=0 direct_scanout_presented_content_epoch=0 direct_scanout_entries=1 direct_scanout_presentations=1 direct_scanout_replacements=1 direct_scanout_exits=1 direct_scanout_composited_fallbacks=1 direct_scanout_duplicate_feedback=0 direct_scanout_duplicate_settlement=0 direct_scanout_early_release_prevented=0 direct_scanout_same_buffer_resubmissions=0 direct_scanout_worker_queue_overflow=0 direct_scanout_callback_owner_leaks=0'
 
-    printf '%s\n' \
-        'perf native.scheduler direct_scanout_entries=1 direct_scanout_presentations=1 direct_scanout_replacements=1 direct_scanout_exits=1 direct_scanout_composited_fallbacks=1 direct_scanout_duplicate_feedback=0 direct_scanout_duplicate_settlement=0 direct_scanout_early_release_prevented=0 direct_scanout_same_buffer_resubmissions=0 direct_scanout_worker_queue_overflow=0 direct_scanout_callback_owner_leaks=0' \
-        >"$pass_fixture"
-    printf '%s\n' \
-        'perf native.scheduler direct_scanout_entries=1 direct_scanout_presentations=1 direct_scanout_replacements=0 direct_scanout_exits=1 direct_scanout_composited_fallbacks=1 direct_scanout_duplicate_feedback=0 direct_scanout_duplicate_settlement=0 direct_scanout_early_release_prevented=0 direct_scanout_same_buffer_resubmissions=0 direct_scanout_worker_queue_overflow=0 direct_scanout_callback_owner_leaks=0' \
-        >"$fail_fixture"
+    # The final record must be selected, not an earlier failed sample.
+    printf '%s\n%s\n' \
+        "${base/direct_scanout_replacements=1/direct_scanout_replacements=0}" "$base" >"$fixture"
+    check_log "$fixture" >/dev/null
+    printf '%s\n' "self-test: final-sample selection PASS"
 
-    check_log "$pass_fixture"
-    if check_log "$fail_fixture"; then
-        printf '%s\n' "self-test: failing fixture unexpectedly passed" >&2
-        return 1
-    fi
+    active_line="${base/direct_scanout_active=false/direct_scanout_active=true}"
+    active_line="${active_line/direct_scanout_presented_surface=0/direct_scanout_presented_surface=7}"
+    active_line="${active_line/direct_scanout_presented_framebuffer=0/direct_scanout_presented_framebuffer=8}"
+    active_line="${active_line/direct_scanout_presented_content_epoch=0/direct_scanout_presented_content_epoch=9}"
+    printf '%s\n' "$active_line" >"$fixture"
+    check_log "$fixture" >/dev/null
+    printf '%s\n' "self-test: active final-state identity PASS"
+
+    expect_failure() {
+        local name="$1"
+        local line="$2"
+        printf '%s\n' "$line" >"$fixture"
+        if check_log "$fixture" >/dev/null 2>&1; then
+            printf 'self-test: %s unexpectedly passed\n' "$name" >&2
+            return 1
+        fi
+        printf 'self-test: %s failure PASS\n' "$name"
+    }
+
+    expect_failure "duplicate-feedback" \
+        "${base/direct_scanout_duplicate_feedback=0/direct_scanout_duplicate_feedback=1}"
+    expect_failure "duplicate-settlement" \
+        "${base/direct_scanout_duplicate_settlement=0/direct_scanout_duplicate_settlement=1}"
+    expect_failure "same-buffer-resubmission" \
+        "${base/direct_scanout_same_buffer_resubmissions=0/direct_scanout_same_buffer_resubmissions=1}"
+    expect_failure "callback-owner-leak" \
+        "${base/direct_scanout_callback_owner_leaks=0/direct_scanout_callback_owner_leaks=1}"
+    expect_failure "inactive-identity" \
+        "${base/direct_scanout_presented_surface=0/direct_scanout_presented_surface=7}"
+
+    missing_field="${base/ direct_scanout_presented_framebuffer=0/}"
+    expect_failure "missing-field" "$missing_field"
+
+    missing_positive="${base/direct_scanout_entries=1/direct_scanout_entries=0}"
+    expect_failure "missing-positive-evidence" "$missing_positive"
+
     printf '%s\n' "self-test: PASS"
 }
 

@@ -8,6 +8,9 @@ use super::super::kms_worker::{
     KmsCommitJob, KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership,
     KmsTestOnlyPolicy, KmsWorkerAdmissionError, KmsWorkerEvent, KmsWorkerFatalJob,
 };
+pub(super) use super::kms_worker_teardown::{
+    retain_complete_submitted_ownership, retain_uncertain_job_with_suspension,
+};
 use super::presentation_transactions::{
     build_compatibility_transaction, settle_dropped_output_transaction,
     settle_failed_output_transaction, settle_forced_shutdown_transaction_if_safe,
@@ -74,26 +77,6 @@ pub(super) fn handle_fatal_worker_jobs(
         }
     }
     Ok(retentions)
-}
-
-pub(super) fn retain_uncertain_job_with_suspension(
-    job: KmsCommitJob,
-    suspended_jobs: &mut Vec<KmsCommitJob>,
-    emergency_jobs: &mut Vec<KmsCommitJob>,
-) -> NativeResult<UncertainJobRetention> {
-    if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
-        emergency_jobs.push(job);
-        return Ok(UncertainJobRetention::EmergencyQuarantined);
-    }
-    suspended_jobs.push(job);
-    Ok(UncertainJobRetention::Suspended)
-}
-
-pub(super) fn retain_complete_submitted_ownership(
-    ownership: KmsSubmittedOwnership,
-    emergency_ownership: &mut Vec<KmsSubmittedOwnership>,
-) {
-    emergency_ownership.push(ownership);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -990,6 +973,8 @@ impl NativeRuntime {
                         )?;
                     }
                 } else if matches!(kind, AtomicCommitKind::DirectPrimary { .. }) {
+                    debug_assert!(!self.scanout.direct_scanout_pending());
+                    debug_assert!(direct_primary_lease.is_some());
                     let Some(direct_primary_lease) = direct_primary_lease else {
                         let mut ownership = self
                             .submitted_worker_ownership
@@ -1049,6 +1034,7 @@ impl NativeRuntime {
                         self.quarantine_after_worker_fatal()?;
                         return Err(error.into());
                     }
+                    debug_assert!(self.scanout.direct_scanout_pending());
                     if let Some(validation_key) = direct_validation_key {
                         self.scanout
                             .record_direct_validation_success(validation_key);

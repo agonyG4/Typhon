@@ -707,6 +707,7 @@ impl NativeRuntime {
                     )?;
                     if previous_assignment.is_some_and(|assignment| assignment.is_direct()) {
                         explicit.complete_composited_transition();
+                        debug_assert!(explicit.direct_scanout_presented_info().is_none());
                     }
                     *confirmed_primary_assignment = Some(ConfirmedPrimaryAssignment::Composed {
                         transaction_id,

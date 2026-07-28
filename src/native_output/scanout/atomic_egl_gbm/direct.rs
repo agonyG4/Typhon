@@ -386,6 +386,10 @@ impl AtomicEglGbmScanout {
             surface_damage,
             std::sync::Arc::clone(&self.direct.live_lease_count),
         );
+        debug_assert_eq!(direct_lease.key(), candidate_key);
+        debug_assert_eq!(direct_lease.surface_id(), candidate_key.content.surface_id);
+        debug_assert_eq!(direct_lease.framebuffer_id(), framebuffer_id);
+        debug_assert_eq!(direct_lease.validation_key(), validation_key);
         self.swapchain_mut()?.advance_external_frame_id(frame_id)?;
         Ok(DirectScanoutAttempt::WorkerQueued {
             transaction_id,
@@ -408,6 +412,7 @@ impl AtomicEglGbmScanout {
             presented_transaction_id,
             presented_token,
             surface_id,
+            framebuffer_id,
             candidate_key,
             protocol_batch_id,
             target,
@@ -424,6 +429,7 @@ impl AtomicEglGbmScanout {
                 presented.transaction_id,
                 presented.token,
                 presented.lease.surface_id(),
+                presented.lease.framebuffer_id(),
                 presented.lease.key(),
                 presented.protocol_batch_id,
                 presented.target,
@@ -438,6 +444,7 @@ impl AtomicEglGbmScanout {
             transaction_id: presented_transaction_id,
             token: presented_token,
             surface_id,
+            framebuffer_id,
             candidate_key,
             protocol_batch_id,
             target,

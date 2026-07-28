@@ -706,77 +706,6 @@ impl DrmAtomicBackend {
         )
     }
 
-    pub fn test_atomic_primary_flip(
-        &self,
-        framebuffer: FramebufferId,
-    ) -> Result<(), AtomicKmsError> {
-        self.test_atomic_primary_flip_with_cursor(framebuffer, None)
-    }
-
-    pub fn test_atomic_primary_flip_with_cursor(
-        &self,
-        framebuffer: FramebufferId,
-        cursor: Option<&AtomicCursorVisualState>,
-    ) -> Result<(), AtomicKmsError> {
-        let mut request =
-            AtomicRequest::primary_flip_with_cursor(&self.discovery.pipeline, framebuffer, cursor)?;
-        request.set_test_input_fence_none(&self.discovery.pipeline)?;
-        let submission = AtomicSubmission::test_only(request);
-        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        submit_atomic(
-            fd,
-            &submission,
-            AtomicKmsErrorKind::TestOnlyRejected,
-            "direct-scanout atomic TEST_ONLY primary flip",
-        )
-    }
-
-    pub fn submit_direct_flip(
-        &self,
-        framebuffer: FramebufferId,
-        token: PageFlipToken,
-    ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
-        self.submit_direct_flip_with_cursor(framebuffer, token, None)
-    }
-
-    pub fn submit_direct_flip_with_cursor(
-        &self,
-        framebuffer: FramebufferId,
-        token: PageFlipToken,
-        cursor: Option<&AtomicCursorVisualState>,
-    ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
-        let mut out_fence_storage = -1i32;
-        let out_fence_ptr = self
-            .discovery
-            .pipeline
-            .crtc_props
-            .out_fence_ptr
-            .map(|_| std::ptr::addr_of_mut!(out_fence_storage));
-        let request = AtomicRequest::primary_flip_with_cursor_and_out_fence(
-            &self.discovery.pipeline,
-            framebuffer,
-            cursor,
-            out_fence_ptr,
-        )?;
-        let submission = AtomicSubmission::page_flip(request, token);
-        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        let result = submit_atomic(
-            fd,
-            &submission,
-            AtomicKmsErrorKind::FlipRejected,
-            "direct-scanout atomic primary flip",
-        );
-        match result {
-            Ok(()) => Ok(AtomicFlipSubmission {
-                out_fence: super::submission::adopt_out_fence(out_fence_storage),
-            }),
-            Err(error) => {
-                drop(super::submission::adopt_out_fence(out_fence_storage));
-                Err(error)
-            }
-        }
-    }
-
     pub fn submit_atomic_flip(
         &self,
         request: AtomicFlipRequest,
@@ -1284,33 +1213,6 @@ impl KmsBackendSelection {
         }
     }
 
-    pub fn test_atomic_primary_flip(
-        &self,
-        framebuffer: FramebufferId,
-    ) -> Result<(), AtomicKmsError> {
-        match &self.backend {
-            KmsDisplayBackend::Atomic(backend) => backend.test_atomic_primary_flip(framebuffer),
-            KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
-                AtomicKmsErrorKind::Unsupported,
-                "legacy KMS cannot test a direct Atomic primary flip",
-            )),
-        }
-    }
-
-    pub fn submit_direct_flip(
-        &self,
-        framebuffer: FramebufferId,
-        token: PageFlipToken,
-    ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
-        match &self.backend {
-            KmsDisplayBackend::Atomic(backend) => backend.submit_direct_flip(framebuffer, token),
-            KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
-                AtomicKmsErrorKind::Unsupported,
-                "legacy KMS cannot submit a direct Atomic primary flip",
-            )),
-        }
-    }
-
     pub fn submit_cursor_flip(
         &self,
         cursor: Option<&AtomicCursorVisualState>,
@@ -1334,39 +1236,6 @@ impl KmsBackendSelection {
             KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
                 AtomicKmsErrorKind::Unsupported,
                 "legacy KMS cannot test an Atomic cursor-plane update",
-            )),
-        }
-    }
-
-    pub fn test_atomic_primary_flip_with_cursor(
-        &self,
-        framebuffer: FramebufferId,
-        cursor: Option<&AtomicCursorVisualState>,
-    ) -> Result<(), AtomicKmsError> {
-        match &self.backend {
-            KmsDisplayBackend::Atomic(backend) => {
-                backend.test_atomic_primary_flip_with_cursor(framebuffer, cursor)
-            }
-            KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
-                AtomicKmsErrorKind::Unsupported,
-                "legacy KMS cannot test a direct Atomic primary flip",
-            )),
-        }
-    }
-
-    pub fn submit_direct_flip_with_cursor(
-        &self,
-        framebuffer: FramebufferId,
-        token: PageFlipToken,
-        cursor: Option<&AtomicCursorVisualState>,
-    ) -> Result<AtomicFlipSubmission, AtomicKmsError> {
-        match &self.backend {
-            KmsDisplayBackend::Atomic(backend) => {
-                backend.submit_direct_flip_with_cursor(framebuffer, token, cursor)
-            }
-            KmsDisplayBackend::Legacy(_) => Err(AtomicKmsError::new(
-                AtomicKmsErrorKind::Unsupported,
-                "legacy KMS cannot submit a direct Atomic primary flip",
             )),
         }
     }

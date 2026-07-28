@@ -32,6 +32,9 @@ pub(crate) struct PresentedDirectPrimary {
     pub(crate) submit_returned_at: MonotonicTimestampNs,
 }
 
+// The ledger owns logical obligations, the worker job owns queued resources,
+// the arbiter owns kernel identity, and this type owns only submitted,
+// presented, or suspended direct leases.
 #[derive(Debug, Default)]
 pub(crate) struct DirectPrimaryOwnership {
     pub(crate) submitted: Option<SubmittedDirectPrimary>,
@@ -69,6 +72,7 @@ pub(crate) struct DirectPageflipCompletion {
     pub(crate) transaction_id: OutputTransactionId,
     pub(crate) token: PageFlipToken,
     pub(crate) surface_id: u32,
+    pub(crate) framebuffer_id: u32,
     pub(crate) candidate_key: DirectScanoutCandidateKey,
     pub(crate) protocol_batch_id: CompositorFrameBatchId,
     pub(crate) target: PresentationTarget,
@@ -254,6 +258,11 @@ impl DirectPrimaryOwnership {
             submit_returned_at: submitted.submit_returned_at,
         };
         let replaced = self.presented.replace(presented);
+        debug_assert!(
+            replaced
+                .as_ref()
+                .is_none_or(|old| { old.transaction_id != transaction_id || old.token != token })
+        );
         Ok((
             self.presented
                 .as_ref()
@@ -568,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn pageflip_promotes_submitted_direct_resource_to_presented() {
+    fn presented_direct_ownership_matches_confirmed_assignment() {
         let key = test_key();
         let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
         let mut ownership = DirectPrimaryOwnership::default();
@@ -587,6 +596,9 @@ mod tests {
         assert_eq!(presented.transaction_id.get(), 82);
         assert_eq!(presented.token.get(), 82);
         assert_eq!(presented.lease.key(), key);
+        assert_eq!(presented.lease.surface_id(), key.content.surface_id);
+        assert_eq!(presented.lease.framebuffer_id(), 42);
+        assert_eq!(presented.lease.key().content.content_epoch.get(), 3);
         assert_eq!(presented.presented_at.get(), 13);
         assert!(replaced.is_none());
         assert!(ownership.submitted.is_none());
@@ -603,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_pageflip_releases_previous_presented_resource() {
+    fn replacement_pageflip_releases_replaced_direct_lease() {
         let key = test_key();
         let (lease_a, cleanup_a) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
         let (lease_b, cleanup_b) = DirectPrimaryLease::test_fixture_with_probe(key, 43);
@@ -764,5 +776,45 @@ mod tests {
         assert!(ownership.presented.is_none());
         drop(released);
         assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn legacy_direct_state_is_not_required_for_session_recovery() {
+        let key = test_key();
+        let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 92);
+        let mut ownership = DirectPrimaryOwnership::default();
+        ownership
+            .accept_submitted(test_submitted(92, lease))
+            .expect("accept direct resource");
+
+        ownership
+            .suspend_for_restore()
+            .expect("suspend direct ownership");
+        assert!(ownership.submitted.is_none());
+        assert!(ownership.presented.is_none());
+        assert_eq!(ownership.suspended.len(), 1);
+        ownership.clear_after_restore();
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn direct_physical_ownership_rejects_second_submission() {
+        let key = test_key();
+        let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 92);
+        let mut ownership = DirectPrimaryOwnership::default();
+        ownership
+            .accept_submitted(test_submitted(92, lease))
+            .expect("accept submitted direct resource");
+
+        let (second_lease, second_cleanup) = DirectPrimaryLease::test_fixture_with_probe(key, 93);
+        let error = ownership
+            .accept_submitted(test_submitted(93, second_lease))
+            .expect_err("a second direct physical owner must be rejected");
+
+        assert!(error.error.to_string().contains("already exists"));
+        assert!(ownership.submitted.is_some());
+        drop(error);
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
+        assert_eq!(second_cleanup.load(Ordering::Acquire), 1);
     }
 }

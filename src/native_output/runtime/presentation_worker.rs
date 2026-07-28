@@ -397,6 +397,8 @@ pub(super) fn finish_direct_worker_queued(
         test_only,
         ready_submit: false,
     };
+    debug_assert!(job.direct_primary_lease.is_some());
+    debug_assert!(matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }));
     let descriptor = output_transactions
         .transaction(transaction_id)
         .ok_or_else(|| io::Error::other("direct worker transaction disappeared"))?;

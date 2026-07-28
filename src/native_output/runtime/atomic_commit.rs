@@ -510,6 +510,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn direct_transaction_is_not_queued_and_submitted_simultaneously() {
+        let mut arbiter = AtomicCommitArbiter::with_watchdog(10, 0);
+        let kind = AtomicCommitKind::DirectPrimary {
+            transaction_id: transaction_id(7),
+            direct_token: token(7),
+            framebuffer_id: 42,
+        };
+
+        arbiter
+            .reserve_worker_queued(token(7), 1, 8, kind, 10)
+            .expect("reserve direct worker transaction");
+        assert!(arbiter.worker_job_queued());
+        assert!(!arbiter.kernel_commit_submitted());
+
+        arbiter
+            .mark_kernel_submitted(token(7), 20, 21)
+            .expect("promote direct worker transaction");
+        assert!(!arbiter.worker_job_queued());
+        assert!(arbiter.kernel_commit_submitted());
+        assert_eq!(arbiter.kernel_submitted_kind(), Some(kind));
+    }
+
     fn primary_kind() -> AtomicCommitKind {
         AtomicCommitKind::CompositedPrimary {
             transaction_id: transaction_id(7),

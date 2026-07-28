@@ -4,6 +4,7 @@ mod client_lifecycle;
 mod cursor;
 mod data_device;
 mod desktop_windows;
+mod dmabuf_feedback;
 mod frame_callbacks;
 mod frames;
 mod fullscreen;
@@ -41,6 +42,8 @@ pub(in crate::compositor) use cursor::*;
 pub(in crate::compositor) use data_device::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use desktop_windows::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use dmabuf_feedback::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use frame_callbacks::*;
 #[allow(unused_imports)]

@@ -218,6 +218,45 @@ fn direct_test_rejection_never_marks_transaction_presented() {
 }
 
 #[test]
+fn terminal_direct_transaction_is_not_still_active() {
+    let mut ledger = OutputTransactionLedger::with_capacities(8, 64);
+    let transaction_id = test_transaction_id(94);
+    ledger
+        .insert(
+            OutputTransaction::direct(
+                transaction_id,
+                1,
+                MonotonicTimestampNs::new(10),
+                test_target(),
+                NativeOutputPacingMode::ReactiveDouble,
+                94,
+                test_direct_key(3),
+                42,
+                None,
+                test_frame_batch_id(94),
+                7,
+                OutputReleasePlan::Pageflip,
+            )
+            .expect("direct transaction"),
+        )
+        .expect("insert direct transaction");
+
+    ledger
+        .mark_failed(
+            transaction_id,
+            OutputTransactionFailureStage::KmsSubmit,
+            MonotonicTimestampNs::new(30),
+        )
+        .expect("terminalize direct transaction");
+
+    assert_eq!(ledger.active_count(), 0);
+    assert_eq!(
+        ledger.submitted_transaction(PageFlipToken::new(94).unwrap(), 1),
+        None
+    );
+}
+
+#[test]
 fn direct_pageflip_is_the_only_presented_transition() {
     let mut ledger = OutputTransactionLedger::with_capacities(8, 64);
     let transaction_id = test_transaction_id(1);

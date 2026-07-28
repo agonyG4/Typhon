@@ -1,5 +1,26 @@
 # Known Issues
 
+## Direct Scanout 2.0 remains experimental
+
+Direct Scanout 2.0 is implemented as a conservative primary-plane assignment
+inside the output transaction and KMS worker pipeline. It remains disabled by
+default: `OBLIVION_ONE_DIRECT_SCANOUT=off` and
+`OBLIVION_ONE_KMS_COMMIT_WORKER=off`. Experimental qualification requires the
+Stage 3 KMS worker and the explicit `experimental-auto` direct policy. Real
+TTY/DRM qualification is still pending and belongs to the next task.
+
+The supported Stage 4 candidate is limited to one opaque solitary fullscreen
+surface on one output: XRGB dmabuf content on the selected DRM device, an
+exactly supported primary-plane format/modifier, identity geometry, identity
+scaling, identity transform, and a supported explicit-synchronization
+contract. Hardware cursor composition is allowed only when the complete
+primary-plus-cursor atomic assignment validates. Any rejection falls back to
+composition.
+
+Stage 4 explicitly excludes overlay planes, VRR, tearing, multi-output,
+hotplug, scaling, transforms, color conversion, HDR, cross-device or
+multi-GPU scanout, primary-plane blending, and broad format expansion.
+
 ## Native SDDM and TTY validation is incomplete
 
 The native session is implemented and deterministic tests cover the planning,

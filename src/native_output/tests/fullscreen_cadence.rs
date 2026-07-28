@@ -141,7 +141,6 @@ fn a_main_loop_stall_does_not_create_duplicate_primary_submits() {
 }
 
 #[test]
-#[ignore = "experimental direct path requires real TTY qualification before comparison"]
 fn experimental_direct_is_no_worse_than_composed() {
     let composed = simulate(165, false);
     let direct = simulate(165, true);

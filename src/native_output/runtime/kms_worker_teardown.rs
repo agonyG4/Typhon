@@ -1,9 +1,29 @@
 use super::super::kms_worker::{
-    KmsCommitJob, KmsCommitWorkerHandle, KmsWorkerEvent, KmsWorkerFatalJob,
+    KmsCommitJob, KmsCommitWorkerHandle, KmsSubmittedOwnership, KmsWorkerEvent, KmsWorkerFatalJob,
 };
 use super::kms_worker::{FatalWorkerJobHandler, UncertainJobRetention};
 use super::*;
 use oblivion_one::native::kms::RestorationOutcome;
+
+pub(super) fn retain_complete_submitted_ownership(
+    ownership: KmsSubmittedOwnership,
+    emergency_ownership: &mut Vec<KmsSubmittedOwnership>,
+) {
+    emergency_ownership.push(ownership);
+}
+
+pub(super) fn retain_uncertain_job_with_suspension(
+    job: KmsCommitJob,
+    suspended_jobs: &mut Vec<KmsCommitJob>,
+    emergency_jobs: &mut Vec<KmsCommitJob>,
+) -> NativeResult<UncertainJobRetention> {
+    if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
+        emergency_jobs.push(job);
+        return Ok(UncertainJobRetention::EmergencyQuarantined);
+    }
+    suspended_jobs.push(job);
+    Ok(UncertainJobRetention::Suspended)
+}
 
 impl FatalWorkerJobHandler for NativeRuntime {
     fn retain_uncertain_worker_job(

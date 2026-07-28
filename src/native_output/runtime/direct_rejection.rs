@@ -89,6 +89,7 @@ impl NativeRuntime {
             self.quarantined_worker_jobs.push(direct_job);
             return Err(error);
         }
+        debug_assert!(!self.scanout.direct_scanout_pending());
         self.scanout.note_direct_rejection(
             rejection_kind == WorkerRejectionKind::TestOnly,
             combined_cursor,
