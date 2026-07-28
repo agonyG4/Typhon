@@ -725,7 +725,6 @@ impl AtomicEglGbmScanout {
                 "native render-fence timing unavailable after confirmed pageflip for frame {id}: {error}"
             );
         }
-        self.complete_composited_transition();
         Ok(CompositedPageflipCompletion {
             presented: PresentedOutputFrame {
                 frame_id: id,

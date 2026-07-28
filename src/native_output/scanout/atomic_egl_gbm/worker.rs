@@ -26,7 +26,17 @@ impl AtomicEglGbmScanout {
         &mut self,
         submitted: SubmittedDirectPrimary,
     ) -> Result<(), Box<SubmittedDirectPrimaryError>> {
-        self.direct.ownership.accept_submitted(submitted)
+        let has_out_fence = submitted.out_fence.is_some();
+        self.direct.ownership.accept_submitted(submitted)?;
+        self.direct.counters.submissions = self.direct.counters.submissions.saturating_add(1);
+        if has_out_fence {
+            self.direct.counters.out_fences_received =
+                self.direct.counters.out_fences_received.saturating_add(1);
+        } else {
+            self.direct.counters.out_fence_missing =
+                self.direct.counters.out_fence_missing.saturating_add(1);
+        }
+        Ok(())
     }
 
     pub(crate) fn record_direct_validation_success(&mut self, key: DirectPlaneValidationKey) {

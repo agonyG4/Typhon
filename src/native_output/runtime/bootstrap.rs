@@ -633,6 +633,7 @@ impl NativeRuntime {
             frame_scheduler,
             atomic_commit_arbiter: AtomicCommitArbiter::new(),
             output_transactions: OutputTransactionLedger::new(),
+            confirmed_primary_assignment: None,
             presentation_deadline,
             scheduled_presentation_target,
             render_journal,

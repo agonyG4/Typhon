@@ -65,6 +65,7 @@ impl NativeRuntime {
             frame_scheduler,
             atomic_commit_arbiter,
             output_transactions,
+            confirmed_primary_assignment,
             presentation_deadline,
             scheduled_presentation_target,
             render_journal,
@@ -267,7 +268,7 @@ impl NativeRuntime {
                 perf,
                 resolved_client_cursor_path,
                 client_cursor_hardware_usable,
-                scanout.direct_scanout_active(),
+                confirmed_primary_assignment.is_some_and(|assignment| assignment.is_direct()),
                 client_cursor,
             );
         }
@@ -427,7 +428,8 @@ impl NativeRuntime {
             scene_changed,
             pending_frame_work,
             primary_redraw_requested,
-            direct_active: scanout.direct_scanout_active(),
+            direct_active: confirmed_primary_assignment
+                .is_some_and(|assignment| assignment.is_direct()),
         });
         let cursor_direct_compatible = direct_inspection.cursor_direct_compatible;
         let atomic_primary_commit_pending = direct_inspection.atomic_primary_commit_pending;
@@ -473,7 +475,8 @@ impl NativeRuntime {
             cursor_hardware_usable,
         );
         let presentation_path = plan_native_presentation_path(NativePresentationPlanInput {
-            direct_active: scanout.direct_scanout_active(),
+            direct_active: confirmed_primary_assignment
+                .is_some_and(|assignment| assignment.is_direct()),
             direct_candidate_changed,
             direct_candidate_eligible,
             primary_visual_work_pending,
@@ -702,20 +705,6 @@ impl NativeRuntime {
                                 });
                             }
                             DirectScanoutAttempt::Fallback(reason) => {
-                                if reason == "cursor_test_only_rejected"
-                                    && let Some(cursor) = atomic_cursor.as_mut()
-                                {
-                                    cursor.note_test_failure();
-                                    cursor.note_software_fallback();
-                                    cursor.set_visible(false);
-                                    *cursor_render_mode = if client_cursor_active {
-                                        NativeCursorRenderMode::SoftwareClient
-                                    } else {
-                                        NativeCursorRenderMode::Software
-                                    };
-                                    effective_cursor = None;
-                                    *queued_redraw_requested = true;
-                                }
                                 perf.log("native.direct_scanout", || {
                                     vec![
                                         NativePerfField::str("transition", "fallback"),
@@ -768,7 +757,9 @@ impl NativeRuntime {
                     pending_frame_work,
                     effective_redraw_requested,
                 );
-                let output_damage = if scanout.direct_scanout_active() {
+                let output_damage = if confirmed_primary_assignment
+                    .is_some_and(|assignment| assignment.is_direct())
+                {
                     NativeOutputDamage::full_output(target.width, target.height)
                 } else {
                     native_output_damage_for_scene_and_cursor(

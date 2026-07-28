@@ -16,6 +16,11 @@ use super::*;
 use crate::native_output::scanout::AtomicEglGbmScanout;
 use oblivion_one::native::kms::{AtomicKmsError, FramebufferId, PageFlipToken};
 
+#[path = "direct_rejection.rs"]
+mod direct_rejection;
+#[allow(unused_imports)]
+pub(super) use direct_rejection::{WorkerRejectionKind, direct_rejection_policy};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WorkerQueueOutcome {
     Queued {
@@ -632,7 +637,7 @@ impl NativeRuntime {
                 oblivion_one::native::kms::AtomicKmsErrorKind::FlipRejected,
                 "KMS worker result notification failed before submit completion",
             ),
-            false,
+            WorkerRejectionKind::TestOnly,
         )
     }
 
@@ -1233,11 +1238,11 @@ impl NativeRuntime {
                 }
             }
             KmsWorkerEvent::TestRejected { job, error } => {
-                self.fail_queued_worker_job(job, error, false)?;
+                self.fail_queued_worker_job(job, error, WorkerRejectionKind::TestOnly)?;
             }
             KmsWorkerEvent::SubmitRejected { job, error }
             | KmsWorkerEvent::BusyExhausted { job, error } => {
-                self.fail_queued_worker_job(job, error, true)?;
+                self.fail_queued_worker_job(job, error, WorkerRejectionKind::RealSubmit)?;
             }
             KmsWorkerEvent::BusyDeferred { .. } => {}
             KmsWorkerEvent::SubmitLate {
@@ -1291,8 +1296,11 @@ impl NativeRuntime {
         &mut self,
         job: KmsCommitJob,
         error: AtomicKmsError,
-        invalidate_direct_validation: bool,
+        rejection_kind: WorkerRejectionKind,
     ) -> NativeResult<()> {
+        if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
+            return self.reject_direct_worker_job(job, error, rejection_kind);
+        }
         if let Some(worker) = self.kms_commit_worker.as_ref() {
             worker.record_worker_pacing_pre_submit_rejection();
         }
@@ -1330,6 +1338,7 @@ impl NativeRuntime {
                     .ok_or_else(|| io::Error::other("cursor worker rejection has no cursor"))?;
                 cursor.note_submit_failure();
                 cursor.note_software_fallback();
+                cursor.note_composed_software_fallback();
                 cursor.set_visible(false);
                 self.cursor_render_mode = if self.server.client_cursor_render_state().is_some() {
                     NativeCursorRenderMode::SoftwareClient
@@ -1355,13 +1364,6 @@ impl NativeRuntime {
             if let Some(worker) = self.kms_commit_worker.as_ref() {
                 worker.record_scheduler_queued_cancellation();
             }
-        }
-        if invalidate_direct_validation
-            && matches!(job.kind, AtomicCommitKind::DirectPrimary { .. })
-            && let Some(lease) = job.direct_primary_lease.as_ref()
-        {
-            self.scanout
-                .invalidate_direct_validation(lease.validation_key());
         }
         self.atomic_commit_arbiter.reject_worker_queued(job.token);
         if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. }) {

@@ -314,6 +314,7 @@ impl NativeSessionIo for NativeRuntime {
             io::Error::other("session recovery completion has no prepared framebuffer")
         })?;
         self.scanout.complete_session_recovery(*recovery)?;
+        self.confirmed_primary_assignment = None;
         self.submitted_worker_ownership.clear();
         self.quarantined_worker_jobs.clear();
         self.emergency_quarantined_worker_jobs.clear();

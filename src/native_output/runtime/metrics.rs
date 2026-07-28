@@ -379,7 +379,8 @@ impl NativeRuntime {
                 ),
                 NativePerfField::bool(
                     "direct_scanout_active",
-                    self.scanout.direct_scanout_active(),
+                    self.confirmed_primary_assignment
+                        .is_some_and(|assignment| assignment.is_direct()),
                 ),
                 NativePerfField::bool(
                     "direct_scanout_qualified",
@@ -447,10 +448,26 @@ impl NativeRuntime {
                         "direct_scanout_test_only_rejections",
                         counters.test_only_rejections,
                     ),
+                    NativePerfField::u64(
+                        "direct_scanout_real_submit_rejections",
+                        counters.submit_rejections,
+                    ),
                     NativePerfField::u64("direct_scanout_submissions", counters.submissions),
                     NativePerfField::u64("direct_scanout_presentations", counters.presentations),
                     NativePerfField::u64("direct_scanout_entries", counters.entries),
+                    NativePerfField::u64(
+                        "direct_scanout_replacements",
+                        counters.direct_replacements,
+                    ),
                     NativePerfField::u64("direct_scanout_exits", counters.exits),
+                    NativePerfField::u64(
+                        "direct_combined_cursor_rejection",
+                        counters.combined_cursor_rejections,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_composited_fallbacks",
+                        counters.fallback_redraws,
+                    ),
                     NativePerfField::u64(
                         "direct_scanout_same_buffer_resubmissions",
                         counters.same_buffer_resubmissions,
@@ -570,6 +587,10 @@ impl NativeRuntime {
                     NativePerfField::u64(
                         "atomic_cursor_software_fallbacks",
                         cursor.counters.software_fallbacks,
+                    ),
+                    NativePerfField::u64(
+                        "composed_cursor_fallback",
+                        cursor.counters.composed_cursor_fallbacks,
                     ),
                 ]);
             }

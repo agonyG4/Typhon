@@ -9,6 +9,7 @@ mod backend;
 mod direct;
 mod direct_lease;
 mod direct_policy;
+mod direct_transition;
 mod direct_validation;
 mod dumb;
 mod egl_gbm;
@@ -690,9 +691,6 @@ impl NativeScanoutBackend {
         }
     }
 
-    pub(crate) fn direct_scanout_active(&self) -> bool {
-        matches!(self, Self::AtomicEglGbm(scanout) if scanout.direct_scanout_active())
-    }
     pub(crate) fn direct_scanout_surface(&self) -> Option<u32> {
         match self {
             Self::AtomicEglGbm(scanout) => scanout.direct_scanout_surface(),
@@ -760,9 +758,12 @@ impl NativeScanoutBackend {
         &mut self,
         transaction_id: OutputTransactionId,
         token: PageFlipToken,
+        presented_at: MonotonicTimestampNs,
     ) -> io::Result<DirectPageflipCompletion> {
         match self {
-            Self::AtomicEglGbm(scanout) => scanout.complete_direct_pageflip(transaction_id, token),
+            Self::AtomicEglGbm(scanout) => {
+                scanout.complete_direct_pageflip(transaction_id, token, presented_at)
+            }
             Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
                 "direct pageflip is unsupported by this backend",
             )),

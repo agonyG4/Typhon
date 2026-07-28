@@ -130,6 +130,16 @@ fn queueing_cursor_job_does_not_advance_last_submitted_epoch() {
 }
 
 #[test]
+fn composed_cursor_fallback_counter_is_separate_from_general_fallbacks() {
+    let mut cursor = test_cursor();
+
+    cursor.note_composed_software_fallback();
+
+    assert_eq!(cursor.counters.software_fallbacks, 0);
+    assert_eq!(cursor.counters.composed_cursor_fallbacks, 1);
+}
+
+#[test]
 fn queued_cursor_assignment_pins_the_exact_framebuffer_resource() {
     let cursor = test_cursor();
     let state = AtomicCursorVisualState {

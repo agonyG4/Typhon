@@ -232,7 +232,6 @@ impl AtomicEglGbmScanout {
         let token = PageFlipToken::new(allocate_native_page_flip_token())
             .expect("allocated native pageflip token is nonzero");
         let framebuffer_id = framebuffer.framebuffer.get();
-        let was_direct = self.direct.ownership.presented.is_some();
         let direct_lease = DirectPrimaryLease::new(
             candidate,
             candidate_key,
@@ -241,10 +240,6 @@ impl AtomicEglGbmScanout {
             surface_damage,
         );
         self.swapchain_mut()?.advance_external_frame_id(frame_id)?;
-        if !was_direct {
-            self.direct.counters.entries += 1;
-        }
-        self.scene.invalidate_presented_damage_history();
         Ok(DirectScanoutAttempt::WorkerQueued {
             transaction_id,
             token: token.get(),
@@ -259,13 +254,14 @@ impl AtomicEglGbmScanout {
         &mut self,
         transaction_id: OutputTransactionId,
         token: PageFlipToken,
+        presented_at: MonotonicTimestampNs,
     ) -> io::Result<DirectPageflipCompletion> {
-        let presented_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         let (
             frame_id,
             presented_transaction_id,
             presented_token,
             surface_id,
+            candidate_key,
             protocol_batch_id,
             target,
             submit_started_at,
@@ -281,13 +277,13 @@ impl AtomicEglGbmScanout {
                 presented.transaction_id,
                 presented.token,
                 presented.lease.surface_id(),
+                presented.lease.key(),
                 presented.protocol_batch_id,
                 presented.target,
                 presented.submit_started_at,
                 presented.submit_returned_at,
             )
         };
-        let surface_damage = self.direct.ownership.take_presented_surface_damage()?;
         self.direct.counters.presentations += 1;
         direct_scanout_debug("direct pageflip presented");
         Ok(DirectPageflipCompletion {
@@ -295,13 +291,48 @@ impl AtomicEglGbmScanout {
             transaction_id: presented_transaction_id,
             token: presented_token,
             surface_id,
+            candidate_key,
             protocol_batch_id,
             target,
             presented_at,
             submit_started_at,
             submit_returned_at,
-            surface_damage,
         })
+    }
+
+    pub(crate) fn direct_pageflip_info(
+        &self,
+        transaction_id: OutputTransactionId,
+        token: PageFlipToken,
+    ) -> io::Result<DirectPageflipInfo> {
+        self.direct
+            .ownership
+            .submitted_pageflip_info(transaction_id, token)
+            .map_err(|error| error.error)
+    }
+
+    pub(crate) fn take_direct_pageflip_surface_damage(
+        &mut self,
+        transaction_id: OutputTransactionId,
+        token: PageFlipToken,
+    ) -> io::Result<oblivion_one::compositor::SurfaceDamagePresentation> {
+        self.direct
+            .ownership
+            .take_submitted_surface_damage(transaction_id, token)
+            .map_err(|error| error.error)
+    }
+
+    pub(crate) fn note_direct_entry(&mut self) {
+        self.direct.counters.entries = self.direct.counters.entries.saturating_add(1);
+    }
+
+    pub(crate) fn note_direct_replacement(&mut self) {
+        self.direct.counters.direct_replacements =
+            self.direct.counters.direct_replacements.saturating_add(1);
+    }
+
+    pub(crate) fn invalidate_presented_damage_history(&mut self) {
+        self.scene.invalidate_presented_damage_history();
     }
 
     pub(crate) fn mark_composited_submission(&mut self) {
@@ -311,16 +342,17 @@ impl AtomicEglGbmScanout {
     }
 
     pub(crate) fn complete_composited_transition(&mut self) {
-        if self.direct.ownership.presented.take().is_some() {
+        if self
+            .direct
+            .ownership
+            .release_presented_for_composed_pageflip()
+            .is_some()
+        {
             self.direct.counters.exits += 1;
             direct_scanout_debug("exited direct scanout to composition");
             self.scene.invalidate_presented_damage_history();
         }
         self.direct.inhibit_until_composited_present = false;
-    }
-
-    pub(crate) fn direct_scanout_active(&self) -> bool {
-        self.direct.ownership.presented.is_some()
     }
 
     pub(crate) fn direct_scanout_pending(&self) -> bool {
@@ -376,6 +408,28 @@ impl AtomicEglGbmScanout {
             .counters
             .composited_render_ahead_suppressed
             .saturating_add(1);
+    }
+
+    pub(crate) fn note_direct_rejection(&mut self, test_only: bool, combined_cursor: bool) {
+        if test_only {
+            self.direct.counters.test_only_rejections =
+                self.direct.counters.test_only_rejections.saturating_add(1);
+        } else {
+            self.direct.counters.submit_rejections =
+                self.direct.counters.submit_rejections.saturating_add(1);
+        }
+        if combined_cursor {
+            self.direct.counters.combined_cursor_rejections = self
+                .direct
+                .counters
+                .combined_cursor_rejections
+                .saturating_add(1);
+        }
+    }
+
+    pub(crate) fn note_direct_fallback_redraw(&mut self) {
+        self.direct.counters.fallback_redraws =
+            self.direct.counters.fallback_redraws.saturating_add(1);
     }
 
     pub(crate) fn direct_scanout_suspend(&mut self) -> io::Result<()> {

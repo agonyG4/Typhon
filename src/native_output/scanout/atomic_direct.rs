@@ -50,18 +50,31 @@ pub(crate) struct DirectOwnershipError {
     pub(crate) error: io::Error,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DirectPageflipInfo {
+    pub(crate) frame_id: u64,
+    pub(crate) transaction_id: OutputTransactionId,
+    pub(crate) token: PageFlipToken,
+    pub(crate) surface_id: u32,
+    pub(crate) candidate_key: DirectScanoutCandidateKey,
+    pub(crate) protocol_batch_id: CompositorFrameBatchId,
+    pub(crate) target: PresentationTarget,
+    pub(crate) submit_started_at: MonotonicTimestampNs,
+    pub(crate) submit_returned_at: MonotonicTimestampNs,
+}
+
 #[derive(Debug)]
 pub(crate) struct DirectPageflipCompletion {
     pub(crate) frame_id: u64,
     pub(crate) transaction_id: OutputTransactionId,
     pub(crate) token: PageFlipToken,
     pub(crate) surface_id: u32,
+    pub(crate) candidate_key: DirectScanoutCandidateKey,
     pub(crate) protocol_batch_id: CompositorFrameBatchId,
     pub(crate) target: PresentationTarget,
     pub(crate) presented_at: MonotonicTimestampNs,
     pub(crate) submit_started_at: MonotonicTimestampNs,
     pub(crate) submit_returned_at: MonotonicTimestampNs,
-    pub(crate) surface_damage: oblivion_one::compositor::SurfaceDamagePresentation,
 }
 
 #[derive(Debug)]
@@ -88,10 +101,14 @@ pub(crate) struct DirectScanoutCounters {
     pub(crate) import_failures: u64,
     pub(crate) test_only_attempts: u64,
     pub(crate) test_only_rejections: u64,
+    pub(crate) submit_rejections: u64,
     pub(crate) submissions: u64,
     pub(crate) presentations: u64,
     pub(crate) entries: u64,
+    pub(crate) direct_replacements: u64,
     pub(crate) exits: u64,
+    pub(crate) combined_cursor_rejections: u64,
+    pub(crate) fallback_redraws: u64,
     pub(crate) same_buffer_resubmissions: u64,
     pub(crate) same_buffer_suppressed: u64,
     pub(crate) out_fences_received: u64,
@@ -135,6 +152,55 @@ pub(super) fn direct_scanout_debug(message: impl std::fmt::Display) {
 }
 
 impl DirectPrimaryOwnership {
+    fn validate_submitted_pageflip(
+        &self,
+        transaction_id: OutputTransactionId,
+        token: PageFlipToken,
+    ) -> Result<&SubmittedDirectPrimary, DirectOwnershipError> {
+        let Some(submitted) = self.submitted.as_ref() else {
+            return Err(DirectOwnershipError {
+                error: io::Error::other("direct pageflip has no submitted ownership"),
+            });
+        };
+        if submitted.transaction_id != transaction_id {
+            return Err(DirectOwnershipError {
+                error: io::Error::other(
+                    "direct pageflip transaction does not match submitted ownership",
+                ),
+            });
+        }
+        if submitted.token != token {
+            return Err(DirectOwnershipError {
+                error: io::Error::other("direct pageflip token does not match submitted ownership"),
+            });
+        }
+        Ok(submitted)
+    }
+
+    pub(crate) fn submitted_pageflip_info(
+        &self,
+        transaction_id: OutputTransactionId,
+        token: PageFlipToken,
+    ) -> Result<DirectPageflipInfo, DirectOwnershipError> {
+        Ok(self
+            .validate_submitted_pageflip(transaction_id, token)?
+            .pageflip_info())
+    }
+
+    pub(crate) fn take_submitted_surface_damage(
+        &mut self,
+        transaction_id: OutputTransactionId,
+        token: PageFlipToken,
+    ) -> Result<oblivion_one::compositor::SurfaceDamagePresentation, DirectOwnershipError> {
+        self.validate_submitted_pageflip(transaction_id, token)?;
+        self.submitted
+            .as_mut()
+            .expect("submitted ownership was validated above")
+            .lease
+            .take_surface_damage()
+            .map_err(|error| DirectOwnershipError { error })
+    }
+
     pub(crate) fn accept_submitted(
         &mut self,
         submitted: SubmittedDirectPrimary,
@@ -156,23 +222,7 @@ impl DirectPrimaryOwnership {
         presented_at: MonotonicTimestampNs,
     ) -> Result<(&PresentedDirectPrimary, Option<PresentedDirectPrimary>), DirectOwnershipError>
     {
-        let Some(submitted) = self.submitted.as_ref() else {
-            return Err(DirectOwnershipError {
-                error: io::Error::other("direct pageflip has no submitted ownership"),
-            });
-        };
-        if submitted.transaction_id != transaction_id {
-            return Err(DirectOwnershipError {
-                error: io::Error::other(
-                    "direct pageflip transaction does not match submitted ownership",
-                ),
-            });
-        }
-        if submitted.token != token {
-            return Err(DirectOwnershipError {
-                error: io::Error::other("direct pageflip token does not match submitted ownership"),
-            });
-        }
+        self.validate_submitted_pageflip(transaction_id, token)?;
         let submitted = self
             .submitted
             .take()
@@ -198,6 +248,12 @@ impl DirectPrimaryOwnership {
         ))
     }
 
+    pub(crate) fn release_presented_for_composed_pageflip(
+        &mut self,
+    ) -> Option<PresentedDirectPrimary> {
+        self.presented.take()
+    }
+
     pub(crate) fn abandon_submitted_for_restore(
         &mut self,
         token: PageFlipToken,
@@ -219,16 +275,6 @@ impl DirectPrimaryOwnership {
         drop(submitted.out_fence);
         self.suspended.push(submitted.lease);
         Ok(())
-    }
-
-    pub(crate) fn take_presented_surface_damage(
-        &mut self,
-    ) -> io::Result<oblivion_one::compositor::SurfaceDamagePresentation> {
-        self.presented
-            .as_mut()
-            .ok_or_else(|| io::Error::other("direct pageflip has no presented ownership"))?
-            .lease
-            .take_surface_damage()
     }
 
     pub(crate) fn suspend_for_restore(&mut self) -> io::Result<()> {
@@ -257,6 +303,38 @@ impl DirectPrimaryOwnership {
         }
         for lease in &self.suspended {
             lease.disarm_drm_cleanup();
+        }
+    }
+}
+
+impl SubmittedDirectPrimary {
+    fn pageflip_info(&self) -> DirectPageflipInfo {
+        DirectPageflipInfo {
+            frame_id: self.frame_id,
+            transaction_id: self.transaction_id,
+            token: self.token,
+            surface_id: self.lease.surface_id(),
+            candidate_key: self.lease.key(),
+            protocol_batch_id: self.protocol_batch_id,
+            target: self.target,
+            submit_started_at: self.submit_started_at,
+            submit_returned_at: self.submit_returned_at,
+        }
+    }
+}
+
+impl PresentedDirectPrimary {
+    fn pageflip_info(&self) -> DirectPageflipInfo {
+        DirectPageflipInfo {
+            frame_id: self.frame_id,
+            transaction_id: self.transaction_id,
+            token: self.token,
+            surface_id: self.lease.surface_id(),
+            candidate_key: self.lease.key(),
+            protocol_batch_id: self.protocol_batch_id,
+            target: self.target,
+            submit_started_at: self.submit_started_at,
+            submit_returned_at: self.submit_returned_at,
         }
     }
 }
@@ -318,9 +396,6 @@ impl DirectScanoutControl {
     }
 
     pub(super) fn suspend(&mut self) -> io::Result<()> {
-        if self.ownership.presented.is_some() {
-            self.counters.exits += 1;
-        }
         self.ownership.suspend_for_restore()?;
         self.inhibit_until_composited_present = true;
         Ok(())
@@ -624,5 +699,31 @@ mod tests {
         assert_eq!(cleanup_b.load(Ordering::Acquire), 1);
         ownership.clear_after_restore();
         assert_eq!(cleanup_a.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn direct_to_composed_releases_direct_resource_after_composed_pageflip() {
+        let key = test_key();
+        let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 91);
+        let mut ownership = DirectPrimaryOwnership::default();
+        ownership
+            .accept_submitted(test_submitted(91, lease))
+            .expect("accept direct resource");
+        ownership
+            .complete_pageflip(
+                OutputTransactionId::new(std::num::NonZeroU64::new(91).unwrap()),
+                PageFlipToken::new(91).unwrap(),
+                MonotonicTimestampNs::new(15),
+            )
+            .expect("present direct resource");
+
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 0);
+        let released = ownership
+            .release_presented_for_composed_pageflip()
+            .expect("release old direct resource after composed pageflip");
+        assert_eq!(released.token.get(), 91);
+        assert!(ownership.presented.is_none());
+        drop(released);
+        assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
     }
 }

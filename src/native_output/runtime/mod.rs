@@ -106,6 +106,26 @@ pub(crate) enum NativeClientCursorPath {
     Software,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConfirmedPrimaryAssignment {
+    Composed {
+        transaction_id: OutputTransactionId,
+        token: PageFlipToken,
+    },
+    Direct {
+        transaction_id: OutputTransactionId,
+        token: PageFlipToken,
+        surface_id: u32,
+        candidate_key: DirectScanoutCandidateKey,
+    },
+}
+
+impl ConfirmedPrimaryAssignment {
+    pub(super) const fn is_direct(self) -> bool {
+        matches!(self, Self::Direct { .. })
+    }
+}
+
 // `TargetDestroyed` means the previous KMS target can no longer reference any
 // submitted framebuffer. Session inactivity or disarmed I/O is not proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +219,7 @@ pub(crate) struct NativeRuntime {
     frame_scheduler: NativeFrameScheduler,
     atomic_commit_arbiter: AtomicCommitArbiter,
     output_transactions: OutputTransactionLedger,
+    confirmed_primary_assignment: Option<ConfirmedPrimaryAssignment>,
     presentation_deadline: PresentationDeadlinePlanner,
     scheduled_presentation_target: Option<PresentationTarget>,
     render_journal: AdaptiveRenderJournal,
@@ -376,6 +397,7 @@ impl Drop for NativeRuntime {
             self.retain_unproven_teardown_ownership();
             return;
         }
+        self.confirmed_primary_assignment = None;
         // SAFETY: scanout is wrapped solely so teardown can disarm DRM cleanup
         // before its normal resource drop. The proven boundary above means
         // KMS no longer references submitted resources, and scanout is

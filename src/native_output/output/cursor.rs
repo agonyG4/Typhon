@@ -292,6 +292,7 @@ pub(crate) struct AtomicCursorCounters {
     pub(crate) test_failures: u64,
     pub(crate) submit_failures: u64,
     pub(crate) software_fallbacks: u64,
+    pub(crate) composed_cursor_fallbacks: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -643,6 +644,11 @@ impl NativeAtomicCursor {
 
     pub(crate) fn note_software_fallback(&mut self) {
         self.counters.software_fallbacks = self.counters.software_fallbacks.saturating_add(1);
+    }
+
+    pub(crate) fn note_composed_software_fallback(&mut self) {
+        self.counters.composed_cursor_fallbacks =
+            self.counters.composed_cursor_fallbacks.saturating_add(1);
     }
 
     pub(crate) fn replace_image(

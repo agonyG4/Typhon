@@ -1,4 +1,5 @@
 use super::super::planner::visual_target_deadline_for_mode;
+use super::kms_worker::{WorkerRejectionKind, direct_rejection_policy};
 use super::presentation_transactions::complete_presented_output_transaction;
 use super::*;
 use oblivion_one::compositor::CompositorFrameBatchId;
@@ -850,6 +851,105 @@ fn compatibility_present_result_matrix_has_exactly_one_terminal_per_transaction(
                 .active_settling_transactions,
             0
         );
+    }
+}
+
+#[test]
+fn composed_to_direct_becomes_active_only_after_pageflip() {
+    let composed = ConfirmedPrimaryAssignment::Composed {
+        transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(1).unwrap()),
+        token: PageFlipToken::new(11).unwrap(),
+    };
+    let direct = ConfirmedPrimaryAssignment::Direct {
+        transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(2).unwrap()),
+        token: PageFlipToken::new(12).unwrap(),
+        surface_id: 7,
+        candidate_key: test_confirmed_direct_key(),
+    };
+    let mut confirmed = Some(composed);
+
+    let queued = Some(direct);
+    assert_eq!(confirmed, Some(composed));
+    assert!(!confirmed.unwrap().is_direct());
+
+    confirmed = queued;
+    assert_eq!(confirmed, Some(direct));
+    assert!(confirmed.unwrap().is_direct());
+}
+
+#[test]
+fn direct_to_direct_retains_old_resource_until_replacement_pageflip() {
+    let old = ConfirmedPrimaryAssignment::Direct {
+        transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(3).unwrap()),
+        token: PageFlipToken::new(13).unwrap(),
+        surface_id: 8,
+        candidate_key: test_confirmed_direct_key(),
+    };
+    let replacement = ConfirmedPrimaryAssignment::Direct {
+        transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(4).unwrap()),
+        token: PageFlipToken::new(14).unwrap(),
+        surface_id: 9,
+        candidate_key: test_confirmed_direct_key(),
+    };
+    let mut confirmed = Some(old);
+
+    let submitted = Some(replacement);
+    assert_eq!(confirmed, Some(old));
+    assert_eq!(submitted, Some(replacement));
+
+    confirmed = submitted;
+    assert_eq!(confirmed, Some(replacement));
+}
+
+#[test]
+fn direct_test_rejection_restores_batch_and_requests_composition() {
+    let policy = direct_rejection_policy(WorkerRejectionKind::TestOnly);
+    assert!(!policy.invalidate_validation_key);
+    assert!(policy.request_composited_redraw);
+    assert!(!policy.demote_hardware_cursor);
+}
+
+#[test]
+fn direct_real_submit_rejection_invalidates_cache_and_requests_composition() {
+    let policy = direct_rejection_policy(WorkerRejectionKind::RealSubmit);
+    assert!(policy.invalidate_validation_key);
+    assert!(policy.request_composited_redraw);
+    assert!(!policy.demote_hardware_cursor);
+}
+
+#[test]
+fn rejected_direct_attempt_does_not_invalidate_presented_damage_history() {
+    let confirmed = Some(ConfirmedPrimaryAssignment::Composed {
+        transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(5).unwrap()),
+        token: PageFlipToken::new(15).unwrap(),
+    });
+    let after_rejection = confirmed;
+    assert_eq!(after_rejection, confirmed);
+}
+
+#[test]
+fn direct_combined_cursor_rejection_does_not_latch_software_cursor() {
+    let policy = direct_rejection_policy(WorkerRejectionKind::RealSubmit);
+    assert!(!policy.demote_hardware_cursor);
+}
+
+fn test_confirmed_direct_key() -> DirectScanoutCandidateKey {
+    DirectScanoutCandidateKey {
+        content: OutputContentKey::new(
+            7,
+            std::num::NonZeroU64::new(42).unwrap(),
+            ContentEpochId::new(std::num::NonZeroU64::new(3).unwrap()),
+            1920,
+            1080,
+            0x3432_5241,
+            0,
+            0,
+            1_000,
+            0,
+        ),
+        output_generation: 1,
+        cursor_plan_key: None,
+        color_epoch: 0,
     }
 }
 

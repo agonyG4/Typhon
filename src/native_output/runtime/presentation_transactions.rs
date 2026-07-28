@@ -624,6 +624,7 @@ pub(super) fn submit_cursor_only(
                     )?;
                     cursor.note_submit_failure();
                     cursor.note_software_fallback();
+                    cursor.note_composed_software_fallback();
                     cursor.set_visible(false);
                     *cursor_render_mode = if client_cursor_active {
                         NativeCursorRenderMode::SoftwareClient
@@ -657,6 +658,7 @@ pub(super) fn submit_cursor_only(
         Err(error) => {
             cursor.note_test_failure();
             cursor.note_software_fallback();
+            cursor.note_composed_software_fallback();
             cursor.set_visible(false);
             *cursor_render_mode = if client_cursor_active {
                 NativeCursorRenderMode::SoftwareClient
