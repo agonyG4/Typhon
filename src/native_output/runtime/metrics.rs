@@ -25,8 +25,8 @@ impl NativeRuntime {
             ) = self.xwayland.xwayland_timing_snapshot();
             let fullscreen = self.server.fullscreen_render_plan_metrics();
             let transaction_counters = self.output_transactions.counters();
-            let buffer_release_metrics = self.server.buffer_release_metrics();
             let presented = self.scanout.direct_scanout_presented_info();
+            let submitted = self.scanout.direct_scanout_submitted_info();
             // Queued identity belongs to the Atomic arbiter; physical resources
             // are reported separately from DirectPrimaryOwnership below.
             let direct_pending = self
@@ -394,9 +394,9 @@ impl NativeRuntime {
                     self.direct_scanout_qualification.status_str(),
                 ),
                 NativePerfField::bool("direct_scanout_pending", direct_pending),
-                NativePerfField::u64(
-                    "direct_scanout_surface",
-                    u64::from(self.scanout.direct_scanout_surface().unwrap_or(0)),
+                NativePerfField::bool(
+                    "direct_scanout_fallback_active",
+                    self.direct_fallback_tracker.is_some(),
                 ),
                 NativePerfField::str(
                     "direct_scanout_first_blocker",
@@ -418,12 +418,10 @@ impl NativeRuntime {
                     ),
                 ]);
             }
-            if let Some((buffer, framebuffer, format, modifier)) =
+            if let Some((_buffer, _framebuffer, format, modifier)) =
                 self.scanout.direct_scanout_info()
             {
                 fields.extend([
-                    NativePerfField::u64("direct_scanout_buffer", buffer),
-                    NativePerfField::u64("direct_scanout_framebuffer", u64::from(framebuffer)),
                     NativePerfField::u64("direct_scanout_format", u64::from(format)),
                     NativePerfField::u64("direct_scanout_modifier", modifier),
                 ]);
@@ -515,6 +513,18 @@ impl NativeRuntime {
                         counters.test_only_timing.max_ns / 1_000,
                     ),
                     NativePerfField::u64(
+                        "direct_scanout_test_only_duration_ns_last",
+                        counters.test_only_timing.last_ns,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_test_only_duration_ns_max",
+                        counters.test_only_timing.max_ns,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_test_only_duration_ns_total",
+                        counters.test_only_timing.total_ns,
+                    ),
+                    NativePerfField::u64(
                         "direct_scanout_real_submit_p50_us",
                         counters.real_submit_timing.percentile_ns(50) / 1_000,
                     ),
@@ -569,16 +579,36 @@ impl NativeRuntime {
                         counters.fallback_cycles,
                     ),
                     NativePerfField::u64(
+                        "direct_scanout_fallback_cycles_current",
+                        counters.fallback_cycles_current,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_fallback_cycles_last",
+                        counters.fallback_cycles_last,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_fallback_cycles_max",
+                        counters.fallback_cycles_max,
+                    ),
+                    NativePerfField::u64(
                         "direct_scanout_duplicate_feedback",
                         counters.duplicate_feedback,
                     ),
                     NativePerfField::u64(
                         "direct_scanout_duplicate_settlement",
-                        transaction_counters.duplicate_obligation_attempts,
+                        transaction_counters.duplicate_settlement_attempts,
                     ),
                     NativePerfField::u64(
                         "direct_scanout_early_release_prevented",
-                        buffer_release_metrics.buffer_release_duplicate_attempts,
+                        counters.early_release_prevented,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_early_release_violations",
+                        counters.early_release_violations,
+                    ),
+                    NativePerfField::u64(
+                        "dmabuf_feedback_unchanged_rebuilds",
+                        counters.dmabuf_feedback_unchanged_rebuilds,
                     ),
                     NativePerfField::u64(
                         "direct_scanout_callback_owner_leaks",
@@ -587,17 +617,37 @@ impl NativeRuntime {
                 ]);
             }
             fields.extend([
-                NativePerfField::u64(
+                NativePerfField::str(
                     "direct_scanout_presented_surface",
-                    u64::from(presented.map_or(0, |value| value.0)),
+                    presented.map_or_else(|| "none".to_string(), |value| value.0.to_string()),
                 ),
-                NativePerfField::u64(
+                NativePerfField::str(
+                    "direct_scanout_presented_buffer",
+                    presented.map_or_else(|| "none".to_string(), |value| value.1.to_string()),
+                ),
+                NativePerfField::str(
                     "direct_scanout_presented_framebuffer",
-                    u64::from(presented.map_or(0, |value| value.1)),
+                    presented.map_or_else(|| "none".to_string(), |value| value.2.to_string()),
                 ),
-                NativePerfField::u64(
+                NativePerfField::str(
                     "direct_scanout_presented_content_epoch",
-                    presented.map_or(0, |value| value.2),
+                    presented.map_or_else(|| "none".to_string(), |value| value.3.to_string()),
+                ),
+                NativePerfField::str(
+                    "direct_scanout_submitted_surface",
+                    submitted.map_or_else(|| "none".to_string(), |value| value.0.to_string()),
+                ),
+                NativePerfField::str(
+                    "direct_scanout_submitted_buffer",
+                    submitted.map_or_else(|| "none".to_string(), |value| value.1.to_string()),
+                ),
+                NativePerfField::str(
+                    "direct_scanout_submitted_framebuffer",
+                    submitted.map_or_else(|| "none".to_string(), |value| value.2.to_string()),
+                ),
+                NativePerfField::str(
+                    "direct_scanout_submitted_content_epoch",
+                    submitted.map_or_else(|| "none".to_string(), |value| value.3.to_string()),
                 ),
             ]);
             if let Some(cursor) = self.atomic_cursor.as_ref() {

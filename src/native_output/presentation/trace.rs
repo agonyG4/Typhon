@@ -286,6 +286,8 @@ impl PresentationTransactionTraceRing {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TimingSummary {
     pub(crate) count: u64,
+    pub(crate) total_ns: u64,
+    pub(crate) last_ns: u64,
     pub(crate) max_ns: u64,
     pub(crate) buckets: [u64; 8],
 }
@@ -293,6 +295,8 @@ pub(crate) struct TimingSummary {
 impl TimingSummary {
     pub(crate) fn record(&mut self, elapsed_ns: u64) {
         self.count = self.count.saturating_add(1);
+        self.total_ns = self.total_ns.saturating_add(elapsed_ns);
+        self.last_ns = elapsed_ns;
         self.max_ns = self.max_ns.max(elapsed_ns);
         let bucket = HISTOGRAM_BUCKETS_NS
             .iter()

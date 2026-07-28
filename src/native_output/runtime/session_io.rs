@@ -213,6 +213,7 @@ impl NativeSessionIo for NativeRuntime {
     }
 
     fn quarantine_pageflip(&mut self) -> NativeResult<()> {
+        self.abandon_direct_fallback();
         self.frame_scheduler.abandon_for_session_suspend();
         self.atomic_commit_arbiter.abandon_for_recovery();
         self.deferred_worker_pageflip = None;
@@ -246,6 +247,7 @@ impl NativeSessionIo for NativeRuntime {
     }
 
     fn recover_kms_pipeline(&mut self) -> NativeResult<()> {
+        self.abandon_direct_fallback();
         if self.atomic_cursor.is_some() {
             self.kms_backend
                 .rediscover_atomic_cursor_for_recovery(self.kms.file().as_fd())?;
@@ -346,10 +348,11 @@ impl NativeSessionIo for NativeRuntime {
 
     fn rearm_explicit_sync(&mut self) -> NativeResult<()> {
         self.drm_file_generation = allocate_native_drm_file_generation();
+        self.abandon_direct_fallback();
         self.scanout
             .rebind_session_generation(self.drm_file_generation);
         if !apply_native_scanout_feedback(&mut self.server, &self.scanout) {
-            self.scanout.note_direct_duplicate_feedback();
+            self.scanout.note_dmabuf_feedback_unchanged_rebuild();
         }
         self.acquire_watches
             .set_drm_file_generation(self.drm_file_generation);

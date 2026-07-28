@@ -463,16 +463,21 @@ impl CompositorState {
         batch_id: CompositorFrameBatchId,
         direct_surface_id: u32,
         presentation: FramePresentation,
-    ) {
-        let batch = self.take_presented_frame_batch(frame_id, batch_id);
+    ) -> u64 {
+        let mut batch = self.take_presented_frame_batch(frame_id, batch_id);
         self.note_frame_callbacks_at_pageflip(batch_id, &batch);
-        let batch = self.complete_frame_batch_releases(batch_id, batch);
+        let callback_owner_leaks = if batch.callback_render_completed_ns.is_some() {
+            batch.callbacks.len() as u64
+        } else {
+            0
+        };
+        let callbacks = std::mem::take(&mut batch.callbacks);
+        self.complete_frame_callbacks(callbacks);
+        let feedbacks = std::mem::take(&mut batch.presentation_feedbacks);
         self.clear_legacy_batch_reference(batch_id);
-        self.complete_direct_presentation_feedbacks(
-            batch.presentation_feedbacks,
-            direct_surface_id,
-            presentation,
-        );
+        self.complete_direct_presentation_feedbacks(feedbacks, direct_surface_id, presentation);
+        let _ = self.complete_frame_batch_releases(batch_id, batch);
+        callback_owner_leaks
     }
 
     pub(in crate::compositor) fn complete_no_visual_change_frame_batch(

@@ -36,7 +36,7 @@ fn candidate_key(content_epoch: u64) -> DirectScanoutCandidateKey {
             0,
         ),
         output_generation: 1,
-        cursor_plan_key: Some(1),
+        cursor_content_key: None,
         color_epoch: 0,
     }
 }

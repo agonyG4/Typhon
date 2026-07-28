@@ -1,4 +1,5 @@
 use super::cursor_cycle::{NativeResolvedCursorSource, resolve_native_cursor_source};
+use super::cycle::direct_fallback::{DirectFallbackReason, DirectFallbackTracker};
 use super::frame::{
     NativeRepaintInputs, cursor_only_allowed_at_deadline, native_repaint_decision,
     update_cursor_output_arbitration,
@@ -64,6 +65,7 @@ impl NativeRuntime {
             kms_commit_worker_transport,
             frame_scheduler,
             atomic_commit_arbiter,
+            emergency_quarantined_worker_jobs,
             output_transactions,
             confirmed_primary_assignment,
             presentation_deadline,
@@ -75,6 +77,8 @@ impl NativeRuntime {
             effective_app_gpu_policy,
             last_rendered_scene_generation,
             last_direct_candidate_key,
+            direct_fallback_tracker,
+            last_refresh_sequence,
             last_submitted_cursor_epoch,
             last_renderable_surfaces,
             last_client_cursor_damage,
@@ -663,10 +667,15 @@ impl NativeRuntime {
                                 token,
                                 framebuffer_id,
                                 lease,
-                                admission,
                                 test_only,
                             } => {
-                                finish_direct_worker_queued(
+                                let direct_result = finish_direct_worker_queued(
+                                    kms_commit_worker
+                                        .as_ref()
+                                        .expect("direct scanout requires KMS worker"),
+                                    scanout,
+                                    emergency_quarantined_worker_jobs,
+                                    direct_fallback_tracker,
                                     server,
                                     output_transactions,
                                     atomic_commit_arbiter,
@@ -691,10 +700,26 @@ impl NativeRuntime {
                                     framebuffer_id,
                                     direct_target,
                                     *lease,
-                                    admission,
                                     test_only,
                                 )?;
-                                direct_submitted = true;
+                                match direct_result {
+                                    DirectWorkerQueueResult::Queued => {
+                                        direct_submitted = true;
+                                    }
+                                    DirectWorkerQueueResult::Suppressed => {
+                                        direct_suppressed = true;
+                                        presentation_deadline.clear_scheduled_target();
+                                        *scheduled_presentation_target = None;
+                                    }
+                                    DirectWorkerQueueResult::AdmissionRejected => {
+                                        let _ = DirectFallbackTracker::start(
+                                            direct_fallback_tracker,
+                                            transaction_id,
+                                            *last_refresh_sequence,
+                                            DirectFallbackReason::WorkerAdmissionRejected,
+                                        );
+                                    }
+                                }
                             }
                             DirectScanoutAttempt::Rejected(rejection) => {
                                 scanout.note_direct_blocker(rejection.as_str());

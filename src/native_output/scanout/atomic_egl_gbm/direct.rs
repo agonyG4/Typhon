@@ -1,5 +1,5 @@
 use super::*;
-use crate::native_output::kms_worker::{KmsTestOnlyPolicy, KmsWorkerAdmissionError};
+use crate::native_output::kms_worker::KmsTestOnlyPolicy;
 
 #[allow(clippy::too_many_arguments)]
 fn settle_no_visual_change_transaction(
@@ -115,7 +115,6 @@ impl AtomicEglGbmScanout {
                 ));
             }
             DirectSyncReadiness::Unsupported(reason) => {
-                self.direct.counters.composited_fallbacks += 1;
                 direct_scanout_debug(format_args!("synchronization rejected: {reason}"));
                 return Ok(DirectScanoutAttempt::Fallback(reason));
             }
@@ -141,7 +140,6 @@ impl AtomicEglGbmScanout {
                 candidate
             }
             Err(rejection) => {
-                self.direct.counters.composited_fallbacks += 1;
                 direct_scanout_debug(format_args!("candidate rejected={}", rejection.as_str()));
                 return Ok(DirectScanoutAttempt::Rejected(rejection));
             }
@@ -150,7 +148,6 @@ impl AtomicEglGbmScanout {
         let Some(candidate_key) =
             direct_candidate_key(&candidate, self.direct.drm_generation, cursor)
         else {
-            self.direct.counters.composited_fallbacks += 1;
             return Ok(DirectScanoutAttempt::Fallback("candidate_key_invalid"));
         };
         let release = match &sync_readiness {
@@ -207,49 +204,11 @@ impl AtomicEglGbmScanout {
             return Ok(DirectScanoutAttempt::Unchanged);
         }
         if candidate.buffer.planes().is_empty() {
-            self.direct.counters.composited_fallbacks += 1;
             return Ok(DirectScanoutAttempt::Fallback("candidate_plane_missing"));
         }
-        let Some(worker) = worker else {
-            self.direct.counters.composited_fallbacks += 1;
+        let Some(_worker) = worker else {
+            self.note_direct_worker_admission_rejected(false);
             return Ok(DirectScanoutAttempt::Fallback("worker_unavailable"));
-        };
-        let worker_admission = match worker.try_reserve_direct_admission(candidate_key) {
-            Ok(Some(admission)) => admission,
-            Ok(None) => {
-                self.direct.counters.same_buffer_suppressed = self
-                    .direct
-                    .counters
-                    .same_buffer_suppressed
-                    .saturating_add(1);
-                settle_no_visual_change_transaction(
-                    server,
-                    output_transactions,
-                    self.direct.drm_generation,
-                    target,
-                    pacing_mode,
-                    candidate_key,
-                    0,
-                    cursor,
-                    cursor_epoch,
-                    candidate.surface_id,
-                    release,
-                )?;
-                return Ok(DirectScanoutAttempt::Unchanged);
-            }
-            Err(error) => {
-                self.direct.counters.worker_admission_rejected = self
-                    .direct
-                    .counters
-                    .worker_admission_rejected
-                    .saturating_add(1);
-                if matches!(error, KmsWorkerAdmissionError::QueueFull) {
-                    self.direct.counters.worker_queue_overflow =
-                        self.direct.counters.worker_queue_overflow.saturating_add(1);
-                }
-                self.direct.counters.composited_fallbacks += 1;
-                return Ok(DirectScanoutAttempt::Fallback("worker_unavailable"));
-            }
         };
         let atomic = kms
             .atomic()
@@ -269,7 +228,15 @@ impl AtomicEglGbmScanout {
             buffer_width: candidate.buffer.size().width,
             buffer_height: candidate.buffer.size().height,
             plane_layout_hash: plane_layout_hash(&candidate.buffer),
-            cursor_plan_key: candidate_key.cursor_plan_key,
+            cursor_atomic_key: direct_cursor_atomic_validation_key(
+                cursor,
+                true,
+                atomic
+                    .discovery()
+                    .cursor_plane
+                    .as_ref()
+                    .map(|plane| plane.plane_id),
+            ),
             synchronization_key: synchronization_contract_key(
                 matches!(
                     &sync_readiness,
@@ -319,7 +286,6 @@ impl AtomicEglGbmScanout {
             Ok(imported) => imported,
             Err(error) => {
                 self.direct.counters.import_failures += 1;
-                self.direct.counters.composited_fallbacks += 1;
                 eprintln!("direct scanout: dma-buf import rejected: {error}");
                 return Ok(DirectScanoutAttempt::Fallback("import_failed"));
             }
@@ -396,7 +362,6 @@ impl AtomicEglGbmScanout {
             token: token.get(),
             framebuffer_id,
             lease: Box::new(direct_lease),
-            admission: worker_admission,
             test_only,
         })
     }
@@ -407,6 +372,27 @@ impl AtomicEglGbmScanout {
         token: PageFlipToken,
         presented_at: MonotonicTimestampNs,
     ) -> io::Result<DirectPageflipCompletion> {
+        let prepared = self.prepare_direct_pageflip(transaction_id, token, presented_at)?;
+        Ok(self.commit_prepared_direct_pageflip(prepared))
+    }
+
+    pub(crate) fn prepare_direct_pageflip(
+        &self,
+        transaction_id: OutputTransactionId,
+        token: PageFlipToken,
+        presented_at: MonotonicTimestampNs,
+    ) -> io::Result<PreparedDirectPageflip> {
+        self.direct
+            .ownership
+            .prepare_pageflip(transaction_id, token, presented_at)
+            .map_err(|error| error.error)
+    }
+
+    pub(crate) fn commit_prepared_direct_pageflip(
+        &mut self,
+        prepared: PreparedDirectPageflip,
+    ) -> DirectPageflipCompletion {
+        let presented_at = prepared.presented_at;
         let (
             frame_id,
             presented_transaction_id,
@@ -418,12 +404,17 @@ impl AtomicEglGbmScanout {
             target,
             submit_started_at,
             submit_returned_at,
+            surface_damage,
+            replaced,
         ) = {
-            let (presented, _replaced) = self
+            let (replaced, surface_damage) =
+                self.direct.ownership.commit_prepared_pageflip(prepared);
+            let presented = self
                 .direct
                 .ownership
-                .complete_pageflip(transaction_id, token, presented_at)
-                .map_err(|error| error.error)?;
+                .presented
+                .as_ref()
+                .expect("presented ownership was just installed");
             (
                 presented.frame_id,
                 presented.transaction_id,
@@ -435,11 +426,12 @@ impl AtomicEglGbmScanout {
                 presented.target,
                 presented.submit_started_at,
                 presented.submit_returned_at,
+                surface_damage,
+                replaced,
             )
         };
-        self.direct.counters.presentations += 1;
         direct_scanout_debug("direct pageflip presented");
-        Ok(DirectPageflipCompletion {
+        DirectPageflipCompletion {
             frame_id,
             transaction_id: presented_transaction_id,
             token: presented_token,
@@ -451,7 +443,9 @@ impl AtomicEglGbmScanout {
             presented_at,
             submit_started_at,
             submit_returned_at,
-        })
+            surface_damage,
+            replaced,
+        }
     }
 
     pub(crate) fn direct_pageflip_info(
@@ -465,19 +459,26 @@ impl AtomicEglGbmScanout {
             .map_err(|error| error.error)
     }
 
-    pub(crate) fn take_direct_pageflip_surface_damage(
-        &mut self,
-        transaction_id: OutputTransactionId,
-        token: PageFlipToken,
-    ) -> io::Result<oblivion_one::compositor::SurfaceDamagePresentation> {
-        self.direct
-            .ownership
-            .take_submitted_surface_damage(transaction_id, token)
-            .map_err(|error| error.error)
-    }
-
     pub(crate) fn note_direct_entry(&mut self) {
         self.direct.counters.entries = self.direct.counters.entries.saturating_add(1);
+    }
+
+    pub(crate) fn note_direct_presentation(&mut self) {
+        self.direct.counters.presentations = self.direct.counters.presentations.saturating_add(1);
+    }
+
+    pub(crate) fn note_direct_fallback_cycles(&mut self, cycles: u64) {
+        self.direct.counters.fallback_cycles_current = cycles;
+    }
+
+    pub(crate) fn note_direct_composited_fallback(&mut self, cycles: u64) {
+        self.direct.counters.fallback_cycles_current = 0;
+        self.direct.counters.fallback_cycles_last = cycles;
+        self.direct.counters.fallback_cycles_max =
+            self.direct.counters.fallback_cycles_max.max(cycles);
+        self.direct.counters.fallback_cycles = cycles;
+        self.direct.counters.composited_fallbacks =
+            self.direct.counters.composited_fallbacks.saturating_add(1);
     }
 
     pub(crate) fn note_direct_replacement(&mut self) {
@@ -495,7 +496,11 @@ impl AtomicEglGbmScanout {
         }
     }
 
-    pub(crate) fn complete_composited_transition(&mut self) {
+    pub(crate) fn complete_composited_transition(&mut self, release_proven: bool) {
+        if !release_proven && self.direct.ownership.presented.is_some() {
+            self.note_direct_early_release_violation();
+            return;
+        }
         if self
             .direct
             .ownership
@@ -517,10 +522,6 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn direct_scanout_pending_token(&self) -> Option<PageFlipToken> {
         self.direct.pending_token()
-    }
-
-    pub(crate) fn direct_scanout_surface(&self) -> Option<u32> {
-        self.direct.active_surface()
     }
 
     pub(crate) fn direct_scanout_info(&self) -> Option<(u64, u32, u32, u64)> {
@@ -548,6 +549,17 @@ impl AtomicEglGbmScanout {
             })
     }
 
+    pub(crate) fn direct_scanout_submitted_info(&self) -> Option<(u32, u64, u32, u64)> {
+        self.direct.ownership.submitted.as_ref().map(|frame| {
+            (
+                frame.lease.surface_id(),
+                frame.lease.key().content.buffer_id.get(),
+                frame.lease.framebuffer_id(),
+                frame.lease.key().content.content_epoch.get(),
+            )
+        })
+    }
+
     pub(crate) fn direct_scanout_counters(&self) -> DirectScanoutCounters {
         let mut counters = self.direct.counters;
         counters.cleanup_failures = self.direct.framebuffer_cache.cleanup_failures();
@@ -570,21 +582,7 @@ impl AtomicEglGbmScanout {
             .saturating_add(1);
     }
 
-    pub(crate) fn note_direct_rejection(&mut self, test_only: bool, combined_cursor: bool) {
-        if test_only {
-            self.direct.counters.test_only_attempts =
-                self.direct.counters.test_only_attempts.saturating_add(1);
-        } else {
-            self.direct.counters.real_submit_attempts =
-                self.direct.counters.real_submit_attempts.saturating_add(1);
-        }
-        if test_only {
-            self.direct.counters.test_only_rejections =
-                self.direct.counters.test_only_rejections.saturating_add(1);
-        } else {
-            self.direct.counters.submit_rejections =
-                self.direct.counters.submit_rejections.saturating_add(1);
-        }
+    pub(crate) fn note_direct_rejection(&mut self, _test_only: bool, combined_cursor: bool) {
         if combined_cursor {
             self.direct.counters.combined_cursor_rejections = self
                 .direct
@@ -592,8 +590,42 @@ impl AtomicEglGbmScanout {
                 .combined_cursor_rejections
                 .saturating_add(1);
         }
-        self.direct.counters.composited_fallbacks =
-            self.direct.counters.composited_fallbacks.saturating_add(1);
+    }
+
+    pub(crate) fn note_direct_test_only(&mut self, duration_ns: u64, rejected: bool) {
+        self.direct.counters.record_test_only(duration_ns, rejected);
+    }
+
+    pub(crate) fn note_direct_real_submit_attempt(&mut self, rejected: bool) {
+        self.direct.counters.record_real_submit_attempt(rejected);
+    }
+
+    pub(crate) fn note_direct_same_buffer_resubmission(&mut self) {
+        self.direct.counters.same_buffer_resubmissions = self
+            .direct
+            .counters
+            .same_buffer_resubmissions
+            .saturating_add(1);
+    }
+
+    pub(crate) fn note_direct_worker_admission_rejected(&mut self, queue_overflow: bool) {
+        self.direct.counters.worker_admission_rejected = self
+            .direct
+            .counters
+            .worker_admission_rejected
+            .saturating_add(1);
+        if queue_overflow {
+            self.direct.counters.worker_queue_overflow =
+                self.direct.counters.worker_queue_overflow.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn note_direct_callback_owner_leaks(&mut self, count: u64) {
+        self.direct.counters.callback_owner_leaks = self
+            .direct
+            .counters
+            .callback_owner_leaks
+            .saturating_add(count);
     }
 
     pub(crate) fn note_direct_fallback_redraw(&mut self) {
@@ -608,12 +640,7 @@ impl AtomicEglGbmScanout {
         submit_returned_at: u64,
     ) {
         let elapsed_ns = submit_returned_at.saturating_sub(submit_started_at);
-        if test_only_was_required {
-            self.direct.counters.test_only_attempts =
-                self.direct.counters.test_only_attempts.saturating_add(1);
-        }
-        self.direct.counters.real_submit_attempts =
-            self.direct.counters.real_submit_attempts.saturating_add(1);
+        let _ = test_only_was_required;
         self.direct.counters.real_submit_timing.record(elapsed_ns);
     }
 
@@ -630,10 +657,41 @@ impl AtomicEglGbmScanout {
             self.direct.counters.duplicate_feedback.saturating_add(1);
     }
 
-    pub(crate) fn direct_scanout_presented_info(&self) -> Option<(u32, u32, u64)> {
+    pub(crate) fn note_direct_early_release_prevented(&mut self) {
+        self.direct.counters.early_release_prevented = self
+            .direct
+            .counters
+            .early_release_prevented
+            .saturating_add(1);
+    }
+
+    pub(crate) fn note_direct_early_release_violation(&mut self) {
+        self.direct.counters.early_release_violations = self
+            .direct
+            .counters
+            .early_release_violations
+            .saturating_add(1);
+    }
+
+    pub(crate) fn note_direct_release_check(&mut self, safe: bool) {
+        if !safe {
+            self.note_direct_early_release_violation();
+        }
+    }
+
+    pub(crate) fn note_dmabuf_feedback_unchanged_rebuild(&mut self) {
+        self.direct.counters.dmabuf_feedback_unchanged_rebuilds = self
+            .direct
+            .counters
+            .dmabuf_feedback_unchanged_rebuilds
+            .saturating_add(1);
+    }
+
+    pub(crate) fn direct_scanout_presented_info(&self) -> Option<(u32, u64, u32, u64)> {
         self.direct.ownership.presented.as_ref().map(|frame| {
             (
                 frame.lease.surface_id(),
+                frame.lease.key().content.buffer_id.get(),
                 frame.lease.framebuffer_id(),
                 frame.lease.key().content.content_epoch.get(),
             )

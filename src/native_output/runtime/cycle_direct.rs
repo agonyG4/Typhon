@@ -1,5 +1,5 @@
-use super::super::cursor_cycle::complete_primary_cursor_pageflip;
-use super::super::presentation_transactions::complete_presented_output_transaction;
+use super::super::cursor_cycle::{commit_primary_cursor_pageflip, prepare_primary_cursor_pageflip};
+use super::super::presentation_transactions::prepare_presented_output_transaction;
 use super::*;
 
 #[allow(clippy::too_many_arguments)]
@@ -24,44 +24,50 @@ pub(super) fn settle_direct_pageflip(
     scheduled_presentation_target: &mut Option<PresentationTarget>,
 ) -> NativeResult<()> {
     let direct_info = scanout.direct_pageflip_info(transaction_id, pageflip_token)?;
-    let mut completed = None;
-    complete_presented_output_transaction(
+    let prepared_physical =
+        scanout.prepare_direct_pageflip(transaction_id, pageflip_token, presented_at)?;
+    let prepared_cursor =
+        prepare_primary_cursor_pageflip(atomic_cursor, pageflip_user_data, drm_file_generation)?;
+    let prepared_logical = prepare_presented_output_transaction(
         output_transactions,
-        presentation_trace,
         transaction_id,
         pageflip_token,
         drm_file_generation,
         presented_at,
         Some(u64::from(pageflip_sequence)),
-        |obligations| {
-            debug_assert_eq!(
-                obligations.direct_surface_id(),
-                scanout.direct_scanout_surface()
-            );
-            complete_primary_cursor_pageflip(
-                atomic_cursor,
-                pageflip_user_data,
-                drm_file_generation,
-            )?;
-            let surface_damage =
-                scanout.take_direct_pageflip_surface_damage(transaction_id, pageflip_token)?;
-            server.commit_surface_damage_presented(surface_damage);
-            server.complete_direct_presented_frame_batch(
-                direct_info.frame_id,
-                direct_info.protocol_batch_id,
-                direct_info.surface_id,
-                presentation,
-            );
-            completed = Some((
-                direct_info.target,
-                direct_info.submit_started_at,
-                direct_info.submit_returned_at,
-            ));
-            Ok(())
-        },
     )?;
-    let completion =
-        scanout.complete_direct_pageflip(transaction_id, pageflip_token, presented_at)?;
+    if prepared_logical.obligations().frame_batch_id() != Some(direct_info.protocol_batch_id)
+        || prepared_logical.obligations().direct_surface_id() != Some(direct_info.surface_id)
+    {
+        output_transactions
+            .rollback_settlement(prepared_logical)
+            .map_err(io::Error::other)?;
+        return Err(io::Error::other("direct pageflip obligation identity mismatch").into());
+    }
+    let prepared_frame_batch = match server.prepare_direct_presented_frame_batch(
+        direct_info.frame_id,
+        direct_info.protocol_batch_id,
+        direct_info.surface_id,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            output_transactions
+                .rollback_settlement(prepared_logical)
+                .map_err(io::Error::other)?;
+            if !server.has_frame_batch(direct_info.protocol_batch_id) {
+                scanout.note_direct_duplicate_feedback();
+                output_transactions.note_duplicate_settlement_attempt();
+            }
+            return Err(error.into());
+        }
+    };
+    let completion = scanout.commit_prepared_direct_pageflip(prepared_physical);
+    output_transactions.commit_prepared_terminal(prepared_logical);
+    if prepared_cursor {
+        commit_primary_cursor_pageflip(atomic_cursor, pageflip_user_data, drm_file_generation);
+    }
+    server.commit_surface_damage_presented(completion.surface_damage);
+    scanout.note_direct_presentation();
     debug_assert_eq!(completion.transaction_id, transaction_id);
     debug_assert_eq!(completion.token, pageflip_token);
     let previous_assignment = *confirmed_primary_assignment;
@@ -81,13 +87,24 @@ pub(super) fn settle_direct_pageflip(
         scanout.direct_scanout_presented_info(),
         Some((
             completion.surface_id,
+            completion.candidate_key.content.buffer_id.get(),
             completion.framebuffer_id,
             completion.candidate_key.content.content_epoch.get(),
         ))
     );
     debug_assert!(output_transactions.transaction(transaction_id).is_none());
-    let (target, submit_started_at, submit_returned_at) =
-        completed.ok_or_else(|| io::Error::other("direct pageflip did not complete"))?;
+    presentation_trace.push(PresentationTransactionEvent::PageflipPresented {
+        transaction_id,
+        timestamp_ns: presented_at.get(),
+    });
+    let callback_owner_leaks =
+        server.commit_prepared_direct_presented_frame_batch(prepared_frame_batch, presentation);
+    scanout.note_direct_callback_owner_leaks(callback_owner_leaks);
+    scanout.note_direct_release_check(true);
+    drop(completion.replaced);
+    let target = direct_info.target;
+    let submit_started_at = direct_info.submit_started_at;
+    let submit_returned_at = direct_info.submit_returned_at;
     render_journal.note_matching_presentation(presented_at);
     frame_pacing.note_explicit_present(ExplicitPresentationObservation {
         planned_sequence: target.sequence,

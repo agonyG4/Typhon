@@ -643,6 +643,8 @@ impl NativeRuntime {
             effective_app_gpu_policy,
             last_rendered_scene_generation,
             last_direct_candidate_key: None,
+            direct_fallback_tracker: None,
+            last_refresh_sequence: 0,
             last_submitted_cursor_epoch,
             last_primary_presented_at_ns,
             last_renderable_surfaces,

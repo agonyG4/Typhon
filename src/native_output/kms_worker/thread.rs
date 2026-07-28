@@ -9,7 +9,10 @@ use super::queue::{
 use super::{
     KmsCommitAdmissionPermit, KmsCommitJob, KmsCommitTimingModel, KmsWorkerAdmissionError,
 };
-use crate::native_output::{OutputTransactionId, runtime::AtomicCommitKind};
+use crate::native_output::{
+    OutputTransactionId, presentation::transaction::DirectScanoutCandidateKey,
+    runtime::AtomicCommitKind,
+};
 use oblivion_one::native::kms::AtomicCommitSubmitter;
 use oblivion_one::native::kms::{AtomicKmsError, AtomicKmsErrorKind, PageFlipToken};
 use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
@@ -173,6 +176,10 @@ impl KmsCommitWorkerHandle {
         }
     }
 
+    pub(crate) fn mark_admission_fatal(&self) {
+        mark_fatal(&self.shared, KmsWorkerFatalReason::EventNotification, false);
+    }
+
     pub(crate) fn admission_available(&self) -> bool {
         let state = self
             .shared
@@ -198,6 +205,10 @@ impl KmsCommitWorkerHandle {
         Option<crate::native_output::DirectScanoutCandidateKey>,
     ) {
         self.shared.direct_content_keys()
+    }
+
+    pub(crate) fn direct_candidate_in_flight(&self, key: DirectScanoutCandidateKey) -> bool {
+        self.shared.direct_candidate_in_flight(key)
     }
 
     pub(crate) fn try_reserve_direct_admission(
@@ -640,9 +651,11 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     state.executing_direct_content_key =
                         job.direct_primary_lease.as_ref().map(|lease| lease.key());
                     drop(state);
+                    let test_started_ns = monotonic_now_ns();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         executor.test_only(&job)
                     }));
+                    let test_duration_ns = monotonic_now_ns().saturating_sub(test_started_ns);
                     let mut state = shared
                         .state
                         .lock()
@@ -650,7 +663,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     state.executing = false;
                     state.executing_direct_content_key = None;
                     drop(state);
-                    Some(result)
+                    Some((result, test_duration_ns))
                 }
             };
             let Some(test) = test else {
@@ -658,8 +671,11 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                 return;
             };
             match test {
-                Ok(Ok(())) => {}
-                Ok(Err(failure)) => {
+                (Ok(Ok(())), duration_ns) => {
+                    job.test_only_duration_ns = Some(duration_ns);
+                }
+                (Ok(Err(failure)), duration_ns) => {
+                    job.test_only_duration_ns = Some(duration_ns);
                     shared
                         .metrics
                         .jobs_rejected
@@ -675,7 +691,8 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     }
                     continue;
                 }
-                Err(_) => {
+                (Err(_), duration_ns) => {
+                    job.test_only_duration_ns = Some(duration_ns);
                     retain_fatal_job(&shared, job, false);
                     mark_fatal(&shared, KmsWorkerFatalReason::Panic, false);
                     return;

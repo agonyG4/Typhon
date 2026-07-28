@@ -169,7 +169,33 @@ pub(super) fn complete_presented_output_transaction<F>(
 where
     F: FnOnce(OutputProtocolObligations) -> NativeResult<()>,
 {
-    let accepted = output_transactions
+    let accepted = prepare_presented_output_transaction(
+        output_transactions,
+        transaction_id,
+        token,
+        output_generation,
+        presented_at,
+        actual_sequence,
+    )?;
+    commit_prepared_presented_output_transaction(
+        output_transactions,
+        presentation_trace,
+        accepted,
+        settle_protocol_obligations,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_presented_output_transaction(
+    output_transactions: &mut OutputTransactionLedger,
+    transaction_id: OutputTransactionId,
+    token: PageFlipToken,
+    output_generation: u64,
+    presented_at: MonotonicTimestampNs,
+    actual_sequence: Option<u64>,
+) -> NativeResult<AcceptedTerminalTransition> {
+    output_transactions
         .accept_presented(
             transaction_id,
             token,
@@ -177,7 +203,24 @@ where
             presented_at,
             actual_sequence,
         )
-        .map_err(io::Error::other)?;
+        .map_err(io::Error::other)
+        .map_err(Into::into)
+}
+
+pub(super) fn commit_prepared_presented_output_transaction<F>(
+    output_transactions: &mut OutputTransactionLedger,
+    presentation_trace: &mut PresentationTransactionTraceRing,
+    accepted: AcceptedTerminalTransition,
+    settle_protocol_obligations: F,
+) -> NativeResult<()>
+where
+    F: FnOnce(OutputProtocolObligations) -> NativeResult<()>,
+{
+    let transaction_id = accepted.transaction_id();
+    let presented_at = match accepted.terminal() {
+        OutputTransactionTerminal::Presented { presented_at, .. } => presented_at,
+        _ => return Err(io::Error::other("prepared output transition is not presented").into()),
+    };
     settle_accepted_output_transaction(output_transactions, accepted, settle_protocol_obligations)?;
     presentation_trace.push(PresentationTransactionEvent::PageflipPresented {
         transaction_id,

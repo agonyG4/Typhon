@@ -578,12 +578,28 @@ impl NativeAtomicCursor {
         token: PageFlipToken,
         generation: u64,
     ) -> io::Result<()> {
+        self.prepare_submission_completion(token, generation)?;
+        self.commit_submission_completion(token, generation);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_submission_completion(
+        &self,
+        token: PageFlipToken,
+        generation: u64,
+    ) -> io::Result<()> {
         if generation != self.generation {
             return Err(io::Error::other("stale Atomic cursor DRM generation"));
         }
         if self.pending_token != Some(token) {
             return Err(io::Error::other("stale Atomic cursor pageflip token"));
         }
+        Ok(())
+    }
+
+    pub(crate) fn commit_submission_completion(&mut self, token: PageFlipToken, generation: u64) {
+        debug_assert_eq!(generation, self.generation);
+        debug_assert_eq!(self.pending_token, Some(token));
         self.pending_token = None;
         self.pending_is_primary = false;
         self.current = self.submitted.clone();
@@ -594,7 +610,6 @@ impl NativeAtomicCursor {
             self.current.framebuffer_id,
         ];
         self.resources.retire_safe(&keep);
-        Ok(())
     }
 
     pub(crate) fn pending_token(&self) -> Option<PageFlipToken> {

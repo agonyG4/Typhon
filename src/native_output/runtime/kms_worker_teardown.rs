@@ -154,6 +154,11 @@ impl NativeRuntime {
         let safety = classify_kms_teardown_safety(proof);
         self.kms_teardown_safety = safety;
         if !safety.permits_release() {
+            if self.scanout.direct_scanout_pending()
+                || self.scanout.direct_scanout_presented_info().is_some()
+            {
+                self.scanout.note_direct_early_release_prevented();
+            }
             self.server.disarm_shutdown_releases();
             self.scanout.disarm_drm_cleanup();
             self.kms_backend.disarm_drm_io();

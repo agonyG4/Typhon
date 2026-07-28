@@ -224,23 +224,6 @@ pub(crate) enum NativeScanoutBackend {
     Dumb(DumbFramebuffer),
 }
 
-pub(crate) fn direct_cursor_plan_key(
-    cursor: Option<&AtomicCursorVisualState>,
-    compatible: bool,
-) -> Option<u64> {
-    compatible.then_some(match cursor {
-        None => 0,
-        Some(cursor) => {
-            let framebuffer = u64::from(cursor.framebuffer_id.unwrap_or_default());
-            cursor
-                .image_generation
-                .rotate_left(17)
-                .wrapping_add(framebuffer.rotate_left(31))
-                .wrapping_add(u64::from(cursor.visible))
-        }
-    })
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeScanoutRecovery {
     AtomicEglGbm(AtomicExplicitRecovery),
@@ -688,51 +671,6 @@ impl NativeScanoutBackend {
                 .or_else(|| scanout.worker_queued_index.map(|(token, _)| token))
                 .map(PageFlipToken::get),
             Self::Dumb(_) => None,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn try_direct_scanout(
-        &mut self,
-        kms: &KmsBackendSelection,
-        server: &mut OwnCompositorServer,
-        output_transactions: &mut OutputTransactionLedger,
-        target: oblivion_one::native::presentation_deadline::PresentationTarget,
-        cursor: Option<&AtomicCursorVisualState>,
-        cursor_epoch: u64,
-        pacing_mode: NativeOutputPacingMode,
-        worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
-    ) -> io::Result<DirectScanoutAttempt> {
-        match self {
-            Self::AtomicEglGbm(scanout) => scanout.try_direct_scanout(
-                kms,
-                server,
-                output_transactions,
-                target,
-                cursor,
-                cursor_epoch,
-                pacing_mode,
-                worker,
-            ),
-            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
-                "direct scanout is unsupported by this backend",
-            )),
-        }
-    }
-
-    pub(crate) fn complete_direct_pageflip(
-        &mut self,
-        transaction_id: OutputTransactionId,
-        token: PageFlipToken,
-        presented_at: MonotonicTimestampNs,
-    ) -> io::Result<DirectPageflipCompletion> {
-        match self {
-            Self::AtomicEglGbm(scanout) => {
-                scanout.complete_direct_pageflip(transaction_id, token, presented_at)
-            }
-            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
-                "direct pageflip is unsupported by this backend",
-            )),
         }
     }
 

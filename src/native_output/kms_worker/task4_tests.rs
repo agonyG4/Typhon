@@ -135,6 +135,11 @@ fn direct_worker_tests_then_submits_the_same_primary_and_cursor_state() {
     assert_eq!(requests[0].cursor, requests[1].cursor);
     assert!(!requests[0].request_out_fence);
     assert!(requests[1].request_out_fence);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        KmsWorkerEvent::Submitted { ownership }
+            if ownership.job.test_only_duration_ns.is_some()
+    )));
 
     handle.ack_pageflip(token, transaction_id, 1).unwrap();
     drop(events);
@@ -168,6 +173,11 @@ fn direct_test_rejection_prevents_real_submit() {
     assert!(events.iter().any(|event| {
         matches!(event, KmsWorkerEvent::TestRejected { job, .. } if job.token.get() == 35)
     }));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        KmsWorkerEvent::TestRejected { job, .. }
+            if job.test_only_duration_ns.is_some()
+    )));
 
     drop(events);
     handle.request_quiesce();

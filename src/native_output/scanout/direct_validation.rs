@@ -1,3 +1,4 @@
+use super::*;
 use std::{
     collections::VecDeque,
     collections::hash_map::DefaultHasher,
@@ -5,6 +6,94 @@ use std::{
 };
 
 use oblivion_one::render_backend::buffer::DmabufBufferHandle;
+
+pub(crate) fn direct_cursor_content_key(
+    cursor: Option<&AtomicCursorVisualState>,
+    compatible: bool,
+) -> Option<CursorContentKey> {
+    compatible.then(|| {
+        cursor.map_or(
+            CursorContentKey {
+                visible: false,
+                framebuffer_id: None,
+                image_generation: 0,
+                hotspot_x: 0,
+                hotspot_y: 0,
+                width: 0,
+                height: 0,
+            },
+            CursorContentKey::from_state,
+        )
+    })
+}
+
+pub(crate) fn direct_cursor_atomic_validation_key(
+    cursor: Option<&AtomicCursorVisualState>,
+    compatible: bool,
+    cursor_plane_id: Option<u32>,
+) -> Option<CursorAtomicValidationKey> {
+    compatible
+        .then_some((cursor?, cursor_plane_id?))
+        .map(|(cursor, cursor_plane_id)| {
+            CursorAtomicValidationKey::from_state(cursor, cursor_plane_id)
+        })
+}
+
+/// Identity of the cursor image used for visual-content suppression.
+///
+/// Cursor movement is intentionally absent: moving an unchanged image does
+/// not change the cursor buffer's content identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CursorContentKey {
+    pub(crate) visible: bool,
+    pub(crate) framebuffer_id: Option<u32>,
+    pub(crate) image_generation: u64,
+    pub(crate) hotspot_x: i32,
+    pub(crate) hotspot_y: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+impl CursorContentKey {
+    pub(crate) fn from_state(state: &oblivion_one::native::kms::AtomicCursorVisualState) -> Self {
+        Self {
+            visible: state.visible,
+            framebuffer_id: state.framebuffer_id,
+            image_generation: state.image_generation,
+            hotspot_x: state.hotspot_x,
+            hotspot_y: state.hotspot_y,
+            width: state.width,
+            height: state.height,
+        }
+    }
+}
+
+/// Complete cursor assignment identity used by an atomic validation request.
+///
+/// This is deliberately distinct from [`CursorContentKey`]. Every field here
+/// is part of the cursor plane state sent to KMS, including position and the
+/// selected cursor plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CursorAtomicValidationKey {
+    pub(crate) content: CursorContentKey,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) cursor_plane_id: u32,
+}
+
+impl CursorAtomicValidationKey {
+    pub(crate) fn from_state(
+        state: &oblivion_one::native::kms::AtomicCursorVisualState,
+        cursor_plane_id: u32,
+    ) -> Self {
+        Self {
+            content: CursorContentKey::from_state(state),
+            x: state.x,
+            y: state.y,
+            cursor_plane_id,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct DirectPlaneValidationKey {
@@ -26,8 +115,8 @@ pub(crate) struct DirectPlaneValidationKey {
     pub(crate) buffer_height: u32,
     /// Stable plane offsets, strides, count, and modifiers used by AddFB2.
     pub(crate) plane_layout_hash: u64,
-    /// The exact primary-plus-cursor assignment fingerprint, if present.
-    pub(crate) cursor_plan_key: Option<u64>,
+    /// The complete cursor assignment used by atomic TEST_ONLY, if present.
+    pub(crate) cursor_atomic_key: Option<CursorAtomicValidationKey>,
     /// Stable input-fence, explicit-sync, and release-fence contract bits.
     pub(crate) synchronization_key: u64,
 }
@@ -78,7 +167,7 @@ pub(crate) fn test_validation_key(seed: u64) -> DirectPlaneValidationKey {
         buffer_width: 1920,
         buffer_height: 1080,
         plane_layout_hash: 0x1000,
-        cursor_plan_key: None,
+        cursor_atomic_key: None,
         synchronization_key: 0x2000,
     }
 }
@@ -135,7 +224,7 @@ mod tests {
             buffer_width: 1920,
             buffer_height: 1080,
             plane_layout_hash: 0x1000,
-            cursor_plan_key: None,
+            cursor_atomic_key: None,
             synchronization_key: 0x2000,
         }
     }
@@ -165,7 +254,20 @@ mod tests {
     #[test]
     fn validation_key_changes_with_cursor_assignment() {
         let mut changed = key(1);
-        changed.cursor_plan_key = Some(91);
+        changed.cursor_atomic_key = Some(CursorAtomicValidationKey {
+            content: CursorContentKey {
+                visible: true,
+                framebuffer_id: Some(1),
+                image_generation: 1,
+                hotspot_x: 0,
+                hotspot_y: 0,
+                width: 1,
+                height: 1,
+            },
+            x: 0,
+            y: 0,
+            cursor_plane_id: 1,
+        });
         assert_ne!(key(1), changed);
     }
 
@@ -284,4 +386,76 @@ mod tests {
         let cache = DirectPlaneValidationCache::default();
         assert!(!cache.contains(key(1)));
     }
+
+    fn cursor_state() -> oblivion_one::native::kms::AtomicCursorVisualState {
+        oblivion_one::native::kms::AtomicCursorVisualState {
+            visible: true,
+            x: 10,
+            y: 20,
+            hotspot_x: 3,
+            hotspot_y: 4,
+            width: 32,
+            height: 24,
+            framebuffer_id: Some(41),
+            image_generation: 7,
+        }
+    }
+
+    fn atomic_cursor_key() -> CursorAtomicValidationKey {
+        CursorAtomicValidationKey::from_state(&cursor_state(), 99)
+    }
+
+    #[test]
+    fn cursor_content_key_can_ignore_position() {
+        let first = cursor_state();
+        let mut second = first.clone();
+        second.x = 100;
+        second.y = 200;
+
+        assert_eq!(
+            CursorContentKey::from_state(&first),
+            CursorContentKey::from_state(&second)
+        );
+    }
+
+    #[test]
+    fn cursor_atomic_validation_key_never_ignores_position() {
+        let first = atomic_cursor_key();
+        let mut moved = cursor_state();
+        moved.x += 1;
+        assert_ne!(first, CursorAtomicValidationKey::from_state(&moved, 99));
+
+        let mut moved_y = cursor_state();
+        moved_y.y += 1;
+        assert_ne!(first, CursorAtomicValidationKey::from_state(&moved_y, 99));
+    }
+
+    macro_rules! cursor_atomic_key_changes_with {
+        ($name:ident, $field:ident, $value:expr) => {
+            #[test]
+            fn $name() {
+                let first = atomic_cursor_key();
+                let mut changed = cursor_state();
+                changed.$field = $value;
+                assert_ne!(first, CursorAtomicValidationKey::from_state(&changed, 99));
+            }
+        };
+    }
+
+    cursor_atomic_key_changes_with!(cursor_validation_key_changes_with_x, x, 11);
+    cursor_atomic_key_changes_with!(cursor_validation_key_changes_with_y, y, 21);
+    cursor_atomic_key_changes_with!(cursor_validation_key_changes_with_hotspot_x, hotspot_x, 5);
+    cursor_atomic_key_changes_with!(cursor_validation_key_changes_with_hotspot_y, hotspot_y, 6);
+    cursor_atomic_key_changes_with!(cursor_validation_key_changes_with_width, width, 33);
+    cursor_atomic_key_changes_with!(cursor_validation_key_changes_with_height, height, 25);
+    cursor_atomic_key_changes_with!(
+        cursor_validation_key_changes_with_framebuffer,
+        framebuffer_id,
+        Some(42)
+    );
+    cursor_atomic_key_changes_with!(
+        cursor_validation_key_changes_with_visibility,
+        visible,
+        false
+    );
 }

@@ -160,6 +160,7 @@ impl OutputTransactionRecord {
 pub(crate) struct AcceptedTerminalTransition {
     transaction_id: OutputTransactionId,
     obligations: super::transaction::OutputProtocolObligations,
+    prior_state: OutputTransactionState,
     terminal: OutputTransactionTerminal,
 }
 
@@ -175,6 +176,10 @@ impl AcceptedTerminalTransition {
     pub(crate) const fn terminal(self) -> OutputTransactionTerminal {
         self.terminal
     }
+
+    pub(crate) const fn prior_state(self) -> OutputTransactionState {
+        self.prior_state
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +193,7 @@ pub(crate) struct OutputTransactionCounters {
     pub(crate) failed: u64,
     pub(crate) invalid_transitions: u64,
     pub(crate) duplicate_obligation_attempts: u64,
+    pub(crate) duplicate_settlement_attempts: u64,
     pub(crate) active_peak: u64,
     pub(crate) terminal_history_overwrites: u64,
     pub(crate) terminal_transitions_accepted: u64,
@@ -377,6 +383,44 @@ impl OutputTransactionLedger {
         Ok(())
     }
 
+    pub(crate) fn rollback_queued(
+        &mut self,
+        id: OutputTransactionId,
+    ) -> Result<(), OutputTransactionError> {
+        let state = self.state(id)?;
+        if !matches!(state, OutputTransactionState::Queued { .. }) {
+            return Err(self.invalid_transition(state, OutputTransactionTransitionKind::Queued));
+        }
+        let content = self
+            .active
+            .get(&id)
+            .expect("queued transaction was observed above")
+            .descriptor
+            .content();
+        self.active
+            .get_mut(&id)
+            .expect("queued transaction was observed above")
+            .state = OutputTransactionState::Built;
+        self.counters.queued = self.counters.queued.saturating_sub(1);
+        match content {
+            OutputTransactionContent::Composited { .. } => {
+                self.counters.queued_composited = self.counters.queued_composited.saturating_sub(1)
+            }
+            OutputTransactionContent::Direct { .. } => {
+                self.counters.queued_direct = self.counters.queued_direct.saturating_sub(1)
+            }
+            OutputTransactionContent::CursorOnly { .. } => {
+                self.counters.queued_cursor_only =
+                    self.counters.queued_cursor_only.saturating_sub(1)
+            }
+            OutputTransactionContent::CompatibilityImmediate { .. } => {
+                self.counters.queued_compatibility =
+                    self.counters.queued_compatibility.saturating_sub(1)
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn mark_submitted(
         &mut self,
         id: OutputTransactionId,
@@ -438,11 +482,24 @@ impl OutputTransactionLedger {
         presented_at: MonotonicTimestampNs,
         actual_sequence: Option<u64>,
     ) -> Result<AcceptedTerminalTransition, OutputTransactionError> {
-        let (descriptor_generation, state) = self
+        let Some((descriptor_generation, state)) = self
             .active
             .get(&id)
             .map(|record| (record.descriptor.output_generation(), record.state))
-            .ok_or_else(|| self.reject_terminal(OutputTransactionError::UnknownTransaction))?;
+        else {
+            if self
+                .recent_terminal
+                .iter()
+                .any(|record| record.descriptor.id() == id)
+            {
+                self.counters.duplicate_settlement_attempts = self
+                    .counters
+                    .duplicate_settlement_attempts
+                    .saturating_add(1);
+                return Err(self.reject_terminal(OutputTransactionError::UnknownTransaction));
+            }
+            return Err(self.reject_terminal(OutputTransactionError::UnknownTransaction));
+        };
         if descriptor_generation != output_generation {
             return Err(self.reject_terminal(OutputTransactionError::GenerationMismatch));
         }
@@ -654,6 +711,26 @@ impl OutputTransactionLedger {
         self.finish_settling(accepted.transaction_id, accepted.terminal)
     }
 
+    pub(crate) fn commit_prepared_terminal(&mut self, accepted: AcceptedTerminalTransition) {
+        let record = self
+            .active
+            .get(&accepted.transaction_id)
+            .expect("prepared terminal transaction disappeared before commit");
+        debug_assert_eq!(
+            record.state,
+            OutputTransactionState::Settling {
+                terminal: accepted.terminal,
+            }
+        );
+        if let Some(batch_id) = record.descriptor.obligations().frame_batch_id() {
+            debug_assert_eq!(
+                self.obligation_owner.get(&batch_id),
+                Some(&accepted.transaction_id)
+            );
+        }
+        self.finish_settling_committed(accepted.transaction_id, accepted.terminal);
+    }
+
     pub(crate) fn fail_settlement(
         &mut self,
         accepted: AcceptedTerminalTransition,
@@ -764,6 +841,13 @@ impl OutputTransactionLedger {
         self.counters
     }
 
+    pub(crate) fn note_duplicate_settlement_attempt(&mut self) {
+        self.counters.duplicate_settlement_attempts = self
+            .counters
+            .duplicate_settlement_attempts
+            .saturating_add(1);
+    }
+
     pub(crate) const fn last_created(&self) -> Option<OutputTransactionId> {
         self.last_created
     }
@@ -784,11 +868,33 @@ impl OutputTransactionLedger {
         terminal: OutputTransactionTerminal,
     ) -> Result<AcceptedTerminalTransition, OutputTransactionError> {
         let Some(state) = self.active.get(&id).map(|record| record.state) else {
+            if let Some(state) = self
+                .recent_terminal
+                .iter()
+                .find(|record| record.descriptor.id() == id)
+                .map(|record| record.state)
+            {
+                if transition_for_terminal(terminal) == OutputTransactionTransitionKind::Presented {
+                    self.counters.duplicate_settlement_attempts = self
+                        .counters
+                        .duplicate_settlement_attempts
+                        .saturating_add(1);
+                }
+                return Err(
+                    self.reject_invalid_transition(state, transition_for_terminal(terminal))
+                );
+            }
             return Err(self.reject_terminal(OutputTransactionError::UnknownTransaction));
         };
         if matches!(state, OutputTransactionState::Settling { .. })
             || matches!(state, OutputTransactionState::Terminal(_))
         {
+            if transition_for_terminal(terminal) == OutputTransactionTransitionKind::Presented {
+                self.counters.duplicate_settlement_attempts = self
+                    .counters
+                    .duplicate_settlement_attempts
+                    .saturating_add(1);
+            }
             return Err(self.reject_invalid_transition(state, transition_for_terminal(terminal)));
         }
         let obligations = self
@@ -805,6 +911,7 @@ impl OutputTransactionLedger {
         let accepted = AcceptedTerminalTransition {
             transaction_id: id,
             obligations,
+            prior_state: state,
             terminal,
         };
         self.active
@@ -818,6 +925,33 @@ impl OutputTransactionLedger {
         self.counters.active_settling_transactions =
             self.counters.active_settling_transactions.saturating_add(1);
         Ok(accepted)
+    }
+
+    pub(crate) fn rollback_settlement(
+        &mut self,
+        accepted: AcceptedTerminalTransition,
+    ) -> Result<(), OutputTransactionError> {
+        let state = self
+            .active
+            .get(&accepted.transaction_id)
+            .map(|record| record.state)
+            .ok_or_else(|| self.reject_terminal(OutputTransactionError::UnknownTransaction))?;
+        if state
+            != (OutputTransactionState::Settling {
+                terminal: accepted.terminal,
+            })
+        {
+            return Err(
+                self.reject_invalid_transition(state, transition_for_terminal(accepted.terminal))
+            );
+        }
+        self.active
+            .get_mut(&accepted.transaction_id)
+            .expect("settling transaction was observed above")
+            .state = accepted.prior_state;
+        self.counters.active_settling_transactions =
+            self.counters.active_settling_transactions.saturating_sub(1);
+        Ok(())
     }
 
     fn finish_settling(
@@ -848,10 +982,19 @@ impl OutputTransactionLedger {
         {
             return Err(self.reject_terminal(OutputTransactionError::DuplicateObligationOwner));
         }
+        self.finish_settling_committed(id, terminal);
+        Ok(())
+    }
+
+    fn finish_settling_committed(
+        &mut self,
+        id: OutputTransactionId,
+        terminal: OutputTransactionTerminal,
+    ) {
         let mut record = self
             .active
             .remove(&id)
-            .ok_or_else(|| self.reject_terminal(OutputTransactionError::UnknownTransaction))?;
+            .expect("validated settling transaction disappeared before commit");
         let content = record.descriptor.content();
         if let Some(batch_id) = record.descriptor.obligations().frame_batch_id()
             && self.obligation_owner.get(&batch_id).copied() == Some(id)
@@ -927,7 +1070,6 @@ impl OutputTransactionLedger {
                 }
             }
         }
-        Ok(())
     }
 
     fn reject_terminal(&mut self, error: OutputTransactionError) -> OutputTransactionError {

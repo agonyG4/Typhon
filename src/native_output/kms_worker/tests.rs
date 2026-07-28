@@ -207,6 +207,7 @@ pub(super) fn test_job(token: u64) -> KmsCommitJob {
         cursor: KmsCursorUpdate::Unchanged,
         cursor_pin: None,
         direct_primary_lease: None,
+        test_only_duration_ns: None,
         pacing_frame_id: None,
         test_only: KmsTestOnlyPolicy::Skip,
         ready_submit: false,

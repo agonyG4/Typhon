@@ -72,7 +72,7 @@ pub(super) fn inspect_direct_presentation(
         DirectScanoutCandidateKey::from_candidate(
             candidate,
             inputs.drm_file_generation,
-            super::scanout::direct_cursor_plan_key(
+            super::scanout::direct_cursor_content_key(
                 inputs.effective_cursor,
                 cursor_direct_compatible,
             ),
@@ -164,7 +164,7 @@ mod tests {
                 0,
             ),
             output_generation: 1,
-            cursor_plan_key: None,
+            cursor_content_key: None,
             color_epoch: 0,
         }
     }

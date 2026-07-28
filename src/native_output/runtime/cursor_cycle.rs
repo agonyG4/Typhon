@@ -304,6 +304,47 @@ pub(crate) fn complete_primary_cursor_pageflip(
     Ok(())
 }
 
+pub(crate) fn prepare_primary_cursor_pageflip(
+    atomic_cursor: &Option<NativeAtomicCursor>,
+    pageflip_token: u64,
+    generation: u64,
+) -> io::Result<bool> {
+    let Some(cursor) = atomic_cursor.as_ref() else {
+        return Ok(false);
+    };
+    if !cursor.pending_is_primary()
+        || cursor
+            .pending_token()
+            .is_none_or(|token| token.get() != pageflip_token)
+    {
+        return Ok(false);
+    }
+    cursor.prepare_submission_completion(
+        PageFlipToken::new(pageflip_token)
+            .ok_or_else(|| io::Error::other("cursor pageflip token is zero"))?,
+        generation,
+    )?;
+    Ok(true)
+}
+
+pub(crate) fn commit_primary_cursor_pageflip(
+    atomic_cursor: &mut Option<NativeAtomicCursor>,
+    pageflip_token: u64,
+    generation: u64,
+) {
+    if let Some(cursor) = atomic_cursor.as_mut()
+        && cursor.pending_is_primary()
+        && cursor
+            .pending_token()
+            .is_some_and(|token| token.get() == pageflip_token)
+    {
+        cursor.commit_submission_completion(
+            PageFlipToken::new(pageflip_token).expect("prepared cursor pageflip token is nonzero"),
+            generation,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

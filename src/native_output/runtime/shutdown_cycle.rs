@@ -5,6 +5,9 @@ impl NativeRuntime {
     pub(super) fn request_native_shutdown(&mut self) -> NativeResult<()> {
         let now_ns = monotonic_now_ns()?;
         let first_request = self.shutdown.is_running();
+        if first_request {
+            self.abandon_direct_fallback();
+        }
         let worker_inflight = if first_request {
             NativeSessionIo::observe(self, NativeIoOperation::KmsWorkerStopAdmission);
             self.stop_kms_worker_admission_for_shutdown()?

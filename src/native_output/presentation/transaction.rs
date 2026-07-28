@@ -6,7 +6,7 @@ use oblivion_one::compositor::{CompositorFrameBatchId, DirectScanoutSceneCandida
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
 
-use crate::native_output::scanout::OutputSlotId;
+use crate::native_output::scanout::{CursorContentKey, OutputSlotId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ContentEpochId(NonZeroU64);
@@ -679,7 +679,7 @@ impl OutputContentKey {
 pub(crate) struct DirectScanoutCandidateKey {
     pub(crate) content: OutputContentKey,
     pub(crate) output_generation: u64,
-    pub(crate) cursor_plan_key: Option<u64>,
+    pub(crate) cursor_content_key: Option<CursorContentKey>,
     pub(crate) color_epoch: u64,
 }
 
@@ -687,7 +687,7 @@ impl DirectScanoutCandidateKey {
     pub(crate) fn from_candidate(
         candidate: &DirectScanoutSceneCandidate,
         output_generation: u64,
-        cursor_plan_key: Option<u64>,
+        cursor_content_key: Option<CursorContentKey>,
         color_epoch: u64,
     ) -> Option<Self> {
         let buffer_id = NonZeroU64::new(candidate.buffer_identity.id().get())?;
@@ -706,7 +706,7 @@ impl DirectScanoutCandidateKey {
                 color_epoch,
             ),
             output_generation,
-            cursor_plan_key,
+            cursor_content_key,
             color_epoch,
         })
     }

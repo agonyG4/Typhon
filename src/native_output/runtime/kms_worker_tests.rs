@@ -66,7 +66,7 @@ fn test_direct_key() -> DirectScanoutCandidateKey {
             0,
         ),
         output_generation: 1,
-        cursor_plan_key: None,
+        cursor_content_key: None,
         color_epoch: 0,
     }
 }
@@ -105,6 +105,7 @@ fn test_uncertain_direct_job(lease: DirectPrimaryLease) -> KmsCommitJob {
         cursor: KmsCursorUpdate::Unchanged,
         cursor_pin: None,
         direct_primary_lease: Some(lease),
+        test_only_duration_ns: None,
         pacing_frame_id: None,
         test_only: KmsTestOnlyPolicy::Skip,
         ready_submit: false,

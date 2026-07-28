@@ -30,6 +30,7 @@ pub(crate) struct KmsCommitJob {
     /// terminal point.
     pub(crate) cursor_pin: Option<CursorFramebufferPin>,
     pub(crate) direct_primary_lease: Option<DirectPrimaryLease>,
+    pub(crate) test_only_duration_ns: Option<u64>,
     pub(crate) pacing_frame_id: Option<u64>,
     pub(crate) test_only: KmsTestOnlyPolicy,
     pub(crate) ready_submit: bool,

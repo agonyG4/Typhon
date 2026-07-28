@@ -1,6 +1,6 @@
 use super::{
-    ContentEpochId, ContentEpochTracker, DirectScanoutCandidateKey, OutputContentKey,
-    OutputTransactionAllocator, OutputTransactionContent, OutputTransactionId,
+    ContentEpochId, ContentEpochTracker, CursorContentKey, DirectScanoutCandidateKey,
+    OutputContentKey, OutputTransactionAllocator, OutputTransactionContent, OutputTransactionId,
     OutputTransactionState,
 };
 use crate::native_output::presentation::qualification::{DirectReleaseMode, DirectSyncReadiness};
@@ -115,7 +115,15 @@ fn candidate_key_ignores_protocol_only_work_but_tracks_visual_epochs() {
     let base = DirectScanoutCandidateKey {
         content,
         output_generation: 1,
-        cursor_plan_key: Some(1),
+        cursor_content_key: Some(CursorContentKey {
+            visible: true,
+            framebuffer_id: Some(1),
+            image_generation: 1,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            width: 1,
+            height: 1,
+        }),
         color_epoch: 0,
     };
 
@@ -133,7 +141,10 @@ fn candidate_key_ignores_protocol_only_work_but_tracks_visual_epochs() {
     assert_ne!(
         base,
         DirectScanoutCandidateKey {
-            cursor_plan_key: Some(2),
+            cursor_content_key: Some(CursorContentKey {
+                image_generation: 2,
+                ..base.cursor_content_key.expect("cursor content key")
+            }),
             ..base
         }
     );
@@ -619,6 +630,28 @@ fn missing_obligation_owner_rejects_terminal_acceptance() {
         ledger.transaction(id).unwrap().state(),
         super::OutputTransactionState::Submitted { .. }
     ));
+}
+
+#[test]
+fn prepared_presented_transition_commits_without_a_second_ledger_validation() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let batch_id = test_batch(112);
+    let transaction = test_composited_transaction(&mut ledger, batch_id, 1);
+    let id = transaction.id();
+    let token = super::PageFlipToken::new(112).unwrap();
+    ledger.insert(transaction).unwrap();
+    ledger
+        .mark_submitted(id, token, MonotonicTimestampNs::new(20))
+        .unwrap();
+
+    let prepared = ledger
+        .accept_presented(id, token, 1, MonotonicTimestampNs::new(30), Some(2))
+        .unwrap();
+    ledger.commit_prepared_terminal(prepared);
+
+    assert!(ledger.transaction(id).is_none());
+    assert_eq!(ledger.obligation_owner(batch_id), None);
+    assert_eq!(ledger.counters().presented, 1);
 }
 
 #[test]
@@ -1318,7 +1351,7 @@ fn test_direct_key() -> DirectScanoutCandidateKey {
     DirectScanoutCandidateKey {
         content,
         output_generation: 1,
-        cursor_plan_key: None,
+        cursor_content_key: None,
         color_epoch: 0,
     }
 }

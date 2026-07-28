@@ -1,3 +1,4 @@
+use super::cycle::direct_fallback::DirectFallbackReason;
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +99,13 @@ impl NativeRuntime {
             WorkerRejectionKind::TestOnly => "test_only_rejected",
             WorkerRejectionKind::RealSubmit => "real_submit_rejected",
         });
+        self.begin_direct_fallback(
+            direct_job.transaction_id,
+            match rejection_kind {
+                WorkerRejectionKind::TestOnly => DirectFallbackReason::TestOnlyRejected,
+                WorkerRejectionKind::RealSubmit => DirectFallbackReason::RealSubmitRejected,
+            },
+        );
         if rejection_policy.request_composited_redraw {
             self.scanout.note_direct_fallback_redraw();
             self.queued_redraw_requested = true;

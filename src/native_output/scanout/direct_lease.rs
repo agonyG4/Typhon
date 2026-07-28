@@ -71,6 +71,12 @@ impl DirectPrimaryLease {
         self.framebuffer.framebuffer.get()
     }
 
+    pub(crate) fn clone_surface_damage(&self) -> io::Result<SurfaceDamagePresentation> {
+        self.surface_damage
+            .clone()
+            .ok_or_else(|| io::Error::other("direct surface damage is already settled"))
+    }
+
     pub(crate) fn take_surface_damage(&mut self) -> io::Result<SurfaceDamagePresentation> {
         self.surface_damage
             .take()

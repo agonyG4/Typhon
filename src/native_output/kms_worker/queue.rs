@@ -313,6 +313,11 @@ impl WorkerShared {
         (queued, executing, inflight)
     }
 
+    pub(crate) fn direct_candidate_in_flight(&self, key: DirectScanoutCandidateKey) -> bool {
+        let (queued, executing, inflight) = self.direct_content_keys();
+        queued == Some(key) || executing == Some(key) || inflight == Some(key)
+    }
+
     pub(crate) fn try_reserve(
         self: &Arc<Self>,
     ) -> Result<KmsCommitAdmissionPermit, KmsWorkerAdmissionError> {

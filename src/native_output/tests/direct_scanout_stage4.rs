@@ -46,7 +46,7 @@ fn test_direct_key(content_epoch: u64) -> DirectScanoutCandidateKey {
     DirectScanoutCandidateKey {
         content,
         output_generation: 1,
-        cursor_plan_key: None,
+        cursor_content_key: None,
         color_epoch: 0,
     }
 }
@@ -157,7 +157,7 @@ fn new_content_epoch_can_reuse_validation_key_but_still_submits() {
         buffer_width: 1920,
         buffer_height: 1080,
         plane_layout_hash: 9,
-        cursor_plan_key: None,
+        cursor_atomic_key: None,
         synchronization_key: 10,
     };
 
@@ -326,6 +326,99 @@ fn direct_pageflip_is_the_only_presented_transition() {
             actual_sequence: Some(2),
         })
     );
+}
+
+#[test]
+fn direct_admission_rollback_restores_built_transaction_before_enqueue() {
+    let mut ledger = OutputTransactionLedger::with_capacities(8, 64);
+    let transaction_id = test_transaction_id(52);
+    ledger
+        .insert(
+            OutputTransaction::direct(
+                transaction_id,
+                1,
+                MonotonicTimestampNs::new(10),
+                test_target(),
+                NativeOutputPacingMode::ReactiveDouble,
+                52,
+                test_direct_key(3),
+                92,
+                None,
+                test_frame_batch_id(52),
+                7,
+                OutputReleasePlan::Pageflip,
+            )
+            .expect("direct transaction"),
+        )
+        .expect("insert direct transaction");
+    ledger
+        .mark_queued(transaction_id, 1, MonotonicTimestampNs::new(11))
+        .expect("queue direct transaction");
+
+    ledger
+        .rollback_queued(transaction_id)
+        .expect("rollback direct queue admission");
+
+    assert!(matches!(
+        ledger
+            .transaction(transaction_id)
+            .expect("transaction")
+            .state(),
+        OutputTransactionState::Built
+    ));
+    assert_eq!(ledger.counters().queued, 0);
+}
+
+#[test]
+fn duplicate_transaction_settlement_is_counted_and_suppressed() {
+    let mut ledger = OutputTransactionLedger::with_capacities(8, 64);
+    let transaction_id = test_transaction_id(53);
+    let token = PageFlipToken::new(53).expect("pageflip token");
+    ledger
+        .insert(
+            OutputTransaction::direct(
+                transaction_id,
+                1,
+                MonotonicTimestampNs::new(10),
+                test_target(),
+                NativeOutputPacingMode::ReactiveDouble,
+                53,
+                test_direct_key(3),
+                92,
+                None,
+                test_frame_batch_id(53),
+                7,
+                OutputReleasePlan::Pageflip,
+            )
+            .expect("direct transaction"),
+        )
+        .expect("insert direct transaction");
+    ledger
+        .mark_submitted(transaction_id, token, MonotonicTimestampNs::new(11))
+        .expect("submit direct transaction");
+    ledger
+        .mark_presented(
+            transaction_id,
+            token,
+            1,
+            MonotonicTimestampNs::new(12),
+            Some(4),
+        )
+        .expect("present direct transaction");
+
+    assert!(
+        ledger
+            .mark_presented(
+                transaction_id,
+                token,
+                1,
+                MonotonicTimestampNs::new(13),
+                Some(5),
+            )
+            .is_err()
+    );
+    assert_eq!(ledger.counters().duplicate_settlement_attempts, 1);
+    assert_eq!(ledger.counters().presented_direct, 1);
 }
 
 fn test_feedback_capabilities() -> DirectScanoutFeedbackCapabilities {

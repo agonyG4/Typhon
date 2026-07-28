@@ -1,5 +1,12 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy)]
+pub struct PreparedDirectFrameBatch {
+    pub(crate) frame_id: u64,
+    pub(crate) batch_id: CompositorFrameBatchId,
+    pub(crate) direct_surface_id: u32,
+}
+
 impl OwnCompositorServer {
     #[doc(hidden)]
     pub fn has_prepared_frame_batch(&self) -> bool {
@@ -22,6 +29,48 @@ impl OwnCompositorServer {
     #[doc(hidden)]
     pub fn frame_batch_count(&self) -> usize {
         self.state.frame_batches.len()
+    }
+
+    pub fn has_frame_batch(&self, batch_id: CompositorFrameBatchId) -> bool {
+        self.state.frame_batches.contains_key(&batch_id)
+    }
+
+    pub fn prepare_direct_presented_frame_batch(
+        &self,
+        frame_id: u64,
+        batch_id: CompositorFrameBatchId,
+        direct_surface_id: u32,
+    ) -> io::Result<PreparedDirectFrameBatch> {
+        let batch = self
+            .state
+            .frame_batches
+            .get(&batch_id)
+            .ok_or_else(|| io::Error::other("direct pageflip frame batch is not owned"))?;
+        if batch.frame_id != frame_id {
+            return Err(io::Error::other(
+                "direct pageflip frame batch frame identity does not match",
+            ));
+        }
+        Ok(PreparedDirectFrameBatch {
+            frame_id,
+            batch_id,
+            direct_surface_id,
+        })
+    }
+
+    pub fn commit_prepared_direct_presented_frame_batch(
+        &mut self,
+        prepared: PreparedDirectFrameBatch,
+        presentation: FramePresentation,
+    ) -> u64 {
+        let callback_owner_leaks = self.state.complete_direct_presented_frame_batch(
+            prepared.frame_id,
+            prepared.batch_id,
+            prepared.direct_surface_id,
+            presentation,
+        );
+        let _ = self.display.flush_clients();
+        callback_owner_leaks
     }
 
     #[doc(hidden)]

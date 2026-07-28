@@ -948,7 +948,7 @@ fn test_confirmed_direct_key() -> DirectScanoutCandidateKey {
             0,
         ),
         output_generation: 1,
-        cursor_plan_key: None,
+        cursor_content_key: None,
         color_epoch: 0,
     }
 }

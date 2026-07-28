@@ -6,37 +6,40 @@ usage() {
 Usage: qualify-direct-scanout PERF_LOG
        qualify-direct-scanout --self-test
 
-Check the final perf native.scheduler record for the Stage 4 direct-scanout
-qualification invariants.
+Validate the final complete native.scheduler Direct Scanout 2.0 metric sample.
 EOF
+}
+
+final_record() {
+    local log_path="$1"
+    awk '$1 == "perf" && $2 == "native.scheduler" { record = $0 } END { if (record == "") exit 1; print record }' "$log_path"
 }
 
 metric() {
     local log_path="$1"
     local key="$2"
+    local record
+    record="$(final_record "$log_path")" || return 1
     awk -v key="$key" '
-        $1 == "perf" && $2 == "native.scheduler" { record = $0 }
-        END {
-            if (record == "") exit 1
-            count = split(record, fields, " ")
+        {
             prefix = key "="
-            for (i = 1; i <= count; i++) {
-                if (index(fields[i], prefix) == 1) {
-                    print substr(fields[i], length(prefix) + 1)
+            for (i = 3; i <= NF; i++) {
+                if (index($i, prefix) == 1) {
+                    print substr($i, length(prefix) + 1)
                     exit 0
                 }
             }
             exit 1
         }
-    ' "$log_path"
+    ' <<<"$record"
 }
 
 check_log() {
     local log_path="$1"
     local failures=0
 
-    printf '%-46s %s\n' "direct-scanout invariant" "result"
-    printf '%-46s %s\n' "----------------------------------------------" "------"
+    printf '%-58s %s\n' "direct-scanout invariant" "result"
+    printf '%-58s %s\n' "----------------------------------------------------------" "------"
 
     check_at_least() {
         local key="$1"
@@ -44,9 +47,9 @@ check_log() {
         local value
         value="$(metric "$log_path" "$key" 2>/dev/null || true)"
         if [[ "$value" =~ ^[0-9]+$ ]] && (( value >= minimum )); then
-            printf '%-46s PASS (%s)\n' "$key >= $minimum" "$value"
+            printf '%-58s PASS (%s)\n' "$key >= $minimum" "$value"
         else
-            printf '%-46s FAIL (%s)\n' "$key >= $minimum" "${value:-missing}"
+            printf '%-58s FAIL (%s)\n' "$key >= $minimum" "${value:-missing}"
             failures=$((failures + 1))
         fi
     }
@@ -56,13 +59,53 @@ check_log() {
         local value
         value="$(metric "$log_path" "$key" 2>/dev/null || true)"
         if [[ "$value" =~ ^[0-9]+$ ]] && (( value == 0 )); then
-            printf '%-46s PASS\n' "$key == 0"
+            printf '%-58s PASS\n' "$key == 0"
         else
-            printf '%-46s FAIL (%s)\n' "$key == 0" "${value:-missing}"
+            printf '%-58s FAIL (%s)\n' "$key == 0" "${value:-missing}"
             failures=$((failures + 1))
         fi
     }
 
+    check_nonnegative() {
+        local key="$1"
+        local value
+        value="$(metric "$log_path" "$key" 2>/dev/null || true)"
+        if [[ "$value" =~ ^[0-9]+$ ]]; then
+            printf '%-58s PASS (%s)\n' "$key >= 0" "$value"
+        else
+            printf '%-58s FAIL (%s)\n' "$key >= 0" "${value:-missing}"
+            failures=$((failures + 1))
+        fi
+    }
+
+    check_empty() {
+        local key="$1"
+        local value
+        value="$(metric "$log_path" "$key" 2>/dev/null || true)"
+        if [[ "$value" == "none" || "$value" == "empty" || "$value" == "" ]]; then
+            printf '%-58s PASS\n' "$key is empty"
+        else
+            printf '%-58s FAIL (%s)\n' "$key is empty" "${value:-missing}"
+            failures=$((failures + 1))
+        fi
+    }
+
+    check_identity_number() {
+        local key="$1"
+        local value
+        value="$(metric "$log_path" "$key" 2>/dev/null || true)"
+        if [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+            printf '%-58s PASS (%s)\n' "$key is nonempty" "$value"
+        else
+            printf '%-58s FAIL (%s)\n' "$key is nonempty" "${value:-missing}"
+            failures=$((failures + 1))
+        fi
+    }
+
+    check_at_least direct_scanout_candidate_checks 1
+    check_at_least direct_scanout_candidates_accepted 1
+    check_at_least direct_scanout_test_only_attempts 1
+    check_at_least direct_scanout_real_submit_attempts 1
     check_at_least direct_scanout_entries 1
     check_at_least direct_scanout_presentations 1
     check_at_least direct_scanout_replacements 1
@@ -71,28 +114,86 @@ check_log() {
 
     check_zero direct_scanout_duplicate_feedback
     check_zero direct_scanout_duplicate_settlement
-    check_zero direct_scanout_early_release_prevented
     check_zero direct_scanout_same_buffer_resubmissions
     check_zero direct_scanout_worker_queue_overflow
     check_zero direct_scanout_callback_owner_leaks
+    check_zero direct_scanout_early_release_violations
 
-    local active surface framebuffer epoch
-    active="$(metric "$log_path" direct_scanout_active 2>/dev/null || true)"
-    surface="$(metric "$log_path" direct_scanout_presented_surface 2>/dev/null || true)"
-    framebuffer="$(metric "$log_path" direct_scanout_presented_framebuffer 2>/dev/null || true)"
-    epoch="$(metric "$log_path" direct_scanout_presented_content_epoch 2>/dev/null || true)"
-    if [[ "$active" == "false" ]] \
-        && [[ "$surface" =~ ^[0-9]+$ && "$framebuffer" =~ ^[0-9]+$ && "$epoch" =~ ^[0-9]+$ ]] \
-        && (( surface == 0 && framebuffer == 0 && epoch == 0 )); then
-        printf '%-46s PASS\n' "inactive presented identity is empty"
-    elif [[ "$active" == "true" ]] \
-        && [[ "$surface" =~ ^[0-9]+$ && "$framebuffer" =~ ^[0-9]+$ && "$epoch" =~ ^[0-9]+$ ]] \
-        && (( surface > 0 && framebuffer > 0 && epoch > 0 )); then
-        printf '%-46s PASS\n' "active presented identity is complete"
+    local attempts total timing_active
+    attempts="$(metric "$log_path" direct_scanout_test_only_attempts 2>/dev/null || true)"
+    total="$(metric "$log_path" direct_scanout_test_only_duration_ns_total 2>/dev/null || true)"
+    timing_active="$(metric "$log_path" direct_scanout_test_only_duration_ns_last 2>/dev/null || true)"
+    if [[ "$attempts" =~ ^[0-9]+$ && "$total" =~ ^[0-9]+$ && "$timing_active" =~ ^[0-9]+$ ]] \
+        && (( attempts > 0 && total > 0 )); then
+        printf '%-58s PASS (attempts=%s total_ns=%s last_ns=%s)\n' \
+            "TEST_ONLY timing exists" "$attempts" "$total" "$timing_active"
     else
-        printf '%-46s FAIL (%s,%s,%s,%s)\n' \
-            "presented identity matches active state" \
-            "${active:-missing}" "${surface:-missing}" "${framebuffer:-missing}" "${epoch:-missing}"
+        printf '%-58s FAIL (attempts=%s total_ns=%s last_ns=%s)\n' \
+            "TEST_ONLY timing exists" "${attempts:-missing}" "${total:-missing}" "${timing_active:-missing}"
+        failures=$((failures + 1))
+    fi
+    check_nonnegative direct_scanout_fallback_cycles_last
+
+    local active live fallback_active
+    active="$(metric "$log_path" direct_scanout_active 2>/dev/null || true)"
+    live="$(metric "$log_path" direct_scanout_live_leases 2>/dev/null || true)"
+    fallback_active="$(metric "$log_path" direct_scanout_fallback_active 2>/dev/null || true)"
+    if [[ "$fallback_active" != "false" ]]; then
+        printf '%-58s FAIL (%s)\n' "fallback tracker is inactive in final sample" "${fallback_active:-missing}"
+        failures=$((failures + 1))
+    else
+        printf '%-58s PASS\n' "fallback tracker is inactive in final sample"
+    fi
+
+    local submitted_surface submitted_buffer submitted_framebuffer submitted_epoch
+    local presented_surface presented_buffer presented_framebuffer presented_epoch
+    submitted_surface="$(metric "$log_path" direct_scanout_submitted_surface 2>/dev/null || true)"
+    submitted_buffer="$(metric "$log_path" direct_scanout_submitted_buffer 2>/dev/null || true)"
+    submitted_framebuffer="$(metric "$log_path" direct_scanout_submitted_framebuffer 2>/dev/null || true)"
+    submitted_epoch="$(metric "$log_path" direct_scanout_submitted_content_epoch 2>/dev/null || true)"
+    presented_surface="$(metric "$log_path" direct_scanout_presented_surface 2>/dev/null || true)"
+    presented_buffer="$(metric "$log_path" direct_scanout_presented_buffer 2>/dev/null || true)"
+    presented_framebuffer="$(metric "$log_path" direct_scanout_presented_framebuffer 2>/dev/null || true)"
+    presented_epoch="$(metric "$log_path" direct_scanout_presented_content_epoch 2>/dev/null || true)"
+
+    if [[ "$active" == "false" ]]; then
+        if [[ "$live" == "0" ]] \
+            && [[ "$submitted_surface" == "none" && "$submitted_buffer" == "none" \
+                && "$submitted_framebuffer" == "none" && "$submitted_epoch" == "none" ]] \
+            && [[ "$presented_surface" == "none" && "$presented_buffer" == "none" \
+                && "$presented_framebuffer" == "none" && "$presented_epoch" == "none" ]]; then
+            printf '%-58s PASS\n' "inactive final state owns no direct lease or identity"
+        else
+            printf '%-58s FAIL\n' "inactive final state owns no direct lease or identity"
+            failures=$((failures + 1))
+        fi
+    elif [[ "$active" == "true" ]]; then
+        if [[ "$live" =~ ^[1-9][0-9]*$ ]] \
+            && [[ "$presented_surface" =~ ^[1-9][0-9]*$ \
+                && "$presented_buffer" =~ ^[1-9][0-9]*$ \
+                && "$presented_framebuffer" =~ ^[1-9][0-9]*$ \
+                && "$presented_epoch" =~ ^[1-9][0-9]*$ ]]; then
+            printf '%-58s PASS\n' "active final state has complete presented identity"
+        else
+            printf '%-58s FAIL\n' "active final state has complete presented identity"
+            failures=$((failures + 1))
+        fi
+        if [[ "$submitted_surface" == "none" && "$submitted_buffer" == "none" \
+            && "$submitted_framebuffer" == "none" && "$submitted_epoch" == "none" ]]; then
+            printf '%-58s PASS\n' "active submitted identity is empty"
+        elif [[ "$submitted_surface" =~ ^[1-9][0-9]*$ \
+            && "$submitted_buffer" =~ ^[1-9][0-9]*$ \
+            && "$submitted_framebuffer" =~ ^[1-9][0-9]*$ \
+            && "$submitted_epoch" =~ ^[1-9][0-9]*$ \
+            && "$submitted_surface:$submitted_buffer:$submitted_framebuffer:$submitted_epoch" \
+                != "$presented_surface:$presented_buffer:$presented_framebuffer:$presented_epoch" ]]; then
+            printf '%-58s PASS\n' "active submitted identity is complete and distinct"
+        else
+            printf '%-58s FAIL\n' "active submitted identity is complete and distinct"
+            failures=$((failures + 1))
+        fi
+    else
+        printf '%-58s FAIL (%s)\n' "direct_scanout_active is boolean" "${active:-missing}"
         failures=$((failures + 1))
     fi
 
@@ -100,24 +201,24 @@ check_log() {
 }
 
 self_test() {
-    local fixture base active_line missing_field missing_positive
+    local fixture base active earlier_fail final_fail
     fixture="$(mktemp)"
-    trap "rm -f '$fixture'" EXIT
-    base='perf native.scheduler direct_scanout_active=false direct_scanout_presented_surface=0 direct_scanout_presented_framebuffer=0 direct_scanout_presented_content_epoch=0 direct_scanout_entries=1 direct_scanout_presentations=1 direct_scanout_replacements=1 direct_scanout_exits=1 direct_scanout_composited_fallbacks=1 direct_scanout_duplicate_feedback=0 direct_scanout_duplicate_settlement=0 direct_scanout_early_release_prevented=0 direct_scanout_same_buffer_resubmissions=0 direct_scanout_worker_queue_overflow=0 direct_scanout_callback_owner_leaks=0'
+    trap "rm -f -- \"$fixture\"" EXIT
+    base='perf native.scheduler direct_scanout_active=false direct_scanout_fallback_active=false direct_scanout_live_leases=0 direct_scanout_submitted_surface=none direct_scanout_submitted_buffer=none direct_scanout_submitted_framebuffer=none direct_scanout_submitted_content_epoch=none direct_scanout_presented_surface=none direct_scanout_presented_buffer=none direct_scanout_presented_framebuffer=none direct_scanout_presented_content_epoch=none direct_scanout_candidate_checks=1 direct_scanout_candidates_accepted=1 direct_scanout_test_only_attempts=1 direct_scanout_test_only_duration_ns_last=10 direct_scanout_test_only_duration_ns_max=10 direct_scanout_test_only_duration_ns_total=10 direct_scanout_real_submit_attempts=1 direct_scanout_entries=1 direct_scanout_presentations=1 direct_scanout_replacements=1 direct_scanout_exits=1 direct_scanout_composited_fallbacks=1 direct_scanout_fallback_cycles_last=0 direct_scanout_duplicate_feedback=0 direct_scanout_duplicate_settlement=0 direct_scanout_same_buffer_resubmissions=0 direct_scanout_worker_queue_overflow=0 direct_scanout_callback_owner_leaks=0 direct_scanout_early_release_prevented=0 direct_scanout_early_release_violations=0'
 
-    # The final record must be selected, not an earlier failed sample.
-    printf '%s\n%s\n' \
-        "${base/direct_scanout_replacements=1/direct_scanout_replacements=0}" "$base" >"$fixture"
+    printf '%s\n' "$base" >"$fixture"
     check_log "$fixture" >/dev/null
-    printf '%s\n' "self-test: final-sample selection PASS"
+    printf '%s\n' "self-test: passing inactive final state PASS"
 
-    active_line="${base/direct_scanout_active=false/direct_scanout_active=true}"
-    active_line="${active_line/direct_scanout_presented_surface=0/direct_scanout_presented_surface=7}"
-    active_line="${active_line/direct_scanout_presented_framebuffer=0/direct_scanout_presented_framebuffer=8}"
-    active_line="${active_line/direct_scanout_presented_content_epoch=0/direct_scanout_presented_content_epoch=9}"
-    printf '%s\n' "$active_line" >"$fixture"
+    active="${base/direct_scanout_active=false/direct_scanout_active=true}"
+    active="${active/direct_scanout_live_leases=0/direct_scanout_live_leases=1}"
+    active="${active/direct_scanout_presented_surface=none/direct_scanout_presented_surface=7}"
+    active="${active/direct_scanout_presented_buffer=none/direct_scanout_presented_buffer=42}"
+    active="${active/direct_scanout_presented_framebuffer=none/direct_scanout_presented_framebuffer=92}"
+    active="${active/direct_scanout_presented_content_epoch=none/direct_scanout_presented_content_epoch=3}"
+    printf '%s\n' "$active" >"$fixture"
     check_log "$fixture" >/dev/null
-    printf '%s\n' "self-test: active final-state identity PASS"
+    printf '%s\n' "self-test: passing active final state PASS"
 
     expect_failure() {
         local name="$1"
@@ -130,22 +231,37 @@ self_test() {
         printf 'self-test: %s failure PASS\n' "$name"
     }
 
-    expect_failure "duplicate-feedback" \
-        "${base/direct_scanout_duplicate_feedback=0/direct_scanout_duplicate_feedback=1}"
-    expect_failure "duplicate-settlement" \
-        "${base/direct_scanout_duplicate_settlement=0/direct_scanout_duplicate_settlement=1}"
-    expect_failure "same-buffer-resubmission" \
-        "${base/direct_scanout_same_buffer_resubmissions=0/direct_scanout_same_buffer_resubmissions=1}"
-    expect_failure "callback-owner-leak" \
-        "${base/direct_scanout_callback_owner_leaks=0/direct_scanout_callback_owner_leaks=1}"
-    expect_failure "inactive-identity" \
-        "${base/direct_scanout_presented_surface=0/direct_scanout_presented_surface=7}"
+    expect_failure "missing TEST_ONLY evidence" "${base/direct_scanout_test_only_attempts=1/direct_scanout_test_only_attempts=0}"
+    expect_failure "missing TEST_ONLY timing" "${base/direct_scanout_test_only_duration_ns_total=10/direct_scanout_test_only_duration_ns_total=0}"
+    expect_failure "early-release violation" "${base/direct_scanout_early_release_violations=0/direct_scanout_early_release_violations=1}"
+    expect_failure "inactive live lease" "${base/direct_scanout_live_leases=0/direct_scanout_live_leases=1}"
+    expect_failure "inactive stale presented identity" "${base/direct_scanout_presented_surface=none/direct_scanout_presented_surface=7}"
+    expect_failure "callback-owner leak" "${base/direct_scanout_callback_owner_leaks=0/direct_scanout_callback_owner_leaks=1}"
+    expect_failure "same-content resubmission" "${base/direct_scanout_same_buffer_resubmissions=0/direct_scanout_same_buffer_resubmissions=1}"
+    expect_failure "queue overflow" "${base/direct_scanout_worker_queue_overflow=0/direct_scanout_worker_queue_overflow=1}"
+    expect_failure "duplicate feedback" "${base/direct_scanout_duplicate_feedback=0/direct_scanout_duplicate_feedback=1}"
+    expect_failure "duplicate settlement" "${base/direct_scanout_duplicate_settlement=0/direct_scanout_duplicate_settlement=1}"
+    expect_failure "fallback remains active" "${base/direct_scanout_fallback_active=false/direct_scanout_fallback_active=true}"
+    expect_failure "missing required field" "${base/ direct_scanout_presented_framebuffer=none/}"
 
-    missing_field="${base/ direct_scanout_presented_framebuffer=0/}"
-    expect_failure "missing-field" "$missing_field"
+    local prevented
+    prevented="${base/direct_scanout_early_release_prevented=0/direct_scanout_early_release_prevented=4}"
+    printf '%s\n' "$prevented" >"$fixture"
+    check_log "$fixture" >/dev/null
+    printf '%s\n' "self-test: nonzero early-release prevented PASS"
 
-    missing_positive="${base/direct_scanout_entries=1/direct_scanout_entries=0}"
-    expect_failure "missing-positive-evidence" "$missing_positive"
+    earlier_fail="${base/direct_scanout_replacements=1/direct_scanout_replacements=0}"
+    printf '%s\n%s\n' "$earlier_fail" "$base" >"$fixture"
+    check_log "$fixture" >/dev/null
+    printf '%s\n' "self-test: earlier failing, final passing PASS"
+
+    final_fail="${base/direct_scanout_duplicate_feedback=0/direct_scanout_duplicate_feedback=1}"
+    printf '%s\n%s\n' "$base" "$final_fail" >"$fixture"
+    if check_log "$fixture" >/dev/null 2>&1; then
+        printf '%s\n' "self-test: earlier passing, final failing unexpectedly passed" >&2
+        return 1
+    fi
+    printf '%s\n' "self-test: earlier passing, final failing failure PASS"
 
     printf '%s\n' "self-test: PASS"
 }
@@ -163,7 +279,10 @@ case "${1:-}" in
         exit 2
         ;;
     *)
-        [[ -f "$1" ]] || { printf 'qualify-direct-scanout: missing perf log: %s\n' "$1" >&2; exit 2; }
+        [[ -f "$1" ]] || {
+            printf 'qualify-direct-scanout: missing perf log: %s\n' "$1" >&2
+            exit 2
+        }
         check_log "$1"
         ;;
 esac

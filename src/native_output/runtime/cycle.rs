@@ -4,6 +4,8 @@ use super::*;
 
 #[path = "cycle_direct.rs"]
 mod cycle_direct;
+#[path = "cycle/fallback.rs"]
+pub(super) mod direct_fallback;
 pub fn run(
     server: OwnCompositorServer,
     app: Vec<String>,
@@ -276,6 +278,8 @@ impl NativeRuntime {
             pending_proven_deadline_miss,
             effective_app_gpu_policy,
             last_primary_presented_at_ns,
+            direct_fallback_tracker,
+            last_refresh_sequence,
             last_renderable_surfaces,
             queued_redraw_requested,
             frame_index,
@@ -516,6 +520,11 @@ impl NativeRuntime {
         let frame_rendered = false;
         let frame_submitted = false;
         if let Some(pageflip) = pageflip_event {
+            *last_refresh_sequence = u64::from(pageflip.sequence);
+            if let Some(tracker) = direct_fallback_tracker.as_mut() {
+                tracker.observe_refresh(*last_refresh_sequence);
+                scanout.note_direct_fallback_cycles(tracker.cycles);
+            }
             completed_pageflip_token = Some(pageflip.user_data);
             let compositor_receive_ns = monotonic_now_ns()?;
             let cursor_commit = atomic_completion.is_some_and(|completion| {
@@ -706,8 +715,12 @@ impl NativeRuntime {
                         },
                     )?;
                     if previous_assignment.is_some_and(|assignment| assignment.is_direct()) {
-                        explicit.complete_composited_transition();
+                        explicit.complete_composited_transition(true);
                         debug_assert!(explicit.direct_scanout_presented_info().is_none());
+                    }
+                    if let Some(mut tracker) = direct_fallback_tracker.take() {
+                        tracker.observe_refresh(*last_refresh_sequence);
+                        explicit.note_direct_composited_fallback(tracker.cycles);
                     }
                     *confirmed_primary_assignment = Some(ConfirmedPrimaryAssignment::Composed {
                         transaction_id,
