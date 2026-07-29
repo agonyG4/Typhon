@@ -72,7 +72,6 @@ fn settle_no_visual_change_transaction(
         transaction_id,
         obligations,
         DirectTerminalCallbackDisposition::NoVisualChange,
-        0,
     );
     settle_no_visual_change_output_transaction(
         output_transactions,
@@ -89,10 +88,12 @@ fn settle_no_visual_change_transaction(
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
     scanout.note_direct_callback_owner_leaks(callback_owner_leaks);
-    if callback_owner_leaks > 0 {
+    if callback_owner_leaks.leak_events > 0 {
         direct_scanout_debug(format_args!(
-            "direct no-visual-change callback-owner leak transaction={} count={callback_owner_leaks}",
-            transaction_id.get()
+            "direct no-visual-change callback-owner leak transaction={} events={} callbacks={}",
+            transaction_id.get(),
+            callback_owner_leaks.leak_events,
+            callback_owner_leaks.leaked_callbacks,
         ));
     }
     Ok(())
@@ -366,7 +367,6 @@ impl AtomicEglGbmScanout {
                     transaction_id,
                     obligations,
                     DirectTerminalCallbackDisposition::NoVisualChange,
-                    0,
                 );
                 settle_no_visual_change_output_transaction(
                     output_transactions,
@@ -394,7 +394,6 @@ impl AtomicEglGbmScanout {
                     transaction_id,
                     obligations,
                     DirectTerminalCallbackDisposition::Retryable,
-                    0,
                 );
                 settle_failed_output_transaction(
                     output_transactions,
@@ -575,30 +574,56 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn complete_composited_transition(
         &mut self,
+        expected: ExpectedPresentedDirectPrimary,
         worker_content_keys: (
             Option<DirectScanoutCandidateKey>,
             Option<DirectScanoutCandidateKey>,
             Option<DirectScanoutCandidateKey>,
         ),
     ) -> CompositedTransitionResult {
-        let worker_owns_current =
-            self.direct
-                .ownership
-                .presented
-                .as_ref()
-                .is_some_and(|presented| {
-                    worker_content_keys.0 == Some(presented.lease.key())
-                        || worker_content_keys.1 == Some(presented.lease.key())
-                        || worker_content_keys.2 == Some(presented.lease.key())
-                });
+        let worker_owns_current = self.worker_owns_presented(worker_content_keys);
         let result = self
             .direct
-            .complete_composited_transition(worker_owns_current);
+            .complete_composited_transition(expected, worker_owns_current);
         if let CompositedTransitionResult::Completed { released: Some(_) } = &result {
             direct_scanout_debug("exited direct scanout to composition");
             self.scene.invalidate_presented_damage_history();
         }
         result
+    }
+
+    pub(crate) fn validate_composited_transition(
+        &mut self,
+        expected: ExpectedPresentedDirectPrimary,
+        worker_content_keys: (
+            Option<DirectScanoutCandidateKey>,
+            Option<DirectScanoutCandidateKey>,
+            Option<DirectScanoutCandidateKey>,
+        ),
+    ) -> Result<(), DirectReleaseViolation> {
+        self.direct.validate_composited_transition(
+            expected,
+            self.worker_owns_presented(worker_content_keys),
+        )
+    }
+
+    fn worker_owns_presented(
+        &self,
+        worker_content_keys: (
+            Option<DirectScanoutCandidateKey>,
+            Option<DirectScanoutCandidateKey>,
+            Option<DirectScanoutCandidateKey>,
+        ),
+    ) -> bool {
+        self.direct
+            .ownership
+            .presented
+            .as_ref()
+            .is_some_and(|presented| {
+                worker_content_keys.0 == Some(presented.lease.key())
+                    || worker_content_keys.1 == Some(presented.lease.key())
+                    || worker_content_keys.2 == Some(presented.lease.key())
+            })
     }
 
     pub(crate) fn direct_scanout_pending(&self) -> bool {
@@ -705,12 +730,17 @@ impl AtomicEglGbmScanout {
         }
     }
 
-    pub(crate) fn note_direct_callback_owner_leaks(&mut self, count: u64) {
-        self.direct.counters.callback_owner_leaks = self
+    pub(crate) fn note_direct_callback_owner_leaks(&mut self, leaks: DirectCallbackLeakMetrics) {
+        self.direct.counters.callback_owner_leak_events = self
             .direct
             .counters
-            .callback_owner_leaks
-            .saturating_add(count);
+            .callback_owner_leak_events
+            .saturating_add(leaks.leak_events);
+        self.direct.counters.callback_owner_leaked_callbacks = self
+            .direct
+            .counters
+            .callback_owner_leaked_callbacks
+            .saturating_add(leaks.leaked_callbacks);
     }
 
     pub(crate) fn note_direct_fallback_redraw(&mut self) {
@@ -789,7 +819,6 @@ impl AtomicEglGbmScanout {
                     frame.transaction_id,
                     transaction.descriptor().obligations(),
                     DirectTerminalCallbackDisposition::Superseded,
-                    0,
                 )
             });
         settle_superseded_output_transaction(

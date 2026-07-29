@@ -168,7 +168,6 @@ fn settle_failed_direct_worker_transaction(
         transaction_id,
         obligations,
         DirectTerminalCallbackDisposition::Retryable,
-        0,
     );
     settle_failed_output_transaction(
         output_transactions,

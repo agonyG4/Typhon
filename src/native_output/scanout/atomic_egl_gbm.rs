@@ -28,9 +28,10 @@ use crate::egl_renderer::{
     detect_partial_repaint_capabilities, load_egl_image_target_texture_2d,
 };
 use crate::native_output::runtime::{
-    DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
-    settle_dropped_output_transaction, settle_failed_output_transaction,
-    settle_no_visual_change_output_transaction, settle_superseded_output_transaction,
+    DirectCallbackLeakMetrics, DirectTerminalCallbackDisposition,
+    direct_terminal_callback_owner_leaks, settle_dropped_output_transaction,
+    settle_failed_output_transaction, settle_no_visual_change_output_transaction,
+    settle_superseded_output_transaction,
 };
 
 use super::atomic_direct::{direct_candidate_key, direct_scanout_debug};

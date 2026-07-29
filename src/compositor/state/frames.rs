@@ -274,6 +274,8 @@ impl CompositorState {
                 callbacks,
                 callback_commit_ns,
                 callback_render_completed_ns: None,
+                callback_render_completed_count: 0,
+                callback_terminal_ownership_checked: false,
                 presentation_feedbacks: std::mem::take(&mut self.pending_presentation_feedbacks),
                 shm_buffer_releases,
                 dmabuf_releases_to_complete_on_present,

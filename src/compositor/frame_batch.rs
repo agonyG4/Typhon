@@ -57,6 +57,8 @@ pub(crate) struct CompositorFrameBatch {
     pub(super) callbacks: Vec<wl_callback::WlCallback>,
     pub(super) callback_commit_ns: Option<u64>,
     pub(super) callback_render_completed_ns: Option<u64>,
+    pub(super) callback_render_completed_count: usize,
+    pub(super) callback_terminal_ownership_checked: bool,
     pub(super) presentation_feedbacks: Vec<PendingPresentationFeedback>,
     pub(super) shm_buffer_releases: Vec<wl_buffer::WlBuffer>,
     pub(super) dmabuf_releases_to_complete_on_present: Vec<SurfaceBufferRelease>,

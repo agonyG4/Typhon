@@ -116,7 +116,8 @@ check_log() {
     check_zero direct_scanout_duplicate_settlement
     check_zero direct_scanout_same_buffer_resubmissions
     check_zero direct_scanout_worker_queue_overflow
-    check_zero direct_scanout_callback_owner_leaks
+    check_zero direct_scanout_callback_owner_leak_events
+    check_zero direct_scanout_callback_owner_leaked_callbacks
     check_zero direct_scanout_early_release_violations
 
     local attempts total timing_active
@@ -212,7 +213,7 @@ self_test() {
     local fixture base active earlier_fail final_fail
     fixture="$(mktemp)"
     trap "rm -f -- \"$fixture\"" EXIT
-    base='perf native.scheduler direct_scanout_active=false direct_scanout_fallback_active=false direct_scanout_fallback_cycles_current=0 direct_scanout_live_leases=0 direct_scanout_submitted_surface=none direct_scanout_submitted_buffer=none direct_scanout_submitted_framebuffer=none direct_scanout_submitted_content_epoch=none direct_scanout_presented_surface=none direct_scanout_presented_buffer=none direct_scanout_presented_framebuffer=none direct_scanout_presented_content_epoch=none direct_scanout_candidate_checks=1 direct_scanout_candidates_accepted=1 direct_scanout_test_only_attempts=1 direct_scanout_test_only_duration_ns_last=10 direct_scanout_test_only_duration_ns_max=10 direct_scanout_test_only_duration_ns_total=10 direct_scanout_real_submit_attempts=1 direct_scanout_entries=1 direct_scanout_presentations=1 direct_scanout_replacements=1 direct_scanout_exits=1 direct_scanout_composited_fallbacks=1 direct_scanout_fallback_cycles_last=0 direct_scanout_duplicate_feedback=0 direct_scanout_duplicate_settlement=0 direct_scanout_same_buffer_resubmissions=0 direct_scanout_worker_queue_overflow=0 direct_scanout_callback_owner_leaks=0 direct_scanout_early_release_prevented=0 direct_scanout_early_release_violations=0'
+    base='perf native.scheduler direct_scanout_active=false direct_scanout_fallback_active=false direct_scanout_fallback_cycles_current=0 direct_scanout_live_leases=0 direct_scanout_submitted_surface=none direct_scanout_submitted_buffer=none direct_scanout_submitted_framebuffer=none direct_scanout_submitted_content_epoch=none direct_scanout_presented_surface=none direct_scanout_presented_buffer=none direct_scanout_presented_framebuffer=none direct_scanout_presented_content_epoch=none direct_scanout_candidate_checks=1 direct_scanout_candidates_accepted=1 direct_scanout_test_only_attempts=1 direct_scanout_test_only_duration_ns_last=10 direct_scanout_test_only_duration_ns_max=10 direct_scanout_test_only_duration_ns_total=10 direct_scanout_real_submit_attempts=1 direct_scanout_entries=1 direct_scanout_presentations=1 direct_scanout_replacements=1 direct_scanout_exits=1 direct_scanout_composited_fallbacks=1 direct_scanout_fallback_cycles_last=0 direct_scanout_duplicate_feedback=0 direct_scanout_duplicate_settlement=0 direct_scanout_same_buffer_resubmissions=0 direct_scanout_worker_queue_overflow=0 direct_scanout_callback_owner_leak_events=0 direct_scanout_callback_owner_leaked_callbacks=0 direct_scanout_early_release_prevented=0 direct_scanout_early_release_violations=0'
 
     printf '%s\n' "$base" >"$fixture"
     check_log "$fixture" >/dev/null
@@ -244,7 +245,8 @@ self_test() {
     expect_failure "early-release violation" "${base/direct_scanout_early_release_violations=0/direct_scanout_early_release_violations=1}"
     expect_failure "inactive live lease" "${base/direct_scanout_live_leases=0/direct_scanout_live_leases=1}"
     expect_failure "inactive stale presented identity" "${base/direct_scanout_presented_surface=none/direct_scanout_presented_surface=7}"
-    expect_failure "callback-owner leak" "${base/direct_scanout_callback_owner_leaks=0/direct_scanout_callback_owner_leaks=1}"
+    expect_failure "callback-owner leak event" "${base/direct_scanout_callback_owner_leak_events=0/direct_scanout_callback_owner_leak_events=1}"
+    expect_failure "leaked callback count" "${base/direct_scanout_callback_owner_leaked_callbacks=0/direct_scanout_callback_owner_leaked_callbacks=1}"
     expect_failure "same-content resubmission" "${base/direct_scanout_same_buffer_resubmissions=0/direct_scanout_same_buffer_resubmissions=1}"
     expect_failure "queue overflow" "${base/direct_scanout_worker_queue_overflow=0/direct_scanout_worker_queue_overflow=1}"
     expect_failure "duplicate feedback" "${base/direct_scanout_duplicate_feedback=0/direct_scanout_duplicate_feedback=1}"

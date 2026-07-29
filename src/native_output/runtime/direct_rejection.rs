@@ -82,11 +82,10 @@ impl NativeRuntime {
         }
         let direct_job = job;
         let callback_owner_leaks = direct_terminal_callback_owner_leaks(
-            &self.server,
+            &mut self.server,
             direct_job.transaction_id,
             obligations,
             DirectTerminalCallbackDisposition::Retryable,
-            0,
         );
         let settlement = settle_failed_output_transaction(
             &mut self.output_transactions,

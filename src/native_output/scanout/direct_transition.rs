@@ -1,4 +1,5 @@
 use super::*;
+use crate::native_output::runtime::DirectCallbackLeakMetrics;
 
 impl NativeScanoutBackend {
     pub(crate) fn direct_scanout_pending(&self) -> bool {
@@ -64,9 +65,9 @@ impl NativeScanoutBackend {
         }
     }
 
-    pub(crate) fn note_direct_callback_owner_leaks(&mut self, count: u64) {
+    pub(crate) fn note_direct_callback_owner_leaks(&mut self, leaks: DirectCallbackLeakMetrics) {
         if let Self::AtomicEglGbm(scanout) = self {
-            scanout.note_direct_callback_owner_leaks(count);
+            scanout.note_direct_callback_owner_leaks(leaks);
         }
     }
 

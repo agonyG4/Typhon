@@ -865,6 +865,7 @@ fn composed_to_direct_becomes_active_only_after_pageflip() {
         token: PageFlipToken::new(12).unwrap(),
         surface_id: 7,
         candidate_key: test_confirmed_direct_key(),
+        framebuffer_id: 42,
     };
     let mut confirmed = Some(composed);
 
@@ -884,12 +885,14 @@ fn direct_to_direct_retains_old_resource_until_replacement_pageflip() {
         token: PageFlipToken::new(13).unwrap(),
         surface_id: 8,
         candidate_key: test_confirmed_direct_key(),
+        framebuffer_id: 42,
     };
     let replacement = ConfirmedPrimaryAssignment::Direct {
         transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(4).unwrap()),
         token: PageFlipToken::new(14).unwrap(),
         surface_id: 9,
         candidate_key: test_confirmed_direct_key(),
+        framebuffer_id: 43,
     };
     let mut confirmed = Some(old);
 

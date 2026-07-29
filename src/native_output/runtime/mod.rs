@@ -58,9 +58,10 @@ pub(super) use planner::{
     decide_native_kms_startup,
 };
 pub(crate) use presentation_transactions::{
-    DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
-    settle_dropped_output_transaction, settle_failed_output_transaction,
-    settle_no_visual_change_output_transaction, settle_superseded_output_transaction,
+    DirectCallbackLeakMetrics, DirectTerminalCallbackDisposition,
+    direct_terminal_callback_owner_leaks, settle_dropped_output_transaction,
+    settle_failed_output_transaction, settle_no_visual_change_output_transaction,
+    settle_superseded_output_transaction,
 };
 pub(crate) use session::{NativeSessionLifecycle, NativeSessionTransition};
 #[cfg(test)]
@@ -118,6 +119,7 @@ pub(super) enum ConfirmedPrimaryAssignment {
         token: PageFlipToken,
         surface_id: u32,
         candidate_key: DirectScanoutCandidateKey,
+        framebuffer_id: u32,
     },
 }
 
@@ -420,11 +422,10 @@ impl Drop for NativeRuntime {
                 continue;
             }
             let callback_owner_leaks = direct_terminal_callback_owner_leaks(
-                &self.server,
+                &mut self.server,
                 transaction_id,
                 transaction.descriptor().obligations(),
                 DirectTerminalCallbackDisposition::Abandoned,
-                0,
             );
             self.scanout
                 .note_direct_callback_owner_leaks(callback_owner_leaks);

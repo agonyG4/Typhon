@@ -334,11 +334,10 @@ impl NativeSessionIo for NativeRuntime {
                 continue;
             }
             let callback_owner_leaks = direct_terminal_callback_owner_leaks(
-                &self.server,
+                &mut self.server,
                 transaction_id,
                 transaction.descriptor().obligations(),
                 DirectTerminalCallbackDisposition::Abandoned,
-                0,
             );
             self.scanout
                 .note_direct_callback_owner_leaks(callback_owner_leaks);

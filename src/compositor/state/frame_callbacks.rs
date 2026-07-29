@@ -54,33 +54,34 @@ impl CompositorState {
     }
 
     pub(crate) fn prepare_terminal_callback_ownership(
-        &self,
+        &mut self,
         batch_id: CompositorFrameBatchId,
         disposition: TerminalCallbackDisposition,
     ) -> TerminalCallbackOwnership {
-        let Some(batch) = self.frame_batches.get(&batch_id) else {
+        let Some(batch) = self.frame_batches.get_mut(&batch_id) else {
             return TerminalCallbackOwnership::Leaked {
                 owner: batch_id,
                 pending: 0,
             };
         };
+        if batch.callback_terminal_ownership_checked {
+            return TerminalCallbackOwnership::None;
+        }
+        batch.callback_terminal_ownership_checked = true;
         let pending = batch
             .callbacks
             .iter()
             .filter(|callback| callback.is_alive())
             .count();
-        if pending == 0 {
+        let returned = batch.callback_render_completed_count;
+        if pending == 0 && returned == 0 {
             return TerminalCallbackOwnership::None;
         }
         match disposition {
-            TerminalCallbackDisposition::Presented
-                if batch.callback_render_completed_ns.is_some() =>
-            {
-                TerminalCallbackOwnership::Leaked {
-                    owner: batch_id,
-                    pending,
-                }
-            }
+            _ if returned > 0 => TerminalCallbackOwnership::Leaked {
+                owner: batch_id,
+                pending: returned,
+            },
             TerminalCallbackDisposition::Retryable => {
                 TerminalCallbackOwnership::Transferred(batch_id)
             }
@@ -156,7 +157,10 @@ impl CompositorState {
                 .get_mut(&batch_id)
                 .expect("missing compositor frame batch at render completion");
             let callbacks = batch.callbacks.drain(..).collect::<Vec<_>>();
-            batch.callback_render_completed_ns = (!callbacks.is_empty()).then_some(completed_ns);
+            if !callbacks.is_empty() {
+                batch.callback_render_completed_ns = Some(completed_ns);
+                batch.callback_render_completed_count = callbacks.len();
+            }
             (callbacks, batch.callback_commit_ns)
         };
         if callbacks.is_empty() {

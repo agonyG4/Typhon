@@ -66,6 +66,43 @@ pub(crate) struct DirectPageflipInfo {
     pub(crate) submit_returned_at: MonotonicTimestampNs,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExpectedPresentedDirectPrimary {
+    pub(crate) transaction_id: OutputTransactionId,
+    pub(crate) token: PageFlipToken,
+    pub(crate) surface_id: u32,
+    pub(crate) candidate_key: DirectScanoutCandidateKey,
+    pub(crate) framebuffer_id: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectRetirementMismatch {
+    MissingOwnership,
+    SubmittedOwnership,
+    WorkerOwnership,
+    SuspendedOwnership,
+    TransactionId,
+    PageflipToken,
+    CandidateKey,
+    SurfaceId,
+    FramebufferId,
+}
+
+#[derive(Debug)]
+pub(crate) enum PresentedDirectRetirement {
+    Retired {
+        lease: DirectPrimaryLease,
+    },
+    Mismatch {
+        expected: ExpectedPresentedDirectPrimary,
+        retained: Box<PresentedDirectPrimary>,
+        reason: DirectRetirementMismatch,
+    },
+    Missing {
+        expected: ExpectedPresentedDirectPrimary,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedDirectPageflip {
     pub(crate) transaction_id: OutputTransactionId,
@@ -94,6 +131,7 @@ pub(crate) enum DirectReleaseViolation {
     Submitted,
     Worker,
     Suspended,
+    Retirement(DirectRetirementMismatch),
 }
 
 #[derive(Debug)]
@@ -113,7 +151,7 @@ pub(crate) enum DirectReleaseOutcome {
 #[derive(Debug)]
 pub(crate) enum CompositedTransitionResult {
     Completed {
-        released: Option<Box<PresentedDirectPrimary>>,
+        released: Option<Box<DirectPrimaryLease>>,
     },
     Fatal {
         reason: DirectReleaseViolation,
@@ -197,7 +235,8 @@ pub(crate) struct DirectScanoutCounters {
     pub(crate) early_release_violations: u64,
     pub(crate) dmabuf_feedback_unchanged_rebuilds: u64,
     pub(crate) worker_queue_overflow: u64,
-    pub(crate) callback_owner_leaks: u64,
+    pub(crate) callback_owner_leak_events: u64,
+    pub(crate) callback_owner_leaked_callbacks: u64,
     pub(crate) first_blocker: Option<&'static str>,
     pub(crate) blocker_set: u64,
 }
@@ -251,6 +290,81 @@ pub(super) fn direct_scanout_debug(message: impl std::fmt::Display) {
 }
 
 impl DirectPrimaryOwnership {
+    fn retirement_mismatch(
+        &self,
+        expected: ExpectedPresentedDirectPrimary,
+        worker_owns_current: bool,
+    ) -> Option<DirectRetirementMismatch> {
+        if self.presented.is_none() {
+            return Some(DirectRetirementMismatch::MissingOwnership);
+        }
+        if self.submitted.is_some() {
+            return Some(DirectRetirementMismatch::SubmittedOwnership);
+        }
+        if worker_owns_current {
+            return Some(DirectRetirementMismatch::WorkerOwnership);
+        }
+        if !self.suspended.is_empty() {
+            return Some(DirectRetirementMismatch::SuspendedOwnership);
+        }
+        let presented = self
+            .presented
+            .as_ref()
+            .expect("presented ownership checked");
+        (presented.transaction_id != expected.transaction_id)
+            .then_some(DirectRetirementMismatch::TransactionId)
+            .or_else(|| {
+                (presented.token != expected.token)
+                    .then_some(DirectRetirementMismatch::PageflipToken)
+            })
+            .or_else(|| {
+                (presented.lease.key() != expected.candidate_key)
+                    .then_some(DirectRetirementMismatch::CandidateKey)
+            })
+            .or_else(|| {
+                (presented.lease.surface_id() != expected.surface_id)
+                    .then_some(DirectRetirementMismatch::SurfaceId)
+            })
+            .or_else(|| {
+                (presented.lease.framebuffer_id() != expected.framebuffer_id)
+                    .then_some(DirectRetirementMismatch::FramebufferId)
+            })
+    }
+
+    pub(crate) fn validate_presented_direct(
+        &self,
+        expected: ExpectedPresentedDirectPrimary,
+        worker_owns_current: bool,
+    ) -> Result<(), DirectRetirementMismatch> {
+        self.retirement_mismatch(expected, worker_owns_current)
+            .map_or(Ok(()), Err)
+    }
+
+    pub(crate) fn retire_presented_direct(
+        &mut self,
+        expected: ExpectedPresentedDirectPrimary,
+        worker_owns_current: bool,
+    ) -> PresentedDirectRetirement {
+        let reason = self.retirement_mismatch(expected, worker_owns_current);
+        if matches!(reason, Some(DirectRetirementMismatch::MissingOwnership)) {
+            return PresentedDirectRetirement::Missing { expected };
+        }
+        if let Some(reason) = reason {
+            return PresentedDirectRetirement::Mismatch {
+                expected,
+                retained: Box::new(self.presented.take().expect("presented ownership checked")),
+                reason,
+            };
+        }
+        PresentedDirectRetirement::Retired {
+            lease: self
+                .presented
+                .take()
+                .expect("presented ownership checked")
+                .lease,
+        }
+    }
+
     pub(crate) fn request_direct_release(
         &mut self,
         proof: DirectReleaseProof,
@@ -533,6 +647,24 @@ impl PresentedDirectPrimary {
 }
 
 impl DirectScanoutControl {
+    pub(crate) fn validate_composited_transition(
+        &mut self,
+        expected: ExpectedPresentedDirectPrimary,
+        worker_owns_current: bool,
+    ) -> Result<(), DirectReleaseViolation> {
+        match self
+            .ownership
+            .validate_presented_direct(expected, worker_owns_current)
+        {
+            Ok(()) => Ok(()),
+            Err(reason) => {
+                self.counters.early_release_violations =
+                    self.counters.early_release_violations.saturating_add(1);
+                Err(DirectReleaseViolation::Retirement(reason))
+            }
+        }
+    }
+
     pub(super) fn new(drm: std::os::fd::BorrowedFd<'_>, generation: u64) -> Self {
         Self {
             ownership: DirectPrimaryOwnership::default(),
@@ -587,24 +719,38 @@ impl DirectScanoutControl {
 
     pub(crate) fn complete_composited_transition(
         &mut self,
+        expected: ExpectedPresentedDirectPrimary,
         worker_owns_current: bool,
     ) -> CompositedTransitionResult {
-        match self.request_direct_release(DirectReleaseProof::ComposedPageflip, worker_owns_current)
+        match self
+            .ownership
+            .retire_presented_direct(expected, worker_owns_current)
         {
-            DirectReleaseOutcome::Released { presented, .. } => {
-                let released = presented;
-                if released.is_some() {
-                    self.counters.exits = self.counters.exits.saturating_add(1);
-                    self.counters.fallback_cycles = self.counters.fallback_cycles.saturating_add(1);
-                }
+            PresentedDirectRetirement::Retired { lease } => {
+                self.counters.exits = self.counters.exits.saturating_add(1);
                 self.inhibit_until_composited_present = false;
-                CompositedTransitionResult::Completed { released }
+                CompositedTransitionResult::Completed {
+                    released: Some(Box::new(lease)),
+                }
             }
-            DirectReleaseOutcome::Deferred { .. } => CompositedTransitionResult::Fatal {
-                reason: DirectReleaseViolation::Submitted,
-            },
-            DirectReleaseOutcome::Violation { reason } => {
-                CompositedTransitionResult::Fatal { reason }
+            PresentedDirectRetirement::Mismatch {
+                retained, reason, ..
+            } => {
+                self.ownership.presented = Some(*retained);
+                self.counters.early_release_violations =
+                    self.counters.early_release_violations.saturating_add(1);
+                CompositedTransitionResult::Fatal {
+                    reason: DirectReleaseViolation::Retirement(reason),
+                }
+            }
+            PresentedDirectRetirement::Missing { .. } => {
+                self.counters.early_release_violations =
+                    self.counters.early_release_violations.saturating_add(1);
+                CompositedTransitionResult::Fatal {
+                    reason: DirectReleaseViolation::Retirement(
+                        DirectRetirementMismatch::MissingOwnership,
+                    ),
+                }
             }
         }
     }
@@ -755,9 +901,163 @@ mod tests {
         ownership
     }
 
+    fn expected_presented_identity_for_release_test() -> ExpectedPresentedDirectPrimary {
+        let key = test_key();
+        ExpectedPresentedDirectPrimary {
+            transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(143).unwrap()),
+            token: PageFlipToken::new(143).unwrap(),
+            surface_id: key.content.surface_id,
+            candidate_key: key,
+            framebuffer_id: 43,
+        }
+    }
+
+    #[test]
+    fn exact_presented_direct_identity_retires_successfully() {
+        let mut ownership = presented_ownership_for_release_test();
+
+        let PresentedDirectRetirement::Retired { lease } = ownership
+            .retire_presented_direct(expected_presented_identity_for_release_test(), false)
+        else {
+            panic!("exact presented direct identity should retire");
+        };
+        assert_eq!(lease.framebuffer_id(), 43);
+        assert!(ownership.presented.is_none());
+    }
+
+    fn assert_retirement_mismatch(
+        expected: ExpectedPresentedDirectPrimary,
+        reason: DirectRetirementMismatch,
+    ) {
+        let mut ownership = presented_ownership_for_release_test();
+        let PresentedDirectRetirement::Mismatch {
+            retained,
+            reason: actual,
+            ..
+        } = ownership.retire_presented_direct(expected, false)
+        else {
+            panic!("presented identity should be rejected");
+        };
+        assert_eq!(actual, reason);
+        assert_eq!(retained.lease.framebuffer_id(), 43);
+        ownership.presented = Some(*retained);
+        assert!(ownership.presented.is_some());
+    }
+
+    #[test]
+    fn missing_presented_ownership_does_not_publish_composed_assignment() {
+        let mut ownership = DirectPrimaryOwnership::default();
+        assert!(matches!(
+            ownership
+                .retire_presented_direct(expected_presented_identity_for_release_test(), false,),
+            PresentedDirectRetirement::Missing { .. }
+        ));
+    }
+
+    #[test]
+    fn transaction_mismatch_does_not_retire_presented_lease() {
+        let expected = ExpectedPresentedDirectPrimary {
+            transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(144).unwrap()),
+            ..expected_presented_identity_for_release_test()
+        };
+        assert_retirement_mismatch(expected, DirectRetirementMismatch::TransactionId);
+    }
+
+    #[test]
+    fn pageflip_token_mismatch_does_not_retire_presented_lease() {
+        let expected = ExpectedPresentedDirectPrimary {
+            token: PageFlipToken::new(144).unwrap(),
+            ..expected_presented_identity_for_release_test()
+        };
+        assert_retirement_mismatch(expected, DirectRetirementMismatch::PageflipToken);
+    }
+
+    #[test]
+    fn candidate_key_mismatch_does_not_retire_presented_lease() {
+        let key = expected_presented_identity_for_release_test().candidate_key;
+        let expected = ExpectedPresentedDirectPrimary {
+            candidate_key: DirectScanoutCandidateKey {
+                content: OutputContentKey {
+                    content_epoch: ContentEpochId::new(std::num::NonZeroU64::new(4).unwrap()),
+                    ..key.content
+                },
+                ..key
+            },
+            ..expected_presented_identity_for_release_test()
+        };
+        assert_retirement_mismatch(expected, DirectRetirementMismatch::CandidateKey);
+    }
+
+    #[test]
+    fn surface_identity_mismatch_does_not_retire_presented_lease() {
+        let expected = ExpectedPresentedDirectPrimary {
+            surface_id: 8,
+            ..expected_presented_identity_for_release_test()
+        };
+        assert_retirement_mismatch(expected, DirectRetirementMismatch::SurfaceId);
+    }
+
+    #[test]
+    fn framebuffer_identity_mismatch_does_not_retire_presented_lease() {
+        let expected = ExpectedPresentedDirectPrimary {
+            framebuffer_id: 44,
+            ..expected_presented_identity_for_release_test()
+        };
+        assert_retirement_mismatch(expected, DirectRetirementMismatch::FramebufferId);
+    }
+
+    #[test]
+    fn content_epoch_mismatch_does_not_retire_presented_lease() {
+        let key = expected_presented_identity_for_release_test().candidate_key;
+        let expected = ExpectedPresentedDirectPrimary {
+            candidate_key: DirectScanoutCandidateKey {
+                content: OutputContentKey {
+                    content_epoch: ContentEpochId::new(std::num::NonZeroU64::new(4).unwrap()),
+                    ..key.content
+                },
+                ..key
+            },
+            ..expected_presented_identity_for_release_test()
+        };
+        assert_retirement_mismatch(expected, DirectRetirementMismatch::CandidateKey);
+    }
+
     fn direct_control_for_transition_test() -> DirectScanoutControl {
         let drm = std::fs::File::open("/dev/null").expect("test DRM file");
         DirectScanoutControl::new(drm.as_fd(), 1)
+    }
+
+    #[test]
+    fn retirement_mismatch_enters_fatal_quarantine() {
+        let mut control = direct_control_for_transition_test();
+        control.ownership = presented_ownership_for_release_test();
+        let expected = ExpectedPresentedDirectPrimary {
+            framebuffer_id: 44,
+            ..expected_presented_identity_for_release_test()
+        };
+
+        assert!(matches!(
+            control.complete_composited_transition(expected, false),
+            CompositedTransitionResult::Fatal {
+                reason: DirectReleaseViolation::Retirement(DirectRetirementMismatch::FramebufferId)
+            }
+        ));
+        assert!(control.ownership.presented.is_some());
+        assert_eq!(control.counters.early_release_violations, 1);
+    }
+
+    #[test]
+    fn successful_retirement_releases_exact_lease_once() {
+        let mut control = direct_control_for_transition_test();
+        control.ownership = presented_ownership_for_release_test();
+
+        let CompositedTransitionResult::Completed { released } = control
+            .complete_composited_transition(expected_presented_identity_for_release_test(), false)
+        else {
+            panic!("exact presented direct identity should retire");
+        };
+        assert!(released.is_some());
+        assert!(control.ownership.presented.is_none());
     }
 
     #[test]
@@ -830,7 +1130,8 @@ mod tests {
     fn composed_assignment_is_published_only_after_direct_release() {
         let mut control = direct_control_for_transition_test();
         control.ownership = presented_ownership_for_release_test();
-        let result = control.complete_composited_transition(false);
+        let result = control
+            .complete_composited_transition(expected_presented_identity_for_release_test(), false);
 
         assert!(matches!(
             result,
@@ -852,7 +1153,8 @@ mod tests {
     fn direct_release_violation_does_not_publish_composed_assignment() {
         let mut control = direct_control_for_transition_test();
         control.ownership = presented_ownership_for_release_test();
-        let result = control.complete_composited_transition(true);
+        let result = control
+            .complete_composited_transition(expected_presented_identity_for_release_test(), true);
 
         assert!(matches!(result, CompositedTransitionResult::Fatal { .. }));
         assert!(control.ownership.presented.is_some());
@@ -862,7 +1164,8 @@ mod tests {
     fn failed_composited_transition_retains_presented_direct_lease() {
         let mut control = direct_control_for_transition_test();
         control.ownership = presented_ownership_for_release_test();
-        let result = control.complete_composited_transition(true);
+        let result = control
+            .complete_composited_transition(expected_presented_identity_for_release_test(), true);
 
         assert!(matches!(result, CompositedTransitionResult::Fatal { .. }));
         assert!(control.ownership.presented.is_some());
@@ -872,7 +1175,8 @@ mod tests {
     fn successful_composited_transition_releases_lease_once() {
         let mut control = direct_control_for_transition_test();
         control.ownership = presented_ownership_for_release_test();
-        let result = control.complete_composited_transition(false);
+        let result = control
+            .complete_composited_transition(expected_presented_identity_for_release_test(), false);
 
         let CompositedTransitionResult::Completed { released } = result else {
             panic!("composited transition should release presented direct ownership")
@@ -888,7 +1192,10 @@ mod tests {
         control.inhibit_until_composited_present = true;
 
         assert!(matches!(
-            control.complete_composited_transition(false),
+            control.complete_composited_transition(
+                expected_presented_identity_for_release_test(),
+                false,
+            ),
             CompositedTransitionResult::Completed { .. }
         ));
         assert!(!control.inhibit_until_composited_present);
@@ -899,11 +1206,14 @@ mod tests {
         let mut control = direct_control_for_transition_test();
         control.ownership = presented_ownership_for_release_test();
 
-        let _ = control.complete_composited_transition(false);
-        let _ = control.complete_composited_transition(false);
+        let expected = expected_presented_identity_for_release_test();
+        let _ = control.complete_composited_transition(expected, false);
+        let _ = control.complete_composited_transition(expected, false);
 
         assert_eq!(control.counters.exits, 1);
-        assert_eq!(control.counters.fallback_cycles, 1);
+        assert_eq!(control.counters.fallback_cycles, 0);
+        assert_eq!(control.counters.fallback_cycles_last, 0);
+        assert_eq!(control.counters.fallback_cycles_max, 0);
     }
 
     #[test]
@@ -912,7 +1222,10 @@ mod tests {
         control.ownership = presented_ownership_for_release_test();
 
         assert!(matches!(
-            control.complete_composited_transition(true),
+            control.complete_composited_transition(
+                expected_presented_identity_for_release_test(),
+                true,
+            ),
             CompositedTransitionResult::Fatal { .. }
         ));
         assert!(control.ownership.presented.is_some());

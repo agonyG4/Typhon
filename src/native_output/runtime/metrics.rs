@@ -611,8 +611,12 @@ impl NativeRuntime {
                         counters.dmabuf_feedback_unchanged_rebuilds,
                     ),
                     NativePerfField::u64(
-                        "direct_scanout_callback_owner_leaks",
-                        counters.callback_owner_leaks,
+                        "direct_scanout_callback_owner_leak_events",
+                        counters.callback_owner_leak_events,
+                    ),
+                    NativePerfField::u64(
+                        "direct_scanout_callback_owner_leaked_callbacks",
+                        counters.callback_owner_leaked_callbacks,
                     ),
                 ]);
             }

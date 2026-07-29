@@ -188,6 +188,11 @@ pub(in crate::compositor::tests) enum ServerCommand {
         batch_id: CompositorFrameBatchId,
         reply: Sender<Vec<u32>>,
     },
+    PrepareTerminalCallbackOwnership {
+        batch_id: CompositorFrameBatchId,
+        disposition: TerminalCallbackDisposition,
+        reply: Sender<TerminalCallbackOwnership>,
+    },
     CompleteFrameBatch {
         frame_id: u64,
         batch_id: CompositorFrameBatchId,
@@ -197,6 +202,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
         frame_id: u64,
         batch_id: CompositorFrameBatchId,
     },
+    CompleteRenderedFrameCallbacks(CompositorFrameBatchId),
     CompleteDirectFrameBatch {
         frame_id: u64,
         batch_id: CompositorFrameBatchId,
@@ -731,6 +737,15 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                         let _ =
                             reply.send(server.test_frame_batch_presentation_surface_ids(batch_id));
                     }
+                    ServerCommand::PrepareTerminalCallbackOwnership {
+                        batch_id,
+                        disposition,
+                        reply,
+                    } => {
+                        let _ = reply.send(
+                            server.prepare_terminal_callback_ownership(batch_id, disposition),
+                        );
+                    }
                     ServerCommand::CompleteFrameBatch {
                         frame_id,
                         batch_id,
@@ -743,6 +758,9 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             FramePresentation::software_now(server.state.presentation_clock)
                                 .expect("test presentation clock should be usable");
                         server.complete_presented_frame_batch(frame_id, batch_id, presentation);
+                    }
+                    ServerCommand::CompleteRenderedFrameCallbacks(batch_id) => {
+                        server.complete_rendered_frame_callbacks(batch_id);
                     }
                     ServerCommand::CompleteDirectFrameBatch {
                         frame_id,

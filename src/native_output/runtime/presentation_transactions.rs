@@ -13,16 +13,21 @@ pub(crate) enum DirectTerminalCallbackDisposition {
     Superseded,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectCallbackLeakMetrics {
+    pub(crate) leak_events: u64,
+    pub(crate) leaked_callbacks: u64,
+}
+
 pub(crate) fn direct_terminal_callback_owner_leaks(
-    server: &OwnCompositorServer,
+    server: &mut OwnCompositorServer,
     transaction_id: OutputTransactionId,
     obligations: OutputProtocolObligations,
     disposition: DirectTerminalCallbackDisposition,
-    observed_leaks: u64,
-) -> u64 {
+) -> DirectCallbackLeakMetrics {
     debug_assert!(transaction_id.get() > 0);
     debug_assert!(obligations.direct_surface_id().is_some());
-    let live_leaks = match disposition {
+    match disposition {
         DirectTerminalCallbackDisposition::Presented => obligations
             .frame_batch_id()
             .map(|batch_id| {
@@ -30,14 +35,25 @@ pub(crate) fn direct_terminal_callback_owner_leaks(
                     batch_id,
                     TerminalCallbackDisposition::Presented,
                 ) {
-                    TerminalCallbackOwnership::Leaked { pending, .. } => pending as u64,
+                    TerminalCallbackOwnership::Leaked { pending, .. } => {
+                        DirectCallbackLeakMetrics {
+                            leak_events: 1,
+                            leaked_callbacks: pending as u64,
+                        }
+                    }
                     TerminalCallbackOwnership::None
                     | TerminalCallbackOwnership::Resolved
                     | TerminalCallbackOwnership::Transferred(_)
-                    | TerminalCallbackOwnership::Cancelled => 0,
+                    | TerminalCallbackOwnership::Cancelled => DirectCallbackLeakMetrics {
+                        leak_events: 0,
+                        leaked_callbacks: 0,
+                    },
                 }
             })
-            .unwrap_or(0),
+            .unwrap_or(DirectCallbackLeakMetrics {
+                leak_events: 0,
+                leaked_callbacks: 0,
+            }),
         DirectTerminalCallbackDisposition::NoVisualChange => obligations
             .frame_batch_id()
             .map(|batch_id| {
@@ -45,14 +61,25 @@ pub(crate) fn direct_terminal_callback_owner_leaks(
                     batch_id,
                     TerminalCallbackDisposition::NoVisualChange,
                 ) {
-                    TerminalCallbackOwnership::Leaked { pending, .. } => pending as u64,
+                    TerminalCallbackOwnership::Leaked { pending, .. } => {
+                        DirectCallbackLeakMetrics {
+                            leak_events: 1,
+                            leaked_callbacks: pending as u64,
+                        }
+                    }
                     TerminalCallbackOwnership::None
                     | TerminalCallbackOwnership::Resolved
                     | TerminalCallbackOwnership::Transferred(_)
-                    | TerminalCallbackOwnership::Cancelled => 0,
+                    | TerminalCallbackOwnership::Cancelled => DirectCallbackLeakMetrics {
+                        leak_events: 0,
+                        leaked_callbacks: 0,
+                    },
                 }
             })
-            .unwrap_or(0),
+            .unwrap_or(DirectCallbackLeakMetrics {
+                leak_events: 0,
+                leaked_callbacks: 0,
+            }),
         DirectTerminalCallbackDisposition::Retryable => obligations
             .frame_batch_id()
             .map(|batch_id| {
@@ -60,14 +87,25 @@ pub(crate) fn direct_terminal_callback_owner_leaks(
                     batch_id,
                     TerminalCallbackDisposition::Retryable,
                 ) {
-                    TerminalCallbackOwnership::Leaked { pending, .. } => pending as u64,
+                    TerminalCallbackOwnership::Leaked { pending, .. } => {
+                        DirectCallbackLeakMetrics {
+                            leak_events: 1,
+                            leaked_callbacks: pending as u64,
+                        }
+                    }
                     TerminalCallbackOwnership::None
                     | TerminalCallbackOwnership::Resolved
                     | TerminalCallbackOwnership::Transferred(_)
-                    | TerminalCallbackOwnership::Cancelled => 0,
+                    | TerminalCallbackOwnership::Cancelled => DirectCallbackLeakMetrics {
+                        leak_events: 0,
+                        leaked_callbacks: 0,
+                    },
                 }
             })
-            .unwrap_or(0),
+            .unwrap_or(DirectCallbackLeakMetrics {
+                leak_events: 0,
+                leaked_callbacks: 0,
+            }),
         DirectTerminalCallbackDisposition::Abandoned => obligations
             .frame_batch_id()
             .map(|batch_id| {
@@ -75,14 +113,25 @@ pub(crate) fn direct_terminal_callback_owner_leaks(
                     batch_id,
                     TerminalCallbackDisposition::Cancelled,
                 ) {
-                    TerminalCallbackOwnership::Leaked { pending, .. } => pending as u64,
+                    TerminalCallbackOwnership::Leaked { pending, .. } => {
+                        DirectCallbackLeakMetrics {
+                            leak_events: 1,
+                            leaked_callbacks: pending as u64,
+                        }
+                    }
                     TerminalCallbackOwnership::None
                     | TerminalCallbackOwnership::Resolved
                     | TerminalCallbackOwnership::Transferred(_)
-                    | TerminalCallbackOwnership::Cancelled => 0,
+                    | TerminalCallbackOwnership::Cancelled => DirectCallbackLeakMetrics {
+                        leak_events: 0,
+                        leaked_callbacks: 0,
+                    },
                 }
             })
-            .unwrap_or(0),
+            .unwrap_or(DirectCallbackLeakMetrics {
+                leak_events: 0,
+                leaked_callbacks: 0,
+            }),
         DirectTerminalCallbackDisposition::Superseded => obligations
             .frame_batch_id()
             .map(|batch_id| {
@@ -90,16 +139,26 @@ pub(crate) fn direct_terminal_callback_owner_leaks(
                     batch_id,
                     TerminalCallbackDisposition::Superseded,
                 ) {
-                    TerminalCallbackOwnership::Leaked { pending, .. } => pending as u64,
+                    TerminalCallbackOwnership::Leaked { pending, .. } => {
+                        DirectCallbackLeakMetrics {
+                            leak_events: 1,
+                            leaked_callbacks: pending as u64,
+                        }
+                    }
                     TerminalCallbackOwnership::None
                     | TerminalCallbackOwnership::Resolved
                     | TerminalCallbackOwnership::Transferred(_)
-                    | TerminalCallbackOwnership::Cancelled => 0,
+                    | TerminalCallbackOwnership::Cancelled => DirectCallbackLeakMetrics {
+                        leak_events: 0,
+                        leaked_callbacks: 0,
+                    },
                 }
             })
-            .unwrap_or(0),
-    };
-    observed_leaks.saturating_add(live_leaks)
+            .unwrap_or(DirectCallbackLeakMetrics {
+                leak_events: 0,
+                leaked_callbacks: 0,
+            }),
+    }
 }
 
 fn settle_accepted_output_transaction<F>(

@@ -395,7 +395,7 @@ mod frame_consumption_tests {
 
     #[test]
     fn disconnect_checks_callbacks_before_owner_removal() {
-        let (state, batch) = terminal_callback_batch();
+        let (mut state, batch) = terminal_callback_batch();
 
         assert_eq!(
             state.prepare_terminal_callback_ownership(
@@ -408,7 +408,7 @@ mod frame_consumption_tests {
 
     #[test]
     fn presented_transaction_checks_callbacks_before_completion() {
-        let (state, batch) = terminal_callback_batch();
+        let (mut state, batch) = terminal_callback_batch();
 
         assert_eq!(
             state.prepare_terminal_callback_ownership(
@@ -421,7 +421,7 @@ mod frame_consumption_tests {
 
     #[test]
     fn injected_terminal_callback_leak_increments_alarm() {
-        let state = CompositorState::default();
+        let mut state = CompositorState::default();
         let missing_batch =
             CompositorFrameBatchId::new(std::num::NonZeroU64::new(901).expect("test batch ID"));
 
@@ -439,7 +439,7 @@ mod frame_consumption_tests {
 
     #[test]
     fn valid_callback_transfer_does_not_increment_alarm() {
-        let (state, batch) = terminal_callback_batch();
+        let (mut state, batch) = terminal_callback_batch();
 
         assert_eq!(
             state.prepare_terminal_callback_ownership(
@@ -452,7 +452,7 @@ mod frame_consumption_tests {
 
     #[test]
     fn callback_leak_check_runs_exactly_once() {
-        let (state, batch) = terminal_callback_batch();
+        let (mut state, batch) = terminal_callback_batch();
 
         let first = state
             .prepare_terminal_callback_ownership(batch, TerminalCallbackDisposition::Presented);
@@ -463,7 +463,7 @@ mod frame_consumption_tests {
 
     #[test]
     fn callback_owner_terminal_check_is_prepared_once() {
-        let (state, batch) = terminal_callback_batch();
+        let (mut state, batch) = terminal_callback_batch();
 
         assert_eq!(
             state.prepare_terminal_callback_ownership(

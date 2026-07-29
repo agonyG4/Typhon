@@ -208,11 +208,10 @@ impl NativeRuntime {
         };
         let direct_callback_owner_leaks = direct_obligations.map(|obligations| {
             direct_terminal_callback_owner_leaks(
-                &self.server,
+                &mut self.server,
                 job.transaction_id,
                 obligations,
                 DirectTerminalCallbackDisposition::Abandoned,
-                0,
             )
         });
         settle_dropped_output_transaction(

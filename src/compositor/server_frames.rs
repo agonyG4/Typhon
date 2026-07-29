@@ -36,7 +36,7 @@ impl OwnCompositorServer {
     }
 
     pub fn prepare_terminal_callback_ownership(
-        &self,
+        &mut self,
         batch_id: CompositorFrameBatchId,
         disposition: TerminalCallbackDisposition,
     ) -> TerminalCallbackOwnership {

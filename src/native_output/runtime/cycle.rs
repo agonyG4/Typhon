@@ -1,5 +1,8 @@
 use super::cursor_cycle::{complete_cursor_only_pageflip, complete_primary_cursor_pageflip};
-use super::presentation_transactions::complete_presented_output_transaction;
+use super::presentation_transactions::{
+    commit_prepared_presented_output_transaction, complete_presented_output_transaction,
+    prepare_presented_output_transaction,
+};
 use super::*;
 
 #[path = "cycle_direct.rs"]
@@ -682,23 +685,66 @@ impl NativeRuntime {
                     let pageflip_token = PageFlipToken::new(pageflip.user_data)
                         .ok_or_else(|| io::Error::other("composited pageflip token is zero"))?;
                     let previous_assignment = *confirmed_primary_assignment;
-                    let mut completed = None;
-                    complete_presented_output_transaction(
+                    let CompositedPageflipCompletion {
+                        presented: frame,
+                        protocol_batch_id,
+                        surface_damage,
+                    } = explicit.complete_pageflip(pageflip_token)?;
+                    let prepared_logical = prepare_presented_output_transaction(
                         output_transactions,
-                        &mut self.presentation_trace,
                         transaction_id,
                         pageflip_token,
                         *drm_file_generation,
                         presented_at,
                         Some(actual_logical_sequence),
+                    )?;
+                    debug_assert!(prepared_logical.obligations().direct_surface_id().is_none());
+                    let direct_transition = match previous_assignment {
+                        Some(ConfirmedPrimaryAssignment::Direct {
+                            transaction_id,
+                            token,
+                            surface_id,
+                            candidate_key,
+                            framebuffer_id,
+                        }) => {
+                            let expected = ExpectedPresentedDirectPrimary {
+                                transaction_id,
+                                token,
+                                surface_id,
+                                candidate_key,
+                                framebuffer_id,
+                            };
+                            let worker_content_keys = kms_commit_worker
+                                .as_ref()
+                                .map(|worker| worker.direct_content_keys())
+                                .unwrap_or((None, None, None));
+                            if let Err(reason) = explicit
+                                .validate_composited_transition(expected, worker_content_keys)
+                            {
+                                output_transactions
+                                    .rollback_settlement(prepared_logical)
+                                    .map_err(io::Error::other)?;
+                                return cycle_direct::fail_composited_transition(
+                                    kms_commit_worker.as_ref(),
+                                    direct_fallback_tracker,
+                                    scanout,
+                                    frame_scheduler,
+                                    atomic_commit_arbiter,
+                                    reason,
+                                );
+                            }
+                            Some((expected, worker_content_keys))
+                        }
+                        _ => None,
+                    };
+                    let mut completed = Some(frame);
+                    commit_prepared_presented_output_transaction(
+                        output_transactions,
+                        &mut self.presentation_trace,
+                        prepared_logical,
                         |obligations| {
                             debug_assert!(obligations.direct_surface_id().is_none());
-                            let completion = explicit.complete_pageflip(pageflip_token)?;
-                            let CompositedPageflipCompletion {
-                                presented: frame,
-                                protocol_batch_id,
-                                surface_damage,
-                            } = completion;
+                            let frame = completed.take().expect("composited frame is available");
                             server.commit_surface_damage_presented(surface_damage);
                             server.complete_presented_frame_batch(
                                 frame.frame_id,
@@ -710,16 +756,12 @@ impl NativeRuntime {
                                 pageflip.user_data,
                                 *drm_file_generation,
                             )?;
-                            completed = Some(frame);
                             Ok(())
                         },
                     )?;
-                    if previous_assignment.is_some_and(|assignment| assignment.is_direct()) {
-                        let worker_content_keys = kms_commit_worker
-                            .as_ref()
-                            .map(|worker| worker.direct_content_keys())
-                            .unwrap_or((None, None, None));
-                        match explicit.complete_composited_transition(worker_content_keys) {
+                    if let Some((expected, worker_content_keys)) = direct_transition {
+                        match explicit.complete_composited_transition(expected, worker_content_keys)
+                        {
                             CompositedTransitionResult::Completed { .. } => {
                                 debug_assert!(explicit.direct_scanout_presented_info().is_none());
                             }

@@ -17,6 +17,7 @@ pub(super) fn fail_composited_transition(
     if let Some(worker) = worker {
         worker.mark_admission_fatal();
     }
+    scanout.note_direct_fallback_cycles(0);
     *direct_fallback_tracker = None;
     frame_scheduler.abandon_for_session_suspend();
     atomic_commit_arbiter.abandon_for_recovery();
@@ -92,7 +93,6 @@ pub(super) fn settle_direct_pageflip(
         transaction_id,
         logical_obligations,
         DirectTerminalCallbackDisposition::Presented,
-        0,
     );
     let completion = scanout.commit_prepared_direct_pageflip(prepared_physical);
     output_transactions.commit_prepared_terminal(prepared_logical);
@@ -115,6 +115,7 @@ pub(super) fn settle_direct_pageflip(
         token: pageflip_token,
         surface_id: completion.surface_id,
         candidate_key: completion.candidate_key,
+        framebuffer_id: completion.framebuffer_id,
     });
     debug_assert_eq!(
         scanout.direct_scanout_presented_info(),

@@ -46,6 +46,58 @@ fn server_reports_pending_frame_callbacks_until_present_frame() {
 }
 
 #[test]
+fn live_frame_callback_batch_reports_terminal_ownership_once() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    create_live_surface_with_unpresented_buffer_frame_callback(&socket_path).unwrap();
+    wait_for_server_commands(&commands);
+    let (batch_reply, batch_receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFrameBatch {
+            frame_id: 1,
+            reply: batch_reply,
+        })
+        .unwrap();
+    let batch_id = batch_receiver.recv().unwrap();
+    commands
+        .send(ServerCommand::CompleteRenderedFrameCallbacks(batch_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::CompleteRenderedFrameCallbacks(batch_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let (ownership_reply, ownership_receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::PrepareTerminalCallbackOwnership {
+            batch_id,
+            disposition: TerminalCallbackDisposition::Presented,
+            reply: ownership_reply,
+        })
+        .unwrap();
+    let first = ownership_receiver.recv().unwrap();
+    let (ownership_reply, ownership_receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::PrepareTerminalCallbackOwnership {
+            batch_id,
+            disposition: TerminalCallbackDisposition::Presented,
+            reply: ownership_reply,
+        })
+        .unwrap();
+    let second = ownership_receiver.recv().unwrap();
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(matches!(
+        first,
+        TerminalCallbackOwnership::Leaked { pending: 1, .. }
+    ));
+    assert_eq!(second, TerminalCallbackOwnership::None);
+}
+
+#[test]
 fn protocol_only_frame_tick_completes_callbacks_without_creating_a_visual_batch() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

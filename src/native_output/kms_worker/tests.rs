@@ -396,7 +396,6 @@ fn successful_retry_releases_input_fence_after_submit() {
     let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
     let fence = test_input_fence();
     let raw_fd = fence.as_raw_fd();
-    let original_identity = fd_identity(raw_fd);
     reserve_for_test(&handle, test_job(31).kind)
         .enqueue(test_job_with_input_fence(31, fence))
         .unwrap();
@@ -405,7 +404,15 @@ fn successful_retry_releases_input_fence_after_submit() {
         31,
         |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 31),
     );
-    assert!(fd_is_closed_or_reused(raw_fd, original_identity.as_deref()));
+    assert_eq!(*executor.attempts.lock().unwrap(), vec![raw_fd, raw_fd]);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        KmsWorkerEvent::Submitted { ownership }
+            if matches!(
+                &ownership.job.primary,
+                KmsPrimaryUpdate::Framebuffer { in_fence: None, .. }
+            )
+    )));
     handle
         .ack_pageflip(test_job(31).token, test_job(31).transaction_id, 1)
         .unwrap();
