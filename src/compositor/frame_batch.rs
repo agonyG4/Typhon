@@ -57,9 +57,76 @@ pub(crate) struct CompositorFrameBatch {
     pub(super) callbacks: Vec<wl_callback::WlCallback>,
     pub(super) callback_commit_ns: Option<u64>,
     pub(super) callback_render_completed_ns: Option<u64>,
-    pub(super) callback_render_completed_count: usize,
+    pub(super) callback_settlement: FrameCallbackSettlement,
     pub(super) callback_terminal_ownership_checked: bool,
     pub(super) presentation_feedbacks: Vec<PendingPresentationFeedback>,
     pub(super) shm_buffer_releases: Vec<wl_buffer::WlBuffer>,
     pub(super) dmabuf_releases_to_complete_on_present: Vec<SurfaceBufferRelease>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FrameCallbackSettlement {
+    pub(crate) originally_owned: usize,
+    pub(crate) completed_after_render: usize,
+    pub(crate) transferred: usize,
+    pub(crate) cancelled: usize,
+    pub(crate) unresolved: usize,
+    pub(crate) count_mismatch: bool,
+}
+
+impl FrameCallbackSettlement {
+    pub(crate) const fn new(originally_owned: usize) -> Self {
+        Self {
+            originally_owned,
+            completed_after_render: 0,
+            transferred: 0,
+            cancelled: 0,
+            unresolved: originally_owned,
+            count_mismatch: false,
+        }
+    }
+
+    pub(crate) fn complete(&mut self, count: usize) {
+        if !self.consume_unresolved(count) {
+            self.count_mismatch = true;
+            return;
+        }
+        self.completed_after_render = self.completed_after_render.saturating_add(count);
+    }
+
+    pub(crate) fn transfer(&mut self, count: usize) {
+        if !self.consume_unresolved(count) {
+            self.count_mismatch = true;
+            return;
+        }
+        self.transferred = self.transferred.saturating_add(count);
+    }
+
+    pub(crate) fn cancel(&mut self, count: usize) {
+        if !self.consume_unresolved(count) {
+            self.count_mismatch = true;
+            return;
+        }
+        self.cancelled = self.cancelled.saturating_add(count);
+    }
+
+    pub(crate) fn is_reconciled(&self) -> bool {
+        let Some(accounted) = self
+            .completed_after_render
+            .checked_add(self.transferred)
+            .and_then(|count| count.checked_add(self.cancelled))
+            .and_then(|count| count.checked_add(self.unresolved))
+        else {
+            return false;
+        };
+        self.originally_owned == accounted
+    }
+
+    fn consume_unresolved(&mut self, count: usize) -> bool {
+        let Some(unresolved) = self.unresolved.checked_sub(count) else {
+            return false;
+        };
+        self.unresolved = unresolved;
+        true
+    }
 }

@@ -203,6 +203,8 @@ pub(in crate::compositor::tests) enum ServerCommand {
         batch_id: CompositorFrameBatchId,
     },
     CompleteRenderedFrameCallbacks(CompositorFrameBatchId),
+    RestoreFrameBatchAfterRenderFailure(CompositorFrameBatchId),
+    CompleteNoVisualChangeFrameBatch(CompositorFrameBatchId),
     CompleteDirectFrameBatch {
         frame_id: u64,
         batch_id: CompositorFrameBatchId,
@@ -761,6 +763,12 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CompleteRenderedFrameCallbacks(batch_id) => {
                         server.complete_rendered_frame_callbacks(batch_id);
+                    }
+                    ServerCommand::RestoreFrameBatchAfterRenderFailure(batch_id) => {
+                        server.restore_frame_batch_after_render_failure(batch_id);
+                    }
+                    ServerCommand::CompleteNoVisualChangeFrameBatch(batch_id) => {
+                        server.complete_no_visual_change_frame_batch(batch_id);
                     }
                     ServerCommand::CompleteDirectFrameBatch {
                         frame_id,

@@ -122,6 +122,7 @@ use explicit_sync::{
     SYNCOBJ_SURFACE_ERROR_UNSUPPORTED_BUFFER, SyncobjSurfaceState, SyncobjTimelineData,
 };
 pub(crate) use frame_batch::CompositorFrameBatch;
+pub(crate) use frame_batch::FrameCallbackSettlement;
 pub use frame_batch::{BufferReleaseMetrics, CompositorFrameBatchId, FrameCallbackMetrics};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,13 +137,29 @@ pub enum TerminalCallbackDisposition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalCallbackOwnership {
     None,
-    Resolved,
-    Transferred(CompositorFrameBatchId),
-    Cancelled,
+    Resolved {
+        completed: usize,
+    },
+    Transferred {
+        owner: CompositorFrameBatchId,
+        callbacks: usize,
+    },
+    Cancelled {
+        callbacks: usize,
+    },
     Leaked {
         owner: CompositorFrameBatchId,
-        pending: usize,
+        unresolved: usize,
+        reason: TerminalCallbackLeakReason,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalCallbackLeakReason {
+    MissingBatch,
+    CountMismatch,
+    UnresolvedAtTerminal,
+    MissingTransferTarget,
 }
 pub use fullscreen::DirectScanoutSceneBlockers;
 pub(crate) use fullscreen::direct_scanout_scene_rejection_for_flags;

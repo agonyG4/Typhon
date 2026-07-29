@@ -46,22 +46,13 @@ fn server_reports_pending_frame_callbacks_until_present_frame() {
 }
 
 #[test]
-fn live_frame_callback_batch_reports_terminal_ownership_once() {
+fn render_completed_callback_is_resolved_at_direct_pageflip() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
-    create_live_surface_with_unpresented_buffer_frame_callback(&socket_path).unwrap();
-    wait_for_server_commands(&commands);
-    let (batch_reply, batch_receiver) = std::sync::mpsc::channel();
-    commands
-        .send(ServerCommand::CaptureFrameBatch {
-            frame_id: 1,
-            reply: batch_reply,
-        })
-        .unwrap();
-    let batch_id = batch_receiver.recv().unwrap();
+    let batch_id = capture_live_frame_batch(&socket_path, &commands, 1);
     commands
         .send(ServerCommand::CompleteRenderedFrameCallbacks(batch_id))
         .unwrap();
@@ -88,13 +79,141 @@ fn live_frame_callback_batch_reports_terminal_ownership_once() {
         })
         .unwrap();
     let second = ownership_receiver.recv().unwrap();
-    let _server = stop_controllable_test_server(commands, server_thread);
+    commands
+        .send(ServerCommand::CompleteDirectFrameBatch {
+            frame_id: 1,
+            batch_id,
+            direct_surface_id: 1,
+            presentation: FramePresentation::synchronized_zero_copy(
+                PresentationClock::Monotonic,
+                1,
+                0,
+                1,
+            )
+            .unwrap(),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let server = stop_controllable_test_server(commands, server_thread);
 
-    assert!(matches!(
-        first,
-        TerminalCallbackOwnership::Leaked { pending: 1, .. }
-    ));
+    assert_eq!(first, TerminalCallbackOwnership::Resolved { completed: 1 });
     assert_eq!(second, TerminalCallbackOwnership::None);
+    assert_eq!(
+        server
+            .frame_callback_metrics()
+            .callbacks_completed_after_render,
+        1
+    );
+}
+
+#[test]
+fn retryable_callback_transfer_preserves_live_callback_ownership() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let batch_id = capture_live_frame_batch(&socket_path, &commands, 2);
+
+    let (reply, receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::PrepareTerminalCallbackOwnership {
+            batch_id,
+            disposition: TerminalCallbackDisposition::Retryable,
+            reply,
+        })
+        .unwrap();
+    assert_eq!(
+        receiver.recv().unwrap(),
+        TerminalCallbackOwnership::Transferred {
+            owner: batch_id,
+            callbacks: 1,
+        }
+    );
+    commands
+        .send(ServerCommand::RestoreFrameBatchAfterRenderFailure(batch_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn no_visual_change_resolves_live_callback_without_feedback() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let batch_id = capture_live_frame_batch(&socket_path, &commands, 3);
+
+    let (reply, receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::PrepareTerminalCallbackOwnership {
+            batch_id,
+            disposition: TerminalCallbackDisposition::NoVisualChange,
+            reply,
+        })
+        .unwrap();
+    assert_eq!(
+        receiver.recv().unwrap(),
+        TerminalCallbackOwnership::Resolved { completed: 1 }
+    );
+    commands
+        .send(ServerCommand::CompleteNoVisualChangeFrameBatch(batch_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let server = stop_controllable_test_server(commands, server_thread);
+    assert_eq!(
+        server
+            .frame_callback_metrics()
+            .callbacks_completed_after_render,
+        0
+    );
+}
+
+#[test]
+fn safe_abandonment_cancels_live_callback_without_leak() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let batch_id = capture_live_frame_batch(&socket_path, &commands, 4);
+
+    let (reply, receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::PrepareTerminalCallbackOwnership {
+            batch_id,
+            disposition: TerminalCallbackDisposition::Cancelled,
+            reply,
+        })
+        .unwrap();
+    assert_eq!(
+        receiver.recv().unwrap(),
+        TerminalCallbackOwnership::Cancelled { callbacks: 1 }
+    );
+    commands
+        .send(ServerCommand::DiscardFrameBatch {
+            batch_id,
+            reason: FrameBatchDiscardReason::OutputDestroyed,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+fn capture_live_frame_batch(
+    socket_path: &PathBuf,
+    commands: &std::sync::mpsc::Sender<ServerCommand>,
+    frame_id: u64,
+) -> CompositorFrameBatchId {
+    create_live_surface_with_unpresented_buffer_frame_callback(socket_path).unwrap();
+    wait_for_server_commands(commands);
+    let (batch_reply, batch_receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFrameBatch {
+            frame_id,
+            reply: batch_reply,
+        })
+        .unwrap();
+    batch_receiver.recv().unwrap()
 }
 
 #[test]

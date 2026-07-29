@@ -432,8 +432,32 @@ mod frame_consumption_tests {
             ),
             TerminalCallbackOwnership::Leaked {
                 owner,
-                pending: 0
+                unresolved: 0,
+                reason: TerminalCallbackLeakReason::MissingBatch,
             } if owner == missing_batch
+        ));
+    }
+
+    #[test]
+    fn callback_count_mismatch_increments_leak_alarm() {
+        let (mut state, batch) = terminal_callback_batch();
+        state
+            .frame_batches
+            .get_mut(&batch)
+            .expect("terminal callback batch")
+            .callback_settlement
+            .originally_owned = 1;
+
+        assert!(matches!(
+            state.prepare_terminal_callback_ownership(
+                batch,
+                TerminalCallbackDisposition::Presented,
+            ),
+            TerminalCallbackOwnership::Leaked {
+                owner,
+                unresolved: 0,
+                reason: TerminalCallbackLeakReason::CountMismatch,
+            } if owner == batch
         ));
     }
 

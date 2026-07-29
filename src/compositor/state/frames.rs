@@ -274,7 +274,7 @@ impl CompositorState {
                 callbacks,
                 callback_commit_ns,
                 callback_render_completed_ns: None,
-                callback_render_completed_count: 0,
+                callback_settlement: FrameCallbackSettlement::new(callback_count),
                 callback_terminal_ownership_checked: false,
                 presentation_feedbacks: std::mem::take(&mut self.pending_presentation_feedbacks),
                 shm_buffer_releases,
@@ -290,6 +290,8 @@ impl CompositorState {
         &mut self,
         batch_id: CompositorFrameBatchId,
     ) {
+        let _ = self
+            .prepare_terminal_callback_ownership(batch_id, TerminalCallbackDisposition::Retryable);
         let mut batch = self
             .frame_batches
             .remove(&batch_id)
@@ -319,6 +321,8 @@ impl CompositorState {
         batch_id: CompositorFrameBatchId,
         reason: FrameBatchDiscardReason,
     ) {
+        let _ = self
+            .prepare_terminal_callback_ownership(batch_id, TerminalCallbackDisposition::Cancelled);
         let batch = self
             .frame_batches
             .remove(&batch_id)
@@ -364,6 +368,8 @@ impl CompositorState {
         batch_id: CompositorFrameBatchId,
         reason: FrameBatchDiscardReason,
     ) {
+        let _ = self
+            .prepare_terminal_callback_ownership(batch_id, TerminalCallbackDisposition::Cancelled);
         let batch = self
             .frame_batches
             .remove(&batch_id)
@@ -400,11 +406,30 @@ impl CompositorState {
         batch_id: CompositorFrameBatchId,
         presentation: FramePresentation,
     ) {
+        self.assert_frame_batch_identity(frame_id, batch_id);
+        let _ = self
+            .prepare_terminal_callback_ownership(batch_id, TerminalCallbackDisposition::Presented);
         let batch = self.take_presented_frame_batch(frame_id, batch_id);
         self.note_frame_callbacks_at_pageflip(batch_id, &batch);
         let batch = self.complete_frame_batch_releases(batch_id, batch);
         self.clear_legacy_batch_reference(batch_id);
         self.complete_presentation_feedbacks(batch.presentation_feedbacks, presentation);
+    }
+
+    pub(in crate::compositor) fn assert_frame_batch_identity(
+        &self,
+        frame_id: u64,
+        batch_id: CompositorFrameBatchId,
+    ) {
+        let registered_frame_id = self
+            .frame_batches
+            .get(&batch_id)
+            .expect("missing compositor frame batch on presentation")
+            .frame_id;
+        assert_eq!(
+            registered_frame_id, frame_id,
+            "pageflip frame ID does not own the compositor frame batch"
+        );
     }
 
     #[cfg(test)]
@@ -429,15 +454,7 @@ impl CompositorState {
         frame_id: u64,
         batch_id: CompositorFrameBatchId,
     ) -> CompositorFrameBatch {
-        let registered_frame_id = self
-            .frame_batches
-            .get(&batch_id)
-            .expect("missing compositor frame batch on presentation")
-            .frame_id;
-        assert_eq!(
-            registered_frame_id, frame_id,
-            "pageflip frame ID does not own the compositor frame batch"
-        );
+        self.assert_frame_batch_identity(frame_id, batch_id);
         self.frame_batches
             .remove(&batch_id)
             .expect("compositor frame batch disappeared during completion")

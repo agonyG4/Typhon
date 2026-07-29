@@ -58,37 +58,102 @@ impl CompositorState {
         batch_id: CompositorFrameBatchId,
         disposition: TerminalCallbackDisposition,
     ) -> TerminalCallbackOwnership {
+        self.settle_terminal_callback_ownership(batch_id, disposition)
+    }
+
+    fn settle_terminal_callback_ownership(
+        &mut self,
+        batch_id: CompositorFrameBatchId,
+        disposition: TerminalCallbackDisposition,
+    ) -> TerminalCallbackOwnership {
         let Some(batch) = self.frame_batches.get_mut(&batch_id) else {
             return TerminalCallbackOwnership::Leaked {
                 owner: batch_id,
-                pending: 0,
+                unresolved: 0,
+                reason: TerminalCallbackLeakReason::MissingBatch,
             };
         };
         if batch.callback_terminal_ownership_checked {
             return TerminalCallbackOwnership::None;
         }
         batch.callback_terminal_ownership_checked = true;
-        let pending = batch
+        let live = batch
             .callbacks
             .iter()
             .filter(|callback| callback.is_alive())
             .count();
-        let returned = batch.callback_render_completed_count;
-        if pending == 0 && returned == 0 {
+        let cancelled = batch.callbacks.len().saturating_sub(live);
+        let settlement = &mut batch.callback_settlement;
+        if settlement.count_mismatch || !settlement.is_reconciled() {
+            return TerminalCallbackOwnership::Leaked {
+                owner: batch_id,
+                unresolved: settlement.unresolved,
+                reason: TerminalCallbackLeakReason::CountMismatch,
+            };
+        }
+        if settlement.originally_owned == 0 {
             return TerminalCallbackOwnership::None;
         }
+        if settlement.unresolved == 0 {
+            return if settlement.completed_after_render == 0 && settlement.cancelled > 0 {
+                TerminalCallbackOwnership::Cancelled {
+                    callbacks: settlement.cancelled,
+                }
+            } else {
+                TerminalCallbackOwnership::Resolved {
+                    completed: settlement.completed_after_render,
+                }
+            };
+        }
         match disposition {
-            _ if returned > 0 => TerminalCallbackOwnership::Leaked {
-                owner: batch_id,
-                pending: returned,
-            },
-            TerminalCallbackDisposition::Retryable => {
-                TerminalCallbackOwnership::Transferred(batch_id)
+            TerminalCallbackDisposition::Presented
+            | TerminalCallbackDisposition::NoVisualChange => {
+                settlement.complete(live);
+                settlement.cancel(cancelled);
+                if settlement.count_mismatch || !settlement.is_reconciled() {
+                    return TerminalCallbackOwnership::Leaked {
+                        owner: batch_id,
+                        unresolved: settlement.unresolved,
+                        reason: TerminalCallbackLeakReason::CountMismatch,
+                    };
+                }
+                TerminalCallbackOwnership::Resolved {
+                    completed: settlement.completed_after_render,
+                }
             }
-            TerminalCallbackDisposition::Cancelled => TerminalCallbackOwnership::Cancelled,
-            TerminalCallbackDisposition::Superseded
-            | TerminalCallbackDisposition::Presented
-            | TerminalCallbackDisposition::NoVisualChange => TerminalCallbackOwnership::Resolved,
+            TerminalCallbackDisposition::Retryable | TerminalCallbackDisposition::Superseded => {
+                settlement.transfer(live);
+                settlement.cancel(cancelled);
+                if settlement.count_mismatch || !settlement.is_reconciled() {
+                    return TerminalCallbackOwnership::Leaked {
+                        owner: batch_id,
+                        unresolved: settlement.unresolved,
+                        reason: TerminalCallbackLeakReason::CountMismatch,
+                    };
+                }
+                if live == 0 {
+                    TerminalCallbackOwnership::Cancelled {
+                        callbacks: cancelled,
+                    }
+                } else {
+                    TerminalCallbackOwnership::Transferred {
+                        owner: batch_id,
+                        callbacks: live,
+                    }
+                }
+            }
+            TerminalCallbackDisposition::Cancelled => {
+                let count = live.saturating_add(cancelled);
+                settlement.cancel(count);
+                if settlement.count_mismatch || !settlement.is_reconciled() {
+                    return TerminalCallbackOwnership::Leaked {
+                        owner: batch_id,
+                        unresolved: settlement.unresolved,
+                        reason: TerminalCallbackLeakReason::CountMismatch,
+                    };
+                }
+                TerminalCallbackOwnership::Cancelled { callbacks: count }
+            }
         }
     }
 
@@ -99,6 +164,9 @@ impl CompositorState {
         direct_surface_id: u32,
         presentation: FramePresentation,
     ) {
+        self.assert_frame_batch_identity(frame_id, batch_id);
+        let _ = self
+            .settle_terminal_callback_ownership(batch_id, TerminalCallbackDisposition::Presented);
         let mut batch = self.take_presented_frame_batch(frame_id, batch_id);
         self.note_frame_callbacks_at_pageflip(batch_id, &batch);
         let callbacks = std::mem::take(&mut batch.callbacks);
@@ -113,6 +181,10 @@ impl CompositorState {
         &mut self,
         batch_id: CompositorFrameBatchId,
     ) {
+        let _ = self.settle_terminal_callback_ownership(
+            batch_id,
+            TerminalCallbackDisposition::NoVisualChange,
+        );
         let mut batch = self
             .frame_batches
             .remove(&batch_id)
@@ -157,9 +229,15 @@ impl CompositorState {
                 .get_mut(&batch_id)
                 .expect("missing compositor frame batch at render completion");
             let callbacks = batch.callbacks.drain(..).collect::<Vec<_>>();
+            let completed = callbacks
+                .iter()
+                .filter(|callback| callback.is_alive())
+                .count();
+            let cancelled = callbacks.len().saturating_sub(completed);
+            batch.callback_settlement.complete(completed);
+            batch.callback_settlement.cancel(cancelled);
             if !callbacks.is_empty() {
                 batch.callback_render_completed_ns = Some(completed_ns);
-                batch.callback_render_completed_count = callbacks.len();
             }
             (callbacks, batch.callback_commit_ns)
         };

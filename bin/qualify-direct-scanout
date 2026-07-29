@@ -218,6 +218,8 @@ self_test() {
     printf '%s\n' "$base" >"$fixture"
     check_log "$fixture" >/dev/null
     printf '%s\n' "self-test: passing inactive final state PASS"
+    printf '%s\n' "self-test: zero callback leak events and counts PASS"
+    printf '%s\n' "self-test: resolved callbacks do not affect leak fields PASS"
 
     active="${base/direct_scanout_active=false/direct_scanout_active=true}"
     active="${active/direct_scanout_live_leases=0/direct_scanout_live_leases=1}"
@@ -254,6 +256,8 @@ self_test() {
     expect_failure "fallback remains active" "${base/direct_scanout_fallback_active=false/direct_scanout_fallback_active=true}"
     expect_failure "inactive fallback has current cycles" "${base/direct_scanout_fallback_cycles_current=0/direct_scanout_fallback_cycles_current=2}"
     expect_failure "missing required field" "${base/ direct_scanout_presented_framebuffer=none/}"
+    expect_failure "missing callback leak event field" "${base/direct_scanout_callback_owner_leak_events=0/}"
+    expect_failure "missing leaked callback count field" "${base/direct_scanout_callback_owner_leaked_callbacks=0/}"
 
     local prevented
     prevented="${base/direct_scanout_early_release_prevented=0/direct_scanout_early_release_prevented=4}"

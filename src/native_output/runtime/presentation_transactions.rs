@@ -35,16 +35,16 @@ pub(crate) fn direct_terminal_callback_owner_leaks(
                     batch_id,
                     TerminalCallbackDisposition::Presented,
                 ) {
-                    TerminalCallbackOwnership::Leaked { pending, .. } => {
+                    TerminalCallbackOwnership::Leaked { unresolved, .. } => {
                         DirectCallbackLeakMetrics {
                             leak_events: 1,
-                            leaked_callbacks: pending as u64,
+                            leaked_callbacks: unresolved as u64,
                         }
                     }
                     TerminalCallbackOwnership::None
-                    | TerminalCallbackOwnership::Resolved
-                    | TerminalCallbackOwnership::Transferred(_)
-                    | TerminalCallbackOwnership::Cancelled => DirectCallbackLeakMetrics {
+                    | TerminalCallbackOwnership::Resolved { .. }
+                    | TerminalCallbackOwnership::Transferred { .. }
+                    | TerminalCallbackOwnership::Cancelled { .. } => DirectCallbackLeakMetrics {
                         leak_events: 0,
                         leaked_callbacks: 0,
                     },
@@ -61,16 +61,16 @@ pub(crate) fn direct_terminal_callback_owner_leaks(
                     batch_id,
                     TerminalCallbackDisposition::NoVisualChange,
                 ) {
-                    TerminalCallbackOwnership::Leaked { pending, .. } => {
+                    TerminalCallbackOwnership::Leaked { unresolved, .. } => {
                         DirectCallbackLeakMetrics {
                             leak_events: 1,
-                            leaked_callbacks: pending as u64,
+                            leaked_callbacks: unresolved as u64,
                         }
                     }
                     TerminalCallbackOwnership::None
-                    | TerminalCallbackOwnership::Resolved
-                    | TerminalCallbackOwnership::Transferred(_)
-                    | TerminalCallbackOwnership::Cancelled => DirectCallbackLeakMetrics {
+                    | TerminalCallbackOwnership::Resolved { .. }
+                    | TerminalCallbackOwnership::Transferred { .. }
+                    | TerminalCallbackOwnership::Cancelled { .. } => DirectCallbackLeakMetrics {
                         leak_events: 0,
                         leaked_callbacks: 0,
                     },
@@ -87,16 +87,16 @@ pub(crate) fn direct_terminal_callback_owner_leaks(
                     batch_id,
                     TerminalCallbackDisposition::Retryable,
                 ) {
-                    TerminalCallbackOwnership::Leaked { pending, .. } => {
+                    TerminalCallbackOwnership::Leaked { unresolved, .. } => {
                         DirectCallbackLeakMetrics {
                             leak_events: 1,
-                            leaked_callbacks: pending as u64,
+                            leaked_callbacks: unresolved as u64,
                         }
                     }
                     TerminalCallbackOwnership::None
-                    | TerminalCallbackOwnership::Resolved
-                    | TerminalCallbackOwnership::Transferred(_)
-                    | TerminalCallbackOwnership::Cancelled => DirectCallbackLeakMetrics {
+                    | TerminalCallbackOwnership::Resolved { .. }
+                    | TerminalCallbackOwnership::Transferred { .. }
+                    | TerminalCallbackOwnership::Cancelled { .. } => DirectCallbackLeakMetrics {
                         leak_events: 0,
                         leaked_callbacks: 0,
                     },
@@ -113,16 +113,16 @@ pub(crate) fn direct_terminal_callback_owner_leaks(
                     batch_id,
                     TerminalCallbackDisposition::Cancelled,
                 ) {
-                    TerminalCallbackOwnership::Leaked { pending, .. } => {
+                    TerminalCallbackOwnership::Leaked { unresolved, .. } => {
                         DirectCallbackLeakMetrics {
                             leak_events: 1,
-                            leaked_callbacks: pending as u64,
+                            leaked_callbacks: unresolved as u64,
                         }
                     }
                     TerminalCallbackOwnership::None
-                    | TerminalCallbackOwnership::Resolved
-                    | TerminalCallbackOwnership::Transferred(_)
-                    | TerminalCallbackOwnership::Cancelled => DirectCallbackLeakMetrics {
+                    | TerminalCallbackOwnership::Resolved { .. }
+                    | TerminalCallbackOwnership::Transferred { .. }
+                    | TerminalCallbackOwnership::Cancelled { .. } => DirectCallbackLeakMetrics {
                         leak_events: 0,
                         leaked_callbacks: 0,
                     },
@@ -139,16 +139,16 @@ pub(crate) fn direct_terminal_callback_owner_leaks(
                     batch_id,
                     TerminalCallbackDisposition::Superseded,
                 ) {
-                    TerminalCallbackOwnership::Leaked { pending, .. } => {
+                    TerminalCallbackOwnership::Leaked { unresolved, .. } => {
                         DirectCallbackLeakMetrics {
                             leak_events: 1,
-                            leaked_callbacks: pending as u64,
+                            leaked_callbacks: unresolved as u64,
                         }
                     }
                     TerminalCallbackOwnership::None
-                    | TerminalCallbackOwnership::Resolved
-                    | TerminalCallbackOwnership::Transferred(_)
-                    | TerminalCallbackOwnership::Cancelled => DirectCallbackLeakMetrics {
+                    | TerminalCallbackOwnership::Resolved { .. }
+                    | TerminalCallbackOwnership::Transferred { .. }
+                    | TerminalCallbackOwnership::Cancelled { .. } => DirectCallbackLeakMetrics {
                         leak_events: 0,
                         leaked_callbacks: 0,
                     },
