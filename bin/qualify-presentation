@@ -74,6 +74,7 @@ run_phase() {
     printf '[%s] phase=%s\n' "$(date --iso-8601=seconds)" "$phase" | tee "$session_log"
     (
         export OBLIVION_ONE_DIRECT_SCANOUT="$direct"
+        export OBLIVION_ONE_NVIDIA_EGL_WAYLAND2_COMPAT="${OBLIVION_ONE_NVIDIA_EGL_WAYLAND2_COMPAT:-auto}"
         export OBLIVION_ONE_TRIPLE_BUFFERING="$triple"
         export OBLIVION_ONE_CURSOR_SCHEDULING="$cursor"
         export OBLIVION_ONE_PRESENTATION_TRACE=1

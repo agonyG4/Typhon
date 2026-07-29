@@ -230,6 +230,8 @@ pub(crate) struct NativeRuntime {
     triple_buffer_policy: AdaptiveTripleBufferPolicy,
     pending_proven_deadline_miss: Option<ProvenDeadlineMiss>,
     effective_app_gpu_policy: EffectiveCompositorAppGpuPolicy,
+    dmabuf_feedback_compatibility: DmabufFeedbackCompatibility,
+    dmabuf_feedback_compat_metrics: DmabufFeedbackCompatibilityMetrics,
     last_rendered_scene_generation: u64,
     last_direct_candidate_key: Option<DirectScanoutCandidateKey>,
     direct_fallback_tracker: Option<cycle::direct_fallback::DirectFallbackTracker>,

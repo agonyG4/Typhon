@@ -427,6 +427,7 @@ impl CompositorState {
             dmabuf_main_device: 0,
             dmabuf_main_device_path: None,
             dmabuf_scanout_capabilities: None,
+            dmabuf_scanout_target_device_override: None,
             syncobj_device,
             clipboard_bridge: Some(Box::new(NoopClipboardBridge)),
             ..Self::default()

@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+socket="${OBLIVION_ONE_SOCKET:-oblivion-one-tty-egl-wayland2}"
+runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+observation_seconds="${OBLIVION_ONE_EGL_WAYLAND2_OBSERVATION_SECONDS:-10}"
+log_dir="${OBLIVION_ONE_EGL_WAYLAND2_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/oblivion-one/qualification-egl-wayland2}"
+compositor_log="$log_dir/compositor.log"
+client_log="$log_dir/client.log"
+compositor_pid=""
+client_pid=""
+
+usage() {
+    cat <<'EOF'
+qualify-nvidia-egl-wayland2
+
+Run one qualification-only native EGL Wayland client observation.
+
+The helper forces Atomic KMS, the KMS commit worker, Direct Scanout
+experimental-auto, and NVIDIA egl-wayland2 compatibility auto. It does not
+run as an ordinary unit test or attach to a desktop session automatically.
+
+Environment:
+  OBLIVION_ONE_EGL_WAYLAND2_CLIENT  client command (default: kitty --config NONE)
+  OBLIVION_ONE_EGL_WAYLAND2_OBSERVATION_SECONDS  liveness window (default: 10)
+  OBLIVION_ONE_EGL_WAYLAND2_LOG_DIR  result directory
+EOF
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    usage
+    exit 0
+fi
+if [[ "$#" -ne 0 ]]; then
+    usage >&2
+    exit 2
+fi
+
+mkdir -p -- "$log_dir"
+: >"$compositor_log"
+: >"$client_log"
+
+contains_failure_text() {
+    local path="$1"
+    awk '/free\(\): invalid pointer|SIGABRT|coredump|core dumped/ { found = 1 } END { exit found ? 0 : 1 }' "$path"
+}
+
+report_coredump() {
+    local pid="$1"
+    if ! command -v coredumpctl >/dev/null 2>&1; then
+        printf 'coredump: unavailable (coredumpctl not installed)\n'
+        return 0
+    fi
+    if coredumpctl --no-pager info "$pid" >"$log_dir/coredump.txt" 2>&1; then
+        printf 'coredump: records found for pid=%s\n' "$pid"
+        return 1
+    fi
+    printf 'coredump: no record for pid=%s\n' "$pid"
+}
+
+stop_compositor() {
+    local status=0
+    if [[ -n "$compositor_pid" ]] && kill -0 "$compositor_pid" 2>/dev/null; then
+        kill -TERM "$compositor_pid" 2>/dev/null || true
+        for _ in {1..50}; do
+            if ! kill -0 "$compositor_pid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.1
+        done
+    fi
+    if [[ -n "$compositor_pid" ]]; then
+        wait "$compositor_pid" || status=$?
+        compositor_pid=""
+    fi
+    return "$status"
+}
+
+cleanup() {
+    if [[ -n "$client_pid" ]] && kill -0 "$client_pid" 2>/dev/null; then
+        kill -TERM "$client_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$client_pid" ]]; then
+        wait "$client_pid" 2>/dev/null || true
+        client_pid=""
+    fi
+    stop_compositor || true
+}
+trap cleanup EXIT INT TERM
+
+export OBLIVION_ONE_PROFILE="${OBLIVION_ONE_PROFILE:-release}"
+export OBLIVION_ONE_SOCKET="$socket"
+export OBLIVION_ONE_MODE="${OBLIVION_ONE_MODE:-1920x1080@165}"
+export OBLIVION_ONE_KMS_MODE=atomic
+export OBLIVION_ONE_KMS_COMMIT_WORKER=force
+export OBLIVION_ONE_DIRECT_SCANOUT=experimental-auto
+export OBLIVION_ONE_NVIDIA_EGL_WAYLAND2_COMPAT=auto
+export OBLIVION_ONE_TRIPLE_BUFFERING=off
+export OBLIVION_ONE_CURSOR=hardware
+export OBLIVION_ONE_PERF_LOG=1
+
+printf 'qualification: compositor_policy kms=atomic worker=force direct=experimental-auto compat=auto\n'
+printf 'qualification: mode=%s socket=%s observation_seconds=%s\n' \
+    "$OBLIVION_ONE_MODE" "$socket" "$observation_seconds"
+
+(
+    exec "$script_dir/start-oblivion-one-tty"
+) >"$compositor_log" 2>&1 &
+compositor_pid=$!
+
+socket_path="$runtime_dir/$socket"
+for _ in {1..100}; do
+    if [[ -S "$socket_path" ]]; then
+        break
+    fi
+    if ! kill -0 "$compositor_pid" 2>/dev/null; then
+        printf 'qualification: compositor exited before Wayland socket\n' >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+if [[ ! -S "$socket_path" ]]; then
+    printf 'qualification: Wayland socket did not appear: %s\n' "$socket_path" >&2
+    exit 1
+fi
+
+read -r -a client_argv <<<"${OBLIVION_ONE_EGL_WAYLAND2_CLIENT:-kitty --config NONE}"
+if [[ "${#client_argv[@]}" -eq 0 ]]; then
+    printf 'qualification: client command is empty\n' >&2
+    exit 2
+fi
+(
+    export WAYLAND_DISPLAY="$socket"
+    export XDG_RUNTIME_DIR="$runtime_dir"
+    exec "${client_argv[@]}"
+) >"$client_log" 2>&1 &
+client_pid=$!
+
+first_toplevel=0
+for _ in {1..100}; do
+    if awk '/app\.first_toplevel/ { found = 1 } END { exit found ? 0 : 1 }' "$compositor_log"; then
+        first_toplevel=1
+        break
+    fi
+    if ! kill -0 "$client_pid" 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+if [[ "$first_toplevel" -ne 1 ]]; then
+    printf 'qualification: first toplevel was not observed\n' >&2
+    exit 1
+fi
+printf 'qualification: first toplevel observed\n'
+
+sleep "$observation_seconds"
+if ! kill -0 "$client_pid" 2>/dev/null; then
+    printf 'qualification: client exited during observation\n' >&2
+    exit 1
+fi
+printf 'qualification: client alive after %ss\n' "$observation_seconds"
+
+if contains_failure_text "$client_log" || contains_failure_text "$compositor_log"; then
+    printf 'qualification: invalid-pointer/abort/coredump text detected\n' >&2
+    exit 1
+fi
+if ! report_coredump "$client_pid"; then
+    printf 'qualification: coredump detected\n' >&2
+    exit 1
+fi
+
+if ! stop_compositor; then
+    printf 'qualification: compositor did not shut down gracefully\n' >&2
+    exit 1
+fi
+printf 'qualification: compositor shutdown graceful\n'
+printf 'qualification: PASS logs=%s\n' "$log_dir"

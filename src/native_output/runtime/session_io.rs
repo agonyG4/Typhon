@@ -370,7 +370,11 @@ impl NativeSessionIo for NativeRuntime {
         self.abandon_direct_fallback();
         self.scanout
             .rebind_session_generation(self.drm_file_generation);
-        if !apply_native_scanout_feedback(&mut self.server, &self.scanout) {
+        if !apply_native_scanout_feedback(
+            &mut self.server,
+            &self.scanout,
+            self.dmabuf_feedback_compatibility.target_device_override(),
+        ) {
             self.scanout.note_dmabuf_feedback_unchanged_rebuild();
         }
         self.acquire_watches

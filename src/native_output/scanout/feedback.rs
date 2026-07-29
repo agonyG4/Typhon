@@ -18,12 +18,14 @@ pub(crate) fn feedback_capabilities_changed(
 pub(crate) fn apply_native_scanout_feedback(
     server: &mut OwnCompositorServer,
     scanout: &NativeScanoutBackend,
+    scanout_target_device_override: Option<u64>,
 ) -> bool {
-    server.set_dmabuf_feedback_with_scanout_capabilities(
+    server.set_dmabuf_feedback_with_scanout_capabilities_and_target(
         scanout.dmabuf_feedback(),
         scanout.dmabuf_main_device(),
         scanout.dmabuf_main_device_path(),
         scanout.dmabuf_scanout_capabilities(),
+        scanout_target_device_override,
     )
 }
 

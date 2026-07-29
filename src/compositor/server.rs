@@ -949,6 +949,27 @@ impl OwnCompositorServer {
         changed
     }
 
+    pub fn set_dmabuf_feedback_with_scanout_capabilities_and_target(
+        &mut self,
+        feedback: EglGlesDmabufFeedback,
+        main_device: Option<u64>,
+        main_device_path: Option<String>,
+        scanout_capabilities: Option<DirectScanoutFeedbackCapabilities>,
+        scanout_target_device_override: Option<u64>,
+    ) -> bool {
+        let changed = self
+            .state
+            .set_dmabuf_feedback_with_scanout_capabilities_and_target(
+                feedback,
+                main_device,
+                main_device_path,
+                scanout_capabilities,
+                scanout_target_device_override,
+            );
+        let _ = self.display.flush_clients();
+        changed
+    }
+
     pub fn set_output_size(&mut self, width: u32, height: u32) -> bool {
         let changed = self.state.set_output_size(width, height);
         let _ = self.display.flush_clients();

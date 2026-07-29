@@ -199,6 +199,8 @@ struct NativeRuntimeBootstrapTail {
     seat_session: Option<NativeSeatSession>,
     startup_app: Option<Vec<String>>,
     effective_app_gpu_policy: EffectiveCompositorAppGpuPolicy,
+    dmabuf_feedback_compatibility: DmabufFeedbackCompatibility,
+    dmabuf_feedback_compat_metrics: DmabufFeedbackCompatibilityMetrics,
 }
 
 impl NativeRuntime {
@@ -229,6 +231,8 @@ impl NativeRuntime {
             seat_session,
             startup_app,
             effective_app_gpu_policy,
+            dmabuf_feedback_compatibility,
+            dmabuf_feedback_compat_metrics,
         } = parts;
         let atomic_cursor = pre_kms_atomic_cursor;
         let mut legacy_cursor = pre_kms_legacy_cursor;
@@ -641,6 +645,8 @@ impl NativeRuntime {
             triple_buffer_policy,
             pending_proven_deadline_miss: None,
             effective_app_gpu_policy,
+            dmabuf_feedback_compatibility,
+            dmabuf_feedback_compat_metrics,
             last_rendered_scene_generation,
             last_direct_candidate_key: None,
             direct_fallback_tracker: None,
@@ -1131,7 +1137,6 @@ impl NativeRuntime {
         println!("native scanout backend active: {}", scanout.kind().as_str());
         let effective_app_gpu_policy =
             resolve_native_app_gpu_policy(app_gpu_preference, scanout.kind())?;
-        apply_native_scanout_feedback(&mut server, &scanout);
         let native_syncobj_device = scanout
             .dmabuf_main_device_path()
             .and_then(|path| OpenOptions::new().read(true).write(true).open(path).ok())
@@ -1148,9 +1153,23 @@ impl NativeRuntime {
             .as_ref()
             .and_then(|device| device.device_identity().ok());
         server.set_native_syncobj_device(native_syncobj_device);
-        if scanout.supports_gpu_buffer_protocols() {
-            let capabilities =
-                native_gpu_protocol_capabilities(&bootstrap, &scanout, native_syncobj_identity);
+        let native_gpu_capabilities = scanout.supports_gpu_buffer_protocols().then(|| {
+            native_gpu_protocol_capabilities(&bootstrap, &scanout, native_syncobj_identity)
+        });
+        let dmabuf_feedback_compatibility = native_dmabuf_feedback_compatibility(
+            &bootstrap,
+            &scanout,
+            native_gpu_capabilities.as_ref(),
+        );
+        println!("{}", dmabuf_feedback_compatibility.startup_diagnostic());
+        let mut dmabuf_feedback_compat_metrics = DmabufFeedbackCompatibilityMetrics::default();
+        dmabuf_feedback_compat_metrics.observe(&dmabuf_feedback_compatibility);
+        apply_native_scanout_feedback(
+            &mut server,
+            &scanout,
+            dmabuf_feedback_compatibility.target_device_override(),
+        );
+        if let Some(capabilities) = native_gpu_capabilities {
             for diagnostic in capabilities.diagnostics() {
                 println!(
                     "native GPU protocol: {:?} enabled={} reason={}",
@@ -1336,7 +1355,66 @@ impl NativeRuntime {
             seat_session,
             startup_app,
             effective_app_gpu_policy,
+            dmabuf_feedback_compatibility,
+            dmabuf_feedback_compat_metrics,
         })
+    }
+}
+
+fn native_dmabuf_feedback_compatibility(
+    bootstrap: &NativeOutputBootstrap,
+    scanout: &NativeScanoutBackend,
+    capabilities: Option<&GpuProtocolCapabilities>,
+) -> DmabufFeedbackCompatibility {
+    let main_device_path = scanout.dmabuf_main_device_path().map(PathBuf::from);
+    let primary_node = bootstrap.kms_device.as_deref().and_then(DrmNode::from_path);
+    let render_node = main_device_path.as_deref().and_then(DrmNode::from_path);
+    let same_physical_gpu = primary_node
+        .as_ref()
+        .zip(render_node.as_ref())
+        .map(|(primary, render)| drm_nodes_share_physical_device(primary, render));
+    let default_feedback_tranche_count = capabilities.map_or(1, |capabilities| {
+        native_dmabuf_feedback_tranche_count(scanout, capabilities)
+    });
+    resolve_dmabuf_feedback_policy(DmabufFeedbackPolicyInput {
+        requested: NvidiaEglWayland2CompatPolicy::from_env(),
+        egl_vendor: scanout.dmabuf_egl_vendor().unwrap_or("unknown"),
+        main_device: scanout.dmabuf_main_device(),
+        main_device_path: main_device_path.as_deref(),
+        scanout_target_device: scanout.dmabuf_scanout_target_device(),
+        scanout_target_path: bootstrap.kms_device.as_deref(),
+        same_physical_gpu,
+        dmabuf_version: capabilities.map_or(0, |capabilities| {
+            capabilities.dmabuf_version().wayland_version()
+        }),
+        default_feedback_tranche_count,
+        surface_feedback_policy: "default-and-surface-same",
+    })
+}
+
+fn native_dmabuf_feedback_tranche_count(
+    scanout: &NativeScanoutBackend,
+    capabilities: &GpuProtocolCapabilities,
+) -> usize {
+    let feedback = scanout.dmabuf_feedback();
+    let Some(scanout_capabilities) = scanout.dmabuf_scanout_capabilities() else {
+        return 1;
+    };
+    let has_scanout_format = scanout_capabilities.formats.iter().any(|format| {
+        capabilities
+            .dmabuf_formats()
+            .iter()
+            .any(|allowed| allowed.fourcc == format.format && allowed.modifier == format.modifier)
+    });
+    let has_render_format = feedback.formats().iter().any(|format| {
+        capabilities.dmabuf_formats().iter().any(|allowed| {
+            allowed.fourcc == format.format.as_fourcc() && allowed.modifier == format.modifier.0
+        })
+    });
+    if has_scanout_format && has_render_format {
+        2
+    } else {
+        1
     }
 }
 

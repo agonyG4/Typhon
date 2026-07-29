@@ -592,6 +592,7 @@ pub struct CompositorState {
     dmabuf_main_device: u64,
     dmabuf_main_device_path: Option<String>,
     dmabuf_scanout_capabilities: Option<DirectScanoutFeedbackCapabilities>,
+    dmabuf_scanout_target_device_override: Option<u64>,
     syncobj_device: Option<DrmSyncobjDevice>,
     clipboard_bridge: Option<Box<dyn ClipboardBridge>>,
     selection_state: SelectionState,

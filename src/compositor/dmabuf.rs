@@ -111,6 +111,7 @@ impl DmabufFeedbackData {
         main_device: u64,
         allowed_formats: &[GpuFormat],
         scanout_capabilities: Option<&DirectScanoutFeedbackCapabilities>,
+        scanout_target_device_override: Option<u64>,
     ) -> io::Result<Self> {
         if main_device == 0 || feedback.format_table_formats().is_empty() {
             return Err(io::Error::new(
@@ -177,8 +178,8 @@ impl DmabufFeedbackData {
                 .filter(|format| gpu_format_is_allowed(*format, allowed_formats))
                 .collect::<Vec<_>>(),
         );
-        let scanout_device = scanout_capabilities
-            .map(|capabilities| capabilities.drm_device)
+        let scanout_device = scanout_target_device_override
+            .or_else(|| scanout_capabilities.map(|capabilities| capabilities.drm_device))
             .filter(|device| *device != 0)
             .unwrap_or(main_device);
         let tranches = if scanout.is_empty() {
@@ -511,12 +512,166 @@ mod tests {
             GpuFormat::new(DrmFormat::Xrgb8888.as_fourcc(), 7),
             GpuFormat::new(DrmFormat::Argb8888.as_fourcc(), DrmModifier::LINEAR.0),
         ];
-        let data = DmabufFeedbackData::new(&feedback, 0x1234, &allowed, None).unwrap();
+        let data = DmabufFeedbackData::new(&feedback, 0x1234, &allowed, None, None).unwrap();
 
         assert_eq!(data.tranches.len(), 2);
         assert!(data.tranches[0].scanout);
         assert!(!data.tranches[1].scanout);
         assert_eq!(data.tranches[0].indices, vec![0]);
         assert_eq!(data.tranches[1].indices, vec![1]);
+    }
+
+    #[test]
+    fn strict_feedback_keeps_primary_scanout_target() {
+        let data = feedback_data(None);
+
+        assert_eq!(data.tranches[0].target_device, 0x200);
+        assert_eq!(data.tranches[1].target_device, 0x100);
+    }
+
+    #[test]
+    fn forced_compat_normalizes_same_gpu_scanout_target() {
+        let data = feedback_data(Some(0x100));
+
+        assert_eq!(data.tranches[0].target_device, 0x100);
+        assert_eq!(data.tranches[1].target_device, 0x100);
+    }
+
+    #[test]
+    fn compat_preserves_scanout_tranche_flag_and_exact_format_subset() {
+        let scanout = EglGlesDmabufFormat::new(DrmFormat::Xrgb8888, DrmModifier(7));
+        let render = EglGlesDmabufFormat::new(DrmFormat::Argb8888, DrmModifier::LINEAR);
+        let feedback = EglGlesDmabufFeedback::with_scanout_tranche([scanout], [render]);
+        let allowed = [
+            GpuFormat::new(DrmFormat::Xrgb8888.as_fourcc(), 7),
+            GpuFormat::new(DrmFormat::Argb8888.as_fourcc(), DrmModifier::LINEAR.0),
+        ];
+        let data = DmabufFeedbackData::new(&feedback, 0x100, &allowed, None, Some(0x100)).unwrap();
+
+        assert!(data.tranches[0].scanout);
+        assert_eq!(data.tranches[0].indices, vec![0]);
+        assert_eq!(data.tranches[1].indices, vec![1]);
+        assert_eq!(
+            data.tranches[0].target_device,
+            data.tranches[1].target_device
+        );
+    }
+
+    #[test]
+    fn compat_does_not_duplicate_format_modifier_pairs() {
+        let scanout = EglGlesDmabufFormat::new(DrmFormat::Xrgb8888, DrmModifier(7));
+        let render = EglGlesDmabufFormat::new(DrmFormat::Argb8888, DrmModifier::LINEAR);
+        let feedback =
+            EglGlesDmabufFeedback::with_scanout_tranche([scanout, scanout], [render, render]);
+        let allowed = [
+            GpuFormat::new(DrmFormat::Xrgb8888.as_fourcc(), 7),
+            GpuFormat::new(DrmFormat::Argb8888.as_fourcc(), DrmModifier::LINEAR.0),
+        ];
+        let data = DmabufFeedbackData::new(&feedback, 0x100, &allowed, None, Some(0x100)).unwrap();
+
+        assert_eq!(data.tranches[0].indices, vec![0]);
+        assert_eq!(data.tranches[1].indices, vec![1]);
+        assert_eq!(data.format_table_size, 32);
+    }
+
+    #[test]
+    fn compat_does_not_expand_direct_scanout_eligibility() {
+        let capabilities = DirectScanoutFeedbackCapabilities::new(
+            0x200,
+            1,
+            42,
+            vec![DirectScanoutFormatCapability {
+                format: DrmFormat::Xrgb8888.as_fourcc(),
+                modifier: 7,
+            }],
+        );
+        let before = capabilities.clone();
+        let feedback = EglGlesDmabufFeedback::with_scanout_tranche(
+            [EglGlesDmabufFormat::new(
+                DrmFormat::Xrgb8888,
+                DrmModifier(7),
+            )],
+            [EglGlesDmabufFormat::new(
+                DrmFormat::Argb8888,
+                DrmModifier::LINEAR,
+            )],
+        );
+        let allowed = [
+            GpuFormat::new(DrmFormat::Xrgb8888.as_fourcc(), 7),
+            GpuFormat::new(DrmFormat::Argb8888.as_fourcc(), DrmModifier::LINEAR.0),
+        ];
+
+        let _ =
+            DmabufFeedbackData::new(&feedback, 0x100, &allowed, Some(&capabilities), Some(0x100))
+                .unwrap();
+
+        assert_eq!(capabilities, before);
+    }
+
+    #[test]
+    fn strict_and_compat_modes_produce_deterministic_feedback() {
+        let strict = feedback_data(None);
+        let strict_again = feedback_data(None);
+        let compat = feedback_data(Some(0x100));
+        let compat_again = feedback_data(Some(0x100));
+
+        assert_eq!(
+            feedback_shape(&strict),
+            feedback_shape(&strict_again),
+            "strict feedback must be deterministic"
+        );
+        assert_eq!(
+            feedback_shape(&compat),
+            feedback_shape(&compat_again),
+            "compatibility feedback must be deterministic"
+        );
+        assert_ne!(feedback_shape(&strict), feedback_shape(&compat));
+    }
+
+    fn feedback_data(scanout_target_override: Option<u64>) -> DmabufFeedbackData {
+        let feedback = EglGlesDmabufFeedback::with_scanout_tranche(
+            [EglGlesDmabufFormat::new(
+                DrmFormat::Xrgb8888,
+                DrmModifier(7),
+            )],
+            [EglGlesDmabufFormat::new(
+                DrmFormat::Argb8888,
+                DrmModifier::LINEAR,
+            )],
+        );
+        let allowed = [
+            GpuFormat::new(DrmFormat::Xrgb8888.as_fourcc(), 7),
+            GpuFormat::new(DrmFormat::Argb8888.as_fourcc(), DrmModifier::LINEAR.0),
+        ];
+        let capabilities = DirectScanoutFeedbackCapabilities::new(
+            0x200,
+            1,
+            42,
+            vec![DirectScanoutFormatCapability {
+                format: DrmFormat::Xrgb8888.as_fourcc(),
+                modifier: 7,
+            }],
+        );
+        DmabufFeedbackData::new(
+            &feedback,
+            0x100,
+            &allowed,
+            Some(&capabilities),
+            scanout_target_override,
+        )
+        .unwrap()
+    }
+
+    fn feedback_shape(data: &DmabufFeedbackData) -> Vec<(Vec<u16>, bool, u64)> {
+        data.tranches
+            .iter()
+            .map(|tranche| {
+                (
+                    tranche.indices.clone(),
+                    tranche.scanout,
+                    tranche.target_device,
+                )
+            })
+            .collect()
     }
 }

@@ -14,6 +14,7 @@ mod direct_validation;
 mod dumb;
 mod egl_gbm;
 mod feedback;
+mod feedback_policy;
 #[allow(dead_code)] // Negotiation is wired into explicit slot allocation in Task 4.
 mod format_negotiation;
 mod gbm_cpu;
@@ -34,6 +35,7 @@ pub(crate) use direct_validation::*;
 pub(crate) use dumb::*;
 pub(crate) use egl_gbm::*;
 pub(crate) use feedback::*;
+pub(crate) use feedback_policy::*;
 #[allow(unused_imports)]
 pub(crate) use format_negotiation::*;
 pub(crate) use gbm_cpu::*;
@@ -708,6 +710,23 @@ impl NativeScanoutBackend {
             Self::AtomicEglGbm(scanout) => scanout.dmabuf_main_device_path(),
             Self::NativeEglGbm(scanout) => scanout.dmabuf_main_device_path.clone(),
             Self::Gbm(_) | Self::Dumb(_) => None,
+        }
+    }
+
+    pub(crate) fn dmabuf_egl_vendor(&self) -> Option<&str> {
+        match self {
+            Self::AtomicEglGbm(scanout) => Some(scanout.dmabuf_egl_vendor()),
+            Self::NativeEglGbm(scanout) => Some(&scanout.dmabuf_egl_vendor),
+            Self::Gbm(_) | Self::Dumb(_) => None,
+        }
+    }
+
+    pub(crate) fn dmabuf_scanout_target_device(&self) -> Option<u64> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout
+                .dmabuf_scanout_capabilities()
+                .map(|capabilities| capabilities.drm_device),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => None,
         }
     }
 

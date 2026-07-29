@@ -61,6 +61,7 @@ pub(crate) struct AtomicEglGbmScanout {
     dmabuf_feedback: EglGlesDmabufFeedback,
     dmabuf_main_device: Option<u64>,
     dmabuf_main_device_path: Option<String>,
+    dmabuf_egl_vendor: String,
     dmabuf_scanout_capabilities: DirectScanoutFeedbackCapabilities,
     pub(crate) format_modifier: DrmFormatModifierPair,
     drm_cleanup_armed: bool,
@@ -313,6 +314,10 @@ impl AtomicEglGbmScanout {
                 oblivion_one::cursor_theme::shared_compositor_cursor_image(),
             )
             .map_err(native_egl_io_error)?;
+            let dmabuf_egl_vendor = egl
+                .query_string(Some(egl_display), egl::VENDOR)
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "unknown".to_string());
             let renderer_dmabuf_feedback = query_egl_dmabuf_feedback(&egl, egl_display);
             let mut scanout_capabilities = Vec::new();
             for format in &discovery.plane_scanout_formats {
@@ -413,6 +418,7 @@ impl AtomicEglGbmScanout {
                 dmabuf_feedback,
                 dmabuf_main_device,
                 dmabuf_main_device_path,
+                dmabuf_egl_vendor,
                 scanout_capabilities,
             ))
         })();
@@ -428,6 +434,7 @@ impl AtomicEglGbmScanout {
                 dmabuf_feedback,
                 dmabuf_main_device,
                 dmabuf_main_device_path,
+                dmabuf_egl_vendor,
                 scanout_capabilities,
             )) => Ok(Self {
                 _device: device,
@@ -445,6 +452,7 @@ impl AtomicEglGbmScanout {
                 dmabuf_feedback,
                 dmabuf_main_device,
                 dmabuf_main_device_path,
+                dmabuf_egl_vendor,
                 dmabuf_scanout_capabilities: scanout_capabilities,
                 format_modifier,
                 drm_cleanup_armed: true,
@@ -895,6 +903,10 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn dmabuf_main_device_path(&self) -> Option<String> {
         self.dmabuf_main_device_path.clone()
+    }
+
+    pub(crate) fn dmabuf_egl_vendor(&self) -> &str {
+        &self.dmabuf_egl_vendor
     }
 
     pub(crate) fn dmabuf_scanout_capabilities(&self) -> Option<DirectScanoutFeedbackCapabilities> {

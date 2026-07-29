@@ -358,6 +358,7 @@ impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for CompositorState {
                     state.dmabuf_main_device,
                     state.gpu_protocol_capabilities.dmabuf_formats(),
                     state.dmabuf_scanout_capabilities.as_ref(),
+                    state.dmabuf_scanout_target_device_override,
                 ) {
                     Ok(data) => {
                         let feedback = data_init.init(id, data);

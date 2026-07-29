@@ -43,6 +43,25 @@ impl NativeRuntime {
                     "perf_records_suppressed",
                     NativePerfLogger::suppressed_records(),
                 ),
+                NativePerfField::bool(
+                    "dmabuf_feedback_egl_wayland2_compat_effective",
+                    self.dmabuf_feedback_compatibility.effective
+                        != DmabufFeedbackCompatibilityEffective::Off,
+                ),
+                NativePerfField::str(
+                    "dmabuf_feedback_egl_wayland2_compat_mode",
+                    self.dmabuf_feedback_compatibility.effective.as_str(),
+                ),
+                NativePerfField::u64(
+                    "dmabuf_feedback_scanout_target_normalizations",
+                    self.dmabuf_feedback_compat_metrics
+                        .scanout_target_normalizations,
+                ),
+                NativePerfField::u64(
+                    "dmabuf_feedback_scanout_target_normalization_rejections",
+                    self.dmabuf_feedback_compat_metrics
+                        .scanout_target_normalization_rejections,
+                ),
                 NativePerfField::str("state_after", format!("{:?}", self.frame_scheduler.state())),
                 NativePerfField::bool("pageflip_pending", self.frame_scheduler.page_flip_pending()),
                 NativePerfField::bool(

@@ -288,6 +288,47 @@ fn scanout_tranche_uses_selected_drm_device() {
 }
 
 #[test]
+fn forced_compat_feedback_has_no_target_device_mismatch() {
+    let capabilities = stage4_feedback_capabilities(
+        0x8877_6655_4433_2211,
+        1,
+        42,
+        [(DrmFormat::Xrgb8888.as_fourcc(), 0)],
+    );
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let main_device: u64 = 0x1122_3344_5566_7788;
+    server.set_dmabuf_feedback_with_scanout_capabilities_and_target(
+        EglGlesDmabufFeedback::with_scanout_tranche(
+            [EglGlesDmabufFormat::new(
+                DrmFormat::Xrgb8888,
+                DrmModifier(0),
+            )],
+            [EglGlesDmabufFormat::new(
+                DrmFormat::Argb8888,
+                DrmModifier::LINEAR,
+            )],
+        ),
+        Some(main_device),
+        Some("/dev/dri/renderD128".to_string()),
+        Some(capabilities),
+        Some(main_device),
+    );
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+    let state = request_dmabuf_default_feedback(&socket_path).unwrap();
+    stop_test_server(running, server_thread);
+
+    assert_eq!(state.dmabuf_feedback_tranche_targets.len(), 2);
+    assert!(
+        state
+            .dmabuf_feedback_tranche_targets
+            .iter()
+            .all(|target| *target == main_device.to_ne_bytes())
+    );
+}
+
+#[test]
 fn scanout_tranche_excludes_renderer_only_formats() {
     let capabilities = stage4_feedback_capabilities(
         0x8877_6655_4433_2211,
