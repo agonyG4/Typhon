@@ -1,5 +1,8 @@
 use super::cursor_cycle::{NativeResolvedCursorSource, resolve_native_cursor_source};
 use super::cycle::direct_fallback::{DirectFallbackReason, DirectFallbackTracker};
+use super::direct_plan::{
+    PreparedPrimaryArbitration, PreparedPrimaryArbitrationInput, arbitrate_prepared_primary,
+};
 use super::frame::{
     NativeRepaintInputs, cursor_only_allowed_at_deadline, native_repaint_decision,
     update_cursor_output_arbitration,
@@ -494,16 +497,35 @@ impl NativeRuntime {
             && cursor_direct_compatible
             && direct_candidate_eligible
             && !composition_required
-            && scanout.discard_ready_frame_before_direct(server, output_transactions)?
+            && let Some(direct_key) = direct_inspection.candidate_key
+            && let Some(PreparedCompositedState::Ready { transaction_id, .. }) =
+                pipeline_snapshot.as_ref().map(|snapshot| snapshot.prepared)
+            && let Some(transaction) = output_transactions.transaction(transaction_id)
         {
-            scheduler_decision = SchedulerDecision::Render;
-            *scheduled_presentation_target = None;
-            presentation_deadline.clear_scheduled_target();
+            let arbitration = arbitrate_prepared_primary(PreparedPrimaryArbitrationInput {
+                composed: transaction_id,
+                state: transaction.state(),
+                output_generation: transaction.descriptor().output_generation(),
+                equivalent_direct_key: transaction.descriptor().equivalent_direct_key(),
+                direct_key,
+                cursor_compatible: cursor_direct_compatible,
+                composition_blocked: composition_required,
+                // No protocol-batch transfer occurs implicitly. Until the
+                // explicit transfer operation is selected, preservation is
+                // the only legal result even for matching content.
+                obligations_transferable: false,
+            });
+            debug_assert!(!matches!(
+                arbitration,
+                PreparedPrimaryArbitration::SupersedeWithEquivalentDirect { .. }
+            ));
             perf.log("direct_scanout", || {
-                vec![NativePerfField::str(
-                    "event",
-                    "retired_pre_entry_composited_frame",
-                )]
+                vec![
+                    NativePerfField::str("event", "prepared_primary_arbitration"),
+                    NativePerfField::str("result", format!("{arbitration:?}")),
+                    NativePerfField::u64("transaction_id", transaction_id.get()),
+                    NativePerfField::u64("content_epoch", direct_key.content.content_epoch.get()),
+                ]
             });
         }
         let can_queue_worker_cursor = worker_cursor_queue_available(
@@ -973,6 +995,9 @@ impl NativeRuntime {
                                     framebuffer_id: state.framebuffer_id,
                                     visible: state.visible,
                                 }),
+                            direct_inspection
+                                .candidate_key
+                                .filter(|_| !composition_required),
                         )?;
                         match render_outcome {
                             AtomicFrameRenderOutcome::Skipped { reason, render_us } => {

@@ -291,6 +291,7 @@ fn output_transaction_descriptor_is_immutable_and_path_typed() {
             frame_id: 11,
             render_generation: 12,
             pool_generation: 13,
+            equivalent_direct_key: None,
         }
     );
     assert_eq!(

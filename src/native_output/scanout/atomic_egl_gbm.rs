@@ -31,7 +31,6 @@ use crate::native_output::runtime::{
     DirectCallbackLeakMetrics, DirectTerminalCallbackDisposition,
     direct_terminal_callback_owner_leaks, settle_dropped_output_transaction,
     settle_failed_output_transaction, settle_no_visual_change_output_transaction,
-    settle_superseded_output_transaction,
 };
 
 use super::atomic_direct::{direct_candidate_key, direct_scanout_debug};
@@ -589,6 +588,7 @@ impl AtomicEglGbmScanout {
         target: PresentationTarget,
         pacing_mode: NativeOutputPacingMode,
         cursor: Option<CursorPlaneAssignment>,
+        equivalent_direct_key: Option<DirectScanoutCandidateKey>,
     ) -> io::Result<AtomicFrameRenderOutcome> {
         let (slot, frame_id, pool_generation) = {
             let swapchain = self.swapchain_mut()?;
@@ -612,7 +612,7 @@ impl AtomicEglGbmScanout {
                 return Err(io::Error::other(error));
             }
         };
-        let transaction = match OutputTransaction::composited(
+        let transaction = match OutputTransaction::composited_with_direct_equivalence(
             transaction_id,
             output_generation,
             MonotonicTimestampNs::new(monotonic_now_ns()?),
@@ -625,6 +625,7 @@ impl AtomicEglGbmScanout {
             framebuffer_id,
             cursor,
             protocol_batch_id,
+            equivalent_direct_key,
         ) {
             Ok(transaction) => transaction,
             Err(error) => {

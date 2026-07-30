@@ -9,6 +9,7 @@ pub(super) struct DirectPresentationInspection {
     pub(super) direct_candidate_eligible: bool,
     pub(super) primary_visual_work_pending: bool,
     pub(super) composition_required: bool,
+    pub(super) candidate_key: Option<DirectScanoutCandidateKey>,
 }
 
 pub(super) struct DirectPresentationInputs<'a> {
@@ -106,6 +107,7 @@ pub(super) fn inspect_direct_presentation(
         direct_candidate_eligible,
         primary_visual_work_pending,
         composition_required,
+        candidate_key: direct_candidate_key,
     }
 }
 

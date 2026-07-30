@@ -157,6 +157,7 @@ fn commit_snapshot(
                 frame_id,
                 render_generation,
                 pool_generation,
+                ..
             },
             PrimaryPlaneAssignment::CompositorFramebuffer {
                 slot,
@@ -425,6 +426,7 @@ pub(super) fn build_output_pipeline_snapshot(
                     frame_id,
                     render_generation,
                     pool_generation,
+                    ..
                 },
                 PrimaryPlaneAssignment::CompositorFramebuffer { slot, .. },
             ) if frame_id == ready.frame_id

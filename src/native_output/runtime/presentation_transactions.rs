@@ -4,6 +4,7 @@ use oblivion_one::compositor::CompositorFrameBatchId;
 use oblivion_one::compositor::{TerminalCallbackDisposition, TerminalCallbackOwnership};
 use oblivion_one::native::kms::KmsBackendKind;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectTerminalCallbackDisposition {
     Presented,
@@ -296,6 +297,7 @@ where
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn settle_superseded_output_transaction<F>(
     output_transactions: &mut OutputTransactionLedger,
     transaction_id: OutputTransactionId,

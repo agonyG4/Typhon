@@ -117,6 +117,7 @@ pub(crate) enum OutputTransactionContent {
         frame_id: u64,
         render_generation: u64,
         pool_generation: u64,
+        equivalent_direct_key: Option<DirectScanoutCandidateKey>,
     },
     Direct {
         frame_id: u64,
@@ -303,6 +304,39 @@ impl OutputTransaction {
         cursor: Option<CursorPlaneAssignment>,
         frame_batch_id: CompositorFrameBatchId,
     ) -> Result<Self, OutputTransactionBuildError> {
+        Self::composited_with_direct_equivalence(
+            id,
+            output_generation,
+            created_at,
+            target,
+            pacing_mode,
+            frame_id,
+            render_generation,
+            pool_generation,
+            slot,
+            framebuffer_id,
+            cursor,
+            frame_batch_id,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn composited_with_direct_equivalence(
+        id: OutputTransactionId,
+        output_generation: u64,
+        created_at: MonotonicTimestampNs,
+        target: PresentationTarget,
+        pacing_mode: NativeOutputPacingMode,
+        frame_id: u64,
+        render_generation: u64,
+        pool_generation: u64,
+        slot: OutputSlotId,
+        framebuffer_id: u32,
+        cursor: Option<CursorPlaneAssignment>,
+        frame_batch_id: CompositorFrameBatchId,
+        equivalent_direct_key: Option<DirectScanoutCandidateKey>,
+    ) -> Result<Self, OutputTransactionBuildError> {
         Self::build(
             id,
             output_generation,
@@ -313,6 +347,7 @@ impl OutputTransaction {
                 frame_id,
                 render_generation,
                 pool_generation,
+                equivalent_direct_key,
             },
             OutputPlanePlan::new(
                 PrimaryPlaneAssignment::CompositorFramebuffer {
@@ -388,6 +423,7 @@ impl OutputTransaction {
                 frame_id,
                 render_generation,
                 pool_generation: output_generation,
+                equivalent_direct_key: None,
             },
             OutputPlanePlan::new(
                 PrimaryPlaneAssignment::CompatibilityFramebuffer { framebuffer_id },
@@ -561,6 +597,18 @@ impl OutputTransaction {
 
     pub(crate) const fn content(&self) -> OutputTransactionContent {
         self.content
+    }
+
+    pub(crate) const fn equivalent_direct_key(&self) -> Option<DirectScanoutCandidateKey> {
+        match self.content {
+            OutputTransactionContent::Composited {
+                equivalent_direct_key,
+                ..
+            } => equivalent_direct_key,
+            OutputTransactionContent::Direct { .. }
+            | OutputTransactionContent::CompatibilityImmediate { .. }
+            | OutputTransactionContent::CursorOnly { .. } => None,
+        }
     }
 
     pub(crate) fn planes(&self) -> &OutputPlanePlan {

@@ -61,6 +61,58 @@ pub(crate) enum DirectScanoutDecision {
     Blocked(DirectScanoutRuntimeBlocker),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparedPrimaryArbitration {
+    PreserveComposited,
+    SupersedeWithEquivalentDirect {
+        composed: OutputTransactionId,
+        direct_key: DirectScanoutCandidateKey,
+    },
+    DeferDirect,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreparedPrimaryArbitrationInput {
+    pub(crate) composed: OutputTransactionId,
+    pub(crate) state: OutputTransactionState,
+    pub(crate) output_generation: u64,
+    pub(crate) equivalent_direct_key: Option<DirectScanoutCandidateKey>,
+    pub(crate) direct_key: DirectScanoutCandidateKey,
+    pub(crate) cursor_compatible: bool,
+    pub(crate) composition_blocked: bool,
+    pub(crate) obligations_transferable: bool,
+}
+
+pub(crate) fn arbitrate_prepared_primary(
+    input: PreparedPrimaryArbitrationInput,
+) -> PreparedPrimaryArbitration {
+    if matches!(
+        input.state,
+        OutputTransactionState::Queued { .. } | OutputTransactionState::Submitted { .. }
+    ) {
+        return PreparedPrimaryArbitration::DeferDirect;
+    }
+    if !matches!(input.state, OutputTransactionState::Ready { .. }) {
+        return PreparedPrimaryArbitration::PreserveComposited;
+    }
+    let equivalent = input
+        .equivalent_direct_key
+        .is_some_and(|key| key == input.direct_key)
+        && input.direct_key.output_generation == input.output_generation;
+    if equivalent
+        && input.cursor_compatible
+        && !input.composition_blocked
+        && input.obligations_transferable
+    {
+        PreparedPrimaryArbitration::SupersedeWithEquivalentDirect {
+            composed: input.composed,
+            direct_key: input.direct_key,
+        }
+    } else {
+        PreparedPrimaryArbitration::PreserveComposited
+    }
+}
+
 pub(crate) fn plan_direct_scanout(input: DirectScanoutPlanInput) -> DirectScanoutDecision {
     let blocker = if !input.policy_enabled {
         Some(DirectScanoutRuntimeBlocker::PolicyOff)
@@ -240,6 +292,76 @@ mod tests {
                 pending_key: None,
             }),
             DirectScanoutDecision::Blocked(DirectScanoutRuntimeBlocker::SameContent)
+        );
+    }
+
+    #[test]
+    fn missing_equivalence_proof_preserves_ready_composited_primary() {
+        let key = test_key();
+        assert_eq!(
+            arbitrate_prepared_primary(PreparedPrimaryArbitrationInput {
+                composed: OutputTransactionId::new(
+                    std::num::NonZeroU64::new(7).expect("transaction id"),
+                ),
+                state: OutputTransactionState::Ready {
+                    ready_at: MonotonicTimestampNs::new(10),
+                },
+                output_generation: 1,
+                equivalent_direct_key: None,
+                direct_key: key,
+                cursor_compatible: true,
+                composition_blocked: false,
+                obligations_transferable: true,
+            }),
+            PreparedPrimaryArbitration::PreserveComposited
+        );
+    }
+
+    #[test]
+    fn exact_equivalence_can_supersede_before_worker_admission() {
+        let key = test_key();
+        let composed =
+            OutputTransactionId::new(std::num::NonZeroU64::new(8).expect("transaction id"));
+        assert_eq!(
+            arbitrate_prepared_primary(PreparedPrimaryArbitrationInput {
+                composed,
+                state: OutputTransactionState::Ready {
+                    ready_at: MonotonicTimestampNs::new(10),
+                },
+                output_generation: 1,
+                equivalent_direct_key: Some(key),
+                direct_key: key,
+                cursor_compatible: true,
+                composition_blocked: false,
+                obligations_transferable: true,
+            }),
+            PreparedPrimaryArbitration::SupersedeWithEquivalentDirect {
+                composed,
+                direct_key: key,
+            }
+        );
+    }
+
+    #[test]
+    fn worker_admitted_composited_primary_always_defers_direct() {
+        let key = test_key();
+        assert_eq!(
+            arbitrate_prepared_primary(PreparedPrimaryArbitrationInput {
+                composed: OutputTransactionId::new(
+                    std::num::NonZeroU64::new(9).expect("transaction id"),
+                ),
+                state: OutputTransactionState::Queued {
+                    queued_at: MonotonicTimestampNs::new(10),
+                    worker_generation: 1,
+                },
+                output_generation: 1,
+                equivalent_direct_key: Some(key),
+                direct_key: key,
+                cursor_compatible: true,
+                composition_blocked: false,
+                obligations_transferable: true,
+            }),
+            PreparedPrimaryArbitration::DeferDirect
         );
     }
 }

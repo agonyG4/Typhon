@@ -565,19 +565,6 @@ impl NativeScanoutBackend {
         }
     }
 
-    pub(crate) fn discard_ready_frame_before_direct(
-        &mut self,
-        server: &mut OwnCompositorServer,
-        output_transactions: &mut OutputTransactionLedger,
-    ) -> io::Result<bool> {
-        match self {
-            Self::AtomicEglGbm(scanout) => {
-                scanout.discard_ready_frame_before_direct(server, output_transactions)
-            }
-            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Ok(false),
-        }
-    }
-
     pub(crate) fn output_render_in_progress(&self) -> bool {
         match self {
             Self::AtomicEglGbm(scanout) => scanout
