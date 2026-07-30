@@ -54,7 +54,6 @@ impl NativeRuntime {
                                 .and_then(|_| self.atomic_commit_arbiter.worker_queued_token())
                                 .map(PageFlipToken::get)
                         })
-                        .or_else(|| self.frame_scheduler.pending_page_flip_token())
                         .or_else(|| {
                             self.atomic_cursor
                                 .as_ref()
@@ -65,7 +64,6 @@ impl NativeRuntime {
                         .pending_atomic_token()
                         .map(PageFlipToken::get)
                         .or_else(|| self.scanout.pending_page_flip_token())
-                        .or_else(|| self.frame_scheduler.pending_page_flip_token())
                         .or_else(|| {
                             self.atomic_cursor
                                 .as_ref()

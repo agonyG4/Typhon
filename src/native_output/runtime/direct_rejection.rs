@@ -54,19 +54,6 @@ impl NativeRuntime {
             self.quarantined_worker_jobs.push(job);
             return Err(io::Error::other("direct rejection pacing identity mismatch").into());
         }
-        if let Err(error) = self
-            .frame_scheduler
-            .cancel_worker_submission(job.token.get(), job.transaction_id.get())
-        {
-            if let Some(worker) = self.kms_commit_worker.as_ref() {
-                worker.record_scheduler_cancel_mismatch();
-            }
-            self.quarantined_worker_jobs.push(job);
-            return Err(io::Error::other(error).into());
-        }
-        if let Some(worker) = self.kms_commit_worker.as_ref() {
-            worker.record_scheduler_queued_cancellation();
-        }
         if self
             .atomic_commit_arbiter
             .reject_worker_queued(job.token)

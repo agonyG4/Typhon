@@ -1188,7 +1188,7 @@ impl NativeRuntime {
                 self.atomic_commit_arbiter
                     .mark_kernel_submitted(token, submit_started_at, submit_returned_at)
                     .map_err(io::Error::other)?;
-                if !matches!(kind, AtomicCommitKind::CursorOnly { .. }) {
+                if compatibility_primary {
                     self.frame_scheduler
                         .confirm_kernel_submission(token.get(), submit_returned_at)
                         .map_err(io::Error::other)?;
@@ -1332,7 +1332,7 @@ impl NativeRuntime {
             }
         }
         if self.deferred_worker_pageflip.is_none() {
-            self.validate_output_pipeline_shadow().map_err(|error| {
+            self.validate_output_pipeline().map_err(|error| {
                 io::Error::other(format!(
                     "worker completion pipeline mismatch: generation={} crtc={} error={error}",
                     self.drm_file_generation, self.target.crtc_id,

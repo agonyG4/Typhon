@@ -2,7 +2,11 @@
 
 use oblivion_one::native::kms::PageFlipToken;
 use oblivion_one::native::presentation_deadline::PresentationTarget;
-use oblivion_one::native::scheduler::NativeOutputPacingMode;
+#[allow(unused_imports)]
+pub(crate) use oblivion_one::native::scheduler::PipelineWaitReason;
+use oblivion_one::native::scheduler::{
+    NativeOutputPacingMode, PresentationPipelineView, SchedulerPreparedPrimary,
+};
 
 use crate::native_output::{DirectScanoutCandidateKey, OutputSlotId, OutputTransactionId};
 
@@ -333,16 +337,52 @@ impl OutputPipelineSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PipelineWaitReason {
-    RefreshDeadline,
-    NoFreeSlot,
-    PreparedFrameExists,
-    FuturePrimaryDepthFull,
-    WorkerQueueOccupied,
-    KernelCommitPending,
-    RenderFence,
-    DirectSteadyState,
-    CompatibilityPath,
-    TripleCapabilityUnavailable,
+impl PresentationPipelineView for OutputPipelineSnapshot {
+    fn pacing_mode(&self) -> NativeOutputPacingMode {
+        self.pacing_mode
+    }
+
+    fn kernel_commit_occupied(&self) -> bool {
+        self.kernel_submitted.is_some()
+    }
+
+    fn kernel_primary_submitted(&self) -> bool {
+        self.kernel_submitted
+            .is_some_and(|commit| commit.kind.is_primary())
+    }
+
+    fn worker_commit_occupied(&self) -> bool {
+        self.worker_queued_next.is_some()
+    }
+
+    fn worker_primary_queued(&self) -> bool {
+        self.worker_queued_next
+            .is_some_and(|commit| commit.kind.is_primary())
+    }
+
+    fn prepared_primary(&self) -> SchedulerPreparedPrimary {
+        match self.prepared {
+            PreparedCompositedState::None => SchedulerPreparedPrimary::None,
+            PreparedCompositedState::Rendering { .. } => SchedulerPreparedPrimary::Rendering,
+            PreparedCompositedState::Ready { target, .. } => {
+                SchedulerPreparedPrimary::Ready { target }
+            }
+        }
+    }
+
+    fn free_compositor_slots(&self) -> u8 {
+        self.free_compositor_slots
+    }
+
+    fn future_primary_depth(&self) -> u8 {
+        OutputPipelineSnapshot::future_primary_depth(self)
+    }
+
+    fn direct_active(&self) -> bool {
+        OutputPipelineSnapshot::direct_active(self)
+    }
+
+    fn triple_capable(&self) -> bool {
+        matches!(self.triple_capability, TripleCapability::Capable)
+    }
 }

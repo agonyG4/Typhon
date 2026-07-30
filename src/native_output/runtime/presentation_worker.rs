@@ -52,7 +52,6 @@ struct DirectWorkerAdmissionGuard {
     ready_submit: bool,
     transaction_queued: bool,
     arbiter_reserved: bool,
-    scheduler_reserved: bool,
     worker_permit: Option<KmsCommitAdmissionPermit>,
 }
 
@@ -71,7 +70,6 @@ impl DirectWorkerAdmissionGuard {
             ready_submit,
             transaction_queued: false,
             arbiter_reserved: false,
-            scheduler_reserved: false,
             worker_permit: Some(worker_permit),
         }
     }
@@ -79,7 +77,6 @@ impl DirectWorkerAdmissionGuard {
     fn rollback(
         &mut self,
         frame_pacing: &mut NativeFramePacing,
-        frame_scheduler: &mut NativeFrameScheduler,
         atomic_commit_arbiter: &mut AtomicCommitArbiter,
         output_transactions: &mut OutputTransactionLedger,
     ) -> Result<(), String> {
@@ -88,12 +85,6 @@ impl DirectWorkerAdmissionGuard {
             && !frame_pacing.cancel_worker_submission(Some(frame_id), self.ready_submit)
         {
             failures.push("pacing reservation identity mismatch".to_string());
-        }
-        if self.scheduler_reserved
-            && let Err(error) = frame_scheduler
-                .cancel_worker_submission(self.token.get(), self.transaction_id.get())
-        {
-            failures.push(format!("scheduler rollback failed: {error}"));
         }
         if self.arbiter_reserved
             && atomic_commit_arbiter
@@ -118,7 +109,6 @@ impl DirectWorkerAdmissionGuard {
     fn commit(&mut self) {
         debug_assert!(self.transaction_queued);
         debug_assert!(self.arbiter_reserved);
-        debug_assert!(self.scheduler_reserved);
         debug_assert!(self.worker_permit.is_none());
     }
 }
@@ -555,7 +545,6 @@ pub(super) fn finish_direct_worker_queued(
     ) {
         let rollback = guard.rollback(
             context.frame_pacing,
-            frame_scheduler,
             atomic_commit_arbiter,
             output_transactions,
         );
@@ -594,7 +583,6 @@ pub(super) fn finish_direct_worker_queued(
     ) {
         let rollback = guard.rollback(
             context.frame_pacing,
-            frame_scheduler,
             atomic_commit_arbiter,
             output_transactions,
         );
@@ -624,39 +612,6 @@ pub(super) fn finish_direct_worker_queued(
         return Err(io::Error::other(error).into());
     }
     guard.arbiter_reserved = true;
-    if let Err(error) = frame_scheduler.reserve_worker_submission(token, transaction_id.get()) {
-        let rollback = guard.rollback(
-            context.frame_pacing,
-            frame_scheduler,
-            atomic_commit_arbiter,
-            output_transactions,
-        );
-        if let Err(reason) = rollback {
-            return quarantine_direct_admission_failure(
-                emergency_quarantined_worker_jobs,
-                direct_fallback_tracker,
-                worker,
-                guard,
-                job,
-                frame_scheduler,
-                atomic_commit_arbiter,
-                scanout,
-                reason,
-            );
-        }
-        settle_failed_direct_worker_transaction(
-            scanout,
-            server,
-            output_transactions,
-            transaction_id,
-            protocol_batch_id,
-            OutputTransactionFailureStage::BackendOwnershipTransfer,
-            MonotonicTimestampNs::new(monotonic_now_ns()?),
-        )?;
-        drop(job);
-        return Err(io::Error::other(error).into());
-    }
-    guard.scheduler_reserved = true;
     let admission = guard
         .worker_permit
         .take()
@@ -669,7 +624,6 @@ pub(super) fn finish_direct_worker_queued(
         ));
         let rollback = guard.rollback(
             context.frame_pacing,
-            frame_scheduler,
             atomic_commit_arbiter,
             output_transactions,
         );

@@ -3,6 +3,9 @@ use crate::native_output::kms_worker::{
     KmsCommitWorkerHandle, KmsCommitWorkerPolicy, KmsCommitWorkerStartupError,
     KmsCommitWorkerTransport,
 };
+use oblivion_one::compositor::gpu_protocol_capabilities::{
+    GpuFormat, GpuProtocolCapabilities, GpuProtocolProbe, inspect_render_node,
+};
 use oblivion_one::cursor_theme::{
     CompositorCursorImage, install_shared_compositor_cursor,
     load_compositor_cursor_from_environment,
@@ -13,11 +16,6 @@ use std::{
     os::{fd::AsFd, unix::fs::MetadataExt},
     sync::Arc,
 };
-
-use oblivion_one::compositor::gpu_protocol_capabilities::{
-    GpuFormat, GpuProtocolCapabilities, GpuProtocolProbe, inspect_render_node,
-};
-
 pub(super) fn log_native_runtime_bootstrap(
     server: &OwnCompositorServer,
     bootstrap: &NativeOutputBootstrap,
@@ -514,7 +512,9 @@ impl NativeRuntime {
                 ]
             });
         }
-        if let Some(token) = scanout.pending_page_flip_token() {
+        if !matches!(scanout, NativeScanoutBackend::AtomicEglGbm(_))
+            && let Some(token) = scanout.pending_page_flip_token()
+        {
             frame_scheduler
                 .note_async_submission(token, scheduler_anchor_ns)
                 .map_err(io::Error::other)?;

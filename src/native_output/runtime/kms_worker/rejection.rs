@@ -27,6 +27,16 @@ impl NativeRuntime {
         {
             return Err(io::Error::other("worker rejection pacing identity mismatch").into());
         }
+        let compatibility_primary = matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. })
+            && self
+                .output_transactions
+                .transaction(job.transaction_id)
+                .is_some_and(|transaction| {
+                    matches!(
+                        transaction.descriptor().planes().primary(),
+                        PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
+                    )
+                });
         let cursor_epoch = match job.kind {
             AtomicCommitKind::CursorOnly { cursor_epoch, .. } => Some(cursor_epoch),
             AtomicCommitKind::CompositedPrimary { .. } | AtomicCommitKind::DirectPrimary { .. } => {
@@ -68,7 +78,7 @@ impl NativeRuntime {
                     worker.record_cursor_worker_rejection_fallback();
                 }
             }
-        } else {
+        } else if compatibility_primary {
             if let Err(error) = self
                 .frame_scheduler
                 .cancel_worker_submission(job.token.get(), job.transaction_id.get())
@@ -84,15 +94,6 @@ impl NativeRuntime {
         }
         self.atomic_commit_arbiter.reject_worker_queued(job.token);
         if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. }) {
-            let compatibility_primary = self
-                .output_transactions
-                .transaction(job.transaction_id)
-                .is_some_and(|transaction| {
-                    matches!(
-                        transaction.descriptor().planes().primary(),
-                        PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
-                    )
-                });
             if compatibility_primary {
                 self.scanout
                     .fail_worker_compatibility_submission(job.token)?;
@@ -143,6 +144,16 @@ impl NativeRuntime {
         {
             self.scanout.note_direct_test_only(duration_ns, false);
         }
+        let compatibility_primary = matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. })
+            && self
+                .output_transactions
+                .transaction(job.transaction_id)
+                .is_some_and(|transaction| {
+                    matches!(
+                        transaction.descriptor().planes().primary(),
+                        PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
+                    )
+                });
         if let AtomicCommitKind::CursorOnly { cursor_epoch, .. } = job.kind {
             let cursor = self
                 .atomic_cursor
@@ -157,34 +168,28 @@ impl NativeRuntime {
             {
                 return Err(io::Error::other("worker shutdown pacing identity mismatch").into());
             }
-            let scheduler_cancel = if drop_reason == OutputTransactionDropReason::SafeAbandonment {
-                self.frame_scheduler
-                    .abandon_worker_submission(job.token.get(), job.transaction_id.get())
-            } else {
-                self.frame_scheduler
-                    .cancel_worker_submission(job.token.get(), job.transaction_id.get())
-            };
-            if let Err(error) = scheduler_cancel {
-                if let Some(worker) = self.kms_commit_worker.as_ref() {
-                    worker.record_scheduler_cancel_mismatch();
+            if compatibility_primary {
+                let scheduler_cancel =
+                    if drop_reason == OutputTransactionDropReason::SafeAbandonment {
+                        self.frame_scheduler
+                            .abandon_worker_submission(job.token.get(), job.transaction_id.get())
+                    } else {
+                        self.frame_scheduler
+                            .cancel_worker_submission(job.token.get(), job.transaction_id.get())
+                    };
+                if let Err(error) = scheduler_cancel {
+                    if let Some(worker) = self.kms_commit_worker.as_ref() {
+                        worker.record_scheduler_cancel_mismatch();
+                    }
+                    return Err(io::Error::other(error).into());
                 }
-                return Err(io::Error::other(error).into());
-            }
-            if let Some(worker) = self.kms_commit_worker.as_ref() {
-                worker.record_scheduler_queued_cancellation();
+                if let Some(worker) = self.kms_commit_worker.as_ref() {
+                    worker.record_scheduler_queued_cancellation();
+                }
             }
         }
         self.atomic_commit_arbiter.reject_worker_queued(job.token);
         if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. }) {
-            let compatibility_primary = self
-                .output_transactions
-                .transaction(job.transaction_id)
-                .is_some_and(|transaction| {
-                    matches!(
-                        transaction.descriptor().planes().primary(),
-                        PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
-                    )
-                });
             if compatibility_primary {
                 self.scanout
                     .suspend_abandon_worker_compatibility(job.token)

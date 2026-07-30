@@ -4,6 +4,12 @@ use crate::native::kms::KmsBackendKind;
 use crate::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
 use std::time::Duration;
 
+mod pipeline;
+pub use pipeline::{
+    ExplicitAtomicSchedulerContext, ExplicitAtomicSchedulerDecision, PipelineWaitReason,
+    PresentationPipelineView, SchedulerPreparedPrimary,
+};
+
 const DEFAULT_PAGE_FLIP_WATCHDOG_NS: u64 = 1_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

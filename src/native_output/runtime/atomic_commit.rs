@@ -50,7 +50,10 @@ pub(crate) struct PendingAtomicCommit {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AtomicCommitCompletion {
-    Completed(AtomicCommitKind),
+    Completed {
+        kind: AtomicCommitKind,
+        submitted_at_ns: u64,
+    },
     DeferredUntilSubmitAck,
     DuplicateEarlyPageflip,
     Mismatched,
@@ -286,7 +289,10 @@ impl AtomicCommitArbiter {
         }
         self.kernel_submitted = None;
         self.atomic_commits_completed_total = self.atomic_commits_completed_total.saturating_add(1);
-        AtomicCommitCompletion::Completed(pending.kind)
+        AtomicCommitCompletion::Completed {
+            kind: pending.kind,
+            submitted_at_ns: pending.submitted_at_ns,
+        }
     }
 
     pub(crate) fn replay_deferred_pageflip(&mut self) -> Option<AtomicCommitCompletion> {
@@ -297,7 +303,10 @@ impl AtomicCommitArbiter {
         }
         self.kernel_submitted = None;
         self.atomic_commits_completed_total = self.atomic_commits_completed_total.saturating_add(1);
-        Some(AtomicCommitCompletion::Completed(pending.kind))
+        Some(AtomicCommitCompletion::Completed {
+            kind: pending.kind,
+            submitted_at_ns: pending.submitted_at_ns,
+        })
     }
 
     pub(crate) fn deferred_pageflip(&self) -> Option<DrmPresentationEvent> {
@@ -469,7 +478,7 @@ pub(crate) fn validate_atomic_pageflip(
     let mut event = event;
     let completion = event.map(|pageflip| arbiter.complete_pageflip(pageflip, generation));
     if let Some(completion) = completion
-        && !matches!(completion, AtomicCommitCompletion::Completed(_))
+        && !matches!(completion, AtomicCommitCompletion::Completed { .. })
     {
         match completion {
             AtomicCommitCompletion::Mismatched | AtomicCommitCompletion::WrongCrtc => {
@@ -485,7 +494,7 @@ pub(crate) fn validate_atomic_pageflip(
             AtomicCommitCompletion::DuplicateEarlyPageflip => {
                 *mismatched_events = mismatched_events.saturating_add(1);
             }
-            AtomicCommitCompletion::Completed(_) => unreachable!(),
+            AtomicCommitCompletion::Completed { .. } => unreachable!(),
         }
         event = None;
     }
@@ -693,7 +702,10 @@ mod tests {
 
         assert_eq!(
             arbiter.complete(token(1), 3, 42),
-            AtomicCommitCompletion::Completed(cursor_kind())
+            AtomicCommitCompletion::Completed {
+                kind: cursor_kind(),
+                submitted_at_ns: 100,
+            }
         );
     }
 
@@ -709,7 +721,10 @@ mod tests {
 
         assert_eq!(
             arbiter.complete(token(1), 3, 42),
-            AtomicCommitCompletion::Completed(direct)
+            AtomicCommitCompletion::Completed {
+                kind: direct,
+                submitted_at_ns: 100,
+            }
         );
     }
 
@@ -774,8 +789,10 @@ mod tests {
             .reserve(token(1), 3, 42, cursor_kind(), 100)
             .unwrap();
 
-        let AtomicCommitCompletion::Completed(AtomicCommitKind::CursorOnly { .. }) =
-            arbiter.complete(token(1), 3, 42)
+        let AtomicCommitCompletion::Completed {
+            kind: AtomicCommitKind::CursorOnly { .. },
+            ..
+        } = arbiter.complete(token(1), 3, 42)
         else {
             panic!("cursor completion was not routed as cursor-only");
         };
@@ -821,7 +838,10 @@ mod tests {
         assert!(arbiter.kernel_commit_submitted());
         assert_eq!(
             arbiter.replay_deferred_pageflip(),
-            Some(AtomicCommitCompletion::Completed(cursor_kind()))
+            Some(AtomicCommitCompletion::Completed {
+                kind: cursor_kind(),
+                submitted_at_ns: 150,
+            })
         );
         assert!(!arbiter.atomic_commit_pending());
     }
@@ -966,13 +986,14 @@ mod tests {
         assert!(event.is_some());
         assert_eq!(
             completion,
-            Some(AtomicCommitCompletion::Completed(
-                AtomicCommitKind::CompositedPrimary {
+            Some(AtomicCommitCompletion::Completed {
+                kind: AtomicCommitKind::CompositedPrimary {
                     transaction_id: transaction_id(11),
                     frame_id: 11,
                     framebuffer_id: 81,
                 },
-            ))
+                submitted_at_ns: 100,
+            })
         );
         assert_eq!(watchdog, None);
         assert_eq!(mismatched, 0);
@@ -1012,7 +1033,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             arbiter.complete(token(1), 3, 42),
-            AtomicCommitCompletion::Completed(primary_kind())
+            AtomicCommitCompletion::Completed {
+                kind: primary_kind(),
+                submitted_at_ns: 100,
+            }
         );
         arbiter
             .mark_kernel_submitted(token(2), 130, 135)

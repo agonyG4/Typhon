@@ -11,7 +11,7 @@ use super::planner::{
 use super::presentation_direct::{
     DirectPresentationInputs, inspect_direct_presentation, suppress_direct_render_ahead,
 };
-use super::presentation_pipeline::{build_output_pipeline_snapshot, validate_scheduler_shadow};
+use super::presentation_pipeline::build_output_pipeline_snapshot;
 use super::presentation_protocol::{
     ProtocolCycleMetrics, complete_protocol_only_tick, log_no_visual_work,
     log_wait_for_presentation,
@@ -351,7 +351,7 @@ impl NativeRuntime {
         } else {
             scanout.render_target_available()
         };
-        if explicit_output {
+        let pipeline_snapshot = if explicit_output {
             let swapchain = scanout.explicit_output_swapchain().ok_or_else(|| {
                 io::Error::other("explicit Atomic presentation has no output swapchain")
             })?;
@@ -372,43 +372,36 @@ impl NativeRuntime {
             )
             .map_err(|error| {
                 io::Error::other(format!(
-                    "output pipeline snapshot mismatch: generation={} crtc={} scheduler={:?} error={error}",
+                    "output pipeline snapshot mismatch: generation={} crtc={} kernel={:?} worker={:?} error={error}",
                     drm_file_generation,
                     target.crtc_id,
-                    frame_scheduler.submission_reservation_state(),
+                    atomic_commit_arbiter.pending_atomic_commit(),
+                    swapchain.worker_queued_identity(),
                 ))
             })?;
-            validate_scheduler_shadow(&pipeline, frame_scheduler).map_err(|error| {
-                io::Error::other(format!(
-                    "output pipeline scheduler shadow mismatch: generation={} crtc={} future_depth={} error={error}",
-                    drm_file_generation,
-                    target.crtc_id,
-                    pipeline.future_primary_depth(),
-                ))
-            })?;
-        }
+            Some(pipeline)
+        } else {
+            None
+        };
         let mut scheduler_decision = if explicit_output {
-            let in_fence = kms_backend
-                .atomic()
-                .is_some_and(|atomic| atomic.discovery().optional.in_fence_fd);
-            frame_scheduler.decision_with_context(SchedulerFrameContext {
-                pacing_mode,
-                capabilities: SchedulerCapabilities::explicit_atomic(in_fence, true),
-                presentation_target: *scheduled_presentation_target,
-                predicted_total_cost: Duration::from_nanos(prediction.total_cost_ns),
-                now: scheduler_now,
-                render_target_available: effective_render_target_available,
-                render_ahead_allowed,
-                ready_frame_present: scanout.ready_frame_queued(),
-                ready_target_current: frame_scheduler
-                    .ready_target()
-                    .is_none_or(|target| presentation_deadline.is_current(target)),
-                worker_queue_available: worker_mode
-                    && atomic_commit_arbiter.worker_slot_available()
-                    && kms_commit_worker
-                        .as_ref()
-                        .is_some_and(|worker| worker.admission_available()),
-            })
+            let decision = frame_scheduler.decision_with_pipeline_diagnostics(
+                ExplicitAtomicSchedulerContext {
+                    now: scheduler_now,
+                    predicted_total_cost: Duration::from_nanos(prediction.total_cost_ns),
+                    presentation_target: *scheduled_presentation_target,
+                    render_ahead_allowed,
+                    worker_queue_available: worker_mode
+                        && atomic_commit_arbiter.worker_slot_available()
+                        && kms_commit_worker
+                            .as_ref()
+                            .is_some_and(|worker| worker.admission_available()),
+                },
+                pipeline_snapshot
+                    .as_ref()
+                    .expect("explicit output built a pipeline snapshot"),
+            );
+            let _pipeline_wait_reason = decision.wait_reason;
+            decision.action
         } else {
             frame_scheduler
                 .decision_with_render_target(scheduler_now.get(), scanout.render_target_available())
@@ -485,7 +478,6 @@ impl NativeRuntime {
             && !composition_required
             && scanout.discard_ready_frame_before_direct(server, output_transactions)?
         {
-            frame_scheduler.discard_ready_frame();
             scheduler_decision = SchedulerDecision::Render;
             *scheduled_presentation_target = None;
             presentation_deadline.clear_scheduled_target();
@@ -505,8 +497,7 @@ impl NativeRuntime {
         let primary_work_for_cursor = primary_visual_work_pending
             || direct_candidate_changed
             || atomic_commit_blocks_cursor
-            || scanout.ready_frame_queued()
-            || frame_scheduler.ready_frame_queued();
+            || scanout.ready_frame_queued();
         let cursor_only_allowed = cursor_only_allowed_at_deadline(
             cursor_output_arbitration,
             *cursor_scheduling_policy,
@@ -532,8 +523,7 @@ impl NativeRuntime {
         let cursor_only_deferred = cursor_state_changed
             && !primary_visual_work_pending
             && !cursor_only_allowed
-            && !scanout.ready_frame_queued()
-            && !frame_scheduler.ready_frame_queued();
+            && !scanout.ready_frame_queued();
         if cursor_only_deferred {
             frame_scheduler.note_immediate_completion();
             scheduler_decision = SchedulerDecision::Idle;
@@ -997,7 +987,6 @@ impl NativeRuntime {
                                 let ready_at_ns = monotonic_now_ns()?;
                                 let waits_for_target = render_ahead;
                                 if waits_for_target {
-                                    frame_scheduler.note_ready_frame(Some(frame_target));
                                     frame_pacing.note_ready_frame(ready_at_ns, render_ahead);
                                 } else {
                                     let Some((
@@ -1056,18 +1045,7 @@ impl NativeRuntime {
                                         });
                                         cursor.begin_primary_submission(cursor_token, state);
                                     }
-                                    if worker_queued {
-                                        frame_scheduler
-                                            .reserve_worker_submission(token, transaction_id.get())
-                                            .map_err(io::Error::other)?;
-                                    } else {
-                                        frame_scheduler
-                                            .note_async_submission(token, monotonic_now_ns()?)
-                                            .map_err(io::Error::other)?;
-                                        if atomic_primary_registered {
-                                            frame_scheduler
-                                                .defer_page_flip_watchdog_to_atomic_arbiter();
-                                        }
+                                    if !worker_queued {
                                         frame_pacing.note_submit(
                                             token,
                                             monotonic_now_ns()?,

@@ -324,14 +324,17 @@ impl NativeRuntime {
             let cursor_commit = atomic_completion.is_some_and(|completion| {
                 matches!(
                     completion,
-                    AtomicCommitCompletion::Completed(AtomicCommitKind::CursorOnly { .. })
+                    AtomicCommitCompletion::Completed {
+                        kind: AtomicCommitKind::CursorOnly { .. },
+                        ..
+                    }
                 )
             });
             let cursor_transaction_id = match atomic_completion {
-                Some(AtomicCommitCompletion::Completed(AtomicCommitKind::CursorOnly {
-                    transaction_id,
+                Some(AtomicCommitCompletion::Completed {
+                    kind: AtomicCommitKind::CursorOnly { transaction_id, .. },
                     ..
-                })) => Some(transaction_id),
+                }) => Some(transaction_id),
                 _ => None,
             };
             if cursor_commit {
@@ -368,17 +371,22 @@ impl NativeRuntime {
                     )?;
                 }
             }
-            let scheduler_state_at_completion = frame_scheduler.state();
             let direct_pending = matches!(
                 atomic_completion,
-                Some(AtomicCommitCompletion::Completed(
-                    AtomicCommitKind::DirectPrimary { .. }
-                ))
+                Some(AtomicCommitCompletion::Completed {
+                    kind: AtomicCommitKind::DirectPrimary { .. },
+                    ..
+                })
             );
             let completion = if cursor_commit {
                 // Cursor-only Atomic commits are validated and completed by
                 // the Atomic arbiter, not by the primary frame scheduler.
                 PageFlipCompletionResult::Stale
+            } else if let Some(AtomicCommitCompletion::Completed {
+                submitted_at_ns, ..
+            }) = atomic_completion
+            {
+                PageFlipCompletionResult::Completed { submitted_at_ns }
             } else {
                 frame_scheduler.complete_kernel_pageflip(pageflip.user_data, compositor_receive_ns)
             };
@@ -425,9 +433,10 @@ impl NativeRuntime {
                     let actual_logical_sequence =
                         presentation_deadline.note_presented(presented_at);
                     let transaction_id = match atomic_completion {
-                        Some(AtomicCommitCompletion::Completed(
-                            AtomicCommitKind::DirectPrimary { transaction_id, .. },
-                        )) => transaction_id,
+                        Some(AtomicCommitCompletion::Completed {
+                            kind: AtomicCommitKind::DirectPrimary { transaction_id, .. },
+                            ..
+                        }) => transaction_id,
                         _ => {
                             return Err(
                                 io::Error::other("direct pageflip has no transaction").into()
@@ -464,9 +473,10 @@ impl NativeRuntime {
                     let actual_logical_sequence =
                         presentation_deadline.note_presented(presented_at);
                     let transaction_id = match atomic_completion {
-                        Some(AtomicCommitCompletion::Completed(
-                            AtomicCommitKind::CompositedPrimary { transaction_id, .. },
-                        )) => transaction_id,
+                        Some(AtomicCommitCompletion::Completed {
+                            kind: AtomicCommitKind::CompositedPrimary { transaction_id, .. },
+                            ..
+                        }) => transaction_id,
                         _ => {
                             return Err(
                                 io::Error::other("composited pageflip has no transaction").into()
@@ -757,15 +767,19 @@ impl NativeRuntime {
                             compositor_receive_ns.saturating_sub(submitted_at_ns) / 1_000,
                         ),
                         NativePerfField::str(
-                            "scheduler_state",
-                            format!("{scheduler_state_at_completion:?}"),
+                            "completion_owner",
+                            if atomic_completion.is_some() {
+                                "atomic_arbiter"
+                            } else {
+                                "compatibility_scheduler"
+                            },
                         ),
                     ]
                 });
             }
             if *kms_commit_worker_transport
                 == crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
-                && let Some(AtomicCommitCompletion::Completed(kind)) = atomic_completion
+                && let Some(AtomicCommitCompletion::Completed { kind, .. }) = atomic_completion
             {
                 let path_completed = match kind {
                     AtomicCommitKind::CursorOnly { .. } => cursor_commit,

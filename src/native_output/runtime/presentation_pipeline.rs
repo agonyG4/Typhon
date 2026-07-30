@@ -1,6 +1,5 @@
 use super::atomic_commit::PendingAtomicCommit;
 use super::*;
-use oblivion_one::native::scheduler::SubmissionReservationState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PipelineSnapshotError {
@@ -32,9 +31,6 @@ pub(super) enum PipelineSnapshotError {
     },
     MissingRenderingTarget,
     PipelineInvariant(PipelineValidationError),
-    SchedulerShadowMismatch {
-        field: &'static str,
-    },
 }
 
 impl std::fmt::Display for PipelineSnapshotError {
@@ -477,58 +473,8 @@ pub(super) fn build_output_pipeline_snapshot(
     Ok(snapshot)
 }
 
-pub(super) fn validate_scheduler_shadow(
-    snapshot: &OutputPipelineSnapshot,
-    scheduler: &NativeFrameScheduler,
-) -> Result<(), PipelineSnapshotError> {
-    let expected_ready = matches!(snapshot.prepared, PreparedCompositedState::Ready { .. });
-    if scheduler.ready_frame_queued() != expected_ready {
-        return Err(PipelineSnapshotError::SchedulerShadowMismatch {
-            field: "ready_frame",
-        });
-    }
-    let snapshot_target = match snapshot.prepared {
-        PreparedCompositedState::Ready { target, .. } => Some(target),
-        PreparedCompositedState::None | PreparedCompositedState::Rendering { .. } => None,
-    };
-    if scheduler.ready_target() != snapshot_target {
-        return Err(PipelineSnapshotError::SchedulerShadowMismatch {
-            field: "ready_target",
-        });
-    }
-    let scheduler_state = scheduler.submission_reservation_state();
-    let mirrored_kernel = snapshot
-        .kernel_submitted
-        .filter(|commit| commit.kind.is_primary());
-    let mirrored_worker = snapshot
-        .worker_queued_next
-        .filter(|commit| commit.kind.is_primary());
-    let expected_state = match (mirrored_kernel, mirrored_worker) {
-        (Some(kernel), None) => SubmissionReservationState::KernelSubmitted {
-            token: kernel.token.get(),
-            transaction_id: kernel.kind.transaction_id().get(),
-        },
-        (None, Some(worker)) => SubmissionReservationState::WorkerQueued {
-            token: worker.token.get(),
-            transaction_id: worker.kind.transaction_id().get(),
-        },
-        (None, None) => SubmissionReservationState::None,
-        (Some(_), Some(_)) => {
-            return Err(PipelineSnapshotError::SchedulerShadowMismatch {
-                field: "bounded_commit_pair_not_representable",
-            });
-        }
-    };
-    if scheduler_state != expected_state {
-        return Err(PipelineSnapshotError::SchedulerShadowMismatch {
-            field: "submission_reservation",
-        });
-    }
-    Ok(())
-}
-
 impl NativeRuntime {
-    pub(super) fn validate_output_pipeline_shadow(
+    pub(super) fn validate_output_pipeline(
         &self,
     ) -> Result<Option<OutputPipelineSnapshot>, PipelineSnapshotError> {
         let Some(swapchain) = self.scanout.explicit_output_swapchain() else {
@@ -549,7 +495,6 @@ impl NativeRuntime {
             self.scheduled_presentation_target,
             capability,
         )?;
-        validate_scheduler_shadow(&snapshot, &self.frame_scheduler)?;
         Ok(Some(snapshot))
     }
 }

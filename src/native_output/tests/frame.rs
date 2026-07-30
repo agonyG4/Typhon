@@ -4,6 +4,7 @@ use crate::native_output::runtime::{
     NativeCursorOutputArbitration, NativeCursorOutputDisposition, earliest_native_deadline,
     update_cursor_output_arbitration,
 };
+use oblivion_one::native::scheduler::SchedulerCapabilities;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReactiveHandoffOperation {
@@ -333,7 +334,6 @@ fn reactive_oracle_steady_direct_remains_idle() {
 use crate::native_output::runtime::{
     NativeRepaintDecision, NativeRepaintInputs, native_repaint_decision,
 };
-use oblivion_one::native::scheduler::SchedulerCapabilities;
 
 #[test]
 fn render_ahead_requires_atomic_in_fence_support() {

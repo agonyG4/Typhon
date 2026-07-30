@@ -194,14 +194,14 @@ pub(super) fn submit_ready_frame(
                 KmsBackendKind::Atomic => NativeIoOperation::AtomicCommit,
                 KmsBackendKind::Legacy => NativeIoOperation::LegacyCommit,
             });
-            if worker_mode {
+            if worker_mode && !explicit_submission {
                 let transaction_id = transaction_id.ok_or_else(|| {
                     io::Error::other("worker Atomic submission has no transaction ID")
                 })?;
                 frame_scheduler
                     .reserve_worker_submission(token, transaction_id.get())
                     .map_err(io::Error::other)?;
-            } else {
+            } else if !worker_mode && !explicit_submission {
                 frame_scheduler
                     .note_ready_submission(token, monotonic_now_ns()?)
                     .map_err(io::Error::other)?;

@@ -240,3 +240,44 @@ fn test_direct_key() -> DirectScanoutCandidateKey {
         color_epoch: 0,
     }
 }
+
+fn explicit_scheduler_context(now: u64) -> ExplicitAtomicSchedulerContext {
+    ExplicitAtomicSchedulerContext {
+        now: MonotonicTimestampNs::new(now),
+        predicted_total_cost: Duration::from_millis(1),
+        presentation_target: None,
+        render_ahead_allowed: false,
+        worker_queue_available: false,
+    }
+}
+
+#[test]
+fn explicit_scheduler_derives_pending_wait_from_pipeline_snapshot() {
+    let mut scheduler = NativeFrameScheduler::new(60, 0);
+    scheduler.queue_visual_work();
+    let mut snapshot = empty_snapshot();
+    snapshot.pacing_mode = NativeOutputPacingMode::ReactiveDouble;
+    snapshot.kernel_submitted = Some(composed_commit(1, 1, 0, 10));
+
+    let decision =
+        scheduler.decision_with_pipeline_diagnostics(explicit_scheduler_context(1), &snapshot);
+    assert_eq!(decision.action, SchedulerDecision::WaitForBuffer);
+    assert_eq!(
+        decision.wait_reason,
+        Some(PipelineWaitReason::KernelCommitPending)
+    );
+}
+
+#[test]
+fn explicit_scheduler_ignores_compatibility_submission_mirror() {
+    let mut scheduler = NativeFrameScheduler::new(60, 0);
+    scheduler.note_async_submission(99, 1).unwrap();
+    scheduler.queue_visual_work();
+    let mut snapshot = empty_snapshot();
+    snapshot.pacing_mode = NativeOutputPacingMode::ReactiveDouble;
+
+    assert_eq!(
+        scheduler.decision_with_pipeline(explicit_scheduler_context(2), &snapshot),
+        SchedulerDecision::Render,
+    );
+}

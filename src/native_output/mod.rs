@@ -45,6 +45,8 @@ use oblivion_one::native::kms::{
     AtomicKmsErrorKind, ConnectorId, CrtcId, DRM_FORMAT_ARGB8888, FramebufferId,
     KmsBackendSelection, KmsPolicy, PageFlipToken,
 };
+#[cfg(test)]
+use oblivion_one::native::scheduler::SchedulerFrameContext;
 use oblivion_one::native::{
     adaptive_buffering::{
         AdaptiveBufferingController, AdaptiveBufferingMode, AdaptiveRenderJournal,
@@ -67,9 +69,8 @@ use oblivion_one::native::{
         PresentationTargetReason,
     },
     scheduler::{
-        NativeFrameScheduler, NativeOutputPacingMode, PageFlipCompletionResult,
-        PresentationCadenceMetrics, SchedulerCapabilities, SchedulerDecision,
-        SchedulerFrameContext,
+        ExplicitAtomicSchedulerContext, NativeFrameScheduler, NativeOutputPacingMode,
+        PageFlipCompletionResult, PresentationCadenceMetrics, SchedulerDecision,
     },
 };
 use oblivion_one::process::{ChildSupervisor, ProcessKind, ProcessOptions, RestartPolicy};
