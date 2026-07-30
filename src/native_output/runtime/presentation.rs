@@ -11,6 +11,7 @@ use super::planner::{
 use super::presentation_direct::{
     DirectPresentationInputs, inspect_direct_presentation, suppress_direct_render_ahead,
 };
+use super::presentation_pipeline::{build_output_pipeline_snapshot, validate_scheduler_shadow};
 use super::presentation_protocol::{
     ProtocolCycleMetrics, complete_protocol_only_tick, log_no_visual_work,
     log_wait_for_presentation,
@@ -350,6 +351,42 @@ impl NativeRuntime {
         } else {
             scanout.render_target_available()
         };
+        if explicit_output {
+            let swapchain = scanout.explicit_output_swapchain().ok_or_else(|| {
+                io::Error::other("explicit Atomic presentation has no output swapchain")
+            })?;
+            let triple_capability = if swapchain.is_poisoned() {
+                TripleCapability::Unavailable(TripleCapabilityBlocker::SwapchainPoisoned)
+            } else {
+                TripleCapability::Capable
+            };
+            let pipeline = build_output_pipeline_snapshot(
+                *drm_file_generation,
+                pacing_mode,
+                swapchain,
+                output_transactions,
+                atomic_commit_arbiter,
+                *confirmed_primary_assignment,
+                *scheduled_presentation_target,
+                triple_capability,
+            )
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "output pipeline snapshot mismatch: generation={} crtc={} scheduler={:?} error={error}",
+                    drm_file_generation,
+                    target.crtc_id,
+                    frame_scheduler.submission_reservation_state(),
+                ))
+            })?;
+            validate_scheduler_shadow(&pipeline, frame_scheduler).map_err(|error| {
+                io::Error::other(format!(
+                    "output pipeline scheduler shadow mismatch: generation={} crtc={} future_depth={} error={error}",
+                    drm_file_generation,
+                    target.crtc_id,
+                    pipeline.future_primary_depth(),
+                ))
+            })?;
+        }
         let mut scheduler_decision = if explicit_output {
             let in_fence = kms_backend
                 .atomic()

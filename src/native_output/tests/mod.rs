@@ -28,3 +28,4 @@ mod output;
 mod presentation_transactions;
 mod scanout;
 mod shell_control;
+mod triple_buffering_model;

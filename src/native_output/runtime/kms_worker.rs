@@ -1331,6 +1331,14 @@ impl NativeRuntime {
                 .into());
             }
         }
+        if self.deferred_worker_pageflip.is_none() {
+            self.validate_output_pipeline_shadow().map_err(|error| {
+                io::Error::other(format!(
+                    "worker completion pipeline mismatch: generation={} crtc={} error={error}",
+                    self.drm_file_generation, self.target.crtc_id,
+                ))
+            })?;
+        }
         Ok(())
     }
 }

@@ -793,6 +793,17 @@ impl OutputTransactionLedger {
         self.active.get(&id)
     }
 
+    pub(crate) fn transaction_including_terminal(
+        &self,
+        id: OutputTransactionId,
+    ) -> Option<&OutputTransactionRecord> {
+        self.active.get(&id).or_else(|| {
+            self.recent_terminal
+                .iter()
+                .find(|record| record.descriptor.id() == id)
+        })
+    }
+
     pub(crate) fn active_transaction_ids(&self) -> Vec<OutputTransactionId> {
         let mut ids: Vec<_> = self.active.keys().copied().collect();
         ids.sort_unstable();

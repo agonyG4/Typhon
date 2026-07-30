@@ -187,6 +187,35 @@ pub(crate) struct WorkerQueuedOutputFrame {
     pub(crate) queued_at: MonotonicTimestampNs,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutputFrameIdentitySnapshot {
+    pub(crate) frame_id: u64,
+    pub(crate) transaction_id: OutputTransactionId,
+    pub(crate) slot: OutputSlotId,
+    pub(crate) render_generation: u64,
+    pub(crate) pool_generation: u64,
+    pub(crate) target: PresentationTarget,
+}
+
+impl From<&RenderedOutputFrame> for OutputFrameIdentitySnapshot {
+    fn from(frame: &RenderedOutputFrame) -> Self {
+        Self {
+            frame_id: frame.id,
+            transaction_id: frame.transaction_id,
+            slot: frame.slot,
+            render_generation: frame.render_generation,
+            pool_generation: frame.pool_generation,
+            target: frame.target,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueuedOutputFrameIdentitySnapshot {
+    pub(crate) frame: OutputFrameIdentitySnapshot,
+    pub(crate) token: PageFlipToken,
+}
+
 #[derive(Debug)]
 pub(crate) struct CompletedOutputFrame {
     pub(crate) frame: RenderedOutputFrame,
@@ -792,6 +821,28 @@ impl AtomicOutputSwapchain {
 
     pub(crate) fn pending_target(&self) -> Option<PresentationTarget> {
         self.pending.as_ref().map(|pending| pending.frame.target)
+    }
+
+    pub(crate) fn pending_identity(&self) -> Option<QueuedOutputFrameIdentitySnapshot> {
+        self.pending
+            .as_ref()
+            .map(|pending| QueuedOutputFrameIdentitySnapshot {
+                frame: (&pending.frame).into(),
+                token: pending.token,
+            })
+    }
+
+    pub(crate) fn worker_queued_identity(&self) -> Option<QueuedOutputFrameIdentitySnapshot> {
+        self.worker_queued
+            .as_ref()
+            .map(|queued| QueuedOutputFrameIdentitySnapshot {
+                frame: (&queued.frame).into(),
+                token: queued.token,
+            })
+    }
+
+    pub(crate) fn ready_identity(&self) -> Option<OutputFrameIdentitySnapshot> {
+        self.ready.as_ref().map(Into::into)
     }
 
     pub(crate) fn pending_frame_mut(&mut self) -> Option<&mut RenderedOutputFrame> {

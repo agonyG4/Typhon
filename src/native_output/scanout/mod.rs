@@ -550,6 +550,13 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn explicit_output_swapchain(&self) -> Option<&AtomicOutputSwapchain> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.swapchain().ok(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => None,
+        }
+    }
+
     pub(crate) fn compatibility_framebuffer_id(&self) -> Option<u32> {
         match self {
             Self::NativeEglGbm(scanout) if scanout.ready_frame_queued() => Some(scanout.fb_id()),

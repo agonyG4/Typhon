@@ -495,7 +495,7 @@ impl NativeRuntime {
                             transaction_id,
                             token,
                             surface_id,
-                            candidate_key,
+                            key: candidate_key,
                             framebuffer_id,
                         }) => {
                             let expected = ExpectedPresentedDirectPrimary {
@@ -574,6 +574,7 @@ impl NativeRuntime {
                     *confirmed_primary_assignment = Some(ConfirmedPrimaryAssignment::Composed {
                         transaction_id,
                         token: pageflip_token,
+                        slot: explicit.swapchain()?.current(),
                     });
                     render_journal.note_matching_presentation(presented_at);
                     render_journal.record_atomic_submit(

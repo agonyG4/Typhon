@@ -348,6 +348,10 @@ impl AtomicCommitArbiter {
         self.worker_queued.map(|pending| pending.kind)
     }
 
+    pub(crate) const fn worker_queued_commit(&self) -> Option<PendingAtomicCommit> {
+        self.worker_queued
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn kernel_submitted_token(&self) -> Option<PageFlipToken> {
         self.kernel_submitted.map(|pending| pending.token)
@@ -355,6 +359,10 @@ impl AtomicCommitArbiter {
 
     pub(crate) fn kernel_submitted_kind(&self) -> Option<AtomicCommitKind> {
         self.kernel_submitted.map(|pending| pending.kind)
+    }
+
+    pub(crate) const fn kernel_submitted_commit(&self) -> Option<PendingAtomicCommit> {
+        self.kernel_submitted
     }
 
     pub(crate) fn pending_atomic_token(&self) -> Option<PageFlipToken> {

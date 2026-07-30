@@ -114,7 +114,7 @@ pub(super) fn settle_direct_pageflip(
         transaction_id,
         token: pageflip_token,
         surface_id: completion.surface_id,
-        candidate_key: completion.candidate_key,
+        key: completion.candidate_key,
         framebuffer_id: completion.framebuffer_id,
     });
     debug_assert_eq!(

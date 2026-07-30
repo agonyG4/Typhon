@@ -16,6 +16,7 @@ mod metrics;
 mod planner;
 mod presentation;
 mod presentation_direct;
+mod presentation_pipeline;
 mod presentation_protocol;
 mod presentation_ready;
 mod presentation_transactions;
@@ -112,26 +113,7 @@ pub(crate) enum NativeClientCursorPath {
     Software,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ConfirmedPrimaryAssignment {
-    Composed {
-        transaction_id: OutputTransactionId,
-        token: PageFlipToken,
-    },
-    Direct {
-        transaction_id: OutputTransactionId,
-        token: PageFlipToken,
-        surface_id: u32,
-        candidate_key: DirectScanoutCandidateKey,
-        framebuffer_id: u32,
-    },
-}
-
-impl ConfirmedPrimaryAssignment {
-    pub(super) const fn is_direct(self) -> bool {
-        matches!(self, Self::Direct { .. })
-    }
-}
+pub(super) type ConfirmedPrimaryAssignment = ConfirmedPrimaryState;
 
 // `TargetDestroyed` means the previous KMS target can no longer reference any
 // submitted framebuffer. Session inactivity or disarmed I/O is not proof.

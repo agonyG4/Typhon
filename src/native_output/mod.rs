@@ -109,6 +109,7 @@ pub(crate) use output::*;
 use pacing::*;
 pub(crate) use perf::*;
 pub(crate) use presentation::ledger::*;
+pub(crate) use presentation::pipeline::*;
 pub(crate) use presentation::qualification::*;
 pub(crate) use presentation::trace::*;
 pub(crate) use presentation::transaction::*;
