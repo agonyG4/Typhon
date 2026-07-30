@@ -528,17 +528,16 @@ impl NativeRuntime {
                         }
                         _ => None,
                     };
-                    let mut completed = Some(frame);
+                    let completed_frame_id = frame.frame_id;
                     commit_prepared_presented_output_transaction(
                         output_transactions,
                         &mut self.presentation_trace,
                         prepared_logical,
                         |obligations| {
                             debug_assert!(obligations.direct_surface_id().is_none());
-                            let frame = completed.take().expect("composited frame is available");
                             server.commit_surface_damage_presented(surface_damage);
                             server.complete_presented_frame_batch(
-                                frame.frame_id,
+                                completed_frame_id,
                                 protocol_batch_id,
                                 presentation,
                             );
@@ -576,25 +575,23 @@ impl NativeRuntime {
                         transaction_id,
                         token: pageflip_token,
                     });
-                    let completed = completed
-                        .ok_or_else(|| io::Error::other("composited pageflip did not complete"))?;
                     render_journal.note_matching_presentation(presented_at);
                     render_journal.record_atomic_submit(
-                        completed
+                        frame
                             .submit_returned_at
                             .get()
-                            .saturating_sub(completed.submit_started_at.get()),
+                            .saturating_sub(frame.submit_started_at.get()),
                     );
-                    let refresh = completed.target.refresh_interval;
+                    let refresh = frame.target.refresh_interval;
                     let before_sample = render_journal.prediction(refresh);
                     let mut proven_miss = pending_proven_deadline_miss.take();
-                    if let Some((signaled_at, quality)) = completed.fence_signal {
+                    if let Some((signaled_at, quality)) = frame.fence_signal {
                         frame_pacing.note_fence_timestamp_quality(quality);
                         render_journal.record_render_sample(
-                            render_sample_duration_ns(completed.composite_started_at, signaled_at),
+                            render_sample_duration_ns(frame.composite_started_at, signaled_at),
                             signaled_at,
                         );
-                        let target_ns = completed.target.presentation_time.get();
+                        let target_ns = frame.target.presentation_time.get();
                         proven_miss = match quality {
                             FenceTimestampQuality::ExactSyncFile
                                 if signaled_at.get() > target_ns =>
@@ -613,13 +610,12 @@ impl NativeRuntime {
                             _ => None,
                         };
                     }
-                    if completed.submit_returned_at.get() > completed.target.presentation_time.get()
-                    {
+                    if frame.submit_returned_at.get() > frame.target.presentation_time.get() {
                         proven_miss = Some(ProvenDeadlineMiss::AtomicSubmit);
                     }
                     proven_miss = merge_presentation_miss(
                         proven_miss,
-                        completed.target.sequence,
+                        frame.target.sequence,
                         actual_logical_sequence,
                     );
                     let prediction = render_journal.prediction(refresh);
@@ -640,15 +636,15 @@ impl NativeRuntime {
                         );
                     }
                     frame_pacing.note_explicit_present(ExplicitPresentationObservation {
-                        planned_sequence: completed.target.sequence,
+                        planned_sequence: frame.target.sequence,
                         actual_sequence: actual_logical_sequence,
-                        target_ns: completed.target.presentation_time.get(),
+                        target_ns: frame.target.presentation_time.get(),
                         presented_ns: presented_at_ns,
-                        composite_started_ns: completed.composite_started_at.get(),
-                        rendered_ns: completed.rendered_at.get(),
-                        submit_started_ns: completed.submit_started_at.get(),
-                        submit_returned_ns: completed.submit_returned_at.get(),
-                        reactive_double: completed.target.reason
+                        composite_started_ns: frame.composite_started_at.get(),
+                        rendered_ns: frame.rendered_at.get(),
+                        submit_started_ns: frame.submit_started_at.get(),
+                        submit_returned_ns: frame.submit_returned_at.get(),
+                        reactive_double: frame.target.reason
                             == PresentationTargetReason::ReactiveDouble,
                     });
                     *scheduled_presentation_target = None;
