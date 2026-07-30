@@ -175,6 +175,19 @@ mod tests {
     }
 
     #[test]
+    fn pacing_summary_exports_exact_pipeline_wait_reasons() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.note_pipeline_wait(PipelineWaitReason::FuturePrimaryDepthFull);
+        pacing.note_pipeline_wait(PipelineWaitReason::KernelCommitPending);
+
+        let summary = pacing.summary_line(0);
+        assert!(summary.contains("pipeline_wait_future_primary_depth_full=1"));
+        assert!(summary.contains("pipeline_wait_kernel_commit_pending=1"));
+        assert!(summary.contains("pipeline_wait_direct_steady_state=0"));
+    }
+
+    #[test]
     fn presentation_miss_entry_has_a_dedicated_adaptive_metric() {
         let mut pacing = NativeFramePacing::from_env();
         pacing.enabled = true;
@@ -235,7 +248,9 @@ use super::scanout::NativeScanoutBufferSnapshot;
 use oblivion_one::native::adaptive_buffering::{
     AdaptiveBufferingMode, FenceTimestampQuality, ProvenDeadlineMiss,
 };
-use oblivion_one::native::scheduler::{NativeOutputPacingMode, SchedulerDecision};
+use oblivion_one::native::scheduler::{
+    NativeOutputPacingMode, PipelineWaitReason, SchedulerDecision,
+};
 use std::collections::VecDeque;
 use std::sync::{
     Arc,
@@ -519,6 +534,7 @@ pub(crate) struct NativeFramePacing {
     pub(crate) adaptive_triple_exits: u64,
     pub(crate) sync_file_info_exact: u64,
     pub(crate) sync_file_info_approximate: u64,
+    pipeline_waits: [u64; 10],
     wake_lateness: BoundedSamples<PACING_SAMPLE_CAPACITY>,
     slot_hold: BoundedSamples<PACING_SAMPLE_CAPACITY>,
     ready_age: BoundedSamples<PACING_SAMPLE_CAPACITY>,
@@ -591,6 +607,7 @@ impl NativeFramePacing {
             adaptive_triple_exits: 0,
             sync_file_info_exact: 0,
             sync_file_info_approximate: 0,
+            pipeline_waits: [0; 10],
             wake_lateness: BoundedSamples::default(),
             slot_hold: BoundedSamples::default(),
             ready_age: BoundedSamples::default(),
@@ -976,6 +993,24 @@ impl NativeFramePacing {
             _ => {}
         }
     }
+    pub(crate) fn note_pipeline_wait(&mut self, reason: PipelineWaitReason) {
+        if !self.enabled {
+            return;
+        }
+        let index = match reason {
+            PipelineWaitReason::RefreshDeadline => 0,
+            PipelineWaitReason::NoFreeSlot => 1,
+            PipelineWaitReason::PreparedFrameExists => 2,
+            PipelineWaitReason::FuturePrimaryDepthFull => 3,
+            PipelineWaitReason::WorkerQueueOccupied => 4,
+            PipelineWaitReason::KernelCommitPending => 5,
+            PipelineWaitReason::RenderFence => 6,
+            PipelineWaitReason::DirectSteadyState => 7,
+            PipelineWaitReason::CompatibilityPath => 8,
+            PipelineWaitReason::TripleCapabilityUnavailable => 9,
+        };
+        self.pipeline_waits[index] = self.pipeline_waits[index].saturating_add(1);
+    }
     pub(crate) fn note_fence_timestamp_quality(&mut self, quality: FenceTimestampQuality) {
         if !self.enabled {
             return;
@@ -1058,6 +1093,31 @@ impl NativeFramePacing {
                     self.adaptive_triple_entries_proven_presentation_miss,
                 ),
                 PacingField::u64("adaptive_triple_exits", self.adaptive_triple_exits),
+                PacingField::u64("pipeline_wait_refresh_deadline", self.pipeline_waits[0]),
+                PacingField::u64("pipeline_wait_no_free_slot", self.pipeline_waits[1]),
+                PacingField::u64(
+                    "pipeline_wait_prepared_frame_exists",
+                    self.pipeline_waits[2],
+                ),
+                PacingField::u64(
+                    "pipeline_wait_future_primary_depth_full",
+                    self.pipeline_waits[3],
+                ),
+                PacingField::u64(
+                    "pipeline_wait_worker_queue_occupied",
+                    self.pipeline_waits[4],
+                ),
+                PacingField::u64(
+                    "pipeline_wait_kernel_commit_pending",
+                    self.pipeline_waits[5],
+                ),
+                PacingField::u64("pipeline_wait_render_fence", self.pipeline_waits[6]),
+                PacingField::u64("pipeline_wait_direct_steady_state", self.pipeline_waits[7]),
+                PacingField::u64("pipeline_wait_compatibility_path", self.pipeline_waits[8]),
+                PacingField::u64(
+                    "pipeline_wait_triple_capability_unavailable",
+                    self.pipeline_waits[9],
+                ),
                 PacingField::u64("sync_file_info_exact", self.sync_file_info_exact),
                 PacingField::u64(
                     "sync_file_info_approximate",

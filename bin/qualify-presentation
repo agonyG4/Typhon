@@ -43,6 +43,21 @@ run_root="$state_root/$(date +%Y%m%d-%H%M%S)"
 qualify_command="${OBLIVION_ONE_QUALIFY_COMMAND:-$script_dir/start-oblivion-one-tty}"
 duration_seconds="${OBLIVION_ONE_QUALIFY_DURATION_SECONDS:-120}"
 
+last_metric() {
+    local name="$1"
+    local log="$2"
+    grep -o "${name}=[0-9]*" "$log" 2>/dev/null | tail -1 | cut -d= -f2 || true
+}
+
+max_metric() {
+    local name="$1"
+    local log="$2"
+    grep -o "${name}=[0-9]*" "$log" 2>/dev/null |
+        cut -d= -f2 |
+        sort -nr |
+        head -1 || true
+}
+
 run_phase() {
     local direct="$1"
     local triple="$2"
@@ -90,12 +105,18 @@ run_phase() {
 
     {
         printf 'phase=%s\n' "$phase"
+        printf 'matrix=direct:%s,triple:%s,cursor:%s\n' "$direct" "$triple" "$cursor"
         printf 'unique_buffers=%s\n' "$(grep -c 'direct_scanout_buffer=' "$session_log" 2>/dev/null || true)"
         printf 'transactions=%s\n' "$(grep -c 'native.direct_scanout' "$session_log" 2>/dev/null || true)"
         printf 'kms_submits=%s\n' "$(grep -c 'transition=submit' "$session_log" 2>/dev/null || true)"
         printf 'same_buffer_submits=%s\n' "$(grep -c 'same_buffer' "$session_log" 2>/dev/null || true)"
         printf 'pageflips=%s\n' "$(grep -c 'pageflip' "$session_log" 2>/dev/null || true)"
-        printf 'trace_dropped=%s\n' "$(grep -o 'presentation_trace_dropped=[0-9]*' "$session_log" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
+        printf 'future_primary_depth_peak=%s\n' "$(max_metric future_primary_depth "$session_log")"
+        printf 'queue_overflow=%s\n' "$(last_metric direct_scanout_worker_queue_overflow "$session_log")"
+        printf 'duplicate_settlement=%s\n' "$(last_metric direct_scanout_duplicate_settlement "$session_log")"
+        printf 'early_release_violations=%s\n' "$(last_metric direct_scanout_early_release_violations "$session_log")"
+        printf 'callback_unpublished=%s\n' "$(last_metric callback_unpublished "$session_log")"
+        printf 'trace_dropped=%s\n' "$(last_metric presentation_trace_dropped "$session_log")"
         printf 'completed=%s\n' "$(date --iso-8601=seconds)"
     } | tee "$summary_file"
 }

@@ -64,13 +64,35 @@ otherwise falls back visibly to a software cursor.
 
 One output commit authority serializes composited-primary, direct-primary, and
 cursor-only Atomic commits and owns the token, DRM generation, CRTC, and
-watchdog for all three kinds. Compatibility scanouts use this same total
-arbiter whenever their effective KMS backend is Atomic. Cursor-only completion
-promotes cursor state only; it does not complete compositor frame batches,
-presentation feedback, damage, or Direct Scanout transitions. Cursor movement
-is coalesced behind the pending primary or cursor commit. Primary and cursor
-state are validated together with `TEST_ONLY`, and framebuffer ownership ends
-only at the matching pageflip (or through generation-aware recovery).
+watchdog for all three kinds. The bounded Atomic lane has one kernel-submitted
+position plus one ordered worker-queued-next position. The worker may prepare
+the later job while the earlier commit waits for its pageflip, but it cannot
+submit that job to the kernel until the earlier pageflip is confirmed.
+Compatibility scanouts use the same kernel authority whenever their effective
+KMS backend is Atomic, without using the explicit three-slot primary pipeline.
+
+The explicit compositor output pool is fixed at exactly three slots. Its
+authoritative presentation snapshot contains at most one confirmed current
+primary and at most two future primary transactions. A cursor-only commit uses
+a commit-lane position but does not count toward primary future depth or occupy
+a prepared compositor slot. A direct primary counts toward future-primary
+depth but owns its client framebuffer lease rather than a compositor slot.
+Cursor-only completion promotes cursor state only; it does not complete
+compositor frame batches, presentation feedback, damage, or Direct Scanout
+transitions. Cursor movement is coalesced behind the pending primary or cursor
+commit. Primary and cursor state are validated together with `TEST_ONLY`, and
+framebuffer ownership ends only at the matching pageflip (or through
+generation-aware recovery).
+
+Triple-buffer pacing is transaction-owned. The scheduler owns demand and
+deadline wakes, the adaptive controller owns Double/Triple policy and
+hysteresis, and immutable `OutputTransaction` records own targets, plane/sync
+plans, content identity, and protocol obligations. The scheduler reads these
+owners through `OutputPipelineSnapshot`; it does not mirror ready, worker,
+kernel, or pageflip identities. Reactive Double never prepares a compositor
+frame behind a queued primary. Predictive Triple may prepare or worker-queue
+one later primary, but never creates a third future primary or grows the
+three-slot pool.
 
 Direct Scanout remains available only to the explicit EGL/GBM scanout. Legacy
 cursor ioctls are a Legacy-KMS-only implementation detail; compatibility

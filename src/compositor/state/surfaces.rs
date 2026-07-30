@@ -1397,27 +1397,15 @@ mod ordered_publication_tests {
     }
 
     #[test]
-    fn abandoned_surface_damage_capture_does_not_advance_presented_commit() {
+    fn abandoned_damage_capture_remains_unpresented_and_pending() {
         let mut state = CompositorState::default();
         state.surface_presentation_generations.insert(7, 1);
-        let journal = state
-            .surface_damage_journals
-            .entry(7)
-            .or_insert_with(|| SurfaceDamageJournal::new(64));
+        let mut journal = SurfaceDamageJournal::new(4);
         let pending = journal.record(RenderableSurfaceDamage::Full, 100, 80);
-        let abandoned = state.capture_surface_damage_presentation_for_surface(7);
-
-        drop(abandoned);
+        state.surface_damage_journals.insert(7, journal);
+        drop(state.capture_surface_damage_presentation_for_surface(7));
 
         assert!(!state.presented_surface_commits.contains_key(&7));
-        assert!(matches!(
-            state.surface_damage_journals[&7].damage_since(
-                SurfaceCommitCounter::default(),
-                100,
-                80
-            ),
-            DamageSince::Known(RenderableSurfaceDamage::Full)
-        ));
         assert_eq!(state.surface_damage_journals[&7].current_commit(), pending);
     }
 

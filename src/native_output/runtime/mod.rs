@@ -16,6 +16,7 @@ mod metrics;
 mod planner;
 mod presentation;
 mod presentation_direct;
+mod presentation_metrics;
 mod presentation_pipeline;
 mod presentation_protocol;
 mod presentation_ready;

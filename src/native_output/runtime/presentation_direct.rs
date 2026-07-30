@@ -1,3 +1,6 @@
+use super::direct_plan::{
+    PreparedPrimaryArbitration, PreparedPrimaryArbitrationInput, arbitrate_prepared_primary,
+};
 use super::planner::NativePresentationPath;
 use super::*;
 use oblivion_one::native::kms::KmsBackendKind;
@@ -144,6 +147,49 @@ pub(super) fn suppress_direct_render_ahead(
             )]
         });
     }
+}
+
+pub(super) fn log_prepared_primary_arbitration(
+    perf: NativePerfLogger,
+    pipeline: Option<&OutputPipelineSnapshot>,
+    output_transactions: &OutputTransactionLedger,
+    direct_key: DirectScanoutCandidateKey,
+    cursor_compatible: bool,
+    composition_blocked: bool,
+) {
+    let Some(PreparedCompositedState::Ready { transaction_id, .. }) =
+        pipeline.map(|snapshot| snapshot.prepared)
+    else {
+        return;
+    };
+    let Some(transaction) = output_transactions.transaction(transaction_id) else {
+        return;
+    };
+    let arbitration = arbitrate_prepared_primary(PreparedPrimaryArbitrationInput {
+        composed: transaction_id,
+        state: transaction.state(),
+        output_generation: transaction.descriptor().output_generation(),
+        equivalent_direct_key: transaction.descriptor().equivalent_direct_key(),
+        direct_key,
+        cursor_compatible,
+        composition_blocked,
+        // Protocol obligations are never transferred implicitly. The ready
+        // frame remains authoritative until an explicit transfer primitive
+        // can atomically move its batch to the direct transaction.
+        obligations_transferable: false,
+    });
+    debug_assert!(!matches!(
+        arbitration,
+        PreparedPrimaryArbitration::SupersedeWithEquivalentDirect { .. }
+    ));
+    perf.log("direct_scanout", || {
+        vec![
+            NativePerfField::str("event", "prepared_primary_arbitration"),
+            NativePerfField::str("result", format!("{arbitration:?}")),
+            NativePerfField::u64("transaction_id", transaction_id.get()),
+            NativePerfField::u64("content_epoch", direct_key.content.content_epoch.get()),
+        ]
+    });
 }
 
 #[cfg(test)]

@@ -1,8 +1,5 @@
 use super::cursor_cycle::{NativeResolvedCursorSource, resolve_native_cursor_source};
 use super::cycle::direct_fallback::{DirectFallbackReason, DirectFallbackTracker};
-use super::direct_plan::{
-    PreparedPrimaryArbitration, PreparedPrimaryArbitrationInput, arbitrate_prepared_primary,
-};
 use super::frame::{
     NativeRepaintInputs, cursor_only_allowed_at_deadline, native_repaint_decision,
     update_cursor_output_arbitration,
@@ -12,8 +9,10 @@ use super::planner::{
     plan_scheduled_target_for_mode,
 };
 use super::presentation_direct::{
-    DirectPresentationInputs, inspect_direct_presentation, suppress_direct_render_ahead,
+    DirectPresentationInputs, inspect_direct_presentation, log_prepared_primary_arbitration,
+    suppress_direct_render_ahead,
 };
+use super::presentation_metrics::log_output_pipeline_snapshot;
 use super::presentation_pipeline::build_output_pipeline_snapshot;
 use super::presentation_protocol::{
     ProtocolCycleMetrics, complete_protocol_only_tick, log_no_visual_work,
@@ -400,6 +399,14 @@ impl NativeRuntime {
                     swapchain.worker_queued_identity(),
                 ))
             })?;
+            log_output_pipeline_snapshot(
+                perf,
+                *triple_buffer_policy,
+                pacing_mode,
+                &pipeline,
+                adaptive_buffering.force_unavailable_blocker(),
+                output_transactions.validate_terminal_ownership().is_ok(),
+            );
             Some(pipeline)
         } else {
             None
@@ -421,7 +428,9 @@ impl NativeRuntime {
                     .as_ref()
                     .expect("explicit output built a pipeline snapshot"),
             );
-            let _pipeline_wait_reason = decision.wait_reason;
+            if let Some(wait_reason) = decision.wait_reason {
+                frame_pacing.note_pipeline_wait(wait_reason);
+            }
             decision.action
         } else {
             frame_scheduler
@@ -498,35 +507,15 @@ impl NativeRuntime {
             && direct_candidate_eligible
             && !composition_required
             && let Some(direct_key) = direct_inspection.candidate_key
-            && let Some(PreparedCompositedState::Ready { transaction_id, .. }) =
-                pipeline_snapshot.as_ref().map(|snapshot| snapshot.prepared)
-            && let Some(transaction) = output_transactions.transaction(transaction_id)
         {
-            let arbitration = arbitrate_prepared_primary(PreparedPrimaryArbitrationInput {
-                composed: transaction_id,
-                state: transaction.state(),
-                output_generation: transaction.descriptor().output_generation(),
-                equivalent_direct_key: transaction.descriptor().equivalent_direct_key(),
+            log_prepared_primary_arbitration(
+                perf,
+                pipeline_snapshot.as_ref(),
+                output_transactions,
                 direct_key,
-                cursor_compatible: cursor_direct_compatible,
-                composition_blocked: composition_required,
-                // No protocol-batch transfer occurs implicitly. Until the
-                // explicit transfer operation is selected, preservation is
-                // the only legal result even for matching content.
-                obligations_transferable: false,
-            });
-            debug_assert!(!matches!(
-                arbitration,
-                PreparedPrimaryArbitration::SupersedeWithEquivalentDirect { .. }
-            ));
-            perf.log("direct_scanout", || {
-                vec![
-                    NativePerfField::str("event", "prepared_primary_arbitration"),
-                    NativePerfField::str("result", format!("{arbitration:?}")),
-                    NativePerfField::u64("transaction_id", transaction_id.get()),
-                    NativePerfField::u64("content_epoch", direct_key.content.content_epoch.get()),
-                ]
-            });
+                cursor_direct_compatible,
+                composition_required,
+            );
         }
         let can_queue_worker_cursor = worker_cursor_queue_available(
             worker_mode,
