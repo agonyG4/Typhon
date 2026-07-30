@@ -668,8 +668,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
         if timing.is_none() {
             timing = Some(KmsCommitTimingModel::new(job.target.refresh_interval));
         }
-        let target_presentation_ns = job.target.presentation_time.get();
-        let model = timing.as_ref().copied().expect("timing model initialized");
+        let model = timing.as_ref().expect("timing model initialized");
         let now_ns = monotonic_now_ns();
         let decision = model.submit_at(job.target, now_ns);
         if decision.submit_at_ns > now_ns && !wait_until_or_quiesce(&shared, decision.submit_at_ns)
@@ -800,6 +799,11 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         .submit_duration_ns_max
                         .fetch_max(submit_duration_ns, std::sync::atomic::Ordering::Relaxed);
                     let queue_wait_ns = submit_started_at.saturating_sub(job.queued_at.get());
+                    let submit_wake_lateness_ns =
+                        submit_started_at.saturating_sub(decision.submit_deadline_ns);
+                    let model = timing.as_mut().expect("timing model initialized");
+                    model.observe_submission(submit_wake_lateness_ns, submit_duration_ns);
+                    let submission_budget_ns = model.submission_budget().submission_budget_ns;
                     shared
                         .metrics
                         .queue_wait_ns_total
@@ -816,6 +820,9 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                             out_fence: submission.out_fence,
                             submit_started_at: MonotonicTimestampNs::new(submit_started_at),
                             submit_returned_at: MonotonicTimestampNs::new(submit_returned_at),
+                            queue_residency_ns: queue_wait_ns,
+                            submit_wake_lateness_ns,
+                            submission_budget_ns,
                         },
                     };
                     if !publish_event(&shared, event) {
@@ -824,16 +831,6 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     if !wait_for_pageflip_or_quiesce(&shared, transaction_id, token) {
                         return;
                     }
-                    timing
-                        .as_mut()
-                        .expect("timing model initialized")
-                        .observe_submit_delta_ns(
-                            i64::try_from(submit_returned_at)
-                                .unwrap_or(i64::MAX)
-                                .saturating_sub(
-                                    i64::try_from(target_presentation_ns).unwrap_or(i64::MAX),
-                                ),
-                        );
                     break;
                 }
                 Ok(Err(failure)) if failure.error.kind == AtomicKmsErrorKind::Busy => {

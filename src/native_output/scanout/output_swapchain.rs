@@ -319,6 +319,10 @@ impl AtomicOutputSwapchain {
         self.pool_generation
     }
 
+    pub(crate) const fn slot_capacity(&self) -> usize {
+        self.slots.capacity()
+    }
+
     pub(crate) fn cancel_render_before_gpu(&mut self, slot: OutputSlotId) -> io::Result<()> {
         if self.rendering != Some(slot) {
             return Err(io::Error::other(

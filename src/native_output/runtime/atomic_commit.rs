@@ -22,6 +22,15 @@ pub(crate) enum AtomicCommitKind {
     },
 }
 
+impl AtomicCommitKind {
+    pub(crate) const fn is_primary(self) -> bool {
+        matches!(
+            self,
+            Self::CompositedPrimary { .. } | Self::DirectPrimary { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AtomicCommitPhase {
     WorkerQueued {

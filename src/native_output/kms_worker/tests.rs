@@ -93,6 +93,7 @@ fn reactive_double_submits_at_not_before() {
     assert_eq!(
         model.submit_at(target, 1_000_000),
         KmsTimingDecision {
+            submit_deadline_ns: 10_000_000,
             submit_at_ns: 10_000_000,
             late: false,
             late_by_ns: 0,
@@ -171,6 +172,29 @@ fn margin_is_bounded_by_half_refresh() {
     let mut model = KmsCommitTimingModel::new(Duration::from_micros(100));
     model.observe_submit_delta_ns(10_000_000);
     assert_eq!(model.safety_margin_ns(), 50_000);
+}
+
+#[test]
+fn submission_budget_combines_submit_wake_and_ioctl_once() {
+    use std::time::Duration;
+    let mut model = KmsCommitTimingModel::new(Duration::from_millis(16));
+    for _ in 0..20 {
+        model.observe_submission(300_000, 700_000);
+    }
+    let budget = model.submission_budget();
+
+    assert_eq!(budget.submit_wake_lateness_ns, 300_000);
+    assert_eq!(budget.ioctl_duration_ns, 700_000);
+    assert_eq!(budget.submission_budget_ns, 1_100_000);
+}
+
+#[test]
+fn submission_budget_is_bounded_by_half_the_refresh_interval() {
+    use std::time::Duration;
+    let mut model = KmsCommitTimingModel::new(Duration::from_millis(4));
+    model.observe_submission(10_000_000, 10_000_000);
+
+    assert_eq!(model.submission_budget().submission_budget_ns, 2_000_000);
 }
 
 pub(super) fn test_job(token: u64) -> KmsCommitJob {

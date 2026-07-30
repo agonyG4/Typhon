@@ -134,7 +134,7 @@ impl NativeRuntime {
                     timing.signaled_at,
                 );
                 let before = render_journal.prediction(timing.target.refresh_interval);
-                *pending_proven_deadline_miss = match timing.quality {
+                let observed_miss = match timing.quality {
                     FenceTimestampQuality::ExactSyncFile
                         if timing.signaled_at > timing.target.presentation_time =>
                     {
@@ -151,6 +151,39 @@ impl NativeRuntime {
                     }
                     _ => None,
                 };
+                if let Some(miss) = observed_miss {
+                    pending_proven_deadline_miss.get_or_insert(miss);
+                    let prepared_frame_exists = explicit.swapchain()?.ready_slot().is_some()
+                        || explicit.swapchain()?.rendering_slot().is_some();
+                    let future_primary_depth = u8::from(
+                        atomic_commit_arbiter
+                            .pending_atomic_commit()
+                            .is_some_and(|commit| commit.kind.is_primary()),
+                    )
+                    .saturating_add(u8::from(
+                        atomic_commit_arbiter
+                            .worker_queued_commit()
+                            .is_some_and(|commit| commit.kind.is_primary()),
+                    ))
+                    .saturating_add(u8::from(prepared_frame_exists));
+                    let buffering_mode_before = adaptive_buffering.mode();
+                    adaptive_buffering.observe_with_pipeline(
+                        before.total_cost_ns,
+                        timing.target.refresh_interval,
+                        Some(miss),
+                        *last_refresh_sequence,
+                        timing.signaled_at,
+                        frame_scheduler.visual_work_queued(),
+                        adaptive_buffering.capability(),
+                        prepared_frame_exists,
+                        future_primary_depth,
+                    );
+                    frame_pacing.note_adaptive_transition(
+                        buffering_mode_before,
+                        adaptive_buffering.mode(),
+                        Some(miss),
+                    );
+                }
                 perf.log("native.render_fence", || {
                     vec![
                         NativePerfField::u64("frame_id", timing.frame_id),
@@ -587,6 +620,11 @@ impl NativeRuntime {
                         slot: explicit.swapchain()?.current(),
                     });
                     render_journal.note_matching_presentation(presented_at);
+                    render_journal.record_target_slip(
+                        presented_at
+                            .get()
+                            .saturating_sub(frame.target.presentation_time.get()),
+                    );
                     render_journal.record_atomic_submit(
                         frame
                             .submit_returned_at
@@ -603,7 +641,7 @@ impl NativeRuntime {
                             signaled_at,
                         );
                         let target_ns = frame.target.presentation_time.get();
-                        proven_miss = match quality {
+                        let fence_miss = match quality {
                             FenceTimestampQuality::ExactSyncFile
                                 if signaled_at.get() > target_ns =>
                             {
@@ -620,6 +658,9 @@ impl NativeRuntime {
                             }
                             _ => None,
                         };
+                        if let Some(miss) = fence_miss {
+                            proven_miss = Some(miss);
+                        }
                     }
                     if frame.submit_returned_at.get() > frame.target.presentation_time.get() {
                         proven_miss = Some(ProvenDeadlineMiss::AtomicSubmit);
@@ -630,22 +671,35 @@ impl NativeRuntime {
                         actual_logical_sequence,
                     );
                     let prediction = render_journal.prediction(refresh);
-                    if !scanout.third_slot_owned() {
-                        let buffering_mode_before = adaptive_buffering.mode();
-                        adaptive_buffering.observe(
-                            prediction.total_cost_ns,
-                            refresh,
-                            proven_miss,
-                            actual_logical_sequence,
-                            presented_at,
-                            server.has_unowned_frame_work() || frame_scheduler.visual_work_queued(),
-                        );
-                        frame_pacing.note_adaptive_transition(
-                            buffering_mode_before,
-                            adaptive_buffering.mode(),
-                            proven_miss,
-                        );
-                    }
+                    let prepared_frame_exists = scanout.third_slot_owned();
+                    let future_primary_depth = u8::from(
+                        atomic_commit_arbiter
+                            .pending_atomic_commit()
+                            .is_some_and(|commit| commit.kind.is_primary()),
+                    )
+                    .saturating_add(u8::from(
+                        atomic_commit_arbiter
+                            .worker_queued_commit()
+                            .is_some_and(|commit| commit.kind.is_primary()),
+                    ))
+                    .saturating_add(u8::from(prepared_frame_exists));
+                    let buffering_mode_before = adaptive_buffering.mode();
+                    adaptive_buffering.observe_with_pipeline(
+                        prediction.total_cost_ns,
+                        refresh,
+                        proven_miss,
+                        actual_logical_sequence,
+                        presented_at,
+                        server.has_unowned_frame_work() || frame_scheduler.visual_work_queued(),
+                        adaptive_buffering.capability(),
+                        prepared_frame_exists,
+                        future_primary_depth,
+                    );
+                    frame_pacing.note_adaptive_transition(
+                        buffering_mode_before,
+                        adaptive_buffering.mode(),
+                        proven_miss,
+                    );
                     frame_pacing.note_explicit_present(ExplicitPresentationObservation {
                         planned_sequence: frame.target.sequence,
                         actual_sequence: actual_logical_sequence,

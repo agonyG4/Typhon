@@ -42,6 +42,9 @@ pub(crate) struct KmsSubmittedOwnership {
     pub(crate) out_fence: Option<OwnedFd>,
     pub(crate) submit_started_at: MonotonicTimestampNs,
     pub(crate) submit_returned_at: MonotonicTimestampNs,
+    pub(crate) queue_residency_ns: u64,
+    pub(crate) submit_wake_lateness_ns: u64,
+    pub(crate) submission_budget_ns: u64,
 }
 
 #[derive(Debug)]

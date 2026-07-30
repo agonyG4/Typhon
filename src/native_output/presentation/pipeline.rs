@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+pub(crate) use oblivion_one::native::adaptive_buffering::{
+    TripleCapability, TripleCapabilityBlocker,
+};
 use oblivion_one::native::kms::PageFlipToken;
 use oblivion_one::native::presentation_deadline::PresentationTarget;
 #[allow(unused_imports)]
@@ -9,6 +12,46 @@ use oblivion_one::native::scheduler::{
 };
 
 use crate::native_output::{DirectScanoutCandidateKey, OutputSlotId, OutputTransactionId};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TripleCapabilityInputs {
+    pub(crate) atomic_kms: bool,
+    pub(crate) explicit_swapchain: bool,
+    pub(crate) slot_capacity: usize,
+    pub(crate) primary_in_fence: bool,
+    pub(crate) render_fence_export: bool,
+    pub(crate) submission_transport_healthy: bool,
+    pub(crate) session_active: bool,
+    pub(crate) output_generation_stable: bool,
+    pub(crate) ordinary_vsync: bool,
+    pub(crate) swapchain_poisoned: bool,
+}
+
+pub(crate) const fn derive_triple_capability(inputs: TripleCapabilityInputs) -> TripleCapability {
+    if !inputs.atomic_kms {
+        TripleCapability::Unavailable(TripleCapabilityBlocker::NonAtomicKms)
+    } else if !inputs.explicit_swapchain {
+        TripleCapability::Unavailable(TripleCapabilityBlocker::ExplicitSwapchainUnavailable)
+    } else if inputs.slot_capacity != 3 {
+        TripleCapability::Unavailable(TripleCapabilityBlocker::SlotCapacityMismatch)
+    } else if !inputs.primary_in_fence {
+        TripleCapability::Unavailable(TripleCapabilityBlocker::PrimaryInFenceUnavailable)
+    } else if !inputs.render_fence_export {
+        TripleCapability::Unavailable(TripleCapabilityBlocker::RenderFenceExportUnavailable)
+    } else if !inputs.submission_transport_healthy {
+        TripleCapability::Unavailable(TripleCapabilityBlocker::SubmissionTransportUnhealthy)
+    } else if !inputs.session_active {
+        TripleCapability::Unavailable(TripleCapabilityBlocker::SessionInactive)
+    } else if !inputs.output_generation_stable {
+        TripleCapability::Unavailable(TripleCapabilityBlocker::OutputGenerationUnstable)
+    } else if !inputs.ordinary_vsync {
+        TripleCapability::Unavailable(TripleCapabilityBlocker::UnsupportedPresentationMode)
+    } else if inputs.swapchain_poisoned {
+        TripleCapability::Unavailable(TripleCapabilityBlocker::SwapchainPoisoned)
+    } else {
+        TripleCapability::Capable
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfirmedPrimaryState {
@@ -122,26 +165,6 @@ impl PreparedCompositedState {
             Self::Rendering { target, .. } | Self::Ready { target, .. } => Some(target),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TripleCapabilityBlocker {
-    NonAtomicKms,
-    ExplicitSwapchainUnavailable,
-    SlotCapacityMismatch,
-    PrimaryInFenceUnavailable,
-    RenderFenceExportUnavailable,
-    SubmissionTransportUnhealthy,
-    SessionInactive,
-    OutputGenerationUnstable,
-    UnsupportedPresentationMode,
-    SwapchainPoisoned,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TripleCapability {
-    Capable,
-    Unavailable(TripleCapabilityBlocker),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

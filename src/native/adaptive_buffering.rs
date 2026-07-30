@@ -48,6 +48,28 @@ pub enum AdaptiveBufferingMode {
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TripleCapabilityBlocker {
+    NonAtomicKms,
+    ExplicitSwapchainUnavailable,
+    SlotCapacityMismatch,
+    PrimaryInFenceUnavailable,
+    RenderFenceExportUnavailable,
+    SubmissionTransportUnhealthy,
+    SessionInactive,
+    OutputGenerationUnstable,
+    UnsupportedPresentationMode,
+    SwapchainPoisoned,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TripleCapability {
+    Capable,
+    Unavailable(TripleCapabilityBlocker),
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TripleEntryReason {
     PredictedDeadlinePressure,
     ProvenReadinessMiss,
@@ -112,6 +134,11 @@ pub struct RenderPrediction {
     pub render_risk_ns: u64,
     pub p95_wake_lateness_ns: u64,
     pub p95_atomic_submit_ns: u64,
+    pub p95_worker_queue_residency_ns: u64,
+    pub p95_worker_submit_wake_lateness_ns: u64,
+    pub p95_atomic_ioctl_ns: u64,
+    pub submission_budget_ns: u64,
+    pub p95_target_slip_ns: u64,
     pub submit_allowance_ns: u64,
     pub safety_margin_ns: u64,
     pub total_cost_ns: u64,
@@ -124,6 +151,10 @@ pub struct AdaptiveRenderJournal {
     render_samples_ns: VecDeque<u64>,
     wake_lateness_samples_ns: VecDeque<u64>,
     atomic_submit_samples_ns: VecDeque<u64>,
+    worker_queue_residency_samples_ns: VecDeque<u64>,
+    worker_submit_wake_lateness_samples_ns: VecDeque<u64>,
+    submission_budget_samples_ns: VecDeque<u64>,
+    target_slip_samples_ns: VecDeque<u64>,
     ewma_render_ns: u64,
     upper_render_deviation_ns: u64,
     last_sample_at: Option<MonotonicTimestampNs>,
@@ -138,6 +169,10 @@ impl Default for AdaptiveRenderJournal {
             render_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
             wake_lateness_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
             atomic_submit_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
+            worker_queue_residency_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
+            worker_submit_wake_lateness_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
+            submission_budget_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
+            target_slip_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
             ewma_render_ns: 0,
             upper_render_deviation_ns: 0,
             last_sample_at: None,
@@ -179,6 +214,22 @@ impl AdaptiveRenderJournal {
 
     pub fn record_atomic_submit(&mut self, sample_ns: u64) {
         push_bounded(&mut self.atomic_submit_samples_ns, sample_ns);
+    }
+
+    pub fn record_worker_queue_residency(&mut self, sample_ns: u64) {
+        push_bounded(&mut self.worker_queue_residency_samples_ns, sample_ns);
+    }
+
+    pub fn record_worker_submit_wake_lateness(&mut self, sample_ns: u64) {
+        push_bounded(&mut self.worker_submit_wake_lateness_samples_ns, sample_ns);
+    }
+
+    pub fn record_submission_budget(&mut self, sample_ns: u64) {
+        push_bounded(&mut self.submission_budget_samples_ns, sample_ns);
+    }
+
+    pub fn record_target_slip(&mut self, sample_ns: u64) {
+        push_bounded(&mut self.target_slip_samples_ns, sample_ns);
     }
 
     pub fn note_matching_presentation(&mut self, at: MonotonicTimestampNs) {
@@ -238,12 +289,21 @@ impl AdaptiveRenderJournal {
                 render_risk.max(self.render_samples_ns.iter().copied().max().unwrap_or(0));
         }
         let p95_wake = nearest_rank(&self.wake_lateness_samples_ns, 95);
-        let p95_submit = nearest_rank(&self.atomic_submit_samples_ns, 95);
-        let submit_allowance = if self.atomic_submit_samples_ns.len() < 20 {
-            p95_submit.max(250_000)
+        let p95_ioctl = nearest_rank(&self.atomic_submit_samples_ns, 95);
+        let p95_worker_wake = nearest_rank(&self.worker_submit_wake_lateness_samples_ns, 95);
+        let p95_queue_residency = nearest_rank(&self.worker_queue_residency_samples_ns, 95);
+        let measured_submission_budget = p95_worker_wake
+            .saturating_add(p95_ioctl)
+            .saturating_add(100_000);
+        let exported_submission_budget = nearest_rank(&self.submission_budget_samples_ns, 95);
+        let submission_budget = if exported_submission_budget != 0 {
+            exported_submission_budget
+        } else if self.atomic_submit_samples_ns.len() < 20 {
+            measured_submission_budget.max(250_000)
         } else {
-            p95_submit
+            measured_submission_budget
         };
+        let submit_allowance = submission_budget;
         let ceiling = 2_000_000_u64.min(refresh_ns / 4).max(500_000);
         let dynamic_margin = p95_wake.saturating_add(250_000).clamp(500_000, ceiling);
         let safety_margin = if self.wake_lateness_samples_ns.len() < 20
@@ -265,7 +325,12 @@ impl AdaptiveRenderJournal {
             p90_recent_render_ns: p90,
             render_risk_ns: render_risk,
             p95_wake_lateness_ns: p95_wake,
-            p95_atomic_submit_ns: p95_submit,
+            p95_atomic_submit_ns: p95_ioctl,
+            p95_worker_queue_residency_ns: p95_queue_residency,
+            p95_worker_submit_wake_lateness_ns: p95_worker_wake,
+            p95_atomic_ioctl_ns: p95_ioctl,
+            submission_budget_ns: submission_budget,
+            p95_target_slip_ns: nearest_rank(&self.target_slip_samples_ns, 95),
             submit_allowance_ns: submit_allowance,
             safety_margin_ns: safety_margin,
             total_cost_ns: total,
@@ -282,6 +347,8 @@ pub struct AdaptiveBufferingController {
     entry_reason: Option<TripleEntryReason>,
     entered_at: Option<(u64, MonotonicTimestampNs)>,
     low_pressure_since: Option<(u64, MonotonicTimestampNs)>,
+    capability: TripleCapability,
+    force_unavailable_blocker: Option<TripleCapabilityBlocker>,
 }
 
 impl AdaptiveBufferingController {
@@ -292,6 +359,10 @@ impl AdaptiveBufferingController {
             entry_reason: None,
             entered_at: None,
             low_pressure_since: None,
+            capability: TripleCapability::Unavailable(
+                TripleCapabilityBlocker::ExplicitSwapchainUnavailable,
+            ),
+            force_unavailable_blocker: None,
         }
     }
 
@@ -304,20 +375,95 @@ impl AdaptiveBufferingController {
         presentation_time: MonotonicTimestampNs,
         visual_work: bool,
     ) {
+        self.observe_with_pipeline(
+            predicted_total_cost_ns,
+            refresh_interval,
+            proven_miss,
+            presentation_sequence,
+            presentation_time,
+            visual_work,
+            TripleCapability::Capable,
+            false,
+            0,
+        );
+    }
+
+    pub fn apply_capability(&mut self, capability: TripleCapability) {
+        self.capability = capability;
+        match (self.policy, capability) {
+            (AdaptiveTripleBufferPolicy::Off, _) => {
+                self.mode = AdaptiveBufferingMode::Double;
+                self.force_unavailable_blocker = None;
+            }
+            (AdaptiveTripleBufferPolicy::Force, TripleCapability::Unavailable(blocker)) => {
+                self.mode = AdaptiveBufferingMode::Double;
+                self.entry_reason = None;
+                self.entered_at = None;
+                self.low_pressure_since = None;
+                self.force_unavailable_blocker = Some(blocker);
+            }
+            (AdaptiveTripleBufferPolicy::Force, TripleCapability::Capable) => {
+                self.mode = AdaptiveBufferingMode::Triple;
+                self.entry_reason = Some(TripleEntryReason::ForcedValidation);
+                self.force_unavailable_blocker = None;
+            }
+            (AdaptiveTripleBufferPolicy::Auto, TripleCapability::Unavailable(_)) => {
+                self.mode = AdaptiveBufferingMode::Double;
+                self.entry_reason = None;
+                self.entered_at = None;
+                self.low_pressure_since = None;
+                self.force_unavailable_blocker = None;
+            }
+            (AdaptiveTripleBufferPolicy::Auto, TripleCapability::Capable) => {
+                self.force_unavailable_blocker = None;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_with_pipeline(
+        &mut self,
+        predicted_total_cost_ns: u64,
+        refresh_interval: Duration,
+        proven_miss: Option<ProvenDeadlineMiss>,
+        presentation_sequence: u64,
+        presentation_time: MonotonicTimestampNs,
+        visual_work: bool,
+        capability: TripleCapability,
+        prepared_frame_exists: bool,
+        future_primary_depth: u8,
+    ) {
+        self.capability = capability;
         if self.policy == AdaptiveTripleBufferPolicy::Off {
             return;
         }
+        let TripleCapability::Capable = capability else {
+            self.force_unavailable_blocker = match (self.policy, capability) {
+                (AdaptiveTripleBufferPolicy::Force, TripleCapability::Unavailable(blocker)) => {
+                    Some(blocker)
+                }
+                _ => None,
+            };
+            self.mode = AdaptiveBufferingMode::Double;
+            self.entry_reason = None;
+            self.entered_at = None;
+            self.low_pressure_since = None;
+            return;
+        };
+        self.force_unavailable_blocker = None;
         let refresh_ns = duration_ns(refresh_interval).max(1);
+        if self.policy == AdaptiveTripleBufferPolicy::Force {
+            if self.mode != AdaptiveBufferingMode::Triple {
+                self.mode = AdaptiveBufferingMode::Triple;
+                self.entry_reason = Some(TripleEntryReason::ForcedValidation);
+                self.entered_at = Some((presentation_sequence, presentation_time));
+            }
+            return;
+        }
         if self.mode == AdaptiveBufferingMode::Double {
-            let proven_entry = proven_miss.is_some();
             let predictive_entry =
                 visual_work && proven_miss.is_none() && predicted_total_cost_ns >= refresh_ns;
-            let forced_entry =
-                self.policy == AdaptiveTripleBufferPolicy::Force && (visual_work || proven_entry);
             let reason = match self.policy {
-                AdaptiveTripleBufferPolicy::Force if forced_entry => {
-                    Some(TripleEntryReason::ForcedValidation)
-                }
                 AdaptiveTripleBufferPolicy::Auto => {
                     proven_miss.map(triple_entry_reason_for_miss).or_else(|| {
                         predictive_entry.then_some(TripleEntryReason::PredictedDeadlinePressure)
@@ -345,10 +491,15 @@ impl AdaptiveBufferingController {
             presentation_sequence,
             presentation_time,
         );
-        let low_pressure = proven_miss.is_none()
-            && predicted_total_cost_ns.saturating_mul(100) < refresh_ns.saturating_mul(80);
-        if !hold_complete || !low_pressure {
+        if proven_miss.is_some() || at_least_percent(predicted_total_cost_ns, refresh_ns, 95) {
             self.low_pressure_since = None;
+            return;
+        }
+        if !hold_complete {
+            return;
+        }
+        let low_pressure = below_percent(predicted_total_cost_ns, refresh_ns, 80);
+        if !low_pressure {
             return;
         }
         let low_start = *self
@@ -359,7 +510,9 @@ impl AdaptiveBufferingController {
             low_start.1,
             presentation_sequence,
             presentation_time,
-        ) {
+        ) && !prepared_frame_exists
+            && future_primary_depth <= 1
+        {
             self.mode = AdaptiveBufferingMode::Double;
             self.entry_reason = None;
             self.entered_at = None;
@@ -372,18 +525,22 @@ impl AdaptiveBufferingController {
     }
 
     pub const fn pacing_mode(&self) -> NativeOutputPacingMode {
-        match self.policy {
-            AdaptiveTripleBufferPolicy::Off => NativeOutputPacingMode::ReactiveDouble,
-            AdaptiveTripleBufferPolicy::Force => NativeOutputPacingMode::PredictiveTriple,
-            AdaptiveTripleBufferPolicy::Auto => match self.mode {
-                AdaptiveBufferingMode::Double => NativeOutputPacingMode::ReactiveDouble,
-                AdaptiveBufferingMode::Triple => NativeOutputPacingMode::PredictiveTriple,
-            },
+        match self.mode {
+            AdaptiveBufferingMode::Double => NativeOutputPacingMode::ReactiveDouble,
+            AdaptiveBufferingMode::Triple => NativeOutputPacingMode::PredictiveTriple,
         }
     }
 
     pub const fn entry_reason(&self) -> Option<TripleEntryReason> {
         self.entry_reason
+    }
+
+    pub const fn capability(&self) -> TripleCapability {
+        self.capability
+    }
+
+    pub const fn force_unavailable_blocker(&self) -> Option<TripleCapabilityBlocker> {
+        self.force_unavailable_blocker
     }
 
     pub fn reset(&mut self) {
@@ -418,6 +575,14 @@ fn elapsed_both(
 ) -> bool {
     sequence.saturating_sub(start_sequence) >= MIN_HYSTERESIS_PRESENTATIONS
         && time.get().saturating_sub(start_time.get()) >= MIN_HYSTERESIS_NS
+}
+
+fn at_least_percent(value: u64, total: u64, percent: u64) -> bool {
+    u128::from(value) * 100 >= u128::from(total) * u128::from(percent)
+}
+
+fn below_percent(value: u64, total: u64, percent: u64) -> bool {
+    u128::from(value) * 100 < u128::from(total) * u128::from(percent)
 }
 
 fn push_bounded(samples: &mut VecDeque<u64>, value: u64) {
@@ -550,7 +715,7 @@ mod tests {
         }
         let prediction = journal.prediction(Duration::from_millis(4));
         assert_eq!(prediction.safety_margin_ns, 1_000_000);
-        assert_eq!(prediction.submit_allowance_ns, 100_000);
+        assert_eq!(prediction.submit_allowance_ns, 200_000);
     }
 
     #[test]
@@ -887,7 +1052,8 @@ mod tests {
     #[test]
     fn pacing_mode_maps_force_and_auto_triple_to_predictive_triple() {
         let refresh = Duration::from_millis(10);
-        let force = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Force);
+        let mut force = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Force);
+        force.observe(0, refresh, None, 1, MonotonicTimestampNs::new(1), true);
         let mut auto = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
         auto.observe(
             10_000_000,
@@ -939,5 +1105,182 @@ mod tests {
             journal.record_render_sample(sample, MonotonicTimestampNs::new(sample));
         }
         assert_eq!(journal.p90_recent_render_ns(), 108);
+    }
+
+    #[test]
+    fn queue_residency_is_observable_but_never_part_of_predicted_cost() {
+        let mut journal = AdaptiveRenderJournal::default();
+        journal.record_worker_queue_residency(500_000_000);
+        let baseline = journal.prediction(Duration::from_millis(10));
+
+        assert_eq!(baseline.p95_worker_queue_residency_ns, 500_000_000);
+        assert!(baseline.total_cost_ns < 10_000_000);
+    }
+
+    #[test]
+    fn timing_dimensions_are_independently_bounded() {
+        let mut journal = AdaptiveRenderJournal::default();
+        for sample in 1..=121 {
+            let at = MonotonicTimestampNs::new(sample);
+            journal.record_render_sample(sample, at);
+            journal.record_wake_lateness(sample + 1_000);
+            journal.record_worker_queue_residency(sample + 2_000);
+            journal.record_worker_submit_wake_lateness(sample + 3_000);
+            journal.record_atomic_submit(sample + 4_000);
+            journal.record_submission_budget(sample + 5_000);
+            journal.record_target_slip(sample + 6_000);
+        }
+
+        assert_eq!(journal.render_samples_ns.len(), SAMPLE_CAPACITY);
+        assert_eq!(journal.wake_lateness_samples_ns.len(), SAMPLE_CAPACITY);
+        assert_eq!(
+            journal.worker_queue_residency_samples_ns.len(),
+            SAMPLE_CAPACITY
+        );
+        assert_eq!(
+            journal.worker_submit_wake_lateness_samples_ns.len(),
+            SAMPLE_CAPACITY
+        );
+        assert_eq!(journal.atomic_submit_samples_ns.len(), SAMPLE_CAPACITY);
+        assert_eq!(journal.submission_budget_samples_ns.len(), SAMPLE_CAPACITY);
+        assert_eq!(journal.target_slip_samples_ns.len(), SAMPLE_CAPACITY);
+
+        let prediction = journal.prediction(Duration::from_millis(10));
+        assert_eq!(prediction.p90_recent_render_ns, 109);
+        assert_eq!(prediction.p95_wake_lateness_ns, 1_115);
+        assert_eq!(prediction.p95_worker_queue_residency_ns, 2_115);
+        assert_eq!(prediction.p95_worker_submit_wake_lateness_ns, 3_115);
+        assert_eq!(prediction.p95_atomic_ioctl_ns, 4_115);
+        assert_eq!(prediction.submission_budget_ns, 5_115);
+        assert_eq!(prediction.p95_target_slip_ns, 6_115);
+    }
+
+    #[test]
+    fn force_never_bypasses_an_exact_capability_blocker() {
+        let mut controller = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Force);
+        controller.observe_with_pipeline(
+            20_000_000,
+            Duration::from_millis(10),
+            None,
+            1,
+            MonotonicTimestampNs::new(10_000_000),
+            true,
+            TripleCapability::Unavailable(TripleCapabilityBlocker::PrimaryInFenceUnavailable),
+            false,
+            0,
+        );
+
+        assert_eq!(controller.mode(), AdaptiveBufferingMode::Double);
+        assert_eq!(
+            controller.force_unavailable_blocker(),
+            Some(TripleCapabilityBlocker::PrimaryInFenceUnavailable)
+        );
+        assert_eq!(
+            controller.pacing_mode(),
+            NativeOutputPacingMode::ReactiveDouble
+        );
+    }
+
+    #[test]
+    fn triple_exit_waits_until_prepared_is_empty_and_future_depth_is_at_most_one() {
+        let refresh = Duration::from_millis(10);
+        let mut controller = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+        controller.observe_with_pipeline(
+            10_000_000,
+            refresh,
+            None,
+            1,
+            MonotonicTimestampNs::new(10_000_000),
+            true,
+            TripleCapability::Capable,
+            false,
+            0,
+        );
+        for sequence in 2..=30 {
+            controller.observe_with_pipeline(
+                7_000_000,
+                refresh,
+                None,
+                sequence,
+                MonotonicTimestampNs::new(sequence * 10_000_000),
+                true,
+                TripleCapability::Capable,
+                false,
+                2,
+            );
+        }
+        assert_eq!(controller.mode(), AdaptiveBufferingMode::Triple);
+
+        for sequence in 31..=41 {
+            controller.observe_with_pipeline(
+                7_000_000,
+                refresh,
+                None,
+                sequence,
+                MonotonicTimestampNs::new(sequence * 10_000_000),
+                true,
+                TripleCapability::Capable,
+                false,
+                1,
+            );
+        }
+        assert_eq!(controller.mode(), AdaptiveBufferingMode::Double);
+    }
+
+    #[test]
+    fn ninety_five_percent_pressure_resets_exit_candidacy_at_common_refresh_rates() {
+        for refresh_ns in [16_666_667, 8_333_333, 6_944_444, 6_060_606] {
+            let refresh = Duration::from_nanos(refresh_ns);
+            let mut controller = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+            controller.observe_with_pipeline(
+                refresh_ns,
+                refresh,
+                None,
+                1,
+                MonotonicTimestampNs::new(refresh_ns),
+                true,
+                TripleCapability::Capable,
+                false,
+                0,
+            );
+            for sequence in 2..=20 {
+                controller.observe_with_pipeline(
+                    refresh_ns * 79 / 100,
+                    refresh,
+                    None,
+                    sequence,
+                    MonotonicTimestampNs::new(sequence * refresh_ns),
+                    true,
+                    TripleCapability::Capable,
+                    false,
+                    0,
+                );
+            }
+            controller.observe_with_pipeline(
+                refresh_ns.saturating_mul(95).div_ceil(100),
+                refresh,
+                None,
+                21,
+                MonotonicTimestampNs::new(21 * refresh_ns),
+                true,
+                TripleCapability::Capable,
+                false,
+                0,
+            );
+            for sequence in 22..=30 {
+                controller.observe_with_pipeline(
+                    refresh_ns * 79 / 100,
+                    refresh,
+                    None,
+                    sequence,
+                    MonotonicTimestampNs::new(sequence * refresh_ns),
+                    true,
+                    TripleCapability::Capable,
+                    false,
+                    0,
+                );
+            }
+            assert_eq!(controller.mode(), AdaptiveBufferingMode::Triple);
+        }
     }
 }

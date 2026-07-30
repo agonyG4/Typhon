@@ -25,6 +25,7 @@ use super::presentation_transactions::{
 use super::presentation_worker::*;
 use super::*;
 use crate::native_output::kms_worker::KmsCommitWorkerTransport;
+use oblivion_one::native::kms::KmsBackendKind;
 
 impl NativeRuntime {
     #[allow(unused_variables)]
@@ -100,7 +101,7 @@ impl NativeRuntime {
             seat_session: _,
             process_supervisor: _,
             shutdown: _,
-            session: _,
+            session,
             #[cfg(test)]
             native_io_recorder,
             ..
@@ -310,13 +311,35 @@ impl NativeRuntime {
             Duration::from_nanos(1_000_000_000 / u64::from((*refresh_hz).max(1)));
         let prediction = render_journal.prediction_at(scheduler_now, refresh_interval);
         let explicit_output = matches!(&**scanout, NativeScanoutBackend::AtomicEglGbm(_));
-        let render_ahead_allowed = match triple_buffer_policy {
-            AdaptiveTripleBufferPolicy::Off => false,
-            AdaptiveTripleBufferPolicy::Force => true,
-            AdaptiveTripleBufferPolicy::Auto => {
-                adaptive_buffering.mode() == AdaptiveBufferingMode::Triple
+        let triple_capability = match scanout.explicit_output_swapchain() {
+            Some(swapchain) => derive_triple_capability(TripleCapabilityInputs {
+                atomic_kms: kms_backend.effective_kind() == KmsBackendKind::Atomic,
+                explicit_swapchain: true,
+                slot_capacity: swapchain.slot_capacity(),
+                primary_in_fence: kms_backend
+                    .atomic()
+                    .is_some_and(|atomic| atomic.discovery().optional.in_fence_fd),
+                render_fence_export: true,
+                submission_transport_healthy: match kms_commit_worker_transport {
+                    KmsCommitWorkerTransport::Synchronous => true,
+                    KmsCommitWorkerTransport::Worker => kms_commit_worker
+                        .as_ref()
+                        .is_some_and(|worker| worker.fatal_reason().is_none()),
+                },
+                session_active: session.permits_output(),
+                output_generation_stable: swapchain.pool_generation() == *drm_file_generation,
+                ordinary_vsync: true,
+                swapchain_poisoned: swapchain.is_poisoned(),
+            }),
+            None if kms_backend.effective_kind() != KmsBackendKind::Atomic => {
+                TripleCapability::Unavailable(TripleCapabilityBlocker::NonAtomicKms)
+            }
+            None => {
+                TripleCapability::Unavailable(TripleCapabilityBlocker::ExplicitSwapchainUnavailable)
             }
         };
+        adaptive_buffering.apply_capability(triple_capability);
+        let render_ahead_allowed = adaptive_buffering.mode() == AdaptiveBufferingMode::Triple;
         let pacing_mode = adaptive_buffering.pacing_mode();
         if pacing_mode == NativeOutputPacingMode::ReactiveDouble {
             *scheduled_presentation_target = None;
@@ -355,11 +378,6 @@ impl NativeRuntime {
             let swapchain = scanout.explicit_output_swapchain().ok_or_else(|| {
                 io::Error::other("explicit Atomic presentation has no output swapchain")
             })?;
-            let triple_capability = if swapchain.is_poisoned() {
-                TripleCapability::Unavailable(TripleCapabilityBlocker::SwapchainPoisoned)
-            } else {
-                TripleCapability::Capable
-            };
             let pipeline = build_output_pipeline_snapshot(
                 *drm_file_generation,
                 pacing_mode,
@@ -810,6 +828,19 @@ impl NativeRuntime {
                     ),
                     PacingField::u64("prediction_p90_ns", prediction.p90_recent_render_ns),
                     PacingField::u64("prediction_render_risk_ns", prediction.render_risk_ns),
+                    PacingField::u64(
+                        "prediction_worker_queue_residency_ns",
+                        prediction.p95_worker_queue_residency_ns,
+                    ),
+                    PacingField::u64(
+                        "prediction_worker_submit_wake_ns",
+                        prediction.p95_worker_submit_wake_lateness_ns,
+                    ),
+                    PacingField::u64("prediction_atomic_ioctl_ns", prediction.p95_atomic_ioctl_ns),
+                    PacingField::u64(
+                        "prediction_submission_budget_ns",
+                        prediction.submission_budget_ns,
+                    ),
                     PacingField::u64("dynamic_safety_margin_ns", prediction.safety_margin_ns),
                     PacingField::u64("predicted_total_cost_ns", prediction.total_cost_ns),
                     PacingField::u64("refresh_interval_ns", refresh_interval.as_nanos() as u64),

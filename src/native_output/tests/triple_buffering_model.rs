@@ -281,3 +281,35 @@ fn explicit_scheduler_ignores_compatibility_submission_mirror() {
         SchedulerDecision::Render,
     );
 }
+
+#[test]
+fn triple_capability_reports_one_exact_blocker_in_safety_order() {
+    let capable = TripleCapabilityInputs {
+        atomic_kms: true,
+        explicit_swapchain: true,
+        slot_capacity: 3,
+        primary_in_fence: true,
+        render_fence_export: true,
+        submission_transport_healthy: true,
+        session_active: true,
+        output_generation_stable: true,
+        ordinary_vsync: true,
+        swapchain_poisoned: false,
+    };
+    assert_eq!(derive_triple_capability(capable), TripleCapability::Capable);
+    assert_eq!(
+        derive_triple_capability(TripleCapabilityInputs {
+            primary_in_fence: false,
+            submission_transport_healthy: false,
+            ..capable
+        }),
+        TripleCapability::Unavailable(TripleCapabilityBlocker::PrimaryInFenceUnavailable)
+    );
+    assert_eq!(
+        derive_triple_capability(TripleCapabilityInputs {
+            ordinary_vsync: false,
+            ..capable
+        }),
+        TripleCapability::Unavailable(TripleCapabilityBlocker::UnsupportedPresentationMode)
+    );
+}

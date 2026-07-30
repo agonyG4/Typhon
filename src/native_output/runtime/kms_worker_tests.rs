@@ -218,6 +218,9 @@ fn promotion_failure_quarantine_retains_complete_submitted_ownership() {
         out_fence: Some(test_eventfd()),
         submit_started_at: MonotonicTimestampNs::new(1),
         submit_returned_at: MonotonicTimestampNs::new(2),
+        queue_residency_ns: 0,
+        submit_wake_lateness_ns: 0,
+        submission_budget_ns: 1_000_000,
     };
     let mut emergency = Vec::new();
 

@@ -934,6 +934,12 @@ impl NativeRuntime {
                 let queued_at = ownership.job.queued_at.get();
                 let submit_started_at = ownership.submit_started_at.get();
                 let submit_returned_at = ownership.submit_returned_at.get();
+                self.render_journal
+                    .record_worker_queue_residency(ownership.queue_residency_ns);
+                self.render_journal
+                    .record_worker_submit_wake_lateness(ownership.submit_wake_lateness_ns);
+                self.render_journal
+                    .record_submission_budget(ownership.submission_budget_ns);
                 let _output_generation = ownership.job.output_generation;
                 let target = ownership.job.target;
                 let cursor = ownership.job.cursor.clone();
@@ -1292,6 +1298,8 @@ impl NativeRuntime {
                 token,
                 late_by_ns,
             } => {
+                self.pending_proven_deadline_miss
+                    .get_or_insert(ProvenDeadlineMiss::AtomicSubmit);
                 self.perf.log("native.kms_commit_worker", || {
                     vec![
                         NativePerfField::u64("late_transaction_id", transaction_id.get()),
