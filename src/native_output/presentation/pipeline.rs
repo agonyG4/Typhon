@@ -26,6 +26,7 @@ pub(crate) struct TripleCapabilityInputs {
     pub(crate) output_generation_stable: bool,
     pub(crate) ordinary_vsync: bool,
     pub(crate) swapchain_poisoned: bool,
+    pub(crate) software_cursor_visible: bool,
 }
 
 pub(crate) const fn derive_triple_capability(inputs: TripleCapabilityInputs) -> TripleCapability {
@@ -49,6 +50,8 @@ pub(crate) const fn derive_triple_capability(inputs: TripleCapabilityInputs) -> 
         TripleCapability::Unavailable(TripleCapabilityBlocker::UnsupportedPresentationMode)
     } else if inputs.swapchain_poisoned {
         TripleCapability::Unavailable(TripleCapabilityBlocker::SwapchainPoisoned)
+    } else if inputs.software_cursor_visible {
+        TripleCapability::Unavailable(TripleCapabilityBlocker::SoftwareCursorVisible)
     } else {
         TripleCapability::Capable
     }

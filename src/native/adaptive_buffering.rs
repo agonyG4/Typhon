@@ -59,6 +59,7 @@ pub enum TripleCapabilityBlocker {
     OutputGenerationUnstable,
     UnsupportedPresentationMode,
     SwapchainPoisoned,
+    SoftwareCursorVisible,
 }
 
 #[doc(hidden)]
@@ -1186,6 +1187,24 @@ mod tests {
         assert_eq!(
             controller.pacing_mode(),
             NativeOutputPacingMode::ReactiveDouble
+        );
+    }
+
+    #[test]
+    fn visible_software_cursor_forces_reactive_double_even_when_triple_is_forced() {
+        let mut controller = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Force);
+        controller.apply_capability(TripleCapability::Unavailable(
+            TripleCapabilityBlocker::SoftwareCursorVisible,
+        ));
+
+        assert_eq!(controller.mode(), AdaptiveBufferingMode::Double);
+        assert_eq!(
+            controller.pacing_mode(),
+            NativeOutputPacingMode::ReactiveDouble
+        );
+        assert_eq!(
+            controller.force_unavailable_blocker(),
+            Some(TripleCapabilityBlocker::SoftwareCursorVisible)
         );
     }
 

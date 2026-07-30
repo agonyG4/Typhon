@@ -309,8 +309,7 @@ impl NativeRuntime {
             frame_scheduler.queue_protocol_work(monotonic_now_ns()?);
         }
         let scheduler_now = MonotonicTimestampNs::new(monotonic_now_ns()?);
-        let refresh_interval =
-            Duration::from_nanos(1_000_000_000 / u64::from((*refresh_hz).max(1)));
+        let refresh_interval = super::plane_cycle::output_refresh_interval(*refresh_hz);
         let prediction = render_journal.prediction_at(scheduler_now, refresh_interval);
         let explicit_output = matches!(&**scanout, NativeScanoutBackend::AtomicEglGbm(_));
         let triple_capability = match scanout.explicit_output_swapchain() {
@@ -332,6 +331,7 @@ impl NativeRuntime {
                 output_generation_stable: swapchain.pool_generation() == *drm_file_generation,
                 ordinary_vsync: true,
                 swapchain_poisoned: swapchain.is_poisoned(),
+                software_cursor_visible: cursor_visible && cursor_render_mode.is_software(),
             }),
             None if kms_backend.effective_kind() != KmsBackendKind::Atomic => {
                 TripleCapability::Unavailable(TripleCapabilityBlocker::NonAtomicKms)

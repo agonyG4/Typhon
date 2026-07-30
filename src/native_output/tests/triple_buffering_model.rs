@@ -483,6 +483,7 @@ fn triple_capability_reports_one_exact_blocker_in_safety_order() {
         output_generation_stable: true,
         ordinary_vsync: true,
         swapchain_poisoned: false,
+        software_cursor_visible: false,
     };
     assert_eq!(derive_triple_capability(capable), TripleCapability::Capable);
     assert_eq!(
@@ -499,5 +500,12 @@ fn triple_capability_reports_one_exact_blocker_in_safety_order() {
             ..capable
         }),
         TripleCapability::Unavailable(TripleCapabilityBlocker::UnsupportedPresentationMode)
+    );
+    assert_eq!(
+        derive_triple_capability(TripleCapabilityInputs {
+            software_cursor_visible: true,
+            ..capable
+        }),
+        TripleCapability::Unavailable(TripleCapabilityBlocker::SoftwareCursorVisible)
     );
 }
