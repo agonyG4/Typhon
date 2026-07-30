@@ -51,6 +51,285 @@ fn matching_pageflip_and_queued_reactive_work_render_and_submit_in_one_cycle() {
     );
     assert!(scheduler.page_flip_pending());
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReactiveOracleScenario {
+    IdleVisual,
+    VisualWhileWorkerQueued,
+    VisualWhileKernelPending,
+    SameWakePageflipAndVisual,
+    ProtocolOnly,
+    WorkerRejection,
+    Watchdog,
+    SuspendRecovery,
+    DirectDisabled,
+    DirectActive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReactiveOracleEvent {
+    Decision(SchedulerDecision),
+    Pageflip(PageFlipCompletionResult),
+    WorkerQueued,
+    WorkerRejected,
+    Submitted(u64),
+    Suspended,
+    DirectPath(crate::native_output::runtime::NativePresentationPath),
+}
+
+fn reactive_context(now_ns: u64) -> SchedulerFrameContext {
+    SchedulerFrameContext {
+        pacing_mode: NativeOutputPacingMode::ReactiveDouble,
+        capabilities: SchedulerCapabilities::explicit_atomic(true, true),
+        presentation_target: None,
+        predicted_total_cost: Duration::from_millis(100),
+        now: MonotonicTimestampNs::new(now_ns),
+        render_target_available: true,
+        render_ahead_allowed: false,
+        ready_frame_present: false,
+        ready_target_current: true,
+        worker_queue_available: false,
+    }
+}
+
+fn reactive_double_oracle(scenario: ReactiveOracleScenario) -> Vec<ReactiveOracleEvent> {
+    use crate::native_output::runtime::{
+        NativePresentationPlanInput, plan_native_presentation_path,
+    };
+
+    let mut scheduler = NativeFrameScheduler::new(60, 0);
+    let mut trace = Vec::new();
+    match scenario {
+        ReactiveOracleScenario::IdleVisual => {
+            scheduler.queue_visual_work();
+            trace.push(ReactiveOracleEvent::Decision(
+                scheduler.decision_with_context(reactive_context(0)),
+            ));
+            scheduler.note_async_submission(41, 1).unwrap();
+            trace.push(ReactiveOracleEvent::Submitted(41));
+            trace.push(ReactiveOracleEvent::Decision(
+                scheduler.decision_with_context(reactive_context(2)),
+            ));
+        }
+        ReactiveOracleScenario::VisualWhileWorkerQueued => {
+            scheduler.reserve_worker_submission(41, 1001).unwrap();
+            trace.push(ReactiveOracleEvent::WorkerQueued);
+            scheduler.queue_visual_work();
+            trace.push(ReactiveOracleEvent::Decision(
+                scheduler.decision_with_context(reactive_context(2)),
+            ));
+            assert!(scheduler.visual_work_queued());
+        }
+        ReactiveOracleScenario::VisualWhileKernelPending => {
+            scheduler.note_async_submission(41, 1).unwrap();
+            trace.push(ReactiveOracleEvent::Submitted(41));
+            scheduler.queue_visual_work();
+            trace.push(ReactiveOracleEvent::Decision(
+                scheduler.decision_with_context(reactive_context(2)),
+            ));
+            assert!(scheduler.visual_work_queued());
+        }
+        ReactiveOracleScenario::SameWakePageflipAndVisual => {
+            scheduler.note_async_submission(41, 1).unwrap();
+            trace.push(ReactiveOracleEvent::Submitted(41));
+            scheduler.queue_visual_work();
+            trace.push(ReactiveOracleEvent::Pageflip(
+                scheduler.note_page_flip_completion(41, 2),
+            ));
+            trace.push(ReactiveOracleEvent::Decision(
+                scheduler.decision_with_context(reactive_context(2)),
+            ));
+            scheduler.note_async_submission(42, 3).unwrap();
+            trace.push(ReactiveOracleEvent::Submitted(42));
+        }
+        ReactiveOracleScenario::ProtocolOnly => {
+            scheduler.queue_protocol_work(1);
+            let deadline = scheduler.next_deadline_ns().unwrap();
+            trace.push(ReactiveOracleEvent::Decision(
+                scheduler.decision_with_context(reactive_context(deadline - 1)),
+            ));
+            trace.push(ReactiveOracleEvent::Decision(
+                scheduler.decision_with_context(reactive_context(deadline)),
+            ));
+            scheduler.complete_protocol_only();
+            trace.push(ReactiveOracleEvent::Decision(
+                scheduler.decision_with_context(reactive_context(deadline)),
+            ));
+        }
+        ReactiveOracleScenario::WorkerRejection => {
+            scheduler.reserve_worker_submission(41, 1001).unwrap();
+            trace.push(ReactiveOracleEvent::WorkerQueued);
+            scheduler.cancel_worker_submission(41, 1001).unwrap();
+            trace.push(ReactiveOracleEvent::WorkerRejected);
+            trace.push(ReactiveOracleEvent::Decision(
+                scheduler.decision_with_context(reactive_context(2)),
+            ));
+        }
+        ReactiveOracleScenario::Watchdog => {
+            scheduler.note_async_submission(41, 1).unwrap();
+            trace.push(ReactiveOracleEvent::Submitted(41));
+            let expired_at = 1_000_000_001;
+            trace.push(ReactiveOracleEvent::Decision(
+                scheduler.decision_with_context(reactive_context(expired_at)),
+            ));
+            trace.push(ReactiveOracleEvent::Decision(
+                scheduler.decision_with_context(reactive_context(expired_at + 1)),
+            ));
+            assert_eq!(scheduler.watchdog_timeout_count(), 1);
+            assert!(scheduler.page_flip_pending());
+        }
+        ReactiveOracleScenario::SuspendRecovery => {
+            scheduler.note_async_submission(41, 1).unwrap();
+            trace.push(ReactiveOracleEvent::Submitted(41));
+            scheduler.abandon_for_session_suspend();
+            trace.push(ReactiveOracleEvent::Suspended);
+            trace.push(ReactiveOracleEvent::Pageflip(
+                scheduler.note_page_flip_completion(41, 2),
+            ));
+            scheduler.queue_visual_work();
+            trace.push(ReactiveOracleEvent::Decision(
+                scheduler.decision_with_context(reactive_context(3)),
+            ));
+        }
+        ReactiveOracleScenario::DirectDisabled | ReactiveOracleScenario::DirectActive => {
+            let direct_active = scenario == ReactiveOracleScenario::DirectActive;
+            trace.push(ReactiveOracleEvent::DirectPath(
+                plan_native_presentation_path(NativePresentationPlanInput {
+                    direct_active,
+                    direct_candidate_changed: false,
+                    direct_candidate_eligible: direct_active,
+                    primary_visual_work_pending: !direct_active,
+                    composition_required: !direct_active,
+                    cursor_changed: false,
+                    cursor_hardware_usable: true,
+                    cursor_visible: false,
+                    atomic_commit_pending: false,
+                    cursor_only_allowed: true,
+                    render_ahead_requested: false,
+                }),
+            ));
+        }
+    }
+    trace
+}
+
+#[test]
+fn reactive_oracle_idle_visual_renders_and_submits_immediately() {
+    assert_eq!(
+        reactive_double_oracle(ReactiveOracleScenario::IdleVisual),
+        [
+            ReactiveOracleEvent::Decision(SchedulerDecision::Render),
+            ReactiveOracleEvent::Submitted(41),
+            ReactiveOracleEvent::Decision(SchedulerDecision::WaitForPageFlip),
+        ]
+    );
+}
+
+#[test]
+fn reactive_oracle_visual_work_waits_while_worker_queued() {
+    assert_eq!(
+        reactive_double_oracle(ReactiveOracleScenario::VisualWhileWorkerQueued),
+        [
+            ReactiveOracleEvent::WorkerQueued,
+            ReactiveOracleEvent::Decision(SchedulerDecision::WaitForWorkerQueue),
+        ]
+    );
+}
+
+#[test]
+fn reactive_oracle_visual_work_waits_while_kernel_pending() {
+    assert_eq!(
+        reactive_double_oracle(ReactiveOracleScenario::VisualWhileKernelPending),
+        [
+            ReactiveOracleEvent::Submitted(41),
+            ReactiveOracleEvent::Decision(SchedulerDecision::WaitForBuffer),
+        ]
+    );
+}
+
+#[test]
+fn reactive_oracle_same_wake_pageflip_and_visual_handoffs_immediately() {
+    assert_eq!(
+        reactive_double_oracle(ReactiveOracleScenario::SameWakePageflipAndVisual),
+        [
+            ReactiveOracleEvent::Submitted(41),
+            ReactiveOracleEvent::Pageflip(PageFlipCompletionResult::Completed {
+                submitted_at_ns: 1,
+            }),
+            ReactiveOracleEvent::Decision(SchedulerDecision::Render),
+            ReactiveOracleEvent::Submitted(42),
+        ]
+    );
+}
+
+#[test]
+fn reactive_oracle_protocol_only_waits_for_one_refresh() {
+    assert_eq!(
+        reactive_double_oracle(ReactiveOracleScenario::ProtocolOnly),
+        [
+            ReactiveOracleEvent::Decision(SchedulerDecision::WaitForRefresh),
+            ReactiveOracleEvent::Decision(SchedulerDecision::CompleteProtocolOnly),
+            ReactiveOracleEvent::Decision(SchedulerDecision::Idle),
+        ]
+    );
+}
+
+#[test]
+fn reactive_oracle_worker_rejection_restores_visual_demand() {
+    assert_eq!(
+        reactive_double_oracle(ReactiveOracleScenario::WorkerRejection),
+        [
+            ReactiveOracleEvent::WorkerQueued,
+            ReactiveOracleEvent::WorkerRejected,
+            ReactiveOracleEvent::Decision(SchedulerDecision::Render),
+        ]
+    );
+}
+
+#[test]
+fn reactive_oracle_watchdog_reports_without_fabricating_completion() {
+    assert_eq!(
+        reactive_double_oracle(ReactiveOracleScenario::Watchdog),
+        [
+            ReactiveOracleEvent::Submitted(41),
+            ReactiveOracleEvent::Decision(SchedulerDecision::PageFlipWatchdogExpired),
+            ReactiveOracleEvent::Decision(SchedulerDecision::PageFlipWatchdogExpired),
+        ]
+    );
+}
+
+#[test]
+fn reactive_oracle_suspend_recovery_rejects_late_pageflip() {
+    assert_eq!(
+        reactive_double_oracle(ReactiveOracleScenario::SuspendRecovery),
+        [
+            ReactiveOracleEvent::Submitted(41),
+            ReactiveOracleEvent::Suspended,
+            ReactiveOracleEvent::Pageflip(PageFlipCompletionResult::Stale),
+            ReactiveOracleEvent::Decision(SchedulerDecision::Render),
+        ]
+    );
+}
+
+#[test]
+fn reactive_oracle_direct_disabled_selects_composition() {
+    assert_eq!(
+        reactive_double_oracle(ReactiveOracleScenario::DirectDisabled),
+        [ReactiveOracleEvent::DirectPath(
+            crate::native_output::runtime::NativePresentationPath::CompositedPrimary,
+        )]
+    );
+}
+
+#[test]
+fn reactive_oracle_steady_direct_remains_idle() {
+    assert_eq!(
+        reactive_double_oracle(ReactiveOracleScenario::DirectActive),
+        [ReactiveOracleEvent::DirectPath(
+            crate::native_output::runtime::NativePresentationPath::IdleDirect,
+        )]
+    );
+}
 use crate::native_output::runtime::{
     NativeRepaintDecision, NativeRepaintInputs, native_repaint_decision,
 };

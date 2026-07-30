@@ -57,6 +57,10 @@ pub(super) use planner::{
     NativeCursorOwnerPlan, NativeKmsStartupDecision, decide_native_cursor_owner,
     decide_native_kms_startup,
 };
+#[cfg(test)]
+pub(crate) use planner::{
+    NativePresentationPath, NativePresentationPlanInput, plan_native_presentation_path,
+};
 pub(crate) use presentation_transactions::{
     DirectCallbackLeakMetrics, DirectTerminalCallbackDisposition,
     direct_terminal_callback_owner_leaks, settle_dropped_output_transaction,
