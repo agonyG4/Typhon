@@ -122,6 +122,10 @@ impl KmsBundleOwners {
         self.cursor.as_ref()
     }
 
+    pub(crate) fn replace_cursor(&mut self, cursor: KmsCursorOwner) -> Option<KmsCursorOwner> {
+        self.cursor.replace(cursor)
+    }
+
     pub(crate) fn primary_transaction_id(&self) -> Option<OutputTransactionId> {
         self.primary.as_ref().map(|owner| owner.transaction.id())
     }

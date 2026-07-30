@@ -650,7 +650,7 @@ fn direct_shutdown_quiesce_returns_the_queued_lease() {
     });
     assert!(events.iter().any(|event| matches!(
         event,
-        KmsWorkerEvent::Quiesced { returned_jobs }
+        KmsWorkerEvent::Quiesced { returned_jobs, .. }
             if returned_jobs.iter().any(|job| job.direct_primary_lease.is_some())
     )));
     drop(events);

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod bundle;
+mod cursor_sidecar;
 mod payload;
 mod policy;
 mod queue;
@@ -18,7 +19,8 @@ pub(crate) use policy::{
 #[cfg(test)]
 pub(crate) use queue::KmsWorkerForcedShutdownDisposition;
 pub(crate) use queue::{
-    KmsCommitAdmissionPermit, KmsWorkerAdmissionError, KmsWorkerFatalJob, WorkerInFlight,
+    CursorSidecarOfferError, KmsCommitAdmissionPermit, KmsWorkerAdmissionError, KmsWorkerFatalJob,
+    WorkerInFlight,
 };
 pub(crate) use thread::{KmsCommitWorkerHandle, KmsWorkerEvent};
 pub(crate) use timing::KmsCommitTimingModel;
@@ -29,6 +31,10 @@ mod direct_lease_tests;
 mod task4_tests;
 #[cfg(test)]
 mod tests;
+pub(crate) use bundle::KmsCursorOwner;
+#[cfg(test)]
+pub(crate) use bundle::KmsPrimaryOwner;
 pub(crate) use bundle::{KmsBundleOwners, KmsCommitBundleIdentity};
 #[cfg(test)]
-pub(crate) use bundle::{KmsCursorOwner, KmsPrimaryOwner};
+pub(crate) use cursor_sidecar::CursorSidecarCoupling;
+pub(crate) use cursor_sidecar::{CursorSidecar, CursorSidecarMailbox};

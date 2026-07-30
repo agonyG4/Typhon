@@ -4,13 +4,13 @@ use super::payload::{KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership, K
 #[cfg(test)]
 use super::queue::DequeuePause;
 use super::queue::{
-    KmsWorkerFatalJob, KmsWorkerForcedShutdown, KmsWorkerLifecycle, KmsWorkerShutdownSnapshot,
-    RESULT_EVENT_CAPACITY, WorkerInFlight, WorkerMetricsSnapshot, WorkerShared, create_eventfd,
-    drain_eventfd, notify_eventfd,
+    KmsWorkerFatalJob, KmsWorkerForcedShutdown, KmsWorkerLifecycle, KmsWorkerPhase,
+    KmsWorkerShutdownSnapshot, RESULT_EVENT_CAPACITY, WorkerInFlight, WorkerMetricsSnapshot,
+    WorkerShared, create_eventfd, drain_eventfd, notify_eventfd,
 };
 use super::{
-    KmsCommitAdmissionPermit, KmsCommitBundleIdentity, KmsCommitJob, KmsCommitTimingModel,
-    KmsWorkerAdmissionError,
+    CursorSidecar, CursorSidecarOfferError, KmsCommitAdmissionPermit, KmsCommitBundleIdentity,
+    KmsCommitJob, KmsCommitTimingModel, KmsCursorOwner, KmsWorkerAdmissionError,
 };
 use crate::native_output::{
     OutputTransactionId, presentation::transaction::DirectScanoutCandidateKey,
@@ -96,6 +96,7 @@ pub(crate) enum KmsWorkerEvent {
     },
     Quiesced {
         returned_jobs: Vec<KmsCommitJob>,
+        returned_sidecar: Option<CursorSidecar>,
     },
     Fatal {
         reason: KmsWorkerFatalReason,
@@ -218,6 +219,36 @@ impl KmsCommitWorkerHandle {
         self.shared.pause_after_dequeue_for_test()
     }
 
+    #[cfg(test)]
+    pub(crate) fn pause_collecting_sidecar_for_test(&self) -> Arc<DequeuePause> {
+        self.shared.pause_collecting_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_freeze_for_test(&self) -> Arc<DequeuePause> {
+        self.shared.pause_frozen_for_test()
+    }
+
+    pub(crate) fn offer_cursor_sidecar(
+        &self,
+        sidecar: CursorSidecar,
+    ) -> Result<Option<CursorSidecar>, CursorSidecarOfferError> {
+        self.shared.offer_cursor_sidecar(sidecar)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_cursor_sidecar_id(
+        &self,
+    ) -> Option<crate::native_output::presentation::plane::CursorSidecarId> {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cursor_sidecar
+            .pending()
+            .map(|sidecar| sidecar.id)
+    }
+
     pub(crate) fn try_reserve_direct_admission(
         &self,
         candidate_key: crate::native_output::DirectScanoutCandidateKey,
@@ -249,6 +280,15 @@ impl KmsCommitWorkerHandle {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         )
+    }
+
+    pub(crate) fn take_pending_cursor_sidecar(&self) -> Option<CursorSidecar> {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cursor_sidecar
+            .take()
     }
 
     pub(crate) fn metrics_snapshot(&self) -> WorkerMetricsSnapshot {
@@ -457,6 +497,7 @@ impl KmsCommitWorkerHandle {
                 | KmsWorkerLifecycle::ShutdownAbandoning
         );
         state.inflight = None;
+        state.phase = KmsWorkerPhase::Idle;
         drop(state);
         if suppress_next_submit {
             self.shared
@@ -550,6 +591,7 @@ impl ExecutingDirectCandidateGuard {
         });
         state.executing = false;
         state.executing_direct_content_key = None;
+        state.phase = KmsWorkerPhase::KernelInFlight;
         self.transferred = true;
     }
 }
@@ -562,6 +604,9 @@ impl Drop for ExecutingDirectCandidateGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.executing = false;
+        if state.inflight.is_none() {
+            state.phase = KmsWorkerPhase::Idle;
+        }
         if !self.transferred && state.executing_direct_content_key == self.candidate {
             state.executing_direct_content_key = None;
         }
@@ -655,6 +700,74 @@ impl Drop for KmsCommitWorkerHandle {
     }
 }
 
+fn set_worker_phase(shared: &WorkerShared, phase: KmsWorkerPhase) {
+    shared
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .phase = phase;
+}
+
+fn collect_cursor_sidecar_before_freeze(
+    shared: &Arc<WorkerShared>,
+    job: &mut KmsCommitJob,
+) -> bool {
+    set_worker_phase(shared, KmsWorkerPhase::CollectingSidecar);
+    #[cfg(test)]
+    if let Some(pause) = shared.take_collecting_pause_for_test() {
+        pause.pause();
+    }
+
+    let sidecar = {
+        let mut state = shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !matches!(state.lifecycle, KmsWorkerLifecycle::Running) {
+            return false;
+        }
+        let primary_id = job.owners.primary_transaction_id();
+        let eligible_job = matches!(job.primary, KmsPrimaryUpdate::Framebuffer { .. })
+            && matches!(job.cursor, KmsCursorUpdate::Unchanged);
+        eligible_job
+            .then(|| {
+                state
+                    .cursor_sidecar
+                    .claim_for(job.output_generation, job.crtc_id, primary_id)
+            })
+            .flatten()
+    };
+    if let Some(sidecar) = sidecar {
+        attach_sidecar(job, sidecar);
+    }
+    set_worker_phase(shared, KmsWorkerPhase::FrozenForValidation);
+    #[cfg(test)]
+    if let Some(pause) = shared.take_frozen_pause_for_test() {
+        pause.pause();
+    }
+    true
+}
+
+fn attach_sidecar(job: &mut KmsCommitJob, sidecar: CursorSidecar) {
+    job.cursor = match &sidecar.assignment {
+        crate::native_output::CursorPlaneAssignment::Atomic {
+            state: Some(state), ..
+        } => KmsCursorUpdate::Set(state.clone()),
+        crate::native_output::CursorPlaneAssignment::Atomic { state: None, .. }
+        | crate::native_output::CursorPlaneAssignment::Disabled => KmsCursorUpdate::Disable,
+        crate::native_output::CursorPlaneAssignment::Unchanged => KmsCursorUpdate::Unchanged,
+    };
+    job.cursor_pin = sidecar.lease;
+    job.owners.replace_cursor(KmsCursorOwner {
+        transaction: sidecar.transaction,
+        sidecar_id: Some(sidecar.id),
+        revision: sidecar.revision,
+    });
+    if matches!(sidecar.test_policy, KmsTestOnlyPolicy::Required) {
+        job.test_only = KmsTestOnlyPolicy::Required;
+    }
+}
+
 fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
     let mut timing = None;
     loop {
@@ -682,6 +795,11 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
             quiesce_with_jobs(&shared, vec![job]);
             return;
         }
+        if !collect_cursor_sidecar_before_freeze(&shared, &mut job) {
+            drop(executing);
+            quiesce_with_jobs(&shared, vec![job]);
+            return;
+        }
         if decision.late {
             shared
                 .metrics
@@ -703,6 +821,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
 
         let mut retries = 0u8;
         if matches!(job.test_only, KmsTestOnlyPolicy::Required) {
+            set_worker_phase(&shared, KmsWorkerPhase::TestOnly);
             let test = {
                 let _submit_gate = shared
                     .submit_gate
@@ -758,6 +877,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
             }
         }
         loop {
+            set_worker_phase(&shared, KmsWorkerPhase::SubmitIoctl);
             let submission = {
                 let _submit_gate = shared
                     .submit_gate
@@ -960,9 +1080,16 @@ fn take_next_job(shared: &Arc<WorkerShared>) -> Option<ExecutingKmsJob> {
                 | KmsWorkerLifecycle::ShutdownAbandoning
         ) {
             let returned_jobs = state.queued.drain(..).collect();
+            let returned_sidecar = state.cursor_sidecar.take();
             state.lifecycle = KmsWorkerLifecycle::Stopped;
             drop(state);
-            publish_event(shared, KmsWorkerEvent::Quiesced { returned_jobs });
+            publish_event(
+                shared,
+                KmsWorkerEvent::Quiesced {
+                    returned_jobs,
+                    returned_sidecar,
+                },
+            );
             return None;
         }
         if state.inflight.is_none()
@@ -972,6 +1099,7 @@ fn take_next_job(shared: &Arc<WorkerShared>) -> Option<ExecutingKmsJob> {
             debug_assert!(!state.executing);
             state.executing = true;
             state.executing_direct_content_key = direct_candidate;
+            state.phase = KmsWorkerPhase::DequeuedWaitingPredecessor;
             return Some(ExecutingKmsJob {
                 job,
                 direct_candidate,
@@ -1002,9 +1130,16 @@ fn wait_for_pageflip_or_quiesce(
             ) && state.inflight.is_none()
         {
             let returned_jobs = state.queued.drain(..).collect();
+            let returned_sidecar = state.cursor_sidecar.take();
             state.lifecycle = KmsWorkerLifecycle::Stopped;
             drop(state);
-            publish_event(shared, KmsWorkerEvent::Quiesced { returned_jobs });
+            publish_event(
+                shared,
+                KmsWorkerEvent::Quiesced {
+                    returned_jobs,
+                    returned_sidecar,
+                },
+            );
             return false;
         }
         if state.inflight.is_none() {
@@ -1078,9 +1213,16 @@ fn quiesce_with_jobs(shared: &Arc<WorkerShared>, mut returned_jobs: Vec<KmsCommi
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     returned_jobs.extend(state.queued.drain(..));
+    let returned_sidecar = state.cursor_sidecar.take();
     state.lifecycle = KmsWorkerLifecycle::Stopped;
     drop(state);
-    publish_event(shared, KmsWorkerEvent::Quiesced { returned_jobs });
+    publish_event(
+        shared,
+        KmsWorkerEvent::Quiesced {
+            returned_jobs,
+            returned_sidecar,
+        },
+    );
 }
 
 fn publish_event(shared: &Arc<WorkerShared>, event: KmsWorkerEvent) -> bool {

@@ -1,6 +1,8 @@
 //! Bounded admission and result queues for the Atomic submit worker.
 
-use super::{KmsCommitBundleIdentity, KmsCommitJob, KmsWorkerEvent};
+use super::{
+    CursorSidecar, CursorSidecarMailbox, KmsCommitBundleIdentity, KmsCommitJob, KmsWorkerEvent,
+};
 use crate::native_output::DirectScanoutCandidateKey;
 use std::{
     collections::{HashSet, VecDeque},
@@ -184,6 +186,17 @@ pub(crate) enum KmsWorkerLifecycle {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KmsWorkerPhase {
+    Idle,
+    DequeuedWaitingPredecessor,
+    CollectingSidecar,
+    FrozenForValidation,
+    TestOnly,
+    SubmitIoctl,
+    KernelInFlight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KmsWorkerAdmissionError {
     DuplicateCandidate,
     QueueFull,
@@ -197,6 +210,12 @@ pub(crate) enum KmsWorkerAdmissionError {
 #[derive(Debug)]
 pub(crate) struct KmsCommitEnqueueError {
     pub(crate) job: KmsCommitJob,
+    pub(crate) reason: KmsWorkerAdmissionError,
+}
+
+#[derive(Debug)]
+pub(crate) struct CursorSidecarOfferError {
+    pub(crate) sidecar: Box<CursorSidecar>,
     pub(crate) reason: KmsWorkerAdmissionError,
 }
 
@@ -220,6 +239,7 @@ pub(crate) struct WorkerInFlight {
 pub(crate) struct KmsWorkerShutdownSnapshot {
     pub(crate) queued_job: Option<KmsCommitJob>,
     pub(crate) inflight: Option<WorkerInFlight>,
+    pub(crate) pending_sidecar: Option<CursorSidecar>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +265,7 @@ impl KmsWorkerForcedShutdownDisposition {
 pub(crate) struct KmsWorkerForcedShutdown {
     pub(crate) queued_job: Option<KmsCommitJob>,
     pub(crate) inflight: Option<WorkerInFlight>,
+    pub(crate) pending_sidecar: Option<CursorSidecar>,
     pub(crate) disposition: KmsWorkerForcedShutdownDisposition,
 }
 
@@ -261,6 +282,10 @@ pub(crate) struct WorkerShared {
     pub(crate) fatal_reason_code: AtomicU64,
     #[cfg(test)]
     pub(crate) dequeue_pause: Mutex<Option<Arc<DequeuePause>>>,
+    #[cfg(test)]
+    pub(crate) collecting_pause: Mutex<Option<Arc<DequeuePause>>>,
+    #[cfg(test)]
+    pub(crate) frozen_pause: Mutex<Option<Arc<DequeuePause>>>,
 }
 
 #[cfg(test)]
@@ -328,6 +353,8 @@ pub(crate) struct WorkerState {
     pub(crate) executing: bool,
     pub(crate) executing_direct_content_key: Option<DirectScanoutCandidateKey>,
     pub(crate) inflight: Option<WorkerInFlight>,
+    pub(crate) phase: KmsWorkerPhase,
+    pub(crate) cursor_sidecar: CursorSidecarMailbox,
 }
 
 impl WorkerShared {
@@ -341,6 +368,8 @@ impl WorkerShared {
                 executing: false,
                 executing_direct_content_key: None,
                 inflight: None,
+                phase: KmsWorkerPhase::Idle,
+                cursor_sidecar: CursorSidecarMailbox::default(),
             }),
             submit_gate: Mutex::new(()),
             work_wakeup: Condvar::new(),
@@ -352,6 +381,10 @@ impl WorkerShared {
             fatal_reason_code: AtomicU64::new(0),
             #[cfg(test)]
             dequeue_pause: Mutex::new(None),
+            #[cfg(test)]
+            collecting_pause: Mutex::new(None),
+            #[cfg(test)]
+            frozen_pause: Mutex::new(None),
         }
     }
 
@@ -371,6 +404,78 @@ impl WorkerShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_collecting_for_test(self: &Arc<Self>) -> Arc<DequeuePause> {
+        let pause = Arc::new(DequeuePause::default());
+        *self
+            .collecting_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&pause));
+        pause
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_collecting_pause_for_test(&self) -> Option<Arc<DequeuePause>> {
+        self.collecting_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_frozen_for_test(self: &Arc<Self>) -> Arc<DequeuePause> {
+        let pause = Arc::new(DequeuePause::default());
+        *self
+            .frozen_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&pause));
+        pause
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_frozen_pause_for_test(&self) -> Option<Arc<DequeuePause>> {
+        self.frozen_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    pub(crate) fn offer_cursor_sidecar(
+        &self,
+        sidecar: CursorSidecar,
+    ) -> Result<Option<CursorSidecar>, CursorSidecarOfferError> {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return Err(CursorSidecarOfferError {
+                    sidecar: Box::new(sidecar),
+                    reason: KmsWorkerAdmissionError::AdmissionContention,
+                });
+            }
+        };
+        let reason = match state.lifecycle {
+            KmsWorkerLifecycle::Running => None,
+            KmsWorkerLifecycle::Quiescing => Some(KmsWorkerAdmissionError::Quiescing),
+            KmsWorkerLifecycle::ShutdownQuiescing | KmsWorkerLifecycle::ShutdownAbandoning => {
+                Some(KmsWorkerAdmissionError::ShutdownQuiescing)
+            }
+            KmsWorkerLifecycle::Stopped => Some(KmsWorkerAdmissionError::Stopped),
+            KmsWorkerLifecycle::Fatal => Some(KmsWorkerAdmissionError::Fatal),
+        };
+        if let Some(reason) = reason {
+            return Err(CursorSidecarOfferError {
+                sidecar: Box::new(sidecar),
+                reason,
+            });
+        }
+        let replaced = state.cursor_sidecar.offer(sidecar);
+        debug_assert!(state.cursor_sidecar.len() <= 1);
+        drop(state);
+        self.work_wakeup.notify_all();
+        Ok(replaced)
     }
 
     pub(crate) fn direct_content_keys(
@@ -541,6 +646,7 @@ impl WorkerShared {
             KmsWorkerLifecycle::ShutdownQuiescing | KmsWorkerLifecycle::ShutdownAbandoning => {}
         }
         let queued_job = state.queued.pop_front();
+        let pending_sidecar = state.cursor_sidecar.take();
         if queued_job.is_some() {
             self.metrics
                 .shutdown_queued_jobs_returned
@@ -560,6 +666,7 @@ impl WorkerShared {
         Ok(KmsWorkerShutdownSnapshot {
             queued_job,
             inflight,
+            pending_sidecar,
         })
     }
 
@@ -585,6 +692,7 @@ impl WorkerShared {
             return Ok(KmsWorkerForcedShutdown {
                 queued_job: None,
                 inflight: None,
+                pending_sidecar: state.cursor_sidecar.take(),
                 disposition: KmsWorkerForcedShutdownDisposition::AlreadyStopped,
             });
         }
@@ -603,6 +711,7 @@ impl WorkerShared {
         };
         state.lifecycle = KmsWorkerLifecycle::ShutdownAbandoning;
         let queued_job = state.queued.pop_front();
+        let pending_sidecar = state.cursor_sidecar.take();
         let inflight = state.inflight.take();
         drop(state);
         self.work_wakeup.notify_all();
@@ -619,6 +728,7 @@ impl WorkerShared {
         Ok(KmsWorkerForcedShutdown {
             queued_job,
             inflight,
+            pending_sidecar,
             disposition,
         })
     }

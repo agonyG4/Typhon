@@ -70,11 +70,17 @@ impl NativeRuntime {
             KmsWorkerEvent::TestRejected { job, .. }
             | KmsWorkerEvent::SubmitRejected { job, .. }
             | KmsWorkerEvent::BusyExhausted { job, .. } => {
-                self.quarantined_worker_jobs.push(job);
+                self.worker_quarantine.jobs.push(job);
                 Ok(())
             }
-            KmsWorkerEvent::Quiesced { returned_jobs } => {
-                self.quarantined_worker_jobs.extend(returned_jobs);
+            KmsWorkerEvent::Quiesced {
+                returned_jobs,
+                returned_sidecar,
+            } => {
+                self.worker_quarantine.jobs.extend(returned_jobs);
+                self.worker_quarantine
+                    .cursor_sidecars
+                    .extend(returned_sidecar);
                 Ok(())
             }
             KmsWorkerEvent::Fatal { .. }
@@ -179,7 +185,8 @@ impl NativeRuntime {
             cursor.disarm_drm_cleanup();
         }
         std::mem::forget(std::mem::take(&mut self.submitted_worker_ownership));
-        std::mem::forget(std::mem::take(&mut self.quarantined_worker_jobs));
+        std::mem::forget(std::mem::take(&mut self.worker_quarantine.jobs));
+        std::mem::forget(std::mem::take(&mut self.worker_quarantine.cursor_sidecars));
         std::mem::forget(std::mem::take(&mut self.emergency_quarantined_worker_jobs));
         std::mem::forget(std::mem::take(
             &mut self.emergency_quarantined_submitted_ownership,
@@ -201,7 +208,7 @@ impl NativeRuntime {
                 }
                 uncertain_submit = true;
             } else {
-                self.quarantined_worker_jobs.push(fatal_job.job);
+                self.worker_quarantine.jobs.push(fatal_job.job);
             }
         }
         if uncertain_submit
@@ -229,11 +236,17 @@ impl NativeRuntime {
                 KmsWorkerEvent::TestRejected { job, .. }
                 | KmsWorkerEvent::SubmitRejected { job, .. }
                 | KmsWorkerEvent::BusyExhausted { job, .. } => {
-                    self.quarantined_worker_jobs.push(job);
+                    self.worker_quarantine.jobs.push(job);
                     Ok(())
                 }
-                KmsWorkerEvent::Quiesced { returned_jobs } => {
-                    self.quarantined_worker_jobs.extend(returned_jobs);
+                KmsWorkerEvent::Quiesced {
+                    returned_jobs,
+                    returned_sidecar,
+                } => {
+                    self.worker_quarantine.jobs.extend(returned_jobs);
+                    self.worker_quarantine
+                        .cursor_sidecars
+                        .extend(returned_sidecar);
                     Ok(())
                 }
                 KmsWorkerEvent::Fatal { .. }

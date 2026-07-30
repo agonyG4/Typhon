@@ -4,9 +4,9 @@ use super::tests::{
 };
 use super::thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
 use super::{
-    KmsBundleOwners, KmsCommitJob, KmsCommitWorkerHandle, KmsCursorOwner, KmsCursorUpdate,
-    KmsPrimaryOwner, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy, KmsWorkerEvent,
-    KmsWorkerFatalJob,
+    CursorSidecar, CursorSidecarCoupling, CursorSidecarMailbox, KmsBundleOwners, KmsCommitJob,
+    KmsCommitWorkerHandle, KmsCursorOwner, KmsCursorUpdate, KmsPrimaryOwner, KmsPrimaryUpdate,
+    KmsSubmittedOwnership, KmsTestOnlyPolicy, KmsWorkerEvent, KmsWorkerFatalJob,
 };
 use oblivion_one::native::kms::AtomicCursorVisualState;
 use std::{
@@ -15,6 +15,59 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+fn test_sidecar(job: &KmsCommitJob, id: u64, coupling: CursorSidecarCoupling) -> CursorSidecar {
+    let transaction_id = crate::native_output::OutputTransactionId::new(
+        std::num::NonZeroU64::new(id.saturating_mul(100)).unwrap(),
+    );
+    let transaction = Arc::new(
+        crate::native_output::OutputTransaction::cursor_only(
+            transaction_id,
+            job.output_generation,
+            oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(id),
+            job.target,
+            oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
+            id,
+            None,
+            crate::native_output::OutputReleasePlan::Pageflip,
+        )
+        .unwrap(),
+    );
+    CursorSidecar {
+        id: crate::native_output::presentation::plane::CursorSidecarId::new(
+            std::num::NonZeroU64::new(id).unwrap(),
+        ),
+        transaction,
+        revision: crate::native_output::presentation::plane::CursorRevision::initial(),
+        assignment: crate::native_output::CursorPlaneAssignment::Atomic {
+            desired_epoch: id,
+            state: None,
+        },
+        lease: None,
+        coupling,
+        created_at: oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(id),
+        deadline: job.target,
+        crtc_id: job.crtc_id,
+        test_policy: KmsTestOnlyPolicy::Skip,
+    }
+}
+
+fn offer_sidecar(
+    handle: &KmsCommitWorkerHandle,
+    mut sidecar: CursorSidecar,
+) -> Option<CursorSidecar> {
+    for _ in 0..1_000 {
+        match handle.offer_cursor_sidecar(sidecar) {
+            Ok(replaced) => return replaced,
+            Err(error) if error.reason == super::KmsWorkerAdmissionError::AdmissionContention => {
+                sidecar = *error.sidecar;
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("sidecar offer failed: {:?}", error.reason),
+        }
+    }
+    panic!("sidecar offer remained contended")
+}
 
 fn two_owner_job(
     token: u64,
@@ -125,8 +178,9 @@ fn terminal_worker_transports_preserve_both_bundle_owners() {
     assert_two_owners(&job, primary_id, cursor_id);
 
     let (job, _, _) = two_owner_job(331);
-    let KmsWorkerEvent::Quiesced { returned_jobs } = (KmsWorkerEvent::Quiesced {
+    let KmsWorkerEvent::Quiesced { returned_jobs, .. } = (KmsWorkerEvent::Quiesced {
         returned_jobs: vec![job],
+        returned_sidecar: None,
     }) else {
         unreachable!();
     };
@@ -152,6 +206,249 @@ fn changed_cursor_property_requires_an_exact_cursor_owner() {
         job.validate_against(&transaction),
         Err(super::KmsCommitPayloadError::MissingCursorOwner)
     );
+}
+
+#[test]
+fn sidecar_offered_before_freeze_is_attached_to_exact_primary_bundle() {
+    let executor = Arc::new(RecordingExecutor::accepting());
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let job = test_job(333);
+    let token = job.token;
+    let transaction_id = job.transaction_id;
+    let pause = handle.pause_collecting_sidecar_for_test();
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    pause.wait_until_selected();
+    let sidecar = test_sidecar(&test_job(333), 900, CursorSidecarCoupling::Independent);
+    let sidecar_id = sidecar.id;
+    assert!(offer_sidecar(&handle, sidecar).is_none());
+    pause.release();
+
+    let events = wait_for_fence_event(&handle, 333, |event| {
+        matches!(event, KmsWorkerEvent::Submitted { .. })
+    });
+    assert!(events.iter().any(|event| matches!(
+        event,
+        KmsWorkerEvent::Submitted { ownership }
+            if matches!(ownership.job.cursor, KmsCursorUpdate::Disable)
+                && ownership.job.owners.cursor().and_then(|owner| owner.sidecar_id)
+                    == Some(sidecar_id)
+    )));
+    handle.ack_pageflip(token, transaction_id, 1).unwrap();
+    drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn sidecar_offered_before_primary_dequeue_is_attached() {
+    let handle = KmsCommitWorkerHandle::start(Arc::new(RecordingExecutor::accepting())).unwrap();
+    let job = test_job(339);
+    let token = job.token;
+    let transaction_id = job.transaction_id;
+    let sidecar = test_sidecar(&job, 908, CursorSidecarCoupling::Independent);
+    let id = sidecar.id;
+    offer_sidecar(&handle, sidecar);
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+
+    let events = wait_for_fence_event(&handle, 339, |event| {
+        matches!(event, KmsWorkerEvent::Submitted { .. })
+    });
+    assert!(events.iter().any(|event| matches!(
+        event,
+        KmsWorkerEvent::Submitted { ownership }
+            if ownership.job.owners.cursor().and_then(|owner| owner.sidecar_id) == Some(id)
+    )));
+    handle.ack_pageflip(token, transaction_id, 1).unwrap();
+    drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn predecessor_pageflip_releases_latest_sidecar_with_queued_next_primary() {
+    let handle = KmsCommitWorkerHandle::start(Arc::new(RecordingExecutor::accepting())).unwrap();
+    let first = test_job(340);
+    let first_token = first.token;
+    let first_transaction = first.transaction_id;
+    reserve_for_test(&handle, first.kind)
+        .enqueue(first)
+        .unwrap();
+    let first_events = wait_for_fence_event(&handle, 340, |event| {
+        matches!(event, KmsWorkerEvent::Submitted { .. })
+    });
+
+    let second = test_job(341);
+    let second_token = second.token;
+    let second_transaction = second.transaction_id;
+    reserve_for_test(&handle, second.kind)
+        .enqueue(second)
+        .unwrap();
+    let older = test_sidecar(&test_job(341), 909, CursorSidecarCoupling::Independent);
+    let latest = test_sidecar(&test_job(341), 910, CursorSidecarCoupling::Independent);
+    let latest_id = latest.id;
+    offer_sidecar(&handle, older);
+    assert!(offer_sidecar(&handle, latest).is_some());
+    handle
+        .ack_pageflip(first_token, first_transaction, 1)
+        .unwrap();
+
+    let second_events = wait_for_fence_event(
+        &handle,
+        341,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token == second_token),
+    );
+    assert!(second_events.iter().any(|event| matches!(
+        event,
+        KmsWorkerEvent::Submitted { ownership }
+            if ownership.job.token == second_token
+                && ownership.job.owners.cursor().and_then(|owner| owner.sidecar_id)
+                    == Some(latest_id)
+    )));
+    handle
+        .ack_pageflip(second_token, second_transaction, 1)
+        .unwrap();
+    drop(first_events);
+    drop(second_events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn sidecar_offered_after_freeze_remains_pending() {
+    let executor = Arc::new(RecordingExecutor::accepting());
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let job = test_job(334);
+    let token = job.token;
+    let transaction_id = job.transaction_id;
+    let pause = handle.pause_after_freeze_for_test();
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    pause.wait_until_selected();
+    let sidecar = test_sidecar(&test_job(334), 901, CursorSidecarCoupling::Independent);
+    let sidecar_id = sidecar.id;
+    assert!(offer_sidecar(&handle, sidecar).is_none());
+    pause.release();
+
+    let events = wait_for_fence_event(&handle, 334, |event| {
+        matches!(event, KmsWorkerEvent::Submitted { .. })
+    });
+    assert!(events.iter().any(|event| matches!(
+        event,
+        KmsWorkerEvent::Submitted { ownership }
+            if matches!(ownership.job.cursor, KmsCursorUpdate::Unchanged)
+    )));
+    assert_eq!(handle.pending_cursor_sidecar_id(), Some(sidecar_id));
+    handle.ack_pageflip(token, transaction_id, 1).unwrap();
+    drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn sidecar_mailbox_replaces_exactly_once_and_never_exceeds_one() {
+    let job = test_job(335);
+    let first = test_sidecar(&job, 902, CursorSidecarCoupling::Independent);
+    let first_id = first.id;
+    let second = test_sidecar(&job, 903, CursorSidecarCoupling::Independent);
+    let second_id = second.id;
+    let mut mailbox = CursorSidecarMailbox::default();
+
+    assert!(mailbox.offer(first).is_none());
+    let replaced = mailbox.offer(second).unwrap();
+    assert_eq!(replaced.id, first_id);
+    assert_eq!(mailbox.len(), 1);
+    assert_eq!(mailbox.pending().map(|sidecar| sidecar.id), Some(second_id));
+}
+
+#[test]
+fn motion_replacement_preserves_existing_required_primary_coupling() {
+    let job = test_job(338);
+    let required = job.transaction_id;
+    let coupled = test_sidecar(&job, 906, CursorSidecarCoupling::MustBundleWith(required));
+    let motion = test_sidecar(&job, 907, CursorSidecarCoupling::Independent);
+    let mut mailbox = CursorSidecarMailbox::default();
+    mailbox.offer(coupled);
+
+    let replaced = mailbox.offer(motion).unwrap();
+    assert!(matches!(
+        replaced.coupling,
+        CursorSidecarCoupling::MustBundleWith(id) if id == required
+    ));
+    assert!(matches!(
+        mailbox.pending().map(|sidecar| sidecar.coupling),
+        Some(CursorSidecarCoupling::MustBundleWith(id)) if id == required
+    ));
+}
+
+#[test]
+fn mismatched_generation_crtc_and_primary_do_not_consume_sidecar() {
+    let job = test_job(336);
+    let required = job.transaction_id;
+    let sidecar = test_sidecar(&job, 904, CursorSidecarCoupling::MustBundleWith(required));
+    let id = sidecar.id;
+    let mut mailbox = CursorSidecarMailbox::default();
+    mailbox.offer(sidecar);
+
+    assert!(
+        mailbox
+            .claim_for(job.output_generation + 1, job.crtc_id, Some(required))
+            .is_none()
+    );
+    assert!(
+        mailbox
+            .claim_for(job.output_generation, job.crtc_id + 1, Some(required))
+            .is_none()
+    );
+    assert!(
+        mailbox
+            .claim_for(
+                job.output_generation,
+                job.crtc_id,
+                Some(crate::native_output::OutputTransactionId::new(
+                    std::num::NonZeroU64::new(999).unwrap()
+                ))
+            )
+            .is_none()
+    );
+    assert_eq!(mailbox.pending().map(|sidecar| sidecar.id), Some(id));
+    assert_eq!(
+        mailbox
+            .claim_for(job.output_generation, job.crtc_id, Some(required))
+            .map(|sidecar| sidecar.id),
+        Some(id)
+    );
+    assert_eq!(mailbox.len(), 0);
+}
+
+#[test]
+fn quiesce_returns_pending_sidecar_owner() {
+    let handle = KmsCommitWorkerHandle::start(Arc::new(RecordingExecutor::accepting())).unwrap();
+    let sidecar = test_sidecar(&test_job(337), 905, CursorSidecarCoupling::Independent);
+    let id = sidecar.id;
+    offer_sidecar(&handle, sidecar);
+    handle.request_quiesce();
+    let events = wait_for_fence_event(&handle, 337, |event| {
+        matches!(event, KmsWorkerEvent::Quiesced { .. })
+    });
+    assert!(events.iter().any(|event| matches!(
+        event,
+        KmsWorkerEvent::Quiesced {
+            returned_sidecar: Some(sidecar),
+            ..
+        } if sidecar.id == id
+    )));
+    handle.join().unwrap();
+}
+
+#[test]
+fn shutdown_snapshot_returns_pending_sidecar_owner() {
+    let handle = KmsCommitWorkerHandle::start(Arc::new(RecordingExecutor::accepting())).unwrap();
+    let sidecar = test_sidecar(&test_job(342), 911, CursorSidecarCoupling::Independent);
+    let id = sidecar.id;
+    offer_sidecar(&handle, sidecar);
+
+    let snapshot = handle.begin_shutdown_quiesce().unwrap();
+    assert_eq!(snapshot.pending_sidecar.map(|sidecar| sidecar.id), Some(id));
+    handle.join().unwrap();
 }
 
 fn required_direct_test_job(token: u64) -> KmsCommitJob {

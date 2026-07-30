@@ -206,6 +206,9 @@ impl NativeSessionIo for NativeRuntime {
             }
         }
         self.defer_fatal_worker_jobs_for_teardown(worker.take_fatal_jobs())?;
+        self.worker_quarantine
+            .cursor_sidecars
+            .extend(worker.take_pending_cursor_sidecar());
         if let Some(error) = event_error {
             return Err(io::Error::other(error).into());
         }
@@ -318,7 +321,8 @@ impl NativeSessionIo for NativeRuntime {
         self.scanout.complete_session_recovery(*recovery)?;
         self.confirmed_primary_assignment = None;
         self.submitted_worker_ownership.clear();
-        self.quarantined_worker_jobs.clear();
+        self.worker_quarantine.jobs.clear();
+        self.worker_quarantine.cursor_sidecars.clear();
         self.emergency_quarantined_worker_jobs.clear();
         self.emergency_quarantined_submitted_ownership.clear();
         let abandoned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);

@@ -100,6 +100,12 @@ pub(super) struct NativeCycleState {
     pub(super) shutdown_requested: bool,
 }
 
+#[derive(Debug, Default)]
+struct KmsWorkerQuarantine {
+    jobs: Vec<super::kms_worker::KmsCommitJob>,
+    cursor_sidecars: Vec<super::kms_worker::CursorSidecar>,
+}
+
 pub(crate) struct NativeRuntimeConfig {
     pub(crate) server: OwnCompositorServer,
     pub(crate) app: Vec<String>,
@@ -194,7 +200,7 @@ pub(crate) struct NativeRuntime {
     kms_commit_worker_reactor_token: Option<ReactorToken>,
     kms_commit_worker_policy: super::kms_worker::KmsCommitWorkerPolicy,
     kms_commit_worker_transport: super::kms_worker::KmsCommitWorkerTransport,
-    quarantined_worker_jobs: Vec<super::kms_worker::KmsCommitJob>,
+    worker_quarantine: KmsWorkerQuarantine,
     emergency_quarantined_worker_jobs: Vec<super::kms_worker::KmsCommitJob>,
     submitted_worker_ownership: Vec<super::kms_worker::KmsSubmittedOwnership>,
     emergency_quarantined_submitted_ownership: Vec<super::kms_worker::KmsSubmittedOwnership>,
@@ -322,6 +328,9 @@ impl Drop for NativeRuntime {
             let _ = worker.join();
             let _ = self.drain_kms_worker_events_for_teardown(&worker);
             let _ = self.defer_fatal_worker_jobs_for_teardown(worker.take_fatal_jobs());
+            self.worker_quarantine
+                .cursor_sidecars
+                .extend(worker.take_pending_cursor_sidecar());
         }
         self.revoke_xwayland_private_client();
         let _ = self
@@ -426,7 +435,8 @@ impl Drop for NativeRuntime {
             unsafe { mem::ManuallyDrop::drop(&mut self.scanout) };
         }
         self.submitted_worker_ownership.clear();
-        self.quarantined_worker_jobs.clear();
+        self.worker_quarantine.jobs.clear();
+        self.worker_quarantine.cursor_sidecars.clear();
         self.emergency_quarantined_worker_jobs.clear();
         self.emergency_quarantined_submitted_ownership.clear();
 

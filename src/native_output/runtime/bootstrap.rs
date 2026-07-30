@@ -623,7 +623,7 @@ impl NativeRuntime {
             kms_commit_worker_reactor_token,
             kms_commit_worker_policy: requested_worker_policy,
             kms_commit_worker_transport,
-            quarantined_worker_jobs: Vec::new(),
+            worker_quarantine: KmsWorkerQuarantine::default(),
             emergency_quarantined_worker_jobs: Vec::new(),
             submitted_worker_ownership: Vec::new(),
             emergency_quarantined_submitted_ownership: Vec::new(),

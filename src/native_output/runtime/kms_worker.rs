@@ -665,7 +665,7 @@ impl NativeRuntime {
         {
             self.scanout.note_direct_test_only(duration_ns, false);
         }
-        let suspended_jobs = &mut self.quarantined_worker_jobs;
+        let suspended_jobs = &mut self.worker_quarantine.jobs;
         let emergency_jobs = &mut self.emergency_quarantined_worker_jobs;
         retain_uncertain_job_with_suspension(job, suspended_jobs, emergency_jobs)
     }
@@ -699,6 +699,9 @@ impl NativeRuntime {
                 OutputTransactionDropReason::SafeAbandonment,
             )?;
         }
+        self.worker_quarantine
+            .cursor_sidecars
+            .extend(snapshot.pending_sidecar);
         Ok(snapshot.inflight)
     }
 
@@ -716,6 +719,9 @@ impl NativeRuntime {
                 OutputTransactionDropReason::SafeAbandonment,
             )?;
         }
+        self.worker_quarantine
+            .cursor_sidecars
+            .extend(snapshot.pending_sidecar);
         if let Some(inflight) = snapshot.inflight {
             self.forced_shutdown_inflight = Some(inflight);
             let pacing_cleared = self
@@ -804,7 +810,12 @@ impl NativeRuntime {
             .as_ref()
             .map(KmsCommitWorkerHandle::take_fatal_jobs)
             .unwrap_or_default();
+        let fatal_sidecar = self
+            .kms_commit_worker
+            .as_ref()
+            .and_then(KmsCommitWorkerHandle::take_pending_cursor_sidecar);
         let _ = handle_fatal_worker_jobs(fatal_jobs, self, FatalWorkerJobDisposition::Fail)?;
+        self.worker_quarantine.cursor_sidecars.extend(fatal_sidecar);
         self.quarantine_after_worker_fatal()?;
         if let Some(error) = event_error {
             return Err(io::Error::other(error).into());
@@ -1371,7 +1382,10 @@ impl NativeRuntime {
                     self.worker_timeout_pending = Some((token, detected_at));
                 }
             }
-            KmsWorkerEvent::Quiesced { returned_jobs } => {
+            KmsWorkerEvent::Quiesced {
+                returned_jobs,
+                returned_sidecar,
+            } => {
                 for job in returned_jobs {
                     let reason = if self.shutdown.is_shutting_down() {
                         OutputTransactionDropReason::SafeAbandonment
@@ -1380,6 +1394,9 @@ impl NativeRuntime {
                     };
                     self.drop_queued_worker_job_with_reason(job, reason)?;
                 }
+                self.worker_quarantine
+                    .cursor_sidecars
+                    .extend(returned_sidecar);
             }
             KmsWorkerEvent::Fatal {
                 reason,

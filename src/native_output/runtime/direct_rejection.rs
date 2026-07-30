@@ -51,7 +51,7 @@ impl NativeRuntime {
             .frame_pacing
             .cancel_worker_submission(job.pacing_frame_id, job.ready_submit)
         {
-            self.quarantined_worker_jobs.push(job);
+            self.worker_quarantine.jobs.push(job);
             return Err(io::Error::other("direct rejection pacing identity mismatch").into());
         }
         if self
@@ -59,7 +59,7 @@ impl NativeRuntime {
             .reject_worker_queued(job.token)
             .is_none()
         {
-            self.quarantined_worker_jobs.push(job);
+            self.worker_quarantine.jobs.push(job);
             return Err(io::Error::other("direct rejection Atomic identity mismatch").into());
         }
         if rejection_policy.invalidate_validation_key
@@ -89,7 +89,7 @@ impl NativeRuntime {
             },
         );
         if let Err(error) = settlement {
-            self.quarantined_worker_jobs.push(direct_job);
+            self.worker_quarantine.jobs.push(direct_job);
             return Err(error);
         }
         self.scanout
