@@ -523,13 +523,13 @@ impl NativeRuntime {
                 composition_required,
             );
         }
-        let can_queue_worker_cursor = worker_cursor_queue_available(
+        let (can_queue_worker_cursor, sidecar_opportunity) = cursor_worker_opportunities(
             worker_mode,
             kms_commit_worker.as_ref(),
             atomic_commit_arbiter,
         );
         let atomic_commit_blocks_cursor = atomic_primary_commit_pending && !can_queue_worker_cursor;
-        let primary_work_for_cursor = primary_visual_work_pending
+        let primary_work_for_cursor = (primary_visual_work_pending && !sidecar_opportunity)
             || direct_candidate_changed
             || atomic_commit_blocks_cursor
             || scanout.ready_frame_queued();
@@ -546,7 +546,7 @@ impl NativeRuntime {
                 .is_some_and(|assignment| assignment.is_direct()),
             direct_candidate_changed,
             direct_candidate_eligible,
-            primary_visual_work_pending,
+            primary_visual_work_pending: primary_visual_work_pending && !sidecar_opportunity,
             cursor_changed: cursor_state_changed,
             cursor_hardware_usable,
             cursor_visible,

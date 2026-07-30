@@ -37,6 +37,11 @@ impl NativeRuntime {
         }
         let rejection_policy = direct_rejection_policy(rejection_kind);
         let combined_cursor = matches!(&job.cursor, KmsCursorUpdate::Set(_));
+        let sidecar_transaction_id = job
+            .owners
+            .cursor()
+            .filter(|owner| owner.sidecar_id.is_some())
+            .map(|owner| owner.transaction.id());
         let validation_key = job
             .direct_primary_lease
             .as_ref()
@@ -91,6 +96,19 @@ impl NativeRuntime {
         if let Err(error) = settlement {
             self.worker_quarantine.jobs.push(direct_job);
             return Err(error);
+        }
+        if let Some(sidecar_transaction_id) = sidecar_transaction_id {
+            settle_failed_output_transaction(
+                &mut self.output_transactions,
+                sidecar_transaction_id,
+                OutputTransactionFailureStage::KmsSubmit,
+                MonotonicTimestampNs::new(monotonic_now_ns()?),
+                |obligations| {
+                    debug_assert!(obligations.frame_batch_id().is_none());
+                    debug_assert!(obligations.direct_surface_id().is_none());
+                    Ok(())
+                },
+            )?;
         }
         self.scanout
             .note_direct_callback_owner_leaks(callback_owner_leaks);

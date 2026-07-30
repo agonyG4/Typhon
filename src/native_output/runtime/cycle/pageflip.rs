@@ -850,11 +850,33 @@ impl NativeRuntime {
                     };
                     let pageflip_token = PageFlipToken::new(pageflip.user_data)
                         .ok_or_else(|| io::Error::other("pageflip token is zero"))?;
+                    let sidecar_transaction_id = submitted_worker_ownership
+                        .iter()
+                        .find(|ownership| ownership.job.token == pageflip_token)
+                        .and_then(|ownership| ownership.job.owners.cursor())
+                        .filter(|owner| owner.sidecar_id.is_some())
+                        .map(|owner| owner.transaction.id());
                     worker
                         .ack_pageflip(pageflip_token, transaction_id, *drm_file_generation)
                         .map_err(|error| {
                             io::Error::other(format!("worker pageflip ack: {error:?}"))
                         })?;
+                    if let Some(sidecar_transaction_id) = sidecar_transaction_id {
+                        complete_presented_output_transaction(
+                            output_transactions,
+                            &mut self.presentation_trace,
+                            sidecar_transaction_id,
+                            pageflip_token,
+                            *drm_file_generation,
+                            MonotonicTimestampNs::new(compositor_receive_ns),
+                            None,
+                            |obligations| {
+                                debug_assert!(obligations.frame_batch_id().is_none());
+                                debug_assert!(obligations.direct_surface_id().is_none());
+                                Ok(())
+                            },
+                        )?;
+                    }
                     submitted_worker_ownership
                         .retain(|ownership| ownership.job.token != pageflip_token);
                 }

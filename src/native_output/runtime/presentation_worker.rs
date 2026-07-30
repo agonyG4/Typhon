@@ -1,5 +1,6 @@
 use super::cycle::direct_fallback::DirectFallbackTracker;
 use super::kms_worker::{WorkerQueueOutcome, queue_explicit_composited_frame, queue_plane_delta};
+pub(super) use super::plane_cycle::cursor_worker_opportunities;
 use super::presentation_transactions::{
     DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
     settle_failed_output_transaction, submit_plane_delta,
@@ -220,7 +221,9 @@ pub(super) fn queue_plane_delta_for_presentation(
         pacing_mode,
         cursor_epoch,
     )? {
-        WorkerQueueOutcome::CursorQueued { .. } => Ok(SchedulerDecision::WaitForPageFlip),
+        WorkerQueueOutcome::CursorQueued { .. } | WorkerQueueOutcome::SidecarQueued { .. } => {
+            Ok(SchedulerDecision::WaitForPageFlip)
+        }
         WorkerQueueOutcome::Unavailable(_) => Ok(SchedulerDecision::Idle),
         WorkerQueueOutcome::Queued { .. } => {
             Err(io::Error::other("cursor worker admission returned a primary queue result").into())
@@ -342,10 +345,9 @@ pub(super) fn queue_explicit_ready_for_presentation(
             framebuffer_id,
         } => Ok(Some((token.get(), framebuffer_id.get(), transaction_id))),
         WorkerQueueOutcome::Unavailable(_) => Ok(None),
-        WorkerQueueOutcome::CursorQueued { .. } => Err(io::Error::other(
-            "composited worker admission returned a cursor queue result",
-        )
-        .into()),
+        WorkerQueueOutcome::CursorQueued { .. } | WorkerQueueOutcome::SidecarQueued { .. } => Err(
+            io::Error::other("composited worker admission returned a cursor queue result").into(),
+        ),
     }
 }
 
@@ -447,10 +449,10 @@ pub(super) fn queue_compatibility_for_presentation(
             None,
         ))),
         WorkerQueueOutcome::Unavailable(_) => Ok(None),
-        WorkerQueueOutcome::CursorQueued { .. } => Err(io::Error::other(
-            "compatibility worker admission returned a cursor queue result",
-        )
-        .into()),
+        WorkerQueueOutcome::CursorQueued { .. } | WorkerQueueOutcome::SidecarQueued { .. } => Err(
+            io::Error::other("compatibility worker admission returned a cursor queue result")
+                .into(),
+        ),
     }
 }
 
@@ -706,10 +708,13 @@ pub(super) fn worker_cursor_queue_available(
     arbiter: &AtomicCommitArbiter,
 ) -> bool {
     worker_mode
-        && arbiter.kernel_commit_submitted()
-        && arbiter.worker_slot_available()
-        && arbiter
-            .kernel_submitted_kind()
-            .is_some_and(|kind| !matches!(kind, AtomicCommitKind::PlaneDelta { .. }))
-        && worker.is_some_and(|worker| worker.admission_available())
+        && worker.is_some_and(|worker| {
+            worker.has_attachable_primary_opportunity()
+                || (arbiter.kernel_commit_submitted()
+                    && arbiter.worker_slot_available()
+                    && arbiter
+                        .kernel_submitted_kind()
+                        .is_some_and(|kind| !matches!(kind, AtomicCommitKind::PlaneDelta { .. }))
+                    && worker.admission_available())
+        })
 }

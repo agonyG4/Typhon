@@ -390,12 +390,22 @@ fn mismatched_generation_crtc_and_primary_do_not_consume_sidecar() {
 
     assert!(
         mailbox
-            .claim_for(job.output_generation + 1, job.crtc_id, Some(required))
+            .claim_for(
+                job.output_generation + 1,
+                job.crtc_id,
+                job.target,
+                Some(required),
+            )
             .is_none()
     );
     assert!(
         mailbox
-            .claim_for(job.output_generation, job.crtc_id + 1, Some(required))
+            .claim_for(
+                job.output_generation,
+                job.crtc_id + 1,
+                job.target,
+                Some(required),
+            )
             .is_none()
     );
     assert!(
@@ -403,6 +413,7 @@ fn mismatched_generation_crtc_and_primary_do_not_consume_sidecar() {
             .claim_for(
                 job.output_generation,
                 job.crtc_id,
+                job.target,
                 Some(crate::native_output::OutputTransactionId::new(
                     std::num::NonZeroU64::new(999).unwrap()
                 ))
@@ -412,7 +423,12 @@ fn mismatched_generation_crtc_and_primary_do_not_consume_sidecar() {
     assert_eq!(mailbox.pending().map(|sidecar| sidecar.id), Some(id));
     assert_eq!(
         mailbox
-            .claim_for(job.output_generation, job.crtc_id, Some(required))
+            .claim_for(
+                job.output_generation,
+                job.crtc_id,
+                job.target,
+                Some(required),
+            )
             .map(|sidecar| sidecar.id),
         Some(id)
     );

@@ -13,6 +13,7 @@ mod kms_worker_teardown;
 #[cfg(test)]
 mod kms_worker_tests;
 mod metrics;
+mod plane_cycle;
 mod planner;
 mod presentation;
 mod presentation_direct;

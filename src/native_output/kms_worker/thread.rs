@@ -236,6 +236,10 @@ impl KmsCommitWorkerHandle {
         self.shared.offer_cursor_sidecar(sidecar)
     }
 
+    pub(crate) fn has_attachable_primary_opportunity(&self) -> bool {
+        self.shared.has_attachable_primary_opportunity()
+    }
+
     #[cfg(test)]
     pub(crate) fn pending_cursor_sidecar_id(
         &self,
@@ -731,9 +735,12 @@ fn collect_cursor_sidecar_before_freeze(
             && matches!(job.cursor, KmsCursorUpdate::Unchanged);
         eligible_job
             .then(|| {
-                state
-                    .cursor_sidecar
-                    .claim_for(job.output_generation, job.crtc_id, primary_id)
+                state.cursor_sidecar.claim_for(
+                    job.output_generation,
+                    job.crtc_id,
+                    job.target,
+                    primary_id,
+                )
             })
             .flatten()
     };

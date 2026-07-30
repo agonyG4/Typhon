@@ -18,6 +18,11 @@ impl NativeRuntime {
         if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
             return self.reject_direct_worker_job(job, error, rejection_kind);
         }
+        let sidecar_owner = job
+            .owners
+            .cursor()
+            .filter(|owner| owner.sidecar_id.is_some())
+            .cloned();
         if let Some(worker) = self.kms_commit_worker.as_ref() {
             worker.record_worker_pacing_pre_submit_rejection();
         }
@@ -37,18 +42,25 @@ impl NativeRuntime {
                         PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
                     )
                 });
-        let cursor_epoch = match job.kind {
-            AtomicCommitKind::PlaneDelta { cursor_epoch, .. } => Some(cursor_epoch),
-            AtomicCommitKind::CompositedPrimary { .. } | AtomicCommitKind::DirectPrimary { .. } => {
-                None
-            }
-        };
+        let cursor_epoch = sidecar_owner
+            .as_ref()
+            .and_then(|owner| match owner.transaction.planes().cursor() {
+                CursorPlaneAssignment::Atomic { desired_epoch, .. } => Some(*desired_epoch),
+                CursorPlaneAssignment::Unchanged | CursorPlaneAssignment::Disabled => None,
+            })
+            .or(match job.kind {
+                AtomicCommitKind::PlaneDelta { cursor_epoch, .. } => Some(cursor_epoch),
+                AtomicCommitKind::CompositedPrimary { .. }
+                | AtomicCommitKind::DirectPrimary { .. } => None,
+            });
         if let Some(cursor_epoch) = cursor_epoch {
-            let cursor = self
-                .atomic_cursor
-                .as_mut()
-                .ok_or_else(|| io::Error::other("cursor worker rejection has no cursor"))?;
-            cursor.cancel_worker_submission(job.transaction_id, job.token, cursor_epoch)?;
+            if sidecar_owner.is_none() {
+                let cursor = self
+                    .atomic_cursor
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("cursor worker rejection has no cursor"))?;
+                cursor.cancel_worker_submission(job.transaction_id, job.token, cursor_epoch)?;
+            }
             if error.kind == oblivion_one::native::kms::AtomicKmsErrorKind::Busy {
                 let now_ns = monotonic_now_ns()?;
                 self.cursor_output_arbitration.defer_after_busy(
@@ -121,6 +133,19 @@ impl NativeRuntime {
                 Ok(())
             },
         )?;
+        if let Some(sidecar) = sidecar_owner {
+            settle_failed_output_transaction(
+                &mut self.output_transactions,
+                sidecar.transaction.id(),
+                OutputTransactionFailureStage::KmsSubmit,
+                MonotonicTimestampNs::new(monotonic_now_ns()?),
+                |obligations| {
+                    debug_assert!(obligations.frame_batch_id().is_none());
+                    debug_assert!(obligations.direct_surface_id().is_none());
+                    Ok(())
+                },
+            )?;
+        }
         self.perf.log("native.kms_commit_worker", || {
             vec![
                 NativePerfField::str("event", "submit_rejected"),
@@ -139,6 +164,11 @@ impl NativeRuntime {
         job: KmsCommitJob,
         drop_reason: OutputTransactionDropReason,
     ) -> NativeResult<()> {
+        let sidecar_transaction_id = job
+            .owners
+            .cursor()
+            .filter(|owner| owner.sidecar_id.is_some())
+            .map(|owner| owner.transaction.id());
         if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. })
             && let Some(duration_ns) = job.test_only_duration_ns
         {
@@ -234,6 +264,19 @@ impl NativeRuntime {
                 Ok(())
             },
         )?;
+        if let Some(sidecar_transaction_id) = sidecar_transaction_id {
+            settle_dropped_output_transaction(
+                &mut self.output_transactions,
+                sidecar_transaction_id,
+                drop_reason,
+                MonotonicTimestampNs::new(monotonic_now_ns()?),
+                |obligations| {
+                    debug_assert!(obligations.frame_batch_id().is_none());
+                    debug_assert!(obligations.direct_surface_id().is_none());
+                    Ok(())
+                },
+            )?;
+        }
         if let Some(callback_owner_leaks) = direct_callback_owner_leaks {
             self.scanout
                 .note_direct_callback_owner_leaks(callback_owner_leaks);

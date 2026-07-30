@@ -35,6 +35,5 @@ pub(crate) use bundle::KmsCursorOwner;
 #[cfg(test)]
 pub(crate) use bundle::KmsPrimaryOwner;
 pub(crate) use bundle::{KmsBundleOwners, KmsCommitBundleIdentity};
-#[cfg(test)]
 pub(crate) use cursor_sidecar::CursorSidecarCoupling;
 pub(crate) use cursor_sidecar::{CursorSidecar, CursorSidecarMailbox};

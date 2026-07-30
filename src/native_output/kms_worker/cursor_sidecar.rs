@@ -58,11 +58,13 @@ impl CursorSidecarMailbox {
         &mut self,
         output_generation: u64,
         crtc_id: u32,
+        target: PresentationTarget,
         primary_transaction_id: Option<OutputTransactionId>,
     ) -> Option<CursorSidecar> {
         let eligible = self.pending.as_ref().is_some_and(|sidecar| {
             sidecar.transaction.output_generation() == output_generation
                 && sidecar.crtc_id == crtc_id
+                && sidecar.deadline == target
                 && match sidecar.coupling {
                     CursorSidecarCoupling::Independent => true,
                     CursorSidecarCoupling::MustBundleWith(required) => {

@@ -358,6 +358,23 @@ pub(crate) struct WorkerState {
 }
 
 impl WorkerShared {
+    pub(crate) fn has_attachable_primary_opportunity(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let queued_primary = state
+            .queued
+            .front()
+            .is_some_and(|job| job.kind.is_primary());
+        let executing_before_freeze = state.executing
+            && matches!(
+                state.phase,
+                KmsWorkerPhase::DequeuedWaitingPredecessor | KmsWorkerPhase::CollectingSidecar
+            );
+        queued_primary || executing_before_freeze
+    }
+
     pub(crate) fn new(result_fd: OwnedFd) -> Self {
         Self {
             state: Mutex::new(WorkerState {

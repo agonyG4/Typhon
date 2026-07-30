@@ -14,6 +14,8 @@ use super::super::kms_worker::{
 pub(super) use super::kms_worker_teardown::{
     retain_complete_submitted_ownership, retain_uncertain_job_with_suspension,
 };
+pub(super) use super::plane_cycle::WorkerQueueOutcome;
+use super::plane_cycle::try_offer_cursor_sidecar;
 use super::presentation_transactions::{
     build_compatibility_transaction, settle_failed_output_transaction,
     settle_forced_shutdown_transaction_if_safe,
@@ -27,20 +29,6 @@ mod direct_rejection;
 #[allow(unused_imports)]
 pub(super) use direct_rejection::{WorkerRejectionKind, direct_rejection_policy};
 mod rejection;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum WorkerQueueOutcome {
-    Queued {
-        transaction_id: OutputTransactionId,
-        token: PageFlipToken,
-        framebuffer_id: FramebufferId,
-    },
-    CursorQueued {
-        transaction_id: OutputTransactionId,
-        token: PageFlipToken,
-    },
-    Unavailable(KmsWorkerAdmissionError),
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FatalWorkerJobDisposition {
@@ -97,10 +85,6 @@ pub(super) fn queue_plane_delta(
     pacing_mode: NativeOutputPacingMode,
     cursor_epoch: u64,
 ) -> NativeResult<WorkerQueueOutcome> {
-    let permit = match worker.try_reserve_admission_slot() {
-        Ok(permit) => permit,
-        Err(error) => return Ok(WorkerQueueOutcome::Unavailable(error)),
-    };
     let transaction_id = output_transactions
         .allocate_id()
         .map_err(io::Error::other)?;
@@ -118,6 +102,32 @@ pub(super) fn queue_plane_delta(
     output_transactions
         .insert(transaction)
         .map_err(io::Error::other)?;
+    if let Some(outcome) = try_offer_cursor_sidecar(
+        worker,
+        cursor,
+        desired.as_ref(),
+        output_transactions,
+        presentation_trace,
+        transaction_id,
+        target,
+        crtc_id,
+    )? {
+        return Ok(outcome);
+    }
+    let permit = match worker.try_reserve_admission_slot() {
+        Ok(permit) => permit,
+        Err(error) => {
+            output_transactions
+                .mark_superseded(
+                    transaction_id,
+                    None,
+                    OutputTransactionSupersedeReason::SameContentSuppressed,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                )
+                .map_err(io::Error::other)?;
+            return Ok(WorkerQueueOutcome::Unavailable(error));
+        }
+    };
     let token = PageFlipToken::new(allocate_native_page_flip_token())
         .expect("allocated native pageflip token is nonzero");
     let queued_at_ns = monotonic_now_ns()?;
@@ -992,6 +1002,12 @@ impl NativeRuntime {
                 let _output_generation = ownership.job.output_generation;
                 let target = ownership.job.target;
                 let cursor = ownership.job.cursor.clone();
+                let sidecar_owner = ownership
+                    .job
+                    .owners
+                    .cursor()
+                    .filter(|owner| owner.sidecar_id.is_some())
+                    .cloned();
                 let pacing_frame_id = ownership.job.pacing_frame_id;
                 let ready_submit = ownership.job.ready_submit;
                 let out_fence = ownership.out_fence.take();
@@ -1024,16 +1040,17 @@ impl NativeRuntime {
                 let transaction = self
                     .output_transactions
                     .transaction(transaction_id)
-                    .ok_or_else(|| io::Error::other("worker success transaction is missing"))?;
+                    .ok_or_else(|| io::Error::other("worker success transaction is missing"))?
+                    .descriptor()
+                    .clone();
                 let compatibility_primary = matches!(
-                    transaction.descriptor().planes().primary(),
+                    transaction.planes().primary(),
                     PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
                 );
                 let has_out_fence = out_fence.is_some();
                 let direct_metadata = if matches!(kind, AtomicCommitKind::DirectPrimary { .. }) {
-                    match transaction.descriptor().content() {
+                    match transaction.content() {
                         OutputTransactionContent::Direct { frame_id, .. } => transaction
-                            .descriptor()
                             .obligations()
                             .frame_batch_id()
                             .map(|protocol_batch_id| (frame_id, protocol_batch_id)),
@@ -1130,84 +1147,126 @@ impl NativeRuntime {
                     )
                     .into());
                 }
-                let cursor_epoch = match kind {
-                    AtomicCommitKind::PlaneDelta { cursor_epoch, .. } => Some(cursor_epoch),
-                    AtomicCommitKind::CompositedPrimary { .. }
-                    | AtomicCommitKind::DirectPrimary { .. } => match transaction
-                        .descriptor()
-                        .planes()
-                        .cursor()
-                    {
+                if let Some(sidecar) = sidecar_owner.as_ref() {
+                    self.output_transactions
+                        .mark_queued(
+                            sidecar.transaction.id(),
+                            ownership.job.output_generation,
+                            MonotonicTimestampNs::new(queued_at),
+                        )
+                        .map_err(io::Error::other)?;
+                }
+                let cursor_epoch = if let Some(sidecar) = sidecar_owner.as_ref() {
+                    match sidecar.transaction.planes().cursor() {
                         CursorPlaneAssignment::Atomic { desired_epoch, .. } => Some(*desired_epoch),
                         CursorPlaneAssignment::Unchanged | CursorPlaneAssignment::Disabled => None,
-                    },
+                    }
+                } else {
+                    match kind {
+                        AtomicCommitKind::PlaneDelta { cursor_epoch, .. } => Some(cursor_epoch),
+                        AtomicCommitKind::CompositedPrimary { .. }
+                        | AtomicCommitKind::DirectPrimary { .. } => {
+                            match transaction.planes().cursor() {
+                                CursorPlaneAssignment::Atomic { desired_epoch, .. } => {
+                                    Some(*desired_epoch)
+                                }
+                                CursorPlaneAssignment::Unchanged
+                                | CursorPlaneAssignment::Disabled => None,
+                            }
+                        }
+                    }
                 };
                 if let Some(cursor_epoch) = cursor_epoch {
-                    let (submitted_state, submitted_revision) =
-                        if matches!(kind, AtomicCommitKind::PlaneDelta { .. }) {
-                            let native_cursor = self.atomic_cursor.as_mut().ok_or_else(|| {
-                                io::Error::other("cursor worker submit has no cursor")
+                    let (submitted_state, submitted_revision) = if let Some(sidecar) =
+                        sidecar_owner.as_ref()
+                    {
+                        let submitted_state = match &cursor {
+                            KmsCursorUpdate::Set(state) => state.clone(),
+                            KmsCursorUpdate::Disable => {
+                                let mut hidden = self
+                                    .atomic_cursor
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        io::Error::other("sidecar submit has no cursor")
+                                    })?
+                                    .desired()
+                                    .clone();
+                                hidden.visible = false;
+                                hidden.framebuffer_id = None;
+                                hidden
+                            }
+                            KmsCursorUpdate::Unchanged => {
+                                return Err(io::Error::other(
+                                    "sidecar submission has no cursor update",
+                                )
+                                .into());
+                            }
+                        };
+                        (submitted_state, sidecar.revision)
+                    } else if matches!(kind, AtomicCommitKind::PlaneDelta { .. }) {
+                        let native_cursor = self.atomic_cursor.as_mut().ok_or_else(|| {
+                            io::Error::other("cursor worker submit has no cursor")
+                        })?;
+                        let queued = native_cursor
+                            .take_worker_submission(transaction_id, token, cursor_epoch)
+                            .inspect_err(|_error| {
+                                if let Some(worker) = self.kms_commit_worker.as_ref() {
+                                    worker.record_cursor_worker_epoch_mismatch();
+                                }
                             })?;
-                            let queued = native_cursor
-                                .take_worker_submission(transaction_id, token, cursor_epoch)
-                                .inspect_err(|_error| {
+                        let submitted_state = match cursor {
+                            KmsCursorUpdate::Set(state) => {
+                                if state != queued.visual_state {
                                     if let Some(worker) = self.kms_commit_worker.as_ref() {
                                         worker.record_cursor_worker_epoch_mismatch();
                                     }
-                                })?;
-                            let submitted_state = match cursor {
-                                KmsCursorUpdate::Set(state) => {
-                                    if state != queued.visual_state {
-                                        if let Some(worker) = self.kms_commit_worker.as_ref() {
-                                            worker.record_cursor_worker_epoch_mismatch();
-                                        }
-                                        return Err(io::Error::other(
+                                    return Err(io::Error::other(
                                         "worker cursor state does not match queued cursor state",
                                     )
                                     .into());
-                                    }
-                                    state.clone()
                                 }
-                                KmsCursorUpdate::Disable => queued.visual_state,
-                                KmsCursorUpdate::Unchanged => {
-                                    return Err(io::Error::other(
-                                        "worker cursor submission has no cursor update",
-                                    )
-                                    .into());
-                                }
-                            };
-                            (submitted_state, queued.revision)
-                        } else {
-                            let submitted_state = match cursor {
-                                KmsCursorUpdate::Set(state) => state.clone(),
-                                KmsCursorUpdate::Disable => {
-                                    let native_cursor =
-                                        self.atomic_cursor.as_ref().ok_or_else(|| {
-                                            io::Error::other("primary cursor submit has no cursor")
-                                        })?;
-                                    let mut hidden = native_cursor.desired().clone();
-                                    hidden.visible = false;
-                                    hidden.framebuffer_id = None;
-                                    hidden
-                                }
-                                KmsCursorUpdate::Unchanged => {
-                                    return Err(io::Error::other(
-                                        "primary cursor submission has no cursor update",
-                                    )
-                                    .into());
-                                }
-                            };
-                            let submitted_revision = self
-                                .atomic_cursor
-                                .as_ref()
-                                .ok_or_else(|| {
-                                    io::Error::other("primary cursor submit has no cursor")
-                                })?
-                                .revision_for_legacy_epoch(cursor_epoch);
-                            (submitted_state, submitted_revision)
+                                state.clone()
+                            }
+                            KmsCursorUpdate::Disable => queued.visual_state,
+                            KmsCursorUpdate::Unchanged => {
+                                return Err(io::Error::other(
+                                    "worker cursor submission has no cursor update",
+                                )
+                                .into());
+                            }
                         };
+                        (submitted_state, queued.revision)
+                    } else {
+                        let submitted_state = match cursor {
+                            KmsCursorUpdate::Set(state) => state.clone(),
+                            KmsCursorUpdate::Disable => {
+                                let native_cursor =
+                                    self.atomic_cursor.as_ref().ok_or_else(|| {
+                                        io::Error::other("primary cursor submit has no cursor")
+                                    })?;
+                                let mut hidden = native_cursor.desired().clone();
+                                hidden.visible = false;
+                                hidden.framebuffer_id = None;
+                                hidden
+                            }
+                            KmsCursorUpdate::Unchanged => {
+                                return Err(io::Error::other(
+                                    "primary cursor submission has no cursor update",
+                                )
+                                .into());
+                            }
+                        };
+                        let submitted_revision = self
+                            .atomic_cursor
+                            .as_ref()
+                            .ok_or_else(|| io::Error::other("primary cursor submit has no cursor"))?
+                            .revision_for_legacy_epoch(cursor_epoch);
+                        (submitted_state, submitted_revision)
+                    };
                     if let Some(native_cursor) = self.atomic_cursor.as_mut() {
-                        if matches!(kind, AtomicCommitKind::PlaneDelta { .. }) {
+                        if matches!(kind, AtomicCommitKind::PlaneDelta { .. })
+                            && sidecar_owner.is_none()
+                        {
                             native_cursor.begin_submission_at_revision(
                                 token,
                                 submitted_state,
@@ -1224,7 +1283,9 @@ impl NativeRuntime {
                         }
                     }
                     self.last_submitted_cursor_epoch = cursor_epoch;
-                    if matches!(kind, AtomicCommitKind::PlaneDelta { .. }) {
+                    if matches!(kind, AtomicCommitKind::PlaneDelta { .. })
+                        && sidecar_owner.is_none()
+                    {
                         self.cursor_output_arbitration.note_plane_delta_submission();
                         self.cursor_output_arbitration.consume_submitted_epoch(
                             cursor_epoch,
@@ -1252,6 +1313,15 @@ impl NativeRuntime {
                         MonotonicTimestampNs::new(submit_returned_at),
                     )
                     .map_err(io::Error::other)?;
+                if let Some(sidecar) = sidecar_owner {
+                    self.output_transactions
+                        .mark_submitted(
+                            sidecar.transaction.id(),
+                            token,
+                            MonotonicTimestampNs::new(submit_returned_at),
+                        )
+                        .map_err(io::Error::other)?;
+                }
                 self.atomic_commit_arbiter
                     .mark_kernel_submitted(token, submit_started_at, submit_returned_at)
                     .map_err(io::Error::other)?;
