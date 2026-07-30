@@ -1,3 +1,4 @@
+use super::cursor_buffer::*;
 use super::*;
 use oblivion_one::cursor_theme::CompositorCursorImage;
 use std::sync::Arc;
@@ -34,275 +35,6 @@ impl NativeCursorImageKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativeCursorSourceKey {
-    Theme,
-    Client(NativeCursorImageKey),
-}
-
-#[derive(Debug)]
-struct AtomicCursorBuffer {
-    fd: RawFd,
-    handle: u32,
-    framebuffer: FramebufferId,
-    width: u32,
-    height: u32,
-    pitch: u32,
-    size: usize,
-    mapping: *mut c_void,
-    drm_cleanup_armed: bool,
-    /// Shared only as a lightweight lease marker. The DRM/CPU buffer itself
-    /// remains compositor-thread-owned; worker jobs carry a clone of this
-    /// marker so retirement cannot drop the buffer while a queued ioctl may
-    /// still reference its framebuffer ID.
-    lease: Arc<()>,
-}
-
-impl AtomicCursorBuffer {
-    fn create(file: &fs::File, width: u32, height: u32) -> io::Result<Self> {
-        let dumb = drm_ffi::mode::dumbbuffer::create(file.as_fd(), width, height, 32, 0)?;
-        let descriptor = ExplicitFramebufferDescriptor::new(
-            width,
-            height,
-            DRM_FORMAT_ARGB8888,
-            &[ExplicitFramebufferPlane {
-                handle: dumb.handle,
-                pitch: dumb.pitch,
-                offset: 0,
-                modifier: 0,
-            }],
-        )?;
-        let framebuffer = match add_explicit_framebuffer(file.as_fd(), &descriptor) {
-            Ok(framebuffer) => framebuffer,
-            Err(error) => {
-                let _ = drm_ffi::mode::dumbbuffer::destroy(file.as_fd(), dumb.handle);
-                return Err(error);
-            }
-        };
-        let map = match drm_ffi::mode::dumbbuffer::map(file.as_fd(), dumb.handle, 0, 0) {
-            Ok(map) => map,
-            Err(error) => {
-                let _ = drm_ffi::mode::rm_fb(file.as_fd(), framebuffer.get());
-                let _ = drm_ffi::mode::dumbbuffer::destroy(file.as_fd(), dumb.handle);
-                return Err(error);
-            }
-        };
-        let size = match usize::try_from(dumb.size) {
-            Ok(size) => size,
-            Err(_) => {
-                let _ = drm_ffi::mode::rm_fb(file.as_fd(), framebuffer.get());
-                let _ = drm_ffi::mode::dumbbuffer::destroy(file.as_fd(), dumb.handle);
-                return Err(io::Error::other("Atomic cursor dumb buffer size overflow"));
-            }
-        };
-        let mapping = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_raw_fd(),
-                map.offset as libc::off_t,
-            )
-        };
-        if mapping == libc::MAP_FAILED {
-            let error = io::Error::last_os_error();
-            let _ = drm_ffi::mode::rm_fb(file.as_fd(), framebuffer.get());
-            let _ = drm_ffi::mode::dumbbuffer::destroy(file.as_fd(), dumb.handle);
-            return Err(error);
-        }
-        Ok(Self {
-            fd: file.as_raw_fd(),
-            handle: dumb.handle,
-            framebuffer,
-            width,
-            height,
-            pitch: dumb.pitch,
-            size,
-            mapping,
-            drm_cleanup_armed: true,
-            lease: Arc::new(()),
-        })
-    }
-
-    fn upload_image(&mut self, image: &CompositorCursorImage) -> io::Result<()> {
-        let bytes = native_cursor_argb_bytes(
-            &image.pixels_argb8888,
-            image.width,
-            image.height,
-            self.width,
-            self.height,
-            self.pitch,
-        )?;
-        let destination =
-            unsafe { slice::from_raw_parts_mut(self.mapping.cast::<u8>(), self.size) };
-        destination.copy_from_slice(&bytes);
-        Ok(())
-    }
-
-    fn disarm_drm_cleanup(&mut self) {
-        self.drm_cleanup_armed = false;
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct CursorFramebufferPin {
-    framebuffer: FramebufferId,
-    #[allow(dead_code)]
-    lease: Arc<()>,
-}
-
-impl CursorFramebufferPin {
-    pub(crate) fn framebuffer_id(&self) -> FramebufferId {
-        self.framebuffer
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_job_owned(&self) -> bool {
-        Arc::strong_count(&self.lease) > 1
-    }
-}
-
-impl Drop for AtomicCursorBuffer {
-    fn drop(&mut self) {
-        if self.drm_cleanup_armed {
-            let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-            let _ = drm_ffi::mode::rm_fb(fd, self.framebuffer.get());
-        }
-        let _ = unsafe { libc::munmap(self.mapping, self.size) };
-        if self.drm_cleanup_armed {
-            let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-            let _ = drm_ffi::mode::dumbbuffer::destroy(fd, self.handle);
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct AtomicCursorResources {
-    current: Option<AtomicCursorBuffer>,
-    retired: Vec<AtomicCursorBuffer>,
-    theme_cache: Option<AtomicCursorBuffer>,
-    client_cache: Option<(NativeCursorImageKey, AtomicCursorBuffer)>,
-}
-
-impl AtomicCursorResources {
-    fn take_cached(&mut self, source_key: NativeCursorSourceKey) -> Option<AtomicCursorBuffer> {
-        match source_key {
-            NativeCursorSourceKey::Theme => self.theme_cache.take(),
-            NativeCursorSourceKey::Client(key) => self
-                .client_cache
-                .take()
-                .and_then(|(cached_key, buffer)| (cached_key == key).then_some(buffer)),
-        }
-    }
-
-    fn cache_current(&mut self, source_key: NativeCursorSourceKey, buffer: AtomicCursorBuffer) {
-        match source_key {
-            NativeCursorSourceKey::Theme => {
-                if let Some(previous) = self.theme_cache.replace(buffer) {
-                    self.retired.push(previous);
-                }
-            }
-            NativeCursorSourceKey::Client(key) => {
-                if let Some((previous_key, previous)) = self.client_cache.replace((key, buffer))
-                    && previous_key != key
-                {
-                    self.retired.push(previous);
-                }
-            }
-        }
-    }
-
-    fn retire_cached_mismatch(&mut self, source_key: NativeCursorSourceKey) {
-        if let NativeCursorSourceKey::Client(key) = source_key
-            && self
-                .client_cache
-                .as_ref()
-                .is_some_and(|(cached_key, _)| *cached_key != key)
-            && let Some((_, buffer)) = self.client_cache.take()
-        {
-            self.retired.push(buffer);
-        }
-    }
-
-    fn retire_safe(&mut self, keep: &[Option<u32>]) {
-        self.retired.retain(|buffer| {
-            Arc::strong_count(&buffer.lease) > 1
-                || keep
-                    .iter()
-                    .flatten()
-                    .any(|framebuffer| *framebuffer == buffer.framebuffer.get())
-        });
-    }
-
-    fn pin_framebuffer(&self, framebuffer: FramebufferId) -> Option<CursorFramebufferPin> {
-        let matches = |buffer: &AtomicCursorBuffer| buffer.framebuffer == framebuffer;
-        self.current
-            .as_ref()
-            .filter(|buffer| matches(buffer))
-            .or_else(|| self.theme_cache.as_ref().filter(|buffer| matches(buffer)))
-            .or_else(|| {
-                self.client_cache
-                    .as_ref()
-                    .map(|(_, buffer)| buffer)
-                    .filter(|buffer| matches(buffer))
-            })
-            .or_else(|| self.retired.iter().find(|buffer| matches(buffer)))
-            .map(|buffer| CursorFramebufferPin {
-                framebuffer,
-                lease: Arc::clone(&buffer.lease),
-            })
-    }
-
-    fn disarm_drm_cleanup(&mut self) {
-        if let Some(current) = self.current.as_mut() {
-            current.disarm_drm_cleanup();
-        }
-        if let Some(theme) = self.theme_cache.as_mut() {
-            theme.disarm_drm_cleanup();
-        }
-        if let Some((_, client)) = self.client_cache.as_mut() {
-            client.disarm_drm_cleanup();
-        }
-        for retired in &mut self.retired {
-            retired.disarm_drm_cleanup();
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct AtomicCursorDirty {
-    pub(crate) position: bool,
-    pub(crate) visibility: bool,
-    pub(crate) image: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct AtomicCursorCounters {
-    pub(crate) image_uploads: u64,
-    pub(crate) client_image_uploads: u64,
-    pub(crate) image_cache_hits: u64,
-    pub(crate) position_submissions: u64,
-    pub(crate) primary_submissions: u64,
-    pub(crate) updates_requested: u64,
-    pub(crate) updates_submitted: u64,
-    pub(crate) updates_completed: u64,
-    pub(crate) updates_coalesced: u64,
-    pub(crate) hidden_updates_suppressed: u64,
-    pub(crate) test_failures: u64,
-    pub(crate) submit_failures: u64,
-    pub(crate) software_fallbacks: u64,
-    pub(crate) composed_cursor_fallbacks: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorkerQueuedCursorSubmission {
-    pub(crate) transaction_id: crate::native_output::OutputTransactionId,
-    pub(crate) token: PageFlipToken,
-    pub(crate) cursor_epoch: u64,
-    pub(crate) visual_state: AtomicCursorVisualState,
-}
-
 #[derive(Debug)]
 pub(crate) struct NativeAtomicCursor {
     pub(crate) image: Arc<CompositorCursorImage>,
@@ -318,10 +50,11 @@ pub(crate) struct NativeAtomicCursor {
     /// intentionally independent of compositor scene/cursor generations.
     desired_epoch: u64,
     submitted_epoch: u64,
+    revisions: CursorRevisionTracker,
     hardware_path_active: bool,
     pub(crate) dirty: AtomicCursorDirty,
     pub(crate) counters: AtomicCursorCounters,
-    failure_latched: bool,
+    plane_lifecycle: CursorPlaneLifecycle,
     client_image_failure: Option<NativeCursorImageKey>,
     pending_token: Option<PageFlipToken>,
     pending_is_primary: bool,
@@ -368,10 +101,11 @@ impl NativeAtomicCursor {
             generation,
             desired_epoch: INITIAL_CURSOR_EPOCH,
             submitted_epoch: INITIAL_CURSOR_EPOCH,
+            revisions: CursorRevisionTracker::new(),
             hardware_path_active: false,
             dirty: AtomicCursorDirty::default(),
             counters: AtomicCursorCounters::default(),
-            failure_latched: false,
+            plane_lifecycle: CursorPlaneLifecycle::new(generation),
             client_image_failure: None,
             pending_token: None,
             pending_is_primary: false,
@@ -408,28 +142,27 @@ impl NativeAtomicCursor {
     pub(crate) fn presented_plane_state(
         &self,
     ) -> crate::native_output::presentation::plane::PresentedCursorState {
-        use crate::native_output::presentation::plane::{
-            CursorCoupling, CursorRevision, PresentedCursorState,
-        };
+        use crate::native_output::presentation::plane::{CursorCoupling, PresentedCursorState};
 
-        let legacy_epoch =
-            std::num::NonZeroU64::new(self.submitted_epoch).expect("cursor epoch is nonzero");
         let coupling = if self.current.visible {
             CursorCoupling::IndependentPlane
         } else {
             CursorCoupling::Hidden
         };
-        let presented = PresentedCursorState::from_atomic(
-            CursorRevision::from_legacy_epoch(legacy_epoch),
-            coupling,
-            &self.current,
-        );
+        let presented =
+            PresentedCursorState::from_atomic(self.revisions.presented(), coupling, &self.current);
         debug_assert!(presented.kms_equivalent_to(&self.current));
         presented
     }
 
     pub(crate) const fn desired_epoch(&self) -> u64 {
         self.desired_epoch
+    }
+
+    pub(crate) const fn desired_revision(
+        &self,
+    ) -> crate::native_output::presentation::plane::CursorRevision {
+        self.revisions.desired()
     }
 
     #[cfg(test)]
@@ -457,10 +190,16 @@ impl NativeAtomicCursor {
                 "Atomic cursor worker submission already queued",
             ));
         }
+        if cursor_epoch != self.desired_epoch {
+            return Err(io::Error::other(
+                "Atomic cursor worker submission has a stale desired epoch",
+            ));
+        }
         self.worker_queued = Some(WorkerQueuedCursorSubmission {
             transaction_id,
             token,
             cursor_epoch,
+            revision: self.desired_revision(),
             visual_state,
         });
         Ok(())
@@ -504,10 +243,38 @@ impl NativeAtomicCursor {
         self.desired_epoch = next_cursor_epoch(self.desired_epoch, self.submitted_epoch);
     }
 
+    fn advance_image_revision(&mut self) {
+        self.advance_desired_epoch();
+        self.revisions.advance_image();
+    }
+
+    fn advance_motion_revision(&mut self) {
+        self.advance_desired_epoch();
+        self.revisions.advance_motion();
+    }
+
+    fn advance_visibility_revision(&mut self) {
+        self.advance_desired_epoch();
+        self.revisions.advance_visibility();
+    }
+
+    pub(crate) fn revision_for_legacy_epoch(
+        &self,
+        cursor_epoch: u64,
+    ) -> crate::native_output::presentation::plane::CursorRevision {
+        if cursor_epoch == self.desired_epoch {
+            self.revisions.desired()
+        } else {
+            let epoch = std::num::NonZeroU64::new(cursor_epoch)
+                .expect("queued cursor epoch must be nonzero");
+            crate::native_output::presentation::plane::CursorRevision::from_legacy_epoch(epoch)
+        }
+    }
+
     pub(crate) fn set_hardware_path_active(&mut self, active: bool) {
         if self.hardware_path_active != active {
             self.hardware_path_active = active;
-            self.advance_desired_epoch();
+            self.advance_visibility_revision();
         }
     }
 
@@ -522,14 +289,16 @@ impl NativeAtomicCursor {
         self.submitted = state.clone();
         self.submitted_epoch = self.desired_epoch;
         self.current = state;
+        self.revisions.mark_initial_presented();
         self.dirty = AtomicCursorDirty::default();
+        self.plane_lifecycle.confirm_initial_clear(self.generation);
     }
 
     pub(crate) fn set_position(&mut self, x: i32, y: i32) {
         if self.desired.x != x || self.desired.y != y {
             self.desired.x = x;
             self.desired.y = y;
-            self.advance_desired_epoch();
+            self.advance_motion_revision();
             self.dirty.position = true;
             self.counters.updates_requested = self.counters.updates_requested.saturating_add(1);
             if !self.desired.visible && !self.current.visible {
@@ -542,10 +311,10 @@ impl NativeAtomicCursor {
     }
 
     pub(crate) fn set_visible(&mut self, visible: bool) {
-        let visible = visible && !self.failure_latched;
+        let visible = visible && !self.failure_latched();
         if self.desired.visible != visible {
             self.desired.visible = visible;
-            self.advance_desired_epoch();
+            self.advance_visibility_revision();
             self.dirty.visibility = true;
             self.counters.updates_requested = self.counters.updates_requested.saturating_add(1);
             if self.pending_token.is_some() {
@@ -583,12 +352,24 @@ impl NativeAtomicCursor {
         state: AtomicCursorVisualState,
         cursor_epoch: u64,
     ) -> AtomicCursorVisualState {
+        let revision = self.revision_for_legacy_epoch(cursor_epoch);
+        self.begin_submission_at_revision(token, state, cursor_epoch, revision)
+    }
+
+    pub(crate) fn begin_submission_at_revision(
+        &mut self,
+        token: PageFlipToken,
+        state: AtomicCursorVisualState,
+        cursor_epoch: u64,
+        revision: crate::native_output::presentation::plane::CursorRevision,
+    ) -> AtomicCursorVisualState {
         if self.dirty.position {
             self.counters.position_submissions =
                 self.counters.position_submissions.saturating_add(1);
         }
         self.submitted = state.clone();
         self.submitted_epoch = cursor_epoch;
+        self.revisions.mark_submitted(revision);
         self.pending_token = Some(token);
         self.pending_is_primary = false;
         self.dirty = AtomicCursorDirty::default();
@@ -626,6 +407,7 @@ impl NativeAtomicCursor {
         self.pending_token = None;
         self.pending_is_primary = false;
         self.current = self.submitted.clone();
+        self.revisions.mark_presented();
         self.counters.updates_completed = self.counters.updates_completed.saturating_add(1);
         let keep = [
             self.desired.framebuffer_id,
@@ -657,27 +439,43 @@ impl NativeAtomicCursor {
         state: AtomicCursorVisualState,
         cursor_epoch: u64,
     ) {
+        let revision = self.revision_for_legacy_epoch(cursor_epoch);
+        self.begin_primary_submission_at_revision(token, state, cursor_epoch, revision);
+    }
+
+    pub(crate) fn begin_primary_submission_at_revision(
+        &mut self,
+        token: PageFlipToken,
+        state: AtomicCursorVisualState,
+        cursor_epoch: u64,
+        revision: crate::native_output::presentation::plane::CursorRevision,
+    ) {
         self.counters.primary_submissions = self.counters.primary_submissions.saturating_add(1);
         self.submitted = state;
         self.submitted_epoch = cursor_epoch;
+        self.revisions.mark_submitted(revision);
         self.pending_token = Some(token);
         self.pending_is_primary = true;
         self.dirty = AtomicCursorDirty::default();
         self.counters.updates_submitted = self.counters.updates_submitted.saturating_add(1);
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_failure_latched(&mut self) {
-        self.failure_latched = true;
+        self.plane_lifecycle
+            .quarantine(CursorQuarantineReason::PermanentSubmitRejection);
     }
 
     pub(crate) fn note_test_failure(&mut self) {
         self.counters.test_failures = self.counters.test_failures.saturating_add(1);
-        self.mark_failure_latched();
+        self.plane_lifecycle
+            .quarantine(CursorQuarantineReason::TestOnlyRejected);
     }
 
     pub(crate) fn note_submit_failure(&mut self) {
         self.counters.submit_failures = self.counters.submit_failures.saturating_add(1);
-        self.mark_failure_latched();
+        self.plane_lifecycle
+            .quarantine(CursorQuarantineReason::PermanentSubmitRejection);
     }
 
     pub(crate) fn note_software_fallback(&mut self) {
@@ -777,7 +575,7 @@ impl NativeAtomicCursor {
             // A new image is a meaningful retry point after a cursor-plane
             // TEST_ONLY failure.  Pointer motion alone never clears this
             // latch, so a rejected plane cannot create a retry storm.
-            self.failure_latched = false;
+            self.plane_lifecycle.invalidate_capability();
         }
         self.source_key = source_key;
         self.client_image_failure = None;
@@ -787,7 +585,7 @@ impl NativeAtomicCursor {
         self.desired.width = self.image.width;
         self.desired.height = self.image.height;
         self.desired.image_generation = self.desired.image_generation.saturating_add(1);
-        self.advance_desired_epoch();
+        self.advance_image_revision();
         self.dirty.image = true;
         if !self.desired.visible && !self.current.visible {
             self.counters.hidden_updates_suppressed =
@@ -828,6 +626,7 @@ impl NativeAtomicCursor {
         }
         self.plane = plane;
         self.generation = generation;
+        self.plane_lifecycle.rearm_generation(generation);
         let framebuffer_id = self
             .resources
             .current
@@ -843,7 +642,7 @@ impl NativeAtomicCursor {
         restored.height = self.image.height;
         restored.framebuffer_id = framebuffer_id;
         if !restored.kms_equivalent(&self.desired) {
-            self.advance_desired_epoch();
+            self.advance_image_revision();
         }
         self.desired = restored.clone();
         self.submitted = AtomicCursorVisualState::hidden(self.image.width, self.image.height);
@@ -853,20 +652,24 @@ impl NativeAtomicCursor {
         self.pending_token = None;
         self.pending_is_primary = false;
         self.dirty = AtomicCursorDirty::default();
-        self.failure_latched = false;
+        self.plane_lifecycle.invalidate_capability();
         self.client_image_failure = None;
         Ok(restored)
     }
 
     pub(crate) const fn failure_latched(&self) -> bool {
-        self.failure_latched
+        matches!(
+            self.plane_lifecycle.capability_status(),
+            CursorCapabilityStatus::Quarantined { .. }
+        )
     }
 
     pub(crate) fn rearm_generation(&mut self, generation: u64) {
         self.generation = generation;
+        self.plane_lifecycle.rearm_generation(generation);
         self.pending_token = None;
         self.pending_is_primary = false;
-        self.failure_latched = false;
+        self.plane_lifecycle.invalidate_capability();
         self.client_image_failure = None;
     }
 

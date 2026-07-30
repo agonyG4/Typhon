@@ -94,10 +94,11 @@ fn test_cursor() -> NativeAtomicCursor {
         generation: 1,
         desired_epoch: INITIAL_CURSOR_EPOCH,
         submitted_epoch: INITIAL_CURSOR_EPOCH,
+        revisions: CursorRevisionTracker::new(),
         hardware_path_active: false,
         dirty: AtomicCursorDirty::default(),
         counters: AtomicCursorCounters::default(),
-        failure_latched: false,
+        plane_lifecycle: CursorPlaneLifecycle::new(1),
         client_image_failure: None,
         pending_token: None,
         pending_is_primary: false,
@@ -127,6 +128,24 @@ fn queueing_cursor_job_does_not_advance_last_submitted_epoch() {
 
     assert_eq!(cursor.submitted_epoch(), INITIAL_CURSOR_EPOCH);
     assert_eq!(cursor.worker_queued_epoch(), Some(epoch));
+}
+
+#[test]
+fn worker_queue_rejects_a_stale_cursor_epoch() {
+    let mut cursor = test_cursor();
+    let stale_epoch = cursor.desired_epoch();
+    cursor.set_position(100, 200);
+    let transaction_id = OutputTransactionId::new(
+        std::num::NonZeroU64::new(76).expect("test transaction ID is nonzero"),
+    );
+    let token = PageFlipToken::new(76).unwrap();
+
+    assert!(
+        cursor
+            .queue_worker_submission(transaction_id, token, stale_epoch, cursor.desired().clone(),)
+            .is_err()
+    );
+    assert!(cursor.worker_queued_epoch().is_none());
 }
 
 #[test]
@@ -194,7 +213,12 @@ fn worker_cursor_success_advances_exact_epoch_once() {
     let queued = cursor
         .take_worker_submission(transaction_id, token, queued_epoch)
         .unwrap();
-    cursor.begin_submission_at_epoch(token, queued.visual_state, queued.cursor_epoch);
+    cursor.begin_submission_at_revision(
+        token,
+        queued.visual_state,
+        queued.cursor_epoch,
+        queued.revision,
+    );
 
     assert_eq!(cursor.submitted_epoch(), queued_epoch);
     assert_ne!(cursor.submitted_epoch(), newer_epoch);
@@ -223,7 +247,13 @@ fn desired_queued_submitted_and_current_cursor_states_advance_at_exact_boundarie
     let queued = cursor
         .take_worker_submission(transaction_id, token, desired_epoch)
         .unwrap();
-    cursor.begin_submission_at_epoch(token, queued.visual_state, queued.cursor_epoch);
+    let submitted_revision = queued.revision;
+    cursor.begin_submission_at_revision(
+        token,
+        queued.visual_state,
+        queued.cursor_epoch,
+        queued.revision,
+    );
     assert!(!cursor.current().visible);
     assert_eq!(cursor.submitted_epoch(), desired_epoch);
 
@@ -245,6 +275,11 @@ fn desired_queued_submitted_and_current_cursor_states_advance_at_exact_boundarie
         .complete_submission(token, cursor.generation)
         .expect("exact pageflip promotes submitted cursor state");
     assert_eq!(cursor.current(), &desired);
+    assert_eq!(
+        cursor.presented_plane_state().revision,
+        submitted_revision,
+        "the pageflip must promote the exact queued typed revision"
+    );
     assert!(
         cursor
             .complete_submission(token, cursor.generation)
@@ -282,6 +317,24 @@ fn new_position_advances_cursor_epoch_once() {
     cursor.set_position(100, 200);
 
     assert_eq!(cursor.desired_epoch(), moved_epoch);
+}
+
+#[test]
+fn cursor_revision_advances_only_the_changed_field() {
+    let mut cursor = test_cursor();
+    let initial = cursor.desired_revision();
+
+    cursor.set_position(100, 200);
+    let moved = cursor.desired_revision();
+    assert_eq!(moved.image, initial.image);
+    assert_ne!(moved.motion, initial.motion);
+    assert_eq!(moved.visibility, initial.visibility);
+
+    cursor.set_visible(true);
+    let visible = cursor.desired_revision();
+    assert_eq!(visible.image, moved.image);
+    assert_eq!(visible.motion, moved.motion);
+    assert_ne!(visible.visibility, moved.visibility);
 }
 
 #[test]
@@ -497,4 +550,36 @@ fn initial_software_modeset_records_a_disabled_cursor_plane() {
     assert!(!cursor.current().visible);
     assert_eq!(cursor.current().framebuffer_id, None);
     assert!(!cursor.needs_submission_for(None));
+}
+
+#[test]
+fn cursor_plane_lifecycle_is_generation_scoped_and_invalidates_quarantine() {
+    let mut lifecycle = CursorPlaneLifecycle::new(4);
+    assert!(lifecycle.initial_clear_required());
+    assert_eq!(
+        lifecycle.capability_status(),
+        CursorCapabilityStatus::Unknown
+    );
+
+    lifecycle.quarantine(CursorQuarantineReason::UnsupportedSize);
+    assert!(matches!(
+        lifecycle.capability_status(),
+        CursorCapabilityStatus::Quarantined {
+            reason: CursorQuarantineReason::UnsupportedSize,
+            failure_count: 1,
+        }
+    ));
+    assert!(!lifecycle.confirm_initial_clear(3));
+    assert!(lifecycle.initial_clear_required());
+    assert!(lifecycle.confirm_initial_clear(4));
+    assert!(!lifecycle.initial_clear_required());
+    assert!(!lifecycle.confirm_initial_clear(4));
+
+    assert!(lifecycle.rearm_generation(5));
+    assert_eq!(lifecycle.generation(), 5);
+    assert_eq!(
+        lifecycle.capability_status(),
+        CursorCapabilityStatus::Unknown
+    );
+    assert!(lifecycle.initial_clear_required());
 }

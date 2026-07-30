@@ -1091,71 +1091,83 @@ impl NativeRuntime {
                     },
                 };
                 if let Some(cursor_epoch) = cursor_epoch {
-                    let submitted_state = if matches!(kind, AtomicCommitKind::CursorOnly { .. }) {
-                        let native_cursor = self.atomic_cursor.as_mut().ok_or_else(|| {
-                            io::Error::other("cursor worker submit has no cursor")
-                        })?;
-                        let queued = native_cursor
-                            .take_worker_submission(transaction_id, token, cursor_epoch)
-                            .inspect_err(|_error| {
-                                if let Some(worker) = self.kms_commit_worker.as_ref() {
-                                    worker.record_cursor_worker_epoch_mismatch();
-                                }
+                    let (submitted_state, submitted_revision) =
+                        if matches!(kind, AtomicCommitKind::CursorOnly { .. }) {
+                            let native_cursor = self.atomic_cursor.as_mut().ok_or_else(|| {
+                                io::Error::other("cursor worker submit has no cursor")
                             })?;
-                        match cursor {
-                            KmsCursorUpdate::Set(state) => {
-                                if state != queued.visual_state {
+                            let queued = native_cursor
+                                .take_worker_submission(transaction_id, token, cursor_epoch)
+                                .inspect_err(|_error| {
                                     if let Some(worker) = self.kms_commit_worker.as_ref() {
                                         worker.record_cursor_worker_epoch_mismatch();
                                     }
-                                    return Err(io::Error::other(
+                                })?;
+                            let submitted_state = match cursor {
+                                KmsCursorUpdate::Set(state) => {
+                                    if state != queued.visual_state {
+                                        if let Some(worker) = self.kms_commit_worker.as_ref() {
+                                            worker.record_cursor_worker_epoch_mismatch();
+                                        }
+                                        return Err(io::Error::other(
                                         "worker cursor state does not match queued cursor state",
                                     )
                                     .into());
+                                    }
+                                    state.clone()
                                 }
-                                state.clone()
-                            }
-                            KmsCursorUpdate::Disable => queued.visual_state,
-                            KmsCursorUpdate::Unchanged => {
-                                return Err(io::Error::other(
-                                    "worker cursor submission has no cursor update",
-                                )
-                                .into());
-                            }
-                        }
-                    } else {
-                        match cursor {
-                            KmsCursorUpdate::Set(state) => state.clone(),
-                            KmsCursorUpdate::Disable => {
-                                let native_cursor =
-                                    self.atomic_cursor.as_ref().ok_or_else(|| {
-                                        io::Error::other("primary cursor submit has no cursor")
-                                    })?;
-                                let mut hidden = native_cursor.desired().clone();
-                                hidden.visible = false;
-                                hidden.framebuffer_id = None;
-                                hidden
-                            }
-                            KmsCursorUpdate::Unchanged => {
-                                return Err(io::Error::other(
-                                    "primary cursor submission has no cursor update",
-                                )
-                                .into());
-                            }
-                        }
-                    };
+                                KmsCursorUpdate::Disable => queued.visual_state,
+                                KmsCursorUpdate::Unchanged => {
+                                    return Err(io::Error::other(
+                                        "worker cursor submission has no cursor update",
+                                    )
+                                    .into());
+                                }
+                            };
+                            (submitted_state, queued.revision)
+                        } else {
+                            let submitted_state = match cursor {
+                                KmsCursorUpdate::Set(state) => state.clone(),
+                                KmsCursorUpdate::Disable => {
+                                    let native_cursor =
+                                        self.atomic_cursor.as_ref().ok_or_else(|| {
+                                            io::Error::other("primary cursor submit has no cursor")
+                                        })?;
+                                    let mut hidden = native_cursor.desired().clone();
+                                    hidden.visible = false;
+                                    hidden.framebuffer_id = None;
+                                    hidden
+                                }
+                                KmsCursorUpdate::Unchanged => {
+                                    return Err(io::Error::other(
+                                        "primary cursor submission has no cursor update",
+                                    )
+                                    .into());
+                                }
+                            };
+                            let submitted_revision = self
+                                .atomic_cursor
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    io::Error::other("primary cursor submit has no cursor")
+                                })?
+                                .revision_for_legacy_epoch(cursor_epoch);
+                            (submitted_state, submitted_revision)
+                        };
                     if let Some(native_cursor) = self.atomic_cursor.as_mut() {
                         if matches!(kind, AtomicCommitKind::CursorOnly { .. }) {
-                            native_cursor.begin_submission_at_epoch(
+                            native_cursor.begin_submission_at_revision(
                                 token,
                                 submitted_state,
                                 cursor_epoch,
+                                submitted_revision,
                             );
                         } else {
-                            native_cursor.begin_primary_submission_at_epoch(
+                            native_cursor.begin_primary_submission_at_revision(
                                 token,
                                 submitted_state,
                                 cursor_epoch,
+                                submitted_revision,
                             );
                         }
                     }
