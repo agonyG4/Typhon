@@ -340,9 +340,9 @@ impl AtomicOutputSwapchain {
         render_generation: u64,
         render_fence: NativeRenderFence,
     ) -> io::Result<u64> {
-        let now = MonotonicTimestampNs::new(0);
+        let now = MonotonicTimestampNs::new(self.next_frame_id);
         let target = PresentationTarget {
-            sequence: 1,
+            sequence: self.next_frame_id,
             presentation_time: now,
             submit_not_before: now,
             render_start_deadline: now,
@@ -399,6 +399,7 @@ impl AtomicOutputSwapchain {
                 "rendered output frame identity does not match the swapchain",
             ));
         }
+        self.validate_later_primary_target(frame.target)?;
         let frame_id = frame.id;
         let next_frame_id = self
             .next_frame_id
@@ -450,11 +451,16 @@ impl AtomicOutputSwapchain {
         queued_at: MonotonicTimestampNs,
     ) -> io::Result<OwnedFd> {
         self.ensure_operational()?;
-        if self.pending.is_some() || self.worker_queued.is_some() {
+        if self.worker_queued.is_some() {
             return Err(io::Error::other(
-                "an output Atomic commit is already owned by the worker or kernel",
+                "an output Atomic commit is already owned by the worker",
             ));
         }
+        let ready = self
+            .ready
+            .as_ref()
+            .ok_or_else(|| io::Error::other("no rendered output frame is ready"))?;
+        self.validate_worker_queued_frame(ready)?;
         let mut frame = self
             .ready
             .take()
@@ -481,11 +487,12 @@ impl AtomicOutputSwapchain {
         queued: WorkerQueuedOutputFrame,
     ) -> io::Result<()> {
         self.ensure_operational()?;
-        if self.worker_queued.is_some() || self.pending.is_some() {
+        if self.worker_queued.is_some() {
             return Err(io::Error::other(
-                "an output Atomic commit is already owned by the worker or kernel",
+                "an output Atomic commit is already owned by the worker",
             ));
         }
+        self.validate_worker_queued_frame(&queued.frame)?;
         self.worker_queued = Some(queued);
         Ok(())
     }
@@ -827,6 +834,13 @@ impl AtomicOutputSwapchain {
         self.pending.as_ref().map(|pending| pending.frame.target)
     }
 
+    pub(crate) fn latest_future_primary_target(&self) -> Option<PresentationTarget> {
+        self.worker_queued
+            .as_ref()
+            .map(|queued| queued.frame.target)
+            .or_else(|| self.pending_target())
+    }
+
     pub(crate) fn pending_identity(&self) -> Option<QueuedOutputFrameIdentitySnapshot> {
         self.pending
             .as_ref()
@@ -916,6 +930,41 @@ impl AtomicOutputSwapchain {
                 "explicit output ownership exceeds three slots",
             ));
         }
+        if self.ready.is_some() && self.rendering.is_some() {
+            return Err(io::Error::other(
+                "more than one composited primary is prepared",
+            ));
+        }
+        if self.pending.is_some()
+            && self.worker_queued.is_some()
+            && (self.ready.is_some() || self.rendering.is_some())
+        {
+            return Err(io::Error::other(
+                "pending plus worker-queued-next cannot own a third future primary",
+            ));
+        }
+        for frame in [
+            self.pending.as_ref().map(|pending| &pending.frame),
+            self.worker_queued.as_ref().map(|queued| &queued.frame),
+            self.ready.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if frame.pool_generation != self.pool_generation
+                || frame.target.clock_generation != self.pool_generation
+            {
+                return Err(io::Error::other(
+                    "output frame belongs to an old swapchain generation",
+                ));
+            }
+        }
+        if let (Some(pending), Some(worker)) = (&self.pending, &self.worker_queued) {
+            validate_strictly_later_target(pending.frame.target, worker.frame.target)?;
+        }
+        if let Some(ready) = &self.ready {
+            self.validate_later_primary_target(ready.target)?;
+        }
         Ok(())
     }
 
@@ -964,6 +1013,45 @@ impl AtomicOutputSwapchain {
         Ok(())
     }
 
+    fn validate_worker_queued_frame(&self, frame: &RenderedOutputFrame) -> io::Result<()> {
+        if self.ready.as_ref().is_some_and(|ready| {
+            ready.slot != frame.slot
+                || ready.id != frame.id
+                || ready.transaction_id != frame.transaction_id
+                || ready.pool_generation != frame.pool_generation
+                || ready.target != frame.target
+        }) {
+            return Err(io::Error::other(
+                "worker-queued frame does not match ready ownership",
+            ));
+        }
+        if frame.pool_generation != self.pool_generation
+            || frame.target.clock_generation != self.pool_generation
+            || frame.slot == self.current
+            || self.pending_slot() == Some(frame.slot)
+            || self.quarantine_slot_id() == Some(frame.slot)
+            || self.rendering == Some(frame.slot)
+        {
+            return Err(io::Error::other(
+                "worker-queued frame identity aliases another output owner",
+            ));
+        }
+        if let Some(pending) = &self.pending {
+            validate_strictly_later_target(pending.frame.target, frame.target)?;
+        }
+        Ok(())
+    }
+
+    fn validate_later_primary_target(&self, target: PresentationTarget) -> io::Result<()> {
+        if let Some(worker) = &self.worker_queued {
+            validate_strictly_later_target(worker.frame.target, target)
+        } else if let Some(pending) = &self.pending {
+            validate_strictly_later_target(pending.frame.target, target)
+        } else {
+            Ok(())
+        }
+    }
+
     fn slot_is_free(&self, slot: OutputSlotId) -> bool {
         slot != self.current
             && self.worker_queued_slot() != Some(slot)
@@ -972,4 +1060,19 @@ impl AtomicOutputSwapchain {
             && self.rendering != Some(slot)
             && self.quarantine_slot_id() != Some(slot)
     }
+}
+
+fn validate_strictly_later_target(
+    earlier: PresentationTarget,
+    later: PresentationTarget,
+) -> io::Result<()> {
+    if earlier.clock_generation != later.clock_generation
+        || later.sequence <= earlier.sequence
+        || later.presentation_time <= earlier.presentation_time
+    {
+        return Err(io::Error::other(
+            "later output primary target is not strictly ordered",
+        ));
+    }
+    Ok(())
 }

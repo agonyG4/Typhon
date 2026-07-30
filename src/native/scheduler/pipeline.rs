@@ -76,6 +76,24 @@ impl NativeFrameScheduler {
         };
 
         if pipeline.worker_primary_queued() {
+            if pipeline.pacing_mode() == NativeOutputPacingMode::PredictiveTriple
+                && self.visual_work_queued
+                && matches!(prepared, SchedulerPreparedPrimary::None)
+                && context.render_ahead_allowed
+                && pipeline.triple_capable()
+                && context.presentation_target.is_some()
+                && pipeline.future_primary_depth() < 2
+                && pipeline.free_compositor_slots() > 0
+                && !pipeline.direct_active()
+            {
+                if context
+                    .presentation_target
+                    .is_some_and(|target| now_ns < target.render_start_deadline.get())
+                {
+                    return SchedulerDecision::WaitForRefresh;
+                }
+                return SchedulerDecision::RenderAhead;
+            }
             return SchedulerDecision::WaitForWorkerQueue;
         }
         if pipeline.pacing_mode() == NativeOutputPacingMode::ReactiveDouble {
@@ -101,37 +119,37 @@ impl NativeFrameScheduler {
         }
 
         if pipeline.kernel_primary_submitted() {
-            if self.visual_work_queued {
-                if matches!(prepared, SchedulerPreparedPrimary::Ready { .. })
-                    && context.worker_queue_available
-                    && context.render_ahead_allowed
-                    && pipeline.triple_capable()
-                {
-                    return ready_submit_decision(now_ns, ready_target);
-                }
-                if !matches!(prepared, SchedulerPreparedPrimary::None) {
-                    return SchedulerDecision::WaitForPageFlip;
-                }
-                if pipeline.free_compositor_slots() == 0 {
-                    return SchedulerDecision::WaitForBuffer;
-                }
-                if !context.render_ahead_allowed
-                    || !pipeline.triple_capable()
-                    || context.presentation_target.is_none()
-                    || pipeline.future_primary_depth() >= 2
-                    || pipeline.direct_active()
-                {
-                    return SchedulerDecision::WaitForPageFlip;
-                }
-                if context
-                    .presentation_target
-                    .is_some_and(|target| now_ns < target.render_start_deadline.get())
-                {
-                    return SchedulerDecision::WaitForRefresh;
-                }
-                return SchedulerDecision::RenderAhead;
+            if matches!(prepared, SchedulerPreparedPrimary::Ready { .. })
+                && context.worker_queue_available
+                && context.render_ahead_allowed
+                && pipeline.triple_capable()
+            {
+                return ready_submit_decision(now_ns, ready_target);
             }
-            return SchedulerDecision::WaitForPageFlip;
+            if !matches!(prepared, SchedulerPreparedPrimary::None) {
+                return SchedulerDecision::WaitForPageFlip;
+            }
+            if !self.visual_work_queued {
+                return SchedulerDecision::WaitForPageFlip;
+            }
+            if pipeline.free_compositor_slots() == 0 {
+                return SchedulerDecision::WaitForBuffer;
+            }
+            if !context.render_ahead_allowed
+                || !pipeline.triple_capable()
+                || context.presentation_target.is_none()
+                || pipeline.future_primary_depth() >= 2
+                || pipeline.direct_active()
+            {
+                return SchedulerDecision::WaitForPageFlip;
+            }
+            if context
+                .presentation_target
+                .is_some_and(|target| now_ns < target.render_start_deadline.get())
+            {
+                return SchedulerDecision::WaitForRefresh;
+            }
+            return SchedulerDecision::RenderAhead;
         }
 
         if matches!(prepared, SchedulerPreparedPrimary::Ready { .. }) {

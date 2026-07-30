@@ -349,7 +349,9 @@ impl OutputPipelineSnapshot {
                     later_generation: later.clock_generation,
                 });
             }
-            if later.sequence <= earlier.sequence {
+            if later.sequence <= earlier.sequence
+                || later.presentation_time <= earlier.presentation_time
+            {
                 return Err(PipelineValidationError::NonMonotonicTargetOrder {
                     earlier_sequence: earlier.sequence,
                     later_sequence: later.sequence,

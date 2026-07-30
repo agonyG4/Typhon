@@ -61,6 +61,57 @@ fn empty_snapshot() -> OutputPipelineSnapshot {
     }
 }
 
+fn with_current(mut snapshot: OutputPipelineSnapshot) -> OutputPipelineSnapshot {
+    snapshot.current_primary = Some(ConfirmedPrimaryState::Composed {
+        transaction_id: transaction_id(9),
+        token: token(9),
+        slot: OutputSlotId::new(0).unwrap(),
+    });
+    snapshot.free_compositor_slots = 2;
+    snapshot
+}
+
+fn ready(transaction: u64, sequence: u64, slot: u8) -> PreparedCompositedState {
+    PreparedCompositedState::Ready {
+        transaction_id: transaction_id(transaction),
+        slot: OutputSlotId::new(slot).unwrap(),
+        target: target(sequence),
+        fence_state:
+            crate::native_output::presentation::pipeline::PreparedFenceState::SubmitWithInFence,
+    }
+}
+
+#[test]
+fn composed_reference_arrangements_cover_every_legal_two_future_pair() {
+    let mut kernel_prepared = with_current(empty_snapshot());
+    kernel_prepared.kernel_submitted = Some(composed_commit(1, 1, 1, 11));
+    kernel_prepared.prepared = ready(2, 2, 2);
+    kernel_prepared.free_compositor_slots = 0;
+    assert_eq!(kernel_prepared.validate(), Ok(()));
+
+    let mut kernel_worker = with_current(empty_snapshot());
+    kernel_worker.kernel_submitted = Some(composed_commit(1, 1, 1, 11));
+    kernel_worker.worker_queued_next = Some(composed_commit(2, 2, 2, 12));
+    kernel_worker.free_compositor_slots = 0;
+    assert_eq!(kernel_worker.validate(), Ok(()));
+
+    let mut worker_prepared = with_current(empty_snapshot());
+    worker_prepared.worker_queued_next = Some(composed_commit(1, 1, 1, 11));
+    worker_prepared.prepared = ready(2, 2, 2);
+    worker_prepared.free_compositor_slots = 0;
+    assert_eq!(worker_prepared.validate(), Ok(()));
+
+    let mut worker = with_current(empty_snapshot());
+    worker.worker_queued_next = Some(composed_commit(1, 1, 1, 11));
+    worker.free_compositor_slots = 1;
+    assert_eq!(worker.validate(), Ok(()));
+
+    let mut prepared = with_current(empty_snapshot());
+    prepared.prepared = ready(1, 1, 1);
+    prepared.free_compositor_slots = 1;
+    assert_eq!(prepared.validate(), Ok(()));
+}
+
 #[test]
 fn pipeline_snapshot_accepts_two_ordered_future_primaries() {
     let mut snapshot = empty_snapshot();
@@ -279,6 +330,62 @@ fn explicit_scheduler_ignores_compatibility_submission_mirror() {
     assert_eq!(
         scheduler.decision_with_pipeline(explicit_scheduler_context(2), &snapshot),
         SchedulerDecision::Render,
+    );
+}
+
+#[test]
+fn prepared_primary_submission_does_not_depend_on_new_visual_demand() {
+    let mut scheduler = NativeFrameScheduler::new(60, 0);
+    let mut snapshot = with_current(empty_snapshot());
+    snapshot.kernel_submitted = Some(composed_commit(1, 1, 1, 11));
+    snapshot.prepared = ready(2, 2, 2);
+    snapshot.free_compositor_slots = 0;
+    let mut context = explicit_scheduler_context(19);
+    context.render_ahead_allowed = true;
+    context.worker_queue_available = true;
+
+    assert_eq!(
+        scheduler.decision_with_pipeline(context, &snapshot),
+        SchedulerDecision::SubmitReady
+    );
+}
+
+#[test]
+fn two_future_primaries_coalesce_new_visual_work_without_rendering_farther_ahead() {
+    let mut scheduler = NativeFrameScheduler::new(60, 0);
+    scheduler.queue_visual_work();
+    let mut snapshot = with_current(empty_snapshot());
+    snapshot.kernel_submitted = Some(composed_commit(1, 1, 1, 11));
+    snapshot.worker_queued_next = Some(composed_commit(2, 2, 2, 12));
+    snapshot.free_compositor_slots = 0;
+    let mut context = explicit_scheduler_context(30);
+    context.render_ahead_allowed = true;
+    context.worker_queue_available = false;
+    context.presentation_target = Some(target(3));
+
+    let decision = scheduler.decision_with_pipeline_diagnostics(context, &snapshot);
+    assert_eq!(decision.action, SchedulerDecision::WaitForWorkerQueue);
+    assert_eq!(
+        decision.wait_reason,
+        Some(PipelineWaitReason::WorkerQueueOccupied)
+    );
+    assert!(scheduler.visual_work_queued());
+}
+
+#[test]
+fn worker_queued_primary_plus_newer_visual_work_can_render_one_later_prepared_frame() {
+    let mut scheduler = NativeFrameScheduler::new(60, 0);
+    scheduler.queue_visual_work();
+    let mut snapshot = with_current(empty_snapshot());
+    snapshot.worker_queued_next = Some(composed_commit(1, 1, 1, 11));
+    snapshot.free_compositor_slots = 1;
+    let mut context = explicit_scheduler_context(30);
+    context.render_ahead_allowed = true;
+    context.presentation_target = Some(target(2));
+
+    assert_eq!(
+        scheduler.decision_with_pipeline(context, &snapshot),
+        SchedulerDecision::RenderAhead
     );
 }
 

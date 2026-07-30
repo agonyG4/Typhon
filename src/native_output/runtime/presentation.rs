@@ -351,7 +351,7 @@ impl NativeRuntime {
         {
             let pending_target = match &**scanout {
                 NativeScanoutBackend::AtomicEglGbm(explicit) => {
-                    explicit.swapchain()?.pending_target()
+                    explicit.swapchain()?.latest_future_primary_target()
                 }
                 _ => None,
             };
@@ -598,11 +598,9 @@ impl NativeRuntime {
                 scheduler_decision,
                 SchedulerDecision::SubmitReady | SchedulerDecision::SubmitReadyLate
             )
-            && atomic_commit_arbiter.kernel_commit_submitted()
-            && atomic_commit_arbiter.worker_slot_available()
-            && atomic_commit_arbiter
-                .kernel_submitted_kind()
-                .is_some_and(|kind| !matches!(kind, AtomicCommitKind::CursorOnly { .. }))
+            && pipeline_snapshot
+                .as_ref()
+                .is_some_and(OutputPipelineSnapshot::can_pre_admit_primary)
             && kms_commit_worker
                 .as_ref()
                 .is_some_and(|worker| worker.admission_available());
@@ -1001,6 +999,7 @@ impl NativeRuntime {
                                 frame_id,
                                 transaction_id,
                             } => {
+                                frame_scheduler.consume_visual_work();
                                 frame_rendered = true;
                                 let trace_timestamp_ns = monotonic_now_ns()?;
                                 presentation_trace.push(

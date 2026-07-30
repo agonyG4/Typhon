@@ -363,6 +363,46 @@ fn explicit_output_swapchain_tracks_one_worker_queued_frame_before_pending() {
 }
 
 #[test]
+fn predictive_swapchain_allows_pending_plus_one_worker_queued_next() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        73,
+    )
+    .unwrap();
+    let pending_slot = swapchain.acquire_render_slot().unwrap();
+    swapchain
+        .finish_render(pending_slot, 1, test_render_fence())
+        .unwrap();
+    swapchain
+        .submit_ready(PageFlipToken::new(730).unwrap(), None)
+        .unwrap();
+
+    let queued_slot = swapchain.acquire_render_slot().unwrap();
+    swapchain
+        .finish_render(queued_slot, 2, test_render_fence())
+        .unwrap();
+    swapchain
+        .take_ready_for_worker(
+            PageFlipToken::new(731).unwrap(),
+            MonotonicTimestampNs::new(10),
+        )
+        .unwrap();
+
+    assert_eq!(swapchain.pending_slot(), Some(pending_slot));
+    assert_eq!(swapchain.worker_queued_slot(), Some(queued_slot));
+    assert_eq!(swapchain.free_slot_count(), 0);
+    assert!(
+        swapchain
+            .acquire_render_slot_for(NativeOutputPacingMode::PredictiveTriple)
+            .is_err()
+    );
+    swapchain
+        .validate_invariants_for(NativeOutputPacingMode::PredictiveTriple)
+        .unwrap();
+}
+
+#[test]
 fn reactive_double_exposes_no_third_render_slot_while_pageflip_is_pending() {
     let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
         explicit_slot_set(),

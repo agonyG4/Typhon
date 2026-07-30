@@ -292,6 +292,12 @@ impl NativeFrameScheduler {
         self.refresh_deadline_ns = None;
     }
 
+    pub fn consume_visual_work(&mut self) {
+        self.visual_work_queued = false;
+        self.protocol_work_queued = false;
+        self.refresh_deadline_ns = None;
+    }
+
     pub fn queue_protocol_work(&mut self, now_ns: u64) {
         if self.visual_work_queued {
             return;
