@@ -202,6 +202,57 @@ fn worker_cursor_success_advances_exact_epoch_once() {
 }
 
 #[test]
+fn desired_queued_submitted_and_current_cursor_states_advance_at_exact_boundaries() {
+    let mut cursor = test_cursor();
+    cursor.set_position(100, 200);
+    cursor.set_visible(true);
+    cursor.set_hardware_path_active(true);
+    let desired = cursor.desired().clone();
+    let desired_epoch = cursor.desired_epoch();
+    let transaction_id = OutputTransactionId::new(
+        std::num::NonZeroU64::new(79).expect("test transaction ID is nonzero"),
+    );
+    let token = PageFlipToken::new(79).unwrap();
+
+    cursor
+        .queue_worker_submission(transaction_id, token, desired_epoch, desired.clone())
+        .unwrap();
+    assert!(!cursor.current().visible);
+    assert_eq!(cursor.submitted_epoch(), INITIAL_CURSOR_EPOCH);
+
+    let queued = cursor
+        .take_worker_submission(transaction_id, token, desired_epoch)
+        .unwrap();
+    cursor.begin_submission_at_epoch(token, queued.visual_state, queued.cursor_epoch);
+    assert!(!cursor.current().visible);
+    assert_eq!(cursor.submitted_epoch(), desired_epoch);
+
+    let stale_token = PageFlipToken::new(80).unwrap();
+    assert!(
+        cursor
+            .complete_submission(stale_token, cursor.generation)
+            .is_err()
+    );
+    assert!(!cursor.current().visible);
+    assert!(
+        cursor
+            .complete_submission(token, cursor.generation + 1)
+            .is_err()
+    );
+    assert!(!cursor.current().visible);
+
+    cursor
+        .complete_submission(token, cursor.generation)
+        .expect("exact pageflip promotes submitted cursor state");
+    assert_eq!(cursor.current(), &desired);
+    assert!(
+        cursor
+            .complete_submission(token, cursor.generation)
+            .is_err()
+    );
+}
+
+#[test]
 fn hidden_cursor_position_changes_do_not_need_submission() {
     let mut cursor = test_cursor();
     cursor.set_position(100, 200);
