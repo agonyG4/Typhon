@@ -55,6 +55,16 @@ fn start_launcher_documents_safe_nvidia_egl_wayland2_default() {
 }
 
 #[test]
+fn nvidia_egl_wayland2_qualifier_accepts_external_kitty_toplevel() {
+    let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let qualifier = fs::read_to_string(repo_dir.join("bin/qualify-nvidia-egl-wayland2"))
+        .expect("NVIDIA EGL Wayland2 qualifier should be readable");
+
+    assert!(qualifier.contains(r"app\.first_toplevel"));
+    assert!(qualifier.contains(r"app\.toplevel.*app_id=kitty"));
+}
+
+#[test]
 fn start_launcher_ignores_inherited_host_display_variables_and_stays_native() {
     let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(repo_dir.join("bin/start-oblivion-one"))

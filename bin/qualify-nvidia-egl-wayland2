@@ -139,7 +139,7 @@ client_pid=$!
 
 first_toplevel=0
 for _ in {1..100}; do
-    if awk '/app\.first_toplevel/ { found = 1 } END { exit found ? 0 : 1 }' "$compositor_log"; then
+    if awk '/app\.first_toplevel|app\.toplevel.*app_id=kitty/ { found = 1 } END { exit found ? 0 : 1 }' "$compositor_log"; then
         first_toplevel=1
         break
     fi
