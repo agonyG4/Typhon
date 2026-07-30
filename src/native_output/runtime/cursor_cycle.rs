@@ -159,12 +159,27 @@ pub(crate) fn atomic_cursor_visibility_policy(
     render_mode: NativeCursorRenderMode,
     input_visible: bool,
 ) -> AtomicCursorVisibilityPolicy {
-    if !input_visible || !desired_visible {
-        AtomicCursorVisibilityPolicy::Hidden
-    } else if render_mode != NativeCursorRenderMode::Hardware || failure_latched {
-        AtomicCursorVisibilityPolicy::UnavailableForDirect
-    } else {
-        AtomicCursorVisibilityPolicy::HardwareVisible
+    let selection = select_cursor_delivery_mode(CursorModePolicyInput {
+        preference: if render_mode == NativeCursorRenderMode::Hardware {
+            CursorPreference::Auto
+        } else {
+            CursorPreference::Software
+        },
+        visible: input_visible && desired_visible,
+        hardware_status: if failure_latched {
+            CursorHardwareStatus::Quarantined
+        } else {
+            CursorHardwareStatus::Proven
+        },
+        geometry_valid: true,
+        software_allowed: true,
+    });
+    match selection {
+        CursorModeSelection::Hidden => AtomicCursorVisibilityPolicy::Hidden,
+        CursorModeSelection::Hardware => AtomicCursorVisibilityPolicy::HardwareVisible,
+        CursorModeSelection::Software | CursorModeSelection::Rejected => {
+            AtomicCursorVisibilityPolicy::UnavailableForDirect
+        }
     }
 }
 

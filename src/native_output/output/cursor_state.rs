@@ -1,7 +1,15 @@
 #![allow(dead_code)]
 
-use crate::native_output::{OutputTransactionId, presentation::plane::CursorRevision};
+use crate::native_output::presentation::plane_policy::{
+    CursorCapabilityKey, CursorCapabilityStatus, CursorQuarantineReason,
+};
+use crate::native_output::{
+    OutputTransactionId,
+    presentation::plane::{CursorRevision, SoftwareCursorSnapshot},
+};
 use oblivion_one::native::kms::{AtomicCursorVisualState, PageFlipToken};
+
+use super::cursor_buffer::CursorFramebufferPin;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct AtomicCursorDirty {
@@ -35,6 +43,24 @@ pub(crate) struct WorkerQueuedCursorSubmission {
     pub(crate) cursor_epoch: u64,
     pub(crate) revision: CursorRevision,
     pub(crate) visual_state: AtomicCursorVisualState,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum CursorDeliveryPlan {
+    Hardware {
+        revision: CursorRevision,
+        state: AtomicCursorVisualState,
+        lease: CursorFramebufferPin,
+        capability_key: CursorCapabilityKey,
+    },
+    Software {
+        revision: CursorRevision,
+        snapshot: SoftwareCursorSnapshot,
+    },
+    Hidden {
+        revision: CursorRevision,
+        disable_hardware_plane: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,27 +112,6 @@ impl CursorRevisionTracker {
         self.submitted = self.desired;
         self.presented = self.desired;
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CursorQuarantineReason {
-    UnsupportedSize,
-    UnsupportedFormat,
-    UnsupportedModifier,
-    UnsupportedTransform,
-    UnsupportedHotspot,
-    TestOnlyRejected,
-    PermanentSubmitRejection,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CursorCapabilityStatus {
-    Unknown,
-    Proven,
-    Quarantined {
-        reason: CursorQuarantineReason,
-        failure_count: u32,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

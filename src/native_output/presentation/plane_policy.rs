@@ -1,0 +1,585 @@
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+
+use crate::native_output::OutputTransactionId;
+
+use super::plane::CursorRevision;
+
+const FIXED_POINT_ONE: u32 = 1 << 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum CursorGeometryClass {
+    FullyVisible,
+    EdgeClipped,
+    CornerClipped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CursorCapabilityKey {
+    pub(crate) output_generation: u64,
+    pub(crate) crtc_id: u32,
+    pub(crate) plane_id: u32,
+    pub(crate) mode_width: u32,
+    pub(crate) mode_height: u32,
+    pub(crate) output_transform: u32,
+    pub(crate) output_scale_milli: u32,
+    pub(crate) format: u32,
+    pub(crate) modifier: u64,
+    pub(crate) cursor_width: u32,
+    pub(crate) cursor_height: u32,
+    pub(crate) hotspot_property_available: bool,
+    pub(crate) geometry_class: CursorGeometryClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorQuarantineReason {
+    UnsupportedSize,
+    UnsupportedFormat,
+    UnsupportedModifier,
+    UnsupportedTransform,
+    UnsupportedHotspot,
+    TestOnlyRejected,
+    PermanentSubmitRejection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorCapabilityStatus {
+    Unknown,
+    Proven,
+    Quarantined {
+        reason: CursorQuarantineReason,
+        failure_count: u32,
+    },
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PlaneCapabilityCache {
+    entries: HashMap<CursorCapabilityKey, CursorCapabilityStatus>,
+}
+
+impl PlaneCapabilityCache {
+    pub(crate) fn status(&self, key: CursorCapabilityKey) -> CursorCapabilityStatus {
+        self.entries
+            .get(&key)
+            .copied()
+            .unwrap_or(CursorCapabilityStatus::Unknown)
+    }
+
+    pub(crate) fn set_status(&mut self, key: CursorCapabilityKey, status: CursorCapabilityStatus) {
+        if status == CursorCapabilityStatus::Unknown {
+            self.entries.remove(&key);
+        } else {
+            self.entries.insert(key, status);
+        }
+    }
+
+    pub(crate) fn mark_proven(&mut self, key: CursorCapabilityKey) {
+        self.entries.insert(key, CursorCapabilityStatus::Proven);
+    }
+
+    pub(crate) fn quarantine(&mut self, key: CursorCapabilityKey, reason: CursorQuarantineReason) {
+        let failure_count = match self.entries.get(&key) {
+            Some(CursorCapabilityStatus::Quarantined {
+                reason: existing,
+                failure_count,
+            }) if *existing == reason => failure_count.saturating_add(1),
+            Some(CursorCapabilityStatus::Unknown)
+            | Some(CursorCapabilityStatus::Proven)
+            | Some(CursorCapabilityStatus::Quarantined { .. })
+            | None => 1,
+        };
+        self.entries.insert(
+            key,
+            CursorCapabilityStatus::Quarantined {
+                reason,
+                failure_count,
+            },
+        );
+    }
+
+    pub(crate) fn invalidate_generation(&mut self, output_generation: u64) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|key, _| key.output_generation == output_generation);
+        before.saturating_sub(self.entries.len())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorFailureKind {
+    Busy,
+    AdmissionContention,
+    UnsupportedSize,
+    UnsupportedFormat,
+    UnsupportedModifier,
+    UnsupportedTransform,
+    UnsupportedHotspot,
+    TestOnlyInvalid,
+    PermanentProperty,
+    TransientIo,
+    GenerationMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorFailureDisposition {
+    Defer,
+    Retry,
+    Quarantine(CursorQuarantineReason),
+    Invalidate,
+}
+
+pub(crate) const fn classify_cursor_failure(
+    failure: CursorFailureKind,
+) -> CursorFailureDisposition {
+    match failure {
+        CursorFailureKind::Busy | CursorFailureKind::AdmissionContention => {
+            CursorFailureDisposition::Defer
+        }
+        CursorFailureKind::UnsupportedSize => {
+            CursorFailureDisposition::Quarantine(CursorQuarantineReason::UnsupportedSize)
+        }
+        CursorFailureKind::UnsupportedFormat => {
+            CursorFailureDisposition::Quarantine(CursorQuarantineReason::UnsupportedFormat)
+        }
+        CursorFailureKind::UnsupportedModifier => {
+            CursorFailureDisposition::Quarantine(CursorQuarantineReason::UnsupportedModifier)
+        }
+        CursorFailureKind::UnsupportedTransform => {
+            CursorFailureDisposition::Quarantine(CursorQuarantineReason::UnsupportedTransform)
+        }
+        CursorFailureKind::UnsupportedHotspot => {
+            CursorFailureDisposition::Quarantine(CursorQuarantineReason::UnsupportedHotspot)
+        }
+        CursorFailureKind::TestOnlyInvalid => {
+            CursorFailureDisposition::Quarantine(CursorQuarantineReason::TestOnlyRejected)
+        }
+        CursorFailureKind::PermanentProperty => {
+            CursorFailureDisposition::Quarantine(CursorQuarantineReason::PermanentSubmitRejection)
+        }
+        CursorFailureKind::TransientIo => CursorFailureDisposition::Retry,
+        CursorFailureKind::GenerationMismatch => CursorFailureDisposition::Invalidate,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CursorGeometryInput {
+    pub(crate) pointer_x: i32,
+    pub(crate) pointer_y: i32,
+    pub(crate) hotspot_x: i32,
+    pub(crate) hotspot_y: i32,
+    pub(crate) cursor_width: u32,
+    pub(crate) cursor_height: u32,
+    pub(crate) output_width: u32,
+    pub(crate) output_height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CursorDestinationRect {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CursorSourceRect {
+    pub(crate) x: u32,
+    pub(crate) y: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NormalizedCursorGeometry {
+    pub(crate) class: CursorGeometryClass,
+    pub(crate) destination: CursorDestinationRect,
+    pub(crate) source: CursorSourceRect,
+}
+
+pub(crate) fn normalize_cursor_geometry(
+    input: CursorGeometryInput,
+) -> Option<NormalizedCursorGeometry> {
+    if input.cursor_width == 0
+        || input.cursor_height == 0
+        || input.output_width == 0
+        || input.output_height == 0
+    {
+        return None;
+    }
+    let origin_x = i64::from(input.pointer_x) - i64::from(input.hotspot_x);
+    let origin_y = i64::from(input.pointer_y) - i64::from(input.hotspot_y);
+    let right = origin_x.saturating_add(i64::from(input.cursor_width));
+    let bottom = origin_y.saturating_add(i64::from(input.cursor_height));
+    let output_right = i64::from(input.output_width);
+    let output_bottom = i64::from(input.output_height);
+    let clipped_left = origin_x.max(0);
+    let clipped_top = origin_y.max(0);
+    let clipped_right = right.min(output_right);
+    let clipped_bottom = bottom.min(output_bottom);
+    if clipped_left >= clipped_right || clipped_top >= clipped_bottom {
+        return None;
+    }
+
+    let clipped_x = clipped_left != origin_x || clipped_right != right;
+    let clipped_y = clipped_top != origin_y || clipped_bottom != bottom;
+    let class = match (clipped_x, clipped_y) {
+        (false, false) => CursorGeometryClass::FullyVisible,
+        (true, true) => CursorGeometryClass::CornerClipped,
+        (true, false) | (false, true) => CursorGeometryClass::EdgeClipped,
+    };
+    let source_x = u32::try_from(clipped_left.saturating_sub(origin_x)).ok()?;
+    let source_y = u32::try_from(clipped_top.saturating_sub(origin_y)).ok()?;
+    let width = u32::try_from(clipped_right.saturating_sub(clipped_left)).ok()?;
+    let height = u32::try_from(clipped_bottom.saturating_sub(clipped_top)).ok()?;
+    Some(NormalizedCursorGeometry {
+        class,
+        destination: CursorDestinationRect {
+            x: i32::try_from(clipped_left).ok()?,
+            y: i32::try_from(clipped_top).ok()?,
+            width,
+            height,
+        },
+        source: CursorSourceRect {
+            x: source_x.checked_mul(FIXED_POINT_ONE)?,
+            y: source_y.checked_mul(FIXED_POINT_ONE)?,
+            width: width.checked_mul(FIXED_POINT_ONE)?,
+            height: height.checked_mul(FIXED_POINT_ONE)?,
+        },
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorPreference {
+    Auto,
+    Hardware,
+    Software,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorHardwareStatus {
+    Unavailable,
+    Unknown,
+    Proven,
+    Quarantined,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CursorModePolicyInput {
+    pub(crate) preference: CursorPreference,
+    pub(crate) visible: bool,
+    pub(crate) hardware_status: CursorHardwareStatus,
+    pub(crate) geometry_valid: bool,
+    pub(crate) software_allowed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorModeSelection {
+    Hidden,
+    Hardware,
+    Software,
+    Rejected,
+}
+
+pub(crate) fn select_cursor_delivery_mode(input: CursorModePolicyInput) -> CursorModeSelection {
+    if !input.visible {
+        return CursorModeSelection::Hidden;
+    }
+    if input.preference == CursorPreference::Software {
+        return if input.software_allowed {
+            CursorModeSelection::Software
+        } else {
+            CursorModeSelection::Rejected
+        };
+    }
+    let hardware_usable = input.geometry_valid
+        && matches!(
+            input.hardware_status,
+            CursorHardwareStatus::Unknown | CursorHardwareStatus::Proven
+        );
+    if hardware_usable {
+        return CursorModeSelection::Hardware;
+    }
+    if input.preference == CursorPreference::Hardware || !input.software_allowed {
+        CursorModeSelection::Rejected
+    } else {
+        CursorModeSelection::Software
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlanePrimaryMode {
+    Composed,
+    Direct,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CursorHardwareCapability {
+    pub(crate) key: CursorCapabilityKey,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PlaneSchedulingInput<'a> {
+    pub(crate) revision: CursorRevision,
+    pub(crate) preference: CursorPreference,
+    pub(crate) visible: bool,
+    pub(crate) geometry: CursorGeometryInput,
+    pub(crate) geometry_valid: bool,
+    pub(crate) hardware: Option<CursorHardwareCapability>,
+    pub(crate) capabilities: &'a PlaneCapabilityCache,
+    pub(crate) primary_mode: PlanePrimaryMode,
+    pub(crate) software_allowed: bool,
+    pub(crate) predictive_triple_active: bool,
+    pub(crate) cursor_kms_changed: bool,
+    pub(crate) hardware_plane_visible: bool,
+    pub(crate) transition_primary: Option<OutputTransactionId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorDeliveryChoice {
+    Hardware {
+        revision: CursorRevision,
+        geometry: NormalizedCursorGeometry,
+        capability_key: CursorCapabilityKey,
+    },
+    Software {
+        revision: CursorRevision,
+    },
+    Hidden {
+        revision: CursorRevision,
+        disable_hardware_plane: bool,
+    },
+    Rejected {
+        revision: CursorRevision,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrimaryPlaneAction {
+    Preserve,
+    TransitionToComposed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorPlaneAction {
+    None,
+    Independent,
+    EmbedInPrimary,
+    AwaitPrimaryTransition,
+    MustBundleWith(OutputTransactionId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorPacingConstraint {
+    Unchanged,
+    ReactiveDouble,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KmsCursorTestPolicy {
+    NotApplicable,
+    Required,
+    SkipProven,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlaneSchedulingReason {
+    Hidden,
+    FullyOutside,
+    SoftwareRequested,
+    HardwareCapabilityUnknown,
+    HardwareCapabilityProven,
+    HardwareCapabilityQuarantined,
+    HardwareUnavailable,
+    InvalidHardwareGeometry,
+    SoftwareUnavailable,
+    HardwareRequiredUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlaneSchedulingDecision {
+    pub(crate) delivery: CursorDeliveryChoice,
+    pub(crate) direct_scanout_compatible: bool,
+    pub(crate) primary_action: PrimaryPlaneAction,
+    pub(crate) cursor_action: CursorPlaneAction,
+    pub(crate) pacing_constraint: CursorPacingConstraint,
+    pub(crate) test_policy: KmsCursorTestPolicy,
+    pub(crate) reason: PlaneSchedulingReason,
+}
+
+pub(crate) fn schedule_planes(input: PlaneSchedulingInput<'_>) -> PlaneSchedulingDecision {
+    let hardware_status = input
+        .hardware
+        .map_or(CursorHardwareStatus::Unavailable, |hardware| {
+            match input.capabilities.status(hardware.key) {
+                CursorCapabilityStatus::Unknown => CursorHardwareStatus::Unknown,
+                CursorCapabilityStatus::Proven => CursorHardwareStatus::Proven,
+                CursorCapabilityStatus::Quarantined { .. } => CursorHardwareStatus::Quarantined,
+            }
+        });
+    let mode = select_cursor_delivery_mode(CursorModePolicyInput {
+        preference: input.preference,
+        visible: input.visible,
+        hardware_status,
+        geometry_valid: input.geometry_valid,
+        software_allowed: input.software_allowed,
+    });
+    if mode == CursorModeSelection::Hidden {
+        return hidden_decision(input, PlaneSchedulingReason::Hidden);
+    }
+    let Some(geometry) = normalize_cursor_geometry(input.geometry) else {
+        return hidden_decision(input, PlaneSchedulingReason::FullyOutside);
+    };
+    if mode == CursorModeSelection::Software && input.preference == CursorPreference::Software {
+        return software_decision(input, PlaneSchedulingReason::SoftwareRequested);
+    }
+    if mode == CursorModeSelection::Rejected {
+        let reason = if !input.software_allowed && input.preference != CursorPreference::Hardware {
+            PlaneSchedulingReason::SoftwareUnavailable
+        } else {
+            PlaneSchedulingReason::HardwareRequiredUnavailable
+        };
+        return rejected_decision(input, reason);
+    }
+    let Some(hardware) = input.hardware else {
+        return hardware_fallback(input, PlaneSchedulingReason::HardwareUnavailable);
+    };
+    if !input.geometry_valid || hardware.key.geometry_class != geometry.class {
+        return hardware_fallback(input, PlaneSchedulingReason::InvalidHardwareGeometry);
+    }
+
+    match input.capabilities.status(hardware.key) {
+        CursorCapabilityStatus::Unknown => hardware_decision(
+            input,
+            geometry,
+            hardware.key,
+            KmsCursorTestPolicy::Required,
+            PlaneSchedulingReason::HardwareCapabilityUnknown,
+        ),
+        CursorCapabilityStatus::Proven => hardware_decision(
+            input,
+            geometry,
+            hardware.key,
+            KmsCursorTestPolicy::SkipProven,
+            PlaneSchedulingReason::HardwareCapabilityProven,
+        ),
+        CursorCapabilityStatus::Quarantined { .. } => {
+            hardware_fallback(input, PlaneSchedulingReason::HardwareCapabilityQuarantined)
+        }
+    }
+}
+
+fn hidden_decision(
+    input: PlaneSchedulingInput<'_>,
+    reason: PlaneSchedulingReason,
+) -> PlaneSchedulingDecision {
+    let disable_hardware_plane = input.hardware_plane_visible;
+    PlaneSchedulingDecision {
+        delivery: CursorDeliveryChoice::Hidden {
+            revision: input.revision,
+            disable_hardware_plane,
+        },
+        direct_scanout_compatible: true,
+        primary_action: PrimaryPlaneAction::Preserve,
+        cursor_action: if disable_hardware_plane && input.cursor_kms_changed {
+            CursorPlaneAction::Independent
+        } else {
+            CursorPlaneAction::None
+        },
+        pacing_constraint: CursorPacingConstraint::Unchanged,
+        test_policy: KmsCursorTestPolicy::NotApplicable,
+        reason,
+    }
+}
+
+fn hardware_fallback(
+    input: PlaneSchedulingInput<'_>,
+    reason: PlaneSchedulingReason,
+) -> PlaneSchedulingDecision {
+    if input.preference == CursorPreference::Hardware {
+        return rejected_decision(input, PlaneSchedulingReason::HardwareRequiredUnavailable);
+    }
+    software_decision(input, reason)
+}
+
+fn software_decision(
+    input: PlaneSchedulingInput<'_>,
+    reason: PlaneSchedulingReason,
+) -> PlaneSchedulingDecision {
+    if !input.software_allowed {
+        return rejected_decision(input, PlaneSchedulingReason::SoftwareUnavailable);
+    }
+    let transition = input.primary_mode == PlanePrimaryMode::Direct;
+    let cursor_action = if let Some(primary) = input.transition_primary {
+        CursorPlaneAction::MustBundleWith(primary)
+    } else if transition {
+        CursorPlaneAction::AwaitPrimaryTransition
+    } else {
+        CursorPlaneAction::EmbedInPrimary
+    };
+    PlaneSchedulingDecision {
+        delivery: CursorDeliveryChoice::Software {
+            revision: input.revision,
+        },
+        direct_scanout_compatible: false,
+        primary_action: if transition {
+            PrimaryPlaneAction::TransitionToComposed
+        } else {
+            PrimaryPlaneAction::Preserve
+        },
+        cursor_action,
+        pacing_constraint: CursorPacingConstraint::ReactiveDouble,
+        test_policy: KmsCursorTestPolicy::NotApplicable,
+        reason,
+    }
+}
+
+fn hardware_decision(
+    input: PlaneSchedulingInput<'_>,
+    geometry: NormalizedCursorGeometry,
+    capability_key: CursorCapabilityKey,
+    test_policy: KmsCursorTestPolicy,
+    reason: PlaneSchedulingReason,
+) -> PlaneSchedulingDecision {
+    PlaneSchedulingDecision {
+        delivery: CursorDeliveryChoice::Hardware {
+            revision: input.revision,
+            geometry,
+            capability_key,
+        },
+        direct_scanout_compatible: true,
+        primary_action: PrimaryPlaneAction::Preserve,
+        cursor_action: if input.cursor_kms_changed {
+            input.transition_primary.map_or(
+                CursorPlaneAction::Independent,
+                CursorPlaneAction::MustBundleWith,
+            )
+        } else {
+            CursorPlaneAction::None
+        },
+        pacing_constraint: CursorPacingConstraint::Unchanged,
+        test_policy,
+        reason,
+    }
+}
+
+fn rejected_decision(
+    input: PlaneSchedulingInput<'_>,
+    reason: PlaneSchedulingReason,
+) -> PlaneSchedulingDecision {
+    PlaneSchedulingDecision {
+        delivery: CursorDeliveryChoice::Rejected {
+            revision: input.revision,
+        },
+        direct_scanout_compatible: false,
+        primary_action: if input.primary_mode == PlanePrimaryMode::Direct {
+            PrimaryPlaneAction::TransitionToComposed
+        } else {
+            PrimaryPlaneAction::Preserve
+        },
+        cursor_action: CursorPlaneAction::None,
+        pacing_constraint: CursorPacingConstraint::Unchanged,
+        test_policy: KmsCursorTestPolicy::NotApplicable,
+        reason,
+    }
+}

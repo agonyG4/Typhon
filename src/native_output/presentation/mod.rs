@@ -1,6 +1,7 @@
 pub(crate) mod ledger;
 pub(crate) mod pipeline;
 pub(crate) mod plane;
+pub(crate) mod plane_policy;
 pub(crate) mod qualification;
 pub(crate) mod trace;
 pub(crate) mod transaction;

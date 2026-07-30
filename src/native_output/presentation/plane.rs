@@ -48,6 +48,52 @@ pub(crate) struct CursorRevision {
     pub(crate) visibility: CursorVisibilityEpoch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorSource {
+    Hidden,
+    Theme,
+    Client,
+    InteractionOverride,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlanePoint {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlaneSize {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutputTransform(pub(crate) u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CursorDesiredState {
+    pub(crate) revision: CursorRevision,
+    pub(crate) source: CursorSource,
+    pub(crate) visible: bool,
+    pub(crate) logical_position: PlanePoint,
+    pub(crate) output_position: PlanePoint,
+    pub(crate) hotspot: PlanePoint,
+    pub(crate) size: PlaneSize,
+    pub(crate) transform: OutputTransform,
+    pub(crate) scale: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SoftwareCursorSnapshot {
+    pub(crate) revision: CursorRevision,
+    pub(crate) output_position: PlanePoint,
+    pub(crate) hotspot: PlanePoint,
+    pub(crate) size: PlaneSize,
+    pub(crate) transform: OutputTransform,
+    pub(crate) scale: u32,
+}
+
 impl CursorRevision {
     pub(crate) const fn initial() -> Self {
         Self {
