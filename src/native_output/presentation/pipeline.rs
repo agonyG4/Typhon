@@ -11,6 +11,7 @@ use oblivion_one::native::scheduler::{
     NativeOutputPacingMode, PresentationPipelineView, SchedulerPreparedPrimary,
 };
 
+use super::plane::PresentedPlaneSnapshot;
 use crate::native_output::{DirectScanoutCandidateKey, OutputSlotId, OutputTransactionId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +172,9 @@ impl PreparedCompositedState {
 pub(crate) struct OutputPipelineSnapshot {
     pub(crate) output_generation: u64,
     pub(crate) pacing_mode: NativeOutputPacingMode,
+    /// Transitional authoritative plane view. `current_primary` remains as a
+    /// compatibility mirror until all pageflip consumers migrate.
+    pub(crate) presented_planes: PresentedPlaneSnapshot,
     pub(crate) current_primary: Option<ConfirmedPrimaryState>,
     pub(crate) kernel_submitted: Option<QueuedCommitSnapshot>,
     pub(crate) worker_queued_next: Option<QueuedCommitSnapshot>,
@@ -212,6 +216,7 @@ pub(crate) enum PipelineValidationError {
     PreparedCapacityExceeded {
         count: u8,
     },
+    PresentedPrimaryMismatch,
 }
 
 pub(crate) fn validate_pipeline_owner_counts(
@@ -283,6 +288,9 @@ impl OutputPipelineSnapshot {
         )?;
         if self.output_generation == 0 {
             return Err(PipelineValidationError::ZeroOutputGeneration);
+        }
+        if self.presented_planes.primary != self.current_primary {
+            return Err(PipelineValidationError::PresentedPrimaryMismatch);
         }
         for commit in [self.kernel_submitted, self.worker_queued_next]
             .into_iter()

@@ -52,6 +52,9 @@ fn empty_snapshot() -> OutputPipelineSnapshot {
     OutputPipelineSnapshot {
         output_generation: 1,
         pacing_mode: NativeOutputPacingMode::PredictiveTriple,
+        presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(
+            None,
+        ),
         current_primary: None,
         kernel_submitted: None,
         worker_queued_next: None,
@@ -62,11 +65,13 @@ fn empty_snapshot() -> OutputPipelineSnapshot {
 }
 
 fn with_current(mut snapshot: OutputPipelineSnapshot) -> OutputPipelineSnapshot {
-    snapshot.current_primary = Some(ConfirmedPrimaryState::Composed {
+    let current = ConfirmedPrimaryState::Composed {
         transaction_id: transaction_id(9),
         token: token(9),
         slot: OutputSlotId::new(0).unwrap(),
-    });
+    };
+    snapshot.current_primary = Some(current);
+    snapshot.presented_planes.primary = Some(current);
     snapshot.free_compositor_slots = 2;
     snapshot
 }
@@ -162,11 +167,13 @@ fn pipeline_snapshot_rejects_old_output_generation() {
 #[test]
 fn pipeline_snapshot_rejects_slot_aliasing() {
     let mut snapshot = empty_snapshot();
-    snapshot.current_primary = Some(ConfirmedPrimaryState::Composed {
+    let current = ConfirmedPrimaryState::Composed {
         transaction_id: transaction_id(9),
         token: token(9),
         slot: OutputSlotId::new(0).unwrap(),
-    });
+    };
+    snapshot.current_primary = Some(current);
+    snapshot.presented_planes.primary = Some(current);
     snapshot.kernel_submitted = Some(composed_commit(1, 1, 0, 10));
 
     assert_eq!(
@@ -301,13 +308,15 @@ fn direct_active_is_derived_only_from_confirmed_primary() {
     assert_eq!(direct_commit.compositor_slot(), None);
 
     snapshot.kernel_submitted = None;
-    snapshot.current_primary = Some(ConfirmedPrimaryState::Direct {
+    let current = ConfirmedPrimaryState::Direct {
         transaction_id: transaction_id(1),
         token: token(1),
         surface_id: 7,
         key: test_direct_key(),
         framebuffer_id: 22,
-    });
+    };
+    snapshot.current_primary = Some(current);
+    snapshot.presented_planes.primary = Some(current);
     assert!(snapshot.direct_active());
 }
 

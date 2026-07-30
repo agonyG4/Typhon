@@ -355,6 +355,14 @@ fn validate_confirmed_primary(
     }
 }
 
+pub(super) fn require_explicit_output_swapchain(
+    scanout: &NativeScanoutBackend,
+) -> io::Result<&AtomicOutputSwapchain> {
+    scanout
+        .explicit_output_swapchain()
+        .ok_or_else(|| io::Error::other("explicit Atomic presentation has no output swapchain"))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_output_pipeline_snapshot(
     output_generation: u64,
@@ -365,6 +373,7 @@ pub(super) fn build_output_pipeline_snapshot(
     current_primary: Option<ConfirmedPrimaryState>,
     rendering_target: Option<PresentationTarget>,
     triple_capability: TripleCapability,
+    legacy_cursor: Option<&crate::native_output::output::NativeAtomicCursor>,
 ) -> Result<OutputPipelineSnapshot, PipelineSnapshotError> {
     swapchain
         .validate_invariants_for(pacing_mode)
@@ -459,9 +468,12 @@ pub(super) fn build_output_pipeline_snapshot(
     } else {
         PreparedCompositedState::None
     };
-    let snapshot = OutputPipelineSnapshot {
+    let mut snapshot = OutputPipelineSnapshot {
         output_generation,
         pacing_mode,
+        presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(
+            current_primary,
+        ),
         current_primary,
         kernel_submitted,
         worker_queued_next,
@@ -469,6 +481,15 @@ pub(super) fn build_output_pipeline_snapshot(
         free_compositor_slots: u8::try_from(swapchain.free_slot_count()).unwrap_or(u8::MAX),
         triple_capability,
     };
+    if let Some(cursor) = legacy_cursor {
+        snapshot.presented_planes.cursor = cursor.presented_plane_state();
+        debug_assert!(
+            snapshot
+                .presented_planes
+                .cursor
+                .kms_equivalent_to(cursor.current())
+        );
+    }
     snapshot
         .validate()
         .map_err(PipelineSnapshotError::PipelineInvariant)?;
@@ -496,6 +517,7 @@ impl NativeRuntime {
             self.confirmed_primary_assignment,
             self.scheduled_presentation_target,
             capability,
+            self.atomic_cursor.as_ref(),
         )?;
         Ok(Some(snapshot))
     }
@@ -672,6 +694,7 @@ mod tests {
             None,
             None,
             TripleCapability::Capable,
+            None,
         )
         .unwrap();
 
@@ -701,6 +724,7 @@ mod tests {
                 None,
                 None,
                 TripleCapability::Capable,
+                None,
             ),
             Err(PipelineSnapshotError::MissingTransaction {
                 owner: "prepared_ready",
@@ -726,6 +750,7 @@ mod tests {
                 None,
                 None,
                 TripleCapability::Capable,
+                None,
             ),
             Err(PipelineSnapshotError::IdentityMismatch {
                 owner: "prepared_ready",
@@ -767,6 +792,7 @@ mod tests {
                 None,
                 None,
                 TripleCapability::Capable,
+                None,
             ),
             Err(PipelineSnapshotError::IdentityMismatch {
                 owner: "kernel_submitted",
@@ -815,6 +841,7 @@ mod tests {
                 None,
                 None,
                 TripleCapability::Capable,
+                None,
             ),
             Err(PipelineSnapshotError::TerminalTransactionOwnsResource {
                 owner: "worker_queued_next",
@@ -880,6 +907,7 @@ mod tests {
                 None,
                 None,
                 TripleCapability::Capable,
+                None,
             ),
             Err(PipelineSnapshotError::UnexpectedSwapchainRole {
                 owner: "worker_queued_next",
@@ -923,6 +951,7 @@ mod tests {
             None,
             None,
             TripleCapability::Capable,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -960,6 +989,7 @@ mod tests {
             Some(current),
             None,
             TripleCapability::Capable,
+            None,
         )
         .unwrap();
         assert_eq!(confirmed.current_primary, Some(current));

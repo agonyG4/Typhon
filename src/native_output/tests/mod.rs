@@ -25,6 +25,7 @@ mod fullscreen_cadence;
 mod input;
 mod input_interaction_liveness;
 mod output;
+mod plane_scheduling_model;
 mod presentation_transactions;
 mod scanout;
 mod shell_control;

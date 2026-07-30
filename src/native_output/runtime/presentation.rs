@@ -382,9 +382,8 @@ impl NativeRuntime {
                 .as_ref()
                 .is_some_and(|worker| worker.admission_available());
         let pipeline_snapshot = if explicit_output {
-            let swapchain = scanout.explicit_output_swapchain().ok_or_else(|| {
-                io::Error::other("explicit Atomic presentation has no output swapchain")
-            })?;
+            let swapchain =
+                super::presentation_pipeline::require_explicit_output_swapchain(scanout)?;
             let pipeline = build_output_pipeline_snapshot(
                 *drm_file_generation,
                 pacing_mode,
@@ -394,6 +393,7 @@ impl NativeRuntime {
                 *confirmed_primary_assignment,
                 *scheduled_presentation_target,
                 triple_capability,
+                atomic_cursor.as_ref(),
             )
             .map_err(|error| {
                 io::Error::other(format!(

@@ -405,6 +405,29 @@ impl NativeAtomicCursor {
         &self.current
     }
 
+    pub(crate) fn presented_plane_state(
+        &self,
+    ) -> crate::native_output::presentation::plane::PresentedCursorState {
+        use crate::native_output::presentation::plane::{
+            CursorCoupling, CursorRevision, PresentedCursorState,
+        };
+
+        let legacy_epoch =
+            std::num::NonZeroU64::new(self.submitted_epoch).expect("cursor epoch is nonzero");
+        let coupling = if self.current.visible {
+            CursorCoupling::IndependentPlane
+        } else {
+            CursorCoupling::Hidden
+        };
+        let presented = PresentedCursorState::from_atomic(
+            CursorRevision::from_legacy_epoch(legacy_epoch),
+            coupling,
+            &self.current,
+        );
+        debug_assert!(presented.kms_equivalent_to(&self.current));
+        presented
+    }
+
     pub(crate) const fn desired_epoch(&self) -> u64 {
         self.desired_epoch
     }
