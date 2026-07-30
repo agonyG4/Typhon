@@ -396,11 +396,13 @@ impl AdaptiveBufferingController {
                 self.force_unavailable_blocker = None;
             }
             (AdaptiveTripleBufferPolicy::Force, TripleCapability::Unavailable(blocker)) => {
-                self.mode = AdaptiveBufferingMode::Double;
-                self.entry_reason = None;
-                self.entered_at = None;
-                self.low_pressure_since = None;
                 self.force_unavailable_blocker = Some(blocker);
+                if self.mode != AdaptiveBufferingMode::Triple {
+                    self.mode = AdaptiveBufferingMode::Double;
+                    self.entry_reason = None;
+                    self.entered_at = None;
+                    self.low_pressure_since = None;
+                }
             }
             (AdaptiveTripleBufferPolicy::Force, TripleCapability::Capable) => {
                 self.mode = AdaptiveBufferingMode::Triple;
@@ -408,11 +410,13 @@ impl AdaptiveBufferingController {
                 self.force_unavailable_blocker = None;
             }
             (AdaptiveTripleBufferPolicy::Auto, TripleCapability::Unavailable(_)) => {
-                self.mode = AdaptiveBufferingMode::Double;
-                self.entry_reason = None;
-                self.entered_at = None;
-                self.low_pressure_since = None;
                 self.force_unavailable_blocker = None;
+                if self.mode != AdaptiveBufferingMode::Triple {
+                    self.mode = AdaptiveBufferingMode::Double;
+                    self.entry_reason = None;
+                    self.entered_at = None;
+                    self.low_pressure_since = None;
+                }
             }
             (AdaptiveTripleBufferPolicy::Auto, TripleCapability::Capable) => {
                 self.force_unavailable_blocker = None;
@@ -444,10 +448,14 @@ impl AdaptiveBufferingController {
                 }
                 _ => None,
             };
-            self.mode = AdaptiveBufferingMode::Double;
-            self.entry_reason = None;
-            self.entered_at = None;
-            self.low_pressure_since = None;
+            if self.mode != AdaptiveBufferingMode::Triple
+                || (!prepared_frame_exists && future_primary_depth <= 1)
+            {
+                self.mode = AdaptiveBufferingMode::Double;
+                self.entry_reason = None;
+                self.entered_at = None;
+                self.low_pressure_since = None;
+            }
             return;
         };
         self.force_unavailable_blocker = None;
@@ -1224,6 +1232,53 @@ mod tests {
                 1,
             );
         }
+        assert_eq!(controller.mode(), AdaptiveBufferingMode::Double);
+    }
+
+    #[test]
+    fn capability_loss_drains_two_future_primaries_before_leaving_triple() {
+        let refresh = Duration::from_millis(10);
+        let blocker = TripleCapabilityBlocker::SubmissionTransportUnhealthy;
+        let mut controller = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+        controller.observe_with_pipeline(
+            10_000_000,
+            refresh,
+            None,
+            1,
+            MonotonicTimestampNs::new(10_000_000),
+            true,
+            TripleCapability::Capable,
+            false,
+            0,
+        );
+        assert_eq!(controller.mode(), AdaptiveBufferingMode::Triple);
+
+        controller.apply_capability(TripleCapability::Unavailable(blocker));
+        assert_eq!(controller.mode(), AdaptiveBufferingMode::Triple);
+        controller.observe_with_pipeline(
+            7_000_000,
+            refresh,
+            None,
+            2,
+            MonotonicTimestampNs::new(20_000_000),
+            true,
+            TripleCapability::Unavailable(blocker),
+            false,
+            2,
+        );
+        assert_eq!(controller.mode(), AdaptiveBufferingMode::Triple);
+
+        controller.observe_with_pipeline(
+            7_000_000,
+            refresh,
+            None,
+            3,
+            MonotonicTimestampNs::new(30_000_000),
+            true,
+            TripleCapability::Unavailable(blocker),
+            false,
+            1,
+        );
         assert_eq!(controller.mode(), AdaptiveBufferingMode::Double);
     }
 
