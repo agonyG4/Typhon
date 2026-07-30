@@ -228,6 +228,61 @@ fn cursor_only_commit_does_not_increase_future_primary_depth() {
 }
 
 #[test]
+fn kernel_cursor_only_allows_one_prepared_primary_but_forbids_pre_admission() {
+    let mut snapshot = empty_snapshot();
+    snapshot.kernel_submitted = Some(QueuedCommitSnapshot {
+        token: token(1),
+        output_generation: 1,
+        crtc_id: 7,
+        target: target(1),
+        kind: PipelineCommitKind::CursorOnly {
+            transaction_id: transaction_id(1),
+            cursor_epoch: 4,
+            framebuffer_id: Some(10),
+        },
+    });
+    snapshot.prepared = ready(2, 2, 0);
+    snapshot.free_compositor_slots = 1;
+
+    assert!(snapshot.kernel_cursor_only());
+    assert_eq!(snapshot.future_primary_depth(), 1);
+    assert!(!snapshot.can_pre_admit_primary());
+    assert_eq!(snapshot.validate(), Ok(()));
+}
+
+#[test]
+fn scheduler_renders_then_holds_primary_behind_kernel_cursor_only() {
+    let mut scheduler = NativeFrameScheduler::new(60, 0);
+    scheduler.queue_visual_work();
+    let mut snapshot = empty_snapshot();
+    snapshot.pacing_mode = NativeOutputPacingMode::PredictiveTriple;
+    snapshot.kernel_submitted = Some(QueuedCommitSnapshot {
+        token: token(1),
+        output_generation: 1,
+        crtc_id: 7,
+        target: target(1),
+        kind: PipelineCommitKind::CursorOnly {
+            transaction_id: transaction_id(1),
+            cursor_epoch: 5,
+            framebuffer_id: Some(10),
+        },
+    });
+    snapshot.free_compositor_slots = 2;
+
+    assert_eq!(
+        scheduler.decision_with_pipeline(explicit_scheduler_context(30), &snapshot),
+        SchedulerDecision::Render
+    );
+
+    snapshot.prepared = ready(2, 2, 0);
+    snapshot.free_compositor_slots = 1;
+    assert_eq!(
+        scheduler.decision_with_pipeline(explicit_scheduler_context(31), &snapshot),
+        SchedulerDecision::WaitForPageFlip
+    );
+}
+
+#[test]
 fn direct_active_is_derived_only_from_confirmed_primary() {
     let mut snapshot = empty_snapshot();
     let direct_commit = PipelineCommitKind::DirectPrimary {

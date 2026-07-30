@@ -249,6 +249,11 @@ impl OutputPipelineSnapshot {
         self.worker_queued_next.is_some()
     }
 
+    pub(crate) fn kernel_cursor_only(&self) -> bool {
+        self.kernel_submitted
+            .is_some_and(|commit| matches!(commit.kind, PipelineCommitKind::CursorOnly { .. }))
+    }
+
     pub(crate) const fn direct_active(&self) -> bool {
         matches!(
             self.current_primary,
@@ -267,9 +272,7 @@ impl OutputPipelineSnapshot {
         matches!(self.prepared, PreparedCompositedState::Ready { .. })
             && self.worker_queued_next.is_none()
             && self.future_primary_depth() <= 2
-            && !self
-                .kernel_submitted
-                .is_some_and(|commit| matches!(commit.kind, PipelineCommitKind::CursorOnly { .. }))
+            && !self.kernel_cursor_only()
     }
 
     pub(crate) fn validate(&self) -> Result<(), PipelineValidationError> {
