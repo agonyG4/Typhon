@@ -1,6 +1,6 @@
 //! Bounded admission and result queues for the Atomic submit worker.
 
-use super::{KmsCommitJob, KmsWorkerEvent};
+use super::{KmsCommitBundleIdentity, KmsCommitJob, KmsWorkerEvent};
 use crate::native_output::DirectScanoutCandidateKey;
 use std::{
     collections::{HashSet, VecDeque},
@@ -208,6 +208,7 @@ pub(crate) struct KmsWorkerFatalJob {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkerInFlight {
+    pub(crate) bundle: KmsCommitBundleIdentity,
     pub(crate) token: oblivion_one::native::kms::PageFlipToken,
     pub(crate) transaction_id: crate::native_output::OutputTransactionId,
     pub(crate) output_generation: u64,

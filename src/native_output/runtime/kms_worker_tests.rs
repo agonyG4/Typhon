@@ -4,8 +4,8 @@ use super::kms_worker::{
     retain_uncertain_job_with_suspension,
 };
 use crate::native_output::kms_worker::{
-    KmsCommitJob, KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy,
-    KmsWorkerFatalJob,
+    KmsBundleOwners, KmsCommitJob, KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership,
+    KmsTestOnlyPolicy, KmsWorkerFatalJob,
 };
 use crate::native_output::runtime::AtomicCommitKind;
 use crate::native_output::scanout::DirectPrimaryLease;
@@ -76,6 +76,9 @@ fn test_uncertain_direct_job(lease: DirectPrimaryLease) -> KmsCommitJob {
     let transaction_id =
         OutputTransactionId::new(std::num::NonZeroU64::new(70).expect("test transaction ID"));
     KmsCommitJob {
+        bundle_id:
+            crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
+        owners: KmsBundleOwners::legacy_unchecked(),
         transaction_id,
         token,
         output_generation: 1,

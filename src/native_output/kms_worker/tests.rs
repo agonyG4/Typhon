@@ -202,6 +202,11 @@ pub(super) fn test_job(token: u64) -> KmsCommitJob {
         std::num::NonZeroU64::new(token).expect("test transaction ID is nonzero"),
     );
     KmsCommitJob {
+        bundle_id:
+            crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(
+                oblivion_one::native::kms::PageFlipToken::new(token).unwrap(),
+            ),
+        owners: KmsBundleOwners::legacy_unchecked(),
         transaction_id,
         token: oblivion_one::native::kms::PageFlipToken::new(token).unwrap(),
         output_generation: 1,

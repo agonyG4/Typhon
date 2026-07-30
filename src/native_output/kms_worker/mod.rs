@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod bundle;
 mod payload;
 mod policy;
 mod queue;
@@ -28,3 +29,6 @@ mod direct_lease_tests;
 mod task4_tests;
 #[cfg(test)]
 mod tests;
+pub(crate) use bundle::{KmsBundleOwners, KmsCommitBundleIdentity};
+#[cfg(test)]
+pub(crate) use bundle::{KmsCursorOwner, KmsPrimaryOwner};

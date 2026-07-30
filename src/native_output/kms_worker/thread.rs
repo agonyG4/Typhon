@@ -9,7 +9,8 @@ use super::queue::{
     drain_eventfd, notify_eventfd,
 };
 use super::{
-    KmsCommitAdmissionPermit, KmsCommitJob, KmsCommitTimingModel, KmsWorkerAdmissionError,
+    KmsCommitAdmissionPermit, KmsCommitBundleIdentity, KmsCommitJob, KmsCommitTimingModel,
+    KmsWorkerAdmissionError,
 };
 use crate::native_output::{
     OutputTransactionId, presentation::transaction::DirectScanoutCandidateKey,
@@ -72,11 +73,13 @@ pub(crate) enum KmsWorkerEvent {
         error: AtomicKmsError,
     },
     BusyDeferred {
+        bundle: KmsCommitBundleIdentity,
         transaction_id: OutputTransactionId,
         token: PageFlipToken,
         retry: u8,
     },
     SubmitLate {
+        bundle: KmsCommitBundleIdentity,
         transaction_id: OutputTransactionId,
         token: PageFlipToken,
         late_by_ns: u64,
@@ -86,6 +89,7 @@ pub(crate) enum KmsWorkerEvent {
         error: AtomicKmsError,
     },
     PageflipTimeout {
+        bundle: KmsCommitBundleIdentity,
         transaction_id: OutputTransactionId,
         token: PageFlipToken,
         detected_at: u64,
@@ -537,6 +541,7 @@ impl ExecutingDirectCandidateGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.inflight = Some(WorkerInFlight {
+            bundle: job.identity(),
             token: job.token,
             transaction_id: job.transaction_id,
             output_generation: job.output_generation,
@@ -685,6 +690,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
             if !publish_event(
                 &shared,
                 KmsWorkerEvent::SubmitLate {
+                    bundle: job.identity(),
                     transaction_id: job.transaction_id,
                     token: job.token,
                     late_by_ns: decision.late_by_ns,
@@ -882,6 +888,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     if !publish_event(
                         &shared,
                         KmsWorkerEvent::BusyDeferred {
+                            bundle: job.identity(),
                             transaction_id: job.transaction_id,
                             token: job.token,
                             retry: retries,
@@ -1008,17 +1015,17 @@ fn wait_for_pageflip_or_quiesce(
             .wait_timeout(state, Duration::from_secs(1))
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state = next;
-        if timeout.timed_out()
-            && !timeout_reported
-            && state
-                .inflight
-                .is_some_and(|inflight| inflight.token == token)
-        {
+        let timed_out_bundle = (timeout.timed_out() && !timeout_reported)
+            .then(|| state.inflight.filter(|inflight| inflight.token == token))
+            .flatten()
+            .map(|inflight| inflight.bundle);
+        if let Some(bundle) = timed_out_bundle {
             timeout_reported = true;
             drop(state);
             if !publish_event(
                 shared,
                 KmsWorkerEvent::PageflipTimeout {
+                    bundle,
                     transaction_id,
                     token,
                     detected_at: monotonic_now_ns(),

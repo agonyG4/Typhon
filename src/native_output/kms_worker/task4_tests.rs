@@ -4,8 +4,9 @@ use super::tests::{
 };
 use super::thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
 use super::{
-    KmsCommitJob, KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy,
-    KmsWorkerEvent,
+    KmsBundleOwners, KmsCommitJob, KmsCommitWorkerHandle, KmsCursorOwner, KmsCursorUpdate,
+    KmsPrimaryOwner, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy, KmsWorkerEvent,
+    KmsWorkerFatalJob,
 };
 use oblivion_one::native::kms::AtomicCursorVisualState;
 use std::{
@@ -14,6 +15,144 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+fn two_owner_job(
+    token: u64,
+) -> (
+    KmsCommitJob,
+    crate::native_output::OutputTransactionId,
+    crate::native_output::OutputTransactionId,
+) {
+    let mut job = test_job(token);
+    let primary_id = job.transaction_id;
+    let cursor_id = crate::native_output::OutputTransactionId::new(
+        std::num::NonZeroU64::new(token.saturating_mul(10)).unwrap(),
+    );
+    let transaction = |id, epoch| {
+        Arc::new(
+            crate::native_output::OutputTransaction::cursor_only(
+                id,
+                1,
+                oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(0),
+                job.target,
+                oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
+                epoch,
+                None,
+                crate::native_output::OutputReleasePlan::Pageflip,
+            )
+            .unwrap(),
+        )
+    };
+    job.owners = KmsBundleOwners::new(
+        Some(KmsPrimaryOwner {
+            transaction: transaction(primary_id, token),
+        }),
+        Some(KmsCursorOwner {
+            transaction: transaction(cursor_id, token.saturating_mul(10)),
+            sidecar_id: None,
+            revision: crate::native_output::presentation::plane::CursorRevision::initial(),
+        }),
+    )
+    .unwrap();
+    (job, primary_id, cursor_id)
+}
+
+fn assert_two_owners(
+    job: &KmsCommitJob,
+    primary_id: crate::native_output::OutputTransactionId,
+    cursor_id: crate::native_output::OutputTransactionId,
+) {
+    assert_eq!(job.owners.primary_transaction_id(), Some(primary_id));
+    assert_eq!(job.owners.cursor_transaction_id(), Some(cursor_id));
+}
+
+#[test]
+fn rejection_event_retains_both_logical_bundle_owners() {
+    let (job, primary_id, cursor_id) = two_owner_job(33);
+    let event = KmsWorkerEvent::TestRejected {
+        job,
+        error: oblivion_one::native::kms::AtomicKmsError::new(
+            oblivion_one::native::kms::AtomicKmsErrorKind::TestOnlyRejected,
+            "test",
+        ),
+    };
+
+    let KmsWorkerEvent::TestRejected { job, .. } = event else {
+        unreachable!();
+    };
+    assert_two_owners(&job, primary_id, cursor_id);
+}
+
+#[test]
+fn terminal_worker_transports_preserve_both_bundle_owners() {
+    let error = || {
+        oblivion_one::native::kms::AtomicKmsError::new(
+            oblivion_one::native::kms::AtomicKmsErrorKind::FlipRejected,
+            "test",
+        )
+    };
+    let (job, primary_id, cursor_id) = two_owner_job(331);
+    let submitted =
+        KmsSubmittedOwnership {
+            job,
+            out_fence: None,
+            submit_started_at:
+                oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(1),
+            submit_returned_at:
+                oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(2),
+            queue_residency_ns: 1,
+            submit_wake_lateness_ns: 0,
+            submission_budget_ns: 1,
+        };
+    assert_two_owners(&submitted.job, primary_id, cursor_id);
+
+    let (job, _, _) = two_owner_job(331);
+    let KmsWorkerEvent::SubmitRejected { job, .. } = (KmsWorkerEvent::SubmitRejected {
+        job,
+        error: error(),
+    }) else {
+        unreachable!();
+    };
+    assert_two_owners(&job, primary_id, cursor_id);
+
+    let (job, _, _) = two_owner_job(331);
+    let KmsWorkerEvent::BusyExhausted { job, .. } = (KmsWorkerEvent::BusyExhausted {
+        job,
+        error: error(),
+    }) else {
+        unreachable!();
+    };
+    assert_two_owners(&job, primary_id, cursor_id);
+
+    let (job, _, _) = two_owner_job(331);
+    let KmsWorkerEvent::Quiesced { returned_jobs } = (KmsWorkerEvent::Quiesced {
+        returned_jobs: vec![job],
+    }) else {
+        unreachable!();
+    };
+    assert_two_owners(&returned_jobs[0], primary_id, cursor_id);
+
+    let (job, _, _) = two_owner_job(331);
+    let fatal = KmsWorkerFatalJob {
+        job,
+        uncertain_submit: true,
+    };
+    assert_two_owners(&fatal.job, primary_id, cursor_id);
+}
+
+#[test]
+fn changed_cursor_property_requires_an_exact_cursor_owner() {
+    let (mut job, _, _) = two_owner_job(332);
+    let primary = job.owners.primary().cloned().unwrap();
+    let transaction = Arc::clone(&primary.transaction);
+    job.owners = KmsBundleOwners::new(Some(primary), None).unwrap();
+    job.cursor = KmsCursorUpdate::Disable;
+
+    assert_eq!(
+        job.validate_against(&transaction),
+        Err(super::KmsCommitPayloadError::MissingCursorOwner)
+    );
+}
 
 fn required_direct_test_job(token: u64) -> KmsCommitJob {
     let mut job = test_job(token);

@@ -21,6 +21,28 @@ impl NativeRuntime {
                     .and_then(|pending| {
                         matches!(pending.phase, AtomicCommitPhase::KernelSubmitted { .. }).then(
                             || super::super::kms_worker::WorkerInFlight {
+                                bundle: super::super::kms_worker::KmsCommitBundleIdentity {
+                                    id: crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(
+                                        pending.token,
+                                    ),
+                                    token: pending.token,
+                                    output_generation: pending.generation,
+                                    crtc_id: pending.crtc_id,
+                                    primary_transaction_id: match pending.kind {
+                                        AtomicCommitKind::CompositedPrimary { transaction_id, .. }
+                                        | AtomicCommitKind::DirectPrimary { transaction_id, .. } => {
+                                            Some(transaction_id)
+                                        }
+                                        AtomicCommitKind::CursorOnly { .. } => None,
+                                    },
+                                    cursor_transaction_id: match pending.kind {
+                                        AtomicCommitKind::CursorOnly { transaction_id, .. } => {
+                                            Some(transaction_id)
+                                        }
+                                        AtomicCommitKind::CompositedPrimary { .. }
+                                        | AtomicCommitKind::DirectPrimary { .. } => None,
+                                    },
+                                },
                                 token: pending.token,
                                 transaction_id: match pending.kind {
                                     AtomicCommitKind::CompositedPrimary {

@@ -1,7 +1,9 @@
 //! Owned, immutable values that may cross into the Atomic submit thread.
 
 use super::super::runtime::AtomicCommitKind;
+use super::{KmsBundleOwners, KmsCommitBundleIdentity};
 use crate::native_output::output::CursorFramebufferPin;
+use crate::native_output::presentation::plane::KmsCommitBundleId;
 use crate::native_output::scanout::DirectPrimaryLease;
 use crate::native_output::{
     CursorPlaneAssignment, OutputTransaction, OutputTransactionContent, OutputTransactionId,
@@ -15,6 +17,8 @@ use std::os::fd::OwnedFd;
 
 #[derive(Debug)]
 pub(crate) struct KmsCommitJob {
+    pub(crate) bundle_id: KmsCommitBundleId,
+    pub(crate) owners: KmsBundleOwners,
     pub(crate) transaction_id: OutputTransactionId,
     pub(crate) token: PageFlipToken,
     pub(crate) output_generation: u64,
@@ -83,9 +87,25 @@ pub(crate) enum KmsCommitPayloadError {
     UnexpectedCompatibilityImmediate,
     CursorResourceMismatch,
     DirectPrimaryResourceMismatch,
+    MissingPrimaryOwner,
+    MissingCursorOwner,
+    OwnerIdentityMismatch,
+    OwnerGenerationMismatch,
+    OwnerTargetMismatch,
 }
 
 impl KmsCommitJob {
+    pub(crate) fn identity(&self) -> KmsCommitBundleIdentity {
+        KmsCommitBundleIdentity {
+            id: self.bundle_id,
+            token: self.token,
+            output_generation: self.output_generation,
+            crtc_id: self.crtc_id,
+            primary_transaction_id: self.owners.primary_transaction_id(),
+            cursor_transaction_id: self.owners.cursor_transaction_id(),
+        }
+    }
+
     pub(crate) fn validate_against(
         &self,
         transaction: &OutputTransaction,
@@ -115,6 +135,41 @@ impl KmsCommitJob {
         }
         if self.target != transaction.target() {
             return Err(KmsCommitPayloadError::TargetMismatch);
+        }
+        if !self.owners.is_legacy_unchecked() {
+            let primary_changed = !matches!(self.primary, KmsPrimaryUpdate::Unchanged);
+            let cursor_changed = !matches!(self.cursor, KmsCursorUpdate::Unchanged);
+            if primary_changed && self.owners.primary().is_none() {
+                return Err(KmsCommitPayloadError::MissingPrimaryOwner);
+            }
+            if cursor_changed && self.owners.cursor().is_none() {
+                return Err(KmsCommitPayloadError::MissingCursorOwner);
+            }
+            for owner in [
+                self.owners
+                    .primary()
+                    .map(|owner| owner.transaction.as_ref()),
+                self.owners.cursor().map(|owner| owner.transaction.as_ref()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if owner.output_generation() != self.output_generation {
+                    return Err(KmsCommitPayloadError::OwnerGenerationMismatch);
+                }
+                if owner.target() != self.target {
+                    return Err(KmsCommitPayloadError::OwnerTargetMismatch);
+                }
+            }
+            let expected_legacy_owner = if matches!(self.kind, AtomicCommitKind::CursorOnly { .. })
+            {
+                self.owners.cursor_transaction_id()
+            } else {
+                self.owners.primary_transaction_id()
+            };
+            if expected_legacy_owner != Some(self.transaction_id) {
+                return Err(KmsCommitPayloadError::OwnerIdentityMismatch);
+            }
         }
 
         match (self.kind, self.direct_primary_lease.as_ref()) {
@@ -212,7 +267,11 @@ impl KmsCommitJob {
         {
             return Err(KmsCommitPayloadError::CursorOnlyMissingCursorUpdate);
         }
-        let cursor_matches = match (&self.cursor, transaction.planes().cursor()) {
+        let cursor_transaction = self
+            .owners
+            .cursor()
+            .map_or(transaction, |owner| owner.transaction.as_ref());
+        let cursor_matches = match (&self.cursor, cursor_transaction.planes().cursor()) {
             (KmsCursorUpdate::Unchanged, CursorPlaneAssignment::Unchanged) => true,
             (KmsCursorUpdate::Disable, CursorPlaneAssignment::Atomic { state: None, .. }) => true,
             (

@@ -133,6 +133,12 @@ impl CursorRevision {
     }
 }
 
+impl KmsCommitBundleId {
+    pub(crate) const fn from_pageflip_token(token: PageFlipToken) -> Self {
+        Self::new(NonZeroU64::new(token.get()).expect("pageflip token is nonzero"))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlaneWriteSet(u8);
 

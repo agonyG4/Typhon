@@ -4,9 +4,12 @@
 //! while ledger settlement, DRM event reading, and physical scanout promotion
 //! remain owned by the compositor thread.
 
+use std::sync::Arc;
+
 use super::super::kms_worker::{
-    KmsCommitJob, KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership,
-    KmsTestOnlyPolicy, KmsWorkerAdmissionError, KmsWorkerEvent, KmsWorkerFatalJob,
+    KmsBundleOwners, KmsCommitJob, KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryUpdate,
+    KmsSubmittedOwnership, KmsTestOnlyPolicy, KmsWorkerAdmissionError, KmsWorkerEvent,
+    KmsWorkerFatalJob,
 };
 pub(super) use super::kms_worker_teardown::{
     retain_complete_submitted_ownership, retain_uncertain_job_with_suspension,
@@ -154,6 +157,18 @@ pub(super) fn queue_cursor_only(
         return Err(io::Error::other(error).into());
     }
     let job = KmsCommitJob {
+        bundle_id:
+            crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
+        owners: KmsBundleOwners::for_legacy_transaction(
+            kind,
+            Arc::new(
+                output_transactions
+                    .transaction(transaction_id)
+                    .ok_or_else(|| io::Error::other("queued cursor transaction disappeared"))?
+                    .descriptor()
+                    .clone(),
+            ),
+        ),
         transaction_id,
         token,
         output_generation,
@@ -331,6 +346,18 @@ pub(super) fn queue_explicit_composited_frame(
         return Err(io::Error::other(error).into());
     }
     let job = KmsCommitJob {
+        bundle_id:
+            crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
+        owners: KmsBundleOwners::for_legacy_transaction(
+            kind,
+            Arc::new(
+                output_transactions
+                    .transaction(transaction_id)
+                    .ok_or_else(|| io::Error::other("queued worker transaction disappeared"))?
+                    .descriptor()
+                    .clone(),
+            ),
+        ),
         transaction_id,
         token,
         output_generation,
@@ -532,6 +559,20 @@ pub(super) fn queue_atomic_compatibility_frame(
         return Err(io::Error::other(error).into());
     }
     let job = KmsCommitJob {
+        bundle_id:
+            crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
+        owners: KmsBundleOwners::for_legacy_transaction(
+            kind,
+            Arc::new(
+                output_transactions
+                    .transaction(transaction_id)
+                    .ok_or_else(|| {
+                        io::Error::other("compatibility worker transaction disappeared")
+                    })?
+                    .descriptor()
+                    .clone(),
+            ),
+        ),
         transaction_id,
         token,
         output_generation,
@@ -1303,6 +1344,7 @@ impl NativeRuntime {
                 }
             }
             KmsWorkerEvent::SubmitLate {
+                bundle: _,
                 transaction_id,
                 token,
                 late_by_ns,
@@ -1318,6 +1360,7 @@ impl NativeRuntime {
                 });
             }
             KmsWorkerEvent::PageflipTimeout {
+                bundle: _,
                 transaction_id: _,
                 token,
                 detected_at,

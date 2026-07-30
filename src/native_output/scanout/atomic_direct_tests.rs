@@ -1,6 +1,6 @@
 use super::*;
 use crate::native_output::kms_worker::{
-    KmsCommitJob, KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy,
+    KmsBundleOwners, KmsCommitJob, KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy,
 };
 use crate::native_output::runtime::AtomicCommitKind;
 use crate::native_output::scanout::DirectPrimaryLease;
@@ -513,6 +513,11 @@ fn worker_queue_owns_direct_resource_before_submit() {
     let key = test_key();
     let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
     let job = KmsCommitJob {
+        bundle_id:
+            crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(
+                PageFlipToken::new(80).unwrap(),
+            ),
+        owners: KmsBundleOwners::legacy_unchecked(),
         transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(80).unwrap()),
         token: PageFlipToken::new(80).unwrap(),
         output_generation: 1,

@@ -6,8 +6,8 @@ use super::presentation_transactions::{
 };
 use super::*;
 use crate::native_output::kms_worker::{
-    KmsCommitAdmissionPermit, KmsCommitJob, KmsCommitWorkerHandle, KmsCursorUpdate,
-    KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsWorkerAdmissionError,
+    KmsBundleOwners, KmsCommitAdmissionPermit, KmsCommitJob, KmsCommitWorkerHandle,
+    KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsWorkerAdmissionError,
 };
 use oblivion_one::native::kms::FramebufferId;
 
@@ -511,6 +511,20 @@ pub(super) fn finish_direct_worker_queued(
             .ok_or_else(|| io::Error::other("direct worker transaction has no frame batch"))?
     };
     let job = KmsCommitJob {
+        bundle_id:
+            crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(
+                commit_token,
+            ),
+        owners: KmsBundleOwners::for_legacy_transaction(
+            kind,
+            std::sync::Arc::new(
+                output_transactions
+                    .transaction(transaction_id)
+                    .ok_or_else(|| io::Error::other("direct worker transaction disappeared"))?
+                    .descriptor()
+                    .clone(),
+            ),
+        ),
         transaction_id,
         token: commit_token,
         output_generation,
