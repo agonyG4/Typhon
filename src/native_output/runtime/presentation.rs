@@ -168,7 +168,7 @@ impl NativeRuntime {
                     false
                 };
                 if image_ready
-                    && !cursor.failure_latched()
+                    && !cursor.capability_quarantined()
                     && *cursor_scheduling_policy != NativeCursorSchedulingPolicy::Software
                     && *cursor_render_mode != NativeCursorRenderMode::Software
                 {
@@ -205,7 +205,7 @@ impl NativeRuntime {
                 }
                 if *cursor_preference == NativeCursorPreference::Software
                     || *cursor_scheduling_policy == NativeCursorSchedulingPolicy::Software
-                    || cursor.failure_latched()
+                    || cursor.capability_quarantined()
                     || !cursor.using_theme_image()
                 {
                     *cursor_render_mode = NativeCursorRenderMode::Software;
@@ -227,7 +227,7 @@ impl NativeRuntime {
         if let Some(cursor) = atomic_cursor.as_mut() {
             cursor.set_hardware_path_active(
                 *cursor_render_mode == NativeCursorRenderMode::Hardware
-                    && !cursor.failure_latched(),
+                    && !cursor.capability_quarantined(),
             );
         }
         let current_client_cursor_damage = client_cursor.map(|cursor| {
@@ -267,7 +267,7 @@ impl NativeRuntime {
             && *cursor_render_mode == NativeCursorRenderMode::Hardware
             && atomic_cursor
                 .as_ref()
-                .is_some_and(|cursor| !cursor.failure_latched());
+                .is_some_and(|cursor| !cursor.capability_quarantined());
         let resolved_client_cursor_path =
             resolve_client_cursor_path(client_cursor_active, client_cursor_hardware_usable);
         if *last_client_cursor_path != Some(resolved_client_cursor_path) {
@@ -566,7 +566,7 @@ impl NativeRuntime {
         suppress_direct_render_ahead(presentation_path, &mut scheduler_decision, scanout, perf);
         if presentation_path == NativePresentationPath::PlaneDelta
             && let Some(cursor) = atomic_cursor.as_mut()
-            && !cursor.failure_latched()
+            && !cursor.capability_quarantined()
             && (!atomic_commit_arbiter.atomic_commit_pending() || can_queue_worker_cursor)
             && !scanout.ready_frame_queued()
         {

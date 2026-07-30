@@ -1,8 +1,6 @@
 #![allow(dead_code)]
 
-use crate::native_output::presentation::plane_policy::{
-    CursorCapabilityKey, CursorCapabilityStatus, CursorQuarantineReason,
-};
+use crate::native_output::presentation::plane_policy::CursorCapabilityKey;
 use crate::native_output::{
     OutputTransactionId,
     presentation::plane::{CursorRevision, SoftwareCursorSnapshot},
@@ -118,7 +116,6 @@ impl CursorRevisionTracker {
 pub(crate) struct CursorPlaneLifecycle {
     generation: u64,
     initial_clear_confirmed: bool,
-    capability_status: CursorCapabilityStatus,
 }
 
 impl CursorPlaneLifecycle {
@@ -126,7 +123,6 @@ impl CursorPlaneLifecycle {
         Self {
             generation,
             initial_clear_confirmed: false,
-            capability_status: CursorCapabilityStatus::Unknown,
         }
     }
 
@@ -136,34 +132,6 @@ impl CursorPlaneLifecycle {
 
     pub(crate) const fn initial_clear_required(self) -> bool {
         !self.initial_clear_confirmed
-    }
-
-    pub(crate) const fn capability_status(self) -> CursorCapabilityStatus {
-        self.capability_status
-    }
-
-    pub(crate) fn mark_proven(&mut self) {
-        self.capability_status = CursorCapabilityStatus::Proven;
-    }
-
-    pub(crate) fn invalidate_capability(&mut self) {
-        self.capability_status = CursorCapabilityStatus::Unknown;
-    }
-
-    pub(crate) fn quarantine(&mut self, reason: CursorQuarantineReason) {
-        let failure_count = match self.capability_status {
-            CursorCapabilityStatus::Quarantined {
-                reason: existing,
-                failure_count,
-            } if existing == reason => failure_count.saturating_add(1),
-            CursorCapabilityStatus::Unknown
-            | CursorCapabilityStatus::Proven
-            | CursorCapabilityStatus::Quarantined { .. } => 1,
-        };
-        self.capability_status = CursorCapabilityStatus::Quarantined {
-            reason,
-            failure_count,
-        };
     }
 
     pub(crate) fn confirm_initial_clear(&mut self, generation: u64) -> bool {
@@ -180,7 +148,6 @@ impl CursorPlaneLifecycle {
         }
         self.generation = generation;
         self.initial_clear_confirmed = false;
-        self.capability_status = CursorCapabilityStatus::Unknown;
         true
     }
 }

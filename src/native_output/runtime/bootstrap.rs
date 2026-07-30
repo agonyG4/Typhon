@@ -717,7 +717,6 @@ impl NativeRuntime {
         };
 
         probe_native_egl_gbm_device(&bootstrap, &perf);
-
         let seat_session = open_native_seat_session(&session_probe);
         let drm_plan = NativeDrmBackendPlan::choose(NativeDrmBackendChoice {
             preference: NativeDrmBackendPreference::from_env(),
@@ -941,6 +940,7 @@ impl NativeRuntime {
                         discovery.cursor_width,
                         discovery.cursor_height,
                         drm_file_generation,
+                        CursorOutputIdentity::new(target.crtc_id, target.width, target.height),
                         cursor_image.clone(),
                     ) {
                         Ok(mut cursor) => {

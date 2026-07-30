@@ -139,7 +139,7 @@ pub(crate) fn effective_atomic_cursor_state<'a>(
 ) -> AtomicCursorSubmissionState<'a> {
     match atomic_cursor_visibility_policy(
         cursor.desired().visible,
-        cursor.failure_latched(),
+        cursor.capability_quarantined(),
         render_mode,
         input_visible,
     ) {
@@ -155,7 +155,7 @@ pub(crate) fn effective_atomic_cursor_state<'a>(
 
 pub(crate) fn atomic_cursor_visibility_policy(
     desired_visible: bool,
-    failure_latched: bool,
+    capability_quarantined: bool,
     render_mode: NativeCursorRenderMode,
     input_visible: bool,
 ) -> AtomicCursorVisibilityPolicy {
@@ -166,7 +166,7 @@ pub(crate) fn atomic_cursor_visibility_policy(
             CursorPreference::Software
         },
         visible: input_visible && desired_visible,
-        hardware_status: if failure_latched {
+        hardware_status: if capability_quarantined {
             CursorHardwareStatus::Quarantined
         } else {
             CursorHardwareStatus::Proven
@@ -393,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_latch_keeps_plane_disabled_after_input_visibility_sync() {
+    fn capability_quarantine_keeps_plane_disabled_after_input_visibility_sync() {
         assert_eq!(
             atomic_cursor_visibility_policy(true, true, NativeCursorRenderMode::Hardware, true,),
             AtomicCursorVisibilityPolicy::UnavailableForDirect
@@ -427,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_motion_does_not_clear_failure_latch() {
+    fn normal_motion_does_not_clear_capability_quarantine() {
         assert_eq!(
             atomic_cursor_visibility_policy(true, true, NativeCursorRenderMode::Hardware, true,),
             AtomicCursorVisibilityPolicy::UnavailableForDirect
@@ -435,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn new_drm_generation_can_clear_failure_latch() {
+    fn new_drm_generation_can_clear_capability_quarantine() {
         assert_eq!(
             atomic_cursor_visibility_policy(true, false, NativeCursorRenderMode::Hardware, true,),
             AtomicCursorVisibilityPolicy::HardwareVisible

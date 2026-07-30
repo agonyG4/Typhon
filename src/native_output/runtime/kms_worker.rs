@@ -15,7 +15,7 @@ pub(super) use super::kms_worker_teardown::{
     retain_complete_submitted_ownership, retain_uncertain_job_with_suspension,
 };
 pub(super) use super::plane_cycle::WorkerQueueOutcome;
-use super::plane_cycle::try_offer_cursor_sidecar;
+use super::plane_cycle::{PlaneDeltaPreparation, prepare_plane_delta};
 use super::presentation_transactions::{
     build_compatibility_transaction, settle_failed_output_transaction,
     settle_forced_shutdown_transaction_if_safe,
@@ -85,35 +85,28 @@ pub(super) fn queue_plane_delta(
     pacing_mode: NativeOutputPacingMode,
     cursor_epoch: u64,
 ) -> NativeResult<WorkerQueueOutcome> {
-    let transaction_id = output_transactions
-        .allocate_id()
-        .map_err(io::Error::other)?;
-    let transaction = OutputTransaction::cursor_plane_delta(
-        transaction_id,
-        output_generation,
-        MonotonicTimestampNs::new(monotonic_now_ns()?),
-        target,
-        pacing_mode,
-        cursor_epoch,
-        desired.clone(),
-        OutputReleasePlan::Pageflip,
-    )
-    .map_err(io::Error::other)?;
-    output_transactions
-        .insert(transaction)
-        .map_err(io::Error::other)?;
-    if let Some(outcome) = try_offer_cursor_sidecar(
+    let preparation = prepare_plane_delta(
         worker,
         cursor,
-        desired.as_ref(),
+        desired,
         output_transactions,
         presentation_trace,
-        transaction_id,
         target,
         crtc_id,
-    )? {
-        return Ok(outcome);
-    }
+        output_generation,
+        pacing_mode,
+        cursor_epoch,
+    )?;
+    let (transaction_id, desired, cursor_epoch, promoted_pin, target) = match preparation {
+        PlaneDeltaPreparation::Return(outcome) => return Ok(outcome),
+        PlaneDeltaPreparation::Submit {
+            transaction_id,
+            desired,
+            cursor_epoch,
+            cursor_pin,
+            target,
+        } => (transaction_id, desired, cursor_epoch, cursor_pin, target),
+    };
     let permit = match worker.try_reserve_admission_slot() {
         Ok(permit) => permit,
         Err(error) => {
@@ -190,15 +183,22 @@ pub(super) fn queue_plane_delta(
         cursor: desired
             .clone()
             .map_or(KmsCursorUpdate::Disable, KmsCursorUpdate::Set),
-        cursor_pin: desired
-            .as_ref()
-            .filter(|state| state.framebuffer_id.is_some())
-            .map(|state| cursor.pin_framebuffer_for(state))
-            .transpose()?,
+        cursor_pin: match promoted_pin {
+            Some(pin) => Some(pin),
+            None => desired
+                .as_ref()
+                .filter(|state| state.framebuffer_id.is_some())
+                .map(|state| cursor.pin_framebuffer_for(state))
+                .transpose()?,
+        },
         direct_primary_lease: None,
         test_only_duration_ns: None,
         pacing_frame_id: None,
-        test_only: KmsTestOnlyPolicy::Required,
+        test_only: if cursor.current_capability_proven() {
+            KmsTestOnlyPolicy::Skip
+        } else {
+            KmsTestOnlyPolicy::Required
+        },
         ready_submit: false,
     };
     let descriptor = output_transactions

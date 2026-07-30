@@ -352,6 +352,26 @@ impl NativeRuntime {
                         metrics.cursor_worker_epoch_mismatches,
                     ),
                     NativePerfField::u64(
+                        "cursor_sidecars_materialized",
+                        metrics.cursor_sidecars_materialized,
+                    ),
+                    NativePerfField::u64(
+                        "cursor_sidecars_replaced",
+                        metrics.cursor_sidecars_replaced,
+                    ),
+                    NativePerfField::u64(
+                        "cursor_sidecars_claimed",
+                        metrics.cursor_sidecars_claimed,
+                    ),
+                    NativePerfField::u64(
+                        "cursor_sidecars_promoted",
+                        metrics.cursor_sidecars_promoted,
+                    ),
+                    NativePerfField::u64(
+                        "cursor_sidecars_missed_freeze",
+                        metrics.cursor_sidecars_missed_freeze,
+                    ),
+                    NativePerfField::u64(
                         "worker_pacing_submits_confirmed",
                         metrics.worker_pacing_submits_confirmed,
                     ),

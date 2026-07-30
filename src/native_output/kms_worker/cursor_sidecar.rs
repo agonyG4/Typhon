@@ -54,6 +54,22 @@ impl CursorSidecarMailbox {
         self.pending.take()
     }
 
+    pub(crate) fn take_independent_due(
+        &mut self,
+        output_generation: u64,
+        crtc_id: u32,
+        target: PresentationTarget,
+    ) -> Option<CursorSidecar> {
+        let promotable = self.pending.as_ref().is_some_and(|sidecar| {
+            sidecar.transaction.output_generation() == output_generation
+                && sidecar.crtc_id == crtc_id
+                && sidecar.deadline.clock_generation == target.clock_generation
+                && sidecar.deadline.presentation_time.get() <= target.presentation_time.get()
+                && matches!(sidecar.coupling, CursorSidecarCoupling::Independent)
+        });
+        promotable.then(|| self.pending.take()).flatten()
+    }
+
     pub(crate) fn claim_for(
         &mut self,
         output_generation: u64,

@@ -59,7 +59,7 @@ pub(super) fn inspect_direct_presentation(
             inputs.atomic_cursor.as_ref().is_some_and(|cursor| {
                 atomic_cursor_visibility_policy(
                     cursor.desired().visible,
-                    cursor.failure_latched(),
+                    cursor.capability_quarantined(),
                     inputs.cursor_render_mode,
                     inputs.cursor_visible,
                 )

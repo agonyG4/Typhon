@@ -467,6 +467,38 @@ fn shutdown_snapshot_returns_pending_sidecar_owner() {
     handle.join().unwrap();
 }
 
+#[test]
+fn independent_sidecar_promotes_at_deadline_but_coupled_sidecar_never_does() {
+    let job = test_job(343);
+    let independent = test_sidecar(&job, 912, CursorSidecarCoupling::Independent);
+    let independent_id = independent.id;
+    let mut mailbox = CursorSidecarMailbox::default();
+    mailbox.offer(independent);
+    assert_eq!(
+        mailbox
+            .take_independent_due(job.output_generation, job.crtc_id, job.target)
+            .map(|sidecar| sidecar.id),
+        Some(independent_id)
+    );
+
+    let coupled = test_sidecar(
+        &job,
+        913,
+        CursorSidecarCoupling::MustBundleWith(job.transaction_id),
+    );
+    let coupled_id = coupled.id;
+    mailbox.offer(coupled);
+    assert!(
+        mailbox
+            .take_independent_due(job.output_generation, job.crtc_id, job.target)
+            .is_none()
+    );
+    assert_eq!(
+        mailbox.pending().map(|sidecar| sidecar.id),
+        Some(coupled_id)
+    );
+}
+
 fn required_direct_test_job(token: u64) -> KmsCommitJob {
     let mut job = test_job(token);
     job.test_only = KmsTestOnlyPolicy::Required;

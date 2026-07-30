@@ -99,6 +99,10 @@ fn test_cursor() -> NativeAtomicCursor {
         dirty: AtomicCursorDirty::default(),
         counters: AtomicCursorCounters::default(),
         plane_lifecycle: CursorPlaneLifecycle::new(1),
+        capability_cache: Default::default(),
+        crtc_id: 2,
+        mode_width: 1920,
+        mode_height: 1080,
         client_image_failure: None,
         pending_token: None,
         pending_is_primary: false,
@@ -531,9 +535,9 @@ fn visible_cursor_position_change_needs_submission() {
 }
 
 #[test]
-fn failure_latch_keeps_plane_disabled_after_input_visibility_sync() {
+fn capability_quarantine_keeps_plane_disabled_after_input_visibility_sync() {
     let mut cursor = test_cursor();
-    cursor.mark_failure_latched();
+    cursor.mark_capability_quarantined();
     cursor.set_visible(true);
 
     assert!(!cursor.desired().visible);
@@ -553,22 +557,9 @@ fn initial_software_modeset_records_a_disabled_cursor_plane() {
 }
 
 #[test]
-fn cursor_plane_lifecycle_is_generation_scoped_and_invalidates_quarantine() {
+fn cursor_plane_lifecycle_is_generation_scoped() {
     let mut lifecycle = CursorPlaneLifecycle::new(4);
     assert!(lifecycle.initial_clear_required());
-    assert_eq!(
-        lifecycle.capability_status(),
-        CursorCapabilityStatus::Unknown
-    );
-
-    lifecycle.quarantine(CursorQuarantineReason::UnsupportedSize);
-    assert!(matches!(
-        lifecycle.capability_status(),
-        CursorCapabilityStatus::Quarantined {
-            reason: CursorQuarantineReason::UnsupportedSize,
-            failure_count: 1,
-        }
-    ));
     assert!(!lifecycle.confirm_initial_clear(3));
     assert!(lifecycle.initial_clear_required());
     assert!(lifecycle.confirm_initial_clear(4));
@@ -577,9 +568,20 @@ fn cursor_plane_lifecycle_is_generation_scoped_and_invalidates_quarantine() {
 
     assert!(lifecycle.rearm_generation(5));
     assert_eq!(lifecycle.generation(), 5);
-    assert_eq!(
-        lifecycle.capability_status(),
-        CursorCapabilityStatus::Unknown
-    );
     assert!(lifecycle.initial_clear_required());
+}
+
+#[test]
+fn proven_cursor_capability_survives_motion_within_geometry_class_only() {
+    let mut cursor = test_cursor();
+    cursor.set_hardware_path_active(true);
+    cursor.set_visible(true);
+    cursor.begin_submission(PageFlipToken::new(500).unwrap(), cursor.desired().clone());
+    assert!(cursor.current_capability_proven());
+
+    cursor.set_position(100, 100);
+    assert!(cursor.current_capability_proven());
+
+    cursor.set_position(-1, 100);
+    assert!(!cursor.current_capability_proven());
 }

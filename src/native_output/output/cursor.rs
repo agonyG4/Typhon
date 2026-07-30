@@ -7,6 +7,23 @@ pub(crate) const NATIVE_HARDWARE_CURSOR_SIZE: u32 = 64;
 const INITIAL_CURSOR_EPOCH: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CursorOutputIdentity {
+    pub(crate) crtc_id: u32,
+    pub(crate) mode_width: u32,
+    pub(crate) mode_height: u32,
+}
+
+impl CursorOutputIdentity {
+    pub(crate) const fn new(crtc_id: u32, mode_width: u32, mode_height: u32) -> Self {
+        Self {
+            crtc_id,
+            mode_width,
+            mode_height,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeCursorImageKey {
     pub(crate) surface_id: u32,
     pub(crate) buffer_id: u64,
@@ -55,6 +72,10 @@ pub(crate) struct NativeAtomicCursor {
     pub(crate) dirty: AtomicCursorDirty,
     pub(crate) counters: AtomicCursorCounters,
     plane_lifecycle: CursorPlaneLifecycle,
+    capability_cache: crate::native_output::presentation::plane_policy::PlaneCapabilityCache,
+    crtc_id: u32,
+    mode_width: u32,
+    mode_height: u32,
     client_image_failure: Option<NativeCursorImageKey>,
     pending_token: Option<PageFlipToken>,
     pending_is_primary: bool,
@@ -70,6 +91,7 @@ impl NativeAtomicCursor {
         width: u32,
         height: u32,
         generation: u64,
+        output: CursorOutputIdentity,
         image: Arc<CompositorCursorImage>,
     ) -> io::Result<Self> {
         if plane.format_modifier.modifier != 0 {
@@ -106,6 +128,10 @@ impl NativeAtomicCursor {
             dirty: AtomicCursorDirty::default(),
             counters: AtomicCursorCounters::default(),
             plane_lifecycle: CursorPlaneLifecycle::new(generation),
+            capability_cache: Default::default(),
+            crtc_id: output.crtc_id,
+            mode_width: output.mode_width,
+            mode_height: output.mode_height,
             client_image_failure: None,
             pending_token: None,
             pending_is_primary: false,
@@ -311,7 +337,7 @@ impl NativeAtomicCursor {
     }
 
     pub(crate) fn set_visible(&mut self, visible: bool) {
-        let visible = visible && !self.failure_latched();
+        let visible = visible && !self.capability_quarantined();
         if self.desired.visible != visible {
             self.desired.visible = visible;
             self.advance_visibility_revision();
@@ -374,6 +400,7 @@ impl NativeAtomicCursor {
         self.pending_is_primary = false;
         self.dirty = AtomicCursorDirty::default();
         self.counters.updates_submitted = self.counters.updates_submitted.saturating_add(1);
+        self.mark_current_capability_proven();
         state
     }
 
@@ -458,24 +485,22 @@ impl NativeAtomicCursor {
         self.pending_is_primary = true;
         self.dirty = AtomicCursorDirty::default();
         self.counters.updates_submitted = self.counters.updates_submitted.saturating_add(1);
+        self.mark_current_capability_proven();
     }
 
     #[cfg(test)]
-    pub(crate) fn mark_failure_latched(&mut self) {
-        self.plane_lifecycle
-            .quarantine(CursorQuarantineReason::PermanentSubmitRejection);
+    pub(crate) fn mark_capability_quarantined(&mut self) {
+        self.quarantine_current_capability(CursorQuarantineReason::PermanentSubmitRejection);
     }
 
     pub(crate) fn note_test_failure(&mut self) {
         self.counters.test_failures = self.counters.test_failures.saturating_add(1);
-        self.plane_lifecycle
-            .quarantine(CursorQuarantineReason::TestOnlyRejected);
+        self.quarantine_current_capability(CursorQuarantineReason::TestOnlyRejected);
     }
 
     pub(crate) fn note_submit_failure(&mut self) {
         self.counters.submit_failures = self.counters.submit_failures.saturating_add(1);
-        self.plane_lifecycle
-            .quarantine(CursorQuarantineReason::PermanentSubmitRejection);
+        self.quarantine_current_capability(CursorQuarantineReason::PermanentSubmitRejection);
     }
 
     pub(crate) fn note_software_fallback(&mut self) {
@@ -571,12 +596,6 @@ impl NativeAtomicCursor {
                     self.counters.client_image_uploads.saturating_add(1);
             }
         }
-        if matches!(source_key, NativeCursorSourceKey::Client(_)) {
-            // A new image is a meaningful retry point after a cursor-plane
-            // TEST_ONLY failure.  Pointer motion alone never clears this
-            // latch, so a rejected plane cannot create a retry storm.
-            self.plane_lifecycle.invalidate_capability();
-        }
         self.source_key = source_key;
         self.client_image_failure = None;
         self.desired.framebuffer_id = framebuffer_id;
@@ -627,6 +646,7 @@ impl NativeAtomicCursor {
         self.plane = plane;
         self.generation = generation;
         self.plane_lifecycle.rearm_generation(generation);
+        self.capability_cache.invalidate_generation(generation);
         let framebuffer_id = self
             .resources
             .current
@@ -652,24 +672,78 @@ impl NativeAtomicCursor {
         self.pending_token = None;
         self.pending_is_primary = false;
         self.dirty = AtomicCursorDirty::default();
-        self.plane_lifecycle.invalidate_capability();
         self.client_image_failure = None;
         Ok(restored)
     }
 
-    pub(crate) const fn failure_latched(&self) -> bool {
-        matches!(
-            self.plane_lifecycle.capability_status(),
-            CursorCapabilityStatus::Quarantined { .. }
-        )
+    fn current_capability_key(
+        &self,
+    ) -> Option<crate::native_output::presentation::plane_policy::CursorCapabilityKey> {
+        use crate::native_output::presentation::plane_policy::{
+            CursorCapabilityKey, CursorGeometryInput, normalize_cursor_geometry,
+        };
+
+        let geometry = normalize_cursor_geometry(CursorGeometryInput {
+            pointer_x: self.desired.x,
+            pointer_y: self.desired.y,
+            hotspot_x: self.desired.hotspot_x,
+            hotspot_y: self.desired.hotspot_y,
+            cursor_width: self.desired.width,
+            cursor_height: self.desired.height,
+            output_width: self.mode_width,
+            output_height: self.mode_height,
+        })?;
+        Some(CursorCapabilityKey {
+            output_generation: self.generation,
+            crtc_id: self.crtc_id,
+            plane_id: self.plane.plane_id,
+            mode_width: self.mode_width,
+            mode_height: self.mode_height,
+            output_transform: 0,
+            output_scale_milli: 1_000,
+            format: self.plane.format_modifier.fourcc,
+            modifier: self.plane.format_modifier.modifier,
+            cursor_width: self.desired.width,
+            cursor_height: self.desired.height,
+            hotspot_property_available: false,
+            geometry_class: geometry.class,
+        })
+    }
+
+    fn quarantine_current_capability(&mut self, reason: CursorQuarantineReason) {
+        if let Some(key) = self.current_capability_key() {
+            self.capability_cache.quarantine(key, reason);
+        }
+    }
+
+    fn mark_current_capability_proven(&mut self) {
+        if self.submitted.visible
+            && let Some(key) = self.current_capability_key()
+        {
+            self.capability_cache.mark_proven(key);
+        }
+    }
+
+    pub(crate) fn capability_quarantined(&self) -> bool {
+        self.current_capability_key().is_some_and(|key| {
+            matches!(
+                self.capability_cache.status(key),
+                CursorCapabilityStatus::Quarantined { .. }
+            )
+        })
+    }
+
+    pub(crate) fn current_capability_proven(&self) -> bool {
+        self.current_capability_key()
+            .is_some_and(|key| self.capability_cache.status(key) == CursorCapabilityStatus::Proven)
     }
 
     pub(crate) fn rearm_generation(&mut self, generation: u64) {
         self.generation = generation;
         self.plane_lifecycle.rearm_generation(generation);
+        self.capability_cache.invalidate_generation(generation);
         self.pending_token = None;
         self.pending_is_primary = false;
-        self.plane_lifecycle.invalidate_capability();
         self.client_image_failure = None;
     }
 

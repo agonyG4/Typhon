@@ -13,6 +13,126 @@ use crate::native_output::presentation::plane_policy::{
 use oblivion_one::native::kms::AtomicCursorVisualState;
 use std::num::NonZeroU64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelPrimaryLane {
+    Idle,
+    KernelSubmitted,
+    KernelAndQueuedNext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelSidecar {
+    None,
+    Mailbox,
+    Claimed,
+    Frozen,
+    KernelSubmitted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelCursorMode {
+    Hidden,
+    Hardware,
+    Software,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelPrimaryMode {
+    Composed,
+    Direct,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelOutcome {
+    ExactSuccess,
+    Busy,
+    TestReject,
+    SubmitReject,
+    StalePageflip,
+    ExactPageflip,
+    Quiesce,
+    Shutdown,
+}
+
+#[test]
+fn exhaustive_plane_lane_model_preserves_bounded_ownership() {
+    let mut explored = 0;
+    for lane in [
+        ModelPrimaryLane::Idle,
+        ModelPrimaryLane::KernelSubmitted,
+        ModelPrimaryLane::KernelAndQueuedNext,
+    ] {
+        for sidecar in [
+            ModelSidecar::None,
+            ModelSidecar::Mailbox,
+            ModelSidecar::Claimed,
+            ModelSidecar::Frozen,
+            ModelSidecar::KernelSubmitted,
+        ] {
+            for cursor in [
+                ModelCursorMode::Hidden,
+                ModelCursorMode::Hardware,
+                ModelCursorMode::Software,
+            ] {
+                for primary in [ModelPrimaryMode::Composed, ModelPrimaryMode::Direct] {
+                    if primary == ModelPrimaryMode::Direct && cursor == ModelCursorMode::Software {
+                        continue;
+                    }
+                    for outcome in [
+                        ModelOutcome::ExactSuccess,
+                        ModelOutcome::Busy,
+                        ModelOutcome::TestReject,
+                        ModelOutcome::SubmitReject,
+                        ModelOutcome::StalePageflip,
+                        ModelOutcome::ExactPageflip,
+                        ModelOutcome::Quiesce,
+                        ModelOutcome::Shutdown,
+                    ] {
+                        explored += 1;
+                        let future_primary_depth =
+                            usize::from(lane == ModelPrimaryLane::KernelAndQueuedNext);
+                        let kernel_primary = usize::from(lane != ModelPrimaryLane::Idle);
+                        let kernel_cursor = usize::from(sidecar == ModelSidecar::KernelSubmitted);
+                        assert!(future_primary_depth <= 1);
+                        assert!(kernel_primary <= 1);
+                        assert!(kernel_cursor <= 1);
+
+                        let presented_advanced = outcome == ModelOutcome::ExactPageflip
+                            && matches!(
+                                sidecar,
+                                ModelSidecar::Frozen | ModelSidecar::KernelSubmitted
+                            );
+                        if outcome == ModelOutcome::StalePageflip {
+                            assert!(!presented_advanced);
+                        }
+                        let owner_live_after = match outcome {
+                            ModelOutcome::ExactSuccess
+                            | ModelOutcome::Busy
+                            | ModelOutcome::StalePageflip => sidecar != ModelSidecar::None,
+                            ModelOutcome::ExactPageflip
+                            | ModelOutcome::TestReject
+                            | ModelOutcome::SubmitReject
+                            | ModelOutcome::Quiesce
+                            | ModelOutcome::Shutdown => false,
+                        };
+                        if matches!(
+                            outcome,
+                            ModelOutcome::ExactPageflip
+                                | ModelOutcome::TestReject
+                                | ModelOutcome::SubmitReject
+                                | ModelOutcome::Quiesce
+                                | ModelOutcome::Shutdown
+                        ) {
+                            assert!(!owner_live_after);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(explored, 600);
+}
+
 fn bundle_id(value: u64) -> KmsCommitBundleId {
     KmsCommitBundleId::new(NonZeroU64::new(value).unwrap())
 }

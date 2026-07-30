@@ -240,6 +240,20 @@ impl KmsCommitWorkerHandle {
         self.shared.has_attachable_primary_opportunity()
     }
 
+    pub(crate) fn attachable_primary_transaction_id(&self) -> Option<OutputTransactionId> {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.executing_primary_transaction_id.or_else(|| {
+            state
+                .queued
+                .front()
+                .and_then(|job| job.owners.primary_transaction_id())
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn pending_cursor_sidecar_id(
         &self,
@@ -295,8 +309,34 @@ impl KmsCommitWorkerHandle {
             .take()
     }
 
+    pub(crate) fn take_due_independent_cursor_sidecar(
+        &self,
+        output_generation: u64,
+        crtc_id: u32,
+        target: oblivion_one::native::presentation_deadline::PresentationTarget,
+    ) -> Option<CursorSidecar> {
+        let sidecar = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cursor_sidecar
+            .take_independent_due(output_generation, crtc_id, target);
+        if sidecar.is_some() {
+            self.record_cursor_sidecar_promoted();
+        }
+        sidecar
+    }
+
     pub(crate) fn metrics_snapshot(&self) -> WorkerMetricsSnapshot {
         self.shared.metrics.snapshot()
+    }
+
+    pub(crate) fn record_cursor_sidecar_promoted(&self) {
+        self.shared
+            .metrics
+            .cursor_sidecars_promoted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn record_result_mismatch(&self) {
@@ -595,6 +635,7 @@ impl ExecutingDirectCandidateGuard {
         });
         state.executing = false;
         state.executing_direct_content_key = None;
+        state.executing_primary_transaction_id = None;
         state.phase = KmsWorkerPhase::KernelInFlight;
         self.transferred = true;
     }
@@ -608,6 +649,7 @@ impl Drop for ExecutingDirectCandidateGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.executing = false;
+        state.executing_primary_transaction_id = None;
         if state.inflight.is_none() {
             state.phase = KmsWorkerPhase::Idle;
         }
@@ -745,6 +787,10 @@ fn collect_cursor_sidecar_before_freeze(
             .flatten()
     };
     if let Some(sidecar) = sidecar {
+        shared
+            .metrics
+            .cursor_sidecars_claimed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         attach_sidecar(job, sidecar);
     }
     set_worker_phase(shared, KmsWorkerPhase::FrozenForValidation);
@@ -1106,6 +1152,7 @@ fn take_next_job(shared: &Arc<WorkerShared>) -> Option<ExecutingKmsJob> {
             debug_assert!(!state.executing);
             state.executing = true;
             state.executing_direct_content_key = direct_candidate;
+            state.executing_primary_transaction_id = job.owners.primary_transaction_id();
             state.phase = KmsWorkerPhase::DequeuedWaitingPredecessor;
             return Some(ExecutingKmsJob {
                 job,

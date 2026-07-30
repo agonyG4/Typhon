@@ -23,6 +23,92 @@ pub(super) enum WorkerQueueOutcome {
     Unavailable(KmsWorkerAdmissionError),
 }
 
+pub(super) enum PlaneDeltaPreparation {
+    Return(WorkerQueueOutcome),
+    Submit {
+        transaction_id: OutputTransactionId,
+        desired: Option<AtomicCursorVisualState>,
+        cursor_epoch: u64,
+        cursor_pin: Option<CursorFramebufferPin>,
+        target: PresentationTarget,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_plane_delta(
+    worker: &KmsCommitWorkerHandle,
+    cursor: &mut NativeAtomicCursor,
+    desired: Option<AtomicCursorVisualState>,
+    output_transactions: &mut OutputTransactionLedger,
+    presentation_trace: &mut PresentationTransactionTraceRing,
+    target: PresentationTarget,
+    crtc_id: u32,
+    output_generation: u64,
+    pacing_mode: NativeOutputPacingMode,
+    cursor_epoch: u64,
+) -> NativeResult<PlaneDeltaPreparation> {
+    if let Some(promoted) =
+        take_promotable_cursor_sidecar(worker, output_generation, crtc_id, target)
+    {
+        let desired = match &promoted.assignment {
+            CursorPlaneAssignment::Atomic { state, .. } => state.clone(),
+            CursorPlaneAssignment::Disabled => None,
+            CursorPlaneAssignment::Unchanged => {
+                return Err(io::Error::other("promoted sidecar has no cursor update").into());
+            }
+        };
+        let cursor_epoch = match promoted.assignment {
+            CursorPlaneAssignment::Atomic { desired_epoch, .. } => desired_epoch,
+            CursorPlaneAssignment::Disabled => cursor_epoch,
+            CursorPlaneAssignment::Unchanged => unreachable!(),
+        };
+        return Ok(PlaneDeltaPreparation::Submit {
+            transaction_id: promoted.transaction.id(),
+            desired,
+            cursor_epoch,
+            cursor_pin: promoted.lease,
+            target: promoted.deadline,
+        });
+    }
+
+    let transaction_id = output_transactions
+        .allocate_id()
+        .map_err(io::Error::other)?;
+    let transaction = OutputTransaction::cursor_plane_delta(
+        transaction_id,
+        output_generation,
+        MonotonicTimestampNs::new(monotonic_now_ns()?),
+        target,
+        pacing_mode,
+        cursor_epoch,
+        desired.clone(),
+        OutputReleasePlan::Pageflip,
+    )
+    .map_err(io::Error::other)?;
+    output_transactions
+        .insert(transaction)
+        .map_err(io::Error::other)?;
+    if let Some(outcome) = try_offer_cursor_sidecar(
+        worker,
+        cursor,
+        desired.as_ref(),
+        output_transactions,
+        presentation_trace,
+        transaction_id,
+        target,
+        crtc_id,
+    )? {
+        return Ok(PlaneDeltaPreparation::Return(outcome));
+    }
+    Ok(PlaneDeltaPreparation::Submit {
+        transaction_id,
+        desired,
+        cursor_epoch,
+        cursor_pin: None,
+        target,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_offer_cursor_sidecar(
     worker: &KmsCommitWorkerHandle,
@@ -47,6 +133,17 @@ pub(super) fn try_offer_cursor_sidecar(
     else {
         unreachable!("cursor plane-delta constructor returned another content kind");
     };
+    let visibility_transition =
+        desired.is_some_and(|state| state.visible) != cursor.current().visible;
+    let coupling = if visibility_transition {
+        CursorSidecarCoupling::MustBundleWith(
+            worker
+                .attachable_primary_transaction_id()
+                .ok_or_else(|| io::Error::other("coupled sidecar has no primary owner"))?,
+        )
+    } else {
+        CursorSidecarCoupling::Independent
+    };
     let sidecar = CursorSidecar {
         id: cursor_sidecar_id,
         transaction: Arc::new(descriptor.clone()),
@@ -56,11 +153,15 @@ pub(super) fn try_offer_cursor_sidecar(
             .filter(|state| state.framebuffer_id.is_some())
             .map(|state| cursor.pin_framebuffer_for(state))
             .transpose()?,
-        coupling: CursorSidecarCoupling::Independent,
+        coupling,
         created_at: descriptor.created_at(),
         deadline: target,
         crtc_id,
-        test_policy: KmsTestOnlyPolicy::Required,
+        test_policy: if cursor.current_capability_proven() {
+            KmsTestOnlyPolicy::Skip
+        } else {
+            KmsTestOnlyPolicy::Required
+        },
     };
     match worker.offer_cursor_sidecar(sidecar) {
         Ok(replaced) => {
@@ -92,6 +193,15 @@ pub(super) fn try_offer_cursor_sidecar(
             Ok(Some(WorkerQueueOutcome::Unavailable(error.reason)))
         }
     }
+}
+
+pub(super) fn take_promotable_cursor_sidecar(
+    worker: &KmsCommitWorkerHandle,
+    output_generation: u64,
+    crtc_id: u32,
+    target: PresentationTarget,
+) -> Option<CursorSidecar> {
+    worker.take_due_independent_cursor_sidecar(output_generation, crtc_id, target)
 }
 
 pub(super) fn cursor_worker_opportunities(

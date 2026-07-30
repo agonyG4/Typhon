@@ -63,6 +63,11 @@ pub(crate) struct WorkerMetrics {
     pub(crate) cursor_worker_rejections_fallback: AtomicU64,
     pub(crate) cursor_worker_arbitration_consumed: AtomicU64,
     pub(crate) cursor_worker_epoch_mismatches: AtomicU64,
+    pub(crate) cursor_sidecars_materialized: AtomicU64,
+    pub(crate) cursor_sidecars_replaced: AtomicU64,
+    pub(crate) cursor_sidecars_claimed: AtomicU64,
+    pub(crate) cursor_sidecars_promoted: AtomicU64,
+    pub(crate) cursor_sidecars_missed_freeze: AtomicU64,
     pub(crate) worker_pacing_submits_confirmed: AtomicU64,
     pub(crate) worker_pacing_pre_submit_rejections: AtomicU64,
 }
@@ -113,6 +118,11 @@ pub(crate) struct WorkerMetricsSnapshot {
     pub(crate) cursor_worker_rejections_fallback: u64,
     pub(crate) cursor_worker_arbitration_consumed: u64,
     pub(crate) cursor_worker_epoch_mismatches: u64,
+    pub(crate) cursor_sidecars_materialized: u64,
+    pub(crate) cursor_sidecars_replaced: u64,
+    pub(crate) cursor_sidecars_claimed: u64,
+    pub(crate) cursor_sidecars_promoted: u64,
+    pub(crate) cursor_sidecars_missed_freeze: u64,
     pub(crate) worker_pacing_submits_confirmed: u64,
     pub(crate) worker_pacing_pre_submit_rejections: u64,
 }
@@ -169,6 +179,11 @@ impl WorkerMetrics {
             cursor_worker_rejections_fallback: read!(cursor_worker_rejections_fallback),
             cursor_worker_arbitration_consumed: read!(cursor_worker_arbitration_consumed),
             cursor_worker_epoch_mismatches: read!(cursor_worker_epoch_mismatches),
+            cursor_sidecars_materialized: read!(cursor_sidecars_materialized),
+            cursor_sidecars_replaced: read!(cursor_sidecars_replaced),
+            cursor_sidecars_claimed: read!(cursor_sidecars_claimed),
+            cursor_sidecars_promoted: read!(cursor_sidecars_promoted),
+            cursor_sidecars_missed_freeze: read!(cursor_sidecars_missed_freeze),
             worker_pacing_submits_confirmed: read!(worker_pacing_submits_confirmed),
             worker_pacing_pre_submit_rejections: read!(worker_pacing_pre_submit_rejections),
         }
@@ -352,6 +367,7 @@ pub(crate) struct WorkerState {
     pub(crate) reserved_direct_content_keys: HashSet<DirectScanoutCandidateKey>,
     pub(crate) executing: bool,
     pub(crate) executing_direct_content_key: Option<DirectScanoutCandidateKey>,
+    pub(crate) executing_primary_transaction_id: Option<crate::native_output::OutputTransactionId>,
     pub(crate) inflight: Option<WorkerInFlight>,
     pub(crate) phase: KmsWorkerPhase,
     pub(crate) cursor_sidecar: CursorSidecarMailbox,
@@ -367,12 +383,7 @@ impl WorkerShared {
             .queued
             .front()
             .is_some_and(|job| job.kind.is_primary());
-        let executing_before_freeze = state.executing
-            && matches!(
-                state.phase,
-                KmsWorkerPhase::DequeuedWaitingPredecessor | KmsWorkerPhase::CollectingSidecar
-            );
-        queued_primary || executing_before_freeze
+        queued_primary || state.executing
     }
 
     pub(crate) fn new(result_fd: OwnedFd) -> Self {
@@ -384,6 +395,7 @@ impl WorkerShared {
                 reserved_direct_content_keys: HashSet::new(),
                 executing: false,
                 executing_direct_content_key: None,
+                executing_primary_transaction_id: None,
                 inflight: None,
                 phase: KmsWorkerPhase::Idle,
                 cursor_sidecar: CursorSidecarMailbox::default(),
@@ -489,6 +501,27 @@ impl WorkerShared {
             });
         }
         let replaced = state.cursor_sidecar.offer(sidecar);
+        self.metrics
+            .cursor_sidecars_materialized
+            .fetch_add(1, Ordering::Relaxed);
+        if replaced.is_some() {
+            self.metrics
+                .cursor_sidecars_replaced
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if state.executing
+            && matches!(
+                state.phase,
+                KmsWorkerPhase::FrozenForValidation
+                    | KmsWorkerPhase::TestOnly
+                    | KmsWorkerPhase::SubmitIoctl
+                    | KmsWorkerPhase::KernelInFlight
+            )
+        {
+            self.metrics
+                .cursor_sidecars_missed_freeze
+                .fetch_add(1, Ordering::Relaxed);
+        }
         debug_assert!(state.cursor_sidecar.len() <= 1);
         drop(state);
         self.work_wakeup.notify_all();
