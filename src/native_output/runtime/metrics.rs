@@ -144,17 +144,17 @@ impl NativeRuntime {
                     self.cursor_output_arbitration.changes_coalesced(),
                 ),
                 NativePerfField::u64(
-                    "cursor_only_plans",
-                    self.cursor_output_arbitration.cursor_only_plans(),
+                    "plane_delta_plans",
+                    self.cursor_output_arbitration.plane_delta_plans(),
                 ),
                 NativePerfField::u64(
-                    "cursor_only_submissions",
-                    self.cursor_output_arbitration.cursor_only_submissions(),
+                    "plane_delta_submissions",
+                    self.cursor_output_arbitration.plane_delta_submissions(),
                 ),
                 NativePerfField::u64(
-                    "cursor_only_deferred_for_primary",
+                    "plane_delta_deferred_for_primary",
                     self.cursor_output_arbitration
-                        .cursor_only_deferred_for_primary(),
+                        .plane_delta_deferred_for_primary(),
                 ),
                 NativePerfField::u64(
                     "cursor_state_piggybacked",

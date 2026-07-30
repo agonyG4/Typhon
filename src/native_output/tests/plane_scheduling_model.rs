@@ -42,10 +42,10 @@ fn cursor_revision_advances_only_the_changed_field() {
 
 #[test]
 fn cursor_write_set_rejects_primary_mutation() {
-    let cursor_only = PlaneWriteSet::CURSOR;
-    assert!(cursor_only.validate_cursor_delta().is_ok());
+    let plane_delta = PlaneWriteSet::CURSOR;
+    assert!(plane_delta.validate_cursor_delta().is_ok());
     assert!(
-        (cursor_only | PlaneWriteSet::PRIMARY)
+        (plane_delta | PlaneWriteSet::PRIMARY)
             .validate_cursor_delta()
             .is_err()
     );

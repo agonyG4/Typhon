@@ -15,7 +15,7 @@ pub(crate) enum AtomicCommitKind {
         direct_token: PageFlipToken,
         framebuffer_id: u32,
     },
-    CursorOnly {
+    PlaneDelta {
         transaction_id: OutputTransactionId,
         cursor_epoch: u64,
         framebuffer_id: Option<u32>,
@@ -429,7 +429,7 @@ impl AtomicCommitArbiter {
         pending.watchdog_reported = true;
         self.atomic_commit_watchdog_timeouts_total =
             self.atomic_commit_watchdog_timeouts_total.saturating_add(1);
-        if matches!(pending.kind, AtomicCommitKind::CursorOnly { .. }) {
+        if matches!(pending.kind, AtomicCommitKind::PlaneDelta { .. }) {
             self.atomic_cursor_watchdog_timeouts =
                 self.atomic_cursor_watchdog_timeouts.saturating_add(1);
         } else {
@@ -529,7 +529,7 @@ mod tests {
     }
 
     fn cursor_kind() -> AtomicCommitKind {
-        AtomicCommitKind::CursorOnly {
+        AtomicCommitKind::PlaneDelta {
             transaction_id: transaction_id(4),
             cursor_epoch: 4,
             framebuffer_id: Some(91),
@@ -659,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_only_reserves_same_atomic_slot_as_primary() {
+    fn plane_delta_reserves_same_atomic_slot_as_primary() {
         let mut arbiter = AtomicCommitArbiter::with_watchdog(2, 100);
         arbiter
             .reserve(token(1), 3, 42, cursor_kind(), 100)
@@ -675,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_cannot_submit_while_cursor_only_is_pending() {
+    fn primary_cannot_submit_while_plane_delta_is_pending() {
         let mut arbiter = AtomicCommitArbiter::with_watchdog(2, 100);
         arbiter
             .reserve(token(1), 3, 42, cursor_kind(), 100)
@@ -703,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn pageflip_routes_cursor_only_by_commit_kind() {
+    fn pageflip_routes_plane_delta_by_commit_kind() {
         let mut arbiter = AtomicCommitArbiter::with_watchdog(2, 100);
         arbiter
             .reserve(token(1), 3, 42, cursor_kind(), 100)
@@ -792,14 +792,14 @@ mod tests {
     }
 
     #[test]
-    fn cursor_only_completion_does_not_complete_frame_batch() {
+    fn plane_delta_completion_does_not_complete_frame_batch() {
         let mut arbiter = AtomicCommitArbiter::with_watchdog(2, 100);
         arbiter
             .reserve(token(1), 3, 42, cursor_kind(), 100)
             .unwrap();
 
         let AtomicCommitCompletion::Completed {
-            kind: AtomicCommitKind::CursorOnly { .. },
+            kind: AtomicCommitKind::PlaneDelta { .. },
             ..
         } = arbiter.complete(token(1), 3, 42)
         else {
@@ -808,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_only_submission_arms_atomic_watchdog() {
+    fn plane_delta_submission_arms_atomic_watchdog() {
         let mut arbiter = AtomicCommitArbiter::with_watchdog(25, 100);
         arbiter
             .reserve(token(1), 3, 42, cursor_kind(), 100)
@@ -872,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_only_pageflip_clears_atomic_watchdog() {
+    fn plane_delta_pageflip_clears_atomic_watchdog() {
         let mut arbiter = AtomicCommitArbiter::with_watchdog(25, 100);
         arbiter
             .reserve(token(1), 3, 42, cursor_kind(), 100)

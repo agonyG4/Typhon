@@ -33,10 +33,10 @@ impl NativeRuntime {
                                         | AtomicCommitKind::DirectPrimary { transaction_id, .. } => {
                                             Some(transaction_id)
                                         }
-                                        AtomicCommitKind::CursorOnly { .. } => None,
+                                        AtomicCommitKind::PlaneDelta { .. } => None,
                                     },
                                     cursor_transaction_id: match pending.kind {
-                                        AtomicCommitKind::CursorOnly { transaction_id, .. } => {
+                                        AtomicCommitKind::PlaneDelta { transaction_id, .. } => {
                                             Some(transaction_id)
                                         }
                                         AtomicCommitKind::CompositedPrimary { .. }
@@ -49,7 +49,7 @@ impl NativeRuntime {
                                         transaction_id, ..
                                     }
                                     | AtomicCommitKind::DirectPrimary { transaction_id, .. }
-                                    | AtomicCommitKind::CursorOnly { transaction_id, .. } => {
+                                    | AtomicCommitKind::PlaneDelta { transaction_id, .. } => {
                                         transaction_id
                                     }
                                 },

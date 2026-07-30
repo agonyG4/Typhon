@@ -1,8 +1,8 @@
 use super::cycle::direct_fallback::DirectFallbackTracker;
-use super::kms_worker::{WorkerQueueOutcome, queue_cursor_only, queue_explicit_composited_frame};
+use super::kms_worker::{WorkerQueueOutcome, queue_explicit_composited_frame, queue_plane_delta};
 use super::presentation_transactions::{
     DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
-    settle_failed_output_transaction, submit_cursor_only,
+    settle_failed_output_transaction, submit_plane_delta,
 };
 use super::*;
 use crate::native_output::kms_worker::{
@@ -194,7 +194,7 @@ fn settle_failed_direct_worker_transaction(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn queue_cursor_only_for_presentation(
+pub(super) fn queue_plane_delta_for_presentation(
     worker: &KmsCommitWorkerHandle,
     cursor: &mut NativeAtomicCursor,
     desired: Option<AtomicCursorVisualState>,
@@ -207,7 +207,7 @@ pub(super) fn queue_cursor_only_for_presentation(
     pacing_mode: NativeOutputPacingMode,
     cursor_epoch: u64,
 ) -> NativeResult<SchedulerDecision> {
-    match queue_cursor_only(
+    match queue_plane_delta(
         worker,
         cursor,
         desired,
@@ -259,7 +259,7 @@ pub(super) fn present_cursor_for_presentation(
 ) -> NativeResult<Option<SchedulerDecision>> {
     if worker_mode {
         let worker = worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?;
-        let decision = queue_cursor_only_for_presentation(
+        let decision = queue_plane_delta_for_presentation(
             worker,
             cursor,
             desired,
@@ -274,7 +274,7 @@ pub(super) fn present_cursor_for_presentation(
         )?;
         return Ok((decision != SchedulerDecision::Idle).then_some(decision));
     }
-    let decision = submit_cursor_only(
+    let decision = submit_plane_delta(
         kms_backend,
         cursor,
         desired,
@@ -710,6 +710,6 @@ pub(super) fn worker_cursor_queue_available(
         && arbiter.worker_slot_available()
         && arbiter
             .kernel_submitted_kind()
-            .is_some_and(|kind| !matches!(kind, AtomicCommitKind::CursorOnly { .. }))
+            .is_some_and(|kind| !matches!(kind, AtomicCommitKind::PlaneDelta { .. }))
         && worker.is_some_and(|worker| worker.admission_available())
 }

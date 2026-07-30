@@ -255,7 +255,7 @@ fn test_job_with_input_fence(token: u64, fence: OwnedFd) -> KmsCommitJob {
 
 fn test_cursor_job(token: u64) -> KmsCommitJob {
     let mut job = test_job(token);
-    job.kind = AtomicCommitKind::CursorOnly {
+    job.kind = AtomicCommitKind::PlaneDelta {
         transaction_id: job.transaction_id,
         cursor_epoch: token,
         framebuffer_id: Some(42),
@@ -864,7 +864,7 @@ fn worker_panic_becomes_fatal_event() {
 }
 
 #[test]
-fn cursor_only_pageflip_ack_releases_worker_inflight() {
+fn plane_delta_pageflip_ack_releases_worker_inflight() {
     let executor = Arc::new(ScriptedExecutor {
         outcomes: Mutex::new(VecDeque::from([Ok(())])),
         submitted: Mutex::new(Vec::new()),

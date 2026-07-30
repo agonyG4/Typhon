@@ -82,8 +82,8 @@ pub(crate) enum KmsCommitPayloadError {
     PrimaryAssignmentMismatch,
     CursorAssignmentMismatch,
     MissingExplicitInputFence,
-    CursorOnlyChangesPrimary,
-    CursorOnlyMissingCursorUpdate,
+    PlaneDeltaChangesPrimary,
+    PlaneDeltaMissingCursorUpdate,
     UnexpectedCompatibilityImmediate,
     CursorResourceMismatch,
     DirectPrimaryResourceMismatch,
@@ -161,7 +161,7 @@ impl KmsCommitJob {
                     return Err(KmsCommitPayloadError::OwnerTargetMismatch);
                 }
             }
-            let expected_legacy_owner = if matches!(self.kind, AtomicCommitKind::CursorOnly { .. })
+            let expected_legacy_owner = if matches!(self.kind, AtomicCommitKind::PlaneDelta { .. })
             {
                 self.owners.cursor_transaction_id()
             } else {
@@ -247,8 +247,8 @@ impl KmsCommitJob {
                 } if expected == framebuffer_id && framebuffer.get() == framebuffer_id
             ) => {}
             (
-                AtomicCommitKind::CursorOnly { .. },
-                OutputTransactionContent::CursorOnly { .. },
+                AtomicCommitKind::PlaneDelta { .. },
+                OutputTransactionContent::PlaneDelta { .. },
                 KmsPrimaryUpdate::Unchanged,
             ) => {}
             (
@@ -256,16 +256,16 @@ impl KmsCommitJob {
                 OutputTransactionContent::CompatibilityImmediate { .. },
                 _,
             ) => return Err(KmsCommitPayloadError::UnexpectedCompatibilityImmediate),
-            (AtomicCommitKind::CursorOnly { .. }, _, KmsPrimaryUpdate::Framebuffer { .. }) => {
-                return Err(KmsCommitPayloadError::CursorOnlyChangesPrimary);
+            (AtomicCommitKind::PlaneDelta { .. }, _, KmsPrimaryUpdate::Framebuffer { .. }) => {
+                return Err(KmsCommitPayloadError::PlaneDeltaChangesPrimary);
             }
             _ => return Err(KmsCommitPayloadError::PrimaryAssignmentMismatch),
         }
 
-        if matches!(self.kind, AtomicCommitKind::CursorOnly { .. })
+        if matches!(self.kind, AtomicCommitKind::PlaneDelta { .. })
             && matches!(self.cursor, KmsCursorUpdate::Unchanged)
         {
-            return Err(KmsCommitPayloadError::CursorOnlyMissingCursorUpdate);
+            return Err(KmsCommitPayloadError::PlaneDeltaMissingCursorUpdate);
         }
         let cursor_transaction = self
             .owners
@@ -301,12 +301,12 @@ impl KmsCommitJob {
                 }
             }
         }
-        if let AtomicCommitKind::CursorOnly { cursor_epoch, .. } = self.kind {
+        if let AtomicCommitKind::PlaneDelta { cursor_epoch, .. } = self.kind {
             if !matches!(
                 transaction.planes().primary(),
                 PrimaryPlaneAssignment::Unchanged
             ) {
-                return Err(KmsCommitPayloadError::CursorOnlyChangesPrimary);
+                return Err(KmsCommitPayloadError::PlaneDeltaChangesPrimary);
             }
             if !matches!(
                 transaction.planes().cursor(),
@@ -326,7 +326,7 @@ fn kind_transaction_id(kind: AtomicCommitKind) -> OutputTransactionId {
     match kind {
         AtomicCommitKind::CompositedPrimary { transaction_id, .. }
         | AtomicCommitKind::DirectPrimary { transaction_id, .. }
-        | AtomicCommitKind::CursorOnly { transaction_id, .. } => transaction_id,
+        | AtomicCommitKind::PlaneDelta { transaction_id, .. } => transaction_id,
     }
 }
 

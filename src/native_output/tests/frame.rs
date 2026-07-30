@@ -205,7 +205,7 @@ fn reactive_double_oracle(scenario: ReactiveOracleScenario) -> Vec<ReactiveOracl
                     cursor_hardware_usable: true,
                     cursor_visible: false,
                     atomic_commit_pending: false,
-                    cursor_only_allowed: true,
+                    plane_delta_allowed: true,
                     render_ahead_requested: false,
                 }),
             ));
@@ -925,7 +925,7 @@ fn cursor_output_work_waits_for_the_next_output_deadline() {
     );
     assert_eq!(
         arbitration.disposition(2_000, false, true),
-        NativeCursorOutputDisposition::SubmitCursorOnly
+        NativeCursorOutputDisposition::SubmitPlaneDelta
     );
 }
 
@@ -991,8 +991,8 @@ fn consume_clears_pending_cursor_work_but_preserves_cumulative_metrics() {
     let mut arbitration = NativeCursorOutputArbitration::default();
     arbitration.request(1, 1_000, 2_000);
     arbitration.request(2, 1_100, 2_000);
-    arbitration.note_disposition(NativeCursorOutputDisposition::SubmitCursorOnly);
-    arbitration.note_cursor_only_submission();
+    arbitration.note_disposition(NativeCursorOutputDisposition::SubmitPlaneDelta);
+    arbitration.note_plane_delta_submission();
 
     arbitration.consume(2);
 
@@ -1001,8 +1001,8 @@ fn consume_clears_pending_cursor_work_but_preserves_cumulative_metrics() {
     assert_eq!(arbitration.desired_epoch(), 0);
     assert_eq!(arbitration.response_windows_opened(), 1);
     assert_eq!(arbitration.changes_coalesced(), 1);
-    assert_eq!(arbitration.cursor_only_plans(), 1);
-    assert_eq!(arbitration.cursor_only_submissions(), 1);
+    assert_eq!(arbitration.plane_delta_plans(), 1);
+    assert_eq!(arbitration.plane_delta_submissions(), 1);
     assert_eq!(arbitration.idle_hardware_updates(), 1);
 }
 
@@ -1061,7 +1061,7 @@ fn one_thousand_pointer_updates_coalesce_before_the_primary_deadline() {
 }
 
 #[test]
-fn one_hundred_cursor_changes_produce_one_cursor_only_plan() {
+fn one_hundred_cursor_changes_produce_one_plane_delta_plan() {
     let mut arbitration = NativeCursorOutputArbitration::default();
     for epoch in 1..=100 {
         arbitration.request(epoch, epoch, 6_060_606);
@@ -1071,14 +1071,14 @@ fn one_hundred_cursor_changes_produce_one_cursor_only_plan() {
     assert_eq!(arbitration.changes_coalesced(), 99);
     assert_eq!(
         arbitration.disposition(6_060_606, false, true),
-        NativeCursorOutputDisposition::SubmitCursorOnly
+        NativeCursorOutputDisposition::SubmitPlaneDelta
     );
-    arbitration.note_disposition(NativeCursorOutputDisposition::SubmitCursorOnly);
-    arbitration.note_cursor_only_submission();
+    arbitration.note_disposition(NativeCursorOutputDisposition::SubmitPlaneDelta);
+    arbitration.note_plane_delta_submission();
     arbitration.consume(100);
 
-    assert_eq!(arbitration.cursor_only_plans(), 1);
-    assert_eq!(arbitration.cursor_only_submissions(), 1);
+    assert_eq!(arbitration.plane_delta_plans(), 1);
+    assert_eq!(arbitration.plane_delta_submissions(), 1);
     assert!(!arbitration.pending());
 }
 

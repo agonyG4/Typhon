@@ -21,7 +21,7 @@ fn test_sidecar(job: &KmsCommitJob, id: u64, coupling: CursorSidecarCoupling) ->
         std::num::NonZeroU64::new(id.saturating_mul(100)).unwrap(),
     );
     let transaction = Arc::new(
-        crate::native_output::OutputTransaction::cursor_only(
+        crate::native_output::OutputTransaction::cursor_plane_delta(
             transaction_id,
             job.output_generation,
             oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(id),
@@ -83,7 +83,7 @@ fn two_owner_job(
     );
     let transaction = |id, epoch| {
         Arc::new(
-            crate::native_output::OutputTransaction::cursor_only(
+            crate::native_output::OutputTransaction::cursor_plane_delta(
                 id,
                 1,
                 oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(0),

@@ -84,7 +84,7 @@ pub(super) fn handle_fatal_worker_jobs(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn queue_cursor_only(
+pub(super) fn queue_plane_delta(
     worker: &KmsCommitWorkerHandle,
     cursor: &mut NativeAtomicCursor,
     desired: Option<AtomicCursorVisualState>,
@@ -104,7 +104,7 @@ pub(super) fn queue_cursor_only(
     let transaction_id = output_transactions
         .allocate_id()
         .map_err(io::Error::other)?;
-    let transaction = OutputTransaction::cursor_only(
+    let transaction = OutputTransaction::cursor_plane_delta(
         transaction_id,
         output_generation,
         MonotonicTimestampNs::new(monotonic_now_ns()?),
@@ -121,7 +121,7 @@ pub(super) fn queue_cursor_only(
     let token = PageFlipToken::new(allocate_native_page_flip_token())
         .expect("allocated native pageflip token is nonzero");
     let queued_at_ns = monotonic_now_ns()?;
-    let kind = AtomicCommitKind::CursorOnly {
+    let kind = AtomicCommitKind::PlaneDelta {
         transaction_id,
         cursor_epoch,
         framebuffer_id: desired.as_ref().and_then(|state| state.framebuffer_id),
@@ -1131,7 +1131,7 @@ impl NativeRuntime {
                     .into());
                 }
                 let cursor_epoch = match kind {
-                    AtomicCommitKind::CursorOnly { cursor_epoch, .. } => Some(cursor_epoch),
+                    AtomicCommitKind::PlaneDelta { cursor_epoch, .. } => Some(cursor_epoch),
                     AtomicCommitKind::CompositedPrimary { .. }
                     | AtomicCommitKind::DirectPrimary { .. } => match transaction
                         .descriptor()
@@ -1144,7 +1144,7 @@ impl NativeRuntime {
                 };
                 if let Some(cursor_epoch) = cursor_epoch {
                     let (submitted_state, submitted_revision) =
-                        if matches!(kind, AtomicCommitKind::CursorOnly { .. }) {
+                        if matches!(kind, AtomicCommitKind::PlaneDelta { .. }) {
                             let native_cursor = self.atomic_cursor.as_mut().ok_or_else(|| {
                                 io::Error::other("cursor worker submit has no cursor")
                             })?;
@@ -1207,7 +1207,7 @@ impl NativeRuntime {
                             (submitted_state, submitted_revision)
                         };
                     if let Some(native_cursor) = self.atomic_cursor.as_mut() {
-                        if matches!(kind, AtomicCommitKind::CursorOnly { .. }) {
+                        if matches!(kind, AtomicCommitKind::PlaneDelta { .. }) {
                             native_cursor.begin_submission_at_revision(
                                 token,
                                 submitted_state,
@@ -1224,8 +1224,8 @@ impl NativeRuntime {
                         }
                     }
                     self.last_submitted_cursor_epoch = cursor_epoch;
-                    if matches!(kind, AtomicCommitKind::CursorOnly { .. }) {
-                        self.cursor_output_arbitration.note_cursor_only_submission();
+                    if matches!(kind, AtomicCommitKind::PlaneDelta { .. }) {
+                        self.cursor_output_arbitration.note_plane_delta_submission();
                         self.cursor_output_arbitration.consume_submitted_epoch(
                             cursor_epoch,
                             submit_returned_at,
@@ -1260,7 +1260,7 @@ impl NativeRuntime {
                         .confirm_kernel_submission(token.get(), submit_returned_at)
                         .map_err(io::Error::other)?;
                 }
-                if !matches!(kind, AtomicCommitKind::CursorOnly { .. }) {
+                if !matches!(kind, AtomicCommitKind::PlaneDelta { .. }) {
                     let pacing_mode = self
                         .output_transactions
                         .transaction(transaction_id)

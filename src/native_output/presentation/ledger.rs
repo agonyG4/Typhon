@@ -231,19 +231,19 @@ pub(crate) struct OutputTransactionCounters {
     pub(crate) queued: u64,
     pub(crate) queued_composited: u64,
     pub(crate) queued_direct: u64,
-    pub(crate) queued_cursor_only: u64,
+    pub(crate) queued_plane_delta: u64,
     pub(crate) queued_compatibility: u64,
     pub(crate) queue_wait_ns_total: u64,
     pub(crate) queue_wait_ns_max: u64,
     pub(crate) built_composited: u64,
     pub(crate) built_direct: u64,
-    pub(crate) built_cursor_only: u64,
+    pub(crate) built_plane_delta: u64,
     pub(crate) submitted_composited: u64,
     pub(crate) submitted_direct: u64,
-    pub(crate) submitted_cursor_only: u64,
+    pub(crate) submitted_plane_delta: u64,
     pub(crate) presented_composited: u64,
     pub(crate) presented_direct: u64,
-    pub(crate) presented_cursor_only: u64,
+    pub(crate) presented_plane_delta: u64,
 }
 
 #[derive(Debug)]
@@ -340,8 +340,8 @@ impl OutputTransactionLedger {
                 self.counters.built_direct = self.counters.built_direct.saturating_add(1);
             }
             OutputTransactionContent::CompatibilityImmediate { .. } => {}
-            OutputTransactionContent::CursorOnly { .. } => {
-                self.counters.built_cursor_only = self.counters.built_cursor_only.saturating_add(1);
+            OutputTransactionContent::PlaneDelta { .. } => {
+                self.counters.built_plane_delta = self.counters.built_plane_delta.saturating_add(1);
             }
         }
         self.counters.active_peak = self.counters.active_peak.max(self.active.len() as u64);
@@ -393,8 +393,8 @@ impl OutputTransactionLedger {
             OutputTransactionContent::Direct { .. } => {
                 counters.queued_direct = counters.queued_direct.saturating_add(1)
             }
-            OutputTransactionContent::CursorOnly { .. } => {
-                counters.queued_cursor_only = counters.queued_cursor_only.saturating_add(1)
+            OutputTransactionContent::PlaneDelta { .. } => {
+                counters.queued_plane_delta = counters.queued_plane_delta.saturating_add(1)
             }
             OutputTransactionContent::CompatibilityImmediate { .. } => {
                 counters.queued_compatibility = counters.queued_compatibility.saturating_add(1)
@@ -429,9 +429,9 @@ impl OutputTransactionLedger {
             OutputTransactionContent::Direct { .. } => {
                 self.counters.queued_direct = self.counters.queued_direct.saturating_sub(1)
             }
-            OutputTransactionContent::CursorOnly { .. } => {
-                self.counters.queued_cursor_only =
-                    self.counters.queued_cursor_only.saturating_sub(1)
+            OutputTransactionContent::PlaneDelta { .. } => {
+                self.counters.queued_plane_delta =
+                    self.counters.queued_plane_delta.saturating_sub(1)
             }
             OutputTransactionContent::CompatibilityImmediate { .. } => {
                 self.counters.queued_compatibility =
@@ -486,8 +486,8 @@ impl OutputTransactionLedger {
             OutputTransactionContent::Direct { .. } => {
                 counters.submitted_direct = counters.submitted_direct.saturating_add(1)
             }
-            OutputTransactionContent::CursorOnly { .. } => {
-                counters.submitted_cursor_only = counters.submitted_cursor_only.saturating_add(1)
+            OutputTransactionContent::PlaneDelta { .. } => {
+                counters.submitted_plane_delta = counters.submitted_plane_delta.saturating_add(1)
             }
             OutputTransactionContent::CompatibilityImmediate { .. } => {}
         });
@@ -1108,9 +1108,9 @@ impl OutputTransactionLedger {
                         self.counters.presented_direct =
                             self.counters.presented_direct.saturating_add(1)
                     }
-                    OutputTransactionContent::CursorOnly { .. } => {
-                        self.counters.presented_cursor_only =
-                            self.counters.presented_cursor_only.saturating_add(1)
+                    OutputTransactionContent::PlaneDelta { .. } => {
+                        self.counters.presented_plane_delta =
+                            self.counters.presented_plane_delta.saturating_add(1)
                     }
                     OutputTransactionContent::CompatibilityImmediate { .. } => {
                         self.counters.immediate_presentations =

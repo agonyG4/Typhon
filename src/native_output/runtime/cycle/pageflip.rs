@@ -1,4 +1,4 @@
-use super::super::cursor_cycle::{complete_cursor_only_pageflip, complete_primary_cursor_pageflip};
+use super::super::cursor_cycle::{complete_plane_delta_pageflip, complete_primary_cursor_pageflip};
 use super::super::presentation_transactions::{
     commit_prepared_presented_output_transaction, complete_presented_output_transaction,
     prepare_presented_output_transaction,
@@ -358,14 +358,14 @@ impl NativeRuntime {
                 matches!(
                     completion,
                     AtomicCommitCompletion::Completed {
-                        kind: AtomicCommitKind::CursorOnly { .. },
+                        kind: AtomicCommitKind::PlaneDelta { .. },
                         ..
                     }
                 )
             });
             let cursor_transaction_id = match atomic_completion {
                 Some(AtomicCommitCompletion::Completed {
-                    kind: AtomicCommitKind::CursorOnly { transaction_id, .. },
+                    kind: AtomicCommitKind::PlaneDelta { transaction_id, .. },
                     ..
                 }) => Some(transaction_id),
                 _ => None,
@@ -386,7 +386,7 @@ impl NativeRuntime {
                         None,
                         |obligations| {
                             debug_assert!(obligations.frame_batch_id().is_none());
-                            let _ = complete_cursor_only_pageflip(
+                            let _ = complete_plane_delta_pageflip(
                                 atomic_cursor,
                                 pageflip.user_data,
                                 *drm_file_generation,
@@ -396,7 +396,7 @@ impl NativeRuntime {
                         },
                     )?;
                 } else {
-                    let _ = complete_cursor_only_pageflip(
+                    let _ = complete_plane_delta_pageflip(
                         atomic_cursor,
                         pageflip.user_data,
                         *drm_file_generation,
@@ -836,7 +836,7 @@ impl NativeRuntime {
                 && let Some(AtomicCommitCompletion::Completed { kind, .. }) = atomic_completion
             {
                 let path_completed = match kind {
-                    AtomicCommitKind::CursorOnly { .. } => cursor_commit,
+                    AtomicCommitKind::PlaneDelta { .. } => cursor_commit,
                     AtomicCommitKind::CompositedPrimary { .. }
                     | AtomicCommitKind::DirectPrimary { .. } => {
                         matches!(completion, PageFlipCompletionResult::Completed { .. })
@@ -846,7 +846,7 @@ impl NativeRuntime {
                     let transaction_id = match kind {
                         AtomicCommitKind::CompositedPrimary { transaction_id, .. }
                         | AtomicCommitKind::DirectPrimary { transaction_id, .. }
-                        | AtomicCommitKind::CursorOnly { transaction_id, .. } => transaction_id,
+                        | AtomicCommitKind::PlaneDelta { transaction_id, .. } => transaction_id,
                     };
                     let pageflip_token = PageFlipToken::new(pageflip.user_data)
                         .ok_or_else(|| io::Error::other("pageflip token is zero"))?;

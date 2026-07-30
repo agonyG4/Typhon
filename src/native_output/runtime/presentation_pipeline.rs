@@ -115,7 +115,7 @@ fn commit_snapshot(
             }
             (transaction_id, None, Some(framebuffer_id))
         }
-        AtomicCommitKind::CursorOnly { transaction_id, .. } => (transaction_id, None, None),
+        AtomicCommitKind::PlaneDelta { transaction_id, .. } => (transaction_id, None, None),
     };
     let record = record_for_active_owner(ledger, owner, transaction_id)?;
     validate_state(record, owner, expected_state)?;
@@ -242,14 +242,12 @@ fn commit_snapshot(
             }
         }
         (
-            AtomicCommitKind::CursorOnly {
+            AtomicCommitKind::PlaneDelta {
                 cursor_epoch,
                 framebuffer_id,
                 ..
             },
-            OutputTransactionContent::CursorOnly {
-                cursor_epoch: content_epoch,
-            },
+            OutputTransactionContent::PlaneDelta { changed, .. },
             PrimaryPlaneAssignment::Unchanged,
         ) => {
             if swapchain_role.is_some() {
@@ -258,7 +256,7 @@ fn commit_snapshot(
                     transaction_id,
                 });
             }
-            if cursor_epoch != content_epoch {
+            if changed.validate_cursor_delta().is_err() {
                 return Err(identity_mismatch(owner, "cursor_epoch", transaction_id));
             }
             match descriptor.planes().cursor() {
@@ -269,7 +267,7 @@ fn commit_snapshot(
                     && state.as_ref().and_then(|state| state.framebuffer_id) == framebuffer_id => {}
                 _ => return Err(identity_mismatch(owner, "cursor_plan", transaction_id)),
             }
-            PipelineCommitKind::CursorOnly {
+            PipelineCommitKind::PlaneDelta {
                 transaction_id,
                 cursor_epoch,
                 framebuffer_id,
@@ -632,7 +630,7 @@ mod tests {
         let id = transaction_id(1);
         ledger
             .insert(
-                OutputTransaction::cursor_only(
+                OutputTransaction::cursor_plane_delta(
                     id,
                     1,
                     MonotonicTimestampNs::new(0),
@@ -773,7 +771,7 @@ mod tests {
                 token(1),
                 1,
                 7,
-                AtomicCommitKind::CursorOnly {
+                AtomicCommitKind::PlaneDelta {
                     transaction_id: id,
                     cursor_epoch: 7,
                     framebuffer_id: Some(90),
@@ -822,7 +820,7 @@ mod tests {
                 token(1),
                 1,
                 7,
-                AtomicCommitKind::CursorOnly {
+                AtomicCommitKind::PlaneDelta {
                     transaction_id: id,
                     cursor_epoch: 7,
                     framebuffer_id: Some(90),

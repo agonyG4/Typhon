@@ -38,7 +38,7 @@ impl NativeRuntime {
                     )
                 });
         let cursor_epoch = match job.kind {
-            AtomicCommitKind::CursorOnly { cursor_epoch, .. } => Some(cursor_epoch),
+            AtomicCommitKind::PlaneDelta { cursor_epoch, .. } => Some(cursor_epoch),
             AtomicCommitKind::CompositedPrimary { .. } | AtomicCommitKind::DirectPrimary { .. } => {
                 None
             }
@@ -154,7 +154,7 @@ impl NativeRuntime {
                         PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
                     )
                 });
-        if let AtomicCommitKind::CursorOnly { cursor_epoch, .. } = job.kind {
+        if let AtomicCommitKind::PlaneDelta { cursor_epoch, .. } = job.kind {
             let cursor = self
                 .atomic_cursor
                 .as_mut()

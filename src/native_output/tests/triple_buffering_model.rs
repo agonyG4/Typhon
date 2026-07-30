@@ -216,14 +216,14 @@ fn reactive_double_rejects_pending_plus_prepared() {
 }
 
 #[test]
-fn cursor_only_commit_does_not_increase_future_primary_depth() {
+fn plane_delta_commit_does_not_increase_future_primary_depth() {
     let mut snapshot = empty_snapshot();
     snapshot.kernel_submitted = Some(QueuedCommitSnapshot {
         token: token(1),
         output_generation: 1,
         crtc_id: 7,
         target: target(1),
-        kind: PipelineCommitKind::CursorOnly {
+        kind: PipelineCommitKind::PlaneDelta {
             transaction_id: transaction_id(1),
             cursor_epoch: 4,
             framebuffer_id: Some(10),
@@ -235,14 +235,14 @@ fn cursor_only_commit_does_not_increase_future_primary_depth() {
 }
 
 #[test]
-fn kernel_cursor_only_allows_one_prepared_primary_but_forbids_pre_admission() {
+fn kernel_plane_delta_allows_one_prepared_primary_but_forbids_pre_admission() {
     let mut snapshot = empty_snapshot();
     snapshot.kernel_submitted = Some(QueuedCommitSnapshot {
         token: token(1),
         output_generation: 1,
         crtc_id: 7,
         target: target(1),
-        kind: PipelineCommitKind::CursorOnly {
+        kind: PipelineCommitKind::PlaneDelta {
             transaction_id: transaction_id(1),
             cursor_epoch: 4,
             framebuffer_id: Some(10),
@@ -251,14 +251,14 @@ fn kernel_cursor_only_allows_one_prepared_primary_but_forbids_pre_admission() {
     snapshot.prepared = ready(2, 2, 0);
     snapshot.free_compositor_slots = 1;
 
-    assert!(snapshot.kernel_cursor_only());
+    assert!(snapshot.kernel_plane_delta());
     assert_eq!(snapshot.future_primary_depth(), 1);
     assert!(!snapshot.can_pre_admit_primary());
     assert_eq!(snapshot.validate(), Ok(()));
 }
 
 #[test]
-fn scheduler_renders_then_holds_primary_behind_kernel_cursor_only() {
+fn scheduler_renders_then_holds_primary_behind_kernel_plane_delta() {
     let mut scheduler = NativeFrameScheduler::new(60, 0);
     scheduler.queue_visual_work();
     let mut snapshot = empty_snapshot();
@@ -268,7 +268,7 @@ fn scheduler_renders_then_holds_primary_behind_kernel_cursor_only() {
         output_generation: 1,
         crtc_id: 7,
         target: target(1),
-        kind: PipelineCommitKind::CursorOnly {
+        kind: PipelineCommitKind::PlaneDelta {
             transaction_id: transaction_id(1),
             cursor_epoch: 5,
             framebuffer_id: Some(10),

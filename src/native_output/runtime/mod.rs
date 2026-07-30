@@ -345,7 +345,7 @@ impl Drop for NativeRuntime {
             );
             let transaction_counters = self.output_transactions.counters();
             println!(
-                "typhon presentation: event=output_transaction_summary active={} built={} ready={} submitted={} presented={} dropped={} superseded={} failed={} invalid_transitions={} duplicate_obligations={} active_peak={} history_overwrites={} accepted_terminals={} finalized_terminals={} rejected_terminals={} settlement_failures={} failure_stage_mismatches={} active_settling={} immediate_presentations={} immediate_presentation_failures={} immediate_presentations_accepted={} immediate_presentations_finalized={} compatibility_noops={} compatibility_failures={} built_composited={} built_direct={} built_cursor_only={} submitted_composited={} submitted_direct={} submitted_cursor_only={} presented_composited={} presented_direct={} presented_cursor_only={}",
+                "typhon presentation: event=output_transaction_summary active={} built={} ready={} submitted={} presented={} dropped={} superseded={} failed={} invalid_transitions={} duplicate_obligations={} active_peak={} history_overwrites={} accepted_terminals={} finalized_terminals={} rejected_terminals={} settlement_failures={} failure_stage_mismatches={} active_settling={} immediate_presentations={} immediate_presentation_failures={} immediate_presentations_accepted={} immediate_presentations_finalized={} compatibility_noops={} compatibility_failures={} built_composited={} built_direct={} built_plane_delta={} submitted_composited={} submitted_direct={} submitted_plane_delta={} presented_composited={} presented_direct={} presented_plane_delta={}",
                 self.output_transactions.active_count(),
                 transaction_counters.built,
                 transaction_counters.ready,
@@ -372,13 +372,13 @@ impl Drop for NativeRuntime {
                 transaction_counters.compatibility_failures,
                 transaction_counters.built_composited,
                 transaction_counters.built_direct,
-                transaction_counters.built_cursor_only,
+                transaction_counters.built_plane_delta,
                 transaction_counters.submitted_composited,
                 transaction_counters.submitted_direct,
-                transaction_counters.submitted_cursor_only,
+                transaction_counters.submitted_plane_delta,
                 transaction_counters.presented_composited,
                 transaction_counters.presented_direct,
-                transaction_counters.presented_cursor_only,
+                transaction_counters.presented_plane_delta,
             );
             if !self.scanout_destroyed
                 && let Some(counters) = self.scanout.explicit_output_counters()

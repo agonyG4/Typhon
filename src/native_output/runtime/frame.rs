@@ -134,7 +134,7 @@ impl NativeCursorSchedulingPolicy {
 pub(crate) enum NativeCursorOutputDisposition {
     PiggybackPrimary,
     DeferForPrimary,
-    SubmitCursorOnly,
+    SubmitPlaneDelta,
     SoftwareOverlay,
     Noop,
 }
@@ -148,9 +148,9 @@ pub(crate) struct NativeCursorOutputArbitration {
     software_overlay_pending: bool,
     pub(crate) response_windows_opened: u64,
     pub(crate) changes_coalesced: u64,
-    pub(crate) cursor_only_plans: u64,
-    pub(crate) cursor_only_submissions: u64,
-    pub(crate) cursor_only_deferred_for_primary: u64,
+    pub(crate) plane_delta_plans: u64,
+    pub(crate) plane_delta_submissions: u64,
+    pub(crate) plane_delta_deferred_for_primary: u64,
     pub(crate) cursor_state_piggybacked: u64,
     pub(crate) idle_hardware_updates: u64,
     pub(crate) idle_software_updates: u64,
@@ -196,11 +196,11 @@ impl NativeCursorOutputArbitration {
                 self.cursor_state_piggybacked = self.cursor_state_piggybacked.saturating_add(1);
             }
             NativeCursorOutputDisposition::DeferForPrimary => {
-                self.cursor_only_deferred_for_primary =
-                    self.cursor_only_deferred_for_primary.saturating_add(1);
+                self.plane_delta_deferred_for_primary =
+                    self.plane_delta_deferred_for_primary.saturating_add(1);
             }
-            NativeCursorOutputDisposition::SubmitCursorOnly => {
-                self.cursor_only_plans = self.cursor_only_plans.saturating_add(1);
+            NativeCursorOutputDisposition::SubmitPlaneDelta => {
+                self.plane_delta_plans = self.plane_delta_plans.saturating_add(1);
                 self.idle_hardware_updates = self.idle_hardware_updates.saturating_add(1);
             }
             NativeCursorOutputDisposition::SoftwareOverlay => {
@@ -210,8 +210,8 @@ impl NativeCursorOutputArbitration {
         }
     }
 
-    pub(crate) fn note_cursor_only_submission(&mut self) {
-        self.cursor_only_submissions = self.cursor_only_submissions.saturating_add(1);
+    pub(crate) fn note_plane_delta_submission(&mut self) {
+        self.plane_delta_submissions = self.plane_delta_submissions.saturating_add(1);
     }
 
     pub(crate) const fn response_windows_opened(&self) -> u64 {
@@ -222,16 +222,16 @@ impl NativeCursorOutputArbitration {
         self.changes_coalesced
     }
 
-    pub(crate) const fn cursor_only_plans(&self) -> u64 {
-        self.cursor_only_plans
+    pub(crate) const fn plane_delta_plans(&self) -> u64 {
+        self.plane_delta_plans
     }
 
-    pub(crate) const fn cursor_only_submissions(&self) -> u64 {
-        self.cursor_only_submissions
+    pub(crate) const fn plane_delta_submissions(&self) -> u64 {
+        self.plane_delta_submissions
     }
 
-    pub(crate) const fn cursor_only_deferred_for_primary(&self) -> u64 {
-        self.cursor_only_deferred_for_primary
+    pub(crate) const fn plane_delta_deferred_for_primary(&self) -> u64 {
+        self.plane_delta_deferred_for_primary
     }
 
     pub(crate) const fn cursor_state_piggybacked(&self) -> u64 {
@@ -266,7 +266,7 @@ impl NativeCursorOutputArbitration {
             };
         }
         if hardware_usable && !self.software_overlay_pending {
-            NativeCursorOutputDisposition::SubmitCursorOnly
+            NativeCursorOutputDisposition::SubmitPlaneDelta
         } else {
             NativeCursorOutputDisposition::SoftwareOverlay
         }
@@ -364,7 +364,7 @@ mod tests {
     }
 }
 
-pub(crate) fn cursor_only_allowed_at_deadline(
+pub(crate) fn plane_delta_allowed_at_deadline(
     arbitration: &mut NativeCursorOutputArbitration,
     _policy: NativeCursorSchedulingPolicy,
     now_ns: u64,
@@ -379,7 +379,7 @@ pub(crate) fn cursor_only_allowed_at_deadline(
     // `PiggybackPrimary` whenever primary work is ready.  Once the output
     // opportunity matures with no primary work, allowing the one queued cursor
     // update prevents a permanently armed deadline in the diagnostic mode.
-    cursor_state_changed && disposition == NativeCursorOutputDisposition::SubmitCursorOnly
+    cursor_state_changed && disposition == NativeCursorOutputDisposition::SubmitPlaneDelta
 }
 
 impl NativeCursorPreference {

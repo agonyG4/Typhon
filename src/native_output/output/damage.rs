@@ -603,7 +603,7 @@ pub(crate) fn native_output_damage_for_repaint_with_cursor(
     render_generation_changed: bool,
     cursor_damage: NativeCursorDamageBounds,
 ) -> NativeOutputDamage {
-    let cursor_only_cause = matches!(
+    let plane_delta_cause = matches!(
         cause,
         RenderGenerationCause::CursorCommit
             | RenderGenerationCause::CursorMotion
@@ -619,7 +619,7 @@ pub(crate) fn native_output_damage_for_repaint_with_cursor(
         ));
         let damage = damage.into_output_damage();
         if damage.rects.is_empty() {
-            if cursor_only_cause {
+            if plane_delta_cause {
                 NativeOutputDamage::empty()
             } else if cause.uses_surface_damage()
                 || matches!(
@@ -636,7 +636,7 @@ pub(crate) fn native_output_damage_for_repaint_with_cursor(
         } else {
             damage
         }
-    } else if cursor_only_cause {
+    } else if plane_delta_cause {
         // Cursor overlays are tracked independently by the renderer.  Returning
         // full-output damage here defeats that tracker and turns pointer motion
         // into a primary repaint.  Native callers add the old/new cursor bounds

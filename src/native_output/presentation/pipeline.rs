@@ -89,7 +89,7 @@ pub(crate) enum PipelineCommitKind {
         key: DirectScanoutCandidateKey,
         framebuffer_id: u32,
     },
-    CursorOnly {
+    PlaneDelta {
         transaction_id: OutputTransactionId,
         cursor_epoch: u64,
         framebuffer_id: Option<u32>,
@@ -101,18 +101,18 @@ impl PipelineCommitKind {
         match self {
             Self::CompositedPrimary { transaction_id, .. }
             | Self::DirectPrimary { transaction_id, .. }
-            | Self::CursorOnly { transaction_id, .. } => transaction_id,
+            | Self::PlaneDelta { transaction_id, .. } => transaction_id,
         }
     }
 
     pub(crate) const fn is_primary(self) -> bool {
-        !matches!(self, Self::CursorOnly { .. })
+        !matches!(self, Self::PlaneDelta { .. })
     }
 
     pub(crate) const fn compositor_slot(self) -> Option<OutputSlotId> {
         match self {
             Self::CompositedPrimary { slot, .. } => Some(slot),
-            Self::DirectPrimary { .. } | Self::CursorOnly { .. } => None,
+            Self::DirectPrimary { .. } | Self::PlaneDelta { .. } => None,
         }
     }
 }
@@ -254,9 +254,9 @@ impl OutputPipelineSnapshot {
         self.worker_queued_next.is_some()
     }
 
-    pub(crate) fn kernel_cursor_only(&self) -> bool {
+    pub(crate) fn kernel_plane_delta(&self) -> bool {
         self.kernel_submitted
-            .is_some_and(|commit| matches!(commit.kind, PipelineCommitKind::CursorOnly { .. }))
+            .is_some_and(|commit| matches!(commit.kind, PipelineCommitKind::PlaneDelta { .. }))
     }
 
     pub(crate) const fn direct_active(&self) -> bool {
@@ -277,7 +277,7 @@ impl OutputPipelineSnapshot {
         matches!(self.prepared, PreparedCompositedState::Ready { .. })
             && self.worker_queued_next.is_none()
             && self.future_primary_depth() <= 2
-            && !self.kernel_cursor_only()
+            && !self.kernel_plane_delta()
     }
 
     pub(crate) fn validate(&self) -> Result<(), PipelineValidationError> {

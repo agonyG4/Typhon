@@ -379,7 +379,7 @@ fn cursor_epoch_wrap_skips_zero_and_submitted_epoch() {
 }
 
 #[test]
-fn idle_theme_cursor_motion_opens_cursor_only_deadline_without_scene_damage() {
+fn idle_theme_cursor_motion_opens_plane_delta_deadline_without_scene_damage() {
     let mut cursor = test_cursor();
     cursor.desired.visible = true;
     cursor.current.visible = true;

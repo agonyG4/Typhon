@@ -619,7 +619,7 @@ pub(super) fn register_primary_transaction(
             OutputTransactionContent::Composited { frame_id, .. }
             | OutputTransactionContent::Direct { frame_id, .. } => Some(frame_id),
             OutputTransactionContent::CompatibilityImmediate { frame_id } => Some(frame_id),
-            OutputTransactionContent::CursorOnly { .. } => None,
+            OutputTransactionContent::PlaneDelta { .. } => None,
         })
         .unwrap_or(frame_index);
     let registered = match register_atomic_primary_submission(
@@ -693,7 +693,7 @@ pub(super) fn build_cursor_transaction(
     let transaction_id = output_transactions
         .allocate_id()
         .map_err(io::Error::other)?;
-    let transaction = OutputTransaction::cursor_only(
+    let transaction = OutputTransaction::cursor_plane_delta(
         transaction_id,
         output_generation,
         MonotonicTimestampNs::new(monotonic_now_ns()?),
@@ -715,7 +715,7 @@ pub(super) fn build_cursor_transaction(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn submit_cursor_only(
+pub(super) fn submit_plane_delta(
     kms_backend: &KmsBackendSelection,
     cursor: &mut NativeAtomicCursor,
     desired: Option<AtomicCursorVisualState>,
@@ -757,7 +757,7 @@ pub(super) fn submit_cursor_only(
                 token,
                 output_generation,
                 crtc_id,
-                AtomicCommitKind::CursorOnly {
+                AtomicCommitKind::PlaneDelta {
                     transaction_id,
                     cursor_epoch,
                     framebuffer_id: desired.as_ref().and_then(|state| state.framebuffer_id),
@@ -793,14 +793,14 @@ pub(super) fn submit_cursor_only(
                         hidden
                     });
                     let submitted_state = cursor.begin_submission(token, submitted_state);
-                    cursor_output_arbitration.note_cursor_only_submission();
+                    cursor_output_arbitration.note_plane_delta_submission();
                     *last_client_cursor_damage = current_client_cursor_damage;
                     *last_software_cursor_damage = current_software_cursor_damage;
                     cursor_output_arbitration.consume(cursor_epoch);
                     perf.log("native.cursor", || {
                         vec![
                             NativePerfField::str("event", "submit"),
-                            NativePerfField::str("kind", "cursor_only"),
+                            NativePerfField::str("kind", "plane_delta"),
                             NativePerfField::u64("generation", cursor.generation),
                             NativePerfField::bool("visible", submitted_state.visible),
                             NativePerfField::str(

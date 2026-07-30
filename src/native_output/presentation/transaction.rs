@@ -7,6 +7,7 @@ use oblivion_one::native::kms::AtomicCursorVisualState;
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
 
+use super::plane::{CursorSidecarId, PlaneWriteSet};
 use crate::native_output::scanout::{CursorContentKey, OutputSlotId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -97,10 +98,10 @@ pub(crate) enum OutputTransactionBuildError {
     MissingDirectSurface,
     DirectPrimaryForCompositedContent,
     CompositorPrimaryForDirectContent,
-    ChangedPrimaryForCursorOnly,
-    FrameBatchForCursorOnly,
+    ChangedPrimaryForPlaneDelta,
+    FrameBatchForPlaneDelta,
     DirectSurfaceForCompositedContent,
-    DirectSurfaceForCursorOnly,
+    DirectSurfaceForPlaneDelta,
     OverlayAssignmentsUnsupported,
 }
 
@@ -127,8 +128,9 @@ pub(crate) enum OutputTransactionContent {
     CompatibilityImmediate {
         frame_id: u64,
     },
-    CursorOnly {
-        cursor_epoch: u64,
+    PlaneDelta {
+        changed: PlaneWriteSet,
+        cursor_sidecar_id: CursorSidecarId,
     },
 }
 
@@ -259,7 +261,7 @@ impl OutputProtocolObligations {
         }
     }
 
-    pub(crate) const fn cursor_only() -> Self {
+    pub(crate) const fn plane_delta() -> Self {
         Self {
             frame_batch_id: None,
             direct_surface_id: None,
@@ -463,12 +465,41 @@ impl OutputTransaction {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn cursor_only(
+    pub(crate) fn cursor_plane_delta(
         id: OutputTransactionId,
         output_generation: u64,
         created_at: MonotonicTimestampNs,
         target: PresentationTarget,
         pacing_mode: NativeOutputPacingMode,
+        cursor_epoch: u64,
+        state: Option<AtomicCursorVisualState>,
+        release: OutputReleasePlan,
+    ) -> Result<Self, OutputTransactionBuildError> {
+        let sidecar_id =
+            CursorSidecarId::new(NonZeroU64::new(cursor_epoch).expect("cursor epoch is nonzero"));
+        Self::plane_delta(
+            id,
+            output_generation,
+            created_at,
+            target,
+            pacing_mode,
+            PlaneWriteSet::CURSOR,
+            sidecar_id,
+            cursor_epoch,
+            state,
+            release,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plane_delta(
+        id: OutputTransactionId,
+        output_generation: u64,
+        created_at: MonotonicTimestampNs,
+        target: PresentationTarget,
+        pacing_mode: NativeOutputPacingMode,
+        changed: PlaneWriteSet,
+        cursor_sidecar_id: CursorSidecarId,
         cursor_epoch: u64,
         state: Option<AtomicCursorVisualState>,
         release: OutputReleasePlan,
@@ -479,7 +510,10 @@ impl OutputTransaction {
             created_at,
             target,
             pacing_mode,
-            OutputTransactionContent::CursorOnly { cursor_epoch },
+            OutputTransactionContent::PlaneDelta {
+                changed,
+                cursor_sidecar_id,
+            },
             OutputPlanePlan::new(
                 PrimaryPlaneAssignment::Unchanged,
                 CursorPlaneAssignment::Atomic {
@@ -489,7 +523,7 @@ impl OutputTransaction {
                 Vec::new(),
             )?,
             OutputSynchronizationPlan::new(OutputAcquirePlan::None, release),
-            OutputProtocolObligations::cursor_only(),
+            OutputProtocolObligations::plane_delta(),
         )
     }
 
@@ -537,15 +571,18 @@ impl OutputTransaction {
                     return Err(OutputTransactionBuildError::DirectPrimaryForCompositedContent);
                 }
             }
-            OutputTransactionContent::CursorOnly { .. } => {
+            OutputTransactionContent::PlaneDelta { changed, .. } => {
+                changed
+                    .validate_cursor_delta()
+                    .map_err(|_| OutputTransactionBuildError::ChangedPrimaryForPlaneDelta)?;
                 if obligations.frame_batch_id.is_some() {
-                    return Err(OutputTransactionBuildError::FrameBatchForCursorOnly);
+                    return Err(OutputTransactionBuildError::FrameBatchForPlaneDelta);
                 }
                 if obligations.direct_surface_id.is_some() {
-                    return Err(OutputTransactionBuildError::DirectSurfaceForCursorOnly);
+                    return Err(OutputTransactionBuildError::DirectSurfaceForPlaneDelta);
                 }
                 if !matches!(planes.primary, PrimaryPlaneAssignment::Unchanged) {
-                    return Err(OutputTransactionBuildError::ChangedPrimaryForCursorOnly);
+                    return Err(OutputTransactionBuildError::ChangedPrimaryForPlaneDelta);
                 }
             }
             OutputTransactionContent::Composited { .. } => {
@@ -605,7 +642,7 @@ impl OutputTransaction {
             } => equivalent_direct_key,
             OutputTransactionContent::Direct { .. }
             | OutputTransactionContent::CompatibilityImmediate { .. }
-            | OutputTransactionContent::CursorOnly { .. } => None,
+            | OutputTransactionContent::PlaneDelta { .. } => None,
         }
     }
 

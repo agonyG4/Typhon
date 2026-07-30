@@ -90,7 +90,7 @@ impl KmsBundleOwners {
         transaction: Arc<OutputTransaction>,
     ) -> Self {
         let primary =
-            (!matches!(kind, AtomicCommitKind::CursorOnly { .. })).then(|| KmsPrimaryOwner {
+            (!matches!(kind, AtomicCommitKind::PlaneDelta { .. })).then(|| KmsPrimaryOwner {
                 transaction: Arc::clone(&transaction),
             });
         let cursor = (!matches!(

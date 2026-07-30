@@ -3,6 +3,7 @@ use super::{
     OutputContentKey, OutputTransactionAllocator, OutputTransactionContent, OutputTransactionId,
     OutputTransactionState,
 };
+use crate::native_output::presentation::plane::{CursorSidecarId, PlaneWriteSet};
 use crate::native_output::presentation::qualification::{DirectReleaseMode, DirectSyncReadiness};
 use crate::native_output::presentation::trace::{
     PresentationTransactionEvent, PresentationTransactionTraceRing,
@@ -1273,7 +1274,7 @@ fn direct_pageflip_rejection_settles_nothing() {
 fn cursor_pageflip_rejection_terminalizes_nothing() {
     let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
     let id = ledger.allocate_id().unwrap();
-    let transaction = super::OutputTransaction::cursor_only(
+    let transaction = super::OutputTransaction::cursor_plane_delta(
         id,
         1,
         MonotonicTimestampNs::new(10),
@@ -1539,22 +1540,28 @@ fn direct_transaction_submits_without_ready_state() {
 }
 
 #[test]
-fn cursor_only_transaction_has_no_protocol_obligations() {
+fn plane_delta_transaction_has_no_protocol_obligations_or_primary_owner() {
     let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
     let id = ledger.allocate_id().unwrap();
     let token = super::PageFlipToken::new(52).expect("token");
-    let transaction = super::OutputTransaction::cursor_only(
+    let transaction = super::OutputTransaction::plane_delta(
         id,
         1,
         MonotonicTimestampNs::new(10),
         test_target(),
         NativeOutputPacingMode::ReactiveDouble,
+        PlaneWriteSet::CURSOR,
+        CursorSidecarId::new(std::num::NonZeroU64::new(99).unwrap()),
         99,
         Some(cursor_state(93)),
         super::OutputReleasePlan::Pageflip,
     )
     .unwrap();
     assert_eq!(transaction.obligations().frame_batch_id(), None);
+    assert_eq!(
+        transaction.planes().primary(),
+        super::PrimaryPlaneAssignment::Unchanged
+    );
     ledger.insert(transaction).unwrap();
     ledger
         .mark_submitted(id, token, MonotonicTimestampNs::new(20))
@@ -1564,7 +1571,7 @@ fn cursor_only_transaction_has_no_protocol_obligations() {
         .unwrap();
 
     assert_eq!(ledger.active_count(), 0);
-    assert_eq!(ledger.counters().presented_cursor_only, 1);
+    assert_eq!(ledger.counters().presented_plane_delta, 1);
 }
 
 #[test]
@@ -1597,12 +1604,14 @@ fn direct_and_cursor_descriptors_have_expected_obligations() {
     );
 
     let cursor_id = ledger.allocate_id().unwrap();
-    let cursor = super::OutputTransaction::cursor_only(
+    let cursor = super::OutputTransaction::plane_delta(
         cursor_id,
         1,
         MonotonicTimestampNs::new(10),
         test_target(),
         NativeOutputPacingMode::ReactiveDouble,
+        PlaneWriteSet::CURSOR,
+        CursorSidecarId::new(std::num::NonZeroU64::new(99).unwrap()),
         99,
         Some(cursor_state(93)),
         super::OutputReleasePlan::Pageflip,
@@ -1615,6 +1624,9 @@ fn direct_and_cursor_descriptors_have_expected_obligations() {
     );
     assert_eq!(
         cursor.content(),
-        OutputTransactionContent::CursorOnly { cursor_epoch: 99 }
+        OutputTransactionContent::PlaneDelta {
+            changed: PlaneWriteSet::CURSOR,
+            cursor_sidecar_id: CursorSidecarId::new(std::num::NonZeroU64::new(99).unwrap()),
+        }
     );
 }

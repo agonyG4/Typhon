@@ -268,19 +268,19 @@ pub(crate) fn apply_cursor_position(
     Ok(())
 }
 
-pub(crate) fn complete_cursor_only_pageflip(
+pub(crate) fn complete_plane_delta_pageflip(
     atomic_cursor: &mut Option<NativeAtomicCursor>,
     pageflip_token: u64,
     generation: u64,
     perf: NativePerfLogger,
 ) -> io::Result<bool> {
-    let is_cursor_only = atomic_cursor.as_ref().is_some_and(|cursor| {
+    let is_plane_delta = atomic_cursor.as_ref().is_some_and(|cursor| {
         !cursor.pending_is_primary()
             && cursor
                 .pending_token()
                 .is_some_and(|token| token.get() == pageflip_token)
     });
-    if !is_cursor_only {
+    if !is_plane_delta {
         return Ok(false);
     }
     let token = PageFlipToken::new(pageflip_token)

@@ -479,7 +479,7 @@ impl KmsCommitWorkerHandle {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(KmsWorkerAckError::GenerationMismatch);
         }
-        if matches!(inflight.kind, AtomicCommitKind::CursorOnly { .. }) {
+        if matches!(inflight.kind, AtomicCommitKind::PlaneDelta { .. }) {
             self.shared
                 .metrics
                 .cursor_pageflip_acks

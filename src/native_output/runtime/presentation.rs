@@ -1,7 +1,7 @@
 use super::cursor_cycle::{NativeResolvedCursorSource, resolve_native_cursor_source};
 use super::cycle::direct_fallback::{DirectFallbackReason, DirectFallbackTracker};
 use super::frame::{
-    NativeRepaintInputs, cursor_only_allowed_at_deadline, native_repaint_decision,
+    NativeRepaintInputs, native_repaint_decision, plane_delta_allowed_at_deadline,
     update_cursor_output_arbitration,
 };
 use super::planner::{
@@ -533,7 +533,7 @@ impl NativeRuntime {
             || direct_candidate_changed
             || atomic_commit_blocks_cursor
             || scanout.ready_frame_queued();
-        let cursor_only_allowed = cursor_only_allowed_at_deadline(
+        let plane_delta_allowed = plane_delta_allowed_at_deadline(
             cursor_output_arbitration,
             *cursor_scheduling_policy,
             scheduler_now.get(),
@@ -552,19 +552,19 @@ impl NativeRuntime {
             cursor_visible,
             composition_required,
             atomic_commit_pending: atomic_commit_blocks_cursor,
-            cursor_only_allowed,
+            plane_delta_allowed,
             render_ahead_requested: scheduler_decision == SchedulerDecision::RenderAhead,
         });
-        let cursor_only_deferred = cursor_state_changed
+        let plane_delta_deferred = cursor_state_changed
             && !primary_visual_work_pending
-            && !cursor_only_allowed
+            && !plane_delta_allowed
             && !scanout.ready_frame_queued();
-        if cursor_only_deferred {
+        if plane_delta_deferred {
             frame_scheduler.note_immediate_completion();
             scheduler_decision = SchedulerDecision::Idle;
         }
         suppress_direct_render_ahead(presentation_path, &mut scheduler_decision, scanout, perf);
-        if presentation_path == NativePresentationPath::CursorOnly
+        if presentation_path == NativePresentationPath::PlaneDelta
             && let Some(cursor) = atomic_cursor.as_mut()
             && !cursor.failure_latched()
             && (!atomic_commit_arbiter.atomic_commit_pending() || can_queue_worker_cursor)

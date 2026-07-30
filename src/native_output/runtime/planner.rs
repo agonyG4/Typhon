@@ -131,7 +131,7 @@ pub(crate) fn decide_native_cursor_owner(
 pub(crate) enum NativePresentationPath {
     DirectPrimary,
     CompositedPrimary,
-    CursorOnly,
+    PlaneDelta,
     IdleDirect,
     IdleComposited,
 }
@@ -150,7 +150,7 @@ pub(crate) struct NativePresentationPlanInput {
     /// Whether a cursor-only transaction may use the primary presentation
     /// lane in this scheduling cycle.  A queued cursor state is harmless;
     /// submitting it while a primary producer is active is not.
-    pub(crate) cursor_only_allowed: bool,
+    pub(crate) plane_delta_allowed: bool,
     pub(crate) render_ahead_requested: bool,
 }
 
@@ -173,10 +173,10 @@ pub(crate) fn plan_native_presentation_path(
             return NativePresentationPath::DirectPrimary;
         }
         if input.cursor_changed
-            && input.cursor_only_allowed
+            && input.plane_delta_allowed
             && (!input.cursor_visible || input.cursor_hardware_usable)
         {
-            return NativePresentationPath::CursorOnly;
+            return NativePresentationPath::PlaneDelta;
         }
         return NativePresentationPath::IdleDirect;
     }
@@ -188,10 +188,10 @@ pub(crate) fn plan_native_presentation_path(
         return NativePresentationPath::DirectPrimary;
     }
     if input.cursor_changed
-        && input.cursor_only_allowed
+        && input.plane_delta_allowed
         && (!input.cursor_visible || input.cursor_hardware_usable)
     {
-        return NativePresentationPath::CursorOnly;
+        return NativePresentationPath::PlaneDelta;
     }
     let _ = input.render_ahead_requested;
     NativePresentationPath::IdleComposited
@@ -427,7 +427,7 @@ mod tests {
             cursor_hardware_usable: true,
             cursor_visible: true,
             atomic_commit_pending: false,
-            cursor_only_allowed: true,
+            plane_delta_allowed: true,
             render_ahead_requested: false,
         }
     }
@@ -441,13 +441,13 @@ mod tests {
     }
 
     #[test]
-    fn active_direct_cursor_motion_uses_cursor_only() {
+    fn active_direct_cursor_motion_uses_plane_delta() {
         assert_eq!(
             plan_native_presentation_path(NativePresentationPlanInput {
                 cursor_changed: true,
                 ..direct_input()
             }),
-            NativePresentationPath::CursorOnly
+            NativePresentationPath::PlaneDelta
         );
     }
 
@@ -456,7 +456,7 @@ mod tests {
         assert_eq!(
             plan_native_presentation_path(NativePresentationPlanInput {
                 cursor_changed: true,
-                cursor_only_allowed: false,
+                plane_delta_allowed: false,
                 ..direct_input()
             }),
             NativePresentationPath::IdleDirect
@@ -483,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_output_still_allows_one_coalesced_cursor_only_update() {
+    fn idle_output_still_allows_one_coalesced_plane_delta_update() {
         assert_eq!(
             plan_native_presentation_path(NativePresentationPlanInput {
                 direct_active: true,
@@ -495,10 +495,10 @@ mod tests {
                 cursor_hardware_usable: true,
                 cursor_visible: true,
                 atomic_commit_pending: false,
-                cursor_only_allowed: true,
+                plane_delta_allowed: true,
                 render_ahead_requested: false,
             }),
-            NativePresentationPath::CursorOnly
+            NativePresentationPath::PlaneDelta
         );
     }
 
@@ -596,12 +596,12 @@ mod tests {
                 composition_required: false,
                 ..direct_input()
             }),
-            NativePresentationPath::CursorOnly
+            NativePresentationPath::PlaneDelta
         );
     }
 
     #[test]
-    fn cursor_only_is_selected_when_primary_scene_is_unchanged() {
+    fn plane_delta_is_selected_when_primary_scene_is_unchanged() {
         assert_eq!(
             plan_native_presentation_path(NativePresentationPlanInput {
                 direct_active: false,
@@ -609,7 +609,7 @@ mod tests {
                 cursor_changed: true,
                 ..direct_input()
             }),
-            NativePresentationPath::CursorOnly
+            NativePresentationPath::PlaneDelta
         );
     }
 
