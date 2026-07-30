@@ -14,7 +14,7 @@ pub(crate) enum NvidiaEglWayland2CompatPolicy {
 impl NvidiaEglWayland2CompatPolicy {
     pub(crate) fn from_env() -> Self {
         let value = std::env::var("OBLIVION_ONE_NVIDIA_EGL_WAYLAND2_COMPAT").ok();
-        let policy = value.as_deref().map(Self::parse).unwrap_or(Self::Off);
+        let policy = value.as_deref().map(Self::parse).unwrap_or(Self::Auto);
         if value
             .as_deref()
             .is_some_and(|value| !Self::is_known_value(value))
@@ -289,6 +289,7 @@ pub(crate) fn drm_nodes_share_physical_device(primary: &DrmNode, render: &DrmNod
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_output::ASTREA_ENV_LOCK;
     use std::path::{Path, PathBuf};
 
     fn input(
@@ -330,6 +331,24 @@ mod tests {
             NvidiaEglWayland2CompatPolicy::parse("unknown"),
             NvidiaEglWayland2CompatPolicy::Off
         );
+    }
+
+    #[test]
+    fn compatibility_policy_defaults_to_auto_when_unset() {
+        let _guard = ASTREA_ENV_LOCK.lock().unwrap();
+        let name = "OBLIVION_ONE_NVIDIA_EGL_WAYLAND2_COMPAT";
+        let previous = std::env::var_os(name);
+        // SAFETY: ASTREA_ENV_LOCK serializes environment mutation in native-output tests.
+        unsafe { std::env::remove_var(name) };
+        let policy = NvidiaEglWayland2CompatPolicy::from_env();
+        match previous {
+            // SAFETY: ASTREA_ENV_LOCK remains held while the prior value is restored.
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            // SAFETY: ASTREA_ENV_LOCK remains held while the prior value is restored.
+            None => unsafe { std::env::remove_var(name) },
+        }
+
+        assert_eq!(policy, NvidiaEglWayland2CompatPolicy::Auto);
     }
 
     #[test]

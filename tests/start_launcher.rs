@@ -34,6 +34,27 @@ fn start_launcher_uses_native_output_without_host_display() {
 }
 
 #[test]
+fn start_launcher_documents_safe_nvidia_egl_wayland2_default() {
+    let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new(repo_dir.join("bin/start-oblivion-one"))
+        .arg("--help")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("start launcher help should run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let compatibility_line = stdout
+        .lines()
+        .find(|line| line.contains("OBLIVION_ONE_NVIDIA_EGL_WAYLAND2_COMPAT"))
+        .expect("launcher help should document NVIDIA EGL Wayland2 compatibility");
+    assert!(compatibility_line.contains("auto (default)"));
+    assert!(compatibility_line.contains("off"));
+    assert!(compatibility_line.contains("rollback"));
+}
+
+#[test]
 fn start_launcher_ignores_inherited_host_display_variables_and_stays_native() {
     let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let output = Command::new(repo_dir.join("bin/start-oblivion-one"))
