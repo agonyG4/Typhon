@@ -434,6 +434,30 @@ fn test_feedback_capabilities() -> DirectScanoutFeedbackCapabilities {
 }
 
 #[test]
+fn feedback_capabilities_require_exact_primary_plane_format_modifier() {
+    let capabilities = DirectScanoutFeedbackCapabilities::new(
+        7,
+        1,
+        42,
+        vec![
+            DirectScanoutFormatCapability {
+                format: 0x3432_5241,
+                modifier: 7,
+            },
+            DirectScanoutFormatCapability {
+                format: 0x3432_5241,
+                modifier: 3,
+            },
+        ],
+    );
+
+    assert!(capabilities.supports(0x3432_5241, 3));
+    assert!(capabilities.supports(0x3432_5241, 7));
+    assert!(!capabilities.supports(0x3432_5241, 5));
+    assert!(!capabilities.supports(0x3432_5258, 3));
+}
+
+#[test]
 fn feedback_identity_unchanged_does_not_rebuild() {
     let capabilities = test_feedback_capabilities();
 

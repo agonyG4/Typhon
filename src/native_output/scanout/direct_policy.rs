@@ -59,6 +59,9 @@ pub(crate) fn direct_blocker(reason: &str) -> (&'static str, u64) {
         "candidate_key_invalid" => ("candidate_key_invalid", 1 << 7),
         "test_only_rejected" => ("test_only_rejected", 1 << 8),
         "real_submit_rejected" => ("real_submit_rejected", 1 << 10),
+        "primary_plane_format_modifier_unsupported" => {
+            ("primary_plane_format_modifier_unsupported", 1 << 11)
+        }
         _ => ("candidate_rejected", 1 << 9),
     }
 }
@@ -106,6 +109,10 @@ mod tests {
         assert_ne!(
             direct_blocker("test_only_rejected").1,
             direct_blocker("real_submit_rejected").1
+        );
+        assert_eq!(
+            direct_blocker("primary_plane_format_modifier_unsupported"),
+            ("primary_plane_format_modifier_unsupported", 1 << 11)
         );
     }
 }

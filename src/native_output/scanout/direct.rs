@@ -100,7 +100,13 @@ impl ImportedDirectFramebuffer {
                 Ok(handle) => handle,
                 Err(error) => {
                     close_gem_handles(&io, &gem_handles);
-                    return Err(error);
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "DRM_IOCTL_PRIME_FD_TO_HANDLE failed for dma-buf plane {}: {error}",
+                            descriptor.plane_index
+                        ),
+                    ));
                 }
             };
             if !gem_handles.contains(&handle) {
@@ -130,7 +136,28 @@ impl ImportedDirectFramebuffer {
             Ok(framebuffer) => framebuffer,
             Err(error) => {
                 close_gem_handles(&io, &gem_handles);
-                return Err(error);
+                let fourcc = buffer.format().as_fourcc().to_le_bytes();
+                let layout = buffer
+                    .planes()
+                    .iter()
+                    .map(|plane| {
+                        let plane = plane.descriptor();
+                        format!(
+                            "plane{}:offset={},stride={},modifier={:#x}",
+                            plane.plane_index, plane.offset, plane.stride, plane.modifier.0
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "drmModeAddFB2 failed for {} {}x{} [{layout}]: {error}",
+                        String::from_utf8_lossy(&fourcc),
+                        buffer.size().width,
+                        buffer.size().height,
+                    ),
+                ));
             }
         };
         if framebuffer.get() == 0 {
@@ -451,11 +478,15 @@ mod tests {
         next_handle: Mutex<u32>,
         next_fb: Mutex<u32>,
         events: Mutex<Vec<String>>,
+        fail_prime: Mutex<bool>,
         fail_add: Mutex<bool>,
     }
 
     impl DirectFramebufferIo for FakeIo {
         fn prime_fd_to_handle(&self, _dma_buf: BorrowedFd<'_>) -> io::Result<u32> {
+            if *self.fail_prime.lock().unwrap() {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
             let mut next = self.next_handle.lock().unwrap();
             *next = next.saturating_add(1).max(1);
             Ok(*next)
@@ -466,7 +497,7 @@ mod tests {
             _descriptor: &ExplicitFramebufferDescriptor,
         ) -> io::Result<FramebufferId> {
             if *self.fail_add.lock().unwrap() {
-                return Err(io::Error::other("injected AddFB2 failure"));
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
             }
             let mut next = self.next_fb.lock().unwrap();
             *next = next.saturating_add(1).max(1);
@@ -554,6 +585,45 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(*io.events.lock().unwrap(), ["gem_close"]);
+    }
+
+    #[test]
+    fn import_error_identifies_prime_fd_to_handle_stage() {
+        let mut ids = oblivion_one::render_backend::buffer::BufferIdAllocator::default();
+        let identity = ids.allocate().unwrap();
+        let io = Arc::new(FakeIo {
+            fail_prime: Mutex::new(true),
+            ..Default::default()
+        });
+        let buffer = test_buffer(&identity);
+
+        let error =
+            ImportedDirectFramebuffer::import(io, Arc::new(AtomicU64::new(0)), &identity, &buffer)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("PRIME_FD_TO_HANDLE"));
+    }
+
+    #[test]
+    fn import_error_identifies_addfb2_stage_and_layout() {
+        let mut ids = oblivion_one::render_backend::buffer::BufferIdAllocator::default();
+        let identity = ids.allocate().unwrap();
+        let io = Arc::new(FakeIo {
+            fail_add: Mutex::new(true),
+            ..Default::default()
+        });
+        let buffer = test_buffer(&identity);
+
+        let error =
+            ImportedDirectFramebuffer::import(io, Arc::new(AtomicU64::new(0)), &identity, &buffer)
+                .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("AddFB2"));
+        assert!(message.contains("XR24"));
+        assert!(message.contains("4x4"));
+        assert!(message.contains("modifier=0x0"));
+        assert!(message.contains("stride=16"));
     }
 
     #[test]

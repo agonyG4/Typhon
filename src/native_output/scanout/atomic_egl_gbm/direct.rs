@@ -216,6 +216,22 @@ impl AtomicEglGbmScanout {
         if candidate.buffer.planes().is_empty() {
             return Ok(DirectScanoutAttempt::Fallback("candidate_plane_missing"));
         }
+        let candidate_format = candidate.buffer.format().as_fourcc();
+        let candidate_modifier = candidate.buffer.planes()[0].descriptor().modifier.0;
+        if !self
+            .dmabuf_scanout_capabilities
+            .supports(candidate_format, candidate_modifier)
+        {
+            direct_scanout_debug(format_args!(
+                "candidate rejected before import: primary plane {} does not support format={:#x} modifier={:#x}",
+                self.dmabuf_scanout_capabilities.primary_plane_id,
+                candidate_format,
+                candidate_modifier,
+            ));
+            return Ok(DirectScanoutAttempt::Fallback(
+                "primary_plane_format_modifier_unsupported",
+            ));
+        }
         let Some(worker) = worker else {
             self.note_direct_worker_admission_rejected(false);
             return Ok(DirectScanoutAttempt::Fallback("worker_unavailable"));
@@ -233,8 +249,8 @@ impl AtomicEglGbmScanout {
             primary_plane_id: atomic.discovery().pipeline.plane.get(),
             mode_width: self.width,
             mode_height: self.height,
-            format: candidate.buffer.format().as_fourcc(),
-            modifier: candidate.buffer.planes()[0].descriptor().modifier.0,
+            format: candidate_format,
+            modifier: candidate_modifier,
             buffer_width: candidate.buffer.size().width,
             buffer_height: candidate.buffer.size().height,
             plane_layout_hash: plane_layout_hash(&candidate.buffer),

@@ -89,6 +89,14 @@ impl DirectScanoutFeedbackCapabilities {
             formats,
         }
     }
+
+    pub fn supports(&self, format: u32, modifier: u64) -> bool {
+        self.formats
+            .binary_search_by_key(&(format, modifier), |capability| {
+                (capability.format, capability.modifier)
+            })
+            .is_ok()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
