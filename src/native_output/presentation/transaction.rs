@@ -3,6 +3,7 @@
 use std::{collections::HashMap, fmt, num::NonZeroU64};
 
 use oblivion_one::compositor::{CompositorFrameBatchId, DirectScanoutSceneCandidate};
+use oblivion_one::native::kms::AtomicCursorVisualState;
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
 
@@ -148,12 +149,11 @@ pub(crate) enum PrimaryPlaneAssignment {
     Disabled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CursorPlaneAssignment {
     Atomic {
         desired_epoch: u64,
-        framebuffer_id: Option<u32>,
-        visible: bool,
+        state: Option<AtomicCursorVisualState>,
     },
     Unchanged,
     Disabled,
@@ -192,8 +192,8 @@ impl OutputPlanePlan {
         self.primary
     }
 
-    pub(crate) const fn cursor(&self) -> CursorPlaneAssignment {
-        self.cursor
+    pub(crate) const fn cursor(&self) -> &CursorPlaneAssignment {
+        &self.cursor
     }
 
     pub(crate) fn overlays(&self) -> &[OverlayPlaneAssignment] {
@@ -470,8 +470,7 @@ impl OutputTransaction {
         target: PresentationTarget,
         pacing_mode: NativeOutputPacingMode,
         cursor_epoch: u64,
-        framebuffer_id: Option<u32>,
-        visible: bool,
+        state: Option<AtomicCursorVisualState>,
         release: OutputReleasePlan,
     ) -> Result<Self, OutputTransactionBuildError> {
         Self::build(
@@ -485,8 +484,7 @@ impl OutputTransaction {
                 PrimaryPlaneAssignment::Unchanged,
                 CursorPlaneAssignment::Atomic {
                     desired_epoch: cursor_epoch,
-                    framebuffer_id,
-                    visible,
+                    state,
                 },
                 Vec::new(),
             )?,

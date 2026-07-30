@@ -69,7 +69,6 @@ pub(super) fn submit_ready_frame(
                     transaction_id,
                     output_generation,
                     crtc_id,
-                    cursor,
                     worker_ctx(atomic_cursor.as_ref(), frame_pacing),
                     true,
                 )?

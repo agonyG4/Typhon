@@ -406,6 +406,23 @@ fn prepared_primary_submission_does_not_depend_on_new_visual_demand() {
 }
 
 #[test]
+fn worker_pre_admits_ready_primary_before_its_submit_not_before_deadline() {
+    let mut scheduler = NativeFrameScheduler::new(60, 0);
+    let mut snapshot = with_current(empty_snapshot());
+    snapshot.kernel_submitted = Some(composed_commit(1, 1, 1, 11));
+    snapshot.prepared = ready(2, 2, 2);
+    snapshot.free_compositor_slots = 0;
+    let mut context = explicit_scheduler_context(17);
+    context.render_ahead_allowed = true;
+    context.worker_queue_available = true;
+
+    assert_eq!(
+        scheduler.decision_with_pipeline(context, &snapshot),
+        SchedulerDecision::SubmitReady
+    );
+}
+
+#[test]
 fn two_future_primaries_coalesce_new_visual_work_without_rendering_farther_ahead() {
     let mut scheduler = NativeFrameScheduler::new(60, 0);
     scheduler.queue_visual_work();

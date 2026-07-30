@@ -264,9 +264,9 @@ fn commit_snapshot(
             match descriptor.planes().cursor() {
                 CursorPlaneAssignment::Atomic {
                     desired_epoch,
-                    framebuffer_id: plane_framebuffer_id,
-                    ..
-                } if desired_epoch == cursor_epoch && plane_framebuffer_id == framebuffer_id => {}
+                    state,
+                } if *desired_epoch == cursor_epoch
+                    && state.as_ref().and_then(|state| state.framebuffer_id) == framebuffer_id => {}
                 _ => return Err(identity_mismatch(owner, "cursor_plan", transaction_id)),
             }
             PipelineCommitKind::CursorOnly {
@@ -617,8 +617,17 @@ mod tests {
                     cursor_target(),
                     NativeOutputPacingMode::ReactiveDouble,
                     7,
-                    Some(90),
-                    true,
+                    Some(AtomicCursorVisualState {
+                        visible: true,
+                        x: 0,
+                        y: 0,
+                        hotspot_x: 0,
+                        hotspot_y: 0,
+                        width: 64,
+                        height: 64,
+                        framebuffer_id: Some(90),
+                        image_generation: 1,
+                    }),
                     OutputReleasePlan::Pageflip,
                 )
                 .unwrap(),

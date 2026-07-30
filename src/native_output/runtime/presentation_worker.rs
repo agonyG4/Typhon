@@ -23,6 +23,24 @@ pub(super) fn worker_cursor_pin(
     }
 }
 
+fn planned_cursor_update(
+    output_transactions: &OutputTransactionLedger,
+    transaction_id: OutputTransactionId,
+) -> NativeResult<KmsCursorUpdate> {
+    let transaction = output_transactions
+        .transaction(transaction_id)
+        .ok_or_else(|| io::Error::other("ready transaction disappeared before cursor planning"))?;
+    match transaction.descriptor().planes().cursor() {
+        CursorPlaneAssignment::Atomic {
+            state: Some(state), ..
+        } => Ok(KmsCursorUpdate::Set(state.clone())),
+        CursorPlaneAssignment::Atomic { state: None, .. } | CursorPlaneAssignment::Disabled => {
+            Ok(KmsCursorUpdate::Disable)
+        }
+        CursorPlaneAssignment::Unchanged => Ok(KmsCursorUpdate::Unchanged),
+    }
+}
+
 pub(super) struct WorkerPrimarySubmissionContext<'a> {
     atomic_cursor: Option<&'a NativeAtomicCursor>,
     frame_pacing: &'a mut NativeFramePacing,
@@ -298,7 +316,7 @@ pub(super) fn queue_explicit_ready_for_presentation(
     transaction_id: OutputTransactionId,
     output_generation: u64,
     crtc_id: u32,
-    cursor: Option<&AtomicCursorVisualState>,
+    cursor_update: KmsCursorUpdate,
     cursor_pin: Option<CursorFramebufferPin>,
     pacing_frame_id: Option<u64>,
     ready_submit: bool,
@@ -313,7 +331,7 @@ pub(super) fn queue_explicit_ready_for_presentation(
         transaction_id,
         output_generation,
         crtc_id,
-        cursor,
+        cursor_update,
         cursor_pin,
         pacing_frame_id,
         ready_submit,
@@ -344,13 +362,16 @@ pub(super) fn submit_explicit_ready_for_presentation(
     transaction_id: OutputTransactionId,
     output_generation: u64,
     crtc_id: u32,
-    cursor: Option<&AtomicCursorVisualState>,
     context: WorkerPrimarySubmissionContext<'_>,
     ready_submit: bool,
 ) -> NativeResult<Option<(u64, u32, OutputTransactionId, bool)>> {
     if worker_mode {
         let worker = worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?;
-        let cursor_pin = worker_cursor_pin(context.atomic_cursor, cursor)?;
+        let cursor_update = planned_cursor_update(output_transactions, transaction_id)?;
+        let cursor_pin = match &cursor_update {
+            KmsCursorUpdate::Set(state) => worker_cursor_pin(context.atomic_cursor, Some(state))?,
+            KmsCursorUpdate::Unchanged | KmsCursorUpdate::Disable => None,
+        };
         let pacing_frame_id = context
             .frame_pacing
             .worker_submission_frame_id(ready_submit);
@@ -364,7 +385,7 @@ pub(super) fn submit_explicit_ready_for_presentation(
             transaction_id,
             output_generation,
             crtc_id,
-            cursor,
+            cursor_update,
             cursor_pin,
             pacing_frame_id,
             ready_submit,
@@ -374,7 +395,7 @@ pub(super) fn submit_explicit_ready_for_presentation(
         }));
     }
     let (token, framebuffer_id, transaction_id) =
-        explicit.submit_ready_frame(kms_backend, server, output_transactions, cursor)?;
+        explicit.submit_ready_frame(kms_backend, server, output_transactions)?;
     Ok(Some((token, framebuffer_id, transaction_id, false)))
 }
 

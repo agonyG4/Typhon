@@ -12,7 +12,7 @@ use super::presentation_direct::{
     DirectPresentationInputs, inspect_direct_presentation, log_prepared_primary_arbitration,
     suppress_direct_render_ahead,
 };
-use super::presentation_metrics::log_output_pipeline_snapshot;
+use super::presentation_metrics::{PipelineSchedulingDiagnostics, log_output_pipeline_snapshot};
 use super::presentation_pipeline::build_output_pipeline_snapshot;
 use super::presentation_protocol::{
     ProtocolCycleMetrics, complete_protocol_only_tick, log_no_visual_work,
@@ -376,6 +376,11 @@ impl NativeRuntime {
         } else {
             scanout.render_target_available()
         };
+        let worker_queue_available = worker_mode
+            && atomic_commit_arbiter.worker_slot_available()
+            && kms_commit_worker
+                .as_ref()
+                .is_some_and(|worker| worker.admission_available());
         let pipeline_snapshot = if explicit_output {
             let swapchain = scanout.explicit_output_swapchain().ok_or_else(|| {
                 io::Error::other("explicit Atomic presentation has no output swapchain")
@@ -404,6 +409,11 @@ impl NativeRuntime {
                 *triple_buffer_policy,
                 pacing_mode,
                 &pipeline,
+                PipelineSchedulingDiagnostics::new(
+                    *scheduled_presentation_target,
+                    render_ahead_allowed,
+                    worker_queue_available,
+                ),
                 adaptive_buffering.force_unavailable_blocker(),
                 output_transactions.validate_terminal_ownership().is_ok(),
             );
@@ -418,11 +428,7 @@ impl NativeRuntime {
                     predicted_total_cost: Duration::from_nanos(prediction.total_cost_ns),
                     presentation_target: *scheduled_presentation_target,
                     render_ahead_allowed,
-                    worker_queue_available: worker_mode
-                        && atomic_commit_arbiter.worker_slot_available()
-                        && kms_commit_worker
-                            .as_ref()
-                            .is_some_and(|worker| worker.admission_available()),
+                    worker_queue_available,
                 },
                 pipeline_snapshot
                     .as_ref()
@@ -615,9 +621,11 @@ impl NativeRuntime {
             && kms_commit_worker
                 .as_ref()
                 .is_some_and(|worker| worker.admission_available());
-        if atomic_commit_arbiter.atomic_commit_pending() && !can_queue_worker_next {
-            scheduler_decision = SchedulerDecision::WaitForPageFlip;
-        }
+        scheduler_decision = oblivion_one::native::scheduler::apply_atomic_commit_lane_guard(
+            scheduler_decision,
+            atomic_commit_arbiter.atomic_commit_pending(),
+            can_queue_worker_next,
+        );
         if matches!(
             scheduler_decision,
             SchedulerDecision::SubmitReady | SchedulerDecision::SubmitReadyLate
@@ -981,8 +989,7 @@ impl NativeRuntime {
                                 .as_ref()
                                 .map(|state| CursorPlaneAssignment::Atomic {
                                     desired_epoch: cursor_epoch,
-                                    framebuffer_id: state.framebuffer_id,
-                                    visible: state.visible,
+                                    state: Some(state.clone()),
                                 }),
                             direct_inspection
                                 .candidate_key
@@ -1050,7 +1057,6 @@ impl NativeRuntime {
                                         transaction_id,
                                         *drm_file_generation,
                                         target.crtc_id,
-                                        effective_cursor.as_ref(),
                                         worker_ctx(atomic_cursor.as_ref(), frame_pacing),
                                         false,
                                     )?

@@ -1,18 +1,20 @@
 use super::tests::{reserve_for_test, test_job, wait_for_fence_event};
 use super::thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
 use super::{
-    KmsCommitJob, KmsCommitPayloadError, KmsCommitWorkerHandle, KmsPrimaryUpdate,
+    KmsCommitJob, KmsCommitPayloadError, KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryUpdate,
     KmsTestOnlyPolicy, KmsWorkerAdmissionError, KmsWorkerEvent,
 };
 use crate::native_output::scanout::DirectPrimaryLease;
 use crate::native_output::{
-    ContentEpochId, DirectScanoutCandidateKey, OutputContentKey, OutputReleasePlan, OutputSlotId,
-    OutputTransaction, OutputTransactionId, runtime::AtomicCommitKind,
-};
-use oblivion_one::native::presentation_deadline::{
-    MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
+    ContentEpochId, CursorPlaneAssignment, DirectScanoutCandidateKey, OutputContentKey,
+    OutputReleasePlan, OutputSlotId, OutputTransaction, OutputTransactionId,
+    runtime::AtomicCommitKind,
 };
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
+use oblivion_one::native::{
+    kms::AtomicCursorVisualState,
+    presentation_deadline::{MonotonicTimestampNs, PresentationTarget, PresentationTargetReason},
+};
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
@@ -126,6 +128,64 @@ fn submitted_composited_job_accepts_consumed_input_fence() {
 
     assert!(job.validate_against(&transaction).is_err());
     assert_eq!(job.validate_submitted_against(&transaction), Ok(()));
+}
+
+#[test]
+fn composited_job_rejects_cursor_geometry_newer_than_transaction_plan() {
+    let token = 603;
+    let transaction_id =
+        OutputTransactionId::new(std::num::NonZeroU64::new(token).expect("transaction id"));
+    let planned_cursor = AtomicCursorVisualState {
+        visible: true,
+        x: 10,
+        y: 20,
+        hotspot_x: 1,
+        hotspot_y: 2,
+        width: 64,
+        height: 64,
+        framebuffer_id: None,
+        image_generation: 4,
+    };
+    let transaction = OutputTransaction::composited(
+        transaction_id,
+        1,
+        MonotonicTimestampNs::new(10),
+        test_target(),
+        NativeOutputPacingMode::ReactiveDouble,
+        token,
+        12,
+        13,
+        OutputSlotId::new(0).expect("output slot"),
+        42,
+        Some(CursorPlaneAssignment::Atomic {
+            desired_epoch: 8,
+            state: Some(planned_cursor.clone()),
+        }),
+        oblivion_one::compositor::CompositorFrameBatchId::new(
+            std::num::NonZeroU64::new(token).expect("frame batch id"),
+        ),
+    )
+    .expect("composited transaction");
+    let mut job = test_job(token);
+    job.kind = AtomicCommitKind::CompositedPrimary {
+        transaction_id,
+        frame_id: token,
+        framebuffer_id: 42,
+    };
+    job.target = test_target();
+    job.primary = KmsPrimaryUpdate::Framebuffer {
+        framebuffer: oblivion_one::native::kms::FramebufferId::new(42).expect("framebuffer"),
+        in_fence: None,
+        request_out_fence: false,
+    };
+    let mut newer_cursor = planned_cursor;
+    newer_cursor.x += 1;
+    job.cursor = KmsCursorUpdate::Set(newer_cursor);
+
+    assert_eq!(
+        job.validate_submitted_against(&transaction),
+        Err(KmsCommitPayloadError::CursorAssignmentMismatch)
+    );
 }
 
 #[test]

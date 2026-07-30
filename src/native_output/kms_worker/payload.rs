@@ -214,22 +214,14 @@ impl KmsCommitJob {
         }
         let cursor_matches = match (&self.cursor, transaction.planes().cursor()) {
             (KmsCursorUpdate::Unchanged, CursorPlaneAssignment::Unchanged) => true,
-            (
-                KmsCursorUpdate::Disable,
-                CursorPlaneAssignment::Atomic {
-                    framebuffer_id,
-                    visible,
-                    ..
-                },
-            ) => framebuffer_id.is_none() && !visible,
+            (KmsCursorUpdate::Disable, CursorPlaneAssignment::Atomic { state: None, .. }) => true,
             (
                 KmsCursorUpdate::Set(state),
                 CursorPlaneAssignment::Atomic {
-                    framebuffer_id,
-                    visible,
+                    state: Some(planned),
                     ..
                 },
-            ) => state.framebuffer_id == framebuffer_id && state.visible == visible,
+            ) => state == planned,
             _ => false,
         };
         if !cursor_matches {
@@ -262,7 +254,7 @@ impl KmsCommitJob {
                 CursorPlaneAssignment::Atomic {
                     desired_epoch,
                     ..
-                } if desired_epoch == cursor_epoch
+                } if *desired_epoch == cursor_epoch
             ) {
                 return Err(KmsCommitPayloadError::CursorAssignmentMismatch);
             }

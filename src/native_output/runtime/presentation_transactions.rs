@@ -484,8 +484,7 @@ pub(super) fn build_compatibility_transaction(
             framebuffer_id,
             cursor.map(|state| CursorPlaneAssignment::Atomic {
                 desired_epoch: cursor_epoch,
-                framebuffer_id: state.framebuffer_id,
-                visible: state.visible,
+                state: Some(state.clone()),
             }),
             frame_batch_id,
         ),
@@ -701,8 +700,7 @@ pub(super) fn build_cursor_transaction(
         target,
         pacing_mode,
         cursor_epoch,
-        desired.and_then(|state| state.framebuffer_id),
-        desired.is_some_and(|state| state.visible),
+        desired.cloned(),
         OutputReleasePlan::Pageflip,
     )
     .map_err(io::Error::other)?;

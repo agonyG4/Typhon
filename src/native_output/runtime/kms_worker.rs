@@ -108,8 +108,7 @@ pub(super) fn queue_cursor_only(
         target,
         pacing_mode,
         cursor_epoch,
-        desired.as_ref().and_then(|state| state.framebuffer_id),
-        desired.as_ref().is_some_and(|state| state.visible),
+        desired.clone(),
         OutputReleasePlan::Pageflip,
     )
     .map_err(io::Error::other)?;
@@ -249,7 +248,7 @@ pub(super) fn queue_explicit_composited_frame(
     transaction_id: OutputTransactionId,
     output_generation: u64,
     crtc_id: u32,
-    cursor: Option<&AtomicCursorVisualState>,
+    cursor_update: KmsCursorUpdate,
     cursor_pin: Option<CursorFramebufferPin>,
     pacing_frame_id: Option<u64>,
     ready_submit: bool,
@@ -344,9 +343,7 @@ pub(super) fn queue_explicit_composited_frame(
             in_fence: Some(in_fence),
             request_out_fence: true,
         },
-        cursor: cursor.map_or(KmsCursorUpdate::Unchanged, |state| {
-            KmsCursorUpdate::Set(state.clone())
-        }),
+        cursor: cursor_update,
         cursor_pin,
         direct_primary_lease: None,
         test_only_duration_ns: None,
@@ -1089,7 +1086,7 @@ impl NativeRuntime {
                         .planes()
                         .cursor()
                     {
-                        CursorPlaneAssignment::Atomic { desired_epoch, .. } => Some(desired_epoch),
+                        CursorPlaneAssignment::Atomic { desired_epoch, .. } => Some(*desired_epoch),
                         CursorPlaneAssignment::Unchanged | CursorPlaneAssignment::Disabled => None,
                     },
                 };

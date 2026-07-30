@@ -8,6 +8,7 @@ use crate::native_output::presentation::trace::{
     PresentationTransactionEvent, PresentationTransactionTraceRing,
 };
 use oblivion_one::compositor::CompositorFrameBatchId;
+use oblivion_one::native::kms::AtomicCursorVisualState;
 use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
 use std::num::NonZeroU64;
@@ -15,6 +16,20 @@ use std::time::Duration;
 
 fn tx(value: u64) -> OutputTransactionId {
     OutputTransactionId::new(NonZeroU64::new(value).expect("non-zero transaction id"))
+}
+
+fn cursor_state(framebuffer_id: u32) -> AtomicCursorVisualState {
+    AtomicCursorVisualState {
+        visible: true,
+        x: 0,
+        y: 0,
+        hotspot_x: 0,
+        hotspot_y: 0,
+        width: 64,
+        height: 64,
+        framebuffer_id: Some(framebuffer_id),
+        image_generation: 1,
+    }
 }
 
 fn observed(id: OutputTransactionId, timestamp_ns: u64) -> PresentationTransactionEvent {
@@ -1265,8 +1280,7 @@ fn cursor_pageflip_rejection_terminalizes_nothing() {
         test_target(),
         NativeOutputPacingMode::ReactiveDouble,
         115,
-        Some(93),
-        true,
+        Some(cursor_state(93)),
         super::OutputReleasePlan::Pageflip,
     )
     .unwrap();
@@ -1536,8 +1550,7 @@ fn cursor_only_transaction_has_no_protocol_obligations() {
         test_target(),
         NativeOutputPacingMode::ReactiveDouble,
         99,
-        Some(93),
-        true,
+        Some(cursor_state(93)),
         super::OutputReleasePlan::Pageflip,
     )
     .unwrap();
@@ -1591,8 +1604,7 @@ fn direct_and_cursor_descriptors_have_expected_obligations() {
         test_target(),
         NativeOutputPacingMode::ReactiveDouble,
         99,
-        Some(93),
-        true,
+        Some(cursor_state(93)),
         super::OutputReleasePlan::Pageflip,
     )
     .unwrap();

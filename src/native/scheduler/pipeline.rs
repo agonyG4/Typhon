@@ -61,6 +61,35 @@ fn ready_submit_decision(now_ns: u64, target: Option<PresentationTarget>) -> Sch
     }
 }
 
+fn ready_worker_admission_decision(
+    now_ns: u64,
+    target: Option<PresentationTarget>,
+) -> SchedulerDecision {
+    if target.is_some_and(|target| now_ns >= target.presentation_time.get()) {
+        SchedulerDecision::SubmitReadyLate
+    } else {
+        SchedulerDecision::SubmitReady
+    }
+}
+
+pub fn apply_atomic_commit_lane_guard(
+    decision: SchedulerDecision,
+    atomic_commit_pending: bool,
+    can_queue_worker_next: bool,
+) -> SchedulerDecision {
+    if atomic_commit_pending
+        && !can_queue_worker_next
+        && matches!(
+            decision,
+            SchedulerDecision::SubmitReady | SchedulerDecision::SubmitReadyLate
+        )
+    {
+        SchedulerDecision::WaitForPageFlip
+    } else {
+        decision
+    }
+}
+
 impl NativeFrameScheduler {
     pub fn decision_with_pipeline(
         &mut self,
@@ -124,7 +153,7 @@ impl NativeFrameScheduler {
                 && context.render_ahead_allowed
                 && pipeline.triple_capable()
             {
-                return ready_submit_decision(now_ns, ready_target);
+                return ready_worker_admission_decision(now_ns, ready_target);
             }
             if !matches!(prepared, SchedulerPreparedPrimary::None) {
                 return SchedulerDecision::WaitForPageFlip;

@@ -9,10 +9,23 @@ impl AtomicEglGbmScanout {
         kms: &KmsBackendSelection,
         server: &mut OwnCompositorServer,
         output_transactions: &mut OutputTransactionLedger,
-        cursor: Option<&AtomicCursorVisualState>,
     ) -> io::Result<(u64, u32, OutputTransactionId)> {
         let mut frame = self.swapchain_mut()?.take_ready_for_submission()?;
         let transaction_id = frame.transaction_id;
+        let planned_cursor = match output_transactions
+            .transaction(transaction_id)
+            .ok_or_else(|| io::Error::other("ready transaction disappeared before submission"))?
+            .descriptor()
+            .planes()
+            .cursor()
+        {
+            CursorPlaneAssignment::Atomic {
+                state: Some(state), ..
+            } => Some(state.clone()),
+            CursorPlaneAssignment::Atomic { state: None, .. }
+            | CursorPlaneAssignment::Unchanged
+            | CursorPlaneAssignment::Disabled => None,
+        };
         let framebuffer = self.framebuffer(frame.slot)?;
         let token = PageFlipToken::new(allocate_native_page_flip_token())
             .expect("allocated native pageflip token is nonzero");
@@ -95,7 +108,7 @@ impl AtomicEglGbmScanout {
             framebuffer,
             token,
             in_fence,
-            cursor: cursor.cloned(),
+            cursor: planned_cursor,
         });
         let submit_returned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
         match submission {

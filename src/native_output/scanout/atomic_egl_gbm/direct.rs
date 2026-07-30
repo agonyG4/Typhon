@@ -45,8 +45,7 @@ fn settle_no_visual_change_transaction(
         framebuffer_id,
         cursor.map(|state| CursorPlaneAssignment::Atomic {
             desired_epoch: cursor_epoch,
-            framebuffer_id: state.framebuffer_id,
-            visible: state.visible,
+            state: Some(state.clone()),
         }),
         frame_batch_id,
         direct_surface_id,
@@ -333,8 +332,7 @@ impl AtomicEglGbmScanout {
             framebuffer.framebuffer.get(),
             cursor.map(|state| CursorPlaneAssignment::Atomic {
                 desired_epoch: cursor_epoch,
-                framebuffer_id: state.framebuffer_id,
-                visible: state.visible,
+                state: Some(state.clone()),
             }),
             protocol_batch_id,
             candidate.surface_id,

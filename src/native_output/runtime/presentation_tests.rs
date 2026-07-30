@@ -3,10 +3,27 @@ use super::kms_worker::{WorkerRejectionKind, direct_rejection_policy};
 use super::presentation_transactions::complete_presented_output_transaction;
 use super::*;
 use oblivion_one::compositor::CompositorFrameBatchId;
+use oblivion_one::native::scheduler::apply_atomic_commit_lane_guard;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_COMPATIBILITY_TEST_SOCKET: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn commit_lane_guard_preserves_predictive_render_ahead() {
+    assert_eq!(
+        apply_atomic_commit_lane_guard(SchedulerDecision::RenderAhead, true, false),
+        SchedulerDecision::RenderAhead
+    );
+}
+
+#[test]
+fn commit_lane_guard_blocks_a_ready_submission_without_worker_capacity() {
+    assert_eq!(
+        apply_atomic_commit_lane_guard(SchedulerDecision::SubmitReady, true, false),
+        SchedulerDecision::WaitForPageFlip
+    );
+}
 
 #[test]
 fn reactive_double_never_schedules_a_normal_visual_target() {
