@@ -132,6 +132,26 @@ pub(crate) enum OutputTransactionError {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputTransactionOwnershipError {
+    MissingObligationOwner {
+        batch_id: CompositorFrameBatchId,
+    },
+    WrongObligationOwner {
+        batch_id: CompositorFrameBatchId,
+        expected: OutputTransactionId,
+        actual: OutputTransactionId,
+    },
+    OrphanedObligationOwner {
+        batch_id: CompositorFrameBatchId,
+        transaction_id: OutputTransactionId,
+    },
+    SettlingCountMismatch {
+        records: u64,
+        counter: u64,
+    },
+}
+
 impl std::fmt::Display for OutputTransactionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{self:?}")
@@ -821,6 +841,57 @@ impl OutputTransactionLedger {
         self.obligation_owner.get(&batch_id).copied()
     }
 
+    pub(crate) fn validate_terminal_ownership(
+        &self,
+    ) -> Result<(), OutputTransactionOwnershipError> {
+        for record in self.active.values() {
+            let Some(batch_id) = record.descriptor.obligations().frame_batch_id() else {
+                continue;
+            };
+            match self.obligation_owner.get(&batch_id).copied() {
+                Some(owner) if owner == record.descriptor.id() => {}
+                Some(actual) => {
+                    return Err(OutputTransactionOwnershipError::WrongObligationOwner {
+                        batch_id,
+                        expected: record.descriptor.id(),
+                        actual,
+                    });
+                }
+                None => {
+                    return Err(OutputTransactionOwnershipError::MissingObligationOwner {
+                        batch_id,
+                    });
+                }
+            }
+        }
+        for (&batch_id, &transaction_id) in &self.obligation_owner {
+            let Some(record) = self.active.get(&transaction_id) else {
+                return Err(OutputTransactionOwnershipError::OrphanedObligationOwner {
+                    batch_id,
+                    transaction_id,
+                });
+            };
+            if record.descriptor.obligations().frame_batch_id() != Some(batch_id) {
+                return Err(OutputTransactionOwnershipError::OrphanedObligationOwner {
+                    batch_id,
+                    transaction_id,
+                });
+            }
+        }
+        let settling_records = self
+            .active
+            .values()
+            .filter(|record| matches!(record.state, OutputTransactionState::Settling { .. }))
+            .count() as u64;
+        if settling_records != self.counters.active_settling_transactions {
+            return Err(OutputTransactionOwnershipError::SettlingCountMismatch {
+                records: settling_records,
+                counter: self.counters.active_settling_transactions,
+            });
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn forget_obligation_owner_for_test(&mut self, batch_id: CompositorFrameBatchId) {
         self.obligation_owner.remove(&batch_id);
@@ -1081,6 +1152,7 @@ impl OutputTransactionLedger {
                 }
             }
         }
+        debug_assert_eq!(self.validate_terminal_ownership(), Ok(()));
     }
 
     fn reject_terminal(&mut self, error: OutputTransactionError) -> OutputTransactionError {

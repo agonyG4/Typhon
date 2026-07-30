@@ -685,6 +685,141 @@ fn settlement_failure_leaves_no_active_obligation_owner() {
 }
 
 #[test]
+fn terminal_ownership_cross_check_detects_a_missing_batch_owner() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let batch_id = test_batch(120);
+    let transaction = test_composited_transaction(&mut ledger, batch_id, 1);
+    ledger.insert(transaction).unwrap();
+
+    assert_eq!(ledger.validate_terminal_ownership(), Ok(()));
+    ledger.forget_obligation_owner_for_test(batch_id);
+    assert_eq!(
+        ledger.validate_terminal_ownership(),
+        Err(super::OutputTransactionOwnershipError::MissingObligationOwner { batch_id })
+    );
+}
+
+#[test]
+fn prepared_terminal_matrix_releases_every_obligation_exactly_once() {
+    use super::{
+        OutputTransactionDropReason as DropReason, OutputTransactionFailureStage as FailureStage,
+        OutputTransactionSupersedeReason as SupersedeReason,
+    };
+
+    #[derive(Clone, Copy)]
+    enum Outcome {
+        Presented,
+        WorkerRejected,
+        AtomicFailed,
+        DirectSuperseded,
+        Suspended,
+        GenerationInvalidated,
+    }
+
+    for (index, outcome) in [
+        Outcome::Presented,
+        Outcome::WorkerRejected,
+        Outcome::AtomicFailed,
+        Outcome::DirectSuperseded,
+        Outcome::Suspended,
+        Outcome::GenerationInvalidated,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+        let batch_id = test_batch(130 + index as u64);
+        let transaction = test_composited_transaction(&mut ledger, batch_id, 1);
+        let id = transaction.id();
+        ledger.insert(transaction).unwrap();
+        ledger
+            .mark_ready(id, MonotonicTimestampNs::new(20))
+            .unwrap();
+
+        match outcome {
+            Outcome::Presented => {
+                let token = super::PageFlipToken::new(130 + index as u64).unwrap();
+                ledger
+                    .mark_submitted(id, token, MonotonicTimestampNs::new(30))
+                    .unwrap();
+                ledger
+                    .mark_presented(id, token, 1, MonotonicTimestampNs::new(40), Some(2))
+                    .unwrap();
+            }
+            Outcome::WorkerRejected => ledger
+                .mark_failed(
+                    id,
+                    FailureStage::BackendOwnershipTransfer,
+                    MonotonicTimestampNs::new(40),
+                )
+                .unwrap(),
+            Outcome::AtomicFailed => ledger
+                .mark_failed(id, FailureStage::KmsSubmit, MonotonicTimestampNs::new(40))
+                .unwrap(),
+            Outcome::DirectSuperseded => ledger
+                .mark_superseded(
+                    id,
+                    None,
+                    SupersedeReason::DirectTransition,
+                    MonotonicTimestampNs::new(40),
+                )
+                .unwrap(),
+            Outcome::Suspended => ledger
+                .mark_dropped(
+                    id,
+                    DropReason::SessionSuspended,
+                    MonotonicTimestampNs::new(40),
+                )
+                .unwrap(),
+            Outcome::GenerationInvalidated => ledger
+                .cleanup_generation(
+                    1,
+                    DropReason::OutputDestroyed,
+                    MonotonicTimestampNs::new(40),
+                )
+                .map(|count| assert_eq!(count, 1))
+                .unwrap(),
+        }
+
+        assert_eq!(ledger.active_count(), 0);
+        assert_eq!(ledger.obligation_owner(batch_id), None);
+        assert_eq!(ledger.counters().terminal_transitions_finalized, 1);
+        assert_eq!(ledger.counters().duplicate_settlement_attempts, 0);
+        assert_eq!(ledger.validate_terminal_ownership(), Ok(()));
+    }
+}
+
+#[test]
+fn newer_client_batch_does_not_replace_a_ready_transactions_obligations() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let ready_batch = test_batch(140);
+    let newer_batch = test_batch(141);
+    let ready = test_composited_transaction(&mut ledger, ready_batch, 1);
+    let ready_id = ready.id();
+    ledger.insert(ready).unwrap();
+    ledger
+        .mark_ready(ready_id, MonotonicTimestampNs::new(20))
+        .unwrap();
+
+    let newer = test_composited_transaction(&mut ledger, newer_batch, 1);
+    let newer_id = newer.id();
+    ledger.insert(newer).unwrap();
+
+    assert_eq!(
+        ledger
+            .transaction(ready_id)
+            .unwrap()
+            .descriptor()
+            .obligations()
+            .frame_batch_id(),
+        Some(ready_batch)
+    );
+    assert_eq!(ledger.obligation_owner(ready_batch), Some(ready_id));
+    assert_eq!(ledger.obligation_owner(newer_batch), Some(newer_id));
+    assert_eq!(ledger.validate_terminal_ownership(), Ok(()));
+}
+
+#[test]
 fn second_terminal_attempt_during_settlement_is_rejected() {
     let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
     let transaction = test_composited_transaction(&mut ledger, test_batch(110), 1);
