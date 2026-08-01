@@ -2,9 +2,11 @@ use std::sync::Arc;
 
 use super::*;
 use crate::native_output::kms_worker::{
-    CursorSidecar, CursorSidecarCoupling, KmsCommitWorkerHandle, KmsTestOnlyPolicy,
-    KmsWorkerAdmissionError,
+    CursorSidecar, CursorSidecarCoupling, KmsBundleOwners, KmsCommitJob, KmsCommitWorkerHandle,
+    KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsWorkerAdmissionError,
 };
+use crate::native_output::presentation::plane::CursorRevision;
+use crate::native_output::runtime::presentation_transactions::settle_failed_output_transaction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WorkerQueueOutcome {
@@ -29,9 +31,228 @@ pub(super) enum PlaneDeltaPreparation {
         transaction_id: OutputTransactionId,
         desired: Option<AtomicCursorVisualState>,
         cursor_epoch: u64,
+        owned_revision: Option<CursorRevision>,
         cursor_pin: Option<CursorFramebufferPin>,
         target: PresentationTarget,
     },
+}
+
+pub(super) fn plane_delta_reservation_outcome(
+    result: Result<(), &'static str>,
+) -> Result<(), KmsWorkerAdmissionError> {
+    result.map_err(|_| KmsWorkerAdmissionError::QueueFull)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn queue_plane_delta(
+    worker: &KmsCommitWorkerHandle,
+    cursor: &mut NativeAtomicCursor,
+    desired: Option<AtomicCursorVisualState>,
+    atomic_commit_arbiter: &mut AtomicCommitArbiter,
+    output_transactions: &mut OutputTransactionLedger,
+    presentation_trace: &mut PresentationTransactionTraceRing,
+    target: PresentationTarget,
+    crtc_id: u32,
+    output_generation: u64,
+    pacing_mode: NativeOutputPacingMode,
+    cursor_epoch: u64,
+) -> NativeResult<WorkerQueueOutcome> {
+    let preparation = prepare_plane_delta(
+        worker,
+        cursor,
+        desired,
+        output_transactions,
+        presentation_trace,
+        target,
+        crtc_id,
+        output_generation,
+        pacing_mode,
+        cursor_epoch,
+    )?;
+    let (transaction_id, desired, cursor_epoch, owned_revision, promoted_pin, target) =
+        match preparation {
+            PlaneDeltaPreparation::Return(outcome) => return Ok(outcome),
+            PlaneDeltaPreparation::Submit {
+                transaction_id,
+                desired,
+                cursor_epoch,
+                owned_revision,
+                cursor_pin,
+                target,
+            } => (
+                transaction_id,
+                desired,
+                cursor_epoch,
+                owned_revision,
+                cursor_pin,
+                target,
+            ),
+        };
+    let permit = match worker.try_reserve_admission_slot() {
+        Ok(permit) => permit,
+        Err(error) => {
+            output_transactions
+                .mark_superseded(
+                    transaction_id,
+                    None,
+                    OutputTransactionSupersedeReason::SameContentSuppressed,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                )
+                .map_err(io::Error::other)?;
+            return Ok(WorkerQueueOutcome::Unavailable(error));
+        }
+    };
+    let token = PageFlipToken::new(allocate_native_page_flip_token())
+        .expect("allocated native pageflip token is nonzero");
+    let queued_at_ns = monotonic_now_ns()?;
+    let kind = AtomicCommitKind::PlaneDelta {
+        transaction_id,
+        cursor_epoch,
+        framebuffer_id: desired.as_ref().and_then(|state| state.framebuffer_id),
+    };
+    if let Err(error) = output_transactions.mark_queued(
+        transaction_id,
+        output_generation,
+        MonotonicTimestampNs::new(queued_at_ns),
+    ) {
+        settle_failed_output_transaction(
+            output_transactions,
+            transaction_id,
+            OutputTransactionFailureStage::KmsSubmit,
+            MonotonicTimestampNs::new(queued_at_ns),
+            |_| Ok(()),
+        )?;
+        return Err(io::Error::other(error).into());
+    }
+    if let Err(reason) =
+        plane_delta_reservation_outcome(atomic_commit_arbiter.reserve_worker_queued(
+            token,
+            output_generation,
+            crtc_id,
+            kind,
+            queued_at_ns,
+        ))
+    {
+        settle_failed_output_transaction(
+            output_transactions,
+            transaction_id,
+            OutputTransactionFailureStage::BackendOwnershipTransfer,
+            MonotonicTimestampNs::new(queued_at_ns),
+            |_| Ok(()),
+        )?;
+        return Ok(WorkerQueueOutcome::Unavailable(reason));
+    }
+    let job = KmsCommitJob {
+        bundle_id:
+            crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
+        owners: KmsBundleOwners::for_legacy_transaction(
+            kind,
+            Arc::new(
+                output_transactions
+                    .transaction(transaction_id)
+                    .ok_or_else(|| io::Error::other("queued cursor transaction disappeared"))?
+                    .descriptor()
+                    .clone(),
+            ),
+        ),
+        transaction_id,
+        token,
+        output_generation,
+        crtc_id,
+        kind,
+        target,
+        queued_at: MonotonicTimestampNs::new(queued_at_ns),
+        primary: KmsPrimaryUpdate::Unchanged,
+        cursor: desired
+            .clone()
+            .map_or(KmsCursorUpdate::Disable, KmsCursorUpdate::Set),
+        cursor_pin: match promoted_pin {
+            Some(pin) => Some(pin),
+            None => desired
+                .as_ref()
+                .filter(|state| state.framebuffer_id.is_some())
+                .map(|state| cursor.pin_framebuffer_for(state))
+                .transpose()?,
+        },
+        direct_primary_lease: None,
+        test_only_duration_ns: None,
+        pacing_frame_id: None,
+        test_only: if cursor.current_capability_proven() {
+            KmsTestOnlyPolicy::Skip
+        } else {
+            KmsTestOnlyPolicy::Required
+        },
+        ready_submit: false,
+    };
+    let descriptor = output_transactions
+        .transaction(transaction_id)
+        .ok_or_else(|| io::Error::other("queued cursor transaction disappeared"))?;
+    if let Err(error) = job.validate_against(descriptor.descriptor()) {
+        atomic_commit_arbiter.reject_worker_queued(token);
+        settle_failed_output_transaction(
+            output_transactions,
+            transaction_id,
+            OutputTransactionFailureStage::BackendOwnershipTransfer,
+            MonotonicTimestampNs::new(queued_at_ns),
+            |_| Ok(()),
+        )?;
+        return Err(io::Error::other(format!("invalid cursor worker payload: {error:?}")).into());
+    }
+    let queued_visual_state = desired.clone().unwrap_or_else(|| {
+        let mut hidden = cursor.desired().clone();
+        hidden.visible = false;
+        hidden.framebuffer_id = None;
+        hidden
+    });
+    let queue_result = match owned_revision {
+        Some(revision) => cursor.queue_owned_worker_submission(
+            transaction_id,
+            token,
+            cursor_epoch,
+            revision,
+            queued_visual_state,
+        ),
+        None => {
+            cursor.queue_worker_submission(transaction_id, token, cursor_epoch, queued_visual_state)
+        }
+    };
+    if let Err(error) = queue_result {
+        atomic_commit_arbiter.reject_worker_queued(token);
+        settle_failed_output_transaction(
+            output_transactions,
+            transaction_id,
+            OutputTransactionFailureStage::BackendOwnershipTransfer,
+            MonotonicTimestampNs::new(queued_at_ns),
+            |_| Ok(()),
+        )?;
+        return Err(error.into());
+    }
+    if let Err(error) = permit.enqueue(job) {
+        drop(error.job);
+        cursor.cancel_worker_submission(transaction_id, token, cursor_epoch)?;
+        atomic_commit_arbiter.reject_worker_queued(token);
+        settle_failed_output_transaction(
+            output_transactions,
+            transaction_id,
+            OutputTransactionFailureStage::KmsSubmit,
+            MonotonicTimestampNs::new(monotonic_now_ns()?),
+            |_| Ok(()),
+        )?;
+        return Err(io::Error::other(format!(
+            "cursor Atomic worker enqueue failed: {:?}",
+            error.reason
+        ))
+        .into());
+    }
+    presentation_trace.push(PresentationTransactionEvent::WorkerQueued {
+        transaction_id,
+        timestamp_ns: monotonic_now_ns()?,
+    });
+    worker.record_cursor_worker_queued();
+    Ok(WorkerQueueOutcome::CursorQueued {
+        transaction_id,
+        token,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -66,6 +287,7 @@ pub(super) fn prepare_plane_delta(
             transaction_id: promoted.transaction.id(),
             desired,
             cursor_epoch,
+            owned_revision: Some(promoted.revision),
             cursor_pin: promoted.lease,
             target: promoted.deadline,
         });
@@ -104,6 +326,7 @@ pub(super) fn prepare_plane_delta(
         transaction_id,
         desired,
         cursor_epoch,
+        owned_revision: None,
         cursor_pin: None,
         target,
     })

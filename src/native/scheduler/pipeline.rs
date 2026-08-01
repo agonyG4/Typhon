@@ -90,6 +90,14 @@ pub fn apply_atomic_commit_lane_guard(
     }
 }
 
+pub const fn rendered_primary_must_wait_for_lane(
+    render_ahead: bool,
+    atomic_commit_pending: bool,
+    can_queue_worker_next: bool,
+) -> bool {
+    render_ahead || (atomic_commit_pending && !can_queue_worker_next)
+}
+
 impl NativeFrameScheduler {
     pub fn decision_with_pipeline(
         &mut self,

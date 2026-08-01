@@ -153,6 +153,32 @@ fn worker_queue_rejects_a_stale_cursor_epoch() {
 }
 
 #[test]
+fn owned_cursor_snapshot_queues_after_desired_motion_advances() {
+    let mut cursor = test_cursor();
+    cursor.set_hardware_path_active(true);
+    let snapshot_epoch = cursor.desired_epoch();
+    let snapshot_revision = cursor.desired_revision();
+    let snapshot_state = cursor.desired().clone();
+    cursor.set_position(100, 200);
+    let transaction_id = OutputTransactionId::new(
+        std::num::NonZeroU64::new(75).expect("test transaction ID is nonzero"),
+    );
+    let token = PageFlipToken::new(75).unwrap();
+
+    cursor
+        .queue_owned_worker_submission(
+            transaction_id,
+            token,
+            snapshot_epoch,
+            snapshot_revision,
+            snapshot_state,
+        )
+        .expect("an immutable owned snapshot remains queueable after newer desired motion");
+
+    assert_eq!(cursor.worker_queued_epoch(), Some(snapshot_epoch));
+}
+
+#[test]
 fn composed_cursor_fallback_counter_is_separate_from_general_fallbacks() {
     let mut cursor = test_cursor();
 

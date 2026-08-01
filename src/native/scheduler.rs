@@ -8,6 +8,7 @@ mod pipeline;
 pub use pipeline::{
     ExplicitAtomicSchedulerContext, ExplicitAtomicSchedulerDecision, PipelineWaitReason,
     PresentationPipelineView, SchedulerPreparedPrimary, apply_atomic_commit_lane_guard,
+    rendered_primary_must_wait_for_lane,
 };
 
 const DEFAULT_PAGE_FLIP_WATCHDOG_NS: u64 = 1_000_000_000;
@@ -749,6 +750,16 @@ impl NativeFrameScheduler {
 mod tests {
     use super::*;
     use crate::native::presentation_deadline::PresentationTargetReason;
+
+    #[test]
+    fn synchronous_render_holds_primary_while_cursor_delta_is_in_flight() {
+        assert!(rendered_primary_must_wait_for_lane(false, true, false));
+    }
+
+    #[test]
+    fn worker_render_can_submit_when_next_commit_can_be_queued() {
+        assert!(!rendered_primary_must_wait_for_lane(false, true, true));
+    }
 
     fn render_ahead_context(
         now_ns: u64,

@@ -3,9 +3,10 @@ use super::kms_worker::{
     handle_fatal_worker_jobs, retain_complete_submitted_ownership,
     retain_uncertain_job_with_suspension,
 };
+use super::plane_cycle::plane_delta_reservation_outcome;
 use crate::native_output::kms_worker::{
     KmsBundleOwners, KmsCommitJob, KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership,
-    KmsTestOnlyPolicy, KmsWorkerFatalJob,
+    KmsTestOnlyPolicy, KmsWorkerAdmissionError, KmsWorkerFatalJob,
 };
 use crate::native_output::runtime::AtomicCommitKind;
 use crate::native_output::scanout::DirectPrimaryLease;
@@ -120,6 +121,14 @@ fn test_eventfd() -> OwnedFd {
     assert!(fd >= 0, "test eventfd should be created");
     // SAFETY: eventfd returned a new owned descriptor for this test.
     unsafe { OwnedFd::from_raw_fd(fd) }
+}
+
+#[test]
+fn occupied_worker_plane_delta_reservation_is_retryable_contention() {
+    assert_eq!(
+        plane_delta_reservation_outcome(Err("an Atomic worker commit is already queued")),
+        Err(KmsWorkerAdmissionError::QueueFull)
+    );
 }
 
 #[test]

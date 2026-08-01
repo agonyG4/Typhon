@@ -28,6 +28,7 @@ use super::presentation_worker::*;
 use super::*;
 use crate::native_output::kms_worker::KmsCommitWorkerTransport;
 use oblivion_one::native::kms::KmsBackendKind;
+use oblivion_one::native::scheduler::rendered_primary_must_wait_for_lane;
 
 impl NativeRuntime {
     #[allow(unused_variables)]
@@ -610,17 +611,12 @@ impl NativeRuntime {
             };
             scheduler_decision = decision;
         }
-        let can_queue_worker_next = worker_mode
-            && matches!(
-                scheduler_decision,
-                SchedulerDecision::SubmitReady | SchedulerDecision::SubmitReadyLate
-            )
-            && pipeline_snapshot
-                .as_ref()
-                .is_some_and(OutputPipelineSnapshot::can_pre_admit_primary)
-            && kms_commit_worker
-                .as_ref()
-                .is_some_and(|worker| worker.admission_available());
+        let can_queue_worker_next = super::presentation_worker::can_queue_worker_primary(
+            worker_mode,
+            scheduler_decision,
+            pipeline_snapshot.as_ref(),
+            kms_commit_worker.as_ref(),
+        );
         scheduler_decision = oblivion_one::native::scheduler::apply_atomic_commit_lane_guard(
             scheduler_decision,
             atomic_commit_arbiter.atomic_commit_pending(),
@@ -1036,7 +1032,11 @@ impl NativeRuntime {
                                     },
                                 );
                                 let ready_at_ns = monotonic_now_ns()?;
-                                let waits_for_target = render_ahead;
+                                let waits_for_target = rendered_primary_must_wait_for_lane(
+                                    render_ahead,
+                                    atomic_commit_arbiter.atomic_commit_pending(),
+                                    can_queue_worker_next,
+                                );
                                 if waits_for_target {
                                     frame_pacing.note_ready_frame(ready_at_ns, render_ahead);
                                 } else {

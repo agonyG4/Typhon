@@ -221,11 +221,33 @@ impl NativeAtomicCursor {
                 "Atomic cursor worker submission has a stale desired epoch",
             ));
         }
+        self.queue_owned_worker_submission(
+            transaction_id,
+            token,
+            cursor_epoch,
+            self.desired_revision(),
+            visual_state,
+        )
+    }
+
+    pub(crate) fn queue_owned_worker_submission(
+        &mut self,
+        transaction_id: crate::native_output::OutputTransactionId,
+        token: PageFlipToken,
+        cursor_epoch: u64,
+        revision: crate::native_output::presentation::plane::CursorRevision,
+        visual_state: AtomicCursorVisualState,
+    ) -> io::Result<()> {
+        if self.worker_queued.is_some() {
+            return Err(io::Error::other(
+                "Atomic cursor worker submission already queued",
+            ));
+        }
         self.worker_queued = Some(WorkerQueuedCursorSubmission {
             transaction_id,
             token,
             cursor_epoch,
-            revision: self.desired_revision(),
+            revision,
             visual_state,
         });
         Ok(())

@@ -12,6 +12,23 @@ use crate::native_output::kms_worker::{
 };
 use oblivion_one::native::kms::FramebufferId;
 
+pub(super) fn can_queue_worker_primary(
+    worker_mode: bool,
+    decision: SchedulerDecision,
+    pipeline: Option<&OutputPipelineSnapshot>,
+    worker: Option<&KmsCommitWorkerHandle>,
+) -> bool {
+    worker_mode
+        && matches!(
+            decision,
+            SchedulerDecision::Render
+                | SchedulerDecision::SubmitReady
+                | SchedulerDecision::SubmitReadyLate
+        )
+        && pipeline.is_some_and(OutputPipelineSnapshot::can_pre_admit_primary)
+        && worker.is_some_and(KmsCommitWorkerHandle::admission_available)
+}
+
 pub(super) fn worker_cursor_pin(
     atomic_cursor: Option<&NativeAtomicCursor>,
     cursor: Option<&AtomicCursorVisualState>,
