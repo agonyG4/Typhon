@@ -672,129 +672,127 @@ impl NativeRuntime {
                             ))
                         }),
                 };
-                if let Some(direct_target) = direct_target {
-                    if worker_mode && kms_commit_worker.is_some() {
-                        match scanout.try_direct_scanout(
-                            kms_backend,
-                            server,
-                            output_transactions,
-                            direct_target,
-                            effective_cursor.as_ref(),
-                            cursor_epoch,
-                            pacing_mode,
-                            kms_commit_worker.as_ref(),
-                        )? {
-                            DirectScanoutAttempt::Unchanged => {
-                                direct_suppressed = true;
-                                presentation_deadline.clear_scheduled_target();
-                                *scheduled_presentation_target = None;
-                                perf.log("native.direct_scanout", || {
-                                    vec![NativePerfField::str(
-                                        "transition",
-                                        "same_buffer_suppressed",
-                                    )]
-                                });
+                if let Some(direct_target) = direct_target
+                    && worker_mode
+                    && kms_commit_worker.is_some()
+                {
+                    match scanout.try_direct_scanout(
+                        kms_backend,
+                        server,
+                        output_transactions,
+                        direct_target,
+                        effective_cursor.as_ref(),
+                        cursor_epoch,
+                        pacing_mode,
+                        kms_commit_worker.as_ref(),
+                    )? {
+                        DirectScanoutAttempt::Unchanged => {
+                            direct_suppressed = true;
+                            presentation_deadline.clear_scheduled_target();
+                            *scheduled_presentation_target = None;
+                            perf.log("native.direct_scanout", || {
+                                vec![NativePerfField::str("transition", "same_buffer_suppressed")]
+                            });
+                        }
+                        DirectScanoutAttempt::WorkerQueued {
+                            transaction_id,
+                            token,
+                            framebuffer_id,
+                            lease,
+                            admission,
+                            mut test_only,
+                        } => {
+                            if atomic_cursor.as_ref().is_some_and(|cursor| {
+                                cursor.scheduled_test_policy() == KmsCursorTestPolicy::Required
+                            }) {
+                                test_only = KmsTestOnlyPolicy::Required;
                             }
-                            DirectScanoutAttempt::WorkerQueued {
+                            let direct_result = finish_direct_worker_queued(
+                                kms_commit_worker
+                                    .as_ref()
+                                    .expect("direct scanout requires KMS worker"),
+                                scanout,
+                                emergency_quarantined_worker_jobs,
+                                direct_fallback_tracker,
+                                server,
+                                output_transactions,
+                                atomic_commit_arbiter,
+                                presentation_trace,
+                                frame_scheduler,
+                                cursor_output_arbitration,
+                                effective_cursor.as_ref(),
+                                worker_ctx(
+                                    atomic_cursor.as_ref(),
+                                    frame_pacing,
+                                    validation_base_for_submission(
+                                        kms_commit_worker.as_ref(),
+                                        *presented_planes,
+                                        *drm_file_generation,
+                                        target.crtc_id,
+                                    ),
+                                    planned_cursor_delivery,
+                                ),
+                                *drm_file_generation,
+                                target.crtc_id,
+                                scene_generation,
+                                cursor_epoch,
+                                current_software_cursor_damage,
+                                last_rendered_scene_generation,
+                                last_submitted_cursor_epoch,
+                                last_renderable_surfaces,
+                                last_software_cursor_damage,
+                                frame_index,
+                                &mut frame_submitted,
                                 transaction_id,
                                 token,
                                 framebuffer_id,
-                                lease,
+                                direct_target,
+                                *lease,
                                 admission,
-                                mut test_only,
-                            } => {
-                                if atomic_cursor.as_ref().is_some_and(|cursor| {
-                                    cursor.scheduled_test_policy() == KmsCursorTestPolicy::Required
-                                }) {
-                                    test_only = KmsTestOnlyPolicy::Required;
+                                test_only,
+                            )?;
+                            match direct_result {
+                                DirectWorkerQueueResult::Queued => {
+                                    direct_submitted = true;
                                 }
-                                let direct_result = finish_direct_worker_queued(
-                                    kms_commit_worker
-                                        .as_ref()
-                                        .expect("direct scanout requires KMS worker"),
-                                    scanout,
-                                    emergency_quarantined_worker_jobs,
-                                    direct_fallback_tracker,
-                                    server,
-                                    output_transactions,
-                                    atomic_commit_arbiter,
-                                    presentation_trace,
-                                    frame_scheduler,
-                                    cursor_output_arbitration,
-                                    effective_cursor.as_ref(),
-                                    worker_ctx(
-                                        atomic_cursor.as_ref(),
-                                        frame_pacing,
-                                        validation_base_for_submission(
-                                            kms_commit_worker.as_ref(),
-                                            *presented_planes,
-                                            *drm_file_generation,
-                                            target.crtc_id,
-                                        ),
-                                        planned_cursor_delivery,
-                                    ),
-                                    *drm_file_generation,
-                                    target.crtc_id,
-                                    scene_generation,
-                                    cursor_epoch,
-                                    current_software_cursor_damage,
-                                    last_rendered_scene_generation,
-                                    last_submitted_cursor_epoch,
-                                    last_renderable_surfaces,
-                                    last_software_cursor_damage,
-                                    frame_index,
-                                    &mut frame_submitted,
-                                    transaction_id,
-                                    token,
-                                    framebuffer_id,
-                                    direct_target,
-                                    *lease,
-                                    admission,
-                                    test_only,
-                                )?;
-                                match direct_result {
-                                    DirectWorkerQueueResult::Queued => {
-                                        direct_submitted = true;
-                                    }
-                                    DirectWorkerQueueResult::AdmissionRejected => {
-                                        let _ = DirectFallbackTracker::start(
-                                            direct_fallback_tracker,
-                                            transaction_id,
-                                            *last_refresh_sequence,
-                                            DirectFallbackReason::WorkerAdmissionRejected,
-                                        );
-                                    }
+                                DirectWorkerQueueResult::AdmissionRejected => {
+                                    let _ = DirectFallbackTracker::start(
+                                        direct_fallback_tracker,
+                                        transaction_id,
+                                        *last_refresh_sequence,
+                                        DirectFallbackReason::WorkerAdmissionRejected,
+                                    );
                                 }
                             }
-                            DirectScanoutAttempt::AdmissionRejected {
+                        }
+                        DirectScanoutAttempt::AdmissionRejected {
+                            transaction_id,
+                            reason: _reason,
+                        } => {
+                            let _ = DirectFallbackTracker::start(
+                                direct_fallback_tracker,
                                 transaction_id,
-                                reason: _reason,
-                            } => {
-                                let _ = DirectFallbackTracker::start(
-                                    direct_fallback_tracker,
-                                    transaction_id,
-                                    *last_refresh_sequence,
-                                    DirectFallbackReason::WorkerAdmissionRejected,
-                                );
-                            }
-                            DirectScanoutAttempt::Rejected(rejection) => {
-                                scanout.note_direct_blocker(rejection.as_str());
-                                perf.log("native.direct_scanout", || {
-                                    vec![
-                                        NativePerfField::str("transition", "fallback"),
-                                        NativePerfField::str("rejection", rejection.as_str()),
-                                    ]
-                                });
-                            }
-                            DirectScanoutAttempt::Fallback(reason) => {
-                                scanout.note_direct_blocker(reason);
-                                perf.log("native.direct_scanout", || {
-                                    vec![
-                                        NativePerfField::str("transition", "fallback"),
-                                        NativePerfField::str("reason", reason),
-                                    ]
-                                });
-                            }
+                                *last_refresh_sequence,
+                                DirectFallbackReason::WorkerAdmissionRejected,
+                            );
+                        }
+                        DirectScanoutAttempt::Rejected(rejection) => {
+                            scanout.note_direct_blocker(rejection.as_str());
+                            perf.log("native.direct_scanout", || {
+                                vec![
+                                    NativePerfField::str("transition", "fallback"),
+                                    NativePerfField::str("rejection", rejection.as_str()),
+                                ]
+                            });
+                        }
+                        DirectScanoutAttempt::Fallback(reason) => {
+                            scanout.note_direct_blocker(reason);
+                            perf.log("native.direct_scanout", || {
+                                vec![
+                                    NativePerfField::str("transition", "fallback"),
+                                    NativePerfField::str("reason", reason),
+                                ]
+                            });
                         }
                     }
                 }
