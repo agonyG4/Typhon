@@ -124,9 +124,10 @@ impl NativeRuntime {
             let may_change_pointer_constraints = event.may_change_pointer_constraints();
             let effect = input_state.handle_hardware_input_event(event);
             let effect_requested_redraw = effect.redraw_requested;
-            let cursor_visible = server.client_cursor_render_state().is_some()
-                || server.interaction_cursor_override_active()
-                || input_state.cursor_visible();
+            let cursor_visible = !server.client_cursor_explicitly_hidden()
+                && (server.client_cursor_render_state().is_some()
+                    || server.interaction_cursor_override_active()
+                    || input_state.cursor_visible());
             if let Err(error) = apply_cursor_position(
                 atomic_cursor,
                 legacy_cursor,

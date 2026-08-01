@@ -81,17 +81,18 @@ pub(crate) enum NativeResolvedCursorSource {
     Client,
 }
 
-pub(crate) const fn resolve_native_cursor_source(
+pub(crate) const fn resolve_native_cursor_source_with_hidden(
     client_active: bool,
+    client_explicitly_hidden: bool,
     interaction_override_active: bool,
     theme_visible: bool,
 ) -> NativeResolvedCursorSource {
     if interaction_override_active {
         NativeResolvedCursorSource::InteractionOverride
     } else if client_active {
-        // The compositor's theme visibility is intentionally false while a
-        // client owns the cursor surface.  It must not hide the client image.
         NativeResolvedCursorSource::Client
+    } else if client_explicitly_hidden {
+        NativeResolvedCursorSource::Hidden
     } else if theme_visible {
         NativeResolvedCursorSource::Theme
     } else {
@@ -216,8 +217,9 @@ pub(crate) fn synchronize_cursor_state_for_server(
     legacy_cursor: &mut Option<NativeLegacyHardwareCursor>,
     input_state: &NativeInputState,
 ) -> io::Result<()> {
-    let source = resolve_native_cursor_source(
+    let source = resolve_native_cursor_source_with_hidden(
         server.client_cursor_render_state().is_some(),
+        server.client_cursor_explicitly_hidden(),
         server.interaction_cursor_override_active(),
         input_state.cursor_visible(),
     );
@@ -367,7 +369,7 @@ mod tests {
     #[test]
     fn client_cursor_source_stays_visible_when_theme_cursor_is_hidden() {
         assert_eq!(
-            resolve_native_cursor_source(true, false, false),
+            resolve_native_cursor_source_with_hidden(true, false, false, false),
             NativeResolvedCursorSource::Client
         );
     }
@@ -375,12 +377,32 @@ mod tests {
     #[test]
     fn hidden_and_interaction_sources_keep_their_precedence() {
         assert_eq!(
-            resolve_native_cursor_source(false, true, false),
+            resolve_native_cursor_source_with_hidden(false, false, true, false),
             NativeResolvedCursorSource::InteractionOverride
         );
         assert_eq!(
-            resolve_native_cursor_source(false, false, false),
+            resolve_native_cursor_source_with_hidden(false, true, false, true),
             NativeResolvedCursorSource::Hidden
+        );
+        assert_eq!(
+            resolve_native_cursor_source_with_hidden(false, false, false, false),
+            NativeResolvedCursorSource::Hidden
+        );
+    }
+
+    #[test]
+    fn explicit_client_concealment_is_restored_after_interaction_override() {
+        assert_eq!(
+            resolve_native_cursor_source_with_hidden(false, true, true, true),
+            NativeResolvedCursorSource::InteractionOverride
+        );
+        assert_eq!(
+            resolve_native_cursor_source_with_hidden(false, true, false, true),
+            NativeResolvedCursorSource::Hidden
+        );
+        assert_eq!(
+            resolve_native_cursor_source_with_hidden(true, false, false, true),
+            NativeResolvedCursorSource::Client
         );
     }
 

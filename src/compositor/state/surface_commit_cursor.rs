@@ -22,6 +22,25 @@ impl CompositorState {
         self.track_committed_buffer_lifetime(surface_id, &pending);
         self.current_surface_buffers.insert(surface_id, pending);
         self.client_cursor_surfaces.insert(surface_id, surface);
+        if let Some(active) = self
+            .active_client_cursor
+            .as_ref()
+            .filter(|active| active.surface_id == surface_id)
+            .cloned()
+            && self
+                .cursor_visibility
+                .client_hidden_pointer
+                .as_ref()
+                .is_some_and(|pointer| same_wayland_resource(pointer, &active.pointer))
+        {
+            self.cursor_visibility.client_hidden_pointer = None;
+            self.cursor_visibility.client_cursor_pointer = Some(active.pointer);
+            self.sync_cursor_visibility_request();
+            pointer_debug_log(format!(
+                "cursor surface buffer restored surface={} reason=new-client-buffer",
+                surface_id
+            ));
+        }
         self.record_surface_damage_commit(
             surface_id,
             RenderableSurfaceDamage::Full,
@@ -107,6 +126,21 @@ impl CompositorState {
             journal_size.height,
         );
         self.set_render_generation(generation, RenderGenerationCause::CursorCommit);
+        if let Some(active) = self
+            .active_client_cursor
+            .as_ref()
+            .filter(|active| active.surface_id == surface_id)
+            .cloned()
+            && self
+                .cursor_visibility
+                .client_hidden_pointer
+                .as_ref()
+                .is_some_and(|pointer| same_wayland_resource(pointer, &active.pointer))
+        {
+            self.cursor_visibility.client_hidden_pointer = None;
+            self.cursor_visibility.client_cursor_pointer = Some(active.pointer);
+            self.sync_cursor_visibility_request();
+        }
         true
     }
 
@@ -131,7 +165,21 @@ impl CompositorState {
         if let Some(release) = self.active_dmabuf_buffers.remove(&surface_id) {
             self.queue_dmabuf_buffer_release(release);
         }
-        if removed {
+        let active_cursor_pointer = self
+            .active_client_cursor
+            .as_ref()
+            .filter(|active| active.surface_id == surface_id)
+            .map(|active| active.pointer.clone());
+        if let Some(pointer) = active_cursor_pointer {
+            self.cursor_visibility.client_cursor_pointer = None;
+            self.cursor_visibility.client_hidden_pointer = Some(pointer);
+            self.advance_render_generation(RenderGenerationCause::CursorState);
+            self.sync_cursor_visibility_request();
+            pointer_debug_log(format!(
+                "cursor surface buffer removed surface={} reason=null-buffer-commit",
+                surface_id
+            ));
+        } else if removed {
             self.advance_render_generation(RenderGenerationCause::CursorCommit);
             pointer_debug_log(format!(
                 "cursor surface buffer removed surface={}",

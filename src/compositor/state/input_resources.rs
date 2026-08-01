@@ -200,6 +200,9 @@ impl CompositorState {
         if self.cursor_visibility.lock_hidden_constraint_id.is_some() {
             return None;
         }
+        if self.cursor_visibility.client_hidden_pointer.is_some() {
+            return None;
+        }
         let active = self.active_client_cursor.as_ref()?;
         let surface = self.client_cursor_surfaces.get(&active.surface_id)?;
         Some(ClientCursorRenderState {
@@ -215,6 +218,10 @@ impl CompositorState {
         self.active_client_cursor
             .as_ref()
             .is_some_and(|active| self.client_cursor_surfaces.contains_key(&active.surface_id))
+    }
+
+    pub(in crate::compositor) fn client_cursor_explicitly_hidden(&self) -> bool {
+        self.cursor_visibility.client_hidden_pointer.is_some()
     }
 
     pub(in crate::compositor) fn send_keyboard_key(&mut self, key: u32, pressed: bool) {
