@@ -575,6 +575,9 @@ pub(crate) fn hardware_input_event_from_libinput(
         }
         #[allow(deprecated)]
         ::input::Event::Pointer(PointerEvent::Axis(event)) => {
+            if !should_forward_libinput_scroll_event(LibinputScrollEventKind::LegacyAxis) {
+                return None;
+            }
             let horizontal = libinput_scroll_axis_value(event.has_axis(Axis::Horizontal), || {
                 event.axis_value(Axis::Horizontal)
             });
@@ -597,6 +600,9 @@ pub(crate) fn hardware_input_event_from_libinput(
             }))
         }
         ::input::Event::Pointer(PointerEvent::ScrollWheel(event)) => {
+            debug_assert!(should_forward_libinput_scroll_event(
+                LibinputScrollEventKind::Wheel
+            ));
             let horizontal = libinput_scroll_axis_value(event.has_axis(Axis::Horizontal), || {
                 event.scroll_value(Axis::Horizontal)
             });
@@ -627,6 +633,9 @@ pub(crate) fn hardware_input_event_from_libinput(
             }))
         }
         ::input::Event::Pointer(PointerEvent::ScrollFinger(event)) => {
+            debug_assert!(should_forward_libinput_scroll_event(
+                LibinputScrollEventKind::Finger
+            ));
             let horizontal = libinput_scroll_axis_value(event.has_axis(Axis::Horizontal), || {
                 event.scroll_value(Axis::Horizontal)
             });
@@ -641,6 +650,9 @@ pub(crate) fn hardware_input_event_from_libinput(
             }))
         }
         ::input::Event::Pointer(PointerEvent::ScrollContinuous(event)) => {
+            debug_assert!(should_forward_libinput_scroll_event(
+                LibinputScrollEventKind::Continuous
+            ));
             let horizontal = libinput_scroll_axis_value(event.has_axis(Axis::Horizontal), || {
                 event.scroll_value(Axis::Horizontal)
             });
@@ -656,6 +668,18 @@ pub(crate) fn hardware_input_event_from_libinput(
         }
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LibinputScrollEventKind {
+    LegacyAxis,
+    Wheel,
+    Finger,
+    Continuous,
+}
+
+pub(crate) const fn should_forward_libinput_scroll_event(kind: LibinputScrollEventKind) -> bool {
+    !matches!(kind, LibinputScrollEventKind::LegacyAxis)
 }
 
 pub(crate) fn libinput_scroll_axis_value<F>(has_axis: bool, read_value: F) -> f64
@@ -1326,4 +1350,25 @@ pub(crate) fn apply_native_window_action(
     };
     resize_perf.observe_action(action, changed, perf);
     changed
+}
+
+#[cfg(test)]
+mod scroll_event_tests {
+    use super::*;
+
+    #[test]
+    fn modern_libinput_scroll_suppresses_duplicated_legacy_axis_events() {
+        assert!(!should_forward_libinput_scroll_event(
+            LibinputScrollEventKind::LegacyAxis,
+        ));
+        assert!(should_forward_libinput_scroll_event(
+            LibinputScrollEventKind::Wheel,
+        ));
+        assert!(should_forward_libinput_scroll_event(
+            LibinputScrollEventKind::Finger,
+        ));
+        assert!(should_forward_libinput_scroll_event(
+            LibinputScrollEventKind::Continuous,
+        ));
+    }
 }

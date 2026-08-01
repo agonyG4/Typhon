@@ -54,6 +54,32 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn unregister_pointer(&mut self, pointer: &wl_pointer::WlPointer) {
+        let owned_active_cursor = self
+            .active_client_cursor
+            .as_ref()
+            .is_some_and(|active| same_wayland_resource(&active.pointer, pointer));
+        let owned_cursor_visibility = self
+            .cursor_visibility
+            .client_hidden_pointer
+            .as_ref()
+            .is_some_and(|owner| same_wayland_resource(owner, pointer))
+            || self
+                .cursor_visibility
+                .client_cursor_pointer
+                .as_ref()
+                .is_some_and(|owner| same_wayland_resource(owner, pointer));
+        let preserve_client_cursor_claim = owned_active_cursor || owned_cursor_visibility;
+        if owned_active_cursor {
+            self.active_client_cursor = None;
+            self.advance_render_generation(RenderGenerationCause::CursorState);
+        }
+        if preserve_client_cursor_claim {
+            // wl_pointer.release does not reset the cursor selected for the
+            // current focus. Keep the client claim hidden until focus changes
+            // or another live pointer supplies a replacement cursor.
+            self.cursor_visibility.client_hidden_pointer = Some(pointer.clone());
+            self.cursor_visibility.client_cursor_pointer = None;
+        }
         self.pointer_resources
             .retain(|resource| !same_wayland_resource(resource, pointer));
         self.pointer_entered_surfaces
@@ -63,34 +89,13 @@ impl CompositorState {
         self.relative_pointer_resources
             .retain(|resource| !same_wayland_resource(&resource.source_pointer, pointer));
         self.deactivate_pointer_constraints_for_pointer(pointer, false);
-        if self
-            .active_client_cursor
-            .as_ref()
-            .is_some_and(|active| same_wayland_resource(&active.pointer, pointer))
-        {
-            self.active_client_cursor = None;
-            self.advance_render_generation(RenderGenerationCause::CursorState);
+        if owned_active_cursor {
             pointer_debug_log(format!(
                 "cursor cleanup pointer={} reason=owning-pointer-destroyed",
                 pointer.id().protocol_id()
             ));
         }
-        if self
-            .cursor_visibility
-            .client_hidden_pointer
-            .as_ref()
-            .is_some_and(|hidden_pointer| same_wayland_resource(hidden_pointer, pointer))
-        {
-            self.cursor_visibility.client_hidden_pointer = None;
-            self.sync_cursor_visibility_request();
-        }
-        if self
-            .cursor_visibility
-            .client_cursor_pointer
-            .as_ref()
-            .is_some_and(|cursor_pointer| same_wayland_resource(cursor_pointer, pointer))
-        {
-            self.cursor_visibility.client_cursor_pointer = None;
+        if preserve_client_cursor_claim {
             self.sync_cursor_visibility_request();
         }
     }

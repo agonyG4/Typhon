@@ -191,21 +191,23 @@ impl CompositorState {
             ));
         }
 
-        let dispatched_ids = recipients
-            .iter()
-            .map(|relative_pointer| relative_pointer.resource.id().protocol_id())
-            .collect::<Vec<_>>();
-        pointer_debug_log(format!(
-            "relative route exact_source_pointer_count={} same_client_count={} same_seat_count={} selected_recipient_count={} dispatched={:?} client={} seat=single constraint={} generation={}",
-            exact_source_pointer_count,
-            same_client_count,
-            same_seat_count,
-            selected_recipient_count,
-            dispatched_ids,
-            wayland_resource_client_label(&active.surface),
-            active.constraint_id,
-            active.generation
-        ));
+        pointer_debug_log_lazy(|| {
+            let dispatched_ids = recipients
+                .iter()
+                .map(|relative_pointer| relative_pointer.resource.id().protocol_id())
+                .collect::<Vec<_>>();
+            format!(
+                "relative route exact_source_pointer_count={} same_client_count={} same_seat_count={} selected_recipient_count={} dispatched={:?} client={} seat=single constraint={} generation={}",
+                exact_source_pointer_count,
+                same_client_count,
+                same_seat_count,
+                selected_recipient_count,
+                dispatched_ids,
+                wayland_resource_client_label(&active.surface),
+                active.constraint_id,
+                active.generation
+            )
+        });
 
         let mut frame_pointers: Vec<wl_pointer::WlPointer> = Vec::new();
         let mut relative_events_sent = 0usize;
@@ -226,7 +228,7 @@ impl CompositorState {
             {
                 frame_pointers.push(relative_pointer.source_pointer.clone());
             }
-            self.relative_motion_debug.note_dispatch(format!(
+            self.relative_motion_debug.note_dispatch(|| format!(
                 "relative motion dispatched constraint={} generation={} pointer={} source_pointer={} relative={} dx={} dy={}",
                 active.constraint_id,
                 active.generation,
@@ -237,10 +239,6 @@ impl CompositorState {
                 motion.dy
             ));
         }
-        let source_pointer_ids = frame_pointers
-            .iter()
-            .map(|pointer| pointer.id().protocol_id())
-            .collect::<Vec<_>>();
         let unique_source_pointer_count = frame_pointers.len();
         let mut pointer_frames_sent = 0usize;
         for pointer in frame_pointers {
@@ -249,16 +247,17 @@ impl CompositorState {
                 pointer_frames_sent += 1;
             }
         }
-        pointer_debug_log(format!(
-            "pointer.relative locked_dispatch constraint={} generation={} selected_recipient_count={} unique_source_pointer_count={} relative_events_sent={} pointer_frames_sent={} source_pointers={:?}",
-            active.constraint_id,
-            active.generation,
-            selected_recipient_count,
-            unique_source_pointer_count,
-            relative_events_sent,
-            pointer_frames_sent,
-            source_pointer_ids
-        ));
+        pointer_debug_log_lazy(|| {
+            format!(
+                "pointer.relative locked_dispatch constraint={} generation={} selected_recipient_count={} unique_source_pointer_count={} relative_events_sent={} pointer_frames_sent={}",
+                active.constraint_id,
+                active.generation,
+                selected_recipient_count,
+                unique_source_pointer_count,
+                relative_events_sent,
+                pointer_frames_sent
+            )
+        });
         if relative_events_sent == 0 {
             let reason = if same_client_count > 0 {
                 format!(
@@ -324,13 +323,15 @@ impl CompositorState {
                 motion.dx_unaccelerated,
                 motion.dy_unaccelerated,
             );
-            self.relative_motion_debug.note_dispatch(format!(
-                "relative motion dispatched client={} relative={} dx={} dy={}",
-                wayland_resource_client_label(surface),
-                resource_id,
-                motion.dx,
-                motion.dy
-            ));
+            self.relative_motion_debug.note_dispatch(|| {
+                format!(
+                    "relative motion dispatched client={} relative={} dx={} dy={}",
+                    wayland_resource_client_label(surface),
+                    resource_id,
+                    motion.dx,
+                    motion.dy
+                )
+            });
         }
         dispatched_resource_ids.len()
     }

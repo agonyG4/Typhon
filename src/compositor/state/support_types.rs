@@ -59,15 +59,30 @@ pub(crate) struct ActiveClientCursor {
 }
 
 pub(in crate::compositor) fn pointer_debug_log(message: impl AsRef<str>) {
-    if std::env::var_os("TYPHON_POINTER_DEBUG").is_some() {
+    if pointer_debug_enabled() {
         eprintln!("typhon pointer: {}", message.as_ref());
     }
 }
 
+pub(in crate::compositor) fn pointer_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TYPHON_POINTER_DEBUG").is_some())
+}
+
+fn pointer_debug_message<T>(enabled: bool, message: impl FnOnce() -> T) -> Option<T> {
+    enabled.then(message)
+}
+
+pub(in crate::compositor) fn pointer_debug_log_lazy(message: impl FnOnce() -> String) {
+    if let Some(message) = pointer_debug_message(pointer_debug_enabled(), message) {
+        eprintln!("typhon pointer: {message}");
+    }
+}
+
 impl RelativeMotionDebugState {
-    pub(in crate::compositor) fn note_dispatch(&mut self, message: String) {
+    pub(in crate::compositor) fn note_dispatch(&mut self, message: impl FnOnce() -> String) {
         self.dispatch_total = self.dispatch_total.saturating_add(1);
-        pointer_debug_log(message);
+        pointer_debug_log_lazy(message);
     }
 
     pub(in crate::compositor) fn note_drop(&mut self, reason: impl Into<String>) {
@@ -77,7 +92,7 @@ impl RelativeMotionDebugState {
     }
 
     pub(in crate::compositor) fn should_log_route_snapshot(&mut self) -> bool {
-        if std::env::var_os("TYPHON_POINTER_DEBUG").is_none() {
+        if !pointer_debug_enabled() {
             return false;
         }
         let now = Instant::now();
@@ -170,5 +185,24 @@ impl CompositorState {
                 self.active_toplevel_resizes.contains_key(&surface_id),
             )
         });
+    }
+}
+
+#[cfg(test)]
+mod pointer_debug_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn disabled_pointer_debug_does_not_format_locked_motion_messages() {
+        let formatted = Cell::new(false);
+
+        let message = pointer_debug_message(false, || {
+            formatted.set(true);
+            "locked motion".to_string()
+        });
+
+        assert_eq!(message, None);
+        assert!(!formatted.get());
     }
 }
