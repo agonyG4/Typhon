@@ -106,6 +106,16 @@ impl NativeRenderFence {
             .ok_or_else(|| io::Error::other("native render submission fence already consumed"))
     }
 
+    pub(crate) fn restore_submission_fd(&mut self, submission_fd: OwnedFd) -> io::Result<()> {
+        if self.submission_fd.is_some() {
+            return Err(io::Error::other(
+                "native render submission fence is already owned",
+            ));
+        }
+        self.submission_fd = Some(submission_fd);
+        Ok(())
+    }
+
     pub(crate) fn timing_fd(&self) -> Option<&OwnedFd> {
         self.timing_fd.as_ref()
     }

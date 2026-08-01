@@ -42,6 +42,40 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn return_worker_submission_for_replan(
+        &mut self,
+        token: PageFlipToken,
+        submission_fence: Option<OwnedFd>,
+    ) -> io::Result<()> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.return_worker_submission_for_replan(
+                token,
+                submission_fence.ok_or_else(|| {
+                    io::Error::other("explicit worker re-plan is missing its input fence")
+                })?,
+            ),
+            Self::NativeEglGbm(scanout) => {
+                if submission_fence.is_some() {
+                    return Err(io::Error::other(
+                        "compatibility worker re-plan unexpectedly has an input fence",
+                    ));
+                }
+                scanout.suspend_abandon_worker_submission(token)
+            }
+            Self::Gbm(scanout) => {
+                if submission_fence.is_some() {
+                    return Err(io::Error::other(
+                        "GBM worker re-plan unexpectedly has an input fence",
+                    ));
+                }
+                scanout.suspend_abandon_worker_submission(token)
+            }
+            Self::Dumb(_) => Err(io::Error::other(
+                "worker re-plan is unavailable for dumb scanout",
+            )),
+        }
+    }
+
     pub(crate) fn accept_direct_submitted(
         &mut self,
         submitted: SubmittedDirectPrimary,

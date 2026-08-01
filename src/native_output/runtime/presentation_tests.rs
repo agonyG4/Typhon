@@ -1,13 +1,57 @@
 use super::super::planner::visual_target_deadline_for_mode;
-use super::kms_worker::{WorkerRejectionKind, direct_rejection_policy};
+use super::kms_worker::{
+    WorkerRejectionKind, direct_rejection_policy, validation_base_invalidation_needs_active_replan,
+};
 use super::presentation_transactions::complete_presented_output_transaction;
 use super::*;
+use crate::native_output::kms_worker::ValidationBaseInvalidationReason;
 use oblivion_one::compositor::CompositorFrameBatchId;
 use oblivion_one::native::scheduler::apply_atomic_commit_lane_guard;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_COMPATIBILITY_TEST_SOCKET: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn active_validation_invalidation_is_replanned_not_suspended() {
+    for reason in [
+        ValidationBaseInvalidationReason::PredecessorTerminal,
+        ValidationBaseInvalidationReason::PresentedRevisionChanged,
+        ValidationBaseInvalidationReason::BundleMismatch,
+    ] {
+        assert!(validation_base_invalidation_needs_active_replan(
+            true, false, 7, 7, reason
+        ));
+    }
+    assert!(!validation_base_invalidation_needs_active_replan(
+        true,
+        false,
+        7,
+        7,
+        ValidationBaseInvalidationReason::GenerationChanged,
+    ));
+    assert!(!validation_base_invalidation_needs_active_replan(
+        false,
+        false,
+        7,
+        7,
+        ValidationBaseInvalidationReason::PredecessorTerminal,
+    ));
+    assert!(!validation_base_invalidation_needs_active_replan(
+        true,
+        true,
+        7,
+        7,
+        ValidationBaseInvalidationReason::PredecessorTerminal,
+    ));
+    assert!(!validation_base_invalidation_needs_active_replan(
+        true,
+        false,
+        8,
+        7,
+        ValidationBaseInvalidationReason::PredecessorTerminal,
+    ));
+}
 
 #[test]
 fn commit_lane_guard_preserves_predictive_render_ahead() {

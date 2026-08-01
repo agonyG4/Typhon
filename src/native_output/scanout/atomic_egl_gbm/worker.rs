@@ -54,4 +54,20 @@ impl AtomicEglGbmScanout {
         self.swapchain_mut()?.suspend_abandon_worker_queued(token)?;
         Ok(())
     }
+
+    pub(crate) fn return_worker_submission_for_replan(
+        &mut self,
+        token: PageFlipToken,
+        submission_fence: OwnedFd,
+    ) -> io::Result<()> {
+        if !self
+            .swapchain_mut()?
+            .return_worker_queued_for_replan(token, submission_fence)?
+        {
+            return Err(io::Error::other(
+                "explicit worker re-plan has no queued output frame",
+            ));
+        }
+        Ok(())
+    }
 }

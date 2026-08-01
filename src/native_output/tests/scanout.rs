@@ -363,6 +363,45 @@ fn explicit_output_swapchain_tracks_one_worker_queued_frame_before_pending() {
 }
 
 #[test]
+fn active_validation_invalidation_returns_worker_frame_without_quarantine() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        72,
+    )
+    .unwrap();
+    let slot = swapchain.acquire_render_slot().unwrap();
+    swapchain
+        .finish_render(slot, 1, test_render_fence())
+        .unwrap();
+    let token = PageFlipToken::new(721).unwrap();
+    let submission_fence = swapchain
+        .take_ready_for_worker(token, MonotonicTimestampNs::new(10))
+        .unwrap();
+
+    assert!(
+        swapchain
+            .return_worker_queued_for_replan(token, submission_fence)
+            .unwrap()
+    );
+    assert_eq!(swapchain.worker_queued_slot(), None);
+    assert_eq!(swapchain.ready_slot(), Some(slot));
+    assert_eq!(swapchain.quarantine_slot_id(), None);
+    assert!(!swapchain.is_poisoned());
+    let retry_fence = swapchain
+        .take_ready_for_worker(
+            PageFlipToken::new(722).unwrap(),
+            MonotonicTimestampNs::new(11),
+        )
+        .unwrap();
+    assert_eq!(swapchain.worker_queued_slot(), Some(slot));
+    swapchain
+        .return_worker_queued_for_replan(PageFlipToken::new(722).unwrap(), retry_fence)
+        .unwrap();
+    swapchain.validate_invariants().unwrap();
+}
+
+#[test]
 fn predictive_swapchain_allows_pending_plus_one_worker_queued_next() {
     let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
         explicit_slot_set(),

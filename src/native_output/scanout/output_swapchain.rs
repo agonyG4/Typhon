@@ -536,6 +536,48 @@ impl AtomicOutputSwapchain {
         Ok(())
     }
 
+    pub(crate) fn return_worker_queued_for_replan(
+        &mut self,
+        token: PageFlipToken,
+        submission_fence: OwnedFd,
+    ) -> io::Result<bool> {
+        if self.quarantine.is_some() {
+            return Err(io::Error::other(
+                "cannot re-plan an output while a slot is quarantined",
+            ));
+        }
+        if self.ready.is_some() {
+            return Err(io::Error::other(
+                "cannot return worker output while another frame is ready",
+            ));
+        }
+        let Some(mut queued) = self.worker_queued.take() else {
+            return Ok(false);
+        };
+        if queued.token != token {
+            self.worker_queued = Some(queued);
+            return Err(io::Error::other(
+                "re-planned worker output token does not match queued ownership",
+            ));
+        }
+        if queued.frame.pool_generation != self.pool_generation {
+            self.worker_queued = Some(queued);
+            return Err(io::Error::other(
+                "re-planned worker output frame belongs to an old pool generation",
+            ));
+        }
+        if let Err(error) = queued
+            .frame
+            .render_fence
+            .restore_submission_fd(submission_fence)
+        {
+            self.worker_queued = Some(queued);
+            return Err(error);
+        }
+        self.ready = Some(queued.frame);
+        Ok(true)
+    }
+
     pub(crate) fn fail_worker_queued(
         &mut self,
         token: PageFlipToken,

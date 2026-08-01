@@ -1,5 +1,5 @@
 use super::super::*;
-use crate::native_output::kms_worker::KmsCommitJob;
+use crate::native_output::kms_worker::{KmsCommitJob, KmsPrimaryUpdate};
 use oblivion_one::native::kms::AtomicKmsError;
 
 use super::super::presentation_transactions::{
@@ -9,6 +9,112 @@ use super::super::presentation_transactions::{
 use super::direct_rejection::WorkerRejectionKind;
 
 impl NativeRuntime {
+    pub(super) fn replan_invalidated_worker_job(
+        &mut self,
+        mut job: KmsCommitJob,
+    ) -> NativeResult<()> {
+        let sidecar_transaction_id = job
+            .owners
+            .cursor()
+            .filter(|owner| owner.sidecar_id.is_some())
+            .map(|owner| owner.transaction.id());
+        let compatibility_primary = matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. })
+            && self
+                .output_transactions
+                .transaction(job.transaction_id)
+                .is_some_and(|transaction| {
+                    matches!(
+                        transaction.descriptor().planes().primary(),
+                        PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
+                    )
+                });
+        let explicit_primary_fence =
+            if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. })
+                && !compatibility_primary
+            {
+                match &mut job.primary {
+                    KmsPrimaryUpdate::Framebuffer { in_fence, .. } => in_fence.take(),
+                    KmsPrimaryUpdate::Unchanged => None,
+                }
+            } else {
+                None
+            };
+
+        if let AtomicCommitKind::PlaneDelta { cursor_epoch, .. } = job.kind {
+            let cursor = self
+                .atomic_cursor
+                .as_mut()
+                .ok_or_else(|| io::Error::other("invalidated cursor job has no cursor"))?;
+            cursor.cancel_worker_submission(job.transaction_id, job.token, cursor_epoch)?;
+            self.cursor_output_arbitration.clear_pending();
+        } else if !self
+            .frame_pacing
+            .cancel_worker_submission(job.pacing_frame_id, job.ready_submit)
+        {
+            return Err(io::Error::other("invalidated worker pacing identity mismatch").into());
+        }
+
+        if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. })
+            && compatibility_primary
+            && let Err(error) = self
+                .frame_scheduler
+                .cancel_worker_submission(job.token.get(), job.transaction_id.get())
+        {
+            if let Some(worker) = self.kms_commit_worker.as_ref() {
+                worker.record_scheduler_cancel_mismatch();
+            }
+            return Err(io::Error::other(error).into());
+        }
+        if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. }) {
+            if compatibility_primary {
+                self.scanout
+                    .return_worker_submission_for_replan(job.token, None)
+                    .map_err(io::Error::other)?;
+            } else {
+                self.scanout
+                    .return_worker_submission_for_replan(job.token, explicit_primary_fence)
+                    .map_err(io::Error::other)?;
+            }
+        }
+
+        if self
+            .atomic_commit_arbiter
+            .reject_worker_queued(job.token)
+            .is_none()
+        {
+            return Err(io::Error::other("invalidated worker Atomic identity mismatch").into());
+        }
+        self.output_transactions
+            .rollback_queued(job.transaction_id)
+            .map_err(io::Error::other)?;
+        if let Some(sidecar_transaction_id) = sidecar_transaction_id
+            && let Some(sidecar) = self.output_transactions.transaction(sidecar_transaction_id)
+            && matches!(
+                sidecar.state(),
+                OutputTransactionState::Built
+                    | OutputTransactionState::Ready { .. }
+                    | OutputTransactionState::Queued { .. }
+            )
+        {
+            self.output_transactions
+                .mark_superseded(
+                    sidecar_transaction_id,
+                    None,
+                    OutputTransactionSupersedeReason::NewerTransaction,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                )
+                .map_err(io::Error::other)?;
+        }
+        self.perf.log("native.kms_commit_worker", || {
+            vec![
+                NativePerfField::str("event", "validation_base_invalidated_replanned"),
+                NativePerfField::u64("transaction_id", job.transaction_id.get()),
+                NativePerfField::u64("token", job.token.get()),
+            ]
+        });
+        Ok(())
+    }
+
     pub(super) fn fail_queued_worker_job(
         &mut self,
         job: KmsCommitJob,
