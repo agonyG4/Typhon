@@ -581,6 +581,16 @@ impl NativeRuntime {
             log_native_app_spawn(perf, &launch);
             pending_launches.push_back(launch);
         }
+        let presented_planes = atomic_cursor
+            .as_ref()
+            .map(|cursor| {
+                crate::native_output::presentation::plane::PresentedPlaneSnapshot::initial(
+                    cursor.presented_plane_state(),
+                )
+            })
+            .unwrap_or_else(|| {
+                crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(None)
+            });
         let mut runtime = Self {
             server,
             cursor_image,
@@ -637,6 +647,7 @@ impl NativeRuntime {
             frame_scheduler,
             atomic_commit_arbiter: AtomicCommitArbiter::new(),
             output_transactions: OutputTransactionLedger::new(),
+            presented_planes,
             confirmed_primary_assignment: None,
             presentation_deadline,
             scheduled_presentation_target,

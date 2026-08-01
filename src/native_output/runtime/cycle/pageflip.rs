@@ -5,6 +5,84 @@ use super::super::presentation_transactions::{
 };
 use super::super::*;
 use super::cycle_direct;
+use crate::native_output::kms_worker::KmsCursorUpdate;
+use crate::native_output::presentation::plane::{
+    CursorCoupling, CursorRevision, PresentedCursorState,
+};
+
+fn pageflip_identity(
+    token: PageFlipToken,
+    output_generation: u64,
+    crtc_id: u32,
+) -> crate::native_output::presentation::plane::PlanePageflipIdentity {
+    crate::native_output::presentation::plane::PlanePageflipIdentity {
+        bundle_id:
+            crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
+        token,
+        output_generation,
+        crtc_id,
+    }
+}
+
+fn confirmed_primary_from_worker_job(
+    job: &crate::native_output::kms_worker::KmsCommitJob,
+) -> Option<ConfirmedPrimaryAssignment> {
+    let transaction = job.owners.primary()?.transaction.as_ref();
+    match job.kind {
+        AtomicCommitKind::CompositedPrimary { .. } => match transaction.planes().primary() {
+            PrimaryPlaneAssignment::CompositorFramebuffer { slot, .. } => {
+                Some(ConfirmedPrimaryAssignment::Composed {
+                    transaction_id: job.transaction_id,
+                    token: job.token,
+                    slot,
+                })
+            }
+            PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
+            | PrimaryPlaneAssignment::ClientFramebuffer { .. }
+            | PrimaryPlaneAssignment::Unchanged
+            | PrimaryPlaneAssignment::Disabled => None,
+        },
+        AtomicCommitKind::DirectPrimary { .. } => {
+            let OutputTransactionContent::Direct { key, .. } = transaction.content() else {
+                return None;
+            };
+            let PrimaryPlaneAssignment::ClientFramebuffer { framebuffer_id, .. } =
+                transaction.planes().primary()
+            else {
+                return None;
+            };
+            Some(ConfirmedPrimaryAssignment::Direct {
+                transaction_id: job.transaction_id,
+                token: job.token,
+                surface_id: transaction.obligations().direct_surface_id()?,
+                key,
+                framebuffer_id,
+            })
+        }
+        AtomicCommitKind::PlaneDelta { .. } => None,
+    }
+}
+
+fn presented_cursor_from_worker_update(
+    update: &KmsCursorUpdate,
+    revision: CursorRevision,
+    coupling: CursorCoupling,
+    fallback: &AtomicCursorVisualState,
+) -> Option<PresentedCursorState> {
+    let state = match update {
+        KmsCursorUpdate::Set(state) => state.clone(),
+        KmsCursorUpdate::Disable => {
+            let mut hidden = fallback.clone();
+            hidden.visible = false;
+            hidden.framebuffer_id = None;
+            hidden
+        }
+        KmsCursorUpdate::Unchanged => return None,
+    };
+    Some(PresentedCursorState::from_atomic(
+        revision, coupling, &state,
+    ))
+}
 
 impl NativeRuntime {
     pub(super) fn wait_for_events_and_pageflips(&mut self) -> NativeResult<NativeCycleState> {
@@ -403,6 +481,25 @@ impl NativeRuntime {
                         perf,
                     )?;
                 }
+                if *kms_commit_worker_transport
+                    != crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
+                    && let Some(cursor) = atomic_cursor.as_ref()
+                {
+                    let token = PageFlipToken::new(pageflip.user_data)
+                        .ok_or_else(|| io::Error::other("cursor pageflip token is zero"))?;
+                    let identity = pageflip_identity(token, *drm_file_generation, target.crtc_id);
+                    if !self.presented_planes.promote_bundle(
+                        identity,
+                        identity,
+                        None,
+                        Some(cursor.presented_plane_state()),
+                    ) {
+                        return Err(io::Error::other(
+                            "cursor pageflip promotion identity mismatch",
+                        )
+                        .into());
+                    }
+                }
             }
             let direct_pending = matches!(
                 atomic_completion,
@@ -498,6 +595,24 @@ impl NativeRuntime {
                         frame_pacing,
                         scheduled_presentation_target,
                     )?;
+                    if *kms_commit_worker_transport
+                        != crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
+                        && let Some(cursor) = atomic_cursor.as_ref()
+                    {
+                        let identity =
+                            pageflip_identity(pageflip_token, *drm_file_generation, target.crtc_id);
+                        if !self.presented_planes.promote_bundle(
+                            identity,
+                            identity,
+                            *confirmed_primary_assignment,
+                            Some(cursor.presented_plane_state()),
+                        ) {
+                            return Err(io::Error::other(
+                                "direct pageflip promotion identity mismatch",
+                            )
+                            .into());
+                        }
+                    }
                 } else if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
                     if let Some(token) = output_render_fence_token.take() {
                         event_loop.unregister(token)?;
@@ -619,6 +734,24 @@ impl NativeRuntime {
                         token: pageflip_token,
                         slot: explicit.swapchain()?.current(),
                     });
+                    if *kms_commit_worker_transport
+                        != crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
+                        && let Some(cursor) = atomic_cursor.as_ref()
+                    {
+                        let identity =
+                            pageflip_identity(pageflip_token, *drm_file_generation, target.crtc_id);
+                        if !self.presented_planes.promote_bundle(
+                            identity,
+                            identity,
+                            *confirmed_primary_assignment,
+                            Some(cursor.presented_plane_state()),
+                        ) {
+                            return Err(io::Error::other(
+                                "composited pageflip promotion identity mismatch",
+                            )
+                            .into());
+                        }
+                    }
                     render_journal.note_matching_presentation(presented_at);
                     render_journal.record_target_slip(
                         presented_at
@@ -850,12 +983,29 @@ impl NativeRuntime {
                     };
                     let pageflip_token = PageFlipToken::new(pageflip.user_data)
                         .ok_or_else(|| io::Error::other("pageflip token is zero"))?;
-                    let sidecar_transaction_id = submitted_worker_ownership
+                    let worker_promotion = submitted_worker_ownership
                         .iter()
                         .find(|ownership| ownership.job.token == pageflip_token)
-                        .and_then(|ownership| ownership.job.owners.cursor())
-                        .filter(|owner| owner.sidecar_id.is_some())
-                        .map(|owner| owner.transaction.id());
+                        .map(|ownership| {
+                            let cursor_owner = ownership.job.owners.cursor();
+                            (
+                                confirmed_primary_from_worker_job(&ownership.job),
+                                cursor_owner.map(|owner| {
+                                    (
+                                        owner.revision,
+                                        owner.sidecar_id.is_some(),
+                                        owner.transaction.id(),
+                                        ownership.job.cursor.clone(),
+                                    )
+                                }),
+                                ownership.job.identity(),
+                            )
+                        });
+                    let sidecar_transaction_id = worker_promotion
+                        .as_ref()
+                        .and_then(|(_, cursor, _)| cursor.as_ref())
+                        .filter(|(_, sidecar, _, _)| *sidecar)
+                        .map(|(_, _, transaction_id, _)| *transaction_id);
                     worker
                         .ack_pageflip(pageflip_token, transaction_id, *drm_file_generation)
                         .map_err(|error| {
@@ -876,6 +1026,51 @@ impl NativeRuntime {
                                 Ok(())
                             },
                         )?;
+                    }
+                    if let Some((primary, cursor_owner, bundle_identity)) = worker_promotion {
+                        if bundle_identity.token != pageflip_token
+                            || bundle_identity.output_generation != *drm_file_generation
+                            || bundle_identity.crtc_id != target.crtc_id
+                        {
+                            return Err(io::Error::other(
+                                "worker pageflip promotion bundle identity mismatch",
+                            )
+                            .into());
+                        }
+                        let identity =
+                            crate::native_output::presentation::plane::PlanePageflipIdentity {
+                                bundle_id: bundle_identity.id,
+                                token: bundle_identity.token,
+                                output_generation: bundle_identity.output_generation,
+                                crtc_id: bundle_identity.crtc_id,
+                            };
+                        let cursor = cursor_owner.and_then(|(revision, sidecar, _, update)| {
+                            let fallback = atomic_cursor.as_ref()?.current();
+                            let coupling = if !matches!(
+                                &update,
+                                KmsCursorUpdate::Set(state) if state.visible
+                            ) {
+                                CursorCoupling::Hidden
+                            } else if sidecar {
+                                CursorCoupling::IndependentPlane
+                            } else {
+                                CursorCoupling::EmbeddedInPrimary
+                            };
+                            presented_cursor_from_worker_update(
+                                &update, revision, coupling, fallback,
+                            )
+                        });
+                        if primary.is_some() || cursor.is_some() {
+                            if !self
+                                .presented_planes
+                                .promote_bundle(identity, identity, primary, cursor)
+                            {
+                                return Err(io::Error::other(
+                                    "worker pageflip promotion identity mismatch",
+                                )
+                                .into());
+                            }
+                        }
                     }
                     submitted_worker_ownership
                         .retain(|ownership| ownership.job.token != pageflip_token);

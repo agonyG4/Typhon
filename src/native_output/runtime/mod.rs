@@ -215,6 +215,7 @@ pub(crate) struct NativeRuntime {
     frame_scheduler: NativeFrameScheduler,
     atomic_commit_arbiter: AtomicCommitArbiter,
     output_transactions: OutputTransactionLedger,
+    presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
     confirmed_primary_assignment: Option<ConfirmedPrimaryAssignment>,
     presentation_deadline: PresentationDeadlinePlanner,
     scheduled_presentation_target: Option<PresentationTarget>,

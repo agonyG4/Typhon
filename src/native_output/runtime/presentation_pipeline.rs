@@ -362,6 +362,7 @@ pub(super) fn require_explicit_output_swapchain(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) fn build_output_pipeline_snapshot(
     output_generation: u64,
     pacing_mode: NativeOutputPacingMode,
@@ -372,6 +373,36 @@ pub(super) fn build_output_pipeline_snapshot(
     rendering_target: Option<PresentationTarget>,
     triple_capability: TripleCapability,
     legacy_cursor: Option<&crate::native_output::output::NativeAtomicCursor>,
+) -> Result<OutputPipelineSnapshot, PipelineSnapshotError> {
+    let mut presented_planes =
+        crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(current_primary);
+    if let Some(cursor) = legacy_cursor {
+        presented_planes.cursor = cursor.presented_plane_state();
+    }
+    build_output_pipeline_snapshot_with_presented(
+        output_generation,
+        pacing_mode,
+        swapchain,
+        ledger,
+        arbiter,
+        presented_planes.primary,
+        rendering_target,
+        triple_capability,
+        presented_planes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_output_pipeline_snapshot_with_presented(
+    output_generation: u64,
+    pacing_mode: NativeOutputPacingMode,
+    swapchain: &AtomicOutputSwapchain,
+    ledger: &OutputTransactionLedger,
+    arbiter: &AtomicCommitArbiter,
+    current_primary: Option<ConfirmedPrimaryState>,
+    rendering_target: Option<PresentationTarget>,
+    triple_capability: TripleCapability,
+    presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
 ) -> Result<OutputPipelineSnapshot, PipelineSnapshotError> {
     swapchain
         .validate_invariants_for(pacing_mode)
@@ -466,12 +497,10 @@ pub(super) fn build_output_pipeline_snapshot(
     } else {
         PreparedCompositedState::None
     };
-    let mut snapshot = OutputPipelineSnapshot {
+    let snapshot = OutputPipelineSnapshot {
         output_generation,
         pacing_mode,
-        presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(
-            current_primary,
-        ),
+        presented_planes,
         current_primary,
         kernel_submitted,
         worker_queued_next,
@@ -479,15 +508,6 @@ pub(super) fn build_output_pipeline_snapshot(
         free_compositor_slots: u8::try_from(swapchain.free_slot_count()).unwrap_or(u8::MAX),
         triple_capability,
     };
-    if let Some(cursor) = legacy_cursor {
-        snapshot.presented_planes.cursor = cursor.presented_plane_state();
-        debug_assert!(
-            snapshot
-                .presented_planes
-                .cursor
-                .kms_equivalent_to(cursor.current())
-        );
-    }
     snapshot
         .validate()
         .map_err(PipelineSnapshotError::PipelineInvariant)?;
@@ -506,16 +526,16 @@ impl NativeRuntime {
         } else {
             TripleCapability::Capable
         };
-        let snapshot = build_output_pipeline_snapshot(
+        let snapshot = build_output_pipeline_snapshot_with_presented(
             self.drm_file_generation,
             self.adaptive_buffering.pacing_mode(),
             swapchain,
             &self.output_transactions,
             &self.atomic_commit_arbiter,
-            self.confirmed_primary_assignment,
+            self.presented_planes.primary,
             self.scheduled_presentation_target,
             capability,
-            self.atomic_cursor.as_ref(),
+            self.presented_planes,
         )?;
         Ok(Some(snapshot))
     }
