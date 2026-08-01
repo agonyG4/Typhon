@@ -1,16 +1,14 @@
 //! Raw x11rb values stay below this module.  The compositor receives only the
 //! generation-bound handles, snapshots, events, and commands defined here.
-
+use crate::compositor::{
+    DesktopWindowKind, WindowConstraints, WindowMetadata, XwaylandSurfaceCommitObserved,
+};
+use crate::xwayland::trace::{self, TraceFields};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
     os::fd::RawFd,
 };
-
-use crate::compositor::{
-    DesktopWindowKind, WindowConstraints, WindowMetadata, XwaylandSurfaceCommitObserved,
-};
-use crate::xwayland::trace::{self, TraceFields};
 use x11rb::protocol::xproto;
 mod adoption;
 mod api;
@@ -19,6 +17,7 @@ mod atoms;
 mod capabilities;
 mod commands;
 pub use commands::XwmCommandOutcome;
+mod configure_timeline;
 mod connection;
 pub mod data_bridge;
 mod events;
@@ -36,27 +35,28 @@ mod resize_sync;
 #[allow(dead_code)]
 pub(crate) mod shape;
 pub(crate) mod startup;
+#[cfg(test)]
+mod tests;
 mod window;
 mod window_runtime;
 mod window_types;
-
-#[cfg(test)]
-mod tests;
-
+use super::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 pub use association::{
     AssociatedSurface, SurfaceAssociationJoin, SurfaceAssociationJoinError, XwmAssociationEvent,
 };
 use atoms::XwmAtoms;
 use capabilities::XwmCapabilities;
+pub use configure_timeline::ConfigureSource;
+pub(crate) use configure_timeline::{
+    ConfigureNotifyClassification, ConfigureNotifyResult, ConfigureTimelineMetrics,
+    WindowConfigureTimeline,
+};
 pub use moveresize::{X11MoveResizeDirection, X11MoveResizeRequest};
 pub use resize_sync::{RESIZE_SYNC_TIMEOUT_NS, ResizeSyncError, ResizeSyncState};
 pub(crate) use resize_sync::{ResizeSyncCommit, ResizeSyncTracker};
 pub use window::X11WindowLifecycle;
 use window::{KindReconciliation, X11WindowRegistry};
 pub use window_types::{X11WindowType, X11WindowTypes};
-
-use super::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
-
 const XWM_EVENT_BUDGET: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -102,6 +102,7 @@ pub enum X11StackMode {
 pub struct X11ConfigureRequest {
     pub requested: X11Geometry,
     pub fields: X11ConfigureFlags,
+    pub x11_request_sequence: Option<u64>,
     pub border_width: u32,
     pub sibling: Option<X11WindowHandle>,
     pub stack_mode: Option<X11StackMode>,
@@ -254,6 +255,7 @@ pub enum XwmCommand {
         window: X11WindowHandle,
         geometry: X11Geometry,
         fields: X11ConfigureFlags,
+        source: ConfigureSource,
         border_width: u32,
     },
     ConfigureFrame {
@@ -402,7 +404,8 @@ pub struct Xwm {
     pub(crate) next_resize_counter_values: HashMap<X11WindowHandle, u64>,
     pub(crate) family_order: HashMap<X11WindowHandle, u64>,
     pub(crate) next_family_order: u64,
-    pub(crate) expected_configures: HashMap<X11WindowHandle, X11Geometry>,
+    pub(crate) configure_timelines: HashMap<X11WindowHandle, WindowConfigureTimeline>,
+    pub(crate) configure_metrics: ConfigureTimelineMetrics,
     pub(crate) immediate_resize_windows: HashSet<X11WindowHandle>,
     pub(crate) fallback_resize_windows: HashSet<X11WindowHandle>,
     pub(crate) last_resize_geometries: HashMap<X11WindowHandle, X11Geometry>,
@@ -511,6 +514,7 @@ impl Xwm {
                 .get(handle)
                 .is_some_and(|record| record.snapshot.is_some())
         {
+            self.clear_configure_timeline(handle);
             self.outgoing_events.push_back(XwmEvent::MetadataChanged {
                 window: handle,
                 delta: X11MetadataDelta::Kind(kind),

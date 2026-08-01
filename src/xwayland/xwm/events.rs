@@ -6,8 +6,8 @@ use x11rb::{
 };
 
 use super::{
-    X11ConfigureFlags, X11ConfigureRequest, X11Geometry, X11StackMode, X11StateRequest,
-    X11WindowHandle, Xwm, XwmDrain, XwmError, XwmEvent,
+    ConfigureNotifyClassification, X11ConfigureFlags, X11ConfigureRequest, X11Geometry,
+    X11StackMode, X11StateRequest, X11WindowHandle, Xwm, XwmDrain, XwmError, XwmEvent,
     atoms::XwmAtomName,
     ewmh::{decode_state_action, state_atom as decode_state_atom},
     properties::PropertyKind,
@@ -199,6 +199,8 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 .push_back(XwmEvent::WindowDestroyed(handle));
         }
         Event::ConfigureRequest(event) => {
+            xwm.configure_metrics.requests_received =
+                xwm.configure_metrics.requests_received.saturating_add(1);
             let handle = ensure_window(xwm, event.window)?;
             let sibling =
                 (event.sibling != 0).then(|| X11WindowHandle::new(xwm.generation, event.sibling));
@@ -210,6 +212,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                     height: u32::from(event.height),
                 },
                 fields: configure_flags(event.value_mask),
+                x11_request_sequence: (event.sequence != 0).then_some(u64::from(event.sequence)),
                 border_width: u32::from(event.border_width),
                 sibling,
                 stack_mode: stack_mode(event.stack_mode),
@@ -230,23 +233,15 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             if xwm.windows.contains(handle) {
                 xwm.reconcile_window_kind(handle, window_kind(event.override_redirect))?;
             }
-            if let Some(record) = xwm.windows.get_mut(handle) {
-                record.geometry = geometry;
-                if let Some(snapshot) = record.snapshot.as_mut() {
-                    snapshot.geometry = record.geometry;
-                }
-            }
-            trace_window_state(
-                xwm,
-                "configure_notify_processed",
-                handle,
-                TraceFields::new()
-                    .field("geometry_x", geometry.x)
-                    .field("geometry_y", geometry.y)
-                    .field("geometry_width", geometry.width)
-                    .field("geometry_height", geometry.height),
-            );
-            if !xwm.note_configure_notify(handle, geometry) && xwm.windows.get(handle).is_some() {
+            let x11_event_sequence = (event.sequence != 0).then_some(u64::from(event.sequence));
+            let classification = xwm.note_configure_notify(handle, geometry, x11_event_sequence);
+            xwm.apply_configure_notify_record(handle, geometry, classification.classification);
+            if matches!(
+                classification.classification,
+                ConfigureNotifyClassification::ExternalAuthoritative
+                    | ConfigureNotifyClassification::UnknownPreserved
+            ) && xwm.windows.get(handle).is_some()
+            {
                 xwm.outgoing_events.push_back(XwmEvent::ConfigureNotify {
                     window: handle,
                     geometry,
@@ -484,6 +479,7 @@ fn normalize_client_message(
                     height: data[4],
                 },
                 fields: flags,
+                x11_request_sequence: (event.sequence != 0).then_some(u64::from(event.sequence)),
                 border_width: 0,
                 sibling: None,
                 stack_mode: None,
@@ -687,7 +683,8 @@ mod tests {
             next_resize_counter_values: Default::default(),
             family_order: Default::default(),
             next_family_order: 0,
-            expected_configures: Default::default(),
+            configure_timelines: Default::default(),
+            configure_metrics: Default::default(),
             immediate_resize_windows: Default::default(),
             fallback_resize_windows: Default::default(),
             last_resize_geometries: Default::default(),
@@ -1422,6 +1419,7 @@ mod tests {
                         width: true,
                         ..X11ConfigureFlags::default()
                     },
+                    x11_request_sequence: None,
                     border_width: 0,
                     sibling: None,
                     stack_mode: None,

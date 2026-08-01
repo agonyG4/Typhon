@@ -19,6 +19,8 @@ use wayland_client::protocol::{
 use wayland_client::{Connection, EventQueue, globals::registry_queue_init};
 use wayland_protocols::xwayland::shell::v1::client::xwayland_shell_v1 as client_xwayland_shell_v1;
 
+#[path = "xwayland_geometry_ordering.rs"]
+mod xwayland_geometry_ordering;
 #[path = "xwayland_resize_visual.rs"]
 mod xwayland_resize_visual;
 
@@ -470,6 +472,7 @@ fn x11_stack_request_publishes_final_client_list_order() {
         request: X11ConfigureRequest {
             requested: first.geometry,
             fields: X11ConfigureFlags::default(),
+            x11_request_sequence: None,
             border_width: 0,
             sibling: Some(second.handle),
             stack_mode: Some(crate::xwayland::xwm::X11StackMode::Above),
@@ -1603,6 +1606,7 @@ fn x11_partial_moveresize_preserves_unrequested_geometry() {
                     x: true,
                     ..X11ConfigureFlags::default()
                 },
+                x11_request_sequence: None,
                 border_width: 0,
                 sibling: None,
                 stack_mode: None,
@@ -1654,6 +1658,7 @@ fn x11_client_configure_left_resize_preserves_right_edge() {
                     width: true,
                     ..X11ConfigureFlags::default()
                 },
+                x11_request_sequence: None,
                 border_width: 0,
                 sibling: None,
                 stack_mode: None,

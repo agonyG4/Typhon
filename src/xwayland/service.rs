@@ -316,14 +316,16 @@ impl XwaylandService {
         };
         match drain {
             Ok(drain) => {
-                let (property_metrics, pending_events, generation) = match &self.state {
-                    ServiceState::Running(resources) => (
-                        resources.xwm.property_metrics(),
-                        resources.xwm.pending_event_count(),
-                        resources.generation,
-                    ),
-                    _ => return false,
-                };
+                let (property_metrics, configure_metrics, pending_events, generation) =
+                    match &self.state {
+                        ServiceState::Running(resources) => (
+                            resources.xwm.property_metrics(),
+                            resources.xwm.configure_metrics(),
+                            resources.xwm.pending_event_count(),
+                            resources.generation,
+                        ),
+                        _ => return false,
+                    };
                 if xwm_reactor_hot_path_logging_enabled(self.config.log_stderr, trace::enabled()) {
                     eprintln!(
                         "oblivion-one xwayland: event=xwm_reactor_drain generation={generation:?} processed={} budget_exhausted={} pending_events={pending_events}",
@@ -335,6 +337,22 @@ impl XwaylandService {
                 self.metrics.property_refresh_coalesced = property_metrics.coalesced;
                 self.metrics.property_refresh_rejected = property_metrics.rejected;
                 self.metrics.property_refresh_stale = property_metrics.stale;
+                self.metrics.x11_configure_requests_received = configure_metrics.requests_received;
+                self.metrics.x11_configures_issued = configure_metrics.configures_issued;
+                self.metrics.x11_configure_notifies_expected_current =
+                    configure_metrics.notifies_expected_current;
+                self.metrics.x11_configure_notifies_expected_older =
+                    configure_metrics.notifies_expected_older;
+                self.metrics.x11_configure_notifies_coalesced =
+                    configure_metrics.notifies_coalesced;
+                self.metrics.x11_configure_notifies_stale_ignored =
+                    configure_metrics.notifies_stale_ignored;
+                self.metrics.x11_configure_notifies_external_applied =
+                    configure_metrics.notifies_external_applied;
+                self.metrics.x11_configure_notifies_unknown_preserved =
+                    configure_metrics.notifies_unknown_preserved;
+                self.metrics.x11_geometry_rollbacks_prevented =
+                    configure_metrics.rollbacks_prevented;
                 self.metrics.xwm_events_received = self
                     .metrics
                     .xwm_events_received

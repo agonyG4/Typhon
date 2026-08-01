@@ -42,7 +42,7 @@ use crate::xwayland::trace::{self, TraceFields};
 
 #[path = "server_xwayland.rs"]
 mod xwayland_api;
-use crate::xwayland::xwm::{XwmCommand, XwmEvent};
+use crate::xwayland::xwm::{ConfigureSource, XwmCommand, XwmEvent};
 use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 #[path = "server_globals.rs"]
 mod server_globals;
@@ -573,7 +573,14 @@ impl OwnCompositorServer {
                     .and_then(|id| self.state.window(id))
                     .map(|window| window.constraints)
                     .unwrap_or_default();
+                let current_authoritative = self.state.x11_authoritative_geometry(window);
                 let geometry = self.x11_configure_request_geometry(window, request, constraints);
+                self.trace_x11_configure_request_normalized(
+                    window,
+                    request,
+                    current_authoritative,
+                    geometry,
+                );
                 if request.fields.x
                     || request.fields.y
                     || request.fields.width
@@ -585,6 +592,7 @@ impl OwnCompositorServer {
                     window,
                     geometry,
                     fields: request.fields,
+                    source: ConfigureSource::ClientRequest,
                     border_width: request.border_width,
                 }];
                 if let Some(mode) = request.stack_mode
@@ -606,7 +614,22 @@ impl OwnCompositorServer {
                 geometry,
                 above_sibling,
             } => {
-                let _ = self.state.reconcile_x11_configure_notify(window, geometry);
+                let placement_policy = self.state.x11_placement_policy(window);
+                if placement_policy
+                    != Some(
+                        crate::compositor::desktop_window::X11PlacementPolicy::CompositorManaged,
+                    )
+                {
+                    let _ = self.state.reconcile_x11_configure_notify(window, geometry);
+                } else {
+                    trace::emit("x11_managed_configure_notify_preserved", || {
+                        TraceFields::new()
+                            .field("source", "compositor")
+                            .field("xid", window.xid())
+                            .field("geometry", format!("{geometry:?}"))
+                            .field("reason", "managed_geometry_authority")
+                    });
+                }
                 let is_override_redirect = self
                     .state
                     .window_id_for_x11_handle(window)

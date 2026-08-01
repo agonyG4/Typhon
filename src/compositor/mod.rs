@@ -318,6 +318,10 @@ pub struct ResizeFlowMetrics {
     pub surface_publication_sequence_regressions: u64,
     pub surface_sampling_exact: u64,
     pub surface_sampling_scaled: u64,
+    pub x11_moveresize_began: u64,
+    pub x11_moveresize_no_pressed_button: u64,
+    pub x11_moveresize_button_mismatch: u64,
+    pub x11_moveresize_stale_request: u64,
 }
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SubsurfaceTransactionMetrics {

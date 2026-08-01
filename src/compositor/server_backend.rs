@@ -1,10 +1,59 @@
 use super::*;
+use crate::xwayland::trace::{self, TraceFields};
 use crate::xwayland::xwm::{
-    RESIZE_SYNC_TIMEOUT_NS, X11ConfigureRequest, X11Geometry, X11MoveResizeDirection as Direction,
-    X11MoveResizeRequest, XwmCommand,
+    ConfigureSource, RESIZE_SYNC_TIMEOUT_NS, X11ConfigureRequest, X11Geometry,
+    X11MoveResizeDirection as Direction, X11MoveResizeRequest, XwmCommand,
 };
 
 impl OwnCompositorServer {
+    pub(super) fn trace_x11_configure_request_normalized(
+        &self,
+        window: X11WindowHandle,
+        request: X11ConfigureRequest,
+        current_authoritative: Option<X11Geometry>,
+        desired: X11Geometry,
+    ) {
+        let root_surface_id = self
+            .state
+            .window_id_for_x11_handle(window)
+            .and_then(|id| self.state.window(id))
+            .map(|window| window.root_surface_id);
+        let visual_geometry = root_surface_id
+            .and_then(|surface_id| self.state.current_visual_root_window_geometry(surface_id))
+            .map(|value| format!("{value:?}"));
+        let committed_content_extent = root_surface_id.and_then(|surface_id| {
+            self.renderable_surfaces()
+                .iter()
+                .find(|surface| surface.surface_id == surface_id)
+                .map(|surface| format!("{}x{}", surface.width, surface.height))
+        });
+        let interaction = self.state.window_interaction_debug_snapshot();
+        trace::emit("x11_configure_request_normalized", || {
+            TraceFields::new()
+                .field("source", "compositor")
+                .field("xid", window.xid())
+                .field("requested", format!("{:?}", request.requested))
+                .field("fields", format!("{:?}", request.fields))
+                .optional("x11_request_sequence", request.x11_request_sequence)
+                .optional(
+                    "current_authoritative_geometry",
+                    current_authoritative.map(|value| format!("{value:?}")),
+                )
+                .field("desired_geometry", format!("{desired:?}"))
+                .field("active_resize", self.state.x11_resize_active(window))
+                .optional(
+                    "active_interaction_id",
+                    interaction.map(|value| value.interaction_id),
+                )
+                .optional(
+                    "active_resize_interaction_id",
+                    interaction.and_then(|value| value.resize_interaction_id),
+                )
+                .optional("visual_geometry", visual_geometry)
+                .optional("committed_content_extent", committed_content_extent)
+        });
+    }
+
     pub(super) fn x11_configure_request_geometry(
         &self,
         window: X11WindowHandle,
@@ -114,6 +163,7 @@ impl OwnCompositorServer {
                             } else {
                                 crate::xwayland::xwm::X11ConfigureFlags::all()
                             },
+                            source: ConfigureSource::Compositor,
                             border_width: 0,
                         })
                     }

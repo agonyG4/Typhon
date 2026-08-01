@@ -265,6 +265,9 @@ impl CompositorState {
                 active_resize: Some(interaction_id),
             },
         );
+        if let Some(window_id) = self.window_id_for_surface(surface_id) {
+            self.set_x11_frame_geometry(window_id, WindowGeometry::new(placement, width, height));
+        }
         self.update_toplevel_visual_render_assignment(surface_id);
         let previous_resize = self.active_toplevel_resizes.get(&surface_id).copied();
         if previous_resize.is_none() {

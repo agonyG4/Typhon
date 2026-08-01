@@ -348,7 +348,7 @@ impl CompositorState {
     }
 
     fn log_x11_move_resize_result(
-        &self,
+        &mut self,
         handle: X11WindowHandle,
         x: f64,
         y: f64,
@@ -356,10 +356,41 @@ impl CompositorState {
         x11_button: u32,
         result: X11MoveResizeBeginResult,
     ) -> X11MoveResizeBeginResult {
+        match result {
+            X11MoveResizeBeginResult::Began => {
+                self.resize_flow_metrics.x11_moveresize_began = self
+                    .resize_flow_metrics
+                    .x11_moveresize_began
+                    .saturating_add(1);
+            }
+            X11MoveResizeBeginResult::NoPressedButton => {
+                self.resize_flow_metrics.x11_moveresize_no_pressed_button = self
+                    .resize_flow_metrics
+                    .x11_moveresize_no_pressed_button
+                    .saturating_add(1);
+            }
+            X11MoveResizeBeginResult::ButtonMismatch => {
+                self.resize_flow_metrics.x11_moveresize_button_mismatch = self
+                    .resize_flow_metrics
+                    .x11_moveresize_button_mismatch
+                    .saturating_add(1);
+            }
+            X11MoveResizeBeginResult::StaleRequest => {
+                self.resize_flow_metrics.x11_moveresize_stale_request = self
+                    .resize_flow_metrics
+                    .x11_moveresize_stale_request
+                    .saturating_add(1);
+            }
+            X11MoveResizeBeginResult::WindowNotFocusable
+            | X11MoveResizeBeginResult::WindowNotRenderable
+            | X11MoveResizeBeginResult::ExistingInteraction => {}
+        }
         resize_debug_log(|| {
             format!(
-                "event=x11_moveresize result={result:?} xid={} root=({x},{y}) kind={kind:?} button={x11_button}",
+                "event=x11_moveresize result={result:?} xid={} root=({x},{y}) kind={kind:?} button={x11_button} held_buttons={} active_interaction={:?}",
                 handle.xid(),
+                self.held_pointer_buttons.len(),
+                self.active_window_interaction_id(),
             )
         });
         result
@@ -739,6 +770,14 @@ impl CompositorState {
                     RenderGenerationCause::WindowMove,
                 );
                 if moved {
+                    self.set_x11_frame_geometry(
+                        interaction.window_id,
+                        WindowGeometry::new(
+                            placement,
+                            interaction.start_width,
+                            interaction.start_height,
+                        ),
+                    );
                     self.queue_backend_configure(
                         interaction.window_id,
                         WindowGeometry::new(

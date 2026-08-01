@@ -14,8 +14,8 @@ use x11rb::{
 };
 
 use super::{
-    X11ConfigureFlags, X11Geometry, X11PublishedState, X11StackMode, Xwm, XwmCommand, XwmError,
-    XwmEvent,
+    ConfigureSource, X11ConfigureFlags, X11Geometry, X11PublishedState, X11StackMode, Xwm,
+    XwmCommand, XwmError, XwmEvent,
     atoms::XwmAtomName,
     ewmh::publishable_state,
     focus::{FocusModel, FocusRepair, FocusTransitionId, focus_model, should_send_take_focus},
@@ -264,6 +264,7 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
             window,
             geometry,
             fields,
+            source,
             border_width,
         } => {
             if (fields.width || fields.height || fields.border_width)
@@ -280,10 +281,19 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
                     .resize_sync
                     .merge_desired_position(window, geometry.x, geometry.y);
             }
-            xwm.connection
+            let cookie = xwm
+                .connection
                 .configure_window(window.xid(), &configure_aux(geometry, fields, border_width))
                 .map_err(XwmError::Connection)?;
-            xwm.note_expected_configure(window, geometry);
+            let x11_request_sequence = Some(cookie.sequence_number());
+            drop(cookie);
+            xwm.note_expected_configure_with_context(
+                window,
+                geometry,
+                fields,
+                source,
+                x11_request_sequence,
+            );
             if xwm.immediate_resize_windows.remove(&window)
                 || xwm.fallback_resize_windows.remove(&window)
             {
@@ -293,13 +303,22 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
             }
         }
         XwmCommand::ConfigureFrame { window, geometry } => {
-            xwm.connection
+            let cookie = xwm
+                .connection
                 .configure_window(
                     window.xid(),
                     &configure_aux(geometry, X11ConfigureFlags::all(), 0),
                 )
                 .map_err(XwmError::Connection)?;
-            xwm.note_expected_configure(window, geometry);
+            let x11_request_sequence = Some(cookie.sequence_number());
+            drop(cookie);
+            xwm.note_expected_configure_with_context(
+                window,
+                geometry,
+                X11ConfigureFlags::all(),
+                ConfigureSource::Compositor,
+                x11_request_sequence,
+            );
         }
         XwmCommand::ConfigureNotify { window, geometry } => {
             let event = xproto::ConfigureNotifyEvent {
@@ -723,7 +742,8 @@ pub(crate) fn configure_immediate(
         }
         return Ok(());
     }
-    xwm.connection
+    let cookie = xwm
+        .connection
         .configure_window(
             window.xid(),
             &configure_aux(geometry, X11ConfigureFlags::all(), 0),
@@ -737,7 +757,15 @@ pub(crate) fn configure_immediate(
         xwm.immediate_resize_windows.insert(window);
     }
     xwm.last_resize_geometries.insert(window, geometry);
-    xwm.note_expected_configure(window, geometry);
+    let x11_request_sequence = Some(cookie.sequence_number());
+    drop(cookie);
+    xwm.note_expected_configure_with_context(
+        window,
+        geometry,
+        X11ConfigureFlags::all(),
+        ConfigureSource::ResizeSync,
+        x11_request_sequence,
+    );
     Ok(())
 }
 
@@ -834,6 +862,7 @@ pub(crate) fn begin_resize_sync(
     xwm.sync_alarms.insert(window, alarm);
     xwm.sync_handles_by_counter.insert(sync_counter, window);
 
+    let mut configure_request_sequence = None;
     let command_error = set_allow_commits(xwm, window, false)
         .map(|()| {
             trace::emit("x11_resize_command_order", || {
@@ -868,7 +897,8 @@ pub(crate) fn begin_resize_sync(
                     &configure_aux(geometry, X11ConfigureFlags::all(), 0),
                 )
                 .map_err(XwmError::Connection)
-                .map(|_| {
+                .map(|cookie| {
+                    configure_request_sequence = Some(cookie.sequence_number());
                     trace::emit("x11_resize_command_order", || {
                         TraceFields::new()
                             .field("source", "xwm")
@@ -888,7 +918,13 @@ pub(crate) fn begin_resize_sync(
         return Err(error);
     }
     xwm.last_resize_geometries.insert(window, geometry);
-    xwm.note_expected_configure(window, geometry);
+    xwm.note_expected_configure_with_context(
+        window,
+        geometry,
+        X11ConfigureFlags::all(),
+        ConfigureSource::ResizeSync,
+        configure_request_sequence,
+    );
     log_resize_event(
         "x11_resize_sync_started",
         xwm,

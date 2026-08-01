@@ -105,6 +105,9 @@ impl Xwm {
                         .windows
                         .clear_association(handle, surface_id, preserve_identity)
                         .map_err(XwmError::InvalidCommand)?;
+                    if cleared {
+                        self.clear_configure_timeline(handle);
+                    }
                     if cleared && !preserve_identity {
                         self.outgoing_events
                             .push_back(XwmEvent::WindowWithdrawn(handle));

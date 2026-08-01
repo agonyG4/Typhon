@@ -163,10 +163,14 @@ impl Xwm {
         self.resize_sync.clear(handle);
         self.clear_resize_sync_alarm(handle);
         self.timed_out_resize_counters.remove(&handle);
-        self.expected_configures.remove(&handle);
+        self.clear_configure_timeline(handle);
         self.immediate_resize_windows.remove(&handle);
         self.fallback_resize_windows.remove(&handle);
         self.last_resize_geometries.remove(&handle);
+    }
+
+    pub(crate) fn clear_configure_timeline(&mut self, handle: X11WindowHandle) {
+        self.configure_timelines.remove(&handle);
     }
 
     pub(crate) fn reset_sync_counter_initialization(&mut self, handle: X11WindowHandle) {
@@ -188,7 +192,7 @@ impl Xwm {
             .retain(|handle, _| handle.generation() != generation);
         self.sync_counter_initializations
             .retain(|handle, _| handle.generation() != generation);
-        self.expected_configures
+        self.configure_timelines
             .retain(|handle, _| handle.generation() != generation);
         self.fallback_resize_windows
             .retain(|handle| handle.generation() != generation);
@@ -197,25 +201,149 @@ impl Xwm {
         }
     }
 
-    pub(crate) fn note_expected_configure(
+    pub(crate) fn note_expected_configure_with_context(
         &mut self,
         handle: X11WindowHandle,
         geometry: X11Geometry,
+        fields: X11ConfigureFlags,
+        source: ConfigureSource,
+        x11_request_sequence: Option<u64>,
     ) {
-        self.expected_configures.insert(handle, geometry);
+        let initial = self
+            .windows
+            .get(handle)
+            .map(|record| record.geometry)
+            .unwrap_or_default();
+        let timeline = self
+            .configure_timelines
+            .entry(handle)
+            .or_insert_with(|| WindowConfigureTimeline::new(initial));
+        let expected = timeline.record(geometry, fields, source, x11_request_sequence);
+        self.configure_metrics.configures_issued =
+            self.configure_metrics.configures_issued.saturating_add(1);
+        trace::emit("x11_configure_expected", || {
+            TraceFields::new()
+                .field("source", "xwm")
+                .field("xid", handle.xid())
+                .field("epoch", expected.epoch)
+                .field("geometry", format!("{geometry:?}"))
+                .field("fields", format!("{fields:?}"))
+                .field("configure_source", format!("{source:?}"))
+                .optional("x11_request_sequence", x11_request_sequence)
+                .field("desired_geometry", format!("{:?}", timeline.desired()))
+                .field("pending_count", timeline.pending_len())
+        });
     }
 
     pub(crate) fn note_configure_notify(
         &mut self,
         handle: X11WindowHandle,
         geometry: X11Geometry,
-    ) -> bool {
-        let expected = self.expected_configures.get(&handle).copied();
-        if expected == Some(geometry) {
-            self.expected_configures.remove(&handle);
-            true
-        } else {
-            false
+        x11_event_sequence: Option<u64>,
+    ) -> ConfigureNotifyResult {
+        let initial = self
+            .windows
+            .get(handle)
+            .map(|record| record.geometry)
+            .unwrap_or_default();
+        let external_authoritative = self
+            .windows
+            .get(handle)
+            .and_then(|record| record.snapshot.as_ref())
+            .is_some_and(|snapshot| {
+                snapshot.override_redirect
+                    || snapshot.kind != DesktopWindowKind::Managed
+                    || snapshot.transient_for.is_some()
+            });
+        let timeline = self
+            .configure_timelines
+            .entry(handle)
+            .or_insert_with(|| WindowConfigureTimeline::new(initial));
+        let result = timeline.notify(geometry, x11_event_sequence, external_authoritative);
+        match result.classification {
+            ConfigureNotifyClassification::ExpectedCurrent => {
+                self.configure_metrics.notifies_expected_current = self
+                    .configure_metrics
+                    .notifies_expected_current
+                    .saturating_add(1);
+            }
+            ConfigureNotifyClassification::ExpectedOlder => {
+                self.configure_metrics.notifies_expected_older = self
+                    .configure_metrics
+                    .notifies_expected_older
+                    .saturating_add(1);
+                self.configure_metrics.rollbacks_prevented =
+                    self.configure_metrics.rollbacks_prevented.saturating_add(1);
+            }
+            ConfigureNotifyClassification::ExpectedCoalesced => {
+                self.configure_metrics.notifies_coalesced =
+                    self.configure_metrics.notifies_coalesced.saturating_add(1);
+                self.configure_metrics.rollbacks_prevented =
+                    self.configure_metrics.rollbacks_prevented.saturating_add(1);
+            }
+            ConfigureNotifyClassification::StaleRetired => {
+                self.configure_metrics.notifies_stale_ignored = self
+                    .configure_metrics
+                    .notifies_stale_ignored
+                    .saturating_add(1);
+                self.configure_metrics.rollbacks_prevented =
+                    self.configure_metrics.rollbacks_prevented.saturating_add(1);
+            }
+            ConfigureNotifyClassification::ExternalAuthoritative => {
+                self.configure_metrics.notifies_external_applied = self
+                    .configure_metrics
+                    .notifies_external_applied
+                    .saturating_add(1);
+            }
+            ConfigureNotifyClassification::UnknownPreserved => {
+                self.configure_metrics.notifies_unknown_preserved = self
+                    .configure_metrics
+                    .notifies_unknown_preserved
+                    .saturating_add(1);
+                self.configure_metrics.rollbacks_prevented =
+                    self.configure_metrics.rollbacks_prevented.saturating_add(1);
+            }
+        }
+        trace::emit("x11_configure_notify_classified", || {
+            TraceFields::new()
+                .field("source", "xwm")
+                .field("xid", handle.xid())
+                .field("classification", format!("{:?}", result.classification))
+                .optional("epoch", result.epoch)
+                .optional("x11_event_sequence", x11_event_sequence)
+                .field("geometry", format!("{geometry:?}"))
+                .field("desired_geometry", format!("{:?}", timeline.desired()))
+                .field(
+                    "acknowledged_geometry",
+                    format!("{:?}", timeline.acknowledged()),
+                )
+                .field("pending_count", timeline.pending_len())
+                .field("retired_count", timeline.retired_len())
+        });
+        result
+    }
+
+    pub(crate) fn configure_metrics(&self) -> ConfigureTimelineMetrics {
+        self.configure_metrics
+    }
+
+    pub(crate) fn apply_configure_notify_record(
+        &mut self,
+        handle: X11WindowHandle,
+        geometry: X11Geometry,
+        classification: ConfigureNotifyClassification,
+    ) {
+        if matches!(
+            classification,
+            ConfigureNotifyClassification::ExpectedCurrent
+                | ConfigureNotifyClassification::ExpectedCoalesced
+                | ConfigureNotifyClassification::ExternalAuthoritative
+        ) && let Some(record) = self.windows.get_mut(handle)
+        {
+            record.geometry = geometry;
+            if let Some(snapshot) = record.snapshot.as_mut() {
+                snapshot.geometry = geometry;
+            }
         }
     }
 
@@ -283,6 +411,7 @@ impl Xwm {
                 .get(handle)
                 .and_then(|record| record.association);
             if current_association != Some(association) {
+                self.clear_configure_timeline(handle);
                 let result = if current_association.is_some() {
                     self.windows.replace_associated(handle, association)
                 } else {

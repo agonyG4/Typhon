@@ -465,6 +465,7 @@ mod tests {
                     window: dead,
                     geometry: Default::default(),
                     fields: Default::default(),
+                    source: oblivion_one::xwayland::xwm::ConfigureSource::Compositor,
                     border_width: 0,
                 },
                 XwmCommand::SetState {

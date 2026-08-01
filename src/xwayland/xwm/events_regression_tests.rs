@@ -135,7 +135,7 @@ fn configure_request_and_destroy_notify_are_normalized_in_one_x11_drain() {
 
     let configure = xproto::ConfigureRequestEvent {
         response_type: 23,
-        sequence: 0,
+        sequence: 77,
         parent: 1,
         window: handle.xid(),
         sibling: 0,
@@ -164,7 +164,8 @@ fn configure_request_and_destroy_notify_are_normalized_in_one_x11_drain() {
     assert!(events.iter().any(|event| {
         matches!(
             event,
-            XwmEvent::ConfigureRequested { window, .. } if *window == handle
+            XwmEvent::ConfigureRequested { window, request }
+                if *window == handle && request.x11_request_sequence == Some(77)
         )
     }));
     assert!(
@@ -173,6 +174,68 @@ fn configure_request_and_destroy_notify_are_normalized_in_one_x11_drain() {
             .any(|event| matches!(event, XwmEvent::WindowDestroyed(window) if *window == handle))
     );
     assert!(!xwm.windows.contains(handle));
+}
+
+#[test]
+fn older_self_generated_configure_notify_is_not_forwarded_as_external_geometry() {
+    let generation = generation(216);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 216, true, false, false);
+    let geometries = [
+        X11Geometry {
+            x: 110,
+            y: 100,
+            width: 630,
+            height: 480,
+        },
+        X11Geometry {
+            x: 120,
+            y: 100,
+            width: 620,
+            height: 480,
+        },
+        X11Geometry {
+            x: 130,
+            y: 100,
+            width: 610,
+            height: 480,
+        },
+    ];
+    for geometry in geometries {
+        xwm.note_expected_configure_with_context(
+            handle,
+            geometry,
+            super::super::X11ConfigureFlags::all(),
+            super::super::ConfigureSource::ClientRequest,
+            None,
+        );
+    }
+
+    normalize(
+        &mut xwm,
+        Event::ConfigureNotify(xproto::ConfigureNotifyEvent {
+            response_type: 22,
+            sequence: 0,
+            event: 1,
+            window: handle.xid(),
+            above_sibling: 0,
+            x: geometries[0].x as i16,
+            y: geometries[0].y as i16,
+            width: geometries[0].width as u16,
+            height: geometries[0].height as u16,
+            border_width: 0,
+            override_redirect: false,
+        }),
+    )
+    .expect("normalize delayed ConfigureNotify");
+
+    assert!(
+        xwm.take_events().all(|event| !matches!(
+            event,
+            XwmEvent::ConfigureNotify { window, .. } if window == handle
+        )),
+        "a delayed self-generated notification must remain inside XWM history"
+    );
 }
 
 #[test]
@@ -192,6 +255,7 @@ fn command_after_destroy_configure_is_obsolete_not_fatal() {
                 ..X11Geometry::default()
             },
             fields: super::super::X11ConfigureFlags::all(),
+            source: super::super::ConfigureSource::Compositor,
             border_width: 0,
         },
     );
@@ -333,6 +397,7 @@ fn target_gone_single_target_commands_are_nonfatal_after_destroy() {
                     window: handle,
                     geometry: X11Geometry::default(),
                     fields: super::super::X11ConfigureFlags::all(),
+                    source: super::super::ConfigureSource::Compositor,
                     border_width: 0,
                 },
                 3 => XwmCommand::ConfigureFrame {
@@ -406,6 +471,7 @@ fn stale_generation_commands_are_dropped_without_touching_current_xwm() {
                 window: stale,
                 geometry: X11Geometry::default(),
                 fields: super::super::X11ConfigureFlags::all(),
+                source: super::super::ConfigureSource::Compositor,
                 border_width: 0,
             },
         ),
@@ -745,6 +811,7 @@ fn position_only_move_bypasses_pending_resize_size_queue() {
                 y: true,
                 ..Default::default()
             },
+            source: super::super::ConfigureSource::Compositor,
             border_width: 0,
         },
     )
@@ -783,6 +850,7 @@ fn position_only_move_bypasses_pending_resize_size_queue() {
                 y: true,
                 ..Default::default()
             },
+            source: super::super::ConfigureSource::Compositor,
             border_width: 0,
         },
     )
