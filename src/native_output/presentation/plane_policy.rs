@@ -280,22 +280,49 @@ pub(crate) enum CursorDeltaClass {
     DeliveryModeTransition,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorDeliveryMode {
+    Hidden,
+    Hardware,
+    Software,
+}
+
 pub(crate) fn classify_cursor_delta(
-    previous: &AtomicCursorVisualState,
+    previous_delivery: CursorDeliveryMode,
+    next_delivery: CursorDeliveryMode,
+    previous: Option<&AtomicCursorVisualState>,
     next: Option<&AtomicCursorVisualState>,
-    software_composition_required: bool,
+    validation_base_unchanged: bool,
 ) -> CursorDeltaClass {
-    let Some(next) = next else {
-        return if software_composition_required && previous.visible {
-            CursorDeltaClass::DeliveryModeTransition
-        } else if previous.visible {
+    let delivery_changed = previous_delivery != next_delivery;
+    if delivery_changed {
+        if matches!(
+            (previous_delivery, next_delivery),
+            (CursorDeliveryMode::Hardware, CursorDeliveryMode::Software)
+                | (CursorDeliveryMode::Software, CursorDeliveryMode::Hardware)
+        ) {
+            return CursorDeltaClass::DeliveryModeTransition;
+        }
+        return if matches!(
+            (previous_delivery, next_delivery),
+            (CursorDeliveryMode::Hidden, CursorDeliveryMode::Hardware)
+                | (CursorDeliveryMode::Hardware, CursorDeliveryMode::Hidden)
+        ) {
             CursorDeltaClass::Visibility
         } else {
-            CursorDeltaClass::PositionOnly
+            CursorDeltaClass::DeliveryModeTransition
         };
+    }
+    if previous_delivery != CursorDeliveryMode::Hardware
+        || next_delivery != CursorDeliveryMode::Hardware
+    {
+        return CursorDeltaClass::Visual;
+    }
+    let (Some(previous), Some(next)) = (previous, next) else {
+        return CursorDeltaClass::Visibility;
     };
-    if software_composition_required && previous.visible != next.visible {
-        return CursorDeltaClass::DeliveryModeTransition;
+    if !validation_base_unchanged {
+        return CursorDeltaClass::Visual;
     }
     if previous.visible != next.visible {
         return CursorDeltaClass::Visibility;

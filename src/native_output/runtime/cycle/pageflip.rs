@@ -1006,8 +1006,16 @@ impl NativeRuntime {
                         .and_then(|(_, cursor, _)| cursor.as_ref())
                         .filter(|(_, sidecar, _, _)| *sidecar)
                         .map(|(_, _, transaction_id, _)| *transaction_id);
+                    let worker_identity = worker_promotion
+                        .as_ref()
+                        .map(|(_, _, identity)| *identity)
+                        .ok_or_else(|| {
+                            io::Error::other(
+                                "worker pageflip has no matching submitted bundle identity",
+                            )
+                        })?;
                     worker
-                        .ack_pageflip(pageflip_token, transaction_id, *drm_file_generation)
+                        .ack_pageflip_identity(worker_identity, transaction_id)
                         .map_err(|error| {
                             io::Error::other(format!("worker pageflip ack: {error:?}"))
                         })?;

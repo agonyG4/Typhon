@@ -139,17 +139,26 @@ pub(super) fn apply_cursor_policy(context: CursorPolicyContext<'_>) -> bool {
         hardware_plane_visible: cursor.current().visible,
         transition_primary,
     });
+    let previous_delivery = if cursor.current().visible {
+        CursorDeliveryMode::Hardware
+    } else if cursor_render_mode.is_software() {
+        CursorDeliveryMode::Software
+    } else {
+        CursorDeliveryMode::Hidden
+    };
+    let next_delivery = match cursor_policy.delivery {
+        CursorDeliveryChoice::Hardware { .. } => CursorDeliveryMode::Hardware,
+        CursorDeliveryChoice::Software { .. } | CursorDeliveryChoice::Rejected { .. } => {
+            CursorDeliveryMode::Software
+        }
+        CursorDeliveryChoice::Hidden { .. } => CursorDeliveryMode::Hidden,
+    };
     let cursor_delta_class = classify_cursor_delta(
-        cursor.current(),
-        matches!(
-            cursor_policy.delivery,
-            CursorDeliveryChoice::Hardware { .. }
-        )
-        .then_some(&prospective),
-        matches!(
-            cursor_policy.delivery,
-            CursorDeliveryChoice::Software { .. } | CursorDeliveryChoice::Rejected { .. }
-        ),
+        previous_delivery,
+        next_delivery,
+        Some(cursor.current()),
+        (next_delivery == CursorDeliveryMode::Hardware).then_some(&prospective),
+        true,
     );
     cursor.set_scheduled_test_policy(if cursor_delta_class == CursorDeltaClass::Visual {
         KmsCursorTestPolicy::Required

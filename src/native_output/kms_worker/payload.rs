@@ -43,8 +43,66 @@ pub(crate) struct KmsCommitJob {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KmsValidationBase {
-    Presented(PresentedPlaneSnapshot),
+    Presented {
+        snapshot: PresentedPlaneSnapshot,
+        output_generation: u64,
+        crtc_id: u32,
+    },
     Predecessor(KmsCommitBundleIdentity),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EstablishedKmsBase {
+    Presented {
+        revision: crate::native_output::presentation::plane::PlaneStateRevision,
+        output_generation: u64,
+        crtc_id: u32,
+    },
+    Pending(KmsCommitBundleIdentity),
+    Bundle(KmsCommitBundleIdentity),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValidationBaseDisposition {
+    Ready,
+    Wait,
+    Invalidated,
+}
+
+pub(crate) fn validation_base_ready(
+    established: EstablishedKmsBase,
+    required: KmsValidationBase,
+) -> ValidationBaseDisposition {
+    match (established, required) {
+        (
+            EstablishedKmsBase::Presented {
+                revision,
+                output_generation,
+                crtc_id,
+            },
+            KmsValidationBase::Presented {
+                snapshot,
+                output_generation: required_generation,
+                crtc_id: required_crtc,
+            },
+        ) if revision == snapshot.revision
+            && output_generation == required_generation
+            && crtc_id == required_crtc =>
+        {
+            ValidationBaseDisposition::Ready
+        }
+        (EstablishedKmsBase::Pending(pending), KmsValidationBase::Predecessor(required))
+            if pending == required =>
+        {
+            ValidationBaseDisposition::Wait
+        }
+        (EstablishedKmsBase::Bundle(established), KmsValidationBase::Predecessor(required))
+            if established == required =>
+        {
+            ValidationBaseDisposition::Ready
+        }
+        _ => ValidationBaseDisposition::Invalidated,
+    }
 }
 
 #[derive(Debug)]
@@ -144,10 +202,20 @@ impl KmsCommitJob {
         if self.target != transaction.target() {
             return Err(KmsCommitPayloadError::TargetMismatch);
         }
-        if let KmsValidationBase::Predecessor(base) = self.validation_base
-            && (base.output_generation != self.output_generation || base.crtc_id != self.crtc_id)
-        {
-            return Err(KmsCommitPayloadError::ValidationBaseMismatch);
+        match self.validation_base {
+            KmsValidationBase::Presented {
+                output_generation,
+                crtc_id,
+                ..
+            }
+            | KmsValidationBase::Predecessor(KmsCommitBundleIdentity {
+                output_generation,
+                crtc_id,
+                ..
+            }) if output_generation != self.output_generation || crtc_id != self.crtc_id => {
+                return Err(KmsCommitPayloadError::ValidationBaseMismatch);
+            }
+            _ => {}
         }
         if !self.owners.is_legacy_unchecked() {
             let primary_changed = !matches!(self.primary, KmsPrimaryUpdate::Unchanged);

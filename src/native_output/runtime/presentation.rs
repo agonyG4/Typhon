@@ -544,7 +544,12 @@ impl NativeRuntime {
                 *drm_file_generation,
                 pacing_mode,
                 cursor_epoch,
-                validation_base_for_submission(atomic_commit_arbiter, *presented_planes),
+                validation_base_for_submission(
+                    atomic_commit_arbiter,
+                    *presented_planes,
+                    *drm_file_generation,
+                    target.crtc_id,
+                ),
                 last_submitted_cursor_epoch,
                 cursor_output_arbitration,
                 frame_scheduler,
@@ -708,6 +713,8 @@ impl NativeRuntime {
                                         validation_base_for_submission(
                                             atomic_commit_arbiter,
                                             *presented_planes,
+                                            *drm_file_generation,
+                                            target.crtc_id,
                                         ),
                                     ),
                                     *drm_file_generation,
@@ -1030,6 +1037,8 @@ impl NativeRuntime {
                                             validation_base_for_submission(
                                                 atomic_commit_arbiter,
                                                 *presented_planes,
+                                                *drm_file_generation,
+                                                target.crtc_id,
                                             ),
                                         ),
                                         false,

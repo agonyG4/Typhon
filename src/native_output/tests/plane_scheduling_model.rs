@@ -173,20 +173,87 @@ fn cursor_delta_classification_separates_position_visual_visibility_and_delivery
     let hidden = None;
 
     assert_eq!(
-        classify_cursor_delta(&previous, Some(&moved), false),
+        classify_cursor_delta(
+            CursorDeliveryMode::Hardware,
+            CursorDeliveryMode::Hardware,
+            Some(&previous),
+            Some(&moved),
+            true,
+        ),
         CursorDeltaClass::PositionOnly
     );
     assert_eq!(
-        classify_cursor_delta(&moved, Some(&visual), false),
+        classify_cursor_delta(
+            CursorDeliveryMode::Hardware,
+            CursorDeliveryMode::Hardware,
+            Some(&moved),
+            Some(&visual),
+            true,
+        ),
         CursorDeltaClass::Visual
     );
     assert_eq!(
-        classify_cursor_delta(&previous, hidden, false),
+        classify_cursor_delta(
+            CursorDeliveryMode::Hardware,
+            CursorDeliveryMode::Hidden,
+            Some(&previous),
+            hidden,
+            true,
+        ),
         CursorDeltaClass::Visibility
     );
     assert_eq!(
-        classify_cursor_delta(&previous, hidden, true),
+        classify_cursor_delta(
+            CursorDeliveryMode::Hardware,
+            CursorDeliveryMode::Software,
+            Some(&previous),
+            hidden,
+            true,
+        ),
         CursorDeltaClass::DeliveryModeTransition
+    );
+}
+
+#[test]
+fn delivery_aware_delta_classification_rejects_position_only_across_delivery_modes() {
+    let mut previous = AtomicCursorVisualState::hidden(64, 64);
+    previous.visible = true;
+    previous.framebuffer_id = Some(91);
+    let moved = {
+        let mut next = previous.clone();
+        next.x = 10;
+        next
+    };
+
+    assert_eq!(
+        classify_cursor_delta(
+            CursorDeliveryMode::Hardware,
+            CursorDeliveryMode::Hardware,
+            Some(&previous),
+            Some(&moved),
+            true,
+        ),
+        CursorDeltaClass::PositionOnly
+    );
+    assert_eq!(
+        classify_cursor_delta(
+            CursorDeliveryMode::Hardware,
+            CursorDeliveryMode::Software,
+            Some(&previous),
+            Some(&moved),
+            true,
+        ),
+        CursorDeltaClass::DeliveryModeTransition
+    );
+    assert_eq!(
+        classify_cursor_delta(
+            CursorDeliveryMode::Hardware,
+            CursorDeliveryMode::Hardware,
+            Some(&previous),
+            Some(&moved),
+            false,
+        ),
+        CursorDeltaClass::Visual
     );
 }
 

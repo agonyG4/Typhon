@@ -51,7 +51,12 @@ pub(super) fn submit_ready_frame(
     #[cfg(test)] native_io_recorder: &mut NativeIoRecorder,
 ) -> NativeResult<ReadySubmissionResult> {
     let repaint_present_start = Instant::now();
-    let validation_base = validation_base_for_submission(atomic_commit_arbiter, presented_planes);
+    let validation_base = validation_base_for_submission(
+        atomic_commit_arbiter,
+        presented_planes,
+        output_generation,
+        crtc_id,
+    );
     let explicit_submission = matches!(scanout, NativeScanoutBackend::AtomicEglGbm(_));
     let (present_result, compatibility_transaction_id) =
         if let NativeScanoutBackend::AtomicEglGbm(explicit) = scanout {

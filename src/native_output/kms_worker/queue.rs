@@ -1,7 +1,8 @@
 //! Bounded admission and result queues for the Atomic submit worker.
 
 use super::{
-    CursorSidecar, CursorSidecarMailbox, KmsCommitBundleIdentity, KmsCommitJob, KmsWorkerEvent,
+    CursorSidecar, CursorSidecarMailbox, EstablishedKmsBase, KmsCommitBundleIdentity, KmsCommitJob,
+    KmsValidationBase, KmsWorkerEvent, ValidationBaseDisposition, validation_base_ready,
 };
 use crate::native_output::DirectScanoutCandidateKey;
 use oblivion_one::native::presentation_deadline::PresentationTarget;
@@ -389,6 +390,7 @@ pub(crate) struct WorkerState {
     pub(crate) inflight: Option<WorkerInFlight>,
     pub(crate) phase: KmsWorkerPhase,
     pub(crate) cursor_sidecar: CursorSidecarMailbox,
+    pub(crate) established_base: Option<EstablishedKmsBase>,
 }
 
 impl WorkerShared {
@@ -457,6 +459,7 @@ impl WorkerShared {
                 inflight: None,
                 phase: KmsWorkerPhase::Idle,
                 cursor_sidecar: CursorSidecarMailbox::default(),
+                established_base: None,
             }),
             submit_gate: Mutex::new(()),
             work_wakeup: Condvar::new(),
@@ -472,6 +475,48 @@ impl WorkerShared {
             collecting_pause: Mutex::new(None),
             #[cfg(test)]
             frozen_pause: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn set_established_presented_base(
+        &self,
+        revision: crate::native_output::presentation::plane::PlaneStateRevision,
+        output_generation: u64,
+        crtc_id: u32,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(state.inflight.is_none());
+        state.established_base = Some(EstablishedKmsBase::Presented {
+            revision,
+            output_generation,
+            crtc_id,
+        });
+        drop(state);
+        self.work_wakeup.notify_all();
+    }
+
+    pub(crate) fn validation_base_disposition(
+        state: &WorkerState,
+        required: KmsValidationBase,
+    ) -> ValidationBaseDisposition {
+        if let Some(established) = state.established_base {
+            return validation_base_ready(established, required);
+        }
+        match required {
+            KmsValidationBase::Presented { .. } => ValidationBaseDisposition::Ready,
+            KmsValidationBase::Predecessor(required) => {
+                if state
+                    .inflight
+                    .is_some_and(|inflight| inflight.bundle == required)
+                {
+                    ValidationBaseDisposition::Wait
+                } else {
+                    ValidationBaseDisposition::Invalidated
+                }
+            }
         }
     }
 
@@ -875,6 +920,19 @@ impl KmsCommitAdmissionPermit {
                 KmsWorkerLifecycle::Running => KmsWorkerAdmissionError::QueueFull,
             };
             return Err(Box::new(KmsCommitEnqueueError { job, reason }));
+        }
+        if state.established_base.is_none()
+            && let KmsValidationBase::Presented {
+                snapshot,
+                output_generation,
+                crtc_id,
+            } = job.validation_base
+        {
+            state.established_base = Some(EstablishedKmsBase::Presented {
+                revision: snapshot.revision,
+                output_generation,
+                crtc_id,
+            });
         }
         state.queued.push_back(job);
         self.shared

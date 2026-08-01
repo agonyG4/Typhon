@@ -529,9 +529,13 @@ fn worker_queue_owns_direct_resource_before_submit() {
             framebuffer_id: 42,
         },
         target: test_target(),
-        validation_base: KmsValidationBase::Presented(
-            crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(None),
-        ),
+        validation_base: KmsValidationBase::Presented {
+            snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(
+                None,
+            ),
+            output_generation: 1,
+            crtc_id: 7,
+        },
         queued_at: MonotonicTimestampNs::new(10),
         primary: KmsPrimaryUpdate::Framebuffer {
             framebuffer: FramebufferId::new(42).unwrap(),

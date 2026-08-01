@@ -100,9 +100,13 @@ fn test_uncertain_direct_job(lease: DirectPrimaryLease) -> KmsCommitJob {
             estimated: true,
             predicted_unreachable: false,
         },
-        validation_base: KmsValidationBase::Presented(
-            crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(None),
-        ),
+        validation_base: KmsValidationBase::Presented {
+            snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(
+                None,
+            ),
+            output_generation: 1,
+            crtc_id: 7,
+        },
         queued_at: MonotonicTimestampNs::new(0),
         primary: KmsPrimaryUpdate::Framebuffer {
             framebuffer: FramebufferId::new(42).expect("test framebuffer ID"),

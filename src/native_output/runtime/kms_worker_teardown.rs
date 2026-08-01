@@ -87,7 +87,8 @@ impl NativeRuntime {
             | KmsWorkerEvent::BusyDeferred { .. }
             | KmsWorkerEvent::SubmitLate { .. }
             | KmsWorkerEvent::PageflipTimeout { .. }
-            | KmsWorkerEvent::CursorSidecarReturned { .. } => Ok(()),
+            | KmsWorkerEvent::CursorSidecarReturned { .. }
+            | KmsWorkerEvent::ValidationBaseInvalidated { .. } => Ok(()),
         }
     }
 
@@ -254,7 +255,8 @@ impl NativeRuntime {
                 | KmsWorkerEvent::BusyDeferred { .. }
                 | KmsWorkerEvent::SubmitLate { .. }
                 | KmsWorkerEvent::PageflipTimeout { .. }
-                | KmsWorkerEvent::CursorSidecarReturned { .. } => Ok(()),
+                | KmsWorkerEvent::CursorSidecarReturned { .. }
+                | KmsWorkerEvent::ValidationBaseInvalidated { .. } => Ok(()),
             };
             if let Err(error) = result
                 && first_error.is_none()

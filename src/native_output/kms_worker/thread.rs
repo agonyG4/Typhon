@@ -1,6 +1,9 @@
 //! Atomic submit worker thread and lifecycle boundary.
 
-use super::payload::{KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy};
+use super::payload::{
+    KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy, KmsValidationBase,
+    ValidationBaseDisposition,
+};
 #[cfg(test)]
 use super::queue::DequeuePause;
 use super::queue::{
@@ -10,9 +13,9 @@ use super::queue::{
     notify_eventfd,
 };
 use super::{
-    CursorSidecar, CursorSidecarOfferError, CursorSidecarReturnReason, KmsCommitAdmissionPermit,
-    KmsCommitBundleIdentity, KmsCommitJob, KmsCommitTimingModel, KmsCursorOwner,
-    KmsWorkerAdmissionError,
+    CursorSidecar, CursorSidecarOfferError, CursorSidecarReturnReason, EstablishedKmsBase,
+    KmsCommitAdmissionPermit, KmsCommitBundleIdentity, KmsCommitJob, KmsCommitTimingModel,
+    KmsCursorOwner, KmsWorkerAdmissionError,
 };
 use crate::native_output::{
     OutputTransactionId, presentation::transaction::DirectScanoutCandidateKey,
@@ -22,6 +25,7 @@ use oblivion_one::native::kms::AtomicCommitSubmitter;
 use oblivion_one::native::kms::{AtomicKmsError, AtomicKmsErrorKind, PageFlipToken};
 use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
 use std::{
+    collections::VecDeque,
     io,
     os::fd::{AsRawFd, BorrowedFd, OwnedFd},
     sync::{Arc, Mutex},
@@ -104,10 +108,66 @@ pub(crate) enum KmsWorkerEvent {
         sidecar: CursorSidecar,
         reason: CursorSidecarReturnReason,
     },
+    ValidationBaseInvalidated {
+        job: KmsCommitJob,
+        expected: KmsValidationBase,
+        established: Option<EstablishedKmsBase>,
+        reason: ValidationBaseInvalidationReason,
+    },
     Fatal {
         reason: KmsWorkerFatalReason,
         uncertain_submit: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValidationBaseInvalidationReason {
+    PredecessorTerminal,
+    PresentedRevisionChanged,
+    GenerationChanged,
+    BundleMismatch,
+}
+
+fn invalidate_queued_dependents(
+    shared: &Arc<WorkerShared>,
+    predecessor: KmsCommitBundleIdentity,
+    reason: ValidationBaseInvalidationReason,
+) {
+    let returned = {
+        let mut state = shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut returned = Vec::new();
+        let mut retained = VecDeque::with_capacity(state.queued.len());
+        while let Some(job) = state.queued.pop_front() {
+            let dependent = matches!(
+                job.validation_base,
+                KmsValidationBase::Predecessor(required) if required == predecessor
+            );
+            if dependent {
+                returned.push(job);
+            } else {
+                retained.push_back(job);
+            }
+        }
+        state.queued = retained;
+        returned
+    };
+    for job in returned {
+        if !publish_event(
+            shared,
+            KmsWorkerEvent::ValidationBaseInvalidated {
+                expected: job.validation_base,
+                job,
+                established: None,
+                reason,
+            },
+        ) {
+            return;
+        }
+    }
+    shared.work_wakeup.notify_all();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +182,8 @@ pub(crate) enum KmsWorkerAckError {
     TokenMismatch,
     TransactionMismatch,
     GenerationMismatch,
+    BundleMismatch,
+    CrtcMismatch,
 }
 
 #[derive(Debug)]
@@ -246,6 +308,14 @@ impl KmsCommitWorkerHandle {
     ) -> Option<AttachablePrimary> {
         self.shared
             .attachable_primary(output_generation, crtc_id, target)
+    }
+
+    pub(crate) fn invalidate_validation_base(
+        &self,
+        predecessor: KmsCommitBundleIdentity,
+        reason: ValidationBaseInvalidationReason,
+    ) {
+        invalidate_queued_dependents(&self.shared, predecessor, reason);
     }
 
     pub(crate) fn has_pre_freeze_primary_opportunity(&self) -> bool {
@@ -480,6 +550,26 @@ impl KmsCommitWorkerHandle {
         transaction_id: OutputTransactionId,
         output_generation: u64,
     ) -> Result<(), KmsWorkerAckError> {
+        let inflight_bundle = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .inflight
+            .map(|inflight| inflight.bundle);
+        let Some(mut identity) = inflight_bundle else {
+            return Err(KmsWorkerAckError::NoInFlightCommit);
+        };
+        identity.output_generation = output_generation;
+        identity.token = token;
+        self.ack_pageflip_identity(identity, transaction_id)
+    }
+
+    pub(crate) fn ack_pageflip_identity(
+        &self,
+        identity: KmsCommitBundleIdentity,
+        transaction_id: OutputTransactionId,
+    ) -> Result<(), KmsWorkerAckError> {
         let mut state = self
             .shared
             .state
@@ -500,7 +590,7 @@ impl KmsCommitWorkerHandle {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(KmsWorkerAckError::NoInFlightCommit);
         };
-        if inflight.token != token {
+        if inflight.token != identity.token {
             self.shared
                 .metrics
                 .result_mismatches
@@ -514,12 +604,50 @@ impl KmsCommitWorkerHandle {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(KmsWorkerAckError::TransactionMismatch);
         }
-        if inflight.output_generation != output_generation {
+        if inflight.output_generation != identity.output_generation {
+            let predecessor = inflight.bundle;
+            drop(state);
+            invalidate_queued_dependents(
+                &self.shared,
+                predecessor,
+                ValidationBaseInvalidationReason::GenerationChanged,
+            );
             self.shared
                 .metrics
                 .result_mismatches
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(KmsWorkerAckError::GenerationMismatch);
+        }
+        if inflight.bundle.id != identity.id
+            || inflight.bundle.primary_transaction_id != identity.primary_transaction_id
+            || inflight.bundle.cursor_transaction_id != identity.cursor_transaction_id
+        {
+            let predecessor = inflight.bundle;
+            drop(state);
+            invalidate_queued_dependents(
+                &self.shared,
+                predecessor,
+                ValidationBaseInvalidationReason::BundleMismatch,
+            );
+            self.shared
+                .metrics
+                .result_mismatches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(KmsWorkerAckError::BundleMismatch);
+        }
+        if inflight.bundle.crtc_id != identity.crtc_id {
+            let predecessor = inflight.bundle;
+            drop(state);
+            invalidate_queued_dependents(
+                &self.shared,
+                predecessor,
+                ValidationBaseInvalidationReason::BundleMismatch,
+            );
+            self.shared
+                .metrics
+                .result_mismatches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(KmsWorkerAckError::CrtcMismatch);
         }
         if matches!(inflight.kind, AtomicCommitKind::PlaneDelta { .. }) {
             self.shared
@@ -535,6 +663,7 @@ impl KmsCommitWorkerHandle {
         let returned_sidecar = state
             .cursor_sidecar
             .take_must_bundle_with(inflight.transaction_id);
+        state.established_base = Some(EstablishedKmsBase::Bundle(inflight.bundle));
         let suppress_next_submit = matches!(
             state.lifecycle,
             KmsWorkerLifecycle::Quiescing
@@ -646,6 +775,7 @@ impl ExecutingDirectCandidateGuard {
             kind: job.kind,
             direct_content_key: self.candidate,
         });
+        state.established_base = Some(EstablishedKmsBase::Pending(job.identity()));
         state.executing = false;
         state.executing_direct_content_key = None;
         state.executing_primary_transaction_id = None;
@@ -818,8 +948,9 @@ fn collect_cursor_sidecar_before_freeze(
         let current_cursor_revision = job.owners.cursor().map(|owner| owner.revision);
         let (claimed, rejected) = match claimed {
             Some(sidecar)
-                if current_cursor_revision
-                    .is_none_or(|revision| sidecar.revision.strictly_newer_than(revision)) =>
+                if sidecar.validation_base == job.validation_base
+                    && current_cursor_revision
+                        .is_none_or(|revision| sidecar.revision.strictly_newer_than(revision)) =>
             {
                 (Some(sidecar), None)
             }
@@ -1246,8 +1377,41 @@ fn take_next_job(shared: &Arc<WorkerShared>) -> Option<ExecutingKmsJob> {
             return None;
         }
         if state.inflight.is_none()
-            && let Some(job) = state.queued.pop_front()
+            && let Some(front) = state.queued.front()
         {
+            match WorkerShared::validation_base_disposition(&state, front.validation_base) {
+                ValidationBaseDisposition::Wait => {
+                    state = shared
+                        .work_wakeup
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    continue;
+                }
+                ValidationBaseDisposition::Invalidated => {
+                    let job = state.queued.pop_front().expect("front job still queued");
+                    let expected = job.validation_base;
+                    let established = state.established_base;
+                    drop(state);
+                    if !publish_event(
+                        shared,
+                        KmsWorkerEvent::ValidationBaseInvalidated {
+                            job,
+                            expected,
+                            established,
+                            reason: ValidationBaseInvalidationReason::PredecessorTerminal,
+                        },
+                    ) {
+                        return None;
+                    }
+                    state = shared
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    continue;
+                }
+                ValidationBaseDisposition::Ready => {}
+            }
+            let job = state.queued.pop_front().expect("front job still queued");
             let direct_candidate = job.direct_primary_lease.as_ref().map(|lease| lease.key());
             debug_assert!(!state.executing);
             state.executing = true;

@@ -227,9 +227,13 @@ pub(super) fn test_job(token: u64) -> KmsCommitJob {
             estimated: true,
             predicted_unreachable: false,
         },
-        validation_base: KmsValidationBase::Presented(
-            crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(None),
-        ),
+        validation_base: KmsValidationBase::Presented {
+            snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(
+                None,
+            ),
+            output_generation: 1,
+            crtc_id: 7,
+        },
         queued_at: MonotonicTimestampNs::new(0),
         primary: KmsPrimaryUpdate::Framebuffer {
             framebuffer: oblivion_one::native::kms::FramebufferId::new(42).unwrap(),
@@ -380,6 +384,7 @@ pub(super) fn wait_for_fence_event(
                 | KmsWorkerEvent::BusyExhausted { job, .. } => job.token.get() == token,
                 KmsWorkerEvent::Quiesced { .. }
                 | KmsWorkerEvent::CursorSidecarReturned { .. }
+                | KmsWorkerEvent::ValidationBaseInvalidated { .. }
                 | KmsWorkerEvent::Fatal { .. } => true,
             }));
             return events;

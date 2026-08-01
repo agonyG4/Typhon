@@ -45,12 +45,20 @@ pub(super) fn worker_cursor_pin(
 pub(super) fn validation_base_for_submission(
     atomic_commit_arbiter: &AtomicCommitArbiter,
     presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
+    output_generation: u64,
+    crtc_id: u32,
 ) -> KmsValidationBase {
     let pending = atomic_commit_arbiter
         .kernel_submitted_commit()
         .or_else(|| atomic_commit_arbiter.worker_queued_commit());
-    pending.map_or(KmsValidationBase::Presented(presented_planes), |pending| {
-        KmsValidationBase::Predecessor(KmsCommitBundleIdentity {
+    pending.map_or(
+        KmsValidationBase::Presented {
+            snapshot: presented_planes,
+            output_generation,
+            crtc_id,
+        },
+        |pending| {
+            KmsValidationBase::Predecessor(KmsCommitBundleIdentity {
             id: crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(
                 pending.token,
             ),
@@ -68,7 +76,8 @@ pub(super) fn validation_base_for_submission(
                 | AtomicCommitKind::DirectPrimary { .. } => None,
             },
         })
-    })
+        },
+    )
 }
 
 fn planned_cursor_update(

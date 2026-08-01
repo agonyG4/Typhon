@@ -4,10 +4,11 @@ use super::tests::{
 };
 use super::thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
 use super::{
-    CursorSidecar, CursorSidecarCoupling, CursorSidecarMailbox, KmsBundleOwners,
-    KmsCommitBundleIdentity, KmsCommitJob, KmsCommitWorkerHandle, KmsCursorOwner, KmsCursorUpdate,
-    KmsPrimaryOwner, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy, KmsValidationBase,
-    KmsWorkerEvent, KmsWorkerFatalJob,
+    CursorSidecar, CursorSidecarCoupling, CursorSidecarMailbox, EstablishedKmsBase,
+    KmsBundleOwners, KmsCommitBundleIdentity, KmsCommitJob, KmsCommitWorkerHandle, KmsCursorOwner,
+    KmsCursorUpdate, KmsPrimaryOwner, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy,
+    KmsValidationBase, KmsWorkerEvent, KmsWorkerFatalJob, ValidationBaseDisposition,
+    validation_base_ready,
 };
 use oblivion_one::native::kms::AtomicCursorVisualState;
 use std::{
@@ -53,6 +54,19 @@ fn test_sidecar(job: &KmsCommitJob, id: u64, coupling: CursorSidecarCoupling) ->
         capability_key: None,
         validation_base: job.validation_base,
     }
+}
+
+fn test_cursor_job(token: u64) -> KmsCommitJob {
+    let mut job = test_job(token);
+    job.kind = crate::native_output::runtime::AtomicCommitKind::PlaneDelta {
+        transaction_id: job.transaction_id,
+        cursor_epoch: token,
+        framebuffer_id: Some(42),
+    };
+    job.primary = KmsPrimaryUpdate::Unchanged;
+    job.cursor = KmsCursorUpdate::Disable;
+    job.test_only = KmsTestOnlyPolicy::Required;
+    job
 }
 
 fn offer_sidecar(
@@ -121,6 +135,188 @@ fn assert_two_owners(
 ) {
     assert_eq!(job.owners.primary_transaction_id(), Some(primary_id));
     assert_eq!(job.owners.cursor_transaction_id(), Some(cursor_id));
+}
+
+#[test]
+fn validation_base_disposition_requires_the_exact_established_bundle() {
+    let predecessor = test_job(333).identity();
+    let other = test_job(334).identity();
+
+    assert_eq!(
+        validation_base_ready(
+            EstablishedKmsBase::Bundle(predecessor),
+            KmsValidationBase::Predecessor(predecessor),
+        ),
+        ValidationBaseDisposition::Ready
+    );
+    assert_eq!(
+        validation_base_ready(
+            EstablishedKmsBase::Bundle(other),
+            KmsValidationBase::Predecessor(predecessor),
+        ),
+        ValidationBaseDisposition::Invalidated
+    );
+    assert_eq!(
+        validation_base_ready(
+            EstablishedKmsBase::Pending(predecessor),
+            KmsValidationBase::Predecessor(predecessor),
+        ),
+        ValidationBaseDisposition::Wait
+    );
+}
+
+#[test]
+fn dependent_cursor_waits_for_the_exact_predecessor_pageflip_before_testing() {
+    let executor = Arc::new(RecordingExecutor::accepting());
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let predecessor = test_job(335);
+    let predecessor_identity = predecessor.identity();
+    let predecessor_token = predecessor.token;
+    let predecessor_transaction = predecessor.transaction_id;
+    let mut cursor = test_cursor_job(336);
+    cursor.validation_base = KmsValidationBase::Predecessor(predecessor_identity);
+
+    reserve_for_test(&handle, predecessor.kind)
+        .enqueue(predecessor)
+        .unwrap();
+    let predecessor_events = wait_for_fence_event(
+        &handle,
+        335,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 335),
+    );
+    reserve_for_test(&handle, cursor.kind)
+        .enqueue(cursor)
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+    assert!(
+        !executor
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.framebuffer_id == 0)
+    );
+
+    handle
+        .ack_pageflip(predecessor_token, predecessor_transaction, 1)
+        .unwrap();
+    let cursor_events = wait_for_fence_event(
+        &handle,
+        336,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 336),
+    );
+    assert!(
+        executor
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.framebuffer_id == 0 && request.test_only)
+    );
+    handle
+        .ack_pageflip(
+            test_cursor_job(336).token,
+            test_cursor_job(336).transaction_id,
+            1,
+        )
+        .unwrap();
+    drop((predecessor_events, cursor_events));
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn rejected_predecessor_returns_dependent_cursor_before_test_or_submit() {
+    let executor = Arc::new(RecordingExecutor {
+        test_outcomes: Mutex::new(VecDeque::from([Err(
+            oblivion_one::native::kms::AtomicKmsErrorKind::TestOnlyRejected,
+        )])),
+        submit_outcomes: Mutex::new(VecDeque::from([Ok(())])),
+        requests: Mutex::new(Vec::new()),
+        real_input_fence_fds: Mutex::new(Vec::new()),
+        real_input_fence_open: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let mut predecessor = required_direct_test_job(337);
+    predecessor.validation_base = KmsValidationBase::Presented {
+        snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(None),
+        output_generation: 1,
+        crtc_id: 7,
+    };
+    let predecessor_identity = predecessor.identity();
+    let mut cursor = test_cursor_job(338);
+    cursor.validation_base = KmsValidationBase::Predecessor(predecessor_identity);
+
+    let pause = handle.pause_after_dequeue_for_test();
+    reserve_for_test(&handle, predecessor.kind)
+        .enqueue(predecessor)
+        .unwrap();
+    pause.wait_until_selected();
+    reserve_for_test(&handle, cursor.kind)
+        .enqueue(cursor)
+        .unwrap();
+    pause.release();
+    let events = wait_for_fence_event(&handle, 338, |event| {
+        matches!(
+            event,
+            KmsWorkerEvent::ValidationBaseInvalidated { job, .. }
+                if job.token.get() == 338
+        )
+    });
+    let requests = executor.requests.lock().unwrap().clone();
+    assert!(requests.iter().any(|request| request.test_only));
+    assert!(!requests.iter().any(|request| !request.test_only));
+    assert!(!requests.iter().any(|request| request.framebuffer_id == 0));
+    drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn mismatched_pageflip_identity_invalidates_dependents_without_releasing_the_inflight_job() {
+    let executor = Arc::new(RecordingExecutor::accepting());
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let predecessor = test_job(3391);
+    let predecessor_identity = predecessor.identity();
+    let mut cursor = test_cursor_job(3392);
+    cursor.validation_base = KmsValidationBase::Predecessor(predecessor_identity);
+    let predecessor_transaction = predecessor.transaction_id;
+
+    reserve_for_test(&handle, predecessor.kind)
+        .enqueue(predecessor)
+        .unwrap();
+    wait_for_fence_event(
+        &handle,
+        3391,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 3391),
+    );
+    reserve_for_test(&handle, cursor.kind)
+        .enqueue(cursor)
+        .unwrap();
+
+    let mut wrong = predecessor_identity;
+    wrong.crtc_id = wrong.crtc_id.saturating_add(1);
+    let error = handle.ack_pageflip_identity(wrong, predecessor_transaction);
+    assert_eq!(error, Err(super::thread::KmsWorkerAckError::CrtcMismatch));
+    let events = wait_for_fence_event(&handle, 3392, |event| {
+        matches!(
+            event,
+            KmsWorkerEvent::ValidationBaseInvalidated { job, .. }
+                if job.token.get() == 3392
+        )
+    });
+    assert!(
+        !executor
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.framebuffer_id == 0)
+    );
+    assert!(handle.inflight());
+    drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
 }
 
 #[test]
@@ -217,7 +413,7 @@ fn cursor_job_keeps_immutable_presented_or_predecessor_validation_base() {
     let job = test_job(3321);
     assert!(matches!(
         job.validation_base,
-        KmsValidationBase::Presented(_)
+        KmsValidationBase::Presented { .. }
     ));
     let predecessor = KmsCommitBundleIdentity {
         id: job.bundle_id,
@@ -228,9 +424,13 @@ fn cursor_job_keeps_immutable_presented_or_predecessor_validation_base() {
         cursor_transaction_id: None,
     };
     assert_ne!(
-        KmsValidationBase::Presented(
-            crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(None)
-        ),
+        KmsValidationBase::Presented {
+            snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(
+                None,
+            ),
+            output_generation: 1,
+            crtc_id: 7,
+        },
         KmsValidationBase::Predecessor(predecessor)
     );
 }
@@ -406,15 +606,27 @@ fn predecessor_pageflip_releases_latest_sidecar_with_queued_next_primary() {
         matches!(event, KmsWorkerEvent::Submitted { .. })
     });
 
-    let second = test_job(341);
+    let mut second = test_job(341);
+    second.validation_base = KmsValidationBase::Predecessor(
+        first_events
+            .iter()
+            .find_map(|event| {
+                if let KmsWorkerEvent::Submitted { ownership } = event {
+                    Some(ownership.job.identity())
+                } else {
+                    None
+                }
+            })
+            .expect("submitted predecessor identity"),
+    );
     let second_token = second.token;
     let second_transaction = second.transaction_id;
+    let older = test_sidecar(&second, 909, CursorSidecarCoupling::Independent);
+    let latest = test_sidecar(&second, 910, CursorSidecarCoupling::Independent);
+    let latest_id = latest.id;
     reserve_for_test(&handle, second.kind)
         .enqueue(second)
         .unwrap();
-    let older = test_sidecar(&test_job(341), 909, CursorSidecarCoupling::Independent);
-    let latest = test_sidecar(&test_job(341), 910, CursorSidecarCoupling::Independent);
-    let latest_id = latest.id;
     offer_sidecar(&handle, older);
     assert!(offer_sidecar(&handle, latest).is_some());
     handle

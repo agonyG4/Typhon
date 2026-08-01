@@ -1332,6 +1332,19 @@ impl NativeRuntime {
                 });
                 drop(sidecar);
             }
+            KmsWorkerEvent::ValidationBaseInvalidated { job, reason, .. } => {
+                self.drop_queued_worker_job_with_reason(
+                    job,
+                    OutputTransactionDropReason::SessionSuspended,
+                )?;
+                self.queued_redraw_requested = true;
+                self.perf.log("native.kms_commit_worker", || {
+                    vec![
+                        NativePerfField::str("event", "validation_base_invalidated"),
+                        NativePerfField::str("reason", format!("{reason:?}")),
+                    ]
+                });
+            }
             KmsWorkerEvent::Fatal {
                 reason,
                 uncertain_submit,
