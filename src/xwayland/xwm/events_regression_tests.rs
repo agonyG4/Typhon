@@ -12,7 +12,7 @@ use x11rb::{
 };
 
 use super::super::X11WindowSnapshot;
-use super::super::{ResizeSyncState, XwmCommand, XwmEvent};
+use super::super::{ResizeSyncState, X11WindowType, X11WindowTypes, XwmCommand, XwmEvent};
 use super::tests::{
     complete_property_refresh, generation, map_event, prepare_managed_window, ready_events,
     ready_surface_id, test_fixture, unmap_event,
@@ -165,7 +165,7 @@ fn configure_request_and_destroy_notify_are_normalized_in_one_x11_drain() {
         matches!(
             event,
             XwmEvent::ConfigureRequested { window, request }
-                if *window == handle && request.x11_request_sequence == Some(77)
+                if *window == handle && request.client_event_sequence == Some(77)
         )
     }));
     assert!(
@@ -239,6 +239,204 @@ fn older_self_generated_configure_notify_is_not_forwarded_as_external_geometry()
 }
 
 #[test]
+fn configure_sequence_diagnostics_count_conflicts_and_sequence_only_rejections() {
+    let generation = generation(220);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 220, true, false, false);
+    let first = X11Geometry {
+        x: 110,
+        y: 100,
+        width: 630,
+        height: 480,
+    };
+    let second = X11Geometry {
+        x: 120,
+        y: 100,
+        width: 620,
+        height: 480,
+    };
+    xwm.note_expected_configure_with_context(
+        handle,
+        first,
+        super::super::X11ConfigureFlags::all(),
+        super::super::ConfigureSource::Compositor,
+        Some(1),
+    );
+    xwm.note_expected_configure_with_context(
+        handle,
+        second,
+        super::super::X11ConfigureFlags::all(),
+        super::super::ConfigureSource::Compositor,
+        Some(2),
+    );
+
+    let conflict = xwm.note_configure_notify(handle, first, Some(2));
+    let sequence_only = xwm.note_configure_notify(
+        handle,
+        X11Geometry {
+            x: 999,
+            y: 999,
+            width: 1,
+            height: 1,
+        },
+        Some(2),
+    );
+    let metrics = xwm.configure_metrics();
+
+    assert!(conflict.sequence_geometry_conflict);
+    assert_eq!(
+        sequence_only.classification,
+        super::super::ConfigureNotifyClassification::SequenceOnlyRejected
+    );
+    assert_eq!(metrics.sequence_geometry_conflicts, 1);
+    assert_eq!(metrics.sequence_only_matches_rejected, 1);
+}
+
+#[test]
+fn override_redirect_can_reuse_retired_geometry_as_external_state() {
+    let generation = generation(217);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 217, true, false, false);
+    let mut snapshot = sync_snapshot(handle, 0);
+    snapshot.kind = DesktopWindowKind::OverrideRedirect;
+    snapshot.override_redirect = true;
+    xwm.windows.get_mut(handle).expect("window record").snapshot = Some(snapshot);
+
+    let retired_geometry = X11Geometry {
+        x: 110,
+        y: 100,
+        width: 630,
+        height: 480,
+    };
+    let current_geometry = X11Geometry {
+        x: 120,
+        y: 100,
+        width: 620,
+        height: 480,
+    };
+    xwm.note_expected_configure_with_context(
+        handle,
+        retired_geometry,
+        super::super::X11ConfigureFlags::all(),
+        super::super::ConfigureSource::Compositor,
+        Some(1),
+    );
+    xwm.note_expected_configure_with_context(
+        handle,
+        current_geometry,
+        super::super::X11ConfigureFlags::all(),
+        super::super::ConfigureSource::Compositor,
+        Some(2),
+    );
+
+    normalize(
+        &mut xwm,
+        Event::ConfigureNotify(xproto::ConfigureNotifyEvent {
+            response_type: 22,
+            sequence: 2,
+            event: 1,
+            window: handle.xid(),
+            above_sibling: 0,
+            x: current_geometry.x as i16,
+            y: current_geometry.y as i16,
+            width: current_geometry.width as u16,
+            height: current_geometry.height as u16,
+            border_width: 0,
+            override_redirect: true,
+        }),
+    )
+    .expect("normalize current override-redirect ConfigureNotify");
+    let _ = xwm.take_events().collect::<Vec<_>>();
+
+    normalize(
+        &mut xwm,
+        Event::ConfigureNotify(xproto::ConfigureNotifyEvent {
+            response_type: 22,
+            sequence: 0,
+            event: 1,
+            window: handle.xid(),
+            above_sibling: 0,
+            x: retired_geometry.x as i16,
+            y: retired_geometry.y as i16,
+            width: retired_geometry.width as u16,
+            height: retired_geometry.height as u16,
+            border_width: 0,
+            override_redirect: true,
+        }),
+    )
+    .expect("normalize reused retired override-redirect ConfigureNotify");
+
+    assert!(xwm.take_events().any(|event| matches!(
+        event,
+        XwmEvent::ConfigureNotify { window, geometry, .. }
+            if window == handle && geometry == retired_geometry
+    )));
+}
+
+#[test]
+fn client_positioned_notification_can_reuse_retired_geometry_as_external_state() {
+    let generation = generation(221);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 221, true, false, false);
+    let mut snapshot = sync_snapshot(handle, 0);
+    snapshot.window_types = X11WindowTypes::new(vec![X11WindowType::Notification]);
+    xwm.windows.get_mut(handle).expect("window record").snapshot = Some(snapshot);
+
+    let retired_geometry = X11Geometry {
+        x: 110,
+        y: 100,
+        width: 630,
+        height: 480,
+    };
+    let current_geometry = X11Geometry {
+        x: 120,
+        y: 100,
+        width: 620,
+        height: 480,
+    };
+    xwm.note_expected_configure_with_context(
+        handle,
+        retired_geometry,
+        super::super::X11ConfigureFlags::all(),
+        super::super::ConfigureSource::Compositor,
+        Some(1),
+    );
+    xwm.note_expected_configure_with_context(
+        handle,
+        current_geometry,
+        super::super::X11ConfigureFlags::all(),
+        super::super::ConfigureSource::Compositor,
+        Some(2),
+    );
+
+    for (geometry, sequence) in [(current_geometry, 2), (retired_geometry, 0)] {
+        normalize(
+            &mut xwm,
+            Event::ConfigureNotify(xproto::ConfigureNotifyEvent {
+                response_type: 22,
+                sequence,
+                event: 1,
+                window: handle.xid(),
+                above_sibling: 0,
+                x: geometry.x as i16,
+                y: geometry.y as i16,
+                width: geometry.width as u16,
+                height: geometry.height as u16,
+                border_width: 0,
+                override_redirect: false,
+            }),
+        )
+        .expect("normalize client-positioned ConfigureNotify");
+    }
+
+    assert!(xwm.take_events().any(|event| matches!(
+        event,
+        XwmEvent::ConfigureNotify { window, geometry, .. }
+            if window == handle && geometry == retired_geometry
+    )));
+}
+
+#[test]
 fn command_after_destroy_configure_is_obsolete_not_fatal() {
     let generation = generation(206);
     let (mut xwm, _peer) = test_fixture(generation);
@@ -265,6 +463,64 @@ fn command_after_destroy_configure_is_obsolete_not_fatal() {
         Ok(super::super::XwmCommandOutcome::DroppedTargetGone { window: dropped })
             if dropped == handle
     ));
+}
+
+#[test]
+fn stacking_only_configure_does_not_create_geometry_timeline() {
+    let generation = generation(218);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 218, true, false, false);
+
+    let result = super::super::commands::execute(
+        &mut xwm,
+        XwmCommand::Configure {
+            window: handle,
+            geometry: X11Geometry {
+                x: 110,
+                y: 100,
+                width: 630,
+                height: 480,
+            },
+            fields: super::super::X11ConfigureFlags {
+                sibling: true,
+                stack_mode: true,
+                ..super::super::X11ConfigureFlags::default()
+            },
+            source: super::super::ConfigureSource::Compositor,
+            border_width: 0,
+        },
+    );
+
+    assert!(result.is_ok());
+    assert!(!xwm.configure_timelines.contains_key(&handle));
+}
+
+#[test]
+fn unknown_configure_notify_does_not_allocate_timeline_state() {
+    let generation = generation(219);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = super::super::X11WindowHandle::new(generation, 219);
+
+    normalize(
+        &mut xwm,
+        Event::ConfigureNotify(xproto::ConfigureNotifyEvent {
+            response_type: 22,
+            sequence: 0,
+            event: 1,
+            window: handle.xid(),
+            above_sibling: 0,
+            x: 10,
+            y: 20,
+            width: 640,
+            height: 480,
+            border_width: 0,
+            override_redirect: false,
+        }),
+    )
+    .expect("normalize unknown ConfigureNotify");
+
+    assert!(!xwm.configure_timelines.contains_key(&handle));
+    assert!(xwm.take_events().next().is_none());
 }
 
 #[test]

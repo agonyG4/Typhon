@@ -353,6 +353,15 @@ impl XwaylandService {
                     configure_metrics.notifies_unknown_preserved;
                 self.metrics.x11_geometry_rollbacks_prevented =
                     configure_metrics.rollbacks_prevented;
+                self.metrics.x11_sequence_geometry_conflicts =
+                    configure_metrics.sequence_geometry_conflicts;
+                self.metrics.x11_sequence_wrap_progress = configure_metrics.sequence_wrap_progress;
+                self.metrics.x11_sequence_only_matches_rejected =
+                    configure_metrics.sequence_only_matches_rejected;
+                self.metrics.x11_client_authoritative_retired_geometry_reuse =
+                    configure_metrics.client_authoritative_retired_geometry_reuse;
+                self.metrics.x11_ambiguous_identical_geometry_matches =
+                    configure_metrics.ambiguous_identical_geometry_matches;
                 self.metrics.xwm_events_received = self
                     .metrics
                     .xwm_events_received

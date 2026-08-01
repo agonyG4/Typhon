@@ -1,10 +1,3 @@
-use crate::compositor::DesktopWindowKind;
-use crate::xwayland::trace::{self, TraceFields};
-use x11rb::{
-    connection::Connection,
-    protocol::{Event, sync::Int64, xproto},
-};
-
 use super::{
     ConfigureNotifyClassification, X11ConfigureFlags, X11ConfigureRequest, X11Geometry,
     X11StackMode, X11StateRequest, X11WindowHandle, Xwm, XwmDrain, XwmError, XwmEvent,
@@ -12,6 +5,12 @@ use super::{
     ewmh::{decode_state_action, state_atom as decode_state_atom},
     properties::PropertyKind,
     window::X11WindowLifecycle,
+};
+use crate::compositor::DesktopWindowKind;
+use crate::xwayland::trace::{self, TraceFields};
+use x11rb::{
+    connection::Connection,
+    protocol::{Event, sync::Int64, xproto},
 };
 
 pub(crate) fn drain(xwm: &mut Xwm, budget: usize) -> Result<XwmDrain, XwmError> {
@@ -212,7 +211,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                     height: u32::from(event.height),
                 },
                 fields: configure_flags(event.value_mask),
-                x11_request_sequence: (event.sequence != 0).then_some(u64::from(event.sequence)),
+                client_event_sequence: Some(event.sequence),
                 border_width: u32::from(event.border_width),
                 sibling,
                 stack_mode: stack_mode(event.stack_mode),
@@ -224,21 +223,24 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         }
         Event::ConfigureNotify(event) => {
             let handle = X11WindowHandle::new(xwm.generation, event.window);
+            if !xwm.windows.contains(handle) {
+                return Ok(());
+            }
             let geometry = X11Geometry {
                 x: i32::from(event.x),
                 y: i32::from(event.y),
                 width: u32::from(event.width),
                 height: u32::from(event.height),
             };
-            if xwm.windows.contains(handle) {
-                xwm.reconcile_window_kind(handle, window_kind(event.override_redirect))?;
-            }
-            let x11_event_sequence = (event.sequence != 0).then_some(u64::from(event.sequence));
-            let classification = xwm.note_configure_notify(handle, geometry, x11_event_sequence);
+            xwm.reconcile_window_kind(handle, window_kind(event.override_redirect))?;
+            let notify_progress_sequence = Some(event.sequence);
+            let classification =
+                xwm.note_configure_notify(handle, geometry, notify_progress_sequence);
             xwm.apply_configure_notify_record(handle, geometry, classification.classification);
             if matches!(
                 classification.classification,
                 ConfigureNotifyClassification::ExternalAuthoritative
+                    | ConfigureNotifyClassification::ClientAuthoritativeRetiredReuse
                     | ConfigureNotifyClassification::UnknownPreserved
             ) && xwm.windows.get(handle).is_some()
             {
@@ -479,7 +481,7 @@ fn normalize_client_message(
                     height: data[4],
                 },
                 fields: flags,
-                x11_request_sequence: (event.sequence != 0).then_some(u64::from(event.sequence)),
+                client_event_sequence: Some(event.sequence),
                 border_width: 0,
                 sibling: None,
                 stack_mode: None,
@@ -1419,7 +1421,7 @@ mod tests {
                         width: true,
                         ..X11ConfigureFlags::default()
                     },
-                    x11_request_sequence: None,
+                    client_event_sequence: Some(0),
                     border_width: 0,
                     sibling: None,
                     stack_mode: None,

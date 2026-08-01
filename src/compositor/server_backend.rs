@@ -34,7 +34,7 @@ impl OwnCompositorServer {
                 .field("xid", window.xid())
                 .field("requested", format!("{:?}", request.requested))
                 .field("fields", format!("{:?}", request.fields))
-                .optional("x11_request_sequence", request.x11_request_sequence)
+                .optional("client_event_sequence", request.client_event_sequence)
                 .optional(
                     "current_authoritative_geometry",
                     current_authoritative.map(|value| format!("{value:?}")),

@@ -102,7 +102,7 @@ pub enum X11StackMode {
 pub struct X11ConfigureRequest {
     pub requested: X11Geometry,
     pub fields: X11ConfigureFlags,
-    pub x11_request_sequence: Option<u64>,
+    pub client_event_sequence: Option<u16>,
     pub border_width: u32,
     pub sibling: Option<X11WindowHandle>,
     pub stack_mode: Option<X11StackMode>,

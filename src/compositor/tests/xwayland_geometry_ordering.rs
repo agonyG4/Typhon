@@ -67,7 +67,7 @@ fn delayed_managed_configure_notify_cannot_restore_an_older_client_geometry() {
                         width: true,
                         ..X11ConfigureFlags::default()
                     },
-                    x11_request_sequence: None,
+                    client_event_sequence: None,
                     border_width: 0,
                     sibling: None,
                     stack_mode: None,
