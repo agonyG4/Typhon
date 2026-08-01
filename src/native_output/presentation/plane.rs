@@ -131,6 +131,15 @@ impl CursorRevision {
             ..self
         }
     }
+
+    pub(crate) const fn strictly_newer_than(self, other: Self) -> bool {
+        self.image.get() >= other.image.get()
+            && self.motion.get() >= other.motion.get()
+            && self.visibility.get() >= other.visibility.get()
+            && (self.image.get() > other.image.get()
+                || self.motion.get() > other.motion.get()
+                || self.visibility.get() > other.visibility.get())
+    }
 }
 
 impl KmsCommitBundleId {
@@ -284,10 +293,25 @@ impl PresentedPlaneSnapshot {
         promotion: &PresentedCursorPromotion,
         pageflip: PlanePageflipIdentity,
     ) -> bool {
-        if promotion.identity != pageflip {
+        self.promote_bundle(promotion.identity, pageflip, None, Some(promotion.cursor))
+    }
+
+    pub(crate) fn promote_bundle(
+        &mut self,
+        identity: PlanePageflipIdentity,
+        pageflip: PlanePageflipIdentity,
+        primary: Option<ConfirmedPrimaryState>,
+        cursor: Option<PresentedCursorState>,
+    ) -> bool {
+        if identity != pageflip || (primary.is_none() && cursor.is_none()) {
             return false;
         }
-        self.cursor = promotion.cursor;
+        if let Some(primary) = primary {
+            self.primary = Some(primary);
+        }
+        if let Some(cursor) = cursor {
+            self.cursor = cursor;
+        }
         self.revision = self.revision.next();
         true
     }

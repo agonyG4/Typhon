@@ -41,6 +41,7 @@ pub(crate) struct WorkerQueuedCursorSubmission {
     pub(crate) cursor_epoch: u64,
     pub(crate) revision: CursorRevision,
     pub(crate) visual_state: AtomicCursorVisualState,
+    pub(crate) capability_key: Option<CursorCapabilityKey>,
 }
 
 #[derive(Debug, Clone)]
