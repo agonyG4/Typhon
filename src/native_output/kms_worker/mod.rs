@@ -23,6 +23,8 @@ pub(crate) use queue::{
     AttachablePrimary, CursorSidecarOfferError, KmsCommitAdmissionPermit, KmsWorkerAdmissionError,
     KmsWorkerFatalJob, WorkerInFlight,
 };
+#[cfg(test)]
+pub(crate) use thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
 pub(crate) use thread::{KmsCommitWorkerHandle, KmsWorkerEvent, ValidationBaseInvalidationReason};
 pub(crate) use timing::KmsCommitTimingModel;
 

@@ -44,14 +44,14 @@ pub(super) enum PlaneDeltaPreparation {
 }
 
 pub(super) struct PlaneDeltaPreparationSubmit {
-    transaction_id: OutputTransactionId,
-    desired: Option<AtomicCursorVisualState>,
-    cursor_epoch: u64,
-    owned_revision: Option<CursorRevision>,
-    cursor_pin: Option<CursorFramebufferPin>,
-    target: PresentationTarget,
-    validation_base: KmsValidationBase,
-    cursor_delivery: PresentedCursorDelivery,
+    pub(super) transaction_id: OutputTransactionId,
+    pub(super) desired: Option<AtomicCursorVisualState>,
+    pub(super) cursor_epoch: u64,
+    pub(super) owned_revision: Option<CursorRevision>,
+    pub(super) cursor_pin: Option<CursorFramebufferPin>,
+    pub(super) target: PresentationTarget,
+    pub(super) validation_base: KmsValidationBase,
+    pub(super) cursor_delivery: PresentedCursorDelivery,
 }
 
 pub(super) fn plane_delta_reservation_outcome(
@@ -355,7 +355,11 @@ pub(super) fn prepare_plane_delta(
                 owned_revision: Some(promoted.revision),
                 cursor_pin: promoted.lease,
                 target: promoted.deadline,
-                validation_base: promoted.validation_base,
+                // The attachment base was only valid while this sidecar was
+                // offered to a particular primary.  Once it is promoted as
+                // an independent submission, the caller has already rebased
+                // it against the current exact lane state.
+                validation_base,
                 cursor_delivery: promoted.cursor_delivery,
             },
         )));
