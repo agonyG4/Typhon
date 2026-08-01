@@ -43,17 +43,28 @@ pub(super) enum UncertainJobRetention {
     EmergencyQuarantined,
 }
 
-pub(super) const fn validation_base_invalidation_needs_active_replan(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ValidationBaseInvalidationDisposition {
+    Replan,
+    Quarantine,
+}
+
+pub(super) const fn validation_base_invalidation_disposition(
     session_permits_output: bool,
     shutting_down: bool,
     current_generation: u64,
     job_generation: u64,
     reason: ValidationBaseInvalidationReason,
-) -> bool {
-    session_permits_output
+) -> ValidationBaseInvalidationDisposition {
+    if session_permits_output
         && !shutting_down
         && current_generation == job_generation
         && !matches!(reason, ValidationBaseInvalidationReason::GenerationChanged)
+    {
+        ValidationBaseInvalidationDisposition::Replan
+    } else {
+        ValidationBaseInvalidationDisposition::Quarantine
+    }
 }
 
 pub(super) trait FatalWorkerJobHandler {
@@ -1355,30 +1366,34 @@ impl NativeRuntime {
                 drop(sidecar);
             }
             KmsWorkerEvent::ValidationBaseInvalidated { job, reason, .. } => {
-                let active_replan = validation_base_invalidation_needs_active_replan(
+                let disposition = validation_base_invalidation_disposition(
                     self.session.permits_output(),
                     self.shutdown.is_shutting_down(),
                     self.drm_file_generation,
                     job.output_generation,
                     reason,
                 );
-                if active_replan {
-                    self.replan_invalidated_worker_job(job)?;
-                } else {
-                    self.drop_queued_worker_job_with_reason(
-                        job,
-                        OutputTransactionDropReason::SessionSuspended,
-                    )?;
-                }
-                if active_replan {
-                    self.queued_redraw_requested = true;
+                match disposition {
+                    ValidationBaseInvalidationDisposition::Replan => {
+                        self.replan_invalidated_worker_job(job)?;
+                        self.queued_redraw_requested = true;
+                    }
+                    ValidationBaseInvalidationDisposition::Quarantine => {
+                        self.drop_queued_worker_job_with_reason(
+                            job,
+                            OutputTransactionDropReason::SessionSuspended,
+                        )?;
+                    }
                 }
                 self.perf.log("native.kms_commit_worker", || {
                     vec![
                         NativePerfField::str("event", "validation_base_invalidated"),
                         NativePerfField::str(
                             "disposition",
-                            if active_replan { "replan" } else { "suspend" },
+                            match disposition {
+                                ValidationBaseInvalidationDisposition::Replan => "replan",
+                                ValidationBaseInvalidationDisposition::Quarantine => "suspend",
+                            },
                         ),
                         NativePerfField::str("reason", format!("{reason:?}")),
                     ]

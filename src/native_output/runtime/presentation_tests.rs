@@ -1,6 +1,7 @@
 use super::super::planner::visual_target_deadline_for_mode;
 use super::kms_worker::{
-    WorkerRejectionKind, direct_rejection_policy, validation_base_invalidation_needs_active_replan,
+    ValidationBaseInvalidationDisposition, WorkerRejectionKind, direct_rejection_policy,
+    validation_base_invalidation_disposition,
 };
 use super::presentation_transactions::complete_presented_output_transaction;
 use super::*;
@@ -19,38 +20,37 @@ fn active_validation_invalidation_is_replanned_not_suspended() {
         ValidationBaseInvalidationReason::PresentedRevisionChanged,
         ValidationBaseInvalidationReason::BundleMismatch,
     ] {
-        assert!(validation_base_invalidation_needs_active_replan(
-            true, false, 7, 7, reason
-        ));
+        assert_eq!(
+            validation_base_invalidation_disposition(true, false, 7, 7, reason),
+            ValidationBaseInvalidationDisposition::Replan
+        );
     }
-    assert!(!validation_base_invalidation_needs_active_replan(
-        true,
-        false,
-        7,
-        7,
-        ValidationBaseInvalidationReason::GenerationChanged,
-    ));
-    assert!(!validation_base_invalidation_needs_active_replan(
-        false,
-        false,
-        7,
-        7,
-        ValidationBaseInvalidationReason::PredecessorTerminal,
-    ));
-    assert!(!validation_base_invalidation_needs_active_replan(
-        true,
-        true,
-        7,
-        7,
-        ValidationBaseInvalidationReason::PredecessorTerminal,
-    ));
-    assert!(!validation_base_invalidation_needs_active_replan(
-        true,
-        false,
-        8,
-        7,
-        ValidationBaseInvalidationReason::PredecessorTerminal,
-    ));
+    assert_eq!(
+        validation_base_invalidation_disposition(
+            true,
+            false,
+            7,
+            7,
+            ValidationBaseInvalidationReason::GenerationChanged,
+        ),
+        ValidationBaseInvalidationDisposition::Quarantine
+    );
+    for (session_permits_output, shutting_down, current_generation, job_generation) in [
+        (false, false, 7, 7),
+        (true, true, 7, 7),
+        (true, false, 8, 7),
+    ] {
+        assert_eq!(
+            validation_base_invalidation_disposition(
+                session_permits_output,
+                shutting_down,
+                current_generation,
+                job_generation,
+                ValidationBaseInvalidationReason::PredecessorTerminal,
+            ),
+            ValidationBaseInvalidationDisposition::Quarantine
+        );
+    }
 }
 
 #[test]
