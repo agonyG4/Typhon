@@ -99,6 +99,17 @@ pub(super) fn submit_ready_frame(
                 _ => None,
             };
             let pacing_frame_id = frame_pacing.worker_submission_frame_id(true);
+            let test_only = atomic_cursor.as_ref().map_or(
+                crate::native_output::kms_worker::KmsTestOnlyPolicy::Skip,
+                |cursor| match cursor.scheduled_test_policy() {
+                    KmsCursorTestPolicy::Required => {
+                        crate::native_output::kms_worker::KmsTestOnlyPolicy::Required
+                    }
+                    KmsCursorTestPolicy::NotApplicable | KmsCursorTestPolicy::SkipProven => {
+                        crate::native_output::kms_worker::KmsTestOnlyPolicy::Skip
+                    }
+                },
+            );
             let Some(result) = queue_compatibility_for_presentation(
                 worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?,
                 scanout,
@@ -113,7 +124,11 @@ pub(super) fn submit_ready_frame(
                 render_generation,
                 cursor,
                 cursor_pin,
+                atomic_cursor.as_ref().and_then(|native_cursor| {
+                    cursor.and_then(|state| native_cursor.capability_key_for(state))
+                }),
                 pacing_frame_id,
+                test_only,
                 cursor_epoch,
             )?
             else {

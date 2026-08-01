@@ -1,4 +1,4 @@
-use super::cursor_cycle::{NativeResolvedCursorSource, resolve_native_cursor_source};
+use super::cursor_cycle::{NativeResolvedCursorSource, resolve_native_cursor_source_with_hidden};
 use super::cycle::direct_fallback::{DirectFallbackReason, DirectFallbackTracker};
 use super::frame::{
     NativeRepaintInputs, native_repaint_decision, plane_delta_allowed_at_deadline,
@@ -13,7 +13,7 @@ use super::presentation_direct::{
     suppress_direct_render_ahead,
 };
 use super::presentation_metrics::{PipelineSchedulingDiagnostics, log_output_pipeline_snapshot};
-use super::presentation_pipeline::build_output_pipeline_snapshot;
+use super::presentation_pipeline::build_output_pipeline_snapshot_with_presented;
 use super::presentation_protocol::{
     ProtocolCycleMetrics, complete_protocol_only_tick, log_no_visual_work,
     log_wait_for_presentation,
@@ -27,6 +27,7 @@ use super::presentation_transactions::{
 use super::presentation_worker::*;
 use super::*;
 use crate::native_output::kms_worker::KmsCommitWorkerTransport;
+use crate::native_output::kms_worker::KmsTestOnlyPolicy;
 use oblivion_one::native::kms::KmsBackendKind;
 use oblivion_one::native::scheduler::rendered_primary_must_wait_for_lane;
 
@@ -72,6 +73,7 @@ impl NativeRuntime {
             atomic_commit_arbiter,
             emergency_quarantined_worker_jobs,
             output_transactions,
+            presented_planes,
             confirmed_primary_assignment,
             presentation_deadline,
             scheduled_presentation_target,
@@ -109,6 +111,7 @@ impl NativeRuntime {
             native_io_recorder,
             ..
         } = self;
+        *confirmed_primary_assignment = presented_planes.primary;
         let wakeup = &cycle.wakeup;
         let worker_mode = *kms_commit_worker_transport == KmsCommitWorkerTransport::Worker;
         let mut frame_completed = cycle.frame_completed;
@@ -133,8 +136,10 @@ impl NativeRuntime {
         let theme_cursor_visible = input_state.cursor_visible();
         let client_cursor = server.client_cursor_render_state();
         let client_cursor_active = client_cursor.is_some();
-        let resolved_cursor_source = resolve_native_cursor_source(
+        let client_cursor_explicitly_hidden = server.client_cursor_explicitly_hidden();
+        let resolved_cursor_source = resolve_native_cursor_source_with_hidden(
             client_cursor_active,
+            client_cursor_explicitly_hidden,
             server.interaction_cursor_override_active(),
             theme_cursor_visible,
         );
@@ -144,6 +149,7 @@ impl NativeRuntime {
         }
         let mut client_cursor_hardware_usable = false;
         if let Some(cursor) = atomic_cursor.as_mut() {
+            let cursor_image_ready;
             if let Some(client) = client_cursor {
                 let source_key = NativeCursorImageKey::for_surface(
                     client.surface,
@@ -168,11 +174,8 @@ impl NativeRuntime {
                     cursor.note_client_image_failure(source_key);
                     false
                 };
-                if image_ready
-                    && !cursor.capability_quarantined()
-                    && *cursor_scheduling_policy != NativeCursorSchedulingPolicy::Software
-                    && *cursor_render_mode != NativeCursorRenderMode::Software
-                {
+                cursor_image_ready = image_ready;
+                if image_ready {
                     let x = client
                         .logical_x
                         .saturating_add(client.surface.x)
@@ -182,21 +185,13 @@ impl NativeRuntime {
                         .saturating_add(client.surface.y)
                         .saturating_add(client.hotspot_y);
                     cursor.set_position(x, y);
-                    cursor.set_visible(cursor_visible);
-                    *cursor_render_mode = NativeCursorRenderMode::Hardware;
-                    client_cursor_hardware_usable = true;
-                } else {
-                    cursor.set_visible(false);
-                    *cursor_render_mode = NativeCursorRenderMode::SoftwareClient;
-                    *last_client_cursor_damage = None;
-                    cursor.note_software_fallback();
                 }
             } else {
+                let mut theme_image_ready = cursor.using_theme_image();
                 if !cursor.using_theme_image()
                     && let Err(error) = cursor.restore_theme_image(kms.file())
                 {
-                    cursor.set_visible(false);
-                    *cursor_render_mode = NativeCursorRenderMode::Software;
+                    theme_image_ready = false;
                     perf.log("native.cursor", || {
                         vec![
                             NativePerfField::str("event", "theme_restore_failed"),
@@ -204,18 +199,105 @@ impl NativeRuntime {
                         ]
                     });
                 }
-                if *cursor_preference == NativeCursorPreference::Software
-                    || *cursor_scheduling_policy == NativeCursorSchedulingPolicy::Software
-                    || cursor.capability_quarantined()
-                    || !cursor.using_theme_image()
-                {
-                    *cursor_render_mode = NativeCursorRenderMode::Software;
-                } else {
-                    *cursor_render_mode = NativeCursorRenderMode::Hardware;
-                }
+                cursor_image_ready = theme_image_ready;
                 let (x, y) = input_state.cursor_position();
                 cursor.set_position(x, y);
-                cursor.set_visible(cursor_visible);
+            }
+
+            let policy_preference =
+                if *cursor_scheduling_policy == NativeCursorSchedulingPolicy::Software {
+                    CursorPreference::Software
+                } else {
+                    match *cursor_preference {
+                        NativeCursorPreference::Auto => CursorPreference::Auto,
+                        NativeCursorPreference::Hardware => CursorPreference::Hardware,
+                        NativeCursorPreference::Software => CursorPreference::Software,
+                    }
+                };
+            let primary_mode =
+                if confirmed_primary_assignment.is_some_and(|assignment| assignment.is_direct()) {
+                    PlanePrimaryMode::Direct
+                } else {
+                    PlanePrimaryMode::Composed
+                };
+            let transition_primary =
+                confirmed_primary_assignment.and_then(|assignment| match assignment {
+                    ConfirmedPrimaryState::Composed { .. } => None,
+                    ConfirmedPrimaryState::Direct { transaction_id, .. } => Some(transaction_id),
+                });
+            let prospective = AtomicCursorVisualState {
+                visible: cursor_visible && cursor_image_ready,
+                ..cursor.desired().clone()
+            };
+            let capability_key = cursor_image_ready
+                .then(|| cursor.capability_key_for(&prospective))
+                .flatten();
+            let cursor_policy = schedule_planes(PlaneSchedulingInput {
+                revision: cursor.desired_revision(),
+                preference: policy_preference,
+                visible: cursor_visible,
+                geometry: CursorGeometryInput {
+                    pointer_x: prospective.x,
+                    pointer_y: prospective.y,
+                    hotspot_x: prospective.hotspot_x,
+                    hotspot_y: prospective.hotspot_y,
+                    cursor_width: prospective.width,
+                    cursor_height: prospective.height,
+                    output_width: target.width,
+                    output_height: target.height,
+                },
+                geometry_valid: capability_key.is_some(),
+                hardware: capability_key.map(|key| CursorHardwareCapability { key }),
+                capabilities: cursor.capability_cache(),
+                primary_mode,
+                software_allowed: true,
+                predictive_triple_active: adaptive_buffering.mode()
+                    == AdaptiveBufferingMode::Triple,
+                cursor_kms_changed: !prospective.kms_equivalent(cursor.current()),
+                hardware_plane_visible: cursor.current().visible,
+                transition_primary,
+            });
+            let cursor_delta_class = classify_cursor_delta(
+                cursor.current(),
+                matches!(
+                    cursor_policy.delivery,
+                    CursorDeliveryChoice::Hardware { .. }
+                )
+                .then_some(&prospective),
+                matches!(
+                    cursor_policy.delivery,
+                    CursorDeliveryChoice::Software { .. } | CursorDeliveryChoice::Rejected { .. }
+                ),
+            );
+            cursor.set_scheduled_test_policy(if cursor_delta_class == CursorDeltaClass::Visual {
+                KmsCursorTestPolicy::Required
+            } else {
+                cursor_policy.test_policy
+            });
+            match cursor_policy.delivery {
+                CursorDeliveryChoice::Hardware { .. } => {
+                    cursor.set_visible(true);
+                    *cursor_render_mode = NativeCursorRenderMode::Hardware;
+                    client_cursor_hardware_usable = client_cursor_active;
+                }
+                CursorDeliveryChoice::Software { .. } => {
+                    cursor.set_visible(false);
+                    *cursor_render_mode = if client_cursor_active {
+                        NativeCursorRenderMode::SoftwareClient
+                    } else {
+                        NativeCursorRenderMode::Software
+                    };
+                    *last_client_cursor_damage = None;
+                    cursor.note_software_fallback();
+                }
+                CursorDeliveryChoice::Hidden { .. } | CursorDeliveryChoice::Rejected { .. } => {
+                    cursor.set_visible(false);
+                    *cursor_render_mode = if client_cursor_active {
+                        NativeCursorRenderMode::SoftwareClient
+                    } else {
+                        NativeCursorRenderMode::Software
+                    };
+                }
             }
         } else if client_cursor_active {
             *cursor_render_mode = NativeCursorRenderMode::SoftwareClient;
@@ -265,10 +347,9 @@ impl NativeRuntime {
             NativeAtomicCursor::desired_epoch,
         );
         let hardware_cursor_work_pending = cursor_state_changed
-            && *cursor_render_mode == NativeCursorRenderMode::Hardware
-            && atomic_cursor
-                .as_ref()
-                .is_some_and(|cursor| !cursor.capability_quarantined());
+            && atomic_cursor.as_ref().is_some_and(|cursor| {
+                cursor.current().visible || *cursor_render_mode == NativeCursorRenderMode::Hardware
+            });
         let resolved_client_cursor_path =
             resolve_client_cursor_path(client_cursor_active, client_cursor_hardware_usable);
         if *last_client_cursor_path != Some(resolved_client_cursor_path) {
@@ -385,16 +466,16 @@ impl NativeRuntime {
         let pipeline_snapshot = if explicit_output {
             let swapchain =
                 super::presentation_pipeline::require_explicit_output_swapchain(scanout)?;
-            let pipeline = build_output_pipeline_snapshot(
+            let pipeline = build_output_pipeline_snapshot_with_presented(
                 *drm_file_generation,
                 pacing_mode,
                 swapchain,
                 output_transactions,
                 atomic_commit_arbiter,
-                *confirmed_primary_assignment,
+                presented_planes.primary,
                 *scheduled_presentation_target,
                 triple_capability,
-                atomic_cursor.as_ref(),
+                *presented_planes,
             )
             .map_err(|error| {
                 io::Error::other(format!(
@@ -482,6 +563,10 @@ impl NativeRuntime {
         if client_cursor_active {
             cursor_hardware_usable = client_cursor_hardware_usable;
         }
+        let cursor_plane_update_usable = cursor_hardware_usable
+            || atomic_cursor.as_ref().is_some_and(|cursor| {
+                cursor_state_changed && cursor.current().visible && !cursor_visible
+            });
         let direct_inspection = inspect_direct_presentation(DirectPresentationInputs {
             server,
             kms_kind: kms_backend.effective_kind(),
@@ -540,7 +625,7 @@ impl NativeRuntime {
             scheduler_now.get(),
             primary_work_for_cursor,
             cursor_state_changed,
-            cursor_hardware_usable,
+            cursor_plane_update_usable,
         );
         let presentation_path = plan_native_presentation_path(NativePresentationPlanInput {
             direct_active: confirmed_primary_assignment
@@ -567,7 +652,6 @@ impl NativeRuntime {
         suppress_direct_render_ahead(presentation_path, &mut scheduler_decision, scanout, perf);
         if presentation_path == NativePresentationPath::PlaneDelta
             && let Some(cursor) = atomic_cursor.as_mut()
-            && !cursor.capability_quarantined()
             && (!atomic_commit_arbiter.atomic_commit_pending() || can_queue_worker_cursor)
             && !scanout.ready_frame_queued()
         {
@@ -726,8 +810,13 @@ impl NativeRuntime {
                                 framebuffer_id,
                                 lease,
                                 admission,
-                                test_only,
+                                mut test_only,
                             } => {
+                                if atomic_cursor.as_ref().is_some_and(|cursor| {
+                                    cursor.scheduled_test_policy() == KmsCursorTestPolicy::Required
+                                }) {
+                                    test_only = KmsTestOnlyPolicy::Required;
+                                }
                                 let direct_result = finish_direct_worker_queued(
                                     kms_commit_worker
                                         .as_ref()

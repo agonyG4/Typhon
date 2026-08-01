@@ -338,7 +338,11 @@ pub(super) fn queue_explicit_ready_for_presentation(
     crtc_id: u32,
     cursor_update: KmsCursorUpdate,
     cursor_pin: Option<CursorFramebufferPin>,
+    cursor_capability_key: Option<
+        crate::native_output::presentation::plane_policy::CursorCapabilityKey,
+    >,
     pacing_frame_id: Option<u64>,
+    test_only: KmsTestOnlyPolicy,
     ready_submit: bool,
 ) -> NativeResult<Option<(u64, u32, OutputTransactionId)>> {
     match queue_explicit_composited_frame(
@@ -353,7 +357,9 @@ pub(super) fn queue_explicit_ready_for_presentation(
         crtc_id,
         cursor_update,
         cursor_pin,
+        cursor_capability_key,
         pacing_frame_id,
+        test_only,
         ready_submit,
     )? {
         WorkerQueueOutcome::Queued {
@@ -391,9 +397,26 @@ pub(super) fn submit_explicit_ready_for_presentation(
             KmsCursorUpdate::Set(state) => worker_cursor_pin(context.atomic_cursor, Some(state))?,
             KmsCursorUpdate::Unchanged | KmsCursorUpdate::Disable => None,
         };
+        let cursor_capability_key = match &cursor_update {
+            KmsCursorUpdate::Set(state) => context
+                .atomic_cursor
+                .and_then(|cursor| cursor.capability_key_for(state)),
+            KmsCursorUpdate::Unchanged | KmsCursorUpdate::Disable => None,
+        };
         let pacing_frame_id = context
             .frame_pacing
             .worker_submission_frame_id(ready_submit);
+        let test_only =
+            context
+                .atomic_cursor
+                .map_or(KmsTestOnlyPolicy::Skip, |cursor| {
+                    match cursor.scheduled_test_policy() {
+                        KmsCursorTestPolicy::Required => KmsTestOnlyPolicy::Required,
+                        KmsCursorTestPolicy::NotApplicable | KmsCursorTestPolicy::SkipProven => {
+                            KmsTestOnlyPolicy::Skip
+                        }
+                    }
+                });
         return Ok(queue_explicit_ready_for_presentation(
             worker,
             explicit,
@@ -406,7 +429,9 @@ pub(super) fn submit_explicit_ready_for_presentation(
             crtc_id,
             cursor_update,
             cursor_pin,
+            cursor_capability_key,
             pacing_frame_id,
+            test_only,
             ready_submit,
         )?
         .map(|(token, framebuffer_id, transaction_id)| {
@@ -433,7 +458,11 @@ pub(super) fn queue_compatibility_for_presentation(
     render_generation: u64,
     cursor: Option<&AtomicCursorVisualState>,
     cursor_pin: Option<CursorFramebufferPin>,
+    cursor_capability_key: Option<
+        crate::native_output::presentation::plane_policy::CursorCapabilityKey,
+    >,
     pacing_frame_id: Option<u64>,
+    test_only: KmsTestOnlyPolicy,
     cursor_epoch: u64,
 ) -> NativeResult<Option<(NativePresentResult, Option<OutputTransactionId>)>> {
     match super::kms_worker::queue_atomic_compatibility_frame(
@@ -450,7 +479,9 @@ pub(super) fn queue_compatibility_for_presentation(
         render_generation,
         cursor,
         cursor_pin,
+        cursor_capability_key,
         pacing_frame_id,
+        test_only,
         cursor_epoch,
     )? {
         WorkerQueueOutcome::Queued {
@@ -543,6 +574,9 @@ pub(super) fn finish_direct_worker_queued(
                     .descriptor()
                     .clone(),
             ),
+            context.atomic_cursor.and_then(|cursor| {
+                effective_cursor.and_then(|state| cursor.capability_key_for(state))
+            }),
         ),
         transaction_id,
         token: commit_token,
@@ -726,7 +760,7 @@ pub(super) fn worker_cursor_queue_available(
 ) -> bool {
     worker_mode
         && worker.is_some_and(|worker| {
-            worker.has_attachable_primary_opportunity()
+            worker.has_pre_freeze_primary_opportunity()
                 || (arbiter.kernel_commit_submitted()
                     && arbiter.worker_slot_available()
                     && arbiter

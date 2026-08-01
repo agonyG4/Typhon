@@ -740,6 +740,9 @@ pub(super) fn submit_plane_delta(
     current_client_cursor_damage: Option<NativeClientCursorDamageState>,
     current_software_cursor_damage: Option<NativeDamageRect>,
 ) -> NativeResult<SchedulerDecision> {
+    let cursor_capability_key = desired
+        .as_ref()
+        .and_then(|state| cursor.capability_key_for(state));
     match kms_backend.test_atomic_cursor_flip(desired.as_ref()) {
         Ok(()) => {
             let transaction_id = build_cursor_transaction(
@@ -792,7 +795,13 @@ pub(super) fn submit_plane_delta(
                         hidden.framebuffer_id = None;
                         hidden
                     });
-                    let submitted_state = cursor.begin_submission(token, submitted_state);
+                    let submitted_state = cursor.begin_submission_at_revision_with_capability_key(
+                        token,
+                        submitted_state,
+                        cursor_epoch,
+                        cursor.revision_for_legacy_epoch(cursor_epoch),
+                        cursor_capability_key,
+                    );
                     cursor_output_arbitration.note_plane_delta_submission();
                     *last_client_cursor_damage = current_client_cursor_damage;
                     *last_software_cursor_damage = current_software_cursor_damage;
@@ -838,7 +847,7 @@ pub(super) fn submit_plane_delta(
                         MonotonicTimestampNs::new(monotonic_now_ns()?),
                         |_| Ok(()),
                     )?;
-                    cursor.note_submit_failure();
+                    cursor.note_submit_failure_for(cursor_capability_key);
                     cursor.note_software_fallback();
                     cursor.note_composed_software_fallback();
                     cursor.set_visible(false);
@@ -872,7 +881,7 @@ pub(super) fn submit_plane_delta(
             Ok(SchedulerDecision::Idle)
         }
         Err(error) => {
-            cursor.note_test_failure();
+            cursor.note_test_failure_for(cursor_capability_key);
             cursor.note_software_fallback();
             cursor.note_composed_software_fallback();
             cursor.set_visible(false);
