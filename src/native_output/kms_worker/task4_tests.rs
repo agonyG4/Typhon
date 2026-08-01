@@ -1085,6 +1085,67 @@ fn visible_sidecar_replaces_hidden_delivery_as_one_owner_unit() {
 }
 
 #[test]
+fn sidecar_replacement_publishes_its_exact_test_policy() {
+    let handle = KmsCommitWorkerHandle::start(Arc::new(RecordingExecutor::accepting())).unwrap();
+    let (mut primary, primary_id, _) = two_owner_job(917);
+    primary.cursor_delivery =
+        crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware;
+    primary.cursor = KmsCursorUpdate::Set(AtomicCursorVisualState {
+        visible: true,
+        framebuffer_id: Some(917),
+        ..AtomicCursorVisualState::hidden(64, 64)
+    });
+    primary.test_only = KmsTestOnlyPolicy::Required;
+    let mut sidecar = test_sidecar(&primary, 9171, CursorSidecarCoupling::Independent);
+    sidecar.revision =
+        crate::native_output::presentation::plane::CursorRevision::initial().advance_motion();
+    sidecar.assignment = crate::native_output::CursorPlaneAssignment::Atomic {
+        desired_epoch: 2,
+        state: Some(AtomicCursorVisualState {
+            visible: true,
+            framebuffer_id: Some(9171),
+            ..AtomicCursorVisualState::hidden(64, 64)
+        }),
+    };
+    sidecar.test_policy = KmsTestOnlyPolicy::Skip;
+    sidecar.cursor_delivery =
+        crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware;
+    let pause = handle.pause_collecting_sidecar_for_test();
+    let primary_kind = primary.kind;
+    reserve_for_test(&handle, primary_kind)
+        .enqueue(primary)
+        .unwrap();
+    pause.wait_until_selected();
+
+    assert!(offer_sidecar(&handle, sidecar).is_none());
+    pause.release();
+
+    let events = wait_for_fence_event(
+        &handle,
+        917,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 917),
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        KmsWorkerEvent::Submitted { ownership }
+            if ownership.job.test_only == KmsTestOnlyPolicy::Skip
+    )));
+    let identity = events.iter().find_map(|event| {
+        if let KmsWorkerEvent::Submitted { ownership } = event {
+            Some(ownership.job.identity())
+        } else {
+            None
+        }
+    });
+    handle
+        .ack_pageflip_identity(identity.expect("submitted sidecar identity"), primary_id)
+        .unwrap();
+    drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
 fn impossible_cursor_delivery_payloads_are_rejected() {
     let cursor_transaction = |job: &KmsCommitJob, desired| {
         crate::native_output::OutputTransaction::cursor_plane_delta(

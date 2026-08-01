@@ -793,9 +793,7 @@ fn attach_sidecar(job: &mut KmsCommitJob, sidecar: CursorSidecar) {
         revision: sidecar.revision,
         capability_key: sidecar.capability_key,
     });
-    if matches!(sidecar.test_policy, KmsTestOnlyPolicy::Required) {
-        job.test_only = KmsTestOnlyPolicy::Required;
-    }
+    job.test_only = sidecar.test_policy;
 }
 
 fn publish_terminal_sidecar_return(
