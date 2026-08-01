@@ -74,6 +74,7 @@ pub(super) struct CursorPolicyContext<'a> {
     pub(super) cursor_render_mode: &'a mut NativeCursorRenderMode,
     pub(super) last_client_cursor_damage: &'a mut Option<NativeClientCursorDamageState>,
     pub(super) attachable_primary: Option<AttachablePrimary>,
+    pub(super) previous_delivery: CursorDeliveryMode,
     pub(super) validation_base_unchanged: bool,
 }
 
@@ -83,6 +84,37 @@ pub(super) struct RuntimePlanePlan {
     pub(super) desired_hardware_state: Option<AtomicCursorVisualState>,
     pub(super) render_mode: NativeCursorRenderMode,
     pub(super) attachable_primary: Option<AttachablePrimary>,
+}
+
+pub(super) fn presented_delivery_for_plan(
+    plan: Option<&RuntimePlanePlan>,
+    hardware_state: Option<&AtomicCursorVisualState>,
+) -> crate::native_output::presentation::plane::PresentedCursorDelivery {
+    plan.map_or_else(
+        || {
+            hardware_state.map_or(
+                crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
+                |state| {
+                    if state.visible {
+                        crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware
+                    } else {
+                        crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden
+                    }
+                },
+            )
+        },
+        |plan| match plan.decision.delivery {
+            CursorDeliveryChoice::Hardware { .. } => {
+                crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware
+            }
+            CursorDeliveryChoice::Software { .. } => {
+                crate::native_output::presentation::plane::PresentedCursorDelivery::Software
+            }
+            CursorDeliveryChoice::Rejected { .. } | CursorDeliveryChoice::Hidden { .. } => {
+                crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden
+            }
+        },
+    )
 }
 
 pub(super) fn planned_cursor_hardware_usable(
@@ -222,6 +254,17 @@ pub(super) fn apply_cursor_policy_with_runtime_inputs(
     });
     context.validation_base_unchanged =
         !atomic_commit_pending && presented_cursor.kms_equivalent_to(context.cursor.current());
+    context.previous_delivery = match presented_cursor.delivery {
+        crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden => {
+            CursorDeliveryMode::Hidden
+        }
+        crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware => {
+            CursorDeliveryMode::Hardware
+        }
+        crate::native_output::presentation::plane::PresentedCursorDelivery::Software => {
+            CursorDeliveryMode::Software
+        }
+    };
     let plan = apply_cursor_policy(context);
     perf.log("native.cursor_plane_policy", || {
         vec![
@@ -264,10 +307,10 @@ fn build_runtime_plane_plan(
     };
     let next_delivery = match provisional.delivery {
         CursorDeliveryChoice::Hardware { .. } => CursorDeliveryMode::Hardware,
-        CursorDeliveryChoice::Software { .. } | CursorDeliveryChoice::Rejected { .. } => {
-            CursorDeliveryMode::Software
+        CursorDeliveryChoice::Software { .. } => CursorDeliveryMode::Software,
+        CursorDeliveryChoice::Hidden { .. } | CursorDeliveryChoice::Rejected { .. } => {
+            CursorDeliveryMode::Hidden
         }
-        CursorDeliveryChoice::Hidden { .. } => CursorDeliveryMode::Hidden,
     };
     input.next_delivery = next_delivery;
     let mut delta_class = classify_cursor_delta(
@@ -325,6 +368,7 @@ pub(super) fn apply_cursor_policy(context: CursorPolicyContext<'_>) -> RuntimePl
         cursor_render_mode,
         last_client_cursor_damage,
         attachable_primary,
+        previous_delivery,
         validation_base_unchanged,
     } = context;
     let policy_preference = if cursor_scheduling_policy == NativeCursorSchedulingPolicy::Software {
@@ -350,13 +394,6 @@ pub(super) fn apply_cursor_policy(context: CursorPolicyContext<'_>) -> RuntimePl
         .then(|| cursor.capability_key_for(&prospective))
         .flatten();
     let previous_capability_key = cursor.capability_key_for(cursor.current());
-    let previous_delivery = if cursor.current().visible {
-        CursorDeliveryMode::Hardware
-    } else if cursor_render_mode.is_software() {
-        CursorDeliveryMode::Software
-    } else {
-        CursorDeliveryMode::Hidden
-    };
     let input = PlaneSchedulingInput {
         revision: cursor.desired_revision(),
         preference: policy_preference,

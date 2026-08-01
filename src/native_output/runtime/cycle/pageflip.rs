@@ -67,6 +67,7 @@ fn presented_cursor_from_worker_update(
     update: &KmsCursorUpdate,
     revision: CursorRevision,
     coupling: CursorCoupling,
+    delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     fallback: &AtomicCursorVisualState,
 ) -> Option<PresentedCursorState> {
     let state = match update {
@@ -77,10 +78,19 @@ fn presented_cursor_from_worker_update(
             hidden.framebuffer_id = None;
             hidden
         }
-        KmsCursorUpdate::Unchanged => return None,
+        KmsCursorUpdate::Unchanged => {
+            let mut preserved = fallback.clone();
+            if delivery
+                != crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware
+            {
+                preserved.visible = false;
+                preserved.framebuffer_id = None;
+            }
+            preserved
+        }
     };
-    Some(PresentedCursorState::from_atomic(
-        revision, coupling, &state,
+    Some(PresentedCursorState::from_atomic_with_delivery(
+        revision, coupling, delivery, &state,
     ))
 }
 
@@ -994,21 +1004,23 @@ impl NativeRuntime {
                                     (
                                         owner.revision,
                                         owner.sidecar_id.is_some(),
-                                        owner.transaction.id(),
+                                        Some(owner.transaction.id()),
                                         ownership.job.cursor.clone(),
+                                        ownership.job.cursor_delivery,
                                     )
                                 }),
+                                ownership.job.cursor_delivery,
                                 ownership.job.identity(),
                             )
                         });
                     let sidecar_transaction_id = worker_promotion
                         .as_ref()
-                        .and_then(|(_, cursor, _)| cursor.as_ref())
-                        .filter(|(_, sidecar, _, _)| *sidecar)
-                        .map(|(_, _, transaction_id, _)| *transaction_id);
+                        .and_then(|(_, cursor, _, _)| cursor.as_ref())
+                        .filter(|(_, sidecar, _, _, _)| *sidecar)
+                        .and_then(|(_, _, transaction_id, _, _)| *transaction_id);
                     let worker_identity = worker_promotion
                         .as_ref()
-                        .map(|(_, _, identity)| *identity)
+                        .map(|(_, _, _, identity)| *identity)
                         .ok_or_else(|| {
                             io::Error::other(
                                 "worker pageflip has no matching submitted bundle identity",
@@ -1035,7 +1047,9 @@ impl NativeRuntime {
                             },
                         )?;
                     }
-                    if let Some((primary, cursor_owner, bundle_identity)) = worker_promotion {
+                    if let Some((primary, cursor_owner, delivery, bundle_identity)) =
+                        worker_promotion
+                    {
                         if bundle_identity.token != pageflip_token
                             || bundle_identity.output_generation != *drm_file_generation
                             || bundle_identity.crtc_id != target.crtc_id
@@ -1052,9 +1066,29 @@ impl NativeRuntime {
                                 output_generation: bundle_identity.output_generation,
                                 crtc_id: bundle_identity.crtc_id,
                             };
-                        let cursor = cursor_owner.and_then(|(revision, sidecar, _, update)| {
+                        let cursor = cursor_owner
+                            .or_else(|| {
+                                primary.as_ref().map(|_| {
+                                    (
+                                        atomic_cursor
+                                            .as_ref()
+                                            .map_or(CursorRevision::initial(), |cursor| {
+                                                cursor.desired_revision()
+                                            }),
+                                        false,
+                                        None,
+                                        KmsCursorUpdate::Unchanged,
+                                        delivery,
+                                    )
+                                })
+                            })
+                            .and_then(|(revision, sidecar, _, update, delivery)| {
                             let fallback = atomic_cursor.as_ref()?.current();
-                            let coupling = if !matches!(
+                            let coupling = if delivery
+                                == crate::native_output::presentation::plane::PresentedCursorDelivery::Software
+                            {
+                                CursorCoupling::EmbeddedInPrimary
+                            } else if !matches!(
                                 &update,
                                 KmsCursorUpdate::Set(state) if state.visible
                             ) {
@@ -1065,7 +1099,7 @@ impl NativeRuntime {
                                 CursorCoupling::EmbeddedInPrimary
                             };
                             presented_cursor_from_worker_update(
-                                &update, revision, coupling, fallback,
+                                &update, revision, coupling, delivery, fallback,
                             )
                         });
                         if (primary.is_some() || cursor.is_some())

@@ -601,6 +601,7 @@ fn hidden_decision(
 ) -> PlaneSchedulingDecision {
     let disable_hardware_plane = input.hardware_plane_visible;
     let software_boundary = input.previous_delivery == CursorDeliveryMode::Software;
+    let independent_hardware_disable = disable_hardware_plane && input.cursor_kms_changed;
     PlaneSchedulingDecision {
         delivery: CursorDeliveryChoice::Hidden {
             revision: input.revision,
@@ -615,13 +616,17 @@ fn hidden_decision(
             } else {
                 CursorPlaneAction::EmbedInPrimary
             }
-        } else if disable_hardware_plane && input.cursor_kms_changed {
+        } else if independent_hardware_disable {
             CursorPlaneAction::Independent
         } else {
             CursorPlaneAction::None
         },
         pacing_constraint: CursorPacingConstraint::Unchanged,
-        test_policy: KmsCursorTestPolicy::NotApplicable,
+        test_policy: if software_boundary || independent_hardware_disable {
+            KmsCursorTestPolicy::Required
+        } else {
+            KmsCursorTestPolicy::NotApplicable
+        },
         primary_action: if software_boundary && input.primary_mode == PlanePrimaryMode::Direct {
             PrimaryPlaneAction::TransitionToComposed
         } else if software_boundary {
@@ -670,7 +675,11 @@ fn software_decision(
         },
         cursor_action,
         pacing_constraint: CursorPacingConstraint::ReactiveDouble,
-        test_policy: KmsCursorTestPolicy::NotApplicable,
+        test_policy: if input.previous_delivery == CursorDeliveryMode::Hardware {
+            KmsCursorTestPolicy::Required
+        } else {
+            KmsCursorTestPolicy::NotApplicable
+        },
         reason,
     }
 }

@@ -1,7 +1,8 @@
 use super::*;
 use crate::native_output::presentation::plane::{
     CursorCoupling, CursorRevision, KmsCommitBundleId, PlanePageflipIdentity, PlaneWriteSet,
-    PresentedCursorPromotion, PresentedCursorState, PresentedPlaneSnapshot,
+    PresentedCursorDelivery, PresentedCursorPromotion, PresentedCursorState,
+    PresentedPlaneSnapshot,
 };
 use crate::native_output::presentation::plane_policy::{
     CursorCapabilityKey, CursorCapabilityStatus, CursorDeliveryChoice, CursorDeltaClass,
@@ -316,6 +317,81 @@ fn software_boundaries_require_the_primary_frame_that_removes_software_cursor_co
         hidden.primary_action,
         PrimaryPlaneAction::RequirePrimaryFrame
     );
+}
+
+#[test]
+fn hardware_disable_requires_atomic_validation_and_does_not_touch_primary() {
+    let cache = PlaneCapabilityCache::default();
+    let key = capability_key(CursorGeometryClass::FullyVisible);
+    let hidden = schedule_planes(PlaneSchedulingInput {
+        revision: CursorRevision::initial().advance_visibility(),
+        preference: CursorPreference::Auto,
+        visible: false,
+        geometry: geometry(100, 100),
+        geometry_valid: true,
+        hardware: Some(CursorHardwareCapability { key }),
+        capabilities: &cache,
+        primary_mode: PlanePrimaryMode::Composed,
+        software_allowed: true,
+        predictive_triple_active: false,
+        cursor_kms_changed: true,
+        hardware_plane_visible: true,
+        delta_class: CursorDeltaClass::Visibility,
+        previous_delivery: CursorDeliveryMode::Hardware,
+        next_delivery: CursorDeliveryMode::Hidden,
+        validation_base_unchanged: true,
+        attachable_primary: None,
+    });
+
+    assert_eq!(hidden.cursor_action, CursorPlaneAction::Independent);
+    assert_eq!(hidden.primary_action, PrimaryPlaneAction::Preserve);
+    assert_eq!(hidden.test_policy, KmsCursorTestPolicy::Required);
+    assert!(hidden.direct_scanout_compatible);
+}
+
+#[test]
+fn stable_hidden_cursor_preserves_direct_scanout_without_any_kms_work() {
+    let cache = PlaneCapabilityCache::default();
+    let decision = schedule_planes(PlaneSchedulingInput {
+        revision: CursorRevision::initial(),
+        preference: CursorPreference::Auto,
+        visible: false,
+        geometry: geometry(100, 100),
+        geometry_valid: false,
+        hardware: None,
+        capabilities: &cache,
+        primary_mode: PlanePrimaryMode::Direct,
+        software_allowed: true,
+        predictive_triple_active: true,
+        cursor_kms_changed: false,
+        hardware_plane_visible: false,
+        delta_class: CursorDeltaClass::Visual,
+        previous_delivery: CursorDeliveryMode::Hidden,
+        next_delivery: CursorDeliveryMode::Hidden,
+        validation_base_unchanged: true,
+        attachable_primary: None,
+    });
+    assert_eq!(decision.cursor_action, CursorPlaneAction::None);
+    assert_eq!(decision.primary_action, PrimaryPlaneAction::Preserve);
+    assert_eq!(decision.test_policy, KmsCursorTestPolicy::NotApplicable);
+    assert_eq!(
+        decision.pacing_constraint,
+        CursorPacingConstraint::Unchanged
+    );
+    assert!(decision.direct_scanout_compatible);
+}
+
+#[test]
+fn presented_delivery_is_explicit_and_pageflip_owned() {
+    let state = AtomicCursorVisualState::hidden(64, 64);
+    let software = PresentedCursorState::from_atomic_with_delivery(
+        CursorRevision::initial(),
+        CursorCoupling::EmbeddedInPrimary,
+        PresentedCursorDelivery::Software,
+        &state,
+    );
+    assert_eq!(software.delivery, PresentedCursorDelivery::Software);
+    assert!(!software.visible);
 }
 
 #[test]
