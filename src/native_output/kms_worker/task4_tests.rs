@@ -49,6 +49,7 @@ fn test_sidecar(job: &KmsCommitJob, id: u64, coupling: CursorSidecarCoupling) ->
         deadline: job.target,
         crtc_id: job.crtc_id,
         test_policy: KmsTestOnlyPolicy::Skip,
+        capability_key: None,
     }
 }
 
@@ -104,6 +105,7 @@ fn two_owner_job(
             transaction: transaction(cursor_id, token.saturating_mul(10)),
             sidecar_id: None,
             revision: crate::native_output::presentation::plane::CursorRevision::initial(),
+            capability_key: None,
         }),
     )
     .unwrap();
@@ -265,6 +267,80 @@ fn sidecar_offered_before_primary_dequeue_is_attached() {
 }
 
 #[test]
+fn attachable_primary_is_one_exact_pre_freeze_snapshot() {
+    let handle = KmsCommitWorkerHandle::start(Arc::new(RecordingExecutor::accepting())).unwrap();
+    let (job, primary_id, _) = two_owner_job(340);
+    let token = job.token;
+    let target = job.target;
+    let pause = handle.pause_after_dequeue_for_test();
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    pause.wait_until_selected();
+
+    let attachable = handle
+        .attachable_primary(1, 7, target)
+        .expect("pre-freeze primary must be attachable");
+    assert_eq!(attachable.transaction_id, primary_id);
+    assert_eq!(attachable.output_generation, 1);
+    assert_eq!(attachable.crtc_id, 7);
+    assert_eq!(attachable.target, target);
+
+    let frozen = handle.pause_after_freeze_for_test();
+    pause.release();
+    frozen.wait_until_selected();
+    assert!(handle.attachable_primary(1, 7, target).is_none());
+    frozen.release();
+    wait_for_fence_event(&handle, 340, |event| {
+        matches!(event, KmsWorkerEvent::Submitted { .. })
+    });
+    handle.ack_pageflip(token, primary_id, 1).unwrap();
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn newer_sidecar_replaces_embedded_cursor_before_freeze() {
+    let executor = Arc::new(RecordingExecutor::accepting());
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let (mut job, primary_id, _) = two_owner_job(341);
+    let token = job.token;
+    let mut embedded = AtomicCursorVisualState::hidden(64, 64);
+    embedded.visible = true;
+    embedded.framebuffer_id = Some(71);
+    embedded.image_generation = 1;
+    job.cursor = KmsCursorUpdate::Set(embedded.clone());
+
+    let pause = handle.pause_collecting_sidecar_for_test();
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    pause.wait_until_selected();
+    let mut sidecar = test_sidecar(&test_job(341), 912, CursorSidecarCoupling::Independent);
+    let sidecar_id = sidecar.id;
+    let mut newer = embedded.clone();
+    newer.x = 1;
+    sidecar.revision =
+        crate::native_output::presentation::plane::CursorRevision::initial().advance_motion();
+    sidecar.assignment = crate::native_output::CursorPlaneAssignment::Atomic {
+        desired_epoch: 2,
+        state: Some(newer.clone()),
+    };
+    assert!(offer_sidecar(&handle, sidecar).is_none());
+    pause.release();
+
+    let events = wait_for_fence_event(&handle, 341, |event| {
+        matches!(event, KmsWorkerEvent::Submitted { .. })
+    });
+    assert!(events.iter().any(|event| matches!(
+        event,
+        KmsWorkerEvent::Submitted { ownership }
+            if ownership.job.owners.cursor().and_then(|owner| owner.sidecar_id) == Some(sidecar_id)
+                && ownership.job.cursor == KmsCursorUpdate::Set(newer.clone())
+    )));
+    handle.ack_pageflip(token, primary_id, 1).unwrap();
+    drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
 fn predecessor_pageflip_releases_latest_sidecar_with_queued_next_primary() {
     let handle = KmsCommitWorkerHandle::start(Arc::new(RecordingExecutor::accepting())).unwrap();
     let first = test_job(340);
@@ -344,6 +420,44 @@ fn sidecar_offered_after_freeze_remains_pending() {
 }
 
 #[test]
+fn coupled_sidecar_offered_after_freeze_is_returned_when_primary_completes() {
+    let handle = KmsCommitWorkerHandle::start(Arc::new(RecordingExecutor::accepting())).unwrap();
+    let (job, primary_id, _) = two_owner_job(342);
+    let token = job.token;
+    let pause = handle.pause_after_freeze_for_test();
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    pause.wait_until_selected();
+
+    let sidecar = test_sidecar(
+        &test_job(342),
+        911,
+        CursorSidecarCoupling::MustBundleWith(primary_id),
+    );
+    let sidecar_id = sidecar.id;
+    assert!(offer_sidecar(&handle, sidecar).is_none());
+    pause.release();
+
+    let submitted = wait_for_fence_event(&handle, 342, |event| {
+        matches!(event, KmsWorkerEvent::Submitted { .. })
+    });
+    assert!(submitted
+        .iter()
+        .any(|event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token == token)));
+    handle.ack_pageflip(token, primary_id, 1).unwrap();
+    let returned = wait_for_fence_event(&handle, 342, |event| {
+        matches!(event, KmsWorkerEvent::CursorSidecarReturned { .. })
+    });
+    assert!(returned.iter().any(|event| matches!(
+        event,
+        KmsWorkerEvent::CursorSidecarReturned { sidecar, .. } if sidecar.id == sidecar_id
+    )));
+    assert!(handle.pending_cursor_sidecar_id().is_none());
+
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
 fn sidecar_mailbox_replaces_exactly_once_and_never_exceeds_one() {
     let job = test_job(335);
     let first = test_sidecar(&job, 902, CursorSidecarCoupling::Independent);
@@ -360,7 +474,7 @@ fn sidecar_mailbox_replaces_exactly_once_and_never_exceeds_one() {
 }
 
 #[test]
-fn motion_replacement_preserves_existing_required_primary_coupling() {
+fn motion_replacement_does_not_copy_existing_required_primary_coupling() {
     let job = test_job(338);
     let required = job.transaction_id;
     let coupled = test_sidecar(&job, 906, CursorSidecarCoupling::MustBundleWith(required));
@@ -369,14 +483,14 @@ fn motion_replacement_preserves_existing_required_primary_coupling() {
     mailbox.offer(coupled);
 
     let replaced = mailbox.offer(motion).unwrap();
-    assert!(matches!(
+    assert_eq!(
         replaced.coupling,
-        CursorSidecarCoupling::MustBundleWith(id) if id == required
-    ));
-    assert!(matches!(
+        CursorSidecarCoupling::MustBundleWith(required)
+    );
+    assert_eq!(
         mailbox.pending().map(|sidecar| sidecar.coupling),
-        Some(CursorSidecarCoupling::MustBundleWith(id)) if id == required
-    ));
+        Some(CursorSidecarCoupling::Independent)
+    );
 }
 
 #[test]

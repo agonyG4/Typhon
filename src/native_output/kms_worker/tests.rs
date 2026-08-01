@@ -375,7 +375,9 @@ pub(super) fn wait_for_fence_event(
                 KmsWorkerEvent::TestRejected { job, .. }
                 | KmsWorkerEvent::SubmitRejected { job, .. }
                 | KmsWorkerEvent::BusyExhausted { job, .. } => job.token.get() == token,
-                KmsWorkerEvent::Quiesced { .. } | KmsWorkerEvent::Fatal { .. } => true,
+                KmsWorkerEvent::Quiesced { .. }
+                | KmsWorkerEvent::CursorSidecarReturned { .. }
+                | KmsWorkerEvent::Fatal { .. } => true,
             }));
             return events;
         }

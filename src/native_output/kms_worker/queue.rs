@@ -4,6 +4,7 @@ use super::{
     CursorSidecar, CursorSidecarMailbox, KmsCommitBundleIdentity, KmsCommitJob, KmsWorkerEvent,
 };
 use crate::native_output::DirectScanoutCandidateKey;
+use oblivion_one::native::presentation_deadline::PresentationTarget;
 use std::{
     collections::{HashSet, VecDeque},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -212,6 +213,22 @@ pub(crate) enum KmsWorkerPhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttachablePrimaryPhase {
+    Queued,
+    DequeuedWaitingPredecessor,
+    CollectingSidecar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AttachablePrimary {
+    pub(crate) transaction_id: crate::native_output::OutputTransactionId,
+    pub(crate) output_generation: u64,
+    pub(crate) crtc_id: u32,
+    pub(crate) target: PresentationTarget,
+    pub(crate) phase: AttachablePrimaryPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KmsWorkerAdmissionError {
     DuplicateCandidate,
     QueueFull,
@@ -368,22 +385,62 @@ pub(crate) struct WorkerState {
     pub(crate) executing: bool,
     pub(crate) executing_direct_content_key: Option<DirectScanoutCandidateKey>,
     pub(crate) executing_primary_transaction_id: Option<crate::native_output::OutputTransactionId>,
+    pub(crate) executing_primary: Option<AttachablePrimary>,
     pub(crate) inflight: Option<WorkerInFlight>,
     pub(crate) phase: KmsWorkerPhase,
     pub(crate) cursor_sidecar: CursorSidecarMailbox,
 }
 
 impl WorkerShared {
-    pub(crate) fn has_attachable_primary_opportunity(&self) -> bool {
+    pub(crate) fn has_pre_freeze_primary_opportunity(&self) -> bool {
         let state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let queued_primary = state
-            .queued
-            .front()
-            .is_some_and(|job| job.kind.is_primary());
-        queued_primary || state.executing
+        state.queued.front().is_some_and(|job| {
+            job.kind.is_primary()
+                && matches!(job.primary, super::KmsPrimaryUpdate::Framebuffer { .. })
+                && matches!(job.cursor, super::KmsCursorUpdate::Unchanged)
+                && job.owners.primary_transaction_id().is_some()
+        }) || state.executing_primary.is_some()
+    }
+
+    pub(crate) fn attachable_primary(
+        &self,
+        output_generation: u64,
+        crtc_id: u32,
+        target: PresentationTarget,
+    ) -> Option<AttachablePrimary> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let queued = state.queued.front().and_then(|job| {
+            if job.kind.is_primary()
+                && matches!(job.primary, super::KmsPrimaryUpdate::Framebuffer { .. })
+                && matches!(job.cursor, super::KmsCursorUpdate::Unchanged)
+                && job.output_generation == output_generation
+                && job.crtc_id == crtc_id
+                && job.target == target
+            {
+                Some(AttachablePrimary {
+                    transaction_id: job.owners.primary_transaction_id()?,
+                    output_generation: job.output_generation,
+                    crtc_id: job.crtc_id,
+                    target: job.target,
+                    phase: AttachablePrimaryPhase::Queued,
+                })
+            } else {
+                None
+            }
+        });
+        queued.or_else(|| {
+            state.executing_primary.filter(|primary| {
+                primary.output_generation == output_generation
+                    && primary.crtc_id == crtc_id
+                    && primary.target == target
+            })
+        })
     }
 
     pub(crate) fn new(result_fd: OwnedFd) -> Self {
@@ -396,6 +453,7 @@ impl WorkerShared {
                 executing: false,
                 executing_direct_content_key: None,
                 executing_primary_transaction_id: None,
+                executing_primary: None,
                 inflight: None,
                 phase: KmsWorkerPhase::Idle,
                 cursor_sidecar: CursorSidecarMailbox::default(),

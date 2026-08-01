@@ -25,6 +25,15 @@ pub(super) enum WorkerQueueOutcome {
     Unavailable(KmsWorkerAdmissionError),
 }
 
+fn scheduled_kms_test_policy(cursor: &NativeAtomicCursor) -> KmsTestOnlyPolicy {
+    match cursor.scheduled_test_policy() {
+        KmsCursorTestPolicy::Required => KmsTestOnlyPolicy::Required,
+        KmsCursorTestPolicy::NotApplicable | KmsCursorTestPolicy::SkipProven => {
+            KmsTestOnlyPolicy::Skip
+        }
+    }
+}
+
 pub(super) enum PlaneDeltaPreparation {
     Return(WorkerQueueOutcome),
     Submit {
@@ -154,6 +163,9 @@ pub(super) fn queue_plane_delta(
                     .descriptor()
                     .clone(),
             ),
+            desired
+                .as_ref()
+                .and_then(|state| cursor.capability_key_for(state)),
         ),
         transaction_id,
         token,
@@ -177,11 +189,7 @@ pub(super) fn queue_plane_delta(
         direct_primary_lease: None,
         test_only_duration_ns: None,
         pacing_frame_id: None,
-        test_only: if cursor.current_capability_proven() {
-            KmsTestOnlyPolicy::Skip
-        } else {
-            KmsTestOnlyPolicy::Required
-        },
+        test_only: scheduled_kms_test_policy(cursor),
         ready_submit: false,
     };
     let descriptor = output_transactions
@@ -205,16 +213,25 @@ pub(super) fn queue_plane_delta(
         hidden
     });
     let queue_result = match owned_revision {
-        Some(revision) => cursor.queue_owned_worker_submission(
+        Some(revision) => cursor.queue_owned_worker_submission_with_capability_key(
             transaction_id,
             token,
             cursor_epoch,
             revision,
             queued_visual_state,
+            desired
+                .as_ref()
+                .and_then(|state| cursor.capability_key_for(state)),
         ),
-        None => {
-            cursor.queue_worker_submission(transaction_id, token, cursor_epoch, queued_visual_state)
-        }
+        None => cursor.queue_worker_submission_with_capability_key(
+            transaction_id,
+            token,
+            cursor_epoch,
+            queued_visual_state,
+            desired
+                .as_ref()
+                .and_then(|state| cursor.capability_key_for(state)),
+        ),
     };
     if let Err(error) = queue_result {
         atomic_commit_arbiter.reject_worker_queued(token);
@@ -319,6 +336,7 @@ pub(super) fn prepare_plane_delta(
         transaction_id,
         target,
         crtc_id,
+        output_generation,
     )? {
         return Ok(PlaneDeltaPreparation::Return(outcome));
     }
@@ -342,10 +360,12 @@ pub(super) fn try_offer_cursor_sidecar(
     transaction_id: OutputTransactionId,
     target: PresentationTarget,
     crtc_id: u32,
+    output_generation: u64,
 ) -> NativeResult<Option<WorkerQueueOutcome>> {
-    if !worker.has_attachable_primary_opportunity() {
+    let Some(attachable_primary) = worker.attachable_primary(output_generation, crtc_id, target)
+    else {
         return Ok(None);
-    }
+    };
     let descriptor = output_transactions
         .transaction(transaction_id)
         .ok_or_else(|| io::Error::other("sidecar transaction disappeared"))?
@@ -359,11 +379,7 @@ pub(super) fn try_offer_cursor_sidecar(
     let visibility_transition =
         desired.is_some_and(|state| state.visible) != cursor.current().visible;
     let coupling = if visibility_transition {
-        CursorSidecarCoupling::MustBundleWith(
-            worker
-                .attachable_primary_transaction_id()
-                .ok_or_else(|| io::Error::other("coupled sidecar has no primary owner"))?,
-        )
+        CursorSidecarCoupling::MustBundleWith(attachable_primary.transaction_id)
     } else {
         CursorSidecarCoupling::Independent
     };
@@ -380,11 +396,8 @@ pub(super) fn try_offer_cursor_sidecar(
         created_at: descriptor.created_at(),
         deadline: target,
         crtc_id,
-        test_policy: if cursor.current_capability_proven() {
-            KmsTestOnlyPolicy::Skip
-        } else {
-            KmsTestOnlyPolicy::Required
-        },
+        test_policy: scheduled_kms_test_policy(cursor),
+        capability_key: desired.and_then(|state| cursor.capability_key_for(state)),
     };
     match worker.offer_cursor_sidecar(sidecar) {
         Ok(replaced) => {
@@ -435,7 +448,7 @@ pub(super) fn cursor_worker_opportunities(
     (
         super::presentation_worker::worker_cursor_queue_available(worker_mode, worker, arbiter),
         worker_mode
-            && worker.is_some_and(KmsCommitWorkerHandle::has_attachable_primary_opportunity),
+            && worker.is_some_and(KmsCommitWorkerHandle::has_pre_freeze_primary_opportunity),
     )
 }
 
