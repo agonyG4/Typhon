@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::native_output::{
     CursorPlaneAssignment, OutputTransaction, OutputTransactionId,
     presentation::plane::{CursorRevision, CursorSidecarId},
+    presentation::plane_policy::CursorCapabilityKey,
     runtime::AtomicCommitKind,
 };
 use oblivion_one::native::kms::PageFlipToken;
@@ -17,6 +18,7 @@ pub(crate) struct KmsCursorOwner {
     pub(crate) transaction: Arc<OutputTransaction>,
     pub(crate) sidecar_id: Option<CursorSidecarId>,
     pub(crate) revision: CursorRevision,
+    pub(crate) capability_key: Option<CursorCapabilityKey>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,6 +90,7 @@ impl KmsBundleOwners {
     pub(crate) fn for_legacy_transaction(
         kind: AtomicCommitKind,
         transaction: Arc<OutputTransaction>,
+        capability_key: Option<CursorCapabilityKey>,
     ) -> Self {
         let primary =
             (!matches!(kind, AtomicCommitKind::PlaneDelta { .. })).then(|| KmsPrimaryOwner {
@@ -110,6 +113,7 @@ impl KmsBundleOwners {
             },
             transaction,
             sidecar_id: None,
+            capability_key,
         });
         Self { primary, cursor }
     }

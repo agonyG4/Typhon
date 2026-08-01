@@ -11,6 +11,8 @@ pub(crate) struct CursorOutputIdentity {
     pub(crate) crtc_id: u32,
     pub(crate) mode_width: u32,
     pub(crate) mode_height: u32,
+    pub(crate) output_transform: u32,
+    pub(crate) output_scale_milli: u32,
 }
 
 impl CursorOutputIdentity {
@@ -19,6 +21,25 @@ impl CursorOutputIdentity {
             crtc_id,
             mode_width,
             mode_height,
+            output_transform: 0,
+            output_scale_milli: 1_000,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn with_transform_scale(
+        crtc_id: u32,
+        mode_width: u32,
+        mode_height: u32,
+        output_transform: u32,
+        output_scale_milli: u32,
+    ) -> Self {
+        Self {
+            crtc_id,
+            mode_width,
+            mode_height,
+            output_transform,
+            output_scale_milli,
         }
     }
 }
@@ -73,9 +94,12 @@ pub(crate) struct NativeAtomicCursor {
     pub(crate) counters: AtomicCursorCounters,
     plane_lifecycle: CursorPlaneLifecycle,
     capability_cache: crate::native_output::presentation::plane_policy::PlaneCapabilityCache,
+    scheduled_test_policy: crate::native_output::presentation::plane_policy::KmsCursorTestPolicy,
     crtc_id: u32,
     mode_width: u32,
     mode_height: u32,
+    output_transform: u32,
+    output_scale_milli: u32,
     client_image_failure: Option<NativeCursorImageKey>,
     pending_token: Option<PageFlipToken>,
     pending_is_primary: bool,
@@ -129,9 +153,13 @@ impl NativeAtomicCursor {
             counters: AtomicCursorCounters::default(),
             plane_lifecycle: CursorPlaneLifecycle::new(generation),
             capability_cache: Default::default(),
+            scheduled_test_policy:
+                crate::native_output::presentation::plane_policy::KmsCursorTestPolicy::Required,
             crtc_id: output.crtc_id,
             mode_width: output.mode_width,
             mode_height: output.mode_height,
+            output_transform: output.output_transform,
+            output_scale_milli: output.output_scale_milli,
             client_image_failure: None,
             pending_token: None,
             pending_is_primary: false,
@@ -168,17 +196,28 @@ impl NativeAtomicCursor {
     pub(crate) fn presented_plane_state(
         &self,
     ) -> crate::native_output::presentation::plane::PresentedCursorState {
-        use crate::native_output::presentation::plane::{CursorCoupling, PresentedCursorState};
+        use crate::native_output::presentation::plane::CursorCoupling;
 
         let coupling = if self.current.visible {
             CursorCoupling::IndependentPlane
         } else {
             CursorCoupling::Hidden
         };
-        let presented =
-            PresentedCursorState::from_atomic(self.revisions.presented(), coupling, &self.current);
+        let presented = self.presented_plane_state_with(self.revisions.presented(), coupling);
         debug_assert!(presented.kms_equivalent_to(&self.current));
         presented
+    }
+
+    pub(crate) fn presented_plane_state_with(
+        &self,
+        revision: crate::native_output::presentation::plane::CursorRevision,
+        coupling: crate::native_output::presentation::plane::CursorCoupling,
+    ) -> crate::native_output::presentation::plane::PresentedCursorState {
+        crate::native_output::presentation::plane::PresentedCursorState::from_atomic(
+            revision,
+            coupling,
+            &self.current,
+        )
     }
 
     pub(crate) const fn desired_epoch(&self) -> u64 {
@@ -204,12 +243,30 @@ impl NativeAtomicCursor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn queue_worker_submission(
         &mut self,
         transaction_id: crate::native_output::OutputTransactionId,
         token: PageFlipToken,
         cursor_epoch: u64,
         visual_state: AtomicCursorVisualState,
+    ) -> io::Result<()> {
+        self.queue_worker_submission_with_capability_key(
+            transaction_id,
+            token,
+            cursor_epoch,
+            visual_state,
+            None,
+        )
+    }
+
+    pub(crate) fn queue_worker_submission_with_capability_key(
+        &mut self,
+        transaction_id: crate::native_output::OutputTransactionId,
+        token: PageFlipToken,
+        cursor_epoch: u64,
+        visual_state: AtomicCursorVisualState,
+        capability_key: Option<CursorCapabilityKey>,
     ) -> io::Result<()> {
         if self.worker_queued.is_some() {
             return Err(io::Error::other(
@@ -221,15 +278,17 @@ impl NativeAtomicCursor {
                 "Atomic cursor worker submission has a stale desired epoch",
             ));
         }
-        self.queue_owned_worker_submission(
+        self.queue_owned_worker_submission_with_capability_key(
             transaction_id,
             token,
             cursor_epoch,
             self.desired_revision(),
             visual_state,
+            capability_key,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn queue_owned_worker_submission(
         &mut self,
         transaction_id: crate::native_output::OutputTransactionId,
@@ -237,6 +296,25 @@ impl NativeAtomicCursor {
         cursor_epoch: u64,
         revision: crate::native_output::presentation::plane::CursorRevision,
         visual_state: AtomicCursorVisualState,
+    ) -> io::Result<()> {
+        self.queue_owned_worker_submission_with_capability_key(
+            transaction_id,
+            token,
+            cursor_epoch,
+            revision,
+            visual_state,
+            None,
+        )
+    }
+
+    pub(crate) fn queue_owned_worker_submission_with_capability_key(
+        &mut self,
+        transaction_id: crate::native_output::OutputTransactionId,
+        token: PageFlipToken,
+        cursor_epoch: u64,
+        revision: crate::native_output::presentation::plane::CursorRevision,
+        visual_state: AtomicCursorVisualState,
+        capability_key: Option<CursorCapabilityKey>,
     ) -> io::Result<()> {
         if self.worker_queued.is_some() {
             return Err(io::Error::other(
@@ -249,6 +327,7 @@ impl NativeAtomicCursor {
             cursor_epoch,
             revision,
             visual_state,
+            capability_key,
         });
         Ok(())
     }
@@ -386,30 +465,13 @@ impl NativeAtomicCursor {
         !desired.kms_equivalent(&self.current) && self.pending_token.is_none()
     }
 
-    pub(crate) fn begin_submission(
-        &mut self,
-        token: PageFlipToken,
-        state: AtomicCursorVisualState,
-    ) -> AtomicCursorVisualState {
-        self.begin_submission_at_epoch(token, state, self.desired_epoch)
-    }
-
-    pub(crate) fn begin_submission_at_epoch(
-        &mut self,
-        token: PageFlipToken,
-        state: AtomicCursorVisualState,
-        cursor_epoch: u64,
-    ) -> AtomicCursorVisualState {
-        let revision = self.revision_for_legacy_epoch(cursor_epoch);
-        self.begin_submission_at_revision(token, state, cursor_epoch, revision)
-    }
-
-    pub(crate) fn begin_submission_at_revision(
+    pub(crate) fn begin_submission_at_revision_with_capability_key(
         &mut self,
         token: PageFlipToken,
         state: AtomicCursorVisualState,
         cursor_epoch: u64,
         revision: crate::native_output::presentation::plane::CursorRevision,
+        capability_key: Option<CursorCapabilityKey>,
     ) -> AtomicCursorVisualState {
         if self.dirty.position {
             self.counters.position_submissions =
@@ -422,7 +484,11 @@ impl NativeAtomicCursor {
         self.pending_is_primary = false;
         self.dirty = AtomicCursorDirty::default();
         self.counters.updates_submitted = self.counters.updates_submitted.saturating_add(1);
-        self.mark_current_capability_proven();
+        if state.visible
+            && let Some(key) = capability_key
+        {
+            self.mark_capability_proven(key);
+        }
         state
     }
 
@@ -499,30 +565,57 @@ impl NativeAtomicCursor {
         cursor_epoch: u64,
         revision: crate::native_output::presentation::plane::CursorRevision,
     ) {
+        self.begin_primary_submission_at_revision_with_capability_key(
+            token,
+            state,
+            cursor_epoch,
+            revision,
+            None,
+        );
+    }
+
+    pub(crate) fn begin_primary_submission_at_revision_with_capability_key(
+        &mut self,
+        token: PageFlipToken,
+        state: AtomicCursorVisualState,
+        cursor_epoch: u64,
+        revision: crate::native_output::presentation::plane::CursorRevision,
+        capability_key: Option<CursorCapabilityKey>,
+    ) {
         self.counters.primary_submissions = self.counters.primary_submissions.saturating_add(1);
-        self.submitted = state;
+        self.submitted = state.clone();
         self.submitted_epoch = cursor_epoch;
         self.revisions.mark_submitted(revision);
         self.pending_token = Some(token);
         self.pending_is_primary = true;
         self.dirty = AtomicCursorDirty::default();
         self.counters.updates_submitted = self.counters.updates_submitted.saturating_add(1);
-        self.mark_current_capability_proven();
+        if state.visible
+            && let Some(key) = capability_key
+        {
+            self.mark_capability_proven(key);
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn mark_capability_quarantined(&mut self) {
-        self.quarantine_current_capability(CursorQuarantineReason::PermanentSubmitRejection);
+        if let Some(key) = self.capability_key_for(&self.desired.clone()) {
+            self.quarantine_capability(key, CursorQuarantineReason::PermanentSubmitRejection);
+        }
     }
 
-    pub(crate) fn note_test_failure(&mut self) {
+    pub(crate) fn note_test_failure_for(&mut self, key: Option<CursorCapabilityKey>) {
         self.counters.test_failures = self.counters.test_failures.saturating_add(1);
-        self.quarantine_current_capability(CursorQuarantineReason::TestOnlyRejected);
+        if let Some(key) = key {
+            self.quarantine_capability(key, CursorQuarantineReason::TestOnlyRejected);
+        }
     }
 
-    pub(crate) fn note_submit_failure(&mut self) {
+    pub(crate) fn note_submit_failure_for(&mut self, key: Option<CursorCapabilityKey>) {
         self.counters.submit_failures = self.counters.submit_failures.saturating_add(1);
-        self.quarantine_current_capability(CursorQuarantineReason::PermanentSubmitRejection);
+        if let Some(key) = key {
+            self.quarantine_capability(key, CursorQuarantineReason::PermanentSubmitRejection);
+        }
     }
 
     pub(crate) fn note_software_fallback(&mut self) {
@@ -698,20 +791,22 @@ impl NativeAtomicCursor {
         Ok(restored)
     }
 
-    fn current_capability_key(
+    pub(crate) fn capability_key_for(
         &self,
+        state: &AtomicCursorVisualState,
     ) -> Option<crate::native_output::presentation::plane_policy::CursorCapabilityKey> {
         use crate::native_output::presentation::plane_policy::{
-            CursorCapabilityKey, CursorGeometryInput, normalize_cursor_geometry,
+            CursorCapabilityKey, CursorGeometryClass, CursorGeometryInput,
+            normalize_cursor_geometry,
         };
 
         let geometry = normalize_cursor_geometry(CursorGeometryInput {
-            pointer_x: self.desired.x,
-            pointer_y: self.desired.y,
-            hotspot_x: self.desired.hotspot_x,
-            hotspot_y: self.desired.hotspot_y,
-            cursor_width: self.desired.width,
-            cursor_height: self.desired.height,
+            pointer_x: state.x,
+            pointer_y: state.y,
+            hotspot_x: state.hotspot_x,
+            hotspot_y: state.hotspot_y,
+            cursor_width: state.width,
+            cursor_height: state.height,
             output_width: self.mode_width,
             output_height: self.mode_height,
         })?;
@@ -721,33 +816,73 @@ impl NativeAtomicCursor {
             plane_id: self.plane.plane_id,
             mode_width: self.mode_width,
             mode_height: self.mode_height,
-            output_transform: 0,
-            output_scale_milli: 1_000,
+            output_transform: self.output_transform,
+            output_scale_milli: self.output_scale_milli,
             format: self.plane.format_modifier.fourcc,
             modifier: self.plane.format_modifier.modifier,
-            cursor_width: self.desired.width,
-            cursor_height: self.desired.height,
+            cursor_width: state.width,
+            cursor_height: state.height,
             hotspot_property_available: false,
             geometry_class: geometry.class,
+            source_x: geometry.source.x,
+            source_y: geometry.source.y,
+            source_width: geometry.source.width,
+            source_height: geometry.source.height,
+            // For fully-visible motion, the destination origin is a
+            // position-only property and must not invalidate the capability
+            // proof. Clipped destinations retain their exact boundary so an
+            // edge/corner crop cannot reuse a proof for another crop.
+            destination_x: if geometry.class == CursorGeometryClass::FullyVisible {
+                0
+            } else {
+                geometry.destination.x
+            },
+            destination_y: if geometry.class == CursorGeometryClass::FullyVisible {
+                0
+            } else {
+                geometry.destination.y
+            },
+            destination_width: geometry.destination.width,
+            destination_height: geometry.destination.height,
         })
     }
 
-    fn quarantine_current_capability(&mut self, reason: CursorQuarantineReason) {
-        if let Some(key) = self.current_capability_key() {
-            self.capability_cache.quarantine(key, reason);
-        }
+    #[cfg(test)]
+    pub(crate) fn capability_status(&self, key: CursorCapabilityKey) -> CursorCapabilityStatus {
+        self.capability_cache.status(key)
     }
 
-    fn mark_current_capability_proven(&mut self) {
-        if self.submitted.visible
-            && let Some(key) = self.current_capability_key()
-        {
-            self.capability_cache.mark_proven(key);
-        }
+    pub(crate) fn capability_cache(&self) -> &PlaneCapabilityCache {
+        &self.capability_cache
+    }
+
+    pub(crate) fn set_scheduled_test_policy(
+        &mut self,
+        policy: crate::native_output::presentation::plane_policy::KmsCursorTestPolicy,
+    ) {
+        self.scheduled_test_policy = policy;
+    }
+
+    pub(crate) const fn scheduled_test_policy(
+        &self,
+    ) -> crate::native_output::presentation::plane_policy::KmsCursorTestPolicy {
+        self.scheduled_test_policy
+    }
+
+    pub(crate) fn mark_capability_proven(&mut self, key: CursorCapabilityKey) {
+        self.capability_cache.mark_proven(key);
+    }
+
+    pub(crate) fn quarantine_capability(
+        &mut self,
+        key: CursorCapabilityKey,
+        reason: CursorQuarantineReason,
+    ) {
+        self.capability_cache.quarantine(key, reason);
     }
 
     pub(crate) fn capability_quarantined(&self) -> bool {
-        self.current_capability_key().is_some_and(|key| {
+        self.capability_key_for(&self.desired).is_some_and(|key| {
             matches!(
                 self.capability_cache.status(key),
                 CursorCapabilityStatus::Quarantined { .. }
@@ -755,8 +890,9 @@ impl NativeAtomicCursor {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn current_capability_proven(&self) -> bool {
-        self.current_capability_key()
+        self.capability_key_for(&self.desired)
             .is_some_and(|key| self.capability_cache.status(key) == CursorCapabilityStatus::Proven)
     }
 

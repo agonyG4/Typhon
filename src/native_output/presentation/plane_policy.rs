@@ -1,8 +1,7 @@
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 use crate::native_output::OutputTransactionId;
+use oblivion_one::native::kms::AtomicCursorVisualState;
 
 use super::plane::CursorRevision;
 
@@ -30,8 +29,20 @@ pub(crate) struct CursorCapabilityKey {
     pub(crate) cursor_height: u32,
     pub(crate) hotspot_property_available: bool,
     pub(crate) geometry_class: CursorGeometryClass,
+    /// Exact normalized source crop used by the Atomic cursor assignment.
+    /// The geometry class is only a policy category; these fields are the
+    /// validation identity for the payload the kernel will receive.
+    pub(crate) source_x: u32,
+    pub(crate) source_y: u32,
+    pub(crate) source_width: u32,
+    pub(crate) source_height: u32,
+    pub(crate) destination_x: i32,
+    pub(crate) destination_y: i32,
+    pub(crate) destination_width: u32,
+    pub(crate) destination_height: u32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CursorQuarantineReason {
     UnsupportedSize,
@@ -66,6 +77,7 @@ impl PlaneCapabilityCache {
             .unwrap_or(CursorCapabilityStatus::Unknown)
     }
 
+    #[cfg(test)]
     pub(crate) fn set_status(&mut self, key: CursorCapabilityKey, status: CursorCapabilityStatus) {
         if status == CursorCapabilityStatus::Unknown {
             self.entries.remove(&key);
@@ -106,6 +118,8 @@ impl PlaneCapabilityCache {
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CursorFailureKind {
     Busy,
@@ -121,6 +135,7 @@ pub(crate) enum CursorFailureKind {
     GenerationMismatch,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CursorFailureDisposition {
     Defer,
@@ -129,6 +144,7 @@ pub(crate) enum CursorFailureDisposition {
     Invalidate,
 }
 
+#[cfg(test)]
 pub(crate) const fn classify_cursor_failure(
     failure: CursorFailureKind,
 ) -> CursorFailureDisposition {
@@ -254,6 +270,47 @@ pub(crate) enum CursorPreference {
     Auto,
     Hardware,
     Software,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorDeltaClass {
+    PositionOnly,
+    Visual,
+    Visibility,
+    DeliveryModeTransition,
+}
+
+pub(crate) fn classify_cursor_delta(
+    previous: &AtomicCursorVisualState,
+    next: Option<&AtomicCursorVisualState>,
+    software_composition_required: bool,
+) -> CursorDeltaClass {
+    let Some(next) = next else {
+        return if software_composition_required && previous.visible {
+            CursorDeltaClass::DeliveryModeTransition
+        } else if previous.visible {
+            CursorDeltaClass::Visibility
+        } else {
+            CursorDeltaClass::PositionOnly
+        };
+    };
+    if software_composition_required && previous.visible != next.visible {
+        return CursorDeltaClass::DeliveryModeTransition;
+    }
+    if previous.visible != next.visible {
+        return CursorDeltaClass::Visibility;
+    }
+    if previous.framebuffer_id != next.framebuffer_id
+        || previous.width != next.width
+        || previous.height != next.height
+        || previous.hotspot_x != next.hotspot_x
+        || previous.hotspot_y != next.hotspot_y
+        || previous.image_generation != next.image_generation
+    {
+        CursorDeltaClass::Visual
+    } else {
+        CursorDeltaClass::PositionOnly
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,6 +465,7 @@ pub(crate) struct PlaneSchedulingDecision {
 }
 
 pub(crate) fn schedule_planes(input: PlaneSchedulingInput<'_>) -> PlaneSchedulingDecision {
+    let _predictive_triple_active = input.predictive_triple_active;
     let hardware_status = input
         .hardware
         .map_or(CursorHardwareStatus::Unavailable, |hardware| {
@@ -444,7 +502,26 @@ pub(crate) fn schedule_planes(input: PlaneSchedulingInput<'_>) -> PlaneSchedulin
     let Some(hardware) = input.hardware else {
         return hardware_fallback(input, PlaneSchedulingReason::HardwareUnavailable);
     };
-    if !input.geometry_valid || hardware.key.geometry_class != geometry.class {
+    let expected_destination_x = if geometry.class == CursorGeometryClass::FullyVisible {
+        0
+    } else {
+        geometry.destination.x
+    };
+    let expected_destination_y = if geometry.class == CursorGeometryClass::FullyVisible {
+        0
+    } else {
+        geometry.destination.y
+    };
+    let geometry_matches_key = hardware.key.geometry_class == geometry.class
+        && hardware.key.source_x == geometry.source.x
+        && hardware.key.source_y == geometry.source.y
+        && hardware.key.source_width == geometry.source.width
+        && hardware.key.source_height == geometry.source.height
+        && hardware.key.destination_x == expected_destination_x
+        && hardware.key.destination_y == expected_destination_y
+        && hardware.key.destination_width == geometry.destination.width
+        && hardware.key.destination_height == geometry.destination.height;
+    if !input.geometry_valid || !geometry_matches_key {
         return hardware_fallback(input, PlaneSchedulingReason::InvalidHardwareGeometry);
     }
 

@@ -92,6 +92,8 @@ fn test_cursor() -> NativeAtomicCursor {
             pixel_blend_mode_premultiplied: None,
         },
         generation: 1,
+        output_transform: 0,
+        output_scale_milli: 1_000,
         desired_epoch: INITIAL_CURSOR_EPOCH,
         submitted_epoch: INITIAL_CURSOR_EPOCH,
         revisions: CursorRevisionTracker::new(),
@@ -100,6 +102,7 @@ fn test_cursor() -> NativeAtomicCursor {
         counters: AtomicCursorCounters::default(),
         plane_lifecycle: CursorPlaneLifecycle::new(1),
         capability_cache: Default::default(),
+        scheduled_test_policy: KmsCursorTestPolicy::Required,
         crtc_id: 2,
         mode_width: 1920,
         mode_height: 1080,
@@ -243,11 +246,12 @@ fn worker_cursor_success_advances_exact_epoch_once() {
     let queued = cursor
         .take_worker_submission(transaction_id, token, queued_epoch)
         .unwrap();
-    cursor.begin_submission_at_revision(
+    cursor.begin_submission_at_revision_with_capability_key(
         token,
         queued.visual_state,
         queued.cursor_epoch,
         queued.revision,
+        queued.capability_key,
     );
 
     assert_eq!(cursor.submitted_epoch(), queued_epoch);
@@ -278,11 +282,12 @@ fn desired_queued_submitted_and_current_cursor_states_advance_at_exact_boundarie
         .take_worker_submission(transaction_id, token, desired_epoch)
         .unwrap();
     let submitted_revision = queued.revision;
-    cursor.begin_submission_at_revision(
+    cursor.begin_submission_at_revision_with_capability_key(
         token,
         queued.visual_state,
         queued.cursor_epoch,
         queued.revision,
+        queued.capability_key,
     );
     assert!(!cursor.current().visible);
     assert_eq!(cursor.submitted_epoch(), desired_epoch);
@@ -602,7 +607,15 @@ fn proven_cursor_capability_survives_motion_within_geometry_class_only() {
     let mut cursor = test_cursor();
     cursor.set_hardware_path_active(true);
     cursor.set_visible(true);
-    cursor.begin_submission(PageFlipToken::new(500).unwrap(), cursor.desired().clone());
+    let frozen = cursor.desired().clone();
+    let frozen_key = cursor.capability_key_for(&frozen).unwrap();
+    cursor.begin_submission_at_revision_with_capability_key(
+        PageFlipToken::new(500).unwrap(),
+        frozen,
+        cursor.desired_epoch(),
+        cursor.desired_revision(),
+        Some(frozen_key),
+    );
     assert!(cursor.current_capability_proven());
 
     cursor.set_position(100, 100);
@@ -610,4 +623,113 @@ fn proven_cursor_capability_survives_motion_within_geometry_class_only() {
 
     cursor.set_position(-1, 100);
     assert!(!cursor.current_capability_proven());
+}
+
+#[test]
+fn capability_result_updates_the_frozen_key_after_desired_state_changes() {
+    let mut cursor = test_cursor();
+    let mut frozen = cursor.desired().clone();
+    frozen.visible = true;
+    frozen.x = 0;
+    frozen.y = 100;
+    frozen.framebuffer_id = Some(91);
+    let frozen_key = cursor
+        .capability_key_for(&frozen)
+        .expect("the frozen cursor geometry is visible");
+
+    let mut newer = frozen.clone();
+    newer.x = 1919;
+    cursor.desired = newer.clone();
+    let newer_key = cursor
+        .capability_key_for(&newer)
+        .expect("the newer cursor geometry is visible");
+    assert_ne!(frozen_key, newer_key);
+
+    cursor.mark_capability_proven(frozen_key);
+
+    assert_eq!(
+        cursor.capability_status(frozen_key),
+        CursorCapabilityStatus::Proven
+    );
+    assert_eq!(
+        cursor.capability_status(newer_key),
+        CursorCapabilityStatus::Unknown
+    );
+}
+
+#[test]
+fn capability_keys_cover_payload_identity_and_each_result_is_owner_bound() {
+    let mut cursor = test_cursor();
+    let mut state_a = cursor.desired().clone();
+    state_a.visible = true;
+    state_a.x = 0;
+    state_a.y = 100;
+    state_a.framebuffer_id = Some(91);
+    let key_a = cursor.capability_key_for(&state_a).unwrap();
+
+    let mut state_b = state_a.clone();
+    state_b.x = 1_900;
+    state_b.width = 32;
+    state_b.height = 32;
+    cursor.output_transform = 1;
+    cursor.output_scale_milli = 1_250;
+    cursor.plane.format_modifier.modifier = 9;
+    let key_b = cursor.capability_key_for(&state_b).unwrap();
+    assert_ne!(key_a, key_b);
+    assert_ne!(key_a.destination_x, key_b.destination_x);
+    assert_ne!(key_a.output_transform, key_b.output_transform);
+    assert_ne!(key_a.output_scale_milli, key_b.output_scale_milli);
+    assert_ne!(key_a.modifier, key_b.modifier);
+    assert_ne!(key_a.cursor_width, key_b.cursor_width);
+
+    // A successful TEST_ONLY/submit result for frozen A never identifies B.
+    cursor.mark_capability_proven(key_a);
+    assert_eq!(
+        cursor.capability_status(key_a),
+        CursorCapabilityStatus::Proven
+    );
+    assert_eq!(
+        cursor.capability_status(key_b),
+        CursorCapabilityStatus::Unknown
+    );
+
+    // Rejections are equally exact-key scoped.
+    cursor.note_test_failure_for(Some(key_a));
+    assert!(matches!(
+        cursor.capability_status(key_a),
+        CursorCapabilityStatus::Quarantined { .. }
+    ));
+    assert_eq!(
+        cursor.capability_status(key_b),
+        CursorCapabilityStatus::Unknown
+    );
+    cursor.note_submit_failure_for(Some(key_a));
+    assert!(matches!(
+        cursor.capability_status(key_a),
+        CursorCapabilityStatus::Quarantined { .. }
+    ));
+
+    // EBUSY is represented by leaving A unknown until the retry succeeds.
+    let mut retry = test_cursor();
+    let retry_key = retry.capability_key_for(&state_a).unwrap();
+    assert_eq!(
+        retry.capability_status(retry_key),
+        CursorCapabilityStatus::Unknown
+    );
+    retry.mark_capability_proven(retry_key);
+    assert_eq!(
+        retry.capability_status(retry_key),
+        CursorCapabilityStatus::Proven
+    );
+
+    // A generation change invalidates the old frozen proof rather than
+    // transferring it to the new-generation desired state.
+    let mut recovered = test_cursor();
+    let old_key = recovered.capability_key_for(&state_a).unwrap();
+    recovered.mark_capability_proven(old_key);
+    recovered.rearm_generation(2);
+    assert_eq!(
+        recovered.capability_status(old_key),
+        CursorCapabilityStatus::Unknown
+    );
 }

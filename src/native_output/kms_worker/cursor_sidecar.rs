@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::native_output::{
     CursorFramebufferPin, CursorPlaneAssignment, OutputTransaction, OutputTransactionId,
     presentation::plane::{CursorRevision, CursorSidecarId},
+    presentation::plane_policy::CursorCapabilityKey,
 };
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
 
@@ -14,6 +15,14 @@ use super::KmsTestOnlyPolicy;
 pub(crate) enum CursorSidecarCoupling {
     Independent,
     MustBundleWith(OutputTransactionId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorSidecarReturnReason {
+    RequiredPrimaryPassedFreeze,
+    RequiredPrimaryTerminal,
+    GenerationInvalidated,
+    Quiesced,
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +37,7 @@ pub(crate) struct CursorSidecar {
     pub(crate) deadline: PresentationTarget,
     pub(crate) crtc_id: u32,
     pub(crate) test_policy: KmsTestOnlyPolicy,
+    pub(crate) capability_key: Option<CursorCapabilityKey>,
 }
 
 #[derive(Debug, Default)]
@@ -36,13 +46,7 @@ pub(crate) struct CursorSidecarMailbox {
 }
 
 impl CursorSidecarMailbox {
-    pub(crate) fn offer(&mut self, mut sidecar: CursorSidecar) -> Option<CursorSidecar> {
-        if let Some(existing) = self.pending.as_ref()
-            && let CursorSidecarCoupling::MustBundleWith(required) = existing.coupling
-            && matches!(sidecar.coupling, CursorSidecarCoupling::Independent)
-        {
-            sidecar.coupling = CursorSidecarCoupling::MustBundleWith(required);
-        }
+    pub(crate) fn offer(&mut self, sidecar: CursorSidecar) -> Option<CursorSidecar> {
         self.pending.replace(sidecar)
     }
 
@@ -52,6 +56,19 @@ impl CursorSidecarMailbox {
 
     pub(crate) fn take(&mut self) -> Option<CursorSidecar> {
         self.pending.take()
+    }
+
+    pub(crate) fn take_must_bundle_with(
+        &mut self,
+        transaction_id: OutputTransactionId,
+    ) -> Option<CursorSidecar> {
+        self.pending
+            .as_ref()
+            .is_some_and(|sidecar| {
+                sidecar.coupling == CursorSidecarCoupling::MustBundleWith(transaction_id)
+            })
+            .then(|| self.pending.take())
+            .flatten()
     }
 
     pub(crate) fn take_independent_due(

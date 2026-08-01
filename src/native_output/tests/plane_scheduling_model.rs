@@ -4,11 +4,12 @@ use crate::native_output::presentation::plane::{
     PresentedCursorPromotion, PresentedCursorState, PresentedPlaneSnapshot,
 };
 use crate::native_output::presentation::plane_policy::{
-    CursorCapabilityKey, CursorCapabilityStatus, CursorDeliveryChoice, CursorFailureDisposition,
-    CursorFailureKind, CursorGeometryClass, CursorGeometryInput, CursorHardwareCapability,
-    CursorPacingConstraint, CursorPlaneAction, CursorPreference, KmsCursorTestPolicy,
-    PlaneCapabilityCache, PlanePrimaryMode, PlaneSchedulingInput, PlaneSchedulingReason,
-    PrimaryPlaneAction, classify_cursor_failure, normalize_cursor_geometry, schedule_planes,
+    CursorCapabilityKey, CursorCapabilityStatus, CursorDeliveryChoice, CursorDeltaClass,
+    CursorFailureDisposition, CursorFailureKind, CursorGeometryClass, CursorGeometryInput,
+    CursorHardwareCapability, CursorPacingConstraint, CursorPlaneAction, CursorPreference,
+    KmsCursorTestPolicy, PlaneCapabilityCache, PlanePrimaryMode, PlaneSchedulingInput,
+    PlaneSchedulingReason, PrimaryPlaneAction, classify_cursor_failure, normalize_cursor_geometry,
+    schedule_planes,
 };
 use oblivion_one::native::kms::AtomicCursorVisualState;
 use std::num::NonZeroU64;
@@ -161,6 +162,35 @@ fn cursor_revision_advances_only_the_changed_field() {
 }
 
 #[test]
+fn cursor_delta_classification_separates_position_visual_visibility_and_delivery() {
+    let mut previous = AtomicCursorVisualState::hidden(64, 64);
+    previous.visible = true;
+    previous.framebuffer_id = Some(91);
+    let mut moved = previous.clone();
+    moved.x = 10;
+    let mut visual = moved.clone();
+    visual.image_generation = visual.image_generation.saturating_add(1);
+    let hidden = None;
+
+    assert_eq!(
+        classify_cursor_delta(&previous, Some(&moved), false),
+        CursorDeltaClass::PositionOnly
+    );
+    assert_eq!(
+        classify_cursor_delta(&moved, Some(&visual), false),
+        CursorDeltaClass::Visual
+    );
+    assert_eq!(
+        classify_cursor_delta(&previous, hidden, false),
+        CursorDeltaClass::Visibility
+    );
+    assert_eq!(
+        classify_cursor_delta(&previous, hidden, true),
+        CursorDeltaClass::DeliveryModeTransition
+    );
+}
+
+#[test]
 fn cursor_write_set_rejects_primary_mutation() {
     let plane_delta = PlaneWriteSet::CURSOR;
     assert!(plane_delta.validate_cursor_delta().is_ok());
@@ -226,7 +256,110 @@ fn presented_cursor_promotes_only_on_the_exact_bundle_pageflip() {
     assert_eq!(snapshot.cursor.framebuffer_id, Some(91));
 }
 
+#[test]
+fn presented_bundle_promotes_primary_and_cursor_atomically() {
+    let hidden = PresentedCursorState::from_atomic(
+        CursorRevision::initial(),
+        CursorCoupling::Hidden,
+        &AtomicCursorVisualState::hidden(64, 64),
+    );
+    let mut snapshot = PresentedPlaneSnapshot::initial(hidden);
+    let identity = PlanePageflipIdentity {
+        bundle_id: bundle_id(70),
+        token: token(71),
+        output_generation: 72,
+        crtc_id: 73,
+    };
+    let primary = ConfirmedPrimaryState::Composed {
+        transaction_id: OutputTransactionId::new(NonZeroU64::new(74).unwrap()),
+        token: token(71),
+        slot: OutputSlotId::new(0).unwrap(),
+    };
+    let mut visible = AtomicCursorVisualState::hidden(64, 64);
+    visible.visible = true;
+    visible.framebuffer_id = Some(92);
+    let cursor = PresentedCursorState::from_atomic(
+        CursorRevision::initial().advance_image(),
+        CursorCoupling::EmbeddedInPrimary,
+        &visible,
+    );
+
+    assert!(snapshot.promote_bundle(identity, identity, Some(primary), Some(cursor)));
+    assert_eq!(snapshot.primary, Some(primary));
+    assert_eq!(snapshot.cursor, cursor);
+
+    let stale = PlanePageflipIdentity {
+        token: token(70),
+        ..identity
+    };
+    assert!(!snapshot.promote_bundle(stale, identity, None, Some(hidden)));
+    assert_eq!(snapshot.primary, Some(primary));
+    assert_eq!(snapshot.cursor, cursor);
+}
+
+#[test]
+fn presented_snapshot_preserves_the_other_plane_and_rejects_every_stale_identity() {
+    let hidden = PresentedCursorState::from_atomic(
+        CursorRevision::initial(),
+        CursorCoupling::Hidden,
+        &AtomicCursorVisualState::hidden(64, 64),
+    );
+    let mut snapshot = PresentedPlaneSnapshot::initial(hidden);
+    let primary = ConfirmedPrimaryState::Composed {
+        transaction_id: OutputTransactionId::new(NonZeroU64::new(80).unwrap()),
+        token: token(81),
+        slot: OutputSlotId::new(1).unwrap(),
+    };
+    let identity = PlanePageflipIdentity {
+        bundle_id: bundle_id(82),
+        token: token(81),
+        output_generation: 83,
+        crtc_id: 84,
+    };
+    assert!(snapshot.promote_bundle(identity, identity, Some(primary), None));
+
+    let mut visible = AtomicCursorVisualState::hidden(64, 64);
+    visible.visible = true;
+    visible.framebuffer_id = Some(93);
+    let cursor = PresentedCursorState::from_atomic(
+        CursorRevision::initial().advance_image(),
+        CursorCoupling::IndependentPlane,
+        &visible,
+    );
+    assert!(snapshot.promote_bundle(identity, identity, None, Some(cursor)));
+    assert_eq!(snapshot.primary, Some(primary));
+
+    for stale in [
+        PlanePageflipIdentity {
+            bundle_id: bundle_id(81),
+            ..identity
+        },
+        PlanePageflipIdentity {
+            token: token(80),
+            ..identity
+        },
+        PlanePageflipIdentity {
+            output_generation: 82,
+            ..identity
+        },
+        PlanePageflipIdentity {
+            crtc_id: 85,
+            ..identity
+        },
+    ] {
+        assert!(!snapshot.promote_bundle(stale, identity, Some(primary), Some(hidden)));
+        assert_eq!(snapshot.primary, Some(primary));
+        assert_eq!(snapshot.cursor, cursor);
+    }
+}
+
 fn capability_key(class: CursorGeometryClass) -> CursorCapabilityKey {
+    let input = match class {
+        CursorGeometryClass::FullyVisible => geometry(100, 100),
+        CursorGeometryClass::EdgeClipped => geometry(-1, 100),
+        CursorGeometryClass::CornerClipped => geometry(-1, -1),
+    };
+    let normalized = normalize_cursor_geometry(input).expect("test geometry is visible");
     CursorCapabilityKey {
         output_generation: 3,
         crtc_id: 4,
@@ -241,6 +374,22 @@ fn capability_key(class: CursorGeometryClass) -> CursorCapabilityKey {
         cursor_height: 64,
         hotspot_property_available: false,
         geometry_class: class,
+        source_x: normalized.source.x,
+        source_y: normalized.source.y,
+        source_width: normalized.source.width,
+        source_height: normalized.source.height,
+        destination_x: if class == CursorGeometryClass::FullyVisible {
+            0
+        } else {
+            normalized.destination.x
+        },
+        destination_y: if class == CursorGeometryClass::FullyVisible {
+            0
+        } else {
+            normalized.destination.y
+        },
+        destination_width: normalized.destination.width,
+        destination_height: normalized.destination.height,
     }
 }
 
@@ -447,6 +596,79 @@ fn proven_motion_skips_test_but_new_geometry_class_requires_it() {
         edge.reason,
         PlaneSchedulingReason::HardwareCapabilityUnknown
     );
+}
+
+#[test]
+fn proven_edge_crop_does_not_authorize_a_different_edge_or_corner_crop() {
+    let mut cache = PlaneCapabilityCache::default();
+    let edge_left = normalize_cursor_geometry(geometry(-10, 100)).unwrap();
+    let edge_right = normalize_cursor_geometry(geometry(1_900, 100)).unwrap();
+    let corner = normalize_cursor_geometry(geometry(-10, -20)).unwrap();
+    assert_eq!(edge_left.class, CursorGeometryClass::EdgeClipped);
+    assert_eq!(edge_right.class, CursorGeometryClass::EdgeClipped);
+    assert_eq!(corner.class, CursorGeometryClass::CornerClipped);
+
+    let mut proven_key = capability_key(CursorGeometryClass::EdgeClipped);
+    proven_key.source_x = edge_left.source.x;
+    proven_key.source_y = edge_left.source.y;
+    proven_key.source_width = edge_left.source.width;
+    proven_key.source_height = edge_left.source.height;
+    proven_key.destination_x = edge_left.destination.x;
+    proven_key.destination_y = edge_left.destination.y;
+    proven_key.destination_width = edge_left.destination.width;
+    proven_key.destination_height = edge_left.destination.height;
+    cache.mark_proven(proven_key);
+
+    let mut right_key = proven_key;
+    right_key.source_x = edge_right.source.x;
+    right_key.source_y = edge_right.source.y;
+    right_key.source_width = edge_right.source.width;
+    right_key.source_height = edge_right.source.height;
+    right_key.destination_x = edge_right.destination.x;
+    right_key.destination_y = edge_right.destination.y;
+    right_key.destination_width = edge_right.destination.width;
+    right_key.destination_height = edge_right.destination.height;
+    let right = schedule_planes(PlaneSchedulingInput {
+        revision: CursorRevision::initial().advance_motion(),
+        preference: CursorPreference::Auto,
+        visible: true,
+        geometry: geometry(1_900, 100),
+        geometry_valid: true,
+        hardware: Some(CursorHardwareCapability { key: right_key }),
+        capabilities: &cache,
+        primary_mode: PlanePrimaryMode::Composed,
+        software_allowed: true,
+        predictive_triple_active: false,
+        cursor_kms_changed: true,
+        hardware_plane_visible: true,
+        transition_primary: None,
+    });
+    assert_eq!(right.test_policy, KmsCursorTestPolicy::Required);
+
+    let mut corner_key = proven_key;
+    corner_key.geometry_class = CursorGeometryClass::CornerClipped;
+    corner_key.source_y = corner.source.y;
+    corner_key.source_width = corner.source.width;
+    corner_key.source_height = corner.source.height;
+    corner_key.destination_y = corner.destination.y;
+    corner_key.destination_width = corner.destination.width;
+    corner_key.destination_height = corner.destination.height;
+    let corner_decision = schedule_planes(PlaneSchedulingInput {
+        revision: CursorRevision::initial().advance_motion(),
+        preference: CursorPreference::Auto,
+        visible: true,
+        geometry: geometry(-10, -20),
+        geometry_valid: true,
+        hardware: Some(CursorHardwareCapability { key: corner_key }),
+        capabilities: &cache,
+        primary_mode: PlanePrimaryMode::Composed,
+        software_allowed: true,
+        predictive_triple_active: false,
+        cursor_kms_changed: true,
+        hardware_plane_visible: true,
+        transition_primary: None,
+    });
+    assert_eq!(corner_decision.test_policy, KmsCursorTestPolicy::Required);
 }
 
 #[test]
