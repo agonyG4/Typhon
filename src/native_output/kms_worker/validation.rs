@@ -44,6 +44,15 @@ pub(super) fn invalidate_queued_dependents(
 }
 
 impl KmsCommitWorkerHandle {
+    pub(crate) fn pending_bundle_identity(
+        &self,
+        output_generation: u64,
+        crtc_id: u32,
+    ) -> Option<KmsCommitBundleIdentity> {
+        self.shared
+            .pending_bundle_identity(output_generation, crtc_id)
+    }
+
     pub(crate) fn attachable_primary(
         &self,
         output_generation: u64,

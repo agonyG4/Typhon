@@ -8,8 +8,8 @@ use super::presentation_transactions::{
 };
 use super::*;
 use crate::native_output::kms_worker::{
-    KmsBundleOwners, KmsCommitAdmissionPermit, KmsCommitBundleIdentity, KmsCommitJob,
-    KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase,
+    KmsBundleOwners, KmsCommitAdmissionPermit, KmsCommitJob, KmsCommitWorkerHandle,
+    KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase,
     KmsWorkerAdmissionError,
 };
 use oblivion_one::native::kms::FramebufferId;
@@ -44,41 +44,21 @@ pub(super) fn worker_cursor_pin(
 }
 
 pub(super) fn validation_base_for_submission(
-    atomic_commit_arbiter: &AtomicCommitArbiter,
+    worker: Option<&KmsCommitWorkerHandle>,
     presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
     output_generation: u64,
     crtc_id: u32,
 ) -> KmsValidationBase {
-    let pending = atomic_commit_arbiter
-        .kernel_submitted_commit()
-        .or_else(|| atomic_commit_arbiter.worker_queued_commit());
-    pending.map_or(
-        KmsValidationBase::Presented {
-            snapshot: presented_planes,
-            output_generation,
-            crtc_id,
-        },
-        |pending| {
-            KmsValidationBase::Predecessor(KmsCommitBundleIdentity {
-            id: crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(
-                pending.token,
-            ),
-            token: pending.token,
-            output_generation: pending.generation,
-            crtc_id: pending.crtc_id,
-            primary_transaction_id: match pending.kind {
-                AtomicCommitKind::CompositedPrimary { transaction_id, .. }
-                | AtomicCommitKind::DirectPrimary { transaction_id, .. } => Some(transaction_id),
-                AtomicCommitKind::PlaneDelta { .. } => None,
+    worker
+        .and_then(|worker| worker.pending_bundle_identity(output_generation, crtc_id))
+        .map_or(
+            KmsValidationBase::Presented {
+                snapshot: presented_planes,
+                output_generation,
+                crtc_id,
             },
-            cursor_transaction_id: match pending.kind {
-                AtomicCommitKind::PlaneDelta { transaction_id, .. } => Some(transaction_id),
-                AtomicCommitKind::CompositedPrimary { .. }
-                | AtomicCommitKind::DirectPrimary { .. } => None,
-            },
-        })
-        },
-    )
+            KmsValidationBase::Predecessor,
+        )
 }
 
 fn planned_cursor_update(
@@ -103,17 +83,20 @@ pub(super) struct WorkerPrimarySubmissionContext<'a> {
     atomic_cursor: Option<&'a NativeAtomicCursor>,
     frame_pacing: &'a mut NativeFramePacing,
     validation_base: KmsValidationBase,
+    cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
 }
 
 pub(super) fn worker_ctx<'a>(
     atomic_cursor: Option<&'a NativeAtomicCursor>,
     frame_pacing: &'a mut NativeFramePacing,
     validation_base: KmsValidationBase,
+    cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
 ) -> WorkerPrimarySubmissionContext<'a> {
     WorkerPrimarySubmissionContext {
         atomic_cursor,
         frame_pacing,
         validation_base,
+        cursor_delivery,
     }
 }
 
@@ -394,6 +377,7 @@ pub(super) fn queue_explicit_ready_for_presentation(
     output_generation: u64,
     crtc_id: u32,
     cursor_update: KmsCursorUpdate,
+    cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     cursor_pin: Option<CursorFramebufferPin>,
     cursor_capability_key: Option<
         crate::native_output::presentation::plane_policy::CursorCapabilityKey,
@@ -414,6 +398,7 @@ pub(super) fn queue_explicit_ready_for_presentation(
         output_generation,
         crtc_id,
         cursor_update,
+        cursor_delivery,
         cursor_pin,
         cursor_capability_key,
         pacing_frame_id,
@@ -487,6 +472,7 @@ pub(super) fn submit_explicit_ready_for_presentation(
             output_generation,
             crtc_id,
             cursor_update,
+            context.cursor_delivery,
             cursor_pin,
             cursor_capability_key,
             pacing_frame_id,
@@ -517,6 +503,7 @@ pub(super) fn queue_compatibility_for_presentation(
     pacing_mode: NativeOutputPacingMode,
     render_generation: u64,
     cursor: Option<&AtomicCursorVisualState>,
+    cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     cursor_pin: Option<CursorFramebufferPin>,
     cursor_capability_key: Option<
         crate::native_output::presentation::plane_policy::CursorCapabilityKey,
@@ -539,6 +526,7 @@ pub(super) fn queue_compatibility_for_presentation(
         pacing_mode,
         render_generation,
         cursor,
+        cursor_delivery,
         cursor_pin,
         cursor_capability_key,
         pacing_frame_id,
@@ -657,6 +645,7 @@ pub(super) fn finish_direct_worker_queued(
         cursor: effective_cursor.map_or(KmsCursorUpdate::Unchanged, |state| {
             KmsCursorUpdate::Set(state.clone())
         }),
+        cursor_delivery: context.cursor_delivery,
         cursor_pin: worker_cursor_pin(context.atomic_cursor, effective_cursor)?,
         direct_primary_lease: Some(direct_lease),
         test_only_duration_ns: None,

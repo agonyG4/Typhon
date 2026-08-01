@@ -12,7 +12,7 @@ use super::presentation_cursor::{
     CursorPolicyContext, apply_cursor_policy_with_runtime_inputs, cursor_damage_states,
     effective_cursor_for_plan, log_client_cursor_path_if_changed, plan_uses_hardware_cursor,
     planned_client_cursor_software_work, planned_cursor_hardware_usable,
-    planned_hardware_cursor_work_pending, prepare_cursor_image,
+    planned_hardware_cursor_work_pending, prepare_cursor_image, presented_delivery_for_plan,
 };
 use super::presentation_direct::{
     DirectPresentationInputs, inspect_direct_presentation, log_prepared_primary_arbitration,
@@ -171,6 +171,7 @@ impl NativeRuntime {
                     cursor_render_mode,
                     last_client_cursor_damage,
                     attachable_primary: None,
+                    previous_delivery: CursorDeliveryMode::Hidden,
                     validation_base_unchanged: false,
                 },
                 kms_commit_worker.as_ref(),
@@ -561,7 +562,7 @@ impl NativeRuntime {
                 pacing_mode,
                 cursor_epoch,
                 validation_base_for_submission(
-                    atomic_commit_arbiter,
+                    kms_commit_worker.as_ref(),
                     *presented_planes,
                     *drm_file_generation,
                     target.crtc_id,
@@ -620,6 +621,7 @@ impl NativeRuntime {
                 effective_cursor.as_ref(),
                 cursor_epoch,
                 *cursor_render_mode,
+                presented_delivery_for_plan(runtime_plane_plan.as_ref(), effective_cursor.as_ref()),
                 atomic_cursor,
                 cursor_output_arbitration,
                 last_submitted_cursor_epoch,
@@ -728,10 +730,14 @@ impl NativeRuntime {
                                         atomic_cursor.as_ref(),
                                         frame_pacing,
                                         validation_base_for_submission(
-                                            atomic_commit_arbiter,
+                                            kms_commit_worker.as_ref(),
                                             *presented_planes,
                                             *drm_file_generation,
                                             target.crtc_id,
+                                        ),
+                                        presented_delivery_for_plan(
+                                            runtime_plane_plan.as_ref(),
+                                            effective_cursor.as_ref(),
                                         ),
                                     ),
                                     *drm_file_generation,
@@ -1052,10 +1058,14 @@ impl NativeRuntime {
                                             atomic_cursor.as_ref(),
                                             frame_pacing,
                                             validation_base_for_submission(
-                                                atomic_commit_arbiter,
+                                                kms_commit_worker.as_ref(),
                                                 *presented_planes,
                                                 *drm_file_generation,
                                                 target.crtc_id,
+                                            ),
+                                            presented_delivery_for_plan(
+                                                runtime_plane_plan.as_ref(),
+                                                effective_cursor.as_ref(),
                                             ),
                                         ),
                                         false,

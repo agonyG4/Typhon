@@ -207,6 +207,13 @@ pub(crate) enum CursorCoupling {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PresentedCursorDelivery {
+    Hidden,
+    Hardware,
+    Software,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CursorPlanePoint {
     pub(crate) x: i32,
     pub(crate) y: i32,
@@ -216,6 +223,7 @@ pub(crate) struct CursorPlanePoint {
 pub(crate) struct PresentedCursorState {
     pub(crate) revision: CursorRevision,
     pub(crate) coupling: CursorCoupling,
+    pub(crate) delivery: PresentedCursorDelivery,
     pub(crate) framebuffer_id: Option<u32>,
     pub(crate) visible: bool,
     pub(crate) output_position: CursorPlanePoint,
@@ -228,9 +236,24 @@ impl PresentedCursorState {
         coupling: CursorCoupling,
         state: &AtomicCursorVisualState,
     ) -> Self {
+        let delivery = if state.visible {
+            PresentedCursorDelivery::Hardware
+        } else {
+            PresentedCursorDelivery::Hidden
+        };
+        Self::from_atomic_with_delivery(revision, coupling, delivery, state)
+    }
+
+    pub(crate) fn from_atomic_with_delivery(
+        revision: CursorRevision,
+        coupling: CursorCoupling,
+        delivery: PresentedCursorDelivery,
+        state: &AtomicCursorVisualState,
+    ) -> Self {
         Self {
             revision,
             coupling,
+            delivery,
             framebuffer_id: state.framebuffer_id,
             visible: state.visible,
             output_position: CursorPlanePoint {
@@ -280,6 +303,7 @@ impl PresentedPlaneSnapshot {
             cursor: PresentedCursorState {
                 revision: CursorRevision::initial(),
                 coupling: CursorCoupling::Hidden,
+                delivery: PresentedCursorDelivery::Hidden,
                 framebuffer_id: None,
                 visible: false,
                 output_position: CursorPlanePoint { x: 0, y: 0 },

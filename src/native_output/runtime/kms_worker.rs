@@ -9,7 +9,7 @@ use std::sync::Arc;
 use super::super::kms_worker::{
     CursorSidecarReturnReason, KmsBundleOwners, KmsCommitJob, KmsCommitWorkerHandle,
     KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy, KmsValidationBase,
-    KmsWorkerAdmissionError, KmsWorkerEvent, KmsWorkerFatalJob,
+    KmsWorkerAdmissionError, KmsWorkerEvent, KmsWorkerFatalJob, ValidationBaseInvalidationReason,
 };
 pub(super) use super::kms_worker_teardown::{
     retain_complete_submitted_ownership, retain_uncertain_job_with_suspension,
@@ -40,6 +40,19 @@ pub(super) enum FatalWorkerJobDisposition {
 pub(super) enum UncertainJobRetention {
     Suspended,
     EmergencyQuarantined,
+}
+
+pub(super) const fn validation_base_invalidation_needs_active_replan(
+    session_permits_output: bool,
+    shutting_down: bool,
+    current_generation: u64,
+    job_generation: u64,
+    reason: ValidationBaseInvalidationReason,
+) -> bool {
+    session_permits_output
+        && !shutting_down
+        && current_generation == job_generation
+        && !matches!(reason, ValidationBaseInvalidationReason::GenerationChanged)
 }
 
 pub(super) trait FatalWorkerJobHandler {
@@ -82,6 +95,7 @@ pub(super) fn queue_explicit_composited_frame(
     output_generation: u64,
     crtc_id: u32,
     cursor_update: KmsCursorUpdate,
+    cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     cursor_pin: Option<CursorFramebufferPin>,
     cursor_capability_key: Option<
         crate::native_output::presentation::plane_policy::CursorCapabilityKey,
@@ -196,6 +210,7 @@ pub(super) fn queue_explicit_composited_frame(
             request_out_fence: true,
         },
         cursor: cursor_update,
+        cursor_delivery,
         cursor_pin,
         direct_primary_lease: None,
         test_only_duration_ns: None,
@@ -280,6 +295,7 @@ pub(super) fn queue_atomic_compatibility_frame(
     pacing_mode: NativeOutputPacingMode,
     render_generation: u64,
     cursor: Option<&AtomicCursorVisualState>,
+    cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     cursor_pin: Option<CursorFramebufferPin>,
     cursor_capability_key: Option<
         crate::native_output::presentation::plane_policy::CursorCapabilityKey,
@@ -421,6 +437,7 @@ pub(super) fn queue_atomic_compatibility_frame(
         cursor: cursor.map_or(KmsCursorUpdate::Unchanged, |state| {
             KmsCursorUpdate::Set(state.clone())
         }),
+        cursor_delivery,
         cursor_pin,
         direct_primary_lease: None,
         test_only_duration_ns: None,
@@ -1333,14 +1350,31 @@ impl NativeRuntime {
                 drop(sidecar);
             }
             KmsWorkerEvent::ValidationBaseInvalidated { job, reason, .. } => {
-                self.drop_queued_worker_job_with_reason(
-                    job,
-                    OutputTransactionDropReason::SessionSuspended,
-                )?;
-                self.queued_redraw_requested = true;
+                let active_replan = validation_base_invalidation_needs_active_replan(
+                    self.session.permits_output(),
+                    self.shutdown.is_shutting_down(),
+                    self.drm_file_generation,
+                    job.output_generation,
+                    reason,
+                );
+                if active_replan {
+                    self.replan_invalidated_worker_job(job)?;
+                } else {
+                    self.drop_queued_worker_job_with_reason(
+                        job,
+                        OutputTransactionDropReason::SessionSuspended,
+                    )?;
+                }
+                if active_replan {
+                    self.queued_redraw_requested = true;
+                }
                 self.perf.log("native.kms_commit_worker", || {
                     vec![
                         NativePerfField::str("event", "validation_base_invalidated"),
+                        NativePerfField::str(
+                            "disposition",
+                            if active_replan { "replan" } else { "suspend" },
+                        ),
                         NativePerfField::str("reason", format!("{reason:?}")),
                     ]
                 });

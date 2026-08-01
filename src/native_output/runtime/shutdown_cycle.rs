@@ -16,48 +16,23 @@ impl NativeRuntime {
         };
         if first_request {
             self.forced_shutdown_inflight = worker_inflight.or_else(|| {
-                self.atomic_commit_arbiter
+                let pending_token = self
+                    .atomic_commit_arbiter
                     .pending_atomic_commit()
-                    .and_then(|pending| {
-                        matches!(pending.phase, AtomicCommitPhase::KernelSubmitted { .. }).then(
-                            || super::super::kms_worker::WorkerInFlight {
-                                bundle: super::super::kms_worker::KmsCommitBundleIdentity {
-                                    id: crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(
-                                        pending.token,
-                                    ),
-                                    token: pending.token,
-                                    output_generation: pending.generation,
-                                    crtc_id: pending.crtc_id,
-                                    primary_transaction_id: match pending.kind {
-                                        AtomicCommitKind::CompositedPrimary { transaction_id, .. }
-                                        | AtomicCommitKind::DirectPrimary { transaction_id, .. } => {
-                                            Some(transaction_id)
-                                        }
-                                        AtomicCommitKind::PlaneDelta { .. } => None,
-                                    },
-                                    cursor_transaction_id: match pending.kind {
-                                        AtomicCommitKind::PlaneDelta { transaction_id, .. } => {
-                                            Some(transaction_id)
-                                        }
-                                        AtomicCommitKind::CompositedPrimary { .. }
-                                        | AtomicCommitKind::DirectPrimary { .. } => None,
-                                    },
-                                },
-                                token: pending.token,
-                                transaction_id: match pending.kind {
-                                    AtomicCommitKind::CompositedPrimary {
-                                        transaction_id, ..
-                                    }
-                                    | AtomicCommitKind::DirectPrimary { transaction_id, .. }
-                                    | AtomicCommitKind::PlaneDelta { transaction_id, .. } => {
-                                        transaction_id
-                                    }
-                                },
-                                output_generation: pending.generation,
-                                kind: pending.kind,
-                                direct_content_key: None,
-                            },
-                        )
+                    .filter(|pending| {
+                        matches!(pending.phase, AtomicCommitPhase::KernelSubmitted { .. })
+                    })
+                    .map(|pending| pending.token)?;
+                self.submitted_worker_ownership
+                    .iter()
+                    .find(|ownership| ownership.job.token == pending_token)
+                    .map(|ownership| super::super::kms_worker::WorkerInFlight {
+                        bundle: ownership.job.identity(),
+                        token: ownership.job.token,
+                        transaction_id: ownership.job.transaction_id,
+                        output_generation: ownership.job.output_generation,
+                        kind: ownership.job.kind,
+                        direct_content_key: None,
                     })
             });
         }

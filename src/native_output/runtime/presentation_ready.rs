@@ -33,6 +33,7 @@ pub(super) fn submit_ready_frame(
     cursor: Option<&AtomicCursorVisualState>,
     cursor_epoch: u64,
     cursor_render_mode: NativeCursorRenderMode,
+    cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     atomic_cursor: &mut Option<NativeAtomicCursor>,
     cursor_output_arbitration: &mut NativeCursorOutputArbitration,
     last_submitted_cursor_epoch: &mut u64,
@@ -51,12 +52,8 @@ pub(super) fn submit_ready_frame(
     #[cfg(test)] native_io_recorder: &mut NativeIoRecorder,
 ) -> NativeResult<ReadySubmissionResult> {
     let repaint_present_start = Instant::now();
-    let validation_base = validation_base_for_submission(
-        atomic_commit_arbiter,
-        presented_planes,
-        output_generation,
-        crtc_id,
-    );
+    let validation_base =
+        validation_base_for_submission(worker, presented_planes, output_generation, crtc_id);
     let explicit_submission = matches!(scanout, NativeScanoutBackend::AtomicEglGbm(_));
     let (present_result, compatibility_transaction_id) =
         if let NativeScanoutBackend::AtomicEglGbm(explicit) = scanout {
@@ -77,7 +74,12 @@ pub(super) fn submit_ready_frame(
                     transaction_id,
                     output_generation,
                     crtc_id,
-                    worker_ctx(atomic_cursor.as_ref(), frame_pacing, validation_base),
+                    worker_ctx(
+                        atomic_cursor.as_ref(),
+                        frame_pacing,
+                        validation_base,
+                        cursor_delivery,
+                    ),
                     true,
                 )?
             else {
@@ -131,6 +133,7 @@ pub(super) fn submit_ready_frame(
                 pacing_mode,
                 render_generation,
                 cursor,
+                cursor_delivery,
                 cursor_pin,
                 atomic_cursor.as_ref().and_then(|native_cursor| {
                     cursor.and_then(|state| native_cursor.capability_key_for(state))

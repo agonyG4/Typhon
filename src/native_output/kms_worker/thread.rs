@@ -566,6 +566,7 @@ impl ExecutingDirectCandidateGuard {
         state.executing = false;
         state.executing_direct_content_key = None;
         state.executing_primary_transaction_id = None;
+        state.executing_bundle_identity = None;
         state.executing_primary = None;
         state.phase = KmsWorkerPhase::KernelInFlight;
         self.transferred = true;
@@ -581,6 +582,7 @@ impl Drop for ExecutingDirectCandidateGuard {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.executing = false;
         state.executing_primary_transaction_id = None;
+        state.executing_bundle_identity = None;
         state.executing_primary = None;
         if state.inflight.is_none() {
             state.phase = KmsWorkerPhase::Idle;
@@ -1236,12 +1238,14 @@ fn take_next_job(shared: &Arc<WorkerShared>) -> Option<ExecutingKmsJob> {
             state.executing = true;
             state.executing_direct_content_key = direct_candidate;
             state.executing_primary_transaction_id = job.owners.primary_transaction_id();
+            state.executing_bundle_identity = Some(job.identity());
             state.executing_primary = (job.kind.is_primary()
-                && matches!(job.primary, KmsPrimaryUpdate::Framebuffer { .. })
-                && matches!(job.cursor, KmsCursorUpdate::Unchanged))
+                && matches!(job.primary, KmsPrimaryUpdate::Framebuffer { .. }))
             .then(|| {
                 Some(AttachablePrimary {
                     transaction_id: job.owners.primary_transaction_id()?,
+                    bundle_identity: job.identity(),
+                    validation_base: job.validation_base,
                     output_generation: job.output_generation,
                     crtc_id: job.crtc_id,
                     target: job.target,

@@ -543,6 +543,7 @@ fn worker_queue_owns_direct_resource_before_submit() {
             request_out_fence: true,
         },
         cursor: KmsCursorUpdate::Unchanged,
+        cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
         cursor_pin: None,
         direct_primary_lease: Some(lease),
         test_only_duration_ns: None,

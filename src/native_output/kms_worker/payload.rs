@@ -3,7 +3,9 @@
 use super::super::runtime::AtomicCommitKind;
 use super::{KmsBundleOwners, KmsCommitBundleIdentity};
 use crate::native_output::output::CursorFramebufferPin;
-use crate::native_output::presentation::plane::{KmsCommitBundleId, PresentedPlaneSnapshot};
+use crate::native_output::presentation::plane::{
+    KmsCommitBundleId, PresentedCursorDelivery, PresentedPlaneSnapshot,
+};
 use crate::native_output::scanout::DirectPrimaryLease;
 use crate::native_output::{
     CursorPlaneAssignment, OutputTransaction, OutputTransactionContent, OutputTransactionId,
@@ -29,6 +31,7 @@ pub(crate) struct KmsCommitJob {
     pub(crate) queued_at: MonotonicTimestampNs,
     pub(crate) primary: KmsPrimaryUpdate,
     pub(crate) cursor: KmsCursorUpdate,
+    pub(crate) cursor_delivery: PresentedCursorDelivery,
     /// A Send-only lease marker for the exact DRM cursor framebuffer named by
     /// `cursor`. The framebuffer object remains compositor-thread-owned; the
     /// lease keeps it in the cursor resource registry until this job reaches a

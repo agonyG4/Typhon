@@ -725,6 +725,111 @@ fn attachable_primary_is_one_exact_pre_freeze_snapshot() {
 }
 
 #[test]
+fn embedded_cursor_primary_is_attachable_and_exposes_exact_bundle_identity() {
+    let handle = KmsCommitWorkerHandle::start(Arc::new(RecordingExecutor::accepting())).unwrap();
+    let first = test_job(343);
+    let first_identity = first.identity();
+    let first_token = first.token;
+    let first_transaction = first.transaction_id;
+    reserve_for_test(&handle, first.kind)
+        .enqueue(first)
+        .unwrap();
+    wait_for_fence_event(
+        &handle,
+        343,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token == first_token),
+    );
+
+    let (mut primary, _, _) = two_owner_job(344);
+    primary.validation_base = KmsValidationBase::Predecessor(first_identity);
+    primary.cursor = KmsCursorUpdate::Set(AtomicCursorVisualState {
+        visible: true,
+        framebuffer_id: Some(344),
+        ..AtomicCursorVisualState::hidden(64, 64)
+    });
+    let primary_identity = primary.identity();
+    let primary_transaction = primary.transaction_id;
+    reserve_for_test(&handle, primary.kind)
+        .enqueue(primary)
+        .unwrap();
+
+    let attachable = handle
+        .attachable_primary(1, 7, test_job(344).target)
+        .expect("embedded cursor primary must remain attachable");
+    assert_eq!(attachable.transaction_id, primary_transaction);
+    assert_eq!(attachable.bundle_identity, primary_identity);
+    assert_eq!(
+        attachable.validation_base,
+        KmsValidationBase::Predecessor(first_identity)
+    );
+    assert_eq!(handle.pending_bundle_identity(1, 7), Some(first_identity));
+
+    handle
+        .ack_pageflip(first_token, first_transaction, 1)
+        .unwrap();
+    wait_for_fence_event(
+        &handle,
+        344,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.identity() == primary_identity),
+    );
+    handle
+        .ack_pageflip(primary_identity.token, primary_transaction, 1)
+        .unwrap();
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn queued_primary_snapshot_carries_its_own_validation_base() {
+    let handle = KmsCommitWorkerHandle::start(Arc::new(RecordingExecutor::accepting())).unwrap();
+    let predecessor = test_job(345);
+    let predecessor_identity = predecessor.identity();
+    let predecessor_token = predecessor.token;
+    let predecessor_transaction = predecessor.transaction_id;
+    reserve_for_test(&handle, predecessor.kind)
+        .enqueue(predecessor)
+        .unwrap();
+    wait_for_fence_event(
+        &handle,
+        345,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token == predecessor_token),
+    );
+
+    let (mut primary, _, _) = two_owner_job(346);
+    primary.validation_base = KmsValidationBase::Predecessor(predecessor_identity);
+    let primary_identity = primary.identity();
+    reserve_for_test(&handle, primary.kind)
+        .enqueue(primary)
+        .unwrap();
+    let attachable = handle
+        .attachable_primary(1, 7, test_job(346).target)
+        .expect("queued primary must be attachable");
+    assert_eq!(attachable.bundle_identity, primary_identity);
+    assert_eq!(
+        attachable.validation_base,
+        KmsValidationBase::Predecessor(predecessor_identity)
+    );
+
+    handle
+        .ack_pageflip(predecessor_token, predecessor_transaction, 1)
+        .unwrap();
+    wait_for_fence_event(
+        &handle,
+        346,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.identity() == primary_identity),
+    );
+    handle
+        .ack_pageflip(
+            primary_identity.token,
+            primary_identity.primary_transaction_id.unwrap(),
+            1,
+        )
+        .unwrap();
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
 fn newer_sidecar_replaces_embedded_cursor_before_freeze() {
     let executor = Arc::new(RecordingExecutor::accepting());
     let handle = KmsCommitWorkerHandle::start(executor).unwrap();

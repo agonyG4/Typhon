@@ -223,6 +223,8 @@ pub(crate) enum AttachablePrimaryPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AttachablePrimary {
     pub(crate) transaction_id: crate::native_output::OutputTransactionId,
+    pub(crate) bundle_identity: KmsCommitBundleIdentity,
+    pub(crate) validation_base: KmsValidationBase,
     pub(crate) output_generation: u64,
     pub(crate) crtc_id: u32,
     pub(crate) target: PresentationTarget,
@@ -386,6 +388,7 @@ pub(crate) struct WorkerState {
     pub(crate) executing: bool,
     pub(crate) executing_direct_content_key: Option<DirectScanoutCandidateKey>,
     pub(crate) executing_primary_transaction_id: Option<crate::native_output::OutputTransactionId>,
+    pub(crate) executing_bundle_identity: Option<KmsCommitBundleIdentity>,
     pub(crate) executing_primary: Option<AttachablePrimary>,
     pub(crate) inflight: Option<WorkerInFlight>,
     pub(crate) phase: KmsWorkerPhase,
@@ -407,13 +410,14 @@ impl WorkerShared {
         let queued = state.queued.front().and_then(|job| {
             if job.kind.is_primary()
                 && matches!(job.primary, super::KmsPrimaryUpdate::Framebuffer { .. })
-                && matches!(job.cursor, super::KmsCursorUpdate::Unchanged)
                 && job.output_generation == output_generation
                 && job.crtc_id == crtc_id
                 && job.target == target
             {
                 Some(AttachablePrimary {
                     transaction_id: job.owners.primary_transaction_id()?,
+                    bundle_identity: job.identity(),
+                    validation_base: job.validation_base,
                     output_generation: job.output_generation,
                     crtc_id: job.crtc_id,
                     target: job.target,
@@ -432,6 +436,25 @@ impl WorkerShared {
         })
     }
 
+    pub(crate) fn pending_bundle_identity(
+        &self,
+        output_generation: u64,
+        crtc_id: u32,
+    ) -> Option<KmsCommitBundleIdentity> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .inflight
+            .map(|inflight| inflight.bundle)
+            .or(state.executing_bundle_identity)
+            .or_else(|| state.queued.front().map(KmsCommitJob::identity))
+            .filter(|identity| {
+                identity.output_generation == output_generation && identity.crtc_id == crtc_id
+            })
+    }
+
     pub(crate) fn new(result_fd: OwnedFd) -> Self {
         Self {
             state: Mutex::new(WorkerState {
@@ -442,6 +465,7 @@ impl WorkerShared {
                 executing: false,
                 executing_direct_content_key: None,
                 executing_primary_transaction_id: None,
+                executing_bundle_identity: None,
                 executing_primary: None,
                 inflight: None,
                 phase: KmsWorkerPhase::Idle,

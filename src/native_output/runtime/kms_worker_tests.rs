@@ -114,6 +114,7 @@ fn test_uncertain_direct_job(lease: DirectPrimaryLease) -> KmsCommitJob {
             request_out_fence: false,
         },
         cursor: KmsCursorUpdate::Unchanged,
+        cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
         cursor_pin: None,
         direct_primary_lease: Some(lease),
         test_only_duration_ns: None,
