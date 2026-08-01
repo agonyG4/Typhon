@@ -109,63 +109,6 @@ fn frozen_primary_cursor_presentation(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::native_output::kms_worker::KmsPrimaryCursorPresentation;
-    use crate::native_output::presentation::plane::PresentedCursorDelivery;
-
-    #[test]
-    fn primary_pageflip_uses_frozen_cursor_presentation_metadata() {
-        let frozen_state = AtomicCursorVisualState::hidden(64, 64);
-        let frozen = PresentedCursorState::from_atomic_with_delivery(
-            CursorRevision::initial().advance_image(),
-            CursorCoupling::EmbeddedInPrimary,
-            crate::native_output::presentation::plane::PresentedCursorDelivery::Software,
-            &frozen_state,
-        );
-        let expected = frozen;
-
-        assert_eq!(
-            frozen_primary_cursor_presentation(KmsPrimaryCursorPresentation::Promote(frozen)),
-            Some(expected)
-        );
-    }
-
-    #[test]
-    fn preserved_primary_cursor_does_not_fabricate_a_new_presentation() {
-        assert_eq!(
-            frozen_primary_cursor_presentation(KmsPrimaryCursorPresentation::Preserve),
-            None
-        );
-    }
-
-    #[test]
-    fn software_primary_metadata_freezes_revision_before_desired_advances() {
-        let mut cursor = crate::native_output::output::test_cursor_for_worker();
-        cursor.set_position(11, 22);
-        let frozen_state = cursor.desired().clone();
-        let frozen_revision = cursor.desired_revision();
-        let metadata =
-            crate::native_output::runtime::presentation_worker::freeze_primary_cursor_presentation(
-                crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
-                crate::native_output::presentation::plane::PresentedCursorDelivery::Software,
-                Some(&frozen_state),
-                Some(&cursor),
-                7,
-            );
-
-        cursor.set_position(900, 901);
-        let KmsPrimaryCursorPresentation::Promote(frozen) = metadata else {
-            panic!("software primary must carry frozen cursor metadata");
-        };
-        assert_eq!(frozen.revision, frozen_revision);
-        assert_eq!(frozen.output_position.x, 11);
-        assert_eq!(frozen.output_position.y, 22);
-        assert_eq!(frozen.delivery, PresentedCursorDelivery::Software);
-    }
-}
-
 impl NativeRuntime {
     pub(super) fn wait_for_events_and_pageflips(&mut self) -> NativeResult<NativeCycleState> {
         let wakeup = self.event_loop.wait()?;
@@ -1209,5 +1152,62 @@ impl NativeRuntime {
             coalesced_input_events: 0,
             shutdown_requested: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_output::kms_worker::KmsPrimaryCursorPresentation;
+    use crate::native_output::presentation::plane::PresentedCursorDelivery;
+
+    #[test]
+    fn primary_pageflip_uses_frozen_cursor_presentation_metadata() {
+        let frozen_state = AtomicCursorVisualState::hidden(64, 64);
+        let frozen = PresentedCursorState::from_atomic_with_delivery(
+            CursorRevision::initial().advance_image(),
+            CursorCoupling::EmbeddedInPrimary,
+            crate::native_output::presentation::plane::PresentedCursorDelivery::Software,
+            &frozen_state,
+        );
+        let expected = frozen;
+
+        assert_eq!(
+            frozen_primary_cursor_presentation(KmsPrimaryCursorPresentation::Promote(frozen)),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn preserved_primary_cursor_does_not_fabricate_a_new_presentation() {
+        assert_eq!(
+            frozen_primary_cursor_presentation(KmsPrimaryCursorPresentation::Preserve),
+            None
+        );
+    }
+
+    #[test]
+    fn software_primary_metadata_freezes_revision_before_desired_advances() {
+        let mut cursor = crate::native_output::output::test_cursor_for_worker();
+        cursor.set_position(11, 22);
+        let frozen_state = cursor.desired().clone();
+        let frozen_revision = cursor.desired_revision();
+        let metadata =
+            crate::native_output::runtime::presentation_worker::freeze_primary_cursor_presentation(
+                crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
+                crate::native_output::presentation::plane::PresentedCursorDelivery::Software,
+                Some(&frozen_state),
+                Some(&cursor),
+                7,
+            );
+
+        cursor.set_position(900, 901);
+        let KmsPrimaryCursorPresentation::Promote(frozen) = metadata else {
+            panic!("software primary must carry frozen cursor metadata");
+        };
+        assert_eq!(frozen.revision, frozen_revision);
+        assert_eq!(frozen.output_position.x, 11);
+        assert_eq!(frozen.output_position.y, 22);
+        assert_eq!(frozen.delivery, PresentedCursorDelivery::Software);
     }
 }
