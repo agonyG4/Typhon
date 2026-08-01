@@ -713,7 +713,7 @@ fn collect_cursor_sidecar_before_freeze(
         pause.pause();
     }
 
-    let sidecar = {
+    let (running, returned_sidecar) = {
         let mut state = shared
             .state
             .lock()
@@ -754,22 +754,26 @@ fn collect_cursor_sidecar_before_freeze(
         } else {
             None
         };
-        (true, claimed, returned)
+        if let Some(sidecar) = claimed {
+            shared
+                .metrics
+                .cursor_sidecars_claimed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            attach_sidecar(job, sidecar);
+            let identity = job.identity();
+            state.executing_bundle_identity = Some(identity);
+            if let Some(primary) = state.executing_primary.as_mut() {
+                primary.bundle_identity = identity;
+            }
+        }
+        (true, returned)
     };
-    let (running, claimed, returned) = sidecar;
-    if let Some(sidecar) = claimed {
-        shared
-            .metrics
-            .cursor_sidecars_claimed
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        attach_sidecar(job, sidecar);
-    }
     set_worker_phase(shared, KmsWorkerPhase::FrozenForValidation);
     #[cfg(test)]
     if let Some(pause) = shared.take_frozen_pause_for_test() {
         pause.pause();
     }
-    (running, returned)
+    (running, returned_sidecar)
 }
 
 fn attach_sidecar(job: &mut KmsCommitJob, sidecar: CursorSidecar) {
