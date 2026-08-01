@@ -785,6 +785,7 @@ fn attach_sidecar(job: &mut KmsCommitJob, sidecar: CursorSidecar) {
         | crate::native_output::CursorPlaneAssignment::Disabled => KmsCursorUpdate::Disable,
         crate::native_output::CursorPlaneAssignment::Unchanged => KmsCursorUpdate::Unchanged,
     };
+    job.cursor_delivery = sidecar.cursor_delivery;
     job.cursor_pin = sidecar.lease;
     job.owners.replace_cursor(KmsCursorOwner {
         transaction: sidecar.transaction,

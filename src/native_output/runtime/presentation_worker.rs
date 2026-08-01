@@ -1,7 +1,7 @@
 use super::cycle::direct_fallback::DirectFallbackTracker;
 use super::kms_worker::{WorkerQueueOutcome, queue_explicit_composited_frame, queue_plane_delta};
 pub(super) use super::plane_cycle::cursor_worker_opportunities;
-use super::presentation_cursor::RuntimePlanePlan;
+use super::presentation_cursor::{RuntimePlanePlan, presented_delivery_for_plan};
 use super::presentation_transactions::{
     DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
     settle_failed_output_transaction, submit_plane_delta,
@@ -253,6 +253,7 @@ pub(super) fn queue_plane_delta_for_presentation(
     validation_base: KmsValidationBase,
     attachable_primary: Option<crate::native_output::kms_worker::AttachablePrimary>,
     cursor_action: crate::native_output::presentation::plane_policy::CursorPlaneAction,
+    cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
 ) -> NativeResult<SchedulerDecision> {
     match queue_plane_delta(
         worker,
@@ -269,6 +270,7 @@ pub(super) fn queue_plane_delta_for_presentation(
         validation_base,
         attachable_primary,
         cursor_action,
+        cursor_delivery,
     )? {
         WorkerQueueOutcome::CursorQueued { .. } | WorkerQueueOutcome::SidecarQueued { .. } => {
             Ok(SchedulerDecision::WaitForPageFlip)
@@ -313,6 +315,7 @@ pub(super) fn present_cursor_for_presentation(
 ) -> NativeResult<Option<SchedulerDecision>> {
     if worker_mode {
         let worker = worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?;
+        let cursor_delivery = presented_delivery_for_plan(plane_plan, &desired);
         let decision = queue_plane_delta_for_presentation(
             worker,
             cursor,
@@ -331,6 +334,7 @@ pub(super) fn present_cursor_for_presentation(
                 crate::native_output::presentation::plane_policy::CursorPlaneAction::Independent,
                 |plan| plan.decision.cursor_action,
             ),
+            cursor_delivery,
         )?;
         return Ok((decision != SchedulerDecision::Idle).then_some(decision));
     }

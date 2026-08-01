@@ -6,7 +6,10 @@ use crate::native_output::kms_worker::{
     KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase,
     KmsWorkerAdmissionError,
 };
-use crate::native_output::presentation::{plane::CursorRevision, plane_policy::CursorPlaneAction};
+use crate::native_output::presentation::{
+    plane::{CursorRevision, PresentedCursorDelivery},
+    plane_policy::CursorPlaneAction,
+};
 use crate::native_output::runtime::presentation_transactions::settle_failed_output_transaction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +51,7 @@ pub(super) struct PlaneDeltaPreparationSubmit {
     cursor_pin: Option<CursorFramebufferPin>,
     target: PresentationTarget,
     validation_base: KmsValidationBase,
+    cursor_delivery: PresentedCursorDelivery,
 }
 
 pub(super) fn plane_delta_reservation_outcome(
@@ -72,6 +76,7 @@ pub(super) fn queue_plane_delta(
     validation_base: KmsValidationBase,
     attachable_primary: Option<AttachablePrimary>,
     cursor_action: CursorPlaneAction,
+    cursor_delivery: PresentedCursorDelivery,
 ) -> NativeResult<WorkerQueueOutcome> {
     let preparation = prepare_plane_delta(
         worker,
@@ -87,6 +92,7 @@ pub(super) fn queue_plane_delta(
         validation_base,
         attachable_primary,
         cursor_action,
+        cursor_delivery,
     )?;
     let (
         transaction_id,
@@ -96,6 +102,7 @@ pub(super) fn queue_plane_delta(
         promoted_pin,
         target,
         validation_base,
+        cursor_delivery,
     ) = match preparation {
         PlaneDeltaPreparation::Return(outcome) => return Ok(outcome),
         PlaneDeltaPreparation::Submit(preparation) => {
@@ -107,6 +114,7 @@ pub(super) fn queue_plane_delta(
                 cursor_pin,
                 target,
                 validation_base,
+                cursor_delivery,
             } = *preparation;
             (
                 transaction_id,
@@ -116,6 +124,7 @@ pub(super) fn queue_plane_delta(
                 cursor_pin,
                 target,
                 validation_base,
+                cursor_delivery,
             )
         }
     };
@@ -201,10 +210,7 @@ pub(super) fn queue_plane_delta(
         cursor: desired
             .clone()
             .map_or(KmsCursorUpdate::Disable, KmsCursorUpdate::Set),
-        cursor_delivery: desired.as_ref().map_or(
-            crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
-            |_| crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware,
-        ),
+        cursor_delivery,
         cursor_pin: match promoted_pin {
             Some(pin) => Some(pin),
             None => desired
@@ -314,6 +320,7 @@ pub(super) fn prepare_plane_delta(
     validation_base: KmsValidationBase,
     attachable_primary: Option<AttachablePrimary>,
     cursor_action: CursorPlaneAction,
+    cursor_delivery: PresentedCursorDelivery,
 ) -> NativeResult<PlaneDeltaPreparation> {
     if matches!(
         cursor_action,
@@ -349,6 +356,7 @@ pub(super) fn prepare_plane_delta(
                 cursor_pin: promoted.lease,
                 target: promoted.deadline,
                 validation_base: promoted.validation_base,
+                cursor_delivery: promoted.cursor_delivery,
             },
         )));
     }
@@ -383,6 +391,7 @@ pub(super) fn prepare_plane_delta(
         validation_base,
         attachable_primary,
         cursor_action,
+        cursor_delivery,
     )? {
         return Ok(PlaneDeltaPreparation::Return(outcome));
     }
@@ -395,6 +404,7 @@ pub(super) fn prepare_plane_delta(
             cursor_pin: None,
             target,
             validation_base,
+            cursor_delivery,
         },
     )))
 }
@@ -413,6 +423,7 @@ pub(super) fn try_offer_cursor_sidecar(
     _validation_base: KmsValidationBase,
     attachable_primary: Option<AttachablePrimary>,
     cursor_action: CursorPlaneAction,
+    cursor_delivery: PresentedCursorDelivery,
 ) -> NativeResult<Option<WorkerQueueOutcome>> {
     let Some(attachable_primary) = attachable_primary else {
         return Ok(None);
@@ -459,6 +470,7 @@ pub(super) fn try_offer_cursor_sidecar(
         deadline: target,
         crtc_id,
         test_policy: scheduled_kms_test_policy(cursor),
+        cursor_delivery,
         capability_key: desired.and_then(|state| cursor.capability_key_for(state)),
         validation_base: sidecar_validation_base,
     };

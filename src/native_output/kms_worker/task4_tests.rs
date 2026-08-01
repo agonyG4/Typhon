@@ -51,6 +51,7 @@ fn test_sidecar(job: &KmsCommitJob, id: u64, coupling: CursorSidecarCoupling) ->
         deadline: job.target,
         crtc_id: job.crtc_id,
         test_policy: KmsTestOnlyPolicy::Skip,
+        cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
         capability_key: None,
         validation_base: job.validation_base,
     }
@@ -960,6 +961,187 @@ fn late_bound_bundle_identity_is_published_before_dependents_observe_it() {
     drop((primary_events, dependent_events));
     handle.request_quiesce();
     handle.join().unwrap();
+}
+
+#[test]
+fn disabling_sidecar_replaces_hardware_delivery_as_one_owner_unit() {
+    let handle = KmsCommitWorkerHandle::start(Arc::new(RecordingExecutor::accepting())).unwrap();
+    let (mut primary, primary_id, _) = two_owner_job(915);
+    primary.cursor_delivery =
+        crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware;
+    primary.cursor = KmsCursorUpdate::Set(AtomicCursorVisualState {
+        visible: true,
+        framebuffer_id: Some(915),
+        ..AtomicCursorVisualState::hidden(64, 64)
+    });
+    let mut sidecar = test_sidecar(&primary, 9151, CursorSidecarCoupling::Independent);
+    sidecar.revision =
+        crate::native_output::presentation::plane::CursorRevision::initial().advance_motion();
+    sidecar.assignment = crate::native_output::CursorPlaneAssignment::Disabled;
+    sidecar.test_policy = KmsTestOnlyPolicy::Required;
+    sidecar.cursor_delivery =
+        crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden;
+    let sidecar_id = sidecar.id;
+    let pause = handle.pause_collecting_sidecar_for_test();
+    let primary_kind = primary.kind;
+    reserve_for_test(&handle, primary_kind)
+        .enqueue(primary)
+        .unwrap();
+    pause.wait_until_selected();
+
+    assert!(offer_sidecar(&handle, sidecar).is_none());
+    pause.release();
+
+    let events = wait_for_fence_event(
+        &handle,
+        915,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 915),
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        KmsWorkerEvent::Submitted { ownership }
+            if ownership.job.cursor == KmsCursorUpdate::Disable
+                && ownership.job.cursor_delivery
+                    == crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden
+                && ownership.job.owners.cursor().and_then(|owner| owner.sidecar_id)
+                    == Some(sidecar_id)
+                && ownership.job.test_only == KmsTestOnlyPolicy::Required
+    )));
+    let identity = events.iter().find_map(|event| {
+        if let KmsWorkerEvent::Submitted { ownership } = event {
+            Some(ownership.job.identity())
+        } else {
+            None
+        }
+    });
+    handle
+        .ack_pageflip_identity(identity.expect("submitted sidecar identity"), primary_id)
+        .unwrap();
+    drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn visible_sidecar_replaces_hidden_delivery_as_one_owner_unit() {
+    let handle = KmsCommitWorkerHandle::start(Arc::new(RecordingExecutor::accepting())).unwrap();
+    let (mut primary, primary_id, _) = two_owner_job(916);
+    primary.cursor_delivery =
+        crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden;
+    primary.cursor = KmsCursorUpdate::Disable;
+    let mut sidecar = test_sidecar(&primary, 9161, CursorSidecarCoupling::Independent);
+    sidecar.revision =
+        crate::native_output::presentation::plane::CursorRevision::initial().advance_motion();
+    sidecar.assignment = crate::native_output::CursorPlaneAssignment::Atomic {
+        desired_epoch: 2,
+        state: Some(AtomicCursorVisualState {
+            visible: true,
+            framebuffer_id: Some(9161),
+            ..AtomicCursorVisualState::hidden(64, 64)
+        }),
+    };
+    sidecar.test_policy = KmsTestOnlyPolicy::Required;
+    sidecar.cursor_delivery =
+        crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware;
+    let sidecar_id = sidecar.id;
+    let pause = handle.pause_collecting_sidecar_for_test();
+    let primary_kind = primary.kind;
+    reserve_for_test(&handle, primary_kind)
+        .enqueue(primary)
+        .unwrap();
+    pause.wait_until_selected();
+
+    assert!(offer_sidecar(&handle, sidecar).is_none());
+    pause.release();
+
+    let events = wait_for_fence_event(
+        &handle,
+        916,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 916),
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        KmsWorkerEvent::Submitted { ownership }
+            if matches!(&ownership.job.cursor, KmsCursorUpdate::Set(state) if state.visible)
+                && ownership.job.cursor_delivery
+                    == crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware
+                && ownership.job.owners.cursor().and_then(|owner| owner.sidecar_id)
+                    == Some(sidecar_id)
+                && ownership.job.test_only == KmsTestOnlyPolicy::Required
+    )));
+    let identity = events.iter().find_map(|event| {
+        if let KmsWorkerEvent::Submitted { ownership } = event {
+            Some(ownership.job.identity())
+        } else {
+            None
+        }
+    });
+    handle
+        .ack_pageflip_identity(identity.expect("submitted sidecar identity"), primary_id)
+        .unwrap();
+    drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn impossible_cursor_delivery_payloads_are_rejected() {
+    let cursor_transaction = |job: &KmsCommitJob, desired| {
+        crate::native_output::OutputTransaction::cursor_plane_delta(
+            job.transaction_id,
+            job.output_generation,
+            oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(0),
+            job.target,
+            oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
+            job.token.get(),
+            desired,
+            crate::native_output::OutputReleasePlan::Pageflip,
+        )
+        .unwrap()
+    };
+
+    let mut disable_hardware = test_cursor_job(917);
+    disable_hardware.cursor_delivery =
+        crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware;
+    let disable_hardware_transaction = cursor_transaction(&disable_hardware, None);
+    assert_eq!(
+        disable_hardware.validate_against(&disable_hardware_transaction),
+        Err(super::KmsCommitPayloadError::CursorDeliveryMismatch)
+    );
+
+    let mut disable_software = test_cursor_job(918);
+    disable_software.cursor_delivery =
+        crate::native_output::presentation::plane::PresentedCursorDelivery::Software;
+    let disable_software_transaction = cursor_transaction(&disable_software, None);
+    assert_eq!(
+        disable_software.validate_against(&disable_software_transaction),
+        Err(super::KmsCommitPayloadError::CursorDeliveryMismatch)
+    );
+
+    let visible = AtomicCursorVisualState {
+        visible: true,
+        framebuffer_id: None,
+        ..AtomicCursorVisualState::hidden(64, 64)
+    };
+    let mut visible_hidden = test_cursor_job(919);
+    visible_hidden.cursor = KmsCursorUpdate::Set(visible.clone());
+    visible_hidden.cursor_delivery =
+        crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden;
+    let visible_hidden_transaction = cursor_transaction(&visible_hidden, Some(visible.clone()));
+    assert_eq!(
+        visible_hidden.validate_against(&visible_hidden_transaction),
+        Err(super::KmsCommitPayloadError::CursorDeliveryMismatch)
+    );
+
+    let mut visible_software = test_cursor_job(920);
+    visible_software.cursor = KmsCursorUpdate::Set(visible.clone());
+    visible_software.cursor_delivery =
+        crate::native_output::presentation::plane::PresentedCursorDelivery::Software;
+    let visible_software_transaction = cursor_transaction(&visible_software, Some(visible));
+    assert_eq!(
+        visible_software.validate_against(&visible_software_transaction),
+        Err(super::KmsCommitPayloadError::CursorDeliveryMismatch)
+    );
 }
 
 #[test]

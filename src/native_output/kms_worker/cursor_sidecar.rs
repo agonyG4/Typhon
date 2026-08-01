@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::native_output::{
     CursorFramebufferPin, CursorPlaneAssignment, OutputTransaction, OutputTransactionId,
-    presentation::plane::{CursorRevision, CursorSidecarId},
+    presentation::plane::{CursorRevision, CursorSidecarId, PresentedCursorDelivery},
     presentation::plane_policy::CursorCapabilityKey,
 };
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
@@ -38,6 +38,7 @@ pub(crate) struct CursorSidecar {
     pub(crate) deadline: PresentationTarget,
     pub(crate) crtc_id: u32,
     pub(crate) test_policy: KmsTestOnlyPolicy,
+    pub(crate) cursor_delivery: PresentedCursorDelivery,
     pub(crate) capability_key: Option<CursorCapabilityKey>,
     pub(crate) validation_base: KmsValidationBase,
 }

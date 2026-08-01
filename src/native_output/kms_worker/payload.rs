@@ -157,6 +157,7 @@ pub(crate) enum KmsCommitPayloadError {
     DirectPrimaryResourceMismatch,
     MissingPrimaryOwner,
     MissingCursorOwner,
+    CursorDeliveryMismatch,
     OwnerIdentityMismatch,
     OwnerGenerationMismatch,
     OwnerTargetMismatch,
@@ -217,6 +218,23 @@ impl KmsCommitJob {
                 ..
             }) if output_generation != self.output_generation || crtc_id != self.crtc_id => {
                 return Err(KmsCommitPayloadError::ValidationBaseMismatch);
+            }
+            _ => {}
+        }
+        match (&self.kind, &self.cursor, self.cursor_delivery) {
+            (_, KmsCursorUpdate::Set(state), delivery)
+                if state.visible && delivery != PresentedCursorDelivery::Hardware =>
+            {
+                return Err(KmsCommitPayloadError::CursorDeliveryMismatch);
+            }
+            (
+                AtomicCommitKind::PlaneDelta { .. },
+                KmsCursorUpdate::Disable,
+                PresentedCursorDelivery::Hardware,
+            )
+            | (AtomicCommitKind::PlaneDelta { .. }, _, PresentedCursorDelivery::Software)
+            | (AtomicCommitKind::DirectPrimary { .. }, _, PresentedCursorDelivery::Software) => {
+                return Err(KmsCommitPayloadError::CursorDeliveryMismatch);
             }
             _ => {}
         }
