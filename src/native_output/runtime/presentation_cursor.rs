@@ -105,6 +105,7 @@ fn build_runtime_plane_plan(
         }
         CursorDeliveryChoice::Hidden { .. } => CursorDeliveryMode::Hidden,
     };
+    input.next_delivery = next_delivery;
     let mut delta_class = classify_cursor_delta(
         previous_delivery,
         next_delivery,
@@ -185,6 +186,13 @@ pub(super) fn apply_cursor_policy(context: CursorPolicyContext<'_>) -> RuntimePl
         .then(|| cursor.capability_key_for(&prospective))
         .flatten();
     let previous_capability_key = cursor.capability_key_for(cursor.current());
+    let previous_delivery = if cursor.current().visible {
+        CursorDeliveryMode::Hardware
+    } else if cursor_render_mode.is_software() {
+        CursorDeliveryMode::Software
+    } else {
+        CursorDeliveryMode::Hidden
+    };
     let input = PlaneSchedulingInput {
         revision: cursor.desired_revision(),
         preference: policy_preference,
@@ -208,15 +216,10 @@ pub(super) fn apply_cursor_policy(context: CursorPolicyContext<'_>) -> RuntimePl
         cursor_kms_changed: !prospective.kms_equivalent(cursor.current()),
         hardware_plane_visible: cursor.current().visible,
         delta_class: CursorDeltaClass::Visual,
+        previous_delivery,
+        next_delivery: CursorDeliveryMode::Hidden,
         validation_base_unchanged,
         attachable_primary: attachable_primary.map(|primary| primary.transaction_id),
-    };
-    let previous_delivery = if cursor.current().visible {
-        CursorDeliveryMode::Hardware
-    } else if cursor_render_mode.is_software() {
-        CursorDeliveryMode::Software
-    } else {
-        CursorDeliveryMode::Hidden
     };
     let plan = build_runtime_plane_plan(
         input,
@@ -316,6 +319,8 @@ mod tests {
             cursor_kms_changed: true,
             hardware_plane_visible: true,
             delta_class: CursorDeltaClass::PositionOnly,
+            previous_delivery: CursorDeliveryMode::Hardware,
+            next_delivery: CursorDeliveryMode::Hardware,
             validation_base_unchanged: true,
             attachable_primary: None,
         };

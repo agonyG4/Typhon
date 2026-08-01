@@ -542,6 +542,8 @@ fn plane_policy_exhaustively_preserves_delivery_invariants() {
                                     cursor_kms_changed: true,
                                     hardware_plane_visible: false,
                                     delta_class: CursorDeltaClass::PositionOnly,
+                                    previous_delivery: CursorDeliveryMode::Hardware,
+                                    next_delivery: CursorDeliveryMode::Hardware,
                                     validation_base_unchanged: true,
                                     attachable_primary: None,
                                 });
@@ -637,6 +639,8 @@ fn proven_motion_skips_test_but_new_geometry_class_requires_it() {
         cursor_kms_changed: true,
         hardware_plane_visible: true,
         delta_class: CursorDeltaClass::PositionOnly,
+        previous_delivery: CursorDeliveryMode::Hardware,
+        next_delivery: CursorDeliveryMode::Hardware,
         validation_base_unchanged: true,
         attachable_primary: None,
     });
@@ -661,6 +665,8 @@ fn proven_motion_skips_test_but_new_geometry_class_requires_it() {
         cursor_kms_changed: true,
         hardware_plane_visible: true,
         delta_class: CursorDeltaClass::PositionOnly,
+        previous_delivery: CursorDeliveryMode::Hardware,
+        next_delivery: CursorDeliveryMode::Hardware,
         validation_base_unchanged: true,
         attachable_primary: None,
     });
@@ -695,6 +701,8 @@ fn proven_capability_requires_exact_fully_visible_position_only_class() {
             cursor_kms_changed: true,
             hardware_plane_visible: true,
             delta_class,
+            previous_delivery: CursorDeliveryMode::Hardware,
+            next_delivery: CursorDeliveryMode::Hardware,
             validation_base_unchanged: true,
             attachable_primary: None,
         });
@@ -721,6 +729,8 @@ fn direct_hardware_motion_is_independent_and_software_transition_needs_an_owner(
         cursor_kms_changed: true,
         hardware_plane_visible: true,
         delta_class: CursorDeltaClass::PositionOnly,
+        previous_delivery: CursorDeliveryMode::Hardware,
+        next_delivery: CursorDeliveryMode::Hardware,
         validation_base_unchanged: true,
         attachable_primary: Some(OutputTransactionId::new(NonZeroU64::new(4).unwrap())),
     });
@@ -740,6 +750,8 @@ fn direct_hardware_motion_is_independent_and_software_transition_needs_an_owner(
         cursor_kms_changed: true,
         hardware_plane_visible: true,
         delta_class: CursorDeltaClass::DeliveryModeTransition,
+        previous_delivery: CursorDeliveryMode::Hardware,
+        next_delivery: CursorDeliveryMode::Software,
         validation_base_unchanged: true,
         attachable_primary: None,
     });
@@ -797,6 +809,8 @@ fn proven_edge_crop_does_not_authorize_a_different_edge_or_corner_crop() {
         cursor_kms_changed: true,
         hardware_plane_visible: true,
         delta_class: CursorDeltaClass::PositionOnly,
+        previous_delivery: CursorDeliveryMode::Hardware,
+        next_delivery: CursorDeliveryMode::Hardware,
         validation_base_unchanged: true,
         attachable_primary: None,
     });
@@ -824,6 +838,8 @@ fn proven_edge_crop_does_not_authorize_a_different_edge_or_corner_crop() {
         cursor_kms_changed: true,
         hardware_plane_visible: true,
         delta_class: CursorDeltaClass::PositionOnly,
+        previous_delivery: CursorDeliveryMode::Hardware,
+        next_delivery: CursorDeliveryMode::Hardware,
         validation_base_unchanged: true,
         attachable_primary: None,
     });
@@ -900,6 +916,8 @@ fn software_direct_transition_requires_exact_primary_coupling() {
         cursor_kms_changed: true,
         hardware_plane_visible: true,
         delta_class: CursorDeltaClass::DeliveryModeTransition,
+        previous_delivery: CursorDeliveryMode::Hardware,
+        next_delivery: CursorDeliveryMode::Software,
         validation_base_unchanged: true,
         attachable_primary: Some(primary),
     });

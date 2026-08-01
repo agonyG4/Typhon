@@ -417,8 +417,23 @@ pub(crate) struct PlaneSchedulingInput<'a> {
     pub(crate) cursor_kms_changed: bool,
     pub(crate) hardware_plane_visible: bool,
     pub(crate) delta_class: CursorDeltaClass,
+    pub(crate) previous_delivery: CursorDeliveryMode,
+    pub(crate) next_delivery: CursorDeliveryMode,
     pub(crate) validation_base_unchanged: bool,
     pub(crate) attachable_primary: Option<OutputTransactionId>,
+}
+
+pub(crate) fn skip_proven_eligible(
+    input: PlaneSchedulingInput<'_>,
+    geometry: NormalizedCursorGeometry,
+    capability_status: CursorCapabilityStatus,
+) -> bool {
+    input.delta_class == CursorDeltaClass::PositionOnly
+        && input.previous_delivery == CursorDeliveryMode::Hardware
+        && input.next_delivery == CursorDeliveryMode::Hardware
+        && input.validation_base_unchanged
+        && geometry.class == CursorGeometryClass::FullyVisible
+        && capability_status == CursorCapabilityStatus::Proven
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -566,10 +581,7 @@ pub(crate) fn schedule_planes(input: PlaneSchedulingInput<'_>) -> PlaneSchedulin
             input,
             geometry,
             hardware.key,
-            if input.delta_class == CursorDeltaClass::PositionOnly
-                && input.validation_base_unchanged
-                && geometry.class == CursorGeometryClass::FullyVisible
-            {
+            if skip_proven_eligible(input, geometry, CursorCapabilityStatus::Proven) {
                 KmsCursorTestPolicy::SkipProven
             } else {
                 KmsCursorTestPolicy::Required
