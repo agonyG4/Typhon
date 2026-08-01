@@ -1,5 +1,7 @@
 use super::*;
 use crate::native_output::kms_worker::AttachablePrimary;
+use crate::native_output::kms_worker::KmsPrimaryCursorPresentation;
+use crate::native_output::presentation::plane::CursorRevision;
 
 pub(super) fn prepare_cursor_image(
     cursor: &mut NativeAtomicCursor,
@@ -81,6 +83,55 @@ pub(super) struct RuntimePlanePlan {
     pub(super) desired_hardware_state: Option<AtomicCursorVisualState>,
     pub(super) render_mode: NativeCursorRenderMode,
     pub(super) attachable_primary: Option<AttachablePrimary>,
+    pub(super) primary_cursor_presentation: KmsPrimaryCursorPresentation,
+}
+
+pub(super) fn plan_primary_cursor_presentation(
+    plan: Option<&RuntimePlanePlan>,
+) -> KmsPrimaryCursorPresentation {
+    plan.map_or(KmsPrimaryCursorPresentation::Preserve, |plan| {
+        plan.primary_cursor_presentation
+    })
+}
+
+pub(super) fn freeze_primary_cursor_presentation(
+    previous_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
+    next_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
+    effective_cursor: Option<&AtomicCursorVisualState>,
+    atomic_cursor: Option<&NativeAtomicCursor>,
+    cursor_epoch: u64,
+) -> KmsPrimaryCursorPresentation {
+    let needs_promotion = next_delivery
+        == crate::native_output::presentation::plane::PresentedCursorDelivery::Software
+        || (previous_delivery
+            == crate::native_output::presentation::plane::PresentedCursorDelivery::Software
+            && next_delivery
+                == crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden);
+    if !needs_promotion {
+        return KmsPrimaryCursorPresentation::Preserve;
+    }
+    let mut state = effective_cursor
+        .cloned()
+        .or_else(|| atomic_cursor.map(NativeAtomicCursor::desired).cloned())
+        .unwrap_or_else(|| AtomicCursorVisualState::hidden(1, 1));
+    state.visible = false;
+    state.framebuffer_id = None;
+    let revision = atomic_cursor.map_or_else(
+        || {
+            CursorRevision::from_legacy_epoch(
+                std::num::NonZeroU64::new(cursor_epoch.max(1)).expect("cursor epoch is nonzero"),
+            )
+        },
+        NativeAtomicCursor::desired_revision,
+    );
+    KmsPrimaryCursorPresentation::Promote(
+        crate::native_output::presentation::plane::PresentedCursorState::from_atomic_with_delivery(
+            revision,
+            crate::native_output::presentation::plane::CursorCoupling::EmbeddedInPrimary,
+            next_delivery,
+            &state,
+        ),
+    )
 }
 
 pub(super) fn presented_delivery_for_plan(
@@ -352,6 +403,7 @@ fn build_runtime_plane_plan(
         delta_class,
         render_mode,
         attachable_primary,
+        primary_cursor_presentation: KmsPrimaryCursorPresentation::Preserve,
     }
 }
 
@@ -426,7 +478,7 @@ pub(super) fn apply_cursor_policy(
         validation_base_unchanged,
         attachable_primary: attachable_primary.map(|primary| primary.transaction_id),
     };
-    let plan = build_runtime_plane_plan(
+    let mut plan = build_runtime_plane_plan(
         input,
         previous_delivery,
         Some(cursor.current()),
@@ -434,6 +486,23 @@ pub(super) fn apply_cursor_policy(
         client_cursor_active,
         attachable_primary,
         previous_capability_key == capability_key,
+    );
+    plan.primary_cursor_presentation = freeze_primary_cursor_presentation(
+        match previous_delivery {
+            CursorDeliveryMode::Hidden => {
+                crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden
+            }
+            CursorDeliveryMode::Hardware => {
+                crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware
+            }
+            CursorDeliveryMode::Software => {
+                crate::native_output::presentation::plane::PresentedCursorDelivery::Software
+            }
+        },
+        presented_delivery_for_plan(Some(&plan), &None),
+        Some(&prospective),
+        Some(cursor),
+        cursor.desired_epoch(),
     );
     cursor.set_scheduled_test_policy(plan.decision.test_policy);
     match plan.decision.delivery {

@@ -1193,7 +1193,7 @@ mod tests {
         let frozen_state = cursor.desired().clone();
         let frozen_revision = cursor.desired_revision();
         let metadata =
-            crate::native_output::runtime::presentation_worker::freeze_primary_cursor_presentation(
+            crate::native_output::runtime::presentation_cursor::freeze_primary_cursor_presentation(
                 crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
                 crate::native_output::presentation::plane::PresentedCursorDelivery::Software,
                 Some(&frozen_state),

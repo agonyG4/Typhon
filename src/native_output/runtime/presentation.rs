@@ -10,8 +10,8 @@ use super::planner::{
 };
 use super::presentation_cursor::{
     CursorPolicyContext, apply_cursor_policy_with_runtime_inputs, cursor_damage_states,
-    effective_cursor_for_plan, log_client_cursor_path_if_changed, plan_uses_hardware_cursor,
-    planned_client_cursor_software_work, planned_cursor_hardware_usable,
+    effective_cursor_for_plan, log_client_cursor_path_if_changed, plan_primary_cursor_presentation,
+    plan_uses_hardware_cursor, planned_client_cursor_software_work, planned_cursor_hardware_usable,
     planned_hardware_cursor_work_pending, prepare_cursor_image, presented_delivery_for_plan,
 };
 use super::presentation_direct::{
@@ -227,6 +227,7 @@ impl NativeRuntime {
             *last_submitted_cursor_epoch,
             NativeAtomicCursor::desired_epoch,
         );
+        let primary_cursor = plan_primary_cursor_presentation(runtime_plane_plan.as_ref());
         let hardware_cursor_work_pending = planned_hardware_cursor_work_pending(
             runtime_plane_plan.as_ref(),
             cursor_state_changed,
@@ -731,13 +732,7 @@ impl NativeRuntime {
                                         target.crtc_id,
                                     ),
                                     planned_cursor_delivery,
-                                    freeze_primary_cursor_presentation(
-                                        presented_planes.cursor.delivery,
-                                        planned_cursor_delivery,
-                                        effective_cursor.as_ref(),
-                                        atomic_cursor.as_ref(),
-                                        cursor_epoch,
-                                    ),
+                                    primary_cursor,
                                 ),
                                 *drm_file_generation,
                                 target.crtc_id,
@@ -1062,13 +1057,7 @@ impl NativeRuntime {
                                                 target.crtc_id,
                                             ),
                                             planned_cursor_delivery,
-                                            freeze_primary_cursor_presentation(
-                                                presented_planes.cursor.delivery,
-                                                planned_cursor_delivery,
-                                                effective_cursor.as_ref(),
-                                                atomic_cursor.as_ref(),
-                                                cursor_epoch,
-                                            ),
+                                            primary_cursor,
                                         ),
                                         false,
                                     )?

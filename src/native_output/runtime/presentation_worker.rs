@@ -12,7 +12,6 @@ use crate::native_output::kms_worker::{
     KmsCursorUpdate, KmsPrimaryCursorPresentation, KmsPrimaryUpdate, KmsTestOnlyPolicy,
     KmsValidationBase, KmsWorkerAdmissionError,
 };
-use crate::native_output::presentation::plane::CursorRevision;
 use oblivion_one::native::kms::FramebufferId;
 
 pub(super) fn can_queue_worker_primary(
@@ -102,46 +101,6 @@ pub(super) fn worker_ctx<'a>(
         cursor_delivery,
         primary_cursor_presentation,
     }
-}
-
-pub(super) fn freeze_primary_cursor_presentation(
-    previous_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
-    next_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
-    effective_cursor: Option<&AtomicCursorVisualState>,
-    atomic_cursor: Option<&NativeAtomicCursor>,
-    cursor_epoch: u64,
-) -> KmsPrimaryCursorPresentation {
-    let needs_promotion = next_delivery
-        == crate::native_output::presentation::plane::PresentedCursorDelivery::Software
-        || (previous_delivery
-            == crate::native_output::presentation::plane::PresentedCursorDelivery::Software
-            && next_delivery
-                == crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden);
-    if !needs_promotion {
-        return KmsPrimaryCursorPresentation::Preserve;
-    }
-    let mut state = effective_cursor
-        .cloned()
-        .or_else(|| atomic_cursor.map(NativeAtomicCursor::desired).cloned())
-        .unwrap_or_else(|| AtomicCursorVisualState::hidden(1, 1));
-    state.visible = false;
-    state.framebuffer_id = None;
-    let revision = atomic_cursor.map_or_else(
-        || {
-            CursorRevision::from_legacy_epoch(
-                std::num::NonZeroU64::new(cursor_epoch.max(1)).expect("cursor epoch is nonzero"),
-            )
-        },
-        NativeAtomicCursor::desired_revision,
-    );
-    KmsPrimaryCursorPresentation::Promote(
-        crate::native_output::presentation::plane::PresentedCursorState::from_atomic_with_delivery(
-            revision,
-            crate::native_output::presentation::plane::CursorCoupling::EmbeddedInPrimary,
-            next_delivery,
-            &state,
-        ),
-    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

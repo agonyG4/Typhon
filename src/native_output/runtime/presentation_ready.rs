@@ -1,10 +1,11 @@
+use super::presentation_cursor::freeze_primary_cursor_presentation;
 use super::presentation_transactions::{
     complete_immediate_output_transaction, present_compatibility_frame,
     register_primary_transaction,
 };
 use super::presentation_worker::{
-    freeze_primary_cursor_presentation, queue_compatibility_for_presentation,
-    submit_explicit_ready_for_presentation, validation_base_for_submission, worker_ctx,
+    queue_compatibility_for_presentation, submit_explicit_ready_for_presentation,
+    validation_base_for_submission, worker_ctx,
 };
 use super::*;
 use crate::native_output::kms_worker::KmsCommitWorkerHandle;
