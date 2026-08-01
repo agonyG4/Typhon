@@ -394,19 +394,6 @@ pub(crate) struct WorkerState {
 }
 
 impl WorkerShared {
-    pub(crate) fn has_pre_freeze_primary_opportunity(&self) -> bool {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.queued.front().is_some_and(|job| {
-            job.kind.is_primary()
-                && matches!(job.primary, super::KmsPrimaryUpdate::Framebuffer { .. })
-                && matches!(job.cursor, super::KmsCursorUpdate::Unchanged)
-                && job.owners.primary_transaction_id().is_some()
-        }) || state.executing_primary.is_some()
-    }
-
     pub(crate) fn attachable_primary(
         &self,
         output_generation: u64,
@@ -489,11 +476,13 @@ impl WorkerShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         debug_assert!(state.inflight.is_none());
-        state.established_base = Some(EstablishedKmsBase::Presented {
-            revision,
-            output_generation,
-            crtc_id,
-        });
+        if state.queued.is_empty() {
+            state.established_base = Some(EstablishedKmsBase::Presented {
+                revision,
+                output_generation,
+                crtc_id,
+            });
+        }
         drop(state);
         self.work_wakeup.notify_all();
     }

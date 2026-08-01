@@ -85,6 +85,170 @@ pub(super) struct RuntimePlanePlan {
     pub(super) attachable_primary: Option<AttachablePrimary>,
 }
 
+pub(super) fn planned_cursor_hardware_usable(
+    plan: Option<&RuntimePlanePlan>,
+    atomic_cursor: Option<&NativeAtomicCursor>,
+    cursor_render_mode: NativeCursorRenderMode,
+    cursor_visible: bool,
+) -> bool {
+    plan.map_or_else(
+        || {
+            atomic_cursor.is_some_and(|cursor| {
+                effective_atomic_cursor_state(cursor, cursor_render_mode, cursor_visible)
+                    .hardware_usable()
+            })
+        },
+        |plan| {
+            matches!(
+                plan.decision.delivery,
+                CursorDeliveryChoice::Hardware { .. }
+            )
+        },
+    )
+}
+
+pub(super) const fn plan_uses_hardware_cursor(plan: &RuntimePlanePlan) -> bool {
+    matches!(
+        plan.decision.delivery,
+        CursorDeliveryChoice::Hardware { .. }
+    )
+}
+
+pub(super) fn planned_client_cursor_software_work(
+    plan: Option<&RuntimePlanePlan>,
+    client_cursor_hardware_usable: bool,
+    last_damage: Option<&NativeClientCursorDamageState>,
+    current_damage: Option<NativeClientCursorDamageState>,
+    client_cursor_active: bool,
+) -> bool {
+    plan.is_some_and(|plan| {
+        plan.decision.pacing_constraint == CursorPacingConstraint::ReactiveDouble
+    }) && !client_cursor_hardware_usable
+        && last_damage != current_damage.as_ref()
+        && (client_cursor_active || last_damage.is_some())
+}
+
+pub(super) fn planned_hardware_cursor_work_pending(
+    plan: Option<&RuntimePlanePlan>,
+    cursor_state_changed: bool,
+    atomic_cursor: Option<&NativeAtomicCursor>,
+    cursor_render_mode: NativeCursorRenderMode,
+) -> bool {
+    cursor_state_changed
+        && plan.is_none_or(|plan| plan.delta_class != CursorDeltaClass::DeliveryModeTransition)
+        && atomic_cursor.is_some_and(|cursor| {
+            cursor.current().visible || cursor_render_mode == NativeCursorRenderMode::Hardware
+        })
+}
+
+pub(super) fn effective_cursor_for_plan(
+    plan: Option<&RuntimePlanePlan>,
+    atomic_cursor: Option<&NativeAtomicCursor>,
+    cursor_render_mode: NativeCursorRenderMode,
+    cursor_visible: bool,
+) -> Option<AtomicCursorVisualState> {
+    plan.and_then(|plan| plan.desired_hardware_state.clone())
+        .or_else(|| {
+            atomic_cursor.and_then(|cursor| {
+                effective_atomic_cursor_state(cursor, cursor_render_mode, cursor_visible)
+                    .kms_state()
+                    .cloned()
+            })
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn cursor_damage_states(
+    client_cursor: Option<oblivion_one::compositor::ClientCursorRenderState<'_>>,
+    output_width: u32,
+    output_height: u32,
+    cursor_render_mode: NativeCursorRenderMode,
+    cursor_visible: bool,
+    client_cursor_active: bool,
+    input_state: &NativeInputState,
+    cursor_image: &oblivion_one::cursor_theme::CompositorCursorImage,
+) -> (
+    Option<NativeClientCursorDamageState>,
+    Option<NativeDamageRect>,
+) {
+    let client_damage = client_cursor.map(|cursor| {
+        NativeClientCursorDamageState::from_cursor(output_width, output_height, cursor)
+    });
+    let software_damage = (cursor_render_mode == NativeCursorRenderMode::Software
+        && cursor_visible
+        && !client_cursor_active)
+        .then(|| {
+            native_theme_cursor_rect(
+                output_width,
+                output_height,
+                input_state.cursor_position(),
+                cursor_image,
+            )
+        })
+        .flatten();
+    (client_damage, software_damage)
+}
+
+pub(super) fn log_client_cursor_path_if_changed(
+    last_path: &mut Option<NativeClientCursorPath>,
+    client_cursor_active: bool,
+    hardware_eligible: bool,
+    direct_active: bool,
+    client_cursor: Option<oblivion_one::compositor::ClientCursorRenderState<'_>>,
+    perf: NativePerfLogger,
+) {
+    let path = resolve_client_cursor_path(client_cursor_active, hardware_eligible);
+    if *last_path != Some(path) {
+        *last_path = Some(path);
+        log_client_cursor_path(perf, path, hardware_eligible, direct_active, client_cursor);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn apply_cursor_policy_with_runtime_inputs(
+    mut context: CursorPolicyContext<'_>,
+    worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
+    output_generation: u64,
+    crtc_id: u32,
+    scheduled_target: Option<oblivion_one::native::presentation_deadline::PresentationTarget>,
+    presented_cursor: crate::native_output::presentation::plane::PresentedCursorState,
+    atomic_commit_pending: bool,
+    perf: NativePerfLogger,
+) -> RuntimePlanePlan {
+    context.attachable_primary = scheduled_target.and_then(|scheduled_target| {
+        worker.and_then(|worker| {
+            worker.attachable_primary(output_generation, crtc_id, scheduled_target)
+        })
+    });
+    context.validation_base_unchanged =
+        !atomic_commit_pending && presented_cursor.kms_equivalent_to(context.cursor.current());
+    let plan = apply_cursor_policy(context);
+    perf.log("native.cursor_plane_policy", || {
+        vec![
+            NativePerfField::str("reason", format!("{:?}", plan.decision.reason)),
+            NativePerfField::str("delta_class", format!("{:?}", plan.delta_class)),
+            NativePerfField::str("delivery", format!("{:?}", plan.decision.delivery)),
+            NativePerfField::str(
+                "cursor_action",
+                format!("{:?}", plan.decision.cursor_action),
+            ),
+            NativePerfField::str(
+                "primary_action",
+                format!("{:?}", plan.decision.primary_action),
+            ),
+            NativePerfField::str("pacing", format!("{:?}", plan.decision.pacing_constraint)),
+            NativePerfField::str("test_policy", format!("{:?}", plan.decision.test_policy)),
+            NativePerfField::bool("direct_compatible", plan.decision.direct_scanout_compatible),
+            NativePerfField::u64(
+                "attachable_primary",
+                plan.attachable_primary
+                    .map_or(0, |primary| primary.transaction_id.get()),
+            ),
+        ]
+    });
+    plan
+}
+
 fn build_runtime_plane_plan(
     mut input: PlaneSchedulingInput<'_>,
     previous_delivery: CursorDeliveryMode,

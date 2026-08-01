@@ -459,6 +459,7 @@ pub(crate) enum CursorDeliveryChoice {
 pub(crate) enum PrimaryPlaneAction {
     Preserve,
     TransitionToComposed,
+    RequirePrimaryFrame,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -599,20 +600,35 @@ fn hidden_decision(
     reason: PlaneSchedulingReason,
 ) -> PlaneSchedulingDecision {
     let disable_hardware_plane = input.hardware_plane_visible;
+    let software_boundary = input.previous_delivery == CursorDeliveryMode::Software;
     PlaneSchedulingDecision {
         delivery: CursorDeliveryChoice::Hidden {
             revision: input.revision,
             disable_hardware_plane,
         },
         direct_scanout_compatible: true,
-        primary_action: PrimaryPlaneAction::Preserve,
-        cursor_action: if disable_hardware_plane && input.cursor_kms_changed {
+        cursor_action: if software_boundary {
+            if let Some(primary) = input.attachable_primary {
+                CursorPlaneAction::MustBundleWith(primary)
+            } else if input.primary_mode == PlanePrimaryMode::Direct {
+                CursorPlaneAction::AwaitPrimaryTransition
+            } else {
+                CursorPlaneAction::EmbedInPrimary
+            }
+        } else if disable_hardware_plane && input.cursor_kms_changed {
             CursorPlaneAction::Independent
         } else {
             CursorPlaneAction::None
         },
         pacing_constraint: CursorPacingConstraint::Unchanged,
         test_policy: KmsCursorTestPolicy::NotApplicable,
+        primary_action: if software_boundary && input.primary_mode == PlanePrimaryMode::Direct {
+            PrimaryPlaneAction::TransitionToComposed
+        } else if software_boundary {
+            PrimaryPlaneAction::RequirePrimaryFrame
+        } else {
+            PrimaryPlaneAction::Preserve
+        },
         reason,
     }
 }
@@ -666,6 +682,7 @@ fn hardware_decision(
     test_policy: KmsCursorTestPolicy,
     reason: PlaneSchedulingReason,
 ) -> PlaneSchedulingDecision {
+    let software_boundary = input.previous_delivery == CursorDeliveryMode::Software;
     PlaneSchedulingDecision {
         delivery: CursorDeliveryChoice::Hardware {
             revision: input.revision,
@@ -673,8 +690,17 @@ fn hardware_decision(
             capability_key,
         },
         direct_scanout_compatible: true,
-        primary_action: PrimaryPlaneAction::Preserve,
-        cursor_action: if input.cursor_kms_changed {
+        primary_action: if software_boundary {
+            PrimaryPlaneAction::RequirePrimaryFrame
+        } else {
+            PrimaryPlaneAction::Preserve
+        },
+        cursor_action: if software_boundary {
+            input.attachable_primary.map_or(
+                CursorPlaneAction::AwaitPrimaryTransition,
+                CursorPlaneAction::MustBundleWith,
+            )
+        } else if input.cursor_kms_changed {
             CursorPlaneAction::Independent
         } else {
             CursorPlaneAction::None

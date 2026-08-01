@@ -258,6 +258,67 @@ fn delivery_aware_delta_classification_rejects_position_only_across_delivery_mod
 }
 
 #[test]
+fn software_boundaries_require_the_primary_frame_that_removes_software_cursor_content() {
+    let primary = OutputTransactionId::new(NonZeroU64::new(52).unwrap());
+    let cache = PlaneCapabilityCache::default();
+    let key = capability_key(CursorGeometryClass::FullyVisible);
+
+    let hardware = schedule_planes(PlaneSchedulingInput {
+        revision: CursorRevision::initial().advance_visibility(),
+        preference: CursorPreference::Auto,
+        visible: true,
+        geometry: geometry(100, 100),
+        geometry_valid: true,
+        hardware: Some(CursorHardwareCapability { key }),
+        capabilities: &cache,
+        primary_mode: PlanePrimaryMode::Composed,
+        software_allowed: true,
+        predictive_triple_active: false,
+        cursor_kms_changed: true,
+        hardware_plane_visible: false,
+        delta_class: CursorDeltaClass::DeliveryModeTransition,
+        previous_delivery: CursorDeliveryMode::Software,
+        next_delivery: CursorDeliveryMode::Hardware,
+        validation_base_unchanged: true,
+        attachable_primary: Some(primary),
+    });
+    assert_eq!(
+        hardware.cursor_action,
+        CursorPlaneAction::MustBundleWith(primary)
+    );
+    assert_eq!(
+        hardware.primary_action,
+        PrimaryPlaneAction::RequirePrimaryFrame
+    );
+    assert_eq!(hardware.test_policy, KmsCursorTestPolicy::Required);
+
+    let hidden = schedule_planes(PlaneSchedulingInput {
+        revision: CursorRevision::initial().advance_visibility(),
+        preference: CursorPreference::Auto,
+        visible: false,
+        geometry: geometry(100, 100),
+        geometry_valid: true,
+        hardware: Some(CursorHardwareCapability { key }),
+        capabilities: &cache,
+        primary_mode: PlanePrimaryMode::Composed,
+        software_allowed: true,
+        predictive_triple_active: false,
+        cursor_kms_changed: true,
+        hardware_plane_visible: false,
+        delta_class: CursorDeltaClass::DeliveryModeTransition,
+        previous_delivery: CursorDeliveryMode::Software,
+        next_delivery: CursorDeliveryMode::Hidden,
+        validation_base_unchanged: true,
+        attachable_primary: None,
+    });
+    assert_eq!(hidden.cursor_action, CursorPlaneAction::EmbedInPrimary);
+    assert_eq!(
+        hidden.primary_action,
+        PrimaryPlaneAction::RequirePrimaryFrame
+    );
+}
+
+#[test]
 fn cursor_write_set_rejects_primary_mutation() {
     let plane_delta = PlaneWriteSet::CURSOR;
     assert!(plane_delta.validate_cursor_delta().is_ok());

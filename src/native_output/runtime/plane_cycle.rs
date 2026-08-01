@@ -497,11 +497,16 @@ pub(super) fn cursor_worker_opportunities(
     worker_mode: bool,
     worker: Option<&KmsCommitWorkerHandle>,
     arbiter: &AtomicCommitArbiter,
+    attachable_primary: Option<crate::native_output::kms_worker::AttachablePrimary>,
 ) -> (bool, bool) {
     (
-        super::presentation_worker::worker_cursor_queue_available(worker_mode, worker, arbiter),
-        worker_mode
-            && worker.is_some_and(KmsCommitWorkerHandle::has_pre_freeze_primary_opportunity),
+        super::presentation_worker::worker_cursor_queue_available(
+            worker_mode,
+            worker,
+            arbiter,
+            attachable_primary,
+        ),
+        worker_mode && attachable_primary.is_some(),
     )
 }
 

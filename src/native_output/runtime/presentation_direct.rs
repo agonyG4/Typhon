@@ -107,7 +107,10 @@ pub(super) fn inspect_direct_presentation(
             && inputs.atomic_cursor.is_none()
             && !inputs.legacy_cursor_available)
         || inputs.plane_decision.is_some_and(|decision| {
-            decision.primary_action == PrimaryPlaneAction::TransitionToComposed
+            matches!(
+                decision.primary_action,
+                PrimaryPlaneAction::TransitionToComposed | PrimaryPlaneAction::RequirePrimaryFrame
+            )
         })
         || !cursor_direct_compatible
         || (inputs.direct_active && !direct_candidate_eligible);

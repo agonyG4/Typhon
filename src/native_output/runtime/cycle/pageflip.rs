@@ -1078,6 +1078,13 @@ impl NativeRuntime {
                             )
                             .into());
                         }
+                        if let Some(worker) = kms_commit_worker.as_ref() {
+                            worker.set_established_presented_base(
+                                self.presented_planes.revision,
+                                *drm_file_generation,
+                                target.crtc_id,
+                            );
+                        }
                     }
                     submitted_worker_ownership
                         .retain(|ownership| ownership.job.token != pageflip_token);

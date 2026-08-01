@@ -820,10 +820,11 @@ pub(super) fn worker_cursor_queue_available(
     worker_mode: bool,
     worker: Option<&KmsCommitWorkerHandle>,
     arbiter: &AtomicCommitArbiter,
+    attachable_primary: Option<crate::native_output::kms_worker::AttachablePrimary>,
 ) -> bool {
     worker_mode
         && worker.is_some_and(|worker| {
-            worker.has_pre_freeze_primary_opportunity()
+            attachable_primary.is_some()
                 || (arbiter.kernel_commit_submitted()
                     && arbiter.worker_slot_available()
                     && arbiter

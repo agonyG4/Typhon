@@ -663,8 +663,10 @@ fn fifo_order_is_preserved_and_second_submit_waits_for_ack() {
         submitted: Mutex::new(Vec::new()),
     });
     let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let first = test_job(1);
+    let first_identity = first.identity();
     reserve_for_test(&handle, test_job(1).kind)
-        .enqueue(test_job(1))
+        .enqueue(first)
         .unwrap();
     for _ in 0..100 {
         if handle.submission_active() {
@@ -672,8 +674,10 @@ fn fifo_order_is_preserved_and_second_submit_waits_for_ack() {
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    reserve_for_test(&handle, test_job(2).kind)
-        .enqueue(test_job(2))
+    let mut second = test_job(2);
+    second.validation_base = KmsValidationBase::Predecessor(first_identity);
+    reserve_for_test(&handle, second.kind)
+        .enqueue(second)
         .unwrap();
 
     std::thread::sleep(Duration::from_millis(10));
@@ -1265,8 +1269,10 @@ fn primary_job_keeps_queued_cursor_pin_until_submission_completes() {
     let mut arbitration = NativeCursorOutputArbitration::default();
     arbitration.request(10, 1, 100);
     arbitration.request(11, 2, 100);
+    let first = test_job(51);
+    let first_identity = first.identity();
     reserve_for_test(&handle, test_job(51).kind)
-        .enqueue(test_job(51))
+        .enqueue(first)
         .unwrap();
     let first_submission = wait_for_fence_event(
         &handle,
@@ -1274,6 +1280,8 @@ fn primary_job_keeps_queued_cursor_pin_until_submission_completes() {
         |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 51),
     );
 
+    let mut second = test_composited_primary_job_with_cursor(52, 91, pin);
+    second.validation_base = KmsValidationBase::Predecessor(first_identity);
     reserve_for_test(
         &handle,
         AtomicCommitKind::CompositedPrimary {
@@ -1282,7 +1290,7 @@ fn primary_job_keeps_queued_cursor_pin_until_submission_completes() {
             framebuffer_id: 91,
         },
     )
-    .enqueue(test_composited_primary_job_with_cursor(52, 91, pin))
+    .enqueue(second)
     .unwrap();
     assert!(pin_observer.is_job_owned());
     drop(cursor);

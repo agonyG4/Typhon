@@ -8,7 +8,12 @@ use super::planner::{
     NativePresentationPath, NativePresentationPlanInput, plan_native_presentation_path,
     plan_scheduled_target_for_mode,
 };
-use super::presentation_cursor::{CursorPolicyContext, apply_cursor_policy, prepare_cursor_image};
+use super::presentation_cursor::{
+    CursorPolicyContext, apply_cursor_policy_with_runtime_inputs, cursor_damage_states,
+    effective_cursor_for_plan, log_client_cursor_path_if_changed, plan_uses_hardware_cursor,
+    planned_client_cursor_software_work, planned_cursor_hardware_usable,
+    planned_hardware_cursor_work_pending, prepare_cursor_image,
+};
 use super::presentation_direct::{
     DirectPresentationInputs, inspect_direct_presentation, log_prepared_primary_arbitration,
     suppress_direct_render_ahead,
@@ -27,11 +32,9 @@ use super::presentation_transactions::{
 };
 use super::presentation_worker::*;
 use super::*;
-use crate::native_output::kms_worker::KmsCommitWorkerTransport;
-use crate::native_output::kms_worker::KmsTestOnlyPolicy;
+use crate::native_output::kms_worker::{KmsCommitWorkerTransport, KmsTestOnlyPolicy};
 use oblivion_one::native::kms::KmsBackendKind;
 use oblivion_one::native::scheduler::rendered_primary_must_wait_for_lane;
-
 impl NativeRuntime {
     #[allow(unused_variables)]
     pub(super) fn render_present_and_update_metrics(
@@ -148,47 +151,37 @@ impl NativeRuntime {
         if client_cursor_active && let Some(cursor) = legacy_cursor.as_mut() {
             cursor.disable()?;
         }
-        let mut runtime_plane_plan = None;
-        let mut client_cursor_hardware_usable = false;
+        let (mut runtime_plane_plan, mut client_cursor_hardware_usable) = (None, false);
         if let Some(cursor) = atomic_cursor.as_mut() {
             let cursor_image_ready =
                 prepare_cursor_image(cursor, client_cursor, kms, input_state, perf);
-
-            let attachable_primary =
-                scheduled_presentation_target
-                    .as_ref()
-                    .and_then(|scheduled_target| {
-                        kms_commit_worker.as_ref().and_then(|worker| {
-                            worker.attachable_primary(
-                                *drm_file_generation,
-                                target.crtc_id,
-                                *scheduled_target,
-                            )
-                        })
-                    });
-            let validation_base_unchanged = !atomic_commit_arbiter.atomic_commit_pending()
-                && presented_planes.cursor.kms_equivalent_to(cursor.current());
-            let plan = apply_cursor_policy(CursorPolicyContext {
-                cursor,
-                cursor_visible,
-                cursor_image_ready,
-                output_width: target.width,
-                output_height: target.height,
-                cursor_preference: *cursor_preference,
-                cursor_scheduling_policy: *cursor_scheduling_policy,
-                confirmed_primary_assignment: *confirmed_primary_assignment,
-                predictive_triple_active: adaptive_buffering.mode()
-                    == AdaptiveBufferingMode::Triple,
-                client_cursor_active,
-                cursor_render_mode,
-                last_client_cursor_damage,
-                attachable_primary,
-                validation_base_unchanged,
-            });
-            client_cursor_hardware_usable = matches!(
-                plan.decision.delivery,
-                CursorDeliveryChoice::Hardware { .. }
+            let plan = apply_cursor_policy_with_runtime_inputs(
+                CursorPolicyContext {
+                    cursor,
+                    cursor_visible,
+                    cursor_image_ready,
+                    output_width: target.width,
+                    output_height: target.height,
+                    cursor_preference: *cursor_preference,
+                    cursor_scheduling_policy: *cursor_scheduling_policy,
+                    confirmed_primary_assignment: *confirmed_primary_assignment,
+                    predictive_triple_active: adaptive_buffering.mode()
+                        == AdaptiveBufferingMode::Triple,
+                    client_cursor_active,
+                    cursor_render_mode,
+                    last_client_cursor_damage,
+                    attachable_primary: None,
+                    validation_base_unchanged: false,
+                },
+                kms_commit_worker.as_ref(),
+                *drm_file_generation,
+                target.crtc_id,
+                *scheduled_presentation_target,
+                presented_planes.cursor,
+                atomic_commit_arbiter.atomic_commit_pending(),
+                perf,
             );
+            client_cursor_hardware_usable = plan_uses_hardware_cursor(&plan);
             runtime_plane_plan = Some(plan);
         } else if client_cursor_active {
             *cursor_render_mode = NativeCursorRenderMode::SoftwareClient;
@@ -204,39 +197,29 @@ impl NativeRuntime {
                     && !cursor.capability_quarantined(),
             );
         }
-        let current_client_cursor_damage = client_cursor.map(|cursor| {
-            NativeClientCursorDamageState::from_cursor(target.width, target.height, cursor)
-        });
-        let current_software_cursor_damage = (*cursor_render_mode
-            == NativeCursorRenderMode::Software
-            && cursor_visible
-            && !client_cursor_active)
-            .then(|| {
-                native_theme_cursor_rect(
-                    target.width,
-                    target.height,
-                    input_state.cursor_position(),
-                    cursor_image,
-                )
-            })
-            .flatten();
-        let client_cursor_software_work = runtime_plane_plan.as_ref().is_some_and(|plan| {
-            plan.decision.pacing_constraint == CursorPacingConstraint::ReactiveDouble
-        }) && !client_cursor_hardware_usable
-            && (*last_client_cursor_damage != current_client_cursor_damage)
-            && (client_cursor_active || last_client_cursor_damage.is_some());
-        let mut effective_cursor = runtime_plane_plan
-            .as_ref()
-            .and_then(|plan| plan.desired_hardware_state.clone())
-            .or_else(|| {
-                atomic_cursor
-                    .as_ref()
-                    .and_then(|cursor| {
-                        effective_atomic_cursor_state(cursor, *cursor_render_mode, cursor_visible)
-                            .kms_state()
-                    })
-                    .cloned()
-            });
+        let (current_client_cursor_damage, current_software_cursor_damage) = cursor_damage_states(
+            client_cursor,
+            target.width,
+            target.height,
+            *cursor_render_mode,
+            cursor_visible,
+            client_cursor_active,
+            input_state,
+            cursor_image,
+        );
+        let client_cursor_software_work = planned_client_cursor_software_work(
+            runtime_plane_plan.as_ref(),
+            client_cursor_hardware_usable,
+            last_client_cursor_damage.as_ref(),
+            current_client_cursor_damage,
+            client_cursor_active,
+        );
+        let mut effective_cursor = effective_cursor_for_plan(
+            runtime_plane_plan.as_ref(),
+            atomic_cursor.as_ref(),
+            *cursor_render_mode,
+            cursor_visible,
+        );
         let cursor_state_changed = atomic_cursor
             .as_ref()
             .is_some_and(|cursor| cursor.needs_submission_for(effective_cursor.as_ref()));
@@ -244,25 +227,20 @@ impl NativeRuntime {
             *last_submitted_cursor_epoch,
             NativeAtomicCursor::desired_epoch,
         );
-        let hardware_cursor_work_pending = cursor_state_changed
-            && runtime_plane_plan
-                .as_ref()
-                .is_none_or(|plan| plan.delta_class != CursorDeltaClass::DeliveryModeTransition)
-            && atomic_cursor.as_ref().is_some_and(|cursor| {
-                cursor.current().visible || *cursor_render_mode == NativeCursorRenderMode::Hardware
-            });
-        let resolved_client_cursor_path =
-            resolve_client_cursor_path(client_cursor_active, client_cursor_hardware_usable);
-        if *last_client_cursor_path != Some(resolved_client_cursor_path) {
-            *last_client_cursor_path = Some(resolved_client_cursor_path);
-            log_client_cursor_path(
-                perf,
-                resolved_client_cursor_path,
-                client_cursor_hardware_usable,
-                confirmed_primary_assignment.is_some_and(|assignment| assignment.is_direct()),
-                client_cursor,
-            );
-        }
+        let hardware_cursor_work_pending = planned_hardware_cursor_work_pending(
+            runtime_plane_plan.as_ref(),
+            cursor_state_changed,
+            atomic_cursor.as_ref(),
+            *cursor_render_mode,
+        );
+        log_client_cursor_path_if_changed(
+            last_client_cursor_path,
+            client_cursor_active,
+            client_cursor_hardware_usable,
+            confirmed_primary_assignment.is_some_and(|assignment| assignment.is_direct()),
+            client_cursor,
+            perf,
+        );
         let (_cursor_epoch_changed, cursor_deadline_due, cursor_work_pending) =
             update_cursor_output_arbitration(
                 cursor_output_arbitration,
@@ -457,19 +435,11 @@ impl NativeRuntime {
             )
             .into());
         }
-        let mut cursor_hardware_usable = runtime_plane_plan.as_ref().map_or_else(
-            || {
-                atomic_cursor.as_ref().is_some_and(|cursor| {
-                    effective_atomic_cursor_state(cursor, *cursor_render_mode, cursor_visible)
-                        .hardware_usable()
-                })
-            },
-            |plan| {
-                matches!(
-                    plan.decision.delivery,
-                    CursorDeliveryChoice::Hardware { .. }
-                )
-            },
+        let mut cursor_hardware_usable = planned_cursor_hardware_usable(
+            runtime_plane_plan.as_ref(),
+            atomic_cursor.as_ref(),
+            *cursor_render_mode,
+            cursor_visible,
         );
         if client_cursor_active {
             cursor_hardware_usable = client_cursor_hardware_usable;
@@ -525,6 +495,9 @@ impl NativeRuntime {
             worker_mode,
             kms_commit_worker.as_ref(),
             atomic_commit_arbiter,
+            runtime_plane_plan
+                .as_ref()
+                .and_then(|plan| plan.attachable_primary),
         );
         let atomic_commit_blocks_cursor = atomic_primary_commit_pending && !can_queue_worker_cursor;
         let primary_work_for_cursor = (primary_visual_work_pending && !sidecar_opportunity)

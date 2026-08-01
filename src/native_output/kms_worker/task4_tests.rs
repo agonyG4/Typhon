@@ -200,6 +200,13 @@ fn dependent_cursor_waits_for_the_exact_predecessor_pageflip_before_testing() {
     handle
         .ack_pageflip(predecessor_token, predecessor_transaction, 1)
         .unwrap();
+    handle.set_established_presented_base(
+        crate::native_output::presentation::plane::PlaneStateRevision::new(
+            std::num::NonZeroU64::new(2).unwrap(),
+        ),
+        1,
+        7,
+    );
     let cursor_events = wait_for_fence_event(
         &handle,
         336,
@@ -221,6 +228,39 @@ fn dependent_cursor_waits_for_the_exact_predecessor_pageflip_before_testing() {
         )
         .unwrap();
     drop((predecessor_events, cursor_events));
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn stale_presented_validation_base_is_returned_before_test_or_submit() {
+    let executor = Arc::new(RecordingExecutor::accepting());
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    handle.set_established_presented_base(
+        crate::native_output::presentation::plane::PlaneStateRevision::new(
+            std::num::NonZeroU64::new(2).unwrap(),
+        ),
+        1,
+        7,
+    );
+    let mut job = test_cursor_job(3361);
+    job.validation_base = KmsValidationBase::Presented {
+        snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(None),
+        output_generation: 1,
+        crtc_id: 7,
+    };
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    wait_for_fence_event(&handle, 3361, |event| {
+        matches!(
+            event,
+            KmsWorkerEvent::ValidationBaseInvalidated { job, reason, .. }
+                if job.token.get() == 3361
+                    && *reason == super::thread::ValidationBaseInvalidationReason::PresentedRevisionChanged
+        )
+    });
+    let requests = executor.requests.lock().unwrap();
+    assert!(!requests.iter().any(|request| request.framebuffer_id == 0));
+    drop(requests);
     handle.request_quiesce();
     handle.join().unwrap();
 }
@@ -273,6 +313,96 @@ fn rejected_predecessor_returns_dependent_cursor_before_test_or_submit() {
 }
 
 #[test]
+fn permanently_rejected_predecessor_invalidates_dependent_before_test_or_submit() {
+    let executor = Arc::new(RecordingExecutor {
+        test_outcomes: Mutex::new(VecDeque::from([Ok(())])),
+        submit_outcomes: Mutex::new(VecDeque::from([Err(
+            oblivion_one::native::kms::AtomicKmsErrorKind::FlipRejected,
+        )])),
+        requests: Mutex::new(Vec::new()),
+        real_input_fence_fds: Mutex::new(Vec::new()),
+        real_input_fence_open: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let predecessor = required_direct_test_job(3381);
+    let predecessor_identity = predecessor.identity();
+    let mut cursor = test_cursor_job(3382);
+    cursor.validation_base = KmsValidationBase::Predecessor(predecessor_identity);
+    let pause = handle.pause_after_dequeue_for_test();
+    reserve_for_test(&handle, predecessor.kind)
+        .enqueue(predecessor)
+        .unwrap();
+    pause.wait_until_selected();
+    reserve_for_test(&handle, cursor.kind)
+        .enqueue(cursor)
+        .unwrap();
+    pause.release();
+    wait_for_fence_event(&handle, 3382, |event| {
+        matches!(
+            event,
+            KmsWorkerEvent::ValidationBaseInvalidated { job, .. }
+                if job.token.get() == 3382
+        )
+    });
+    assert!(
+        !executor
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.framebuffer_id == 0)
+    );
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn busy_exhausted_predecessor_invalidates_dependent_before_test_or_submit() {
+    let executor = Arc::new(RecordingExecutor {
+        test_outcomes: Mutex::new(VecDeque::from([Ok(())])),
+        submit_outcomes: Mutex::new(VecDeque::from([
+            Err(oblivion_one::native::kms::AtomicKmsErrorKind::Busy),
+            Err(oblivion_one::native::kms::AtomicKmsErrorKind::Busy),
+            Err(oblivion_one::native::kms::AtomicKmsErrorKind::Busy),
+        ])),
+        requests: Mutex::new(Vec::new()),
+        real_input_fence_fds: Mutex::new(Vec::new()),
+        real_input_fence_open: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let predecessor = required_direct_test_job(3383);
+    let predecessor_identity = predecessor.identity();
+    let mut cursor = test_cursor_job(3384);
+    cursor.validation_base = KmsValidationBase::Predecessor(predecessor_identity);
+    let pause = handle.pause_after_dequeue_for_test();
+    reserve_for_test(&handle, predecessor.kind)
+        .enqueue(predecessor)
+        .unwrap();
+    pause.wait_until_selected();
+    reserve_for_test(&handle, cursor.kind)
+        .enqueue(cursor)
+        .unwrap();
+    pause.release();
+    wait_for_fence_event(&handle, 3384, |event| {
+        matches!(
+            event,
+            KmsWorkerEvent::ValidationBaseInvalidated { job, .. }
+                if job.token.get() == 3384
+        )
+    });
+    assert!(
+        !executor
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.framebuffer_id == 0)
+    );
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
 fn mismatched_pageflip_identity_invalidates_dependents_without_releasing_the_inflight_job() {
     let executor = Arc::new(RecordingExecutor::accepting());
     let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
@@ -315,6 +445,50 @@ fn mismatched_pageflip_identity_invalidates_dependents_without_releasing_the_inf
     );
     assert!(handle.inflight());
     drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn explicit_predecessor_replacement_returns_dependent_before_test_or_submit() {
+    let executor = Arc::new(RecordingExecutor::accepting());
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let predecessor = test_job(3393);
+    let predecessor_identity = predecessor.identity();
+    let mut cursor = test_cursor_job(3394);
+    cursor.validation_base = KmsValidationBase::Predecessor(predecessor_identity);
+
+    reserve_for_test(&handle, predecessor.kind)
+        .enqueue(predecessor)
+        .unwrap();
+    wait_for_fence_event(
+        &handle,
+        3393,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 3393),
+    );
+    reserve_for_test(&handle, cursor.kind)
+        .enqueue(cursor)
+        .unwrap();
+    handle.invalidate_validation_base(
+        predecessor_identity,
+        super::thread::ValidationBaseInvalidationReason::PredecessorTerminal,
+    );
+    wait_for_fence_event(&handle, 3394, |event| {
+        matches!(
+            event,
+            KmsWorkerEvent::ValidationBaseInvalidated { job, .. }
+                if job.token.get() == 3394
+        )
+    });
+    assert!(
+        !executor
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.framebuffer_id == 0)
+    );
+    assert!(handle.inflight());
     handle.request_quiesce();
     handle.join().unwrap();
 }
