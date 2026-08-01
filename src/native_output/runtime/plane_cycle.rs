@@ -201,6 +201,10 @@ pub(super) fn queue_plane_delta(
         cursor: desired
             .clone()
             .map_or(KmsCursorUpdate::Disable, KmsCursorUpdate::Set),
+        cursor_delivery: desired.as_ref().map_or(
+            crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
+            |_| crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware,
+        ),
         cursor_pin: match promoted_pin {
             Some(pin) => Some(pin),
             None => desired
@@ -406,7 +410,7 @@ pub(super) fn try_offer_cursor_sidecar(
     target: PresentationTarget,
     crtc_id: u32,
     _output_generation: u64,
-    validation_base: KmsValidationBase,
+    _validation_base: KmsValidationBase,
     attachable_primary: Option<AttachablePrimary>,
     cursor_action: CursorPlaneAction,
 ) -> NativeResult<Option<WorkerQueueOutcome>> {
@@ -435,6 +439,12 @@ pub(super) fn try_offer_cursor_sidecar(
             return Ok(None);
         }
     };
+    // Once a sidecar is offered to this primary, it becomes part of P's
+    // frozen bundle regardless of whether the policy required coupling.  The
+    // bundle must therefore be tested against P's own immutable base.  A
+    // standalone retry receives a fresh Predecessor(P) base only after this
+    // attachment attempt has been returned to runtime.
+    let sidecar_validation_base = attachable_primary.validation_base;
     let sidecar = CursorSidecar {
         id: cursor_sidecar_id,
         transaction: Arc::new(descriptor.clone()),
@@ -450,7 +460,7 @@ pub(super) fn try_offer_cursor_sidecar(
         crtc_id,
         test_policy: scheduled_kms_test_policy(cursor),
         capability_key: desired.and_then(|state| cursor.capability_key_for(state)),
-        validation_base,
+        validation_base: sidecar_validation_base,
     };
     match worker.offer_cursor_sidecar(sidecar) {
         Ok(replaced) => {
