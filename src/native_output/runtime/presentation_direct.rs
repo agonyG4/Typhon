@@ -33,6 +33,7 @@ pub(super) struct DirectPresentationInputs<'a> {
     pub(super) pending_frame_work: bool,
     pub(super) primary_redraw_requested: bool,
     pub(super) direct_active: bool,
+    pub(super) plane_decision: Option<&'a PlaneSchedulingDecision>,
 }
 
 fn direct_candidate_changed(
@@ -53,18 +54,22 @@ pub(super) fn inspect_direct_presentation(
     inputs: DirectPresentationInputs<'_>,
 ) -> DirectPresentationInspection {
     let cursor_direct_compatible = if inputs.kms_kind == KmsBackendKind::Atomic {
-        if inputs.client_cursor_active {
-            !inputs.cursor_visible || inputs.client_cursor_hardware_usable
+        if let Some(decision) = inputs.plane_decision {
+            decision.direct_scanout_compatible
         } else {
-            inputs.atomic_cursor.as_ref().is_some_and(|cursor| {
-                atomic_cursor_visibility_policy(
-                    cursor.desired().visible,
-                    cursor.capability_quarantined(),
-                    inputs.cursor_render_mode,
-                    inputs.cursor_visible,
-                )
-                .direct_compatible(inputs.cursor_visible)
-            }) || !inputs.cursor_visible
+            if inputs.client_cursor_active {
+                !inputs.cursor_visible || inputs.client_cursor_hardware_usable
+            } else {
+                inputs.atomic_cursor.as_ref().is_some_and(|cursor| {
+                    atomic_cursor_visibility_policy(
+                        cursor.desired().visible,
+                        cursor.capability_quarantined(),
+                        inputs.cursor_render_mode,
+                        inputs.cursor_visible,
+                    )
+                    .direct_compatible(inputs.cursor_visible)
+                }) || !inputs.cursor_visible
+            }
         }
     } else {
         true
@@ -101,6 +106,9 @@ pub(super) fn inspect_direct_presentation(
             && inputs.cursor_render_mode == NativeCursorRenderMode::Hardware
             && inputs.atomic_cursor.is_none()
             && !inputs.legacy_cursor_available)
+        || inputs.plane_decision.is_some_and(|decision| {
+            decision.primary_action == PrimaryPlaneAction::TransitionToComposed
+        })
         || !cursor_direct_compatible
         || (inputs.direct_active && !direct_candidate_eligible);
     DirectPresentationInspection {

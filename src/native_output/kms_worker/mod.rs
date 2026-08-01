@@ -20,8 +20,8 @@ pub(crate) use policy::{
 #[cfg(test)]
 pub(crate) use queue::KmsWorkerForcedShutdownDisposition;
 pub(crate) use queue::{
-    CursorSidecarOfferError, KmsCommitAdmissionPermit, KmsWorkerAdmissionError, KmsWorkerFatalJob,
-    WorkerInFlight,
+    AttachablePrimary, CursorSidecarOfferError, KmsCommitAdmissionPermit, KmsWorkerAdmissionError,
+    KmsWorkerFatalJob, WorkerInFlight,
 };
 pub(crate) use thread::{KmsCommitWorkerHandle, KmsWorkerEvent};
 pub(crate) use timing::KmsCommitTimingModel;

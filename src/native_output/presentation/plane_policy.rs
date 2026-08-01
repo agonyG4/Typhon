@@ -416,7 +416,9 @@ pub(crate) struct PlaneSchedulingInput<'a> {
     pub(crate) predictive_triple_active: bool,
     pub(crate) cursor_kms_changed: bool,
     pub(crate) hardware_plane_visible: bool,
-    pub(crate) transition_primary: Option<OutputTransactionId>,
+    pub(crate) delta_class: CursorDeltaClass,
+    pub(crate) validation_base_unchanged: bool,
+    pub(crate) attachable_primary: Option<OutputTransactionId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -564,7 +566,14 @@ pub(crate) fn schedule_planes(input: PlaneSchedulingInput<'_>) -> PlaneSchedulin
             input,
             geometry,
             hardware.key,
-            KmsCursorTestPolicy::SkipProven,
+            if input.delta_class == CursorDeltaClass::PositionOnly
+                && input.validation_base_unchanged
+                && geometry.class == CursorGeometryClass::FullyVisible
+            {
+                KmsCursorTestPolicy::SkipProven
+            } else {
+                KmsCursorTestPolicy::Required
+            },
             PlaneSchedulingReason::HardwareCapabilityProven,
         ),
         CursorCapabilityStatus::Quarantined { .. } => {
@@ -614,7 +623,7 @@ fn software_decision(
         return rejected_decision(input, PlaneSchedulingReason::SoftwareUnavailable);
     }
     let transition = input.primary_mode == PlanePrimaryMode::Direct;
-    let cursor_action = if let Some(primary) = input.transition_primary {
+    let cursor_action = if let Some(primary) = input.attachable_primary {
         CursorPlaneAction::MustBundleWith(primary)
     } else if transition {
         CursorPlaneAction::AwaitPrimaryTransition
@@ -654,10 +663,7 @@ fn hardware_decision(
         direct_scanout_compatible: true,
         primary_action: PrimaryPlaneAction::Preserve,
         cursor_action: if input.cursor_kms_changed {
-            input.transition_primary.map_or(
-                CursorPlaneAction::Independent,
-                CursorPlaneAction::MustBundleWith,
-            )
+            CursorPlaneAction::Independent
         } else {
             CursorPlaneAction::None
         },

@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use super::*;
 use crate::native_output::kms_worker::{
-    CursorSidecar, CursorSidecarCoupling, KmsBundleOwners, KmsCommitJob, KmsCommitWorkerHandle,
-    KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase,
+    AttachablePrimary, CursorSidecar, CursorSidecarCoupling, KmsBundleOwners, KmsCommitJob,
+    KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase,
     KmsWorkerAdmissionError,
 };
-use crate::native_output::presentation::plane::CursorRevision;
+use crate::native_output::presentation::{plane::CursorRevision, plane_policy::CursorPlaneAction};
 use crate::native_output::runtime::presentation_transactions::settle_failed_output_transaction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +70,8 @@ pub(super) fn queue_plane_delta(
     pacing_mode: NativeOutputPacingMode,
     cursor_epoch: u64,
     validation_base: KmsValidationBase,
+    attachable_primary: Option<AttachablePrimary>,
+    cursor_action: CursorPlaneAction,
 ) -> NativeResult<WorkerQueueOutcome> {
     let preparation = prepare_plane_delta(
         worker,
@@ -83,6 +85,8 @@ pub(super) fn queue_plane_delta(
         pacing_mode,
         cursor_epoch,
         validation_base,
+        attachable_primary,
+        cursor_action,
     )?;
     let (
         transaction_id,
@@ -304,7 +308,19 @@ pub(super) fn prepare_plane_delta(
     pacing_mode: NativeOutputPacingMode,
     cursor_epoch: u64,
     validation_base: KmsValidationBase,
+    attachable_primary: Option<AttachablePrimary>,
+    cursor_action: CursorPlaneAction,
 ) -> NativeResult<PlaneDeltaPreparation> {
+    if matches!(
+        cursor_action,
+        CursorPlaneAction::AwaitPrimaryTransition | CursorPlaneAction::EmbedInPrimary
+    ) || matches!(cursor_action, CursorPlaneAction::MustBundleWith(required)
+        if attachable_primary.is_none_or(|primary| primary.transaction_id != required))
+    {
+        return Ok(PlaneDeltaPreparation::Return(
+            WorkerQueueOutcome::Unavailable(KmsWorkerAdmissionError::QueueFull),
+        ));
+    }
     if let Some(promoted) =
         take_promotable_cursor_sidecar(worker, output_generation, crtc_id, target)
     {
@@ -361,6 +377,8 @@ pub(super) fn prepare_plane_delta(
         crtc_id,
         output_generation,
         validation_base,
+        attachable_primary,
+        cursor_action,
     )? {
         return Ok(PlaneDeltaPreparation::Return(outcome));
     }
@@ -387,11 +405,12 @@ pub(super) fn try_offer_cursor_sidecar(
     transaction_id: OutputTransactionId,
     target: PresentationTarget,
     crtc_id: u32,
-    output_generation: u64,
+    _output_generation: u64,
     validation_base: KmsValidationBase,
+    attachable_primary: Option<AttachablePrimary>,
+    cursor_action: CursorPlaneAction,
 ) -> NativeResult<Option<WorkerQueueOutcome>> {
-    let Some(attachable_primary) = worker.attachable_primary(output_generation, crtc_id, target)
-    else {
+    let Some(attachable_primary) = attachable_primary else {
         return Ok(None);
     };
     let descriptor = output_transactions
@@ -404,12 +423,17 @@ pub(super) fn try_offer_cursor_sidecar(
     else {
         unreachable!("cursor plane-delta constructor returned another content kind");
     };
-    let visibility_transition =
-        desired.is_some_and(|state| state.visible) != cursor.current().visible;
-    let coupling = if visibility_transition {
-        CursorSidecarCoupling::MustBundleWith(attachable_primary.transaction_id)
-    } else {
-        CursorSidecarCoupling::Independent
+    let coupling = match cursor_action {
+        CursorPlaneAction::MustBundleWith(required)
+            if required == attachable_primary.transaction_id =>
+        {
+            CursorSidecarCoupling::MustBundleWith(required)
+        }
+        CursorPlaneAction::Independent => CursorSidecarCoupling::Independent,
+        CursorPlaneAction::AwaitPrimaryTransition | CursorPlaneAction::None => return Ok(None),
+        CursorPlaneAction::MustBundleWith(_) | CursorPlaneAction::EmbedInPrimary => {
+            return Ok(None);
+        }
     };
     let sidecar = CursorSidecar {
         id: cursor_sidecar_id,

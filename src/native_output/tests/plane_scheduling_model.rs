@@ -541,7 +541,9 @@ fn plane_policy_exhaustively_preserves_delivery_invariants() {
                                     predictive_triple_active,
                                     cursor_kms_changed: true,
                                     hardware_plane_visible: false,
-                                    transition_primary: None,
+                                    delta_class: CursorDeltaClass::PositionOnly,
+                                    validation_base_unchanged: true,
+                                    attachable_primary: None,
                                 });
                                 explored += 1;
 
@@ -634,7 +636,9 @@ fn proven_motion_skips_test_but_new_geometry_class_requires_it() {
         predictive_triple_active: true,
         cursor_kms_changed: true,
         hardware_plane_visible: true,
-        transition_primary: None,
+        delta_class: CursorDeltaClass::PositionOnly,
+        validation_base_unchanged: true,
+        attachable_primary: None,
     });
     assert_eq!(centered.test_policy, KmsCursorTestPolicy::SkipProven);
     assert_eq!(
@@ -656,12 +660,96 @@ fn proven_motion_skips_test_but_new_geometry_class_requires_it() {
         predictive_triple_active: true,
         cursor_kms_changed: true,
         hardware_plane_visible: true,
-        transition_primary: None,
+        delta_class: CursorDeltaClass::PositionOnly,
+        validation_base_unchanged: true,
+        attachable_primary: None,
     });
     assert_eq!(edge.test_policy, KmsCursorTestPolicy::Required);
     assert_eq!(
         edge.reason,
         PlaneSchedulingReason::HardwareCapabilityUnknown
+    );
+}
+
+#[test]
+fn proven_capability_requires_exact_fully_visible_position_only_class() {
+    let mut cache = PlaneCapabilityCache::default();
+    let key = capability_key(CursorGeometryClass::FullyVisible);
+    cache.mark_proven(key);
+    for delta_class in [
+        CursorDeltaClass::Visual,
+        CursorDeltaClass::Visibility,
+        CursorDeltaClass::DeliveryModeTransition,
+    ] {
+        let decision = schedule_planes(PlaneSchedulingInput {
+            revision: CursorRevision::initial().advance_motion(),
+            preference: CursorPreference::Auto,
+            visible: true,
+            geometry: geometry(100, 100),
+            geometry_valid: true,
+            hardware: Some(CursorHardwareCapability { key }),
+            capabilities: &cache,
+            primary_mode: PlanePrimaryMode::Composed,
+            software_allowed: true,
+            predictive_triple_active: false,
+            cursor_kms_changed: true,
+            hardware_plane_visible: true,
+            delta_class,
+            validation_base_unchanged: true,
+            attachable_primary: None,
+        });
+        assert_eq!(decision.test_policy, KmsCursorTestPolicy::Required);
+    }
+}
+
+#[test]
+fn direct_hardware_motion_is_independent_and_software_transition_needs_an_owner() {
+    let mut cache = PlaneCapabilityCache::default();
+    let key = capability_key(CursorGeometryClass::FullyVisible);
+    cache.mark_proven(key);
+    let hardware = schedule_planes(PlaneSchedulingInput {
+        revision: CursorRevision::initial().advance_motion(),
+        preference: CursorPreference::Auto,
+        visible: true,
+        geometry: geometry(100, 100),
+        geometry_valid: true,
+        hardware: Some(CursorHardwareCapability { key }),
+        capabilities: &cache,
+        primary_mode: PlanePrimaryMode::Direct,
+        software_allowed: true,
+        predictive_triple_active: false,
+        cursor_kms_changed: true,
+        hardware_plane_visible: true,
+        delta_class: CursorDeltaClass::PositionOnly,
+        validation_base_unchanged: true,
+        attachable_primary: Some(OutputTransactionId::new(NonZeroU64::new(4).unwrap())),
+    });
+    assert_eq!(hardware.cursor_action, CursorPlaneAction::Independent);
+
+    let software = schedule_planes(PlaneSchedulingInput {
+        revision: CursorRevision::initial().advance_motion(),
+        preference: CursorPreference::Software,
+        visible: true,
+        geometry: geometry(100, 100),
+        geometry_valid: true,
+        hardware: Some(CursorHardwareCapability { key }),
+        capabilities: &cache,
+        primary_mode: PlanePrimaryMode::Direct,
+        software_allowed: true,
+        predictive_triple_active: false,
+        cursor_kms_changed: true,
+        hardware_plane_visible: true,
+        delta_class: CursorDeltaClass::DeliveryModeTransition,
+        validation_base_unchanged: true,
+        attachable_primary: None,
+    });
+    assert_eq!(
+        software.cursor_action,
+        CursorPlaneAction::AwaitPrimaryTransition
+    );
+    assert_eq!(
+        software.primary_action,
+        PrimaryPlaneAction::TransitionToComposed
     );
 }
 
@@ -708,7 +796,9 @@ fn proven_edge_crop_does_not_authorize_a_different_edge_or_corner_crop() {
         predictive_triple_active: false,
         cursor_kms_changed: true,
         hardware_plane_visible: true,
-        transition_primary: None,
+        delta_class: CursorDeltaClass::PositionOnly,
+        validation_base_unchanged: true,
+        attachable_primary: None,
     });
     assert_eq!(right.test_policy, KmsCursorTestPolicy::Required);
 
@@ -733,7 +823,9 @@ fn proven_edge_crop_does_not_authorize_a_different_edge_or_corner_crop() {
         predictive_triple_active: false,
         cursor_kms_changed: true,
         hardware_plane_visible: true,
-        transition_primary: None,
+        delta_class: CursorDeltaClass::PositionOnly,
+        validation_base_unchanged: true,
+        attachable_primary: None,
     });
     assert_eq!(corner_decision.test_policy, KmsCursorTestPolicy::Required);
 }
@@ -807,7 +899,9 @@ fn software_direct_transition_requires_exact_primary_coupling() {
         predictive_triple_active: true,
         cursor_kms_changed: true,
         hardware_plane_visible: true,
-        transition_primary: Some(primary),
+        delta_class: CursorDeltaClass::DeliveryModeTransition,
+        validation_base_unchanged: true,
+        attachable_primary: Some(primary),
     });
 
     assert_eq!(

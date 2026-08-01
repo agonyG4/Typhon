@@ -148,12 +148,27 @@ impl NativeRuntime {
         if client_cursor_active && let Some(cursor) = legacy_cursor.as_mut() {
             cursor.disable()?;
         }
+        let mut runtime_plane_plan = None;
         let mut client_cursor_hardware_usable = false;
         if let Some(cursor) = atomic_cursor.as_mut() {
             let cursor_image_ready =
                 prepare_cursor_image(cursor, client_cursor, kms, input_state, perf);
 
-            client_cursor_hardware_usable = apply_cursor_policy(CursorPolicyContext {
+            let attachable_primary =
+                scheduled_presentation_target
+                    .as_ref()
+                    .and_then(|scheduled_target| {
+                        kms_commit_worker.as_ref().and_then(|worker| {
+                            worker.attachable_primary(
+                                *drm_file_generation,
+                                target.crtc_id,
+                                *scheduled_target,
+                            )
+                        })
+                    });
+            let validation_base_unchanged = !atomic_commit_arbiter.atomic_commit_pending()
+                && presented_planes.cursor.kms_equivalent_to(cursor.current());
+            let plan = apply_cursor_policy(CursorPolicyContext {
                 cursor,
                 cursor_visible,
                 cursor_image_ready,
@@ -167,7 +182,14 @@ impl NativeRuntime {
                 client_cursor_active,
                 cursor_render_mode,
                 last_client_cursor_damage,
+                attachable_primary,
+                validation_base_unchanged,
             });
+            client_cursor_hardware_usable = matches!(
+                plan.decision.delivery,
+                CursorDeliveryChoice::Hardware { .. }
+            );
+            runtime_plane_plan = Some(plan);
         } else if client_cursor_active {
             *cursor_render_mode = NativeCursorRenderMode::SoftwareClient;
         } else if *cursor_preference == NativeCursorPreference::Software || legacy_cursor.is_none()
@@ -198,16 +220,23 @@ impl NativeRuntime {
                 )
             })
             .flatten();
-        let client_cursor_software_work = !client_cursor_hardware_usable
+        let client_cursor_software_work = runtime_plane_plan.as_ref().is_some_and(|plan| {
+            plan.decision.pacing_constraint == CursorPacingConstraint::ReactiveDouble
+        }) && !client_cursor_hardware_usable
             && (*last_client_cursor_damage != current_client_cursor_damage)
             && (client_cursor_active || last_client_cursor_damage.is_some());
-        let mut effective_cursor = atomic_cursor
+        let mut effective_cursor = runtime_plane_plan
             .as_ref()
-            .and_then(|cursor| {
-                effective_atomic_cursor_state(cursor, *cursor_render_mode, cursor_visible)
-                    .kms_state()
-            })
-            .cloned();
+            .and_then(|plan| plan.desired_hardware_state.clone())
+            .or_else(|| {
+                atomic_cursor
+                    .as_ref()
+                    .and_then(|cursor| {
+                        effective_atomic_cursor_state(cursor, *cursor_render_mode, cursor_visible)
+                            .kms_state()
+                    })
+                    .cloned()
+            });
         let cursor_state_changed = atomic_cursor
             .as_ref()
             .is_some_and(|cursor| cursor.needs_submission_for(effective_cursor.as_ref()));
@@ -216,6 +245,9 @@ impl NativeRuntime {
             NativeAtomicCursor::desired_epoch,
         );
         let hardware_cursor_work_pending = cursor_state_changed
+            && runtime_plane_plan
+                .as_ref()
+                .is_none_or(|plan| plan.delta_class != CursorDeltaClass::DeliveryModeTransition)
             && atomic_cursor.as_ref().is_some_and(|cursor| {
                 cursor.current().visible || *cursor_render_mode == NativeCursorRenderMode::Hardware
             });
@@ -425,10 +457,20 @@ impl NativeRuntime {
             )
             .into());
         }
-        let mut cursor_hardware_usable = atomic_cursor.as_ref().is_some_and(|cursor| {
-            effective_atomic_cursor_state(cursor, *cursor_render_mode, cursor_visible)
-                .hardware_usable()
-        });
+        let mut cursor_hardware_usable = runtime_plane_plan.as_ref().map_or_else(
+            || {
+                atomic_cursor.as_ref().is_some_and(|cursor| {
+                    effective_atomic_cursor_state(cursor, *cursor_render_mode, cursor_visible)
+                        .hardware_usable()
+                })
+            },
+            |plan| {
+                matches!(
+                    plan.decision.delivery,
+                    CursorDeliveryChoice::Hardware { .. }
+                )
+            },
+        );
         if client_cursor_active {
             cursor_hardware_usable = client_cursor_hardware_usable;
         }
@@ -455,6 +497,7 @@ impl NativeRuntime {
             primary_redraw_requested,
             direct_active: confirmed_primary_assignment
                 .is_some_and(|assignment| assignment.is_direct()),
+            plane_decision: runtime_plane_plan.as_ref().map(|plan| &plan.decision),
         });
         let cursor_direct_compatible = direct_inspection.cursor_direct_compatible;
         let atomic_primary_commit_pending = direct_inspection.atomic_primary_commit_pending;
@@ -563,6 +606,7 @@ impl NativeRuntime {
                 last_software_cursor_damage,
                 current_client_cursor_damage,
                 current_software_cursor_damage,
+                runtime_plane_plan.as_ref(),
             )?
             else {
                 *queued_redraw_requested = true;
