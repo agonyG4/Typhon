@@ -170,9 +170,6 @@ impl NativeRuntime {
                     client_cursor_active,
                     cursor_render_mode,
                     last_client_cursor_damage,
-                    attachable_primary: None,
-                    previous_delivery: CursorDeliveryMode::Hidden,
-                    validation_base_unchanged: false,
                 },
                 kms_commit_worker.as_ref(),
                 *drm_file_generation,
@@ -221,6 +218,8 @@ impl NativeRuntime {
             *cursor_render_mode,
             cursor_visible,
         );
+        let planned_cursor_delivery =
+            presented_delivery_for_plan(runtime_plane_plan.as_ref(), &effective_cursor);
         let cursor_state_changed = atomic_cursor
             .as_ref()
             .is_some_and(|cursor| cursor.needs_submission_for(effective_cursor.as_ref()));
@@ -621,7 +620,7 @@ impl NativeRuntime {
                 effective_cursor.as_ref(),
                 cursor_epoch,
                 *cursor_render_mode,
-                presented_delivery_for_plan(runtime_plane_plan.as_ref(), effective_cursor.as_ref()),
+                planned_cursor_delivery,
                 atomic_cursor,
                 cursor_output_arbitration,
                 last_submitted_cursor_epoch,
@@ -674,10 +673,7 @@ impl NativeRuntime {
                         }),
                 };
                 if let Some(direct_target) = direct_target {
-                    if !worker_mode || kms_commit_worker.is_none() {
-                        // Direct scanout has no synchronous fallback. Keep the
-                        // candidate available for a later worker cycle.
-                    } else {
+                    if worker_mode && kms_commit_worker.is_some() {
                         match scanout.try_direct_scanout(
                             kms_backend,
                             server,
@@ -735,10 +731,7 @@ impl NativeRuntime {
                                             *drm_file_generation,
                                             target.crtc_id,
                                         ),
-                                        presented_delivery_for_plan(
-                                            runtime_plane_plan.as_ref(),
-                                            effective_cursor.as_ref(),
-                                        ),
+                                        planned_cursor_delivery,
                                     ),
                                     *drm_file_generation,
                                     target.crtc_id,
@@ -1063,10 +1056,7 @@ impl NativeRuntime {
                                                 *drm_file_generation,
                                                 target.crtc_id,
                                             ),
-                                            presented_delivery_for_plan(
-                                                runtime_plane_plan.as_ref(),
-                                                effective_cursor.as_ref(),
-                                            ),
+                                            planned_cursor_delivery,
                                         ),
                                         false,
                                     )?
@@ -1190,7 +1180,6 @@ impl NativeRuntime {
                         );
                         if matches!(paint_outcome, NativePaintOutcome::Skipped(_)) {
                             frame_scheduler.note_immediate_completion();
-                            // Settle the already-owned batch, not unowned work.
                             server.finish_prepared_frame();
                             frame_completed = true;
                             perf.log("native.frame_skip", || {

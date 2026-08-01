@@ -73,9 +73,6 @@ pub(super) struct CursorPolicyContext<'a> {
     pub(super) client_cursor_active: bool,
     pub(super) cursor_render_mode: &'a mut NativeCursorRenderMode,
     pub(super) last_client_cursor_damage: &'a mut Option<NativeClientCursorDamageState>,
-    pub(super) attachable_primary: Option<AttachablePrimary>,
-    pub(super) previous_delivery: CursorDeliveryMode,
-    pub(super) validation_base_unchanged: bool,
 }
 
 pub(super) struct RuntimePlanePlan {
@@ -88,11 +85,11 @@ pub(super) struct RuntimePlanePlan {
 
 pub(super) fn presented_delivery_for_plan(
     plan: Option<&RuntimePlanePlan>,
-    hardware_state: Option<&AtomicCursorVisualState>,
+    hardware_state: &Option<AtomicCursorVisualState>,
 ) -> crate::native_output::presentation::plane::PresentedCursorDelivery {
     plan.map_or_else(
         || {
-            hardware_state.map_or(
+            hardware_state.as_ref().map_or(
                 crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
                 |state| {
                     if state.visible {
@@ -238,7 +235,7 @@ pub(super) fn log_client_cursor_path_if_changed(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_cursor_policy_with_runtime_inputs(
-    mut context: CursorPolicyContext<'_>,
+    context: CursorPolicyContext<'_>,
     worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
     output_generation: u64,
     crtc_id: u32,
@@ -247,14 +244,14 @@ pub(super) fn apply_cursor_policy_with_runtime_inputs(
     atomic_commit_pending: bool,
     perf: NativePerfLogger,
 ) -> RuntimePlanePlan {
-    context.attachable_primary = scheduled_target.and_then(|scheduled_target| {
+    let attachable_primary = scheduled_target.and_then(|scheduled_target| {
         worker.and_then(|worker| {
             worker.attachable_primary(output_generation, crtc_id, scheduled_target)
         })
     });
-    context.validation_base_unchanged =
+    let validation_base_unchanged =
         !atomic_commit_pending && presented_cursor.kms_equivalent_to(context.cursor.current());
-    context.previous_delivery = match presented_cursor.delivery {
+    let previous_delivery = match presented_cursor.delivery {
         crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden => {
             CursorDeliveryMode::Hidden
         }
@@ -265,7 +262,12 @@ pub(super) fn apply_cursor_policy_with_runtime_inputs(
             CursorDeliveryMode::Software
         }
     };
-    let plan = apply_cursor_policy(context);
+    let plan = apply_cursor_policy(
+        context,
+        attachable_primary,
+        previous_delivery,
+        validation_base_unchanged,
+    );
     perf.log("native.cursor_plane_policy", || {
         vec![
             NativePerfField::str("reason", format!("{:?}", plan.decision.reason)),
@@ -353,7 +355,12 @@ fn build_runtime_plane_plan(
     }
 }
 
-pub(super) fn apply_cursor_policy(context: CursorPolicyContext<'_>) -> RuntimePlanePlan {
+pub(super) fn apply_cursor_policy(
+    context: CursorPolicyContext<'_>,
+    attachable_primary: Option<AttachablePrimary>,
+    previous_delivery: CursorDeliveryMode,
+    validation_base_unchanged: bool,
+) -> RuntimePlanePlan {
     let CursorPolicyContext {
         cursor,
         cursor_visible,
@@ -367,9 +374,6 @@ pub(super) fn apply_cursor_policy(context: CursorPolicyContext<'_>) -> RuntimePl
         client_cursor_active,
         cursor_render_mode,
         last_client_cursor_damage,
-        attachable_primary,
-        previous_delivery,
-        validation_base_unchanged,
     } = context;
     let policy_preference = if cursor_scheduling_policy == NativeCursorSchedulingPolicy::Software {
         CursorPreference::Software
