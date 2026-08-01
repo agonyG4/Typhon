@@ -3,7 +3,8 @@ use std::sync::Arc;
 use super::*;
 use crate::native_output::kms_worker::{
     CursorSidecar, CursorSidecarCoupling, KmsBundleOwners, KmsCommitJob, KmsCommitWorkerHandle,
-    KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsWorkerAdmissionError,
+    KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase,
+    KmsWorkerAdmissionError,
 };
 use crate::native_output::presentation::plane::CursorRevision;
 use crate::native_output::runtime::presentation_transactions::settle_failed_output_transaction;
@@ -36,14 +37,17 @@ fn scheduled_kms_test_policy(cursor: &NativeAtomicCursor) -> KmsTestOnlyPolicy {
 
 pub(super) enum PlaneDeltaPreparation {
     Return(WorkerQueueOutcome),
-    Submit {
-        transaction_id: OutputTransactionId,
-        desired: Option<AtomicCursorVisualState>,
-        cursor_epoch: u64,
-        owned_revision: Option<CursorRevision>,
-        cursor_pin: Option<CursorFramebufferPin>,
-        target: PresentationTarget,
-    },
+    Submit(Box<PlaneDeltaPreparationSubmit>),
+}
+
+pub(super) struct PlaneDeltaPreparationSubmit {
+    transaction_id: OutputTransactionId,
+    desired: Option<AtomicCursorVisualState>,
+    cursor_epoch: u64,
+    owned_revision: Option<CursorRevision>,
+    cursor_pin: Option<CursorFramebufferPin>,
+    target: PresentationTarget,
+    validation_base: KmsValidationBase,
 }
 
 pub(super) fn plane_delta_reservation_outcome(
@@ -65,6 +69,7 @@ pub(super) fn queue_plane_delta(
     output_generation: u64,
     pacing_mode: NativeOutputPacingMode,
     cursor_epoch: u64,
+    validation_base: KmsValidationBase,
 ) -> NativeResult<WorkerQueueOutcome> {
     let preparation = prepare_plane_delta(
         worker,
@@ -77,26 +82,39 @@ pub(super) fn queue_plane_delta(
         output_generation,
         pacing_mode,
         cursor_epoch,
+        validation_base,
     )?;
-    let (transaction_id, desired, cursor_epoch, owned_revision, promoted_pin, target) =
-        match preparation {
-            PlaneDeltaPreparation::Return(outcome) => return Ok(outcome),
-            PlaneDeltaPreparation::Submit {
+    let (
+        transaction_id,
+        desired,
+        cursor_epoch,
+        owned_revision,
+        promoted_pin,
+        target,
+        validation_base,
+    ) = match preparation {
+        PlaneDeltaPreparation::Return(outcome) => return Ok(outcome),
+        PlaneDeltaPreparation::Submit(preparation) => {
+            let PlaneDeltaPreparationSubmit {
                 transaction_id,
                 desired,
                 cursor_epoch,
                 owned_revision,
                 cursor_pin,
                 target,
-            } => (
+                validation_base,
+            } = *preparation;
+            (
                 transaction_id,
                 desired,
                 cursor_epoch,
                 owned_revision,
                 cursor_pin,
                 target,
-            ),
-        };
+                validation_base,
+            )
+        }
+    };
     let permit = match worker.try_reserve_admission_slot() {
         Ok(permit) => permit,
         Err(error) => {
@@ -173,6 +191,7 @@ pub(super) fn queue_plane_delta(
         crtc_id,
         kind,
         target,
+        validation_base,
         queued_at: MonotonicTimestampNs::new(queued_at_ns),
         primary: KmsPrimaryUpdate::Unchanged,
         cursor: desired
@@ -284,6 +303,7 @@ pub(super) fn prepare_plane_delta(
     output_generation: u64,
     pacing_mode: NativeOutputPacingMode,
     cursor_epoch: u64,
+    validation_base: KmsValidationBase,
 ) -> NativeResult<PlaneDeltaPreparation> {
     if let Some(promoted) =
         take_promotable_cursor_sidecar(worker, output_generation, crtc_id, target)
@@ -300,14 +320,17 @@ pub(super) fn prepare_plane_delta(
             CursorPlaneAssignment::Disabled => cursor_epoch,
             CursorPlaneAssignment::Unchanged => unreachable!(),
         };
-        return Ok(PlaneDeltaPreparation::Submit {
-            transaction_id: promoted.transaction.id(),
-            desired,
-            cursor_epoch,
-            owned_revision: Some(promoted.revision),
-            cursor_pin: promoted.lease,
-            target: promoted.deadline,
-        });
+        return Ok(PlaneDeltaPreparation::Submit(Box::new(
+            PlaneDeltaPreparationSubmit {
+                transaction_id: promoted.transaction.id(),
+                desired,
+                cursor_epoch,
+                owned_revision: Some(promoted.revision),
+                cursor_pin: promoted.lease,
+                target: promoted.deadline,
+                validation_base: promoted.validation_base,
+            },
+        )));
     }
 
     let transaction_id = output_transactions
@@ -337,17 +360,21 @@ pub(super) fn prepare_plane_delta(
         target,
         crtc_id,
         output_generation,
+        validation_base,
     )? {
         return Ok(PlaneDeltaPreparation::Return(outcome));
     }
-    Ok(PlaneDeltaPreparation::Submit {
-        transaction_id,
-        desired,
-        cursor_epoch,
-        owned_revision: None,
-        cursor_pin: None,
-        target,
-    })
+    Ok(PlaneDeltaPreparation::Submit(Box::new(
+        PlaneDeltaPreparationSubmit {
+            transaction_id,
+            desired,
+            cursor_epoch,
+            owned_revision: None,
+            cursor_pin: None,
+            target,
+            validation_base,
+        },
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -361,6 +388,7 @@ pub(super) fn try_offer_cursor_sidecar(
     target: PresentationTarget,
     crtc_id: u32,
     output_generation: u64,
+    validation_base: KmsValidationBase,
 ) -> NativeResult<Option<WorkerQueueOutcome>> {
     let Some(attachable_primary) = worker.attachable_primary(output_generation, crtc_id, target)
     else {
@@ -398,6 +426,7 @@ pub(super) fn try_offer_cursor_sidecar(
         crtc_id,
         test_policy: scheduled_kms_test_policy(cursor),
         capability_key: desired.and_then(|state| cursor.capability_key_for(state)),
+        validation_base,
     };
     match worker.offer_cursor_sidecar(sidecar) {
         Ok(replaced) => {

@@ -153,26 +153,22 @@ impl KmsCommitWorkerHandle {
             join: Mutex::new(Some(join)),
         })
     }
-
     pub(crate) fn start_atomic(
         submitter: AtomicCommitSubmitter,
     ) -> Result<Self, KmsCommitWorkerStartError> {
         Self::start(Arc::new(AtomicKmsWorkerExecutor { submitter }))
     }
-
     pub(crate) fn try_reserve_admission(
         &self,
         _kind: AtomicCommitKind,
     ) -> Result<KmsCommitAdmissionPermit, KmsWorkerAdmissionError> {
         self.shared.try_reserve()
     }
-
     pub(crate) fn try_reserve_admission_slot(
         &self,
     ) -> Result<KmsCommitAdmissionPermit, KmsWorkerAdmissionError> {
         self.shared.try_reserve()
     }
-
     pub(crate) fn event_fd(&self) -> i32 {
         self.shared.result_fd.as_raw_fd()
     }

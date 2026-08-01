@@ -3,7 +3,8 @@ use super::presentation_transactions::{
     register_primary_transaction,
 };
 use super::presentation_worker::{
-    queue_compatibility_for_presentation, submit_explicit_ready_for_presentation, worker_ctx,
+    queue_compatibility_for_presentation, submit_explicit_ready_for_presentation,
+    validation_base_for_submission, worker_ctx,
 };
 use super::*;
 use crate::native_output::kms_worker::KmsCommitWorkerHandle;
@@ -43,12 +44,14 @@ pub(super) fn submit_ready_frame(
     output_transactions: &mut OutputTransactionLedger,
     presentation_trace: &mut PresentationTransactionTraceRing,
     pacing_mode: NativeOutputPacingMode,
+    presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
     frame_index: &mut u64,
     frame_submitted: &mut bool,
     perf: NativePerfLogger,
     #[cfg(test)] native_io_recorder: &mut NativeIoRecorder,
 ) -> NativeResult<ReadySubmissionResult> {
     let repaint_present_start = Instant::now();
+    let validation_base = validation_base_for_submission(atomic_commit_arbiter, presented_planes);
     let explicit_submission = matches!(scanout, NativeScanoutBackend::AtomicEglGbm(_));
     let (present_result, compatibility_transaction_id) =
         if let NativeScanoutBackend::AtomicEglGbm(explicit) = scanout {
@@ -69,7 +72,7 @@ pub(super) fn submit_ready_frame(
                     transaction_id,
                     output_generation,
                     crtc_id,
-                    worker_ctx(atomic_cursor.as_ref(), frame_pacing),
+                    worker_ctx(atomic_cursor.as_ref(), frame_pacing, validation_base),
                     true,
                 )?
             else {
@@ -130,6 +133,7 @@ pub(super) fn submit_ready_frame(
                 pacing_frame_id,
                 test_only,
                 cursor_epoch,
+                validation_base,
             )?
             else {
                 return Ok(ReadySubmissionResult::Unavailable);

@@ -16,6 +16,7 @@ mod metrics;
 mod plane_cycle;
 mod planner;
 mod presentation;
+mod presentation_cursor;
 mod presentation_direct;
 mod presentation_metrics;
 mod presentation_pipeline;
@@ -64,6 +65,7 @@ pub(super) use planner::{
 pub(crate) use planner::{
     NativePresentationPath, NativePresentationPlanInput, plan_native_presentation_path,
 };
+pub(super) use presentation_pipeline::initial_presented;
 pub(crate) use presentation_transactions::{
     DirectCallbackLeakMetrics, DirectTerminalCallbackDisposition,
     direct_terminal_callback_owner_leaks, settle_dropped_output_transaction,

@@ -1060,16 +1060,15 @@ impl NativeRuntime {
                                 &update, revision, coupling, fallback,
                             )
                         });
-                        if primary.is_some() || cursor.is_some() {
-                            if !self
+                        if (primary.is_some() || cursor.is_some())
+                            && !self
                                 .presented_planes
                                 .promote_bundle(identity, identity, primary, cursor)
-                            {
-                                return Err(io::Error::other(
-                                    "worker pageflip promotion identity mismatch",
-                                )
-                                .into());
-                            }
+                        {
+                            return Err(io::Error::other(
+                                "worker pageflip promotion identity mismatch",
+                            )
+                            .into());
                         }
                     }
                     submitted_worker_ownership

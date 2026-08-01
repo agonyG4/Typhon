@@ -1,6 +1,7 @@
 use super::*;
 use crate::native_output::kms_worker::{
     KmsBundleOwners, KmsCommitJob, KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy,
+    KmsValidationBase,
 };
 use crate::native_output::runtime::AtomicCommitKind;
 use crate::native_output::scanout::DirectPrimaryLease;
@@ -528,6 +529,9 @@ fn worker_queue_owns_direct_resource_before_submit() {
             framebuffer_id: 42,
         },
         target: test_target(),
+        validation_base: KmsValidationBase::Presented(
+            crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(None),
+        ),
         queued_at: MonotonicTimestampNs::new(10),
         primary: KmsPrimaryUpdate::Framebuffer {
             framebuffer: FramebufferId::new(42).unwrap(),

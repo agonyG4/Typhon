@@ -1,5 +1,6 @@
 use super::atomic_commit::PendingAtomicCommit;
 use super::*;
+use crate::native_output::presentation::plane::PresentedPlaneSnapshot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PipelineSnapshotError {
@@ -359,6 +360,15 @@ pub(super) fn require_explicit_output_swapchain(
     scanout
         .explicit_output_swapchain()
         .ok_or_else(|| io::Error::other("explicit Atomic presentation has no output swapchain"))
+}
+
+pub(crate) fn initial_presented(
+    atomic_cursor: Option<&NativeAtomicCursor>,
+) -> PresentedPlaneSnapshot {
+    atomic_cursor.map_or_else(
+        || PresentedPlaneSnapshot::legacy(None),
+        |cursor| PresentedPlaneSnapshot::initial(cursor.presented_plane_state()),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

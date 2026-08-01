@@ -12,6 +12,7 @@ mod timing;
 pub(crate) use payload::KmsCommitPayloadError;
 pub(crate) use payload::{
     KmsCommitJob, KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy,
+    KmsValidationBase,
 };
 pub(crate) use policy::{
     KmsCommitWorkerPolicy, KmsCommitWorkerStartupError, KmsCommitWorkerTransport,

@@ -7,8 +7,9 @@ use super::presentation_transactions::{
 };
 use super::*;
 use crate::native_output::kms_worker::{
-    KmsBundleOwners, KmsCommitAdmissionPermit, KmsCommitJob, KmsCommitWorkerHandle,
-    KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsWorkerAdmissionError,
+    KmsBundleOwners, KmsCommitAdmissionPermit, KmsCommitBundleIdentity, KmsCommitJob,
+    KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase,
+    KmsWorkerAdmissionError,
 };
 use oblivion_one::native::kms::FramebufferId;
 
@@ -41,6 +42,35 @@ pub(super) fn worker_cursor_pin(
     }
 }
 
+pub(super) fn validation_base_for_submission(
+    atomic_commit_arbiter: &AtomicCommitArbiter,
+    presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
+) -> KmsValidationBase {
+    let pending = atomic_commit_arbiter
+        .kernel_submitted_commit()
+        .or_else(|| atomic_commit_arbiter.worker_queued_commit());
+    pending.map_or(KmsValidationBase::Presented(presented_planes), |pending| {
+        KmsValidationBase::Predecessor(KmsCommitBundleIdentity {
+            id: crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(
+                pending.token,
+            ),
+            token: pending.token,
+            output_generation: pending.generation,
+            crtc_id: pending.crtc_id,
+            primary_transaction_id: match pending.kind {
+                AtomicCommitKind::CompositedPrimary { transaction_id, .. }
+                | AtomicCommitKind::DirectPrimary { transaction_id, .. } => Some(transaction_id),
+                AtomicCommitKind::PlaneDelta { .. } => None,
+            },
+            cursor_transaction_id: match pending.kind {
+                AtomicCommitKind::PlaneDelta { transaction_id, .. } => Some(transaction_id),
+                AtomicCommitKind::CompositedPrimary { .. }
+                | AtomicCommitKind::DirectPrimary { .. } => None,
+            },
+        })
+    })
+}
+
 fn planned_cursor_update(
     output_transactions: &OutputTransactionLedger,
     transaction_id: OutputTransactionId,
@@ -62,15 +92,18 @@ fn planned_cursor_update(
 pub(super) struct WorkerPrimarySubmissionContext<'a> {
     atomic_cursor: Option<&'a NativeAtomicCursor>,
     frame_pacing: &'a mut NativeFramePacing,
+    validation_base: KmsValidationBase,
 }
 
 pub(super) fn worker_ctx<'a>(
     atomic_cursor: Option<&'a NativeAtomicCursor>,
     frame_pacing: &'a mut NativeFramePacing,
+    validation_base: KmsValidationBase,
 ) -> WorkerPrimarySubmissionContext<'a> {
     WorkerPrimarySubmissionContext {
         atomic_cursor,
         frame_pacing,
+        validation_base,
     }
 }
 
@@ -224,6 +257,7 @@ pub(super) fn queue_plane_delta_for_presentation(
     output_generation: u64,
     pacing_mode: NativeOutputPacingMode,
     cursor_epoch: u64,
+    validation_base: KmsValidationBase,
 ) -> NativeResult<SchedulerDecision> {
     match queue_plane_delta(
         worker,
@@ -237,6 +271,7 @@ pub(super) fn queue_plane_delta_for_presentation(
         output_generation,
         pacing_mode,
         cursor_epoch,
+        validation_base,
     )? {
         WorkerQueueOutcome::CursorQueued { .. } | WorkerQueueOutcome::SidecarQueued { .. } => {
             Ok(SchedulerDecision::WaitForPageFlip)
@@ -263,6 +298,7 @@ pub(super) fn present_cursor_for_presentation(
     output_generation: u64,
     pacing_mode: NativeOutputPacingMode,
     cursor_epoch: u64,
+    validation_base: KmsValidationBase,
     last_submitted_cursor_epoch: &mut u64,
     cursor_output_arbitration: &mut NativeCursorOutputArbitration,
     frame_scheduler: &mut NativeFrameScheduler,
@@ -291,6 +327,7 @@ pub(super) fn present_cursor_for_presentation(
             output_generation,
             pacing_mode,
             cursor_epoch,
+            validation_base,
         )?;
         return Ok((decision != SchedulerDecision::Idle).then_some(decision));
     }
@@ -344,6 +381,7 @@ pub(super) fn queue_explicit_ready_for_presentation(
     pacing_frame_id: Option<u64>,
     test_only: KmsTestOnlyPolicy,
     ready_submit: bool,
+    validation_base: KmsValidationBase,
 ) -> NativeResult<Option<(u64, u32, OutputTransactionId)>> {
     match queue_explicit_composited_frame(
         worker,
@@ -361,6 +399,7 @@ pub(super) fn queue_explicit_ready_for_presentation(
         pacing_frame_id,
         test_only,
         ready_submit,
+        validation_base,
     )? {
         WorkerQueueOutcome::Queued {
             transaction_id,
@@ -433,6 +472,7 @@ pub(super) fn submit_explicit_ready_for_presentation(
             pacing_frame_id,
             test_only,
             ready_submit,
+            context.validation_base,
         )?
         .map(|(token, framebuffer_id, transaction_id)| {
             (token, framebuffer_id, transaction_id, true)
@@ -464,6 +504,7 @@ pub(super) fn queue_compatibility_for_presentation(
     pacing_frame_id: Option<u64>,
     test_only: KmsTestOnlyPolicy,
     cursor_epoch: u64,
+    validation_base: KmsValidationBase,
 ) -> NativeResult<Option<(NativePresentResult, Option<OutputTransactionId>)>> {
     match super::kms_worker::queue_atomic_compatibility_frame(
         worker,
@@ -483,6 +524,7 @@ pub(super) fn queue_compatibility_for_presentation(
         pacing_frame_id,
         test_only,
         cursor_epoch,
+        validation_base,
     )? {
         WorkerQueueOutcome::Queued {
             transaction_id,
@@ -584,6 +626,7 @@ pub(super) fn finish_direct_worker_queued(
         crtc_id,
         kind,
         target: direct_target,
+        validation_base: context.validation_base,
         queued_at: MonotonicTimestampNs::new(queued_at_ns),
         primary: KmsPrimaryUpdate::Framebuffer {
             framebuffer: FramebufferId::new(framebuffer_id)

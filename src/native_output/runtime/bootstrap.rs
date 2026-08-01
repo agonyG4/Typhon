@@ -222,7 +222,7 @@ impl NativeRuntime {
             cursor_preference,
             cursor_scheduling_policy,
             direct_scanout_preference,
-            pre_kms_atomic_cursor,
+            pre_kms_atomic_cursor: atomic_cursor,
             pre_kms_legacy_cursor,
             mut cursor_render_mode,
             input_plan,
@@ -232,7 +232,6 @@ impl NativeRuntime {
             dmabuf_feedback_compatibility,
             dmabuf_feedback_compat_metrics,
         } = parts;
-        let atomic_cursor = pre_kms_atomic_cursor;
         let mut legacy_cursor = pre_kms_legacy_cursor;
         scanout.finish_initial_scanout();
         if let Some(cursor) = legacy_cursor.as_mut() {
@@ -581,16 +580,6 @@ impl NativeRuntime {
             log_native_app_spawn(perf, &launch);
             pending_launches.push_back(launch);
         }
-        let presented_planes = atomic_cursor
-            .as_ref()
-            .map(|cursor| {
-                crate::native_output::presentation::plane::PresentedPlaneSnapshot::initial(
-                    cursor.presented_plane_state(),
-                )
-            })
-            .unwrap_or_else(|| {
-                crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(None)
-            });
         let mut runtime = Self {
             server,
             cursor_image,
@@ -612,6 +601,7 @@ impl NativeRuntime {
             direct_scanout_preference,
             direct_scanout_qualification: DirectScanoutQualificationState::default(),
             cursor_render_mode,
+            presented_planes: initial_presented(atomic_cursor.as_ref()),
             atomic_cursor,
             legacy_cursor,
             input_devices,
@@ -647,7 +637,6 @@ impl NativeRuntime {
             frame_scheduler,
             atomic_commit_arbiter: AtomicCommitArbiter::new(),
             output_transactions: OutputTransactionLedger::new(),
-            presented_planes,
             confirmed_primary_assignment: None,
             presentation_deadline,
             scheduled_presentation_target,

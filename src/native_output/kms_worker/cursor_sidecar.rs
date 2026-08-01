@@ -10,6 +10,7 @@ use crate::native_output::{
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
 
 use super::KmsTestOnlyPolicy;
+use super::KmsValidationBase;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CursorSidecarCoupling {
@@ -38,6 +39,7 @@ pub(crate) struct CursorSidecar {
     pub(crate) crtc_id: u32,
     pub(crate) test_policy: KmsTestOnlyPolicy,
     pub(crate) capability_key: Option<CursorCapabilityKey>,
+    pub(crate) validation_base: KmsValidationBase,
 }
 
 #[derive(Debug, Default)]

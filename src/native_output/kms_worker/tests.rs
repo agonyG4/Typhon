@@ -227,6 +227,9 @@ pub(super) fn test_job(token: u64) -> KmsCommitJob {
             estimated: true,
             predicted_unreachable: false,
         },
+        validation_base: KmsValidationBase::Presented(
+            crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(None),
+        ),
         queued_at: MonotonicTimestampNs::new(0),
         primary: KmsPrimaryUpdate::Framebuffer {
             framebuffer: oblivion_one::native::kms::FramebufferId::new(42).unwrap(),

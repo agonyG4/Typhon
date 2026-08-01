@@ -3,7 +3,7 @@
 use super::super::runtime::AtomicCommitKind;
 use super::{KmsBundleOwners, KmsCommitBundleIdentity};
 use crate::native_output::output::CursorFramebufferPin;
-use crate::native_output::presentation::plane::KmsCommitBundleId;
+use crate::native_output::presentation::plane::{KmsCommitBundleId, PresentedPlaneSnapshot};
 use crate::native_output::scanout::DirectPrimaryLease;
 use crate::native_output::{
     CursorPlaneAssignment, OutputTransaction, OutputTransactionContent, OutputTransactionId,
@@ -25,6 +25,7 @@ pub(crate) struct KmsCommitJob {
     pub(crate) crtc_id: u32,
     pub(crate) kind: AtomicCommitKind,
     pub(crate) target: PresentationTarget,
+    pub(crate) validation_base: KmsValidationBase,
     pub(crate) queued_at: MonotonicTimestampNs,
     pub(crate) primary: KmsPrimaryUpdate,
     pub(crate) cursor: KmsCursorUpdate,
@@ -38,6 +39,12 @@ pub(crate) struct KmsCommitJob {
     pub(crate) pacing_frame_id: Option<u64>,
     pub(crate) test_only: KmsTestOnlyPolicy,
     pub(crate) ready_submit: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KmsValidationBase {
+    Presented(PresentedPlaneSnapshot),
+    Predecessor(KmsCommitBundleIdentity),
 }
 
 #[derive(Debug)]
@@ -92,6 +99,7 @@ pub(crate) enum KmsCommitPayloadError {
     OwnerIdentityMismatch,
     OwnerGenerationMismatch,
     OwnerTargetMismatch,
+    ValidationBaseMismatch,
 }
 
 impl KmsCommitJob {
@@ -135,6 +143,11 @@ impl KmsCommitJob {
         }
         if self.target != transaction.target() {
             return Err(KmsCommitPayloadError::TargetMismatch);
+        }
+        if let KmsValidationBase::Predecessor(base) = self.validation_base
+            && (base.output_generation != self.output_generation || base.crtc_id != self.crtc_id)
+        {
+            return Err(KmsCommitPayloadError::ValidationBaseMismatch);
         }
         if !self.owners.is_legacy_unchecked() {
             let primary_changed = !matches!(self.primary, KmsPrimaryUpdate::Unchanged);

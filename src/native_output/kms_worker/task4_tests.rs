@@ -4,9 +4,10 @@ use super::tests::{
 };
 use super::thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
 use super::{
-    CursorSidecar, CursorSidecarCoupling, CursorSidecarMailbox, KmsBundleOwners, KmsCommitJob,
-    KmsCommitWorkerHandle, KmsCursorOwner, KmsCursorUpdate, KmsPrimaryOwner, KmsPrimaryUpdate,
-    KmsSubmittedOwnership, KmsTestOnlyPolicy, KmsWorkerEvent, KmsWorkerFatalJob,
+    CursorSidecar, CursorSidecarCoupling, CursorSidecarMailbox, KmsBundleOwners,
+    KmsCommitBundleIdentity, KmsCommitJob, KmsCommitWorkerHandle, KmsCursorOwner, KmsCursorUpdate,
+    KmsPrimaryOwner, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy, KmsValidationBase,
+    KmsWorkerEvent, KmsWorkerFatalJob,
 };
 use oblivion_one::native::kms::AtomicCursorVisualState;
 use std::{
@@ -50,6 +51,7 @@ fn test_sidecar(job: &KmsCommitJob, id: u64, coupling: CursorSidecarCoupling) ->
         crtc_id: job.crtc_id,
         test_policy: KmsTestOnlyPolicy::Skip,
         capability_key: None,
+        validation_base: job.validation_base,
     }
 }
 
@@ -207,6 +209,57 @@ fn changed_cursor_property_requires_an_exact_cursor_owner() {
     assert_eq!(
         job.validate_against(&transaction),
         Err(super::KmsCommitPayloadError::MissingCursorOwner)
+    );
+}
+
+#[test]
+fn cursor_job_keeps_immutable_presented_or_predecessor_validation_base() {
+    let job = test_job(3321);
+    assert!(matches!(
+        job.validation_base,
+        KmsValidationBase::Presented(_)
+    ));
+    let predecessor = KmsCommitBundleIdentity {
+        id: job.bundle_id,
+        token: job.token,
+        output_generation: job.output_generation,
+        crtc_id: job.crtc_id,
+        primary_transaction_id: Some(job.transaction_id),
+        cursor_transaction_id: None,
+    };
+    assert_ne!(
+        KmsValidationBase::Presented(
+            crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(None)
+        ),
+        KmsValidationBase::Predecessor(predecessor)
+    );
+}
+
+#[test]
+fn predecessor_validation_base_must_match_job_output_identity() {
+    let mut job = test_job(3322);
+    job.validation_base = KmsValidationBase::Predecessor(KmsCommitBundleIdentity {
+        id: job.bundle_id,
+        token: job.token,
+        output_generation: job.output_generation,
+        crtc_id: job.crtc_id + 1,
+        primary_transaction_id: Some(job.transaction_id),
+        cursor_transaction_id: None,
+    });
+    let transaction = crate::native_output::OutputTransaction::cursor_plane_delta(
+        job.transaction_id,
+        job.output_generation,
+        oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(0),
+        job.target,
+        oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
+        1,
+        None,
+        crate::native_output::OutputReleasePlan::Pageflip,
+    )
+    .unwrap();
+    assert_eq!(
+        job.validate_against(&transaction),
+        Err(super::KmsCommitPayloadError::ValidationBaseMismatch)
     );
 }
 

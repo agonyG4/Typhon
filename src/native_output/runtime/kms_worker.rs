@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use super::super::kms_worker::{
     CursorSidecarReturnReason, KmsBundleOwners, KmsCommitJob, KmsCommitWorkerHandle,
-    KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy,
+    KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy, KmsValidationBase,
     KmsWorkerAdmissionError, KmsWorkerEvent, KmsWorkerFatalJob,
 };
 pub(super) use super::kms_worker_teardown::{
@@ -89,6 +89,7 @@ pub(super) fn queue_explicit_composited_frame(
     pacing_frame_id: Option<u64>,
     test_only: KmsTestOnlyPolicy,
     ready_submit: bool,
+    validation_base: KmsValidationBase,
 ) -> NativeResult<WorkerQueueOutcome> {
     let slot = explicit
         .swapchain()?
@@ -187,6 +188,7 @@ pub(super) fn queue_explicit_composited_frame(
         crtc_id,
         kind,
         target,
+        validation_base,
         queued_at: MonotonicTimestampNs::new(queued_at_ns),
         primary: KmsPrimaryUpdate::Framebuffer {
             framebuffer,
@@ -285,6 +287,7 @@ pub(super) fn queue_atomic_compatibility_frame(
     pacing_frame_id: Option<u64>,
     test_only: KmsTestOnlyPolicy,
     cursor_epoch: u64,
+    validation_base: KmsValidationBase,
 ) -> NativeResult<WorkerQueueOutcome> {
     if scanout.compatibility_framebuffer_id().is_none() {
         return Ok(WorkerQueueOutcome::Unavailable(
@@ -407,6 +410,7 @@ pub(super) fn queue_atomic_compatibility_frame(
         crtc_id,
         kind,
         target,
+        validation_base,
         queued_at: MonotonicTimestampNs::new(queued_at_ns),
         primary: KmsPrimaryUpdate::Framebuffer {
             framebuffer: FramebufferId::new(framebuffer_id)

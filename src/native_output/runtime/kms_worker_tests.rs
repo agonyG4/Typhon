@@ -6,7 +6,7 @@ use super::kms_worker::{
 use super::plane_cycle::plane_delta_reservation_outcome;
 use crate::native_output::kms_worker::{
     KmsBundleOwners, KmsCommitJob, KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership,
-    KmsTestOnlyPolicy, KmsWorkerAdmissionError, KmsWorkerFatalJob,
+    KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerAdmissionError, KmsWorkerFatalJob,
 };
 use crate::native_output::runtime::AtomicCommitKind;
 use crate::native_output::scanout::DirectPrimaryLease;
@@ -100,6 +100,9 @@ fn test_uncertain_direct_job(lease: DirectPrimaryLease) -> KmsCommitJob {
             estimated: true,
             predicted_unreachable: false,
         },
+        validation_base: KmsValidationBase::Presented(
+            crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(None),
+        ),
         queued_at: MonotonicTimestampNs::new(0),
         primary: KmsPrimaryUpdate::Framebuffer {
             framebuffer: FramebufferId::new(42).expect("test framebuffer ID"),

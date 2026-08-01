@@ -8,6 +8,7 @@ use super::planner::{
     NativePresentationPath, NativePresentationPlanInput, plan_native_presentation_path,
     plan_scheduled_target_for_mode,
 };
+use super::presentation_cursor::{CursorPolicyContext, apply_cursor_policy, prepare_cursor_image};
 use super::presentation_direct::{
     DirectPresentationInputs, inspect_direct_presentation, log_prepared_primary_arbitration,
     suppress_direct_render_ahead,
@@ -149,156 +150,24 @@ impl NativeRuntime {
         }
         let mut client_cursor_hardware_usable = false;
         if let Some(cursor) = atomic_cursor.as_mut() {
-            let cursor_image_ready;
-            if let Some(client) = client_cursor {
-                let source_key = NativeCursorImageKey::for_surface(
-                    client.surface,
-                    client.hotspot_x,
-                    client.hotspot_y,
-                );
-                let image_ready = if cursor.client_image_matches(source_key) {
-                    true
-                } else if cursor.client_image_failure_matches(source_key) {
-                    false
-                } else if let Some(image) =
-                    client_cursor_image(client.surface, client.hotspot_x, client.hotspot_y)
-                {
-                    match cursor.replace_image(kms.file(), image, source_key) {
-                        Ok(()) => true,
-                        Err(_) => {
-                            cursor.note_client_image_failure(source_key);
-                            false
-                        }
-                    }
-                } else {
-                    cursor.note_client_image_failure(source_key);
-                    false
-                };
-                cursor_image_ready = image_ready;
-                if image_ready {
-                    let x = client
-                        .logical_x
-                        .saturating_add(client.surface.x)
-                        .saturating_add(client.hotspot_x);
-                    let y = client
-                        .logical_y
-                        .saturating_add(client.surface.y)
-                        .saturating_add(client.hotspot_y);
-                    cursor.set_position(x, y);
-                }
-            } else {
-                let mut theme_image_ready = cursor.using_theme_image();
-                if !cursor.using_theme_image()
-                    && let Err(error) = cursor.restore_theme_image(kms.file())
-                {
-                    theme_image_ready = false;
-                    perf.log("native.cursor", || {
-                        vec![
-                            NativePerfField::str("event", "theme_restore_failed"),
-                            NativePerfField::str("error", error.to_string()),
-                        ]
-                    });
-                }
-                cursor_image_ready = theme_image_ready;
-                let (x, y) = input_state.cursor_position();
-                cursor.set_position(x, y);
-            }
+            let cursor_image_ready =
+                prepare_cursor_image(cursor, client_cursor, kms, input_state, perf);
 
-            let policy_preference =
-                if *cursor_scheduling_policy == NativeCursorSchedulingPolicy::Software {
-                    CursorPreference::Software
-                } else {
-                    match *cursor_preference {
-                        NativeCursorPreference::Auto => CursorPreference::Auto,
-                        NativeCursorPreference::Hardware => CursorPreference::Hardware,
-                        NativeCursorPreference::Software => CursorPreference::Software,
-                    }
-                };
-            let primary_mode =
-                if confirmed_primary_assignment.is_some_and(|assignment| assignment.is_direct()) {
-                    PlanePrimaryMode::Direct
-                } else {
-                    PlanePrimaryMode::Composed
-                };
-            let transition_primary =
-                confirmed_primary_assignment.and_then(|assignment| match assignment {
-                    ConfirmedPrimaryState::Composed { .. } => None,
-                    ConfirmedPrimaryState::Direct { transaction_id, .. } => Some(transaction_id),
-                });
-            let prospective = AtomicCursorVisualState {
-                visible: cursor_visible && cursor_image_ready,
-                ..cursor.desired().clone()
-            };
-            let capability_key = cursor_image_ready
-                .then(|| cursor.capability_key_for(&prospective))
-                .flatten();
-            let cursor_policy = schedule_planes(PlaneSchedulingInput {
-                revision: cursor.desired_revision(),
-                preference: policy_preference,
-                visible: cursor_visible,
-                geometry: CursorGeometryInput {
-                    pointer_x: prospective.x,
-                    pointer_y: prospective.y,
-                    hotspot_x: prospective.hotspot_x,
-                    hotspot_y: prospective.hotspot_y,
-                    cursor_width: prospective.width,
-                    cursor_height: prospective.height,
-                    output_width: target.width,
-                    output_height: target.height,
-                },
-                geometry_valid: capability_key.is_some(),
-                hardware: capability_key.map(|key| CursorHardwareCapability { key }),
-                capabilities: cursor.capability_cache(),
-                primary_mode,
-                software_allowed: true,
+            client_cursor_hardware_usable = apply_cursor_policy(CursorPolicyContext {
+                cursor,
+                cursor_visible,
+                cursor_image_ready,
+                output_width: target.width,
+                output_height: target.height,
+                cursor_preference: *cursor_preference,
+                cursor_scheduling_policy: *cursor_scheduling_policy,
+                confirmed_primary_assignment: *confirmed_primary_assignment,
                 predictive_triple_active: adaptive_buffering.mode()
                     == AdaptiveBufferingMode::Triple,
-                cursor_kms_changed: !prospective.kms_equivalent(cursor.current()),
-                hardware_plane_visible: cursor.current().visible,
-                transition_primary,
+                client_cursor_active,
+                cursor_render_mode,
+                last_client_cursor_damage,
             });
-            let cursor_delta_class = classify_cursor_delta(
-                cursor.current(),
-                matches!(
-                    cursor_policy.delivery,
-                    CursorDeliveryChoice::Hardware { .. }
-                )
-                .then_some(&prospective),
-                matches!(
-                    cursor_policy.delivery,
-                    CursorDeliveryChoice::Software { .. } | CursorDeliveryChoice::Rejected { .. }
-                ),
-            );
-            cursor.set_scheduled_test_policy(if cursor_delta_class == CursorDeltaClass::Visual {
-                KmsCursorTestPolicy::Required
-            } else {
-                cursor_policy.test_policy
-            });
-            match cursor_policy.delivery {
-                CursorDeliveryChoice::Hardware { .. } => {
-                    cursor.set_visible(true);
-                    *cursor_render_mode = NativeCursorRenderMode::Hardware;
-                    client_cursor_hardware_usable = client_cursor_active;
-                }
-                CursorDeliveryChoice::Software { .. } => {
-                    cursor.set_visible(false);
-                    *cursor_render_mode = if client_cursor_active {
-                        NativeCursorRenderMode::SoftwareClient
-                    } else {
-                        NativeCursorRenderMode::Software
-                    };
-                    *last_client_cursor_damage = None;
-                    cursor.note_software_fallback();
-                }
-                CursorDeliveryChoice::Hidden { .. } | CursorDeliveryChoice::Rejected { .. } => {
-                    cursor.set_visible(false);
-                    *cursor_render_mode = if client_cursor_active {
-                        NativeCursorRenderMode::SoftwareClient
-                    } else {
-                        NativeCursorRenderMode::Software
-                    };
-                }
-            }
         } else if client_cursor_active {
             *cursor_render_mode = NativeCursorRenderMode::SoftwareClient;
         } else if *cursor_preference == NativeCursorPreference::Software || legacy_cursor.is_none()
@@ -675,6 +544,7 @@ impl NativeRuntime {
                 *drm_file_generation,
                 pacing_mode,
                 cursor_epoch,
+                validation_base_for_submission(atomic_commit_arbiter, *presented_planes),
                 last_submitted_cursor_epoch,
                 cursor_output_arbitration,
                 frame_scheduler,
@@ -739,6 +609,7 @@ impl NativeRuntime {
                 output_transactions,
                 presentation_trace,
                 pacing_mode,
+                *presented_planes,
                 frame_index,
                 &mut frame_submitted,
                 perf,
@@ -831,7 +702,14 @@ impl NativeRuntime {
                                     frame_scheduler,
                                     cursor_output_arbitration,
                                     effective_cursor.as_ref(),
-                                    worker_ctx(atomic_cursor.as_ref(), frame_pacing),
+                                    worker_ctx(
+                                        atomic_cursor.as_ref(),
+                                        frame_pacing,
+                                        validation_base_for_submission(
+                                            atomic_commit_arbiter,
+                                            *presented_planes,
+                                        ),
+                                    ),
                                     *drm_file_generation,
                                     target.crtc_id,
                                     scene_generation,
@@ -1146,7 +1024,14 @@ impl NativeRuntime {
                                         transaction_id,
                                         *drm_file_generation,
                                         target.crtc_id,
-                                        worker_ctx(atomic_cursor.as_ref(), frame_pacing),
+                                        worker_ctx(
+                                            atomic_cursor.as_ref(),
+                                            frame_pacing,
+                                            validation_base_for_submission(
+                                                atomic_commit_arbiter,
+                                                *presented_planes,
+                                            ),
+                                        ),
                                         false,
                                     )?
                                     else {
