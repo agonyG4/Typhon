@@ -53,6 +53,7 @@ impl NativeRuntime {
                 AtomicCommitKind::CompositedPrimary { .. }
                 | AtomicCommitKind::DirectPrimary { .. } => None,
             });
+        let cursor_capability_key = job.owners.cursor().and_then(|owner| owner.capability_key);
         if let Some(cursor_epoch) = cursor_epoch {
             if sidecar_owner.is_none() {
                 let cursor = self
@@ -75,7 +76,7 @@ impl NativeRuntime {
                     .atomic_cursor
                     .as_mut()
                     .ok_or_else(|| io::Error::other("cursor worker rejection has no cursor"))?;
-                cursor.note_submit_failure();
+                cursor.note_submit_failure_for(cursor_capability_key);
                 cursor.note_software_fallback();
                 cursor.note_composed_software_fallback();
                 cursor.set_visible(false);

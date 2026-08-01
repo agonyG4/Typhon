@@ -86,7 +86,8 @@ impl NativeRuntime {
             KmsWorkerEvent::Fatal { .. }
             | KmsWorkerEvent::BusyDeferred { .. }
             | KmsWorkerEvent::SubmitLate { .. }
-            | KmsWorkerEvent::PageflipTimeout { .. } => Ok(()),
+            | KmsWorkerEvent::PageflipTimeout { .. }
+            | KmsWorkerEvent::CursorSidecarReturned { .. } => Ok(()),
         }
     }
 
@@ -252,7 +253,8 @@ impl NativeRuntime {
                 KmsWorkerEvent::Fatal { .. }
                 | KmsWorkerEvent::BusyDeferred { .. }
                 | KmsWorkerEvent::SubmitLate { .. }
-                | KmsWorkerEvent::PageflipTimeout { .. } => Ok(()),
+                | KmsWorkerEvent::PageflipTimeout { .. }
+                | KmsWorkerEvent::CursorSidecarReturned { .. } => Ok(()),
             };
             if let Err(error) = result
                 && first_error.is_none()
