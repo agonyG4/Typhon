@@ -242,6 +242,7 @@ pub(super) fn test_job(token: u64) -> KmsCommitJob {
         },
         cursor: KmsCursorUpdate::Unchanged,
         cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
+        primary_cursor_presentation: KmsPrimaryCursorPresentation::Preserve,
         cursor_pin: None,
         direct_primary_lease: None,
         test_only_duration_ns: None,

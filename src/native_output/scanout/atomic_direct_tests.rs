@@ -1,7 +1,7 @@
 use super::*;
 use crate::native_output::kms_worker::{
-    KmsBundleOwners, KmsCommitJob, KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy,
-    KmsValidationBase,
+    KmsBundleOwners, KmsCommitJob, KmsCursorUpdate, KmsPrimaryCursorPresentation, KmsPrimaryUpdate,
+    KmsTestOnlyPolicy, KmsValidationBase,
 };
 use crate::native_output::runtime::AtomicCommitKind;
 use crate::native_output::scanout::DirectPrimaryLease;
@@ -544,6 +544,7 @@ fn worker_queue_owns_direct_resource_before_submit() {
         },
         cursor: KmsCursorUpdate::Unchanged,
         cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
+        primary_cursor_presentation: KmsPrimaryCursorPresentation::Preserve,
         cursor_pin: None,
         direct_primary_lease: Some(lease),
         test_only_duration_ns: None,

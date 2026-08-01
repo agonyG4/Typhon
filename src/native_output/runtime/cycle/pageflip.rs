@@ -5,7 +5,7 @@ use super::super::presentation_transactions::{
 };
 use super::super::*;
 use super::cycle_direct;
-use crate::native_output::kms_worker::KmsCursorUpdate;
+use crate::native_output::kms_worker::{KmsCursorUpdate, KmsPrimaryCursorPresentation};
 use crate::native_output::presentation::plane::{
     CursorCoupling, CursorRevision, PresentedCursorState,
 };
@@ -68,30 +68,102 @@ fn presented_cursor_from_worker_update(
     revision: CursorRevision,
     coupling: CursorCoupling,
     delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
-    fallback: &AtomicCursorVisualState,
+    fallback: &PresentedCursorState,
 ) -> Option<PresentedCursorState> {
     let state = match update {
         KmsCursorUpdate::Set(state) => state.clone(),
         KmsCursorUpdate::Disable => {
-            let mut hidden = fallback.clone();
+            let mut hidden = *fallback;
+            hidden.revision = revision;
+            hidden.coupling = coupling;
+            hidden.delivery = delivery;
             hidden.visible = false;
             hidden.framebuffer_id = None;
-            hidden
+            return Some(hidden);
         }
         KmsCursorUpdate::Unchanged => {
-            let mut preserved = fallback.clone();
+            let mut preserved = *fallback;
+            preserved.revision = revision;
+            preserved.coupling = coupling;
+            preserved.delivery = delivery;
             if delivery
                 != crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware
             {
                 preserved.visible = false;
                 preserved.framebuffer_id = None;
             }
-            preserved
+            return Some(preserved);
         }
     };
     Some(PresentedCursorState::from_atomic_with_delivery(
         revision, coupling, delivery, &state,
     ))
+}
+
+fn frozen_primary_cursor_presentation(
+    presentation: KmsPrimaryCursorPresentation,
+) -> Option<PresentedCursorState> {
+    match presentation {
+        KmsPrimaryCursorPresentation::Preserve => None,
+        KmsPrimaryCursorPresentation::Promote(state) => Some(state),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_output::kms_worker::KmsPrimaryCursorPresentation;
+    use crate::native_output::presentation::plane::PresentedCursorDelivery;
+
+    #[test]
+    fn primary_pageflip_uses_frozen_cursor_presentation_metadata() {
+        let frozen_state = AtomicCursorVisualState::hidden(64, 64);
+        let frozen = PresentedCursorState::from_atomic_with_delivery(
+            CursorRevision::initial().advance_image(),
+            CursorCoupling::EmbeddedInPrimary,
+            crate::native_output::presentation::plane::PresentedCursorDelivery::Software,
+            &frozen_state,
+        );
+        let expected = frozen;
+
+        assert_eq!(
+            frozen_primary_cursor_presentation(KmsPrimaryCursorPresentation::Promote(frozen)),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn preserved_primary_cursor_does_not_fabricate_a_new_presentation() {
+        assert_eq!(
+            frozen_primary_cursor_presentation(KmsPrimaryCursorPresentation::Preserve),
+            None
+        );
+    }
+
+    #[test]
+    fn software_primary_metadata_freezes_revision_before_desired_advances() {
+        let mut cursor = crate::native_output::output::test_cursor_for_worker();
+        cursor.set_position(11, 22);
+        let frozen_state = cursor.desired().clone();
+        let frozen_revision = cursor.desired_revision();
+        let metadata =
+            crate::native_output::runtime::presentation_worker::freeze_primary_cursor_presentation(
+                crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
+                crate::native_output::presentation::plane::PresentedCursorDelivery::Software,
+                Some(&frozen_state),
+                Some(&cursor),
+                7,
+            );
+
+        cursor.set_position(900, 901);
+        let KmsPrimaryCursorPresentation::Promote(frozen) = metadata else {
+            panic!("software primary must carry frozen cursor metadata");
+        };
+        assert_eq!(frozen.revision, frozen_revision);
+        assert_eq!(frozen.output_position.x, 11);
+        assert_eq!(frozen.output_position.y, 22);
+        assert_eq!(frozen.delivery, PresentedCursorDelivery::Software);
+    }
 }
 
 impl NativeRuntime {
@@ -1009,7 +1081,7 @@ impl NativeRuntime {
                                         ownership.job.cursor_delivery,
                                     )
                                 }),
-                                ownership.job.cursor_delivery,
+                                ownership.job.primary_cursor_presentation,
                                 ownership.job.identity(),
                             )
                         });
@@ -1047,8 +1119,12 @@ impl NativeRuntime {
                             },
                         )?;
                     }
-                    if let Some((primary, cursor_owner, delivery, bundle_identity)) =
-                        worker_promotion
+                    if let Some((
+                        primary,
+                        cursor_owner,
+                        primary_cursor_presentation,
+                        bundle_identity,
+                    )) = worker_promotion
                     {
                         if bundle_identity.token != pageflip_token
                             || bundle_identity.output_generation != *drm_file_generation
@@ -1067,41 +1143,30 @@ impl NativeRuntime {
                                 crtc_id: bundle_identity.crtc_id,
                             };
                         let cursor = cursor_owner
-                            .or_else(|| {
-                                primary.as_ref().map(|_| {
-                                    (
-                                        atomic_cursor
-                                            .as_ref()
-                                            .map_or(CursorRevision::initial(), |cursor| {
-                                                cursor.desired_revision()
-                                            }),
-                                        false,
-                                        None,
-                                        KmsCursorUpdate::Unchanged,
-                                        delivery,
-                                    )
-                                })
-                            })
                             .and_then(|(revision, sidecar, _, update, delivery)| {
-                            let fallback = atomic_cursor.as_ref()?.current();
-                            let coupling = if delivery
-                                == crate::native_output::presentation::plane::PresentedCursorDelivery::Software
-                            {
-                                CursorCoupling::EmbeddedInPrimary
-                            } else if !matches!(
-                                &update,
-                                KmsCursorUpdate::Set(state) if state.visible
-                            ) {
-                                CursorCoupling::Hidden
-                            } else if sidecar {
-                                CursorCoupling::IndependentPlane
-                            } else {
-                                CursorCoupling::EmbeddedInPrimary
-                            };
-                            presented_cursor_from_worker_update(
-                                &update, revision, coupling, delivery, fallback,
-                            )
-                        });
+                                let coupling = if delivery
+                                    == crate::native_output::presentation::plane::PresentedCursorDelivery::Software
+                                {
+                                    CursorCoupling::EmbeddedInPrimary
+                                } else if !matches!(
+                                    &update,
+                                    KmsCursorUpdate::Set(state) if state.visible
+                                ) {
+                                    CursorCoupling::Hidden
+                                } else if sidecar {
+                                    CursorCoupling::IndependentPlane
+                                } else {
+                                    CursorCoupling::EmbeddedInPrimary
+                                };
+                                presented_cursor_from_worker_update(
+                                    &update,
+                                    revision,
+                                    coupling,
+                                    delivery,
+                                    &self.presented_planes.cursor,
+                                )
+                            })
+                            .or_else(|| frozen_primary_cursor_presentation(primary_cursor_presentation));
                         if (primary.is_some() || cursor.is_some())
                             && !self
                                 .presented_planes

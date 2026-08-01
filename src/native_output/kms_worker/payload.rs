@@ -4,7 +4,7 @@ use super::super::runtime::AtomicCommitKind;
 use super::{KmsBundleOwners, KmsCommitBundleIdentity};
 use crate::native_output::output::CursorFramebufferPin;
 use crate::native_output::presentation::plane::{
-    KmsCommitBundleId, PresentedCursorDelivery, PresentedPlaneSnapshot,
+    KmsCommitBundleId, PresentedCursorDelivery, PresentedCursorState, PresentedPlaneSnapshot,
 };
 use crate::native_output::scanout::DirectPrimaryLease;
 use crate::native_output::{
@@ -32,6 +32,7 @@ pub(crate) struct KmsCommitJob {
     pub(crate) primary: KmsPrimaryUpdate,
     pub(crate) cursor: KmsCursorUpdate,
     pub(crate) cursor_delivery: PresentedCursorDelivery,
+    pub(crate) primary_cursor_presentation: KmsPrimaryCursorPresentation,
     /// A Send-only lease marker for the exact DRM cursor framebuffer named by
     /// `cursor`. The framebuffer object remains compositor-thread-owned; the
     /// lease keeps it in the cursor resource registry until this job reaches a
@@ -42,6 +43,12 @@ pub(crate) struct KmsCommitJob {
     pub(crate) pacing_frame_id: Option<u64>,
     pub(crate) test_only: KmsTestOnlyPolicy,
     pub(crate) ready_submit: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KmsPrimaryCursorPresentation {
+    Preserve,
+    Promote(PresentedCursorState),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,23 +228,6 @@ impl KmsCommitJob {
             }
             _ => {}
         }
-        match (&self.kind, &self.cursor, self.cursor_delivery) {
-            (_, KmsCursorUpdate::Set(state), delivery)
-                if state.visible && delivery != PresentedCursorDelivery::Hardware =>
-            {
-                return Err(KmsCommitPayloadError::CursorDeliveryMismatch);
-            }
-            (
-                AtomicCommitKind::PlaneDelta { .. },
-                KmsCursorUpdate::Disable,
-                PresentedCursorDelivery::Hardware,
-            )
-            | (AtomicCommitKind::PlaneDelta { .. }, _, PresentedCursorDelivery::Software)
-            | (AtomicCommitKind::DirectPrimary { .. }, _, PresentedCursorDelivery::Software) => {
-                return Err(KmsCommitPayloadError::CursorDeliveryMismatch);
-            }
-            _ => {}
-        }
         if !self.owners.is_legacy_unchecked() {
             let primary_changed = !matches!(self.primary, KmsPrimaryUpdate::Unchanged);
             let cursor_changed = !matches!(self.cursor, KmsCursorUpdate::Unchanged);
@@ -387,6 +377,23 @@ impl KmsCommitJob {
         };
         if !cursor_matches {
             return Err(KmsCommitPayloadError::CursorAssignmentMismatch);
+        }
+        match (&self.kind, &self.cursor, self.cursor_delivery) {
+            (_, KmsCursorUpdate::Set(state), delivery)
+                if state.visible && delivery != PresentedCursorDelivery::Hardware =>
+            {
+                return Err(KmsCommitPayloadError::CursorDeliveryMismatch);
+            }
+            (
+                AtomicCommitKind::PlaneDelta { .. },
+                KmsCursorUpdate::Disable,
+                PresentedCursorDelivery::Hardware,
+            )
+            | (AtomicCommitKind::PlaneDelta { .. }, _, PresentedCursorDelivery::Software)
+            | (AtomicCommitKind::DirectPrimary { .. }, _, PresentedCursorDelivery::Software) => {
+                return Err(KmsCommitPayloadError::CursorDeliveryMismatch);
+            }
+            _ => {}
         }
         match &self.cursor {
             KmsCursorUpdate::Set(state) if state.framebuffer_id.is_some() => {

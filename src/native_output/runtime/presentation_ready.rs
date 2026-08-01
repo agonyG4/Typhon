@@ -3,8 +3,8 @@ use super::presentation_transactions::{
     register_primary_transaction,
 };
 use super::presentation_worker::{
-    queue_compatibility_for_presentation, submit_explicit_ready_for_presentation,
-    validation_base_for_submission, worker_ctx,
+    freeze_primary_cursor_presentation, queue_compatibility_for_presentation,
+    submit_explicit_ready_for_presentation, validation_base_for_submission, worker_ctx,
 };
 use super::*;
 use crate::native_output::kms_worker::KmsCommitWorkerHandle;
@@ -54,6 +54,13 @@ pub(super) fn submit_ready_frame(
     let repaint_present_start = Instant::now();
     let validation_base =
         validation_base_for_submission(worker, presented_planes, output_generation, crtc_id);
+    let primary_cursor_presentation = freeze_primary_cursor_presentation(
+        presented_planes.cursor.delivery,
+        cursor_delivery,
+        cursor,
+        atomic_cursor.as_ref(),
+        cursor_epoch,
+    );
     let explicit_submission = matches!(scanout, NativeScanoutBackend::AtomicEglGbm(_));
     let (present_result, compatibility_transaction_id) =
         if let NativeScanoutBackend::AtomicEglGbm(explicit) = scanout {
@@ -79,6 +86,7 @@ pub(super) fn submit_ready_frame(
                         frame_pacing,
                         validation_base,
                         cursor_delivery,
+                        primary_cursor_presentation,
                     ),
                     true,
                 )?
@@ -134,6 +142,7 @@ pub(super) fn submit_ready_frame(
                 render_generation,
                 cursor,
                 cursor_delivery,
+                primary_cursor_presentation,
                 cursor_pin,
                 atomic_cursor.as_ref().and_then(|native_cursor| {
                     cursor.and_then(|state| native_cursor.capability_key_for(state))

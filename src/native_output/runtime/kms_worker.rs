@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use super::super::kms_worker::{
     CursorSidecarReturnReason, KmsBundleOwners, KmsCommitJob, KmsCommitWorkerHandle,
-    KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy, KmsValidationBase,
-    KmsWorkerAdmissionError, KmsWorkerEvent, KmsWorkerFatalJob, ValidationBaseInvalidationReason,
+    KmsCursorUpdate, KmsPrimaryCursorPresentation, KmsPrimaryUpdate, KmsSubmittedOwnership,
+    KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerAdmissionError, KmsWorkerEvent,
+    KmsWorkerFatalJob, ValidationBaseInvalidationReason,
 };
 pub(super) use super::kms_worker_teardown::{
     retain_complete_submitted_ownership, retain_uncertain_job_with_suspension,
@@ -96,6 +97,7 @@ pub(super) fn queue_explicit_composited_frame(
     crtc_id: u32,
     cursor_update: KmsCursorUpdate,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
+    primary_cursor_presentation: KmsPrimaryCursorPresentation,
     cursor_pin: Option<CursorFramebufferPin>,
     cursor_capability_key: Option<
         crate::native_output::presentation::plane_policy::CursorCapabilityKey,
@@ -211,6 +213,7 @@ pub(super) fn queue_explicit_composited_frame(
         },
         cursor: cursor_update,
         cursor_delivery,
+        primary_cursor_presentation,
         cursor_pin,
         direct_primary_lease: None,
         test_only_duration_ns: None,
@@ -296,6 +299,7 @@ pub(super) fn queue_atomic_compatibility_frame(
     render_generation: u64,
     cursor: Option<&AtomicCursorVisualState>,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
+    primary_cursor_presentation: KmsPrimaryCursorPresentation,
     cursor_pin: Option<CursorFramebufferPin>,
     cursor_capability_key: Option<
         crate::native_output::presentation::plane_policy::CursorCapabilityKey,
@@ -438,6 +442,7 @@ pub(super) fn queue_atomic_compatibility_frame(
             KmsCursorUpdate::Set(state.clone())
         }),
         cursor_delivery,
+        primary_cursor_presentation,
         cursor_pin,
         direct_primary_lease: None,
         test_only_duration_ns: None,

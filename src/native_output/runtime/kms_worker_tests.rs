@@ -5,8 +5,9 @@ use super::kms_worker::{
 };
 use super::plane_cycle::plane_delta_reservation_outcome;
 use crate::native_output::kms_worker::{
-    KmsBundleOwners, KmsCommitJob, KmsCursorUpdate, KmsPrimaryUpdate, KmsSubmittedOwnership,
-    KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerAdmissionError, KmsWorkerFatalJob,
+    KmsBundleOwners, KmsCommitJob, KmsCursorUpdate, KmsPrimaryCursorPresentation, KmsPrimaryUpdate,
+    KmsSubmittedOwnership, KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerAdmissionError,
+    KmsWorkerFatalJob,
 };
 use crate::native_output::runtime::AtomicCommitKind;
 use crate::native_output::scanout::DirectPrimaryLease;
@@ -115,6 +116,7 @@ fn test_uncertain_direct_job(lease: DirectPrimaryLease) -> KmsCommitJob {
         },
         cursor: KmsCursorUpdate::Unchanged,
         cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
+        primary_cursor_presentation: KmsPrimaryCursorPresentation::Preserve,
         cursor_pin: None,
         direct_primary_lease: Some(lease),
         test_only_duration_ns: None,

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use super::*;
 use crate::native_output::kms_worker::{
     AttachablePrimary, CursorSidecar, CursorSidecarCoupling, KmsBundleOwners, KmsCommitJob,
-    KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase,
-    KmsWorkerAdmissionError,
+    KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryCursorPresentation, KmsPrimaryUpdate,
+    KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerAdmissionError,
 };
 use crate::native_output::presentation::{
     plane::{CursorRevision, PresentedCursorDelivery},
@@ -211,6 +211,7 @@ pub(super) fn queue_plane_delta(
             .clone()
             .map_or(KmsCursorUpdate::Disable, KmsCursorUpdate::Set),
         cursor_delivery,
+        primary_cursor_presentation: KmsPrimaryCursorPresentation::Preserve,
         cursor_pin: match promoted_pin {
             Some(pin) => Some(pin),
             None => desired

@@ -731,6 +731,13 @@ impl NativeRuntime {
                                         target.crtc_id,
                                     ),
                                     planned_cursor_delivery,
+                                    freeze_primary_cursor_presentation(
+                                        presented_planes.cursor.delivery,
+                                        planned_cursor_delivery,
+                                        effective_cursor.as_ref(),
+                                        atomic_cursor.as_ref(),
+                                        cursor_epoch,
+                                    ),
                                 ),
                                 *drm_file_generation,
                                 target.crtc_id,
@@ -1055,6 +1062,13 @@ impl NativeRuntime {
                                                 target.crtc_id,
                                             ),
                                             planned_cursor_delivery,
+                                            freeze_primary_cursor_presentation(
+                                                presented_planes.cursor.delivery,
+                                                planned_cursor_delivery,
+                                                effective_cursor.as_ref(),
+                                                atomic_cursor.as_ref(),
+                                                cursor_epoch,
+                                            ),
                                         ),
                                         false,
                                     )?

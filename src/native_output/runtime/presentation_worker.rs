@@ -9,9 +9,10 @@ use super::presentation_transactions::{
 use super::*;
 use crate::native_output::kms_worker::{
     KmsBundleOwners, KmsCommitAdmissionPermit, KmsCommitJob, KmsCommitWorkerHandle,
-    KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase,
-    KmsWorkerAdmissionError,
+    KmsCursorUpdate, KmsPrimaryCursorPresentation, KmsPrimaryUpdate, KmsTestOnlyPolicy,
+    KmsValidationBase, KmsWorkerAdmissionError,
 };
+use crate::native_output::presentation::plane::CursorRevision;
 use oblivion_one::native::kms::FramebufferId;
 
 pub(super) fn can_queue_worker_primary(
@@ -84,6 +85,7 @@ pub(super) struct WorkerPrimarySubmissionContext<'a> {
     frame_pacing: &'a mut NativeFramePacing,
     validation_base: KmsValidationBase,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
+    primary_cursor_presentation: KmsPrimaryCursorPresentation,
 }
 
 pub(super) fn worker_ctx<'a>(
@@ -91,13 +93,55 @@ pub(super) fn worker_ctx<'a>(
     frame_pacing: &'a mut NativeFramePacing,
     validation_base: KmsValidationBase,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
+    primary_cursor_presentation: KmsPrimaryCursorPresentation,
 ) -> WorkerPrimarySubmissionContext<'a> {
     WorkerPrimarySubmissionContext {
         atomic_cursor,
         frame_pacing,
         validation_base,
         cursor_delivery,
+        primary_cursor_presentation,
     }
+}
+
+pub(super) fn freeze_primary_cursor_presentation(
+    previous_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
+    next_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
+    effective_cursor: Option<&AtomicCursorVisualState>,
+    atomic_cursor: Option<&NativeAtomicCursor>,
+    cursor_epoch: u64,
+) -> KmsPrimaryCursorPresentation {
+    let needs_promotion = next_delivery
+        == crate::native_output::presentation::plane::PresentedCursorDelivery::Software
+        || (previous_delivery
+            == crate::native_output::presentation::plane::PresentedCursorDelivery::Software
+            && next_delivery
+                == crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden);
+    if !needs_promotion {
+        return KmsPrimaryCursorPresentation::Preserve;
+    }
+    let mut state = effective_cursor
+        .cloned()
+        .or_else(|| atomic_cursor.map(NativeAtomicCursor::desired).cloned())
+        .unwrap_or_else(|| AtomicCursorVisualState::hidden(1, 1));
+    state.visible = false;
+    state.framebuffer_id = None;
+    let revision = atomic_cursor.map_or_else(
+        || {
+            CursorRevision::from_legacy_epoch(
+                std::num::NonZeroU64::new(cursor_epoch.max(1)).expect("cursor epoch is nonzero"),
+            )
+        },
+        NativeAtomicCursor::desired_revision,
+    );
+    KmsPrimaryCursorPresentation::Promote(
+        crate::native_output::presentation::plane::PresentedCursorState::from_atomic_with_delivery(
+            revision,
+            crate::native_output::presentation::plane::CursorCoupling::EmbeddedInPrimary,
+            next_delivery,
+            &state,
+        ),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +426,7 @@ pub(super) fn queue_explicit_ready_for_presentation(
     crtc_id: u32,
     cursor_update: KmsCursorUpdate,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
+    primary_cursor_presentation: KmsPrimaryCursorPresentation,
     cursor_pin: Option<CursorFramebufferPin>,
     cursor_capability_key: Option<
         crate::native_output::presentation::plane_policy::CursorCapabilityKey,
@@ -403,6 +448,7 @@ pub(super) fn queue_explicit_ready_for_presentation(
         crtc_id,
         cursor_update,
         cursor_delivery,
+        primary_cursor_presentation,
         cursor_pin,
         cursor_capability_key,
         pacing_frame_id,
@@ -477,6 +523,7 @@ pub(super) fn submit_explicit_ready_for_presentation(
             crtc_id,
             cursor_update,
             context.cursor_delivery,
+            context.primary_cursor_presentation,
             cursor_pin,
             cursor_capability_key,
             pacing_frame_id,
@@ -508,6 +555,7 @@ pub(super) fn queue_compatibility_for_presentation(
     render_generation: u64,
     cursor: Option<&AtomicCursorVisualState>,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
+    primary_cursor_presentation: KmsPrimaryCursorPresentation,
     cursor_pin: Option<CursorFramebufferPin>,
     cursor_capability_key: Option<
         crate::native_output::presentation::plane_policy::CursorCapabilityKey,
@@ -531,6 +579,7 @@ pub(super) fn queue_compatibility_for_presentation(
         render_generation,
         cursor,
         cursor_delivery,
+        primary_cursor_presentation,
         cursor_pin,
         cursor_capability_key,
         pacing_frame_id,
@@ -650,6 +699,7 @@ pub(super) fn finish_direct_worker_queued(
             KmsCursorUpdate::Set(state.clone())
         }),
         cursor_delivery: context.cursor_delivery,
+        primary_cursor_presentation: context.primary_cursor_presentation,
         cursor_pin: worker_cursor_pin(context.atomic_cursor, effective_cursor)?,
         direct_primary_lease: Some(direct_lease),
         test_only_duration_ns: None,
