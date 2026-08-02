@@ -456,7 +456,10 @@ impl NativeSessionIo for NativeRuntime {
                 self.frame_scheduler.next_deadline_ns(),
                 self.acquire_watches.next_fallback_deadline_ns(),
             ),
-            self.xwayland.next_deadline_ns(),
+            earliest_native_deadline(
+                self.xwayland.next_deadline_ns(),
+                self.control_server.next_deadline_ns(),
+            ),
         ))?;
         Ok(())
     }

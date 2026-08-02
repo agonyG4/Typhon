@@ -1,7 +1,7 @@
 //! Native, nonblocking control socket ownership and client state machines.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt, fs, io,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
@@ -11,6 +11,7 @@ use std::{
         },
     },
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 use crate::control::{
@@ -18,10 +19,14 @@ use crate::control::{
     MAX_REQUEST_BYTES, decode_request, encode_response,
 };
 
-use super::event_loop::{ControlReadyEvent, NativeEventLoop, NativeEventSource, ReactorToken};
+use super::event_loop::{
+    ControlReadyEvent, NativeEventLoop, NativeEventSource, ReactorToken, monotonic_now_ns,
+};
 
 pub const MAX_CONTROL_CLIENTS: usize = 32;
 pub const MAX_CONTROL_OPERATIONS_PER_CYCLE: usize = 16;
+pub const CONTROL_REQUEST_IDLE_TIMEOUT_NS: u64 = 10_000_000_000;
+pub const CONTROL_RESPONSE_IDLE_TIMEOUT_NS: u64 = 10_000_000_000;
 
 const DIRECTORY_MODE: u32 = 0o700;
 const SOCKET_MODE: u32 = 0o600;
@@ -40,6 +45,7 @@ pub enum ControlServerError {
     InvalidInstance(String),
     UnsafePath(String),
     SocketInUse(PathBuf),
+    InstanceLocked(PathBuf),
     ForeignSocket(PathBuf),
     ListenerFailure(String),
     Io(io::Error),
@@ -57,6 +63,13 @@ impl fmt::Display for ControlServerError {
             Self::UnsafePath(reason) => write!(formatter, "unsafe control socket path: {reason}"),
             Self::SocketInUse(path) => {
                 write!(formatter, "control socket is in use: {}", path.display())
+            }
+            Self::InstanceLocked(path) => {
+                write!(
+                    formatter,
+                    "control instance is already locked: {}",
+                    path.display()
+                )
             }
             Self::ForeignSocket(path) => write!(
                 formatter,
@@ -110,6 +123,10 @@ impl ControlRuntimePaths {
         &self.socket_path
     }
 
+    pub fn lock_path(&self) -> PathBuf {
+        self.socket_dir.join("control.lock")
+    }
+
     fn prepare_directories(&self, owner_uid: u32) -> Result<(), ControlServerError> {
         ensure_owned_directory(&self.runtime_dir.join("astrea"), owner_uid)?;
         ensure_owned_directory(&self.runtime_dir.join("astrea").join("typhon"), owner_uid)?;
@@ -126,13 +143,47 @@ struct SocketIdentity {
 
 #[derive(Debug)]
 pub struct NativeControlServer {
-    listener: OwnedFd,
+    listener: Option<OwnedFd>,
+    _instance_lock: InstanceLock,
     listener_token: ReactorToken,
     clients: HashMap<ReactorToken, ControlClient>,
     paths: ControlRuntimePaths,
     owner_uid: u32,
     socket_identity: SocketIdentity,
+    counters: ControlServerCounters,
     shut_down: bool,
+}
+
+#[derive(Debug)]
+struct InstanceLock {
+    _fd: OwnedFd,
+    path: PathBuf,
+}
+
+static HELD_INSTANCE_LOCKS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        if let Some(locks) = HELD_INSTANCE_LOCKS.get()
+            && let Ok(mut locks) = locks.lock()
+        {
+            locks.remove(&self.path);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ControlServerCounters {
+    pub accepted: u64,
+    pub unauthorized: u64,
+    pub capacity_rejected: u64,
+    pub registration_rejected: u64,
+    pub malformed: u64,
+    pub oversized: u64,
+    pub request_timeouts: u64,
+    pub response_timeouts: u64,
+    pub stale_tokens: u64,
+    pub client_io_failures: u64,
 }
 
 #[derive(Debug)]
@@ -142,6 +193,8 @@ struct ControlClient {
     output: Vec<u8>,
     written: usize,
     state: ControlClientState,
+    peer_write_closed: bool,
+    last_progress_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,11 +221,15 @@ impl NativeControlServer {
         let paths = ControlRuntimePaths::for_runtime_dir(runtime_dir, instance)?;
         let owner_uid = effective_uid();
         paths.prepare_directories(owner_uid)?;
+        let instance_lock = acquire_instance_lock(&paths.lock_path(), owner_uid)?;
         remove_stale_socket(&paths, owner_uid)?;
 
         let listener = create_listener(&paths.socket_path)?;
         let socket_identity = socket_path_identity(&paths.socket_path)?;
-        set_socket_mode(&paths.socket_path, owner_uid, socket_identity)?;
+        if let Err(error) = set_socket_mode(&paths.socket_path, owner_uid, socket_identity) {
+            remove_socket_if_identity(&paths.socket_path, socket_identity);
+            return Err(error);
+        }
         let listener_token = match event_loop.register_with_events(
             listener.as_raw_fd(),
             NativeEventSource::ControlListener,
@@ -190,12 +247,14 @@ impl NativeControlServer {
             instance
         );
         Ok(Self {
-            listener,
+            listener: Some(listener),
+            _instance_lock: instance_lock,
             listener_token,
             clients: HashMap::new(),
             paths,
             owner_uid,
             socket_identity,
+            counters: ControlServerCounters::default(),
             shut_down: false,
         })
     }
@@ -210,6 +269,53 @@ impl NativeControlServer {
 
     pub fn client_count(&self) -> usize {
         self.clients.len()
+    }
+
+    pub fn counters(&self) -> ControlServerCounters {
+        self.counters
+    }
+
+    pub fn next_deadline_ns(&self) -> Option<u64> {
+        self.clients
+            .values()
+            .filter_map(ControlClient::next_deadline_ns)
+            .min()
+    }
+
+    pub fn expire_idle_clients(
+        &mut self,
+        event_loop: &mut NativeEventLoop,
+        now_ns: u64,
+        budget: usize,
+    ) {
+        let expired = self
+            .clients
+            .iter()
+            .filter(|(_, client)| {
+                client
+                    .next_deadline_ns()
+                    .is_some_and(|deadline| deadline <= now_ns)
+            })
+            .map(|(token, client)| (*token, client.state))
+            .take(budget.min(MAX_CONTROL_OPERATIONS_PER_CYCLE))
+            .collect::<Vec<_>>();
+        for (token, state) in expired {
+            match state {
+                ControlClientState::Reading => {
+                    self.counters.request_timeouts =
+                        self.counters.request_timeouts.saturating_add(1)
+                }
+                ControlClientState::Writing => {
+                    self.counters.response_timeouts =
+                        self.counters.response_timeouts.saturating_add(1)
+                }
+                ControlClientState::AwaitingResponse => {
+                    self.counters.response_timeouts =
+                        self.counters.response_timeouts.saturating_add(1)
+                }
+            }
+            self.remove_client(event_loop, token);
+        }
     }
 
     pub fn service_events(
@@ -238,7 +344,7 @@ impl NativeControlServer {
 
             let action = {
                 let Some(client) = self.clients.get_mut(&event.token) else {
-                    eprintln!("typhon control: stale_token raw={}", event.token.raw());
+                    self.counters.stale_tokens = self.counters.stale_tokens.saturating_add(1);
                     continue;
                 };
                 let action = client.advance(event.flags);
@@ -250,13 +356,29 @@ impl NativeControlServer {
             match action {
                 ClientAction::None => {}
                 ClientAction::Request(request) => {
-                    if !event_loop.modify(event.token, WAITING_EVENTS)? {
+                    if !event_loop
+                        .modify(event.token, WAITING_EVENTS)
+                        .unwrap_or(false)
+                    {
+                        self.counters.client_io_failures =
+                            self.counters.client_io_failures.saturating_add(1);
                         self.remove_client(event_loop, event.token);
                         continue;
                     }
                     pending.push((event.token, request));
                 }
                 ClientAction::Response(response) => {
+                    if let Some(error) = response.error.as_ref() {
+                        match error.code {
+                            ControlErrorCode::MalformedJson => {
+                                self.counters.malformed = self.counters.malformed.saturating_add(1)
+                            }
+                            ControlErrorCode::RequestTooLarge => {
+                                self.counters.oversized = self.counters.oversized.saturating_add(1)
+                            }
+                            _ => {}
+                        }
+                    }
                     self.queue_response(event_loop, event.token, response)?;
                 }
                 ClientAction::Close => {
@@ -297,7 +419,9 @@ impl NativeControlServer {
         client.output = encoded;
         client.written = 0;
         client.state = ControlClientState::Writing;
-        if !event_loop.modify(token, WRITE_EVENTS)? {
+        client.last_progress_ns = monotonic_now_ns().unwrap_or(client.last_progress_ns);
+        if !event_loop.modify(token, WRITE_EVENTS).unwrap_or(false) {
+            self.counters.client_io_failures = self.counters.client_io_failures.saturating_add(1);
             self.remove_client(event_loop, token);
         }
         Ok(())
@@ -308,15 +432,20 @@ impl NativeControlServer {
             return Ok(());
         }
         let tokens = self.clients.keys().copied().collect::<Vec<_>>();
+        let mut first_error = None;
         for token in tokens {
-            let _ = event_loop.unregister(token);
+            if let Err(error) = event_loop.unregister(token) {
+                first_error.get_or_insert(error);
+            }
         }
         self.clients.clear();
-        let _ = event_loop.unregister(self.listener_token);
+        if let Err(error) = event_loop.unregister(self.listener_token) {
+            first_error.get_or_insert(error);
+        }
+        self.listener.take();
         self.shut_down = true;
         remove_socket_if_identity(&self.paths.socket_path, self.socket_identity);
-        eprintln!("typhon control: shutdown_cleanup clients=0");
-        Ok(())
+        first_error.map_or(Ok(()), |error| Err(error.into()))
     }
 
     fn accept_one(&mut self, event_loop: &mut NativeEventLoop) -> Result<(), ControlServerError> {
@@ -325,7 +454,7 @@ impl NativeControlServer {
                 // SAFETY: `self.listener` is a live listening socket owned by
                 // this server, and the flags request nonblocking CLOEXEC I/O.
                 libc::accept4(
-                    self.listener.as_raw_fd(),
+                    self.listener.as_ref().expect("live listener").as_raw_fd(),
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
@@ -338,9 +467,18 @@ impl NativeControlServer {
             match error.raw_os_error() {
                 Some(libc::EINTR) => continue,
                 Some(libc::EAGAIN) => return Ok(()),
-                _ => {
+                Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK) => {
                     return Err(ControlServerError::ListenerFailure(error.to_string()));
                 }
+                Some(
+                    libc::ECONNABORTED
+                    | libc::EPROTO
+                    | libc::EMFILE
+                    | libc::ENFILE
+                    | libc::ENOBUFS
+                    | libc::ENOMEM,
+                ) => return Ok(()),
+                _ => return Ok(()),
             }
         };
         let client_fd = unsafe {
@@ -349,22 +487,27 @@ impl NativeControlServer {
         };
         let peer_uid = peer_uid(client_fd.as_raw_fd());
         if peer_uid != Some(self.owner_uid) {
-            eprintln!("typhon control: rejected_unauthorized");
+            self.counters.unauthorized = self.counters.unauthorized.saturating_add(1);
             send_best_effort_unauthorized(client_fd.as_raw_fd());
             return Ok(());
         }
         if self.clients.len() >= MAX_CONTROL_CLIENTS {
-            eprintln!(
-                "typhon control: rejected_capacity clients={}",
-                self.clients.len()
-            );
+            self.counters.capacity_rejected = self.counters.capacity_rejected.saturating_add(1);
             return Ok(());
         }
-        let token = event_loop.register_with_events(
+        let token = match event_loop.register_with_events(
             client_fd.as_raw_fd(),
             NativeEventSource::ControlClient,
             READ_EVENTS,
-        )?;
+        ) {
+            Ok(token) => token,
+            Err(_) => {
+                self.counters.registration_rejected =
+                    self.counters.registration_rejected.saturating_add(1);
+                return Ok(());
+            }
+        };
+        let now_ns = monotonic_now_ns().unwrap_or(0);
         self.clients.insert(
             token,
             ControlClient {
@@ -373,17 +516,17 @@ impl NativeControlServer {
                 output: Vec::new(),
                 written: 0,
                 state: ControlClientState::Reading,
+                peer_write_closed: false,
+                last_progress_ns: now_ns,
             },
         );
-        eprintln!("typhon control: accepted clients={}", self.clients.len());
+        self.counters.accepted = self.counters.accepted.saturating_add(1);
         Ok(())
     }
 
     fn remove_client(&mut self, event_loop: &mut NativeEventLoop, token: ReactorToken) {
         let _ = event_loop.unregister(token);
-        if self.clients.remove(&token).is_some() {
-            eprintln!("typhon control: client_cleanup");
-        }
+        if self.clients.remove(&token).is_some() {}
     }
 }
 
@@ -396,18 +539,45 @@ impl Drop for NativeControlServer {
 }
 
 impl ControlClient {
+    fn next_deadline_ns(&self) -> Option<u64> {
+        let timeout = match self.state {
+            ControlClientState::Reading => CONTROL_REQUEST_IDLE_TIMEOUT_NS,
+            ControlClientState::AwaitingResponse | ControlClientState::Writing => {
+                CONTROL_RESPONSE_IDLE_TIMEOUT_NS
+            }
+        };
+        Some(self.last_progress_ns.saturating_add(timeout))
+    }
+
     fn advance(&mut self, flags: u32) -> ClientAction {
-        if flags & TERMINAL_EVENTS != 0 {
-            return ClientAction::Close;
+        let terminal = flags & TERMINAL_EVENTS != 0;
+        if flags & libc::EPOLLERR as u32 != 0 {
+            let mut socket_error = 0i32;
+            let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
+            let _ = unsafe {
+                // SAFETY: this is a live client socket and both output values
+                // point to valid writable storage for SO_ERROR.
+                libc::getsockopt(
+                    self.fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    (&mut socket_error as *mut i32).cast(),
+                    &mut length,
+                )
+            };
         }
         match self.state {
-            ControlClientState::Reading if flags & libc::EPOLLIN as u32 != 0 => self.read_once(),
-            ControlClientState::Writing if flags & libc::EPOLLOUT as u32 != 0 => self.write_once(),
+            ControlClientState::Reading if flags & libc::EPOLLIN as u32 != 0 || terminal => {
+                self.read_once(terminal)
+            }
+            ControlClientState::Writing if flags & libc::EPOLLOUT as u32 != 0 || terminal => {
+                self.write_once()
+            }
             _ => ClientAction::None,
         }
     }
 
-    fn read_once(&mut self) -> ClientAction {
+    fn read_once(&mut self, terminal: bool) -> ClientAction {
         let remaining = MAX_REQUEST_BYTES.saturating_sub(self.input.len());
         let read_len = remaining.saturating_add(1).min(4096);
         if read_len == 0 {
@@ -422,6 +592,7 @@ impl ControlClient {
         };
         if read > 0 {
             self.input.extend_from_slice(&buffer[..read as usize]);
+            self.last_progress_ns = monotonic_now_ns().unwrap_or(self.last_progress_ns);
             if let Some(newline) = self.input.iter().position(|byte| *byte == b'\n') {
                 let request = decode_request(&self.input[..=newline]);
                 return match request {
@@ -435,11 +606,31 @@ impl ControlClient {
             return ClientAction::None;
         }
         if read == 0 {
-            return ClientAction::Close;
+            self.peer_write_closed = true;
+            return if self.input.is_empty() {
+                ClientAction::Close
+            } else {
+                ClientAction::Response(ControlResponse::failure(
+                    0,
+                    ControlError::new(
+                        ControlErrorCode::InvalidRequest,
+                        "control request ended before a newline",
+                    ),
+                ))
+            };
         }
         match io::Error::last_os_error().raw_os_error() {
             Some(libc::EAGAIN | libc::EINTR) => ClientAction::None,
             Some(libc::EPIPE | libc::ECONNRESET) => ClientAction::Close,
+            _ if terminal && !self.input.is_empty() => {
+                ClientAction::Response(ControlResponse::failure(
+                    0,
+                    ControlError::new(
+                        ControlErrorCode::InvalidRequest,
+                        "control request could not be read completely",
+                    ),
+                ))
+            }
             _ => ClientAction::Close,
         }
     }
@@ -452,14 +643,16 @@ impl ControlClient {
         let written = unsafe {
             // SAFETY: `self.fd` is a live nonblocking client socket and the
             // slice points to initialized response bytes owned by this client.
-            libc::write(
+            libc::send(
                 self.fd.as_raw_fd(),
                 remaining.as_ptr().cast(),
                 remaining.len(),
+                libc::MSG_NOSIGNAL,
             )
         };
         if written > 0 {
             self.written += written as usize;
+            self.last_progress_ns = monotonic_now_ns().unwrap_or(self.last_progress_ns);
             if self.written == self.output.len() {
                 return ClientAction::Close;
             }
@@ -523,7 +716,7 @@ fn send_best_effort_unauthorized(fd: RawFd) {
     let _ = unsafe {
         // SAFETY: `fd` is the accepted descriptor owned by the caller for the
         // duration of this best-effort nonblocking write.
-        libc::write(fd, bytes.as_ptr().cast(), bytes.len())
+        libc::send(fd, bytes.as_ptr().cast(), bytes.len(), libc::MSG_NOSIGNAL)
     };
 }
 
@@ -561,7 +754,7 @@ fn validate_instance(instance: &str) -> Result<(), ControlServerError> {
             "instance length is outside the supported range".to_string(),
         ));
     }
-    if instance == ".." || instance.contains("..") {
+    if instance == "." || instance == ".." || instance.contains("..") {
         return Err(ControlServerError::InvalidInstance(
             "instance contains traversal syntax".to_string(),
         ));
@@ -581,9 +774,24 @@ fn ensure_owned_directory(path: &Path, owner_uid: u32) -> Result<(), ControlServ
     match fs::symlink_metadata(path) {
         Ok(metadata) => verify_owned_directory(path, &metadata, owner_uid),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(path).map_err(|error| {
-                ControlServerError::UnsafePath(format!("create {}: {error}", path.display()))
-            })?;
+            match fs::create_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let metadata = fs::symlink_metadata(path).map_err(|error| {
+                        ControlServerError::UnsafePath(format!(
+                            "inspect {}: {error}",
+                            path.display()
+                        ))
+                    })?;
+                    return verify_owned_directory(path, &metadata, owner_uid);
+                }
+                Err(error) => {
+                    return Err(ControlServerError::UnsafePath(format!(
+                        "create {}: {error}",
+                        path.display()
+                    )));
+                }
+            }
             fs::set_permissions(path, fs::Permissions::from_mode(DIRECTORY_MODE)).map_err(
                 |error| {
                     ControlServerError::UnsafePath(format!("chmod {}: {error}", path.display()))
@@ -645,13 +853,21 @@ fn remove_stale_socket(
             paths.socket_path().to_path_buf(),
         ));
     }
+    let identity = SocketIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
     match probe_existing_socket(paths.socket_path())? {
         SocketProbe::Live => Err(ControlServerError::SocketInUse(
             paths.socket_path().to_path_buf(),
         )),
         SocketProbe::Dead => {
             let revalidated = fs::symlink_metadata(paths.socket_path())?;
-            if !revalidated.file_type().is_socket() || revalidated.uid() != owner_uid {
+            if !revalidated.file_type().is_socket()
+                || revalidated.uid() != owner_uid
+                || revalidated.dev() != identity.device
+                || revalidated.ino() != identity.inode
+            {
                 return Err(ControlServerError::UnsafePath(
                     "socket changed during stale cleanup".to_string(),
                 ));
@@ -660,6 +876,74 @@ fn remove_stale_socket(
             Ok(())
         }
     }
+}
+
+fn acquire_instance_lock(path: &Path, owner_uid: u32) -> Result<InstanceLock, ControlServerError> {
+    let bytes = path_bytes(path)?;
+    let fd = unsafe {
+        // SAFETY: `bytes` is a validated NUL-free path and the flags request a
+        // new non-following close-on-exec descriptor.
+        libc::open(
+            bytes.as_ptr().cast(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ELOOP)) {
+            return Err(ControlServerError::UnsafePath(format!(
+                "lock path is a symlink: {}",
+                path.display()
+            )));
+        }
+        return Err(error.into());
+    }
+    let lock = unsafe {
+        // SAFETY: `open` returned a new owned descriptor.
+        OwnedFd::from_raw_fd(fd)
+    };
+    let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
+    let result = unsafe {
+        // SAFETY: `lock` is live and `metadata` is valid writable stat storage.
+        libc::fstat(lock.as_raw_fd(), &mut metadata)
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    if metadata.st_uid != owner_uid
+        || metadata.st_mode & libc::S_IFMT != libc::S_IFREG
+        || metadata.st_mode & 0o777 != 0o600
+    {
+        return Err(ControlServerError::UnsafePath(format!(
+            "unsafe instance lock: {}",
+            path.display()
+        )));
+    }
+    let result = unsafe {
+        // SAFETY: `lock` is a valid regular-file descriptor and flock only
+        // changes its kernel lock state.
+        libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+    };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Err(ControlServerError::InstanceLocked(path.to_path_buf()));
+        }
+        return Err(error.into());
+    }
+    let held_locks = HELD_INSTANCE_LOCKS.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut held_locks = held_locks.lock().map_err(|_| {
+        ControlServerError::UnsafePath("instance lock registry poisoned".to_string())
+    })?;
+    if !held_locks.insert(path.to_path_buf()) {
+        return Err(ControlServerError::InstanceLocked(path.to_path_buf()));
+    }
+    drop(held_locks);
+    Ok(InstanceLock {
+        _fd: lock,
+        path: path.to_path_buf(),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -758,11 +1042,13 @@ fn create_listener(path: &Path) -> Result<OwnedFd, ControlServerError> {
     if result < 0 {
         return Err(io::Error::last_os_error().into());
     }
+    let identity = socket_path_identity(path)?;
     let result = unsafe {
         // SAFETY: `listener` is the socket just successfully bound above.
         libc::listen(listener.as_raw_fd(), LISTEN_BACKLOG)
     };
     if result < 0 {
+        remove_socket_if_identity(path, identity);
         return Err(io::Error::last_os_error().into());
     }
     Ok(listener)

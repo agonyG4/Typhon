@@ -42,6 +42,11 @@ impl NativeRuntime {
             self.revoke_xwayland_private_client();
         }
         if cycle.wakeup.reasons.timer() {
+            self.control_server.expire_idle_clients(
+                &mut self.event_loop,
+                monotonic_now_ns()?,
+                oblivion_one::native::control::MAX_CONTROL_OPERATIONS_PER_CYCLE,
+            );
             self.xwayland
                 .handle_deadline(monotonic_now_ns()?, &mut self.process_supervisor)?;
             if self.xwayland.generation().is_none() {
@@ -172,8 +177,10 @@ impl NativeRuntime {
                         self.log_shutdown_transition(transition);
                         continue;
                     }
-                    self.event_loop
-                        .arm_deadline(Some(monotonic_now_ns()?.saturating_add(50_000_000)))?;
+                    self.event_loop.arm_deadline(earliest_native_deadline(
+                        Some(monotonic_now_ns()?.saturating_add(50_000_000)),
+                        self.control_server.next_deadline_ns(),
+                    ))?;
                     return Ok(());
                 }
                 ShutdownState::Restoring => {
@@ -185,8 +192,10 @@ impl NativeRuntime {
     }
 
     fn arm_shutdown_deadline(&mut self) -> NativeResult<()> {
-        self.event_loop
-            .arm_deadline(self.shutdown.pageflip_deadline_ns())?;
+        self.event_loop.arm_deadline(earliest_native_deadline(
+            self.shutdown.pageflip_deadline_ns(),
+            self.control_server.next_deadline_ns(),
+        ))?;
         Ok(())
     }
 
@@ -259,8 +268,10 @@ impl NativeRuntime {
         })?;
         self.session.finish_suspend();
         self.log_session_transition("suspending", "suspended", "disable_acknowledged");
-        self.event_loop
-            .arm_deadline(self.shutdown.suspended_reactor_deadline_ns())?;
+        self.event_loop.arm_deadline(earliest_native_deadline(
+            self.shutdown.suspended_reactor_deadline_ns(),
+            self.control_server.next_deadline_ns(),
+        ))?;
         Ok(())
     }
     fn resume_native_session(&mut self) -> NativeResult<()> {

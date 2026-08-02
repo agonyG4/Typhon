@@ -838,7 +838,10 @@ impl NativeRuntime {
                 self.acquire_watches.next_fallback_deadline_ns(),
                 earliest_native_deadline(
                     self.xwayland.next_deadline_ns(),
-                    self.cursor_output_arbitration.deadline_ns(),
+                    earliest_native_deadline(
+                        self.cursor_output_arbitration.deadline_ns(),
+                        self.control_server.next_deadline_ns(),
+                    ),
                 ),
             ),
         ))?;

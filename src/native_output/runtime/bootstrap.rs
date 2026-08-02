@@ -168,7 +168,6 @@ fn build_native_kms_startup_plan(
         }),
     }
 }
-
 struct NativeRuntimeBootstrapTail {
     server: OwnCompositorServer,
     cursor_image: Arc<CompositorCursorImage>,
@@ -198,7 +197,6 @@ struct NativeRuntimeBootstrapTail {
     dmabuf_feedback_compatibility: DmabufFeedbackCompatibility,
     dmabuf_feedback_compat_metrics: DmabufFeedbackCompatibilityMetrics,
 }
-
 impl NativeRuntime {
     fn finish_bootstrap(parts: NativeRuntimeBootstrapTail) -> NativeResult<Self> {
         let NativeRuntimeBootstrapTail {
@@ -522,7 +520,10 @@ impl NativeRuntime {
                 frame_scheduler.next_deadline_ns(),
                 acquire_watches.next_fallback_deadline_ns(),
             ),
-            xwayland.next_deadline_ns(),
+            earliest_native_deadline(
+                xwayland.next_deadline_ns(),
+                control_server.next_deadline_ns(),
+            ),
         ))?;
         let last_rendered_scene_generation = server.scene_render_generation();
         let last_submitted_cursor_epoch = atomic_cursor
@@ -679,7 +680,6 @@ impl NativeRuntime {
         runtime.attach_xwayland_private_client()?;
         Ok(runtime)
     }
-
     pub(super) fn bootstrap_native(config: NativeRuntimeConfig) -> NativeResult<Self> {
         let NativeRuntimeConfig {
             mut server,

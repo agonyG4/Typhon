@@ -1,12 +1,15 @@
 use std::{
-    env, fs,
+    fs,
     io::{Read, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::{
         fs::MetadataExt,
+        fs::PermissionsExt,
         net::{UnixListener, UnixStream},
     },
     path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::json;
@@ -14,14 +17,51 @@ use serde_json::json;
 use crate::control::{ControlRequest, ControlResponse, encode_request};
 
 use super::{
-    control::{ControlRuntimePaths, NativeControlServer, peer_uid_matches},
+    control::{
+        ControlRuntimePaths, MAX_CONTROL_CLIENTS, MAX_CONTROL_OPERATIONS_PER_CYCLE,
+        NativeControlServer, peer_uid_matches,
+    },
     event_loop::*,
 };
 
+static TEST_RUNTIME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct TestRuntime(PathBuf);
+
+impl TestRuntime {
+    fn new() -> Self {
+        let sequence = TEST_RUNTIME_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = PathBuf::from(format!(
+            "/tmp/typhon-control-test-{}-{nonce}-{sequence}",
+            std::process::id(),
+        ));
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    fn keep_alive_until_here(self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+impl Drop for TestRuntime {
+    fn drop(&mut self) {}
+}
+
 #[test]
 fn control_runtime_path_uses_the_instance_name_without_traversal() {
-    let runtime_dir = PathBuf::from(env::var_os("XDG_RUNTIME_DIR").expect("runtime directory"));
-    let paths = ControlRuntimePaths::for_runtime_dir(&runtime_dir, "oblivion-one-0").unwrap();
+    let runtime = TestRuntime::new();
+    let runtime_dir = runtime.path();
+    let paths = ControlRuntimePaths::for_runtime_dir(runtime_dir, "oblivion-one-0").unwrap();
 
     assert_eq!(
         paths.socket_path(),
@@ -31,17 +71,20 @@ fn control_runtime_path_uses_the_instance_name_without_traversal() {
             .join("oblivion-one-0")
             .join("control.sock")
     );
+    runtime.keep_alive_until_here();
 }
 
 #[test]
 fn control_runtime_path_rejects_unsafe_instance_names() {
-    let runtime_dir = PathBuf::from(env::var_os("XDG_RUNTIME_DIR").expect("runtime directory"));
-    for instance in ["", "/", "\\", "..", "a/b", "a\\b", "a\0b", "a\n"] {
+    let runtime = TestRuntime::new();
+    let runtime_dir = runtime.path();
+    for instance in ["", "/", "\\", ".", "./", "..", "a/b", "a\\b", "a\0b", "a\n"] {
         assert!(
-            ControlRuntimePaths::for_runtime_dir(&runtime_dir, instance).is_err(),
+            ControlRuntimePaths::for_runtime_dir(runtime_dir, instance).is_err(),
             "instance {instance:?} should be rejected"
         );
     }
+    runtime.keep_alive_until_here();
 }
 
 #[test]
@@ -92,10 +135,11 @@ fn control_readiness_preserves_a_generation_safe_token_and_flags() {
 
 #[test]
 fn control_server_decodes_a_request_split_across_readiness_cycles() {
-    let runtime_dir = PathBuf::from(env::var_os("XDG_RUNTIME_DIR").expect("runtime directory"));
+    let runtime = TestRuntime::new();
+    let runtime_dir = runtime.path();
     let instance = test_instance("split");
     let mut event_loop = NativeEventLoop::new().unwrap();
-    let mut server = NativeControlServer::bind(&mut event_loop, &runtime_dir, &instance).unwrap();
+    let mut server = NativeControlServer::bind(&mut event_loop, runtime_dir, &instance).unwrap();
     let socket_path = server.socket_path().to_path_buf();
     assert_eq!(
         fs::symlink_metadata(&socket_path).unwrap().mode() & 0o777,
@@ -172,22 +216,138 @@ fn control_server_decodes_a_request_split_across_readiness_cycles() {
         "{\"protocol\":\"astrea.control\",\"version\":1,\"id\":7,\"ok\":true,\"result\":{}}\n"
     );
     server.shutdown(&mut event_loop).unwrap();
+    runtime.keep_alive_until_here();
+}
+
+#[test]
+fn complete_request_survives_peer_write_half_close() {
+    let runtime = TestRuntime::new();
+    let instance = test_instance("half-close");
+    let mut event_loop = NativeEventLoop::new().unwrap();
+    let mut server = NativeControlServer::bind(&mut event_loop, runtime.path(), &instance).unwrap();
+    let mut client = UnixStream::connect(server.socket_path()).unwrap();
+    let request = encode_request(&ControlRequest::new(11, "status", json!({})).unwrap()).unwrap();
+    client.write_all(&request).unwrap();
+    client.shutdown(std::net::Shutdown::Write).unwrap();
+
+    let mut pending = Vec::new();
+    for _ in 0..4 {
+        let wakeup = event_loop.wait().unwrap();
+        pending = server
+            .service_events(&mut event_loop, &wakeup.control_events, 16)
+            .unwrap();
+        if !pending.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(pending.len(), 1);
+    server
+        .queue_response(
+            &mut event_loop,
+            pending[0].0,
+            ControlResponse::success(11, json!({})),
+        )
+        .unwrap();
+    let write_wakeup = event_loop.wait().unwrap();
+    server
+        .service_events(&mut event_loop, &write_wakeup.control_events, 16)
+        .unwrap();
+
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.contains("\"id\":11"));
+    server.shutdown(&mut event_loop).unwrap();
+    runtime.keep_alive_until_here();
+}
+
+#[test]
+fn instance_lock_is_retained_until_server_drop() {
+    let runtime = TestRuntime::new();
+    let instance = test_instance("lock");
+    let mut first_loop = NativeEventLoop::new().unwrap();
+    let mut first = NativeControlServer::bind(&mut first_loop, runtime.path(), &instance)
+        .unwrap_or_else(|error| panic!("runtime={} error={error:?}", runtime.path().display()));
+    first.shutdown(&mut first_loop).unwrap();
+
+    let mut second_loop = NativeEventLoop::new().unwrap();
+    let second = NativeControlServer::bind(&mut second_loop, runtime.path(), &instance);
+    assert!(
+        matches!(
+            &second,
+            Err(super::control::ControlServerError::InstanceLocked(_))
+        ),
+        "{second:?}"
+    );
+    drop(first);
+
+    let mut third_loop = NativeEventLoop::new().unwrap();
+    let mut third = NativeControlServer::bind(&mut third_loop, runtime.path(), &instance).unwrap();
+    assert!(third.socket_path().exists());
+    third.shutdown(&mut third_loop).unwrap();
+    runtime.keep_alive_until_here();
+}
+
+#[test]
+fn stalled_clients_expire_with_a_bounded_budget() {
+    let runtime = TestRuntime::new();
+    let instance = test_instance("timeout");
+    let mut event_loop = NativeEventLoop::new().unwrap();
+    let mut server = NativeControlServer::bind(&mut event_loop, runtime.path(), &instance).unwrap();
+    let clients = (0..MAX_CONTROL_CLIENTS)
+        .map(|_| UnixStream::connect(server.socket_path()).unwrap())
+        .collect::<Vec<_>>();
+    let wakeup = event_loop.wait().unwrap();
+    server
+        .service_events(
+            &mut event_loop,
+            &wakeup.control_events,
+            MAX_CONTROL_OPERATIONS_PER_CYCLE,
+        )
+        .unwrap();
+    for _ in 0..64 {
+        let wakeup = event_loop.wait().unwrap();
+        server
+            .service_events(
+                &mut event_loop,
+                &wakeup.control_events,
+                MAX_CONTROL_OPERATIONS_PER_CYCLE,
+            )
+            .unwrap();
+        if server.client_count() == MAX_CONTROL_CLIENTS {
+            break;
+        }
+    }
+    assert_eq!(server.client_count(), MAX_CONTROL_CLIENTS);
+    let deadline = u64::MAX;
+    server.expire_idle_clients(&mut event_loop, deadline, 16);
+    assert_eq!(server.client_count(), 16);
+    server.expire_idle_clients(&mut event_loop, deadline, MAX_CONTROL_CLIENTS);
+    assert_eq!(server.client_count(), 0);
+    assert_eq!(
+        server.counters().request_timeouts,
+        MAX_CONTROL_CLIENTS as u64
+    );
+    drop(clients);
+    server.shutdown(&mut event_loop).unwrap();
+    runtime.keep_alive_until_here();
 }
 
 #[test]
 fn live_control_socket_is_not_replaced_and_stale_socket_is_reclaimed() {
-    let runtime_dir = PathBuf::from(env::var_os("XDG_RUNTIME_DIR").expect("runtime directory"));
+    let runtime = TestRuntime::new();
+    let runtime_dir = runtime.path();
     let instance = test_instance("stale");
     let mut first_loop = NativeEventLoop::new().unwrap();
-    let mut first = NativeControlServer::bind(&mut first_loop, &runtime_dir, &instance).unwrap();
+    let mut first = NativeControlServer::bind(&mut first_loop, runtime_dir, &instance).unwrap();
 
     let mut second_loop = NativeEventLoop::new().unwrap();
-    let error = NativeControlServer::bind(&mut second_loop, &runtime_dir, &instance).unwrap_err();
+    let error = NativeControlServer::bind(&mut second_loop, runtime_dir, &instance).unwrap_err();
     assert!(matches!(
         error,
-        super::control::ControlServerError::SocketInUse(_)
+        super::control::ControlServerError::InstanceLocked(_)
     ));
     first.shutdown(&mut first_loop).unwrap();
+    drop(first);
 
     let socket_path = runtime_dir
         .join("astrea")
@@ -198,17 +358,19 @@ fn live_control_socket_is_not_replaced_and_stale_socket_is_reclaimed() {
     drop(stale);
     let mut replacement_loop = NativeEventLoop::new().unwrap();
     let mut replacement =
-        NativeControlServer::bind(&mut replacement_loop, &runtime_dir, &instance).unwrap();
+        NativeControlServer::bind(&mut replacement_loop, runtime_dir, &instance).unwrap();
     assert_eq!(replacement.socket_path(), socket_path);
     replacement.shutdown(&mut replacement_loop).unwrap();
+    runtime.keep_alive_until_here();
 }
 
 #[test]
 fn control_listener_never_services_more_than_sixteen_accept_operations() {
-    let runtime_dir = PathBuf::from(env::var_os("XDG_RUNTIME_DIR").expect("runtime directory"));
+    let runtime = TestRuntime::new();
+    let runtime_dir = runtime.path();
     let instance = test_instance("budget");
     let mut event_loop = NativeEventLoop::new().unwrap();
-    let mut server = NativeControlServer::bind(&mut event_loop, &runtime_dir, &instance).unwrap();
+    let mut server = NativeControlServer::bind(&mut event_loop, runtime_dir, &instance).unwrap();
     let clients = (0..32)
         .map(|_| UnixStream::connect(server.socket_path()).unwrap())
         .collect::<Vec<_>>();
@@ -235,25 +397,28 @@ fn control_listener_never_services_more_than_sixteen_accept_operations() {
     assert_eq!(server.client_count(), 32);
     drop(clients);
     server.shutdown(&mut event_loop).unwrap();
+    runtime.keep_alive_until_here();
 }
 
 #[test]
 fn socket_symlink_is_rejected_without_unlinking_the_target() {
-    let runtime_dir = PathBuf::from(env::var_os("XDG_RUNTIME_DIR").expect("runtime directory"));
+    let runtime = TestRuntime::new();
+    let runtime_dir = runtime.path();
     let instance = test_instance("symlink");
     let mut setup_loop = NativeEventLoop::new().unwrap();
-    let mut setup = NativeControlServer::bind(&mut setup_loop, &runtime_dir, &instance).unwrap();
+    let mut setup = NativeControlServer::bind(&mut setup_loop, runtime_dir, &instance).unwrap();
     let socket_path = setup.socket_path().to_path_buf();
     setup.shutdown(&mut setup_loop).unwrap();
+    drop(setup);
     std::os::unix::fs::symlink("/dev/null", &socket_path).unwrap();
 
     let mut event_loop = NativeEventLoop::new().unwrap();
-    let error = NativeControlServer::bind(&mut event_loop, &runtime_dir, &instance).unwrap_err();
+    let error = NativeControlServer::bind(&mut event_loop, runtime_dir, &instance).unwrap_err();
 
-    assert!(matches!(
-        error,
-        super::control::ControlServerError::UnsafePath(_)
-    ));
+    assert!(
+        matches!(&error, super::control::ControlServerError::UnsafePath(_)),
+        "{error:?}"
+    );
     assert!(
         fs::symlink_metadata(&socket_path)
             .unwrap()
@@ -261,14 +426,16 @@ fn socket_symlink_is_rejected_without_unlinking_the_target() {
             .is_symlink()
     );
     fs::remove_file(socket_path).unwrap();
+    runtime.keep_alive_until_here();
 }
 
 #[test]
 fn malformed_request_gets_one_bounded_error_response() {
-    let runtime_dir = PathBuf::from(env::var_os("XDG_RUNTIME_DIR").expect("runtime directory"));
+    let runtime = TestRuntime::new();
+    let runtime_dir = runtime.path();
     let instance = test_instance("malformed");
     let mut event_loop = NativeEventLoop::new().unwrap();
-    let mut server = NativeControlServer::bind(&mut event_loop, &runtime_dir, &instance).unwrap();
+    let mut server = NativeControlServer::bind(&mut event_loop, runtime_dir, &instance).unwrap();
     let mut client = UnixStream::connect(server.socket_path()).unwrap();
     client.write_all(b"{\n").unwrap();
 
@@ -292,6 +459,7 @@ fn malformed_request_gets_one_bounded_error_response() {
     client.read_to_string(&mut response).unwrap();
     assert!(response.contains("\"code\":\"malformed_json\""));
     server.shutdown(&mut event_loop).unwrap();
+    runtime.keep_alive_until_here();
 }
 
 #[test]
