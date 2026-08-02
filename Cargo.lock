@@ -661,6 +661,7 @@ dependencies = [
  "khronos-egl",
  "libc",
  "libseat",
+ "serde",
  "serde_json",
  "unicode-normalization",
  "wayland-backend",

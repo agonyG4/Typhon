@@ -1,6 +1,7 @@
 pub mod astrea_shell_control;
 pub mod astrea_shortcuts;
 pub mod compositor;
+pub mod control;
 pub mod core;
 pub mod cursor_theme;
 mod defaults;
@@ -498,3 +499,6 @@ mod tests {
         assert!(!values.contains_key("org.unknown"));
     }
 }
+
+#[cfg(test)]
+mod control_tests;
