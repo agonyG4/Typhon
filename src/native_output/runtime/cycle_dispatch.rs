@@ -1,7 +1,41 @@
 use super::cursor_cycle::apply_cursor_position;
 use super::*;
 
+use oblivion_one::control::{
+    ControlCommand, ControlError, ControlErrorCode, ControlRequest, ControlResponse,
+};
+use oblivion_one::native::event_loop::NativeWakeup;
+
 impl NativeRuntime {
+    pub(super) fn service_control_events(&mut self, wakeup: &NativeWakeup) -> NativeResult<()> {
+        if !wakeup.reasons.control() {
+            return Ok(());
+        }
+        let pending = self.control_server.service_events(
+            &mut self.event_loop,
+            &wakeup.control_events,
+            oblivion_one::native::control::MAX_CONTROL_OPERATIONS_PER_CYCLE,
+        )?;
+        for (token, request) in pending {
+            let response = self.dispatch_control_command(request);
+            self.control_server
+                .queue_response(&mut self.event_loop, token, response)?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_control_command(&mut self, request: ControlRequest) -> ControlResponse {
+        let message = if ControlCommand::parse(&request.command).is_some() {
+            "control command semantics are pending M3"
+        } else {
+            "unknown control command"
+        };
+        ControlResponse::failure(
+            request.id,
+            ControlError::new(ControlErrorCode::InvalidCommand, message),
+        )
+    }
+
     #[allow(unused_variables)]
     pub(super) fn dispatch_wayland_and_input(
         &mut self,

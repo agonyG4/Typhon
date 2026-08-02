@@ -1,5 +1,5 @@
 use std::{
-    env,
+    env, io,
     path::{Path, PathBuf},
 };
 
@@ -27,6 +27,12 @@ pub fn default_state_dir_from_home(home: impl AsRef<Path>) -> PathBuf {
         .join(".local")
         .join("state")
         .join(STATE_DIR_NAME)
+}
+
+pub fn xdg_runtime_dir() -> io::Result<PathBuf> {
+    env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))
 }
 
 pub fn discover_tools(names: &[&str]) -> Vec<ToolStatus> {

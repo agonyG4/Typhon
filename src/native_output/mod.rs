@@ -53,6 +53,7 @@ use oblivion_one::native::{
         AdaptiveTripleBufferPolicy, FenceTimestampQuality, ProvenDeadlineMiss,
         approximate_observation_is_late, merge_presentation_miss, render_sample_duration_ns,
     },
+    control::NativeControlServer,
     drm::{
         DrmPresentationEvent, DrmTimestampClock, drain_drm_page_flip_events,
         query_drm_timestamp_clock, sample_clock_microseconds,

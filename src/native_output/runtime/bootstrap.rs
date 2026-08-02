@@ -136,7 +136,6 @@ pub(super) fn log_native_runtime_bootstrap(
         });
     }
 }
-
 enum NativeKmsStartupPlan {
     Atomic {
         discovery: Box<AtomicDiscovery>,
@@ -145,7 +144,6 @@ enum NativeKmsStartupPlan {
         atomic_fallback_reason: Option<AtomicKmsError>,
     },
 }
-
 fn build_native_kms_startup_plan(
     policy: KmsPolicy,
     scanout: NativeScanoutKind,
@@ -415,10 +413,11 @@ impl NativeRuntime {
             ExplicitSyncWatchRegistry::new(refresh_interval_ns, drm_file_generation);
         server.enable_external_acquire_readiness();
         let mut event_loop = NativeEventLoop::new()?;
+        let control_server = create_native_control_server(&mut event_loop, &server)?;
         let mut process_supervisor = ChildSupervisor::with_sigchld_reaper()?;
         let mut xwayland = XwaylandService::bootstrap()?;
         let mut xwayland_reactor_tokens = Vec::new();
-        sync_xwayland_reactor_sources(
+        sync_xwayland_bootstrap_sources(
             &mut event_loop,
             &mut xwayland,
             &mut xwayland_reactor_tokens,
@@ -614,6 +613,7 @@ impl NativeRuntime {
             acquire_watches,
             parked_acquire_watches: Vec::new(),
             event_loop,
+            control_server,
             xwayland,
             xwayland_reactor_tokens,
             xwayland_client_identity: None,

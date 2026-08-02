@@ -142,6 +142,26 @@ pub(crate) enum NativeClientCursorPath {
 
 pub(super) type ConfirmedPrimaryAssignment = ConfirmedPrimaryState;
 
+fn create_native_control_server(
+    event_loop: &mut NativeEventLoop,
+    server: &OwnCompositorServer,
+) -> NativeResult<NativeControlServer> {
+    let runtime_dir = oblivion_one::xdg_runtime_dir()?;
+    Ok(NativeControlServer::bind(
+        event_loop,
+        &runtime_dir,
+        server.socket_name(),
+    )?)
+}
+
+fn sync_xwayland_bootstrap_sources(
+    event_loop: &mut NativeEventLoop,
+    xwayland: &mut XwaylandService,
+    tokens: &mut Vec<(ReactorToken, XwaylandReactorRegistration)>,
+) -> NativeResult<()> {
+    sync_xwayland_reactor_sources(event_loop, xwayland, tokens)
+}
+
 // `TargetDestroyed` means the previous KMS target can no longer reference any
 // submitted framebuffer. Session inactivity or disarmed I/O is not proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,6 +232,7 @@ pub(crate) struct NativeRuntime {
     acquire_watches: ExplicitSyncWatchRegistry,
     parked_acquire_watches: Vec<oblivion_one::compositor::AcquireWatchRequest>,
     event_loop: NativeEventLoop,
+    control_server: NativeControlServer,
     xwayland: XwaylandService,
     xwayland_reactor_tokens: Vec<(ReactorToken, XwaylandReactorRegistration)>,
     xwayland_client_identity: Option<oblivion_one::compositor::XwaylandClientIdentity>,
@@ -339,6 +360,7 @@ impl NativeRuntime {
 
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
+        let _ = self.control_server.shutdown(&mut self.event_loop);
         if let Some(worker) = self.kms_commit_worker.take() {
             if let Some(token) = self.kms_commit_worker_reactor_token.take() {
                 let _ = self.event_loop.unregister(token);
