@@ -471,6 +471,8 @@ impl CompositorState {
         self.xwayland
             .buffer_level_events
             .retain(|(event_generation, _)| *event_generation != generation);
+        self.applied_override_redirect_stack = None;
+        self.clear_xwayland_scene_snapshot_for_generation(generation);
     }
 
     pub(in crate::compositor) fn take_xwayland_buffer_ready_events(

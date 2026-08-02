@@ -72,4 +72,10 @@ pub(crate) struct XwaylandMetrics {
     pub(crate) stderr_lines: u64,
     pub(crate) stderr_truncated: u64,
     pub(crate) stderr_closed: u64,
+    pub(crate) override_redirect_stack_queries_issued: u64,
+    pub(crate) override_redirect_stack_queries_coalesced: u64,
+    pub(crate) override_redirect_stack_replies_superseded: u64,
+    pub(crate) override_redirect_stack_replies_incomplete: u64,
+    pub(crate) override_redirect_stack_snapshots_emitted: u64,
+    pub(crate) override_redirect_stack_entries_pruned: u64,
 }

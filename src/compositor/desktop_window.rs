@@ -147,6 +147,11 @@ impl DesktopWindow {
         )
     }
 
+    pub(crate) fn participates_in_x11_transient_family(&self) -> bool {
+        matches!(self.backend, WindowBackend::X11(_))
+            && self.x11_role != Some(X11DesktopRole::OverrideRedirect)
+    }
+
     pub(crate) fn new_xdg(id: WindowId, root_surface_id: u32) -> Self {
         Self {
             id,

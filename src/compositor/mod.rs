@@ -88,6 +88,7 @@ mod server;
 mod server_backend;
 mod server_error;
 mod server_frames;
+mod server_xwayland_events;
 mod shm;
 mod state_data;
 mod subsurface;
@@ -227,7 +228,11 @@ use shm::{
     WL_SHM_FORMAT_ARGB2101010, WL_SHM_FORMAT_XBGR8888, WL_SHM_FORMAT_XBGR2101010,
     WL_SHM_FORMAT_XRGB2101010, shm_format_descriptor,
 };
-pub use state::AstreaShortcutPhase;
+pub(crate) use state::OverrideRedirectStackSnapshotResult;
+pub use state::{
+    AstreaShortcutPhase, XwaylandSceneBatchError, XwaylandSceneBatchToken,
+    XwaylandSceneMetricsSnapshot,
+};
 use state_data::*;
 use subsurface::{CachedSubsurfaceCommit, SubsurfaceSyncMode, SubsurfaceTransactionState};
 pub use surface::{
@@ -262,45 +267,6 @@ pub struct XwaylandSurfaceCommitObserved {
     pub commit_sequence: SurfaceCommitSequence,
     pub buffer_id: Option<BufferId>,
     pub buffer_size: Option<BufferSize>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct XwaylandSceneBatchToken {
-    epoch: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum XwaylandSceneBatchError {
-    AlreadyActive,
-    NotActive,
-    InvalidToken,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct XwaylandSceneBatchMetrics {
-    pub(crate) xwayland_scene_batches: u64,
-    pub(crate) xwayland_scene_mutations: u64,
-    pub(crate) pointer_refreshes_deferred: u64,
-    pub(crate) pointer_refreshes_committed: u64,
-    pub(crate) intermediate_pointer_targets_suppressed: u64,
-    pub(crate) render_stack_reorders_coalesced: u64,
-    pub(crate) client_list_syncs_coalesced: u64,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct XwaylandSceneBatchDirty {
-    pub(crate) pointer_focus_dirty: bool,
-    pub(crate) render_stack_dirty: bool,
-    pub(crate) client_lists_dirty: bool,
-    pub(crate) repaint_dirty: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct XwaylandSceneBatchState {
-    active: Option<XwaylandSceneBatchToken>,
-    next_epoch: u64,
-    pub(crate) dirty: XwaylandSceneBatchDirty,
-    pub(crate) metrics: XwaylandSceneBatchMetrics,
 }
 
 use window_state::{ToplevelMode, WindowGeometry, WindowState, xdg_toplevel_state_bytes};

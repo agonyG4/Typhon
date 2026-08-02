@@ -48,8 +48,6 @@ use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGenerat
 mod server_globals;
 #[path = "server_gpu_globals.rs"]
 mod server_gpu_globals;
-#[cfg(test)]
-use super::XwaylandSceneBatchMetrics;
 use super::{
     AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, BufferReleaseMetrics,
     ClientCursorRenderState, CompositorError, CompositorFrameBatchId, CompositorState,
@@ -61,7 +59,7 @@ use super::{
     RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
     SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
     WindowInteractionDebugSnapshot, WindowInteractionEndReason, XwaylandSceneBatchError,
-    XwaylandSceneBatchToken, color,
+    XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 #[derive(Debug)]
@@ -124,7 +122,7 @@ impl Drop for OwnCompositorServer {
 }
 
 impl OwnCompositorServer {
-    fn focused_x11_window_xid(&self) -> Option<u32> {
+    pub(crate) fn focused_x11_window_xid(&self) -> Option<u32> {
         let window_id = self.state.focused_window_id?;
         match self.state.window(window_id)?.backend {
             super::WindowBackend::X11(handle) => Some(handle.xid()),
@@ -412,8 +410,8 @@ impl OwnCompositorServer {
         token: XwaylandSceneBatchToken,
     ) -> Result<Vec<XwmCommand>, XwaylandSceneBatchError> {
         let dirty = self.state.commit_xwayland_scene_batch(token)?;
-        if dirty.render_stack_dirty {
-            self.state.normalize_window_stacking();
+        if dirty.render_stack_dirty && self.state.normalize_window_stacking() {
+            self.state.mark_xwayland_scene_repaint();
         }
         let mut commands = Vec::new();
         if dirty.client_lists_dirty {
@@ -433,160 +431,48 @@ impl OwnCompositorServer {
         self.state.abort_xwayland_scene_batch(token)
     }
 
+    pub fn take_xwayland_scene_repaint_request(&mut self) -> bool {
+        self.state.take_xwayland_scene_repaint_request()
+    }
+
+    pub fn xwayland_scene_metrics(&self) -> XwaylandSceneMetricsSnapshot {
+        self.state.xwayland_scene_metrics()
+    }
+
     #[cfg(test)]
     pub(crate) fn xwayland_scene_batch_dirty_for_test(&self) -> bool {
         self.state.xwayland_scene_batch_dirty_for_test()
     }
 
-    #[cfg(test)]
-    pub(crate) fn xwayland_scene_batch_metrics_for_test(&self) -> XwaylandSceneBatchMetrics {
-        self.state.xwayland_scene_batch_metrics_for_test()
+    pub fn apply_xwayland_window_event(&mut self, event: XwmEvent) -> Vec<XwmCommand> {
+        let scene_generation_before = self.state.scene_render_generation;
+        let commands = self.apply_xwayland_window_event_inner(event);
+        if self.state.xwayland_scene_batch_active()
+            && self.state.scene_render_generation != scene_generation_before
+        {
+            self.state.mark_xwayland_scene_repaint();
+        }
+        commands
     }
 
-    pub fn apply_xwayland_window_event(&mut self, event: XwmEvent) -> Vec<XwmCommand> {
+    fn apply_xwayland_window_event_inner(&mut self, event: XwmEvent) -> Vec<XwmCommand> {
         self.state.note_xwayland_scene_mutation();
         match event {
             XwmEvent::WindowMapRequested(handle) => vec![XwmCommand::Map(handle)],
-            XwmEvent::WindowReady(snapshot) => {
-                let surface_id = snapshot.surface_id;
-                let handle = snapshot.handle;
-                let snapshot_for_trace = snapshot.clone();
-                let focus_before = self.focused_x11_window_xid();
-                match self.state.insert_x11_window(snapshot) {
-                    Ok(window_id) => {
-                        let published = self
-                            .state
-                            .adopt_current_xwayland_surface_content(surface_id);
-                        let wants_initial_focus =
-                            self.state.x11_window_wants_initial_focus(window_id);
-                        let focused =
-                            wants_initial_focus && self.state.focus_desktop_window(window_id);
-                        self.state.refresh_pointer_focus_at_last_position();
-                        let focus_after = self.focused_x11_window_xid();
-                        trace::emit("focus_decision", || {
-                            TraceFields::new()
-                                .field("source", "compositor")
-                                .field("xid", handle.xid())
-                                .field("surface_id", surface_id)
-                                .field("focus_decision", "initial_focus")
-                                .field("focus_requested", wants_initial_focus)
-                                .field("focus_result", focused)
-                                .optional("focus_before", focus_before)
-                                .optional("focus_after", focus_after)
-                                .field(
-                                    "window_types",
-                                    format!("{:?}", snapshot_for_trace.window_types),
-                                )
-                                .field(
-                                    "override_redirect_stored",
-                                    snapshot_for_trace.override_redirect,
-                                )
-                                .optional(
-                                    "transient_for",
-                                    snapshot_for_trace.transient_for.map(|parent| parent.xid()),
-                                )
-                        });
-                        eprintln!(
-                            "oblivion-one compositor: event=xwayland_window_admitted surface_id={surface_id} retained_buffer={published} published={published} focused={focused}"
-                        );
-                        let mut commands = Vec::with_capacity(2);
-                        if self
-                            .state
-                            .window(window_id)
-                            .and_then(|window| window.x11_placement_policy)
-                            == Some(crate::compositor::desktop_window::X11PlacementPolicy::CompositorManaged)
-                            && let Some(geometry) = self.state.x11_authoritative_geometry(handle)
-                        {
-                            commands.push(XwmCommand::ConfigureFrame { window: handle, geometry });
-                        }
-                        if !self.state.defer_client_list_sync() {
-                            commands.push(self.sync_xwayland_client_lists());
-                        }
-                        commands
-                    }
-                    Err(error) => {
-                        let pre_admission_cancellation = snapshot_for_trace.override_redirect;
-                        trace::emit("xwayland_window_admission_failed", || {
-                            TraceFields::new()
-                                .field("source", "compositor")
-                                .field("xid", handle.xid())
-                                .field("generation", handle.generation().get())
-                                .field("surface_id", surface_id)
-                                .field("override_redirect", pre_admission_cancellation)
-                                .field(
-                                    "terminal_reason",
-                                    if pre_admission_cancellation {
-                                        "pre_admission_cancellation"
-                                    } else {
-                                        "admission_rejected"
-                                    },
-                                )
-                        });
-                        eprintln!(
-                            "oblivion-one compositor: event=xwayland_window_admission_failed surface_id={surface_id} error={error:?}"
-                        );
-                        Vec::new()
-                    }
-                }
+            XwmEvent::WindowReady(snapshot) => self.apply_xwayland_window_ready(snapshot),
+            XwmEvent::WindowAdmissionCancelled { window, reason } => {
+                self.state.note_pre_admission_popup_cancellation();
+                trace::emit("xwayland_popup_admission_cancelled", || {
+                    TraceFields::new()
+                        .field("source", "compositor")
+                        .field("xid", window.xid())
+                        .field("generation", window.generation().get())
+                        .field("reason", format!("{reason:?}"))
+                });
+                Vec::new()
             }
-            XwmEvent::WindowDestroyed(handle) => {
-                let focus_before = self.focused_x11_window_xid();
-                if self.remove_x11_desktop_window(handle) {
-                    self.state.refresh_pointer_focus_at_last_position();
-                    trace::emit("window_destroyed", || {
-                        TraceFields::new()
-                            .field("source", "compositor")
-                            .field("xid", handle.xid())
-                            .optional("focus_before", focus_before)
-                            .optional("focus_after", self.focused_x11_window_xid())
-                            .field("teardown_reason", "x11_destroy")
-                            .field("destruction_outcome", "first_effective_destruction")
-                    });
-                    if self.state.defer_client_list_sync() {
-                        Vec::new()
-                    } else {
-                        vec![self.sync_xwayland_client_lists()]
-                    }
-                } else {
-                    trace::emit("window_cleanup_redundant", || {
-                        TraceFields::new()
-                            .field("source", "compositor")
-                            .field("xid", handle.xid())
-                            .field("teardown_reason", "redundant_idempotent_cleanup")
-                            .field("destruction_outcome", "redundant_noop_cleanup")
-                    });
-                    Vec::new()
-                }
-            }
-            XwmEvent::WindowWithdrawn(handle) => {
-                let focus_before = self.focused_x11_window_xid();
-                if self.remove_x11_desktop_window(handle) {
-                    self.state.refresh_pointer_focus_at_last_position();
-                    trace::emit("window_withdrawn", || {
-                        TraceFields::new()
-                            .field("source", "compositor")
-                            .field("xid", handle.xid())
-                            .optional("focus_before", focus_before)
-                            .optional("focus_after", self.focused_x11_window_xid())
-                            .field("teardown_reason", "x11_unmap")
-                            .field("destruction_outcome", "first_effective_destruction")
-                    });
-                    if self.state.defer_client_list_sync() {
-                        Vec::new()
-                    } else {
-                        vec![self.sync_xwayland_client_lists()]
-                    }
-                } else {
-                    trace::emit("window_cleanup_redundant", || {
-                        TraceFields::new()
-                            .field("source", "compositor")
-                            .field("xid", handle.xid())
-                            .field("teardown_reason", "redundant_idempotent_cleanup")
-                            .field("destruction_outcome", "redundant_noop_cleanup")
-                    });
-                    Vec::new()
-                }
-            }
+            XwmEvent::WindowDestroyed(handle) => self.apply_xwayland_window_teardown(handle, true),
+            XwmEvent::WindowWithdrawn(handle) => self.apply_xwayland_window_teardown(handle, false),
             XwmEvent::MetadataChanged { window, delta } => {
                 let prior_id = self.state.window_id_for_x11_handle(window);
                 let delta_debug = format!("{delta:?}");
@@ -733,7 +619,10 @@ impl OwnCompositorServer {
                                 crate::compositor::desktop_window::X11DesktopRole::OverrideRedirect,
                             )
                     });
-                let _ = (is_override_redirect, above_sibling);
+                if is_override_redirect && above_sibling.is_some() {
+                    self.state
+                        .note_override_redirect_restack_writeback_prevented();
+                }
                 self.state.refresh_pointer_focus_at_last_position();
                 Vec::new()
             }
@@ -742,10 +631,25 @@ impl OwnCompositorServer {
                 epoch,
                 bottom_to_top,
             } => {
-                if self.state.apply_override_redirect_stack_snapshot(
-                    generation,
-                    epoch,
-                    &bottom_to_top,
+                let outcome = if self.state.xwayland_scene_batch_active() {
+                    self.state.stage_override_redirect_stack_snapshot(
+                        generation,
+                        epoch,
+                        bottom_to_top,
+                    );
+                    crate::compositor::OverrideRedirectStackSnapshotResult::Rejected
+                } else {
+                    self.state.apply_override_redirect_stack_snapshot(
+                        generation,
+                        epoch,
+                        &bottom_to_top,
+                    )
+                };
+                if matches!(
+                    outcome,
+                    crate::compositor::OverrideRedirectStackSnapshotResult::Applied {
+                        logical_stack_changed: true,
+                    }
                 ) {
                     self.state.refresh_pointer_focus_at_last_position();
                 }

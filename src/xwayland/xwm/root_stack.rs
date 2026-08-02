@@ -9,14 +9,15 @@ use x11rb_protocol::SequenceNumber;
 
 use super::{X11WindowLifecycle, Xwm, XwmError, XwmEvent, connection};
 use crate::compositor::DesktopWindowKind;
+use crate::xwayland::trace::{self, TraceCategory, TraceFields};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct OverrideRedirectStackMetrics {
     pub(crate) queries_issued: u64,
     pub(crate) queries_coalesced: u64,
     pub(crate) replies: u64,
-    pub(crate) superseded_replies: u64,
-    pub(crate) incomplete_replies: u64,
+    pub(crate) replies_superseded: u64,
+    pub(crate) replies_incomplete: u64,
     pub(crate) snapshots_emitted: u64,
     pub(crate) entries_pruned: u64,
 }
@@ -28,7 +29,7 @@ pub(crate) struct OverrideRedirectStackState {
     pending: Option<PendingQuery>,
     last_applied_epoch: Option<u64>,
     last_snapshot: Vec<super::X11WindowHandle>,
-    metrics: OverrideRedirectStackMetrics,
+    pub(crate) metrics: OverrideRedirectStackMetrics,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -104,10 +105,10 @@ impl Xwm {
             .saturating_add(1);
 
         if pending.epoch != self.override_redirect_stack.epoch {
-            self.override_redirect_stack.metrics.superseded_replies = self
+            self.override_redirect_stack.metrics.replies_superseded = self
                 .override_redirect_stack
                 .metrics
-                .superseded_replies
+                .replies_superseded
                 .saturating_add(1);
             self.override_redirect_stack.dirty = true;
             return Ok(());
@@ -115,10 +116,10 @@ impl Xwm {
 
         let (bottom_to_top, complete) = self.filter_override_redirect_children(&reply.children);
         if !complete {
-            self.override_redirect_stack.metrics.incomplete_replies = self
+            self.override_redirect_stack.metrics.replies_incomplete = self
                 .override_redirect_stack
                 .metrics
-                .incomplete_replies
+                .replies_incomplete
                 .saturating_add(1);
             self.override_redirect_stack.dirty = true;
             return Ok(());
@@ -132,6 +133,17 @@ impl Xwm {
             .metrics
             .snapshots_emitted
             .saturating_add(1);
+        trace::emit_category(
+            TraceCategory::Stacking,
+            "override_redirect_stack_snapshot_emitted",
+            || {
+                TraceFields::new()
+                    .field("source", "xwm")
+                    .field("generation", self.generation.get())
+                    .field("epoch", pending.epoch)
+                    .field("entries", bottom_to_top.len())
+            },
+        );
         self.outgoing_events
             .push_back(XwmEvent::OverrideRedirectStackSnapshot {
                 generation: self.generation,

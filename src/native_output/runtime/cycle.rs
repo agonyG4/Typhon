@@ -64,7 +64,7 @@ impl NativeRuntime {
         self.dispatch_xwayland_client_disconnects()?;
         self.dispatch_xwayland_shell_binds()?;
         self.initialize_managed_xwayland()?;
-        self.dispatch_xwayland_scene_batch()?;
+        cycle.redraw_requested |= self.dispatch_xwayland_scene_batch()?;
         self.sync_xwayland_reactor_sources()?;
         if cycle.shutdown_requested {
             self.request_native_shutdown()?;

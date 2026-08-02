@@ -188,7 +188,7 @@ impl NativeRuntime {
         }
     }
 
-    pub(super) fn dispatch_xwayland_scene_batch(&mut self) -> NativeResult<()> {
+    pub(super) fn dispatch_xwayland_scene_batch(&mut self) -> NativeResult<bool> {
         let token = self.server.begin_xwayland_scene_batch().map_err(|error| {
             std::io::Error::other(format!("begin XWayland scene batch: {error:?}"))
         })?;
@@ -202,7 +202,7 @@ impl NativeRuntime {
     fn dispatch_xwayland_scene_batch_inner(
         &mut self,
         token: oblivion_one::compositor::XwaylandSceneBatchToken,
-    ) -> NativeResult<()> {
+    ) -> NativeResult<bool> {
         let association_events = self.server.take_xwayland_association_events();
         self.xwayland.record_association_events(&association_events);
         self.dispatch_xwayland_association_events();
@@ -232,6 +232,7 @@ impl NativeRuntime {
                     std::io::Error::other(format!("commit XWayland scene batch: {error:?}"))
                 })?,
         );
+        let repaint_requested = self.server.take_xwayland_scene_repaint_request();
         let now_ns = monotonic_now_ns()?;
         commands.extend(self.server.take_xwayland_backend_commands(now_ns));
         let has_focus_command = commands
@@ -269,7 +270,7 @@ impl NativeRuntime {
         let _ = self
             .xwayland
             .flush_managed_commands(&mut self.process_supervisor);
-        Ok(())
+        Ok(repaint_requested)
     }
 
     pub(super) fn dispatch_xwayland_buffer_ready(&mut self) {

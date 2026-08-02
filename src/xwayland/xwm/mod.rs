@@ -20,6 +20,8 @@ pub use commands::XwmCommandOutcome;
 mod configure_timeline;
 mod connection;
 pub mod data_bridge;
+mod event_trace;
+mod event_types;
 mod events;
 pub(crate) mod ewmh;
 pub(crate) mod focus;
@@ -52,9 +54,11 @@ pub(crate) use configure_timeline::{
     ConfigureNotifyClassification, ConfigureNotifyResult, ConfigureTimelineMetrics,
     WindowConfigureTimeline,
 };
+pub use event_types::{X11AdmissionCancellationReason, XwmDrain, XwmEvent};
 pub use moveresize::{X11MoveResizeDirection, X11MoveResizeRequest};
 pub use resize_sync::{RESIZE_SYNC_TIMEOUT_NS, ResizeSyncError, ResizeSyncState};
 pub(crate) use resize_sync::{ResizeSyncCommit, ResizeSyncTracker};
+pub(crate) use root_stack::OverrideRedirectStackMetrics;
 use root_stack::OverrideRedirectStackState;
 pub use window::X11WindowLifecycle;
 use window::{KindReconciliation, X11WindowRegistry};
@@ -180,82 +184,6 @@ pub enum X11MetadataDelta {
         supports_delete: bool,
         supports_take_focus: bool,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct XwmDrain {
-    pub processed: usize,
-    pub budget_exhausted: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum XwmEvent {
-    WindowMapRequested(X11WindowHandle),
-    WindowReady(X11WindowSnapshot),
-    WindowWithdrawn(X11WindowHandle),
-    WindowDestroyed(X11WindowHandle),
-    MetadataChanged {
-        window: X11WindowHandle,
-        delta: X11MetadataDelta,
-    },
-    ConfigureRequested {
-        window: X11WindowHandle,
-        request: X11ConfigureRequest,
-    },
-    MoveResizeRequested {
-        window: X11WindowHandle,
-        request: X11MoveResizeRequest,
-    },
-    ConfigureNotify {
-        window: X11WindowHandle,
-        geometry: X11Geometry,
-        above_sibling: Option<X11WindowHandle>,
-    },
-    /// Current X root-tree order for live override-redirect windows.
-    ///
-    /// QueryTree reports children from bottom to top.  This event preserves
-    /// that order without asking the compositor to echo it back to X.
-    OverrideRedirectStackSnapshot {
-        generation: XwaylandGeneration,
-        epoch: u64,
-        bottom_to_top: Vec<X11WindowHandle>,
-    },
-    StateRequested {
-        window: X11WindowHandle,
-        request: X11StateRequest,
-    },
-    FocusRequested {
-        window: X11WindowHandle,
-        source: u32,
-        timestamp: u32,
-        current_time: u32,
-        user_time: Option<u32>,
-    },
-    CloseRequestedByClient(X11WindowHandle),
-    ResizeSyncAckObserved {
-        window: X11WindowHandle,
-        counter_value: u64,
-    },
-    ResizeSyncPresented {
-        window: X11WindowHandle,
-        transaction_id: u64,
-        geometry: X11Geometry,
-    },
-    /// A transaction presented while another desired geometry still belongs to
-    /// the same interactive resize chain, or while the transaction is not the
-    /// final release configure.  The compositor must keep its preview active
-    /// and only advance the XSync state machine.
-    ResizeSyncPresentedIntermediate {
-        window: X11WindowHandle,
-        transaction_id: u64,
-        geometry: X11Geometry,
-    },
-    ResizeSyncImmediate {
-        window: X11WindowHandle,
-        geometry: X11Geometry,
-    },
-    ResizeSyncTimedOut(X11WindowHandle),
-    ResizeSyncTimedOutWithFollowup(X11WindowHandle),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -509,6 +437,10 @@ impl Xwm {
 
     pub(crate) fn property_metrics(&self) -> properties::PropertyMetrics {
         self.property_metrics
+    }
+
+    pub(crate) fn override_redirect_stack_metrics(&self) -> OverrideRedirectStackMetrics {
+        self.override_redirect_stack.metrics
     }
 
     pub(crate) fn reconcile_window_kind(

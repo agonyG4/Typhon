@@ -13,16 +13,23 @@ use crate::xwayland::xwm::{
 };
 use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 use wayland_client::protocol::{
-    wl_buffer as client_wl_buffer, wl_compositor as client_wl_compositor, wl_shm as client_wl_shm,
-    wl_shm_pool as client_wl_shm_pool, wl_surface as client_wl_surface,
+    wl_buffer as client_wl_buffer, wl_compositor as client_wl_compositor,
+    wl_seat as client_wl_seat, wl_shm as client_wl_shm, wl_shm_pool as client_wl_shm_pool,
+    wl_surface as client_wl_surface,
 };
 use wayland_client::{Connection, EventQueue, globals::registry_queue_init};
 use wayland_protocols::xwayland::shell::v1::client::xwayland_shell_v1 as client_xwayland_shell_v1;
 
+#[path = "xwayland_admission.rs"]
+mod xwayland_admission;
 #[path = "xwayland_geometry_ordering.rs"]
 mod xwayland_geometry_ordering;
+#[path = "xwayland_pointer_batch.rs"]
+mod xwayland_pointer_batch;
 #[path = "xwayland_resize_visual.rs"]
 mod xwayland_resize_visual;
+#[path = "xwayland_root_stack.rs"]
+mod xwayland_root_stack;
 
 struct FirstBufferFixture {
     server: super::OwnCompositorServer,
@@ -116,6 +123,8 @@ struct StationaryPointerXwaylandFixture {
     server: super::OwnCompositorServer,
     connection: Connection,
     queue: EventQueue<super::RegistryTestState>,
+    _seat: client_wl_seat::WlSeat,
+    _pointer: super::client_wl_pointer::WlPointer,
     _parent_surface: client_wl_surface::WlSurface,
     _popup_surface: client_wl_surface::WlSurface,
     _pool: client_wl_shm_pool::WlShmPool,
@@ -146,6 +155,8 @@ fn stationary_pointer_xwayland_fixture() -> StationaryPointerXwaylandFixture {
     let compositor: client_wl_compositor::WlCompositor =
         globals.bind(&qh, 1..=6, ()).expect("bind compositor");
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).expect("bind shm");
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 5..=5, ()).expect("bind seat");
+    let pointer = seat.get_pointer(&qh, ());
     let parent_surface = compositor.create_surface(&qh, ());
     let parent_shell_surface = shell.get_xwayland_surface(&parent_surface, &qh, ());
     parent_shell_surface.set_serial(0x1111_2222, 0x3333_4444);
@@ -203,6 +214,8 @@ fn stationary_pointer_xwayland_fixture() -> StationaryPointerXwaylandFixture {
         server,
         connection,
         queue,
+        _seat: seat,
+        _pointer: pointer,
         _parent_surface: parent_surface,
         _popup_surface: popup_surface,
         _pool: pool,
@@ -263,6 +276,17 @@ fn fake_snapshot() -> X11WindowSnapshot {
         supports_sync_request: false,
         sync_counter: None,
     }
+}
+
+fn install_test_xwayland_identity(
+    server: &mut super::OwnCompositorServer,
+    generation: XwaylandGeneration,
+) -> std::os::unix::net::UnixStream {
+    let (server_stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    server
+        .insert_xwayland_client(server_stream, generation)
+        .expect("install test XWayland identity");
+    peer
 }
 
 #[test]
@@ -379,7 +403,7 @@ fn xwayland_scene_batch_abort_has_no_side_effects_and_can_be_retried() {
     server
         .abort_xwayland_scene_batch(token)
         .expect("abort XWayland scene batch");
-    assert!(server.xwayland_scene_batch_dirty_for_test());
+    assert!(!server.xwayland_scene_batch_dirty_for_test());
     let retry = server
         .begin_xwayland_scene_batch()
         .expect("retry XWayland scene batch");
@@ -410,7 +434,7 @@ fn xwayland_scene_batch_suppresses_intermediate_popup_target_and_preserves_keybo
     let focused_before = fixture.server.state.focused_window_id;
     let refreshes_before = fixture
         .server
-        .xwayland_scene_batch_metrics_for_test()
+        .xwayland_scene_metrics()
         .pointer_refreshes_committed;
 
     let token = fixture
@@ -456,14 +480,14 @@ fn xwayland_scene_batch_suppresses_intermediate_popup_target_and_preserves_keybo
     assert_eq!(
         fixture
             .server
-            .xwayland_scene_batch_metrics_for_test()
+            .xwayland_scene_metrics()
             .pointer_refreshes_committed,
         refreshes_before + 1
     );
     assert!(
         fixture
             .server
-            .xwayland_scene_batch_metrics_for_test()
+            .xwayland_scene_metrics()
             .intermediate_pointer_targets_suppressed
             > 0
     );
@@ -642,144 +666,6 @@ fn compositor_x11_raise_emits_restacks_and_client_list_sync() {
         .take_xwayland_backend_commands(0)
         .iter()
         .any(|command| matches!(command, XwmCommand::RestackExact { order, .. } if order.contains(&first.handle))));
-}
-
-#[test]
-fn override_redirect_configure_notify_requests_reconciliation_without_restaking() {
-    let socket = super::unique_socket_name();
-    let mut server = super::OwnCompositorServer::bind_cpu_composition(&socket)
-        .expect("bind fake compositor server");
-    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
-    let mut first = fake_snapshot();
-    first.kind = DesktopWindowKind::OverrideRedirect;
-    first.override_redirect = true;
-    let mut second = first.clone();
-    second.handle = X11WindowHandle::new(generation, 103);
-    second.surface_id = 10;
-    let first_id = server.state.allocate_window_id().expect("first window id");
-    let second_id = server.state.allocate_window_id().expect("second window id");
-    server
-        .state
-        .insert_desktop_window(crate::compositor::DesktopWindow::new_x11(
-            first_id,
-            first.clone(),
-        ))
-        .expect("insert first OR window");
-    server
-        .state
-        .insert_desktop_window(crate::compositor::DesktopWindow::new_x11(
-            second_id,
-            second.clone(),
-        ))
-        .expect("insert second OR window");
-
-    let original_stacking = server.state.window_stacking.clone();
-    let commands = server.apply_xwayland_window_event(XwmEvent::ConfigureNotify {
-        window: first.handle,
-        geometry: first.geometry,
-        above_sibling: Some(second.handle),
-    });
-
-    assert_eq!(server.state.window_stacking, original_stacking);
-    assert!(
-        !commands
-            .iter()
-            .any(|command| matches!(command, XwmCommand::RestackExact { .. }))
-    );
-}
-
-#[test]
-fn override_redirect_configure_notify_without_sibling_does_not_write_back_observed_order() {
-    let socket = super::unique_socket_name();
-    let mut server = super::OwnCompositorServer::bind_cpu_composition(&socket)
-        .expect("bind fake compositor server");
-    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
-    let mut first = fake_snapshot();
-    first.kind = DesktopWindowKind::OverrideRedirect;
-    first.override_redirect = true;
-    let mut second = first.clone();
-    second.handle = X11WindowHandle::new(generation, 104);
-    second.surface_id = 11;
-    let first_id = server.state.allocate_window_id().expect("first window id");
-    let second_id = server.state.allocate_window_id().expect("second window id");
-    server
-        .state
-        .insert_desktop_window(crate::compositor::DesktopWindow::new_x11(
-            first_id,
-            first.clone(),
-        ))
-        .expect("insert first OR window");
-    server
-        .state
-        .insert_desktop_window(crate::compositor::DesktopWindow::new_x11(
-            second_id,
-            second.clone(),
-        ))
-        .expect("insert second OR window");
-
-    let original_stacking = server.state.window_stacking.clone();
-    let commands = server.apply_xwayland_window_event(XwmEvent::ConfigureNotify {
-        window: second.handle,
-        geometry: second.geometry,
-        above_sibling: None,
-    });
-
-    assert_eq!(server.state.window_stacking, original_stacking);
-    assert!(
-        !commands
-            .iter()
-            .any(|command| matches!(command, XwmCommand::RestackExact { .. }))
-    );
-}
-
-#[test]
-fn override_redirect_snapshot_follows_root_order_without_changing_managed_order() {
-    let socket = super::unique_socket_name();
-    let mut server = super::OwnCompositorServer::bind_cpu_composition(&socket)
-        .expect("bind fake compositor server");
-    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
-    let managed = fake_snapshot();
-    let mut first = managed.clone();
-    first.handle = X11WindowHandle::new(generation, 105);
-    first.surface_id = 12;
-    first.kind = DesktopWindowKind::OverrideRedirect;
-    first.override_redirect = true;
-    let mut second = first.clone();
-    second.handle = X11WindowHandle::new(generation, 106);
-    second.surface_id = 13;
-    let managed_id = server.state.allocate_window_id().expect("managed id");
-    let first_id = server.state.allocate_window_id().expect("first id");
-    let second_id = server.state.allocate_window_id().expect("second id");
-    for (id, snapshot) in [
-        (managed_id, managed.clone()),
-        (first_id, first.clone()),
-        (second_id, second.clone()),
-    ] {
-        server
-            .state
-            .insert_desktop_window(crate::compositor::DesktopWindow::new_x11(id, snapshot))
-            .expect("insert X11 window");
-    }
-
-    server.apply_xwayland_window_event(XwmEvent::OverrideRedirectStackSnapshot {
-        generation,
-        epoch: 1,
-        bottom_to_top: vec![second.handle, first.handle],
-    });
-    assert_eq!(
-        server.state.window_stacking,
-        vec![managed_id, second_id, first_id]
-    );
-
-    server.apply_xwayland_window_event(XwmEvent::OverrideRedirectStackSnapshot {
-        generation,
-        epoch: 2,
-        bottom_to_top: vec![first.handle, second.handle],
-    });
-    assert_eq!(
-        server.state.window_stacking,
-        vec![managed_id, first_id, second_id]
-    );
 }
 
 #[test]
@@ -2059,6 +1945,13 @@ fn window_admission_failure_does_not_publish_retained_buffer() {
             .expect("retained buffer remains")
             .get(),
         fixture.initial_buffer_id
+    );
+    assert_eq!(
+        fixture
+            .server
+            .xwayland_scene_metrics()
+            .pre_admission_popup_cancellations,
+        0
     );
 }
 

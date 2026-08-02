@@ -201,6 +201,10 @@ fn override_redirect_query_tree_emits_current_bottom_to_top_snapshot() {
         )),
         "current root order should be emitted bottom-to-top"
     );
+    let metrics = xwm.override_redirect_stack_metrics_for_test();
+    assert_eq!(metrics.snapshots_emitted, 1);
+    assert_eq!(metrics.replies_superseded, 0);
+    assert_eq!(metrics.replies_incomplete, 0);
 }
 
 #[test]
@@ -233,10 +237,13 @@ fn override_redirect_query_tree_superseded_reply_is_not_emitted() {
     );
     assert_eq!(
         xwm.override_redirect_stack_metrics_for_test()
-            .superseded_replies,
+            .replies_superseded,
         1,
         "a reply for epoch {first_epoch} should be counted as superseded"
     );
+    let metrics = xwm.override_redirect_stack_metrics_for_test();
+    assert_eq!(metrics.snapshots_emitted, 0);
+    assert_eq!(metrics.replies_incomplete, 0);
     assert_eq!(
         xwm.override_redirect_stack_metrics_for_test()
             .queries_issued,
@@ -273,15 +280,149 @@ fn incomplete_override_redirect_query_tree_reply_does_not_remove_live_window() {
     assert!(xwm.windows.contains(missing));
     assert_eq!(
         xwm.override_redirect_stack_metrics_for_test()
-            .incomplete_replies,
+            .replies_incomplete,
         1
     );
+    let metrics = xwm.override_redirect_stack_metrics_for_test();
+    assert_eq!(metrics.snapshots_emitted, 0);
+    assert_eq!(metrics.replies_superseded, 0);
     assert_eq!(
         xwm.override_redirect_stack_metrics_for_test()
             .queries_issued,
         2,
         "an incomplete reply should request one fresh reconciliation"
     );
+}
+
+#[test]
+fn partial_xwm_drain_does_not_emit_root_snapshot_before_queued_lifecycle_events() {
+    let generation = generation(253);
+    let (mut xwm, mut peer) = test_fixture(generation);
+    let bottom = prepare_mapped_override_redirect_window(&mut xwm, 256);
+    let top = prepare_mapped_override_redirect_window(&mut xwm, 257);
+
+    xwm.mark_override_redirect_stack_dirty();
+    xwm.drain_events(256).expect("issue root stack query");
+    let (sequence, _) = xwm
+        .override_redirect_stack_query_for_test()
+        .expect("one root stack query");
+    peer.write_all(&query_tree_reply(
+        sequence as u16,
+        xwm.root,
+        &[bottom.xid(), top.xid()],
+    ))
+    .expect("root stack reply");
+
+    let mut unrelated_property = [0_u8; 32];
+    unrelated_property[0] = 28;
+    unrelated_property[4..8].copy_from_slice(&0xdead_beef_u32.to_ne_bytes());
+    for _ in 0..256 {
+        peer.write_all(&unrelated_property)
+            .expect("unrelated property event");
+    }
+    let configure = xproto::ConfigureNotifyEvent {
+        response_type: 22,
+        sequence: 0,
+        event: 1,
+        window: top.xid(),
+        above_sibling: bottom.xid(),
+        x: 10,
+        y: 20,
+        width: 100,
+        height: 80,
+        border_width: 0,
+        override_redirect: true,
+    };
+    peer.write_all(&<[u8; 32]>::from(configure))
+        .expect("queued stacking event");
+
+    let partial = xwm.drain_events(256).expect("partial XWM drain");
+    assert!(partial.budget_exhausted);
+    assert!(!partial.events_quiescent);
+    assert!(partial.property_replies_quiescent);
+    assert!(!partial.quiescent);
+    assert!(
+        xwm.take_events()
+            .all(|event| !matches!(event, XwmEvent::OverrideRedirectStackSnapshot { .. }))
+    );
+    assert_eq!(
+        xwm.override_redirect_stack_query_for_test()
+            .map(|query| query.0),
+        Some(sequence),
+        "partial drain must not replace the pending root-stack query"
+    );
+
+    let complete = xwm.drain_events(256).expect("quiescent XWM drain");
+    assert!(!complete.budget_exhausted);
+    assert!(complete.quiescent);
+    let (final_sequence, _) = xwm
+        .override_redirect_stack_query_for_test()
+        .expect("final root stack query after the lifecycle event");
+    assert_ne!(final_sequence, sequence);
+    assert!(
+        xwm.take_events()
+            .all(|event| !matches!(event, XwmEvent::OverrideRedirectStackSnapshot { .. }))
+    );
+}
+
+#[test]
+fn override_redirect_unmap_before_ready_emits_one_admission_cancellation() {
+    let generation = generation(254);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = super::X11WindowHandle::new(generation, 258);
+    assert!(xwm.windows.insert_observed_with_kind(
+        handle,
+        DesktopWindowKind::OverrideRedirect,
+        X11Geometry::default()
+    ));
+    normalize(&mut xwm, map_event(handle.xid(), true)).expect("normalize popup MapNotify");
+    let _ = xwm.take_events().collect::<Vec<_>>();
+
+    normalize(&mut xwm, unmap_event(handle.xid())).expect("normalize popup UnmapNotify");
+    assert_eq!(
+        xwm.take_events().collect::<Vec<_>>(),
+        vec![XwmEvent::WindowAdmissionCancelled {
+            window: handle,
+            reason: super::super::X11AdmissionCancellationReason::Unmap,
+        }]
+    );
+    let record = xwm.windows.get(handle).expect("withdrawn popup record");
+    assert_eq!(record.lifecycle, X11WindowLifecycle::Withdrawn);
+    assert!(record.association.is_none());
+    assert!(!record.buffer_ready);
+}
+
+#[test]
+fn override_redirect_destroy_before_ready_emits_one_admission_cancellation() {
+    let generation = generation(255);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = super::X11WindowHandle::new(generation, 259);
+    assert!(xwm.windows.insert_observed_with_kind(
+        handle,
+        DesktopWindowKind::OverrideRedirect,
+        X11Geometry::default()
+    ));
+    normalize(&mut xwm, map_event(handle.xid(), true)).expect("normalize popup MapNotify");
+    let _ = xwm.take_events().collect::<Vec<_>>();
+
+    normalize(
+        &mut xwm,
+        Event::DestroyNotify(xproto::DestroyNotifyEvent {
+            response_type: 17,
+            sequence: 0,
+            event: 1,
+            window: handle.xid(),
+        }),
+    )
+    .expect("normalize popup DestroyNotify");
+    assert_eq!(
+        xwm.take_events().collect::<Vec<_>>(),
+        vec![XwmEvent::WindowAdmissionCancelled {
+            window: handle,
+            reason: super::super::X11AdmissionCancellationReason::Destroy,
+        }]
+    );
+    assert!(!xwm.windows.contains(handle));
 }
 
 #[test]

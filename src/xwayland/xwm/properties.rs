@@ -295,7 +295,14 @@ pub(crate) fn cancel_generation(xwm: &mut Xwm, generation: super::XwaylandGenera
     }
 }
 
-pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize) -> Result<usize, XwmError> {
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PropertyDrain {
+    pub(crate) processed: usize,
+    pub(crate) budget_exhausted: bool,
+    pub(crate) quiescent: bool,
+}
+
+pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize) -> Result<PropertyDrain, XwmError> {
     drain_deferred(xwm)?;
     let sequences = xwm
         .pending_properties
@@ -303,6 +310,7 @@ pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize) -> Result<usize, XwmErr
         .copied()
         .take(budget)
         .collect::<Vec<_>>();
+    let budget_exhausted = budget != 0 && sequences.len() >= budget;
     let mut completed = 0;
     for sequence in sequences {
         let Some(pending) = xwm.pending_properties.remove(&sequence) else {
@@ -336,7 +344,11 @@ pub(crate) fn poll_replies(xwm: &mut Xwm, budget: usize) -> Result<usize, XwmErr
         completed += 1;
         drain_deferred(xwm)?;
     }
-    Ok(completed)
+    Ok(PropertyDrain {
+        processed: completed,
+        budget_exhausted,
+        quiescent: budget != 0 && !budget_exhausted && xwm.pending_properties.is_empty(),
+    })
 }
 
 #[cfg(test)]

@@ -187,7 +187,7 @@ impl OwnCompositorServer {
             .map(|pending| pending.data.buffer_id())
     }
 
-    pub(super) fn remove_x11_desktop_window(&mut self, handle: X11WindowHandle) -> bool {
+    pub(crate) fn remove_x11_desktop_window(&mut self, handle: X11WindowHandle) -> bool {
         let Some(window_id) = self.state.window_id_for_x11_handle(handle) else {
             return false;
         };
@@ -221,7 +221,7 @@ impl OwnCompositorServer {
         removed
     }
 
-    pub(super) fn sync_xwayland_client_lists(&self) -> XwmCommand {
+    pub(crate) fn sync_xwayland_client_lists(&self) -> XwmCommand {
         let (client_list, stacking) = self.state.x11_client_lists();
         XwmCommand::SyncClientLists {
             client_list,

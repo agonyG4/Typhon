@@ -153,22 +153,53 @@ impl Xwm {
         let budget = budget.min(XWM_EVENT_BUDGET);
         let mut events_processed = 0;
         let mut replies_processed = 0;
+        let mut events_quiescent = budget != 0;
+        let mut property_replies_quiescent = budget != 0;
+        let mut budget_exhausted = false;
         loop {
-            let event_drain = events::drain(self, budget.saturating_sub(events_processed))?;
-            events_processed = events_processed.saturating_add(event_drain.processed);
-            self.poll_root_event_mask()?;
-            let replies = properties::poll_replies(self, budget.saturating_sub(replies_processed))?;
-            replies_processed = replies_processed.saturating_add(replies);
-            if event_drain.processed == 0 && replies == 0
-                || events_processed == budget && replies_processed == budget
+            let event_budget = budget.saturating_sub(events_processed);
+            let event_drain = if event_budget == 0 {
+                events_quiescent = false;
+                budget_exhausted = budget_exhausted || budget != 0;
+                None
+            } else {
+                let drain = events::drain(self, event_budget)?;
+                events_processed = events_processed.saturating_add(drain.processed);
+                events_quiescent &= drain.events_quiescent;
+                budget_exhausted |= drain.budget_exhausted;
+                self.poll_root_event_mask()?;
+                Some(drain)
+            };
+            let reply_budget = budget.saturating_sub(replies_processed);
+            let reply_drain = if reply_budget == 0 {
+                property_replies_quiescent = false;
+                budget_exhausted = budget_exhausted || budget != 0;
+                None
+            } else {
+                let drain = properties::poll_replies(self, reply_budget)?;
+                replies_processed = replies_processed.saturating_add(drain.processed);
+                property_replies_quiescent &= drain.quiescent;
+                budget_exhausted |= drain.budget_exhausted;
+                Some(drain)
+            };
+            if event_drain.is_none_or(|drain| drain.processed == 0)
+                && reply_drain.is_none_or(|drain| drain.processed == 0)
             {
                 break;
             }
         }
-        self.reconcile_override_redirect_stack()?;
+        let quiescent = events_quiescent && property_replies_quiescent;
+        if quiescent {
+            self.reconcile_override_redirect_stack()?;
+        }
         Ok(XwmDrain {
-            processed: events_processed,
-            budget_exhausted: events_processed == budget && budget != 0,
+            processed: events_processed.saturating_add(replies_processed),
+            budget_exhausted,
+            events_processed,
+            property_replies_processed: replies_processed,
+            events_quiescent,
+            property_replies_quiescent,
+            quiescent,
         })
     }
 

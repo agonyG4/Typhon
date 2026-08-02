@@ -650,14 +650,24 @@ impl CompositorState {
             .desktop_windows
             .values()
             .filter_map(|window| {
-                matches!(window.backend, WindowBackend::X11(_)).then_some((
+                window.participates_in_x11_transient_family().then_some((
                     window.id,
                     window
                         .x11_transient_for
-                        .and_then(|parent| handles_by_id.get(&parent).copied()),
+                        .and_then(|parent| handles_by_id.get(&parent).copied())
+                        .filter(|parent_id| {
+                            self.window(*parent_id)
+                                .is_some_and(DesktopWindow::participates_in_x11_transient_family)
+                        }),
                 ))
             })
             .collect::<std::collections::HashMap<_, _>>();
+        for window in self.desktop_windows.values_mut().filter(|window| {
+            matches!(window.backend, WindowBackend::X11(_))
+                && !window.participates_in_x11_transient_family()
+        }) {
+            window.relationships.transient_for = None;
+        }
 
         // Resolve parent handles against the complete admission set, then
         // reject any edge that would leave a cycle in the relationship graph.
@@ -690,7 +700,8 @@ impl CompositorState {
             .desktop_windows
             .values()
             .filter_map(|window| {
-                matches!(window.backend, WindowBackend::X11(_))
+                window
+                    .participates_in_x11_transient_family()
                     .then_some(window.id)
                     .filter(|id| {
                         self.window(*id)
@@ -705,7 +716,7 @@ impl CompositorState {
         self.normalize_window_stacking();
     }
 
-    pub(in crate::compositor) fn normalize_window_stacking(&mut self) {
+    pub(in crate::compositor) fn normalize_window_stacking(&mut self) -> bool {
         let layers = self
             .desktop_windows
             .values()
@@ -717,7 +728,7 @@ impl CompositorState {
                 .copied()
                 .unwrap_or(DesktopStackLayer::Normal)
         });
-        self.reorder_renderable_surfaces_by_window_stack();
+        self.reorder_renderable_surfaces_by_window_stack()
     }
 
     pub(in crate::compositor) fn filter_x11_geometry(
@@ -1033,61 +1044,6 @@ impl CompositorState {
         true
     }
 
-    pub(in crate::compositor) fn apply_override_redirect_stack_snapshot(
-        &mut self,
-        generation: XwaylandGeneration,
-        epoch: u64,
-        bottom_to_top: &[X11WindowHandle],
-    ) -> bool {
-        if self.applied_override_redirect_stack.is_some_and(
-            |(applied_generation, applied_epoch)| {
-                applied_generation != generation || applied_epoch >= epoch
-            },
-        ) {
-            return false;
-        }
-
-        let override_redirect_ids = self
-            .window_stacking
-            .iter()
-            .copied()
-            .filter(|window_id| {
-                self.window(*window_id)
-                    .is_some_and(|window| window.x11_role == Some(X11DesktopRole::OverrideRedirect))
-            })
-            .collect::<Vec<_>>();
-        if override_redirect_ids.is_empty() {
-            self.applied_override_redirect_stack = Some((generation, epoch));
-            return false;
-        }
-
-        let override_redirect_set = override_redirect_ids
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
-        let mut ordered = bottom_to_top
-            .iter()
-            .filter_map(|handle| self.window_id_for_x11_handle(*handle))
-            .filter(|window_id| override_redirect_set.contains(window_id))
-            .collect::<Vec<_>>();
-        for window_id in override_redirect_ids.iter().copied() {
-            if !ordered.contains(&window_id) {
-                ordered.push(window_id);
-            }
-        }
-
-        let mut next = ordered.into_iter();
-        for window_id in &mut self.window_stacking {
-            if override_redirect_set.contains(window_id)
-                && let Some(replacement) = next.next()
-            {
-                *window_id = replacement;
-            }
-        }
-        self.applied_override_redirect_stack = Some((generation, epoch));
-        self.reorder_renderable_surfaces_by_window_stack()
-    }
-
     pub(in crate::compositor) fn apply_x11_stack_request(
         &mut self,
         handle: X11WindowHandle,
@@ -1238,6 +1194,11 @@ impl CompositorState {
             .desktop_windows
             .values()
             .filter(|window| {
+                if matches!(window.backend, WindowBackend::X11(_))
+                    && !window.participates_in_x11_transient_family()
+                {
+                    return false;
+                }
                 let mut current = window.id;
                 let mut seen = std::collections::HashSet::new();
                 while seen.insert(current) {
@@ -1304,7 +1265,7 @@ impl CompositorState {
         self.window_stacking
             .iter()
             .filter_map(|id| self.window(*id))
-            .filter(|window| matches!(window.backend, WindowBackend::X11(_)))
+            .filter(|window| window.participates_in_x11_transient_family())
             .map(|window| window.id)
             .collect()
     }
@@ -1313,6 +1274,7 @@ impl CompositorState {
         self.window_stacking
             .iter()
             .filter_map(|id| self.window(*id))
+            .filter(|window| window.participates_in_x11_transient_family())
             .filter_map(|window| match window.backend {
                 WindowBackend::X11(handle) => Some(handle),
                 WindowBackend::Xdg(_) => None,

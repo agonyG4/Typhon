@@ -316,16 +316,22 @@ impl XwaylandService {
         };
         match drain {
             Ok(drain) => {
-                let (property_metrics, configure_metrics, pending_events, generation) =
-                    match &self.state {
-                        ServiceState::Running(resources) => (
-                            resources.xwm.property_metrics(),
-                            resources.xwm.configure_metrics(),
-                            resources.xwm.pending_event_count(),
-                            resources.generation,
-                        ),
-                        _ => return false,
-                    };
+                let (
+                    property_metrics,
+                    configure_metrics,
+                    root_stack_metrics,
+                    pending_events,
+                    generation,
+                ) = match &self.state {
+                    ServiceState::Running(resources) => (
+                        resources.xwm.property_metrics(),
+                        resources.xwm.configure_metrics(),
+                        resources.xwm.override_redirect_stack_metrics(),
+                        resources.xwm.pending_event_count(),
+                        resources.generation,
+                    ),
+                    _ => return false,
+                };
                 if xwm_reactor_hot_path_logging_enabled(self.config.log_stderr, trace::enabled()) {
                     eprintln!(
                         "oblivion-one xwayland: event=xwm_reactor_drain generation={generation:?} processed={} budget_exhausted={} pending_events={pending_events}",
@@ -375,10 +381,22 @@ impl XwaylandService {
                     configure_metrics.retired_geometry_reuse_external;
                 self.metrics.x11_retired_geometry_ambiguous_managed =
                     configure_metrics.retired_geometry_ambiguous_managed;
+                self.metrics.override_redirect_stack_queries_issued =
+                    root_stack_metrics.queries_issued;
+                self.metrics.override_redirect_stack_queries_coalesced =
+                    root_stack_metrics.queries_coalesced;
+                self.metrics.override_redirect_stack_replies_superseded =
+                    root_stack_metrics.replies_superseded;
+                self.metrics.override_redirect_stack_replies_incomplete =
+                    root_stack_metrics.replies_incomplete;
+                self.metrics.override_redirect_stack_snapshots_emitted =
+                    root_stack_metrics.snapshots_emitted;
+                self.metrics.override_redirect_stack_entries_pruned =
+                    root_stack_metrics.entries_pruned;
                 self.metrics.xwm_events_received = self
                     .metrics
                     .xwm_events_received
-                    .saturating_add(drain.processed as u64);
+                    .saturating_add(drain.events_processed as u64);
                 self.metrics.xwm_drain_max_us = self
                     .metrics
                     .xwm_drain_max_us
@@ -386,7 +404,7 @@ impl XwaylandService {
                 self.metrics.xwm_events_per_cycle_max = self
                     .metrics
                     .xwm_events_per_cycle_max
-                    .max(drain.processed as u64);
+                    .max(drain.events_processed as u64);
                 if drain.budget_exhausted {
                     self.metrics.xwm_drain_budget_exhaustions =
                         self.metrics.xwm_drain_budget_exhaustions.saturating_add(1);

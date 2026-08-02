@@ -366,6 +366,9 @@ impl CompositorState {
         self.surface_window_geometries.remove(&surface_id);
         self.pending_surface_window_geometries.remove(&surface_id);
         self.clear_resize_state_for_surfaces(&[surface_id]);
+        if !had_live_role {
+            self.note_popup_lifecycle_redundant_cleanup();
+        }
         popup_debug_log(|| {
             format!(
                 "popup_destroy_role popup={surface_id} outcome={} reason=role_destroyed",

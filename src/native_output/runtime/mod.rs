@@ -359,6 +359,13 @@ impl Drop for NativeRuntime {
             .xwayland
             .emergency_cleanup(&mut self.process_supervisor);
         let _ = self.sync_xwayland_reactor_sources();
+        if oblivion_one::xwayland::trace::enabled() {
+            for line in oblivion_one::xwayland::trace::take_recent_lifecycle_trace() {
+                eprintln!("oblivion-one xwayland: lifecycle_ring_dump=true {line}");
+            }
+        } else {
+            let _ = oblivion_one::xwayland::trace::take_recent_lifecycle_trace();
+        }
         if self.frame_pacing.enabled() {
             println!(
                 "{}",

@@ -235,68 +235,46 @@ impl CompositorState {
             self.pin_confined_pointer_focus(&active);
             return;
         }
+        if let Some(grabbed_surface) = self.implicit_pointer_grab_surface("surface-destroyed") {
+            self.pointer_surface = Some(grabbed_surface);
+            return;
+        }
 
         let target = self
             .pointer_target_at(self.last_pointer_x, self.last_pointer_y)
-            .filter(|target| target.surface.is_alive());
+            .filter(|target| target.surface.is_alive())
+            .filter(|target| self.pointer_target_allowed_by_popup_grab(target));
         let target_surface = target.as_ref().map(|target| target.surface.clone());
-        self.pointer_surface = target_surface.clone();
-        self.pointer_resources.retain(Resource::is_alive);
-
-        let pointers = self.pointer_resources.clone();
-        let mut frame_pointers = Vec::new();
-        for pointer in pointers {
-            let previous = self
-                .pointer_entered_surfaces
-                .iter()
-                .position(|(resource, _)| same_wayland_resource(resource, &pointer))
-                .map(|index| self.pointer_entered_surfaces.remove(index).1);
-            let same_target = previous
-                .as_ref()
-                .zip(target_surface.as_ref())
-                .is_some_and(|(previous, target)| same_surface_resource(previous, target));
-            if same_target {
-                continue;
-            }
-
-            let mut sent_event = false;
-            if let Some(previous) = previous {
-                self.forget_pointer_enter_serial(&pointer);
-                if previous.is_alive() && resource_belongs_to_surface_client(&pointer, &previous) {
-                    let serial = self.next_configure_serial();
-                    let _ = pointer.send_event(wl_pointer::Event::Leave {
-                        serial,
-                        surface: previous,
-                    });
-                    sent_event = true;
+        let same_target = self
+            .pointer_surface
+            .as_ref()
+            .zip(target_surface.as_ref())
+            .is_some_and(|(previous, target)| same_surface_resource(previous, target));
+        if same_target {
+            if let Some(target) = target.as_ref() {
+                let mut frame_pointers = Vec::new();
+                self.queue_pointer_enter_events(target, &mut frame_pointers);
+                for pointer in frame_pointers {
+                    send_pointer_frame_if_supported(&pointer);
                 }
             }
-
-            if let Some(target) = target.as_ref()
-                && resource_belongs_to_surface_client(&pointer, &target.surface)
-            {
-                let serial = self.next_configure_serial();
-                let _ = pointer.send_event(wl_pointer::Event::Enter {
-                    serial,
-                    surface: target.surface.clone(),
-                    surface_x: target.surface_x,
-                    surface_y: target.surface_y,
-                });
-                self.remember_input_serial(
-                    serial,
-                    target.surface.clone(),
-                    InputSerialKind::PointerEnter,
-                );
-                self.remember_pointer_enter_serial(&pointer, &target.surface, serial);
-                self.pointer_entered_surfaces
-                    .push((pointer.clone(), target.surface.clone()));
-                sent_event = true;
-            }
-            if sent_event {
-                frame_pointers.push(pointer);
-            }
+            return;
         }
 
+        let previous = self.clear_pointer_focus_state();
+        self.pointer_surface = target_surface;
+        let mut frame_pointers = Vec::new();
+        for (pointer, surface) in previous {
+            if !surface.is_alive() {
+                continue;
+            }
+            let serial = self.next_configure_serial();
+            let _ = pointer.send_event(wl_pointer::Event::Leave { serial, surface });
+            push_pointer_frame_once(&mut frame_pointers, pointer);
+        }
+        if let Some(target) = target.as_ref() {
+            self.queue_pointer_enter_events(target, &mut frame_pointers);
+        }
         for pointer in frame_pointers {
             send_pointer_frame_if_supported(&pointer);
         }
@@ -692,33 +670,64 @@ impl CompositorState {
         }
     }
 
-    pub(in crate::compositor) fn clear_pointer_focus(&mut self) {
+    fn queue_pointer_enter_events(
+        &mut self,
+        target: &PointerTarget,
+        frame_pointers: &mut Vec<wl_pointer::WlPointer>,
+    ) {
+        self.pointer_resources.retain(Resource::is_alive);
+        let pointers = self
+            .pointer_resources
+            .iter()
+            .filter(|pointer| resource_belongs_to_surface_client(*pointer, &target.surface))
+            .cloned()
+            .collect::<Vec<_>>();
+        for pointer in pointers {
+            if self.pointer_resource_entered_surface(&pointer, &target.surface) {
+                continue;
+            }
+            let serial = self.next_configure_serial();
+            let _ = pointer.send_event(wl_pointer::Event::Enter {
+                serial,
+                surface: target.surface.clone(),
+                surface_x: target.surface_x,
+                surface_y: target.surface_y,
+            });
+            self.remember_input_serial(
+                serial,
+                target.surface.clone(),
+                InputSerialKind::PointerEnter,
+            );
+            self.remember_pointer_enter_serial(&pointer, &target.surface, serial);
+            self.pointer_entered_surfaces
+                .push((pointer.clone(), target.surface.clone()));
+            push_pointer_frame_once(frame_pointers, pointer);
+        }
+        let surface_id = compositor_surface_id(&target.surface);
+        let constraint_ids = self
+            .pointer_constraints
+            .values()
+            .filter(|constraint| compositor_surface_id(&constraint.surface) == surface_id)
+            .map(|constraint| constraint.id)
+            .collect::<Vec<_>>();
+        for constraint_id in constraint_ids {
+            self.maybe_request_pointer_constraint_activation(constraint_id);
+        }
+    }
+
+    fn clear_pointer_focus_state(&mut self) -> Vec<(wl_pointer::WlPointer, wl_surface::WlSurface)> {
         if self.window_interaction.is_some() {
             self.clear_window_interaction_state(WindowInteractionEndReason::FocusLoss);
         }
         if let Some(active) = self.active_locked_pointer_binding() {
-            pointer_debug_log(format!(
-                "pointer focus clear suppressed by locked route id={} surface={}",
-                active.constraint_id,
-                compositor_surface_id(&active.surface)
-            ));
             self.pin_locked_pointer_focus(&active);
-            return;
+            return Vec::new();
         }
         if let Some(active) = self.active_confined_pointer_binding() {
-            pointer_debug_log(format!(
-                "pointer focus clear suppressed by confined route id={} surface={}",
-                active.constraint_id,
-                compositor_surface_id(&active.surface)
-            ));
             self.pin_confined_pointer_focus(&active);
-            return;
+            return Vec::new();
         }
         if let Some(surface_id) = self.pointer_surface.as_ref().map(compositor_surface_id) {
-            pointer_debug_log(format!(
-                "pointer focus loss deactivating constraints surface={}",
-                surface_id
-            ));
             self.deactivate_pointer_constraints_for_surface_focus_loss(surface_id, true);
         }
         let cleared_client_cursor = self.active_client_cursor.take().is_some();
@@ -726,12 +735,12 @@ impl CompositorState {
         self.cursor_visibility.client_cursor_pointer = None;
         if cleared_client_cursor {
             self.advance_render_generation(RenderGenerationCause::CursorState);
-            pointer_debug_log("cursor cleanup reason=pointer-focus-loss");
         }
         self.sync_cursor_visibility_request();
         self.pointer_surface = None;
         self.pointer_resources.retain(Resource::is_alive);
         let pointers = self.pointer_resources.clone();
+        let mut leaves = Vec::new();
         for pointer in pointers {
             let Some(index) = self
                 .pointer_entered_surfaces
@@ -742,12 +751,31 @@ impl CompositorState {
             };
             let (_, surface) = self.pointer_entered_surfaces.remove(index);
             self.forget_pointer_enter_serial(&pointer);
-            if !resource_belongs_to_surface_client(&pointer, &surface) {
-                continue;
+            if resource_belongs_to_surface_client(&pointer, &surface) {
+                leaves.push((pointer, surface));
             }
+        }
+        leaves
+    }
+
+    pub(in crate::compositor) fn clear_pointer_focus(&mut self) {
+        let leaves = self.clear_pointer_focus_state();
+        for (pointer, surface) in leaves {
             let serial = self.next_configure_serial();
             let _ = pointer.send_event(wl_pointer::Event::Leave { serial, surface });
             send_pointer_frame_if_supported(&pointer);
         }
+    }
+}
+
+fn push_pointer_frame_once(
+    frame_pointers: &mut Vec<wl_pointer::WlPointer>,
+    pointer: wl_pointer::WlPointer,
+) {
+    if !frame_pointers
+        .iter()
+        .any(|existing| same_wayland_resource(existing, &pointer))
+    {
+        frame_pointers.push(pointer);
     }
 }

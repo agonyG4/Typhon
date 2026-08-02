@@ -14,6 +14,7 @@ mod input_dispatch;
 mod input_resources;
 mod output_membership;
 mod output_state;
+mod override_redirect_stack;
 mod pointer_constraints;
 mod resize;
 mod roles;
@@ -34,6 +35,16 @@ mod xdg_lifecycle;
 mod xwayland_mode;
 mod xwayland_scene;
 mod xwayland_windows;
+
+pub(crate) use override_redirect_stack::OverrideRedirectStackSnapshotResult;
+
+#[allow(unused_imports)]
+pub(in crate::compositor) use xwayland_scene::{
+    XwaylandSceneBatchDirty, XwaylandSceneBatchMetrics, XwaylandSceneBatchState,
+};
+pub use xwayland_scene::{
+    XwaylandSceneBatchError, XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot,
+};
 
 #[allow(unused_imports)]
 pub(in crate::compositor) use client_lifecycle::*;
