@@ -6,9 +6,9 @@ use super::thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailu
 use super::{
     CursorSidecar, CursorSidecarCoupling, CursorSidecarMailbox, EstablishedKmsBase,
     KmsBundleOwners, KmsCommitBundleIdentity, KmsCommitJob, KmsCommitTestPolicy,
-    KmsCommitWorkerHandle, KmsCursorOwner, KmsCursorUpdate, KmsPrimaryOwner, KmsPrimaryUpdate,
-    KmsSubmittedOwnership, KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerEvent, KmsWorkerFatalJob,
-    ValidationBaseDisposition, validation_base_ready,
+    KmsCommitWorkerHandle, KmsCursorOwner, KmsCursorUpdate, KmsPrimaryCursorPresentation,
+    KmsPrimaryOwner, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy, KmsValidationBase,
+    KmsWorkerEvent, KmsWorkerFatalJob, ValidationBaseDisposition, validation_base_ready,
 };
 use oblivion_one::native::kms::AtomicCursorVisualState;
 use std::{
@@ -1336,6 +1336,57 @@ fn impossible_cursor_delivery_payloads_are_rejected() {
     assert_eq!(
         visible_software.validate_against(&visible_software_transaction),
         Err(super::KmsCommitPayloadError::CursorDeliveryMismatch)
+    );
+}
+
+#[test]
+fn software_primary_presentation_requires_a_matching_primary_payload() {
+    let mut job = test_job(920);
+    job.kind = crate::native_output::runtime::AtomicCommitKind::CompositedPrimary {
+        transaction_id: job.transaction_id,
+        frame_id: 920,
+        framebuffer_id: 42,
+    };
+    job.primary = KmsPrimaryUpdate::Framebuffer {
+        framebuffer: oblivion_one::native::kms::FramebufferId::new(42).unwrap(),
+        in_fence: None,
+        request_out_fence: true,
+    };
+    job.cursor_delivery =
+        crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden;
+    job.primary_cursor_presentation = KmsPrimaryCursorPresentation::Promote(
+        crate::native_output::presentation::plane::PresentedCursorState {
+            revision: crate::native_output::presentation::plane::CursorRevision::initial(),
+            coupling: crate::native_output::presentation::plane::CursorCoupling::EmbeddedInPrimary,
+            delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Software,
+            framebuffer_id: None,
+            visible: false,
+            output_position: crate::native_output::presentation::plane::CursorPlanePoint {
+                x: 12,
+                y: 34,
+            },
+            hotspot: crate::native_output::presentation::plane::CursorPlanePoint { x: 1, y: 2 },
+        },
+    );
+    let transaction = crate::native_output::OutputTransaction::compatibility_composited(
+        job.transaction_id,
+        1,
+        oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(0),
+        job.target,
+        oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
+        920,
+        1,
+        42,
+        None,
+        oblivion_one::compositor::CompositorFrameBatchId::new(
+            std::num::NonZeroU64::new(920).unwrap(),
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        job.validate_against(&transaction),
+        Err(super::KmsCommitPayloadError::PrimaryCursorPresentationMismatch)
     );
 }
 

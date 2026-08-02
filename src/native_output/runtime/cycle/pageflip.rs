@@ -109,6 +109,16 @@ fn frozen_primary_cursor_presentation(
     }
 }
 
+fn select_cursor_promotion(
+    primary_presentation: KmsPrimaryCursorPresentation,
+    cursor_plane_promotion: Option<PresentedCursorState>,
+) -> Option<PresentedCursorState> {
+    match primary_presentation {
+        KmsPrimaryCursorPresentation::Promote(state) => Some(state),
+        KmsPrimaryCursorPresentation::Preserve => cursor_plane_promotion,
+    }
+}
+
 impl NativeRuntime {
     pub(super) fn wait_for_events_and_pageflips(&mut self) -> NativeResult<NativeCycleState> {
         let wakeup = self.event_loop.wait()?;
@@ -1085,7 +1095,7 @@ impl NativeRuntime {
                                 output_generation: bundle_identity.output_generation,
                                 crtc_id: bundle_identity.crtc_id,
                             };
-                        let cursor = cursor_owner
+                        let cursor_plane_promotion = cursor_owner
                             .and_then(|(revision, sidecar, _, update, delivery)| {
                                 let coupling = if delivery
                                     == crate::native_output::presentation::plane::PresentedCursorDelivery::Software
@@ -1108,8 +1118,13 @@ impl NativeRuntime {
                                     delivery,
                                     &self.presented_planes.cursor,
                                 )
-                            })
-                            .or_else(|| frozen_primary_cursor_presentation(primary_cursor_presentation));
+                            });
+                        let cursor = select_cursor_promotion(
+                            primary_cursor_presentation,
+                            cursor_plane_promotion.or_else(|| {
+                                frozen_primary_cursor_presentation(primary_cursor_presentation)
+                            }),
+                        );
                         if (primary.is_some() || cursor.is_some())
                             && !self
                                 .presented_planes
@@ -1159,7 +1174,40 @@ impl NativeRuntime {
 mod tests {
     use super::*;
     use crate::native_output::kms_worker::KmsPrimaryCursorPresentation;
-    use crate::native_output::presentation::plane::PresentedCursorDelivery;
+    use crate::native_output::presentation::plane::{
+        CursorCoupling, CursorPlanePoint, CursorRevision, PresentedCursorDelivery,
+        PresentedCursorState,
+    };
+
+    #[test]
+    fn primary_software_presentation_wins_over_disabled_cursor_owner() {
+        let software = PresentedCursorState {
+            revision: CursorRevision::initial().advance_image(),
+            coupling: CursorCoupling::EmbeddedInPrimary,
+            delivery: PresentedCursorDelivery::Software,
+            framebuffer_id: None,
+            visible: true,
+            output_position: CursorPlanePoint { x: 200, y: 300 },
+            hotspot: CursorPlanePoint { x: 4, y: 5 },
+        };
+        let old_hardware = PresentedCursorState {
+            revision: CursorRevision::initial(),
+            coupling: CursorCoupling::IndependentPlane,
+            delivery: PresentedCursorDelivery::Hardware,
+            framebuffer_id: Some(91),
+            visible: true,
+            output_position: CursorPlanePoint { x: 10, y: 20 },
+            hotspot: CursorPlanePoint { x: 1, y: 2 },
+        };
+
+        assert_eq!(
+            select_cursor_promotion(
+                KmsPrimaryCursorPresentation::Promote(software),
+                Some(old_hardware),
+            ),
+            Some(software)
+        );
+    }
 
     #[test]
     fn primary_pageflip_uses_frozen_cursor_presentation_metadata() {

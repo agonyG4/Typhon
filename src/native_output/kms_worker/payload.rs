@@ -197,6 +197,7 @@ pub(crate) enum KmsCommitPayloadError {
     MissingPrimaryOwner,
     MissingCursorOwner,
     CursorDeliveryMismatch,
+    PrimaryCursorPresentationMismatch,
     OwnerIdentityMismatch,
     OwnerGenerationMismatch,
     OwnerTargetMismatch,
@@ -384,6 +385,55 @@ impl KmsCommitJob {
                 return Err(KmsCommitPayloadError::PlaneDeltaChangesPrimary);
             }
             _ => return Err(KmsCommitPayloadError::PrimaryAssignmentMismatch),
+        }
+
+        match (
+            self.primary_cursor_presentation,
+            self.kind,
+            &self.primary,
+            self.cursor_delivery,
+            &self.cursor,
+        ) {
+            (
+                KmsPrimaryCursorPresentation::Promote(_),
+                AtomicCommitKind::PlaneDelta { .. },
+                _,
+                _,
+                _,
+            ) => return Err(KmsCommitPayloadError::PrimaryCursorPresentationMismatch),
+            (KmsPrimaryCursorPresentation::Promote(_), _, KmsPrimaryUpdate::Unchanged, _, _) => {
+                return Err(KmsCommitPayloadError::PrimaryCursorPresentationMismatch);
+            }
+            (
+                KmsPrimaryCursorPresentation::Promote(state),
+                AtomicCommitKind::DirectPrimary { .. },
+                _,
+                _,
+                _,
+            ) if state.delivery == PresentedCursorDelivery::Software => {
+                return Err(KmsCommitPayloadError::PrimaryCursorPresentationMismatch);
+            }
+            (
+                KmsPrimaryCursorPresentation::Promote(state),
+                _,
+                KmsPrimaryUpdate::Framebuffer { .. },
+                delivery,
+                KmsCursorUpdate::Set(cursor),
+            ) if state.delivery != delivery
+                || (state.delivery == PresentedCursorDelivery::Software && cursor.visible) =>
+            {
+                return Err(KmsCommitPayloadError::PrimaryCursorPresentationMismatch);
+            }
+            (
+                KmsPrimaryCursorPresentation::Promote(state),
+                _,
+                KmsPrimaryUpdate::Framebuffer { .. },
+                delivery,
+                _,
+            ) if state.delivery != delivery => {
+                return Err(KmsCommitPayloadError::PrimaryCursorPresentationMismatch);
+            }
+            _ => {}
         }
 
         if matches!(self.kind, AtomicCommitKind::PlaneDelta { .. })
