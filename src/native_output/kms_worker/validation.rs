@@ -1,3 +1,4 @@
+use super::super::queue::PendingBundleSnapshot;
 use super::*;
 
 pub(super) fn invalidate_queued_dependents(
@@ -44,13 +45,13 @@ pub(super) fn invalidate_queued_dependents(
 }
 
 impl KmsCommitWorkerHandle {
-    pub(crate) fn pending_bundle_identity(
+    pub(crate) fn pending_bundle_snapshot(
         &self,
         output_generation: u64,
         crtc_id: u32,
-    ) -> Option<KmsCommitBundleIdentity> {
+    ) -> Option<PendingBundleSnapshot> {
         self.shared
-            .pending_bundle_identity(output_generation, crtc_id)
+            .pending_bundle_snapshot(output_generation, crtc_id)
     }
 
     pub(crate) fn attachable_primary(

@@ -547,6 +547,15 @@ impl NativeRuntime {
                 .ok_or_else(|| {
                     io::Error::other("cursor-only Atomic output has no presentation target")
                 })?;
+            let Some(validation_base) = validation_base_for_submission(
+                kms_commit_worker.as_ref(),
+                *presented_planes,
+                *drm_file_generation,
+                target.crtc_id,
+            ) else {
+                *queued_redraw_requested = true;
+                return Ok(());
+            };
             let Some(decision) = present_cursor_for_presentation(
                 worker_mode,
                 kms_commit_worker.as_ref(),
@@ -561,12 +570,7 @@ impl NativeRuntime {
                 *drm_file_generation,
                 pacing_mode,
                 cursor_epoch,
-                validation_base_for_submission(
-                    kms_commit_worker.as_ref(),
-                    *presented_planes,
-                    *drm_file_generation,
-                    target.crtc_id,
-                ),
+                validation_base,
                 last_submitted_cursor_epoch,
                 cursor_output_arbitration,
                 frame_scheduler,
@@ -708,6 +712,15 @@ impl NativeRuntime {
                             }) {
                                 test_only = KmsTestOnlyPolicy::Required;
                             }
+                            let Some(validation_base) = validation_base_for_submission(
+                                kms_commit_worker.as_ref(),
+                                *presented_planes,
+                                *drm_file_generation,
+                                target.crtc_id,
+                            ) else {
+                                *queued_redraw_requested = true;
+                                return Ok(());
+                            };
                             let direct_result = finish_direct_worker_queued(
                                 kms_commit_worker
                                     .as_ref()
@@ -725,12 +738,7 @@ impl NativeRuntime {
                                 worker_ctx(
                                     atomic_cursor.as_ref(),
                                     frame_pacing,
-                                    validation_base_for_submission(
-                                        kms_commit_worker.as_ref(),
-                                        *presented_planes,
-                                        *drm_file_generation,
-                                        target.crtc_id,
-                                    ),
+                                    validation_base,
                                     planned_cursor_delivery,
                                     primary_cursor,
                                 ),
@@ -1030,6 +1038,15 @@ impl NativeRuntime {
                                 if waits_for_target {
                                     frame_pacing.note_ready_frame(ready_at_ns, render_ahead);
                                 } else {
+                                    let Some(validation_base) = validation_base_for_submission(
+                                        kms_commit_worker.as_ref(),
+                                        *presented_planes,
+                                        *drm_file_generation,
+                                        target.crtc_id,
+                                    ) else {
+                                        *queued_redraw_requested = true;
+                                        return Ok(());
+                                    };
                                     let Some((
                                         token,
                                         framebuffer_id,
@@ -1050,12 +1067,7 @@ impl NativeRuntime {
                                         worker_ctx(
                                             atomic_cursor.as_ref(),
                                             frame_pacing,
-                                            validation_base_for_submission(
-                                                kms_commit_worker.as_ref(),
-                                                *presented_planes,
-                                                *drm_file_generation,
-                                                target.crtc_id,
-                                            ),
+                                            validation_base,
                                             planned_cursor_delivery,
                                             primary_cursor,
                                         ),

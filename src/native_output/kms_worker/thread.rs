@@ -766,11 +766,12 @@ fn collect_cursor_sidecar_before_freeze(
                 primary.bundle_identity = identity;
             }
         }
+        state.phase = KmsWorkerPhase::FrozenForValidation;
+        state.executing_primary = None;
         (true, returned)
     };
-    set_worker_phase(shared, KmsWorkerPhase::FrozenForValidation);
     #[cfg(test)]
-    if let Some(pause) = shared.take_frozen_pause_for_test() {
+    if running && let Some(pause) = shared.take_frozen_pause_for_test() {
         pause.pause();
     }
     (running, returned_sidecar)

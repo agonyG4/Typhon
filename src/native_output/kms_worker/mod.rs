@@ -22,7 +22,7 @@ pub(crate) use policy::{
 pub(crate) use queue::KmsWorkerForcedShutdownDisposition;
 pub(crate) use queue::{
     AttachablePrimary, CursorSidecarOfferError, KmsCommitAdmissionPermit, KmsWorkerAdmissionError,
-    KmsWorkerFatalJob, WorkerInFlight,
+    KmsWorkerFatalJob, PendingBundleSnapshot, WorkerInFlight,
 };
 #[cfg(test)]
 pub(crate) use thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};

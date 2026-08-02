@@ -221,6 +221,15 @@ pub(crate) enum AttachablePrimaryPhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingBundleSnapshot {
+    MutablePreFreeze {
+        primary_transaction_id: crate::native_output::OutputTransactionId,
+    },
+    Frozen(KmsCommitBundleIdentity),
+    InFlight(KmsCommitBundleIdentity),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AttachablePrimary {
     pub(crate) transaction_id: crate::native_output::OutputTransactionId,
     pub(crate) bundle_identity: KmsCommitBundleIdentity,
@@ -436,23 +445,47 @@ impl WorkerShared {
         })
     }
 
-    pub(crate) fn pending_bundle_identity(
+    pub(crate) fn pending_bundle_snapshot(
         &self,
         output_generation: u64,
         crtc_id: u32,
-    ) -> Option<KmsCommitBundleIdentity> {
+    ) -> Option<PendingBundleSnapshot> {
         let state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state
-            .inflight
-            .map(|inflight| inflight.bundle)
-            .or(state.executing_bundle_identity)
-            .or_else(|| state.queued.front().map(KmsCommitJob::identity))
-            .filter(|identity| {
-                identity.output_generation == output_generation && identity.crtc_id == crtc_id
-            })
+        if let Some(inflight) = state.inflight {
+            return (inflight.output_generation == output_generation
+                && inflight.bundle.crtc_id == crtc_id)
+                .then_some(PendingBundleSnapshot::InFlight(inflight.bundle));
+        }
+        if state.executing {
+            let identity = state.executing_bundle_identity?;
+            if identity.output_generation != output_generation || identity.crtc_id != crtc_id {
+                return None;
+            }
+            return state.executing_primary.as_ref().map_or_else(
+                || Some(PendingBundleSnapshot::Frozen(identity)),
+                |primary| {
+                    Some(PendingBundleSnapshot::MutablePreFreeze {
+                        primary_transaction_id: primary.transaction_id,
+                    })
+                },
+            );
+        }
+        let job = state.queued.front()?;
+        if job.output_generation != output_generation || job.crtc_id != crtc_id {
+            return None;
+        }
+        if job.kind.is_primary()
+            && matches!(job.primary, super::KmsPrimaryUpdate::Framebuffer { .. })
+            && let Some(primary_transaction_id) = job.owners.primary_transaction_id()
+        {
+            return Some(PendingBundleSnapshot::MutablePreFreeze {
+                primary_transaction_id,
+            });
+        }
+        Some(PendingBundleSnapshot::Frozen(job.identity()))
     }
 
     pub(crate) fn new(result_fd: OwnedFd) -> Self {
@@ -524,6 +557,11 @@ impl WorkerShared {
                 if state
                     .inflight
                     .is_some_and(|inflight| inflight.bundle == required)
+                    || state.executing_primary.is_some()
+                    || state.queued.front().is_some_and(|job| {
+                        job.kind.is_primary()
+                            && matches!(job.primary, super::KmsPrimaryUpdate::Framebuffer { .. })
+                    })
                 {
                     ValidationBaseDisposition::Wait
                 } else {

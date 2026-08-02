@@ -10,7 +10,7 @@ use super::*;
 use crate::native_output::kms_worker::{
     KmsBundleOwners, KmsCommitAdmissionPermit, KmsCommitJob, KmsCommitWorkerHandle,
     KmsCursorUpdate, KmsPrimaryCursorPresentation, KmsPrimaryUpdate, KmsTestOnlyPolicy,
-    KmsValidationBase, KmsWorkerAdmissionError,
+    KmsValidationBase, KmsWorkerAdmissionError, PendingBundleSnapshot,
 };
 use oblivion_one::native::kms::FramebufferId;
 
@@ -48,16 +48,24 @@ pub(super) fn validation_base_for_submission(
     presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
     output_generation: u64,
     crtc_id: u32,
-) -> KmsValidationBase {
+) -> Option<KmsValidationBase> {
     worker
-        .and_then(|worker| worker.pending_bundle_identity(output_generation, crtc_id))
-        .map_or(
-            KmsValidationBase::Presented {
-                snapshot: presented_planes,
-                output_generation,
-                crtc_id,
+        .and_then(|worker| worker.pending_bundle_snapshot(output_generation, crtc_id))
+        .map_or_else(
+            || {
+                Some(KmsValidationBase::Presented {
+                    snapshot: presented_planes,
+                    output_generation,
+                    crtc_id,
+                })
             },
-            KmsValidationBase::Predecessor,
+            |snapshot| match snapshot {
+                PendingBundleSnapshot::MutablePreFreeze { .. } => None,
+                PendingBundleSnapshot::Frozen(identity)
+                | PendingBundleSnapshot::InFlight(identity) => {
+                    Some(KmsValidationBase::Predecessor(identity))
+                }
+            },
         )
 }
 

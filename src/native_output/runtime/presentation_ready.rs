@@ -53,8 +53,11 @@ pub(super) fn submit_ready_frame(
     #[cfg(test)] native_io_recorder: &mut NativeIoRecorder,
 ) -> NativeResult<ReadySubmissionResult> {
     let repaint_present_start = Instant::now();
-    let validation_base =
-        validation_base_for_submission(worker, presented_planes, output_generation, crtc_id);
+    let Some(validation_base) =
+        validation_base_for_submission(worker, presented_planes, output_generation, crtc_id)
+    else {
+        return Ok(ReadySubmissionResult::Unavailable);
+    };
     let primary_cursor_presentation = freeze_primary_cursor_presentation(
         presented_planes.cursor.delivery,
         cursor_delivery,

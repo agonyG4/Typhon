@@ -681,8 +681,15 @@ fn sidecar_offered_before_primary_dequeue_is_attached() {
         cursor_transaction_id: Some(sidecar.transaction.id()),
         ..job.identity()
     };
+    let freeze_pause = handle.pause_after_freeze_for_test();
     offer_sidecar(&handle, sidecar);
     reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    freeze_pause.wait_until_selected();
+    assert_eq!(
+        handle.pending_bundle_snapshot(1, 7),
+        Some(super::PendingBundleSnapshot::Frozen(expected_identity))
+    );
+    freeze_pause.release();
 
     let events = wait_for_fence_event(&handle, 339, |event| {
         matches!(event, KmsWorkerEvent::Submitted { .. })
@@ -695,6 +702,29 @@ fn sidecar_offered_before_primary_dequeue_is_attached() {
     )));
     handle.ack_pageflip(token, transaction_id, 1).unwrap();
     drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn primary_without_sidecar_publishes_its_frozen_identity() {
+    let handle = KmsCommitWorkerHandle::start(Arc::new(RecordingExecutor::accepting())).unwrap();
+    let job = test_job(338);
+    let identity = job.identity();
+    let token = job.token;
+    let transaction_id = job.transaction_id;
+    let freeze_pause = handle.pause_after_freeze_for_test();
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    freeze_pause.wait_until_selected();
+    assert_eq!(
+        handle.pending_bundle_snapshot(1, 7),
+        Some(super::PendingBundleSnapshot::Frozen(identity))
+    );
+    freeze_pause.release();
+    wait_for_fence_event(&handle, 338, |event| {
+        matches!(event, KmsWorkerEvent::Submitted { .. })
+    });
+    handle.ack_pageflip(token, transaction_id, 1).unwrap();
     handle.request_quiesce();
     handle.join().unwrap();
 }
@@ -768,7 +798,10 @@ fn embedded_cursor_primary_is_attachable_and_exposes_exact_bundle_identity() {
         attachable.validation_base,
         KmsValidationBase::Predecessor(first_identity)
     );
-    assert_eq!(handle.pending_bundle_identity(1, 7), Some(first_identity));
+    assert_eq!(
+        handle.pending_bundle_snapshot(1, 7),
+        Some(super::PendingBundleSnapshot::InFlight(first_identity))
+    );
 
     handle
         .ack_pageflip(first_token, first_transaction, 1)
@@ -917,8 +950,8 @@ fn late_bound_bundle_identity_is_published_before_dependents_observe_it() {
         ..old_identity
     };
     assert_eq!(
-        handle.pending_bundle_identity(1, 7),
-        Some(replaced_identity)
+        handle.pending_bundle_snapshot(1, 7),
+        Some(super::PendingBundleSnapshot::Frozen(replaced_identity))
     );
 
     let mut dependent = test_cursor_job(9142);
@@ -954,6 +987,91 @@ fn late_bound_bundle_identity_is_published_before_dependents_observe_it() {
         event,
         KmsWorkerEvent::Submitted { ownership }
             if ownership.job.validation_base == KmsValidationBase::Predecessor(replaced_identity)
+    )));
+    handle
+        .ack_pageflip(dependent_token, dependent_transaction, 1)
+        .unwrap();
+    drop((primary_events, dependent_events));
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
+fn mutable_pre_freeze_primary_does_not_publish_a_predecessor_identity() {
+    let handle = KmsCommitWorkerHandle::start(Arc::new(RecordingExecutor::accepting())).unwrap();
+    let (mut primary, primary_id, _) = two_owner_job(921);
+    let mut embedded = AtomicCursorVisualState::hidden(64, 64);
+    embedded.visible = true;
+    embedded.framebuffer_id = Some(921);
+    embedded.image_generation = 1;
+    primary.cursor = KmsCursorUpdate::Set(embedded.clone());
+    let old_identity = primary.identity();
+    let mut sidecar = test_sidecar(&primary, 9211, CursorSidecarCoupling::Independent);
+    sidecar.revision =
+        crate::native_output::presentation::plane::CursorRevision::initial().advance_motion();
+    let mut replacement = embedded;
+    replacement.x = 4;
+    replacement.image_generation = 2;
+    sidecar.assignment = crate::native_output::CursorPlaneAssignment::Atomic {
+        desired_epoch: 2,
+        state: Some(replacement),
+    };
+    let collecting_pause = handle.pause_collecting_sidecar_for_test();
+    let frozen_pause = handle.pause_after_freeze_for_test();
+    reserve_for_test(&handle, primary.kind)
+        .enqueue(primary)
+        .unwrap();
+    collecting_pause.wait_until_selected();
+
+    let pre_freeze_snapshot = handle.pending_bundle_snapshot(1, 7);
+    assert!(offer_sidecar(&handle, sidecar).is_none());
+    collecting_pause.release();
+    frozen_pause.wait_until_selected();
+
+    assert!(matches!(
+        pre_freeze_snapshot,
+        Some(super::PendingBundleSnapshot::MutablePreFreeze {
+            primary_transaction_id
+        }) if primary_transaction_id == primary_id
+    ));
+
+    let final_identity = KmsCommitBundleIdentity {
+        cursor_transaction_id: Some(crate::native_output::OutputTransactionId::new(
+            std::num::NonZeroU64::new(921100).unwrap(),
+        )),
+        ..old_identity
+    };
+    assert_eq!(
+        handle.pending_bundle_snapshot(1, 7),
+        Some(super::PendingBundleSnapshot::Frozen(final_identity))
+    );
+
+    let mut dependent = test_cursor_job(9212);
+    dependent.validation_base = KmsValidationBase::Predecessor(final_identity);
+    let dependent_token = dependent.token;
+    let dependent_transaction = dependent.transaction_id;
+    reserve_for_test(&handle, dependent.kind)
+        .enqueue(dependent)
+        .unwrap();
+    frozen_pause.release();
+
+    let primary_events = wait_for_fence_event(
+        &handle,
+        921,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.identity() == final_identity),
+    );
+    handle
+        .ack_pageflip_identity(final_identity, primary_id)
+        .unwrap();
+    let dependent_events = wait_for_fence_event(
+        &handle,
+        9212,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token == dependent_token),
+    );
+    assert!(dependent_events.iter().any(|event| matches!(
+        event,
+        KmsWorkerEvent::Submitted { ownership }
+            if ownership.job.validation_base == KmsValidationBase::Predecessor(final_identity)
     )));
     handle
         .ack_pageflip(dependent_token, dependent_transaction, 1)
