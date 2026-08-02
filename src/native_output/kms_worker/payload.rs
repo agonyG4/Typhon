@@ -41,7 +41,7 @@ pub(crate) struct KmsCommitJob {
     pub(crate) direct_primary_lease: Option<DirectPrimaryLease>,
     pub(crate) test_only_duration_ns: Option<u64>,
     pub(crate) pacing_frame_id: Option<u64>,
-    pub(crate) test_only: KmsTestOnlyPolicy,
+    pub(crate) test_policy: KmsCommitTestPolicy,
     pub(crate) ready_submit: bool,
 }
 
@@ -147,6 +147,38 @@ pub(crate) enum KmsCursorUpdate {
 pub(crate) enum KmsTestOnlyPolicy {
     Skip,
     Required,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KmsCommitTestPolicy {
+    pub(crate) primary: KmsTestOnlyPolicy,
+    pub(crate) cursor: KmsTestOnlyPolicy,
+}
+
+impl KmsCommitTestPolicy {
+    pub(crate) const fn from_primary(primary: KmsTestOnlyPolicy) -> Self {
+        Self {
+            primary,
+            cursor: KmsTestOnlyPolicy::Skip,
+        }
+    }
+
+    pub(crate) const fn from_cursor(cursor: KmsTestOnlyPolicy) -> Self {
+        Self {
+            primary: KmsTestOnlyPolicy::Skip,
+            cursor,
+        }
+    }
+
+    pub(crate) const fn effective(self) -> KmsTestOnlyPolicy {
+        if matches!(self.primary, KmsTestOnlyPolicy::Required)
+            || matches!(self.cursor, KmsTestOnlyPolicy::Required)
+        {
+            KmsTestOnlyPolicy::Required
+        } else {
+            KmsTestOnlyPolicy::Skip
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -8,9 +8,9 @@ use super::presentation_transactions::{
 };
 use super::*;
 use crate::native_output::kms_worker::{
-    KmsBundleOwners, KmsCommitAdmissionPermit, KmsCommitJob, KmsCommitWorkerHandle,
-    KmsCursorUpdate, KmsPrimaryCursorPresentation, KmsPrimaryUpdate, KmsTestOnlyPolicy,
-    KmsValidationBase, KmsWorkerAdmissionError, PendingBundleSnapshot,
+    KmsBundleOwners, KmsCommitAdmissionPermit, KmsCommitJob, KmsCommitTestPolicy,
+    KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryCursorPresentation, KmsPrimaryUpdate,
+    KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerAdmissionError, PendingBundleSnapshot,
 };
 use oblivion_one::native::kms::FramebufferId;
 
@@ -399,7 +399,7 @@ pub(super) fn queue_explicit_ready_for_presentation(
         crate::native_output::presentation::plane_policy::CursorCapabilityKey,
     >,
     pacing_frame_id: Option<u64>,
-    test_only: KmsTestOnlyPolicy,
+    test_policy: KmsCommitTestPolicy,
     ready_submit: bool,
     validation_base: KmsValidationBase,
 ) -> NativeResult<Option<(u64, u32, OutputTransactionId)>> {
@@ -419,7 +419,7 @@ pub(super) fn queue_explicit_ready_for_presentation(
         cursor_pin,
         cursor_capability_key,
         pacing_frame_id,
-        test_only,
+        test_policy,
         ready_submit,
         validation_base,
     )? {
@@ -494,7 +494,7 @@ pub(super) fn submit_explicit_ready_for_presentation(
             cursor_pin,
             cursor_capability_key,
             pacing_frame_id,
-            test_only,
+            KmsCommitTestPolicy::from_cursor(test_only),
             ready_submit,
             context.validation_base,
         )?
@@ -528,7 +528,7 @@ pub(super) fn queue_compatibility_for_presentation(
         crate::native_output::presentation::plane_policy::CursorCapabilityKey,
     >,
     pacing_frame_id: Option<u64>,
-    test_only: KmsTestOnlyPolicy,
+    test_policy: KmsCommitTestPolicy,
     cursor_epoch: u64,
     validation_base: KmsValidationBase,
 ) -> NativeResult<Option<(NativePresentResult, Option<OutputTransactionId>)>> {
@@ -550,7 +550,7 @@ pub(super) fn queue_compatibility_for_presentation(
         cursor_pin,
         cursor_capability_key,
         pacing_frame_id,
-        test_only,
+        test_policy,
         cursor_epoch,
         validation_base,
     )? {
@@ -671,7 +671,7 @@ pub(super) fn finish_direct_worker_queued(
         direct_primary_lease: Some(direct_lease),
         test_only_duration_ns: None,
         pacing_frame_id,
-        test_only,
+        test_policy: KmsCommitTestPolicy::from_primary(test_only),
         ready_submit: false,
     };
     debug_assert!(job.direct_primary_lease.is_some());

@@ -794,7 +794,7 @@ fn attach_sidecar(job: &mut KmsCommitJob, sidecar: CursorSidecar) {
         revision: sidecar.revision,
         capability_key: sidecar.capability_key,
     });
-    job.test_only = sidecar.test_policy;
+    job.test_policy.cursor = sidecar.test_policy;
 }
 
 fn publish_terminal_sidecar_return(
@@ -885,7 +885,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
         }
 
         let mut retries = 0u8;
-        if matches!(job.test_only, KmsTestOnlyPolicy::Required) {
+        if matches!(job.test_policy.effective(), KmsTestOnlyPolicy::Required) {
             set_worker_phase(&shared, KmsWorkerPhase::TestOnly);
             let test = {
                 let _submit_gate = shared

@@ -5,10 +5,10 @@ use super::tests::{
 use super::thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
 use super::{
     CursorSidecar, CursorSidecarCoupling, CursorSidecarMailbox, EstablishedKmsBase,
-    KmsBundleOwners, KmsCommitBundleIdentity, KmsCommitJob, KmsCommitWorkerHandle, KmsCursorOwner,
-    KmsCursorUpdate, KmsPrimaryOwner, KmsPrimaryUpdate, KmsSubmittedOwnership, KmsTestOnlyPolicy,
-    KmsValidationBase, KmsWorkerEvent, KmsWorkerFatalJob, ValidationBaseDisposition,
-    validation_base_ready,
+    KmsBundleOwners, KmsCommitBundleIdentity, KmsCommitJob, KmsCommitTestPolicy,
+    KmsCommitWorkerHandle, KmsCursorOwner, KmsCursorUpdate, KmsPrimaryOwner, KmsPrimaryUpdate,
+    KmsSubmittedOwnership, KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerEvent, KmsWorkerFatalJob,
+    ValidationBaseDisposition, validation_base_ready,
 };
 use oblivion_one::native::kms::AtomicCursorVisualState;
 use std::{
@@ -57,6 +57,20 @@ fn test_sidecar(job: &KmsCommitJob, id: u64, coupling: CursorSidecarCoupling) ->
     }
 }
 
+#[test]
+fn commit_test_policy_preserves_and_composes_component_requirements() {
+    let mut policy = KmsCommitTestPolicy::from_primary(KmsTestOnlyPolicy::Required);
+    policy.cursor = KmsTestOnlyPolicy::Skip;
+    assert_eq!(policy.effective(), KmsTestOnlyPolicy::Required);
+
+    let mut policy = KmsCommitTestPolicy::from_primary(KmsTestOnlyPolicy::Skip);
+    policy.cursor = KmsTestOnlyPolicy::Required;
+    assert_eq!(policy.effective(), KmsTestOnlyPolicy::Required);
+
+    let policy = KmsCommitTestPolicy::from_primary(KmsTestOnlyPolicy::Skip);
+    assert_eq!(policy.effective(), KmsTestOnlyPolicy::Skip);
+}
+
 fn test_cursor_job(token: u64) -> KmsCommitJob {
     let mut job = test_job(token);
     job.kind = crate::native_output::runtime::AtomicCommitKind::PlaneDelta {
@@ -66,7 +80,7 @@ fn test_cursor_job(token: u64) -> KmsCommitJob {
     };
     job.primary = KmsPrimaryUpdate::Unchanged;
     job.cursor = KmsCursorUpdate::Disable;
-    job.test_only = KmsTestOnlyPolicy::Required;
+    job.test_policy.cursor = KmsTestOnlyPolicy::Required;
     job
 }
 
@@ -1123,7 +1137,7 @@ fn disabling_sidecar_replaces_hardware_delivery_as_one_owner_unit() {
                     == crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden
                 && ownership.job.owners.cursor().and_then(|owner| owner.sidecar_id)
                     == Some(sidecar_id)
-                && ownership.job.test_only == KmsTestOnlyPolicy::Required
+                && ownership.job.test_policy.effective() == KmsTestOnlyPolicy::Required
     )));
     let identity = events.iter().find_map(|event| {
         if let KmsWorkerEvent::Submitted { ownership } = event {
@@ -1185,7 +1199,7 @@ fn visible_sidecar_replaces_hidden_delivery_as_one_owner_unit() {
                     == crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware
                 && ownership.job.owners.cursor().and_then(|owner| owner.sidecar_id)
                     == Some(sidecar_id)
-                && ownership.job.test_only == KmsTestOnlyPolicy::Required
+                && ownership.job.test_policy.effective() == KmsTestOnlyPolicy::Required
     )));
     let identity = events.iter().find_map(|event| {
         if let KmsWorkerEvent::Submitted { ownership } = event {
@@ -1213,7 +1227,7 @@ fn sidecar_replacement_publishes_its_exact_test_policy() {
         framebuffer_id: Some(917),
         ..AtomicCursorVisualState::hidden(64, 64)
     });
-    primary.test_only = KmsTestOnlyPolicy::Required;
+    primary.test_policy.primary = KmsTestOnlyPolicy::Required;
     let mut sidecar = test_sidecar(&primary, 9171, CursorSidecarCoupling::Independent);
     sidecar.revision =
         crate::native_output::presentation::plane::CursorRevision::initial().advance_motion();
@@ -1246,7 +1260,9 @@ fn sidecar_replacement_publishes_its_exact_test_policy() {
     assert!(events.iter().any(|event| matches!(
         event,
         KmsWorkerEvent::Submitted { ownership }
-            if ownership.job.test_only == KmsTestOnlyPolicy::Skip
+            if ownership.job.test_policy.primary == KmsTestOnlyPolicy::Required
+                && ownership.job.test_policy.cursor == KmsTestOnlyPolicy::Skip
+                && ownership.job.test_policy.effective() == KmsTestOnlyPolicy::Required
     )));
     let identity = events.iter().find_map(|event| {
         if let KmsWorkerEvent::Submitted { ownership } = event {
@@ -1610,7 +1626,7 @@ fn independent_sidecar_promotes_at_deadline_but_coupled_sidecar_never_does() {
 
 fn required_direct_test_job(token: u64) -> KmsCommitJob {
     let mut job = test_job(token);
-    job.test_only = KmsTestOnlyPolicy::Required;
+    job.test_policy.primary = KmsTestOnlyPolicy::Required;
     job.cursor = KmsCursorUpdate::Set(AtomicCursorVisualState {
         framebuffer_id: Some(91),
         visible: true,

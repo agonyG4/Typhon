@@ -247,7 +247,7 @@ pub(super) fn test_job(token: u64) -> KmsCommitJob {
         direct_primary_lease: None,
         test_only_duration_ns: None,
         pacing_frame_id: None,
-        test_only: KmsTestOnlyPolicy::Skip,
+        test_policy: KmsCommitTestPolicy::from_primary(KmsTestOnlyPolicy::Skip),
         ready_submit: false,
     }
 }
@@ -271,7 +271,7 @@ fn test_cursor_job(token: u64) -> KmsCommitJob {
     };
     job.primary = KmsPrimaryUpdate::Unchanged;
     job.cursor = KmsCursorUpdate::Disable;
-    job.test_only = KmsTestOnlyPolicy::Required;
+    job.test_policy.cursor = KmsTestOnlyPolicy::Required;
     job
 }
 

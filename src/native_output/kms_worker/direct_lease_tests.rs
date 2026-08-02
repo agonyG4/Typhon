@@ -1,8 +1,8 @@
 use super::tests::{reserve_for_test, test_job, wait_for_fence_event};
 use super::thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
 use super::{
-    KmsCommitJob, KmsCommitPayloadError, KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryUpdate,
-    KmsTestOnlyPolicy, KmsWorkerAdmissionError, KmsWorkerEvent,
+    KmsCommitJob, KmsCommitPayloadError, KmsCommitTestPolicy, KmsCommitWorkerHandle,
+    KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsWorkerAdmissionError, KmsWorkerEvent,
 };
 use crate::native_output::scanout::DirectPrimaryLease;
 use crate::native_output::{
@@ -356,7 +356,7 @@ fn assert_executing_direct_candidate_survives_real_submit(
     let key = test_direct_key(3);
     let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
     let mut job = test_direct_job(token, key, 42, Some(lease));
-    job.test_only = test_only;
+    job.test_policy = KmsCommitTestPolicy::from_primary(test_only);
     reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
 
     executor.started.wait();
@@ -397,7 +397,7 @@ fn assert_duplicate_candidate_is_rejected_after_atomic_dequeue(
     let key = test_direct_key(3);
     let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
     let mut job = test_direct_job(token, key, 42, Some(lease));
-    job.test_only = test_only;
+    job.test_policy = KmsCommitTestPolicy::from_primary(test_only);
     reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
 
     pause.wait_until_selected();
@@ -582,7 +582,7 @@ fn direct_test_rejection_returns_the_lease_once() {
     let key = test_direct_key(3);
     let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
     let mut job = test_direct_job(66, key, 42, Some(lease));
-    job.test_only = KmsTestOnlyPolicy::Required;
+    job.test_policy.primary = KmsTestOnlyPolicy::Required;
     reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
 
     let events = wait_for_fence_event(
@@ -680,7 +680,7 @@ fn successful_direct_submit_transfers_the_lease_to_submitted_event() {
         event,
         KmsWorkerEvent::Submitted { ownership } if ownership.job.direct_primary_lease.as_ref()
             .is_some_and(|lease| lease.key() == key && lease.framebuffer_id() == 42)
-            && ownership.job.test_only == KmsTestOnlyPolicy::Skip
+            && ownership.job.test_policy.effective() == KmsTestOnlyPolicy::Skip
     )));
     assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 0);
     handle

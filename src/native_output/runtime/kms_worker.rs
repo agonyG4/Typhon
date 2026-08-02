@@ -7,10 +7,10 @@
 use std::sync::Arc;
 
 use super::super::kms_worker::{
-    CursorSidecarReturnReason, KmsBundleOwners, KmsCommitJob, KmsCommitWorkerHandle,
-    KmsCursorUpdate, KmsPrimaryCursorPresentation, KmsPrimaryUpdate, KmsSubmittedOwnership,
-    KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerAdmissionError, KmsWorkerEvent,
-    KmsWorkerFatalJob, ValidationBaseInvalidationReason,
+    CursorSidecarReturnReason, KmsBundleOwners, KmsCommitJob, KmsCommitTestPolicy,
+    KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryCursorPresentation, KmsPrimaryUpdate,
+    KmsSubmittedOwnership, KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerAdmissionError,
+    KmsWorkerEvent, KmsWorkerFatalJob, ValidationBaseInvalidationReason,
 };
 pub(super) use super::kms_worker_teardown::{
     retain_complete_submitted_ownership, retain_uncertain_job_with_suspension,
@@ -114,7 +114,7 @@ pub(super) fn queue_explicit_composited_frame(
         crate::native_output::presentation::plane_policy::CursorCapabilityKey,
     >,
     pacing_frame_id: Option<u64>,
-    test_only: KmsTestOnlyPolicy,
+    test_policy: KmsCommitTestPolicy,
     ready_submit: bool,
     validation_base: KmsValidationBase,
 ) -> NativeResult<WorkerQueueOutcome> {
@@ -229,7 +229,7 @@ pub(super) fn queue_explicit_composited_frame(
         direct_primary_lease: None,
         test_only_duration_ns: None,
         pacing_frame_id,
-        test_only,
+        test_policy,
         ready_submit,
     };
     let queued_descriptor = output_transactions
@@ -316,7 +316,7 @@ pub(super) fn queue_atomic_compatibility_frame(
         crate::native_output::presentation::plane_policy::CursorCapabilityKey,
     >,
     pacing_frame_id: Option<u64>,
-    test_only: KmsTestOnlyPolicy,
+    test_policy: KmsCommitTestPolicy,
     cursor_epoch: u64,
     validation_base: KmsValidationBase,
 ) -> NativeResult<WorkerQueueOutcome> {
@@ -458,7 +458,7 @@ pub(super) fn queue_atomic_compatibility_frame(
         direct_primary_lease: None,
         test_only_duration_ns: None,
         pacing_frame_id,
-        test_only,
+        test_policy,
         ready_submit: true,
     };
     let descriptor = output_transactions
@@ -868,7 +868,10 @@ impl NativeRuntime {
                 let out_fence = ownership.out_fence.take();
                 let direct_validation_key =
                     if matches!(kind, AtomicCommitKind::DirectPrimary { .. })
-                        && matches!(ownership.job.test_only, KmsTestOnlyPolicy::Required)
+                        && matches!(
+                            ownership.job.test_policy.effective(),
+                            KmsTestOnlyPolicy::Required
+                        )
                     {
                         ownership
                             .job
@@ -880,14 +883,17 @@ impl NativeRuntime {
                     };
                 let direct_primary_lease = ownership.job.direct_primary_lease.take();
                 if matches!(kind, AtomicCommitKind::DirectPrimary { .. }) {
-                    if ownership.job.test_only == KmsTestOnlyPolicy::Required
+                    if ownership.job.test_policy.effective() == KmsTestOnlyPolicy::Required
                         && let Some(duration_ns) = ownership.job.test_only_duration_ns
                     {
                         self.scanout.note_direct_test_only(duration_ns, false);
                     }
                     self.scanout.note_direct_real_submit_attempt(false);
                     self.scanout.note_direct_worker_submission(
-                        matches!(ownership.job.test_only, KmsTestOnlyPolicy::Required),
+                        matches!(
+                            ownership.job.test_policy.effective(),
+                            KmsTestOnlyPolicy::Required
+                        ),
                         submit_started_at,
                         submit_returned_at,
                     );
@@ -1272,7 +1278,7 @@ impl NativeRuntime {
             KmsWorkerEvent::SubmitRejected { job, error }
             | KmsWorkerEvent::BusyExhausted { job, error } => {
                 if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
-                    if job.test_only == KmsTestOnlyPolicy::Required
+                    if job.test_policy.effective() == KmsTestOnlyPolicy::Required
                         && let Some(duration_ns) = job.test_only_duration_ns
                     {
                         self.scanout.note_direct_test_only(duration_ns, false);

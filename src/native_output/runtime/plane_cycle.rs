@@ -3,8 +3,8 @@ use std::sync::Arc;
 use super::*;
 use crate::native_output::kms_worker::{
     AttachablePrimary, CursorSidecar, CursorSidecarCoupling, KmsBundleOwners, KmsCommitJob,
-    KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryCursorPresentation, KmsPrimaryUpdate,
-    KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerAdmissionError,
+    KmsCommitTestPolicy, KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryCursorPresentation,
+    KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerAdmissionError,
 };
 use crate::native_output::presentation::{
     plane::{CursorRevision, PresentedCursorDelivery},
@@ -223,7 +223,7 @@ pub(super) fn queue_plane_delta(
         direct_primary_lease: None,
         test_only_duration_ns: None,
         pacing_frame_id: None,
-        test_only: scheduled_kms_test_policy(cursor),
+        test_policy: KmsCommitTestPolicy::from_cursor(scheduled_kms_test_policy(cursor)),
         ready_submit: false,
     };
     let descriptor = output_transactions

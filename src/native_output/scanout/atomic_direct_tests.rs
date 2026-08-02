@@ -549,7 +549,9 @@ fn worker_queue_owns_direct_resource_before_submit() {
         direct_primary_lease: Some(lease),
         test_only_duration_ns: None,
         pacing_frame_id: None,
-        test_only: KmsTestOnlyPolicy::Required,
+        test_policy: crate::native_output::kms_worker::KmsCommitTestPolicy::from_primary(
+            KmsTestOnlyPolicy::Required,
+        ),
         ready_submit: false,
     };
     let ownership = DirectPrimaryOwnership::default();

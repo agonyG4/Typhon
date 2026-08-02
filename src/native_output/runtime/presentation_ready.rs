@@ -152,7 +152,7 @@ pub(super) fn submit_ready_frame(
                     cursor.and_then(|state| native_cursor.capability_key_for(state))
                 }),
                 pacing_frame_id,
-                test_only,
+                crate::native_output::kms_worker::KmsCommitTestPolicy::from_cursor(test_only),
                 cursor_epoch,
                 validation_base,
             )?
