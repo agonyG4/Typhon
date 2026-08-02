@@ -9,10 +9,61 @@ use std::cell::RefCell;
 
 type ExplicitBatchReleaseTrace = ((u32, u32, u32), Vec<u32>, Vec<u32>);
 
+pub(in crate::compositor::tests) struct TestShmBuffer {
+    _file: File,
+    pool: client_wl_shm_pool::WlShmPool,
+    buffer: client_wl_buffer::WlBuffer,
+}
+
+impl TestShmBuffer {
+    fn new(
+        shm: &client_wl_shm::WlShm,
+        qh: &QueueHandle<RegistryTestState>,
+        width: usize,
+        height: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let pixels = vec![0xff20_3040; width * height];
+        let file = create_test_shm_file(&pixels)?;
+        let pool = shm.create_pool(file.as_fd(), (pixels.len() * 4) as i32, qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            width as i32,
+            height as i32,
+            (width * 4) as i32,
+            client_wl_shm::Format::Argb8888,
+            qh,
+            (),
+        );
+        Ok(Self {
+            _file: file,
+            pool,
+            buffer,
+        })
+    }
+
+    fn attach(&self, surface: &client_wl_surface::WlSurface, width: usize, height: usize) {
+        surface.attach(Some(&self.buffer), 0, 0);
+        surface.damage_buffer(0, 0, width as i32, height as i32);
+    }
+}
+
+impl Drop for TestShmBuffer {
+    fn drop(&mut self) {
+        // The commit request is queued before this owner is dropped, so the
+        // buffer can be destroyed before its backing pool.
+        if self.buffer.is_alive() {
+            self.buffer.destroy();
+        }
+        if self.pool.is_alive() {
+            self.pool.destroy();
+        }
+    }
+}
+
 type InitialXdgTestBuffer = (
     wayland_client::backend::Backend,
     client_wl_surface::WlSurface,
-    client_wl_buffer::WlBuffer,
+    TestShmBuffer,
     i32,
     i32,
 );
@@ -24,7 +75,7 @@ thread_local! {
 
 fn register_initial_xdg_test_buffer(
     surface: &client_wl_surface::WlSurface,
-    buffer: client_wl_buffer::WlBuffer,
+    buffer: TestShmBuffer,
     width: i32,
     height: i32,
 ) {
@@ -54,9 +105,9 @@ pub(in crate::compositor::tests) fn commit_registered_initial_xdg_test_buffer(
     let Some((_, surface, buffer, width, height)) = pending else {
         return;
     };
-    surface.attach(Some(&buffer), 0, 0);
-    surface.damage_buffer(0, 0, width, height);
+    buffer.attach(&surface, width as usize, height as usize);
     surface.commit();
+    drop(buffer);
 }
 
 pub(in crate::compositor::tests) fn assign_test_toplevel(
@@ -1267,18 +1318,7 @@ pub(in crate::compositor::tests) fn create_test_buffered_toplevel(
     let surface = compositor.create_surface(qh, ());
     let xdg_surface = wm_base.get_xdg_surface(&surface, qh, ());
     let toplevel = xdg_surface.get_toplevel(qh, ());
-    let pixels = vec![0xff20_3040; width * height];
-    let file = create_test_shm_file(&pixels)?;
-    let pool = shm.create_pool(file.as_fd(), (pixels.len() * 4) as i32, qh, ());
-    let buffer = pool.create_buffer(
-        0,
-        width as i32,
-        height as i32,
-        (width * 4) as i32,
-        client_wl_shm::Format::Argb8888,
-        qh,
-        (),
-    );
+    let buffer = TestShmBuffer::new(shm, qh, width, height)?;
     register_initial_xdg_test_buffer(&surface, buffer, width as i32, height as i32);
     Ok((surface, xdg_surface, toplevel))
 }
@@ -1290,8 +1330,9 @@ pub(in crate::compositor::tests) fn commit_test_buffered_surface(
     width: usize,
     height: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    attach_test_buffered_surface(surface, shm, qh, width, height)?;
+    let buffer = attach_test_buffered_surface(surface, shm, qh, width, height)?;
     surface.commit();
+    drop(buffer);
     Ok(())
 }
 
@@ -1334,22 +1375,10 @@ pub(in crate::compositor::tests) fn attach_test_buffered_surface(
     qh: &QueueHandle<RegistryTestState>,
     width: usize,
     height: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let pixels = vec![0xff20_3040; width * height];
-    let file = create_test_shm_file(&pixels)?;
-    let pool = shm.create_pool(file.as_fd(), (pixels.len() * 4) as i32, qh, ());
-    let buffer = pool.create_buffer(
-        0,
-        width as i32,
-        height as i32,
-        (width * 4) as i32,
-        client_wl_shm::Format::Argb8888,
-        qh,
-        (),
-    );
-    surface.attach(Some(&buffer), 0, 0);
-    surface.damage_buffer(0, 0, width as i32, height as i32);
-    Ok(())
+) -> Result<TestShmBuffer, Box<dyn std::error::Error>> {
+    let buffer = TestShmBuffer::new(shm, qh, width, height)?;
+    buffer.attach(surface, width, height);
+    Ok(buffer)
 }
 
 pub(in crate::compositor::tests) fn create_client_toplevel_with_positioned_subsurface_buffer(
@@ -1537,14 +1566,18 @@ pub(in crate::compositor::tests) fn capture_multiple_synchronized_child_commits(
     parent.commit();
     connection.flush()?;
     queue.roundtrip(&mut RegistryTestState::default())?;
-    commit_test_buffered_surface(&child, &shm, &qh, 5, 5)?;
-    commit_test_buffered_surface(&parent, &shm, &qh, 20, 15)?;
+    let child_initial = attach_test_buffered_surface(&child, &shm, &qh, 5, 5)?;
+    child.commit();
+    let parent_initial = attach_test_buffered_surface(&parent, &shm, &qh, 20, 15)?;
+    parent.commit();
     connection.flush()?;
     let mut state = RegistryTestState::default();
     queue.roundtrip(&mut state)?;
 
-    commit_test_buffered_surface(&child, &shm, &qh, 11, 7)?;
-    commit_test_buffered_surface(&child, &shm, &qh, 13, 9)?;
+    let child_update_a = attach_test_buffered_surface(&child, &shm, &qh, 11, 7)?;
+    child.commit();
+    let child_update_b = attach_test_buffered_surface(&child, &shm, &qh, 13, 9)?;
+    child.commit();
     connection.flush()?;
     queue.roundtrip(&mut state)?;
     let before_parent = capture_renderable_surface_snapshot(commands);
@@ -1553,6 +1586,10 @@ pub(in crate::compositor::tests) fn capture_multiple_synchronized_child_commits(
     connection.flush()?;
     queue.roundtrip(&mut state)?;
     let after_parent = capture_renderable_surface_snapshot(commands);
+    drop(child_update_b);
+    drop(child_update_a);
+    drop(child_initial);
+    drop(parent_initial);
     Ok(MultipleSynchronizedCommitSnapshots {
         before_parent,
         after_parent,

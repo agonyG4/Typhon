@@ -166,6 +166,7 @@ impl Dispatch<wl_buffer::WlBuffer, ShmBufferData> for CompositorState {
             resource,
             AcquireWatchCancelReason::BufferDestroyed,
         );
+        state.scrub_dead_buffer_releases();
     }
 }
 

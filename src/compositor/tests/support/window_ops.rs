@@ -86,7 +86,7 @@ pub(in crate::compositor::tests) fn create_client_surface_with_buffer_offset(
     surface.commit();
     connection.flush()?;
     queue.roundtrip(&mut RegistryTestState::default())?;
-    attach_test_buffered_surface(&surface, &shm, &qh, 40, 30)?;
+    let _buffer = attach_test_buffered_surface(&surface, &shm, &qh, 40, 30)?;
     surface.offset(5, 7);
     surface.commit();
     connection.flush()?;

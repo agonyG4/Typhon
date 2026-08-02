@@ -59,7 +59,7 @@ pub(in crate::compositor::tests) fn create_scaled_buffer_toplevel_then_right_edg
     surface.commit();
     connection.flush()?;
     queue.roundtrip(&mut RegistryTestState::default())?;
-    attach_test_buffered_surface(&surface, &shm, &qh, 600, 400)?;
+    let _buffer = attach_test_buffered_surface(&surface, &shm, &qh, 600, 400)?;
     surface.commit();
     connection.flush()?;
 
@@ -104,7 +104,7 @@ pub(in crate::compositor::tests) fn create_scaled_buffer_toplevel_then_left_edge
     surface.commit();
     connection.flush()?;
     queue.roundtrip(&mut RegistryTestState::default())?;
-    attach_test_buffered_surface(&surface, &shm, &qh, 600, 400)?;
+    let _buffer = attach_test_buffered_surface(&surface, &shm, &qh, 600, 400)?;
     surface.commit();
     connection.flush()?;
 
@@ -204,7 +204,7 @@ pub(in crate::compositor::tests) fn capture_gecko_pre_role_subsurface_adoption(
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
 
     let child = compositor.create_surface(&qh, ());
-    attach_test_buffered_surface(&child, &shm, &qh, 1, 1)?;
+    let _buffer = attach_test_buffered_surface(&child, &shm, &qh, 1, 1)?;
     child.commit();
     connection.flush()?;
     let mut state = RegistryTestState::default();

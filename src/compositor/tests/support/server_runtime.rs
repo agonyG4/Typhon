@@ -21,6 +21,12 @@ pub(in crate::compositor::tests) fn create_test_shm_file(
     Ok(file)
 }
 
+pub(in crate::compositor::tests) fn open_fd_count() -> usize {
+    fs::read_dir("/proc/self/fd")
+        .expect("test process must expose /proc/self/fd")
+        .count()
+}
+
 pub(in crate::compositor::tests) fn spawn_test_server(
     mut server: OwnCompositorServer,
 ) -> (Arc<AtomicBool>, JoinHandle<OwnCompositorServer>) {
@@ -125,6 +131,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureRenderGenerationCause(Sender<RenderGenerationCause>),
     CaptureRenderableSurfaceCount(Sender<usize>),
     CaptureSurfaceResourceCount(Sender<usize>),
+    CaptureShmResourceCounts(Sender<(usize, usize, usize)>),
     CaptureRenderableSurfaceSnapshot(Sender<Vec<RenderableSurfaceSnapshot>>),
     CaptureCommittedWindowGeometry(Sender<Option<XdgWindowGeometry>>),
     CaptureToplevelVisualGeometry(Sender<Option<ToplevelVisualGeometrySnapshot>>),
@@ -396,6 +403,14 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureSurfaceResourceCount(reply) => {
                         let _ = reply.send(server.state.surface_resources.len());
+                    }
+                    ServerCommand::CaptureShmResourceCounts(reply) => {
+                        let _ = reply.send((
+                            server.state.current_surface_buffers.len(),
+                            server.state.pending_buffer_releases.len(),
+                            server.state.frame_batches.len()
+                                + server.state.retired_frame_batches.len(),
+                        ));
                     }
                     ServerCommand::CaptureRenderableSurfaceSnapshot(reply) => {
                         let surfaces = server.renderable_surfaces();
@@ -902,6 +917,18 @@ pub(in crate::compositor::tests) fn capture_surface_resource_count(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report surface resource count")
+}
+
+pub(in crate::compositor::tests) fn capture_shm_resource_counts(
+    commands: &Sender<ServerCommand>,
+) -> (usize, usize, usize) {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureShmResourceCounts(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report SHM resource counts")
 }
 
 pub(in crate::compositor::tests) fn capture_renderable_surface_snapshot(

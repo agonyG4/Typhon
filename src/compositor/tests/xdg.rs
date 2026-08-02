@@ -730,7 +730,7 @@ fn pending_surface_content_rejects_xdg_association_and_preserves_healthy_client(
     let wm_base_a: client_xdg_wm_base::XdgWmBase = globals_a.bind(&qh_a, 1..=6, ()).unwrap();
     let shm_a: client_wl_shm::WlShm = globals_a.bind(&qh_a, 1..=1, ()).unwrap();
     let surface_a = compositor_a.create_surface(&qh_a, ());
-    attach_test_buffered_surface(&surface_a, &shm_a, &qh_a, 2, 2).unwrap();
+    let _buffer_a = attach_test_buffered_surface(&surface_a, &shm_a, &qh_a, 2, 2).unwrap();
 
     let connection_b = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
     let (globals_b, _queue_b) = registry_queue_init::<RegistryTestState>(&connection_b).unwrap();
@@ -1361,6 +1361,7 @@ fn xdg_parent_unmap_dismisses_popup_and_late_destroy_is_idempotent() {
 
 #[test]
 fn rapid_xdg_popup_cycles_leave_no_stale_popup_state() {
+    const MAX_POPUP_FD_DELTA: usize = 8;
     let socket_name = unique_socket_name();
     let socket_path = runtime_socket_path(&socket_name);
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -1374,11 +1375,12 @@ fn rapid_xdg_popup_cycles_leave_no_stale_popup_state() {
     let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
     let mut state = RegistryTestState::default();
 
-    let (parent_surface, parent_xdg_surface, _parent_toplevel) =
+    let (parent_surface, parent_xdg_surface, parent_toplevel) =
         create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 120, 90).unwrap();
     parent_surface.commit();
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
+    let baseline_fd_count = open_fd_count();
 
     for index in 0..1000 {
         let popup_surface = compositor.create_surface(&qh, ());
@@ -1410,6 +1412,8 @@ fn rapid_xdg_popup_cycles_leave_no_stale_popup_state() {
             connection.flush().unwrap();
             queue.roundtrip(&mut state).unwrap();
             child_popup.destroy();
+            child_xdg_surface.destroy();
+            child_positioner.destroy();
             child_surface.destroy();
         }
 
@@ -1421,6 +1425,8 @@ fn rapid_xdg_popup_cycles_leave_no_stale_popup_state() {
         }
 
         popup.destroy();
+        popup_xdg_surface.destroy();
+        positioner.destroy();
         popup_surface.destroy();
         connection.flush().unwrap();
         queue.roundtrip(&mut state).unwrap();
@@ -1436,6 +1442,18 @@ fn rapid_xdg_popup_cycles_leave_no_stale_popup_state() {
             assert_eq!(snapshot.popup_count, 0);
             assert_eq!(snapshot.popup_node_count, 0);
             assert!(!snapshot.popup_grab_active);
+            let surface_resource_count = capture_surface_resource_count(&commands);
+            assert_eq!(surface_resource_count, 1);
+            let (current_buffer_count, pending_release_count, frame_batch_count) =
+                capture_shm_resource_counts(&commands);
+            assert_eq!(current_buffer_count, 1);
+            assert_eq!(pending_release_count, 0);
+            assert_eq!(frame_batch_count, 0);
+            let fd_count = open_fd_count();
+            assert!(
+                fd_count <= baseline_fd_count + MAX_POPUP_FD_DELTA,
+                "popup cycle {index} grew open descriptors from {baseline_fd_count} to {fd_count}"
+            );
         }
     }
 
@@ -1445,5 +1463,10 @@ fn rapid_xdg_popup_cycles_leave_no_stale_popup_state() {
     assert!(!snapshot.popup_grab_active);
     assert_eq!(capture_renderable_surface_count(&commands), 1);
 
+    parent_toplevel.destroy();
+    parent_xdg_surface.destroy();
+    parent_surface.destroy();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
     let _server = stop_controllable_test_server(commands, server_thread);
 }
