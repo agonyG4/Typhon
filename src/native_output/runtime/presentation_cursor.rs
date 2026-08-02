@@ -94,6 +94,37 @@ pub(super) fn plan_primary_cursor_presentation(
     })
 }
 
+pub(super) fn frozen_cursor_plan_for_render(
+    delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
+    primary: KmsPrimaryCursorPresentation,
+    plan: Option<&RuntimePlanePlan>,
+) -> crate::native_output::presentation::plane::FrozenPrimaryCursorPlan {
+    crate::native_output::presentation::plane::FrozenPrimaryCursorPlan {
+        delivery,
+        primary_presentation: match primary {
+            KmsPrimaryCursorPresentation::Preserve => {
+                crate::native_output::presentation::plane::FrozenPrimaryCursorPresentation::Preserve
+            }
+            KmsPrimaryCursorPresentation::Promote(state) => {
+                crate::native_output::presentation::plane::FrozenPrimaryCursorPresentation::Promote(
+                    state,
+                )
+            }
+        },
+        cursor_test_policy: match plan
+            .map(|plan| plan.decision.test_policy)
+            .unwrap_or(KmsCursorTestPolicy::NotApplicable)
+        {
+            KmsCursorTestPolicy::Required => {
+                crate::native_output::presentation::plane::FrozenCursorTestPolicy::Required
+            }
+            KmsCursorTestPolicy::NotApplicable | KmsCursorTestPolicy::SkipProven => {
+                crate::native_output::presentation::plane::FrozenCursorTestPolicy::Skip
+            }
+        },
+    }
+}
+
 pub(super) fn freeze_primary_cursor_presentation(
     previous_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     next_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,

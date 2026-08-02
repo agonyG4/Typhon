@@ -10,8 +10,9 @@ use super::planner::{
 };
 use super::presentation_cursor::{
     CursorPolicyContext, apply_cursor_policy_with_runtime_inputs, cursor_damage_states,
-    effective_cursor_for_plan, log_client_cursor_path_if_changed, plan_primary_cursor_presentation,
-    plan_uses_hardware_cursor, planned_client_cursor_software_work, planned_cursor_hardware_usable,
+    effective_cursor_for_plan, frozen_cursor_plan_for_render, log_client_cursor_path_if_changed,
+    plan_primary_cursor_presentation, plan_uses_hardware_cursor,
+    planned_client_cursor_software_work, planned_cursor_hardware_usable,
     planned_hardware_cursor_work_pending, prepare_cursor_image, presented_delivery_for_plan,
 };
 use super::presentation_direct::{
@@ -32,10 +33,10 @@ use super::presentation_transactions::{
 };
 use super::presentation_worker::*;
 use super::*;
-use crate::native_output::kms_worker::KmsPrimaryCursorPresentation;
 use crate::native_output::kms_worker::{KmsCommitWorkerTransport, KmsTestOnlyPolicy};
 use oblivion_one::native::kms::KmsBackendKind;
 use oblivion_one::native::scheduler::rendered_primary_must_wait_for_lane;
+
 impl NativeRuntime {
     #[allow(unused_variables)]
     pub(super) fn render_present_and_update_metrics(
@@ -116,6 +117,8 @@ impl NativeRuntime {
             native_io_recorder,
             ..
         } = self;
+        #[rustfmt::skip]
+        let validation_base_context = (kms_commit_worker.as_ref(), *presented_planes, *drm_file_generation, target.crtc_id);
         *confirmed_primary_assignment = presented_planes.primary;
         let wakeup = &cycle.wakeup;
         let worker_mode = *kms_commit_worker_transport == KmsCommitWorkerTransport::Worker;
@@ -548,15 +551,8 @@ impl NativeRuntime {
                 .ok_or_else(|| {
                     io::Error::other("cursor-only Atomic output has no presentation target")
                 })?;
-            let Some(validation_base) = validation_base_for_submission(
-                kms_commit_worker.as_ref(),
-                *presented_planes,
-                *drm_file_generation,
-                target.crtc_id,
-            ) else {
-                *queued_redraw_requested = true;
-                return Ok(());
-            };
+            #[rustfmt::skip]
+            let validation_base = require_validation_base!(validation_base_context, queued_redraw_requested);
             let Some(decision) = present_cursor_for_presentation(
                 worker_mode,
                 kms_commit_worker.as_ref(),
@@ -713,15 +709,8 @@ impl NativeRuntime {
                             }) {
                                 test_only = KmsTestOnlyPolicy::Required;
                             }
-                            let Some(validation_base) = validation_base_for_submission(
-                                kms_commit_worker.as_ref(),
-                                *presented_planes,
-                                *drm_file_generation,
-                                target.crtc_id,
-                            ) else {
-                                *queued_redraw_requested = true;
-                                return Ok(());
-                            };
+                            #[rustfmt::skip]
+                            let validation_base = require_validation_base!(validation_base_context, queued_redraw_requested);
                             let direct_result = finish_direct_worker_queued(
                                 kms_commit_worker
                                     .as_ref()
@@ -989,30 +978,11 @@ impl NativeRuntime {
                             direct_inspection
                                 .candidate_key
                                 .filter(|_| !composition_required),
-                            crate::native_output::presentation::plane::FrozenPrimaryCursorPlan {
-                                delivery: planned_cursor_delivery,
-                                primary_presentation: match primary_cursor {
-                                    KmsPrimaryCursorPresentation::Preserve => {
-                                        crate::native_output::presentation::plane::FrozenPrimaryCursorPresentation::Preserve
-                                    }
-                                    KmsPrimaryCursorPresentation::Promote(state) => {
-                                        crate::native_output::presentation::plane::FrozenPrimaryCursorPresentation::Promote(state)
-                                    }
-                                },
-                                cursor_test_policy: match runtime_plane_plan
-                                    .as_ref()
-                                    .map(|plan| plan.decision.test_policy)
-                                    .unwrap_or(KmsCursorTestPolicy::NotApplicable)
-                                {
-                                    KmsCursorTestPolicy::Required => {
-                                        crate::native_output::presentation::plane::FrozenCursorTestPolicy::Required
-                                    }
-                                    KmsCursorTestPolicy::NotApplicable
-                                    | KmsCursorTestPolicy::SkipProven => {
-                                        crate::native_output::presentation::plane::FrozenCursorTestPolicy::Skip
-                                    }
-                                },
-                            },
+                            frozen_cursor_plan_for_render(
+                                planned_cursor_delivery,
+                                primary_cursor,
+                                runtime_plane_plan.as_ref(),
+                            ),
                         )?;
                         match render_outcome {
                             AtomicFrameRenderOutcome::Skipped { reason, render_us } => {
@@ -1063,15 +1033,8 @@ impl NativeRuntime {
                                 if waits_for_target {
                                     frame_pacing.note_ready_frame(ready_at_ns, render_ahead);
                                 } else {
-                                    let Some(validation_base) = validation_base_for_submission(
-                                        kms_commit_worker.as_ref(),
-                                        *presented_planes,
-                                        *drm_file_generation,
-                                        target.crtc_id,
-                                    ) else {
-                                        *queued_redraw_requested = true;
-                                        return Ok(());
-                                    };
+                                    #[rustfmt::skip]
+                                    let validation_base = require_validation_base!(validation_base_context, queued_redraw_requested);
                                     let Some((
                                         token,
                                         framebuffer_id,

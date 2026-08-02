@@ -1,6 +1,22 @@
 use super::*;
 use oblivion_one::compositor::FrameBatchDiscardReason;
 
+macro_rules! require_validation_base {
+    ($context:expr, $redraw:ident) => {
+        match $context {
+            (worker, presented, generation, crtc) => {
+                match validation_base_for_submission(worker, presented, generation, crtc) {
+                    Some(base) => base,
+                    None => {
+                        *$redraw = true;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    };
+}
+
 mod atomic_commit;
 mod bootstrap;
 mod cursor_cycle;
