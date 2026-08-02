@@ -200,6 +200,9 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn refresh_pointer_focus_at_last_position(&mut self) {
+        if self.defer_pointer_focus_refresh() {
+            return;
+        }
         if self.active_locked_pointer_binding().is_some() {
             if let Some(active) = self.active_locked_pointer_binding() {
                 self.pin_locked_pointer_focus(&active);
@@ -221,6 +224,82 @@ impl CompositorState {
         ));
         self.ensure_pointer_focus(&target.surface);
         self.send_pointer_enter_if_needed(&target);
+    }
+
+    pub(in crate::compositor) fn commit_pointer_crossing_at_last_position(&mut self) {
+        if let Some(active) = self.active_locked_pointer_binding() {
+            self.pin_locked_pointer_focus(&active);
+            return;
+        }
+        if let Some(active) = self.active_confined_pointer_binding() {
+            self.pin_confined_pointer_focus(&active);
+            return;
+        }
+
+        let target = self
+            .pointer_target_at(self.last_pointer_x, self.last_pointer_y)
+            .filter(|target| target.surface.is_alive());
+        let target_surface = target.as_ref().map(|target| target.surface.clone());
+        self.pointer_surface = target_surface.clone();
+        self.pointer_resources.retain(Resource::is_alive);
+
+        let pointers = self.pointer_resources.clone();
+        let mut frame_pointers = Vec::new();
+        for pointer in pointers {
+            let previous = self
+                .pointer_entered_surfaces
+                .iter()
+                .position(|(resource, _)| same_wayland_resource(resource, &pointer))
+                .map(|index| self.pointer_entered_surfaces.remove(index).1);
+            let same_target = previous
+                .as_ref()
+                .zip(target_surface.as_ref())
+                .is_some_and(|(previous, target)| same_surface_resource(previous, target));
+            if same_target {
+                continue;
+            }
+
+            let mut sent_event = false;
+            if let Some(previous) = previous {
+                self.forget_pointer_enter_serial(&pointer);
+                if previous.is_alive() && resource_belongs_to_surface_client(&pointer, &previous) {
+                    let serial = self.next_configure_serial();
+                    let _ = pointer.send_event(wl_pointer::Event::Leave {
+                        serial,
+                        surface: previous,
+                    });
+                    sent_event = true;
+                }
+            }
+
+            if let Some(target) = target.as_ref()
+                && resource_belongs_to_surface_client(&pointer, &target.surface)
+            {
+                let serial = self.next_configure_serial();
+                let _ = pointer.send_event(wl_pointer::Event::Enter {
+                    serial,
+                    surface: target.surface.clone(),
+                    surface_x: target.surface_x,
+                    surface_y: target.surface_y,
+                });
+                self.remember_input_serial(
+                    serial,
+                    target.surface.clone(),
+                    InputSerialKind::PointerEnter,
+                );
+                self.remember_pointer_enter_serial(&pointer, &target.surface, serial);
+                self.pointer_entered_surfaces
+                    .push((pointer.clone(), target.surface.clone()));
+                sent_event = true;
+            }
+            if sent_event {
+                frame_pointers.push(pointer);
+            }
+        }
+
+        for pointer in frame_pointers {
+            send_pointer_frame_if_supported(&pointer);
+        }
     }
 
     pub(in crate::compositor) fn refresh_pointer_focus_after_implicit_grab(

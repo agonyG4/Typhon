@@ -115,6 +115,14 @@ impl OwnCompositorServer {
                         .optional("old_surface_id", replaced_surface_id)
                         .field("surface_id", surface_id)
                         .field("replacement", replaced_surface_id.is_some())
+                        .field(
+                            "teardown_reason",
+                            if replaced_surface_id.is_some() {
+                                "attachment_replacement"
+                            } else {
+                                "association_committed"
+                            },
+                        )
                 });
                 let _ = self
                     .state
@@ -145,6 +153,7 @@ impl OwnCompositorServer {
                         .field("generation", generation.get())
                         .field("surface_id", surface_id)
                         .field("replacement", false)
+                        .field("teardown_reason", "wayland_association_removed")
                 });
             }
         }

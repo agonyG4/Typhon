@@ -348,6 +348,128 @@ fn xwayland_popup_map_refreshes_pointer_focus_without_pointer_motion() {
 }
 
 #[test]
+fn xwayland_scene_batch_requires_one_explicit_non_nested_commit() {
+    let socket = super::unique_socket_name();
+    let mut server =
+        super::OwnCompositorServer::bind_cpu_composition(&socket).expect("bind compositor server");
+    let token = server
+        .begin_xwayland_scene_batch()
+        .expect("begin XWayland scene batch");
+    assert!(server.begin_xwayland_scene_batch().is_err());
+    server
+        .commit_xwayland_scene_batch(token)
+        .expect("commit XWayland scene batch");
+    assert!(server.commit_xwayland_scene_batch(token).is_err());
+}
+
+#[test]
+fn xwayland_scene_batch_abort_has_no_side_effects_and_can_be_retried() {
+    let socket = super::unique_socket_name();
+    let mut server =
+        super::OwnCompositorServer::bind_cpu_composition(&socket).expect("bind compositor server");
+    let token = server
+        .begin_xwayland_scene_batch()
+        .expect("begin XWayland scene batch");
+    let commands = server.apply_xwayland_window_event(XwmEvent::WindowReady(fake_snapshot()));
+    assert!(
+        !commands
+            .iter()
+            .any(|command| matches!(command, XwmCommand::SyncClientLists { .. }))
+    );
+    server
+        .abort_xwayland_scene_batch(token)
+        .expect("abort XWayland scene batch");
+    assert!(server.xwayland_scene_batch_dirty_for_test());
+    let retry = server
+        .begin_xwayland_scene_batch()
+        .expect("retry XWayland scene batch");
+    server
+        .commit_xwayland_scene_batch(retry)
+        .expect("commit retried XWayland scene batch");
+}
+
+#[test]
+fn xwayland_scene_batch_suppresses_intermediate_popup_target_and_preserves_keyboard_focus() {
+    let mut fixture = stationary_pointer_xwayland_fixture();
+    let mut parent = fake_snapshot();
+    parent.surface_id = fixture.parent_surface_id;
+    parent.geometry = X11Geometry {
+        x: 40,
+        y: 40,
+        width: 2,
+        height: 2,
+    };
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(parent));
+    let parent_placement = fixture.server.renderable_surfaces()[0].placement;
+    fixture.server.send_pointer_motion(
+        f64::from(parent_placement.local_x + 1),
+        f64::from(parent_placement.local_y + 1),
+    );
+    let focused_before = fixture.server.state.focused_window_id;
+    let refreshes_before = fixture
+        .server
+        .xwayland_scene_batch_metrics_for_test()
+        .pointer_refreshes_committed;
+
+    let token = fixture
+        .server
+        .begin_xwayland_scene_batch()
+        .expect("begin popup scene batch");
+    let mut popup = fake_snapshot();
+    popup.handle = X11WindowHandle::new(
+        XwaylandGeneration::new(NonZeroU64::new(1).expect("generation")),
+        107,
+    );
+    popup.surface_id = fixture.popup_surface_id;
+    popup.kind = DesktopWindowKind::OverrideRedirect;
+    popup.override_redirect = true;
+    popup.geometry = X11Geometry {
+        x: parent_placement.local_x,
+        y: parent_placement.local_y,
+        width: 2,
+        height: 2,
+    };
+    let popup_handle = popup.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(popup));
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowWithdrawn(popup_handle));
+    fixture
+        .server
+        .commit_xwayland_scene_batch(token)
+        .expect("commit popup scene batch");
+
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .pointer_surface
+            .as_ref()
+            .map(crate::compositor::compositor_surface_id),
+        Some(fixture.parent_surface_id)
+    );
+    assert_eq!(fixture.server.state.focused_window_id, focused_before);
+    assert_eq!(
+        fixture
+            .server
+            .xwayland_scene_batch_metrics_for_test()
+            .pointer_refreshes_committed,
+        refreshes_before + 1
+    );
+    assert!(
+        fixture
+            .server
+            .xwayland_scene_batch_metrics_for_test()
+            .intermediate_pointer_targets_suppressed
+            > 0
+    );
+}
+
+#[test]
 fn managed_window_receives_exactly_one_map_command_from_fake_x11_events() {
     let socket =
         std::env::temp_dir().join(format!("typhon-xwayland-map-test-{}", std::process::id()));

@@ -188,7 +188,26 @@ impl NativeRuntime {
         }
     }
 
-    pub(super) fn dispatch_xwayland_window_events(&mut self) -> NativeResult<()> {
+    pub(super) fn dispatch_xwayland_scene_batch(&mut self) -> NativeResult<()> {
+        let token = self.server.begin_xwayland_scene_batch().map_err(|error| {
+            std::io::Error::other(format!("begin XWayland scene batch: {error:?}"))
+        })?;
+        let result = self.dispatch_xwayland_scene_batch_inner(token);
+        if result.is_err() {
+            let _ = self.server.abort_xwayland_scene_batch(token);
+        }
+        result
+    }
+
+    fn dispatch_xwayland_scene_batch_inner(
+        &mut self,
+        token: oblivion_one::compositor::XwaylandSceneBatchToken,
+    ) -> NativeResult<()> {
+        let association_events = self.server.take_xwayland_association_events();
+        self.xwayland.record_association_events(&association_events);
+        self.dispatch_xwayland_association_events();
+        self.dispatch_xwayland_buffer_ready();
+
         let translation_started = std::time::Instant::now();
         let mut commands = Vec::new();
         let mut destroyed = HashSet::new();
@@ -205,6 +224,14 @@ impl NativeRuntime {
             });
             commands.extend(self.server.apply_xwayland_window_event(event));
         }
+        let translation_us = translation_started.elapsed().as_micros() as u64;
+        commands.extend(
+            self.server
+                .commit_xwayland_scene_batch(token)
+                .map_err(|error| {
+                    std::io::Error::other(format!("commit XWayland scene batch: {error:?}"))
+                })?,
+        );
         let now_ns = monotonic_now_ns()?;
         commands.extend(self.server.take_xwayland_backend_commands(now_ns));
         let has_focus_command = commands
@@ -225,7 +252,6 @@ impl NativeRuntime {
                 normalization.pruned_handles,
             );
         }
-        let translation_us = translation_started.elapsed().as_micros() as u64;
         let execution_started = std::time::Instant::now();
         let commands = coalesce_client_list_sync(normalization.commands);
         let command_count = commands.len();

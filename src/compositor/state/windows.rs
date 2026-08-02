@@ -319,6 +319,11 @@ impl CompositorState {
     }
 
     fn destroy_popup_role(&mut self, surface_id: u32) {
+        let had_live_role = self.popup_surfaces.contains_key(&surface_id)
+            || self
+                .surface_role_lifecycle(surface_id)
+                .live_instance
+                .is_some_and(|role| role == LiveRoleInstance::XdgPopup);
         let children = self
             .popup_nodes
             .get(&surface_id)
@@ -361,7 +366,16 @@ impl CompositorState {
         self.surface_window_geometries.remove(&surface_id);
         self.pending_surface_window_geometries.remove(&surface_id);
         self.clear_resize_state_for_surfaces(&[surface_id]);
-        popup_debug_log(|| format!("popup_destroy_role popup={surface_id}"));
+        popup_debug_log(|| {
+            format!(
+                "popup_destroy_role popup={surface_id} outcome={} reason=role_destroyed",
+                if had_live_role {
+                    "first_effective_destruction"
+                } else {
+                    "redundant_noop_cleanup"
+                }
+            )
+        });
         if self
             .focused_surface
             .as_ref()

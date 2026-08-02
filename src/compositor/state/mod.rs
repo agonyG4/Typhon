@@ -32,6 +32,7 @@ mod window_resize;
 mod windows;
 mod xdg_lifecycle;
 mod xwayland_mode;
+mod xwayland_scene;
 mod xwayland_windows;
 
 #[allow(unused_imports)]
@@ -98,6 +99,8 @@ pub(in crate::compositor) use windows::*;
 pub(in crate::compositor) use xdg_lifecycle::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use xwayland_mode::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use xwayland_scene::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use xwayland_windows::*;
 

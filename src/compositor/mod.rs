@@ -263,6 +263,46 @@ pub struct XwaylandSurfaceCommitObserved {
     pub buffer_id: Option<BufferId>,
     pub buffer_size: Option<BufferSize>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XwaylandSceneBatchToken {
+    epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XwaylandSceneBatchError {
+    AlreadyActive,
+    NotActive,
+    InvalidToken,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct XwaylandSceneBatchMetrics {
+    pub(crate) xwayland_scene_batches: u64,
+    pub(crate) xwayland_scene_mutations: u64,
+    pub(crate) pointer_refreshes_deferred: u64,
+    pub(crate) pointer_refreshes_committed: u64,
+    pub(crate) intermediate_pointer_targets_suppressed: u64,
+    pub(crate) render_stack_reorders_coalesced: u64,
+    pub(crate) client_list_syncs_coalesced: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct XwaylandSceneBatchDirty {
+    pub(crate) pointer_focus_dirty: bool,
+    pub(crate) render_stack_dirty: bool,
+    pub(crate) client_lists_dirty: bool,
+    pub(crate) repaint_dirty: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct XwaylandSceneBatchState {
+    active: Option<XwaylandSceneBatchToken>,
+    next_epoch: u64,
+    pub(crate) dirty: XwaylandSceneBatchDirty,
+    pub(crate) metrics: XwaylandSceneBatchMetrics,
+}
+
 use window_state::{ToplevelMode, WindowGeometry, WindowState, xdg_toplevel_state_bytes};
 const MIN_WINDOW_WIDTH: u32 = 160;
 const MIN_WINDOW_HEIGHT: u32 = 120;
@@ -514,6 +554,7 @@ pub struct CompositorState {
     pub(in crate::compositor) next_window_id: u64,
     pub(in crate::compositor) window_stacking: Vec<WindowId>,
     pub(in crate::compositor) applied_override_redirect_stack: Option<(XwaylandGeneration, u64)>,
+    xwayland_scene_batch: XwaylandSceneBatchState,
     pub(in crate::compositor) backend_commands: Vec<window_backend::WindowBackendCommand>,
     cursor_surface_ids: HashSet<u32>,
     active_client_cursor: Option<ActiveClientCursor>,

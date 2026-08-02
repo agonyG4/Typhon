@@ -27,6 +27,7 @@ pub(crate) struct OverrideRedirectStackState {
     epoch: u64,
     pending: Option<PendingQuery>,
     last_applied_epoch: Option<u64>,
+    last_snapshot: Vec<super::X11WindowHandle>,
     metrics: OverrideRedirectStackMetrics,
 }
 
@@ -125,6 +126,7 @@ impl Xwm {
 
         self.override_redirect_stack.dirty = false;
         self.override_redirect_stack.last_applied_epoch = Some(pending.epoch);
+        self.override_redirect_stack.last_snapshot = bottom_to_top.clone();
         self.override_redirect_stack.metrics.snapshots_emitted = self
             .override_redirect_stack
             .metrics
@@ -182,6 +184,19 @@ impl Xwm {
 
     pub(crate) fn clear_override_redirect_stack_state(&mut self) {
         self.override_redirect_stack = OverrideRedirectStackState::default();
+    }
+
+    pub(crate) fn override_redirect_stack_trace(
+        &self,
+        handle: super::X11WindowHandle,
+    ) -> (Option<u64>, Option<usize>) {
+        (
+            self.override_redirect_stack.last_applied_epoch,
+            self.override_redirect_stack
+                .last_snapshot
+                .iter()
+                .position(|candidate| *candidate == handle),
+        )
     }
 
     #[cfg(test)]

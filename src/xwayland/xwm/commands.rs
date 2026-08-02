@@ -701,11 +701,6 @@ fn prune_handles(
 }
 
 pub(crate) fn flush(xwm: &Xwm) -> Result<(), XwmError> {
-    trace::emit("x11_resize_command_order", || {
-        TraceFields::new()
-            .field("source", "xwm")
-            .field("command_order", "flush")
-    });
     xwm.connection.flush().map_err(XwmError::Connection)
 }
 

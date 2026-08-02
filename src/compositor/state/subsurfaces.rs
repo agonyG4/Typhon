@@ -1186,6 +1186,9 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn reorder_renderable_surfaces_by_committed_stack(&mut self) -> bool {
+        if self.defer_render_stack_reorder() {
+            return false;
+        }
         if self.renderable_surfaces.len() <= 1 {
             return false;
         }

@@ -183,6 +183,15 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             if was_ready {
                 xwm.outgoing_events
                     .push_back(XwmEvent::WindowWithdrawn(handle));
+            } else {
+                trace::emit("pre_admission_popup_cancellation", || {
+                    TraceFields::new()
+                        .field("source", "x11")
+                        .field("xid", handle.xid())
+                        .field("generation", handle.generation().get())
+                        .field("terminal_reason", "x11_unmap")
+                        .field("lifecycle", "pre_admission_cancellation")
+                });
             }
             if is_override_redirect {
                 xwm.mark_override_redirect_stack_dirty();
@@ -195,6 +204,11 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 .windows
                 .get(handle)
                 .is_some_and(|record| record.kind == DesktopWindowKind::OverrideRedirect);
+            let was_ready = xwm.windows.get(handle).is_some_and(|record| {
+                record.snapshot.is_some()
+                    || matches!(record.lifecycle, X11WindowLifecycle::Renderable)
+            });
+            trace_window_state(xwm, "destroy_window_observed", handle, TraceFields::new());
             xwm.adoption
                 .cancel(handle, super::adoption::AdoptionCancelReason::Destroy);
             xwm.clear_resize_sync(handle);
@@ -215,6 +229,16 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             });
             xwm.outgoing_events
                 .push_back(XwmEvent::WindowDestroyed(handle));
+            if !was_ready {
+                trace::emit("pre_admission_popup_cancellation", || {
+                    TraceFields::new()
+                        .field("source", "x11")
+                        .field("xid", handle.xid())
+                        .field("generation", handle.generation().get())
+                        .field("terminal_reason", "x11_destroy")
+                        .field("lifecycle", "pre_admission_cancellation")
+                });
+            }
             if is_override_redirect {
                 xwm.mark_override_redirect_stack_dirty();
             }
@@ -405,8 +429,13 @@ fn trace_window_state(
         fields
             .field("source", "xwm")
             .field("xid", handle.xid())
+            .field("generation", handle.generation().get())
             .field(
                 "override_redirect_stored",
+                record.kind == DesktopWindowKind::OverrideRedirect,
+            )
+            .field(
+                "override_redirect",
                 record.kind == DesktopWindowKind::OverrideRedirect,
             )
             .field("lifecycle", format!("{:?}", record.lifecycle))
@@ -414,6 +443,10 @@ fn trace_window_state(
             .field("properties_ready", record.properties_ready)
             .field("buffer_ready", record.buffer_ready)
             .field("map_serial", record.map_serial)
+            .field("geometry_x", record.geometry.x)
+            .field("geometry_y", record.geometry.y)
+            .field("geometry_width", record.geometry.width)
+            .field("geometry_height", record.geometry.height)
             .field("inflight_wm_unmaps", record.inflight_wm_unmaps)
             .field(
                 "window_types",
@@ -428,6 +461,18 @@ fn trace_window_state(
                 association.map(|value| value.serial.get()),
             )
             .optional("surface_id", association.map(|value| value.surface_id))
+            .optional(
+                "client_leader",
+                record.properties.client_leader.map(|leader| leader.xid()),
+            )
+            .optional(
+                "root_tree_stack_epoch",
+                xwm.override_redirect_stack_trace(handle).0,
+            )
+            .optional(
+                "root_tree_stack_index",
+                xwm.override_redirect_stack_trace(handle).1,
+            )
     });
 }
 

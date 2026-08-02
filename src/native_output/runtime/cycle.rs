@@ -64,11 +64,7 @@ impl NativeRuntime {
         self.dispatch_xwayland_client_disconnects()?;
         self.dispatch_xwayland_shell_binds()?;
         self.initialize_managed_xwayland()?;
-        let association_events = self.server.take_xwayland_association_events();
-        self.xwayland.record_association_events(&association_events);
-        self.dispatch_xwayland_association_events();
-        self.dispatch_xwayland_buffer_ready();
-        self.dispatch_xwayland_window_events()?;
+        self.dispatch_xwayland_scene_batch()?;
         self.sync_xwayland_reactor_sources()?;
         if cycle.shutdown_requested {
             self.request_native_shutdown()?;

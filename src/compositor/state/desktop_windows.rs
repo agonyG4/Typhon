@@ -705,7 +705,7 @@ impl CompositorState {
         self.normalize_window_stacking();
     }
 
-    fn normalize_window_stacking(&mut self) {
+    pub(in crate::compositor) fn normalize_window_stacking(&mut self) {
         let layers = self
             .desktop_windows
             .values()

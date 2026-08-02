@@ -48,6 +48,8 @@ use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGenerat
 mod server_globals;
 #[path = "server_gpu_globals.rs"]
 mod server_gpu_globals;
+#[cfg(test)]
+use super::XwaylandSceneBatchMetrics;
 use super::{
     AcquireCommitId, AcquireWatchChange, AstreaShortcutPhase, BufferReleaseMetrics,
     ClientCursorRenderState, CompositorError, CompositorFrameBatchId, CompositorState,
@@ -58,7 +60,8 @@ use super::{
     PointerAxisFrame, PresentationClock, ProtocolOnlyCompletion, RenderGenerationCause,
     RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
     SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
-    WindowInteractionDebugSnapshot, WindowInteractionEndReason, color,
+    WindowInteractionDebugSnapshot, WindowInteractionEndReason, XwaylandSceneBatchError,
+    XwaylandSceneBatchToken, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
 };
 #[derive(Debug)]
@@ -398,7 +401,50 @@ impl OwnCompositorServer {
         self.display.as_fd()
     }
 
+    pub fn begin_xwayland_scene_batch(
+        &mut self,
+    ) -> Result<XwaylandSceneBatchToken, XwaylandSceneBatchError> {
+        self.state.begin_xwayland_scene_batch()
+    }
+
+    pub fn commit_xwayland_scene_batch(
+        &mut self,
+        token: XwaylandSceneBatchToken,
+    ) -> Result<Vec<XwmCommand>, XwaylandSceneBatchError> {
+        let dirty = self.state.commit_xwayland_scene_batch(token)?;
+        if dirty.render_stack_dirty {
+            self.state.normalize_window_stacking();
+        }
+        let mut commands = Vec::new();
+        if dirty.client_lists_dirty {
+            commands.push(self.sync_xwayland_client_lists());
+        }
+        if dirty.pointer_focus_dirty {
+            self.state.commit_pointer_crossing_at_last_position();
+            self.state.note_committed_pointer_refresh();
+        }
+        Ok(commands)
+    }
+
+    pub fn abort_xwayland_scene_batch(
+        &mut self,
+        token: XwaylandSceneBatchToken,
+    ) -> Result<(), XwaylandSceneBatchError> {
+        self.state.abort_xwayland_scene_batch(token)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn xwayland_scene_batch_dirty_for_test(&self) -> bool {
+        self.state.xwayland_scene_batch_dirty_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn xwayland_scene_batch_metrics_for_test(&self) -> XwaylandSceneBatchMetrics {
+        self.state.xwayland_scene_batch_metrics_for_test()
+    }
+
     pub fn apply_xwayland_window_event(&mut self, event: XwmEvent) -> Vec<XwmCommand> {
+        self.state.note_xwayland_scene_mutation();
         match event {
             XwmEvent::WindowMapRequested(handle) => vec![XwmCommand::Map(handle)],
             XwmEvent::WindowReady(snapshot) => {
@@ -453,10 +499,29 @@ impl OwnCompositorServer {
                         {
                             commands.push(XwmCommand::ConfigureFrame { window: handle, geometry });
                         }
-                        commands.push(self.sync_xwayland_client_lists());
+                        if !self.state.defer_client_list_sync() {
+                            commands.push(self.sync_xwayland_client_lists());
+                        }
                         commands
                     }
                     Err(error) => {
+                        let pre_admission_cancellation = snapshot_for_trace.override_redirect;
+                        trace::emit("xwayland_window_admission_failed", || {
+                            TraceFields::new()
+                                .field("source", "compositor")
+                                .field("xid", handle.xid())
+                                .field("generation", handle.generation().get())
+                                .field("surface_id", surface_id)
+                                .field("override_redirect", pre_admission_cancellation)
+                                .field(
+                                    "terminal_reason",
+                                    if pre_admission_cancellation {
+                                        "pre_admission_cancellation"
+                                    } else {
+                                        "admission_rejected"
+                                    },
+                                )
+                        });
                         eprintln!(
                             "oblivion-one compositor: event=xwayland_window_admission_failed surface_id={surface_id} error={error:?}"
                         );
@@ -474,9 +539,22 @@ impl OwnCompositorServer {
                             .field("xid", handle.xid())
                             .optional("focus_before", focus_before)
                             .optional("focus_after", self.focused_x11_window_xid())
+                            .field("teardown_reason", "x11_destroy")
+                            .field("destruction_outcome", "first_effective_destruction")
                     });
-                    vec![self.sync_xwayland_client_lists()]
+                    if self.state.defer_client_list_sync() {
+                        Vec::new()
+                    } else {
+                        vec![self.sync_xwayland_client_lists()]
+                    }
                 } else {
+                    trace::emit("window_cleanup_redundant", || {
+                        TraceFields::new()
+                            .field("source", "compositor")
+                            .field("xid", handle.xid())
+                            .field("teardown_reason", "redundant_idempotent_cleanup")
+                            .field("destruction_outcome", "redundant_noop_cleanup")
+                    });
                     Vec::new()
                 }
             }
@@ -490,9 +568,22 @@ impl OwnCompositorServer {
                             .field("xid", handle.xid())
                             .optional("focus_before", focus_before)
                             .optional("focus_after", self.focused_x11_window_xid())
+                            .field("teardown_reason", "x11_unmap")
+                            .field("destruction_outcome", "first_effective_destruction")
                     });
-                    vec![self.sync_xwayland_client_lists()]
+                    if self.state.defer_client_list_sync() {
+                        Vec::new()
+                    } else {
+                        vec![self.sync_xwayland_client_lists()]
+                    }
                 } else {
+                    trace::emit("window_cleanup_redundant", || {
+                        TraceFields::new()
+                            .field("source", "compositor")
+                            .field("xid", handle.xid())
+                            .field("teardown_reason", "redundant_idempotent_cleanup")
+                            .field("destruction_outcome", "redundant_noop_cleanup")
+                    });
                     Vec::new()
                 }
             }
@@ -542,7 +633,9 @@ impl OwnCompositorServer {
                 if !publish_lists {
                     return commands;
                 }
-                commands.push(self.sync_xwayland_client_lists());
+                if !self.state.defer_client_list_sync() {
+                    commands.push(self.sync_xwayland_client_lists());
+                }
                 commands
             }
             XwmEvent::ConfigureRequested { window, request } => {
