@@ -1,6 +1,6 @@
 use super::{
-    ConfigureNotifyClassification, X11ConfigureFlags, X11ConfigureRequest, X11Geometry,
-    X11StackMode, X11StateRequest, X11WindowHandle, Xwm, XwmDrain, XwmError, XwmEvent,
+    X11ConfigureFlags, X11ConfigureRequest, X11Geometry, X11StackMode, X11StateRequest,
+    X11WindowHandle, Xwm, XwmDrain, XwmError, XwmEvent,
     atoms::XwmAtomName,
     ewmh::{decode_state_action, state_atom as decode_state_atom},
     properties::PropertyKind,
@@ -12,7 +12,6 @@ use x11rb::{
     connection::Connection,
     protocol::{Event, sync::Int64, xproto},
 };
-
 pub(crate) fn drain(xwm: &mut Xwm, budget: usize) -> Result<XwmDrain, XwmError> {
     let mut processed = 0;
     while processed < budget {
@@ -31,7 +30,6 @@ pub(crate) fn drain(xwm: &mut Xwm, budget: usize) -> Result<XwmDrain, XwmError> 
         budget_exhausted: processed == budget && budget != 0,
     })
 }
-
 fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
     trace_raw_event(&event);
     match event {
@@ -236,13 +234,14 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             let notify_progress_sequence = Some(event.sequence);
             let classification =
                 xwm.note_configure_notify(handle, geometry, notify_progress_sequence);
-            xwm.apply_configure_notify_record(handle, geometry, classification.classification);
-            if matches!(
+            xwm.apply_configure_notify_record(
+                handle,
+                geometry,
                 classification.classification,
-                ConfigureNotifyClassification::ExternalAuthoritative
-                    | ConfigureNotifyClassification::ClientAuthoritativeRetiredReuse
-                    | ConfigureNotifyClassification::UnknownPreserved
-            ) && xwm.windows.get(handle).is_some()
+                classification.preserve_external_geometry,
+            );
+            if classification.classification.forwards_to_compositor()
+                && xwm.windows.get(handle).is_some()
             {
                 xwm.outgoing_events.push_back(XwmEvent::ConfigureNotify {
                     window: handle,
@@ -277,7 +276,6 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
     }
     Ok(())
 }
-
 fn trace_raw_event(event: &Event) {
     match event {
         Event::CreateNotify(event) => trace::emit("CreateNotify", || {

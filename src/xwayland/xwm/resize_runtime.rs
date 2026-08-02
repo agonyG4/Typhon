@@ -246,26 +246,25 @@ impl Xwm {
             .get(handle)
             .map(|record| record.geometry)
             .unwrap_or_default();
-        let external_authoritative = self
+        let geometry_authority = self
             .windows
             .get(handle)
             .and_then(|record| record.snapshot.as_ref())
-            .is_some_and(|snapshot| {
-                snapshot.override_redirect
-                    || snapshot.kind != DesktopWindowKind::Managed
-                    || snapshot.transient_for.is_some()
-                    || snapshot
-                        .window_types
-                        .preferred_supported_type()
-                        .is_some_and(|window_type| {
-                            !matches!(window_type, X11WindowType::Normal | X11WindowType::Other(_))
-                        })
-            });
+            .map(|snapshot| {
+                let role = crate::compositor::classify_x11_role(
+                    snapshot.kind,
+                    &snapshot.window_types,
+                    snapshot.transient_for.is_some(),
+                    snapshot.override_redirect,
+                );
+                crate::compositor::x11_placement_policy(role)
+            })
+            .unwrap_or(crate::compositor::X11PlacementPolicy::CompositorManaged);
         let timeline = self
             .configure_timelines
             .entry(handle)
             .or_insert_with(|| WindowConfigureTimeline::new(initial));
-        let result = timeline.notify(geometry, notify_progress_sequence, external_authoritative);
+        let result = timeline.notify(geometry, notify_progress_sequence, geometry_authority);
         if result.sequence_geometry_conflict {
             self.configure_metrics.sequence_geometry_conflicts = self
                 .configure_metrics
@@ -276,6 +275,18 @@ impl Xwm {
             self.configure_metrics.sequence_wrap_progress = self
                 .configure_metrics
                 .sequence_wrap_progress
+                .saturating_add(1);
+        }
+        if result.retired_geometry_match_count > 1 {
+            self.configure_metrics.retired_geometry_multiple_matches = self
+                .configure_metrics
+                .retired_geometry_multiple_matches
+                .saturating_add(1);
+        }
+        if result.retired_cookie_match {
+            self.configure_metrics.retired_cookie_match_stale = self
+                .configure_metrics
+                .retired_cookie_match_stale
                 .saturating_add(1);
         }
         match result.classification {
@@ -317,11 +328,26 @@ impl Xwm {
                     .configure_metrics
                     .client_authoritative_retired_geometry_reuse
                     .saturating_add(1);
+                self.configure_metrics.retired_geometry_reuse_external = self
+                    .configure_metrics
+                    .retired_geometry_reuse_external
+                    .saturating_add(1);
             }
             ConfigureNotifyClassification::ExternalAuthoritative => {
                 self.configure_metrics.notifies_external_applied = self
                     .configure_metrics
                     .notifies_external_applied
+                    .saturating_add(1);
+            }
+            ConfigureNotifyClassification::ExternalAuthoritativeSequenceCollision => {
+                self.configure_metrics.notifies_external_applied = self
+                    .configure_metrics
+                    .notifies_external_applied
+                    .saturating_add(1);
+                self.configure_metrics
+                    .sequence_collision_client_authoritative_applied = self
+                    .configure_metrics
+                    .sequence_collision_client_authoritative_applied
                     .saturating_add(1);
             }
             ConfigureNotifyClassification::SequenceOnlyRejected => {
@@ -331,11 +357,23 @@ impl Xwm {
                     .saturating_add(1);
                 self.configure_metrics.rollbacks_prevented =
                     self.configure_metrics.rollbacks_prevented.saturating_add(1);
+                self.configure_metrics.sequence_collision_managed_preserved = self
+                    .configure_metrics
+                    .sequence_collision_managed_preserved
+                    .saturating_add(1);
             }
             ConfigureNotifyClassification::AmbiguousGeometry => {
                 self.configure_metrics.ambiguous_identical_geometry_matches = self
                     .configure_metrics
                     .ambiguous_identical_geometry_matches
+                    .saturating_add(1);
+                self.configure_metrics.rollbacks_prevented =
+                    self.configure_metrics.rollbacks_prevented.saturating_add(1);
+            }
+            ConfigureNotifyClassification::AmbiguousRetired => {
+                self.configure_metrics.retired_geometry_ambiguous_managed = self
+                    .configure_metrics
+                    .retired_geometry_ambiguous_managed
                     .saturating_add(1);
                 self.configure_metrics.rollbacks_prevented =
                     self.configure_metrics.rollbacks_prevented.saturating_add(1);
@@ -362,6 +400,16 @@ impl Xwm {
                     result.sequence_geometry_conflict,
                 )
                 .field("sequence_wrap_progress", result.sequence_wrap_progress)
+                .field("geometry_authority", format!("{geometry_authority:?}"))
+                .field(
+                    "retired_geometry_match_count",
+                    result.retired_geometry_match_count,
+                )
+                .field("retired_cookie_match", result.retired_cookie_match)
+                .field(
+                    "preserve_external_geometry",
+                    result.preserve_external_geometry,
+                )
                 .field(
                     "sequence_only_match_rejected",
                     matches!(
@@ -374,6 +422,24 @@ impl Xwm {
                     matches!(
                         result.classification,
                         ConfigureNotifyClassification::AmbiguousGeometry
+                    ),
+                )
+                .field(
+                    "pending_ownership_consumed",
+                    matches!(
+                        result.classification,
+                        ConfigureNotifyClassification::ExpectedCurrent
+                            | ConfigureNotifyClassification::ExpectedOlder
+                            | ConfigureNotifyClassification::ExpectedCoalesced
+                    ),
+                )
+                .field(
+                    "external_geometry_applied",
+                    matches!(
+                        result.classification,
+                        ConfigureNotifyClassification::ExternalAuthoritative
+                            | ConfigureNotifyClassification::ExternalAuthoritativeSequenceCollision
+                            | ConfigureNotifyClassification::ClientAuthoritativeRetiredReuse
                     ),
                 )
                 .field("desired_geometry", format!("{:?}", timeline.desired()))
@@ -396,14 +462,17 @@ impl Xwm {
         handle: X11WindowHandle,
         geometry: X11Geometry,
         classification: ConfigureNotifyClassification,
+        preserve_external_geometry: bool,
     ) {
         if matches!(
             classification,
             ConfigureNotifyClassification::ExpectedCurrent
                 | ConfigureNotifyClassification::ExpectedCoalesced
                 | ConfigureNotifyClassification::ExternalAuthoritative
+                | ConfigureNotifyClassification::ExternalAuthoritativeSequenceCollision
                 | ConfigureNotifyClassification::ClientAuthoritativeRetiredReuse
-        ) && let Some(record) = self.windows.get_mut(handle)
+        ) && !preserve_external_geometry
+            && let Some(record) = self.windows.get_mut(handle)
         {
             record.geometry = geometry;
             if let Some(snapshot) = record.snapshot.as_mut() {

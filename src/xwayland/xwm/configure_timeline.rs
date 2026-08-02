@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+use crate::compositor::X11PlacementPolicy;
+
 use super::{X11ConfigureFlags, X11Geometry};
 
 pub(crate) const CONFIGURE_HISTORY_LIMIT: usize = 32;
@@ -20,6 +22,12 @@ pub(crate) struct ConfigureTimelineMetrics {
     pub(crate) sequence_only_matches_rejected: u64,
     pub(crate) client_authoritative_retired_geometry_reuse: u64,
     pub(crate) ambiguous_identical_geometry_matches: u64,
+    pub(crate) sequence_collision_managed_preserved: u64,
+    pub(crate) sequence_collision_client_authoritative_applied: u64,
+    pub(crate) retired_geometry_multiple_matches: u64,
+    pub(crate) retired_cookie_match_stale: u64,
+    pub(crate) retired_geometry_reuse_external: u64,
+    pub(crate) retired_geometry_ambiguous_managed: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,9 +64,23 @@ pub(crate) enum ConfigureNotifyClassification {
     StaleRetired,
     ClientAuthoritativeRetiredReuse,
     ExternalAuthoritative,
+    ExternalAuthoritativeSequenceCollision,
     SequenceOnlyRejected,
     AmbiguousGeometry,
+    AmbiguousRetired,
     UnknownPreserved,
+}
+
+impl ConfigureNotifyClassification {
+    pub(crate) const fn forwards_to_compositor(self) -> bool {
+        matches!(
+            self,
+            Self::ExternalAuthoritative
+                | Self::ExternalAuthoritativeSequenceCollision
+                | Self::ClientAuthoritativeRetiredReuse
+                | Self::UnknownPreserved
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +90,9 @@ pub(crate) struct ConfigureNotifyResult {
     pub(crate) geometry: X11Geometry,
     pub(crate) sequence_geometry_conflict: bool,
     pub(crate) sequence_wrap_progress: bool,
+    pub(crate) retired_geometry_match_count: usize,
+    pub(crate) retired_cookie_match: bool,
+    pub(crate) preserve_external_geometry: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +143,7 @@ pub(crate) struct WindowConfigureTimeline {
     acknowledged: Option<X11Geometry>,
     pending: VecDeque<ExpectedConfigure>,
     retired: VecDeque<RetiredConfigure>,
+    external_authoritative_geometry: Option<X11Geometry>,
 }
 
 impl WindowConfigureTimeline {
@@ -128,6 +154,7 @@ impl WindowConfigureTimeline {
             acknowledged: None,
             pending: VecDeque::new(),
             retired: VecDeque::new(),
+            external_authoritative_geometry: None,
         }
     }
 
@@ -147,6 +174,7 @@ impl WindowConfigureTimeline {
             configure_cookie_sequence,
         };
         self.desired = geometry;
+        self.external_authoritative_geometry = None;
         self.pending.push_back(expected);
         self.trim_pending();
         expected
@@ -156,14 +184,19 @@ impl WindowConfigureTimeline {
         &mut self,
         geometry: X11Geometry,
         notify_progress_sequence: Option<u16>,
-        external_authoritative: bool,
+        geometry_authority: X11PlacementPolicy,
     ) -> ConfigureNotifyResult {
+        let client_authoritative = geometry_authority != X11PlacementPolicy::CompositorManaged;
         match self.pending_match(geometry, notify_progress_sequence) {
             PendingMatch::Matched {
                 index,
                 sequence_geometry_conflict,
                 sequence_wrap_progress,
             } => {
+                let preserve_external_geometry = client_authoritative
+                    && self
+                        .external_authoritative_geometry
+                        .is_some_and(|external| external != geometry);
                 let was_current = index + 1 == self.pending.len();
                 let expected = self
                     .pending
@@ -194,15 +227,30 @@ impl WindowConfigureTimeline {
                     geometry,
                     sequence_geometry_conflict,
                     sequence_wrap_progress,
+                    retired_geometry_match_count: 0,
+                    retired_cookie_match: false,
+                    preserve_external_geometry,
                 }
             }
-            PendingMatch::SequenceOnlyRejected => ConfigureNotifyResult {
-                classification: ConfigureNotifyClassification::SequenceOnlyRejected,
-                epoch: None,
-                geometry,
-                sequence_geometry_conflict: false,
-                sequence_wrap_progress: false,
-            },
+            PendingMatch::SequenceOnlyRejected => {
+                if client_authoritative {
+                    self.external_authoritative_geometry = Some(geometry);
+                }
+                ConfigureNotifyResult {
+                    classification: if client_authoritative {
+                        ConfigureNotifyClassification::ExternalAuthoritativeSequenceCollision
+                    } else {
+                        ConfigureNotifyClassification::SequenceOnlyRejected
+                    },
+                    epoch: None,
+                    geometry,
+                    sequence_geometry_conflict: false,
+                    sequence_wrap_progress: false,
+                    retired_geometry_match_count: 0,
+                    retired_cookie_match: false,
+                    preserve_external_geometry: false,
+                }
+            }
             PendingMatch::Ambiguous {
                 sequence_geometry_conflict,
             } => ConfigureNotifyResult {
@@ -211,34 +259,52 @@ impl WindowConfigureTimeline {
                 geometry,
                 sequence_geometry_conflict,
                 sequence_wrap_progress: false,
+                retired_geometry_match_count: 0,
+                retired_cookie_match: false,
+                preserve_external_geometry: false,
             },
             PendingMatch::None => {
-                let retired = self
-                    .retired
-                    .iter()
-                    .find(|retired| retired.geometry == geometry);
-                if let Some(retired) = retired {
-                    let delayed_self_configure = external_authoritative
-                        && notify_progress_sequence.is_some_and(|sequence| {
+                let mut retired_geometry_match_count = 0;
+                let mut retired_epoch = None;
+                let mut retired_cookie_match = false;
+                for retired in &self.retired {
+                    if retired.geometry == geometry {
+                        retired_geometry_match_count += 1;
+                        retired_epoch = Some(retired.epoch);
+                        if notify_progress_sequence.is_some_and(|sequence| {
                             retired
                                 .configure_cookie_sequence
                                 .is_some_and(|cookie| sequence16_eq(cookie, sequence))
-                        });
+                        }) {
+                            retired_cookie_match = true;
+                        }
+                    }
+                }
+                if retired_geometry_match_count > 0 {
                     return ConfigureNotifyResult {
-                        classification: if external_authoritative && !delayed_self_configure {
+                        classification: if retired_cookie_match {
+                            ConfigureNotifyClassification::StaleRetired
+                        } else if client_authoritative {
+                            self.external_authoritative_geometry = Some(geometry);
                             ConfigureNotifyClassification::ClientAuthoritativeRetiredReuse
                         } else {
-                            ConfigureNotifyClassification::StaleRetired
+                            ConfigureNotifyClassification::AmbiguousRetired
                         },
-                        epoch: Some(retired.epoch),
+                        epoch: retired_epoch,
                         geometry,
                         sequence_geometry_conflict: false,
                         sequence_wrap_progress: false,
+                        retired_geometry_match_count,
+                        retired_cookie_match,
+                        preserve_external_geometry: false,
                     };
                 }
 
+                if client_authoritative {
+                    self.external_authoritative_geometry = Some(geometry);
+                }
                 ConfigureNotifyResult {
-                    classification: if external_authoritative {
+                    classification: if client_authoritative {
                         ConfigureNotifyClassification::ExternalAuthoritative
                     } else {
                         ConfigureNotifyClassification::UnknownPreserved
@@ -247,6 +313,9 @@ impl WindowConfigureTimeline {
                     geometry,
                     sequence_geometry_conflict: false,
                     sequence_wrap_progress: false,
+                    retired_geometry_match_count: 0,
+                    retired_cookie_match: false,
+                    preserve_external_geometry: false,
                 }
             }
         }
@@ -404,7 +473,7 @@ mod tests {
             );
         }
 
-        let result = timeline.notify(values[0], None, false);
+        let result = timeline.notify(values[0], None, X11PlacementPolicy::CompositorManaged);
 
         assert_eq!(
             result.classification,
@@ -437,7 +506,7 @@ mod tests {
                 );
             }
             for index in order {
-                timeline.notify(values[index], None, false);
+                timeline.notify(values[index], None, X11PlacementPolicy::CompositorManaged);
             }
             assert_eq!(timeline.desired(), values[2]);
         }
@@ -480,7 +549,7 @@ mod tests {
             );
         }
 
-        timeline.notify(values[0], None, false);
+        timeline.notify(values[0], None, X11PlacementPolicy::CompositorManaged);
 
         assert_eq!(timeline.desired(), values[2]);
         assert_eq!(timeline.desired().x + timeline.desired().width as i32, 740);
@@ -488,7 +557,8 @@ mod tests {
     }
 
     #[test]
-    fn newest_notification_retires_older_configures_and_late_events_are_stale() {
+    fn newest_notification_retires_older_configures_and_late_events_without_identity_are_ambiguous()
+    {
         let mut timeline = WindowConfigureTimeline::new(geometry(100, 640));
         let values = [geometry(110, 630), geometry(120, 620), geometry(130, 610)];
         for value in values {
@@ -500,8 +570,8 @@ mod tests {
             );
         }
 
-        let current = timeline.notify(values[2], None, false);
-        let stale = timeline.notify(values[0], None, false);
+        let current = timeline.notify(values[2], None, X11PlacementPolicy::CompositorManaged);
+        let stale = timeline.notify(values[0], None, X11PlacementPolicy::CompositorManaged);
 
         assert_eq!(
             current.classification,
@@ -509,7 +579,7 @@ mod tests {
         );
         assert_eq!(
             stale.classification,
-            ConfigureNotifyClassification::StaleRetired
+            ConfigureNotifyClassification::AmbiguousRetired
         );
         assert_eq!(timeline.desired(), values[2]);
         assert_eq!(timeline.pending_len(), 0);
@@ -532,7 +602,11 @@ mod tests {
             Some(0x10002),
         );
 
-        let result = timeline.notify(first.geometry, Some(2), false);
+        let result = timeline.notify(
+            first.geometry,
+            Some(2),
+            X11PlacementPolicy::CompositorManaged,
+        );
 
         assert_eq!(result.epoch, Some(first.epoch));
         assert_eq!(timeline.acknowledged(), Some(first.geometry));
@@ -549,12 +623,131 @@ mod tests {
             Some(10),
         );
 
-        let result = timeline.notify(geometry(999, 1), Some(10), false);
+        let result = timeline.notify(
+            geometry(999, 1),
+            Some(10),
+            X11PlacementPolicy::CompositorManaged,
+        );
 
         assert_eq!(timeline.acknowledged(), None);
         assert_eq!(timeline.desired(), expected.geometry);
         assert_eq!(timeline.pending_len(), 1);
         assert_ne!(result.epoch, Some(expected.epoch));
+    }
+
+    #[test]
+    fn client_authoritative_sequence_collision_applies_external_geometry_without_consuming_pending()
+    {
+        let mut timeline = WindowConfigureTimeline::new(geometry(100, 640));
+        let pending_geometry = geometry(110, 630);
+        let external_geometry = geometry(220, 620);
+        timeline.record(
+            pending_geometry,
+            X11ConfigureFlags::all(),
+            ConfigureSource::Compositor,
+            Some(10),
+        );
+
+        let result = timeline.notify(
+            external_geometry,
+            Some(10),
+            X11PlacementPolicy::ClientPositioned,
+        );
+
+        assert_ne!(
+            result.classification,
+            ConfigureNotifyClassification::SequenceOnlyRejected
+        );
+        assert_eq!(result.geometry, external_geometry);
+        assert_eq!(timeline.pending_len(), 1);
+        assert_eq!(timeline.acknowledged(), None);
+        assert_eq!(timeline.desired(), pending_geometry);
+    }
+
+    #[test]
+    fn repeated_retired_geometry_checks_the_matching_cookie_not_only_the_first_entry() {
+        let mut timeline = WindowConfigureTimeline::new(geometry(100, 640));
+        let repeated = geometry(110, 630);
+        timeline.record(
+            repeated,
+            X11ConfigureFlags::all(),
+            ConfigureSource::Compositor,
+            Some(10),
+        );
+        timeline.record(
+            geometry(120, 620),
+            X11ConfigureFlags::all(),
+            ConfigureSource::Compositor,
+            Some(11),
+        );
+        timeline.record(
+            repeated,
+            X11ConfigureFlags::all(),
+            ConfigureSource::Compositor,
+            Some(20),
+        );
+        let final_geometry = timeline.record(
+            geometry(130, 610),
+            X11ConfigureFlags::all(),
+            ConfigureSource::Compositor,
+            Some(30),
+        );
+        timeline.notify(
+            final_geometry.geometry,
+            Some(30),
+            X11PlacementPolicy::CompositorManaged,
+        );
+
+        let result = timeline.notify(repeated, Some(20), X11PlacementPolicy::ClientPositioned);
+
+        assert_eq!(
+            result.classification,
+            ConfigureNotifyClassification::StaleRetired
+        );
+        assert_eq!(timeline.retired_len(), 3);
+    }
+
+    #[test]
+    fn managed_reused_retired_geometry_without_cookie_evidence_is_ambiguous() {
+        let mut timeline = WindowConfigureTimeline::new(geometry(100, 640));
+        let repeated = geometry(110, 630);
+        timeline.record(
+            repeated,
+            X11ConfigureFlags::all(),
+            ConfigureSource::Compositor,
+            Some(10),
+        );
+        timeline.record(
+            geometry(120, 620),
+            X11ConfigureFlags::all(),
+            ConfigureSource::Compositor,
+            Some(11),
+        );
+        timeline.record(
+            repeated,
+            X11ConfigureFlags::all(),
+            ConfigureSource::Compositor,
+            Some(20),
+        );
+        let final_geometry = timeline.record(
+            geometry(130, 610),
+            X11ConfigureFlags::all(),
+            ConfigureSource::Compositor,
+            Some(30),
+        );
+        timeline.notify(
+            final_geometry.geometry,
+            Some(30),
+            X11PlacementPolicy::CompositorManaged,
+        );
+
+        let result = timeline.notify(repeated, Some(99), X11PlacementPolicy::CompositorManaged);
+
+        assert_ne!(
+            result.classification,
+            ConfigureNotifyClassification::StaleRetired
+        );
+        assert_eq!(timeline.desired(), final_geometry.geometry);
     }
 
     #[test]
@@ -573,7 +766,11 @@ mod tests {
             Some(11),
         );
 
-        let result = timeline.notify(first.geometry, Some(12), false);
+        let result = timeline.notify(
+            first.geometry,
+            Some(12),
+            X11PlacementPolicy::CompositorManaged,
+        );
 
         assert_eq!(result.epoch, Some(first.epoch));
         assert_eq!(timeline.acknowledged(), Some(first.geometry));
@@ -604,7 +801,7 @@ mod tests {
             Some(3),
         );
 
-        let result = timeline.notify(repeated, Some(2), false);
+        let result = timeline.notify(repeated, Some(2), X11PlacementPolicy::CompositorManaged);
 
         assert_eq!(timeline.acknowledged(), None);
         assert_eq!(timeline.pending_len(), 3);
@@ -634,7 +831,7 @@ mod tests {
             Some(0x1_0001),
         );
 
-        let result = timeline.notify(repeated, Some(2), false);
+        let result = timeline.notify(repeated, Some(2), X11PlacementPolicy::CompositorManaged);
 
         assert_eq!(result.epoch, Some(newest.epoch));
         assert_eq!(timeline.acknowledged(), Some(repeated));
@@ -668,7 +865,11 @@ mod tests {
             Some(0xffff),
         );
 
-        let result = timeline.notify(expected_geometry, Some(0), false);
+        let result = timeline.notify(
+            expected_geometry,
+            Some(0),
+            X11PlacementPolicy::CompositorManaged,
+        );
 
         assert!(result.sequence_wrap_progress);
     }
@@ -689,9 +890,13 @@ mod tests {
             ConfigureSource::Compositor,
             Some(2),
         );
-        timeline.notify(geometry(120, 620), Some(2), false);
+        timeline.notify(
+            geometry(120, 620),
+            Some(2),
+            X11PlacementPolicy::CompositorManaged,
+        );
 
-        let result = timeline.notify(retired_geometry, None, true);
+        let result = timeline.notify(retired_geometry, None, X11PlacementPolicy::ClientPositioned);
 
         assert_ne!(
             result.classification,
@@ -716,9 +921,17 @@ mod tests {
             ConfigureSource::Compositor,
             Some(2),
         );
-        timeline.notify(geometry(120, 620), Some(2), false);
+        timeline.notify(
+            geometry(120, 620),
+            Some(2),
+            X11PlacementPolicy::CompositorManaged,
+        );
 
-        let result = timeline.notify(retired_geometry, Some(1), true);
+        let result = timeline.notify(
+            retired_geometry,
+            Some(1),
+            X11PlacementPolicy::ClientPositioned,
+        );
 
         assert_eq!(
             result.classification,

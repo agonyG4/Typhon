@@ -293,6 +293,343 @@ fn configure_sequence_diagnostics_count_conflicts_and_sequence_only_rejections()
 }
 
 #[test]
+fn retired_geometry_metrics_cover_multiple_matches_and_ambiguous_reuse() {
+    let generation = generation(226);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 226, true, false, false);
+    let repeated = X11Geometry {
+        x: 110,
+        y: 100,
+        width: 630,
+        height: 480,
+    };
+    for (geometry, sequence) in [
+        (repeated, 10),
+        (X11Geometry { x: 120, ..repeated }, 11),
+        (repeated, 20),
+        (X11Geometry { x: 130, ..repeated }, 30),
+    ] {
+        xwm.note_expected_configure_with_context(
+            handle,
+            geometry,
+            super::super::X11ConfigureFlags::all(),
+            super::super::ConfigureSource::Compositor,
+            Some(sequence),
+        );
+    }
+    xwm.note_configure_notify(handle, X11Geometry { x: 130, ..repeated }, Some(30));
+    xwm.note_configure_notify(handle, repeated, Some(20));
+    xwm.note_configure_notify(handle, repeated, Some(99));
+
+    let metrics = xwm.configure_metrics();
+    assert_eq!(metrics.retired_geometry_multiple_matches, 2);
+    assert_eq!(metrics.retired_cookie_match_stale, 1);
+    assert_eq!(metrics.retired_geometry_ambiguous_managed, 1);
+}
+
+#[test]
+fn override_redirect_sequence_collision_applies_external_geometry_and_keeps_pending_self_configure()
+{
+    let generation = generation(222);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 222, true, false, false);
+    let mut snapshot = sync_snapshot(handle, 0);
+    snapshot.kind = DesktopWindowKind::OverrideRedirect;
+    snapshot.override_redirect = true;
+    let record = xwm.windows.get_mut(handle).expect("window record");
+    record.kind = DesktopWindowKind::OverrideRedirect;
+    record.snapshot = Some(snapshot);
+    let pending_geometry = X11Geometry {
+        x: 110,
+        y: 100,
+        width: 630,
+        height: 480,
+    };
+    let external_geometry = X11Geometry {
+        x: 220,
+        y: 140,
+        width: 620,
+        height: 470,
+    };
+    xwm.note_expected_configure_with_context(
+        handle,
+        pending_geometry,
+        super::super::X11ConfigureFlags::all(),
+        super::super::ConfigureSource::Compositor,
+        Some(10),
+    );
+
+    normalize(
+        &mut xwm,
+        Event::ConfigureNotify(xproto::ConfigureNotifyEvent {
+            response_type: 22,
+            sequence: 10,
+            event: 1,
+            window: handle.xid(),
+            above_sibling: 0,
+            x: external_geometry.x as i16,
+            y: external_geometry.y as i16,
+            width: external_geometry.width as u16,
+            height: external_geometry.height as u16,
+            border_width: 0,
+            override_redirect: true,
+        }),
+    )
+    .expect("normalize override-redirect sequence collision");
+
+    assert!(xwm.take_events().any(|event| matches!(
+        event,
+        XwmEvent::ConfigureNotify { window, geometry, .. }
+            if window == handle && geometry == external_geometry
+    )));
+    assert_eq!(
+        xwm.windows.get(handle).expect("window record").geometry,
+        external_geometry
+    );
+    assert_eq!(
+        xwm.configure_timelines
+            .get(&handle)
+            .expect("timeline")
+            .pending_len(),
+        1
+    );
+    assert_eq!(
+        xwm.configure_timelines
+            .get(&handle)
+            .expect("timeline")
+            .acknowledged(),
+        None
+    );
+    assert_eq!(
+        xwm.configure_metrics()
+            .sequence_collision_client_authoritative_applied,
+        1
+    );
+
+    normalize(
+        &mut xwm,
+        Event::ConfigureNotify(xproto::ConfigureNotifyEvent {
+            response_type: 22,
+            sequence: 10,
+            event: 1,
+            window: handle.xid(),
+            above_sibling: 0,
+            x: pending_geometry.x as i16,
+            y: pending_geometry.y as i16,
+            width: pending_geometry.width as u16,
+            height: pending_geometry.height as u16,
+            border_width: 0,
+            override_redirect: true,
+        }),
+    )
+    .expect("normalize later matching self-configure");
+    assert_eq!(
+        xwm.configure_timelines
+            .get(&handle)
+            .expect("timeline")
+            .pending_len(),
+        0
+    );
+    assert_eq!(
+        xwm.windows.get(handle).expect("window record").geometry,
+        external_geometry
+    );
+}
+
+#[test]
+fn managed_sequence_collision_preserves_geometry_and_pending_ownership() {
+    let generation = generation(223);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 223, true, false, false);
+    let pending_geometry = X11Geometry {
+        x: 110,
+        y: 100,
+        width: 630,
+        height: 480,
+    };
+    let external_geometry = X11Geometry {
+        x: 220,
+        y: 140,
+        width: 620,
+        height: 470,
+    };
+    xwm.note_expected_configure_with_context(
+        handle,
+        pending_geometry,
+        super::super::X11ConfigureFlags::all(),
+        super::super::ConfigureSource::Compositor,
+        Some(10),
+    );
+
+    normalize(
+        &mut xwm,
+        Event::ConfigureNotify(xproto::ConfigureNotifyEvent {
+            response_type: 22,
+            sequence: 10,
+            event: 1,
+            window: handle.xid(),
+            above_sibling: 0,
+            x: external_geometry.x as i16,
+            y: external_geometry.y as i16,
+            width: external_geometry.width as u16,
+            height: external_geometry.height as u16,
+            border_width: 0,
+            override_redirect: false,
+        }),
+    )
+    .expect("normalize managed sequence collision");
+
+    assert!(xwm.take_events().all(|event| !matches!(
+        event,
+        XwmEvent::ConfigureNotify { window, .. } if window == handle
+    )));
+    assert_eq!(
+        xwm.configure_timelines
+            .get(&handle)
+            .expect("timeline")
+            .pending_len(),
+        1
+    );
+    assert_eq!(
+        xwm.configure_timelines
+            .get(&handle)
+            .expect("timeline")
+            .desired(),
+        pending_geometry
+    );
+    assert_eq!(
+        xwm.configure_metrics().sequence_collision_managed_preserved,
+        1
+    );
+    assert_eq!(xwm.configure_metrics().sequence_only_matches_rejected, 1);
+}
+
+#[test]
+fn client_positioned_sequence_collision_applies_external_geometry_and_keeps_pending() {
+    let generation = generation(224);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 224, true, false, false);
+    let mut snapshot = sync_snapshot(handle, 0);
+    snapshot.window_types = X11WindowTypes::new(vec![X11WindowType::Notification]);
+    xwm.windows.get_mut(handle).expect("window record").snapshot = Some(snapshot);
+    let pending_geometry = X11Geometry {
+        x: 110,
+        y: 100,
+        width: 630,
+        height: 480,
+    };
+    let external_geometry = X11Geometry {
+        x: 220,
+        y: 140,
+        width: 620,
+        height: 470,
+    };
+    xwm.note_expected_configure_with_context(
+        handle,
+        pending_geometry,
+        super::super::X11ConfigureFlags::all(),
+        super::super::ConfigureSource::Compositor,
+        Some(10),
+    );
+
+    normalize(
+        &mut xwm,
+        Event::ConfigureNotify(xproto::ConfigureNotifyEvent {
+            response_type: 22,
+            sequence: 10,
+            event: 1,
+            window: handle.xid(),
+            above_sibling: 0,
+            x: external_geometry.x as i16,
+            y: external_geometry.y as i16,
+            width: external_geometry.width as u16,
+            height: external_geometry.height as u16,
+            border_width: 0,
+            override_redirect: false,
+        }),
+    )
+    .expect("normalize client-positioned sequence collision");
+
+    assert!(xwm.take_events().any(|event| matches!(
+        event,
+        XwmEvent::ConfigureNotify { window, geometry, .. }
+            if window == handle && geometry == external_geometry
+    )));
+    assert_eq!(
+        xwm.configure_timelines
+            .get(&handle)
+            .expect("timeline")
+            .pending_len(),
+        1
+    );
+    assert_eq!(
+        xwm.configure_metrics()
+            .sequence_collision_client_authoritative_applied,
+        1
+    );
+}
+
+#[test]
+fn transient_parent_relative_sequence_collision_applies_external_geometry() {
+    let generation = generation(225);
+    let (mut xwm, _peer) = test_fixture(generation);
+    let handle = prepare_managed_window(&mut xwm, 225, true, false, false);
+    let mut snapshot = sync_snapshot(handle, 0);
+    snapshot.transient_for = Some(super::super::X11WindowHandle::new(generation, 999));
+    xwm.windows.get_mut(handle).expect("window record").snapshot = Some(snapshot);
+    let pending_geometry = X11Geometry {
+        x: 110,
+        y: 100,
+        width: 630,
+        height: 480,
+    };
+    let external_geometry = X11Geometry {
+        x: 220,
+        y: 140,
+        width: 620,
+        height: 470,
+    };
+    xwm.note_expected_configure_with_context(
+        handle,
+        pending_geometry,
+        super::super::X11ConfigureFlags::all(),
+        super::super::ConfigureSource::Compositor,
+        Some(10),
+    );
+
+    normalize(
+        &mut xwm,
+        Event::ConfigureNotify(xproto::ConfigureNotifyEvent {
+            response_type: 22,
+            sequence: 10,
+            event: 1,
+            window: handle.xid(),
+            above_sibling: 0,
+            x: external_geometry.x as i16,
+            y: external_geometry.y as i16,
+            width: external_geometry.width as u16,
+            height: external_geometry.height as u16,
+            border_width: 0,
+            override_redirect: false,
+        }),
+    )
+    .expect("normalize transient sequence collision");
+
+    assert!(xwm.take_events().any(|event| matches!(
+        event,
+        XwmEvent::ConfigureNotify { window, geometry, .. }
+            if window == handle && geometry == external_geometry
+    )));
+    assert_eq!(
+        xwm.configure_timelines
+            .get(&handle)
+            .expect("timeline")
+            .pending_len(),
+        1
+    );
+}
+
+#[test]
 fn override_redirect_can_reuse_retired_geometry_as_external_state() {
     let generation = generation(217);
     let (mut xwm, _peer) = test_fixture(generation);

@@ -362,6 +362,19 @@ impl XwaylandService {
                     configure_metrics.client_authoritative_retired_geometry_reuse;
                 self.metrics.x11_ambiguous_identical_geometry_matches =
                     configure_metrics.ambiguous_identical_geometry_matches;
+                self.metrics.x11_sequence_collision_managed_preserved =
+                    configure_metrics.sequence_collision_managed_preserved;
+                self.metrics
+                    .x11_sequence_collision_client_authoritative_applied =
+                    configure_metrics.sequence_collision_client_authoritative_applied;
+                self.metrics.x11_retired_geometry_multiple_matches =
+                    configure_metrics.retired_geometry_multiple_matches;
+                self.metrics.x11_retired_cookie_match_stale =
+                    configure_metrics.retired_cookie_match_stale;
+                self.metrics.x11_retired_geometry_reuse_external =
+                    configure_metrics.retired_geometry_reuse_external;
+                self.metrics.x11_retired_geometry_ambiguous_managed =
+                    configure_metrics.retired_geometry_ambiguous_managed;
                 self.metrics.xwm_events_received = self
                     .metrics
                     .xwm_events_received

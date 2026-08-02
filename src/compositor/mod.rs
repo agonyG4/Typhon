@@ -102,6 +102,7 @@ pub use desktop_window::{
 #[allow(unused_imports)]
 pub(crate) use desktop_window::{
     DesktopWindow, DesktopWindowError, WindowBackend, WindowRelationships, XdgWindowHandle,
+    classify_x11_role, x11_placement_policy,
 };
 pub use dmabuf::{DirectScanoutFeedbackCapabilities, DirectScanoutFormatCapability};
 use dmabuf::{
