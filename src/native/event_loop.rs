@@ -23,6 +23,8 @@ pub enum NativeEventSource {
     XwaylandDisplayReady,
     XwaylandXwm,
     XwaylandStderr,
+    ControlListener,
+    ControlClient,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -78,6 +80,7 @@ impl WakeReasons {
     const XWAYLAND_DISPLAY_READY: u32 = 1 << 10;
     const XWAYLAND_XWM: u32 = 1 << 11;
     const XWAYLAND_STDERR: u32 = 1 << 12;
+    const CONTROL: u32 = 1 << 14;
 
     pub const fn drm(self) -> bool {
         self.0 & Self::DRM != 0
@@ -135,6 +138,10 @@ impl WakeReasons {
         self.0 & Self::XWAYLAND_STDERR != 0
     }
 
+    pub const fn control(self) -> bool {
+        self.0 & Self::CONTROL != 0
+    }
+
     pub const fn bits(self) -> u32 {
         self.0
     }
@@ -155,12 +162,19 @@ impl WakeReasons {
             NativeEventSource::XwaylandDisplayReady => Self::XWAYLAND_DISPLAY_READY,
             NativeEventSource::XwaylandXwm => Self::XWAYLAND_XWM,
             NativeEventSource::XwaylandStderr => Self::XWAYLAND_STDERR,
+            NativeEventSource::ControlListener | NativeEventSource::ControlClient => Self::CONTROL,
         };
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XwaylandReadyEvent {
+    pub token: ReactorToken,
+    pub flags: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlReadyEvent {
     pub token: ReactorToken,
     pub flags: u32,
 }
@@ -173,6 +187,7 @@ pub struct NativeWakeup {
     pub timer_lateness_ns: Option<u64>,
     pub explicit_sync_acquire_tokens: Vec<ReactorToken>,
     pub xwayland_events: Vec<XwaylandReadyEvent>,
+    pub control_events: Vec<ControlReadyEvent>,
 }
 
 #[derive(Debug)]
@@ -402,6 +417,7 @@ impl NativeEventLoop {
         let mut reasons = WakeReasons::default();
         let mut explicit_sync_acquire_tokens = Vec::new();
         let mut xwayland_events = Vec::new();
+        let mut control_events = Vec::new();
 
         for index in 0..ready {
             let event = self.events[index];
@@ -424,18 +440,20 @@ impl NativeEventLoop {
             let error_events =
                 libc::EPOLLERR as u32 | libc::EPOLLHUP as u32 | libc::EPOLLRDHUP as u32;
             if event_flags & error_events != 0 {
-                if matches!(
-                    registration_source,
-                    NativeEventSource::XwaylandListen
-                        | NativeEventSource::XwaylandDisplayReady
-                        | NativeEventSource::XwaylandXwm
-                        | NativeEventSource::XwaylandStderr
-                ) {
+                if is_xwayland_source(registration_source) || is_control_source(registration_source)
+                {
                     reasons.insert(registration_source);
-                    xwayland_events.push(XwaylandReadyEvent {
-                        token,
-                        flags: event_flags,
-                    });
+                    if is_xwayland_source(registration_source) {
+                        xwayland_events.push(XwaylandReadyEvent {
+                            token,
+                            flags: event_flags,
+                        });
+                    } else {
+                        control_events.push(ControlReadyEvent {
+                            token,
+                            flags: event_flags,
+                        });
+                    }
                     continue;
                 }
                 let _ = self.unregister(token);
@@ -455,6 +473,12 @@ impl NativeEventLoop {
                     | NativeEventSource::XwaylandXwm
                     | NativeEventSource::XwaylandStderr => {
                         xwayland_events.push(XwaylandReadyEvent {
+                            token,
+                            flags: event_flags,
+                        });
+                    }
+                    NativeEventSource::ControlListener | NativeEventSource::ControlClient => {
+                        control_events.push(ControlReadyEvent {
                             token,
                             flags: event_flags,
                         });
@@ -481,6 +505,7 @@ impl NativeEventLoop {
             timer_lateness_ns,
             explicit_sync_acquire_tokens,
             xwayland_events,
+            control_events,
         })
     }
 
@@ -580,7 +605,7 @@ impl NativeEventLoop {
             libc::epoll_ctl(
                 self.epoll.as_raw_fd(),
                 libc::EPOLL_CTL_MOD,
-                registration.fd,
+                registration.identity_fd.as_raw_fd(),
                 &mut event,
             )
         };
@@ -648,6 +673,13 @@ fn is_xwayland_source(source: NativeEventSource) -> bool {
             | NativeEventSource::XwaylandDisplayReady
             | NativeEventSource::XwaylandXwm
             | NativeEventSource::XwaylandStderr
+    )
+}
+
+fn is_control_source(source: NativeEventSource) -> bool {
+    matches!(
+        source,
+        NativeEventSource::ControlListener | NativeEventSource::ControlClient
     )
 }
 
