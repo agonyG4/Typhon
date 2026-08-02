@@ -32,6 +32,7 @@ pub(crate) enum KmsBundleOwnerError {
     Empty,
     GenerationMismatch,
     TargetMismatch,
+    CursorRevisionMismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,35 +88,33 @@ impl KmsBundleOwners {
         }
     }
 
-    pub(crate) fn for_legacy_transaction(
+    pub(crate) fn for_transaction(
         kind: AtomicCommitKind,
         transaction: Arc<OutputTransaction>,
+        cursor_revision: Option<CursorRevision>,
         capability_key: Option<CursorCapabilityKey>,
-    ) -> Self {
+    ) -> Result<Self, KmsBundleOwnerError> {
         let primary =
             (!matches!(kind, AtomicCommitKind::PlaneDelta { .. })).then(|| KmsPrimaryOwner {
                 transaction: Arc::clone(&transaction),
             });
-        let cursor = (!matches!(
-            transaction.planes().cursor(),
-            CursorPlaneAssignment::Unchanged
-        ))
-        .then(|| KmsCursorOwner {
-            revision: match transaction.planes().cursor() {
-                CursorPlaneAssignment::Atomic { desired_epoch, .. } => {
-                    let epoch = std::num::NonZeroU64::new(*desired_epoch)
-                        .expect("cursor transaction epoch is nonzero");
-                    CursorRevision::from_legacy_epoch(epoch)
+        let cursor = match transaction.planes().cursor() {
+            CursorPlaneAssignment::Unchanged => {
+                if cursor_revision.is_some() || capability_key.is_some() {
+                    return Err(KmsBundleOwnerError::CursorRevisionMismatch);
                 }
-                CursorPlaneAssignment::Unchanged | CursorPlaneAssignment::Disabled => {
-                    CursorRevision::initial()
-                }
-            },
-            transaction,
-            sidecar_id: None,
-            capability_key,
-        });
-        Self { primary, cursor }
+                None
+            }
+            CursorPlaneAssignment::Atomic { .. } | CursorPlaneAssignment::Disabled => {
+                Some(KmsCursorOwner {
+                    revision: cursor_revision.ok_or(KmsBundleOwnerError::CursorRevisionMismatch)?,
+                    transaction,
+                    sidecar_id: None,
+                    capability_key,
+                })
+            }
+        };
+        Self::new(primary, cursor)
     }
 
     pub(crate) fn primary(&self) -> Option<&KmsPrimaryOwner> {

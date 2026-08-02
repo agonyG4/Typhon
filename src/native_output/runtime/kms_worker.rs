@@ -21,6 +21,7 @@ use super::presentation_transactions::{
     settle_forced_shutdown_transaction_if_safe,
 };
 use super::*;
+use crate::native_output::presentation::plane::CursorRevision;
 use crate::native_output::scanout::AtomicEglGbmScanout;
 use oblivion_one::native::kms::{AtomicKmsError, FramebufferId, PageFlipToken};
 
@@ -144,8 +145,10 @@ pub(super) fn queue_explicit_composited_frame(
         Err(error) => return Ok(WorkerQueueOutcome::Unavailable(error)),
     };
     let queued_at_ns = monotonic_now_ns()?;
-    let frozen_cursor_owner = explicit.swapchain()?.ready_cursor_plane_owner();
-    let frozen_cursor_capability_key = frozen_cursor_owner.and_then(|owner| owner.capability_key);
+    let frozen_cursor_owner_metadata = explicit
+        .swapchain()?
+        .ready_cursor_plane_owner()
+        .map(|owner| (owner.revision, owner.capability_key));
     let in_fence_and_owner = explicit
         .swapchain_mut()?
         .take_ready_for_worker(token, MonotonicTimestampNs::new(queued_at_ns))?;
@@ -197,7 +200,7 @@ pub(super) fn queue_explicit_composited_frame(
     let job = KmsCommitJob {
         bundle_id:
             crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
-        owners: KmsBundleOwners::for_legacy_transaction(
+        owners: KmsBundleOwners::for_transaction(
             kind,
             Arc::new(
                 output_transactions
@@ -206,8 +209,10 @@ pub(super) fn queue_explicit_composited_frame(
                     .descriptor()
                     .clone(),
             ),
-            frozen_cursor_capability_key,
-        ),
+            frozen_cursor_owner_metadata.map(|(revision, _)| revision),
+            frozen_cursor_owner_metadata.and_then(|(_, capability_key)| capability_key),
+        )
+        .map_err(|error| io::Error::other(format!("invalid ready cursor owner: {error:?}")))?,
         transaction_id,
         token,
         output_generation,
@@ -308,6 +313,7 @@ pub(super) fn queue_atomic_compatibility_frame(
     pacing_mode: NativeOutputPacingMode,
     render_generation: u64,
     cursor: Option<&AtomicCursorVisualState>,
+    cursor_revision: Option<CursorRevision>,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     primary_cursor_presentation: KmsPrimaryCursorPresentation,
     cursor_pin: Option<CursorFramebufferPin>,
@@ -421,7 +427,7 @@ pub(super) fn queue_atomic_compatibility_frame(
     let job = KmsCommitJob {
         bundle_id:
             crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
-        owners: KmsBundleOwners::for_legacy_transaction(
+        owners: KmsBundleOwners::for_transaction(
             kind,
             Arc::new(
                 output_transactions
@@ -432,8 +438,12 @@ pub(super) fn queue_atomic_compatibility_frame(
                     .descriptor()
                     .clone(),
             ),
+            cursor_revision,
             cursor_capability_key,
-        ),
+        )
+        .map_err(|error| {
+            io::Error::other(format!("invalid compatibility cursor owner: {error:?}"))
+        })?,
         transaction_id,
         token,
         output_generation,
@@ -1115,13 +1125,16 @@ impl NativeRuntime {
                                     .into());
                                 }
                             };
-                            let submitted_revision = self
-                                .atomic_cursor
-                                .as_ref()
+                            let submitted_revision = ownership
+                                .job
+                                .owners
+                                .cursor()
+                                .map(|owner| owner.revision)
                                 .ok_or_else(|| {
-                                    io::Error::other("primary cursor submit has no cursor")
-                                })?
-                                .revision_for_legacy_epoch(cursor_epoch);
+                                    io::Error::other(
+                                        "primary cursor submit has no frozen cursor revision",
+                                    )
+                                })?;
                             (
                                 submitted_state,
                                 submitted_revision,

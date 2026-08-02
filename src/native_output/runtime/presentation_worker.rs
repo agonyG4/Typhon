@@ -13,7 +13,7 @@ use crate::native_output::kms_worker::{
     KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerAdmissionError, PendingBundleSnapshot,
 };
 use crate::native_output::presentation::plane::{
-    FrozenCursorTestPolicy, FrozenPrimaryCursorPresentation,
+    CursorRevision, FrozenCursorTestPolicy, FrozenPrimaryCursorPresentation,
 };
 use oblivion_one::native::kms::FramebufferId;
 
@@ -517,6 +517,7 @@ pub(super) fn queue_compatibility_for_presentation(
     pacing_mode: NativeOutputPacingMode,
     render_generation: u64,
     cursor: Option<&AtomicCursorVisualState>,
+    cursor_revision: Option<CursorRevision>,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     primary_cursor_presentation: KmsPrimaryCursorPresentation,
     cursor_pin: Option<CursorFramebufferPin>,
@@ -541,6 +542,7 @@ pub(super) fn queue_compatibility_for_presentation(
         pacing_mode,
         render_generation,
         cursor,
+        cursor_revision,
         cursor_delivery,
         primary_cursor_presentation,
         cursor_pin,
@@ -583,6 +585,7 @@ pub(super) fn finish_direct_worker_queued(
     frame_scheduler: &mut NativeFrameScheduler,
     _cursor_output_arbitration: &mut NativeCursorOutputArbitration,
     effective_cursor: Option<&AtomicCursorVisualState>,
+    cursor_revision: Option<CursorRevision>,
     context: WorkerPrimarySubmissionContext<'_>,
     output_generation: u64,
     crtc_id: u32,
@@ -631,7 +634,7 @@ pub(super) fn finish_direct_worker_queued(
             crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(
                 commit_token,
             ),
-        owners: KmsBundleOwners::for_legacy_transaction(
+        owners: KmsBundleOwners::for_transaction(
             kind,
             std::sync::Arc::new(
                 output_transactions
@@ -640,10 +643,12 @@ pub(super) fn finish_direct_worker_queued(
                     .descriptor()
                     .clone(),
             ),
+            cursor_revision,
             context.atomic_cursor.and_then(|cursor| {
                 effective_cursor.and_then(|state| cursor.capability_key_for(state))
             }),
-        ),
+        )
+        .map_err(|error| io::Error::other(format!("invalid direct cursor owner: {error:?}")))?,
         transaction_id,
         token: commit_token,
         output_generation,

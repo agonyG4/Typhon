@@ -188,6 +188,7 @@ pub(crate) enum DirectScanoutAttempt {
         transaction_id: OutputTransactionId,
         token: u64,
         framebuffer_id: u32,
+        cursor_revision: Option<crate::native_output::presentation::plane::CursorRevision>,
         lease: Box<DirectPrimaryLease>,
         admission: crate::native_output::kms_worker::KmsCommitAdmissionPermit,
         test_only: crate::native_output::kms_worker::KmsTestOnlyPolicy,

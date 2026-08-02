@@ -145,6 +145,9 @@ pub(super) fn submit_ready_frame(
                 pacing_mode,
                 render_generation,
                 cursor,
+                atomic_cursor
+                    .as_ref()
+                    .and_then(|cursor_state| cursor.map(|_| cursor_state.desired_revision())),
                 cursor_delivery,
                 primary_cursor_presentation,
                 cursor_pin,

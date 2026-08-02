@@ -150,6 +150,31 @@ pub(super) fn freeze_cursor_plane_owner(
     }))
 }
 
+pub(super) fn freeze_cursor_assignment_for_render(
+    effective_cursor: Option<&AtomicCursorVisualState>,
+    cursor_epoch: u64,
+    cursor: Option<&NativeAtomicCursor>,
+) -> NativeResult<(
+    Option<CursorPlaneAssignment>,
+    Option<FrozenCursorPlaneOwner>,
+)> {
+    let assignment = effective_cursor.map(|state| CursorPlaneAssignment::Atomic {
+        desired_epoch: cursor_epoch,
+        state: Some(state.clone()),
+    });
+    let owner = freeze_cursor_plane_owner(assignment.as_ref(), cursor)?;
+    Ok((assignment, owner))
+}
+
+pub(super) fn frozen_revision(
+    effective_cursor: Option<&AtomicCursorVisualState>,
+    cursor: Option<&NativeAtomicCursor>,
+) -> Option<CursorRevision> {
+    effective_cursor
+        .and(cursor)
+        .map(NativeAtomicCursor::desired_revision)
+}
+
 pub(super) fn freeze_primary_cursor_presentation(
     previous_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     next_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,

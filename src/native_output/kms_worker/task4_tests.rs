@@ -71,6 +71,61 @@ fn commit_test_policy_preserves_and_composes_component_requirements() {
     assert_eq!(policy.effective(), KmsTestOnlyPolicy::Skip);
 }
 
+#[test]
+fn embedded_primary_owner_preserves_exact_component_cursor_revision() {
+    let transaction_id =
+        crate::native_output::OutputTransactionId::new(std::num::NonZeroU64::new(8_001).unwrap());
+    let target = test_job(8_001).target;
+    let mut exact =
+        crate::native_output::presentation::plane::CursorRevision::initial().advance_image();
+    for _ in 0..98 {
+        exact = exact.advance_motion();
+    }
+    let transaction = Arc::new(
+        crate::native_output::OutputTransaction::composited(
+            transaction_id,
+            1,
+            oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(1),
+            target,
+            oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
+            1,
+            1,
+            1,
+            crate::native_output::OutputSlotId::new(1).unwrap(),
+            42,
+            Some(crate::native_output::CursorPlaneAssignment::Atomic {
+                desired_epoch: 100,
+                state: Some(AtomicCursorVisualState::hidden(64, 64)),
+            }),
+            oblivion_one::compositor::CompositorFrameBatchId::new(
+                std::num::NonZeroU64::new(1).unwrap(),
+            ),
+        )
+        .unwrap(),
+    );
+    let owners = KmsBundleOwners::for_transaction(
+        crate::native_output::runtime::AtomicCommitKind::CompositedPrimary {
+            transaction_id,
+            frame_id: 1,
+            framebuffer_id: 42,
+        },
+        transaction,
+        Some(exact),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(owners.cursor().unwrap().revision, exact);
+    assert_ne!(
+        owners.cursor().unwrap().revision,
+        crate::native_output::presentation::plane::CursorRevision::from_legacy_epoch(
+            std::num::NonZeroU64::new(100).unwrap(),
+        )
+    );
+    let visibility_only = exact.advance_visibility();
+    assert!(visibility_only.strictly_newer_than(exact));
+}
+
 fn test_cursor_job(token: u64) -> KmsCommitJob {
     let mut job = test_job(token);
     job.kind = crate::native_output::runtime::AtomicCommitKind::PlaneDelta {

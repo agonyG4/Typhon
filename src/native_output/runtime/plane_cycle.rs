@@ -185,7 +185,7 @@ pub(super) fn queue_plane_delta(
     let job = KmsCommitJob {
         bundle_id:
             crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
-        owners: KmsBundleOwners::for_legacy_transaction(
+        owners: KmsBundleOwners::for_transaction(
             kind,
             Arc::new(
                 output_transactions
@@ -194,10 +194,12 @@ pub(super) fn queue_plane_delta(
                     .descriptor()
                     .clone(),
             ),
+            Some(owned_revision.unwrap_or_else(|| cursor.desired_revision())),
             desired
                 .as_ref()
                 .and_then(|state| cursor.capability_key_for(state)),
-        ),
+        )
+        .map_err(|error| io::Error::other(format!("invalid cursor owner: {error:?}")))?,
         transaction_id,
         token,
         output_generation,
@@ -405,7 +407,7 @@ pub(super) fn prepare_plane_delta(
             transaction_id,
             desired,
             cursor_epoch,
-            owned_revision: None,
+            owned_revision: Some(cursor.desired_revision()),
             cursor_pin: None,
             target,
             validation_base,

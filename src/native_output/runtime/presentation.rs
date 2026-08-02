@@ -8,13 +8,7 @@ use super::planner::{
     NativePresentationPath, NativePresentationPlanInput, plan_native_presentation_path,
     plan_scheduled_target_for_mode,
 };
-use super::presentation_cursor::{
-    CursorPolicyContext, apply_cursor_policy_with_runtime_inputs, cursor_damage_states,
-    effective_cursor_for_plan, freeze_cursor_plane_owner, frozen_cursor_plan_for_render,
-    log_client_cursor_path_if_changed, plan_primary_cursor_presentation, plan_uses_hardware_cursor,
-    planned_client_cursor_software_work, planned_cursor_hardware_usable,
-    planned_hardware_cursor_work_pending, prepare_cursor_image, presented_delivery_for_plan,
-};
+use super::presentation_cursor::*;
 use super::presentation_direct::{
     DirectPresentationInputs, inspect_direct_presentation, log_prepared_primary_arbitration,
     suppress_direct_render_ahead,
@@ -684,6 +678,7 @@ impl NativeRuntime {
                         output_transactions,
                         direct_target,
                         effective_cursor.as_ref(),
+                        frozen_revision(effective_cursor.as_ref(), atomic_cursor.as_ref()),
                         cursor_epoch,
                         pacing_mode,
                         kms_commit_worker.as_ref(),
@@ -700,6 +695,7 @@ impl NativeRuntime {
                             transaction_id,
                             token,
                             framebuffer_id,
+                            cursor_revision,
                             lease,
                             admission,
                             mut test_only,
@@ -725,6 +721,7 @@ impl NativeRuntime {
                                 frame_scheduler,
                                 cursor_output_arbitration,
                                 effective_cursor.as_ref(),
+                                cursor_revision,
                                 worker_ctx(
                                     atomic_cursor.as_ref(),
                                     frame_pacing,
@@ -958,17 +955,12 @@ impl NativeRuntime {
                             )
                         })?;
                         presentation_deadline.clear_scheduled_target();
-                        let cursor_assignment =
-                            effective_cursor
-                                .as_ref()
-                                .map(|state| CursorPlaneAssignment::Atomic {
-                                    desired_epoch: cursor_epoch,
-                                    state: Some(state.clone()),
-                                });
-                        let frozen_cursor_plane_owner = freeze_cursor_plane_owner(
-                            cursor_assignment.as_ref(),
-                            atomic_cursor.as_ref(),
-                        )?;
+                        let (cursor_assignment, frozen_cursor_plane_owner) =
+                            freeze_cursor_assignment_for_render(
+                                effective_cursor.as_ref(),
+                                cursor_epoch,
+                                atomic_cursor.as_ref(),
+                            )?;
                         let render_outcome = explicit.render_frame(
                             frame_renderer,
                             server,

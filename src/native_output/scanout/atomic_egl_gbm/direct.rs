@@ -1,5 +1,6 @@
 use super::*;
 use crate::native_output::kms_worker::KmsTestOnlyPolicy;
+use crate::native_output::presentation::plane::CursorRevision;
 
 #[allow(clippy::too_many_arguments)]
 fn settle_no_visual_change_transaction(
@@ -107,6 +108,7 @@ impl AtomicEglGbmScanout {
         output_transactions: &mut OutputTransactionLedger,
         target: PresentationTarget,
         cursor: Option<&AtomicCursorVisualState>,
+        cursor_revision: Option<CursorRevision>,
         cursor_epoch: u64,
         pacing_mode: NativeOutputPacingMode,
         worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
@@ -450,6 +452,7 @@ impl AtomicEglGbmScanout {
             transaction_id,
             token: token.get(),
             framebuffer_id,
+            cursor_revision,
             lease: Box::new(direct_lease),
             admission,
             test_only,
