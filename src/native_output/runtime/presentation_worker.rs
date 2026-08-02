@@ -12,6 +12,9 @@ use crate::native_output::kms_worker::{
     KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryCursorPresentation, KmsPrimaryUpdate,
     KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerAdmissionError, PendingBundleSnapshot,
 };
+use crate::native_output::presentation::plane::{
+    FrozenCursorTestPolicy, FrozenPrimaryCursorPresentation,
+};
 use oblivion_one::native::kms::FramebufferId;
 
 pub(super) fn can_queue_worker_primary(
@@ -453,6 +456,13 @@ pub(super) fn submit_explicit_ready_for_presentation(
 ) -> NativeResult<Option<(u64, u32, OutputTransactionId, bool)>> {
     if worker_mode {
         let worker = worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?;
+        let frozen_cursor_plan = explicit
+            .swapchain()?
+            .ready_cursor_plan()
+            .ok_or_else(|| io::Error::other("ready explicit frame has no frozen cursor plan"))?;
+        let frozen_cursor_delivery = frozen_cursor_plan.delivery;
+        let frozen_primary_cursor_presentation =
+            kms_primary_cursor_presentation(frozen_cursor_plan.primary_presentation);
         let cursor_update = planned_cursor_update(output_transactions, transaction_id)?;
         let cursor_pin = match &cursor_update {
             KmsCursorUpdate::Set(state) => worker_cursor_pin(context.atomic_cursor, Some(state))?,
@@ -467,17 +477,10 @@ pub(super) fn submit_explicit_ready_for_presentation(
         let pacing_frame_id = context
             .frame_pacing
             .worker_submission_frame_id(ready_submit);
-        let test_only =
-            context
-                .atomic_cursor
-                .map_or(KmsTestOnlyPolicy::Skip, |cursor| {
-                    match cursor.scheduled_test_policy() {
-                        KmsCursorTestPolicy::Required => KmsTestOnlyPolicy::Required,
-                        KmsCursorTestPolicy::NotApplicable | KmsCursorTestPolicy::SkipProven => {
-                            KmsTestOnlyPolicy::Skip
-                        }
-                    }
-                });
+        let test_only = match frozen_cursor_plan.cursor_test_policy {
+            FrozenCursorTestPolicy::Required => KmsTestOnlyPolicy::Required,
+            FrozenCursorTestPolicy::Skip => KmsTestOnlyPolicy::Skip,
+        };
         return Ok(queue_explicit_ready_for_presentation(
             worker,
             explicit,
@@ -489,8 +492,8 @@ pub(super) fn submit_explicit_ready_for_presentation(
             output_generation,
             crtc_id,
             cursor_update,
-            context.cursor_delivery,
-            context.primary_cursor_presentation,
+            frozen_cursor_delivery,
+            frozen_primary_cursor_presentation,
             cursor_pin,
             cursor_capability_key,
             pacing_frame_id,
@@ -505,6 +508,17 @@ pub(super) fn submit_explicit_ready_for_presentation(
     let (token, framebuffer_id, transaction_id) =
         explicit.submit_ready_frame(kms_backend, server, output_transactions)?;
     Ok(Some((token, framebuffer_id, transaction_id, false)))
+}
+
+fn kms_primary_cursor_presentation(
+    presentation: FrozenPrimaryCursorPresentation,
+) -> KmsPrimaryCursorPresentation {
+    match presentation {
+        FrozenPrimaryCursorPresentation::Preserve => KmsPrimaryCursorPresentation::Preserve,
+        FrozenPrimaryCursorPresentation::Promote(state) => {
+            KmsPrimaryCursorPresentation::Promote(state)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

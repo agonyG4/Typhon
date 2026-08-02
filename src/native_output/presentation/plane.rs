@@ -214,6 +214,25 @@ pub(crate) enum PresentedCursorDelivery {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrozenPrimaryCursorPresentation {
+    Preserve,
+    Promote(PresentedCursorState),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrozenCursorTestPolicy {
+    Skip,
+    Required,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FrozenPrimaryCursorPlan {
+    pub(crate) delivery: PresentedCursorDelivery,
+    pub(crate) primary_presentation: FrozenPrimaryCursorPresentation,
+    pub(crate) cursor_test_policy: FrozenCursorTestPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CursorPlanePoint {
     pub(crate) x: i32,
     pub(crate) y: i32,

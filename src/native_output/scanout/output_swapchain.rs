@@ -15,6 +15,7 @@ use oblivion_one::native::scheduler::NativeOutputPacingMode;
 
 use crate::egl_renderer::{EglSceneFrameCommit, native_fence::NativeRenderFence};
 use crate::native_output::OutputTransactionId;
+use crate::native_output::presentation::plane::FrozenPrimaryCursorPlan;
 
 pub(crate) const EXPLICIT_OUTPUT_SLOT_CAPACITY: usize = 3;
 
@@ -169,6 +170,7 @@ pub(crate) struct RenderedOutputFrame {
     pub(crate) rendered_at: MonotonicTimestampNs,
     pub(crate) cpu_prepass_duration_ns: u64,
     pub(crate) cpu_encode_duration_ns: u64,
+    pub(crate) frozen_cursor_plan: FrozenPrimaryCursorPlan,
 }
 
 #[derive(Debug)]
@@ -381,6 +383,13 @@ impl AtomicOutputSwapchain {
             rendered_at: now,
             cpu_prepass_duration_ns: 0,
             cpu_encode_duration_ns: 0,
+            frozen_cursor_plan: FrozenPrimaryCursorPlan {
+                delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
+                primary_presentation:
+                    crate::native_output::presentation::plane::FrozenPrimaryCursorPresentation::Preserve,
+                cursor_test_policy:
+                    crate::native_output::presentation::plane::FrozenCursorTestPolicy::Skip,
+            },
         })
     }
 
@@ -409,6 +418,63 @@ impl AtomicOutputSwapchain {
         self.rendering = None;
         self.ready = Some(frame);
         Ok(frame_id)
+    }
+
+    pub(crate) fn ready_cursor_plan(&self) -> Option<FrozenPrimaryCursorPlan> {
+        self.ready.as_ref().map(|frame| frame.frozen_cursor_plan)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_ready_for_test(
+        &mut self,
+        slot: OutputSlotId,
+        render_fence: NativeRenderFence,
+        frozen_cursor_plan: FrozenPrimaryCursorPlan,
+    ) -> io::Result<()> {
+        self.ensure_operational()?;
+        if self.rendering != Some(slot) || self.ready.is_some() {
+            return Err(io::Error::other("test ready frame ownership mismatch"));
+        }
+        let now = MonotonicTimestampNs::new(self.next_frame_id);
+        let frame_id = self.next_frame_id;
+        self.next_frame_id = self
+            .next_frame_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("test output frame ID overflow"))?;
+        self.rendering = None;
+        self.ready = Some(RenderedOutputFrame {
+            id: frame_id,
+            transaction_id: OutputTransactionId::new(
+                std::num::NonZeroU64::new(frame_id).expect("test transaction ID is nonzero"),
+            ),
+            slot,
+            render_generation: 1,
+            pool_generation: self.pool_generation,
+            target: PresentationTarget {
+                sequence: frame_id,
+                presentation_time: now,
+                submit_not_before: now,
+                render_start_deadline: now,
+                refresh_interval: std::time::Duration::from_nanos(1),
+                reason: PresentationTargetReason::ForcedValidation,
+                clock_generation: self.pool_generation,
+                estimated: true,
+                predicted_unreachable: false,
+            },
+            render_fence,
+            scene_commit: EglSceneFrameCommit::empty_for_test(),
+            surface_damage: SurfaceDamagePresentation::default(),
+            protocol_batch_id: CompositorFrameBatchId::new(
+                std::num::NonZeroU64::new(frame_id).expect("test batch ID is nonzero"),
+            ),
+            composite_started_at: now,
+            fence_exported_at: now,
+            rendered_at: now,
+            cpu_prepass_duration_ns: 0,
+            cpu_encode_duration_ns: 0,
+            frozen_cursor_plan,
+        });
+        Ok(())
     }
 
     pub(crate) fn submit_ready(

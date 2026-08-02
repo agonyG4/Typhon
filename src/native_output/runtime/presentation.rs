@@ -32,6 +32,7 @@ use super::presentation_transactions::{
 };
 use super::presentation_worker::*;
 use super::*;
+use crate::native_output::kms_worker::KmsPrimaryCursorPresentation;
 use crate::native_output::kms_worker::{KmsCommitWorkerTransport, KmsTestOnlyPolicy};
 use oblivion_one::native::kms::KmsBackendKind;
 use oblivion_one::native::scheduler::rendered_primary_must_wait_for_lane;
@@ -988,6 +989,30 @@ impl NativeRuntime {
                             direct_inspection
                                 .candidate_key
                                 .filter(|_| !composition_required),
+                            crate::native_output::presentation::plane::FrozenPrimaryCursorPlan {
+                                delivery: planned_cursor_delivery,
+                                primary_presentation: match primary_cursor {
+                                    KmsPrimaryCursorPresentation::Preserve => {
+                                        crate::native_output::presentation::plane::FrozenPrimaryCursorPresentation::Preserve
+                                    }
+                                    KmsPrimaryCursorPresentation::Promote(state) => {
+                                        crate::native_output::presentation::plane::FrozenPrimaryCursorPresentation::Promote(state)
+                                    }
+                                },
+                                cursor_test_policy: match runtime_plane_plan
+                                    .as_ref()
+                                    .map(|plan| plan.decision.test_policy)
+                                    .unwrap_or(KmsCursorTestPolicy::NotApplicable)
+                                {
+                                    KmsCursorTestPolicy::Required => {
+                                        crate::native_output::presentation::plane::FrozenCursorTestPolicy::Required
+                                    }
+                                    KmsCursorTestPolicy::NotApplicable
+                                    | KmsCursorTestPolicy::SkipProven => {
+                                        crate::native_output::presentation::plane::FrozenCursorTestPolicy::Skip
+                                    }
+                                },
+                            },
                         )?;
                         match render_outcome {
                             AtomicFrameRenderOutcome::Skipped { reason, render_us } => {

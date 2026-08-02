@@ -632,7 +632,7 @@ pub(crate) struct SurfacePresentationKey {
     generation: u64,
 }
 #[doc(hidden)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SurfaceDamagePresentation {
     sampled_commits: Vec<(SurfacePresentationKey, SurfaceCommitCounter)>,
 }

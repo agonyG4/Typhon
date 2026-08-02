@@ -253,6 +253,32 @@ fn current_pending_ready_slots_never_alias() {
     assert!(ownership.set_ready(OutputSlotId::new(0).unwrap()).is_err());
 }
 
+#[test]
+fn ready_frame_keeps_its_frozen_cursor_contract() {
+    let slots = OutputSlotSet::new([
+        OutputSlotId::new(0).unwrap(),
+        OutputSlotId::new(1).unwrap(),
+        OutputSlotId::new(2).unwrap(),
+    ])
+    .unwrap();
+    let mut swapchain =
+        AtomicOutputSwapchain::from_presented_slots(slots, OutputSlotId::new(0).unwrap(), 1)
+            .unwrap();
+    let slot = swapchain.acquire_render_slot().unwrap();
+    let frozen = crate::native_output::presentation::plane::FrozenPrimaryCursorPlan {
+        delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware,
+        primary_presentation:
+            crate::native_output::presentation::plane::FrozenPrimaryCursorPresentation::Preserve,
+        cursor_test_policy:
+            crate::native_output::presentation::plane::FrozenCursorTestPolicy::Required,
+    };
+    swapchain
+        .prepare_ready_for_test(slot, test_render_fence(), frozen)
+        .unwrap();
+
+    assert_eq!(swapchain.ready_cursor_plan(), Some(frozen));
+}
+
 fn explicit_slot_set() -> OutputSlotSet {
     OutputSlotSet::new([
         OutputSlotId::new(0).unwrap(),
