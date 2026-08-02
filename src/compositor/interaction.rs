@@ -105,6 +105,73 @@ pub enum WindowInteractionSource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerReleaseDelivery {
+    ClientOwned,
+    CompositorOwned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowInteractionReleaseContext {
+    pub interaction_id: WindowInteractionId,
+    pub source: WindowInteractionSource,
+    pub trigger_button: u32,
+    pub trigger_serial: Option<u32>,
+    pub original_surface_id: Option<u32>,
+    pub original_root_surface_id: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowInteractionButtonRelease {
+    NotInteractionTrigger,
+    Ended {
+        delivery: TriggerReleaseDelivery,
+        context: WindowInteractionReleaseContext,
+    },
+}
+
+impl WindowInteractionButtonRelease {
+    pub const fn ended(self) -> bool {
+        matches!(self, Self::Ended { .. })
+    }
+}
+
+impl WindowInteractionSource {
+    pub const fn trigger_release_delivery(self) -> TriggerReleaseDelivery {
+        match self {
+            Self::NativeBinding => TriggerReleaseDelivery::CompositorOwned,
+            Self::XdgToplevelMove | Self::XdgToplevelResize | Self::X11NetWmMoveResize => {
+                TriggerReleaseDelivery::ClientOwned
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WindowInteractionReleaseMetrics {
+    pub window_interaction_trigger_releases: u64,
+    pub window_interaction_client_releases_forwarded: u64,
+    pub window_interaction_compositor_releases_consumed: u64,
+    pub window_interaction_release_target_missing: u64,
+    pub window_interaction_stale_buttons_cleared: u64,
+    pub window_interaction_duplicate_releases_prevented: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowInteractionReleaseDebugRecord {
+    pub interaction_id: u64,
+    pub source: WindowInteractionSource,
+    pub trigger_button: u32,
+    pub trigger_serial: Option<u32>,
+    pub original_surface_id: Option<u32>,
+    pub release_target_surface_id: Option<u32>,
+    pub delivery: TriggerReleaseDelivery,
+    pub held_button_count_before: usize,
+    pub held_button_count_after: usize,
+    pub implicit_grab_surface_id_before: Option<u32>,
+    pub implicit_grab_surface_id_after: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum X11MoveResizeBeginResult {
     Began,
     NoPressedButton,

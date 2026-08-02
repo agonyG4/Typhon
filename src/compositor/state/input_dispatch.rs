@@ -372,6 +372,175 @@ impl CompositorState {
         }
     }
 
+    fn pointer_press_matches_release_context(
+        press: &PointerPress,
+        context: WindowInteractionReleaseContext,
+    ) -> bool {
+        press.button == context.trigger_button
+            && context
+                .trigger_serial
+                .is_none_or(|serial| press.serial == serial)
+            && context
+                .original_surface_id
+                .is_none_or(|surface_id| compositor_surface_id(&press.surface) == surface_id)
+    }
+
+    fn client_owned_trigger_release_target(
+        &self,
+        context: WindowInteractionReleaseContext,
+    ) -> Option<wl_surface::WlSurface> {
+        let original_press = self
+            .held_pointer_buttons
+            .iter()
+            .chain(self.last_pointer_press.iter())
+            .find(|press| Self::pointer_press_matches_release_context(press, context));
+        if let Some(press) = original_press
+            && press.surface.is_alive()
+        {
+            return Some(press.surface.clone());
+        }
+        None
+    }
+
+    fn has_client_owned_trigger_ownership(&self, context: WindowInteractionReleaseContext) -> bool {
+        self.held_pointer_buttons
+            .iter()
+            .chain(self.last_pointer_press.iter())
+            .any(|press| Self::pointer_press_matches_release_context(press, context))
+    }
+
+    fn clear_client_owned_trigger_ownership(&mut self, button: u32) -> usize {
+        let before = self.held_pointer_buttons.len();
+        self.forget_held_pointer_button(button);
+        if self
+            .last_pointer_press
+            .as_ref()
+            .is_some_and(|press| press.button == button)
+        {
+            self.last_pointer_press = None;
+        }
+        let cleared = before.saturating_sub(self.held_pointer_buttons.len());
+        if cleared > 0 {
+            self.window_interaction_release_metrics
+                .window_interaction_stale_buttons_cleared = self
+                .window_interaction_release_metrics
+                .window_interaction_stale_buttons_cleared
+                .saturating_add(cleared as u64);
+        }
+        if self.held_pointer_buttons.is_empty() {
+            if self.implicit_pointer_grab.is_some() {
+                self.end_implicit_pointer_grab("release-target-missing");
+            }
+            self.refresh_pointer_focus_after_implicit_grab(None);
+        }
+        cleared
+    }
+
+    pub(in crate::compositor) fn send_client_owned_trigger_release(
+        &mut self,
+        context: WindowInteractionReleaseContext,
+    ) -> bool {
+        let held_button_count_before = self.held_pointer_buttons.len();
+        let implicit_grab_surface_id_before = self
+            .implicit_pointer_grab
+            .as_ref()
+            .map(|grab| compositor_surface_id(&grab.surface));
+        let has_ownership = self.has_client_owned_trigger_ownership(context);
+        if !has_ownership {
+            self.window_interaction_release_metrics
+                .window_interaction_duplicate_releases_prevented = self
+                .window_interaction_release_metrics
+                .window_interaction_duplicate_releases_prevented
+                .saturating_add(1);
+            self.record_client_owned_window_interaction_release(
+                context,
+                None,
+                held_button_count_before,
+                self.held_pointer_buttons.len(),
+                implicit_grab_surface_id_before,
+                self.implicit_pointer_grab
+                    .as_ref()
+                    .map(|grab| compositor_surface_id(&grab.surface)),
+            );
+            return false;
+        }
+
+        let target = self.client_owned_trigger_release_target(context);
+        let Some(target) = target else {
+            self.window_interaction_release_metrics
+                .window_interaction_release_target_missing = self
+                .window_interaction_release_metrics
+                .window_interaction_release_target_missing
+                .saturating_add(1);
+            self.clear_client_owned_trigger_ownership(context.trigger_button);
+            self.record_client_owned_window_interaction_release(
+                context,
+                None,
+                held_button_count_before,
+                self.held_pointer_buttons.len(),
+                implicit_grab_surface_id_before,
+                self.implicit_pointer_grab
+                    .as_ref()
+                    .map(|grab| compositor_surface_id(&grab.surface)),
+            );
+            return false;
+        };
+
+        let target_surface_id = compositor_surface_id(&target);
+        self.send_pointer_release_to_surface(&target, context.trigger_button);
+        self.window_interaction_release_metrics
+            .window_interaction_client_releases_forwarded = self
+            .window_interaction_release_metrics
+            .window_interaction_client_releases_forwarded
+            .saturating_add(1);
+        self.record_client_owned_window_interaction_release(
+            context,
+            Some(target_surface_id),
+            held_button_count_before,
+            self.held_pointer_buttons.len(),
+            implicit_grab_surface_id_before,
+            self.implicit_pointer_grab
+                .as_ref()
+                .map(|grab| compositor_surface_id(&grab.surface)),
+        );
+        true
+    }
+
+    fn send_pointer_release_to_surface(&mut self, surface: &wl_surface::WlSurface, button: u32) {
+        let state = wl_pointer::ButtonState::Released;
+        let serial = self.next_configure_serial();
+        let time = wayland_event_time();
+        self.forget_held_pointer_button(button);
+        if self
+            .last_pointer_press
+            .as_ref()
+            .is_some_and(|press| press.button == button)
+        {
+            self.last_pointer_press = None;
+        }
+        for pointer in self
+            .pointer_resources
+            .iter()
+            .filter(|pointer| resource_belongs_to_surface_client(*pointer, surface))
+        {
+            let _ = pointer.send_event(wl_pointer::Event::Button {
+                serial,
+                time,
+                button,
+                state: WEnum::Value(state),
+            });
+            send_pointer_frame_if_supported(pointer);
+        }
+        if self.held_pointer_buttons.is_empty() && self.implicit_pointer_grab.is_some() {
+            let old_surface_id = self
+                .implicit_pointer_grab
+                .as_ref()
+                .map(|grab| compositor_surface_id(&grab.surface));
+            self.end_implicit_pointer_grab("last-release");
+            self.refresh_pointer_focus_after_implicit_grab(old_surface_id);
+        }
+    }
+
     pub(in crate::compositor) fn implicit_pointer_grab_surface(
         &mut self,
         reason: &'static str,
@@ -633,15 +802,21 @@ impl CompositorState {
         let Some(surface) = grabbed_surface
             .or_else(|| {
                 (!pressed).then(|| {
-                    self.last_pointer_press
-                        .as_ref()
-                        .filter(|press| press.button == button)
+                    self.held_pointer_buttons
+                        .iter()
+                        .rev()
+                        .chain(self.last_pointer_press.iter())
+                        .find(|press| press.button == button)
                         .map(|press| press.surface.clone())
                 })?
             })
-            .or_else(|| target.map(|target| target.surface))
-            .or_else(|| self.pointer_surface.clone())
-            .or_else(|| self.focused_surface.clone())
+            .or_else(|| {
+                pressed
+                    .then(|| target.map(|target| target.surface))
+                    .flatten()
+            })
+            .or_else(|| pressed.then(|| self.pointer_surface.clone()).flatten())
+            .or_else(|| pressed.then(|| self.focused_surface.clone()).flatten())
         else {
             return;
         };

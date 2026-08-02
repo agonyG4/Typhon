@@ -3,8 +3,8 @@ use std::{fs::File, num::NonZeroU64, os::fd::AsFd, path::PathBuf};
 use crate::compositor::{
     DesktopWindowKind, LiveRoleInstance, PermanentSurfaceRole, RenderGenerationCause,
     ResizeInteractionId, SurfacePlacement, SurfacePublicationSource, SurfaceRoleLifecycle,
-    SurfaceTargetRect, WindowConstraints, WindowMetadata, X11MoveResizeBeginResult,
-    XwaylandSurfaceState,
+    SurfaceTargetRect, TriggerReleaseDelivery, WindowConstraints, WindowInteractionButtonRelease,
+    WindowInteractionKind, WindowMetadata, X11MoveResizeBeginResult, XwaylandSurfaceState,
 };
 use crate::xwayland::xwm::{
     X11ConfigureFlags, X11ConfigureRequest, X11Geometry, X11MoveResizeDirection,
@@ -1518,7 +1518,12 @@ fn release_after_client_message_does_not_retroactively_reject_request() {
         1,
     );
     assert_eq!(result, X11MoveResizeBeginResult::Began);
-    assert!(fixture.server.end_window_interaction_for_button(0x110));
+    assert!(
+        fixture
+            .server
+            .end_window_interaction_for_button(0x110)
+            .ended()
+    );
     fixture.server.send_pointer_button(0x110, false);
     assert!(!fixture.server.window_interaction_active());
 }

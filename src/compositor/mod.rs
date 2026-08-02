@@ -88,6 +88,7 @@ mod server;
 mod server_backend;
 mod server_error;
 mod server_frames;
+mod server_interaction;
 mod server_xwayland_events;
 mod shm;
 mod state_data;
@@ -185,11 +186,15 @@ use interaction::{
     InteractionCursorOverride, InteractionCursorShape, PendingResizeConfigure, PointerPress,
     PointerTarget, ResizeAckDecision, ResizeCommitSnapshot, ResizeConfigureFlow, ResizeEdges,
     RootSurfaceHit, WindowFrameHit, WindowInteraction, WindowInteractionEndReason,
-    WindowInteractionKind, WindowInteractionSource, interactive_resize_geometry,
-    resize_drag_threshold_reached, resize_edges_for_window_point, resize_edges_from_xdg,
-    window_frame_action_for_local_point,
+    WindowInteractionSource, interactive_resize_geometry, resize_drag_threshold_reached,
+    resize_edges_for_window_point, resize_edges_from_xdg, window_frame_action_for_local_point,
 };
-pub use interaction::{ResizeInteractionId, WindowInteractionDebugSnapshot, WindowInteractionId};
+pub use interaction::{
+    ResizeInteractionId, TriggerReleaseDelivery, WindowInteractionButtonRelease,
+    WindowInteractionDebugSnapshot, WindowInteractionId, WindowInteractionKind,
+    WindowInteractionReleaseContext, WindowInteractionReleaseDebugRecord,
+    WindowInteractionReleaseMetrics,
+};
 use layer_shell::{Layer, LayerSurfaceRole};
 use output::{
     OutputRefreshRate, OutputScale, OutputSize, send_output_description,
@@ -559,6 +564,8 @@ pub struct CompositorState {
     pending_xwayland_visual_content: HashSet<u32>,
     next_window_interaction_id: u64,
     next_resize_interaction_id: u64,
+    window_interaction_release_metrics: WindowInteractionReleaseMetrics,
+    window_interaction_release_debug: VecDeque<WindowInteractionReleaseDebugRecord>,
     next_resize_configure_sequence: u64,
     next_surface_commit_sequence: u64,
     commit_debug: CommitDebugState,

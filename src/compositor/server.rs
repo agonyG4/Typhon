@@ -1203,12 +1203,6 @@ impl OwnCompositorServer {
         cancelled
     }
 
-    pub fn end_window_interaction_for_button(&mut self, button: u32) -> bool {
-        let ended = self.state.end_window_interaction_for_button(button);
-        let _ = self.display.flush_clients();
-        ended
-    }
-
     pub fn window_interaction_active(&self) -> bool {
         self.state.window_interaction_active()
     }

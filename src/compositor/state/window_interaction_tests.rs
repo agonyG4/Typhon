@@ -406,9 +406,53 @@ fn non_trigger_button_release_does_not_end_resize() {
         ..Default::default()
     };
 
-    assert!(!state.end_window_interaction_for_button(0x110));
+    assert!(!state.end_window_interaction_for_button(0x110).ended());
 
     assert!(state.window_interaction_active());
+}
+
+#[test]
+fn client_owned_trigger_release_reports_client_delivery() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction_with_target(
+            1,
+            WindowInteractionKind::Move,
+            WindowInteractionSource::X11NetWmMoveResize,
+            Some(0x110),
+            Some(42),
+        )),
+        ..Default::default()
+    };
+
+    assert!(matches!(
+        state.end_window_interaction_for_button(0x110),
+        WindowInteractionButtonRelease::Ended {
+            delivery: TriggerReleaseDelivery::ClientOwned,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn compositor_owned_trigger_release_reports_consumed_delivery() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction_with_target(
+            1,
+            WindowInteractionKind::Move,
+            WindowInteractionSource::NativeBinding,
+            Some(0x110),
+            Some(42),
+        )),
+        ..Default::default()
+    };
+
+    assert!(matches!(
+        state.end_window_interaction_for_button(0x110),
+        WindowInteractionButtonRelease::Ended {
+            delivery: TriggerReleaseDelivery::CompositorOwned,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -422,8 +466,8 @@ fn normal_trigger_release_ends_interaction_once() {
         ..Default::default()
     };
 
-    assert!(state.end_window_interaction_for_button(0x110));
-    assert!(!state.end_window_interaction_for_button(0x110));
+    assert!(state.end_window_interaction_for_button(0x110).ended());
+    assert!(!state.end_window_interaction_for_button(0x110).ended());
     assert!(!state.window_interaction_active());
 }
 
@@ -453,7 +497,7 @@ fn interaction_end_does_not_wait_for_resize_ack() {
         ..Default::default()
     };
 
-    assert!(state.end_window_interaction_for_button(0x111));
+    assert!(state.end_window_interaction_for_button(0x111).ended());
     assert!(!state.window_interaction_active());
     assert_eq!(
         state.resize_configure_flows[&42].in_flight_configure_count(),
@@ -489,7 +533,7 @@ fn interaction_end_does_not_wait_for_resize_commit() {
         ..Default::default()
     };
 
-    assert!(state.end_window_interaction_for_button(0x111));
+    assert!(state.end_window_interaction_for_button(0x111).ended());
     assert!(!state.window_interaction_active());
     assert_eq!(state.resize_configure_flows[&42].captured_count(), 1);
 }
@@ -538,7 +582,7 @@ fn x11_resize_release_finalizes_preview_without_xdg_commit() {
     state.window_interaction = Some(interaction);
     assert!(state.renderable_surfaces[0].visual_clip.is_some());
 
-    assert!(state.end_window_interaction_for_button(0x111));
+    assert!(state.end_window_interaction_for_button(0x111).ended());
 
     assert!(state.active_toplevel_resizes.contains_key(&surface_id));
     assert_eq!(
@@ -789,24 +833,61 @@ fn new_move_can_begin_after_resize_release_with_outstanding_protocol_work() {
         ..Default::default()
     };
 
-    assert!(state.end_window_interaction_for_button(0x111));
+    assert!(state.end_window_interaction_for_button(0x111).ended());
     assert!(state.resize_configure_flows[&42].has_in_flight());
     assert!(!state.window_interaction_active());
 }
 
 #[test]
-fn xdg_resize_trigger_button_release_ends_interaction() {
+fn xdg_resize_trigger_release_reports_client_delivery() {
     let mut state = CompositorState {
-        window_interaction: Some(test_window_interaction(
+        window_interaction: Some(test_window_interaction_with_target(
             1,
             WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+            WindowInteractionSource::XdgToplevelResize,
             Some(0x110),
+            Some(42),
         )),
         ..Default::default()
     };
 
-    assert!(state.end_window_interaction_for_button(0x110));
+    assert!(matches!(
+        state.end_window_interaction_for_button(0x110),
+        WindowInteractionButtonRelease::Ended {
+            delivery: TriggerReleaseDelivery::ClientOwned,
+            context: WindowInteractionReleaseContext {
+                source: WindowInteractionSource::XdgToplevelResize,
+                ..
+            },
+        }
+    ));
 
+    assert!(!state.window_interaction_active());
+}
+
+#[test]
+fn xdg_move_trigger_release_reports_client_delivery() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction_with_target(
+            1,
+            WindowInteractionKind::Move,
+            WindowInteractionSource::XdgToplevelMove,
+            Some(0x110),
+            Some(42),
+        )),
+        ..Default::default()
+    };
+
+    assert!(matches!(
+        state.end_window_interaction_for_button(0x110),
+        WindowInteractionButtonRelease::Ended {
+            delivery: TriggerReleaseDelivery::ClientOwned,
+            context: WindowInteractionReleaseContext {
+                source: WindowInteractionSource::XdgToplevelMove,
+                ..
+            },
+        }
+    ));
     assert!(!state.window_interaction_active());
 }
 
@@ -982,7 +1063,7 @@ fn ending_window_interaction_clears_cursor_override_and_only_advances_cursor_gen
     let before_render_generation = state.render_generation;
     let before_scene_generation = state.scene_render_generation;
 
-    assert!(state.end_window_interaction_for_button(0x110));
+    assert!(state.end_window_interaction_for_button(0x110).ended());
 
     assert!(state.interaction_cursor_override.is_none());
     assert!(state.render_generation > before_render_generation);

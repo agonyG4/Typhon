@@ -997,14 +997,24 @@ pub(crate) fn apply_native_input_effect(
     for event in effect.pointer_buttons {
         let active = context.server.window_interaction_debug_snapshot();
         let end_attempt = !event.pressed;
-        let end_result = end_attempt
-            && context
+        let release_outcome = if end_attempt {
+            context
                 .server
-                .end_window_interaction_for_button(event.button);
-        let client_dispatch = !end_result;
+                .end_window_interaction_for_button(event.button)
+        } else {
+            oblivion_one::compositor::WindowInteractionButtonRelease::NotInteractionTrigger
+        };
+        let compositor_release_consumed = matches!(
+            release_outcome,
+            oblivion_one::compositor::WindowInteractionButtonRelease::Ended {
+                delivery: oblivion_one::compositor::TriggerReleaseDelivery::CompositorOwned,
+                ..
+            }
+        );
+        let client_dispatch = !compositor_release_consumed;
         resize_debug_log(|| {
             format!(
-                "event=apply_button button={} pressed={} active_interaction_id={} active_trigger_button={} end_attempt={} end_result={} client_dispatch={}",
+                "event=apply_button button={} pressed={} active_interaction_id={} active_trigger_button={} end_attempt={} release_outcome={release_outcome:?} client_dispatch={client_dispatch}",
                 event.button,
                 event.pressed,
                 active.map_or_else(
@@ -1015,11 +1025,25 @@ pub(crate) fn apply_native_input_effect(
                     .and_then(|snapshot| snapshot.trigger_button)
                     .map_or_else(|| "none".to_string(), |button| button.to_string()),
                 end_attempt,
-                end_result,
-                client_dispatch,
             )
         });
-        if end_result {
+        if let oblivion_one::compositor::WindowInteractionButtonRelease::Ended {
+            delivery: oblivion_one::compositor::TriggerReleaseDelivery::ClientOwned,
+            context: release_context,
+        } = release_outcome
+        {
+            let _ = context
+                .server
+                .send_client_owned_trigger_release(release_context);
+            context.resize_perf.observe_action(
+                NativeWindowAction::EndInteraction,
+                true,
+                context.perf,
+            );
+            application.redraw_requested = true;
+            continue;
+        }
+        if compositor_release_consumed {
             context.resize_perf.observe_action(
                 NativeWindowAction::EndInteraction,
                 true,

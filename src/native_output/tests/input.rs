@@ -1,3 +1,4 @@
+use super::input_protocol::{ClientCommand, ClientEvent};
 use super::*;
 use crate::native_output::runtime::{
     NativePointerConstraint, NativePointerConstraintBackendAction,
@@ -30,6 +31,10 @@ use wayland_client::{
 use wayland_protocols::xdg::shell::client::{
     xdg_surface as client_xdg_surface, xdg_toplevel as client_xdg_toplevel,
     xdg_wm_base as client_xdg_wm_base,
+};
+use wayland_protocols::xwayland::shell::v1::client::{
+    xwayland_shell_v1 as client_xwayland_shell_v1,
+    xwayland_surface_v1 as client_xwayland_surface_v1,
 };
 
 #[test]
@@ -1590,45 +1595,17 @@ fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion(
     );
 }
 
-#[derive(Debug, PartialEq)]
-pub(super) enum ClientEvent {
-    ReadyForPointer,
-    Active {
-        pointer_motion_count: usize,
-        pointer_surface_x: Option<f64>,
-        pointer_surface_y: Option<f64>,
-        pointer_enter_count: usize,
-        pointer_leave_count: usize,
-    },
-    CursorReady {
-        pointer_motion_count: usize,
-        pointer_enter_count: usize,
-        pointer_leave_count: usize,
-    },
-    Finished {
-        pointer_motion_count: usize,
-        pointer_surface_x: Option<f64>,
-        pointer_surface_y: Option<f64>,
-        pointer_enter_count: usize,
-        pointer_leave_count: usize,
-    },
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum ClientCommand {
-    SetCursor,
-    CaptureActive,
-    Finish,
-}
-
 #[derive(Default)]
-struct NativeInputClientState {
-    pointer_enter_serial: Option<u32>,
-    pointer_motion_count: usize,
-    pointer_enter_count: usize,
-    pointer_leave_count: usize,
-    pointer_surface_x: Option<f64>,
-    pointer_surface_y: Option<f64>,
+pub(super) struct NativeInputClientState {
+    pub(super) pointer_enter_serial: Option<u32>,
+    pub(super) pointer_motion_count: usize,
+    pub(super) pointer_enter_count: usize,
+    pub(super) pointer_leave_count: usize,
+    pub(super) pointer_surface_x: Option<f64>,
+    pub(super) pointer_surface_y: Option<f64>,
+    pub(super) last_button_press_serial: Option<u32>,
+    pub(super) pointer_button_press_count: usize,
+    pub(super) pointer_button_release_count: usize,
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for NativeInputClientState {
@@ -1666,6 +1643,8 @@ native_input_noop_dispatch!(client_wl_shm::WlShm);
 native_input_noop_dispatch!(client_wl_shm_pool::WlShmPool);
 native_input_noop_dispatch!(client_wl_buffer::WlBuffer);
 native_input_noop_dispatch!(client_xdg_toplevel::XdgToplevel);
+native_input_noop_dispatch!(client_xwayland_shell_v1::XwaylandShellV1);
+native_input_noop_dispatch!(client_xwayland_surface_v1::XwaylandSurfaceV1);
 
 impl Dispatch<client_wl_pointer::WlPointer, ()> for NativeInputClientState {
     fn event(
@@ -1691,6 +1670,20 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for NativeInputClientState {
                 state.pointer_surface_x = Some(surface_x);
                 state.pointer_surface_y = Some(surface_y);
             }
+            client_wl_pointer::Event::Button {
+                serial,
+                state: wayland_client::WEnum::Value(button_state),
+                ..
+            } => match button_state {
+                client_wl_pointer::ButtonState::Pressed => {
+                    state.last_button_press_serial = Some(serial);
+                    state.pointer_button_press_count += 1;
+                }
+                client_wl_pointer::ButtonState::Released => {
+                    state.pointer_button_release_count += 1;
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -1744,7 +1737,7 @@ pub(super) fn spawn_native_input_resize_client(
         let pointer = seat.get_pointer(&qh, ());
         let surface = compositor.create_surface(&qh, ());
         let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
-        let _toplevel = xdg_surface.get_toplevel(&qh, ());
+        let toplevel = xdg_surface.get_toplevel(&qh, ());
         let mut state = NativeInputClientState::default();
         surface.commit();
         connection.flush().unwrap();
@@ -1768,49 +1761,57 @@ pub(super) fn spawn_native_input_resize_client(
                 pointer_leave_count: state.pointer_leave_count,
             })
             .unwrap();
-        match commands_receiver.recv().unwrap() {
-            ClientCommand::CaptureActive => {
-                queue.roundtrip(&mut state).unwrap();
-                events_sender
-                    .send(ClientEvent::Active {
-                        pointer_motion_count: state.pointer_motion_count,
-                        pointer_surface_x: state.pointer_surface_x,
-                        pointer_surface_y: state.pointer_surface_y,
-                        pointer_enter_count: state.pointer_enter_count,
-                        pointer_leave_count: state.pointer_leave_count,
-                    })
-                    .unwrap();
-                assert_eq!(commands_receiver.recv().unwrap(), ClientCommand::Finish);
-                queue.roundtrip(&mut state).unwrap();
-                events_sender
-                    .send(ClientEvent::Finished {
-                        pointer_motion_count: state.pointer_motion_count,
-                        pointer_surface_x: state.pointer_surface_x,
-                        pointer_surface_y: state.pointer_surface_y,
-                        pointer_enter_count: state.pointer_enter_count,
-                        pointer_leave_count: state.pointer_leave_count,
-                    })
-                    .unwrap();
+        loop {
+            match commands_receiver.recv().unwrap() {
+                ClientCommand::CaptureActive => {
+                    queue.roundtrip(&mut state).unwrap();
+                    events_sender
+                        .send(ClientEvent::Active {
+                            pointer_motion_count: state.pointer_motion_count,
+                            pointer_surface_x: state.pointer_surface_x,
+                            pointer_surface_y: state.pointer_surface_y,
+                            pointer_enter_count: state.pointer_enter_count,
+                            pointer_leave_count: state.pointer_leave_count,
+                        })
+                        .unwrap();
+                }
+                ClientCommand::BeginXdgMove => {
+                    queue.roundtrip(&mut state).unwrap();
+                    toplevel._move(&seat, state.last_button_press_serial.unwrap());
+                    connection.flush().unwrap();
+                    queue.roundtrip(&mut state).unwrap();
+                    events_sender.send(ClientEvent::MoveRequested).unwrap();
+                }
+                ClientCommand::CaptureButtons => {
+                    queue.roundtrip(&mut state).unwrap();
+                    events_sender
+                        .send(ClientEvent::Buttons {
+                            pressed_count: state.pointer_button_press_count,
+                            released_count: state.pointer_button_release_count,
+                        })
+                        .unwrap();
+                }
+                ClientCommand::Finish => {
+                    queue.roundtrip(&mut state).unwrap();
+                    events_sender
+                        .send(ClientEvent::Finished {
+                            pointer_motion_count: state.pointer_motion_count,
+                            pointer_surface_x: state.pointer_surface_x,
+                            pointer_surface_y: state.pointer_surface_y,
+                            pointer_enter_count: state.pointer_enter_count,
+                            pointer_leave_count: state.pointer_leave_count,
+                        })
+                        .unwrap();
+                    break;
+                }
+                ClientCommand::SetCursor => panic!("cursor was already set"),
             }
-            ClientCommand::Finish => {
-                queue.roundtrip(&mut state).unwrap();
-                events_sender
-                    .send(ClientEvent::Finished {
-                        pointer_motion_count: state.pointer_motion_count,
-                        pointer_surface_x: state.pointer_surface_x,
-                        pointer_surface_y: state.pointer_surface_y,
-                        pointer_enter_count: state.pointer_enter_count,
-                        pointer_leave_count: state.pointer_leave_count,
-                    })
-                    .unwrap();
-            }
-            ClientCommand::SetCursor => panic!("cursor was already set"),
         }
     });
     (commands_sender, events_receiver)
 }
 
-fn attach_native_input_test_buffer(
+pub(super) fn attach_native_input_test_buffer(
     surface: &client_wl_surface::WlSurface,
     shm: &client_wl_shm::WlShm,
     qh: &QueueHandle<NativeInputClientState>,

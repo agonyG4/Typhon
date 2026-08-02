@@ -1,5 +1,7 @@
 use super::*;
 
+const MAX_WINDOW_INTERACTION_RELEASE_DEBUG_RECORDS: usize = 64;
+
 #[derive(Debug, Clone, Copy)]
 pub(in crate::compositor) struct BeginWindowInteraction {
     pub(super) window_id: Option<WindowId>,
@@ -923,17 +925,110 @@ impl CompositorState {
         true
     }
 
-    pub(in crate::compositor) fn end_window_interaction_for_button(&mut self, button: u32) -> bool {
+    pub(in crate::compositor) fn end_window_interaction_for_button(
+        &mut self,
+        button: u32,
+    ) -> WindowInteractionButtonRelease {
         let Some(interaction) = self.window_interaction else {
-            return false;
+            return WindowInteractionButtonRelease::NotInteractionTrigger;
         };
         if interaction.trigger_button != Some(button) {
-            return false;
+            return WindowInteractionButtonRelease::NotInteractionTrigger;
         }
-        self.end_window_interaction_by_id_with_reason(
+        let context = WindowInteractionReleaseContext {
+            interaction_id: interaction.id,
+            source: interaction.source,
+            trigger_button: button,
+            trigger_serial: interaction.trigger_serial,
+            original_surface_id: interaction.pointer_motion_surface_id,
+            original_root_surface_id: interaction.root_surface_id,
+        };
+        let delivery = interaction.source.trigger_release_delivery();
+        if !self.end_window_interaction_by_id_with_reason(
             interaction.id,
             WindowInteractionEndReason::TriggerButtonRelease,
-        )
+        ) {
+            return WindowInteractionButtonRelease::NotInteractionTrigger;
+        }
+        self.window_interaction_release_metrics
+            .window_interaction_trigger_releases = self
+            .window_interaction_release_metrics
+            .window_interaction_trigger_releases
+            .saturating_add(1);
+        let held_button_count = self.held_pointer_buttons.len();
+        let implicit_grab_surface_id = self
+            .implicit_pointer_grab
+            .as_ref()
+            .map(|grab| compositor_surface_id(&grab.surface));
+        if delivery == TriggerReleaseDelivery::CompositorOwned {
+            self.window_interaction_release_metrics
+                .window_interaction_compositor_releases_consumed = self
+                .window_interaction_release_metrics
+                .window_interaction_compositor_releases_consumed
+                .saturating_add(1);
+            self.record_window_interaction_release(WindowInteractionReleaseDebugRecord {
+                interaction_id: context.interaction_id.get(),
+                source: context.source,
+                trigger_button: context.trigger_button,
+                trigger_serial: context.trigger_serial,
+                original_surface_id: context.original_surface_id,
+                release_target_surface_id: None,
+                delivery,
+                held_button_count_before: held_button_count,
+                held_button_count_after: held_button_count,
+                implicit_grab_surface_id_before: implicit_grab_surface_id,
+                implicit_grab_surface_id_after: implicit_grab_surface_id,
+            });
+        }
+        WindowInteractionButtonRelease::Ended { delivery, context }
+    }
+
+    fn record_window_interaction_release(&mut self, record: WindowInteractionReleaseDebugRecord) {
+        self.window_interaction_release_debug.push_back(record);
+        while self.window_interaction_release_debug.len()
+            > MAX_WINDOW_INTERACTION_RELEASE_DEBUG_RECORDS
+        {
+            self.window_interaction_release_debug.pop_front();
+        }
+    }
+
+    pub(in crate::compositor) fn record_client_owned_window_interaction_release(
+        &mut self,
+        context: WindowInteractionReleaseContext,
+        release_target_surface_id: Option<u32>,
+        held_button_count_before: usize,
+        held_button_count_after: usize,
+        implicit_grab_surface_id_before: Option<u32>,
+        implicit_grab_surface_id_after: Option<u32>,
+    ) {
+        self.record_window_interaction_release(WindowInteractionReleaseDebugRecord {
+            interaction_id: context.interaction_id.get(),
+            source: context.source,
+            trigger_button: context.trigger_button,
+            trigger_serial: context.trigger_serial,
+            original_surface_id: context.original_surface_id,
+            release_target_surface_id,
+            delivery: TriggerReleaseDelivery::ClientOwned,
+            held_button_count_before,
+            held_button_count_after,
+            implicit_grab_surface_id_before,
+            implicit_grab_surface_id_after,
+        });
+    }
+
+    pub(in crate::compositor) fn window_interaction_release_metrics(
+        &self,
+    ) -> WindowInteractionReleaseMetrics {
+        self.window_interaction_release_metrics
+    }
+
+    pub(in crate::compositor) fn window_interaction_release_debug_records(
+        &self,
+    ) -> Vec<WindowInteractionReleaseDebugRecord> {
+        self.window_interaction_release_debug
+            .iter()
+            .copied()
+            .collect()
     }
 
     pub(in crate::compositor) fn apply_pending_interactive_resize_update(&mut self) -> bool {

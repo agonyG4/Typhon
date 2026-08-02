@@ -24,6 +24,8 @@ mod frame;
 mod fullscreen_cadence;
 mod input;
 mod input_interaction_liveness;
+mod input_protocol;
+mod input_xwayland_client;
 mod output;
 mod plane_scheduling_model;
 mod presentation_transactions;
