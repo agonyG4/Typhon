@@ -631,6 +631,7 @@ impl AtomicOutputSwapchain {
         &mut self,
         token: PageFlipToken,
         submission_fence: OwnedFd,
+        cursor_owner: &mut Option<FrozenCursorPlaneOwner>,
     ) -> io::Result<bool> {
         if self.quarantine.is_some() {
             return Err(io::Error::other(
@@ -657,6 +658,12 @@ impl AtomicOutputSwapchain {
                 "re-planned worker output frame belongs to an old pool generation",
             ));
         }
+        if queued.frame.frozen_cursor_plane_owner.is_some() {
+            self.worker_queued = Some(queued);
+            return Err(io::Error::other(
+                "re-planned worker output frame already owns a frozen cursor",
+            ));
+        }
         if let Err(error) = queued
             .frame
             .render_fence
@@ -665,6 +672,7 @@ impl AtomicOutputSwapchain {
             self.worker_queued = Some(queued);
             return Err(error);
         }
+        queued.frame.frozen_cursor_plane_owner = cursor_owner.take();
         self.ready = Some(queued.frame);
         Ok(true)
     }

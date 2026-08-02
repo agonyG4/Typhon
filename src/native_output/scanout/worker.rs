@@ -46,6 +46,7 @@ impl NativeScanoutBackend {
         &mut self,
         token: PageFlipToken,
         submission_fence: Option<OwnedFd>,
+        cursor_owner: &mut Option<FrozenCursorPlaneOwner>,
     ) -> io::Result<()> {
         match self {
             Self::AtomicEglGbm(scanout) => scanout.return_worker_submission_for_replan(
@@ -53,6 +54,7 @@ impl NativeScanoutBackend {
                 submission_fence.ok_or_else(|| {
                     io::Error::other("explicit worker re-plan is missing its input fence")
                 })?,
+                cursor_owner,
             ),
             Self::NativeEglGbm(scanout) => {
                 if submission_fence.is_some() {

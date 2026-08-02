@@ -330,6 +330,138 @@ fn ready_frame_retains_and_transfers_its_frozen_cursor_pin() {
 }
 
 #[test]
+fn ready_frame_cursor_owner_round_trips_through_replan_and_second_admission() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        1,
+    )
+    .unwrap();
+    let slot = swapchain.acquire_render_slot().unwrap();
+    let lease = Arc::new(());
+    let revision =
+        crate::native_output::presentation::plane::CursorRevision::initial().advance_image();
+    let owner = FrozenCursorPlaneOwner {
+        revision,
+        capability_key: Some(test_cursor_capability_key()),
+        pin: Some(CursorFramebufferPin::for_test(103, Arc::clone(&lease))),
+    };
+    swapchain
+        .prepare_ready_for_test(
+            slot,
+            test_render_fence(),
+            crate::native_output::presentation::plane::FrozenPrimaryCursorPlan {
+                delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware,
+                primary_presentation:
+                    crate::native_output::presentation::plane::FrozenPrimaryCursorPresentation::Preserve,
+                cursor_test_policy:
+                    crate::native_output::presentation::plane::FrozenCursorTestPolicy::Required,
+            },
+            Some(owner),
+        )
+        .unwrap();
+
+    let (submission_fence, mut job_owner) = swapchain
+        .take_ready_for_worker(
+            PageFlipToken::new(43).unwrap(),
+            MonotonicTimestampNs::new(1),
+        )
+        .unwrap();
+    assert_eq!(job_owner.as_ref().unwrap().revision, revision);
+    assert_eq!(Arc::strong_count(&lease), 2);
+
+    assert!(
+        swapchain
+            .return_worker_queued_for_replan(
+                PageFlipToken::new(43).unwrap(),
+                submission_fence,
+                &mut job_owner,
+            )
+            .unwrap()
+    );
+    assert!(job_owner.is_none());
+    assert_eq!(
+        swapchain.ready_cursor_plane_owner().unwrap().revision,
+        revision
+    );
+    assert_eq!(
+        swapchain.ready_cursor_plane_owner().unwrap().capability_key,
+        Some(test_cursor_capability_key())
+    );
+    assert_eq!(Arc::strong_count(&lease), 2);
+
+    let (_second_fence, second_owner) = swapchain
+        .take_ready_for_worker(
+            PageFlipToken::new(44).unwrap(),
+            MonotonicTimestampNs::new(2),
+        )
+        .unwrap();
+    assert_eq!(second_owner.as_ref().unwrap().revision, revision);
+    assert_eq!(
+        second_owner.as_ref().unwrap().capability_key,
+        Some(test_cursor_capability_key())
+    );
+    assert_eq!(
+        second_owner
+            .as_ref()
+            .unwrap()
+            .pin
+            .as_ref()
+            .unwrap()
+            .framebuffer_id()
+            .get(),
+        103
+    );
+    drop(second_owner);
+    assert_eq!(Arc::strong_count(&lease), 1);
+}
+
+#[test]
+fn failed_ready_cursor_owner_replan_keeps_owner_with_caller() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        1,
+    )
+    .unwrap();
+    let slot = swapchain.acquire_render_slot().unwrap();
+    let lease = Arc::new(());
+    swapchain
+        .prepare_ready_for_test(
+            slot,
+            test_render_fence(),
+            crate::native_output::presentation::plane::FrozenPrimaryCursorPlan {
+                delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware,
+                primary_presentation:
+                    crate::native_output::presentation::plane::FrozenPrimaryCursorPresentation::Preserve,
+                cursor_test_policy:
+                    crate::native_output::presentation::plane::FrozenCursorTestPolicy::Required,
+            },
+            Some(FrozenCursorPlaneOwner {
+                revision: crate::native_output::presentation::plane::CursorRevision::initial(),
+                capability_key: None,
+                pin: Some(CursorFramebufferPin::for_test(104, Arc::clone(&lease))),
+            }),
+        )
+        .unwrap();
+    let (submission_fence, mut job_owner) = swapchain
+        .take_ready_for_worker(
+            PageFlipToken::new(45).unwrap(),
+            MonotonicTimestampNs::new(1),
+        )
+        .unwrap();
+
+    let error = swapchain.return_worker_queued_for_replan(
+        PageFlipToken::new(46).unwrap(),
+        submission_fence,
+        &mut job_owner,
+    );
+    assert!(error.is_err());
+    assert!(job_owner.is_some());
+    assert_eq!(Arc::strong_count(&lease), 2);
+}
+
+#[test]
 fn ready_frame_cursor_pin_drops_when_suspended_frame_is_abandoned() {
     let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
         explicit_slot_set(),
@@ -362,6 +494,32 @@ fn ready_frame_cursor_pin_drops_when_suspended_frame_is_abandoned() {
     assert!(swapchain.suspend_abandon_ready().unwrap());
     drop(swapchain.take_suspended_ready_frame());
     assert_eq!(Arc::strong_count(&lease), 1);
+}
+
+fn test_cursor_capability_key() -> CursorCapabilityKey {
+    CursorCapabilityKey {
+        output_generation: 1,
+        crtc_id: 7,
+        plane_id: 9,
+        mode_width: 1920,
+        mode_height: 1080,
+        output_transform: 0,
+        output_scale_milli: 1000,
+        format: 875713112,
+        modifier: 0,
+        cursor_width: 64,
+        cursor_height: 64,
+        hotspot_property_available: true,
+        geometry_class: CursorGeometryClass::FullyVisible,
+        source_x: 0,
+        source_y: 0,
+        source_width: 64,
+        source_height: 64,
+        destination_x: 0,
+        destination_y: 0,
+        destination_width: 64,
+        destination_height: 64,
+    }
 }
 
 fn explicit_slot_set() -> OutputSlotSet {
@@ -490,9 +648,10 @@ fn active_validation_invalidation_returns_worker_frame_without_quarantine() {
         .take_ready_for_worker(token, MonotonicTimestampNs::new(10))
         .unwrap();
 
+    let mut cursor_owner = None;
     assert!(
         swapchain
-            .return_worker_queued_for_replan(token, submission_fence)
+            .return_worker_queued_for_replan(token, submission_fence, &mut cursor_owner)
             .unwrap()
     );
     assert_eq!(swapchain.worker_queued_slot(), None);
@@ -505,9 +664,14 @@ fn active_validation_invalidation_returns_worker_frame_without_quarantine() {
             MonotonicTimestampNs::new(11),
         )
         .unwrap();
+    let mut retry_cursor_owner = None;
     assert_eq!(swapchain.worker_queued_slot(), Some(slot));
     swapchain
-        .return_worker_queued_for_replan(PageFlipToken::new(722).unwrap(), retry_fence)
+        .return_worker_queued_for_replan(
+            PageFlipToken::new(722).unwrap(),
+            retry_fence,
+            &mut retry_cursor_owner,
+        )
         .unwrap();
     swapchain.validate_invariants().unwrap();
 }

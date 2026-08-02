@@ -59,11 +59,13 @@ impl AtomicEglGbmScanout {
         &mut self,
         token: PageFlipToken,
         submission_fence: OwnedFd,
+        cursor_owner: &mut Option<FrozenCursorPlaneOwner>,
     ) -> io::Result<()> {
-        if !self
-            .swapchain_mut()?
-            .return_worker_queued_for_replan(token, submission_fence)?
-        {
+        if !self.swapchain_mut()?.return_worker_queued_for_replan(
+            token,
+            submission_fence,
+            cursor_owner,
+        )? {
             return Err(io::Error::other(
                 "explicit worker re-plan has no queued output frame",
             ));
