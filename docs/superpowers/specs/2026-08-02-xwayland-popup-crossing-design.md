@@ -33,22 +33,34 @@ pointer crossing and can create a ConfigureNotify/restack feedback loop.
 ### Explicit scene batch
 
 `CompositorState` gains an explicit XWayland scene-batch guard. The native
-cycle begins the batch before association dispatch and ends it after:
+cycle begins the batch before association dispatch and commits it before
+collecting compositor backend commands:
 
 1. XWayland association events;
 2. buffer-level and buffer-ready events;
 3. XWM window events;
-4. XWayland backend-command collection.
+4. scene-batch commit;
+5. compositor backend-command collection;
+6. terminal-window command normalization;
+7. command execution and XWM flush.
+
+The current native dispatch path is split so batch commit can produce
+coalesced client-list synchronization, focus repair, or deliberate managed
+window commands before backend commands are collected. No command produced by
+commit is delayed until a later native cycle.
 
 Logical state changes remain immediate. While a batch is active, scene side
 effects set dirty state instead of refreshing pointer focus, reordering the
 render stack, synchronizing client lists, or requesting duplicate repaint
 work. Direct test/API calls remain immediate when no batch is active.
 
-The guard is fail-safe. A scoped guard commits on normal drop or explicitly
-returns its commit outcome, and commit state cannot leave the compositor in a
-permanent active-batch state after an error or early return. Commit does not
-wait for X replies.
+The guard has explicit, non-nestable ownership. `begin_xwayland_scene_batch()`
+returns an exact batch token and epoch. The caller must pass that token to
+`commit_xwayland_scene_batch(token)`. A mismatched token, double commit, or
+nested begin is rejected and fails closed. Drop or failure cleanup only clears
+active-batch bookkeeping; it performs no pointer, protocol, stack, or repaint
+side effects. Logical mutations and dirty work remain available for a later
+successful commit. Commit does not wait for X replies.
 
 ### Commit order
 
@@ -64,8 +76,8 @@ Batch commit performs the following steps:
    locked-pointer, confined-pointer, and implicit-grab ownership.
 6. Send leave for the previous target before enter for the final target.
 7. Send one pointer frame per affected client.
-8. Request repaint once while preserving the union of all required damage and
-   presentation work.
+8. Schedule one repaint signal while preserving all damage and presentation
+   work already recorded by the existing owners.
 
 If a snapshot reply is not ready, the current logical state is committed and
 the dirty/query state remains pending for a later batch. Applying the same
@@ -82,11 +94,20 @@ generation:
 - the newest applied snapshot epoch.
 
 Relevant X events mark the state dirty. If dirty and no request is pending,
-XWM sends `QueryTree(root)`, stores the exact sequence, and flushes without
-blocking. The next reactor wakeup reconstructs the x11rb cookie and calls
-`reply_unchecked()`. `WouldBlock` preserves the pending request. If more
-changes arrive while it is pending, the reply is consumed and exactly one
-follow-up query is issued.
+XWM sends `QueryTree(root)`, stores the exact sequence and request epoch, and
+flushes without blocking. The next reactor wakeup reconstructs the x11rb
+cookie and calls `reply_unchecked()`. `WouldBlock` preserves the pending
+request.
+
+The reply is authoritative only when its request epoch equals the current
+dirty epoch. If a newer stack mutation occurred while the request was in
+flight, XWM consumes the reply, counts it as superseded, emits no snapshot,
+and issues exactly one follow-up query. This prevents an older root order from
+becoming an intermediate compositor scene. A reply that omits a currently
+live, mapped override-redirect record is treated as incomplete: it is not
+used to remove or reorder that window, the current logical placement is
+retained, and a fresh reconciliation is requested. Unknown XIDs may still be
+pruned from an otherwise complete reply.
 
 The X11 protocol defines QueryTree children in bottom-to-top stacking order.
 The emitted event documents this explicitly:
@@ -100,10 +121,12 @@ XwmEvent::OverrideRedirectStackSnapshot {
 ```
 
 The vector contains only current-generation, live, mapped,
-override-redirect windows known to XWM. Unknown, missing, stale, destroyed,
-or kind-changed XIDs are pruned and counted rather than invalidating the
-complete snapshot. Generation and epoch checks occur in both XWM and the
-compositor.
+override-redirect windows known to XWM. Unknown XIDs present in the reply and
+records that became stale, destroyed, or kind-changed are pruned and counted.
+A currently live mapped record missing from the reply makes the reply
+incomplete instead of producing a partial snapshot; its current logical
+placement is retained and a fresh query is issued. Generation and epoch
+checks occur in both XWM and the compositor.
 
 Snapshot application changes only the relative order of override-redirect
 desktop windows. Managed X11 ordering, XDG ordering, layer-shell ordering,
@@ -141,6 +164,19 @@ grabs. Suppressing intermediate crossings does not transfer pointer
 ownership. Stable targets do not receive leave/re-enter churn; a changed
 target receives leave before enter.
 
+Batch commit uses one atomic pointer-crossing primitive rather than composing
+`clear_pointer_focus()`, `ensure_pointer_focus()`, and
+`send_pointer_enter_if_needed()`. It captures the old target, resolves the
+final target, queues all valid leave events, queues all valid enter events,
+updates pointer bookkeeping, and sends frames only after the complete
+crossing is queued. If the old surface was destroyed, its bookkeeping is
+cleared without sending an event to the dead resource. Same-client leave and
+enter are grouped into one pointer frame where protocol/resource support
+allows it; different clients receive one final frame each. The primitive runs
+only when pointer target, render-stack order, placement, association, or
+relevant input state is dirty. Metadata-only mutations that cannot affect
+hit-testing do not refresh the pointer.
+
 ### Lifecycle settlement
 
 Unmap and destroy remove XWM and compositor popup state immediately. A popup
@@ -177,10 +213,16 @@ cancellations, and redundant popup cleanup.
 ## Error Handling
 
 QueryTree transport failures use the existing XWM error path. A temporarily
-unavailable reply is not an error and remains in flight. A malformed or stale
-reply is discarded and counted without mutating compositor state. A failed
-scene commit leaves logical state intact, releases the batch guard, and does
-not block the native cycle waiting for X11.
+unavailable reply is not an error and remains in flight. A malformed, stale,
+superseded, or incomplete reply is consumed and counted without mutating
+compositor state. A failed scene commit clears only active-batch bookkeeping;
+logical state, existing damage journals, and dirty work remain available for a
+later commit. It does not block the native cycle waiting for X11.
+
+The scene batch does not create a second damage accumulator. Surface damage,
+publication, and presentation state continue to be recorded immediately by
+their existing journals and owners. The batch tracks only whether repaint
+scheduling is needed and emits one scheduling signal at commit.
 
 Terminal lifecycle events and required protocol replies are never coalesced
 away. Client-list synchronization, render-stack normalization, pointer
@@ -196,20 +238,24 @@ failure before the fix. Coverage includes:
 - no ConfigureNotify-to-RestackExact feedback;
 - one in-flight QueryTree request with one follow-up after concurrent dirties;
 - stale epoch and generation rejection;
+- superseded and incomplete QueryTree replies retaining logical order;
 - same-batch temporary popup suppression and map/unmap cancellation;
 - leave-before-enter sibling hover transitions;
 - parent/submenu coexistence and unrelated popup families;
 - focus preservation with actual popup pointer targeting;
 - attachment replacement without an intermediate retired-surface enter;
 - window kind transitions in both directions;
+- mismatched, double, nested, and dropped/aborted scene-batch tokens;
+- atomic leave/enter queueing and pointer-frame grouping;
 - lifecycle trace retention through flush storms;
 - deterministic 1000-cycle popup storms with bounded work;
 - real XWM event drain to QueryTree reply to scene commit where the fixture
   supports it.
 
 Performance assertions target O(N) state ingestion per batch, one final
-pointer refresh, one final render-stack reorder, at most one active QueryTree,
-and zero observation-driven RestackExact commands.
+pointer refresh only when pointer-affecting dirty state exists, one final
+render-stack reorder, at most one active QueryTree, and zero
+observation-driven RestackExact commands.
 
 Full validation uses the repository's locked Cargo checks/tests/build and
 source-layout checks. Hardware Steam qualification is reported only when
