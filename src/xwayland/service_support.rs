@@ -117,6 +117,10 @@ pub(crate) fn drain_stderr_pipe(
 }
 
 impl XwaylandService {
+    pub fn xwayland_override_redirect_stack_snapshots_emitted(&self) -> u64 {
+        self.metrics.override_redirect_stack_snapshots_emitted
+    }
+
     pub(crate) fn handle_stderr_ready_impl(
         &mut self,
         generation: super::XwaylandGeneration,

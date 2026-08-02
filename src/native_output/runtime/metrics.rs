@@ -1,6 +1,61 @@
 use super::planner::visual_target_deadline_for_mode;
 use super::*;
 
+fn xwayland_scene_metric_fields(
+    metrics: oblivion_one::compositor::XwaylandSceneMetricsSnapshot,
+    snapshots_emitted: u64,
+) -> Vec<NativePerfField> {
+    vec![
+        NativePerfField::u64("xwayland_stack_snapshots_emitted", snapshots_emitted),
+        NativePerfField::u64("xwayland_scene_batches", metrics.xwayland_scene_batches),
+        NativePerfField::u64("xwayland_scene_mutations", metrics.xwayland_scene_mutations),
+        NativePerfField::u64(
+            "pointer_refreshes_deferred",
+            metrics.pointer_refreshes_deferred,
+        ),
+        NativePerfField::u64(
+            "pointer_refreshes_committed",
+            metrics.pointer_refreshes_committed,
+        ),
+        NativePerfField::u64(
+            "intermediate_pointer_targets_suppressed",
+            metrics.intermediate_pointer_targets_suppressed,
+        ),
+        NativePerfField::u64(
+            "render_stack_reorders_coalesced",
+            metrics.render_stack_reorders_coalesced,
+        ),
+        NativePerfField::u64(
+            "client_list_syncs_coalesced",
+            metrics.client_list_syncs_coalesced,
+        ),
+        NativePerfField::u64(
+            "override_redirect_stack_snapshots_applied",
+            metrics.override_redirect_stack_snapshots_applied,
+        ),
+        NativePerfField::u64(
+            "override_redirect_stack_snapshots_rejected_stale",
+            metrics.override_redirect_stack_snapshots_rejected_stale,
+        ),
+        NativePerfField::u64(
+            "override_redirect_stack_snapshots_rejected_generation",
+            metrics.override_redirect_stack_snapshots_rejected_generation,
+        ),
+        NativePerfField::u64(
+            "override_redirect_restack_writebacks_prevented",
+            metrics.override_redirect_restack_writebacks_prevented,
+        ),
+        NativePerfField::u64(
+            "pre_admission_popup_cancellations",
+            metrics.pre_admission_popup_cancellations,
+        ),
+        NativePerfField::u64(
+            "popup_lifecycle_redundant_cleanup",
+            metrics.popup_lifecycle_redundant_cleanup,
+        ),
+    ]
+}
+
 impl NativeRuntime {
     pub(super) fn update_cycle_metrics(
         &mut self,
@@ -230,6 +285,11 @@ impl NativeRuntime {
                         .unwrap_or("none"),
                 ),
             ];
+            fields.extend(xwayland_scene_metric_fields(
+                self.server.xwayland_scene_metrics(),
+                self.xwayland
+                    .xwayland_override_redirect_stack_snapshots_emitted(),
+            ));
             if let Some(worker) = self.kms_commit_worker.as_ref() {
                 let metrics = worker.metrics_snapshot();
                 fields.extend([
@@ -783,5 +843,52 @@ impl NativeRuntime {
             ),
         ))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xwayland_scene_metrics_export_each_counter_without_conflation() {
+        let snapshot = oblivion_one::compositor::XwaylandSceneMetricsSnapshot {
+            xwayland_scene_batches: 15,
+            xwayland_scene_mutations: 16,
+            pointer_refreshes_deferred: 17,
+            pointer_refreshes_committed: 18,
+            intermediate_pointer_targets_suppressed: 19,
+            render_stack_reorders_coalesced: 20,
+            client_list_syncs_coalesced: 21,
+            override_redirect_stack_snapshots_applied: 22,
+            override_redirect_stack_snapshots_rejected_stale: 23,
+            override_redirect_stack_snapshots_rejected_generation: 24,
+            override_redirect_restack_writebacks_prevented: 25,
+            pre_admission_popup_cancellations: 26,
+            popup_lifecycle_redundant_cleanup: 27,
+        };
+        let fields = xwayland_scene_metric_fields(snapshot, 14);
+
+        assert_eq!(fields.len(), 14);
+        for (field, expected) in fields.iter().zip(14_u64..=27) {
+            assert_eq!(field.value, expected.to_string(), "field {}", field.key);
+        }
+        assert_eq!(fields[0].key, "xwayland_stack_snapshots_emitted");
+        assert_eq!(fields[0].value, "14");
+        assert_eq!(
+            fields
+                .iter()
+                .filter(|field| field.key.contains("applied"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            fields
+                .iter()
+                .filter(|field| field.key.contains("rejected"))
+                .count(),
+            2
+        );
+        assert_ne!(fields[3].value, fields[4].value);
     }
 }
