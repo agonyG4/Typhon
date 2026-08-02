@@ -6,7 +6,7 @@ use oblivion_one::render_backend::{
 };
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 struct TestGbmAllocationProbe {
     rejected: Vec<DrmFormatModifierPair>,
@@ -273,10 +273,95 @@ fn ready_frame_keeps_its_frozen_cursor_contract() {
             crate::native_output::presentation::plane::FrozenCursorTestPolicy::Required,
     };
     swapchain
-        .prepare_ready_for_test(slot, test_render_fence(), frozen)
+        .prepare_ready_for_test(slot, test_render_fence(), frozen, None)
         .unwrap();
 
     assert_eq!(swapchain.ready_cursor_plan(), Some(frozen));
+}
+
+#[test]
+fn ready_frame_retains_and_transfers_its_frozen_cursor_pin() {
+    let slots = explicit_slot_set();
+    let mut swapchain =
+        AtomicOutputSwapchain::from_presented_slots(slots, OutputSlotId::new(0).unwrap(), 1)
+            .unwrap();
+    let slot = swapchain.acquire_render_slot().unwrap();
+    let lease = Arc::new(());
+    let owner = FrozenCursorPlaneOwner {
+        revision: crate::native_output::presentation::plane::CursorRevision::initial(),
+        capability_key: None,
+        pin: Some(CursorFramebufferPin::for_test(101, Arc::clone(&lease))),
+    };
+    let frozen = crate::native_output::presentation::plane::FrozenPrimaryCursorPlan {
+        delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware,
+        primary_presentation:
+            crate::native_output::presentation::plane::FrozenPrimaryCursorPresentation::Preserve,
+        cursor_test_policy:
+            crate::native_output::presentation::plane::FrozenCursorTestPolicy::Required,
+    };
+    swapchain
+        .prepare_ready_for_test(slot, test_render_fence(), frozen, Some(owner))
+        .unwrap();
+    assert_eq!(Arc::strong_count(&lease), 2);
+    assert_eq!(
+        swapchain
+            .ready_cursor_plane_owner()
+            .unwrap()
+            .pin
+            .as_ref()
+            .unwrap()
+            .framebuffer_id()
+            .get(),
+        101
+    );
+
+    let token = PageFlipToken::new(41).unwrap();
+    let (_fence, transferred) = swapchain
+        .take_ready_for_worker(token, MonotonicTimestampNs::new(1))
+        .unwrap();
+    let transferred = transferred.unwrap();
+    assert_eq!(
+        transferred.pin.as_ref().unwrap().framebuffer_id().get(),
+        101
+    );
+    assert_eq!(Arc::strong_count(&lease), 2);
+    drop(transferred);
+    assert_eq!(Arc::strong_count(&lease), 1);
+}
+
+#[test]
+fn ready_frame_cursor_pin_drops_when_suspended_frame_is_abandoned() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        1,
+    )
+    .unwrap();
+    let slot = swapchain.acquire_render_slot().unwrap();
+    let lease = Arc::new(());
+    let owner = FrozenCursorPlaneOwner {
+        revision: crate::native_output::presentation::plane::CursorRevision::initial(),
+        capability_key: None,
+        pin: Some(CursorFramebufferPin::for_test(102, Arc::clone(&lease))),
+    };
+    swapchain
+        .prepare_ready_for_test(
+            slot,
+            test_render_fence(),
+            crate::native_output::presentation::plane::FrozenPrimaryCursorPlan {
+                delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware,
+                primary_presentation:
+                    crate::native_output::presentation::plane::FrozenPrimaryCursorPresentation::Preserve,
+                cursor_test_policy:
+                    crate::native_output::presentation::plane::FrozenCursorTestPolicy::Required,
+            },
+            Some(owner),
+        )
+        .unwrap();
+    assert_eq!(Arc::strong_count(&lease), 2);
+    assert!(swapchain.suspend_abandon_ready().unwrap());
+    drop(swapchain.take_suspended_ready_frame());
+    assert_eq!(Arc::strong_count(&lease), 1);
 }
 
 fn explicit_slot_set() -> OutputSlotSet {
@@ -368,7 +453,7 @@ fn explicit_output_swapchain_tracks_one_worker_queued_frame_before_pending() {
         .finish_render(slot, 1, test_render_fence())
         .unwrap();
     let token = PageFlipToken::new(720).unwrap();
-    let fence = swapchain
+    let (fence, _) = swapchain
         .take_ready_for_worker(token, MonotonicTimestampNs::new(10))
         .unwrap();
 
@@ -401,7 +486,7 @@ fn active_validation_invalidation_returns_worker_frame_without_quarantine() {
         .finish_render(slot, 1, test_render_fence())
         .unwrap();
     let token = PageFlipToken::new(721).unwrap();
-    let submission_fence = swapchain
+    let (submission_fence, _) = swapchain
         .take_ready_for_worker(token, MonotonicTimestampNs::new(10))
         .unwrap();
 
@@ -414,7 +499,7 @@ fn active_validation_invalidation_returns_worker_frame_without_quarantine() {
     assert_eq!(swapchain.ready_slot(), Some(slot));
     assert_eq!(swapchain.quarantine_slot_id(), None);
     assert!(!swapchain.is_poisoned());
-    let retry_fence = swapchain
+    let (retry_fence, _) = swapchain
         .take_ready_for_worker(
             PageFlipToken::new(722).unwrap(),
             MonotonicTimestampNs::new(11),
@@ -447,7 +532,7 @@ fn predictive_swapchain_allows_pending_plus_one_worker_queued_next() {
     swapchain
         .finish_render(queued_slot, 2, test_render_fence())
         .unwrap();
-    swapchain
+    let _ = swapchain
         .take_ready_for_worker(
             PageFlipToken::new(731).unwrap(),
             MonotonicTimestampNs::new(10),

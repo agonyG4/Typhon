@@ -590,6 +590,7 @@ impl AtomicEglGbmScanout {
         cursor: Option<CursorPlaneAssignment>,
         equivalent_direct_key: Option<DirectScanoutCandidateKey>,
         frozen_cursor_plan: crate::native_output::presentation::plane::FrozenPrimaryCursorPlan,
+        frozen_cursor_plane_owner: Option<FrozenCursorPlaneOwner>,
     ) -> io::Result<AtomicFrameRenderOutcome> {
         let (slot, frame_id, pool_generation) = {
             let swapchain = self.swapchain_mut()?;
@@ -730,6 +731,7 @@ impl AtomicEglGbmScanout {
             cpu_prepass_duration_ns: 0,
             cpu_encode_duration_ns: parts.render_us.saturating_mul(1_000),
             frozen_cursor_plan,
+            frozen_cursor_plane_owner,
         };
         match self.swapchain_mut()?.finish_render_owned(frame) {
             Ok(frame_id) => {

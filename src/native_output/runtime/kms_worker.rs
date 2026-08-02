@@ -109,10 +109,6 @@ pub(super) fn queue_explicit_composited_frame(
     cursor_update: KmsCursorUpdate,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     primary_cursor_presentation: KmsPrimaryCursorPresentation,
-    cursor_pin: Option<CursorFramebufferPin>,
-    cursor_capability_key: Option<
-        crate::native_output::presentation::plane_policy::CursorCapabilityKey,
-    >,
     pacing_frame_id: Option<u64>,
     test_policy: KmsCommitTestPolicy,
     ready_submit: bool,
@@ -148,9 +144,12 @@ pub(super) fn queue_explicit_composited_frame(
         Err(error) => return Ok(WorkerQueueOutcome::Unavailable(error)),
     };
     let queued_at_ns = monotonic_now_ns()?;
-    let in_fence = explicit
+    let frozen_cursor_owner = explicit.swapchain()?.ready_cursor_plane_owner();
+    let frozen_cursor_capability_key = frozen_cursor_owner.and_then(|owner| owner.capability_key);
+    let in_fence_and_owner = explicit
         .swapchain_mut()?
         .take_ready_for_worker(token, MonotonicTimestampNs::new(queued_at_ns))?;
+    let (in_fence, frozen_cursor_owner) = in_fence_and_owner;
     if let Err(error) = output_transactions.mark_queued(
         transaction_id,
         output_generation,
@@ -207,7 +206,7 @@ pub(super) fn queue_explicit_composited_frame(
                     .descriptor()
                     .clone(),
             ),
-            cursor_capability_key,
+            frozen_cursor_capability_key,
         ),
         transaction_id,
         token,
@@ -225,7 +224,7 @@ pub(super) fn queue_explicit_composited_frame(
         cursor: cursor_update,
         cursor_delivery,
         primary_cursor_presentation,
-        cursor_pin,
+        cursor_pin: frozen_cursor_owner.and_then(|owner| owner.pin),
         direct_primary_lease: None,
         test_only_duration_ns: None,
         pacing_frame_id,

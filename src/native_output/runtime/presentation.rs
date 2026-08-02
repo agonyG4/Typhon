@@ -10,8 +10,8 @@ use super::planner::{
 };
 use super::presentation_cursor::{
     CursorPolicyContext, apply_cursor_policy_with_runtime_inputs, cursor_damage_states,
-    effective_cursor_for_plan, frozen_cursor_plan_for_render, log_client_cursor_path_if_changed,
-    plan_primary_cursor_presentation, plan_uses_hardware_cursor,
+    effective_cursor_for_plan, freeze_cursor_plane_owner, frozen_cursor_plan_for_render,
+    log_client_cursor_path_if_changed, plan_primary_cursor_presentation, plan_uses_hardware_cursor,
     planned_client_cursor_software_work, planned_cursor_hardware_usable,
     planned_hardware_cursor_work_pending, prepare_cursor_image, presented_delivery_for_plan,
 };
@@ -958,6 +958,17 @@ impl NativeRuntime {
                             )
                         })?;
                         presentation_deadline.clear_scheduled_target();
+                        let cursor_assignment =
+                            effective_cursor
+                                .as_ref()
+                                .map(|state| CursorPlaneAssignment::Atomic {
+                                    desired_epoch: cursor_epoch,
+                                    state: Some(state.clone()),
+                                });
+                        let frozen_cursor_plane_owner = freeze_cursor_plane_owner(
+                            cursor_assignment.as_ref(),
+                            atomic_cursor.as_ref(),
+                        )?;
                         let render_outcome = explicit.render_frame(
                             frame_renderer,
                             server,
@@ -969,12 +980,7 @@ impl NativeRuntime {
                             *drm_file_generation,
                             frame_target,
                             pacing_mode,
-                            effective_cursor
-                                .as_ref()
-                                .map(|state| CursorPlaneAssignment::Atomic {
-                                    desired_epoch: cursor_epoch,
-                                    state: Some(state.clone()),
-                                }),
+                            cursor_assignment,
                             direct_inspection
                                 .candidate_key
                                 .filter(|_| !composition_required),
@@ -983,6 +989,7 @@ impl NativeRuntime {
                                 primary_cursor,
                                 runtime_plane_plan.as_ref(),
                             ),
+                            frozen_cursor_plane_owner,
                         )?;
                         match render_outcome {
                             AtomicFrameRenderOutcome::Skipped { reason, render_us } => {

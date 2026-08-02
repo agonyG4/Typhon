@@ -15,7 +15,11 @@ use oblivion_one::native::scheduler::NativeOutputPacingMode;
 
 use crate::egl_renderer::{EglSceneFrameCommit, native_fence::NativeRenderFence};
 use crate::native_output::OutputTransactionId;
-use crate::native_output::presentation::plane::FrozenPrimaryCursorPlan;
+use crate::native_output::output::CursorFramebufferPin;
+use crate::native_output::presentation::plane::CursorRevision;
+use crate::native_output::presentation::{
+    plane::FrozenPrimaryCursorPlan, plane_policy::CursorCapabilityKey,
+};
 
 pub(crate) const EXPLICIT_OUTPUT_SLOT_CAPACITY: usize = 3;
 
@@ -171,6 +175,14 @@ pub(crate) struct RenderedOutputFrame {
     pub(crate) cpu_prepass_duration_ns: u64,
     pub(crate) cpu_encode_duration_ns: u64,
     pub(crate) frozen_cursor_plan: FrozenPrimaryCursorPlan,
+    pub(crate) frozen_cursor_plane_owner: Option<FrozenCursorPlaneOwner>,
+}
+
+#[derive(Debug)]
+pub(crate) struct FrozenCursorPlaneOwner {
+    pub(crate) revision: CursorRevision,
+    pub(crate) capability_key: Option<CursorCapabilityKey>,
+    pub(crate) pin: Option<CursorFramebufferPin>,
 }
 
 #[derive(Debug)]
@@ -390,6 +402,7 @@ impl AtomicOutputSwapchain {
                 cursor_test_policy:
                     crate::native_output::presentation::plane::FrozenCursorTestPolicy::Skip,
             },
+            frozen_cursor_plane_owner: None,
         })
     }
 
@@ -424,12 +437,19 @@ impl AtomicOutputSwapchain {
         self.ready.as_ref().map(|frame| frame.frozen_cursor_plan)
     }
 
+    pub(crate) fn ready_cursor_plane_owner(&self) -> Option<&FrozenCursorPlaneOwner> {
+        self.ready
+            .as_ref()
+            .and_then(|frame| frame.frozen_cursor_plane_owner.as_ref())
+    }
+
     #[cfg(test)]
     pub(crate) fn prepare_ready_for_test(
         &mut self,
         slot: OutputSlotId,
         render_fence: NativeRenderFence,
         frozen_cursor_plan: FrozenPrimaryCursorPlan,
+        frozen_cursor_plane_owner: Option<FrozenCursorPlaneOwner>,
     ) -> io::Result<()> {
         self.ensure_operational()?;
         if self.rendering != Some(slot) || self.ready.is_some() {
@@ -473,6 +493,7 @@ impl AtomicOutputSwapchain {
             cpu_prepass_duration_ns: 0,
             cpu_encode_duration_ns: 0,
             frozen_cursor_plan,
+            frozen_cursor_plane_owner,
         });
         Ok(())
     }
@@ -515,7 +536,7 @@ impl AtomicOutputSwapchain {
         &mut self,
         token: PageFlipToken,
         queued_at: MonotonicTimestampNs,
-    ) -> io::Result<OwnedFd> {
+    ) -> io::Result<(OwnedFd, Option<FrozenCursorPlaneOwner>)> {
         self.ensure_operational()?;
         if self.worker_queued.is_some() {
             return Err(io::Error::other(
@@ -545,7 +566,11 @@ impl AtomicOutputSwapchain {
         });
         // The FD is returned separately so the caller can move it into the
         // cross-thread job while this holder retains all EGL/GBM ownership.
-        Ok(fence)
+        let owner = self
+            .worker_queued
+            .as_mut()
+            .and_then(|queued| queued.frame.frozen_cursor_plane_owner.take());
+        Ok((fence, owner))
     }
 
     pub(crate) fn store_worker_queued(

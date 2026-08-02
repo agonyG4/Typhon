@@ -397,10 +397,6 @@ pub(super) fn queue_explicit_ready_for_presentation(
     cursor_update: KmsCursorUpdate,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     primary_cursor_presentation: KmsPrimaryCursorPresentation,
-    cursor_pin: Option<CursorFramebufferPin>,
-    cursor_capability_key: Option<
-        crate::native_output::presentation::plane_policy::CursorCapabilityKey,
-    >,
     pacing_frame_id: Option<u64>,
     test_policy: KmsCommitTestPolicy,
     ready_submit: bool,
@@ -419,8 +415,6 @@ pub(super) fn queue_explicit_ready_for_presentation(
         cursor_update,
         cursor_delivery,
         primary_cursor_presentation,
-        cursor_pin,
-        cursor_capability_key,
         pacing_frame_id,
         test_policy,
         ready_submit,
@@ -464,16 +458,6 @@ pub(super) fn submit_explicit_ready_for_presentation(
         let frozen_primary_cursor_presentation =
             kms_primary_cursor_presentation(frozen_cursor_plan.primary_presentation);
         let cursor_update = planned_cursor_update(output_transactions, transaction_id)?;
-        let cursor_pin = match &cursor_update {
-            KmsCursorUpdate::Set(state) => worker_cursor_pin(context.atomic_cursor, Some(state))?,
-            KmsCursorUpdate::Unchanged | KmsCursorUpdate::Disable => None,
-        };
-        let cursor_capability_key = match &cursor_update {
-            KmsCursorUpdate::Set(state) => context
-                .atomic_cursor
-                .and_then(|cursor| cursor.capability_key_for(state)),
-            KmsCursorUpdate::Unchanged | KmsCursorUpdate::Disable => None,
-        };
         let pacing_frame_id = context
             .frame_pacing
             .worker_submission_frame_id(ready_submit);
@@ -494,8 +478,6 @@ pub(super) fn submit_explicit_ready_for_presentation(
             cursor_update,
             frozen_cursor_delivery,
             frozen_primary_cursor_presentation,
-            cursor_pin,
-            cursor_capability_key,
             pacing_frame_id,
             KmsCommitTestPolicy::from_cursor(test_only),
             ready_submit,

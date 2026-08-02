@@ -883,7 +883,7 @@ mod tests {
         let mut swapchain = ready_swapchain();
         let ready = swapchain.ready_identity().unwrap();
         let pageflip = token(1);
-        let _fence = swapchain
+        let (_fence, _) = swapchain
             .take_ready_for_worker(pageflip, MonotonicTimestampNs::new(1))
             .unwrap();
         let key = direct_key();

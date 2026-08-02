@@ -125,6 +125,31 @@ pub(super) fn frozen_cursor_plan_for_render(
     }
 }
 
+pub(super) fn freeze_cursor_plane_owner(
+    assignment: Option<&CursorPlaneAssignment>,
+    cursor: Option<&NativeAtomicCursor>,
+) -> NativeResult<Option<FrozenCursorPlaneOwner>> {
+    let assignment = assignment.unwrap_or(&CursorPlaneAssignment::Unchanged);
+    let needs_owner = !matches!(assignment, CursorPlaneAssignment::Unchanged);
+    if !needs_owner {
+        return Ok(None);
+    }
+    let cursor = cursor.ok_or_else(|| io::Error::other("cursor assignment has no cursor state"))?;
+    let state = match assignment {
+        CursorPlaneAssignment::Atomic { state, .. } => state.as_ref(),
+        CursorPlaneAssignment::Disabled | CursorPlaneAssignment::Unchanged => None,
+    };
+    let pin = state
+        .filter(|state| state.framebuffer_id.is_some())
+        .map(|state| cursor.pin_framebuffer_for(state))
+        .transpose()?;
+    Ok(Some(FrozenCursorPlaneOwner {
+        revision: cursor.desired_revision(),
+        capability_key: state.and_then(|state| cursor.capability_key_for(state)),
+        pin,
+    }))
+}
+
 pub(super) fn freeze_primary_cursor_presentation(
     previous_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     next_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,

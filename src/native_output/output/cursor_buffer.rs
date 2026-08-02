@@ -128,6 +128,14 @@ impl CursorFramebufferPin {
     }
 
     #[cfg(test)]
+    pub(crate) fn for_test(framebuffer: u32, lease: Arc<()>) -> Self {
+        Self {
+            framebuffer: FramebufferId::new(framebuffer).expect("test framebuffer is nonzero"),
+            lease,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn is_job_owned(&self) -> bool {
         Arc::strong_count(&self.lease) > 1
     }
