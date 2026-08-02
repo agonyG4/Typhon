@@ -127,6 +127,163 @@ fn sync_snapshot(handle: super::X11WindowHandle, counter: u64) -> X11WindowSnaps
     }
 }
 
+fn prepare_mapped_override_redirect_window(
+    xwm: &mut super::super::Xwm,
+    xid: u32,
+) -> super::X11WindowHandle {
+    let handle = super::X11WindowHandle::new(xwm.generation, xid);
+    assert!(xwm.windows.insert_observed_with_kind(
+        handle,
+        DesktopWindowKind::OverrideRedirect,
+        X11Geometry {
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 80,
+        },
+    ));
+    xwm.windows
+        .adopt_mapped(handle)
+        .expect("map override-redirect window");
+    handle
+}
+
+fn query_tree_reply(sequence: u16, root: u32, children: &[u32]) -> Vec<u8> {
+    let length = u32::try_from(children.len()).expect("child count fits X11 reply");
+    let mut reply = vec![0_u8; 32 + children.len() * 4];
+    reply[0] = 1;
+    reply[2..4].copy_from_slice(&sequence.to_ne_bytes());
+    reply[4..8].copy_from_slice(&length.to_ne_bytes());
+    reply[8..12].copy_from_slice(&root.to_ne_bytes());
+    reply[12..16].copy_from_slice(&root.to_ne_bytes());
+    reply[16..18].copy_from_slice(
+        &u16::try_from(children.len())
+            .expect("child count fits X11 reply")
+            .to_ne_bytes(),
+    );
+    for (index, child) in children.iter().copied().enumerate() {
+        let offset = 32 + index * 4;
+        reply[offset..offset + 4].copy_from_slice(&child.to_ne_bytes());
+    }
+    reply
+}
+
+#[test]
+fn override_redirect_query_tree_emits_current_bottom_to_top_snapshot() {
+    let generation = generation(250);
+    let (mut xwm, mut peer) = test_fixture(generation);
+    let bottom = prepare_mapped_override_redirect_window(&mut xwm, 250);
+    let top = prepare_mapped_override_redirect_window(&mut xwm, 251);
+
+    xwm.mark_override_redirect_stack_dirty();
+    xwm.drain_events(256).expect("issue root stack query");
+    let (sequence, epoch) = xwm
+        .override_redirect_stack_query_for_test()
+        .expect("one root stack query");
+    peer.write_all(&query_tree_reply(
+        sequence as u16,
+        xwm.root,
+        &[bottom.xid(), top.xid(), 0xdead_beef],
+    ))
+    .expect("root stack reply");
+    xwm.drain_events(256).expect("consume root stack reply");
+
+    assert!(
+        xwm.take_events().any(|event| matches!(
+            event,
+            XwmEvent::OverrideRedirectStackSnapshot {
+                generation: event_generation,
+                epoch: event_epoch,
+                bottom_to_top,
+            } if event_generation == generation
+                && event_epoch == epoch
+                && bottom_to_top == vec![bottom, top]
+        )),
+        "current root order should be emitted bottom-to-top"
+    );
+}
+
+#[test]
+fn override_redirect_query_tree_superseded_reply_is_not_emitted() {
+    let generation = generation(251);
+    let (mut xwm, mut peer) = test_fixture(generation);
+    let bottom = prepare_mapped_override_redirect_window(&mut xwm, 252);
+    let top = prepare_mapped_override_redirect_window(&mut xwm, 253);
+
+    xwm.mark_override_redirect_stack_dirty();
+    xwm.drain_events(256).expect("issue root stack query");
+    let (first_sequence, first_epoch) = xwm
+        .override_redirect_stack_query_for_test()
+        .expect("first root stack query");
+    xwm.mark_override_redirect_stack_dirty();
+    xwm.drain_events(256)
+        .expect("retain dirty root stack query");
+    peer.write_all(&query_tree_reply(
+        first_sequence as u16,
+        xwm.root,
+        &[bottom.xid(), top.xid()],
+    ))
+    .expect("superseded root stack reply");
+    xwm.drain_events(256)
+        .expect("consume superseded root stack reply");
+
+    assert!(
+        xwm.take_events()
+            .all(|event| !matches!(event, XwmEvent::OverrideRedirectStackSnapshot { .. }))
+    );
+    assert_eq!(
+        xwm.override_redirect_stack_metrics_for_test()
+            .superseded_replies,
+        1,
+        "a reply for epoch {first_epoch} should be counted as superseded"
+    );
+    assert_eq!(
+        xwm.override_redirect_stack_metrics_for_test()
+            .queries_issued,
+        2,
+        "a superseded reply should cause exactly one follow-up query"
+    );
+}
+
+#[test]
+fn incomplete_override_redirect_query_tree_reply_does_not_remove_live_window() {
+    let generation = generation(252);
+    let (mut xwm, mut peer) = test_fixture(generation);
+    let present = prepare_mapped_override_redirect_window(&mut xwm, 254);
+    let missing = prepare_mapped_override_redirect_window(&mut xwm, 255);
+
+    xwm.mark_override_redirect_stack_dirty();
+    xwm.drain_events(256).expect("issue root stack query");
+    let (sequence, _) = xwm
+        .override_redirect_stack_query_for_test()
+        .expect("root stack query");
+    peer.write_all(&query_tree_reply(
+        sequence as u16,
+        xwm.root,
+        &[present.xid()],
+    ))
+    .expect("incomplete root stack reply");
+    xwm.drain_events(256)
+        .expect("consume incomplete root stack reply");
+
+    assert!(
+        xwm.take_events()
+            .all(|event| !matches!(event, XwmEvent::OverrideRedirectStackSnapshot { .. }))
+    );
+    assert!(xwm.windows.contains(missing));
+    assert_eq!(
+        xwm.override_redirect_stack_metrics_for_test()
+            .incomplete_replies,
+        1
+    );
+    assert_eq!(
+        xwm.override_redirect_stack_metrics_for_test()
+            .queries_issued,
+        2,
+        "an incomplete reply should request one fresh reconciliation"
+    );
+}
+
 #[test]
 fn configure_request_and_destroy_notify_are_normalized_in_one_x11_drain() {
     let generation = generation(205);

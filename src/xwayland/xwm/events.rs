@@ -48,6 +48,9 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             if !xwm.observe_window_with_kind(handle, kind, geometry)? {
                 xwm.reconcile_window_kind(handle, kind)?;
             }
+            if event.override_redirect {
+                xwm.mark_override_redirect_stack_dirty();
+            }
             trace_window_state(xwm, "create_window_observed", handle, TraceFields::new());
         }
         Event::MapRequest(event) => {
@@ -68,12 +71,22 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             xwm.begin_map_to_association_wait(handle)?;
             xwm.refresh_window_properties(handle)?;
             xwm.emit_ready_if_complete(handle)?;
+            if xwm
+                .windows
+                .get(handle)
+                .is_some_and(|record| record.kind == DesktopWindowKind::OverrideRedirect)
+            {
+                xwm.mark_override_redirect_stack_dirty();
+            }
             trace_window_state(xwm, "map_request_processed", handle, TraceFields::new());
         }
         Event::MapNotify(event) => {
             let handle =
                 ensure_window_with_kind(xwm, event.window, window_kind(event.override_redirect))?;
             xwm.reconcile_window_kind(handle, window_kind(event.override_redirect))?;
+            if event.override_redirect {
+                xwm.mark_override_redirect_stack_dirty();
+            }
             if xwm
                 .windows
                 .get(handle)
@@ -135,6 +148,7 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             let Some(record) = xwm.windows.get(handle) else {
                 return Ok(());
             };
+            let is_override_redirect = record.kind == DesktopWindowKind::OverrideRedirect;
             xwm.adoption
                 .cancel(handle, super::adoption::AdoptionCancelReason::Unmap);
             let was_ready = record.snapshot.is_some()
@@ -170,10 +184,17 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 xwm.outgoing_events
                     .push_back(XwmEvent::WindowWithdrawn(handle));
             }
+            if is_override_redirect {
+                xwm.mark_override_redirect_stack_dirty();
+            }
         }
         Event::DestroyNotify(event) => {
             let handle = X11WindowHandle::new(xwm.generation, event.window);
             xwm.note_focus_destroyed(event.window);
+            let is_override_redirect = xwm
+                .windows
+                .get(handle)
+                .is_some_and(|record| record.kind == DesktopWindowKind::OverrideRedirect);
             xwm.adoption
                 .cancel(handle, super::adoption::AdoptionCancelReason::Destroy);
             xwm.clear_resize_sync(handle);
@@ -194,6 +215,9 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             });
             xwm.outgoing_events
                 .push_back(XwmEvent::WindowDestroyed(handle));
+            if is_override_redirect {
+                xwm.mark_override_redirect_stack_dirty();
+            }
         }
         Event::ConfigureRequest(event) => {
             xwm.configure_metrics.requests_received =
@@ -214,6 +238,14 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 sibling,
                 stack_mode: stack_mode(event.stack_mode),
             };
+            if xwm
+                .windows
+                .get(handle)
+                .is_some_and(|record| record.kind == DesktopWindowKind::OverrideRedirect)
+                && request.stack_mode.is_some()
+            {
+                xwm.mark_override_redirect_stack_dirty();
+            }
             xwm.outgoing_events.push_back(XwmEvent::ConfigureRequested {
                 window: handle,
                 request,
@@ -231,6 +263,9 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
                 height: u32::from(event.height),
             };
             xwm.reconcile_window_kind(handle, window_kind(event.override_redirect))?;
+            if event.override_redirect {
+                xwm.mark_override_redirect_stack_dirty();
+            }
             let notify_progress_sequence = Some(event.sequence);
             let classification =
                 xwm.note_configure_notify(handle, geometry, notify_progress_sequence);
@@ -694,6 +729,7 @@ mod tests {
             pending_properties: Default::default(),
             deferred_properties: Default::default(),
             property_metrics: Default::default(),
+            override_redirect_stack: Default::default(),
             root_event_mask_probe: None,
             root_event_mask: None,
             buffer_ready_surfaces: Default::default(),

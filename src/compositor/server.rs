@@ -640,17 +640,22 @@ impl OwnCompositorServer {
                                 crate::compositor::desktop_window::X11DesktopRole::OverrideRedirect,
                             )
                     });
-                if is_override_redirect {
-                    let (sibling, mode) = match above_sibling {
-                        Some(sibling) => (Some(sibling), crate::xwayland::xwm::X11StackMode::Above),
-                        None => (None, crate::xwayland::xwm::X11StackMode::Below),
-                    };
-                    if self.state.apply_x11_stack_request(window, sibling, mode) {
-                        self.state.refresh_pointer_focus_at_last_position();
-                        return vec![self.restack_xwayland_windows()];
-                    }
-                }
+                let _ = (is_override_redirect, above_sibling);
                 self.state.refresh_pointer_focus_at_last_position();
+                Vec::new()
+            }
+            XwmEvent::OverrideRedirectStackSnapshot {
+                generation,
+                epoch,
+                bottom_to_top,
+            } => {
+                if self.state.apply_override_redirect_stack_snapshot(
+                    generation,
+                    epoch,
+                    &bottom_to_top,
+                ) {
+                    self.state.refresh_pointer_focus_at_last_position();
+                }
                 Vec::new()
             }
             XwmEvent::StateRequested { window, request } => {

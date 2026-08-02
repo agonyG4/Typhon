@@ -513,6 +513,7 @@ pub struct CompositorState {
     pub(in crate::compositor) window_by_x11_handle: HashMap<X11WindowHandle, WindowId>,
     pub(in crate::compositor) next_window_id: u64,
     pub(in crate::compositor) window_stacking: Vec<WindowId>,
+    pub(in crate::compositor) applied_override_redirect_stack: Option<(XwaylandGeneration, u64)>,
     pub(in crate::compositor) backend_commands: Vec<window_backend::WindowBackendCommand>,
     cursor_surface_ids: HashSet<u32>,
     active_client_cursor: Option<ActiveClientCursor>,

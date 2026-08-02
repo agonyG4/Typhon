@@ -165,6 +165,7 @@ impl Xwm {
                 break;
             }
         }
+        self.reconcile_override_redirect_stack()?;
         Ok(XwmDrain {
             processed: events_processed,
             budget_exhausted: events_processed == budget && budget != 0,

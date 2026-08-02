@@ -262,6 +262,10 @@ impl X11WindowRegistry {
         self.records.contains_key(&handle)
     }
 
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&X11WindowHandle, &X11WindowRecord)> {
+        self.records.iter()
+    }
+
     pub(crate) fn handle_by_xid(&self, xid: u32) -> Option<X11WindowHandle> {
         self.records
             .keys()

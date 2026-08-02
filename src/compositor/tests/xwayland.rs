@@ -523,7 +523,7 @@ fn compositor_x11_raise_emits_restacks_and_client_list_sync() {
 }
 
 #[test]
-fn override_redirect_configure_notify_reconciles_x_stack_order() {
+fn override_redirect_configure_notify_requests_reconciliation_without_restaking() {
     let socket = super::unique_socket_name();
     let mut server = super::OwnCompositorServer::bind_cpu_composition(&socket)
         .expect("bind fake compositor server");
@@ -551,22 +551,23 @@ fn override_redirect_configure_notify_reconciles_x_stack_order() {
         ))
         .expect("insert second OR window");
 
+    let original_stacking = server.state.window_stacking.clone();
     let commands = server.apply_xwayland_window_event(XwmEvent::ConfigureNotify {
         window: first.handle,
         geometry: first.geometry,
         above_sibling: Some(second.handle),
     });
 
-    assert_eq!(server.state.window_stacking, vec![second_id, first_id]);
+    assert_eq!(server.state.window_stacking, original_stacking);
     assert!(
-        commands
+        !commands
             .iter()
-            .any(|command| matches!(command, XwmCommand::RestackExact { order, .. } if order == &vec![second.handle, first.handle]))
+            .any(|command| matches!(command, XwmCommand::RestackExact { .. }))
     );
 }
 
 #[test]
-fn override_redirect_configure_notify_without_sibling_moves_to_bottom() {
+fn override_redirect_configure_notify_without_sibling_does_not_write_back_observed_order() {
     let socket = super::unique_socket_name();
     let mut server = super::OwnCompositorServer::bind_cpu_composition(&socket)
         .expect("bind fake compositor server");
@@ -594,17 +595,69 @@ fn override_redirect_configure_notify_without_sibling_moves_to_bottom() {
         ))
         .expect("insert second OR window");
 
+    let original_stacking = server.state.window_stacking.clone();
     let commands = server.apply_xwayland_window_event(XwmEvent::ConfigureNotify {
         window: second.handle,
         geometry: second.geometry,
         above_sibling: None,
     });
 
-    assert_eq!(server.state.window_stacking, vec![second_id, first_id]);
-    assert!(commands.iter().any(|command| matches!(
-        command,
-        XwmCommand::RestackExact { order, .. } if order == &vec![second.handle, first.handle]
-    )));
+    assert_eq!(server.state.window_stacking, original_stacking);
+    assert!(
+        !commands
+            .iter()
+            .any(|command| matches!(command, XwmCommand::RestackExact { .. }))
+    );
+}
+
+#[test]
+fn override_redirect_snapshot_follows_root_order_without_changing_managed_order() {
+    let socket = super::unique_socket_name();
+    let mut server = super::OwnCompositorServer::bind_cpu_composition(&socket)
+        .expect("bind fake compositor server");
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let managed = fake_snapshot();
+    let mut first = managed.clone();
+    first.handle = X11WindowHandle::new(generation, 105);
+    first.surface_id = 12;
+    first.kind = DesktopWindowKind::OverrideRedirect;
+    first.override_redirect = true;
+    let mut second = first.clone();
+    second.handle = X11WindowHandle::new(generation, 106);
+    second.surface_id = 13;
+    let managed_id = server.state.allocate_window_id().expect("managed id");
+    let first_id = server.state.allocate_window_id().expect("first id");
+    let second_id = server.state.allocate_window_id().expect("second id");
+    for (id, snapshot) in [
+        (managed_id, managed.clone()),
+        (first_id, first.clone()),
+        (second_id, second.clone()),
+    ] {
+        server
+            .state
+            .insert_desktop_window(crate::compositor::DesktopWindow::new_x11(id, snapshot))
+            .expect("insert X11 window");
+    }
+
+    server.apply_xwayland_window_event(XwmEvent::OverrideRedirectStackSnapshot {
+        generation,
+        epoch: 1,
+        bottom_to_top: vec![second.handle, first.handle],
+    });
+    assert_eq!(
+        server.state.window_stacking,
+        vec![managed_id, second_id, first_id]
+    );
+
+    server.apply_xwayland_window_event(XwmEvent::OverrideRedirectStackSnapshot {
+        generation,
+        epoch: 2,
+        bottom_to_top: vec![first.handle, second.handle],
+    });
+    assert_eq!(
+        server.state.window_stacking,
+        vec![managed_id, first_id, second_id]
+    );
 }
 
 #[test]

@@ -1352,6 +1352,7 @@ impl XwmStartup {
             pending_properties: Default::default(),
             deferred_properties: Default::default(),
             property_metrics: Default::default(),
+            override_redirect_stack: Default::default(),
             root_event_mask_probe: None,
             root_event_mask: None,
             buffer_ready_surfaces: Default::default(),
@@ -1370,6 +1371,7 @@ impl XwmStartup {
                 let _ = xwm.begin_map_to_association_wait(handle);
             }
         }
+        xwm.mark_override_redirect_stack_dirty();
         self.state = XwmStartupState::Running;
         Some(xwm)
     }

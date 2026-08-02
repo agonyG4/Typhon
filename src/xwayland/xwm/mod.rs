@@ -32,6 +32,7 @@ pub mod randr;
 mod reactor;
 mod resize_runtime;
 mod resize_sync;
+mod root_stack;
 #[allow(dead_code)]
 pub(crate) mod shape;
 pub(crate) mod startup;
@@ -54,6 +55,7 @@ pub(crate) use configure_timeline::{
 pub use moveresize::{X11MoveResizeDirection, X11MoveResizeRequest};
 pub use resize_sync::{RESIZE_SYNC_TIMEOUT_NS, ResizeSyncError, ResizeSyncState};
 pub(crate) use resize_sync::{ResizeSyncCommit, ResizeSyncTracker};
+use root_stack::OverrideRedirectStackState;
 pub use window::X11WindowLifecycle;
 use window::{KindReconciliation, X11WindowRegistry};
 pub use window_types::{X11WindowType, X11WindowTypes};
@@ -208,6 +210,15 @@ pub enum XwmEvent {
         window: X11WindowHandle,
         geometry: X11Geometry,
         above_sibling: Option<X11WindowHandle>,
+    },
+    /// Current X root-tree order for live override-redirect windows.
+    ///
+    /// QueryTree reports children from bottom to top.  This event preserves
+    /// that order without asking the compositor to echo it back to X.
+    OverrideRedirectStackSnapshot {
+        generation: XwaylandGeneration,
+        epoch: u64,
+        bottom_to_top: Vec<X11WindowHandle>,
     },
     StateRequested {
         window: X11WindowHandle,
@@ -416,6 +427,7 @@ pub struct Xwm {
         HashMap<x11rb::connection::SequenceNumber, properties::PendingProperty>,
     pub(crate) deferred_properties: VecDeque<properties::PendingProperty>,
     pub(crate) property_metrics: properties::PropertyMetrics,
+    pub(crate) override_redirect_stack: OverrideRedirectStackState,
     root_event_mask_probe: Option<x11rb::connection::SequenceNumber>,
     root_event_mask: Option<xproto::EventMask>,
     buffer_ready_surfaces: HashSet<u32>,
@@ -508,6 +520,18 @@ impl Xwm {
             .windows
             .reconcile_kind(handle, kind)
             .map_err(XwmError::InvalidCommand)?;
+        if matches!(
+            reconciliation,
+            KindReconciliation::Changed {
+                old: DesktopWindowKind::OverrideRedirect,
+                ..
+            } | KindReconciliation::Changed {
+                new: DesktopWindowKind::OverrideRedirect,
+                ..
+            }
+        ) {
+            self.mark_override_redirect_stack_dirty();
+        }
         if matches!(reconciliation, KindReconciliation::Changed { .. })
             && self
                 .windows
@@ -581,6 +605,7 @@ impl Xwm {
         if generation == self.generation {
             self.buffer_ready_surfaces.clear();
             self.buffer_ready_commits.clear();
+            self.clear_override_redirect_stack_state();
         }
     }
 
