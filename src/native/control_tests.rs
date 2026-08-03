@@ -19,7 +19,8 @@ use crate::control::{ControlRequest, ControlResponse, encode_request};
 use super::{
     control::{
         ControlRuntimePaths, MAX_CONTROL_CLIENTS, MAX_CONTROL_OPERATIONS_PER_CYCLE,
-        NativeControlServer, peer_uid_matches,
+        NativeControlServer, force_temporary_collisions_for_test, peer_uid_matches,
+        remove_instance_directory_after_lock_for_test, temporary_socket_path_for_test,
     },
     event_loop::*,
 };
@@ -87,6 +88,146 @@ fn control_runtime_path_rejects_unsafe_instance_names() {
 fn control_peer_policy_requires_the_effective_uid() {
     assert!(peer_uid_matches(1000, 1000));
     assert!(!peer_uid_matches(1001, 1000));
+}
+
+#[test]
+fn temporary_listener_path_is_unique_and_private() {
+    let runtime = TestRuntime::new();
+    let paths = ControlRuntimePaths::for_runtime_dir(runtime.path(), "temporary").unwrap();
+    fs::create_dir_all(paths.socket_path().parent().unwrap()).unwrap();
+    let first = temporary_socket_path_for_test(paths.socket_path().parent().unwrap()).unwrap();
+    let second = temporary_socket_path_for_test(paths.socket_path().parent().unwrap()).unwrap();
+    assert_ne!(first, second);
+    assert_eq!(first.parent(), paths.socket_path().parent());
+    let name = first.file_name().unwrap().to_string_lossy();
+    assert!(name.starts_with("control.sock.tmp-") || name.starts_with("t-"));
+}
+
+#[test]
+fn publication_preserves_the_listener_device_and_inode() {
+    let runtime = TestRuntime::new();
+    let instance = test_instance("identity");
+    let mut event_loop = NativeEventLoop::new().unwrap();
+    let server = NativeControlServer::bind(&mut event_loop, runtime.path(), &instance).unwrap();
+    let metadata = fs::symlink_metadata(server.socket_path()).unwrap();
+    assert_eq!(
+        (metadata.dev(), metadata.ino()),
+        server.captured_socket_identity()
+    );
+    assert_eq!(metadata.mode() & 0o777, 0o600);
+}
+
+#[test]
+fn existing_live_control_socket_is_never_overwritten() {
+    let runtime = TestRuntime::new();
+    let runtime_dir = runtime.path();
+    let instance = test_instance("conflict");
+    let paths = ControlRuntimePaths::for_runtime_dir(runtime_dir, &instance).unwrap();
+    fs::create_dir_all(paths.socket_path().parent().unwrap()).unwrap();
+    let socket_dir = paths.socket_path().parent().unwrap();
+    for directory in [
+        socket_dir,
+        socket_dir.parent().unwrap(),
+        socket_dir.parent().unwrap().parent().unwrap(),
+    ] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let existing = UnixListener::bind(paths.socket_path()).unwrap();
+    let before = fs::symlink_metadata(paths.socket_path()).unwrap();
+    let mut event_loop = NativeEventLoop::new().unwrap();
+    let error = NativeControlServer::bind(&mut event_loop, runtime_dir, &instance).unwrap_err();
+    assert!(
+        matches!(&error, super::control::ControlServerError::SocketInUse(_)),
+        "{error:?}"
+    );
+    let after = fs::symlink_metadata(paths.socket_path()).unwrap();
+    assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+    drop(existing);
+}
+
+#[test]
+fn shutdown_is_idempotent_and_never_removes_a_replacement_socket() {
+    let runtime = TestRuntime::new();
+    let instance = test_instance("shutdown");
+    let mut event_loop = NativeEventLoop::new().unwrap();
+    let mut server = NativeControlServer::bind(&mut event_loop, runtime.path(), &instance).unwrap();
+    let socket_path = server.socket_path().to_path_buf();
+    fs::remove_file(&socket_path).unwrap();
+    let replacement = UnixListener::bind(&socket_path).unwrap();
+
+    server.shutdown(&mut event_loop).unwrap();
+    server.shutdown(&mut event_loop).unwrap();
+    assert!(socket_path.exists());
+    drop(server);
+    assert!(socket_path.exists());
+    drop(replacement);
+}
+
+#[test]
+fn instance_directory_disappearance_fails_closed_and_fresh_bind_reacquires_lock() {
+    let runtime = TestRuntime::new();
+    let instance = test_instance("recreated");
+    let paths = ControlRuntimePaths::for_runtime_dir(runtime.path(), &instance).unwrap();
+    let mut failed_loop = NativeEventLoop::new().unwrap();
+    remove_instance_directory_after_lock_for_test(&paths.socket_dir_for_test());
+    let error = NativeControlServer::bind(&mut failed_loop, runtime.path(), &instance).unwrap_err();
+    assert!(
+        matches!(&error, super::control::ControlServerError::ListenerFailure(message) if message.contains("directory disappeared")),
+        "{error:?}"
+    );
+
+    let mut fresh_loop = NativeEventLoop::new().unwrap();
+    let mut fresh = NativeControlServer::bind(&mut fresh_loop, runtime.path(), &instance).unwrap();
+    assert!(fresh.socket_path().exists());
+    let mut competing_loop = NativeEventLoop::new().unwrap();
+    assert!(matches!(
+        NativeControlServer::bind(&mut competing_loop, runtime.path(), &instance),
+        Err(super::control::ControlServerError::InstanceLocked(_))
+    ));
+    fresh.shutdown(&mut fresh_loop).unwrap();
+}
+
+#[test]
+fn temporary_collision_retries_are_bounded_and_leave_no_endpoint() {
+    let runtime = TestRuntime::new();
+    let instance = test_instance("collision");
+    let paths = ControlRuntimePaths::for_runtime_dir(runtime.path(), &instance).unwrap();
+    force_temporary_collisions_for_test(paths.socket_dir_for_test(), 16);
+    let mut event_loop = NativeEventLoop::new().unwrap();
+    let error = NativeControlServer::bind(&mut event_loop, runtime.path(), &instance).unwrap_err();
+    assert!(matches!(
+        error,
+        super::control::ControlServerError::ListenerFailure(message)
+            if message.contains("collision limit")
+    ));
+    assert!(!paths.socket_path().exists());
+    let socket_dir = paths.socket_path().parent().unwrap();
+    if socket_dir.exists() {
+        assert!(
+            fs::read_dir(socket_dir)
+                .unwrap()
+                .flatten()
+                .all(|entry| entry.file_name() != "control.sock")
+        );
+    }
+
+    let mut fresh_loop = NativeEventLoop::new().unwrap();
+    let mut fresh = NativeControlServer::bind(&mut fresh_loop, runtime.path(), &instance).unwrap();
+    fresh.shutdown(&mut fresh_loop).unwrap();
+}
+
+#[test]
+fn different_instance_names_have_independent_locks_and_listeners() {
+    let runtime = TestRuntime::new();
+    let mut first_loop = NativeEventLoop::new().unwrap();
+    let mut first =
+        NativeControlServer::bind(&mut first_loop, runtime.path(), "m2-independent-a").unwrap();
+    let mut second_loop = NativeEventLoop::new().unwrap();
+    let mut second =
+        NativeControlServer::bind(&mut second_loop, runtime.path(), "m2-independent-b").unwrap();
+    assert_ne!(first.socket_path(), second.socket_path());
+    first.shutdown(&mut first_loop).unwrap();
+    second.shutdown(&mut second_loop).unwrap();
 }
 
 fn test_instance(suffix: &str) -> String {

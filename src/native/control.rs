@@ -38,6 +38,12 @@ const WRITE_EVENTS: u32 =
 const WAITING_EVENTS: u32 = (libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32;
 const TERMINAL_EVENTS: u32 = (libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32;
 const MAX_INSTANCE_BYTES: usize = 128;
+const MAX_TEMPORARY_SOCKET_ATTEMPTS: usize = 16;
+
+#[cfg(test)]
+static REMOVE_INSTANCE_DIRECTORY_AFTER_LOCK: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+static FORCED_TEMPORARY_COLLISIONS: OnceLock<Mutex<Option<(PathBuf, usize)>>> = OnceLock::new();
 
 #[derive(Debug)]
 pub enum ControlServerError {
@@ -127,6 +133,11 @@ impl ControlRuntimePaths {
         self.socket_dir.join("control.lock")
     }
 
+    #[cfg(test)]
+    pub(crate) fn socket_dir_for_test(&self) -> &Path {
+        &self.socket_dir
+    }
+
     fn prepare_directories(&self, owner_uid: u32) -> Result<(), ControlServerError> {
         ensure_owned_directory(&self.runtime_dir.join("astrea"), owner_uid)?;
         ensure_owned_directory(&self.runtime_dir.join("astrea").join("typhon"), owner_uid)?;
@@ -159,6 +170,10 @@ impl BoundSocketGuard {
 
     fn set_identity(&mut self, identity: SocketIdentity) {
         self.identity = Some(identity);
+    }
+
+    fn set_path(&mut self, path: &Path) {
+        self.path = path.to_path_buf();
     }
 
     fn disarm(&mut self) {
@@ -264,14 +279,43 @@ impl NativeControlServer {
         let owner_uid = effective_uid();
         paths.prepare_directories(owner_uid)?;
         let instance_lock = acquire_instance_lock(&paths.lock_path(), owner_uid)?;
+        #[cfg(test)]
+        if remove_instance_directory_after_lock_requested(&paths.socket_dir) {
+            fs::remove_dir_all(&paths.socket_dir)?;
+        }
         remove_stale_socket(&paths, owner_uid)?;
 
+        let mut temporary_attempts = 0;
         let CreatedListener {
             fd: listener,
             identity: socket_identity,
             cleanup: mut bound_socket,
-        } = create_listener(&paths.socket_path)?;
-        set_socket_mode(&paths.socket_path, owner_uid, socket_identity)?;
+        } = loop {
+            match create_listener(&paths, owner_uid) {
+                Ok(listener) => break listener,
+                Err(ControlServerError::SocketInUse(path)) if path == *paths.socket_path() => {
+                    remove_stale_socket(&paths, owner_uid)?;
+                }
+                Err(ControlServerError::Io(error))
+                    if error.raw_os_error() == Some(libc::EADDRINUSE) =>
+                {
+                    temporary_attempts += 1;
+                    if temporary_attempts >= MAX_TEMPORARY_SOCKET_ATTEMPTS {
+                        return Err(ControlServerError::ListenerFailure(
+                            "temporary control socket collision limit exhausted".to_string(),
+                        ));
+                    }
+                }
+                Err(ControlServerError::Io(error))
+                    if error.raw_os_error() == Some(libc::ENOENT) =>
+                {
+                    return Err(ControlServerError::ListenerFailure(format!(
+                        "control instance directory disappeared during listener setup: {error}"
+                    )));
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let listener_token = match event_loop.register_with_events(
             listener.as_raw_fd(),
             NativeEventSource::ControlListener,
@@ -280,7 +324,9 @@ impl NativeControlServer {
             Ok(token) => token,
             Err(error) => {
                 remove_socket_if_identity(&paths.socket_path, socket_identity);
-                return Err(error.into());
+                return Err(ControlServerError::ListenerFailure(format!(
+                    "listener registration: {error}"
+                )));
             }
         };
 
@@ -316,6 +362,11 @@ impl NativeControlServer {
 
     pub fn counters(&self) -> ControlServerCounters {
         self.counters
+    }
+
+    #[cfg(test)]
+    pub(crate) fn captured_socket_identity(&self) -> (u64, u64) {
+        (self.socket_identity.device, self.socket_identity.inode)
     }
 
     pub fn next_deadline_ns(&self) -> Option<u64> {
@@ -915,7 +966,12 @@ fn remove_stale_socket(
                     "socket changed during stale cleanup".to_string(),
                 ));
             }
-            fs::remove_file(paths.socket_path())?;
+            remove_socket_if_identity(paths.socket_path(), identity);
+            if paths.socket_path().exists() {
+                return Err(ControlServerError::UnsafePath(
+                    "stale socket changed during removal".to_string(),
+                ));
+            }
             Ok(())
         }
     }
@@ -923,11 +979,13 @@ fn remove_stale_socket(
 
 fn acquire_instance_lock(path: &Path, owner_uid: u32) -> Result<InstanceLock, ControlServerError> {
     let bytes = path_bytes(path)?;
+    let path_c = std::ffi::CString::new(bytes)
+        .map_err(|_| ControlServerError::UnsafePath("lock path contains NUL".to_string()))?;
     let fd = unsafe {
-        // SAFETY: `bytes` is a validated NUL-free path and the flags request a
-        // new non-following close-on-exec descriptor.
+        // SAFETY: `path_c` is a validated NUL-terminated path and the flags
+        // request a new non-following close-on-exec descriptor.
         libc::open(
-            bytes.as_ptr().cast(),
+            path_c.as_ptr(),
             libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             0o600,
         )
@@ -1055,8 +1113,16 @@ fn probe_existing_socket(path: &Path) -> Result<SocketProbe, ControlServerError>
     }
 }
 
-fn create_listener(path: &Path) -> Result<CreatedListener, ControlServerError> {
-    let (address, address_len) = unix_socket_address(path)?;
+fn create_listener(
+    paths: &ControlRuntimePaths,
+    owner_uid: u32,
+) -> Result<CreatedListener, ControlServerError> {
+    #[cfg(test)]
+    if forced_temporary_collision_requested(&paths.socket_dir) {
+        return Err(io::Error::from_raw_os_error(libc::EADDRINUSE).into());
+    }
+    let temporary_path = temporary_socket_path(&paths.socket_dir)?;
+    let (address, address_len) = unix_socket_address(&temporary_path)?;
     let fd = unsafe {
         // SAFETY: the arguments describe the required local nonblocking stream
         // socket and close-on-exec is set atomically at creation.
@@ -1074,8 +1140,8 @@ fn create_listener(path: &Path) -> Result<CreatedListener, ControlServerError> {
         OwnedFd::from_raw_fd(fd)
     };
     let result = unsafe {
-        // SAFETY: `address` is initialized and names only the validated
-        // Astrea socket path.
+        // SAFETY: `address` is initialized and names only a unique pathname
+        // inside the already validated private instance directory.
         libc::bind(
             listener.as_raw_fd(),
             (&address as *const libc::sockaddr_un).cast(),
@@ -1085,17 +1151,32 @@ fn create_listener(path: &Path) -> Result<CreatedListener, ControlServerError> {
     if result < 0 {
         return Err(io::Error::last_os_error().into());
     }
-    let mut bound_socket = BoundSocketGuard::new(path);
-    let identity = socket_path_identity(path)?;
+    let mut bound_socket = BoundSocketGuard::new(&temporary_path);
+    let identity = socket_path_identity(&temporary_path)?;
     bound_socket.set_identity(identity);
+    set_socket_mode(&temporary_path, owner_uid, identity)?;
     let result = unsafe {
         // SAFETY: `listener` is the socket just successfully bound above.
         libc::listen(listener.as_raw_fd(), LISTEN_BACKLOG)
     };
     if result < 0 {
-        remove_socket_if_identity(path, identity);
         return Err(io::Error::last_os_error().into());
     }
+
+    match rename_noreplace(&temporary_path, paths.socket_path()) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+            return Err(ControlServerError::SocketInUse(
+                paths.socket_path().to_path_buf(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
+    if let Err(error) = verify_socket_identity(paths.socket_path(), owner_uid, identity, true) {
+        remove_socket_if_identity(paths.socket_path(), identity);
+        return Err(error);
+    }
+    bound_socket.set_path(paths.socket_path());
     Ok(CreatedListener {
         fd: listener,
         identity,
@@ -1108,26 +1189,25 @@ fn set_socket_mode(
     owner_uid: u32,
     identity: SocketIdentity,
 ) -> Result<(), ControlServerError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_socket()
-        || metadata.uid() != owner_uid
-        || metadata.dev() != identity.device
-        || metadata.ino() != identity.inode
-    {
-        return Err(ControlServerError::UnsafePath(
-            "bound control socket changed before mode setup".to_string(),
-        ));
-    }
     fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_MODE))?;
+    verify_socket_identity(path, owner_uid, identity, true)
+}
+
+fn verify_socket_identity(
+    path: &Path,
+    owner_uid: u32,
+    identity: SocketIdentity,
+    require_mode: bool,
+) -> Result<(), ControlServerError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_socket()
         || metadata.uid() != owner_uid
-        || metadata.mode() & 0o777 != SOCKET_MODE
+        || (require_mode && metadata.mode() & 0o777 != SOCKET_MODE)
         || metadata.dev() != identity.device
         || metadata.ino() != identity.inode
     {
         return Err(ControlServerError::UnsafePath(format!(
-            "bound control socket changed during setup type={} uid={} mode={:o} dev={} expected_dev={} ino={} expected_ino={}",
+            "control socket identity verification failed type={} uid={} mode={:o} dev={} expected_dev={} ino={} expected_ino={}",
             metadata.file_type().is_socket(),
             metadata.uid(),
             metadata.mode() & 0o777,
@@ -1148,7 +1228,26 @@ fn remove_socket_if_identity(path: &Path, identity: SocketIdentity) {
         && metadata.dev() == identity.device
         && metadata.ino() == identity.inode
     {
-        let _ = fs::remove_file(path);
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        for _ in 0..16 {
+            let Ok(quarantine) = temporary_socket_path(parent) else {
+                return;
+            };
+            match rename_noreplace(path, &quarantine) {
+                Ok(()) => {
+                    if socket_path_identity(&quarantine).is_ok_and(|moved| moved == identity) {
+                        let _ = fs::remove_file(&quarantine);
+                    } else {
+                        let _ = rename_noreplace(&quarantine, path);
+                    }
+                    return;
+                }
+                Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
+                Err(_) => return,
+            }
+        }
     }
 }
 
@@ -1158,6 +1257,115 @@ fn socket_path_identity(path: &Path) -> Result<SocketIdentity, ControlServerErro
         device: metadata.dev(),
         inode: metadata.ino(),
     })
+}
+
+fn temporary_socket_path(socket_dir: &Path) -> Result<PathBuf, ControlServerError> {
+    // Keep the basename short enough for the Unix pathname limit even when
+    // the validated instance name is near the maximum supported length.
+    let mut nonce = [0u8; 8];
+    let result = unsafe {
+        // SAFETY: `nonce` is valid writable storage for exactly its length.
+        libc::getrandom(nonce.as_mut_ptr().cast(), nonce.len(), 0)
+    };
+    if result != nonce.len() as isize {
+        return Err(io::Error::last_os_error().into());
+    }
+    let suffix = nonce
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let preferred = socket_dir.join(format!("control.sock.tmp-{suffix}"));
+    let max_path = unsafe {
+        // SAFETY: zeroed storage is used only to query the fixed pathname
+        // array length for this platform's Unix socket address.
+        std::mem::zeroed::<libc::sockaddr_un>().sun_path.len()
+    };
+    if preferred.as_os_str().as_bytes().len() < max_path {
+        Ok(preferred)
+    } else {
+        Ok(socket_dir.join(format!("t-{suffix}")))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn temporary_socket_path_for_test(
+    socket_dir: &Path,
+) -> Result<PathBuf, ControlServerError> {
+    temporary_socket_path(socket_dir)
+}
+
+#[cfg(test)]
+pub(crate) fn remove_instance_directory_after_lock_for_test(socket_dir: &Path) {
+    *REMOVE_INSTANCE_DIRECTORY_AFTER_LOCK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = Some(socket_dir.to_path_buf());
+}
+
+#[cfg(test)]
+pub(crate) fn force_temporary_collisions_for_test(socket_dir: &Path, attempts: usize) {
+    *FORCED_TEMPORARY_COLLISIONS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = Some((socket_dir.to_path_buf(), attempts));
+}
+
+#[cfg(test)]
+fn remove_instance_directory_after_lock_requested(socket_dir: &Path) -> bool {
+    let mut request = REMOVE_INSTANCE_DIRECTORY_AFTER_LOCK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap();
+    if request
+        .as_ref()
+        .is_some_and(|requested| requested == socket_dir)
+    {
+        request.take();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+fn forced_temporary_collision_requested(socket_dir: &Path) -> bool {
+    let mut request = FORCED_TEMPORARY_COLLISIONS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap();
+    let Some((requested, remaining)) = request.as_mut() else {
+        return false;
+    };
+    if requested != socket_dir || *remaining == 0 {
+        return false;
+    }
+    *remaining -= 1;
+    true
+}
+
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "temporary socket contains NUL")
+    })?;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path contains NUL"))?;
+    let result = unsafe {
+        // SAFETY: both paths are validated NUL-free absolute paths and the
+        // syscall only changes the directory entries named by those paths.
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn unix_socket_address(
