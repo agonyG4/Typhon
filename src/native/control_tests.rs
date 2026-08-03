@@ -47,17 +47,11 @@ impl TestRuntime {
     fn path(&self) -> &std::path::Path {
         &self.0
     }
-
-    fn keep_alive_until_here(self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
 }
 
 impl Drop for TestRuntime {
     fn drop(&mut self) {
-        if std::thread::panicking() {
-            let _ = fs::remove_dir_all(&self.0);
-        }
+        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -75,7 +69,6 @@ fn control_runtime_path_uses_the_instance_name_without_traversal() {
             .join("oblivion-one-0")
             .join("control.sock")
     );
-    runtime.keep_alive_until_here();
 }
 
 #[test]
@@ -88,7 +81,6 @@ fn control_runtime_path_rejects_unsafe_instance_names() {
             "instance {instance:?} should be rejected"
         );
     }
-    runtime.keep_alive_until_here();
 }
 
 #[test]
@@ -220,7 +212,6 @@ fn control_server_decodes_a_request_split_across_readiness_cycles() {
         "{\"protocol\":\"astrea.control\",\"version\":1,\"id\":7,\"ok\":true,\"result\":{}}\n"
     );
     server.shutdown(&mut event_loop).unwrap();
-    runtime.keep_alive_until_here();
 }
 
 #[test]
@@ -261,7 +252,6 @@ fn complete_request_survives_peer_write_half_close() {
     client.read_to_string(&mut response).unwrap();
     assert!(response.contains("\"id\":11"));
     server.shutdown(&mut event_loop).unwrap();
-    runtime.keep_alive_until_here();
 }
 
 #[test]
@@ -288,7 +278,6 @@ fn instance_lock_is_retained_until_server_drop() {
     let mut third = NativeControlServer::bind(&mut third_loop, runtime.path(), &instance).unwrap();
     assert!(third.socket_path().exists());
     third.shutdown(&mut third_loop).unwrap();
-    runtime.keep_alive_until_here();
 }
 
 #[test]
@@ -333,7 +322,6 @@ fn stalled_clients_expire_with_a_bounded_budget() {
     );
     drop(clients);
     server.shutdown(&mut event_loop).unwrap();
-    runtime.keep_alive_until_here();
 }
 
 #[test]
@@ -365,7 +353,6 @@ fn live_control_socket_is_not_replaced_and_stale_socket_is_reclaimed() {
         NativeControlServer::bind(&mut replacement_loop, runtime_dir, &instance).unwrap();
     assert_eq!(replacement.socket_path(), socket_path);
     replacement.shutdown(&mut replacement_loop).unwrap();
-    runtime.keep_alive_until_here();
 }
 
 #[test]
@@ -401,7 +388,6 @@ fn control_listener_never_services_more_than_sixteen_accept_operations() {
     assert_eq!(server.client_count(), 32);
     drop(clients);
     server.shutdown(&mut event_loop).unwrap();
-    runtime.keep_alive_until_here();
 }
 
 #[test]
@@ -430,7 +416,6 @@ fn socket_symlink_is_rejected_without_unlinking_the_target() {
             .is_symlink()
     );
     fs::remove_file(socket_path).unwrap();
-    runtime.keep_alive_until_here();
 }
 
 #[test]
@@ -463,7 +448,6 @@ fn malformed_request_gets_one_bounded_error_response() {
     client.read_to_string(&mut response).unwrap();
     assert!(response.contains("\"code\":\"malformed_json\""));
     server.shutdown(&mut event_loop).unwrap();
-    runtime.keep_alive_until_here();
 }
 
 #[test]

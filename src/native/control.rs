@@ -177,6 +177,13 @@ impl Drop for BoundSocketGuard {
 }
 
 #[derive(Debug)]
+struct CreatedListener {
+    fd: OwnedFd,
+    identity: SocketIdentity,
+    cleanup: BoundSocketGuard,
+}
+
+#[derive(Debug)]
 pub struct NativeControlServer {
     listener: Option<OwnedFd>,
     _instance_lock: InstanceLock,
@@ -259,12 +266,12 @@ impl NativeControlServer {
         let instance_lock = acquire_instance_lock(&paths.lock_path(), owner_uid)?;
         remove_stale_socket(&paths, owner_uid)?;
 
-        let (listener, mut bound_socket) = create_listener(&paths.socket_path)?;
-        let socket_identity = socket_path_identity(&paths.socket_path)?;
-        if let Err(error) = set_socket_mode(&paths.socket_path, owner_uid, socket_identity) {
-            remove_socket_if_identity(&paths.socket_path, socket_identity);
-            return Err(error);
-        }
+        let CreatedListener {
+            fd: listener,
+            identity: socket_identity,
+            cleanup: mut bound_socket,
+        } = create_listener(&paths.socket_path)?;
+        set_socket_mode(&paths.socket_path, owner_uid, socket_identity)?;
         let listener_token = match event_loop.register_with_events(
             listener.as_raw_fd(),
             NativeEventSource::ControlListener,
@@ -1048,7 +1055,7 @@ fn probe_existing_socket(path: &Path) -> Result<SocketProbe, ControlServerError>
     }
 }
 
-fn create_listener(path: &Path) -> Result<(OwnedFd, BoundSocketGuard), ControlServerError> {
+fn create_listener(path: &Path) -> Result<CreatedListener, ControlServerError> {
     let (address, address_len) = unix_socket_address(path)?;
     let fd = unsafe {
         // SAFETY: the arguments describe the required local nonblocking stream
@@ -1089,7 +1096,11 @@ fn create_listener(path: &Path) -> Result<(OwnedFd, BoundSocketGuard), ControlSe
         remove_socket_if_identity(path, identity);
         return Err(io::Error::last_os_error().into());
     }
-    Ok((listener, bound_socket))
+    Ok(CreatedListener {
+        fd: listener,
+        identity,
+        cleanup: bound_socket,
+    })
 }
 
 fn set_socket_mode(
@@ -1097,6 +1108,16 @@ fn set_socket_mode(
     owner_uid: u32,
     identity: SocketIdentity,
 ) -> Result<(), ControlServerError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != owner_uid
+        || metadata.dev() != identity.device
+        || metadata.ino() != identity.inode
+    {
+        return Err(ControlServerError::UnsafePath(
+            "bound control socket changed before mode setup".to_string(),
+        ));
+    }
     fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_MODE))?;
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_socket()

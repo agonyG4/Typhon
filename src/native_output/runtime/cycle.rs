@@ -59,7 +59,7 @@ impl NativeRuntime {
         if !self.session.permits_output() {
             self.dispatch_suspended_sources(&cycle)?;
             if !self.shutdown.is_running() {
-                self.control_server.shutdown(&mut self.event_loop)?;
+                self.quiesce_control_server()?;
                 return Ok(());
             }
             self.service_control_events(&cycle.wakeup)?;
@@ -67,7 +67,7 @@ impl NativeRuntime {
             return Ok(());
         }
         if !self.shutdown.is_running() {
-            self.control_server.shutdown(&mut self.event_loop)?;
+            self.quiesce_control_server()?;
             return Ok(());
         }
         let wayland_dispatch_started = Instant::now();
@@ -83,6 +83,9 @@ impl NativeRuntime {
             self.request_native_shutdown()?;
         }
         if !self.shutdown.is_running() || !self.session.permits_output() {
+            if !self.shutdown.is_running() {
+                self.quiesce_control_server()?;
+            }
             return Ok(());
         }
         drain_pending_process_launches_with_xwayland_environment(
@@ -211,6 +214,11 @@ impl NativeRuntime {
             self.shutdown.suspended_reactor_deadline_ns(),
             self.control_server.next_deadline_ns(),
         ))?;
+        Ok(())
+    }
+
+    fn quiesce_control_server(&mut self) -> NativeResult<()> {
+        self.control_server.shutdown(&mut self.event_loop)?;
         Ok(())
     }
 
