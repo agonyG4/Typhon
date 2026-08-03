@@ -54,7 +54,11 @@ impl TestRuntime {
 }
 
 impl Drop for TestRuntime {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 }
 
 #[test]

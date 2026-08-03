@@ -142,6 +142,41 @@ struct SocketIdentity {
 }
 
 #[derive(Debug)]
+struct BoundSocketGuard {
+    path: PathBuf,
+    identity: Option<SocketIdentity>,
+    armed: bool,
+}
+
+impl BoundSocketGuard {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            identity: None,
+            armed: true,
+        }
+    }
+
+    fn set_identity(&mut self, identity: SocketIdentity) {
+        self.identity = Some(identity);
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BoundSocketGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(identity) = self.identity
+        {
+            remove_socket_if_identity(&self.path, identity);
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct NativeControlServer {
     listener: Option<OwnedFd>,
     _instance_lock: InstanceLock,
@@ -224,7 +259,7 @@ impl NativeControlServer {
         let instance_lock = acquire_instance_lock(&paths.lock_path(), owner_uid)?;
         remove_stale_socket(&paths, owner_uid)?;
 
-        let listener = create_listener(&paths.socket_path)?;
+        let (listener, mut bound_socket) = create_listener(&paths.socket_path)?;
         let socket_identity = socket_path_identity(&paths.socket_path)?;
         if let Err(error) = set_socket_mode(&paths.socket_path, owner_uid, socket_identity) {
             remove_socket_if_identity(&paths.socket_path, socket_identity);
@@ -246,6 +281,7 @@ impl NativeControlServer {
             "typhon control: listener_created instance={} mode=0600",
             instance
         );
+        bound_socket.disarm();
         Ok(Self {
             listener: Some(listener),
             _instance_lock: instance_lock,
@@ -1012,7 +1048,7 @@ fn probe_existing_socket(path: &Path) -> Result<SocketProbe, ControlServerError>
     }
 }
 
-fn create_listener(path: &Path) -> Result<OwnedFd, ControlServerError> {
+fn create_listener(path: &Path) -> Result<(OwnedFd, BoundSocketGuard), ControlServerError> {
     let (address, address_len) = unix_socket_address(path)?;
     let fd = unsafe {
         // SAFETY: the arguments describe the required local nonblocking stream
@@ -1042,7 +1078,9 @@ fn create_listener(path: &Path) -> Result<OwnedFd, ControlServerError> {
     if result < 0 {
         return Err(io::Error::last_os_error().into());
     }
+    let mut bound_socket = BoundSocketGuard::new(path);
     let identity = socket_path_identity(path)?;
+    bound_socket.set_identity(identity);
     let result = unsafe {
         // SAFETY: `listener` is the socket just successfully bound above.
         libc::listen(listener.as_raw_fd(), LISTEN_BACKLOG)
@@ -1051,7 +1089,7 @@ fn create_listener(path: &Path) -> Result<OwnedFd, ControlServerError> {
         remove_socket_if_identity(path, identity);
         return Err(io::Error::last_os_error().into());
     }
-    Ok(listener)
+    Ok((listener, bound_socket))
 }
 
 fn set_socket_mode(

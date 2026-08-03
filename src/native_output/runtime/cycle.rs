@@ -58,9 +58,16 @@ impl NativeRuntime {
         self.advance_shutdown_lifecycle(&cycle)?;
         if !self.session.permits_output() {
             self.dispatch_suspended_sources(&cycle)?;
+            if !self.shutdown.is_running() {
+                self.control_server.shutdown(&mut self.event_loop)?;
+                return Ok(());
+            }
+            self.service_control_events(&cycle.wakeup)?;
+            self.arm_suspended_deadline()?;
             return Ok(());
         }
         if !self.shutdown.is_running() {
+            self.control_server.shutdown(&mut self.event_loop)?;
             return Ok(());
         }
         let wayland_dispatch_started = Instant::now();
@@ -199,6 +206,14 @@ impl NativeRuntime {
         Ok(())
     }
 
+    fn arm_suspended_deadline(&mut self) -> NativeResult<()> {
+        self.event_loop.arm_deadline(earliest_native_deadline(
+            self.shutdown.suspended_reactor_deadline_ns(),
+            self.control_server.next_deadline_ns(),
+        ))?;
+        Ok(())
+    }
+
     pub(super) fn log_shutdown_transition(&self, transition: ShutdownTransition) {
         self.perf.log("native.shutdown_transition", || {
             vec![
@@ -268,10 +283,7 @@ impl NativeRuntime {
         })?;
         self.session.finish_suspend();
         self.log_session_transition("suspending", "suspended", "disable_acknowledged");
-        self.event_loop.arm_deadline(earliest_native_deadline(
-            self.shutdown.suspended_reactor_deadline_ns(),
-            self.control_server.next_deadline_ns(),
-        ))?;
+        self.arm_suspended_deadline()?;
         Ok(())
     }
     fn resume_native_session(&mut self) -> NativeResult<()> {
