@@ -2,7 +2,7 @@
 
 use std::{
     path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, RwLock},
 };
 
 #[cfg(test)]
@@ -10,9 +10,67 @@ use std::path::Path;
 
 use xcursor::{CursorTheme, parser::Image};
 
-const DEFAULT_CURSOR_SIZE: u32 = 24;
-const MAX_CURSOR_SIZE: u32 = 256;
+pub const DEFAULT_CURSOR_THEME: &str = "default";
+pub const DEFAULT_CURSOR_SIZE: u32 = 24;
+pub const MIN_CURSOR_SIZE: u32 = 8;
+pub const MAX_CURSOR_SIZE: u32 = 256;
+pub const MAX_CURSOR_THEME_BYTES: usize = 128;
 const CURSOR_NAMES: [&str; 3] = ["left_ptr", "default", "arrow"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorConfigurationError {
+    InvalidTheme,
+    InvalidSize,
+}
+
+impl std::fmt::Display for CursorConfigurationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidTheme => formatter.write_str("invalid cursor theme"),
+            Self::InvalidSize => formatter.write_str("invalid cursor size"),
+        }
+    }
+}
+
+impl std::error::Error for CursorConfigurationError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorConfiguration {
+    pub theme: String,
+    pub size_px: u32,
+}
+
+impl CursorConfiguration {
+    pub fn new(theme: impl AsRef<str>, size_px: u32) -> Result<Self, CursorConfigurationError> {
+        validate_cursor_theme(theme.as_ref())?;
+        validate_cursor_size(size_px)?;
+        Ok(Self {
+            theme: theme.as_ref().to_string(),
+            size_px,
+        })
+    }
+}
+
+pub fn validate_cursor_theme(theme: &str) -> Result<(), CursorConfigurationError> {
+    if theme.is_empty() || theme.len() > MAX_CURSOR_THEME_BYTES || theme.contains("..") {
+        return Err(CursorConfigurationError::InvalidTheme);
+    }
+    if !theme
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(CursorConfigurationError::InvalidTheme);
+    }
+    Ok(())
+}
+
+pub fn validate_cursor_size(size_px: u32) -> Result<(), CursorConfigurationError> {
+    if (MIN_CURSOR_SIZE..=MAX_CURSOR_SIZE).contains(&size_px) {
+        Ok(())
+    } else {
+        Err(CursorConfigurationError::InvalidSize)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompositorCursorImage {
@@ -103,16 +161,23 @@ impl CompositorCursorImage {
     }
 }
 
-static SHARED_CURSOR_IMAGE: OnceLock<Arc<CompositorCursorImage>> = OnceLock::new();
+static SHARED_CURSOR_IMAGE: OnceLock<RwLock<Arc<CompositorCursorImage>>> = OnceLock::new();
 
 pub fn install_shared_compositor_cursor(image: Arc<CompositorCursorImage>) {
-    let _ = SHARED_CURSOR_IMAGE.set(image);
+    let shared = SHARED_CURSOR_IMAGE
+        .get_or_init(|| RwLock::new(Arc::new(CompositorCursorImage::builtin_fallback())));
+    if let Ok(mut current) = shared.write() {
+        *current = image;
+    }
 }
 
 pub fn shared_compositor_cursor_image() -> Arc<CompositorCursorImage> {
-    SHARED_CURSOR_IMAGE
-        .get_or_init(|| Arc::new(CompositorCursorImage::builtin_fallback()))
-        .clone()
+    let shared = SHARED_CURSOR_IMAGE
+        .get_or_init(|| RwLock::new(Arc::new(CompositorCursorImage::builtin_fallback())));
+    shared
+        .read()
+        .map(|current| current.clone())
+        .unwrap_or_else(|_| Arc::new(CompositorCursorImage::builtin_fallback()))
 }
 
 #[derive(Debug, Default, Clone)]
@@ -146,7 +211,7 @@ fn resolve_theme_name(environment: &CursorEnvironment) -> String {
         .as_deref()
         .or(environment.xcursor_theme.as_deref())
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("default")
+        .unwrap_or(DEFAULT_CURSOR_THEME)
         .to_string()
 }
 
@@ -159,16 +224,26 @@ fn resolve_requested_size(environment: &CursorEnvironment) -> u32 {
         return DEFAULT_CURSOR_SIZE;
     };
     match value.trim().parse::<u32>() {
-        Ok(size) if (1..=MAX_CURSOR_SIZE).contains(&size) => size,
+        Ok(size) if validate_cursor_size(size).is_ok() => size,
         _ => DEFAULT_CURSOR_SIZE,
     }
 }
 
-pub fn load_compositor_cursor_from_environment() -> CompositorCursorImage {
+pub fn default_cursor_configuration() -> CursorConfiguration {
     let environment = CursorEnvironment::from_process();
-    let theme = resolve_theme_name(&environment);
-    let requested_size = resolve_requested_size(&environment);
-    match load_cursor_from_theme(&theme, requested_size) {
+    CursorConfiguration::new(
+        resolve_theme_name(&environment),
+        resolve_requested_size(&environment),
+    )
+    .unwrap_or_else(|_| {
+        CursorConfiguration::new(DEFAULT_CURSOR_THEME, DEFAULT_CURSOR_SIZE)
+            .expect("built-in cursor default is valid")
+    })
+}
+
+pub fn load_compositor_cursor_from_environment() -> CompositorCursorImage {
+    let configuration = default_cursor_configuration();
+    match load_cursor_from_theme(&configuration.theme, configuration.size_px) {
         Ok(image) => {
             eprintln!(
                 "cursor theme: loaded theme={} size={} image={}x{} hotspot={},{} source={}",
@@ -192,7 +267,7 @@ pub fn load_compositor_cursor_from_environment() -> CompositorCursorImage {
     }
 }
 
-fn load_cursor_from_theme(
+pub(crate) fn load_cursor_from_theme(
     theme_name: &str,
     requested_size: u32,
 ) -> Result<CompositorCursorImage, String> {
@@ -282,11 +357,18 @@ fn load_cursor_from_search_path(
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
     let previous = std::env::var_os("XCURSOR_PATH");
+    // SAFETY: this test-only environment override is serialized by ENV_LOCK.
     unsafe { std::env::set_var("XCURSOR_PATH", search_path) };
     let result = load_cursor_from_theme(theme, size);
     match previous {
-        Some(value) => unsafe { std::env::set_var("XCURSOR_PATH", value) },
-        None => unsafe { std::env::remove_var("XCURSOR_PATH") },
+        Some(value) => {
+            // SAFETY: this test-only environment restore is serialized by ENV_LOCK.
+            unsafe { std::env::set_var("XCURSOR_PATH", value) }
+        }
+        None => {
+            // SAFETY: this test-only environment restore is serialized by ENV_LOCK.
+            unsafe { std::env::remove_var("XCURSOR_PATH") }
+        }
     }
     result
 }
@@ -316,6 +398,46 @@ const CURSOR_PATTERN: [&str; 17] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_configuration_accepts_bounded_logical_theme_names_and_sizes() {
+        assert!(CursorConfiguration::new("Bibata-Modern-Ice", 24).is_ok());
+        assert!(CursorConfiguration::new("a", 8).is_ok());
+        assert!(CursorConfiguration::new("a".repeat(128), 256).is_ok());
+        assert!(CursorConfiguration::new("a", 24).is_ok());
+    }
+
+    #[test]
+    fn cursor_configuration_rejects_invalid_theme_syntax() {
+        for theme in [
+            "",
+            &"a".repeat(129),
+            "theme/name",
+            r"theme\\name",
+            "theme name",
+            "..",
+            "theme\0name",
+            "theme\nname",
+            "тема",
+            "/absolute/theme",
+            "../theme",
+        ] {
+            assert!(
+                CursorConfiguration::new(theme, 24).is_err(),
+                "theme should be rejected: {theme:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_configuration_rejects_sizes_outside_the_runtime_range() {
+        for size in [0, 1, 7, 257, u32::MAX] {
+            assert!(CursorConfiguration::new("default", size).is_err());
+        }
+        assert!(CursorConfiguration::new("default", 8).is_ok());
+        assert!(CursorConfiguration::new("default", 24).is_ok());
+        assert!(CursorConfiguration::new("default", 256).is_ok());
+    }
 
     #[test]
     fn override_theme_precedes_xcursor_theme() {

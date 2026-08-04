@@ -66,6 +66,25 @@ pub(crate) struct NativeFrameRenderer {
     pub(crate) frame_surfaces: Vec<RenderableSurface>,
 }
 
+impl NativeFrameRenderer {
+    pub(crate) fn with_cursor_image(
+        cursor_image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
+    ) -> Self {
+        Self {
+            scene_renderer: DesktopSceneRenderer::with_cursor_image(cursor_image),
+            frame: Vec::new(),
+            frame_surfaces: Vec::new(),
+        }
+    }
+
+    pub(crate) fn set_cursor_image(
+        &mut self,
+        cursor_image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
+    ) {
+        self.scene_renderer.set_cursor_image(cursor_image);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeCursorRenderMode {
     Software,

@@ -234,6 +234,36 @@ mod tests {
     }
 
     #[test]
+    fn one_hundred_suspend_query_resume_cycles_preserve_active_state() {
+        let mut lifecycle = NativeSessionLifecycle::default();
+
+        for _ in 0..100 {
+            assert_eq!(
+                lifecycle.begin_for_event(NativeSeatEvent::Disabled),
+                Some(NativeSessionTransition::BeginSuspend)
+            );
+            assert_eq!(lifecycle.control_state(), ControlSessionState::Recovering);
+            assert_eq!(
+                lifecycle.finish_suspend(),
+                Some(NativeSessionTransition::Suspended)
+            );
+            assert_eq!(lifecycle.control_state(), ControlSessionState::Suspended);
+
+            assert_eq!(
+                lifecycle.begin_for_event(NativeSeatEvent::Enabled),
+                Some(NativeSessionTransition::BeginResume)
+            );
+            assert_eq!(lifecycle.control_state(), ControlSessionState::Recovering);
+            assert_eq!(
+                lifecycle.finish_resume(),
+                Some(NativeSessionTransition::Active)
+            );
+            assert_eq!(lifecycle.control_state(), ControlSessionState::Active);
+            assert!(lifecycle.permits_output());
+        }
+    }
+
+    #[test]
     fn enable_after_shutdown_does_not_leave_session_resuming() {
         let mut lifecycle = NativeSessionLifecycle {
             state: NativeSessionState::Suspended,

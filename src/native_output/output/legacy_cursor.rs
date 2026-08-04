@@ -1,5 +1,6 @@
 use super::*;
 use oblivion_one::cursor_theme::CompositorCursorImage;
+use std::sync::Arc;
 
 pub(crate) struct NativeLegacyHardwareCursor {
     pub(crate) bo: gbm::BufferObject<()>,
@@ -11,6 +12,7 @@ pub(crate) struct NativeLegacyHardwareCursor {
     pub(crate) hotspot_x: i32,
     pub(crate) hotspot_y: i32,
     pub(crate) active: bool,
+    image: Arc<CompositorCursorImage>,
 }
 
 impl NativeLegacyHardwareCursor {
@@ -61,7 +63,12 @@ impl NativeLegacyHardwareCursor {
             bo,
             _device: device,
             active: false,
+            image: Arc::new(image.clone()),
         })
+    }
+
+    pub(crate) fn matches_image(&self, image: &Arc<CompositorCursorImage>) -> bool {
+        self.image.as_ref() == image.as_ref()
     }
 
     pub(crate) fn enable(&mut self) -> io::Result<()> {

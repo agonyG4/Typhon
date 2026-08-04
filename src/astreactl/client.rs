@@ -1,3 +1,4 @@
+use serde::de::Error as _;
 use std::{
     error::Error,
     fmt,
@@ -13,9 +14,10 @@ use crate::control::{
     decode_response, encode_request,
 };
 use crate::control_snapshots::{
-    ActiveWindowSnapshot, AstreactlResult, DoctorSnapshot, OutputListSnapshot, StatusSnapshot,
-    VersionSnapshot, WindowListSnapshot,
+    ActiveWindowSnapshot, AstreactlResult, CursorSnapshot, DoctorSnapshot, OutputListSnapshot,
+    StatusSnapshot, VersionSnapshot, WindowListSnapshot,
 };
+use crate::cursor_theme::CursorConfiguration;
 
 #[derive(Debug)]
 pub enum AstreactlError {
@@ -44,7 +46,12 @@ impl fmt::Display for AstreactlError {
                 formatter,
                 "control response id mismatch: expected {expected}, got {actual}"
             ),
-            Self::Server(error) => write!(formatter, "{:?}: {}", error.code, error.message),
+            Self::Server(error) => write!(
+                formatter,
+                "{}: {}",
+                error.code.as_str(),
+                error.detail.as_deref().unwrap_or(&error.message)
+            ),
         }
     }
 }
@@ -74,6 +81,17 @@ fn decode_command_result(
         "active-window" => {
             serde_json::from_value::<ActiveWindowSnapshot>(value).map(AstreactlResult::ActiveWindow)
         }
+        "cursor.get" | "cursor.set-theme" | "cursor.set-size" | "cursor.set" | "cursor.reload" => {
+            serde_json::from_value::<CursorSnapshot>(value)
+                .and_then(|snapshot| {
+                    CursorConfiguration::new(&snapshot.desired_theme, snapshot.desired_size_px)
+                        .map_err(|_| serde_json::Error::custom("invalid desired cursor state"))?;
+                    CursorConfiguration::new(&snapshot.active_theme, snapshot.active_size_px)
+                        .map_err(|_| serde_json::Error::custom("invalid active cursor state"))?;
+                    Ok(snapshot)
+                })
+                .map(AstreactlResult::Cursor)
+        }
         _ => return Err(AstreactlError::Usage("unknown control command".to_string())),
     };
     decoded.map_err(|_| AstreactlError::MalformedResponse)
@@ -84,7 +102,16 @@ pub fn request(
     command: &str,
     timeout: Duration,
 ) -> Result<AstreactlResult, AstreactlError> {
-    let request = ControlRequest::new(1, command, serde_json::json!({}))
+    request_with_args(path, command, serde_json::json!({}), timeout)
+}
+
+pub fn request_with_args(
+    path: &Path,
+    command: &str,
+    args: serde_json::Value,
+    timeout: Duration,
+) -> Result<AstreactlResult, AstreactlError> {
+    let request = ControlRequest::new(1, command, args)
         .map_err(|_| AstreactlError::Usage("invalid control request".to_string()))?;
     let encoded = encode_request(&request).map_err(|_| {
         AstreactlError::Usage("control request exceeds the protocol limit".to_string())

@@ -1,4 +1,4 @@
-use crate::control_snapshots::{AstreactlResult, DoctorCheck, WindowSnapshot};
+use crate::control_snapshots::{AstreactlResult, CursorSnapshot, DoctorCheck, WindowSnapshot};
 
 pub fn human(result: &AstreactlResult) -> String {
     match result {
@@ -70,7 +70,22 @@ pub fn human(result: &AstreactlResult) -> String {
                 )
             })
             .unwrap_or_else(|| "No active window".to_string()),
+        AstreactlResult::Cursor(snapshot) => format_cursor(snapshot),
     }
+}
+
+fn format_cursor(snapshot: &CursorSnapshot) -> String {
+    format!(
+        "Theme: {}\nSize: {} px\nActive: {} at {} px\nGeneration: {}\nBackend: {}\nSource: {}\nPersistence: {}",
+        sanitize_terminal_text(&snapshot.desired_theme),
+        snapshot.desired_size_px,
+        sanitize_terminal_text(&snapshot.active_theme),
+        snapshot.active_size_px,
+        snapshot.generation,
+        snapshot.backend.as_str(),
+        snapshot.source.as_str(),
+        snapshot.persistence.as_str(),
+    )
 }
 
 fn format_doctor_check(check: &DoctorCheck) -> String {

@@ -31,9 +31,9 @@ pub(super) fn log_output_pipeline_snapshot(
 ) {
     perf.log("native.presentation_pipeline", || {
         vec![
-            NativePerfField::str("configured_policy", format!("{configured_policy:?}")),
-            NativePerfField::str("effective_mode", format!("{pacing_mode:?}")),
-            NativePerfField::str("capability", format!("{:?}", pipeline.triple_capability)),
+            NativePerfField::str("configured_policy", configured_policy.as_str()),
+            NativePerfField::str("effective_mode", pacing_mode.as_str()),
+            NativePerfField::str("capability", pipeline.triple_capability.as_str()),
             NativePerfField::str("current_primary", format!("{:?}", pipeline.current_primary)),
             NativePerfField::str(
                 "kernel_submitted",
@@ -59,7 +59,10 @@ pub(super) fn log_output_pipeline_snapshot(
                 u64::from(pipeline.free_compositor_slots),
             ),
             NativePerfField::bool("direct_active", pipeline.direct_active()),
-            NativePerfField::str("force_unavailable", format!("{force_unavailable:?}")),
+            NativePerfField::str(
+                "force_unavailable",
+                force_unavailable.map_or("none", TripleCapabilityBlocker::as_str),
+            ),
             NativePerfField::bool("terminal_ownership_valid", terminal_ownership_valid),
         ]
     });

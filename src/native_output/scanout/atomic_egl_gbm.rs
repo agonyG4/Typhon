@@ -103,6 +103,12 @@ impl GbmAllocationProbe for DeviceAllocationProbe<'_> {
 }
 
 impl AtomicEglGbmScanout {
+    pub(crate) fn set_cursor_image(
+        &mut self,
+        image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
+    ) {
+        self.scene.set_cursor_image(image);
+    }
     pub(crate) fn prepare_session_recovery(&self) -> io::Result<AtomicExplicitRecovery> {
         let swapchain = self.swapchain()?;
         let current = swapchain.current();

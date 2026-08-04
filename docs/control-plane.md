@@ -55,9 +55,50 @@ rejections, malformed and oversized requests, timeouts, stale tokens, and
 client I/O failures rather than logging every connection or client string.
 
 M3 adds bounded read-only `version`, `status`, `doctor`, `outputs`, `windows`,
-and `active-window` snapshots. Snapshot data is copied into owned values before
-encoding. Cursor changes, wallpaper commands, window actions, and shell
-protocol remain unavailable.
+and `active-window` snapshots. M4 adds typed `cursor.get`, `cursor.set-theme`,
+`cursor.set-size`, `cursor.set`, and `cursor.reload` commands. Snapshot data is
+copied into owned values before encoding, and the client decodes each success
+into the exact command-specific result type. Missing, null, incompatible, or
+malformed results are protocol errors (client exit `6`). Snapshot objects use
+strict version-one schemas and stable string vocabularies.
+
+Cursor mutation is dispatched on the native runtime thread. The transport only
+decodes bounded arguments and queues a response; it does not load cursor
+assets, access configuration files, create framebuffers, or submit KMS state.
+The runtime loads and validates a complete candidate, atomically persists the
+desired configuration, publishes a new cursor generation, schedules ordinary
+repaint and cursor-plane replanning, and then returns the snapshot. Failed
+validation, loading, or persistence leaves the active generation unchanged.
+Old cursor generations remain retained while KMS transactions, worker jobs,
+cursor-plane owners, or software frames still reference them.
+
+Cursor configuration is persisted at
+`$XDG_CONFIG_HOME/AstreaOS/input/cursor.json`, or
+`$HOME/.config/AstreaOS/input/cursor.json` when `XDG_CONFIG_HOME` is unset.
+AstreaOS-owned directories are private `0700` directories and the file is a
+regular `0600` file. Publication uses a private unpredictable temporary file,
+flush, file `fsync`, atomic rename, and parent-directory `fsync` where
+supported. Symlinks, foreign ownership, unexpected node types, malformed
+documents, and unsupported versions are rejected. Startup falls back to the
+existing built-in/default cursor and emits one bounded warning when persisted
+configuration is invalid or unavailable.
+
+Cursor backend values are `hardware`, `software`, `hidden`, and `unavailable`.
+The active theme and size are shared by the software-rendered and hardware
+cursor paths. Hardware update failure falls back to software without making a
+valid logical configuration fatal. Future supervised children receive
+`XCURSOR_THEME` and `XCURSOR_SIZE` in their command-local environment; Typhon
+does not mutate its process-global environment, and already-running clients
+that own their own cursor surfaces are not forced to reload.
+
+Window snapshots use an explicit serialized-byte budget below the 1 MiB
+response cap. If the complete authoritative window set cannot fit, the list is
+truncated before adding another object and its full `total` is retained. A
+recognized command whose response serialization still fails is reported as a
+bounded internal error, not `invalid_command`.
+
+Cursor changes, wallpaper commands, window actions, and shell protocol remain
+unavailable.
 
 For a live socket conflict, inspect the instance-specific path above and stop
 the owning Typhon instance before starting another one. An insecure or missing

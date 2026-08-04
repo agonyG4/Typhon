@@ -71,11 +71,45 @@ pub enum TripleCapabilityBlocker {
     SoftwareCursorVisible,
 }
 
+impl TripleCapabilityBlocker {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NonAtomicKms => "non_atomic_kms",
+            Self::ExplicitSwapchainUnavailable => "explicit_swapchain_unavailable",
+            Self::SlotCapacityMismatch => "slot_capacity_mismatch",
+            Self::PrimaryInFenceUnavailable => "primary_in_fence_unavailable",
+            Self::RenderFenceExportUnavailable => "render_fence_export_unavailable",
+            Self::SubmissionTransportUnhealthy => "submission_transport_unhealthy",
+            Self::SessionInactive => "session_inactive",
+            Self::OutputGenerationUnstable => "output_generation_unstable",
+            Self::UnsupportedPresentationMode => "unsupported_presentation_mode",
+            Self::SwapchainPoisoned => "swapchain_poisoned",
+            Self::SoftwareCursorVisible => "software_cursor_visible",
+        }
+    }
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TripleCapability {
     Capable,
     Unavailable(TripleCapabilityBlocker),
+}
+
+impl TripleCapability {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Capable => "capable",
+            Self::Unavailable(_) => "unavailable",
+        }
+    }
+
+    pub const fn blocker(self) -> Option<TripleCapabilityBlocker> {
+        match self {
+            Self::Capable => None,
+            Self::Unavailable(blocker) => Some(blocker),
+        }
+    }
 }
 
 #[doc(hidden)]

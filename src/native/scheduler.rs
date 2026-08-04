@@ -46,6 +46,15 @@ pub enum NativeOutputPacingMode {
     PredictiveTriple,
 }
 
+impl NativeOutputPacingMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReactiveDouble => "reactive_double",
+            Self::PredictiveTriple => "predictive_triple",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedulerCapabilities {
     kms_backend: KmsBackendKind,

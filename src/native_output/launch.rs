@@ -117,6 +117,26 @@ pub(crate) fn launch_native_shell_command_with_xwayland_environment(
     source: NativeLaunchSource,
     xwayland: Option<oblivion_one::xwayland::XwaylandAppEnvironment>,
 ) -> NativeResult<Option<NativeAppLaunchPerf>> {
+    launch_native_shell_command_with_xwayland_environment_and_cursor(
+        server,
+        supervisor,
+        command,
+        app_gpu_policy,
+        source,
+        xwayland,
+        None,
+    )
+}
+
+pub(crate) fn launch_native_shell_command_with_xwayland_environment_and_cursor(
+    server: &OwnCompositorServer,
+    supervisor: &mut ChildSupervisor,
+    command: Vec<String>,
+    app_gpu_policy: EffectiveCompositorAppGpuPolicy,
+    source: NativeLaunchSource,
+    xwayland: Option<oblivion_one::xwayland::XwaylandAppEnvironment>,
+    cursor: Option<oblivion_one::cursor_theme::CursorConfiguration>,
+) -> NativeResult<Option<NativeAppLaunchPerf>> {
     let Some(request) = native_launch_request(command, app_gpu_policy, source) else {
         return Ok(None);
     };
@@ -129,24 +149,27 @@ pub(crate) fn launch_native_shell_command_with_xwayland_environment(
             let argv = request.argv.clone();
             let gpu_policy = request.gpu_policy;
             let xwayland = xwayland.clone();
+            let cursor = cursor.clone();
             supervisor.spawn_restartable(
                 move || {
-                    compositor_app_command_with_policy_and_xwayland(
+                    compositor_app_command_with_policy_and_xwayland_and_cursor(
                         &socket_name,
                         &argv,
                         gpu_policy,
                         xwayland.as_ref(),
+                        cursor.as_ref(),
                     )?
                     .ok_or_else(|| io::Error::other("native shell command is empty"))
                 },
                 process_options,
             )
         }
-        _ => match compositor_app_command_with_policy_and_xwayland(
+        _ => match compositor_app_command_with_policy_and_xwayland_and_cursor(
             &socket_name,
             &request.argv,
             request.gpu_policy,
             xwayland.as_ref(),
+            cursor.as_ref(),
         )? {
             Some(command) => supervisor.spawn(command, process_options),
             None => return Ok(None),
@@ -190,7 +213,7 @@ pub(crate) fn drain_pending_process_launches(
     perf: NativePerfLogger,
     pending_launches: &mut VecDeque<NativeAppLaunchPerf>,
 ) {
-    drain_pending_process_launches_with_xwayland_environment(
+    drain_pending_process_launches_with_xwayland_environment_and_cursor(
         server,
         supervisor,
         launch_tracker,
@@ -198,10 +221,12 @@ pub(crate) fn drain_pending_process_launches(
         perf,
         pending_launches,
         None,
+        None,
     );
 }
 
-pub(crate) fn drain_pending_process_launches_with_xwayland_environment(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drain_pending_process_launches_with_xwayland_environment_and_cursor(
     server: &mut OwnCompositorServer,
     supervisor: &mut ChildSupervisor,
     launch_tracker: &mut AstreaLaunchLifecycleTracker,
@@ -209,6 +234,7 @@ pub(crate) fn drain_pending_process_launches_with_xwayland_environment(
     perf: NativePerfLogger,
     pending_launches: &mut VecDeque<NativeAppLaunchPerf>,
     xwayland: Option<oblivion_one::xwayland::XwaylandAppEnvironment>,
+    cursor: Option<&oblivion_one::cursor_theme::CursorConfiguration>,
 ) {
     let socket_name = server.socket_name().to_string();
     for pending in server.take_pending_process_launches() {
@@ -225,11 +251,12 @@ pub(crate) fn drain_pending_process_launches_with_xwayland_environment(
         };
         let spawn_start = Instant::now();
         let process_options = native_process_options(&request);
-        let command = match compositor_app_command_with_policy_and_xwayland(
+        let command = match compositor_app_command_with_policy_and_xwayland_and_cursor(
             &socket_name,
             &request.argv,
             request.gpu_policy,
             xwayland.as_ref(),
+            cursor,
         ) {
             Ok(Some(command)) => command,
             Ok(None) => {

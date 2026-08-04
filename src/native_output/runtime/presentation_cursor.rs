@@ -1,10 +1,73 @@
+use super::cursor_cycle::{NativeResolvedCursorSource, resolve_native_cursor_source_with_hidden};
 use super::*;
 use crate::native_output::kms_worker::AttachablePrimary;
 use crate::native_output::kms_worker::KmsPrimaryCursorPresentation;
 use crate::native_output::presentation::plane::CursorRevision;
 
+pub(super) fn resolve_native_cursor_visibility<'a>(
+    server: &'a OwnCompositorServer,
+    input_state: &NativeInputState,
+) -> (
+    Option<oblivion_one::compositor::ClientCursorRenderState<'a>>,
+    bool,
+    bool,
+) {
+    let theme_cursor_visible = input_state.cursor_visible();
+    let client_cursor = server.client_cursor_render_state();
+    let client_cursor_active = client_cursor.is_some();
+    let resolved_cursor_source = resolve_native_cursor_source_with_hidden(
+        client_cursor_active,
+        server.client_cursor_explicitly_hidden(),
+        server.interaction_cursor_override_active(),
+        theme_cursor_visible,
+    );
+    let cursor_visible = !matches!(resolved_cursor_source, NativeResolvedCursorSource::Hidden);
+    (client_cursor, client_cursor_active, cursor_visible)
+}
+
+pub(super) fn refresh_legacy_cursor_theme(
+    legacy_cursor: &mut Option<NativeLegacyHardwareCursor>,
+    kms: &NativeDrmDevice,
+    crtc_id: u32,
+    cursor_image: &std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
+    cursor_render_mode: &mut NativeCursorRenderMode,
+    cursor_manager: &mut oblivion_one::cursor_manager::CursorThemeManager,
+    perf: NativePerfLogger,
+) -> NativeResult<()> {
+    let Some(legacy) = legacy_cursor.as_ref() else {
+        return Ok(());
+    };
+    if legacy.matches_image(cursor_image) {
+        return Ok(());
+    }
+    match NativeLegacyHardwareCursor::create(kms.file(), crtc_id, cursor_image.as_ref()) {
+        Ok(replacement) => {
+            if let Some(mut previous) = legacy_cursor.replace(replacement)
+                && previous.active
+            {
+                previous.disable()?;
+            }
+            *cursor_render_mode = NativeCursorRenderMode::Hardware;
+        }
+        Err(error) => {
+            let _ = legacy_cursor.take();
+            *cursor_render_mode = NativeCursorRenderMode::Software;
+            cursor_manager.note_hardware_fallback();
+            perf.log("native.cursor", || {
+                vec![
+                    NativePerfField::str("event", "legacy_theme_replace_failed"),
+                    NativePerfField::str("error", error.to_string()),
+                ]
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn prepare_cursor_image(
     cursor: &mut NativeAtomicCursor,
+    theme_image: &std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
+    theme_generation: u64,
     client_cursor: Option<oblivion_one::compositor::ClientCursorRenderState<'_>>,
     kms: &NativeDrmDevice,
     input_state: &NativeInputState,
@@ -44,8 +107,24 @@ pub(super) fn prepare_cursor_image(
         }
         image_ready
     } else {
-        let mut theme_image_ready = cursor.using_theme_image();
-        if !cursor.using_theme_image()
+        let mut theme_image_ready = cursor.theme_image_matches(theme_image);
+        if !theme_image_ready {
+            if let Err(error) =
+                cursor.replace_theme_image(kms.file(), theme_image.clone(), theme_generation)
+            {
+                perf.log("native.cursor", || {
+                    vec![
+                        NativePerfField::str("event", "theme_replace_failed"),
+                        NativePerfField::str("error", error.to_string()),
+                    ]
+                });
+                theme_image_ready = false;
+            } else {
+                theme_image_ready = true;
+            }
+        }
+        if theme_image_ready
+            && !cursor.using_theme_image()
             && let Err(error) = cursor.restore_theme_image(kms.file())
         {
             theme_image_ready = false;

@@ -90,6 +90,69 @@ impl FeatureState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum CursorBackendSnapshot {
+    Hardware,
+    Software,
+    Hidden,
+    Unavailable,
+}
+
+impl CursorBackendSnapshot {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hardware => "hardware",
+            Self::Software => "software",
+            Self::Hidden => "hidden",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum CursorConfigSource {
+    Default,
+    Config,
+    Control,
+}
+
+impl CursorConfigSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Config => "config",
+            Self::Control => "control",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum CursorPersistenceSnapshot {
+    Saved,
+    Missing,
+    Invalid,
+    Insecure,
+    WriteFailed,
+}
+
+impl CursorPersistenceSnapshot {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Saved => "saved",
+            Self::Missing => "missing",
+            Self::Invalid => "invalid",
+            Self::Insecure => "insecure",
+            Self::WriteFailed => "write_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct ControlWindowId(pub u64);
@@ -286,6 +349,20 @@ pub struct ActiveWindowSnapshot {
     pub window: Option<WindowSnapshot>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct CursorSnapshot {
+    pub desired_theme: String,
+    pub desired_size_px: u32,
+    pub active_theme: String,
+    pub active_size_px: u32,
+    pub generation: u64,
+    pub backend: CursorBackendSnapshot,
+    pub source: CursorConfigSource,
+    pub persistence: CursorPersistenceSnapshot,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum AstreactlResult {
@@ -295,6 +372,7 @@ pub enum AstreactlResult {
     Outputs(OutputListSnapshot),
     Windows(WindowListSnapshot),
     ActiveWindow(ActiveWindowSnapshot),
+    Cursor(CursorSnapshot),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

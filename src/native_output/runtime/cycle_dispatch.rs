@@ -10,6 +10,30 @@ use oblivion_one::control_snapshots::{
     PositionSnapshot, StatusSnapshot, VersionSnapshot, XwaylandStatusSnapshot,
 };
 use oblivion_one::native::event_loop::NativeWakeup;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyCursorArgs {}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CursorThemeArgs {
+    theme: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CursorSizeArgs {
+    size_px: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CursorSetArgs {
+    theme: String,
+    size_px: u32,
+}
 
 impl NativeRuntime {
     pub(super) fn service_control_events(&mut self, wakeup: &NativeWakeup) -> NativeResult<()> {
@@ -140,6 +164,19 @@ impl NativeRuntime {
                         self.cursor_render_mode.as_str(),
                     ),
                     doctor_check(
+                        "cursor.configuration",
+                        self.cursor_configuration_doctor_severity(),
+                        format!(
+                            "desired={}@{} active={}@{} source={} persistence={}",
+                            self.cursor_manager.desired_configuration().theme,
+                            self.cursor_manager.desired_configuration().size_px,
+                            self.cursor_manager.active_configuration().theme,
+                            self.cursor_manager.active_configuration().size_px,
+                            self.cursor_manager.source().as_str(),
+                            self.cursor_manager.persistence().as_str(),
+                        ),
+                    ),
+                    doctor_check(
                         "xwayland.state",
                         match self.xwayland.state_kind() {
                             oblivion_one::xwayland::XwaylandStateKind::Failed => {
@@ -232,6 +269,75 @@ impl NativeRuntime {
             ControlCommand::ActiveWindow => serde_json::to_value(ActiveWindowSnapshot {
                 window: self.server.control_active_window_snapshot(),
             }),
+            ControlCommand::CursorGet => {
+                if serde_json::from_value::<EmptyCursorArgs>(request.args).is_err() {
+                    self.cursor_manager.note_validation_failure();
+                    return cursor_argument_failure(request.id);
+                }
+                self.cursor_manager.note_get();
+                serde_json::to_value(self.cursor_snapshot())
+            }
+            ControlCommand::CursorSetTheme => {
+                let args = match serde_json::from_value::<CursorThemeArgs>(request.args) {
+                    Ok(args) => args,
+                    Err(_) => {
+                        self.cursor_manager.note_validation_failure();
+                        return cursor_argument_failure(request.id);
+                    }
+                };
+                match self.cursor_manager.set_theme(&args.theme) {
+                    Ok(change) => {
+                        self.publish_cursor_change(change);
+                        serde_json::to_value(self.cursor_snapshot())
+                    }
+                    Err(error) => return cursor_failure(request.id, error),
+                }
+            }
+            ControlCommand::CursorSetSize => {
+                let args = match serde_json::from_value::<CursorSizeArgs>(request.args) {
+                    Ok(args) => args,
+                    Err(_) => {
+                        self.cursor_manager.note_validation_failure();
+                        return cursor_argument_failure(request.id);
+                    }
+                };
+                match self.cursor_manager.set_size(args.size_px) {
+                    Ok(change) => {
+                        self.publish_cursor_change(change);
+                        serde_json::to_value(self.cursor_snapshot())
+                    }
+                    Err(error) => return cursor_failure(request.id, error),
+                }
+            }
+            ControlCommand::CursorSet => {
+                let args = match serde_json::from_value::<CursorSetArgs>(request.args) {
+                    Ok(args) => args,
+                    Err(_) => {
+                        self.cursor_manager.note_validation_failure();
+                        return cursor_argument_failure(request.id);
+                    }
+                };
+                match self.cursor_manager.apply_values(&args.theme, args.size_px) {
+                    Ok(change) => {
+                        self.publish_cursor_change(change);
+                        serde_json::to_value(self.cursor_snapshot())
+                    }
+                    Err(error) => return cursor_failure(request.id, error),
+                }
+            }
+            ControlCommand::CursorReload => {
+                if serde_json::from_value::<EmptyCursorArgs>(request.args).is_err() {
+                    self.cursor_manager.note_validation_failure();
+                    return cursor_argument_failure(request.id);
+                }
+                match self.cursor_manager.reload() {
+                    Ok(change) => {
+                        self.publish_cursor_change(change);
+                        serde_json::to_value(self.cursor_snapshot())
+                    }
+                    Err(error) => return cursor_failure(request.id, error),
+                }
+            }
             _ => {
                 return ControlResponse::failure(
                     request.id,
@@ -249,6 +355,50 @@ impl NativeRuntime {
                 ControlError::new(ControlErrorCode::Internal, "control snapshot failed"),
             ),
         }
+    }
+
+    fn cursor_snapshot(&self) -> oblivion_one::control_snapshots::CursorSnapshot {
+        self.cursor_manager.snapshot(self.cursor_backend_snapshot())
+    }
+
+    fn cursor_backend_snapshot(&self) -> oblivion_one::control_snapshots::CursorBackendSnapshot {
+        if self.scanout_destroyed {
+            oblivion_one::control_snapshots::CursorBackendSnapshot::Unavailable
+        } else if !self.input_state.cursor_visible() {
+            oblivion_one::control_snapshots::CursorBackendSnapshot::Hidden
+        } else {
+            match self.cursor_render_mode {
+                NativeCursorRenderMode::Hardware => {
+                    oblivion_one::control_snapshots::CursorBackendSnapshot::Hardware
+                }
+                NativeCursorRenderMode::Software | NativeCursorRenderMode::SoftwareClient => {
+                    oblivion_one::control_snapshots::CursorBackendSnapshot::Software
+                }
+            }
+        }
+    }
+
+    fn cursor_configuration_doctor_severity(&self) -> DoctorSeverity {
+        cursor_configuration_doctor_severity(
+            !self.scanout_destroyed,
+            true,
+            true,
+            self.cursor_manager.active_configuration()
+                == self.cursor_manager.desired_configuration(),
+            self.cursor_manager.persistence(),
+        )
+    }
+
+    fn publish_cursor_change(&mut self, change: oblivion_one::cursor_manager::CursorChange) {
+        if !change.published {
+            return;
+        }
+        self.cursor_image = change.image;
+        self.frame_renderer
+            .set_cursor_image(self.cursor_image.clone());
+        self.scanout.set_cursor_image(self.cursor_image.clone());
+        oblivion_one::cursor_theme::install_shared_compositor_cursor(self.cursor_image.clone());
+        self.queued_redraw_requested = true;
     }
 
     #[allow(unused_variables)]
@@ -472,6 +622,58 @@ impl NativeRuntime {
     }
 }
 
+fn cursor_failure(
+    id: u64,
+    error: oblivion_one::cursor_manager::CursorManagerError,
+) -> ControlResponse {
+    let code = if matches!(
+        error,
+        oblivion_one::cursor_manager::CursorManagerError::ResourceBusy
+    ) {
+        ControlErrorCode::Internal
+    } else {
+        ControlErrorCode::InvalidArgument
+    };
+    ControlResponse::failure(
+        id,
+        ControlError::new(code, "cursor command failed").with_detail(error.detail()),
+    )
+}
+
+fn cursor_argument_failure(id: u64) -> ControlResponse {
+    ControlResponse::failure(
+        id,
+        ControlError::new(
+            ControlErrorCode::InvalidArgument,
+            "invalid cursor arguments",
+        )
+        .with_detail("invalid_cursor_arguments"),
+    )
+}
+
+fn cursor_configuration_doctor_severity(
+    runtime_available: bool,
+    active_theme_available: bool,
+    software_fallback_available: bool,
+    active_matches_desired: bool,
+    persistence: oblivion_one::control_snapshots::CursorPersistenceSnapshot,
+) -> DoctorSeverity {
+    use oblivion_one::control_snapshots::CursorPersistenceSnapshot;
+
+    if !runtime_available || (!active_theme_available && !software_fallback_available) {
+        return DoctorSeverity::Error;
+    }
+    if !active_matches_desired {
+        return DoctorSeverity::Warning;
+    }
+    match persistence {
+        CursorPersistenceSnapshot::Invalid
+        | CursorPersistenceSnapshot::Insecure
+        | CursorPersistenceSnapshot::WriteFailed => DoctorSeverity::Warning,
+        CursorPersistenceSnapshot::Saved | CursorPersistenceSnapshot::Missing => DoctorSeverity::Ok,
+    }
+}
+
 fn doctor_check(id: &str, severity: DoctorSeverity, summary: impl Into<String>) -> DoctorCheck {
     DoctorCheck {
         id: id.to_string(),
@@ -557,4 +759,92 @@ fn reconcile_trigger_liveness(
         });
     };
     server.reconcile_window_interaction_trigger(trigger_pressed)
+}
+
+#[cfg(test)]
+mod cursor_doctor_tests {
+    use super::cursor_configuration_doctor_severity;
+    use oblivion_one::control_snapshots::{CursorPersistenceSnapshot, DoctorSeverity};
+
+    #[test]
+    fn cursor_configuration_doctor_matrix_preserves_healthy_fallbacks() {
+        let cases = [
+            (
+                true,
+                true,
+                true,
+                true,
+                CursorPersistenceSnapshot::Missing,
+                DoctorSeverity::Ok,
+            ),
+            (
+                true,
+                true,
+                true,
+                true,
+                CursorPersistenceSnapshot::Saved,
+                DoctorSeverity::Ok,
+            ),
+            (
+                true,
+                true,
+                true,
+                true,
+                CursorPersistenceSnapshot::Invalid,
+                DoctorSeverity::Warning,
+            ),
+            (
+                true,
+                true,
+                true,
+                false,
+                CursorPersistenceSnapshot::Saved,
+                DoctorSeverity::Warning,
+            ),
+            (
+                true,
+                false,
+                true,
+                true,
+                CursorPersistenceSnapshot::Saved,
+                DoctorSeverity::Ok,
+            ),
+            (
+                true,
+                false,
+                false,
+                true,
+                CursorPersistenceSnapshot::Saved,
+                DoctorSeverity::Error,
+            ),
+            (
+                false,
+                true,
+                true,
+                true,
+                CursorPersistenceSnapshot::Saved,
+                DoctorSeverity::Error,
+            ),
+        ];
+        for (
+            runtime_available,
+            active_theme_available,
+            software_fallback_available,
+            active_matches_desired,
+            persistence,
+            expected,
+        ) in cases
+        {
+            assert_eq!(
+                cursor_configuration_doctor_severity(
+                    runtime_available,
+                    active_theme_available,
+                    software_fallback_available,
+                    active_matches_desired,
+                    persistence,
+                ),
+                expected,
+            );
+        }
+    }
 }

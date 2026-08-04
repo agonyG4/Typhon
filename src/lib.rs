@@ -5,6 +5,8 @@ pub mod compositor;
 pub mod control;
 pub mod control_snapshots;
 pub mod core;
+pub mod cursor_manager;
+pub mod cursor_persistence;
 pub mod cursor_theme;
 mod defaults;
 mod launch_env;
@@ -164,6 +166,41 @@ mod tests {
                 .expect("bridge path should be exported");
             assert!(!value.contains("/home/agony/GitHub/Typhon/"));
         }
+    }
+
+    #[test]
+    fn supervised_child_cursor_environment_is_command_local() {
+        let configuration = cursor_theme::CursorConfiguration::new("Bibata", 32).unwrap();
+        let theme_before = std::env::var_os("XCURSOR_THEME");
+        let size_before = std::env::var_os("XCURSOR_SIZE");
+        let child = compositor_app_command_with_policy_and_xwayland_and_cursor(
+            "oblivion-one-test",
+            &["true".to_string()],
+            EffectiveCompositorAppGpuPolicy::Accelerated,
+            None,
+            Some(&configuration),
+        )
+        .unwrap()
+        .expect("command should be created");
+        let env = child
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            env.get("XCURSOR_THEME").and_then(Option::as_deref),
+            Some("Bibata")
+        );
+        assert_eq!(
+            env.get("XCURSOR_SIZE").and_then(Option::as_deref),
+            Some("32")
+        );
+        assert_eq!(std::env::var_os("XCURSOR_THEME"), theme_before);
+        assert_eq!(std::env::var_os("XCURSOR_SIZE"), size_before);
     }
 
     #[test]

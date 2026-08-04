@@ -122,6 +122,19 @@ pub(super) struct NativeCycleState {
     pub(super) shutdown_requested: bool,
 }
 
+impl NativeCycleState {
+    pub(super) const fn record_presentation_result(
+        &mut self,
+        frame_completed: bool,
+        frame_rendered: bool,
+        frame_submitted: bool,
+    ) {
+        self.frame_completed = frame_completed;
+        self.frame_rendered = frame_rendered;
+        self.frame_submitted = frame_submitted;
+    }
+}
+
 #[derive(Debug, Default)]
 struct KmsWorkerQuarantine {
     jobs: Vec<super::kms_worker::KmsCommitJob>,
@@ -203,6 +216,7 @@ impl KmsTeardownSafety {
 pub(crate) struct NativeRuntime {
     server: OwnCompositorServer,
     cursor_image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
+    cursor_manager: oblivion_one::cursor_manager::CursorThemeManager,
     perf: NativePerfLogger,
     target: KmsTarget,
     mode_label: String,

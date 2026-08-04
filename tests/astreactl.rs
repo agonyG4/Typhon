@@ -32,6 +32,18 @@ fn valid_result(command: &str) -> serde_json::Value {
         "outputs" => serde_json::json!({"outputs": [], "total": 0, "truncated": false}),
         "windows" => serde_json::json!({"windows": [], "total": 0, "truncated": false}),
         "activewindow" | "active-window" => serde_json::json!({"window": null}),
+        "cursor.get" | "cursor.set-theme" | "cursor.set-size" | "cursor.set" | "cursor.reload" => {
+            serde_json::json!({
+                "desiredTheme": "default",
+                "desiredSizePx": 24,
+                "activeTheme": "default",
+                "activeSizePx": 24,
+                "generation": 1,
+                "backend": "software",
+                "source": "default",
+                "persistence": "missing"
+            })
+        }
         other => panic!("no typed fixture for {other}"),
     }
 }
@@ -245,7 +257,90 @@ fn typed_results_are_validated_for_every_read_only_command() {
     );
 }
 
+#[test]
+fn typed_cursor_results_are_validated_for_every_cursor_command() {
+    let commands = [
+        ("cursor.get", vec!["cursor", "get"]),
+        ("cursor.set-theme", vec!["cursor", "set-theme", "default"]),
+        ("cursor.set-size", vec!["cursor", "set-size", "24"]),
+        (
+            "cursor.set",
+            vec!["cursor", "set", "--theme", "default", "--size", "24"],
+        ),
+        ("cursor.reload", vec!["cursor", "reload"]),
+    ];
+    for (wire_command, cli_args) in commands {
+        let valid = run_socket_once_args(&cli_args, envelope(valid_result(wire_command)));
+        assert_eq!(valid.status.code(), Some(0), "command={wire_command}");
+        for result in [serde_json::json!({}), serde_json::Value::Null] {
+            assert_eq!(
+                run_socket_once_args(&cli_args, envelope(result))
+                    .status
+                    .code(),
+                Some(6),
+                "command={wire_command}"
+            );
+        }
+        let mut missing = valid_result(wire_command);
+        missing.as_object_mut().unwrap().remove("activeTheme");
+        assert_eq!(
+            run_socket_once_args(&cli_args, envelope(missing))
+                .status
+                .code(),
+            Some(6)
+        );
+        let mut wrong_type = valid_result(wire_command);
+        wrong_type["activeSizePx"] = serde_json::json!("large");
+        assert_eq!(
+            run_socket_once_args(&cli_args, envelope(wrong_type))
+                .status
+                .code(),
+            Some(6)
+        );
+        assert_eq!(
+            run_socket_once_args(&cli_args, envelope(valid_result("status")))
+                .status
+                .code(),
+            Some(6)
+        );
+        let mut unknown = valid_result(wire_command);
+        unknown["unknownField"] = serde_json::json!(true);
+        assert_eq!(
+            run_socket_once_args(&cli_args, envelope(unknown))
+                .status
+                .code(),
+            Some(6)
+        );
+    }
+}
+
+#[test]
+fn cursor_cli_rejects_invalid_values_and_duplicate_options_locally() {
+    for args in [
+        vec!["cursor", "set-theme", "bad/theme"],
+        vec!["cursor", "set-theme"],
+        vec!["cursor", "set-size", "7"],
+        vec!["cursor", "set-size"],
+        vec!["cursor", "set", "--theme", "default"],
+        vec!["cursor", "set", "--size", "24"],
+        vec![
+            "cursor", "set", "--theme", "default", "--theme", "other", "--size", "24",
+        ],
+        vec![
+            "cursor", "set", "--theme", "default", "--size", "24", "--size", "32",
+        ],
+        vec!["cursor", "unknown"],
+    ] {
+        let output = run(&args);
+        assert_eq!(output.status.code(), Some(2), "args={args:?}");
+    }
+}
+
 fn run_socket_cycles(command: &str, response: Vec<u8>, expected_code: i32) {
+    run_socket_cycles_args(&[command], response, expected_code);
+}
+
+fn run_socket_cycles_args(args: &[&str], response: Vec<u8>, expected_code: i32) {
     let path = std::env::temp_dir().join(format!(
         "typhon-astreactl-stress-{}-{}.sock",
         std::process::id(),
@@ -265,7 +360,9 @@ fn run_socket_cycles(command: &str, response: Vec<u8>, expected_code: i32) {
         }
     });
     for _ in 0..100 {
-        let output = run(&["--json", "--socket", path.to_str().unwrap(), command]);
+        let mut cli_args = vec!["--json", "--socket", path.to_str().unwrap()];
+        cli_args.extend_from_slice(args);
+        let output = run(&cli_args);
         assert_eq!(output.status.code(), Some(expected_code));
     }
     server.join().unwrap();
@@ -273,6 +370,10 @@ fn run_socket_cycles(command: &str, response: Vec<u8>, expected_code: i32) {
 }
 
 fn run_socket_once(command: &str, response: Vec<u8>) -> std::process::Output {
+    run_socket_once_args(&[command], response)
+}
+
+fn run_socket_once_args(args: &[&str], response: Vec<u8>) -> std::process::Output {
     let path = std::env::temp_dir().join(format!(
         "typhon-astreactl-once-{}-{}.sock",
         std::process::id(),
@@ -289,8 +390,10 @@ fn run_socket_once(command: &str, response: Vec<u8>) -> std::process::Output {
         stream.read_to_end(&mut request).unwrap();
         stream.write_all(&response).unwrap();
     });
+    let mut cli_args = vec!["--json", "--socket", path.to_str().unwrap()];
+    cli_args.extend_from_slice(args);
     let output = Command::new(env!("CARGO_BIN_EXE_astreactl"))
-        .args(["--json", "--socket", path.to_str().unwrap(), command])
+        .args(cli_args)
         .output()
         .unwrap();
     server.join().unwrap();
@@ -400,6 +503,34 @@ fn astreactl_handles_one_hundred_discovery_cycles() {
 #[test]
 fn astreactl_handles_one_hundred_write_half_close_cycles() {
     run_socket_cycles("activewindow", envelope(valid_result("activewindow")), 0);
+}
+
+#[test]
+fn astreactl_handles_one_hundred_cursor_get_cycles() {
+    run_socket_cycles_args(&["cursor", "get"], envelope(valid_result("cursor.get")), 0);
+}
+
+#[test]
+fn astreactl_handles_one_hundred_cursor_write_half_close_cycles() {
+    run_socket_cycles_args(&["cursor", "get"], envelope(valid_result("cursor.get")), 0);
+}
+
+#[test]
+fn astreactl_handles_one_hundred_cursor_reload_cycles() {
+    run_socket_cycles_args(
+        &["cursor", "reload"],
+        envelope(valid_result("cursor.reload")),
+        0,
+    );
+}
+
+#[test]
+fn astreactl_handles_one_hundred_cursor_server_error_cycles() {
+    run_socket_cycles_args(
+        &["cursor", "set-theme", "missing"],
+        server_error_envelope(),
+        1,
+    );
 }
 
 #[test]

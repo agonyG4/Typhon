@@ -115,8 +115,8 @@ fn crash_preserves_final_stderr_ring() {
         .expect("readiness snapshot")
         .process_id;
     supervisor
-        .kill_managed_now(process_id)
-        .expect("kill Xwayland test process");
+        .terminate_managed(process_id)
+        .expect("terminate Xwayland test process");
     let exit = super::reap_one(&mut supervisor);
     service
         .handle_process_exit(&exit)

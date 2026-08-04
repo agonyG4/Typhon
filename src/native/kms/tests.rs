@@ -412,6 +412,18 @@ fn pipe_read_end() -> OwnedFd {
     unsafe { OwnedFd::from_raw_fd(pipe[0]) }
 }
 
+fn pipe_read_end_at_least(min_fd: i32) -> OwnedFd {
+    let pipe = pipe_read_end();
+    // SAFETY: `pipe` owns a valid descriptor, and `F_DUPFD_CLOEXEC` returns a
+    // new descriptor referring to the same open file description.
+    let duplicated = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_DUPFD_CLOEXEC, min_fd) };
+    assert!(duplicated >= min_fd);
+    drop(pipe);
+    // SAFETY: `duplicated` was returned by `F_DUPFD_CLOEXEC` above and is now
+    // the sole owner of the duplicated descriptor.
+    unsafe { OwnedFd::from_raw_fd(duplicated) }
+}
+
 fn discovery() -> AtomicDiscovery {
     let (connector, crtc, plane, connector_props, crtc_props, plane_props) = ids();
     AtomicDiscovery {
@@ -748,7 +760,7 @@ fn explicit_atomic_flip_adopts_out_fence_and_closes_input_after_success() {
     let pipeline = explicit_fence_pipeline();
     let input = pipe_read_end();
     let input_raw = input.as_raw_fd();
-    let returned_out = pipe_read_end();
+    let returned_out = pipe_read_end_at_least(10_000);
     let returned_out_raw = returned_out.as_raw_fd();
     assert_ne!(input_raw, returned_out_raw);
     std::mem::forget(returned_out);
@@ -789,7 +801,7 @@ fn explicit_atomic_flip_closes_kernel_written_out_fence_on_ioctl_failure() {
     let pipeline = explicit_fence_pipeline();
     let input = pipe_read_end();
     let input_raw = input.as_raw_fd();
-    let returned_out = pipe_read_end();
+    let returned_out = pipe_read_end_at_least(10_000);
     let returned_out_raw = returned_out.as_raw_fd();
     assert_ne!(input_raw, returned_out_raw);
     std::mem::forget(returned_out);

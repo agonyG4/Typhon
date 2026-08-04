@@ -1,4 +1,3 @@
-use super::cursor_cycle::{NativeResolvedCursorSource, resolve_native_cursor_source_with_hidden};
 use super::cycle::direct_fallback::{DirectFallbackReason, DirectFallbackTracker};
 use super::frame::{
     NativeRepaintInputs, native_repaint_decision, plane_delta_allowed_at_deadline,
@@ -41,6 +40,7 @@ impl NativeRuntime {
         let Self {
             server,
             cursor_image,
+            cursor_manager,
             perf: _,
             kms,
             kms_backend,
@@ -135,24 +135,24 @@ impl NativeRuntime {
         let scene_changed = scene_generation != *last_rendered_scene_generation;
         let pending_frame_work = server.has_unowned_frame_work();
         let pacing_now_ns = monotonic_now_ns()?;
-        let theme_cursor_visible = input_state.cursor_visible();
-        let client_cursor = server.client_cursor_render_state();
-        let client_cursor_active = client_cursor.is_some();
-        let client_cursor_explicitly_hidden = server.client_cursor_explicitly_hidden();
-        let resolved_cursor_source = resolve_native_cursor_source_with_hidden(
-            client_cursor_active,
-            client_cursor_explicitly_hidden,
-            server.interaction_cursor_override_active(),
-            theme_cursor_visible,
-        );
-        let cursor_visible = !matches!(resolved_cursor_source, NativeResolvedCursorSource::Hidden);
+        let (client_cursor, client_cursor_active, cursor_visible) =
+            resolve_native_cursor_visibility(server, input_state);
+        #[rustfmt::skip]
+        refresh_legacy_cursor_theme(legacy_cursor, kms, target.crtc_id, cursor_image, cursor_render_mode, cursor_manager, perf)?;
         if client_cursor_active && let Some(cursor) = legacy_cursor.as_mut() {
             cursor.disable()?;
         }
         let (mut runtime_plane_plan, mut client_cursor_hardware_usable) = (None, false);
         if let Some(cursor) = atomic_cursor.as_mut() {
-            let cursor_image_ready =
-                prepare_cursor_image(cursor, client_cursor, kms, input_state, perf);
+            let cursor_image_ready = prepare_cursor_image(
+                cursor,
+                cursor_image,
+                cursor_manager.generation(),
+                client_cursor,
+                kms,
+                input_state,
+                perf,
+            );
             let plan = apply_cursor_policy_with_runtime_inputs(
                 CursorPolicyContext {
                     cursor,
@@ -818,7 +818,7 @@ impl NativeRuntime {
                     PacingField::u64("render_generation", render_generation),
                     PacingField::u64("render_observed_at_ns", render_observed_at_ns),
                     PacingField::bool("render_ahead", render_ahead),
-                    PacingField::str("buffering_mode", format!("{:?}", adaptive_buffering.mode())),
+                    PacingField::str("buffering_mode", adaptive_buffering.mode().as_str()),
                     PacingField::u64("prediction_ewma_ns", prediction.ewma_render_ns),
                     PacingField::u64(
                         "prediction_upper_deviation_ns",
@@ -1487,9 +1487,7 @@ impl NativeRuntime {
                 ),
             );
         }
-        cycle.frame_completed = frame_completed;
-        cycle.frame_rendered = frame_rendered;
-        cycle.frame_submitted = frame_submitted;
+        cycle.record_presentation_result(frame_completed, frame_rendered, frame_submitted);
         self.update_cycle_metrics(cycle, scheduler_decision)?;
         Ok(())
     }

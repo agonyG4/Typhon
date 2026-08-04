@@ -83,7 +83,7 @@ use oblivion_one::xwayland::{
 };
 use oblivion_one::{
     CompositorAppGpuPreference, EffectiveCompositorAppGpuPolicy,
-    compositor_app_command_with_policy_and_xwayland, shell_quote,
+    compositor_app_command_with_policy_and_xwayland_and_cursor, shell_quote,
 };
 use wayland_server::Resource;
 

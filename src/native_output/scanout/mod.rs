@@ -258,6 +258,16 @@ pub(crate) struct AtomicExplicitRecovery {
 }
 
 impl NativeScanoutBackend {
+    pub(crate) fn set_cursor_image(
+        &mut self,
+        image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
+    ) {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.set_cursor_image(image),
+            Self::NativeEglGbm(scanout) => scanout.set_cursor_image(image),
+            Self::Gbm(_) | Self::Dumb(_) => {}
+        }
+    }
     pub(crate) fn explicit_output_counters(&self) -> Option<ExplicitOutputCounters> {
         match self {
             Self::AtomicEglGbm(scanout) => Some(scanout.counters()),

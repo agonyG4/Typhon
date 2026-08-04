@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::{
+    cursor_theme::CursorConfiguration,
     default_state_dir,
     portal::{PortalRuntime, prepend_data_dir},
     xwayland::XwaylandAppEnvironment,
@@ -295,6 +296,22 @@ pub fn compositor_app_command_with_policy_and_xwayland(
     gpu_policy: EffectiveCompositorAppGpuPolicy,
     xwayland: Option<&XwaylandAppEnvironment>,
 ) -> io::Result<Option<Command>> {
+    compositor_app_command_with_policy_and_xwayland_and_cursor(
+        socket_name,
+        app,
+        gpu_policy,
+        xwayland,
+        None,
+    )
+}
+
+pub fn compositor_app_command_with_policy_and_xwayland_and_cursor(
+    socket_name: &str,
+    app: &[String],
+    gpu_policy: EffectiveCompositorAppGpuPolicy,
+    xwayland: Option<&XwaylandAppEnvironment>,
+    cursor: Option<&CursorConfiguration>,
+) -> io::Result<Option<Command>> {
     let Some(mut command) = compositor_app_command_with_policy(socket_name, app, gpu_policy)?
     else {
         return Ok(None);
@@ -305,6 +322,10 @@ pub fn compositor_app_command_with_policy_and_xwayland(
             socket_name,
             xwayland,
         );
+    }
+    if let Some(cursor) = cursor {
+        command.env("XCURSOR_THEME", &cursor.theme);
+        command.env("XCURSOR_SIZE", cursor.size_px.to_string());
     }
     Ok(Some(command))
 }

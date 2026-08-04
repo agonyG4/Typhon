@@ -4,10 +4,9 @@ use crate::native_output::kms_worker::KmsCommitWorkerPolicy;
 use oblivion_one::compositor::gpu_protocol_capabilities::{
     GpuFormat, GpuProtocolCapabilities, GpuProtocolProbe, inspect_render_node,
 };
-use oblivion_one::cursor_theme::{
-    CompositorCursorImage, install_shared_compositor_cursor,
-    load_compositor_cursor_from_environment,
-};
+use oblivion_one::cursor_manager::{CursorThemeManager, SystemCursorThemeLoader};
+use oblivion_one::cursor_persistence::CursorConfigurationStore;
+use oblivion_one::cursor_theme::{CompositorCursorImage, install_shared_compositor_cursor};
 use oblivion_one::native::kms::{AtomicDiscovery, AtomicKmsError, KmsBackendKind};
 use std::{
     fs::OpenOptions,
@@ -169,6 +168,7 @@ fn build_native_kms_startup_plan(
 struct NativeRuntimeBootstrapTail {
     server: OwnCompositorServer,
     cursor_image: Arc<CompositorCursorImage>,
+    cursor_manager: CursorThemeManager,
     perf: NativePerfLogger,
     kms: NativeDrmDevice,
     kms_backend: KmsBackendSelection,
@@ -201,6 +201,7 @@ impl NativeRuntime {
         let NativeRuntimeBootstrapTail {
             mut server,
             cursor_image,
+            cursor_manager,
             perf,
             kms,
             kms_backend,
@@ -507,14 +508,16 @@ impl NativeRuntime {
         let resize_perf = NativeResizePerfState::default();
         let pointer_constraint_backend = NativePointerConstraintBackend::new();
         let xwayland_app_environment = xwayland.normal_app_environment();
+        let child_cursor_configuration = cursor_manager.active_configuration().clone();
         if let Some(command) = external_shell_command()
-            && let Some(launch) = launch_native_shell_command_with_xwayland_environment(
+            && let Some(launch) = launch_native_shell_command_with_xwayland_environment_and_cursor(
                 &server,
                 &mut process_supervisor,
                 command,
                 effective_app_gpu_policy,
                 NativeLaunchSource::ExternalShell,
                 xwayland_app_environment.clone(),
+                Some(child_cursor_configuration.clone()),
             )
             .map_err(|error| {
                 eprintln!("native external shell launch failed: {error}");
@@ -528,13 +531,14 @@ impl NativeRuntime {
             pending_launches.push_back(launch);
         }
         if let Some(command) = startup_app
-            && let Some(launch) = launch_native_shell_command_with_xwayland_environment(
+            && let Some(launch) = launch_native_shell_command_with_xwayland_environment_and_cursor(
                 &server,
                 &mut process_supervisor,
                 command,
                 effective_app_gpu_policy,
                 NativeLaunchSource::Startup,
                 xwayland_app_environment,
+                Some(child_cursor_configuration),
             )?
         {
             log_native_app_spawn(perf, &launch);
@@ -543,6 +547,7 @@ impl NativeRuntime {
         let mut runtime = Self {
             server,
             cursor_image,
+            cursor_manager,
             perf,
             kms,
             kms_backend,
@@ -727,7 +732,11 @@ impl NativeRuntime {
         );
         server.set_output_size(target.width, target.height);
         server.set_output_refresh_hz(refresh_hz);
-        let cursor_image = Arc::new(load_compositor_cursor_from_environment());
+        let cursor_store = CursorConfigurationStore::from_environment()
+            .unwrap_or_else(CursorConfigurationStore::unavailable);
+        let cursor_manager =
+            CursorThemeManager::startup(cursor_store, Box::new(SystemCursorThemeLoader));
+        let cursor_image = cursor_manager.active_image();
         install_shared_compositor_cursor(cursor_image.clone());
         let scanout_preference = NativeScanoutPreference::from_env();
         let scanout_plan = NativeScanoutPlan::choose(NativeScanoutChoice {
@@ -879,7 +888,7 @@ impl NativeRuntime {
                 NativePerfField::u64("refresh_interval_ns", refresh_interval_ns),
             ]
         });
-        let mut frame_renderer = NativeFrameRenderer::default();
+        let mut frame_renderer = NativeFrameRenderer::with_cursor_image(cursor_image.clone());
         let input_state = NativeInputState::new(target.width, target.height);
         let cursor_preference = NativeCursorPreference::from_env();
         let cursor_scheduling_policy = NativeCursorSchedulingPolicy::from_env();
@@ -975,6 +984,7 @@ impl NativeRuntime {
                 NativeCursorOwnerPlan::LegacyHardware
             ) | (_, NativeCursorOwnerPlan::Software)
         ));
+        scanout.set_cursor_image(cursor_image.clone());
         let cursor_render_mode =
             if pre_kms_atomic_cursor.is_some() || pre_kms_legacy_cursor.is_some() {
                 NativeCursorRenderMode::Hardware
@@ -1291,6 +1301,7 @@ impl NativeRuntime {
         Self::finish_bootstrap(NativeRuntimeBootstrapTail {
             server,
             cursor_image,
+            cursor_manager,
             perf,
             kms,
             kms_backend,

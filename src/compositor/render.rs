@@ -363,6 +363,11 @@ impl DesktopSceneRenderer {
         }
     }
 
+    pub fn set_cursor_image(&mut self, cursor_image: Arc<CompositorCursorImage>) {
+        self.cursor_image = cursor_image;
+        self.reusable_frame_key = None;
+    }
+
     pub fn compose(
         &mut self,
         frame: &mut [u32],
@@ -2287,6 +2292,47 @@ mod tests {
         );
 
         assert_eq!(renderer.scene_generation(), first_generation);
+    }
+
+    #[test]
+    fn cursor_image_change_invalidates_reusable_frame_and_draws_new_image() {
+        let old_image =
+            Arc::new(CompositorCursorImage::from_argb8888(vec![0xff00_0000], 1, 1, 0, 0).unwrap());
+        let new_image =
+            Arc::new(CompositorCursorImage::from_argb8888(vec![0xffff_0000], 1, 1, 0, 0).unwrap());
+        let mut renderer = DesktopSceneRenderer::with_cursor_image(old_image);
+        let mut frame = vec![0; 8 * 8];
+
+        renderer.compose_request(DesktopComposeRequest {
+            frame: &mut frame,
+            frame_width: 8,
+            frame_height: 8,
+            output_scale: 1.0,
+            surfaces: &[],
+            external_overlay_surface_ids: Vec::new(),
+            content_generation: 1,
+            visual_state: DesktopVisualState::wallpaper_only(),
+            client_cursor: None,
+        });
+        assert!(renderer.reusable_frame_key.is_none());
+
+        renderer.compose_reusing_frame(DesktopComposeRequest {
+            frame: &mut frame,
+            frame_width: 8,
+            frame_height: 8,
+            output_scale: 1.0,
+            surfaces: &[],
+            external_overlay_surface_ids: Vec::new(),
+            content_generation: 1,
+            visual_state: DesktopVisualState::wallpaper_only(),
+            client_cursor: None,
+        });
+        assert!(renderer.reusable_frame_key.is_some());
+
+        renderer.set_cursor_image(new_image);
+        assert!(renderer.reusable_frame_key.is_none());
+        renderer.compose(&mut frame, 8, 8, &[], DesktopVisualState::with_cursor(3, 2));
+        assert_eq!(frame[2 * 8 + 3], 0xffff_0000);
     }
 
     #[test]

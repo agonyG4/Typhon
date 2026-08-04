@@ -756,6 +756,10 @@ impl EglOutputDamageTracker {
         }
     }
 
+    pub(super) fn set_cursor_image(&mut self, cursor_image: Arc<CompositorCursorImage>) {
+        self.cursor_image = cursor_image;
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn damage_for_frame(
         &self,

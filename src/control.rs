@@ -48,6 +48,8 @@ pub enum ControlCommand {
     Windows,
     ActiveWindow,
     CursorGet,
+    CursorSetTheme,
+    CursorSetSize,
     CursorSet,
     CursorReload,
     WindowActivate,
@@ -66,6 +68,8 @@ impl ControlCommand {
             Self::Windows => "windows",
             Self::ActiveWindow => "active-window",
             Self::CursorGet => "cursor.get",
+            Self::CursorSetTheme => "cursor.set-theme",
+            Self::CursorSetSize => "cursor.set-size",
             Self::CursorSet => "cursor.set",
             Self::CursorReload => "cursor.reload",
             Self::WindowActivate => "window.activate",
@@ -84,6 +88,8 @@ impl ControlCommand {
             "windows" => Self::Windows,
             "active-window" => Self::ActiveWindow,
             "cursor.get" => Self::CursorGet,
+            "cursor.set-theme" => Self::CursorSetTheme,
+            "cursor.set-size" => Self::CursorSetSize,
             "cursor.set" => Self::CursorSet,
             "cursor.reload" => Self::CursorReload,
             "window.activate" => Self::WindowActivate,
@@ -109,11 +115,29 @@ pub enum ControlErrorCode {
     Internal,
 }
 
+impl ControlErrorCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidArgument => "invalid_argument",
+            Self::InvalidCommand => "invalid_command",
+            Self::InvalidRequest => "invalid_request",
+            Self::MalformedJson => "malformed_json",
+            Self::RequestTooLarge => "request_too_large",
+            Self::ResponseTooLarge => "response_too_large",
+            Self::Unauthorized => "unauthorized",
+            Self::UnsupportedVersion => "unsupported_version",
+            Self::Internal => "internal",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlError {
     pub code: ControlErrorCode,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl ControlError {
@@ -121,7 +145,13 @@ impl ControlError {
         Self {
             code,
             message: message.into(),
+            detail: None,
         }
+    }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
     }
 }
 

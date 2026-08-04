@@ -1,4 +1,4 @@
-use std::{collections::HashMap, error::Error, ffi::c_void, io, ptr};
+use std::{collections::HashMap, error::Error, ffi::c_void, io, ptr, sync::Arc};
 
 use glow::HasContext;
 use khronos_egl as egl;
@@ -181,6 +181,7 @@ pub(crate) struct GlesSceneRenderer {
     presented_scene_key: Option<EglSceneCacheKey>,
     wallpaper_resource: Option<EglImageResource>,
     cursor_resource: Option<EglImageResource>,
+    cursor_resource_stale: bool,
     surface_resources: HashMap<u32, EglSurfaceResource>,
     dmabuf_resource_cache: HashMap<DmabufImageKey, CachedDmabufResource<EglImageResource>>,
     dmabuf_cache_peak_entries: usize,
@@ -270,6 +271,7 @@ impl GlesSceneRenderer {
             presented_scene_key: None,
             wallpaper_resource: None,
             cursor_resource: None,
+            cursor_resource_stale: false,
             surface_resources: HashMap::new(),
             dmabuf_resource_cache: HashMap::new(),
             dmabuf_cache_peak_entries: 0,
@@ -288,6 +290,13 @@ impl GlesSceneRenderer {
 
     pub(crate) const fn last_frame_stats(&self) -> GlesSceneFrameStats {
         self.frame_stats
+    }
+
+    pub(crate) fn set_cursor_image(&mut self, cursor_image: Arc<CompositorCursorImage>) {
+        self.cursor_image = cursor_image.clone();
+        self.damage_tracker.set_cursor_image(cursor_image);
+        self.cursor_resource_stale = true;
+        self.repaint_planner.invalidate();
     }
 
     pub(crate) fn renderer_info(&self) -> GlesRendererInfo {
@@ -599,7 +608,7 @@ impl GlesSceneRenderer {
         if self
             .cursor_resource
             .as_ref()
-            .is_some_and(|resource| resource.size == (width, height))
+            .is_some_and(|resource| resource.size == (width, height) && !self.cursor_resource_stale)
         {
             return Ok(());
         }
@@ -617,6 +626,7 @@ impl GlesSceneRenderer {
         }
         resource.generation = 1;
         self.cursor_resource = Some(resource);
+        self.cursor_resource_stale = false;
         Ok(())
     }
 
@@ -2520,6 +2530,110 @@ mod tests {
                 OutputRect::new(8, 9, 4, 3),
                 OutputRect::new(18, 21, 4, 3),
             ])
+        );
+    }
+
+    #[test]
+    fn output_damage_tracker_damages_old_and_new_bounds_when_cursor_image_changes() {
+        let old_image = std::sync::Arc::new(
+            oblivion_one::cursor_theme::CompositorCursorImage::from_argb8888(
+                vec![0xff00_0000],
+                1,
+                1,
+                0,
+                0,
+            )
+            .unwrap(),
+        );
+        let new_image = std::sync::Arc::new(
+            oblivion_one::cursor_theme::CompositorCursorImage::from_argb8888(
+                vec![0xffff_0000; 3 * 2],
+                3,
+                2,
+                0,
+                0,
+            )
+            .unwrap(),
+        );
+        let mut tracker = EglOutputDamageTracker::with_cursor_image(old_image.clone());
+        tracker.damage_for_frame(
+            1280,
+            800,
+            true,
+            None,
+            DesktopVisualState::with_cursor(10, 10),
+            None,
+        );
+        tracker.commit_presented(EglOutputDamageTracker::candidate_state(
+            1280,
+            800,
+            DesktopVisualState::with_cursor(10, 10),
+            None,
+            &old_image,
+        ));
+
+        tracker.set_cursor_image(new_image);
+        let damage = tracker.damage_for_frame(
+            1280,
+            800,
+            false,
+            Some(OutputDamage::Empty),
+            DesktopVisualState::with_cursor(10, 10),
+            None,
+        );
+        assert_eq!(damage.rect_count(), 1);
+        assert_eq!(damage.pixels(1280, 800), Some(6));
+    }
+
+    #[test]
+    fn output_damage_tracker_does_not_damage_hidden_cursor_after_settling() {
+        let image = oblivion_one::cursor_theme::CompositorCursorImage::builtin_fallback();
+        let mut tracker = EglOutputDamageTracker::default();
+        tracker.damage_for_frame(
+            1280,
+            800,
+            true,
+            None,
+            DesktopVisualState::with_cursor(10, 10),
+            None,
+        );
+        tracker.commit_presented(EglOutputDamageTracker::candidate_state(
+            1280,
+            800,
+            DesktopVisualState::with_cursor(10, 10),
+            None,
+            &image,
+        ));
+
+        let hide_damage = tracker.damage_for_frame(
+            1280,
+            800,
+            false,
+            Some(OutputDamage::Empty),
+            DesktopVisualState::wallpaper_only(),
+            None,
+        );
+        assert_eq!(
+            hide_damage.pixels(1280, 800),
+            Some(u64::from(image.width) * u64::from(image.height))
+        );
+        tracker.commit_presented(EglOutputDamageTracker::candidate_state(
+            1280,
+            800,
+            DesktopVisualState::wallpaper_only(),
+            None,
+            &image,
+        ));
+        assert_eq!(
+            tracker.damage_for_frame(
+                1280,
+                800,
+                false,
+                Some(OutputDamage::Empty),
+                DesktopVisualState::wallpaper_only(),
+                None,
+            ),
+            OutputDamage::Empty
         );
     }
 

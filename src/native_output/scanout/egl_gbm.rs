@@ -333,6 +333,12 @@ impl NativeGbmFramebufferCache {
 }
 
 impl NativeEglGbmScanout {
+    pub(crate) fn set_cursor_image(
+        &mut self,
+        image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
+    ) {
+        self.scene.set_cursor_image(image);
+    }
     pub(crate) fn create(
         kms: &fs::File,
         width: u32,

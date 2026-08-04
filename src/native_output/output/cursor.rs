@@ -646,6 +646,22 @@ impl NativeAtomicCursor {
         self.replace_image_with_source(file, self.theme_image.clone(), NativeCursorSourceKey::Theme)
     }
 
+    pub(crate) fn theme_image_matches(&self, image: &Arc<CompositorCursorImage>) -> bool {
+        Arc::ptr_eq(&self.theme_image, image)
+    }
+
+    pub(crate) fn replace_theme_image(
+        &mut self,
+        file: &fs::File,
+        image: Arc<CompositorCursorImage>,
+        generation: u64,
+    ) -> io::Result<()> {
+        self.replace_image_with_source(file, image.clone(), NativeCursorSourceKey::Theme)?;
+        self.theme_image = image;
+        self.desired.image_generation = generation;
+        Ok(())
+    }
+
     pub(crate) const fn using_theme_image(&self) -> bool {
         matches!(self.source_key, NativeCursorSourceKey::Theme)
     }

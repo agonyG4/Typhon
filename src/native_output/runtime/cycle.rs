@@ -88,7 +88,7 @@ impl NativeRuntime {
             }
             return Ok(());
         }
-        drain_pending_process_launches_with_xwayland_environment(
+        drain_pending_process_launches_with_xwayland_environment_and_cursor(
             &mut self.server,
             &mut self.process_supervisor,
             &mut self.astrea_launch_tracker,
@@ -96,6 +96,7 @@ impl NativeRuntime {
             self.perf,
             &mut self.pending_launches,
             self.xwayland.normal_app_environment(),
+            Some(self.cursor_manager.active_configuration()),
         );
         let prepare_started = Instant::now();
         self.process_acquire_and_prepare(&cycle)?;
