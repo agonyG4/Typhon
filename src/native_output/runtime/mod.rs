@@ -25,6 +25,7 @@ mod cycle_dispatch;
 mod direct_plan;
 mod frame;
 mod kms_worker;
+mod kms_worker_startup;
 mod kms_worker_teardown;
 #[cfg(test)]
 mod kms_worker_tests;
@@ -233,6 +234,8 @@ pub(crate) struct NativeRuntime {
     parked_acquire_watches: Vec<oblivion_one::compositor::AcquireWatchRequest>,
     event_loop: NativeEventLoop,
     control_server: NativeControlServer,
+    started_at: Instant,
+    vrr_plan: NativeVrrPlan,
     xwayland: XwaylandService,
     xwayland_reactor_tokens: Vec<(ReactorToken, XwaylandReactorRegistration)>,
     xwayland_client_identity: Option<oblivion_one::compositor::XwaylandClientIdentity>,
@@ -242,6 +245,7 @@ pub(crate) struct NativeRuntime {
     kms_commit_worker_reactor_token: Option<ReactorToken>,
     kms_commit_worker_policy: super::kms_worker::KmsCommitWorkerPolicy,
     kms_commit_worker_transport: super::kms_worker::KmsCommitWorkerTransport,
+    kms_commit_worker_startup: super::kms_worker::KmsCommitWorkerStartup,
     worker_quarantine: KmsWorkerQuarantine,
     emergency_quarantined_worker_jobs: Vec<super::kms_worker::KmsCommitJob>,
     submitted_worker_ownership: Vec<super::kms_worker::KmsSubmittedOwnership>,

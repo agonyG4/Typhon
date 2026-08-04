@@ -85,6 +85,48 @@ impl NativeVrrPlan {
     }
 }
 
+pub(crate) const fn vrr_doctor_severity(
+    requested: NativeVrrPreference,
+    supported: bool,
+) -> oblivion_one::control_snapshots::DoctorSeverity {
+    match requested {
+        NativeVrrPreference::On if !supported => {
+            oblivion_one::control_snapshots::DoctorSeverity::Warning
+        }
+        NativeVrrPreference::Auto | NativeVrrPreference::Off | NativeVrrPreference::On => {
+            oblivion_one::control_snapshots::DoctorSeverity::Ok
+        }
+    }
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    use super::*;
+    use oblivion_one::control_snapshots::DoctorSeverity;
+
+    #[test]
+    fn doctor_severity_matches_vrr_policy_matrix() {
+        for supported in [false, true] {
+            assert_eq!(
+                vrr_doctor_severity(NativeVrrPreference::Off, supported),
+                DoctorSeverity::Ok
+            );
+            assert_eq!(
+                vrr_doctor_severity(NativeVrrPreference::Auto, supported),
+                DoctorSeverity::Ok
+            );
+        }
+        assert_eq!(
+            vrr_doctor_severity(NativeVrrPreference::On, true),
+            DoctorSeverity::Ok
+        );
+        assert_eq!(
+            vrr_doctor_severity(NativeVrrPreference::On, false),
+            DoctorSeverity::Warning
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KmsResources {
     pub(crate) crtc_count: usize,

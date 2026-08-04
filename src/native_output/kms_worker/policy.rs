@@ -35,6 +35,34 @@ pub(crate) enum KmsCommitWorkerTransport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KmsCommitWorkerStartup {
+    IntentionallySynchronous,
+    UnsupportedLegacyFallback,
+    AutomaticStartupDegraded,
+    WorkerStarted,
+}
+
+impl KmsCommitWorkerStartup {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::IntentionallySynchronous => "intentionally_synchronous",
+            Self::UnsupportedLegacyFallback => "unsupported_legacy_fallback",
+            Self::AutomaticStartupDegraded => "automatic_startup_degraded",
+            Self::WorkerStarted => "worker_started",
+        }
+    }
+}
+
+impl KmsCommitWorkerTransport {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Synchronous => "synchronous",
+            Self::Worker => "worker",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KmsCommitWorkerStartupError {
     UnsupportedBackend,
     StartupFailed,
@@ -96,5 +124,99 @@ impl KmsCommitWorkerPolicy {
                 Err(KmsCommitWorkerStartupError::StartupFailed)
             }
         }
+    }
+}
+
+pub(crate) fn kms_worker_doctor_severity(
+    policy: KmsCommitWorkerPolicy,
+    transport: KmsCommitWorkerTransport,
+    startup: KmsCommitWorkerStartup,
+    worker_present: bool,
+) -> oblivion_one::control_snapshots::DoctorSeverity {
+    use oblivion_one::control_snapshots::DoctorSeverity;
+
+    match policy {
+        KmsCommitWorkerPolicy::Off => DoctorSeverity::Ok,
+        KmsCommitWorkerPolicy::Auto => match (transport, worker_present, startup) {
+            (KmsCommitWorkerTransport::Worker, true, _) => DoctorSeverity::Ok,
+            (
+                KmsCommitWorkerTransport::Synchronous,
+                false,
+                KmsCommitWorkerStartup::AutomaticStartupDegraded,
+            ) => DoctorSeverity::Warning,
+            (KmsCommitWorkerTransport::Synchronous, false, _) => DoctorSeverity::Ok,
+            _ => DoctorSeverity::Error,
+        },
+        KmsCommitWorkerPolicy::Force => {
+            if transport == KmsCommitWorkerTransport::Worker && worker_present {
+                DoctorSeverity::Ok
+            } else {
+                DoctorSeverity::Error
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    use super::*;
+    use oblivion_one::control_snapshots::DoctorSeverity;
+
+    #[test]
+    fn doctor_severity_matches_kms_worker_policy_matrix() {
+        assert_eq!(
+            kms_worker_doctor_severity(
+                KmsCommitWorkerPolicy::Off,
+                KmsCommitWorkerTransport::Synchronous,
+                KmsCommitWorkerStartup::IntentionallySynchronous,
+                false,
+            ),
+            DoctorSeverity::Ok
+        );
+        assert_eq!(
+            kms_worker_doctor_severity(
+                KmsCommitWorkerPolicy::Auto,
+                KmsCommitWorkerTransport::Worker,
+                KmsCommitWorkerStartup::WorkerStarted,
+                true,
+            ),
+            DoctorSeverity::Ok
+        );
+        assert_eq!(
+            kms_worker_doctor_severity(
+                KmsCommitWorkerPolicy::Auto,
+                KmsCommitWorkerTransport::Synchronous,
+                KmsCommitWorkerStartup::AutomaticStartupDegraded,
+                false,
+            ),
+            DoctorSeverity::Warning
+        );
+        assert_eq!(
+            kms_worker_doctor_severity(
+                KmsCommitWorkerPolicy::Auto,
+                KmsCommitWorkerTransport::Synchronous,
+                KmsCommitWorkerStartup::UnsupportedLegacyFallback,
+                false,
+            ),
+            DoctorSeverity::Ok
+        );
+        assert_eq!(
+            kms_worker_doctor_severity(
+                KmsCommitWorkerPolicy::Force,
+                KmsCommitWorkerTransport::Worker,
+                KmsCommitWorkerStartup::WorkerStarted,
+                true,
+            ),
+            DoctorSeverity::Ok
+        );
+        assert_eq!(
+            kms_worker_doctor_severity(
+                KmsCommitWorkerPolicy::Force,
+                KmsCommitWorkerTransport::Synchronous,
+                KmsCommitWorkerStartup::AutomaticStartupDegraded,
+                false,
+            ),
+            DoctorSeverity::Error
+        );
     }
 }

@@ -1,8 +1,6 @@
+use super::kms_worker_startup::start_kms_commit_worker;
 use super::*;
-use crate::native_output::kms_worker::{
-    KmsCommitWorkerHandle, KmsCommitWorkerPolicy, KmsCommitWorkerStartupError,
-    KmsCommitWorkerTransport,
-};
+use crate::native_output::kms_worker::KmsCommitWorkerPolicy;
 use oblivion_one::compositor::gpu_protocol_capabilities::{
     GpuFormat, GpuProtocolCapabilities, GpuProtocolProbe, inspect_render_node,
 };
@@ -196,6 +194,7 @@ struct NativeRuntimeBootstrapTail {
     effective_app_gpu_policy: EffectiveCompositorAppGpuPolicy,
     dmabuf_feedback_compatibility: DmabufFeedbackCompatibility,
     dmabuf_feedback_compat_metrics: DmabufFeedbackCompatibilityMetrics,
+    vrr_plan: NativeVrrPlan,
 }
 impl NativeRuntime {
     fn finish_bootstrap(parts: NativeRuntimeBootstrapTail) -> NativeResult<Self> {
@@ -227,6 +226,7 @@ impl NativeRuntime {
             effective_app_gpu_policy,
             dmabuf_feedback_compatibility,
             dmabuf_feedback_compat_metrics,
+            vrr_plan,
         } = parts;
         let mut legacy_cursor = pre_kms_legacy_cursor;
         scanout.finish_initial_scanout();
@@ -351,59 +351,19 @@ impl NativeRuntime {
                 .as_deref(),
         )
         .map_err(io::Error::other)?;
-        let mut kms_commit_worker = None;
-        let kms_commit_worker_transport = match (
-            requested_worker_policy,
-            kms_backend.effective_kind(),
-        ) {
-            (KmsCommitWorkerPolicy::Off, _) => KmsCommitWorkerTransport::Synchronous,
-            (KmsCommitWorkerPolicy::Force, KmsBackendKind::Legacy) => {
-                return Err(
-                    io::Error::other(KmsCommitWorkerStartupError::UnsupportedBackend).into(),
-                );
-            }
-            (_, KmsBackendKind::Legacy) => KmsCommitWorkerTransport::Synchronous,
-            (policy, KmsBackendKind::Atomic) => {
-                let submitter = kms_backend
-                    .atomic()
-                    .expect("Atomic backend kind has an Atomic implementation")
-                    .commit_submitter();
-                match KmsCommitWorkerHandle::start_atomic(submitter) {
-                    Ok(worker) => {
-                        kms_commit_worker = Some(worker);
-                        KmsCommitWorkerTransport::Worker
-                    }
-                    Err(error) if policy == KmsCommitWorkerPolicy::Auto => {
-                        eprintln!(
-                            "native KMS commit worker: requested={} startup failed ({error:?}); using synchronous transport",
-                            requested_worker_policy.as_str()
-                        );
-                        KmsCommitWorkerTransport::Synchronous
-                    }
-                    Err(error) => {
-                        return Err(io::Error::other(format!(
-                            "native KMS commit worker startup failed in force mode: {error:?}"
-                        ))
-                        .into());
-                    }
-                }
-            }
-        };
+        let (kms_commit_worker, kms_commit_worker_transport, kms_commit_worker_startup) =
+            start_kms_commit_worker(requested_worker_policy, &kms_backend)?;
         println!(
-            "native KMS commit worker: requested={} effective={:?}",
+            "native KMS commit worker: requested={} effective={} startup={}",
             requested_worker_policy.as_str(),
-            kms_commit_worker_transport
+            kms_commit_worker_transport.as_str(),
+            kms_commit_worker_startup.as_str(),
         );
         perf.log("native.kms_commit_worker", || {
             vec![
                 NativePerfField::str("requested", requested_worker_policy.as_str()),
-                NativePerfField::str(
-                    "effective",
-                    match kms_commit_worker_transport {
-                        KmsCommitWorkerTransport::Synchronous => "sync",
-                        KmsCommitWorkerTransport::Worker => "worker",
-                    },
-                ),
+                NativePerfField::str("effective", kms_commit_worker_transport.as_str()),
+                NativePerfField::str("startup", kms_commit_worker_startup.as_str()),
             ]
         });
         let acquire_notifier = DrmAcquirePointNotifier;
@@ -615,6 +575,8 @@ impl NativeRuntime {
             parked_acquire_watches: Vec::new(),
             event_loop,
             control_server,
+            started_at: Instant::now(),
+            vrr_plan,
             xwayland,
             xwayland_reactor_tokens,
             xwayland_client_identity: None,
@@ -624,6 +586,7 @@ impl NativeRuntime {
             kms_commit_worker_reactor_token,
             kms_commit_worker_policy: requested_worker_policy,
             kms_commit_worker_transport,
+            kms_commit_worker_startup,
             worker_quarantine: KmsWorkerQuarantine::default(),
             emergency_quarantined_worker_jobs: Vec::new(),
             submitted_worker_ownership: Vec::new(),
@@ -698,7 +661,6 @@ impl NativeRuntime {
                 .as_ref()
                 .and_then(|connector| connector.vrr_capable),
         );
-
         log_native_runtime_bootstrap(
             &server,
             &bootstrap,
@@ -707,7 +669,6 @@ impl NativeRuntime {
             startup_app.as_ref(),
             perf,
         );
-
         let Some(kms_device) = bootstrap.kms_device.as_deref() else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -715,7 +676,6 @@ impl NativeRuntime {
             )
             .into());
         };
-
         probe_native_egl_gbm_device(&bootstrap, &perf);
         let seat_session = open_native_seat_session(&session_probe);
         let drm_plan = NativeDrmBackendPlan::choose(NativeDrmBackendChoice {
@@ -765,7 +725,6 @@ impl NativeRuntime {
             refresh_hz,
             refresh_interval_ns / 1_000
         );
-
         server.set_output_size(target.width, target.height);
         server.set_output_refresh_hz(refresh_hz);
         let cursor_image = Arc::new(load_compositor_cursor_from_environment());
@@ -1357,10 +1316,10 @@ impl NativeRuntime {
             effective_app_gpu_policy,
             dmabuf_feedback_compatibility,
             dmabuf_feedback_compat_metrics,
+            vrr_plan,
         })
     }
 }
-
 fn native_dmabuf_feedback_compatibility(
     bootstrap: &NativeOutputBootstrap,
     scanout: &NativeScanoutBackend,

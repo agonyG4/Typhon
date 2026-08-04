@@ -40,6 +40,8 @@ use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
 use crate::syncobj::DrmSyncobjDevice;
 use crate::xwayland::trace::{self, TraceFields};
 
+#[path = "server_control.rs"]
+mod control_api;
 #[path = "server_xwayland.rs"]
 mod xwayland_api;
 use crate::xwayland::xwm::{ConfigureSource, XwmCommand, XwmEvent};

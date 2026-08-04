@@ -1,5 +1,19 @@
 use super::*;
 
+impl XwaylandStateKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Armed => "armed",
+            Self::Starting => "starting",
+            Self::RunningBase => "running_base",
+            Self::Running => "running",
+            Self::Backoff => "backoff",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 impl XwaylandService {
     pub(crate) fn reactor_state_label(&self) -> &'static str {
         match self.state {

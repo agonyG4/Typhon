@@ -106,6 +106,7 @@ mod runtime;
 mod scanout;
 
 pub(crate) use input::*;
+pub(crate) use kms_worker::kms_worker_doctor_severity;
 pub(crate) use launch::*;
 pub(crate) use output::*;
 use pacing::*;

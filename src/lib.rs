@@ -1,7 +1,9 @@
 pub mod astrea_shell_control;
 pub mod astrea_shortcuts;
+pub mod astreactl;
 pub mod compositor;
 pub mod control;
+pub mod control_snapshots;
 pub mod core;
 pub mod cursor_theme;
 mod defaults;

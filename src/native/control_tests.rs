@@ -169,7 +169,7 @@ fn instance_directory_disappearance_fails_closed_and_fresh_bind_reacquires_lock(
     let instance = test_instance("recreated");
     let paths = ControlRuntimePaths::for_runtime_dir(runtime.path(), &instance).unwrap();
     let mut failed_loop = NativeEventLoop::new().unwrap();
-    remove_instance_directory_after_lock_for_test(&paths.socket_dir_for_test());
+    remove_instance_directory_after_lock_for_test(paths.socket_dir_for_test());
     let error = NativeControlServer::bind(&mut failed_loop, runtime.path(), &instance).unwrap_err();
     assert!(
         matches!(&error, super::control::ControlServerError::ListenerFailure(message) if message.contains("directory disappeared")),

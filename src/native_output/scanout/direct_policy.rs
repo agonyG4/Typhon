@@ -66,6 +66,22 @@ pub(crate) fn direct_blocker(reason: &str) -> (&'static str, u64) {
     }
 }
 
+pub(crate) fn direct_scanout_doctor_severity(
+    enabled: bool,
+    state: oblivion_one::control_snapshots::FeatureState,
+) -> oblivion_one::control_snapshots::DoctorSeverity {
+    use oblivion_one::control_snapshots::{DoctorSeverity, FeatureState};
+
+    if !enabled {
+        return DoctorSeverity::Ok;
+    }
+    match state {
+        FeatureState::Configured => DoctorSeverity::Warning,
+        FeatureState::Unavailable | FeatureState::Degraded => DoctorSeverity::Warning,
+        FeatureState::Available | FeatureState::Active => DoctorSeverity::Ok,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +95,24 @@ mod tests {
         assert_eq!(
             NativeDirectScanoutPreference::from_value(Some("experimental-auto")),
             NativeDirectScanoutPreference::ExperimentalAuto
+        );
+    }
+
+    #[test]
+    fn doctor_severity_distinguishes_disabled_qualification_and_active_states() {
+        use oblivion_one::control_snapshots::{DoctorSeverity, FeatureState};
+
+        assert_eq!(
+            direct_scanout_doctor_severity(false, FeatureState::Unavailable),
+            DoctorSeverity::Ok
+        );
+        assert_eq!(
+            direct_scanout_doctor_severity(true, FeatureState::Configured),
+            DoctorSeverity::Warning
+        );
+        assert_eq!(
+            direct_scanout_doctor_severity(true, FeatureState::Active),
+            DoctorSeverity::Ok
         );
     }
 

@@ -1,6 +1,7 @@
 //! Runtime ownership of a libseat-managed native session.
 
 use crate::native_output::NativeSeatEvent;
+use oblivion_one::control_snapshots::{ControlSessionState, DoctorSeverity};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeSessionState {
@@ -43,6 +44,36 @@ impl NativeSessionLifecycle {
     #[cfg(test)]
     pub(crate) const fn state(self) -> NativeSessionState {
         self.state
+    }
+
+    pub(crate) const fn state_name(self) -> &'static str {
+        match self.state {
+            NativeSessionState::Active => "active",
+            NativeSessionState::Suspending | NativeSessionState::Resuming => "recovering",
+            NativeSessionState::Suspended => "suspended",
+            NativeSessionState::Failed => "failed",
+        }
+    }
+
+    pub(crate) const fn control_state(self) -> ControlSessionState {
+        match self.state {
+            NativeSessionState::Active => ControlSessionState::Active,
+            NativeSessionState::Suspended => ControlSessionState::Suspended,
+            NativeSessionState::Suspending | NativeSessionState::Resuming => {
+                ControlSessionState::Recovering
+            }
+            NativeSessionState::Failed => ControlSessionState::Failed,
+        }
+    }
+
+    pub(crate) const fn doctor_severity(self) -> DoctorSeverity {
+        match self.state {
+            NativeSessionState::Active => DoctorSeverity::Ok,
+            NativeSessionState::Suspended
+            | NativeSessionState::Suspending
+            | NativeSessionState::Resuming => DoctorSeverity::Warning,
+            NativeSessionState::Failed => DoctorSeverity::Error,
+        }
     }
     pub(crate) const fn permits_output(self) -> bool {
         self.state.permits_output()
@@ -156,6 +187,50 @@ mod tests {
         );
         assert!(!lifecycle.permits_output());
         assert_eq!(lifecycle.finish_resume(), None);
+    }
+
+    #[test]
+    fn failed_session_state_remains_failed_in_control_mapping() {
+        let lifecycle = NativeSessionLifecycle {
+            state: NativeSessionState::Failed,
+        };
+        assert_eq!(lifecycle.state_name(), "failed");
+    }
+
+    #[test]
+    fn session_control_and_doctor_mappings_are_exhaustive() {
+        let cases = [
+            (
+                NativeSessionState::Active,
+                ControlSessionState::Active,
+                DoctorSeverity::Ok,
+            ),
+            (
+                NativeSessionState::Suspending,
+                ControlSessionState::Recovering,
+                DoctorSeverity::Warning,
+            ),
+            (
+                NativeSessionState::Resuming,
+                ControlSessionState::Recovering,
+                DoctorSeverity::Warning,
+            ),
+            (
+                NativeSessionState::Suspended,
+                ControlSessionState::Suspended,
+                DoctorSeverity::Warning,
+            ),
+            (
+                NativeSessionState::Failed,
+                ControlSessionState::Failed,
+                DoctorSeverity::Error,
+            ),
+        ];
+        for (state, control, severity) in cases {
+            let lifecycle = NativeSessionLifecycle { state };
+            assert_eq!(lifecycle.control_state(), control);
+            assert_eq!(lifecycle.doctor_severity(), severity);
+        }
     }
 
     #[test]

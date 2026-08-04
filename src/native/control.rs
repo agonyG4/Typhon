@@ -491,18 +491,23 @@ impl NativeControlServer {
     ) -> Result<(), ControlServerError> {
         let encoded = match encode_response(&response) {
             Ok(encoded) => encoded,
-            Err(_) => encode_response(&ControlResponse::failure(
-                response.id,
-                ControlError::new(
-                    ControlErrorCode::Internal,
-                    "control response exceeded the protocol limit",
-                ),
-            ))
-            .map_err(|_| {
-                ControlServerError::ListenerFailure(
-                    "failed to encode bounded error response".to_string(),
-                )
-            })?,
+            Err(error) => {
+                if matches!(error, ControlCodecError::ResponseTooLarge) {
+                    self.counters.oversized = self.counters.oversized.saturating_add(1);
+                }
+                encode_response(&ControlResponse::failure(
+                    response.id,
+                    ControlError::new(
+                        ControlErrorCode::Internal,
+                        "control response exceeded the protocol limit",
+                    ),
+                ))
+                .map_err(|_| {
+                    ControlServerError::ListenerFailure(
+                        "failed to encode bounded error response".to_string(),
+                    )
+                })?
+            }
         };
         let Some(client) = self.clients.get_mut(&token) else {
             return Ok(());

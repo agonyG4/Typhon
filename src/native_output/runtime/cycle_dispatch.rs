@@ -4,6 +4,11 @@ use super::*;
 use oblivion_one::control::{
     ControlCommand, ControlError, ControlErrorCode, ControlRequest, ControlResponse,
 };
+use oblivion_one::control_snapshots::{
+    ActiveWindowSnapshot, ControlStatusSnapshot, DoctorCheck, DoctorSeverity, DoctorSnapshot,
+    FeatureState, FeatureStateSnapshot, ModeSnapshot, OutputListSnapshot, OutputSnapshot,
+    PositionSnapshot, StatusSnapshot, VersionSnapshot, XwaylandStatusSnapshot,
+};
 use oblivion_one::native::event_loop::NativeWakeup;
 
 impl NativeRuntime {
@@ -25,15 +30,225 @@ impl NativeRuntime {
     }
 
     fn dispatch_control_command(&mut self, request: ControlRequest) -> ControlResponse {
-        let message = if ControlCommand::parse(&request.command).is_some() {
-            "control command semantics are pending M3"
-        } else {
-            "unknown control command"
+        let Some(command) = ControlCommand::parse(&request.command) else {
+            return ControlResponse::failure(
+                request.id,
+                ControlError::new(ControlErrorCode::InvalidCommand, "unknown control command"),
+            );
         };
-        ControlResponse::failure(
-            request.id,
-            ControlError::new(ControlErrorCode::InvalidCommand, message),
-        )
+        let result = match command {
+            ControlCommand::Version => serde_json::to_value(VersionSnapshot {
+                protocol_version: oblivion_one::control::CONTROL_VERSION,
+                compositor_name: "Typhon".to_string(),
+                compositor_version: env!("CARGO_PKG_VERSION").to_string(),
+                git_commit: option_env!("GIT_COMMIT").map(str::to_string),
+                build_profile: if cfg!(debug_assertions) {
+                    "debug".to_string()
+                } else {
+                    "release".to_string()
+                },
+                rustc_version: option_env!("RUSTC_VERSION").map(str::to_string),
+            }),
+            ControlCommand::Status => {
+                let (_, mapped, minimized) = self.server.control_window_counts();
+                serde_json::to_value(StatusSnapshot {
+                    instance: self.server.socket_name().to_string(),
+                    wayland_display: self.server.socket_name().to_string(),
+                    uptime_ms: self
+                        .started_at
+                        .elapsed()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64,
+                    session_state: self.session.control_state(),
+                    shutdown_state: self.shutdown.state().as_str().to_string(),
+                    output_count: if self.scanout_destroyed { 0 } else { 1 },
+                    mapped_window_count: mapped,
+                    minimized_window_count: minimized,
+                    active_window: self
+                        .server
+                        .control_active_window_snapshot()
+                        .map(|window| window.id),
+                    xwayland: XwaylandStatusSnapshot {
+                        configured: !matches!(
+                            self.xwayland.state_kind(),
+                            oblivion_one::xwayland::XwaylandStateKind::Disabled
+                        ),
+                        state: self.xwayland.state_kind().as_str().to_string(),
+                        generation: self
+                            .xwayland
+                            .generation()
+                            .map(|generation| generation.get()),
+                    },
+                    control: ControlStatusSnapshot {
+                        endpoint_active: !self.shutdown.is_complete(),
+                        client_count: u32::try_from(self.control_server.client_count())
+                            .unwrap_or(u32::MAX),
+                        accepted: self.control_server.counters().accepted,
+                    },
+                })
+            }
+            ControlCommand::Doctor => {
+                let output_available = !self.scanout_destroyed;
+                let session_severity = self.session.doctor_severity();
+                let direct_state = self.direct_scanout_state();
+                let checks = vec![
+                    doctor_check(
+                        "control.endpoint",
+                        DoctorSeverity::Ok,
+                        "secure endpoint active",
+                    ),
+                    doctor_check(
+                        "session.state",
+                        session_severity,
+                        format!("session {}", self.session.state_name()),
+                    ),
+                    doctor_check(
+                        "output.available",
+                        if output_available {
+                            DoctorSeverity::Ok
+                        } else {
+                            DoctorSeverity::Error
+                        },
+                        if output_available {
+                            "active output available"
+                        } else {
+                            "no active output"
+                        },
+                    ),
+                    doctor_check(
+                        "kms.backend",
+                        DoctorSeverity::Ok,
+                        self.kms_backend.effective_kind().as_str(),
+                    ),
+                    doctor_check(
+                        "renderer.backend",
+                        DoctorSeverity::Ok,
+                        self.scanout.kind().as_str(),
+                    ),
+                    doctor_check(
+                        "output.mode",
+                        if output_available {
+                            DoctorSeverity::Ok
+                        } else {
+                            DoctorSeverity::Error
+                        },
+                        self.mode_label.clone(),
+                    ),
+                    doctor_check(
+                        "cursor.backend",
+                        DoctorSeverity::Ok,
+                        self.cursor_render_mode.as_str(),
+                    ),
+                    doctor_check(
+                        "xwayland.state",
+                        match self.xwayland.state_kind() {
+                            oblivion_one::xwayland::XwaylandStateKind::Failed => {
+                                DoctorSeverity::Warning
+                            }
+                            oblivion_one::xwayland::XwaylandStateKind::Disabled => {
+                                DoctorSeverity::Ok
+                            }
+                            _ => DoctorSeverity::Ok,
+                        },
+                        format!("XWayland {}", self.xwayland.state_kind().as_str()),
+                    ),
+                    doctor_check(
+                        "shutdown.state",
+                        if self.shutdown.is_complete() {
+                            DoctorSeverity::Warning
+                        } else {
+                            DoctorSeverity::Ok
+                        },
+                        self.shutdown.state().as_str(),
+                    ),
+                    doctor_check(
+                        "kms_worker.state",
+                        kms_worker_doctor_severity(
+                            self.kms_commit_worker_policy,
+                            self.kms_commit_worker_transport,
+                            self.kms_commit_worker_startup,
+                            self.kms_commit_worker.is_some(),
+                        ),
+                        format!(
+                            "policy={} transport={} startup={}",
+                            self.kms_commit_worker_policy.as_str(),
+                            self.kms_commit_worker_transport.as_str(),
+                            self.kms_commit_worker_startup.as_str()
+                        ),
+                    ),
+                    doctor_check(
+                        "direct_scanout.state",
+                        direct_scanout_doctor_severity(
+                            self.direct_scanout_preference.enabled(),
+                            direct_state,
+                        ),
+                        direct_state.as_str(),
+                    ),
+                    doctor_check(
+                        "triple_buffering.state",
+                        oblivion_one::native::adaptive_buffering::triple_buffering_doctor_severity(
+                            self.triple_buffer_policy,
+                            self.adaptive_buffering.mode(),
+                            self.adaptive_buffering
+                                .force_unavailable_blocker()
+                                .is_some(),
+                        ),
+                        format!(
+                            "policy={} mode={}",
+                            self.triple_buffer_policy.as_str(),
+                            self.adaptive_buffering.mode().as_str()
+                        ),
+                    ),
+                    doctor_check(
+                        "vrr.state",
+                        vrr_doctor_severity(self.vrr_plan.requested, self.vrr_plan.supported),
+                        format!(
+                            "requested={} supported={}",
+                            self.vrr_plan.requested.as_str(),
+                            self.vrr_plan.supported
+                        ),
+                    ),
+                ];
+                serde_json::to_value(DoctorSnapshot {
+                    healthy: checks
+                        .iter()
+                        .all(|check| matches!(check.severity, DoctorSeverity::Ok)),
+                    checks,
+                })
+            }
+            ControlCommand::Outputs => serde_json::to_value(OutputListSnapshot {
+                outputs: if self.scanout_destroyed {
+                    Vec::new()
+                } else {
+                    vec![self.control_output_snapshot()]
+                },
+                total: if self.scanout_destroyed { 0 } else { 1 },
+                truncated: false,
+            }),
+            ControlCommand::Windows => self
+                .server
+                .control_window_list_snapshot()
+                .and_then(serde_json::to_value),
+            ControlCommand::ActiveWindow => serde_json::to_value(ActiveWindowSnapshot {
+                window: self.server.control_active_window_snapshot(),
+            }),
+            _ => {
+                return ControlResponse::failure(
+                    request.id,
+                    ControlError::new(
+                        ControlErrorCode::InvalidCommand,
+                        "command is not available in M3",
+                    ),
+                );
+            }
+        };
+        match result {
+            Ok(result) => ControlResponse::success(request.id, result),
+            Err(_) => ControlResponse::failure(
+                request.id,
+                ControlError::new(ControlErrorCode::Internal, "control snapshot failed"),
+            ),
+        }
     }
 
     #[allow(unused_variables)]
@@ -254,6 +469,67 @@ impl NativeRuntime {
         cycle.raw_input_events = raw_input_events;
         cycle.coalesced_input_events = coalesced_input_events;
         Ok(())
+    }
+}
+
+fn doctor_check(id: &str, severity: DoctorSeverity, summary: impl Into<String>) -> DoctorCheck {
+    DoctorCheck {
+        id: id.to_string(),
+        severity,
+        summary: summary.into(),
+        detail: None,
+    }
+}
+
+impl NativeRuntime {
+    fn direct_scanout_state(&self) -> FeatureState {
+        if !self.direct_scanout_preference.enabled() || self.scanout_destroyed {
+            FeatureState::Unavailable
+        } else if self
+            .presented_planes
+            .primary
+            .is_some_and(ConfirmedPrimaryAssignment::is_direct)
+        {
+            FeatureState::Active
+        } else if self.direct_scanout_qualification.is_qualified() {
+            FeatureState::Available
+        } else {
+            FeatureState::Configured
+        }
+    }
+
+    fn control_output_snapshot(&self) -> OutputSnapshot {
+        let direct_state = self.direct_scanout_state();
+        let vrr_state = if !self.vrr_plan.supported {
+            FeatureState::Unavailable
+        } else if self.vrr_plan.planned_enabled {
+            FeatureState::Configured
+        } else {
+            FeatureState::Available
+        };
+        OutputSnapshot {
+            id: "oblivion-1".to_string(),
+            name: "Oblivion-1".to_string(),
+            make: None,
+            model: None,
+            serial: None,
+            enabled: !self.scanout_destroyed,
+            current_mode: (!self.scanout_destroyed).then_some(ModeSnapshot {
+                width: self.target.width,
+                height: self.target.height,
+                refresh_millihz: self.refresh_hz.saturating_mul(1000),
+            }),
+            physical_size_mm: None,
+            scale_milli: 1000,
+            transform: "normal".to_string(),
+            position: PositionSnapshot { x: 0, y: 0 },
+            focused: true,
+            backend: self.kms_backend.effective_kind().as_str().to_string(),
+            vrr: FeatureStateSnapshot { state: vrr_state },
+            direct_scanout: FeatureStateSnapshot {
+                state: direct_state,
+            },
+        }
     }
 }
 

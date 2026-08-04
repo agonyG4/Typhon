@@ -1480,3 +1480,18 @@ fn installed_xwayland_private_socket_smoke_test() -> Result<(), Box<dyn std::err
     assert!(!auth_path.exists());
     Ok(())
 }
+#[test]
+fn xwayland_state_kind_uses_exhaustive_stable_names() {
+    let states = [
+        (XwaylandStateKind::Disabled, "disabled"),
+        (XwaylandStateKind::Armed, "armed"),
+        (XwaylandStateKind::Starting, "starting"),
+        (XwaylandStateKind::RunningBase, "running_base"),
+        (XwaylandStateKind::Running, "running"),
+        (XwaylandStateKind::Backoff, "backoff"),
+        (XwaylandStateKind::Failed, "failed"),
+    ];
+    for (state, expected) in states {
+        assert_eq!(state.as_str(), expected);
+    }
+}

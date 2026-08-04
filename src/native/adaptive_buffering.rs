@@ -46,6 +46,15 @@ pub enum AdaptiveBufferingMode {
     Triple,
 }
 
+impl AdaptiveBufferingMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Double => "double",
+            Self::Triple => "triple",
+        }
+    }
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TripleCapabilityBlocker {
@@ -554,6 +563,21 @@ impl AdaptiveBufferingController {
 
     pub fn reset(&mut self) {
         *self = Self::new(self.policy);
+    }
+}
+
+pub fn triple_buffering_doctor_severity(
+    policy: AdaptiveTripleBufferPolicy,
+    mode: AdaptiveBufferingMode,
+    forced_requirement_failed: bool,
+) -> crate::control_snapshots::DoctorSeverity {
+    use crate::control_snapshots::DoctorSeverity;
+
+    match (policy, mode, forced_requirement_failed) {
+        (AdaptiveTripleBufferPolicy::Force, AdaptiveBufferingMode::Double, true) => {
+            DoctorSeverity::Warning
+        }
+        _ => DoctorSeverity::Ok,
     }
 }
 
@@ -1356,5 +1380,55 @@ mod tests {
             }
             assert_eq!(controller.mode(), AdaptiveBufferingMode::Triple);
         }
+    }
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    use super::*;
+    use crate::control_snapshots::DoctorSeverity;
+
+    #[test]
+    fn doctor_severity_does_not_penalize_intentional_double_buffering() {
+        assert_eq!(
+            triple_buffering_doctor_severity(
+                AdaptiveTripleBufferPolicy::Off,
+                AdaptiveBufferingMode::Double,
+                false,
+            ),
+            DoctorSeverity::Ok
+        );
+        assert_eq!(
+            triple_buffering_doctor_severity(
+                AdaptiveTripleBufferPolicy::Auto,
+                AdaptiveBufferingMode::Double,
+                false,
+            ),
+            DoctorSeverity::Ok
+        );
+        assert_eq!(
+            triple_buffering_doctor_severity(
+                AdaptiveTripleBufferPolicy::Force,
+                AdaptiveBufferingMode::Triple,
+                false,
+            ),
+            DoctorSeverity::Ok
+        );
+        assert_eq!(
+            triple_buffering_doctor_severity(
+                AdaptiveTripleBufferPolicy::Force,
+                AdaptiveBufferingMode::Double,
+                false,
+            ),
+            DoctorSeverity::Ok
+        );
+        assert_eq!(
+            triple_buffering_doctor_severity(
+                AdaptiveTripleBufferPolicy::Force,
+                AdaptiveBufferingMode::Double,
+                true,
+            ),
+            DoctorSeverity::Warning
+        );
     }
 }

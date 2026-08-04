@@ -16,7 +16,8 @@ pub(crate) use payload::{
     KmsValidationBase, ValidationBaseDisposition, validation_base_ready,
 };
 pub(crate) use policy::{
-    KmsCommitWorkerPolicy, KmsCommitWorkerStartupError, KmsCommitWorkerTransport,
+    KmsCommitWorkerPolicy, KmsCommitWorkerStartup, KmsCommitWorkerStartupError,
+    KmsCommitWorkerTransport, kms_worker_doctor_severity,
 };
 #[cfg(test)]
 pub(crate) use queue::KmsWorkerForcedShutdownDisposition;
