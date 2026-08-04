@@ -851,6 +851,10 @@ impl OwnCompositorServer {
         self.state.interaction_cursor_override_active()
     }
 
+    pub fn compositor_cursor_shape(&self) -> crate::cursor_theme::CompositorCursorShape {
+        self.state.compositor_cursor_shape()
+    }
+
     pub fn client_cursor_request_active(&self) -> bool {
         self.state.active_client_cursor.is_some()
     }

@@ -687,6 +687,30 @@ impl CompositorState {
         self.interaction_cursor_override.is_some()
     }
 
+    pub(in crate::compositor) fn compositor_cursor_shape(
+        &self,
+    ) -> crate::cursor_theme::CompositorCursorShape {
+        match self
+            .interaction_cursor_override
+            .map(|override_state| override_state.shape)
+        {
+            None => crate::cursor_theme::CompositorCursorShape::Pointer,
+            Some(InteractionCursorShape::Move) => crate::cursor_theme::CompositorCursorShape::Move,
+            Some(InteractionCursorShape::ResizeHorizontal) => {
+                crate::cursor_theme::CompositorCursorShape::ResizeHorizontal
+            }
+            Some(InteractionCursorShape::ResizeVertical) => {
+                crate::cursor_theme::CompositorCursorShape::ResizeVertical
+            }
+            Some(InteractionCursorShape::ResizeDiagonalNwSe) => {
+                crate::cursor_theme::CompositorCursorShape::ResizeDiagonalNwSe
+            }
+            Some(InteractionCursorShape::ResizeDiagonalNeSw) => {
+                crate::cursor_theme::CompositorCursorShape::ResizeDiagonalNeSw
+            }
+        }
+    }
+
     pub(in crate::compositor) fn allocate_window_interaction_id(&mut self) -> WindowInteractionId {
         self.next_window_interaction_id = self.next_window_interaction_id.saturating_add(1);
         WindowInteractionId::new(self.next_window_interaction_id.max(1))

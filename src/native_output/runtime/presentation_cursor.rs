@@ -4,6 +4,62 @@ use crate::native_output::kms_worker::AttachablePrimary;
 use crate::native_output::kms_worker::KmsPrimaryCursorPresentation;
 use crate::native_output::presentation::plane::CursorRevision;
 
+pub(super) fn synchronize_active_cursor_image(
+    server: &OwnCompositorServer,
+    cursor_manager: &mut oblivion_one::cursor_manager::CursorThemeManager,
+    cursor_image: &mut std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
+    frame_renderer: &mut NativeFrameRenderer,
+    scanout: &mut NativeScanoutBackend,
+    queued_redraw_requested: &mut bool,
+) {
+    cursor_manager.collect_retired_generations();
+    let image = cursor_manager.active_image_for_shape(server.compositor_cursor_shape());
+    if !std::sync::Arc::ptr_eq(cursor_image, &image) {
+        *cursor_image = image.clone();
+        frame_renderer.set_cursor_image(image.clone());
+        scanout.set_cursor_image(image.clone());
+        oblivion_one::cursor_theme::install_shared_compositor_cursor(image);
+        *queued_redraw_requested = true;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_legacy_cursor_for_frame(
+    legacy_cursor: &mut Option<NativeLegacyHardwareCursor>,
+    kms: &NativeDrmDevice,
+    crtc_id: u32,
+    cursor_image: &std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
+    cursor_render_mode: &mut NativeCursorRenderMode,
+    cursor_manager: &mut oblivion_one::cursor_manager::CursorThemeManager,
+    client_cursor_active: bool,
+    perf: NativePerfLogger,
+) -> NativeResult<()> {
+    refresh_legacy_cursor_theme(
+        legacy_cursor,
+        kms,
+        crtc_id,
+        cursor_image,
+        cursor_render_mode,
+        cursor_manager,
+        perf,
+    )?;
+    if client_cursor_active && let Some(mut cursor) = legacy_cursor.take() {
+        if let Err(error) = cursor.disable() {
+            cursor.disarm_drm_cleanup();
+            cursor_manager.note_hardware_fallback();
+            perf.log("native.cursor", || {
+                vec![
+                    NativePerfField::str("event", "legacy_client_cursor_disable_failed"),
+                    NativePerfField::str("error", error.to_string()),
+                ]
+            });
+        } else {
+            *legacy_cursor = Some(cursor);
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn resolve_native_cursor_visibility<'a>(
     server: &'a OwnCompositorServer,
     input_state: &NativeInputState,
@@ -40,12 +96,23 @@ pub(super) fn refresh_legacy_cursor_theme(
     if legacy.matches_image(cursor_image) {
         return Ok(());
     }
-    match NativeLegacyHardwareCursor::create(kms.file(), crtc_id, cursor_image.as_ref()) {
+    match NativeLegacyHardwareCursor::create(kms.file(), crtc_id, cursor_image) {
         Ok(replacement) => {
             if let Some(mut previous) = legacy_cursor.replace(replacement)
                 && previous.active
+                && let Err(error) = previous.disable()
             {
-                previous.disable()?;
+                previous.disarm_drm_cleanup();
+                *legacy_cursor = None;
+                *cursor_render_mode = NativeCursorRenderMode::Software;
+                cursor_manager.note_hardware_fallback();
+                perf.log("native.cursor", || {
+                    vec![
+                        NativePerfField::str("event", "legacy_cursor_disable_failed"),
+                        NativePerfField::str("error", error.to_string()),
+                    ]
+                });
+                return Ok(());
             }
             *cursor_render_mode = NativeCursorRenderMode::Hardware;
         }
@@ -64,6 +131,7 @@ pub(super) fn refresh_legacy_cursor_theme(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_cursor_image(
     cursor: &mut NativeAtomicCursor,
     theme_image: &std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
@@ -71,6 +139,7 @@ pub(super) fn prepare_cursor_image(
     client_cursor: Option<oblivion_one::compositor::ClientCursorRenderState<'_>>,
     kms: &NativeDrmDevice,
     input_state: &NativeInputState,
+    cursor_manager: &mut oblivion_one::cursor_manager::CursorThemeManager,
     perf: NativePerfLogger,
 ) -> bool {
     if let Some(client) = client_cursor {
@@ -112,6 +181,7 @@ pub(super) fn prepare_cursor_image(
             if let Err(error) =
                 cursor.replace_theme_image(kms.file(), theme_image.clone(), theme_generation)
             {
+                cursor_manager.note_hardware_fallback();
                 perf.log("native.cursor", || {
                     vec![
                         NativePerfField::str("event", "theme_replace_failed"),

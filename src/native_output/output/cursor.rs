@@ -656,6 +656,9 @@ impl NativeAtomicCursor {
         image: Arc<CompositorCursorImage>,
         generation: u64,
     ) -> io::Result<()> {
+        if !Arc::ptr_eq(&self.theme_image, &image) {
+            self.resources.retire_theme_cache();
+        }
         self.replace_image_with_source(file, image.clone(), NativeCursorSourceKey::Theme)?;
         self.theme_image = image;
         self.desired.image_generation = generation;

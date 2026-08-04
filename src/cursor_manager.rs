@@ -1,11 +1,13 @@
 //! Runtime-owned cursor configuration, loading, publication, and retirement.
 
 use crate::control_snapshots::{
-    CursorBackendSnapshot, CursorConfigSource, CursorPersistenceSnapshot, CursorSnapshot,
+    CursorAssetSource, CursorBackendSnapshot, CursorConfigSource, CursorPersistenceSnapshot,
+    CursorSnapshot,
 };
 use crate::cursor_persistence::{CursorConfigurationStore, CursorPersistenceError};
 use crate::cursor_theme::{
-    CompositorCursorImage, CursorConfiguration, default_cursor_configuration,
+    CompositorCursorImage, CompositorCursorShape, CursorConfiguration, CursorShapeImages,
+    CursorThemeLoadError, default_cursor_configuration,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -19,6 +21,9 @@ pub enum CursorManagerError {
     InvalidSize,
     ThemeNotFound,
     ThemeLoadFailed,
+    RequiredPointerMissing,
+    CursorFileReadFailed,
+    CursorFileInvalid,
     ConfigMissing,
     ConfigInvalid,
     ConfigInsecure,
@@ -33,6 +38,9 @@ impl CursorManagerError {
             Self::InvalidSize => "invalid_cursor_size",
             Self::ThemeNotFound => "cursor_theme_not_found",
             Self::ThemeLoadFailed => "cursor_theme_load_failed",
+            Self::RequiredPointerMissing => "required_pointer_missing",
+            Self::CursorFileReadFailed => "cursor_file_read_failed",
+            Self::CursorFileInvalid => "cursor_file_invalid",
             Self::ConfigMissing => "cursor_config_missing",
             Self::ConfigInvalid => "cursor_config_invalid",
             Self::ConfigInsecure => "cursor_config_insecure",
@@ -53,15 +61,33 @@ impl std::error::Error for CursorManagerError {}
 #[derive(Debug)]
 pub struct LoadedCursorTheme {
     pub configuration: CursorConfiguration,
-    pub image: Arc<CompositorCursorImage>,
+    pub images: CursorShapeImages,
+    pub asset_source: CursorAssetSource,
 }
 
 impl LoadedCursorTheme {
     pub fn new(configuration: CursorConfiguration, image: Arc<CompositorCursorImage>) -> Self {
         Self {
             configuration,
-            image,
+            images: CursorShapeImages::from_pointer(image),
+            asset_source: CursorAssetSource::SystemTheme,
         }
+    }
+
+    pub fn from_images(
+        configuration: CursorConfiguration,
+        images: CursorShapeImages,
+        asset_source: CursorAssetSource,
+    ) -> Self {
+        Self {
+            configuration,
+            images,
+            asset_source,
+        }
+    }
+
+    pub fn image(&self, shape: CompositorCursorShape) -> Arc<CompositorCursorImage> {
+        self.images.image(shape)
     }
 }
 
@@ -69,7 +95,7 @@ pub trait CursorThemeLoader {
     fn load(
         &mut self,
         configuration: &CursorConfiguration,
-    ) -> Result<LoadedCursorTheme, CursorManagerError>;
+    ) -> Result<LoadedCursorTheme, CursorThemeLoadError>;
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -146,10 +172,10 @@ impl CursorThemeManager {
                 Err(error) => {
                     eprintln!("cursor configuration: using default ({error})");
                     (
-                        default.clone(),
+                        configuration,
                         startup_default_theme(&mut *loader, &default),
-                        CursorConfigSource::Default,
-                        CursorPersistenceSnapshot::Invalid,
+                        CursorConfigSource::Config,
+                        CursorPersistenceSnapshot::Saved,
                     )
                 }
             },
@@ -260,11 +286,23 @@ impl CursorThemeManager {
             backend,
             source: self.source,
             persistence: self.persistence,
+            asset_source: self.active.asset_source,
         }
     }
 
     pub fn active_image(&self) -> Arc<CompositorCursorImage> {
-        self.active.image.clone()
+        self.active.image(CompositorCursorShape::Pointer)
+    }
+
+    pub fn active_image_for_shape(
+        &self,
+        shape: CompositorCursorShape,
+    ) -> Arc<CompositorCursorImage> {
+        self.active.image(shape)
+    }
+
+    pub const fn asset_source(&self) -> CursorAssetSource {
+        self.active.asset_source
     }
 
     pub fn desired_configuration(&self) -> &CursorConfiguration {
@@ -316,7 +354,7 @@ impl CursorThemeManager {
     pub fn collect_retired_generations(&mut self) {
         let before = self.retired.len();
         self.retired
-            .retain(|retired| Arc::strong_count(&retired.theme.image) > 1);
+            .retain(|retired| retired.theme.images.has_external_owner());
         let retired = before.saturating_sub(self.retired.len());
         self.diagnostics.retired_generations = self
             .diagnostics
@@ -362,7 +400,7 @@ impl CursorThemeManager {
             Err(error) => {
                 self.diagnostics.theme_load_failures =
                     self.diagnostics.theme_load_failures.saturating_add(1);
-                Err(error)
+                Err(map_theme_load_error(error))
             }
         }
     }
@@ -433,21 +471,13 @@ impl CursorThemeLoader for SystemCursorThemeLoader {
     fn load(
         &mut self,
         configuration: &CursorConfiguration,
-    ) -> Result<LoadedCursorTheme, CursorManagerError> {
-        let image = crate::cursor_theme::load_cursor_from_theme(
-            &configuration.theme,
-            configuration.size_px,
-        )
-        .map_err(|error| {
-            if error.contains("has no left pointer cursor") {
-                CursorManagerError::ThemeNotFound
-            } else {
-                CursorManagerError::ThemeLoadFailed
-            }
-        })?;
-        Ok(LoadedCursorTheme::new(
+    ) -> Result<LoadedCursorTheme, CursorThemeLoadError> {
+        let images =
+            crate::cursor_theme::load_cursor_theme(&configuration.theme, configuration.size_px)?;
+        Ok(LoadedCursorTheme::from_images(
             configuration.clone(),
-            Arc::new(image),
+            images,
+            CursorAssetSource::SystemTheme,
         ))
     }
 }
@@ -457,11 +487,21 @@ fn startup_default_theme(
     configuration: &CursorConfiguration,
 ) -> LoadedCursorTheme {
     loader.load(configuration).unwrap_or_else(|_| {
-        LoadedCursorTheme::new(
+        LoadedCursorTheme::from_images(
             configuration.clone(),
-            Arc::new(CompositorCursorImage::builtin_fallback()),
+            CursorShapeImages::from_pointer(Arc::new(CompositorCursorImage::builtin_fallback())),
+            CursorAssetSource::BuiltinFallback,
         )
     })
+}
+
+fn map_theme_load_error(error: CursorThemeLoadError) -> CursorManagerError {
+    match error {
+        CursorThemeLoadError::ThemeNotFound => CursorManagerError::ThemeNotFound,
+        CursorThemeLoadError::RequiredPointerMissing => CursorManagerError::RequiredPointerMissing,
+        CursorThemeLoadError::CursorFileReadFailed => CursorManagerError::CursorFileReadFailed,
+        CursorThemeLoadError::CursorFileInvalid => CursorManagerError::CursorFileInvalid,
+    }
 }
 
 fn persistence_snapshot(error: CursorPersistenceError) -> CursorPersistenceSnapshot {

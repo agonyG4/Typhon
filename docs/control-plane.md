@@ -76,20 +76,30 @@ Cursor configuration is persisted at
 `$XDG_CONFIG_HOME/AstreaOS/input/cursor.json`, or
 `$HOME/.config/AstreaOS/input/cursor.json` when `XDG_CONFIG_HOME` is unset.
 AstreaOS-owned directories are private `0700` directories and the file is a
-regular `0600` file. Publication uses a private unpredictable temporary file,
-flush, file `fsync`, atomic rename, and parent-directory `fsync` where
-supported. Symlinks, foreign ownership, unexpected node types, malformed
-documents, and unsupported versions are rejected. Startup falls back to the
-existing built-in/default cursor and emits one bounded warning when persisted
-configuration is invalid or unavailable.
+regular `0600` file. Reads and writes are relative to validated no-follow
+directory descriptors. Publication uses a private unpredictable temporary
+file, flush, file `fsync`, no-replace publication, exact-inode verification,
+and parent-directory `fsync` where supported. Symlinks, foreign ownership,
+unexpected node types, malformed documents, and unsupported versions are
+rejected. A missing standard `$HOME/.config` is securely created as `0700`; a
+missing explicit `XDG_CONFIG_HOME` is not created implicitly. Startup falls
+back to the existing default or builtin cursor, keeps the desired logical
+configuration, and emits one bounded warning when persisted configuration or
+assets are invalid or unavailable.
 
 Cursor backend values are `hardware`, `software`, `hidden`, and `unavailable`.
-The active theme and size are shared by the software-rendered and hardware
-cursor paths. Hardware update failure falls back to software without making a
-valid logical configuration fatal. Future supervised children receive
+The compositor-owned shape values are `pointer`, `move`,
+`resize_horizontal`, `resize_vertical`, `resize_diagonal_nw_se`, and
+`resize_diagonal_ne_sw`. The pointer uses `left_ptr`, `default`, and `arrow`;
+optional interaction aliases fall back to the pointer. The active shape bundle
+is shared by software, atomic hardware, and legacy hardware paths. Hardware
+update failure falls back to software without making a valid logical
+configuration fatal. Future supervised children receive the desired logical
 `XCURSOR_THEME` and `XCURSOR_SIZE` in their command-local environment; Typhon
 does not mutate its process-global environment, and already-running clients
-that own their own cursor surfaces are not forced to reload.
+that own their own cursor surfaces are not forced to reload. The snapshot
+`asset_source` value is `system_theme` for a loaded system theme and
+`builtin_fallback` for Typhon's fallback; the latter is a doctor warning.
 
 Window snapshots use an explicit serialized-byte budget below the 1 MiB
 response cap. If the complete authoritative window set cannot fit, the list is

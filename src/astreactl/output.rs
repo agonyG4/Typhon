@@ -76,7 +76,7 @@ pub fn human(result: &AstreactlResult) -> String {
 
 fn format_cursor(snapshot: &CursorSnapshot) -> String {
     format!(
-        "Theme: {}\nSize: {} px\nActive: {} at {} px\nGeneration: {}\nBackend: {}\nSource: {}\nPersistence: {}",
+        "Theme: {}\nSize: {} px\nActive: {} at {} px\nGeneration: {}\nBackend: {}\nSource: {}\nPersistence: {}\nAsset: {}",
         sanitize_terminal_text(&snapshot.desired_theme),
         snapshot.desired_size_px,
         sanitize_terminal_text(&snapshot.active_theme),
@@ -85,6 +85,7 @@ fn format_cursor(snapshot: &CursorSnapshot) -> String {
         snapshot.backend.as_str(),
         snapshot.source.as_str(),
         snapshot.persistence.as_str(),
+        snapshot.asset_source.as_str(),
     )
 }
 

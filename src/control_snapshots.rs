@@ -153,6 +153,23 @@ impl CursorPersistenceSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum CursorAssetSource {
+    SystemTheme,
+    BuiltinFallback,
+}
+
+impl CursorAssetSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SystemTheme => "system_theme",
+            Self::BuiltinFallback => "builtin_fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct ControlWindowId(pub u64);
@@ -361,6 +378,7 @@ pub struct CursorSnapshot {
     pub backend: CursorBackendSnapshot,
     pub source: CursorConfigSource,
     pub persistence: CursorPersistenceSnapshot,
+    pub asset_source: CursorAssetSource,
 }
 
 #[derive(Debug, Clone, Serialize)]

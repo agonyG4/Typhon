@@ -15,7 +15,98 @@ pub const DEFAULT_CURSOR_SIZE: u32 = 24;
 pub const MIN_CURSOR_SIZE: u32 = 8;
 pub const MAX_CURSOR_SIZE: u32 = 256;
 pub const MAX_CURSOR_THEME_BYTES: usize = 128;
-const CURSOR_NAMES: [&str; 3] = ["left_ptr", "default", "arrow"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompositorCursorShape {
+    Pointer,
+    Move,
+    ResizeHorizontal,
+    ResizeVertical,
+    ResizeDiagonalNwSe,
+    ResizeDiagonalNeSw,
+}
+
+impl CompositorCursorShape {
+    pub const ALL: [Self; 6] = [
+        Self::Pointer,
+        Self::Move,
+        Self::ResizeHorizontal,
+        Self::ResizeVertical,
+        Self::ResizeDiagonalNwSe,
+        Self::ResizeDiagonalNeSw,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pointer => "pointer",
+            Self::Move => "move",
+            Self::ResizeHorizontal => "resize_horizontal",
+            Self::ResizeVertical => "resize_vertical",
+            Self::ResizeDiagonalNwSe => "resize_diagonal_nw_se",
+            Self::ResizeDiagonalNeSw => "resize_diagonal_ne_sw",
+        }
+    }
+
+    pub const fn aliases(self) -> &'static [&'static str] {
+        match self {
+            Self::Pointer => &["left_ptr", "default", "arrow"],
+            Self::Move => &["move", "fleur", "all-scroll"],
+            Self::ResizeHorizontal => &[
+                "ew-resize",
+                "size_hor",
+                "sb_h_double_arrow",
+                "left_side",
+                "right_side",
+            ],
+            Self::ResizeVertical => &[
+                "ns-resize",
+                "size_ver",
+                "sb_v_double_arrow",
+                "top_side",
+                "bottom_side",
+            ],
+            Self::ResizeDiagonalNwSe => &[
+                "nwse-resize",
+                "size_fdiag",
+                "top_left_corner",
+                "bottom_right_corner",
+            ],
+            Self::ResizeDiagonalNeSw => &[
+                "nesw-resize",
+                "size_bdiag",
+                "top_right_corner",
+                "bottom_left_corner",
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorThemeLoadError {
+    ThemeNotFound,
+    RequiredPointerMissing,
+    CursorFileReadFailed,
+    CursorFileInvalid,
+}
+
+impl CursorThemeLoadError {
+    pub const fn detail(self) -> &'static str {
+        match self {
+            Self::ThemeNotFound => "theme_not_found",
+            Self::RequiredPointerMissing => "required_pointer_missing",
+            Self::CursorFileReadFailed => "cursor_file_read_failed",
+            Self::CursorFileInvalid => "cursor_file_invalid",
+        }
+    }
+}
+
+impl std::fmt::Display for CursorThemeLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.detail())
+    }
+}
+
+impl std::error::Error for CursorThemeLoadError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CursorConfigurationError {
@@ -82,6 +173,79 @@ pub struct CompositorCursorImage {
     pub(crate) requested_size: u32,
     pub(crate) theme: String,
     pub(crate) source: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CursorShapeImages {
+    images: [Arc<CompositorCursorImage>; 6],
+}
+
+impl CursorShapeImages {
+    pub fn from_pointer(pointer: Arc<CompositorCursorImage>) -> Self {
+        Self {
+            images: [
+                pointer.clone(),
+                pointer.clone(),
+                pointer.clone(),
+                pointer.clone(),
+                pointer.clone(),
+                pointer,
+            ],
+        }
+    }
+
+    pub fn from_images(
+        pointer: Arc<CompositorCursorImage>,
+        movement: Arc<CompositorCursorImage>,
+        horizontal: Arc<CompositorCursorImage>,
+        vertical: Arc<CompositorCursorImage>,
+        diagonal_nw_se: Arc<CompositorCursorImage>,
+        diagonal_ne_sw: Arc<CompositorCursorImage>,
+    ) -> Self {
+        Self {
+            images: [
+                pointer,
+                movement,
+                horizontal,
+                vertical,
+                diagonal_nw_se,
+                diagonal_ne_sw,
+            ],
+        }
+    }
+
+    pub fn image(&self, shape: CompositorCursorShape) -> Arc<CompositorCursorImage> {
+        self.images[shape as usize].clone()
+    }
+
+    pub fn has_external_owner(&self) -> bool {
+        for (index, image) in self.images.iter().enumerate() {
+            if self.images[..index]
+                .iter()
+                .find(|candidate| Arc::ptr_eq(candidate, image))
+                .is_some()
+            {
+                continue;
+            }
+            let internal_references = self
+                .images
+                .iter()
+                .filter(|candidate| Arc::ptr_eq(candidate, image))
+                .count();
+            if Arc::strong_count(image) > internal_references {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn all(
+        &self,
+    ) -> impl Iterator<Item = (CompositorCursorShape, Arc<CompositorCursorImage>)> + '_ {
+        CompositorCursorShape::ALL
+            .into_iter()
+            .zip(self.images.iter().cloned())
+    }
 }
 
 impl CompositorCursorImage {
@@ -243,8 +407,9 @@ pub fn default_cursor_configuration() -> CursorConfiguration {
 
 pub fn load_compositor_cursor_from_environment() -> CompositorCursorImage {
     let configuration = default_cursor_configuration();
-    match load_cursor_from_theme(&configuration.theme, configuration.size_px) {
-        Ok(image) => {
+    match load_cursor_theme(&configuration.theme, configuration.size_px) {
+        Ok(theme) => {
+            let image = theme.image(CompositorCursorShape::Pointer);
             eprintln!(
                 "cursor theme: loaded theme={} size={} image={}x{} hotspot={},{} source={}",
                 image.theme,
@@ -258,7 +423,7 @@ pub fn load_compositor_cursor_from_environment() -> CompositorCursorImage {
                     .as_deref()
                     .map_or_else(|| "unknown".to_string(), |path| path.display().to_string()),
             );
-            image
+            image.as_ref().clone()
         }
         Err(reason) => {
             eprintln!("cursor theme: using built-in fallback reason={reason}");
@@ -267,21 +432,178 @@ pub fn load_compositor_cursor_from_environment() -> CompositorCursorImage {
     }
 }
 
-pub(crate) fn load_cursor_from_theme(
+pub(crate) fn load_cursor_theme(
+    theme_name: &str,
+    requested_size: u32,
+) -> Result<CursorShapeImages, CursorThemeLoadError> {
+    let theme = CursorTheme::load(theme_name);
+    let theme_exists = cursor_theme_directory_exists(theme_name);
+    let pointer = load_shape_image(
+        &theme,
+        theme_name,
+        CompositorCursorShape::Pointer,
+        requested_size,
+        true,
+        theme_exists,
+    )?
+    .expect("required pointer image must be present");
+    let pointer = Arc::new(pointer);
+    let optional = [
+        CompositorCursorShape::Move,
+        CompositorCursorShape::ResizeHorizontal,
+        CompositorCursorShape::ResizeVertical,
+        CompositorCursorShape::ResizeDiagonalNwSe,
+        CompositorCursorShape::ResizeDiagonalNeSw,
+    ];
+    let mut images: [Arc<CompositorCursorImage>; 5] = std::array::from_fn(|_| pointer.clone());
+    for (slot, shape) in images.iter_mut().zip(optional) {
+        if let Ok(Some(image)) = load_shape_image(
+            &theme,
+            theme_name,
+            shape,
+            requested_size,
+            false,
+            theme_exists,
+        ) {
+            *slot = if image.source.as_ref() == pointer.source.as_ref() {
+                pointer.clone()
+            } else {
+                Arc::new(image)
+            };
+        }
+    }
+    Ok(CursorShapeImages::from_images(
+        pointer,
+        images[0].clone(),
+        images[1].clone(),
+        images[2].clone(),
+        images[3].clone(),
+        images[4].clone(),
+    ))
+}
+
+#[cfg(test)]
+fn load_cursor_from_theme(
     theme_name: &str,
     requested_size: u32,
 ) -> Result<CompositorCursorImage, String> {
-    let theme = CursorTheme::load(theme_name);
-    let (path, _) = CURSOR_NAMES
+    load_cursor_theme(theme_name, requested_size)
+        .map(|theme| theme.image(CompositorCursorShape::Pointer).as_ref().clone())
+        .map_err(|error| error.to_string())
+}
+
+fn load_shape_image(
+    theme: &CursorTheme,
+    theme_name: &str,
+    shape: CompositorCursorShape,
+    requested_size: u32,
+    required: bool,
+    theme_exists: bool,
+) -> Result<Option<CompositorCursorImage>, CursorThemeLoadError> {
+    let Some((path, _)) = shape
+        .aliases()
         .iter()
         .find_map(|name| theme.load_icon_with_depth(name))
-        .ok_or_else(|| format!("theme {theme_name:?} has no left pointer cursor"))?;
-    let content =
-        std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    let frames = xcursor::parser::parse_xcursor(&content)
-        .ok_or_else(|| format!("parse {}", path.display()))?;
-    let image = select_nearest_frame(frames, requested_size)?;
+    else {
+        return if required {
+            Err(if !theme_exists {
+                CursorThemeLoadError::ThemeNotFound
+            } else if matches!(shape, CompositorCursorShape::Pointer) {
+                CursorThemeLoadError::RequiredPointerMissing
+            } else {
+                CursorThemeLoadError::ThemeNotFound
+            })
+        } else {
+            Ok(None)
+        };
+    };
+    let content = std::fs::read(&path).map_err(|_| CursorThemeLoadError::CursorFileReadFailed)?;
+    let frames =
+        xcursor::parser::parse_xcursor(&content).ok_or(CursorThemeLoadError::CursorFileInvalid)?;
+    let image = select_nearest_frame(frames, requested_size)
+        .map_err(|_| CursorThemeLoadError::CursorFileInvalid)?;
     compositor_image_from_frame(image, theme_name, requested_size, path)
+        .map(Some)
+        .map_err(|_| CursorThemeLoadError::CursorFileInvalid)
+}
+
+fn cursor_theme_directory_exists(theme_name: &str) -> bool {
+    const MAX_SEARCH_PATHS: usize = 32;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut paths = Vec::with_capacity(MAX_SEARCH_PATHS);
+    if let Some(value) = std::env::var_os("XCURSOR_PATH") {
+        for entry in value.to_string_lossy().split(':') {
+            if entry.is_empty() || paths.len() == MAX_SEARCH_PATHS {
+                continue;
+            }
+            let path = if entry == "~" {
+                home.clone()
+            } else if let Some(rest) = entry.strip_prefix("~/") {
+                home.as_ref().map(|home| home.join(rest))
+            } else {
+                Some(PathBuf::from(entry))
+            };
+            if let Some(path) = path {
+                push_bounded_theme_path(&mut paths, path, MAX_SEARCH_PATHS);
+            }
+        }
+    } else {
+        if let Some(value) = std::env::var_os("XDG_DATA_HOME") {
+            push_bounded_theme_path(&mut paths, PathBuf::from(value), MAX_SEARCH_PATHS);
+        } else if let Some(home) = home.as_ref() {
+            push_bounded_theme_path(
+                &mut paths,
+                home.join(".local/share/icons"),
+                MAX_SEARCH_PATHS,
+            );
+        }
+        if let Some(home) = home.as_ref() {
+            push_bounded_theme_path(&mut paths, home.join(".icons"), MAX_SEARCH_PATHS);
+        }
+        if let Some(value) = std::env::var_os("XDG_DATA_DIRS") {
+            for entry in value.to_string_lossy().split(':') {
+                if entry.is_empty() || paths.len() == MAX_SEARCH_PATHS {
+                    continue;
+                }
+                push_bounded_theme_path(
+                    &mut paths,
+                    PathBuf::from(entry).join("icons"),
+                    MAX_SEARCH_PATHS,
+                );
+            }
+        } else {
+            push_bounded_theme_path(
+                &mut paths,
+                PathBuf::from("/usr/local/share/icons"),
+                MAX_SEARCH_PATHS,
+            );
+            push_bounded_theme_path(
+                &mut paths,
+                PathBuf::from("/usr/share/icons"),
+                MAX_SEARCH_PATHS,
+            );
+        }
+        push_bounded_theme_path(
+            &mut paths,
+            PathBuf::from("/usr/share/pixmaps"),
+            MAX_SEARCH_PATHS,
+        );
+        if let Some(home) = home {
+            push_bounded_theme_path(&mut paths, home.join(".cursors"), MAX_SEARCH_PATHS);
+        }
+        push_bounded_theme_path(
+            &mut paths,
+            PathBuf::from("/usr/share/cursors/xorg-x11"),
+            MAX_SEARCH_PATHS,
+        );
+    }
+    paths.iter().any(|path| path.join(theme_name).is_dir())
+}
+
+fn push_bounded_theme_path(paths: &mut Vec<PathBuf>, path: PathBuf, limit: usize) {
+    if paths.len() < limit {
+        paths.push(path);
+    }
 }
 
 fn select_nearest_frame(frames: Vec<Image>, requested_size: u32) -> Result<Image, String> {
@@ -353,9 +675,7 @@ fn load_cursor_from_search_path(
     size: u32,
     search_path: &Path,
 ) -> Result<CompositorCursorImage, String> {
-    use std::sync::{Mutex, OnceLock};
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let _guard = cursor_env_lock().lock().unwrap();
     let previous = std::env::var_os("XCURSOR_PATH");
     // SAFETY: this test-only environment override is serialized by ENV_LOCK.
     unsafe { std::env::set_var("XCURSOR_PATH", search_path) };
@@ -371,6 +691,36 @@ fn load_cursor_from_search_path(
         }
     }
     result
+}
+
+#[cfg(test)]
+fn load_cursor_theme_from_search_path(
+    theme: &str,
+    size: u32,
+    search_path: &Path,
+) -> Result<CursorShapeImages, CursorThemeLoadError> {
+    let _guard = cursor_env_lock().lock().unwrap();
+    let previous = std::env::var_os("XCURSOR_PATH");
+    // SAFETY: this test-only environment override is serialized by ENV_LOCK.
+    unsafe { std::env::set_var("XCURSOR_PATH", search_path) };
+    let result = load_cursor_theme(theme, size);
+    match previous {
+        Some(value) => {
+            // SAFETY: this test-only environment restore is serialized by ENV_LOCK.
+            unsafe { std::env::set_var("XCURSOR_PATH", value) }
+        }
+        None => {
+            // SAFETY: this test-only environment restore is serialized by ENV_LOCK.
+            unsafe { std::env::remove_var("XCURSOR_PATH") }
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+fn cursor_env_lock() -> &'static std::sync::Mutex<()> {
+    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 const BUILTIN_CURSOR_FILL: u32 = 0xffff_ffff;
@@ -398,6 +748,95 @@ const CURSOR_PATTERN: [&str; 17] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_shape_bundle_is_exhaustive_and_optional_shapes_fall_back_to_pointer() {
+        let pointer = Arc::new(CompositorCursorImage::builtin_fallback());
+        let images = CursorShapeImages::from_pointer(pointer.clone());
+
+        assert_eq!(CompositorCursorShape::ALL.len(), 6);
+        for shape in CompositorCursorShape::ALL {
+            assert!(Arc::ptr_eq(&images.image(shape), &pointer));
+        }
+    }
+
+    #[test]
+    fn cursor_shape_bundle_retirement_counts_each_unique_external_image_owner() {
+        let images =
+            CursorShapeImages::from_pointer(Arc::new(CompositorCursorImage::builtin_fallback()));
+        assert!(!images.has_external_owner());
+        let external_shape = images.image(CompositorCursorShape::Move);
+        assert!(images.has_external_owner());
+        drop(external_shape);
+        assert!(!images.has_external_owner());
+    }
+
+    #[test]
+    fn cursor_theme_loads_every_required_interaction_shape_at_requested_size() {
+        let fixture = CursorFixture::new();
+        fixture.write_theme("Theme", None);
+        for (name, pixel) in [
+            ("left_ptr", 11),
+            ("move", 22),
+            ("ew-resize", 33),
+            ("ns-resize", 44),
+            ("nwse-resize", 55),
+            ("nesw-resize", 66),
+        ] {
+            fixture.write_cursor("Theme", name, &[pixel], 24, 24, 3, 4);
+        }
+
+        let theme = load_cursor_theme_from_search_path("Theme", 24, &fixture.root).unwrap();
+        for (shape, pixel) in [
+            (CompositorCursorShape::Pointer, 11),
+            (CompositorCursorShape::Move, 22),
+            (CompositorCursorShape::ResizeHorizontal, 33),
+            (CompositorCursorShape::ResizeVertical, 44),
+            (CompositorCursorShape::ResizeDiagonalNwSe, 55),
+            (CompositorCursorShape::ResizeDiagonalNeSw, 66),
+        ] {
+            let image = theme.image(shape);
+            assert_eq!(image.requested_size, 24);
+            assert_eq!((image.pixels_argb8888[0] >> 16) & 0xff, pixel);
+            assert_eq!((image.hotspot_x, image.hotspot_y), (3, 4));
+        }
+    }
+
+    #[test]
+    fn malformed_optional_shape_falls_back_without_rejecting_theme() {
+        let fixture = CursorFixture::new();
+        fixture.write_theme("Theme", None);
+        fixture.write_cursor("Theme", "left_ptr", &[11], 24, 24, 3, 4);
+        fixture.write_cursor_raw("Theme", "move", malformed_cursor(24, 24, 24, 0));
+
+        let theme = load_cursor_theme_from_search_path("Theme", 24, &fixture.root).unwrap();
+        assert!(Arc::ptr_eq(
+            &theme.image(CompositorCursorShape::Move),
+            &theme.image(CompositorCursorShape::Pointer)
+        ));
+    }
+
+    #[test]
+    fn malformed_required_pointer_rejects_theme_with_typed_error() {
+        let fixture = CursorFixture::new();
+        fixture.write_theme("Theme", None);
+        fixture.write_cursor_raw("Theme", "left_ptr", malformed_cursor(24, 24, 24, 0));
+
+        assert!(matches!(
+            load_cursor_theme_from_search_path("Theme", 24, &fixture.root),
+            Err(CursorThemeLoadError::CursorFileInvalid)
+        ));
+    }
+
+    #[test]
+    fn missing_theme_is_reported_as_a_typed_theme_not_found_error() {
+        let fixture = CursorFixture::new();
+
+        assert!(matches!(
+            load_cursor_theme_from_search_path("Missing", 24, &fixture.root),
+            Err(CursorThemeLoadError::ThemeNotFound)
+        ));
+    }
 
     #[test]
     fn cursor_configuration_accepts_bounded_logical_theme_names_and_sizes() {

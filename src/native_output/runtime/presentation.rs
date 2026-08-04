@@ -135,13 +135,12 @@ impl NativeRuntime {
         let scene_changed = scene_generation != *last_rendered_scene_generation;
         let pending_frame_work = server.has_unowned_frame_work();
         let pacing_now_ns = monotonic_now_ns()?;
+        #[rustfmt::skip]
+        synchronize_active_cursor_image(server, cursor_manager, cursor_image, frame_renderer, scanout, queued_redraw_requested);
         let (client_cursor, client_cursor_active, cursor_visible) =
             resolve_native_cursor_visibility(server, input_state);
         #[rustfmt::skip]
-        refresh_legacy_cursor_theme(legacy_cursor, kms, target.crtc_id, cursor_image, cursor_render_mode, cursor_manager, perf)?;
-        if client_cursor_active && let Some(cursor) = legacy_cursor.as_mut() {
-            cursor.disable()?;
-        }
+        prepare_legacy_cursor_for_frame(legacy_cursor, kms, target.crtc_id, cursor_image, cursor_render_mode, cursor_manager, client_cursor_active, perf)?;
         let (mut runtime_plane_plan, mut client_cursor_hardware_usable) = (None, false);
         if let Some(cursor) = atomic_cursor.as_mut() {
             let cursor_image_ready = prepare_cursor_image(
@@ -151,6 +150,7 @@ impl NativeRuntime {
                 client_cursor,
                 kms,
                 input_state,
+                cursor_manager,
                 perf,
             );
             let plan = apply_cursor_policy_with_runtime_inputs(

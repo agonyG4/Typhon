@@ -1019,6 +1019,40 @@ fn interaction_cursor_shape_maps_every_window_resize_edge() {
 }
 
 #[test]
+fn compositor_cursor_shape_boundary_maps_override_and_pointer() {
+    let cases = [
+        (None, crate::cursor_theme::CompositorCursorShape::Pointer),
+        (
+            Some(InteractionCursorShape::Move),
+            crate::cursor_theme::CompositorCursorShape::Move,
+        ),
+        (
+            Some(InteractionCursorShape::ResizeHorizontal),
+            crate::cursor_theme::CompositorCursorShape::ResizeHorizontal,
+        ),
+        (
+            Some(InteractionCursorShape::ResizeVertical),
+            crate::cursor_theme::CompositorCursorShape::ResizeVertical,
+        ),
+        (
+            Some(InteractionCursorShape::ResizeDiagonalNwSe),
+            crate::cursor_theme::CompositorCursorShape::ResizeDiagonalNwSe,
+        ),
+        (
+            Some(InteractionCursorShape::ResizeDiagonalNeSw),
+            crate::cursor_theme::CompositorCursorShape::ResizeDiagonalNeSw,
+        ),
+    ];
+    for (shape, expected) in cases {
+        let state = CompositorState {
+            interaction_cursor_override: shape.map(|shape| InteractionCursorOverride { shape }),
+            ..Default::default()
+        };
+        assert_eq!(state.compositor_cursor_shape(), expected);
+    }
+}
+
+#[test]
 fn failed_interaction_begin_does_not_activate_cursor_override() {
     let mut state = CompositorState::default();
 

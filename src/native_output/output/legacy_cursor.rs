@@ -19,7 +19,7 @@ impl NativeLegacyHardwareCursor {
     pub(crate) fn create(
         kms: &fs::File,
         crtc_id: u32,
-        image: &CompositorCursorImage,
+        image: &Arc<CompositorCursorImage>,
     ) -> io::Result<Self> {
         let gbm_fd = duplicate_fd_cloexec(kms.as_raw_fd()).map_err(io::Error::from_raw_os_error)?;
         let device = gbm::Device::new(gbm_fd)?;
@@ -63,7 +63,7 @@ impl NativeLegacyHardwareCursor {
             bo,
             _device: device,
             active: false,
-            image: Arc::new(image.clone()),
+            image: image.clone(),
         })
     }
 

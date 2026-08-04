@@ -41,7 +41,8 @@ fn valid_result(command: &str) -> serde_json::Value {
                 "generation": 1,
                 "backend": "software",
                 "source": "default",
-                "persistence": "missing"
+                "persistence": "missing",
+                "assetSource": "system_theme"
             })
         }
         other => panic!("no typed fixture for {other}"),

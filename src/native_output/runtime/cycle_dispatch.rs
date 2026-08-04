@@ -167,13 +167,14 @@ impl NativeRuntime {
                         "cursor.configuration",
                         self.cursor_configuration_doctor_severity(),
                         format!(
-                            "desired={}@{} active={}@{} source={} persistence={}",
+                            "desired={}@{} active={}@{} source={} persistence={} asset={}",
                             self.cursor_manager.desired_configuration().theme,
                             self.cursor_manager.desired_configuration().size_px,
                             self.cursor_manager.active_configuration().theme,
                             self.cursor_manager.active_configuration().size_px,
                             self.cursor_manager.source().as_str(),
                             self.cursor_manager.persistence().as_str(),
+                            self.cursor_manager.asset_source().as_str(),
                         ),
                     ),
                     doctor_check(
@@ -386,6 +387,7 @@ impl NativeRuntime {
             self.cursor_manager.active_configuration()
                 == self.cursor_manager.desired_configuration(),
             self.cursor_manager.persistence(),
+            self.cursor_manager.asset_source(),
         )
     }
 
@@ -393,7 +395,9 @@ impl NativeRuntime {
         if !change.published {
             return;
         }
-        self.cursor_image = change.image;
+        self.cursor_image = self
+            .cursor_manager
+            .active_image_for_shape(self.server.compositor_cursor_shape());
         self.frame_renderer
             .set_cursor_image(self.cursor_image.clone());
         self.scanout.set_cursor_image(self.cursor_image.clone());
@@ -657,13 +661,17 @@ fn cursor_configuration_doctor_severity(
     software_fallback_available: bool,
     active_matches_desired: bool,
     persistence: oblivion_one::control_snapshots::CursorPersistenceSnapshot,
+    asset_source: oblivion_one::control_snapshots::CursorAssetSource,
 ) -> DoctorSeverity {
-    use oblivion_one::control_snapshots::CursorPersistenceSnapshot;
+    use oblivion_one::control_snapshots::{CursorAssetSource, CursorPersistenceSnapshot};
 
     if !runtime_available || (!active_theme_available && !software_fallback_available) {
         return DoctorSeverity::Error;
     }
     if !active_matches_desired {
+        return DoctorSeverity::Warning;
+    }
+    if matches!(asset_source, CursorAssetSource::BuiltinFallback) {
         return DoctorSeverity::Warning;
     }
     match persistence {
@@ -764,7 +772,9 @@ fn reconcile_trigger_liveness(
 #[cfg(test)]
 mod cursor_doctor_tests {
     use super::cursor_configuration_doctor_severity;
-    use oblivion_one::control_snapshots::{CursorPersistenceSnapshot, DoctorSeverity};
+    use oblivion_one::control_snapshots::{
+        CursorAssetSource, CursorPersistenceSnapshot, DoctorSeverity,
+    };
 
     #[test]
     fn cursor_configuration_doctor_matrix_preserves_healthy_fallbacks() {
@@ -775,6 +785,7 @@ mod cursor_doctor_tests {
                 true,
                 true,
                 CursorPersistenceSnapshot::Missing,
+                CursorAssetSource::SystemTheme,
                 DoctorSeverity::Ok,
             ),
             (
@@ -783,6 +794,7 @@ mod cursor_doctor_tests {
                 true,
                 true,
                 CursorPersistenceSnapshot::Saved,
+                CursorAssetSource::SystemTheme,
                 DoctorSeverity::Ok,
             ),
             (
@@ -791,6 +803,7 @@ mod cursor_doctor_tests {
                 true,
                 true,
                 CursorPersistenceSnapshot::Invalid,
+                CursorAssetSource::SystemTheme,
                 DoctorSeverity::Warning,
             ),
             (
@@ -799,6 +812,7 @@ mod cursor_doctor_tests {
                 true,
                 false,
                 CursorPersistenceSnapshot::Saved,
+                CursorAssetSource::SystemTheme,
                 DoctorSeverity::Warning,
             ),
             (
@@ -807,6 +821,7 @@ mod cursor_doctor_tests {
                 true,
                 true,
                 CursorPersistenceSnapshot::Saved,
+                CursorAssetSource::SystemTheme,
                 DoctorSeverity::Ok,
             ),
             (
@@ -815,6 +830,7 @@ mod cursor_doctor_tests {
                 false,
                 true,
                 CursorPersistenceSnapshot::Saved,
+                CursorAssetSource::SystemTheme,
                 DoctorSeverity::Error,
             ),
             (
@@ -823,7 +839,17 @@ mod cursor_doctor_tests {
                 true,
                 true,
                 CursorPersistenceSnapshot::Saved,
+                CursorAssetSource::SystemTheme,
                 DoctorSeverity::Error,
+            ),
+            (
+                true,
+                true,
+                true,
+                true,
+                CursorPersistenceSnapshot::Missing,
+                CursorAssetSource::BuiltinFallback,
+                DoctorSeverity::Warning,
             ),
         ];
         for (
@@ -832,6 +858,7 @@ mod cursor_doctor_tests {
             software_fallback_available,
             active_matches_desired,
             persistence,
+            asset_source,
             expected,
         ) in cases
         {
@@ -842,6 +869,7 @@ mod cursor_doctor_tests {
                     software_fallback_available,
                     active_matches_desired,
                     persistence,
+                    asset_source,
                 ),
                 expected,
             );

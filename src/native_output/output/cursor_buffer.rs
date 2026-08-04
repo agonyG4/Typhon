@@ -21,6 +21,7 @@ pub(super) struct AtomicCursorBuffer {
     pub(super) size: usize,
     pub(super) mapping: *mut c_void,
     pub(super) drm_cleanup_armed: bool,
+    pub(super) image_owner: Option<Arc<CompositorCursorImage>>,
     /// Shared only as a lightweight lease marker. The DRM/CPU buffer itself
     /// remains compositor-thread-owned; worker jobs carry a clone of this
     /// marker so retirement cannot drop the buffer while a queued ioctl may
@@ -91,11 +92,12 @@ impl AtomicCursorBuffer {
             size,
             mapping,
             drm_cleanup_armed: true,
+            image_owner: None,
             lease: Arc::new(()),
         })
     }
 
-    pub(super) fn upload_image(&mut self, image: &CompositorCursorImage) -> io::Result<()> {
+    pub(super) fn upload_image(&mut self, image: &Arc<CompositorCursorImage>) -> io::Result<()> {
         let bytes = native_cursor_argb_bytes(
             &image.pixels_argb8888,
             image.width,
@@ -107,6 +109,7 @@ impl AtomicCursorBuffer {
         let destination =
             unsafe { slice::from_raw_parts_mut(self.mapping.cast::<u8>(), self.size) };
         destination.copy_from_slice(&bytes);
+        self.image_owner = Some(image.clone());
         Ok(())
     }
 
@@ -206,6 +209,12 @@ impl AtomicCursorResources {
                 .is_some_and(|(cached_key, _)| *cached_key != key)
             && let Some((_, buffer)) = self.client_cache.take()
         {
+            self.retired.push(buffer);
+        }
+    }
+
+    pub(super) fn retire_theme_cache(&mut self) {
+        if let Some(buffer) = self.theme_cache.take() {
             self.retired.push(buffer);
         }
     }

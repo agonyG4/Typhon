@@ -409,7 +409,7 @@ impl NativeSessionIo for NativeRuntime {
         match NativeLegacyHardwareCursor::create(
             self.kms.file(),
             self.target.crtc_id,
-            self.cursor_image.as_ref(),
+            &self.cursor_image,
         ) {
             Ok(mut cursor) => {
                 let (x, y) = self.input_state.cursor_position();

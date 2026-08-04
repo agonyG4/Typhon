@@ -1,10 +1,12 @@
-use oblivion_one::control_snapshots::{CursorConfigSource, CursorPersistenceSnapshot};
+use oblivion_one::control_snapshots::{
+    CursorAssetSource, CursorConfigSource, CursorPersistenceSnapshot,
+};
 use oblivion_one::cursor_manager::{
     CursorManagerError, CursorThemeLoader, CursorThemeManager, LoadedCursorTheme,
 };
 use oblivion_one::cursor_persistence::CursorConfigurationStore;
 use oblivion_one::cursor_theme::{
-    CompositorCursorImage, CursorConfiguration, default_cursor_configuration,
+    CompositorCursorImage, CursorConfiguration, CursorThemeLoadError, default_cursor_configuration,
 };
 use std::collections::VecDeque;
 use std::fs;
@@ -15,8 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
 struct FakeLoader {
-    results: VecDeque<Result<(), CursorManagerError>>,
-    always_error: Option<CursorManagerError>,
+    results: VecDeque<Result<(), CursorThemeLoadError>>,
+    always_error: Option<CursorThemeLoadError>,
     loads: usize,
 }
 
@@ -29,7 +31,7 @@ impl FakeLoader {
         }
     }
 
-    fn fails_once(error: CursorManagerError) -> Self {
+    fn fails_once(error: CursorThemeLoadError) -> Self {
         Self {
             results: VecDeque::from([Err(error)]),
             always_error: None,
@@ -37,7 +39,7 @@ impl FakeLoader {
         }
     }
 
-    fn fails_always(error: CursorManagerError) -> Self {
+    fn fails_always(error: CursorThemeLoadError) -> Self {
         Self {
             results: VecDeque::new(),
             always_error: Some(error),
@@ -50,7 +52,7 @@ impl CursorThemeLoader for FakeLoader {
     fn load(
         &mut self,
         configuration: &CursorConfiguration,
-    ) -> Result<LoadedCursorTheme, CursorManagerError> {
+    ) -> Result<LoadedCursorTheme, CursorThemeLoadError> {
         self.loads += 1;
         if let Some(result) = self.results.pop_front() {
             result?;
@@ -60,7 +62,7 @@ impl CursorThemeLoader for FakeLoader {
         }
         let pixel = (self.loads as u32) << 16 | 0xff;
         let image = CompositorCursorImage::from_argb8888(vec![pixel], 1, 1, 0, 0)
-            .map_err(|_| CursorManagerError::ThemeLoadFailed)?;
+            .map_err(|_| CursorThemeLoadError::CursorFileInvalid)?;
         Ok(LoadedCursorTheme::new(
             configuration.clone(),
             Arc::new(image),
@@ -113,14 +115,14 @@ fn manager(loader: Box<dyn CursorThemeLoader>) -> (CursorThemeManager, TestRoot)
 #[test]
 fn failed_candidate_load_preserves_active_generation_and_persisted_configuration() {
     let (mut manager, _root) = manager(Box::new(FakeLoader::fails_once(
-        CursorManagerError::ThemeNotFound,
+        CursorThemeLoadError::RequiredPointerMissing,
     )));
     let configuration = CursorConfiguration::new("Bibata", 24).unwrap();
     let before = manager.snapshot(oblivion_one::control_snapshots::CursorBackendSnapshot::Software);
 
     assert!(matches!(
         manager.apply(configuration),
-        Err(CursorManagerError::ThemeNotFound)
+        Err(CursorManagerError::RequiredPointerMissing)
     ));
     assert_eq!(manager.generation(), before.generation);
     assert_eq!(manager.snapshot(before.backend), before);
@@ -239,15 +241,22 @@ fn unavailable_persisted_theme_falls_back_without_changing_the_active_default() 
 
     let manager = CursorThemeManager::startup(
         store,
-        Box::new(FakeLoader::fails_once(CursorManagerError::ThemeNotFound)),
+        Box::new(FakeLoader::fails_always(
+            CursorThemeLoadError::ThemeNotFound,
+        )),
     );
 
-    assert_eq!(manager.source(), CursorConfigSource::Default);
-    assert_eq!(manager.persistence(), CursorPersistenceSnapshot::Invalid);
+    assert_eq!(manager.source(), CursorConfigSource::Config);
+    assert_eq!(manager.persistence(), CursorPersistenceSnapshot::Saved);
+    assert_eq!(
+        manager.desired_configuration(),
+        &CursorConfiguration::new("missing-theme", 24).unwrap()
+    );
     assert_eq!(
         manager.active_configuration(),
         &default_cursor_configuration()
     );
+    assert_eq!(manager.asset_source(), CursorAssetSource::BuiltinFallback);
 }
 
 #[test]
@@ -324,13 +333,13 @@ fn one_hundred_reloads_publish_without_leaking_generations() {
 #[test]
 fn one_hundred_failed_theme_loads_leave_runtime_and_persistence_unchanged() {
     let (mut manager, root) = manager(Box::new(FakeLoader::fails_always(
-        CursorManagerError::ThemeNotFound,
+        CursorThemeLoadError::RequiredPointerMissing,
     )));
     let before = manager.snapshot(oblivion_one::control_snapshots::CursorBackendSnapshot::Software);
     for _ in 0..100 {
         assert!(matches!(
             manager.set_theme("missing-theme"),
-            Err(CursorManagerError::ThemeNotFound)
+            Err(CursorManagerError::RequiredPointerMissing)
         ));
     }
     assert_eq!(manager.snapshot(before.backend), before);

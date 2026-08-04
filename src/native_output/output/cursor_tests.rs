@@ -43,6 +43,7 @@ fn test_cursor() -> NativeAtomicCursor {
                 size: 1,
                 mapping,
                 drm_cleanup_armed: false,
+                image_owner: None,
                 lease: Arc::new(()),
             }),
             retired: Vec::new(),

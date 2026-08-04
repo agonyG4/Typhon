@@ -1,20 +1,28 @@
-//! Secure persistence for the compositor-owned cursor configuration.
+//! Secure, descriptor-relative persistence for the compositor-owned cursor configuration.
 
 use crate::cursor_theme::CursorConfiguration;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::{CString, OsStr, OsString},
+    fs::File,
+    io::{self, Read, Write},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        unix::ffi::OsStrExt,
+    },
+    path::{Path, PathBuf},
+};
 
 const ASTREA_DIRECTORY: &str = "AstreaOS";
 const INPUT_DIRECTORY: &str = "input";
 const CONFIGURATION_FILE: &str = "cursor.json";
 const TEMP_PREFIX: &str = ".cursor.json.tmp-";
+const QUARANTINE_PREFIX: &str = ".cursor.json.quarantine-";
 const TEMP_ATTEMPTS: usize = 8;
-const MAX_DOCUMENT_BYTES: u64 = 4096;
+const MAX_DOCUMENT_BYTES: usize = 4096;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
+const RENAME_NOREPLACE: libc::c_uint = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorPersistenceError {
@@ -43,21 +51,22 @@ pub struct CursorConfigurationStore {
     astrea_directory: PathBuf,
     input_directory: PathBuf,
     configuration_file: PathBuf,
+    create_missing_config_home: bool,
     unavailable: Option<CursorPersistenceError>,
 }
 
 impl CursorConfigurationStore {
     pub fn from_environment() -> Result<Self, CursorPersistenceError> {
-        let config_home = match std::env::var_os("XDG_CONFIG_HOME") {
-            Some(value) if !value.is_empty() => PathBuf::from(value),
+        let (config_home, create_missing_config_home) = match std::env::var_os("XDG_CONFIG_HOME") {
+            Some(value) if !value.is_empty() => (PathBuf::from(value), false),
             _ => {
                 let home = std::env::var_os("HOME")
                     .ok_or(CursorPersistenceError::Insecure)
                     .map(PathBuf::from)?;
-                home.join(".config")
+                (home.join(".config"), true)
             }
         };
-        Self::new(config_home)
+        Self::new_with_policy(config_home, create_missing_config_home)
     }
 
     pub fn unavailable(error: CursorPersistenceError) -> Self {
@@ -66,11 +75,19 @@ impl CursorConfigurationStore {
             astrea_directory: PathBuf::from("/.invalid/AstreaOS"),
             input_directory: PathBuf::from("/.invalid/AstreaOS/input"),
             configuration_file: PathBuf::from("/.invalid/AstreaOS/input/cursor.json"),
+            create_missing_config_home: false,
             unavailable: Some(error),
         }
     }
 
     pub fn new(config_home: PathBuf) -> Result<Self, CursorPersistenceError> {
+        Self::new_with_policy(config_home, false)
+    }
+
+    fn new_with_policy(
+        config_home: PathBuf,
+        create_missing_config_home: bool,
+    ) -> Result<Self, CursorPersistenceError> {
         if !config_home.is_absolute() {
             return Err(CursorPersistenceError::Insecure);
         }
@@ -82,6 +99,7 @@ impl CursorConfigurationStore {
             astrea_directory,
             input_directory,
             configuration_file,
+            create_missing_config_home,
             unavailable: None,
         })
     }
@@ -94,21 +112,12 @@ impl CursorConfigurationStore {
         if let Some(error) = self.unavailable {
             return Err(error);
         }
-        self.validate_config_home(false)?;
-        self.validate_directory(&self.astrea_directory, false)?;
-        self.validate_directory(&self.input_directory, false)?;
-        self.validate_configuration_file()?;
-
-        let metadata =
-            fs::symlink_metadata(&self.configuration_file).map_err(classify_read_metadata_error)?;
-        if metadata.len() > MAX_DOCUMENT_BYTES {
-            return Err(CursorPersistenceError::Invalid);
-        }
-        let mut file =
-            File::open(&self.configuration_file).map_err(|_| CursorPersistenceError::Invalid)?;
-        let mut document = Vec::with_capacity(metadata.len() as usize);
-        file.read_to_end(&mut document)
-            .map_err(|_| CursorPersistenceError::Invalid)?;
+        let directories = self.open_directories(false)?;
+        let file = open_file_at(directories.input.as_raw_fd(), CONFIGURATION_FILE, false)?
+            .ok_or(CursorPersistenceError::Missing)?;
+        let identity = NodeIdentity::from_fd(file.as_raw_fd())?;
+        validate_configuration_identity(identity)?;
+        let document = read_bounded(file)?;
         let persisted: PersistedCursorConfiguration =
             serde_json::from_slice(&document).map_err(|_| CursorPersistenceError::Invalid)?;
         if persisted.version != 1 {
@@ -124,109 +133,86 @@ impl CursorConfigurationStore {
         }
         CursorConfiguration::new(&configuration.theme, configuration.size_px)
             .map_err(|_| CursorPersistenceError::Invalid)?;
-        self.validate_config_home(true)?;
-        self.ensure_directory(&self.astrea_directory)?;
-        self.ensure_directory(&self.input_directory)?;
-        if self.configuration_file.exists() || self.configuration_file.is_symlink() {
-            self.validate_configuration_file()
-                .map_err(|_| CursorPersistenceError::Insecure)?;
-        }
-
         let document = serde_json::to_vec(&PersistedCursorConfiguration {
             version: 1,
             theme: configuration.theme.clone(),
             size_px: configuration.size_px,
         })
         .map_err(|_| CursorPersistenceError::WriteFailed)?;
-
-        let mut temporary = None;
-        let mut file = None;
-        for _ in 0..TEMP_ATTEMPTS {
-            let candidate = self.input_directory.join(format!(
-                "{TEMP_PREFIX}{}",
-                random_suffix().map_err(|_| CursorPersistenceError::WriteFailed)?
-            ));
-            match OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(PRIVATE_FILE_MODE)
-                .open(&candidate)
-            {
-                Ok(created) => {
-                    temporary = Some(candidate);
-                    file = Some(created);
-                    break;
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(_) => return Err(CursorPersistenceError::WriteFailed),
-            }
-        }
-        let temporary = temporary.ok_or(CursorPersistenceError::WriteFailed)?;
-        let mut file = file.expect("temporary file exists with its path");
+        let directories = self.open_directories(true)?;
+        let existing = open_file_at(directories.input.as_raw_fd(), CONFIGURATION_FILE, true)?;
+        let existing_identity = existing
+            .as_ref()
+            .map(|file| {
+                let identity = NodeIdentity::from_fd(file.as_raw_fd())?;
+                validate_configuration_identity(identity)?;
+                Ok(identity)
+            })
+            .transpose()?;
+        let (temporary_name, mut temporary) = create_temporary_file(directories.input.as_raw_fd())?;
+        let temporary_identity = NodeIdentity::from_fd(temporary.as_raw_fd())?;
         let write_result = (|| {
-            file.write_all(&document)
+            temporary
+                .write_all(&document)
                 .map_err(|_| CursorPersistenceError::WriteFailed)?;
-            file.flush()
+            temporary
+                .flush()
                 .map_err(|_| CursorPersistenceError::WriteFailed)?;
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+            temporary
+                .sync_all()
                 .map_err(|_| CursorPersistenceError::WriteFailed)?;
-            file.sync_all()
-                .map_err(|_| CursorPersistenceError::WriteFailed)?;
-            verify_regular_owned_file(&temporary, PRIVATE_FILE_MODE)?;
-            drop(file);
-            fs::rename(&temporary, &self.configuration_file)
-                .map_err(|_| CursorPersistenceError::WriteFailed)?;
-            sync_directory(&self.input_directory)?;
-            verify_regular_owned_file(&self.configuration_file, PRIVATE_FILE_MODE)
+            validate_configuration_identity(NodeIdentity::from_fd(temporary.as_raw_fd())?)?;
+            publish_configuration(
+                directories.input.as_raw_fd(),
+                &temporary_name,
+                temporary_identity,
+                existing_identity,
+            )?;
+            sync_directory(directories.input.as_raw_fd())?;
+            Ok(())
         })();
-        if write_result.is_err() && temporary.exists() {
-            let _ = fs::remove_file(&temporary);
+        drop(temporary);
+        if write_result.is_err() {
+            let _ = remove_owned_at(
+                directories.input.as_raw_fd(),
+                &temporary_name,
+                temporary_identity,
+            );
         }
         write_result
     }
 
-    fn validate_config_home(&self, for_write: bool) -> Result<(), CursorPersistenceError> {
-        match fs::symlink_metadata(&self.config_home) {
-            Ok(metadata) => {
-                if !metadata.file_type().is_dir() || metadata.uid() != effective_uid() {
-                    Err(CursorPersistenceError::Insecure)
-                } else {
-                    Ok(())
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound && for_write => {
-                Err(CursorPersistenceError::WriteFailed)
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                Err(CursorPersistenceError::Missing)
-            }
-            Err(_) => Err(CursorPersistenceError::Insecure),
-        }
+    fn open_directories(
+        &self,
+        for_write: bool,
+    ) -> Result<OpenedDirectories, CursorPersistenceError> {
+        let config_home = self.open_config_home(for_write)?;
+        let astrea =
+            open_or_create_directory_at(config_home.as_raw_fd(), ASTREA_DIRECTORY, for_write)?;
+        let input = open_or_create_directory_at(astrea.as_raw_fd(), INPUT_DIRECTORY, for_write)?;
+        Ok(OpenedDirectories {
+            _config_home: config_home,
+            _astrea: astrea,
+            input,
+        })
     }
 
-    fn validate_directory(
-        &self,
-        path: &Path,
-        for_write: bool,
-    ) -> Result<(), CursorPersistenceError> {
-        match fs::symlink_metadata(path) {
-            Ok(metadata) => {
-                if !metadata.file_type().is_dir()
-                    || !owned_with_mode(
-                        metadata.uid(),
-                        metadata.mode(),
-                        effective_uid(),
-                        Some(PRIVATE_DIRECTORY_MODE),
-                    )
-                {
-                    Err(CursorPersistenceError::Insecure)
-                } else {
-                    Ok(())
+    fn open_config_home(&self, for_write: bool) -> Result<OwnedFd, CursorPersistenceError> {
+        match open_directory_path(&self.config_home) {
+            Ok(directory) => {
+                validate_config_home_identity(NodeIdentity::from_fd(directory.as_raw_fd())?)?;
+                Ok(directory)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if !for_write {
+                    return Err(CursorPersistenceError::Missing);
                 }
+                if !self.create_missing_config_home {
+                    return Err(CursorPersistenceError::WriteFailed);
+                }
+                create_standard_config_home(&self.config_home)
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound && !for_write => {
-                Err(CursorPersistenceError::Missing)
-            }
+            Err(error) if is_symlink_error(&error) => Err(CursorPersistenceError::Insecure),
             Err(_) => Err(if for_write {
                 CursorPersistenceError::WriteFailed
             } else {
@@ -234,77 +220,465 @@ impl CursorConfigurationStore {
             }),
         }
     }
+}
 
-    fn ensure_directory(&self, path: &Path) -> Result<(), CursorPersistenceError> {
-        match fs::symlink_metadata(path) {
-            Ok(_) => self.validate_directory(path, true),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(path).map_err(|_| CursorPersistenceError::WriteFailed)?;
-                fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
-                    .map_err(|_| CursorPersistenceError::WriteFailed)?;
-                self.validate_directory(path, true)
-            }
-            Err(_) => Err(CursorPersistenceError::WriteFailed),
+struct OpenedDirectories {
+    _config_home: OwnedFd,
+    _astrea: OwnedFd,
+    input: OwnedFd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NodeIdentity {
+    device: u64,
+    inode: u64,
+    owner: u32,
+    file_type: libc::mode_t,
+    mode: u32,
+}
+
+impl NodeIdentity {
+    fn from_fd(fd: RawFd) -> Result<Self, CursorPersistenceError> {
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        // SAFETY: `stat` is initialized writable storage and `fd` is owned by
+        // the caller for the duration of this fstat call.
+        if unsafe { libc::fstat(fd, &mut stat) } < 0 {
+            return Err(CursorPersistenceError::Insecure);
         }
-    }
-
-    fn validate_configuration_file(&self) -> Result<(), CursorPersistenceError> {
-        verify_regular_owned_file(&self.configuration_file, PRIVATE_FILE_MODE)
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct PersistedCursorConfiguration {
-    version: u32,
-    theme: String,
-    size_px: u32,
-}
-
-fn classify_read_metadata_error(error: io::Error) -> CursorPersistenceError {
-    if error.kind() == io::ErrorKind::NotFound {
-        CursorPersistenceError::Missing
-    } else {
-        CursorPersistenceError::Insecure
+        Ok(Self {
+            device: stat.st_dev,
+            inode: stat.st_ino,
+            owner: stat.st_uid,
+            file_type: stat.st_mode & libc::S_IFMT,
+            mode: stat.st_mode & 0o777,
+        })
     }
 }
 
-fn verify_regular_owned_file(
-    path: &Path,
-    expected_mode: u32,
-) -> Result<(), CursorPersistenceError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| CursorPersistenceError::Insecure)?;
-    if !metadata.file_type().is_file()
-        || !owned_with_mode(
-            metadata.uid(),
-            metadata.mode(),
-            effective_uid(),
-            Some(expected_mode),
-        )
+fn validate_config_home_identity(identity: NodeIdentity) -> Result<(), CursorPersistenceError> {
+    if identity.file_type != libc::S_IFDIR || identity.owner != effective_uid() {
+        return Err(CursorPersistenceError::Insecure);
+    }
+    Ok(())
+}
+
+fn validate_directory_identity(identity: NodeIdentity) -> Result<(), CursorPersistenceError> {
+    if identity.file_type != libc::S_IFDIR
+        || identity.owner != effective_uid()
+        || identity.mode != PRIVATE_DIRECTORY_MODE
     {
         return Err(CursorPersistenceError::Insecure);
     }
     Ok(())
 }
 
-fn owned_with_mode(uid: u32, mode: u32, effective_uid: u32, exact_mode: Option<u32>) -> bool {
-    uid == effective_uid
-        && exact_mode.map_or(mode & 0o022 == 0, |expected| mode & 0o777 == expected)
+fn validate_configuration_identity(identity: NodeIdentity) -> Result<(), CursorPersistenceError> {
+    if identity.file_type != libc::S_IFREG
+        || identity.owner != effective_uid()
+        || identity.mode != PRIVATE_FILE_MODE
+    {
+        return Err(CursorPersistenceError::Insecure);
+    }
+    Ok(())
 }
 
-fn sync_directory(path: &Path) -> Result<(), CursorPersistenceError> {
-    match File::open(path).and_then(|directory| directory.sync_all()) {
-        Ok(()) => Ok(()),
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
-            ) =>
-        {
-            Ok(())
-        }
-        Err(_) => Err(CursorPersistenceError::WriteFailed),
+fn open_directory_path(path: &Path) -> io::Result<OwnedFd> {
+    let path = c_string(path.as_os_str(), "directory path")?;
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
     }
+    // SAFETY: `open` returned a new owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn create_standard_config_home(path: &Path) -> Result<OwnedFd, CursorPersistenceError> {
+    let parent = path.parent().ok_or(CursorPersistenceError::WriteFailed)?;
+    let name = path
+        .file_name()
+        .ok_or(CursorPersistenceError::WriteFailed)?;
+    let parent_fd = open_directory_path(parent).map_err(|_| CursorPersistenceError::WriteFailed)?;
+    validate_config_home_identity(NodeIdentity::from_fd(parent_fd.as_raw_fd())?)?;
+    let name =
+        c_string(name, "config directory name").map_err(|_| CursorPersistenceError::WriteFailed)?;
+    let result =
+        unsafe { libc::mkdirat(parent_fd.as_raw_fd(), name.as_ptr(), PRIVATE_DIRECTORY_MODE) };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(CursorPersistenceError::WriteFailed);
+        }
+    }
+    let directory = open_directory_at(parent_fd.as_raw_fd(), OsStr::from_bytes(name.as_bytes()))
+        .map_err(|_| CursorPersistenceError::WriteFailed)?;
+    validate_config_home_identity(NodeIdentity::from_fd(directory.as_raw_fd())?)?;
+    Ok(directory)
+}
+
+fn open_or_create_directory_at(
+    parent_fd: RawFd,
+    name: &str,
+    for_write: bool,
+) -> Result<OwnedFd, CursorPersistenceError> {
+    match open_directory_at(parent_fd, OsStr::new(name)) {
+        Ok(directory) => {
+            validate_directory_identity(NodeIdentity::from_fd(directory.as_raw_fd())?)?;
+            Ok(directory)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound && for_write => {
+            let c_name = c_string(OsStr::new(name), "directory name")
+                .map_err(|_| CursorPersistenceError::WriteFailed)?;
+            let result =
+                unsafe { libc::mkdirat(parent_fd, c_name.as_ptr(), PRIVATE_DIRECTORY_MODE) };
+            if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {
+                return Err(CursorPersistenceError::WriteFailed);
+            }
+            let directory = open_directory_at(parent_fd, OsStr::new(name)).map_err(|error| {
+                if is_symlink_error(&error) {
+                    CursorPersistenceError::Insecure
+                } else {
+                    CursorPersistenceError::WriteFailed
+                }
+            })?;
+            validate_directory_identity(NodeIdentity::from_fd(directory.as_raw_fd())?)?;
+            Ok(directory)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(CursorPersistenceError::Missing)
+        }
+        Err(error) if is_symlink_error(&error) => Err(CursorPersistenceError::Insecure),
+        Err(_) => Err(if for_write {
+            CursorPersistenceError::WriteFailed
+        } else {
+            CursorPersistenceError::Insecure
+        }),
+    }
+}
+
+fn open_directory_at(parent_fd: RawFd, name: &OsStr) -> io::Result<OwnedFd> {
+    let name = c_string(name, "directory name")?;
+    let fd = unsafe {
+        libc::openat(
+            parent_fd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a new owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn open_file_at(
+    parent_fd: RawFd,
+    name: &str,
+    for_write: bool,
+) -> Result<Option<File>, CursorPersistenceError> {
+    let name =
+        c_string(OsStr::new(name), "file name").map_err(|_| CursorPersistenceError::Insecure)?;
+    let fd = unsafe {
+        libc::openat(
+            parent_fd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else if for_write || is_symlink_error(&error) {
+            Err(CursorPersistenceError::Insecure)
+        } else {
+            Err(CursorPersistenceError::Invalid)
+        };
+    }
+    // SAFETY: `openat` returned a new owned descriptor.
+    Ok(Some(unsafe { File::from_raw_fd(fd) }))
+}
+
+fn create_temporary_file(parent_fd: RawFd) -> Result<(OsString, File), CursorPersistenceError> {
+    for _ in 0..TEMP_ATTEMPTS {
+        let name = OsString::from(format!(
+            "{TEMP_PREFIX}{}",
+            random_suffix().map_err(|_| { CursorPersistenceError::WriteFailed })?
+        ));
+        let c_name = c_string(&name, "temporary file name")
+            .map_err(|_| CursorPersistenceError::WriteFailed)?;
+        let fd = unsafe {
+            libc::openat(
+                parent_fd,
+                c_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                PRIVATE_FILE_MODE,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: `openat` returned a new owned descriptor.
+            return Ok((name, unsafe { File::from_raw_fd(fd) }));
+        }
+        if io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {
+            return Err(CursorPersistenceError::WriteFailed);
+        }
+    }
+    Err(CursorPersistenceError::WriteFailed)
+}
+
+fn publish_configuration(
+    parent_fd: RawFd,
+    temporary_name: &OsStr,
+    temporary_identity: NodeIdentity,
+    existing_identity: Option<NodeIdentity>,
+) -> Result<(), CursorPersistenceError> {
+    let destination = OsStr::new(CONFIGURATION_FILE);
+    match existing_identity {
+        None => {
+            rename_at2(
+                parent_fd,
+                temporary_name,
+                parent_fd,
+                destination,
+                RENAME_NOREPLACE,
+            )
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    CursorPersistenceError::Insecure
+                } else {
+                    CursorPersistenceError::WriteFailed
+                }
+            })?;
+            verify_published_file(parent_fd, destination, temporary_identity)
+        }
+        Some(expected_old) => {
+            let quarantine_name = transaction_name(QUARANTINE_PREFIX)?;
+            let current = open_file_at(parent_fd, CONFIGURATION_FILE, true)?
+                .ok_or(CursorPersistenceError::Insecure)?;
+            let current_identity = NodeIdentity::from_fd(current.as_raw_fd())?;
+            if current_identity != expected_old {
+                return Err(CursorPersistenceError::Insecure);
+            }
+            rename_at2(
+                parent_fd,
+                destination,
+                parent_fd,
+                &quarantine_name,
+                RENAME_NOREPLACE,
+            )
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    CursorPersistenceError::Insecure
+                } else {
+                    CursorPersistenceError::WriteFailed
+                }
+            })?;
+            let quarantined = match open_file_at(parent_fd, quarantine_name.to_str().unwrap(), true)
+            {
+                Ok(Some(file)) => file,
+                Ok(None) | Err(_) => {
+                    let _ = restore_entry(parent_fd, &quarantine_name, destination);
+                    return Err(CursorPersistenceError::Insecure);
+                }
+            };
+            if NodeIdentity::from_fd(quarantined.as_raw_fd())? != expected_old {
+                drop(quarantined);
+                restore_entry(parent_fd, &quarantine_name, destination)?;
+                return Err(CursorPersistenceError::Insecure);
+            }
+            drop(quarantined);
+
+            if let Err(error) = rename_at2(
+                parent_fd,
+                temporary_name,
+                parent_fd,
+                destination,
+                RENAME_NOREPLACE,
+            ) {
+                let _ = restore_entry(parent_fd, &quarantine_name, destination);
+                return Err(if error.kind() == io::ErrorKind::AlreadyExists {
+                    CursorPersistenceError::Insecure
+                } else {
+                    CursorPersistenceError::WriteFailed
+                });
+            }
+
+            if let Err(error) = verify_published_file(parent_fd, destination, temporary_identity) {
+                let rollback = (|| {
+                    rename_at2(
+                        parent_fd,
+                        destination,
+                        parent_fd,
+                        temporary_name,
+                        RENAME_NOREPLACE,
+                    )
+                    .map_err(|_| CursorPersistenceError::WriteFailed)?;
+                    restore_entry(parent_fd, &quarantine_name, destination)
+                })();
+                if rollback.is_err() {
+                    return Err(CursorPersistenceError::WriteFailed);
+                }
+                return Err(error);
+            }
+            remove_owned_at(parent_fd, &quarantine_name, expected_old)
+        }
+    }
+}
+
+fn verify_published_file(
+    parent_fd: RawFd,
+    destination: &OsStr,
+    expected: NodeIdentity,
+) -> Result<(), CursorPersistenceError> {
+    let file = open_file_at(parent_fd, destination.to_str().unwrap(), true)?
+        .ok_or(CursorPersistenceError::WriteFailed)?;
+    let identity = NodeIdentity::from_fd(file.as_raw_fd())?;
+    if identity != expected {
+        return Err(CursorPersistenceError::Insecure);
+    }
+    validate_configuration_identity(identity)?;
+    file.sync_all()
+        .map_err(|_| CursorPersistenceError::WriteFailed)
+}
+
+fn rename_at2(
+    source_dir: RawFd,
+    source: &OsStr,
+    destination_dir: RawFd,
+    destination: &OsStr,
+    flags: libc::c_uint,
+) -> io::Result<()> {
+    let source = c_string(source, "source name")?;
+    let destination = c_string(destination, "destination name")?;
+    let result = unsafe {
+        // SAFETY: the directory descriptors and NUL-free names are owned by
+        // this transaction; `renameat2` only changes the named entries.
+        libc::syscall(
+            libc::SYS_renameat2,
+            source_dir,
+            source.as_ptr(),
+            destination_dir,
+            destination.as_ptr(),
+            flags,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn remove_owned_at(
+    parent_fd: RawFd,
+    name: &OsStr,
+    expected: NodeIdentity,
+) -> Result<(), CursorPersistenceError> {
+    let cleanup_name = transaction_name(QUARANTINE_PREFIX)?;
+    match rename_at2(parent_fd, name, parent_fd, &cleanup_name, RENAME_NOREPLACE) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(CursorPersistenceError::WriteFailed),
+    }
+    let current = match open_file_at(parent_fd, cleanup_name.to_str().unwrap(), true) {
+        Ok(Some(file)) => file,
+        Ok(None) | Err(_) => {
+            let _ = restore_entry(parent_fd, &cleanup_name, name);
+            return Err(CursorPersistenceError::Insecure);
+        }
+    };
+    if NodeIdentity::from_fd(current.as_raw_fd())? != expected {
+        drop(current);
+        restore_entry(parent_fd, &cleanup_name, name)?;
+        return Err(CursorPersistenceError::Insecure);
+    }
+    drop(current);
+    let cleanup_name =
+        c_string(&cleanup_name, "cleanup name").map_err(|_| CursorPersistenceError::WriteFailed)?;
+    let result = unsafe {
+        // SAFETY: `parent_fd` is the validated input directory and the
+        // quarantined entry was verified against the exact expected identity.
+        libc::unlinkat(parent_fd, cleanup_name.as_ptr(), 0)
+    };
+    if result < 0 {
+        Err(CursorPersistenceError::WriteFailed)
+    } else {
+        Ok(())
+    }
+}
+
+fn restore_entry(
+    parent_fd: RawFd,
+    quarantine_name: &OsStr,
+    destination: &OsStr,
+) -> Result<(), CursorPersistenceError> {
+    rename_at2(
+        parent_fd,
+        quarantine_name,
+        parent_fd,
+        destination,
+        RENAME_NOREPLACE,
+    )
+    .map_err(|_| CursorPersistenceError::WriteFailed)
+}
+
+fn transaction_name(prefix: &str) -> Result<OsString, CursorPersistenceError> {
+    Ok(OsString::from(format!(
+        "{prefix}{}",
+        random_suffix().map_err(|_| CursorPersistenceError::WriteFailed)?
+    )))
+}
+
+fn read_bounded(mut file: File) -> Result<Vec<u8>, CursorPersistenceError> {
+    let mut document = Vec::with_capacity(MAX_DOCUMENT_BYTES + 1);
+    let mut buffer = [0_u8; 512];
+    loop {
+        let remaining = MAX_DOCUMENT_BYTES + 1 - document.len();
+        if remaining == 0 {
+            return Err(CursorPersistenceError::Invalid);
+        }
+        let read_len = remaining.min(buffer.len());
+        let count = file
+            .read(&mut buffer[..read_len])
+            .map_err(|_| CursorPersistenceError::Invalid)?;
+        if count == 0 {
+            return Ok(document);
+        }
+        if document.len().saturating_add(count) > MAX_DOCUMENT_BYTES {
+            return Err(CursorPersistenceError::Invalid);
+        }
+        document.extend_from_slice(&buffer[..count]);
+    }
+}
+
+fn sync_directory(fd: RawFd) -> Result<(), CursorPersistenceError> {
+    let result = unsafe {
+        // SAFETY: `fd` is the validated input directory descriptor retained by
+        // the write transaction.
+        libc::fsync(fd)
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP)) {
+        Ok(())
+    } else {
+        Err(CursorPersistenceError::WriteFailed)
+    }
+}
+
+fn c_string(value: &OsStr, label: &str) -> io::Result<CString> {
+    CString::new(value.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, label))
+}
+
+fn is_symlink_error(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ELOOP)
 }
 
 fn random_suffix() -> io::Result<String> {
@@ -336,6 +710,14 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PersistedCursorConfiguration {
+    version: u32,
+    theme: String,
+    size_px: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,10 +731,20 @@ mod tests {
 
     #[test]
     fn metadata_policy_requires_effective_uid_and_expected_mode() {
-        assert!(owned_with_mode(1000, 0o700, 1000, Some(0o700)));
-        assert!(!owned_with_mode(1001, 0o700, 1000, Some(0o700)));
-        assert!(!owned_with_mode(1000, 0o755, 1000, Some(0o700)));
-        assert!(owned_with_mode(1000, 0o755, 1000, None));
-        assert!(!owned_with_mode(1000, 0o775, 1000, None));
+        assert!(owned_with_mode_for_test(1000, 0o700, 1000, Some(0o700)));
+        assert!(!owned_with_mode_for_test(1001, 0o700, 1000, Some(0o700)));
+        assert!(!owned_with_mode_for_test(1000, 0o755, 1000, Some(0o700)));
+        assert!(owned_with_mode_for_test(1000, 0o755, 1000, None));
+        assert!(!owned_with_mode_for_test(1000, 0o775, 1000, None));
+    }
+
+    fn owned_with_mode_for_test(
+        uid: u32,
+        mode: u32,
+        effective_uid: u32,
+        exact_mode: Option<u32>,
+    ) -> bool {
+        uid == effective_uid
+            && exact_mode.map_or(mode & 0o022 == 0, |expected| mode & 0o777 == expected)
     }
 }

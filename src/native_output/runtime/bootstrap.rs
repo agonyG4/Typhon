@@ -508,7 +508,7 @@ impl NativeRuntime {
         let resize_perf = NativeResizePerfState::default();
         let pointer_constraint_backend = NativePointerConstraintBackend::new();
         let xwayland_app_environment = xwayland.normal_app_environment();
-        let child_cursor_configuration = cursor_manager.active_configuration().clone();
+        let child_cursor_configuration = cursor_manager.desired_configuration().clone();
         if let Some(command) = external_shell_command()
             && let Some(launch) = launch_native_shell_command_with_xwayland_environment_and_cursor(
                 &server,
@@ -948,11 +948,8 @@ impl NativeRuntime {
                     .into());
                 }
             } else if atomic_discovery.is_none() {
-                match NativeLegacyHardwareCursor::create(
-                    kms.file(),
-                    target.crtc_id,
-                    cursor_image.as_ref(),
-                ) {
+                match NativeLegacyHardwareCursor::create(kms.file(), target.crtc_id, &cursor_image)
+                {
                     Ok(cursor) => pre_kms_legacy_cursor = Some(cursor),
                     Err(error) if cursor_preference == NativeCursorPreference::Hardware => {
                         return Err(error.into());

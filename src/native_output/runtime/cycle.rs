@@ -96,7 +96,7 @@ impl NativeRuntime {
             self.perf,
             &mut self.pending_launches,
             self.xwayland.normal_app_environment(),
-            Some(self.cursor_manager.active_configuration()),
+            Some(self.cursor_manager.desired_configuration()),
         );
         let prepare_started = Instant::now();
         self.process_acquire_and_prepare(&cycle)?;

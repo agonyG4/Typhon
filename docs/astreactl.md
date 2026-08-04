@@ -118,6 +118,9 @@ Cursor commands are typed M4 commands. `cursor get` and every successful cursor
 mutation return a `CursorSnapshot` containing desired and active theme/size,
 the generation, backend (`hardware`, `software`, `hidden`, or `unavailable`),
 configuration source (`default`, `config`, or `control`), and persistence state.
+It also reports `asset_source` as `system_theme` or `builtin_fallback`. The
+snapshot distinguishes the desired logical XCursor configuration from the
+actually loaded fallback asset.
 The client validates the complete result before formatting it. A valid envelope
 with a missing, null, incompatible, or malformed result is a protocol error and
 exits `6`; it is never treated as an empty successful snapshot.
