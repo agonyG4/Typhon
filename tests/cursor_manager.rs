@@ -6,7 +6,8 @@ use oblivion_one::cursor_manager::{
 };
 use oblivion_one::cursor_persistence::CursorConfigurationStore;
 use oblivion_one::cursor_theme::{
-    CompositorCursorImage, CursorConfiguration, CursorThemeLoadError, default_cursor_configuration,
+    CompositorCursorImage, CursorConfiguration, CursorShapeImages, CursorThemeLoadError,
+    default_cursor_configuration,
 };
 use std::collections::VecDeque;
 use std::fs;
@@ -61,11 +62,23 @@ impl CursorThemeLoader for FakeLoader {
             return Err(error);
         }
         let pixel = (self.loads as u32) << 16 | 0xff;
-        let image = CompositorCursorImage::from_argb8888(vec![pixel], 1, 1, 0, 0)
-            .map_err(|_| CursorThemeLoadError::CursorFileInvalid)?;
-        Ok(LoadedCursorTheme::new(
+        let image = |offset| {
+            CompositorCursorImage::from_argb8888(vec![pixel + offset], 1, 1, 0, 0)
+                .map(Arc::new)
+                .map_err(|_| CursorThemeLoadError::CursorFileInvalid)
+        };
+        let images = CursorShapeImages::from_images(
+            image(0)?,
+            image(1)?,
+            image(2)?,
+            image(3)?,
+            image(4)?,
+            image(5)?,
+        );
+        Ok(LoadedCursorTheme::from_images(
             configuration.clone(),
-            Arc::new(image),
+            images,
+            CursorAssetSource::SystemTheme,
         ))
     }
 }
@@ -361,4 +374,40 @@ fn one_hundred_generation_retirement_cycles_release_all_unowned_generations() {
     }
     assert_eq!(manager.retired_generation_count(), 0);
     assert_eq!(manager.diagnostics().retired_generations, 100);
+}
+
+#[test]
+fn one_hundred_builtin_fallback_snapshots_report_the_asset_source_truthfully() {
+    for _ in 0..100 {
+        let root = TestRoot::new();
+        let manager = CursorThemeManager::startup(
+            root.store(),
+            Box::new(FakeLoader::fails_always(
+                CursorThemeLoadError::ThemeNotFound,
+            )),
+        );
+        assert_eq!(manager.asset_source(), CursorAssetSource::BuiltinFallback);
+        assert_eq!(
+            manager.desired_configuration(),
+            &default_cursor_configuration()
+        );
+    }
+}
+
+#[test]
+fn one_hundred_multi_shape_retirement_cycles_release_after_the_final_shape_owner() {
+    let (mut manager, _root) = manager(Box::new(FakeLoader::succeeds()));
+    for index in 0..100 {
+        let held_shape = manager.active_image_for_shape(
+            oblivion_one::cursor_theme::CompositorCursorShape::ResizeDiagonalNeSw,
+        );
+        manager
+            .set_size(if index % 2 == 0 { 8 } else { 256 })
+            .unwrap();
+        manager.collect_retired_generations();
+        assert_eq!(manager.retired_generation_count(), 1);
+        drop(held_shape);
+        manager.collect_retired_generations();
+        assert_eq!(manager.retired_generation_count(), 0);
+    }
 }

@@ -474,6 +474,20 @@ fn oversized_theme_cursor_falls_back_to_software_in_auto() {
 }
 
 #[test]
+fn one_hundred_oversized_hardware_replacements_remain_software_eligible() {
+    let image =
+        CompositorCursorImage::from_argb8888(vec![0xffff_ffff; 65 * 64], 65, 64, 0, 0).unwrap();
+    for _ in 0..100 {
+        assert!(!cursor_image_fits_buffer(
+            &image,
+            NATIVE_HARDWARE_CURSOR_SIZE,
+            64
+        ));
+        assert!(validate_atomic_cursor_image(&image, NATIVE_HARDWARE_CURSOR_SIZE, 64).is_err());
+    }
+}
+
+#[test]
 fn oversized_theme_cursor_fails_in_hardware_mode() {
     let image =
         CompositorCursorImage::from_argb8888(vec![0xffff_ffff; 65 * 64], 65, 64, 0, 0).unwrap();

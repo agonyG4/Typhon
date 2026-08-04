@@ -771,6 +771,65 @@ mod tests {
         assert!(!images.has_external_owner());
     }
 
+    fn test_shape_bundle() -> CursorShapeImages {
+        CursorShapeImages::from_images(
+            Arc::new(CompositorCursorImage::from_argb8888(vec![1], 1, 1, 0, 0).unwrap()),
+            Arc::new(CompositorCursorImage::from_argb8888(vec![2], 1, 1, 0, 0).unwrap()),
+            Arc::new(CompositorCursorImage::from_argb8888(vec![3], 1, 1, 0, 0).unwrap()),
+            Arc::new(CompositorCursorImage::from_argb8888(vec![4], 1, 1, 0, 0).unwrap()),
+            Arc::new(CompositorCursorImage::from_argb8888(vec![5], 1, 1, 0, 0).unwrap()),
+            Arc::new(CompositorCursorImage::from_argb8888(vec![6], 1, 1, 0, 0).unwrap()),
+        )
+    }
+
+    #[test]
+    fn one_hundred_pointer_move_shape_transitions_select_exact_images() {
+        let images = test_shape_bundle();
+        for index in 0..100 {
+            let shape = if index % 2 == 0 {
+                CompositorCursorShape::Pointer
+            } else {
+                CompositorCursorShape::Move
+            };
+            assert_eq!(
+                images.image(shape).pixels_argb8888[0],
+                if index % 2 == 0 { 1 } else { 2 }
+            );
+        }
+    }
+
+    #[test]
+    fn one_hundred_horizontal_vertical_shape_transitions_select_exact_images() {
+        let images = test_shape_bundle();
+        for index in 0..100 {
+            let shape = if index % 2 == 0 {
+                CompositorCursorShape::ResizeHorizontal
+            } else {
+                CompositorCursorShape::ResizeVertical
+            };
+            assert_eq!(
+                images.image(shape).pixels_argb8888[0],
+                if index % 2 == 0 { 3 } else { 4 }
+            );
+        }
+    }
+
+    #[test]
+    fn one_hundred_diagonal_shape_transitions_select_exact_images() {
+        let images = test_shape_bundle();
+        for index in 0..100 {
+            let shape = if index % 2 == 0 {
+                CompositorCursorShape::ResizeDiagonalNwSe
+            } else {
+                CompositorCursorShape::ResizeDiagonalNeSw
+            };
+            assert_eq!(
+                images.image(shape).pixels_argb8888[0],
+                if index % 2 == 0 { 5 } else { 6 }
+            );
+        }
+    }
+
     #[test]
     fn cursor_theme_loads_every_required_interaction_shape_at_requested_size() {
         let fixture = CursorFixture::new();

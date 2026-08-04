@@ -173,6 +173,32 @@ fn failed_write_before_rename_keeps_the_replacement_and_leaves_no_temporary_file
     assert!(temporary_files(&root.0).is_empty());
 }
 
+#[test]
+fn one_hundred_destination_symlink_replacements_are_rejected_without_overwrite() {
+    let root = TestRoot::new();
+    let store = root.store();
+    let original = CursorConfiguration::new("default", 24).unwrap();
+    let replacement = root.0.join("replacement.json");
+    store.write(&original).unwrap();
+
+    for index in 0..100 {
+        let parked = root.0.join(format!("parked-{index}.json"));
+        fs::rename(root.file(), &parked).unwrap();
+        fs::write(&replacement, b"replacement must survive").unwrap();
+        std::os::unix::fs::symlink(&replacement, root.file()).unwrap();
+
+        assert!(matches!(
+            store.write(&CursorConfiguration::new("other", 32).unwrap()),
+            Err(CursorPersistenceError::Insecure)
+        ));
+        assert_eq!(fs::read(&replacement).unwrap(), b"replacement must survive");
+        assert!(temporary_files(&root.0).is_empty());
+
+        fs::remove_file(root.file()).unwrap();
+        fs::rename(parked, root.file()).unwrap();
+    }
+}
+
 fn temporary_files(root: &Path) -> Vec<PathBuf> {
     let input = root.join("AstreaOS/input");
     fs::read_dir(input)
