@@ -54,11 +54,10 @@ directories remain. The server tracks bounded saturating counters for accepts,
 rejections, malformed and oversized requests, timeouts, stale tokens, and
 client I/O failures rather than logging every connection or client string.
 
-M2 provides transport and reactor infrastructure only. Requests currently
-receive a bounded `invalid_command` response: known command semantics are
-installed by M3, and unknown commands are rejected. No compositor snapshots,
-cursor changes, wallpaper commands, window actions, or shell protocol are
-implemented by this milestone.
+M3 adds bounded read-only `version`, `status`, `doctor`, `outputs`, `windows`,
+and `active-window` snapshots. Snapshot data is copied into owned values before
+encoding. Cursor changes, wallpaper commands, window actions, and shell
+protocol remain unavailable.
 
 For a live socket conflict, inspect the instance-specific path above and stop
 the owning Typhon instance before starting another one. An insecure or missing
