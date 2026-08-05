@@ -821,7 +821,17 @@ impl CursorIoWorker {
     }
 
     pub fn receive_completion(&self) -> Option<CursorIoCompletion> {
-        self.completions.recv().ok()
+        let completion = self.completions.recv().ok();
+        if completion.is_some() {
+            // The worker publishes the completion before releasing the one-job
+            // admission slot.  Wait for that release so callers never observe
+            // a completed operation and immediately race the worker's state
+            // transition with the next submission.
+            while self.busy.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+        }
+        completion
     }
 
     pub fn is_busy(&self) -> bool {

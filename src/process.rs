@@ -375,6 +375,7 @@ impl ChildSupervisor {
     }
 
     pub fn with_sigchld_reaper() -> io::Result<Self> {
+        block_sigchld_for_current_thread()?;
         let mut supervisor = Self::new();
         supervisor.sigchld_fd = Some(create_sigchld_signalfd()?);
         Ok(supervisor)
@@ -927,21 +928,80 @@ impl Drop for ChildSupervisor {
 }
 
 fn create_sigchld_signalfd() -> io::Result<OwnedFd> {
-    let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-    if unsafe { libc::sigemptyset(&mut mask) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { libc::sigaddset(&mut mask, libc::SIGCHLD) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let fd = unsafe { libc::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK) };
+    block_sigchld_for_current_thread()?;
+    let mask = sigchld_mask()?;
+    let fd = unsafe {
+        // SAFETY: `mask` is initialized with SIGCHLD and the returned
+        // descriptor is configured nonblocking and close-on-exec.
+        libc::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK)
+    };
     if fd < 0 {
         Err(io::Error::last_os_error())
     } else {
+        // SAFETY: `signalfd` returned a new owned descriptor.
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+fn sigchld_mask() -> io::Result<libc::sigset_t> {
+    let mut mask = unsafe {
+        // SAFETY: zeroed storage is valid for `sigemptyset` to initialize.
+        std::mem::zeroed::<libc::sigset_t>()
+    };
+    if unsafe {
+        // SAFETY: `mask` is valid writable signal-set storage.
+        libc::sigemptyset(&mut mask)
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe {
+        // SAFETY: `mask` was initialized by `sigemptyset` above.
+        libc::sigaddset(&mut mask, libc::SIGCHLD)
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(mask)
+}
+
+/// Block process-child notifications in the current thread.
+///
+/// Native bootstrap calls this before driver and library initialization so all
+/// later Typhon-created threads inherit the mask and the supervisor's
+/// `signalfd` remains the normal SIGCHLD delivery path.
+pub fn block_sigchld_for_current_thread() -> io::Result<()> {
+    let mask = sigchld_mask()?;
+    let result = unsafe {
+        // SAFETY: `mask` is a fully initialized signal set and the null old
+        // mask pointer is permitted because the caller does not need it.
+        libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut())
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(result))
+    }
+}
+
+pub fn sigchld_is_blocked_for_current_thread() -> io::Result<bool> {
+    let mut current = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    let result = unsafe {
+        // SAFETY: a null new-mask pointer queries the current thread's mask
+        // into the valid `current` storage.
+        libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut current)
+    };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result));
+    }
+    let member = unsafe {
+        // SAFETY: `current` was initialized by `pthread_sigmask` above.
+        libc::sigismember(&current, libc::SIGCHLD)
+    };
+    match member {
+        1 => Ok(true),
+        0 => Ok(false),
+        _ => Err(io::Error::last_os_error()),
     }
 }
 
@@ -972,48 +1032,6 @@ mod tests {
     };
 
     use super::*;
-
-    #[test]
-    fn sigchld_reaper_blocks_sigchld_in_the_bootstrap_thread() {
-        let mut previous = unsafe {
-            // SAFETY: a zeroed `sigset_t` is valid storage for the signal-mask
-            // query below.
-            std::mem::zeroed::<libc::sigset_t>()
-        };
-        let query_result = unsafe {
-            // SAFETY: a null new-mask pointer queries the current thread's
-            // signal mask into the valid `previous` storage.
-            libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut previous)
-        };
-        assert_eq!(query_result, 0);
-
-        let supervisor = ChildSupervisor::with_sigchld_reaper().unwrap();
-        let mut current = unsafe {
-            // SAFETY: a zeroed `sigset_t` is valid storage for the signal-mask
-            // query below.
-            std::mem::zeroed::<libc::sigset_t>()
-        };
-        let query_result = unsafe {
-            // SAFETY: a null new-mask pointer queries the current thread's
-            // signal mask into the valid `current` storage.
-            libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut current)
-        };
-        assert_eq!(query_result, 0);
-        let sigchld_member = unsafe {
-            // SAFETY: `current` is a fully initialized signal set queried from
-            // the current thread.
-            libc::sigismember(&current, libc::SIGCHLD)
-        };
-        assert_eq!(sigchld_member, 1);
-        assert!(supervisor.signal_fd().is_some());
-
-        let restore_result = unsafe {
-            // SAFETY: `previous` was populated by the earlier query and is a
-            // valid signal set for restoring this test thread's mask.
-            libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut())
-        };
-        assert_eq!(restore_result, 0);
-    }
 
     fn shell_command(script: &str) -> Command {
         let mut command = Command::new("sh");

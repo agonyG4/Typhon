@@ -133,11 +133,14 @@ slot, unregisters the worker source, and makes later mutations return
 readiness is kept separate from control-client readiness, including terminal
 `HUP` and `ERR` events.
 
-Native bootstrap creates the child supervisor and blocks `SIGCHLD` before
-starting the KMS or cursor workers. The signalfd remains the single child
-notification mechanism; every later worker inherits the blocked mask, and
-session-owned children are launched only after that supervisor ownership is
-valid.
+The native compositor entry blocks `SIGCHLD` with `pthread_sigmask` before
+constructing the Wayland server or entering output discovery, EGL/GBM probing,
+DRM opening, renderer or input setup. `NativeRuntime::bootstrap` repeats this
+idempotently, and the child supervisor repeats it immediately before creating
+the signalfd. The signalfd remains the single child notification mechanism;
+every later KMS, cursor, XWayland, and session-owned child path inherits the
+blocked mask, and session-owned children are launched only after signalfd
+ownership is valid.
 
 The loader caps each cursor file at 16 MiB, each frame dimension at 1024,
 each frame at 1,048,576 pixels, each file at 256 frames, and each candidate
@@ -150,12 +153,17 @@ Persistence has a global advisory lock at
 `$XDG_CONFIG_HOME/AstreaOS/input/cursor.lock` (or the corresponding
 `$HOME/.config` path). It is a descriptor-relative, owned regular file with
 exact mode `0600`, opened with no-follow and held with nonblocking exclusive
-`flock` through stale cleanup, publication, rollback, and cleanup. The lock
-file remains after shutdown. Reads do not acquire it because canonical
-publication is atomic; compliant Typhon instances serialize all writes. An
-insecure lock fails closed, while lock contention is a bounded busy error and
-does not clean transaction files or change runtime state. Arbitrary same-UID
-filesystem replacement is still handled by exact identity checks.
+`flock` through stale cleanup, publication, rollback, and cleanup. Typhon
+captures the opened descriptor's device, inode, type, owner, and mode, then
+compares the descriptor-relative `cursor.lock` entry with that exact identity
+immediately after locking, before stale cleanup, and immediately before
+publication. A replacement, symlink, or mode/ownership change fails closed as
+`cursor_config_insecure`; it never cleans transaction files, publishes the
+configuration, removes, or chmods the replacement lock. The lock file remains
+after shutdown. Reads do not acquire it because canonical publication is
+atomic; compliant Typhon instances serialize all writes. Advisory locking is
+not a privilege boundary against arbitrary same-UID filesystem interference;
+identity checks make such interference fail closed.
 
 Persistence has a commit point: the exact new `cursor.json` identity has been
 verified, its contents synchronized, and the parent directory synchronization

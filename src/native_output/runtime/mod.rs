@@ -326,6 +326,11 @@ pub(crate) struct NativeRuntime {
 
 impl NativeRuntime {
     pub(crate) fn bootstrap(config: NativeRuntimeConfig) -> NativeResult<Self> {
+        // Block process-directed SIGCHLD before any native driver, graphics
+        // library, or compositor initialization can create a thread.  Every
+        // later worker inherits this mask and the child supervisor's signalfd
+        // remains the sole normal notification path.
+        oblivion_one::process::block_sigchld_for_current_thread()?;
         Self::bootstrap_native(config)
     }
 

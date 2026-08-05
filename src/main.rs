@@ -182,6 +182,9 @@ fn native_protocol_names() -> Vec<&'static str> {
 }
 
 fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
+    // Block process-directed SIGCHLD before constructing the Wayland server or
+    // entering any native driver, graphics-library, or worker initialization.
+    oblivion_one::process::block_sigchld_for_current_thread()?;
     let plan = CompositorPlan::new(&options.socket_name);
     println!("Typhon native compositor");
     println!("socket: {}", plan.socket_name);

@@ -16,7 +16,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Barrier;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -95,6 +95,10 @@ struct PanicLoader {
     entered: Arc<Barrier>,
 }
 
+struct SignalMaskLoader {
+    blocked: Arc<AtomicBool>,
+}
+
 impl CursorThemeLoader for PanicLoader {
     fn load(
         &mut self,
@@ -112,6 +116,22 @@ impl CursorThemeLoader for BlockingLoader {
     ) -> Result<LoadedCursorTheme, CursorThemeLoadError> {
         self.entered.wait();
         self.release.wait();
+        Ok(LoadedCursorTheme::new(
+            configuration.clone(),
+            Arc::new(CompositorCursorImage::builtin_fallback()),
+        ))
+    }
+}
+
+impl CursorThemeLoader for SignalMaskLoader {
+    fn load(
+        &mut self,
+        configuration: &CursorConfiguration,
+    ) -> Result<LoadedCursorTheme, CursorThemeLoadError> {
+        self.blocked.store(
+            oblivion_one::process::sigchld_is_blocked_for_current_thread().unwrap(),
+            Ordering::Release,
+        );
         Ok(LoadedCursorTheme::new(
             configuration.clone(),
             Arc::new(CompositorCursorImage::builtin_fallback()),
@@ -483,6 +503,30 @@ fn cursor_io_worker_rejects_a_second_mutation_while_the_first_is_running() {
     );
     release.wait();
     assert!(worker.receive_completion().is_some());
+}
+
+#[test]
+fn cursor_io_worker_inherits_the_early_sigchld_mask() {
+    oblivion_one::process::block_sigchld_for_current_thread().unwrap();
+    let blocked = Arc::new(AtomicBool::new(false));
+    let root = TestRoot::new();
+    let worker = oblivion_one::cursor_manager::CursorIoWorker::new(
+        root.store(),
+        Box::new(SignalMaskLoader {
+            blocked: Arc::clone(&blocked),
+        }),
+    )
+    .unwrap();
+    worker
+        .submit(CursorIoOperation::Apply {
+            job_id: CursorJobId(1),
+            configuration: CursorConfiguration::new("theme-a", 24).unwrap(),
+            persist: false,
+            kind: CursorMutationKind::Theme,
+        })
+        .unwrap();
+    assert!(worker.receive_completion().is_some());
+    assert!(blocked.load(Ordering::Acquire));
 }
 
 #[test]

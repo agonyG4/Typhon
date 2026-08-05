@@ -27,6 +27,15 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 const RENAME_NOREPLACE: libc::c_uint = 1;
 const RENAME_EXCHANGE: libc::c_uint = 2;
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockReplacementPhase {
+    AfterOpen,
+    AfterFlock,
+    BeforeStaleCleanup,
+    BeforePublication,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CursorWriteOutcome {
     pub committed: bool,
@@ -35,6 +44,10 @@ pub struct CursorWriteOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorPersistenceFault {
+    AfterLockOpen,
+    AfterFlock,
+    BeforeStaleCleanup,
+    BeforePublication,
     TemporaryCreation,
     TemporaryWrite,
     TemporaryFsync,
@@ -79,6 +92,8 @@ pub struct CursorConfigurationStore {
     create_missing_config_home: bool,
     unavailable: Option<CursorPersistenceError>,
     fault: Option<CursorPersistenceFault>,
+    #[cfg(test)]
+    lock_replacement_phase: Option<LockReplacementPhase>,
 }
 
 impl CursorConfigurationStore {
@@ -104,6 +119,8 @@ impl CursorConfigurationStore {
             create_missing_config_home: false,
             unavailable: Some(error),
             fault: None,
+            #[cfg(test)]
+            lock_replacement_phase: None,
         }
     }
 
@@ -129,11 +146,19 @@ impl CursorConfigurationStore {
             create_missing_config_home,
             unavailable: None,
             fault: None,
+            #[cfg(test)]
+            lock_replacement_phase: None,
         })
     }
 
     pub fn with_fault_injection(mut self, fault: CursorPersistenceFault) -> Self {
         self.fault = Some(fault);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_lock_replacement_for_test(mut self, phase: LockReplacementPhase) -> Self {
+        self.lock_replacement_phase = Some(phase);
         self
     }
 
@@ -176,7 +201,37 @@ impl CursorConfigurationStore {
         })
         .map_err(|_| CursorPersistenceError::WriteFailed)?;
         let directories = self.open_directories(true)?;
-        let _lock = open_cursor_lock(directories.input.as_raw_fd())?;
+        let (lock, lock_identity) = open_cursor_lock(directories.input.as_raw_fd())?;
+        #[cfg(test)]
+        self.replace_lock_for_test_if_requested(
+            LockReplacementPhase::AfterOpen,
+            directories.input.as_raw_fd(),
+        )?;
+        self.fail_if_fault(CursorPersistenceFault::AfterLockOpen)?;
+        acquire_cursor_lock(&lock)?;
+        #[cfg(test)]
+        self.replace_lock_for_test_if_requested(
+            LockReplacementPhase::AfterFlock,
+            directories.input.as_raw_fd(),
+        )?;
+        self.fail_if_fault(CursorPersistenceFault::AfterFlock)?;
+        let mut lock_identity_lost = false;
+        require_lock_identity(
+            directories.input.as_raw_fd(),
+            lock_identity,
+            &mut lock_identity_lost,
+        )?;
+        #[cfg(test)]
+        self.replace_lock_for_test_if_requested(
+            LockReplacementPhase::BeforeStaleCleanup,
+            directories.input.as_raw_fd(),
+        )?;
+        self.fail_if_fault(CursorPersistenceFault::BeforeStaleCleanup)?;
+        require_lock_identity(
+            directories.input.as_raw_fd(),
+            lock_identity,
+            &mut lock_identity_lost,
+        )?;
         cleanup_stale_transaction_files(directories.input.as_raw_fd())?;
         let existing = open_file_at(directories.input.as_raw_fd(), CONFIGURATION_FILE, true)?;
         let existing_identity = existing
@@ -203,16 +258,24 @@ impl CursorConfigurationStore {
                 .sync_all()
                 .map_err(|_| CursorPersistenceError::WriteFailed)?;
             validate_configuration_identity(NodeIdentity::from_fd(temporary.as_raw_fd())?)?;
+            #[cfg(test)]
+            self.replace_lock_for_test_if_requested(
+                LockReplacementPhase::BeforePublication,
+                directories.input.as_raw_fd(),
+            )?;
+            self.fail_if_fault(CursorPersistenceFault::BeforePublication)?;
             publish_configuration(
                 directories.input.as_raw_fd(),
                 &temporary_name,
                 temporary_identity,
                 existing_identity,
+                lock_identity,
+                &mut lock_identity_lost,
                 self.fault,
             )
         })();
         drop(temporary);
-        if write_result.is_err() {
+        if write_result.is_err() && !lock_identity_lost {
             let _ = remove_owned_at(
                 directories.input.as_raw_fd(),
                 &temporary_name,
@@ -228,6 +291,48 @@ impl CursorConfigurationStore {
         } else {
             Ok(())
         }
+    }
+
+    #[cfg(test)]
+    fn replace_lock_for_test_if_requested(
+        &self,
+        phase: LockReplacementPhase,
+        parent_fd: RawFd,
+    ) -> Result<(), CursorPersistenceError> {
+        if self.lock_replacement_phase != Some(phase) {
+            return Ok(());
+        }
+        let parked = OsString::from(format!(
+            ".cursor.lock.replaced-{}",
+            random_suffix().map_err(|_| CursorPersistenceError::WriteFailed)?
+        ));
+        rename_at2(
+            parent_fd,
+            OsStr::new(LOCK_FILE),
+            parent_fd,
+            &parked,
+            RENAME_NOREPLACE,
+        )
+        .map_err(|_| CursorPersistenceError::WriteFailed)?;
+        let name = c_string(OsStr::new(LOCK_FILE), "lock file name")
+            .map_err(|_| CursorPersistenceError::WriteFailed)?;
+        let fd = unsafe {
+            // SAFETY: `parent_fd` is the validated input directory and the
+            // bounded name is NUL-free; exclusive creation makes this the
+            // only replacement created by this test hook.
+            libc::openat(
+                parent_fd,
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                PRIVATE_FILE_MODE,
+            )
+        };
+        if fd < 0 {
+            return Err(CursorPersistenceError::WriteFailed);
+        }
+        // SAFETY: `openat` returned a new owned replacement descriptor.
+        drop(unsafe { OwnedFd::from_raw_fd(fd) });
+        Ok(())
     }
 
     fn open_directories(
@@ -456,7 +561,7 @@ fn open_file_at(
     Ok(Some(unsafe { File::from_raw_fd(fd) }))
 }
 
-fn open_cursor_lock(parent_fd: RawFd) -> Result<OwnedFd, CursorPersistenceError> {
+fn open_cursor_lock(parent_fd: RawFd) -> Result<(OwnedFd, NodeIdentity), CursorPersistenceError> {
     let name = c_string(OsStr::new(LOCK_FILE), "lock file name")
         .map_err(|_| CursorPersistenceError::Insecure)?;
     let fd = unsafe {
@@ -485,20 +590,51 @@ fn open_cursor_lock(parent_fd: RawFd) -> Result<OwnedFd, CursorPersistenceError>
     }
     // SAFETY: `openat` returned a new owned descriptor.
     let lock = unsafe { OwnedFd::from_raw_fd(fd) };
-    validate_configuration_identity(NodeIdentity::from_fd(lock.as_raw_fd())?)?;
+    let identity = NodeIdentity::from_fd(lock.as_raw_fd())?;
+    validate_configuration_identity(identity)?;
+    Ok((lock, identity))
+}
+
+fn acquire_cursor_lock(lock: &OwnedFd) -> Result<(), CursorPersistenceError> {
     let result = unsafe {
         // SAFETY: `lock` is a valid descriptor for the validated lock file;
         // `flock` only changes this process's advisory lock state.
         libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
     };
     if result == 0 {
-        Ok(lock)
+        Ok(())
     } else {
         let error = io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::EAGAIN) {
             Err(CursorPersistenceError::Busy)
         } else {
             Err(CursorPersistenceError::WriteFailed)
+        }
+    }
+}
+
+fn validate_lock_identity(
+    parent_fd: RawFd,
+    expected: NodeIdentity,
+) -> Result<(), CursorPersistenceError> {
+    let actual = entry_identity_at(parent_fd, OsStr::new(LOCK_FILE))?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(CursorPersistenceError::Insecure)
+    }
+}
+
+fn require_lock_identity(
+    parent_fd: RawFd,
+    expected: NodeIdentity,
+    invalidated: &mut bool,
+) -> Result<(), CursorPersistenceError> {
+    match validate_lock_identity(parent_fd, expected) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            *invalidated = true;
+            Err(error)
         }
     }
 }
@@ -573,12 +709,15 @@ fn publish_configuration(
     temporary_name: &OsStr,
     temporary_identity: NodeIdentity,
     existing_identity: Option<NodeIdentity>,
+    lock_identity: NodeIdentity,
+    lock_identity_lost: &mut bool,
     fault: Option<CursorPersistenceFault>,
 ) -> Result<CursorWriteOutcome, CursorPersistenceError> {
     let destination = OsStr::new(CONFIGURATION_FILE);
     match existing_identity {
         None => {
             fail_if_fault(fault, CursorPersistenceFault::NoReplacePublication)?;
+            require_lock_identity(parent_fd, lock_identity, lock_identity_lost)?;
             rename_at2(
                 parent_fd,
                 temporary_name,
@@ -622,6 +761,7 @@ fn publish_configuration(
             }
             drop(current);
             fail_if_fault(fault, CursorPersistenceFault::Exchange)?;
+            require_lock_identity(parent_fd, lock_identity, lock_identity_lost)?;
             if let Err(error) = rename_at2(
                 parent_fd,
                 temporary_name,
@@ -989,6 +1129,99 @@ struct PersistedCursorConfiguration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_path_identity_must_match_the_open_lock_descriptor() {
+        let root = std::env::temp_dir().join(format!(
+            "typhon-cursor-lock-identity-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let store = CursorConfigurationStore::new(root.clone()).unwrap();
+        let directories = store.open_directories(true).unwrap();
+        let (lock, expected) = open_cursor_lock(directories.input.as_raw_fd()).unwrap();
+        let parked = root.join("parked-cursor.lock");
+        std::fs::rename(root.join("AstreaOS/input/cursor.lock"), &parked).unwrap();
+        std::fs::write(root.join("AstreaOS/input/cursor.lock"), b"replacement").unwrap();
+
+        assert_eq!(
+            validate_lock_identity(directories.input.as_raw_fd(), expected),
+            Err(CursorPersistenceError::Insecure)
+        );
+        assert!(parked.exists());
+        assert!(root.join("AstreaOS/input/cursor.lock").exists());
+        drop(lock);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lock_phase_faults_fail_before_publication() {
+        let phases = [
+            CursorPersistenceFault::AfterLockOpen,
+            CursorPersistenceFault::AfterFlock,
+            CursorPersistenceFault::BeforeStaleCleanup,
+            CursorPersistenceFault::BeforePublication,
+        ];
+        for phase in phases {
+            let root = std::env::temp_dir().join(format!(
+                "typhon-cursor-lock-fault-{}-{}",
+                std::process::id(),
+                phase as u8
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir(&root).unwrap();
+            let store = CursorConfigurationStore::new(root.clone())
+                .unwrap()
+                .with_fault_injection(phase);
+            let result = store.write(&CursorConfiguration::new("default", 24).unwrap());
+            assert_eq!(result, Err(CursorPersistenceError::WriteFailed));
+            assert!(matches!(store.read(), Err(CursorPersistenceError::Missing)));
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn lock_replacement_at_each_admission_phase_fails_closed() {
+        let phases = [
+            LockReplacementPhase::AfterOpen,
+            LockReplacementPhase::AfterFlock,
+            LockReplacementPhase::BeforeStaleCleanup,
+            LockReplacementPhase::BeforePublication,
+        ];
+        for (index, phase) in phases.into_iter().enumerate() {
+            let root = std::env::temp_dir().join(format!(
+                "typhon-cursor-lock-replacement-{}-{index}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir(&root).unwrap();
+            let original = CursorConfiguration::new("default", 24).unwrap();
+            let next = CursorConfiguration::new("other", 32).unwrap();
+            let store = CursorConfigurationStore::new(root.clone()).unwrap();
+            store.write(&original).unwrap();
+
+            let result = store
+                .clone()
+                .with_lock_replacement_for_test(phase)
+                .write(&next);
+            assert_eq!(result, Err(CursorPersistenceError::Insecure));
+            assert_eq!(store.read().unwrap(), original);
+            assert!(root.join("AstreaOS/input/cursor.lock").exists());
+            assert!(
+                std::fs::read_dir(root.join("AstreaOS/input"))
+                    .unwrap()
+                    .any(|entry| {
+                        entry
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".cursor.lock.replaced-")
+                    })
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
 
     #[test]
     fn persistence_document_validation_uses_shared_cursor_validator() {
