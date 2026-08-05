@@ -44,6 +44,7 @@ impl CompositorState {
         surface: wl_surface::WlSurface,
         xdg_surface: xdg_surface::XdgSurface,
         toplevel: xdg_toplevel::XdgToplevel,
+        pid: Option<u32>,
     ) {
         let surface_id = compositor_surface_id(&surface);
         if self.is_cursor_surface(surface_id) {
@@ -57,10 +58,9 @@ impl CompositorState {
         let Ok(window_id) = self.allocate_window_id() else {
             return;
         };
-        if self
-            .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
-            .is_err()
-        {
+        let mut desktop_window = DesktopWindow::new_xdg(window_id, surface_id);
+        desktop_window.metadata.pid = pid;
+        if self.insert_desktop_window(desktop_window).is_err() {
             return;
         }
         self.toplevel_surfaces.insert(

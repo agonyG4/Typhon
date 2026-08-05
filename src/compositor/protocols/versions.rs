@@ -540,6 +540,7 @@ pub(crate) const WL_DRM: u32 = 2;
 pub(crate) const XDG_ACTIVATION_V1: u32 = 1;
 pub(crate) const ASTREA_SHORTCUTS_MANAGER_V1: u32 = 1;
 pub(crate) const ASTREA_SHELL_CONTROL_MANAGER_V1: u32 = 1;
+pub(crate) const ASTREA_TOPLEVEL_MANAGER_V1: u32 = 1;
 pub(crate) const XDG_WM_BASE: u32 = 6;
 pub(crate) const WL_OUTPUT: u32 = 4;
 pub(crate) const WL_SEAT: u32 = 7;
@@ -583,6 +584,7 @@ pub(crate) const ALL_GLOBALS: &[GlobalAdvertisement] = &[
         "astrea_shell_control_manager_v1",
         ASTREA_SHELL_CONTROL_MANAGER_V1,
     ),
+    GlobalAdvertisement::new("astrea_toplevel_manager_v1", ASTREA_TOPLEVEL_MANAGER_V1),
     GlobalAdvertisement::new("xdg_wm_base", XDG_WM_BASE),
     GlobalAdvertisement::new("wl_output", WL_OUTPUT),
     GlobalAdvertisement::new("wl_seat", WL_SEAT),

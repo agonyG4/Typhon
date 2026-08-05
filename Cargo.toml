@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 ab_glyph = "0.2.32"
+bitflags = "2.13.0"
 bytemuck = "1.25.0"
 drm-ffi = "0.9.1"
 drm-sys = "0.8.1"

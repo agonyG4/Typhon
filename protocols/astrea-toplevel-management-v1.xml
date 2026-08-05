@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="astrea_toplevel_management_v1">
+  <copyright>
+    Copyright 2026 AstreaOS contributors
+  </copyright>
+
+  <interface name="astrea_toplevel_manager_v1" version="1">
+    <description summary="authoritative read-only Astrea toplevel list">
+      This private protocol publishes compositor-managed application toplevels.
+      Version 1 has no window mutation requests.
+    </description>
+
+    <enum name="error">
+      <entry name="unauthorized" value="0"/>
+      <entry name="manager_limit" value="1"/>
+      <entry name="resource_limit" value="2"/>
+    </enum>
+
+    <enum name="done_flags" bitfield="true">
+      <entry name="truncated" value="1"/>
+    </enum>
+
+    <request name="destroy" type="destructor"/>
+
+    <event name="toplevel">
+      <arg name="id" type="new_id" interface="astrea_toplevel_v1"/>
+    </event>
+
+    <event name="done">
+      <arg name="revision_hi" type="uint"/>
+      <arg name="revision_lo" type="uint"/>
+      <arg name="total" type="uint"/>
+      <arg name="flags" type="uint" enum="done_flags"/>
+    </event>
+  </interface>
+
+  <interface name="astrea_toplevel_v1" version="1">
+    <description summary="one compositor-managed Astrea toplevel">
+      The handle is read-only. Its identifier is the stable decimal Typhon
+      WindowId, and its lifetime is independent of the underlying compositor
+      window object.
+    </description>
+
+    <enum name="kind">
+      <entry name="xdg_toplevel" value="0"/>
+      <entry name="x11_toplevel" value="1"/>
+      <entry name="x11_dialog" value="2"/>
+    </enum>
+
+    <enum name="state" bitfield="true">
+      <entry name="active" value="1"/>
+      <entry name="minimized" value="2"/>
+      <entry name="maximized" value="4"/>
+      <entry name="fullscreen" value="8"/>
+    </enum>
+
+    <request name="destroy" type="destructor"/>
+
+    <event name="identifier">
+      <arg name="identifier" type="string"/>
+    </event>
+    <event name="app_id">
+      <arg name="app_id" type="string"/>
+    </event>
+    <event name="title">
+      <arg name="title" type="string"/>
+    </event>
+    <event name="pid">
+      <arg name="pid" type="uint"/>
+    </event>
+    <event name="kind">
+      <arg name="kind" type="uint" enum="kind"/>
+    </event>
+    <event name="state">
+      <arg name="state" type="uint" enum="state"/>
+    </event>
+    <event name="focus_serial">
+      <arg name="serial_hi" type="uint"/>
+      <arg name="serial_lo" type="uint"/>
+    </event>
+    <event name="done">
+      <arg name="revision_hi" type="uint"/>
+      <arg name="revision_lo" type="uint"/>
+    </event>
+    <event name="closed"/>
+  </interface>
+</protocol>

@@ -379,7 +379,7 @@ impl Dispatch<xdg_surface::XdgSurface, XdgSurfaceData> for CompositorState {
         resource: &xdg_surface::XdgSurface,
         request: xdg_surface::Request,
         data: &XdgSurfaceData,
-        _dhandle: &DisplayHandle,
+        dhandle: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
         let surface_id = compositor_surface_id(&data.surface);
@@ -433,6 +433,11 @@ impl Dispatch<xdg_surface::XdgSurface, XdgSurfaceData> for CompositorState {
                     data.surface.clone(),
                     resource.clone(),
                     toplevel.clone(),
+                    client
+                        .get_credentials(dhandle)
+                        .ok()
+                        .and_then(|credentials| u32::try_from(credentials.pid).ok())
+                        .filter(|pid| *pid != 0),
                 );
                 state.adopt_current_surface_content_for_role(surface_id);
                 if let XdgAssociationReservation::Reassociation { permanent_role } =

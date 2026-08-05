@@ -280,8 +280,19 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn mark_xdg_buffer_commit(&mut self, surface_id: u32) {
+        let was_mapped = self
+            .xdg_surface_lifecycle(surface_id)
+            .is_some_and(|lifecycle| lifecycle.currently_mapped);
         if let Some(lifecycle) = self.xdg_surface_lifecycle_mut(surface_id) {
             lifecycle.mark_buffer_commit();
+        }
+        if !was_mapped
+            && self
+                .xdg_surface_lifecycle(surface_id)
+                .is_some_and(|lifecycle| lifecycle.currently_mapped)
+            && let Some(window_id) = self.window_id_for_surface(surface_id)
+        {
+            self.assign_focus_serial_if_needed(window_id);
         }
     }
 

@@ -80,6 +80,7 @@ Typhon’s local generated protocols are invoked from:
 
 - `src/astrea_shortcuts.rs` -> `protocols/astrea-shortcuts-v1.xml`
 - `src/astrea_shell_control.rs` -> `protocols/astrea-shell-control-v1.xml`
+- `src/astrea_toplevel_management.rs` -> `protocols/astrea-toplevel-management-v1.xml`
 - `src/wayland_drm.rs` -> `protocols/wayland-drm.xml`
 
 ## XML hashes used by this audit
@@ -92,6 +93,7 @@ Typhon’s local generated protocols are invoked from:
 | stable `presentation-time.xml` | `dffac93bcb2bb1d8c385e72b8a8c2c0d4d79a336866322f3ba886dce2b27b1e2` |
 | stable `linux-dmabuf-v1.xml` | `ef39de11196083a41e865737f71e89a9ce3d61b94d2dbbed9b156cd89d6bb97f` |
 | WLR `wlr-layer-shell-unstable-v1.xml` | `87e0b9c837aecd6977f76f3c47d73088b7159871f5d979dc1840f6cadb5e2ed8` |
+| Astrea `astrea-toplevel-management-v1.xml` | `e693df18b4da304378bf2e1f1a681a278ad25439c205a407303563e3f182f237` |
 
 ## Upstream comparison source
 
@@ -144,6 +146,7 @@ The target contract is:
 | `xdg_activation_v1` | 1 | always |
 | `astrea_shortcuts_manager_v1` | 1 | always |
 | `astrea_shell_control_manager_v1` | 1 | always |
+| `astrea_toplevel_manager_v1` | 1 | always |
 | `xdg_wm_base` | 6 | always |
 | `wl_output` | 4 | always |
 | `wl_seat` | 7 | always |

@@ -112,6 +112,11 @@ pub(super) fn register_minimum_globals(
         astrea_shell_control_manager_v1::AstreaShellControlManagerV1,
         _,
     >(versions::ASTREA_SHELL_CONTROL_MANAGER_V1, ());
+    display
+        .create_global::<CompositorState, astrea_toplevel_manager_v1::AstreaToplevelManagerV1, _>(
+            versions::ASTREA_TOPLEVEL_MANAGER_V1,
+            (),
+        );
     display.create_global::<CompositorState, xdg_wm_base::XdgWmBase, _>(versions::XDG_WM_BASE, ());
     display.create_global::<CompositorState, wl_output::WlOutput, _>(versions::WL_OUTPUT, ());
     display.create_global::<CompositorState, wl_seat::WlSeat, _>(versions::WL_SEAT, ());

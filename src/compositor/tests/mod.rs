@@ -118,6 +118,7 @@ mod protocol_contract;
 mod protocol_error;
 mod subsurface;
 mod surface_frames;
+mod toplevel_management;
 mod windows;
 mod windows_resize_liveness;
 mod xdg;

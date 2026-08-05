@@ -1,5 +1,6 @@
 pub mod astrea_shell_control;
 pub mod astrea_shortcuts;
+pub mod astrea_toplevel_management;
 pub mod astreactl;
 pub mod compositor;
 pub mod control;

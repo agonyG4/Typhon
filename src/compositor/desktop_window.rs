@@ -125,6 +125,7 @@ pub struct DesktopWindow {
     pub constraints: WindowConstraints,
     pub relationships: WindowRelationships,
     pub state: WindowState,
+    pub(crate) last_focus_serial: u64,
 }
 
 impl DesktopWindow {
@@ -170,6 +171,7 @@ impl DesktopWindow {
             constraints: WindowConstraints::default(),
             relationships: WindowRelationships::default(),
             state: WindowState::default(),
+            last_focus_serial: 0,
         }
     }
 
@@ -205,6 +207,7 @@ impl DesktopWindow {
             constraints: snapshot.constraints,
             relationships: WindowRelationships::default(),
             state: WindowState::default(),
+            last_focus_serial: 0,
         }
     }
 }

@@ -28,6 +28,14 @@ impl CompositorState {
         }
         self.focused_surface = Some(surface.clone());
         self.focused_window_id = self.update_desktop_focus_window(new_surface_id, changed);
+        let focus_generation = self.focus_generation;
+        if changed
+            && let Some(window_id) = self.focused_window_id
+            && self.astrea_toplevel_snapshot(window_id).is_some()
+            && let Some(window) = self.window_mut(window_id)
+        {
+            window.last_focus_serial = focus_generation;
+        }
         self.ensure_keyboard_focus(&surface);
         crate::xwayland::trace::emit("focus_wayland_keyboard", || {
             crate::xwayland::trace::TraceFields::new()
@@ -56,6 +64,20 @@ impl CompositorState {
         self.focused_client_id()
             .as_ref()
             .is_some_and(|focused_client_id| focused_client_id == client_id)
+    }
+
+    pub(in crate::compositor) fn assign_focus_serial_if_needed(&mut self, window_id: WindowId) {
+        if self.focused_window_id != Some(window_id)
+            || self.astrea_toplevel_snapshot(window_id).is_none()
+        {
+            return;
+        }
+        let focus_generation = self.focus_generation;
+        if let Some(window) = self.window_mut(window_id)
+            && window.last_focus_serial == 0
+        {
+            window.last_focus_serial = focus_generation;
+        }
     }
 }
 

@@ -338,6 +338,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     ServerCommand::FocusRootWindow(surface_id) => {
                         if let Some(surface) = server.state.surface_resource_by_id(surface_id) {
                             server.state.focus_surface(surface);
+                            server.publish_astrea_toplevel_updates();
                         }
                     }
                     ServerCommand::RaiseRootWindow(surface_id) => {

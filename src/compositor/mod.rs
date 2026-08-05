@@ -89,11 +89,13 @@ mod server_backend;
 mod server_error;
 mod server_frames;
 mod server_interaction;
+mod server_toplevel;
 mod server_xwayland_events;
 mod shm;
 mod state_data;
 mod subsurface;
 mod surface;
+mod toplevel_publication;
 mod window_backend;
 mod window_state;
 use commit_debug::*;
@@ -127,6 +129,8 @@ use explicit_sync::{
 pub(crate) use frame_batch::CompositorFrameBatch;
 pub(crate) use frame_batch::FrameCallbackSettlement;
 pub use frame_batch::{BufferReleaseMetrics, CompositorFrameBatchId, FrameCallbackMetrics};
+#[allow(unused_imports)]
+pub(in crate::compositor) use toplevel_publication::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalCallbackDisposition {
@@ -632,6 +636,7 @@ pub struct CompositorState {
     next_activation_token_serial: u64,
     pending_color_info: Vec<color::PendingColorInfo>,
     astrea_shortcut_registry: AstreaShortcutRegistry,
+    astrea_toplevel_publisher: AstreaToplevelPublisher,
     astrea_shell_client_pids: HashSet<u32>,
     astrea_shell_client_uids: HashSet<u32>,
     typhon_socket_name: Option<String>,

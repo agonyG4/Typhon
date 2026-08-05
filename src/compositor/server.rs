@@ -34,6 +34,7 @@ use super::gpu_protocol_capabilities::GpuProtocolCapabilities;
 use super::protocols::versions;
 use crate::astrea_shell_control::server::astrea_shell_control_manager_v1;
 use crate::astrea_shortcuts::server::astrea_shortcuts_manager_v1;
+use crate::astrea_toplevel_management::server::astrea_toplevel_manager_v1;
 #[cfg(test)]
 use crate::render_backend::buffer::BufferId;
 use crate::render_backend::egl_gles::EglGlesDmabufFeedback;
@@ -62,7 +63,7 @@ use super::{
     SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
     WindowInteractionDebugSnapshot, WindowInteractionEndReason, XwaylandSceneBatchError,
     XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot, color,
-    input::{PointerConstraintBackendId, PointerConstraintBackendRequest, PointerMotionSample},
+    input::{PointerConstraintBackendId, PointerConstraintBackendRequest},
 };
 #[derive(Debug)]
 pub struct OwnCompositorServer {
@@ -423,6 +424,7 @@ impl OwnCompositorServer {
             self.state.commit_pointer_crossing_at_last_position();
             self.state.note_committed_pointer_refresh();
         }
+        self.publish_astrea_toplevel_updates();
         Ok(commands)
     }
 
@@ -453,6 +455,9 @@ impl OwnCompositorServer {
             && self.state.scene_render_generation != scene_generation_before
         {
             self.state.mark_xwayland_scene_repaint();
+        }
+        if !self.state.xwayland_scene_batch_active() {
+            self.publish_astrea_toplevel_updates();
         }
         commands
     }
@@ -1037,44 +1042,6 @@ impl OwnCompositorServer {
         self.state.presentation_clock
     }
 
-    pub fn send_keyboard_key(&mut self, key: u32, pressed: bool) {
-        self.state.send_keyboard_key(key, pressed);
-        let _ = self.display.flush_clients();
-    }
-
-    pub fn send_pointer_motion(&mut self, x: f64, y: f64) {
-        self.state.send_pointer_motion(x, y);
-        let _ = self.display.flush_clients();
-    }
-
-    pub fn update_pointer_position_without_client_dispatch(&mut self, x: f64, y: f64) -> bool {
-        self.state
-            .update_pointer_position_without_client_dispatch(x, y)
-    }
-
-    pub fn send_pointer_motion_sample(&mut self, sample: PointerMotionSample) {
-        self.state.send_pointer_motion_sample(sample);
-        let _ = self.display.flush_clients();
-    }
-
-    pub fn send_window_interaction_pointer_motion(
-        &mut self,
-        timestamp_usec: u64,
-        x: f64,
-        y: f64,
-    ) -> usize {
-        let dispatched = self
-            .state
-            .send_window_interaction_pointer_motion(timestamp_usec, x, y);
-        let _ = self.display.flush_clients();
-        dispatched
-    }
-
-    pub fn send_pointer_button(&mut self, button: u32, pressed: bool) {
-        self.state.send_pointer_button(button, pressed);
-        let _ = self.display.flush_clients();
-    }
-
     pub fn send_pointer_axis(&mut self, horizontal: f64, vertical: f64) {
         self.state.send_pointer_axis(horizontal, vertical);
         let _ = self.display.flush_clients();
@@ -1256,42 +1223,6 @@ impl OwnCompositorServer {
         resized
     }
 
-    pub fn minimize_focused_window(&mut self) -> bool {
-        let minimized = self.state.minimize_focused_window();
-        let _ = self.display.flush_clients();
-        minimized
-    }
-
-    pub fn close_focused_window(&mut self) -> bool {
-        let closed = self.state.close_focused_window();
-        let _ = self.display.flush_clients();
-        closed
-    }
-
-    pub fn restore_next_minimized_window(&mut self) -> bool {
-        let restored = self.state.restore_next_minimized_window();
-        let _ = self.display.flush_clients();
-        restored
-    }
-
-    pub fn activate_window(&mut self, surface_id: u32) -> bool {
-        let activated = self.state.activate_root_window(surface_id);
-        let _ = self.display.flush_clients();
-        activated
-    }
-
-    pub fn toggle_maximize_focused_window(&mut self) -> bool {
-        let changed = self.state.toggle_maximize_focused_window();
-        let _ = self.display.flush_clients();
-        changed
-    }
-
-    pub fn toggle_fullscreen_focused_window(&mut self) -> bool {
-        let changed = self.state.toggle_fullscreen_focused_window();
-        let _ = self.display.flush_clients();
-        changed
-    }
-
     pub fn prepare_frame(&mut self) {
         self.state.commit_ready_explicit_sync_buffers();
         color::flush_pending_color_info(&mut self.state);
@@ -1444,6 +1375,7 @@ impl OwnCompositorServer {
         let dispatch_result = self.display.dispatch_clients(&mut self.state);
         self.state.finish_client_dispatch_cycle();
         self.teardown_disconnected_clients();
+        self.publish_astrea_toplevel_updates();
         self.state.clear_dead_active_clipboard_source();
         self.state.poll_clipboard_bridge();
         self.display.flush_clients()?;
