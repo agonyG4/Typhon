@@ -65,26 +65,7 @@ fn one_child_exit_wakes_the_sigchld_signalfd_once() {
         // bounded timeout only waits for this supervisor-owned fd.
         libc::poll(&mut readiness, 1, 2_000)
     };
-    if poll_result == 0 {
-        // The Rust test harness can have sibling threads with an unblocked
-        // SIGCHLD mask, so Linux may deliver the process-directed notification
-        // to one of them.  Target the already-blocked test thread to make the
-        // signalfd assertion deterministic without a traditional handler.
-        let signal_result = unsafe {
-            // SAFETY: `pthread_self` identifies the current test thread, and
-            // `pthread_kill` targets only that thread with SIGCHLD.
-            libc::pthread_kill(libc::pthread_self(), libc::SIGCHLD)
-        };
-        assert_eq!(signal_result, 0);
-        let retry = unsafe {
-            // SAFETY: `readiness` remains the initialized descriptor for the
-            // supervisor-owned signalfd.
-            libc::poll(&mut readiness, 1, 2_000)
-        };
-        assert_eq!(retry, 1);
-    } else {
-        assert_eq!(poll_result, 1);
-    }
+    assert_eq!(poll_result, 1);
     assert_ne!(readiness.revents & libc::POLLIN, 0);
 
     let exits = supervisor.reap_exited().unwrap();

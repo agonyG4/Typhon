@@ -1,3 +1,5 @@
+mod child_signal;
+
 use std::{
     collections::{HashMap, VecDeque},
     io,
@@ -450,6 +452,7 @@ impl ChildSupervisor {
             command.process_group(0);
         }
         let id = self.allocate_process_id()?;
+        child_signal::prepare_child_signal_mask(command);
         let mut child = command.spawn()?;
         let stderr = child.stderr.take().map(|stderr| {
             let raw_fd = std::os::fd::IntoRawFd::into_raw_fd(stderr);

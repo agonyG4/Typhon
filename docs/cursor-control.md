@@ -142,6 +142,16 @@ every later KMS, cursor, XWayland, and session-owned child path inherits the
 blocked mask, and session-owned children are launched only after signalfd
 ownership is valid.
 
+The external-process boundary is the inverse: `ChildSupervisor::spawn_inner`
+installs one central `pre_exec` hook that removes only `SIGCHLD` from the child
+mask with `sigprocmask(SIG_UNBLOCK, ...)` immediately before `exec`. This covers
+ordinary launches, restartable children, XWayland, session shells,
+`SpawnCommand` FD-mapped launches, and applications. Existing FD-mapping
+`pre_exec` hooks remain chained with it. The parent and all Typhon workers stay
+blocked, while external applications and their descendants start with normal
+`SIGCHLD` delivery and do not inherit Typhon's signalfd policy. A child-side
+mask-reset failure aborts the spawn before registration or exec.
+
 The loader caps each cursor file at 16 MiB, each frame dimension at 1024,
 each frame at 1,048,576 pixels, each file at 256 frames, and each candidate
 load at six unique source images. A per-load source-path cache parses repeated
