@@ -10,7 +10,12 @@ use crate::cursor_theme::{
     CursorThemeLoadError, default_cursor_configuration,
 };
 use std::collections::VecDeque;
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::thread::{self, JoinHandle};
 
 const INITIAL_CURSOR_GENERATION: u64 = 1;
 const MAX_RETIRED_GENERATIONS: usize = 16;
@@ -91,7 +96,7 @@ impl LoadedCursorTheme {
     }
 }
 
-pub trait CursorThemeLoader {
+pub trait CursorThemeLoader: Send {
     fn load(
         &mut self,
         configuration: &CursorConfiguration,
@@ -111,6 +116,16 @@ pub struct CursorDiagnostics {
     pub no_op_requests: u64,
     pub hardware_fallbacks: u64,
     pub retired_generations: u64,
+    pub cursor_jobs_submitted: u64,
+    pub cursor_jobs_rejected_busy: u64,
+    pub worker_load_failures: u64,
+    pub cursor_file_overflow: u64,
+    pub frame_bound_violations: u64,
+    pub persistence_precommit_failures: u64,
+    pub persistence_commits: u64,
+    pub persistence_cleanup_degradations: u64,
+    pub stale_client_completions: u64,
+    pub asynchronous_publications: u64,
 }
 
 #[derive(Debug)]
@@ -130,8 +145,8 @@ pub struct CursorThemeManager {
     generation: u64,
     source: CursorConfigSource,
     persistence: CursorPersistenceSnapshot,
-    store: CursorConfigurationStore,
-    loader: Box<dyn CursorThemeLoader>,
+    store: Option<CursorConfigurationStore>,
+    loader: Option<Box<dyn CursorThemeLoader>>,
     retired: VecDeque<RetiredCursorGeneration>,
     diagnostics: CursorDiagnostics,
 }
@@ -151,8 +166,8 @@ impl CursorThemeManager {
             generation: INITIAL_CURSOR_GENERATION,
             source,
             persistence,
-            store,
-            loader,
+            store: Some(store),
+            loader: Some(loader),
             retired: VecDeque::new(),
             diagnostics: CursorDiagnostics::default(),
         }
@@ -198,7 +213,7 @@ impl CursorThemeManager {
         &mut self,
         configuration: CursorConfiguration,
     ) -> Result<CursorChange, CursorManagerError> {
-        self.apply_with_kind(configuration, ChangeKind::Combined)
+        self.apply_with_kind(configuration, CursorMutationKind::Combined)
     }
 
     pub fn set_theme(&mut self, theme: &str) -> Result<CursorChange, CursorManagerError> {
@@ -213,7 +228,7 @@ impl CursorThemeManager {
                     CursorManagerError::InvalidSize
                 }
             })?;
-        self.apply_with_kind(configuration, ChangeKind::Theme)
+        self.apply_with_kind(configuration, CursorMutationKind::Theme)
     }
 
     pub fn set_size(&mut self, size_px: u32) -> Result<CursorChange, CursorManagerError> {
@@ -229,7 +244,7 @@ impl CursorThemeManager {
                 }
             },
         )?;
-        self.apply_with_kind(configuration, ChangeKind::Size)
+        self.apply_with_kind(configuration, CursorMutationKind::Size)
     }
 
     pub fn apply_values(
@@ -253,11 +268,16 @@ impl CursorThemeManager {
     }
 
     pub fn reload(&mut self) -> Result<CursorChange, CursorManagerError> {
-        let configuration = self.store.read().map_err(|error| {
-            self.diagnostics.persistence_failures =
-                self.diagnostics.persistence_failures.saturating_add(1);
-            map_persistence_error(error)
-        })?;
+        let configuration = self
+            .store
+            .as_ref()
+            .ok_or(CursorManagerError::ResourceBusy)?
+            .read()
+            .map_err(|error| {
+                self.diagnostics.persistence_failures =
+                    self.diagnostics.persistence_failures.saturating_add(1);
+                map_persistence_error(error)
+            })?;
         self.reload_with(configuration)
     }
 
@@ -272,7 +292,7 @@ impl CursorThemeManager {
             candidate,
             CursorConfigSource::Config,
             CursorPersistenceSnapshot::Saved,
-            ChangeKind::Reload,
+            CursorMutationKind::Reload,
         ))
     }
 
@@ -329,6 +349,129 @@ impl CursorThemeManager {
         self.diagnostics
     }
 
+    pub fn start_io_worker(&mut self) -> io::Result<CursorIoWorker> {
+        let store = self
+            .store
+            .take()
+            .ok_or_else(|| io::Error::other("cursor I/O worker already started"))?;
+        let Some(loader) = self.loader.take() else {
+            self.store = Some(store);
+            return Err(io::Error::other("cursor I/O loader already moved"));
+        };
+        CursorIoWorker::new(store, loader)
+    }
+
+    pub fn configuration_for_theme(
+        &mut self,
+        theme: &str,
+    ) -> Result<CursorConfiguration, CursorManagerError> {
+        CursorConfiguration::new(theme, self.desired.size_px).map_err(|error| {
+            self.diagnostics.validation_failures =
+                self.diagnostics.validation_failures.saturating_add(1);
+            map_configuration_error(error)
+        })
+    }
+
+    pub fn configuration_for_size(
+        &mut self,
+        size_px: u32,
+    ) -> Result<CursorConfiguration, CursorManagerError> {
+        CursorConfiguration::new(&self.desired.theme, size_px).map_err(|error| {
+            self.diagnostics.validation_failures =
+                self.diagnostics.validation_failures.saturating_add(1);
+            map_configuration_error(error)
+        })
+    }
+
+    pub fn configuration_for_values(
+        &mut self,
+        theme: &str,
+        size_px: u32,
+    ) -> Result<CursorConfiguration, CursorManagerError> {
+        CursorConfiguration::new(theme, size_px).map_err(|error| {
+            self.diagnostics.validation_failures =
+                self.diagnostics.validation_failures.saturating_add(1);
+            map_configuration_error(error)
+        })
+    }
+
+    pub fn is_no_op(&self, configuration: &CursorConfiguration) -> bool {
+        self.desired == *configuration && self.active.configuration == *configuration
+    }
+
+    pub fn note_no_op(&mut self) {
+        self.diagnostics.no_op_requests = self.diagnostics.no_op_requests.saturating_add(1);
+    }
+
+    pub fn ensure_mutation_capacity(&mut self) -> Result<(), CursorManagerError> {
+        self.ensure_retirement_capacity()
+    }
+
+    pub fn publish_prepared(&mut self, prepared: PreparedCursorMutation) -> CursorChange {
+        if prepared.persistence_cleanup_degraded {
+            self.diagnostics.persistence_cleanup_degradations = self
+                .diagnostics
+                .persistence_cleanup_degradations
+                .saturating_add(1);
+        }
+        if prepared.persisted {
+            self.diagnostics.persistence_commits =
+                self.diagnostics.persistence_commits.saturating_add(1);
+        }
+        self.diagnostics.asynchronous_publications =
+            self.diagnostics.asynchronous_publications.saturating_add(1);
+        self.publish(
+            prepared.configuration,
+            prepared.candidate,
+            prepared.source,
+            prepared.persistence,
+            prepared.kind,
+        )
+    }
+
+    pub fn note_cursor_job_submitted(&mut self) {
+        self.diagnostics.cursor_jobs_submitted =
+            self.diagnostics.cursor_jobs_submitted.saturating_add(1);
+    }
+
+    pub fn note_cursor_job_busy(&mut self) {
+        self.diagnostics.cursor_jobs_rejected_busy =
+            self.diagnostics.cursor_jobs_rejected_busy.saturating_add(1);
+    }
+
+    pub fn note_worker_error(&mut self, error: CursorIoError) {
+        if matches!(error, CursorIoError::Load(_)) {
+            self.diagnostics.worker_load_failures =
+                self.diagnostics.worker_load_failures.saturating_add(1);
+            self.diagnostics.theme_load_failures =
+                self.diagnostics.theme_load_failures.saturating_add(1);
+        }
+        match error {
+            CursorIoError::Load(CursorThemeLoadError::CursorFileTooLarge) => {
+                self.diagnostics.cursor_file_overflow =
+                    self.diagnostics.cursor_file_overflow.saturating_add(1);
+            }
+            CursorIoError::Load(CursorThemeLoadError::FrameBoundsExceeded) => {
+                self.diagnostics.frame_bound_violations =
+                    self.diagnostics.frame_bound_violations.saturating_add(1);
+            }
+            CursorIoError::Persistence(_) => {
+                self.diagnostics.persistence_failures =
+                    self.diagnostics.persistence_failures.saturating_add(1);
+                self.diagnostics.persistence_precommit_failures = self
+                    .diagnostics
+                    .persistence_precommit_failures
+                    .saturating_add(1);
+            }
+            CursorIoError::Load(_) => {}
+        }
+    }
+
+    pub fn note_stale_client_completion(&mut self) {
+        self.diagnostics.stale_client_completions =
+            self.diagnostics.stale_client_completions.saturating_add(1);
+    }
+
     pub fn note_get(&mut self) {
         self.diagnostics.get_commands = self.diagnostics.get_commands.saturating_add(1);
     }
@@ -365,7 +508,7 @@ impl CursorThemeManager {
     fn apply_with_kind(
         &mut self,
         configuration: CursorConfiguration,
-        kind: ChangeKind,
+        kind: CursorMutationKind,
     ) -> Result<CursorChange, CursorManagerError> {
         if self.desired == configuration && self.active.configuration == configuration {
             self.diagnostics.no_op_requests = self.diagnostics.no_op_requests.saturating_add(1);
@@ -377,11 +520,28 @@ impl CursorThemeManager {
         }
         let candidate = self.load_candidate(&configuration)?;
         self.ensure_retirement_capacity()?;
-        self.store.write(&configuration).map_err(|error| {
-            self.diagnostics.persistence_failures =
-                self.diagnostics.persistence_failures.saturating_add(1);
-            map_persistence_error(error)
-        })?;
+        let outcome = self
+            .store
+            .as_ref()
+            .ok_or(CursorManagerError::ResourceBusy)?
+            .write(&configuration)
+            .map_err(|error| {
+                self.diagnostics.persistence_failures =
+                    self.diagnostics.persistence_failures.saturating_add(1);
+                self.diagnostics.persistence_precommit_failures = self
+                    .diagnostics
+                    .persistence_precommit_failures
+                    .saturating_add(1);
+                map_persistence_error(error)
+            })?;
+        self.diagnostics.persistence_commits =
+            self.diagnostics.persistence_commits.saturating_add(1);
+        if outcome.cleanup_degraded {
+            self.diagnostics.persistence_cleanup_degradations = self
+                .diagnostics
+                .persistence_cleanup_degradations
+                .saturating_add(1);
+        }
         Ok(self.publish(
             configuration,
             candidate,
@@ -395,7 +555,10 @@ impl CursorThemeManager {
         &mut self,
         configuration: &CursorConfiguration,
     ) -> Result<LoadedCursorTheme, CursorManagerError> {
-        match self.loader.load(configuration) {
+        let Some(loader) = self.loader.as_mut() else {
+            return Err(CursorManagerError::ResourceBusy);
+        };
+        match loader.load(configuration) {
             Ok(candidate) => Ok(candidate),
             Err(error) => {
                 self.diagnostics.theme_load_failures =
@@ -420,7 +583,7 @@ impl CursorThemeManager {
         candidate: LoadedCursorTheme,
         source: CursorConfigSource,
         persistence: CursorPersistenceSnapshot,
-        kind: ChangeKind,
+        kind: CursorMutationKind,
     ) -> CursorChange {
         let previous = std::mem::replace(&mut self.active, candidate);
         self.retired
@@ -430,21 +593,21 @@ impl CursorThemeManager {
         self.persistence = persistence;
         self.generation = self.generation.saturating_add(1);
         match kind {
-            ChangeKind::Theme => {
+            CursorMutationKind::Theme => {
                 self.diagnostics.successful_theme_changes =
                     self.diagnostics.successful_theme_changes.saturating_add(1);
             }
-            ChangeKind::Size => {
+            CursorMutationKind::Size => {
                 self.diagnostics.successful_size_changes =
                     self.diagnostics.successful_size_changes.saturating_add(1);
             }
-            ChangeKind::Combined => {
+            CursorMutationKind::Combined => {
                 self.diagnostics.successful_combined_changes = self
                     .diagnostics
                     .successful_combined_changes
                     .saturating_add(1);
             }
-            ChangeKind::Reload => {
+            CursorMutationKind::Reload => {
                 self.diagnostics.successful_reloads =
                     self.diagnostics.successful_reloads.saturating_add(1);
             }
@@ -458,11 +621,265 @@ impl CursorThemeManager {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ChangeKind {
+pub enum CursorMutationKind {
     Theme,
     Size,
     Combined,
     Reload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorJobId(pub u64);
+
+#[derive(Debug)]
+pub enum CursorIoOperation {
+    Apply {
+        job_id: CursorJobId,
+        configuration: CursorConfiguration,
+        persist: bool,
+        kind: CursorMutationKind,
+    },
+    Reload {
+        job_id: CursorJobId,
+    },
+}
+
+impl CursorIoOperation {
+    pub const fn job_id(&self) -> CursorJobId {
+        match self {
+            Self::Apply { job_id, .. } | Self::Reload { job_id } => *job_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorIoSubmitError {
+    Busy,
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorIoError {
+    Load(CursorThemeLoadError),
+    Persistence(CursorPersistenceError),
+}
+
+#[derive(Debug)]
+pub struct PreparedCursorMutation {
+    pub job_id: CursorJobId,
+    pub configuration: CursorConfiguration,
+    pub candidate: LoadedCursorTheme,
+    pub source: CursorConfigSource,
+    pub persistence: CursorPersistenceSnapshot,
+    pub kind: CursorMutationKind,
+    pub persisted: bool,
+    pub persistence_cleanup_degraded: bool,
+}
+
+#[derive(Debug)]
+pub struct CursorIoCompletion {
+    pub job_id: CursorJobId,
+    pub result: Result<PreparedCursorMutation, CursorIoError>,
+}
+
+pub struct CursorIoWorker {
+    jobs: SyncSender<CursorIoOperation>,
+    completions: Receiver<CursorIoCompletion>,
+    notification: OwnedFd,
+    busy: Arc<AtomicBool>,
+    _thread: JoinHandle<()>,
+}
+
+impl CursorIoWorker {
+    pub fn new(
+        store: CursorConfigurationStore,
+        mut loader: Box<dyn CursorThemeLoader>,
+    ) -> io::Result<Self> {
+        let notification = create_event_fd()?;
+        let worker_notification = duplicate_fd(notification.as_raw_fd())?;
+        let (jobs, job_receiver) = mpsc::sync_channel::<CursorIoOperation>(1);
+        let (completion_sender, completions) = mpsc::sync_channel::<CursorIoCompletion>(1);
+        let busy = Arc::new(AtomicBool::new(false));
+        let worker_busy = busy.clone();
+        let thread = thread::Builder::new()
+            .name("typhon-cursor-io".to_string())
+            .spawn(move || {
+                while let Ok(operation) = job_receiver.recv() {
+                    let job_id = operation.job_id();
+                    let result = execute_cursor_io(operation, &store, &mut *loader);
+                    let completion = CursorIoCompletion { job_id, result };
+                    let delivered = completion_sender.send(completion).is_ok();
+                    worker_busy.store(false, Ordering::Release);
+                    if !delivered {
+                        break;
+                    }
+                    signal_event_fd(worker_notification.as_raw_fd());
+                }
+            })?;
+        Ok(Self {
+            jobs,
+            completions,
+            notification,
+            busy,
+            _thread: thread,
+        })
+    }
+
+    pub fn event_fd(&self) -> RawFd {
+        self.notification.as_raw_fd()
+    }
+
+    pub fn submit(&self, operation: CursorIoOperation) -> Result<(), CursorIoSubmitError> {
+        if self.busy.swap(true, Ordering::AcqRel) {
+            return Err(CursorIoSubmitError::Busy);
+        }
+        match self.jobs.try_send(operation) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                self.busy.store(false, Ordering::Release);
+                Err(CursorIoSubmitError::Busy)
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.busy.store(false, Ordering::Release);
+                Err(CursorIoSubmitError::Closed)
+            }
+        }
+    }
+
+    pub fn drain_notification(&self) -> io::Result<()> {
+        let mut value = 0_u64;
+        let count = unsafe {
+            // SAFETY: `value` is valid writable storage for one eventfd word,
+            // and the descriptor is owned by this worker.
+            libc::read(
+                self.notification.as_raw_fd(),
+                (&mut value as *mut u64).cast(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if count < 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::WouldBlock {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        if count == std::mem::size_of::<u64>() as isize {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short cursor worker notification",
+            ))
+        }
+    }
+
+    pub fn try_completion(&self) -> Option<CursorIoCompletion> {
+        self.completions.try_recv().ok()
+    }
+
+    pub fn receive_completion(&self) -> Option<CursorIoCompletion> {
+        self.completions.recv().ok()
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::Acquire)
+    }
+}
+
+fn execute_cursor_io(
+    operation: CursorIoOperation,
+    store: &CursorConfigurationStore,
+    loader: &mut dyn CursorThemeLoader,
+) -> Result<PreparedCursorMutation, CursorIoError> {
+    match operation {
+        CursorIoOperation::Apply {
+            job_id,
+            configuration,
+            persist,
+            kind,
+        } => {
+            let candidate = loader.load(&configuration).map_err(CursorIoError::Load)?;
+            let outcome = if persist {
+                Some(
+                    store
+                        .write(&configuration)
+                        .map_err(CursorIoError::Persistence)?,
+                )
+            } else {
+                None
+            };
+            Ok(PreparedCursorMutation {
+                job_id,
+                configuration,
+                candidate,
+                source: CursorConfigSource::Control,
+                persistence: CursorPersistenceSnapshot::Saved,
+                kind,
+                persisted: outcome.is_some_and(|outcome| outcome.committed),
+                persistence_cleanup_degraded: outcome
+                    .is_some_and(|outcome| outcome.cleanup_degraded),
+            })
+        }
+        CursorIoOperation::Reload { job_id } => {
+            let configuration = store.read().map_err(CursorIoError::Persistence)?;
+            let candidate = loader.load(&configuration).map_err(CursorIoError::Load)?;
+            Ok(PreparedCursorMutation {
+                job_id,
+                configuration,
+                candidate,
+                source: CursorConfigSource::Config,
+                persistence: CursorPersistenceSnapshot::Saved,
+                kind: CursorMutationKind::Reload,
+                persisted: false,
+                persistence_cleanup_degraded: false,
+            })
+        }
+    }
+}
+
+fn create_event_fd() -> io::Result<OwnedFd> {
+    let fd = unsafe {
+        // SAFETY: `eventfd` has no pointer arguments and creates an owned
+        // nonblocking close-on-exec descriptor for worker notifications.
+        libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe {
+        // SAFETY: `eventfd` returned a new owned descriptor.
+        OwnedFd::from_raw_fd(fd)
+    })
+}
+
+fn duplicate_fd(fd: RawFd) -> io::Result<OwnedFd> {
+    let duplicate = unsafe {
+        // SAFETY: `fd` is the live notification descriptor owned by the
+        // worker, and `dup` returns an independently owned descriptor.
+        libc::dup(fd)
+    };
+    if duplicate < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe {
+        // SAFETY: `dup` returned a new owned descriptor.
+        OwnedFd::from_raw_fd(duplicate)
+    })
+}
+
+fn signal_event_fd(fd: RawFd) {
+    let value = 1_u64;
+    let _ = unsafe {
+        // SAFETY: `value` is valid readable storage for one eventfd word, and
+        // the worker owns the duplicated descriptor for this notification.
+        libc::write(
+            fd,
+            (&value as *const u64).cast(),
+            std::mem::size_of::<u64>(),
+        )
+    };
 }
 
 pub struct SystemCursorThemeLoader;
@@ -501,6 +918,22 @@ fn map_theme_load_error(error: CursorThemeLoadError) -> CursorManagerError {
         CursorThemeLoadError::RequiredPointerMissing => CursorManagerError::RequiredPointerMissing,
         CursorThemeLoadError::CursorFileReadFailed => CursorManagerError::CursorFileReadFailed,
         CursorThemeLoadError::CursorFileInvalid => CursorManagerError::CursorFileInvalid,
+        CursorThemeLoadError::CursorFileTooLarge | CursorThemeLoadError::FrameBoundsExceeded => {
+            CursorManagerError::CursorFileInvalid
+        }
+    }
+}
+
+fn map_configuration_error(
+    error: crate::cursor_theme::CursorConfigurationError,
+) -> CursorManagerError {
+    match error {
+        crate::cursor_theme::CursorConfigurationError::InvalidTheme => {
+            CursorManagerError::InvalidTheme
+        }
+        crate::cursor_theme::CursorConfigurationError::InvalidSize => {
+            CursorManagerError::InvalidSize
+        }
     }
 }
 

@@ -201,7 +201,7 @@ impl NativeRuntime {
         let NativeRuntimeBootstrapTail {
             mut server,
             cursor_image,
-            cursor_manager,
+            mut cursor_manager,
             perf,
             kms,
             kms_backend,
@@ -373,6 +373,11 @@ impl NativeRuntime {
         server.enable_external_acquire_readiness();
         let mut event_loop = NativeEventLoop::new()?;
         let control_server = create_native_control_server(&mut event_loop, &server)?;
+        let cursor_io_worker = cursor_manager.start_io_worker()?;
+        let cursor_io_worker_reactor_token = Some(event_loop.register(
+            cursor_io_worker.event_fd(),
+            NativeEventSource::CursorIoWorker,
+        )?);
         let mut process_supervisor = ChildSupervisor::with_sigchld_reaper()?;
         let mut xwayland = XwaylandService::bootstrap()?;
         let mut xwayland_reactor_tokens = Vec::new();
@@ -589,6 +594,10 @@ impl NativeRuntime {
             output_render_fence_token: None,
             kms_commit_worker,
             kms_commit_worker_reactor_token,
+            cursor_io_worker: Some(cursor_io_worker),
+            cursor_io_worker_reactor_token,
+            pending_cursor_job: None,
+            next_cursor_job_id: 1,
             kms_commit_worker_policy: requested_worker_policy,
             kms_commit_worker_transport,
             kms_commit_worker_startup,

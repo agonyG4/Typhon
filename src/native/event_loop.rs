@@ -11,6 +11,7 @@ const MAX_READY_EVENTS: usize = 64;
 pub enum NativeEventSource {
     Drm,
     KmsCommitWorker,
+    CursorIoWorker,
     Seat,
     WaylandListener,
     WaylandClients,
@@ -68,6 +69,7 @@ pub struct WakeReasons(u32);
 impl WakeReasons {
     const DRM: u32 = 1 << 0;
     const KMS_COMMIT_WORKER: u32 = 1 << 13;
+    const CURSOR_IO_WORKER: u32 = 1 << 15;
     const SEAT: u32 = 1 << 7;
     const WAYLAND_LISTENER: u32 = 1 << 1;
     const WAYLAND_CLIENTS: u32 = 1 << 2;
@@ -88,6 +90,10 @@ impl WakeReasons {
 
     pub const fn kms_commit_worker(self) -> bool {
         self.0 & Self::KMS_COMMIT_WORKER != 0
+    }
+
+    pub const fn cursor_io_worker(self) -> bool {
+        self.0 & Self::CURSOR_IO_WORKER != 0
     }
 
     pub const fn seat(self) -> bool {
@@ -150,6 +156,7 @@ impl WakeReasons {
         self.0 |= match source {
             NativeEventSource::Drm => Self::DRM,
             NativeEventSource::KmsCommitWorker => Self::KMS_COMMIT_WORKER,
+            NativeEventSource::CursorIoWorker => Self::CURSOR_IO_WORKER,
             NativeEventSource::Seat => Self::SEAT,
             NativeEventSource::WaylandListener => Self::WAYLAND_LISTENER,
             NativeEventSource::WaylandClients => Self::WAYLAND_CLIENTS,
@@ -440,7 +447,9 @@ impl NativeEventLoop {
             let error_events =
                 libc::EPOLLERR as u32 | libc::EPOLLHUP as u32 | libc::EPOLLRDHUP as u32;
             if event_flags & error_events != 0 {
-                if is_xwayland_source(registration_source) || is_control_source(registration_source)
+                if is_xwayland_source(registration_source)
+                    || is_control_source(registration_source)
+                    || registration_source == NativeEventSource::CursorIoWorker
                 {
                     reasons.insert(registration_source);
                     if is_xwayland_source(registration_source) {

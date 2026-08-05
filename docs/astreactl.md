@@ -129,7 +129,10 @@ Themes are logical XCursor names, not paths. They are 1–128 UTF-8 bytes made
 only from ASCII letters, digits, `.`, `_`, and `-`; path separators,
 whitespace, controls, traversal, and non-ASCII characters are rejected locally
 with exit `2`. Cursor sizes are integers from 8 through 256 pixels. Syntactically
-valid but unavailable themes are server errors and exit `1`.
+valid but unavailable themes are server errors and exit `1`. Only one cursor
+mutation may be active at a time. A second mutation returns the stable
+`cursor_generation_busy` detail and exit `1`; `cursor get` remains immediate
+while a mutation is loading or persisting.
 
 Human output sanitizes all client-controlled labels before writing them to a
 terminal. Newlines, tabs, carriage returns, and other control characters become

@@ -360,6 +360,10 @@ impl NativeControlServer {
         self.clients.len()
     }
 
+    pub fn has_client(&self, token: ReactorToken) -> bool {
+        self.clients.contains_key(&token)
+    }
+
     pub fn counters(&self) -> ControlServerCounters {
         self.counters
     }

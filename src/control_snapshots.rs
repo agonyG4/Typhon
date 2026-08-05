@@ -232,7 +232,25 @@ pub struct DoctorCheck {
     pub id: String,
     pub severity: DoctorSeverity,
     pub summary: String,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub detail: Option<String>,
+}
+
+#[cfg(test)]
+mod doctor_schema_tests {
+    use super::DoctorCheck;
+    use serde_json::json;
+
+    #[test]
+    fn doctor_check_requires_the_detail_field_on_the_wire() {
+        let result = serde_json::from_value::<DoctorCheck>(json!({
+            "id": "cursor.configuration",
+            "severity": "ok",
+            "summary": "ready"
+        }));
+
+        assert!(result.is_err());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

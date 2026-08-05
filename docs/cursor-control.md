@@ -101,17 +101,51 @@ created as `0700`; a missing explicit `XDG_CONFIG_HOME` is a persistence error.
 The file is `0600`, and reads are bounded before allocation beyond the document
 cap. A complete document is written to a private unpredictable temporary
 file, flushed, `fsync`ed, and published relative to the validated directory.
-First publication uses atomic no-replace. Replacement first quarantines only
-the exact validated inode, publishes with no-replace, verifies the new inode,
-and rolls back on failure; unexpected replacements are never overwritten or
-removed. The parent directory is `fsync`ed where supported.
+First publication uses atomic no-replace. Replacement exchanges the temporary
+entry with the exact validated destination inode, verifies both identities, and
+exchanges back on failure when both entries remain proven; unexpected
+replacements are never overwritten or removed. The parent directory is
+`fsync`ed where supported.
 
-Set and reload operations validate and load the complete candidate before
-persistence and publication. Any failure preserves the active cursor, active
-generation, and previously valid persisted file. Startup uses a valid and
-loadable persisted configuration; a missing, malformed, insecure, or unavailable
-configuration falls back to the existing default and produces one bounded
-warning without preventing compositor startup.
+Set and reload operations validate on the native thread, then submit at most
+one bounded mutation job to the cursor I/O worker. The worker owns persisted
+configuration reads, bounded XCursor file reads and parsing, complete shape
+bundle construction, temporary writes, file and directory synchronization, and
+atomic publication. The native reactor never waits for those operations. While
+one job is active, another mutation returns `cursor_generation_busy`; `get` and
+all M3 read-only commands remain immediate. A disconnected or timed-out client
+does not cancel an accepted job: the worker result is still published, while a
+stale response token is ignored. Shutdown uses the deterministic policy that an
+already accepted job is not canceled; it may finish its persistence transaction
+independently while the runtime tears down, and the worker never accesses
+compositor state. Shutdown unregisters the worker notification and does not
+wait indefinitely for a blocked filesystem call.
+
+The loader caps each cursor file at 16 MiB, each frame dimension at 1024,
+each frame at 1,048,576 pixels, each file at 256 frames, and each candidate
+load at six unique source images. A per-load source-path cache parses repeated
+aliases once and retains only the selected bounded image. Overflow, malformed
+frames, and unsafe dimensions reject the required pointer or fall back for an
+optional shape.
+
+Persistence has a commit point: the exact new `cursor.json` identity has been
+verified, its contents synchronized, and the parent directory synchronization
+has completed or been accepted as unsupported. First publication uses
+`renameat2(RENAME_NOREPLACE)`. Replacement uses
+`renameat2(RENAME_EXCHANGE)`, verifies both exact identities, and exchanges back
+only when both entries are still proven. Every pre-commit failure rolls back
+and preserves the prior canonical file. After commit, old-inode cleanup is
+best effort; cleanup or its directory synchronization can produce a bounded
+degradation counter but cannot fail the mutation or leave runtime using the
+old configuration while disk contains the new one. Verified stale files with
+the `.cursor.json.tmp-*` and `.cursor.json.quarantine-*` prefixes are cleaned
+on a later write; unexpected nodes are never removed.
+
+Any pre-commit failure preserves the active cursor, active generation, and
+previously valid persisted file. Startup uses a valid and loadable persisted
+configuration; a missing, malformed, insecure, or unavailable configuration
+falls back to the existing default and produces one bounded warning without
+preventing compositor startup.
 
 ## Rendering and generations
 

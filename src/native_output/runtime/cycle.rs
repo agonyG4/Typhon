@@ -63,6 +63,7 @@ impl NativeRuntime {
                 return Ok(());
             }
             self.service_control_events(&cycle.wakeup)?;
+            self.service_cursor_io_completions(&cycle.wakeup)?;
             self.arm_suspended_deadline()?;
             return Ok(());
         }
@@ -74,6 +75,7 @@ impl NativeRuntime {
         self.dispatch_wayland_and_input(&mut cycle)?;
         self.note_timing_scope("wayland_dispatch", wayland_dispatch_started.elapsed());
         self.service_control_events(&cycle.wakeup)?;
+        self.service_cursor_io_completions(&cycle.wakeup)?;
         self.dispatch_xwayland_client_disconnects()?;
         self.dispatch_xwayland_shell_binds()?;
         self.initialize_managed_xwayland()?;

@@ -1,6 +1,9 @@
 //! Shared compositor-owned XCursor image loading.
 
 use std::{
+    collections::HashMap,
+    fs::File,
+    io::Read,
     path::PathBuf,
     sync::{Arc, OnceLock, RwLock},
 };
@@ -15,6 +18,12 @@ pub const DEFAULT_CURSOR_SIZE: u32 = 24;
 pub const MIN_CURSOR_SIZE: u32 = 8;
 pub const MAX_CURSOR_SIZE: u32 = 256;
 pub const MAX_CURSOR_THEME_BYTES: usize = 128;
+pub const MAX_CURSOR_FILE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_CURSOR_FRAME_DIMENSION: u32 = 1024;
+pub const MAX_CURSOR_FRAME_PIXELS: usize = 1024 * 1024;
+pub const MAX_CURSOR_FRAMES_PER_FILE: usize = 256;
+pub const MAX_CURSOR_UNIQUE_IMAGES: usize = 6;
+pub const MAX_CURSOR_TOTAL_FRAME_PIXELS: usize = MAX_CURSOR_UNIQUE_IMAGES * MAX_CURSOR_FRAME_PIXELS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CompositorCursorShape {
@@ -87,6 +96,8 @@ pub enum CursorThemeLoadError {
     RequiredPointerMissing,
     CursorFileReadFailed,
     CursorFileInvalid,
+    CursorFileTooLarge,
+    FrameBoundsExceeded,
 }
 
 impl CursorThemeLoadError {
@@ -96,6 +107,8 @@ impl CursorThemeLoadError {
             Self::RequiredPointerMissing => "required_pointer_missing",
             Self::CursorFileReadFailed => "cursor_file_read_failed",
             Self::CursorFileInvalid => "cursor_file_invalid",
+            Self::CursorFileTooLarge => "cursor_file_too_large",
+            Self::FrameBoundsExceeded => "cursor_frame_bounds_exceeded",
         }
     }
 }
@@ -411,17 +424,13 @@ pub fn load_compositor_cursor_from_environment() -> CompositorCursorImage {
         Ok(theme) => {
             let image = theme.image(CompositorCursorShape::Pointer);
             eprintln!(
-                "cursor theme: loaded theme={} size={} image={}x{} hotspot={},{} source={}",
+                "cursor theme: loaded theme={} size={} image={}x{} hotspot={},{} source=system",
                 image.theme,
                 image.requested_size,
                 image.width,
                 image.height,
                 image.hotspot_x,
                 image.hotspot_y,
-                image
-                    .source
-                    .as_deref()
-                    .map_or_else(|| "unknown".to_string(), |path| path.display().to_string()),
             );
             image.as_ref().clone()
         }
@@ -438,6 +447,7 @@ pub(crate) fn load_cursor_theme(
 ) -> Result<CursorShapeImages, CursorThemeLoadError> {
     let theme = CursorTheme::load(theme_name);
     let theme_exists = cursor_theme_directory_exists(theme_name);
+    let mut cache = HashMap::new();
     let pointer = load_shape_image(
         &theme,
         theme_name,
@@ -445,9 +455,9 @@ pub(crate) fn load_cursor_theme(
         requested_size,
         true,
         theme_exists,
+        &mut cache,
     )?
     .expect("required pointer image must be present");
-    let pointer = Arc::new(pointer);
     let optional = [
         CompositorCursorShape::Move,
         CompositorCursorShape::ResizeHorizontal,
@@ -464,12 +474,9 @@ pub(crate) fn load_cursor_theme(
             requested_size,
             false,
             theme_exists,
+            &mut cache,
         ) {
-            *slot = if image.source.as_ref() == pointer.source.as_ref() {
-                pointer.clone()
-            } else {
-                Arc::new(image)
-            };
+            *slot = image;
         }
     }
     Ok(CursorShapeImages::from_images(
@@ -499,7 +506,8 @@ fn load_shape_image(
     requested_size: u32,
     required: bool,
     theme_exists: bool,
-) -> Result<Option<CompositorCursorImage>, CursorThemeLoadError> {
+    cache: &mut HashMap<PathBuf, Result<Arc<CompositorCursorImage>, CursorThemeLoadError>>,
+) -> Result<Option<Arc<CompositorCursorImage>>, CursorThemeLoadError> {
     let Some((path, _)) = shape
         .aliases()
         .iter()
@@ -517,14 +525,153 @@ fn load_shape_image(
             Ok(None)
         };
     };
-    let content = std::fs::read(&path).map_err(|_| CursorThemeLoadError::CursorFileReadFailed)?;
-    let frames =
-        xcursor::parser::parse_xcursor(&content).ok_or(CursorThemeLoadError::CursorFileInvalid)?;
-    let image = select_nearest_frame(frames, requested_size)
-        .map_err(|_| CursorThemeLoadError::CursorFileInvalid)?;
-    compositor_image_from_frame(image, theme_name, requested_size, path)
-        .map(Some)
-        .map_err(|_| CursorThemeLoadError::CursorFileInvalid)
+    let source_path =
+        std::fs::canonicalize(&path).map_err(|_| CursorThemeLoadError::CursorFileReadFailed)?;
+    let parsed = if let Some(cached) = cache.get(&source_path) {
+        cached.clone()
+    } else {
+        if cache.len() >= MAX_CURSOR_UNIQUE_IMAGES {
+            return Err(CursorThemeLoadError::CursorFileInvalid);
+        }
+        let parsed = read_cursor_file(&source_path).and_then(|content| {
+            validate_xcursor_bounds(&content)?;
+            let frames = xcursor::parser::parse_xcursor(&content)
+                .ok_or(CursorThemeLoadError::CursorFileInvalid)?;
+            let image = select_nearest_frame(&frames, requested_size)
+                .map_err(|_| CursorThemeLoadError::CursorFileInvalid)?;
+            compositor_image_from_frame(image, theme_name, requested_size, source_path.clone())
+                .map(Arc::new)
+                .map_err(|_| CursorThemeLoadError::CursorFileInvalid)
+        });
+        cache.insert(source_path, parsed.clone());
+        parsed
+    }?;
+    Ok(Some(parsed))
+}
+
+fn read_cursor_file(path: &std::path::Path) -> Result<Vec<u8>, CursorThemeLoadError> {
+    let file = File::open(path).map_err(|_| CursorThemeLoadError::CursorFileReadFailed)?;
+    read_bounded_cursor_bytes(file)
+}
+
+fn read_bounded_cursor_bytes<R: Read>(mut reader: R) -> Result<Vec<u8>, CursorThemeLoadError> {
+    let mut content = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let remaining = MAX_CURSOR_FILE_BYTES + 1 - content.len();
+        if remaining == 0 {
+            return Err(CursorThemeLoadError::CursorFileTooLarge);
+        }
+        let read_len = remaining.min(buffer.len());
+        let count = reader
+            .read(&mut buffer[..read_len])
+            .map_err(|_| CursorThemeLoadError::CursorFileReadFailed)?;
+        if count == 0 {
+            return Ok(content);
+        }
+        if content.len().saturating_add(count) > MAX_CURSOR_FILE_BYTES {
+            return Err(CursorThemeLoadError::CursorFileTooLarge);
+        }
+        content.extend_from_slice(&buffer[..count]);
+    }
+}
+
+fn validate_xcursor_bounds(content: &[u8]) -> Result<(), CursorThemeLoadError> {
+    const HEADER_BYTES: usize = 16;
+    const TOC_BYTES: usize = 12;
+    const IMAGE_HEADER_BYTES: usize = 36;
+
+    if content.len() < HEADER_BYTES || &content[..4] != b"Xcur" {
+        return Err(CursorThemeLoadError::CursorFileInvalid);
+    }
+    let header = read_u32(content, 4).ok_or(CursorThemeLoadError::CursorFileInvalid)?;
+    let toc_count = read_u32(content, 12).ok_or(CursorThemeLoadError::CursorFileInvalid)?;
+    let toc_count =
+        usize::try_from(toc_count).map_err(|_| CursorThemeLoadError::FrameBoundsExceeded)?;
+    if toc_count > MAX_CURSOR_FRAMES_PER_FILE {
+        return Err(CursorThemeLoadError::FrameBoundsExceeded);
+    }
+    let toc_start = usize::try_from(header).map_err(|_| CursorThemeLoadError::CursorFileInvalid)?;
+    let toc_end = toc_start
+        .checked_add(
+            toc_count
+                .checked_mul(TOC_BYTES)
+                .ok_or(CursorThemeLoadError::FrameBoundsExceeded)?,
+        )
+        .ok_or(CursorThemeLoadError::FrameBoundsExceeded)?;
+    if toc_start < HEADER_BYTES || toc_end > content.len() {
+        return Err(CursorThemeLoadError::CursorFileInvalid);
+    }
+
+    let mut frame_count = 0_usize;
+    let mut total_frame_pixels = 0_usize;
+    for index in 0..toc_count {
+        let toc = toc_start + index * TOC_BYTES;
+        let kind = read_u32(content, toc).ok_or(CursorThemeLoadError::CursorFileInvalid)?;
+        if kind != 0xfffd_0002 {
+            continue;
+        }
+        frame_count = frame_count.saturating_add(1);
+        if frame_count > MAX_CURSOR_FRAMES_PER_FILE {
+            return Err(CursorThemeLoadError::FrameBoundsExceeded);
+        }
+        let position = read_u32(content, toc + 8)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or(CursorThemeLoadError::CursorFileInvalid)?;
+        let frame_end = position
+            .checked_add(IMAGE_HEADER_BYTES)
+            .ok_or(CursorThemeLoadError::FrameBoundsExceeded)?;
+        if frame_end > content.len() {
+            return Err(CursorThemeLoadError::CursorFileInvalid);
+        }
+        let width =
+            read_u32(content, position + 16).ok_or(CursorThemeLoadError::CursorFileInvalid)?;
+        let height =
+            read_u32(content, position + 20).ok_or(CursorThemeLoadError::CursorFileInvalid)?;
+        let xhot =
+            read_u32(content, position + 24).ok_or(CursorThemeLoadError::CursorFileInvalid)?;
+        let yhot =
+            read_u32(content, position + 28).ok_or(CursorThemeLoadError::CursorFileInvalid)?;
+        if width == 0 || height == 0 || xhot >= width || yhot >= height {
+            return Err(CursorThemeLoadError::CursorFileInvalid);
+        }
+        if width > MAX_CURSOR_FRAME_DIMENSION || height > MAX_CURSOR_FRAME_DIMENSION {
+            return Err(CursorThemeLoadError::FrameBoundsExceeded);
+        }
+        let pixel_count = usize::try_from(width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .ok_or(CursorThemeLoadError::FrameBoundsExceeded)?;
+        if pixel_count > MAX_CURSOR_FRAME_PIXELS {
+            return Err(CursorThemeLoadError::FrameBoundsExceeded);
+        }
+        total_frame_pixels = total_frame_pixels
+            .checked_add(pixel_count)
+            .ok_or(CursorThemeLoadError::FrameBoundsExceeded)?;
+        if total_frame_pixels > MAX_CURSOR_TOTAL_FRAME_PIXELS {
+            return Err(CursorThemeLoadError::FrameBoundsExceeded);
+        }
+        let payload_end = frame_end
+            .checked_add(
+                pixel_count
+                    .checked_mul(4)
+                    .ok_or(CursorThemeLoadError::FrameBoundsExceeded)?,
+            )
+            .ok_or(CursorThemeLoadError::FrameBoundsExceeded)?;
+        if payload_end > content.len() {
+            return Err(CursorThemeLoadError::CursorFileInvalid);
+        }
+    }
+    Ok(())
+}
+
+fn read_u32(content: &[u8], offset: usize) -> Option<u32> {
+    let bytes = content.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
 fn cursor_theme_directory_exists(theme_name: &str) -> bool {
@@ -606,20 +753,25 @@ fn push_bounded_theme_path(paths: &mut Vec<PathBuf>, path: PathBuf, limit: usize
     }
 }
 
-fn select_nearest_frame(frames: Vec<Image>, requested_size: u32) -> Result<Image, String> {
-    let mut selected = None;
+fn select_nearest_frame(frames: &[Image], requested_size: u32) -> Result<Image, String> {
+    let mut selected: Option<&Image> = None;
     for frame in frames {
-        let replace = selected.as_ref().is_none_or(|current: &Image| {
-            let frame_distance = frame.size.abs_diff(requested_size);
-            let current_distance = current.size.abs_diff(requested_size);
-            frame_distance < current_distance
-                || (frame_distance == current_distance && frame.size < current.size)
-        });
+        let replace = match selected {
+            None => true,
+            Some(current) => {
+                let frame_distance = frame.size.abs_diff(requested_size);
+                let current_distance = current.size.abs_diff(requested_size);
+                frame_distance < current_distance
+                    || (frame_distance == current_distance && frame.size < current.size)
+            }
+        };
         if replace {
             selected = Some(frame);
         }
     }
-    selected.ok_or_else(|| "cursor file has no image frames".to_string())
+    selected
+        .cloned()
+        .ok_or_else(|| "cursor file has no image frames".to_string())
 }
 
 fn compositor_image_from_frame(
@@ -748,6 +900,7 @@ const CURSOR_PATTERN: [&str; 17] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn cursor_shape_bundle_is_exhaustive_and_optional_shapes_fall_back_to_pointer() {
@@ -758,6 +911,53 @@ mod tests {
         for shape in CompositorCursorShape::ALL {
             assert!(Arc::ptr_eq(&images.image(shape), &pointer));
         }
+    }
+
+    #[test]
+    fn bounded_cursor_reader_rejects_the_first_byte_above_the_file_cap() {
+        let content = vec![0_u8; MAX_CURSOR_FILE_BYTES + 1];
+
+        let result = read_bounded_cursor_bytes(Cursor::new(content));
+
+        assert_eq!(result, Err(CursorThemeLoadError::CursorFileTooLarge));
+    }
+
+    #[test]
+    fn cursor_frame_dimension_at_the_cap_is_accepted() {
+        let content = cursor_file(&[(MAX_CURSOR_FRAME_DIMENSION, 1, 0, 0, 1)]);
+
+        assert!(validate_xcursor_bounds(&content).is_ok());
+    }
+
+    #[test]
+    fn cursor_frame_dimension_above_the_cap_is_rejected() {
+        let content = cursor_file(&[(MAX_CURSOR_FRAME_DIMENSION + 1, 1, 0, 0, 1)]);
+
+        assert_eq!(
+            validate_xcursor_bounds(&content),
+            Err(CursorThemeLoadError::FrameBoundsExceeded)
+        );
+    }
+
+    #[test]
+    fn cursor_frame_count_above_the_cap_is_rejected_before_parsing() {
+        let frames = (0..=MAX_CURSOR_FRAMES_PER_FILE)
+            .map(|_| (1, 1, 0, 0, 1))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            validate_xcursor_bounds(&cursor_file(&frames)),
+            Err(CursorThemeLoadError::FrameBoundsExceeded)
+        );
+    }
+
+    #[test]
+    fn cursor_frame_count_at_the_cap_is_accepted() {
+        let frames = (0..MAX_CURSOR_FRAMES_PER_FILE)
+            .map(|_| (1, 1, 0, 0, 1))
+            .collect::<Vec<_>>();
+
+        assert!(validate_xcursor_bounds(&cursor_file(&frames)).is_ok());
     }
 
     #[test]
@@ -872,6 +1072,25 @@ mod tests {
         assert!(Arc::ptr_eq(
             &theme.image(CompositorCursorShape::Move),
             &theme.image(CompositorCursorShape::Pointer)
+        ));
+    }
+
+    #[test]
+    fn aliases_resolving_to_one_cursor_file_share_the_selected_image() {
+        let fixture = CursorFixture::new();
+        fixture.write_theme("Theme", None);
+        fixture.write_cursor("Theme", "left_ptr", &[11], 24, 24, 3, 4);
+        std::os::unix::fs::symlink(
+            fixture.root.join("Theme/cursors/left_ptr"),
+            fixture.root.join("Theme/cursors/move"),
+        )
+        .unwrap();
+
+        let theme = load_cursor_theme_from_search_path("Theme", 24, &fixture.root).unwrap();
+
+        assert!(Arc::ptr_eq(
+            &theme.image(CompositorCursorShape::Pointer),
+            &theme.image(CompositorCursorShape::Move)
         ));
     }
 

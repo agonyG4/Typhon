@@ -2,7 +2,8 @@ use oblivion_one::control_snapshots::{
     CursorAssetSource, CursorConfigSource, CursorPersistenceSnapshot,
 };
 use oblivion_one::cursor_manager::{
-    CursorManagerError, CursorThemeLoader, CursorThemeManager, LoadedCursorTheme,
+    CursorIoOperation, CursorIoSubmitError, CursorJobId, CursorManagerError, CursorMutationKind,
+    CursorThemeLoader, CursorThemeManager, LoadedCursorTheme,
 };
 use oblivion_one::cursor_persistence::CursorConfigurationStore;
 use oblivion_one::cursor_theme::{
@@ -13,6 +14,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -79,6 +81,25 @@ impl CursorThemeLoader for FakeLoader {
             configuration.clone(),
             images,
             CursorAssetSource::SystemTheme,
+        ))
+    }
+}
+
+struct BlockingLoader {
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+}
+
+impl CursorThemeLoader for BlockingLoader {
+    fn load(
+        &mut self,
+        configuration: &CursorConfiguration,
+    ) -> Result<LoadedCursorTheme, CursorThemeLoadError> {
+        self.entered.wait();
+        self.release.wait();
+        Ok(LoadedCursorTheme::new(
+            configuration.clone(),
+            Arc::new(CompositorCursorImage::builtin_fallback()),
         ))
     }
 }
@@ -410,4 +431,87 @@ fn one_hundred_multi_shape_retirement_cycles_release_after_the_final_shape_owner
         manager.collect_retired_generations();
         assert_eq!(manager.retired_generation_count(), 0);
     }
+}
+
+#[test]
+fn cursor_io_worker_rejects_a_second_mutation_while_the_first_is_running() {
+    let root = TestRoot::new();
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let worker = oblivion_one::cursor_manager::CursorIoWorker::new(
+        root.store(),
+        Box::new(BlockingLoader {
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+    )
+    .unwrap();
+    let configuration = CursorConfiguration::new("theme-a", 24).unwrap();
+    let operation = CursorIoOperation::Apply {
+        job_id: CursorJobId(1),
+        configuration: configuration.clone(),
+        persist: true,
+        kind: CursorMutationKind::Theme,
+    };
+
+    worker.submit(operation).unwrap();
+    entered.wait();
+
+    assert_eq!(
+        worker.submit(CursorIoOperation::Apply {
+            job_id: CursorJobId(2),
+            configuration,
+            persist: true,
+            kind: CursorMutationKind::Theme,
+        }),
+        Err(CursorIoSubmitError::Busy)
+    );
+    release.wait();
+    assert!(worker.receive_completion().is_some());
+}
+
+#[test]
+fn one_hundred_sequential_cursor_io_jobs_leave_one_published_configuration() {
+    let root = TestRoot::new();
+    let worker = oblivion_one::cursor_manager::CursorIoWorker::new(
+        root.store(),
+        Box::new(FakeLoader::succeeds()),
+    )
+    .unwrap();
+
+    for index in 0..100 {
+        let configuration = CursorConfiguration::new(
+            format!("theme-{index}"),
+            if index % 2 == 0 { 8 } else { 256 },
+        )
+        .unwrap();
+        worker
+            .submit(CursorIoOperation::Apply {
+                job_id: CursorJobId(index + 1),
+                configuration: configuration.clone(),
+                persist: true,
+                kind: CursorMutationKind::Combined,
+            })
+            .unwrap();
+        let completion = worker.receive_completion().unwrap();
+        assert_eq!(completion.job_id, CursorJobId(index + 1));
+        assert_eq!(completion.result.unwrap().configuration, configuration);
+        worker.drain_notification().unwrap();
+    }
+
+    assert_eq!(
+        root.store().read().unwrap(),
+        CursorConfiguration::new("theme-99", 256).unwrap()
+    );
+    let entries = fs::read_dir(root.0.join("AstreaOS/input"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(".cursor.json."))
+        })
+        .count();
+    assert_eq!(entries, 0);
 }

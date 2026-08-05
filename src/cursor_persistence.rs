@@ -19,10 +19,32 @@ const CONFIGURATION_FILE: &str = "cursor.json";
 const TEMP_PREFIX: &str = ".cursor.json.tmp-";
 const QUARANTINE_PREFIX: &str = ".cursor.json.quarantine-";
 const TEMP_ATTEMPTS: usize = 8;
+const MAX_TRANSACTION_DEBRIS: usize = 32;
 const MAX_DOCUMENT_BYTES: usize = 4096;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const RENAME_NOREPLACE: libc::c_uint = 1;
+const RENAME_EXCHANGE: libc::c_uint = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorWriteOutcome {
+    pub committed: bool,
+    pub cleanup_degraded: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorPersistenceFault {
+    TemporaryCreation,
+    TemporaryWrite,
+    TemporaryFsync,
+    NoReplacePublication,
+    Exchange,
+    PostExchangeIdentityVerification,
+    NewFileFsync,
+    FirstDirectoryFsync,
+    OldInodeCleanup,
+    CleanupDirectoryFsync,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorPersistenceError {
@@ -53,6 +75,7 @@ pub struct CursorConfigurationStore {
     configuration_file: PathBuf,
     create_missing_config_home: bool,
     unavailable: Option<CursorPersistenceError>,
+    fault: Option<CursorPersistenceFault>,
 }
 
 impl CursorConfigurationStore {
@@ -77,6 +100,7 @@ impl CursorConfigurationStore {
             configuration_file: PathBuf::from("/.invalid/AstreaOS/input/cursor.json"),
             create_missing_config_home: false,
             unavailable: Some(error),
+            fault: None,
         }
     }
 
@@ -101,7 +125,13 @@ impl CursorConfigurationStore {
             configuration_file,
             create_missing_config_home,
             unavailable: None,
+            fault: None,
         })
+    }
+
+    pub fn with_fault_injection(mut self, fault: CursorPersistenceFault) -> Self {
+        self.fault = Some(fault);
+        self
     }
 
     pub fn configuration_file(&self) -> &Path {
@@ -127,7 +157,10 @@ impl CursorConfigurationStore {
             .map_err(|_| CursorPersistenceError::Invalid)
     }
 
-    pub fn write(&self, configuration: &CursorConfiguration) -> Result<(), CursorPersistenceError> {
+    pub fn write(
+        &self,
+        configuration: &CursorConfiguration,
+    ) -> Result<CursorWriteOutcome, CursorPersistenceError> {
         if let Some(error) = self.unavailable {
             return Err(error);
         }
@@ -140,6 +173,7 @@ impl CursorConfigurationStore {
         })
         .map_err(|_| CursorPersistenceError::WriteFailed)?;
         let directories = self.open_directories(true)?;
+        cleanup_stale_transaction_files(directories.input.as_raw_fd())?;
         let existing = open_file_at(directories.input.as_raw_fd(), CONFIGURATION_FILE, true)?;
         let existing_identity = existing
             .as_ref()
@@ -149,15 +183,18 @@ impl CursorConfigurationStore {
                 Ok(identity)
             })
             .transpose()?;
+        self.fail_if_fault(CursorPersistenceFault::TemporaryCreation)?;
         let (temporary_name, mut temporary) = create_temporary_file(directories.input.as_raw_fd())?;
         let temporary_identity = NodeIdentity::from_fd(temporary.as_raw_fd())?;
         let write_result = (|| {
+            self.fail_if_fault(CursorPersistenceFault::TemporaryWrite)?;
             temporary
                 .write_all(&document)
                 .map_err(|_| CursorPersistenceError::WriteFailed)?;
             temporary
                 .flush()
                 .map_err(|_| CursorPersistenceError::WriteFailed)?;
+            self.fail_if_fault(CursorPersistenceFault::TemporaryFsync)?;
             temporary
                 .sync_all()
                 .map_err(|_| CursorPersistenceError::WriteFailed)?;
@@ -167,9 +204,8 @@ impl CursorConfigurationStore {
                 &temporary_name,
                 temporary_identity,
                 existing_identity,
-            )?;
-            sync_directory(directories.input.as_raw_fd())?;
-            Ok(())
+                self.fault,
+            )
         })();
         drop(temporary);
         if write_result.is_err() {
@@ -180,6 +216,14 @@ impl CursorConfigurationStore {
             );
         }
         write_result
+    }
+
+    fn fail_if_fault(&self, fault: CursorPersistenceFault) -> Result<(), CursorPersistenceError> {
+        if self.fault == Some(fault) {
+            Err(CursorPersistenceError::WriteFailed)
+        } else {
+            Ok(())
+        }
     }
 
     fn open_directories(
@@ -245,13 +289,17 @@ impl NodeIdentity {
         if unsafe { libc::fstat(fd, &mut stat) } < 0 {
             return Err(CursorPersistenceError::Insecure);
         }
-        Ok(Self {
+        Ok(Self::from_stat(&stat))
+    }
+
+    fn from_stat(stat: &libc::stat) -> Self {
+        Self {
             device: stat.st_dev,
             inode: stat.st_ino,
             owner: stat.st_uid,
             file_type: stat.st_mode & libc::S_IFMT,
             mode: stat.st_mode & 0o777,
-        })
+        }
     }
 }
 
@@ -431,15 +479,55 @@ fn create_temporary_file(parent_fd: RawFd) -> Result<(OsString, File), CursorPer
     Err(CursorPersistenceError::WriteFailed)
 }
 
+fn cleanup_stale_transaction_files(parent_fd: RawFd) -> Result<(), CursorPersistenceError> {
+    let directory = format!("/proc/self/fd/{parent_fd}");
+    let entries = std::fs::read_dir(directory).map_err(|_| CursorPersistenceError::WriteFailed)?;
+    let mut transaction_names = Vec::with_capacity(MAX_TRANSACTION_DEBRIS + 1);
+    for entry in entries {
+        let entry = entry.map_err(|_| CursorPersistenceError::WriteFailed)?;
+        let name = entry.file_name();
+        let Some(name_string) = name.to_str() else {
+            continue;
+        };
+        if !(name_string.starts_with(TEMP_PREFIX) || name_string.starts_with(QUARANTINE_PREFIX)) {
+            continue;
+        }
+        if transaction_names.len() >= MAX_TRANSACTION_DEBRIS {
+            return Err(CursorPersistenceError::WriteFailed);
+        };
+        transaction_names.push(name);
+    }
+    transaction_names.sort_unstable();
+    let mut remaining = 0_usize;
+    for name in transaction_names {
+        let Ok(identity) = open_identity_at(parent_fd, &name) else {
+            remaining = remaining.saturating_add(1);
+            continue;
+        };
+        if validate_configuration_identity(identity).is_err()
+            || remove_owned_at(parent_fd, &name, identity).is_err()
+        {
+            remaining = remaining.saturating_add(1);
+        }
+    }
+    if remaining >= MAX_TRANSACTION_DEBRIS {
+        Err(CursorPersistenceError::WriteFailed)
+    } else {
+        Ok(())
+    }
+}
+
 fn publish_configuration(
     parent_fd: RawFd,
     temporary_name: &OsStr,
     temporary_identity: NodeIdentity,
     existing_identity: Option<NodeIdentity>,
-) -> Result<(), CursorPersistenceError> {
+    fault: Option<CursorPersistenceFault>,
+) -> Result<CursorWriteOutcome, CursorPersistenceError> {
     let destination = OsStr::new(CONFIGURATION_FILE);
     match existing_identity {
         None => {
+            fail_if_fault(fault, CursorPersistenceFault::NoReplacePublication)?;
             rename_at2(
                 parent_fd,
                 temporary_name,
@@ -454,53 +542,42 @@ fn publish_configuration(
                     CursorPersistenceError::WriteFailed
                 }
             })?;
-            verify_published_file(parent_fd, destination, temporary_identity)
+            if let Err(error) =
+                verify_published_file(parent_fd, destination, temporary_identity, fault)
+            {
+                let _ = remove_owned_at(parent_fd, destination, temporary_identity);
+                return Err(error);
+            }
+            fail_if_fault(fault, CursorPersistenceFault::FirstDirectoryFsync).inspect_err(
+                |_| {
+                    let _ = remove_owned_at(parent_fd, destination, temporary_identity);
+                },
+            )?;
+            if let Err(error) = sync_directory(parent_fd) {
+                let _ = remove_owned_at(parent_fd, destination, temporary_identity);
+                return Err(error);
+            }
+            Ok(CursorWriteOutcome {
+                committed: true,
+                cleanup_degraded: false,
+            })
         }
         Some(expected_old) => {
-            let quarantine_name = transaction_name(QUARANTINE_PREFIX)?;
             let current = open_file_at(parent_fd, CONFIGURATION_FILE, true)?
                 .ok_or(CursorPersistenceError::Insecure)?;
             let current_identity = NodeIdentity::from_fd(current.as_raw_fd())?;
             if current_identity != expected_old {
                 return Err(CursorPersistenceError::Insecure);
             }
-            rename_at2(
-                parent_fd,
-                destination,
-                parent_fd,
-                &quarantine_name,
-                RENAME_NOREPLACE,
-            )
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::AlreadyExists {
-                    CursorPersistenceError::Insecure
-                } else {
-                    CursorPersistenceError::WriteFailed
-                }
-            })?;
-            let quarantined = match open_file_at(parent_fd, quarantine_name.to_str().unwrap(), true)
-            {
-                Ok(Some(file)) => file,
-                Ok(None) | Err(_) => {
-                    let _ = restore_entry(parent_fd, &quarantine_name, destination);
-                    return Err(CursorPersistenceError::Insecure);
-                }
-            };
-            if NodeIdentity::from_fd(quarantined.as_raw_fd())? != expected_old {
-                drop(quarantined);
-                restore_entry(parent_fd, &quarantine_name, destination)?;
-                return Err(CursorPersistenceError::Insecure);
-            }
-            drop(quarantined);
-
+            drop(current);
+            fail_if_fault(fault, CursorPersistenceFault::Exchange)?;
             if let Err(error) = rename_at2(
                 parent_fd,
                 temporary_name,
                 parent_fd,
                 destination,
-                RENAME_NOREPLACE,
+                RENAME_EXCHANGE,
             ) {
-                let _ = restore_entry(parent_fd, &quarantine_name, destination);
                 return Err(if error.kind() == io::ErrorKind::AlreadyExists {
                     CursorPersistenceError::Insecure
                 } else {
@@ -508,25 +585,163 @@ fn publish_configuration(
                 });
             }
 
-            if let Err(error) = verify_published_file(parent_fd, destination, temporary_identity) {
-                let rollback = (|| {
-                    rename_at2(
-                        parent_fd,
-                        destination,
-                        parent_fd,
-                        temporary_name,
-                        RENAME_NOREPLACE,
-                    )
-                    .map_err(|_| CursorPersistenceError::WriteFailed)?;
-                    restore_entry(parent_fd, &quarantine_name, destination)
-                })();
-                if rollback.is_err() {
+            if let Err(error) = fail_if_fault(
+                fault,
+                CursorPersistenceFault::PostExchangeIdentityVerification,
+            ) {
+                if rollback_exchange_if_exact(
+                    parent_fd,
+                    temporary_name,
+                    destination,
+                    temporary_identity,
+                    expected_old,
+                ) {
+                    return Err(error);
+                }
+                return Err(CursorPersistenceError::WriteFailed);
+            }
+            let destination_identity = entry_identity_at(parent_fd, destination)?;
+            let temporary_after_exchange = entry_identity_at(parent_fd, temporary_name)?;
+            if destination_identity != temporary_identity
+                || temporary_after_exchange != expected_old
+            {
+                let rolled_back = rollback_exchange_if_exact(
+                    parent_fd,
+                    temporary_name,
+                    destination,
+                    temporary_identity,
+                    temporary_after_exchange,
+                );
+                if !rolled_back {
                     return Err(CursorPersistenceError::WriteFailed);
                 }
-                return Err(error);
+                return Err(CursorPersistenceError::Insecure);
             }
-            remove_owned_at(parent_fd, &quarantine_name, expected_old)
+            if let Err(error) =
+                verify_published_file(parent_fd, destination, temporary_identity, fault)
+            {
+                if rollback_exchange_if_exact(
+                    parent_fd,
+                    temporary_name,
+                    destination,
+                    temporary_identity,
+                    expected_old,
+                ) {
+                    return Err(error);
+                }
+                return Err(CursorPersistenceError::WriteFailed);
+            }
+            if let Err(error) = fail_if_fault(fault, CursorPersistenceFault::FirstDirectoryFsync) {
+                if rollback_exchange_if_exact(
+                    parent_fd,
+                    temporary_name,
+                    destination,
+                    temporary_identity,
+                    expected_old,
+                ) {
+                    return Err(error);
+                }
+                return Err(CursorPersistenceError::WriteFailed);
+            }
+            if let Err(error) = sync_directory(parent_fd) {
+                if rollback_exchange_if_exact(
+                    parent_fd,
+                    temporary_name,
+                    destination,
+                    temporary_identity,
+                    expected_old,
+                ) {
+                    return Err(error);
+                }
+                return Err(CursorPersistenceError::WriteFailed);
+            }
+            let cleanup_degraded = fail_if_fault(fault, CursorPersistenceFault::OldInodeCleanup)
+                .is_err()
+                || remove_owned_at(parent_fd, temporary_name, expected_old).is_err()
+                || fail_if_fault(fault, CursorPersistenceFault::CleanupDirectoryFsync).is_err()
+                || sync_directory(parent_fd).is_err();
+            Ok(CursorWriteOutcome {
+                committed: true,
+                cleanup_degraded,
+            })
         }
+    }
+}
+
+fn rollback_exchange_if_exact(
+    parent_fd: RawFd,
+    temporary_name: &OsStr,
+    destination: &OsStr,
+    new_identity: NodeIdentity,
+    old_identity: NodeIdentity,
+) -> bool {
+    let Ok(destination_identity) = entry_identity_at(parent_fd, destination) else {
+        return false;
+    };
+    let Ok(temporary_identity) = entry_identity_at(parent_fd, temporary_name) else {
+        return false;
+    };
+    if destination_identity != new_identity || temporary_identity != old_identity {
+        return false;
+    }
+    rename_at2(
+        parent_fd,
+        temporary_name,
+        parent_fd,
+        destination,
+        RENAME_EXCHANGE,
+    )
+    .is_ok()
+}
+
+fn fail_if_fault(
+    fault: Option<CursorPersistenceFault>,
+    expected: CursorPersistenceFault,
+) -> Result<(), CursorPersistenceError> {
+    if fault == Some(expected) {
+        Err(CursorPersistenceError::WriteFailed)
+    } else {
+        Ok(())
+    }
+}
+
+fn open_identity_at(
+    parent_fd: RawFd,
+    name: &OsStr,
+) -> Result<NodeIdentity, CursorPersistenceError> {
+    let file = open_file_at(
+        parent_fd,
+        name.to_str().ok_or(CursorPersistenceError::Insecure)?,
+        true,
+    )?
+    .ok_or(CursorPersistenceError::Insecure)?;
+    NodeIdentity::from_fd(file.as_raw_fd())
+}
+
+fn entry_identity_at(
+    parent_fd: RawFd,
+    name: &OsStr,
+) -> Result<NodeIdentity, CursorPersistenceError> {
+    let name = c_string(name, "entry name").map_err(|_| CursorPersistenceError::Insecure)?;
+    let mut stat = unsafe {
+        // SAFETY: zeroed storage is valid before `fstatat` initializes the
+        // complete `libc::stat` value.
+        std::mem::zeroed::<libc::stat>()
+    };
+    let result = unsafe {
+        // SAFETY: `parent_fd` is the validated input directory, `name` is a
+        // bounded NUL-free entry name, and `stat` is writable storage.
+        libc::fstatat(
+            parent_fd,
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result < 0 {
+        Err(CursorPersistenceError::Insecure)
+    } else {
+        Ok(NodeIdentity::from_stat(&stat))
     }
 }
 
@@ -534,6 +749,7 @@ fn verify_published_file(
     parent_fd: RawFd,
     destination: &OsStr,
     expected: NodeIdentity,
+    fault: Option<CursorPersistenceFault>,
 ) -> Result<(), CursorPersistenceError> {
     let file = open_file_at(parent_fd, destination.to_str().unwrap(), true)?
         .ok_or(CursorPersistenceError::WriteFailed)?;
@@ -541,6 +757,7 @@ fn verify_published_file(
     if identity != expected {
         return Err(CursorPersistenceError::Insecure);
     }
+    fail_if_fault(fault, CursorPersistenceFault::NewFileFsync)?;
     validate_configuration_identity(identity)?;
     file.sync_all()
         .map_err(|_| CursorPersistenceError::WriteFailed)

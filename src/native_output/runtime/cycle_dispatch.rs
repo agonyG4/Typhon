@@ -9,6 +9,9 @@ use oblivion_one::control_snapshots::{
     FeatureState, FeatureStateSnapshot, ModeSnapshot, OutputListSnapshot, OutputSnapshot,
     PositionSnapshot, StatusSnapshot, VersionSnapshot, XwaylandStatusSnapshot,
 };
+use oblivion_one::cursor_manager::{
+    CursorIoError, CursorIoOperation, CursorIoSubmitError, CursorJobId, CursorMutationKind,
+};
 use oblivion_one::native::event_loop::NativeWakeup;
 use serde::Deserialize;
 
@@ -46,19 +49,67 @@ impl NativeRuntime {
             oblivion_one::native::control::MAX_CONTROL_OPERATIONS_PER_CYCLE,
         )?;
         for (token, request) in pending {
-            let response = self.dispatch_control_command(request);
-            self.control_server
-                .queue_response(&mut self.event_loop, token, response)?;
+            if let Some(response) = self.dispatch_control_command(token, request) {
+                self.control_server
+                    .queue_response(&mut self.event_loop, token, response)?;
+            }
         }
         Ok(())
     }
 
-    fn dispatch_control_command(&mut self, request: ControlRequest) -> ControlResponse {
+    pub(super) fn service_cursor_io_completions(
+        &mut self,
+        wakeup: &NativeWakeup,
+    ) -> NativeResult<()> {
+        if !wakeup.reasons.cursor_io_worker() {
+            return Ok(());
+        }
+        let Some(worker) = self.cursor_io_worker.as_ref() else {
+            return Ok(());
+        };
+        if let Err(error) = worker.drain_notification() {
+            eprintln!("cursor I/O worker notification failed: {error}");
+            return Ok(());
+        }
+        let Some(completion) = worker.try_completion() else {
+            return Ok(());
+        };
+        let Some(pending) = self.pending_cursor_job.take() else {
+            return Ok(());
+        };
+        if completion.job_id != pending.job_id {
+            self.cursor_manager.note_stale_client_completion();
+            return Ok(());
+        }
+        let response = match completion.result {
+            Ok(prepared) => {
+                let change = self.cursor_manager.publish_prepared(prepared);
+                self.publish_cursor_change(change);
+                cursor_snapshot_response(self, pending.request_id)
+            }
+            Err(error) => {
+                self.cursor_manager.note_worker_error(error);
+                cursor_failure(pending.request_id, map_cursor_io_error(error))
+            }
+        };
+        if !self.control_server.has_client(pending.token) {
+            self.cursor_manager.note_stale_client_completion();
+        }
+        self.control_server
+            .queue_response(&mut self.event_loop, pending.token, response)?;
+        Ok(())
+    }
+
+    fn dispatch_control_command(
+        &mut self,
+        token: oblivion_one::native::event_loop::ReactorToken,
+        request: ControlRequest,
+    ) -> Option<ControlResponse> {
         let Some(command) = ControlCommand::parse(&request.command) else {
-            return ControlResponse::failure(
+            return Some(ControlResponse::failure(
                 request.id,
                 ControlError::new(ControlErrorCode::InvalidCommand, "unknown control command"),
-            );
+            ));
         };
         let result = match command {
             ControlCommand::Version => serde_json::to_value(VersionSnapshot {
@@ -273,7 +324,7 @@ impl NativeRuntime {
             ControlCommand::CursorGet => {
                 if serde_json::from_value::<EmptyCursorArgs>(request.args).is_err() {
                     self.cursor_manager.note_validation_failure();
-                    return cursor_argument_failure(request.id);
+                    return Some(cursor_argument_failure(request.id));
                 }
                 self.cursor_manager.note_get();
                 serde_json::to_value(self.cursor_snapshot())
@@ -283,78 +334,177 @@ impl NativeRuntime {
                     Ok(args) => args,
                     Err(_) => {
                         self.cursor_manager.note_validation_failure();
-                        return cursor_argument_failure(request.id);
+                        return Some(cursor_argument_failure(request.id));
                     }
                 };
-                match self.cursor_manager.set_theme(&args.theme) {
-                    Ok(change) => {
-                        self.publish_cursor_change(change);
-                        serde_json::to_value(self.cursor_snapshot())
-                    }
-                    Err(error) => return cursor_failure(request.id, error),
-                }
+                let configuration = match self.cursor_manager.configuration_for_theme(&args.theme) {
+                    Ok(configuration) => configuration,
+                    Err(error) => return Some(cursor_failure(request.id, error)),
+                };
+                return self.queue_cursor_operation(
+                    token,
+                    request.id,
+                    CursorIoOperation::Apply {
+                        job_id: CursorJobId(0),
+                        configuration,
+                        persist: true,
+                        kind: CursorMutationKind::Theme,
+                    },
+                );
             }
             ControlCommand::CursorSetSize => {
                 let args = match serde_json::from_value::<CursorSizeArgs>(request.args) {
                     Ok(args) => args,
                     Err(_) => {
                         self.cursor_manager.note_validation_failure();
-                        return cursor_argument_failure(request.id);
+                        return Some(cursor_argument_failure(request.id));
                     }
                 };
-                match self.cursor_manager.set_size(args.size_px) {
-                    Ok(change) => {
-                        self.publish_cursor_change(change);
-                        serde_json::to_value(self.cursor_snapshot())
-                    }
-                    Err(error) => return cursor_failure(request.id, error),
-                }
+                let configuration = match self.cursor_manager.configuration_for_size(args.size_px) {
+                    Ok(configuration) => configuration,
+                    Err(error) => return Some(cursor_failure(request.id, error)),
+                };
+                return self.queue_cursor_operation(
+                    token,
+                    request.id,
+                    CursorIoOperation::Apply {
+                        job_id: CursorJobId(0),
+                        configuration,
+                        persist: true,
+                        kind: CursorMutationKind::Size,
+                    },
+                );
             }
             ControlCommand::CursorSet => {
                 let args = match serde_json::from_value::<CursorSetArgs>(request.args) {
                     Ok(args) => args,
                     Err(_) => {
                         self.cursor_manager.note_validation_failure();
-                        return cursor_argument_failure(request.id);
+                        return Some(cursor_argument_failure(request.id));
                     }
                 };
-                match self.cursor_manager.apply_values(&args.theme, args.size_px) {
-                    Ok(change) => {
-                        self.publish_cursor_change(change);
-                        serde_json::to_value(self.cursor_snapshot())
-                    }
-                    Err(error) => return cursor_failure(request.id, error),
-                }
+                let configuration = match self
+                    .cursor_manager
+                    .configuration_for_values(&args.theme, args.size_px)
+                {
+                    Ok(configuration) => configuration,
+                    Err(error) => return Some(cursor_failure(request.id, error)),
+                };
+                return self.queue_cursor_operation(
+                    token,
+                    request.id,
+                    CursorIoOperation::Apply {
+                        job_id: CursorJobId(0),
+                        configuration,
+                        persist: true,
+                        kind: CursorMutationKind::Combined,
+                    },
+                );
             }
             ControlCommand::CursorReload => {
                 if serde_json::from_value::<EmptyCursorArgs>(request.args).is_err() {
                     self.cursor_manager.note_validation_failure();
-                    return cursor_argument_failure(request.id);
+                    return Some(cursor_argument_failure(request.id));
                 }
-                match self.cursor_manager.reload() {
-                    Ok(change) => {
-                        self.publish_cursor_change(change);
-                        serde_json::to_value(self.cursor_snapshot())
-                    }
-                    Err(error) => return cursor_failure(request.id, error),
-                }
+                return self.queue_cursor_operation(
+                    token,
+                    request.id,
+                    CursorIoOperation::Reload {
+                        job_id: CursorJobId(0),
+                    },
+                );
             }
             _ => {
-                return ControlResponse::failure(
+                return Some(ControlResponse::failure(
                     request.id,
                     ControlError::new(
                         ControlErrorCode::InvalidCommand,
                         "command is not available in M3",
                     ),
-                );
+                ));
             }
         };
         match result {
-            Ok(result) => ControlResponse::success(request.id, result),
-            Err(_) => ControlResponse::failure(
+            Ok(result) => Some(ControlResponse::success(request.id, result)),
+            Err(_) => Some(ControlResponse::failure(
                 request.id,
                 ControlError::new(ControlErrorCode::Internal, "control snapshot failed"),
-            ),
+            )),
+        }
+    }
+
+    fn queue_cursor_operation(
+        &mut self,
+        token: oblivion_one::native::event_loop::ReactorToken,
+        request_id: u64,
+        operation: CursorIoOperation,
+    ) -> Option<ControlResponse> {
+        if self.pending_cursor_job.is_some() {
+            self.cursor_manager.note_cursor_job_busy();
+            return Some(cursor_failure(
+                request_id,
+                oblivion_one::cursor_manager::CursorManagerError::ResourceBusy,
+            ));
+        }
+        if let CursorIoOperation::Apply { configuration, .. } = &operation
+            && self.cursor_manager.is_no_op(configuration)
+        {
+            self.cursor_manager.note_no_op();
+            return Some(cursor_snapshot_response(self, request_id));
+        }
+        if let Err(error) = self.cursor_manager.ensure_mutation_capacity() {
+            self.cursor_manager.note_cursor_job_busy();
+            return Some(cursor_failure(request_id, error));
+        }
+        let Some(worker) = self.cursor_io_worker.as_ref() else {
+            return Some(ControlResponse::failure(
+                request_id,
+                ControlError::new(ControlErrorCode::Internal, "cursor I/O worker unavailable")
+                    .with_detail("cursor_io_unavailable"),
+            ));
+        };
+        let job_id = CursorJobId(self.next_cursor_job_id.max(1));
+        self.next_cursor_job_id = self.next_cursor_job_id.saturating_add(1).max(1);
+        let operation = match operation {
+            CursorIoOperation::Apply {
+                configuration,
+                persist,
+                kind,
+                ..
+            } => CursorIoOperation::Apply {
+                job_id,
+                configuration,
+                persist,
+                kind,
+            },
+            CursorIoOperation::Reload { .. } => CursorIoOperation::Reload { job_id },
+        };
+        self.pending_cursor_job = Some(PendingCursorJob {
+            token,
+            request_id,
+            job_id,
+        });
+        match worker.submit(operation) {
+            Ok(()) => {
+                self.cursor_manager.note_cursor_job_submitted();
+                None
+            }
+            Err(CursorIoSubmitError::Busy) => {
+                self.pending_cursor_job = None;
+                self.cursor_manager.note_cursor_job_busy();
+                Some(cursor_failure(
+                    request_id,
+                    oblivion_one::cursor_manager::CursorManagerError::ResourceBusy,
+                ))
+            }
+            Err(CursorIoSubmitError::Closed) => {
+                self.pending_cursor_job = None;
+                Some(ControlResponse::failure(
+                    request_id,
+                    ControlError::new(ControlErrorCode::Internal, "cursor I/O worker closed")
+                        .with_detail("cursor_io_unavailable"),
+                ))
+            }
         }
     }
 
@@ -644,6 +794,41 @@ fn cursor_failure(
     )
 }
 
+fn map_cursor_io_error(error: CursorIoError) -> oblivion_one::cursor_manager::CursorManagerError {
+    match error {
+        CursorIoError::Load(error) => match error {
+            oblivion_one::cursor_theme::CursorThemeLoadError::ThemeNotFound => {
+                oblivion_one::cursor_manager::CursorManagerError::ThemeNotFound
+            }
+            oblivion_one::cursor_theme::CursorThemeLoadError::RequiredPointerMissing => {
+                oblivion_one::cursor_manager::CursorManagerError::RequiredPointerMissing
+            }
+            oblivion_one::cursor_theme::CursorThemeLoadError::CursorFileReadFailed => {
+                oblivion_one::cursor_manager::CursorManagerError::CursorFileReadFailed
+            }
+            oblivion_one::cursor_theme::CursorThemeLoadError::CursorFileInvalid
+            | oblivion_one::cursor_theme::CursorThemeLoadError::CursorFileTooLarge
+            | oblivion_one::cursor_theme::CursorThemeLoadError::FrameBoundsExceeded => {
+                oblivion_one::cursor_manager::CursorManagerError::CursorFileInvalid
+            }
+        },
+        CursorIoError::Persistence(error) => match error {
+            oblivion_one::cursor_persistence::CursorPersistenceError::Missing => {
+                oblivion_one::cursor_manager::CursorManagerError::ConfigMissing
+            }
+            oblivion_one::cursor_persistence::CursorPersistenceError::Invalid => {
+                oblivion_one::cursor_manager::CursorManagerError::ConfigInvalid
+            }
+            oblivion_one::cursor_persistence::CursorPersistenceError::Insecure => {
+                oblivion_one::cursor_manager::CursorManagerError::ConfigInsecure
+            }
+            oblivion_one::cursor_persistence::CursorPersistenceError::WriteFailed => {
+                oblivion_one::cursor_manager::CursorManagerError::ConfigWriteFailed
+            }
+        },
+    }
+}
+
 fn cursor_argument_failure(id: u64) -> ControlResponse {
     ControlResponse::failure(
         id,
@@ -653,6 +838,20 @@ fn cursor_argument_failure(id: u64) -> ControlResponse {
         )
         .with_detail("invalid_cursor_arguments"),
     )
+}
+
+fn cursor_snapshot_response(runtime: &NativeRuntime, id: u64) -> ControlResponse {
+    match serde_json::to_value(runtime.cursor_snapshot()) {
+        Ok(snapshot) => ControlResponse::success(id, snapshot),
+        Err(_) => ControlResponse::failure(
+            id,
+            ControlError::new(
+                ControlErrorCode::Internal,
+                "cursor snapshot serialization failed",
+            )
+            .with_detail("cursor_snapshot_internal"),
+        ),
+    }
 }
 
 fn cursor_configuration_doctor_severity(

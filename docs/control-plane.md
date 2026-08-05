@@ -62,15 +62,21 @@ into the exact command-specific result type. Missing, null, incompatible, or
 malformed results are protocol errors (client exit `6`). Snapshot objects use
 strict version-one schemas and stable string vocabularies.
 
-Cursor mutation is dispatched on the native runtime thread. The transport only
-decodes bounded arguments and queues a response; it does not load cursor
-assets, access configuration files, create framebuffers, or submit KMS state.
-The runtime loads and validates a complete candidate, atomically persists the
-desired configuration, publishes a new cursor generation, schedules ordinary
-repaint and cursor-plane replanning, and then returns the snapshot. Failed
-validation, loading, or persistence leaves the active generation unchanged.
-Old cursor generations remain retained while KMS transactions, worker jobs,
-cursor-plane owners, or software frames still reference them.
+Cursor mutation validation and final publication are dispatched on the native
+runtime thread. The transport only decodes bounded arguments and queues a
+response; it does not load cursor assets, access configuration files, create
+framebuffers, or submit KMS state. One bounded cursor I/O worker owns complete
+candidate loading and persistence. A second mutation is rejected as
+`cursor_generation_busy`, while M3 reads and `cursor get` remain responsive.
+After the worker completes, the runtime publishes a new cursor generation,
+schedules ordinary repaint and cursor-plane replanning, and returns the
+snapshot. Accepted jobs still publish after a client disconnects; only the
+stale response token is ignored. Shutdown does not cancel an accepted job; it
+drops the worker without waiting indefinitely for filesystem I/O, so a blocked
+job may finish independently while the process tears down. Failed validation, loading, or pre-commit
+persistence leaves the active generation unchanged. Old cursor generations
+remain retained while KMS transactions, worker jobs, cursor-plane owners, or
+software frames still reference them.
 
 Cursor configuration is persisted at
 `$XDG_CONFIG_HOME/AstreaOS/input/cursor.json`, or
@@ -78,14 +84,24 @@ Cursor configuration is persisted at
 AstreaOS-owned directories are private `0700` directories and the file is a
 regular `0600` file. Reads and writes are relative to validated no-follow
 directory descriptors. Publication uses a private unpredictable temporary
-file, flush, file `fsync`, no-replace publication, exact-inode verification,
-and parent-directory `fsync` where supported. Symlinks, foreign ownership,
+file, flush, file `fsync`, `RENAME_NOREPLACE` for first publication, and
+`RENAME_EXCHANGE` plus exact old/new inode verification for replacement. The
+parent-directory `fsync` is part of the persistence commit point where
+supported. Symlinks, foreign ownership,
 unexpected node types, malformed documents, and unsupported versions are
 rejected. A missing standard `$HOME/.config` is securely created as `0700`; a
 missing explicit `XDG_CONFIG_HOME` is not created implicitly. Startup falls
 back to the existing default or builtin cursor, keeps the desired logical
 configuration, and emits one bounded warning when persisted configuration or
 assets are invalid or unavailable.
+
+Cursor file input is bounded to 16 MiB; frames are limited to 1024 pixels per
+dimension, 1,048,576 pixels, and 256 frames per file. A candidate retains at
+most six unique selected images and caches repeated source aliases for the
+duration of one load. Post-commit cleanup failures are reported as bounded
+degradation and never cause runtime/disk divergence. Verified transaction
+debris with `.cursor.json.tmp-*` or `.cursor.json.quarantine-*` prefixes may be
+cleaned by a later write; replacement nodes are never removed.
 
 Cursor backend values are `hardware`, `software`, `hidden`, and `unavailable`.
 The compositor-owned shape values are `pointer`, `move`,

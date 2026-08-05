@@ -141,6 +141,12 @@ struct KmsWorkerQuarantine {
     cursor_sidecars: Vec<super::kms_worker::CursorSidecar>,
 }
 
+struct PendingCursorJob {
+    token: ReactorToken,
+    request_id: u64,
+    job_id: oblivion_one::cursor_manager::CursorJobId,
+}
+
 pub(crate) struct NativeRuntimeConfig {
     pub(crate) server: OwnCompositorServer,
     pub(crate) app: Vec<String>,
@@ -257,6 +263,10 @@ pub(crate) struct NativeRuntime {
     output_render_fence_token: Option<ReactorToken>,
     kms_commit_worker: Option<super::kms_worker::KmsCommitWorkerHandle>,
     kms_commit_worker_reactor_token: Option<ReactorToken>,
+    cursor_io_worker: Option<oblivion_one::cursor_manager::CursorIoWorker>,
+    cursor_io_worker_reactor_token: Option<ReactorToken>,
+    pending_cursor_job: Option<PendingCursorJob>,
+    next_cursor_job_id: u64,
     kms_commit_worker_policy: super::kms_worker::KmsCommitWorkerPolicy,
     kms_commit_worker_transport: super::kms_worker::KmsCommitWorkerTransport,
     kms_commit_worker_startup: super::kms_worker::KmsCommitWorkerStartup,
@@ -379,6 +389,11 @@ impl NativeRuntime {
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
         let _ = self.control_server.shutdown(&mut self.event_loop);
+        if let Some(token) = self.cursor_io_worker_reactor_token.take() {
+            let _ = self.event_loop.unregister(token);
+        }
+        self.pending_cursor_job = None;
+        self.cursor_io_worker.take();
         if let Some(worker) = self.kms_commit_worker.take() {
             if let Some(token) = self.kms_commit_worker_reactor_token.take() {
                 let _ = self.event_loop.unregister(token);

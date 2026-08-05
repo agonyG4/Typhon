@@ -1,4 +1,6 @@
-use oblivion_one::cursor_persistence::{CursorConfigurationStore, CursorPersistenceError};
+use oblivion_one::cursor_persistence::{
+    CursorConfigurationStore, CursorPersistenceError, CursorPersistenceFault,
+};
 use oblivion_one::cursor_theme::CursorConfiguration;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -56,7 +58,10 @@ fn valid_configuration_is_written_atomically_and_read_back() {
     let configuration = CursorConfiguration::new("Bibata-Modern-Ice", 24).unwrap();
     fs::set_permissions(&root.0, fs::Permissions::from_mode(0o755)).unwrap();
 
-    store.write(&configuration).unwrap();
+    let outcome = store.write(&configuration).unwrap();
+
+    assert!(outcome.committed);
+    assert!(!outcome.cleanup_degraded);
 
     assert_eq!(store.read().unwrap(), configuration);
     assert_eq!(fs::metadata(&root.0).unwrap().mode() & 0o777, 0o755);
@@ -73,7 +78,7 @@ fn valid_configuration_is_written_atomically_and_read_back() {
     // current process identity check used by this filesystem test.
     let effective_uid = unsafe { libc::geteuid() };
     assert_eq!(fs::metadata(root.file()).unwrap().uid(), effective_uid);
-    assert!(temporary_files(&root.0).is_empty());
+    assert!(transaction_files(&root.0).is_empty());
     assert_eq!(
         fs::read_to_string(root.file()).unwrap(),
         r#"{"version":1,"theme":"Bibata-Modern-Ice","sizePx":24}"#
@@ -170,7 +175,7 @@ fn failed_write_before_rename_keeps_the_replacement_and_leaves_no_temporary_file
         r#"{"version":1,"theme":"default","sizePx":24}"#
     );
     assert_eq!(store.read().unwrap_err(), CursorPersistenceError::Insecure);
-    assert!(temporary_files(&root.0).is_empty());
+    assert!(transaction_files(&root.0).is_empty());
 }
 
 #[test]
@@ -192,14 +197,112 @@ fn one_hundred_destination_symlink_replacements_are_rejected_without_overwrite()
             Err(CursorPersistenceError::Insecure)
         ));
         assert_eq!(fs::read(&replacement).unwrap(), b"replacement must survive");
-        assert!(temporary_files(&root.0).is_empty());
+        assert!(transaction_files(&root.0).is_empty());
 
         fs::remove_file(root.file()).unwrap();
         fs::rename(parked, root.file()).unwrap();
     }
 }
 
-fn temporary_files(root: &Path) -> Vec<PathBuf> {
+#[test]
+fn precommit_faults_preserve_the_previous_canonical_configuration() {
+    let phases = [
+        CursorPersistenceFault::TemporaryCreation,
+        CursorPersistenceFault::TemporaryWrite,
+        CursorPersistenceFault::TemporaryFsync,
+        CursorPersistenceFault::Exchange,
+        CursorPersistenceFault::PostExchangeIdentityVerification,
+        CursorPersistenceFault::NewFileFsync,
+        CursorPersistenceFault::FirstDirectoryFsync,
+    ];
+    for phase in phases {
+        let root = TestRoot::new();
+        let original = CursorConfiguration::new("default", 24).unwrap();
+        root.store().write(&original).unwrap();
+        let failing = root.store().with_fault_injection(phase);
+
+        assert_eq!(
+            failing.write(&CursorConfiguration::new("other", 32).unwrap()),
+            Err(CursorPersistenceError::WriteFailed)
+        );
+        assert_eq!(root.store().read().unwrap(), original);
+        assert!(transaction_files(&root.0).is_empty());
+    }
+}
+
+#[test]
+fn first_publication_faults_leave_no_canonical_configuration() {
+    let phases = [
+        CursorPersistenceFault::TemporaryCreation,
+        CursorPersistenceFault::TemporaryWrite,
+        CursorPersistenceFault::TemporaryFsync,
+        CursorPersistenceFault::NoReplacePublication,
+        CursorPersistenceFault::NewFileFsync,
+        CursorPersistenceFault::FirstDirectoryFsync,
+    ];
+    for phase in phases {
+        let root = TestRoot::new();
+        let store = root.store().with_fault_injection(phase);
+        let configuration = CursorConfiguration::new("default", 24).unwrap();
+
+        assert_eq!(
+            store.write(&configuration),
+            Err(CursorPersistenceError::WriteFailed)
+        );
+        assert!(matches!(
+            root.store().read(),
+            Err(CursorPersistenceError::Missing)
+        ));
+        assert!(transaction_files(&root.0).is_empty());
+    }
+}
+
+#[test]
+fn postcommit_cleanup_faults_report_commit_without_runtime_disk_divergence() {
+    for phase in [
+        CursorPersistenceFault::OldInodeCleanup,
+        CursorPersistenceFault::CleanupDirectoryFsync,
+    ] {
+        let root = TestRoot::new();
+        let store = root.store();
+        store
+            .write(&CursorConfiguration::new("default", 24).unwrap())
+            .unwrap();
+        let next = CursorConfiguration::new("other", 32).unwrap();
+
+        let outcome = store.with_fault_injection(phase).write(&next).unwrap();
+
+        assert!(outcome.committed);
+        assert!(outcome.cleanup_degraded);
+        assert_eq!(root.store().read().unwrap(), next);
+    }
+}
+
+#[test]
+fn successful_retry_cleans_verified_stale_transaction_debris() {
+    let root = TestRoot::new();
+    let store = root.store();
+    store
+        .write(&CursorConfiguration::new("default", 24).unwrap())
+        .unwrap();
+    let next = CursorConfiguration::new("other", 32).unwrap();
+
+    let outcome = store
+        .clone()
+        .with_fault_injection(CursorPersistenceFault::OldInodeCleanup)
+        .write(&next)
+        .unwrap();
+    assert!(outcome.cleanup_degraded);
+    assert!(!transaction_files(&root.0).is_empty());
+
+    store
+        .write(&CursorConfiguration::new("retry", 48).unwrap())
+        .unwrap();
+
+    assert!(transaction_files(&root.0).is_empty());
+}
+
+fn transaction_files(root: &Path) -> Vec<PathBuf> {
     let input = root.join("AstreaOS/input");
     fs::read_dir(input)
         .unwrap()
@@ -208,7 +311,10 @@ fn temporary_files(root: &Path) -> Vec<PathBuf> {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(".cursor.json.tmp-"))
+                .is_some_and(|name| {
+                    name.starts_with(".cursor.json.tmp-")
+                        || name.starts_with(".cursor.json.quarantine-")
+                })
         })
         .collect()
 }
