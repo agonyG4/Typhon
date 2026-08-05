@@ -2,9 +2,14 @@ use oblivion_one::cursor_persistence::{
     CursorConfigurationStore, CursorPersistenceError, CursorPersistenceFault,
 };
 use oblivion_one::cursor_theme::CursorConfiguration;
-use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::fs::{self, OpenOptions};
+use std::os::{
+    fd::AsRawFd,
+    unix::fs::{MetadataExt, PermissionsExt},
+};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -299,6 +304,201 @@ fn successful_retry_cleans_verified_stale_transaction_debris() {
         .write(&CursorConfiguration::new("retry", 48).unwrap())
         .unwrap();
 
+    assert!(transaction_files(&root.0).is_empty());
+}
+
+#[test]
+fn a_second_store_fails_busy_without_touching_the_canonical_file() {
+    let root = TestRoot::new();
+    let first = root.store();
+    let second = root.store();
+    let original = CursorConfiguration::new("default", 24).unwrap();
+    first.write(&original).unwrap();
+
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.input_dir().join("cursor.lock"))
+        .unwrap();
+    let result = unsafe {
+        // SAFETY: `lock` is a valid descriptor for the test lock file and
+        // `flock` only changes its advisory lock state.
+        libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+    };
+    assert_eq!(result, 0);
+
+    assert_eq!(
+        second.write(&CursorConfiguration::new("other", 32).unwrap()),
+        Err(CursorPersistenceError::Busy)
+    );
+    assert_eq!(root.store().read().unwrap(), original);
+    assert!(transaction_files(&root.0).is_empty());
+}
+
+#[test]
+fn lock_release_allows_the_next_store_and_lock_file_remains_private() {
+    let root = TestRoot::new();
+    let first = root.store();
+    let second = root.store();
+    first
+        .write(&CursorConfiguration::new("default", 24).unwrap())
+        .unwrap();
+    let lock_path = root.input_dir().join("cursor.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    let result = unsafe {
+        // SAFETY: `lock` is a valid descriptor for the test lock file and
+        // `flock` only changes its advisory lock state.
+        libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+    };
+    assert_eq!(result, 0);
+    drop(lock);
+
+    second
+        .write(&CursorConfiguration::new("other", 32).unwrap())
+        .unwrap();
+    assert_eq!(fs::metadata(lock_path).unwrap().mode() & 0o777, 0o600);
+    assert!(
+        fs::metadata(root.input_dir().join("cursor.lock"))
+            .unwrap()
+            .is_file()
+    );
+}
+
+#[test]
+fn active_transaction_debris_is_not_cleaned_while_another_store_holds_the_lock() {
+    let root = TestRoot::new();
+    let first = root.store();
+    let second = root.store();
+    first
+        .write(&CursorConfiguration::new("default", 24).unwrap())
+        .unwrap();
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.input_dir().join("cursor.lock"))
+        .unwrap();
+    let result = unsafe {
+        // SAFETY: `lock` is a valid descriptor for the test lock file and
+        // `flock` only changes its advisory lock state.
+        libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+    };
+    assert_eq!(result, 0);
+    let debris = root.input_dir().join(".cursor.json.tmp-live");
+    fs::write(&debris, b"active transaction").unwrap();
+
+    assert_eq!(
+        second.write(&CursorConfiguration::new("other", 32).unwrap()),
+        Err(CursorPersistenceError::Busy)
+    );
+    assert!(debris.exists());
+}
+
+#[test]
+fn symlinked_cursor_lock_fails_closed_without_touching_the_configuration() {
+    let root = TestRoot::new();
+    let store = root.store();
+    let original = CursorConfiguration::new("default", 24).unwrap();
+    store.write(&original).unwrap();
+    let lock_path = root.input_dir().join("cursor.lock");
+    let target = root.0.join("lock-target");
+    fs::rename(&lock_path, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &lock_path).unwrap();
+
+    assert_eq!(
+        store.write(&CursorConfiguration::new("other", 32).unwrap()),
+        Err(CursorPersistenceError::Insecure)
+    );
+    assert_eq!(root.store().read().unwrap(), original);
+    assert!(target.exists());
+}
+
+#[test]
+fn incorrectly_permissioned_cursor_lock_fails_closed_without_rewriting_configuration() {
+    let root = TestRoot::new();
+    let store = root.store();
+    let original = CursorConfiguration::new("default", 24).unwrap();
+    store.write(&original).unwrap();
+    let lock_path = root.input_dir().join("cursor.lock");
+    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_eq!(
+        store.write(&CursorConfiguration::new("other", 32).unwrap()),
+        Err(CursorPersistenceError::Insecure)
+    );
+    assert_eq!(root.store().read().unwrap(), original);
+}
+
+#[test]
+fn one_hundred_alternating_stores_leave_one_valid_configuration_and_lock() {
+    let root = TestRoot::new();
+    let first = root.store();
+    let second = root.store();
+    for index in 0..100 {
+        let configuration = CursorConfiguration::new(
+            if index % 2 == 0 { "store-a" } else { "store-b" },
+            if index % 2 == 0 { 8 } else { 256 },
+        )
+        .unwrap();
+        if index % 2 == 0 {
+            first.write(&configuration).unwrap();
+        } else {
+            second.write(&configuration).unwrap();
+        }
+    }
+    assert_eq!(
+        root.store().read().unwrap(),
+        CursorConfiguration::new("store-b", 256).unwrap()
+    );
+    assert!(transaction_files(&root.0).is_empty());
+    assert_eq!(
+        fs::metadata(root.input_dir().join("cursor.lock"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn concurrent_first_publication_is_serialized_to_one_valid_document() {
+    let root = TestRoot::new();
+    let first = root.store();
+    let second = root.store();
+    let barrier = Arc::new(Barrier::new(3));
+    std::thread::scope(|scope| {
+        let first_barrier = barrier.clone();
+        let first_handle = scope.spawn(move || {
+            first_barrier.wait();
+            first.write(&CursorConfiguration::new("first", 24).unwrap())
+        });
+        let second_barrier = barrier.clone();
+        let second_handle = scope.spawn(move || {
+            second_barrier.wait();
+            second.write(&CursorConfiguration::new("second", 32).unwrap())
+        });
+        barrier.wait();
+        let first_result = first_handle.join().unwrap();
+        let second_result = second_handle.join().unwrap();
+        assert!(matches!(
+            first_result,
+            Ok(_) | Err(CursorPersistenceError::Busy)
+        ));
+        assert!(matches!(
+            second_result,
+            Ok(_) | Err(CursorPersistenceError::Busy)
+        ));
+        assert!(first_result.is_ok() || second_result.is_ok());
+    });
+
+    let final_configuration = root.store().read().unwrap();
+    assert!(
+        final_configuration == CursorConfiguration::new("first", 24).unwrap()
+            || final_configuration == CursorConfiguration::new("second", 32).unwrap()
+    );
     assert!(transaction_files(&root.0).is_empty());
 }
 

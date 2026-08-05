@@ -346,6 +346,11 @@ impl NativeRuntime {
             ]
         });
         set_fd_nonblocking(kms.file().as_raw_fd())?;
+        // Create the signalfd before any native worker thread.  SIGCHLD is
+        // blocked by the calling thread here and inherited by every worker
+        // created below, keeping process-directed delivery pending for the
+        // supervisor's signalfd.
+        let mut process_supervisor = ChildSupervisor::with_sigchld_reaper()?;
         let requested_worker_policy = KmsCommitWorkerPolicy::parse(
             std::env::var("OBLIVION_ONE_KMS_COMMIT_WORKER")
                 .ok()
@@ -378,7 +383,6 @@ impl NativeRuntime {
             cursor_io_worker.event_fd(),
             NativeEventSource::CursorIoWorker,
         )?);
-        let mut process_supervisor = ChildSupervisor::with_sigchld_reaper()?;
         let mut xwayland = XwaylandService::bootstrap()?;
         let mut xwayland_reactor_tokens = Vec::new();
         sync_xwayland_bootstrap_sources(

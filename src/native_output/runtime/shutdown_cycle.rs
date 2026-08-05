@@ -94,6 +94,7 @@ impl NativeRuntime {
                 explicit_sync_acquire_tokens: Vec::new(),
                 xwayland_events: Vec::new(),
                 control_events: Vec::new(),
+                cursor_io_events: Vec::new(),
             },
             pageflip_drain_us: 0,
             pageflip_completed: false,

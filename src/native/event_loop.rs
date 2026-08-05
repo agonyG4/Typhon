@@ -186,6 +186,12 @@ pub struct ControlReadyEvent {
     pub flags: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorIoReadyEvent {
+    pub token: ReactorToken,
+    pub flags: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeWakeup {
     pub reasons: WakeReasons,
@@ -195,6 +201,7 @@ pub struct NativeWakeup {
     pub explicit_sync_acquire_tokens: Vec<ReactorToken>,
     pub xwayland_events: Vec<XwaylandReadyEvent>,
     pub control_events: Vec<ControlReadyEvent>,
+    pub cursor_io_events: Vec<CursorIoReadyEvent>,
 }
 
 #[derive(Debug)]
@@ -425,6 +432,7 @@ impl NativeEventLoop {
         let mut explicit_sync_acquire_tokens = Vec::new();
         let mut xwayland_events = Vec::new();
         let mut control_events = Vec::new();
+        let mut cursor_io_events = Vec::new();
 
         for index in 0..ready {
             let event = self.events[index];
@@ -454,6 +462,11 @@ impl NativeEventLoop {
                     reasons.insert(registration_source);
                     if is_xwayland_source(registration_source) {
                         xwayland_events.push(XwaylandReadyEvent {
+                            token,
+                            flags: event_flags,
+                        });
+                    } else if registration_source == NativeEventSource::CursorIoWorker {
+                        cursor_io_events.push(CursorIoReadyEvent {
                             token,
                             flags: event_flags,
                         });
@@ -492,6 +505,12 @@ impl NativeEventLoop {
                             flags: event_flags,
                         });
                     }
+                    NativeEventSource::CursorIoWorker => {
+                        cursor_io_events.push(CursorIoReadyEvent {
+                            token,
+                            flags: event_flags,
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -515,6 +534,7 @@ impl NativeEventLoop {
             explicit_sync_acquire_tokens,
             xwayland_events,
             control_events,
+            cursor_io_events,
         })
     }
 
@@ -807,6 +827,117 @@ mod tests {
 
         assert!(wakeup.reasons.kms_commit_worker());
         assert!(!wakeup.reasons.drm());
+    }
+
+    #[test]
+    fn cursor_worker_readiness_is_dedicated_and_never_a_control_event() {
+        let worker = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let token = event_loop
+            .register(worker.as_raw_fd(), NativeEventSource::CursorIoWorker)
+            .unwrap();
+
+        signal(worker.as_raw_fd());
+        let wakeup = event_loop.wait().unwrap();
+
+        assert!(wakeup.reasons.cursor_io_worker());
+        assert!(wakeup.control_events.is_empty());
+        assert_eq!(wakeup.cursor_io_events.len(), 1);
+        assert_eq!(wakeup.cursor_io_events[0].token, token);
+        assert_ne!(wakeup.cursor_io_events[0].flags & libc::EPOLLIN as u32, 0);
+    }
+
+    #[test]
+    fn cursor_worker_terminal_readiness_is_not_fatal_or_a_control_event() {
+        let mut pipe = [0; 2];
+        assert_eq!(
+            unsafe {
+                // SAFETY: `pipe` points to two writable integer slots and the
+                // requested flags are valid for `pipe2`.
+                libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK)
+            },
+            0
+        );
+        let read = unsafe {
+            // SAFETY: `pipe[0]` is the owned read end returned by `pipe2`.
+            OwnedFd::from_raw_fd(pipe[0])
+        };
+        let write = unsafe {
+            // SAFETY: `pipe[1]` is the owned write end returned by `pipe2`.
+            OwnedFd::from_raw_fd(pipe[1])
+        };
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let token = event_loop
+            .register(read.as_raw_fd(), NativeEventSource::CursorIoWorker)
+            .unwrap();
+        drop(write);
+
+        let wakeup = event_loop.wait().unwrap();
+
+        assert!(wakeup.reasons.cursor_io_worker());
+        assert!(wakeup.control_events.is_empty());
+        assert_eq!(wakeup.cursor_io_events[0].token, token);
+        assert_ne!(wakeup.cursor_io_events[0].flags & libc::EPOLLHUP as u32, 0);
+    }
+
+    #[test]
+    fn stale_cursor_worker_token_is_ignored_without_control_diagnostics() {
+        let worker = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let token = event_loop
+            .register(worker.as_raw_fd(), NativeEventSource::CursorIoWorker)
+            .unwrap();
+        assert!(event_loop.unregister(token).unwrap());
+        signal(worker.as_raw_fd());
+        event_loop
+            .arm_deadline(Some(monotonic_now_ns().unwrap()))
+            .unwrap();
+
+        let wakeup = event_loop.wait().unwrap();
+
+        assert!(wakeup.reasons.timer());
+        assert!(!wakeup.reasons.cursor_io_worker());
+        assert!(wakeup.cursor_io_events.is_empty());
+        assert!(wakeup.control_events.is_empty());
+    }
+
+    #[test]
+    fn terminal_cursor_worker_readiness_can_be_unregistered_without_a_busy_loop() {
+        let mut pipe = [0; 2];
+        assert_eq!(
+            unsafe {
+                // SAFETY: `pipe` points to two writable integer slots and the
+                // requested flags are valid for `pipe2`.
+                libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK)
+            },
+            0
+        );
+        let read = unsafe {
+            // SAFETY: `pipe[0]` is the owned read end returned by `pipe2`.
+            OwnedFd::from_raw_fd(pipe[0])
+        };
+        let write = unsafe {
+            // SAFETY: `pipe[1]` is the owned write end returned by `pipe2`.
+            OwnedFd::from_raw_fd(pipe[1])
+        };
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let token = event_loop
+            .register(read.as_raw_fd(), NativeEventSource::CursorIoWorker)
+            .unwrap();
+        drop(write);
+        let wakeup = event_loop.wait().unwrap();
+        assert!(!wakeup.cursor_io_events.is_empty());
+        assert!(event_loop.unregister(token).unwrap());
+        event_loop
+            .arm_deadline(Some(monotonic_now_ns().unwrap()))
+            .unwrap();
+
+        let next_wakeup = event_loop.wait().unwrap();
+
+        assert!(next_wakeup.reasons.timer());
+        assert!(!next_wakeup.reasons.cursor_io_worker());
+        assert!(next_wakeup.cursor_io_events.is_empty());
+        assert!(next_wakeup.control_events.is_empty());
     }
 
     #[test]

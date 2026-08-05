@@ -2,8 +2,8 @@ use oblivion_one::control_snapshots::{
     CursorAssetSource, CursorConfigSource, CursorPersistenceSnapshot,
 };
 use oblivion_one::cursor_manager::{
-    CursorIoOperation, CursorIoSubmitError, CursorJobId, CursorManagerError, CursorMutationKind,
-    CursorThemeLoader, CursorThemeManager, LoadedCursorTheme,
+    CursorIoError, CursorIoOperation, CursorIoSubmitError, CursorJobId, CursorManagerError,
+    CursorMutationKind, CursorThemeLoader, CursorThemeManager, LoadedCursorTheme,
 };
 use oblivion_one::cursor_persistence::CursorConfigurationStore;
 use oblivion_one::cursor_theme::{
@@ -12,6 +12,7 @@ use oblivion_one::cursor_theme::{
 };
 use std::collections::VecDeque;
 use std::fs;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Barrier;
@@ -88,6 +89,20 @@ impl CursorThemeLoader for FakeLoader {
 struct BlockingLoader {
     entered: Arc<Barrier>,
     release: Arc<Barrier>,
+}
+
+struct PanicLoader {
+    entered: Arc<Barrier>,
+}
+
+impl CursorThemeLoader for PanicLoader {
+    fn load(
+        &mut self,
+        _configuration: &CursorConfiguration,
+    ) -> Result<LoadedCursorTheme, CursorThemeLoadError> {
+        self.entered.wait();
+        panic!("controlled cursor loader panic");
+    }
 }
 
 impl CursorThemeLoader for BlockingLoader {
@@ -471,6 +486,64 @@ fn cursor_io_worker_rejects_a_second_mutation_while_the_first_is_running() {
 }
 
 #[test]
+fn panicking_cursor_io_worker_publishes_terminal_completion_and_becomes_unavailable() {
+    let root = TestRoot::new();
+    let entered = Arc::new(Barrier::new(2));
+    let worker = oblivion_one::cursor_manager::CursorIoWorker::new(
+        root.store(),
+        Box::new(PanicLoader {
+            entered: entered.clone(),
+        }),
+    )
+    .unwrap();
+    let descriptor_flags = unsafe {
+        // SAFETY: the worker owns a live eventfd and `F_GETFD` only reads its
+        // descriptor flags.
+        libc::fcntl(worker.event_fd(), libc::F_GETFD)
+    };
+    assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
+    worker
+        .submit(CursorIoOperation::Apply {
+            job_id: CursorJobId(1),
+            configuration: CursorConfiguration::new("theme-a", 24).unwrap(),
+            persist: true,
+            kind: CursorMutationKind::Theme,
+        })
+        .unwrap();
+    entered.wait();
+
+    let mut completion = None;
+    for _ in 0..10_000 {
+        if let Some(value) = worker.try_completion() {
+            completion = Some(value);
+            break;
+        }
+        std::thread::yield_now();
+    }
+    let completion = completion.expect("panic completion should be delivered");
+    assert_eq!(completion.job_id, CursorJobId(1));
+    assert!(matches!(
+        completion.result,
+        Err(CursorIoError::WorkerPanicked)
+    ));
+
+    for _ in 0..10_000 {
+        if !worker.is_available() {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(!worker.is_available());
+    assert!(!worker.is_busy());
+    assert_eq!(
+        worker.submit(CursorIoOperation::Reload {
+            job_id: CursorJobId(2),
+        }),
+        Err(CursorIoSubmitError::Unavailable)
+    );
+}
+
+#[test]
 fn one_hundred_sequential_cursor_io_jobs_leave_one_published_configuration() {
     let root = TestRoot::new();
     let worker = oblivion_one::cursor_manager::CursorIoWorker::new(
@@ -514,4 +587,137 @@ fn one_hundred_sequential_cursor_io_jobs_leave_one_published_configuration() {
         })
         .count();
     assert_eq!(entries, 0);
+}
+
+#[test]
+fn real_native_event_loop_routes_cursor_completion_without_blocking_other_sources() {
+    let root = TestRoot::new();
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let worker = oblivion_one::cursor_manager::CursorIoWorker::new(
+        root.store(),
+        Box::new(BlockingLoader {
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+    )
+    .unwrap();
+    let mut event_loop = oblivion_one::native::event_loop::NativeEventLoop::new().unwrap();
+    let cursor_token = event_loop
+        .register(
+            worker.event_fd(),
+            oblivion_one::native::event_loop::NativeEventSource::CursorIoWorker,
+        )
+        .unwrap();
+    let timer = event_loop.register(
+        event_fd().as_raw_fd(),
+        oblivion_one::native::event_loop::NativeEventSource::Timer,
+    );
+    assert!(timer.is_err());
+    let input = event_fd();
+    let control = event_fd();
+    let wayland = event_fd();
+    event_loop
+        .register(
+            input.as_raw_fd(),
+            oblivion_one::native::event_loop::NativeEventSource::Input(0),
+        )
+        .unwrap();
+    event_loop
+        .register(
+            control.as_raw_fd(),
+            oblivion_one::native::event_loop::NativeEventSource::ControlClient,
+        )
+        .unwrap();
+    event_loop
+        .register(
+            wayland.as_raw_fd(),
+            oblivion_one::native::event_loop::NativeEventSource::WaylandClients,
+        )
+        .unwrap();
+    event_loop
+        .arm_deadline(Some(
+            oblivion_one::native::event_loop::monotonic_now_ns().unwrap(),
+        ))
+        .unwrap();
+
+    worker
+        .submit(CursorIoOperation::Apply {
+            job_id: CursorJobId(1),
+            configuration: CursorConfiguration::new("event-loop", 24).unwrap(),
+            persist: false,
+            kind: CursorMutationKind::Theme,
+        })
+        .unwrap();
+    entered.wait();
+    signal_fd(input.as_raw_fd());
+    signal_fd(control.as_raw_fd());
+    signal_fd(wayland.as_raw_fd());
+
+    let wakeup = event_loop.wait().unwrap();
+    assert!(wakeup.reasons.timer());
+    assert!(wakeup.reasons.input());
+    assert!(wakeup.reasons.control());
+    assert!(wakeup.reasons.wayland_clients());
+    assert!(!wakeup.reasons.cursor_io_worker());
+    assert!(
+        wakeup
+            .control_events
+            .iter()
+            .all(|event| { event.token != cursor_token })
+    );
+    drain_fd(input.as_raw_fd());
+    drain_fd(control.as_raw_fd());
+    drain_fd(wayland.as_raw_fd());
+
+    release.wait();
+    let completion_wakeup = event_loop.wait().unwrap();
+    assert!(completion_wakeup.reasons.cursor_io_worker());
+    assert!(completion_wakeup.control_events.is_empty());
+    assert_eq!(completion_wakeup.cursor_io_events.len(), 1);
+    assert_eq!(completion_wakeup.cursor_io_events[0].token, cursor_token);
+    worker.drain_notification().unwrap();
+    assert!(worker.try_completion().is_some());
+    assert!(worker.try_completion().is_none());
+}
+
+fn event_fd() -> OwnedFd {
+    let fd = unsafe {
+        // SAFETY: `eventfd` has no pointer arguments and returns an owned
+        // nonblocking close-on-exec descriptor.
+        libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)
+    };
+    assert!(fd >= 0);
+    unsafe {
+        // SAFETY: `eventfd` returned a new owned descriptor.
+        OwnedFd::from_raw_fd(fd)
+    }
+}
+
+fn signal_fd(fd: std::os::fd::RawFd) {
+    let value = 1_u64;
+    let count = unsafe {
+        // SAFETY: `value` is valid readable storage for one eventfd word and
+        // `fd` is a live eventfd descriptor owned by this test.
+        libc::write(
+            fd,
+            (&value as *const u64).cast(),
+            std::mem::size_of::<u64>(),
+        )
+    };
+    assert_eq!(count, std::mem::size_of::<u64>() as isize);
+}
+
+fn drain_fd(fd: std::os::fd::RawFd) {
+    let mut value = 0_u64;
+    let count = unsafe {
+        // SAFETY: `value` is writable storage for one eventfd word and `fd`
+        // is a live eventfd descriptor owned by this test.
+        libc::read(
+            fd,
+            (&mut value as *mut u64).cast(),
+            std::mem::size_of::<u64>(),
+        )
+    };
+    assert_eq!(count, std::mem::size_of::<u64>() as isize);
 }

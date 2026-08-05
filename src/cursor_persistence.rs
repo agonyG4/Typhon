@@ -16,6 +16,7 @@ use std::{
 const ASTREA_DIRECTORY: &str = "AstreaOS";
 const INPUT_DIRECTORY: &str = "input";
 const CONFIGURATION_FILE: &str = "cursor.json";
+const LOCK_FILE: &str = "cursor.lock";
 const TEMP_PREFIX: &str = ".cursor.json.tmp-";
 const QUARANTINE_PREFIX: &str = ".cursor.json.quarantine-";
 const TEMP_ATTEMPTS: usize = 8;
@@ -52,6 +53,7 @@ pub enum CursorPersistenceError {
     Invalid,
     Insecure,
     WriteFailed,
+    Busy,
 }
 
 impl std::fmt::Display for CursorPersistenceError {
@@ -61,6 +63,7 @@ impl std::fmt::Display for CursorPersistenceError {
             Self::Invalid => "cursor configuration is invalid",
             Self::Insecure => "cursor configuration is insecure",
             Self::WriteFailed => "cursor configuration could not be saved",
+            Self::Busy => "cursor configuration is being changed by another instance",
         })
     }
 }
@@ -173,6 +176,7 @@ impl CursorConfigurationStore {
         })
         .map_err(|_| CursorPersistenceError::WriteFailed)?;
         let directories = self.open_directories(true)?;
+        let _lock = open_cursor_lock(directories.input.as_raw_fd())?;
         cleanup_stale_transaction_files(directories.input.as_raw_fd())?;
         let existing = open_file_at(directories.input.as_raw_fd(), CONFIGURATION_FILE, true)?;
         let existing_identity = existing
@@ -450,6 +454,53 @@ fn open_file_at(
     }
     // SAFETY: `openat` returned a new owned descriptor.
     Ok(Some(unsafe { File::from_raw_fd(fd) }))
+}
+
+fn open_cursor_lock(parent_fd: RawFd) -> Result<OwnedFd, CursorPersistenceError> {
+    let name = c_string(OsStr::new(LOCK_FILE), "lock file name")
+        .map_err(|_| CursorPersistenceError::Insecure)?;
+    let fd = unsafe {
+        // SAFETY: `parent_fd` is the validated input directory and `name` is
+        // a bounded NUL-free entry name.  The flags prevent symlink following
+        // and make the returned descriptor close-on-exec.
+        libc::openat(
+            parent_fd,
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            PRIVATE_FILE_MODE,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return Err(
+            if is_symlink_error(&error)
+                || error.raw_os_error() == Some(libc::EISDIR)
+                || error.raw_os_error() == Some(libc::ENXIO)
+            {
+                CursorPersistenceError::Insecure
+            } else {
+                CursorPersistenceError::WriteFailed
+            },
+        );
+    }
+    // SAFETY: `openat` returned a new owned descriptor.
+    let lock = unsafe { OwnedFd::from_raw_fd(fd) };
+    validate_configuration_identity(NodeIdentity::from_fd(lock.as_raw_fd())?)?;
+    let result = unsafe {
+        // SAFETY: `lock` is a valid descriptor for the validated lock file;
+        // `flock` only changes this process's advisory lock state.
+        libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+    };
+    if result == 0 {
+        Ok(lock)
+    } else {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EAGAIN) {
+            Err(CursorPersistenceError::Busy)
+        } else {
+            Err(CursorPersistenceError::WriteFailed)
+        }
+    }
 }
 
 fn create_temporary_file(parent_fd: RawFd) -> Result<(OsString, File), CursorPersistenceError> {
@@ -953,6 +1004,40 @@ mod tests {
         assert!(!owned_with_mode_for_test(1000, 0o755, 1000, Some(0o700)));
         assert!(owned_with_mode_for_test(1000, 0o755, 1000, None));
         assert!(!owned_with_mode_for_test(1000, 0o775, 1000, None));
+    }
+
+    #[test]
+    fn lock_identity_requires_a_private_owned_regular_file() {
+        let uid = effective_uid();
+        let valid = NodeIdentity {
+            device: 1,
+            inode: 1,
+            owner: uid,
+            file_type: libc::S_IFREG,
+            mode: PRIVATE_FILE_MODE,
+        };
+        assert!(validate_configuration_identity(valid).is_ok());
+        assert!(
+            validate_configuration_identity(NodeIdentity {
+                owner: uid ^ 1,
+                ..valid
+            })
+            .is_err()
+        );
+        assert!(
+            validate_configuration_identity(NodeIdentity {
+                mode: 0o644,
+                ..valid
+            })
+            .is_err()
+        );
+        assert!(
+            validate_configuration_identity(NodeIdentity {
+                file_type: libc::S_IFDIR,
+                ..valid
+            })
+            .is_err()
+        );
     }
 
     fn owned_with_mode_for_test(

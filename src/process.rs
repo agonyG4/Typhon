@@ -973,6 +973,48 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn sigchld_reaper_blocks_sigchld_in_the_bootstrap_thread() {
+        let mut previous = unsafe {
+            // SAFETY: a zeroed `sigset_t` is valid storage for the signal-mask
+            // query below.
+            std::mem::zeroed::<libc::sigset_t>()
+        };
+        let query_result = unsafe {
+            // SAFETY: a null new-mask pointer queries the current thread's
+            // signal mask into the valid `previous` storage.
+            libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut previous)
+        };
+        assert_eq!(query_result, 0);
+
+        let supervisor = ChildSupervisor::with_sigchld_reaper().unwrap();
+        let mut current = unsafe {
+            // SAFETY: a zeroed `sigset_t` is valid storage for the signal-mask
+            // query below.
+            std::mem::zeroed::<libc::sigset_t>()
+        };
+        let query_result = unsafe {
+            // SAFETY: a null new-mask pointer queries the current thread's
+            // signal mask into the valid `current` storage.
+            libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut current)
+        };
+        assert_eq!(query_result, 0);
+        let sigchld_member = unsafe {
+            // SAFETY: `current` is a fully initialized signal set queried from
+            // the current thread.
+            libc::sigismember(&current, libc::SIGCHLD)
+        };
+        assert_eq!(sigchld_member, 1);
+        assert!(supervisor.signal_fd().is_some());
+
+        let restore_result = unsafe {
+            // SAFETY: `previous` was populated by the earlier query and is a
+            // valid signal set for restoring this test thread's mask.
+            libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut())
+        };
+        assert_eq!(restore_result, 0);
+    }
+
     fn shell_command(script: &str) -> Command {
         let mut command = Command::new("sh");
         command.arg("-c").arg(script);

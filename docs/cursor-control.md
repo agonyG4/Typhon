@@ -112,14 +112,32 @@ one bounded mutation job to the cursor I/O worker. The worker owns persisted
 configuration reads, bounded XCursor file reads and parsing, complete shape
 bundle construction, temporary writes, file and directory synchronization, and
 atomic publication. The native reactor never waits for those operations. While
-one job is active, another mutation returns `cursor_generation_busy`; `get` and
-all M3 read-only commands remain immediate. A disconnected or timed-out client
-does not cancel an accepted job: the worker result is still published, while a
-stale response token is ignored. Shutdown uses the deterministic policy that an
-already accepted job is not canceled; it may finish its persistence transaction
-independently while the runtime tears down, and the worker never accesses
-compositor state. Shutdown unregisters the worker notification and does not
-wait indefinitely for a blocked filesystem call.
+one job is active, another mutation returns `cursor_generation_busy`; a second
+Typhon instance that holds the persistence lock returns
+`cursor_persistence_busy`. `get` and all M3 read-only commands remain
+immediate. A disconnected or timed-out client does not cancel an accepted job:
+the worker result is still published, while a stale response token is ignored.
+Shutdown uses the deterministic policy that an already accepted job is allowed
+to finish only its owned persistence work; runtime publication is stopped once
+shutdown tears down the compositor. The worker never accesses compositor
+state. Shutdown unregisters the worker notification and does not wait
+indefinitely for a blocked filesystem call.
+
+The worker and reactor share one `O_CLOEXEC` nonblocking `eventfd`. Notification
+writes retry `EINTR`, treat `EAGAIN` as already notified, and reject short
+writes. The reactor drain retries `EINTR` and continues until `EAGAIN`; notification
+failures make the worker terminal and are counted. A panic in loading, parsing,
+or persistence produces one bounded terminal completion, releases the mutation
+slot, unregisters the worker source, and makes later mutations return
+`cursor_io_unavailable`; read-only commands remain available. Cursor-worker
+readiness is kept separate from control-client readiness, including terminal
+`HUP` and `ERR` events.
+
+Native bootstrap creates the child supervisor and blocks `SIGCHLD` before
+starting the KMS or cursor workers. The signalfd remains the single child
+notification mechanism; every later worker inherits the blocked mask, and
+session-owned children are launched only after that supervisor ownership is
+valid.
 
 The loader caps each cursor file at 16 MiB, each frame dimension at 1024,
 each frame at 1,048,576 pixels, each file at 256 frames, and each candidate
@@ -127,6 +145,17 @@ load at six unique source images. A per-load source-path cache parses repeated
 aliases once and retains only the selected bounded image. Overflow, malformed
 frames, and unsafe dimensions reject the required pointer or fall back for an
 optional shape.
+
+Persistence has a global advisory lock at
+`$XDG_CONFIG_HOME/AstreaOS/input/cursor.lock` (or the corresponding
+`$HOME/.config` path). It is a descriptor-relative, owned regular file with
+exact mode `0600`, opened with no-follow and held with nonblocking exclusive
+`flock` through stale cleanup, publication, rollback, and cleanup. The lock
+file remains after shutdown. Reads do not acquire it because canonical
+publication is atomic; compliant Typhon instances serialize all writes. An
+insecure lock fails closed, while lock contention is a bounded busy error and
+does not clean transaction files or change runtime state. Arbitrary same-UID
+filesystem replacement is still handled by exact identity checks.
 
 Persistence has a commit point: the exact new `cursor.json` identity has been
 verified, its contents synchronized, and the parent directory synchronization
@@ -199,6 +228,8 @@ cursor_config_missing
 cursor_config_invalid
 cursor_config_insecure
 cursor_config_write_failed
+cursor_persistence_busy
+cursor_io_unavailable
 ```
 
 On a real native session, qualify with an installed theme:

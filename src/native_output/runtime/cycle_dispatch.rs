@@ -61,43 +61,89 @@ impl NativeRuntime {
         &mut self,
         wakeup: &NativeWakeup,
     ) -> NativeResult<()> {
-        if !wakeup.reasons.cursor_io_worker() {
+        let worker_failed_without_readiness = self
+            .cursor_io_worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_available());
+        if !wakeup.reasons.cursor_io_worker() && !worker_failed_without_readiness {
             return Ok(());
         }
-        let Some(worker) = self.cursor_io_worker.as_ref() else {
-            return Ok(());
+        let terminal_readiness = wakeup.cursor_io_events.iter().any(|event| {
+            event.flags & (libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32 != 0
+        });
+        let (notification_error, completion, worker_unavailable) = {
+            let Some(worker) = self.cursor_io_worker.as_ref() else {
+                return Ok(());
+            };
+            let notification_error = worker.drain_notification().err();
+            let completion = worker.try_completion();
+            (notification_error, completion, !worker.is_available())
         };
-        if let Err(error) = worker.drain_notification() {
-            eprintln!("cursor I/O worker notification failed: {error}");
-            return Ok(());
+        if notification_error.is_some() {
+            self.cursor_manager.note_worker_notification_failure();
         }
-        let Some(completion) = worker.try_completion() else {
-            return Ok(());
-        };
-        let Some(pending) = self.pending_cursor_job.take() else {
-            return Ok(());
-        };
-        if completion.job_id != pending.job_id {
-            self.cursor_manager.note_stale_client_completion();
-            return Ok(());
-        }
-        let response = match completion.result {
-            Ok(prepared) => {
-                let change = self.cursor_manager.publish_prepared(prepared);
-                self.publish_cursor_change(change);
-                cursor_snapshot_response(self, pending.request_id)
+        let mut terminal_failure =
+            terminal_readiness || worker_unavailable || notification_error.is_some();
+        if let Some(completion) = completion {
+            let Some(pending) = self.pending_cursor_job.take() else {
+                self.cursor_manager.note_stale_client_completion();
+                if terminal_failure {
+                    self.disable_cursor_io_worker();
+                }
+                return Ok(());
+            };
+            if completion.job_id != pending.job_id {
+                self.cursor_manager.note_stale_client_completion();
+            } else {
+                let response = match completion.result {
+                    Ok(prepared) => {
+                        let change = self.cursor_manager.publish_prepared(prepared);
+                        self.publish_cursor_change(change);
+                        cursor_snapshot_response(self, pending.request_id)
+                    }
+                    Err(error) => {
+                        terminal_failure |= matches!(
+                            error,
+                            CursorIoError::WorkerPanicked | CursorIoError::WorkerUnavailable
+                        );
+                        self.cursor_manager.note_worker_error(error);
+                        cursor_failure(pending.request_id, map_cursor_io_error(error))
+                    }
+                };
+                if !self.control_server.has_client(pending.token) {
+                    self.cursor_manager.note_stale_client_completion();
+                }
+                self.control_server.queue_response(
+                    &mut self.event_loop,
+                    pending.token,
+                    response,
+                )?;
             }
-            Err(error) => {
-                self.cursor_manager.note_worker_error(error);
-                cursor_failure(pending.request_id, map_cursor_io_error(error))
+        } else if terminal_failure && let Some(pending) = self.pending_cursor_job.take() {
+            self.cursor_manager
+                .note_worker_error(CursorIoError::WorkerUnavailable);
+            let response = ControlResponse::failure(
+                pending.request_id,
+                ControlError::new(ControlErrorCode::Internal, "cursor I/O worker unavailable")
+                    .with_detail("cursor_io_unavailable"),
+            );
+            if !self.control_server.has_client(pending.token) {
+                self.cursor_manager.note_stale_client_completion();
             }
-        };
-        if !self.control_server.has_client(pending.token) {
-            self.cursor_manager.note_stale_client_completion();
+            self.control_server
+                .queue_response(&mut self.event_loop, pending.token, response)?;
         }
-        self.control_server
-            .queue_response(&mut self.event_loop, pending.token, response)?;
+        if terminal_failure {
+            self.disable_cursor_io_worker();
+        }
         Ok(())
+    }
+
+    fn disable_cursor_io_worker(&mut self) {
+        if let Some(token) = self.cursor_io_worker_reactor_token.take() {
+            let _ = self.event_loop.unregister(token);
+        }
+        self.cursor_io_worker.take();
     }
 
     fn dispatch_control_command(
@@ -457,12 +503,21 @@ impl NativeRuntime {
             return Some(cursor_failure(request_id, error));
         }
         let Some(worker) = self.cursor_io_worker.as_ref() else {
+            self.cursor_manager.note_worker_unavailable();
             return Some(ControlResponse::failure(
                 request_id,
                 ControlError::new(ControlErrorCode::Internal, "cursor I/O worker unavailable")
                     .with_detail("cursor_io_unavailable"),
             ));
         };
+        if !worker.is_available() {
+            self.cursor_manager.note_worker_unavailable();
+            return Some(ControlResponse::failure(
+                request_id,
+                ControlError::new(ControlErrorCode::Internal, "cursor I/O worker unavailable")
+                    .with_detail("cursor_io_unavailable"),
+            ));
+        }
         let job_id = CursorJobId(self.next_cursor_job_id.max(1));
         self.next_cursor_job_id = self.next_cursor_job_id.saturating_add(1).max(1);
         let operation = match operation {
@@ -499,9 +554,19 @@ impl NativeRuntime {
             }
             Err(CursorIoSubmitError::Closed) => {
                 self.pending_cursor_job = None;
+                self.cursor_manager.note_worker_unavailable();
                 Some(ControlResponse::failure(
                     request_id,
                     ControlError::new(ControlErrorCode::Internal, "cursor I/O worker closed")
+                        .with_detail("cursor_io_unavailable"),
+                ))
+            }
+            Err(CursorIoSubmitError::Unavailable) => {
+                self.pending_cursor_job = None;
+                self.cursor_manager.note_worker_unavailable();
+                Some(ControlResponse::failure(
+                    request_id,
+                    ControlError::new(ControlErrorCode::Internal, "cursor I/O worker unavailable")
                         .with_detail("cursor_io_unavailable"),
                 ))
             }
@@ -783,6 +848,8 @@ fn cursor_failure(
     let code = if matches!(
         error,
         oblivion_one::cursor_manager::CursorManagerError::ResourceBusy
+            | oblivion_one::cursor_manager::CursorManagerError::PersistenceBusy
+            | oblivion_one::cursor_manager::CursorManagerError::WorkerUnavailable
     ) {
         ControlErrorCode::Internal
     } else {
@@ -825,7 +892,13 @@ fn map_cursor_io_error(error: CursorIoError) -> oblivion_one::cursor_manager::Cu
             oblivion_one::cursor_persistence::CursorPersistenceError::WriteFailed => {
                 oblivion_one::cursor_manager::CursorManagerError::ConfigWriteFailed
             }
+            oblivion_one::cursor_persistence::CursorPersistenceError::Busy => {
+                oblivion_one::cursor_manager::CursorManagerError::PersistenceBusy
+            }
         },
+        CursorIoError::WorkerPanicked | CursorIoError::WorkerUnavailable => {
+            oblivion_one::cursor_manager::CursorManagerError::WorkerUnavailable
+        }
     }
 }
 

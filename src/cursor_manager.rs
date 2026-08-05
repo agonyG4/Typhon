@@ -34,6 +34,8 @@ pub enum CursorManagerError {
     ConfigInsecure,
     ConfigWriteFailed,
     ResourceBusy,
+    PersistenceBusy,
+    WorkerUnavailable,
 }
 
 impl CursorManagerError {
@@ -51,6 +53,8 @@ impl CursorManagerError {
             Self::ConfigInsecure => "cursor_config_insecure",
             Self::ConfigWriteFailed => "cursor_config_write_failed",
             Self::ResourceBusy => "cursor_generation_busy",
+            Self::PersistenceBusy => "cursor_persistence_busy",
+            Self::WorkerUnavailable => "cursor_io_unavailable",
         }
     }
 }
@@ -126,6 +130,11 @@ pub struct CursorDiagnostics {
     pub persistence_cleanup_degradations: u64,
     pub stale_client_completions: u64,
     pub asynchronous_publications: u64,
+    pub worker_notification_failures: u64,
+    pub worker_terminal_failures: u64,
+    pub worker_unavailable_requests: u64,
+    pub persistence_lock_contentions: u64,
+    pub cross_instance_transaction_admissions: u64,
 }
 
 #[derive(Debug)]
@@ -417,6 +426,10 @@ impl CursorThemeManager {
         if prepared.persisted {
             self.diagnostics.persistence_commits =
                 self.diagnostics.persistence_commits.saturating_add(1);
+            self.diagnostics.cross_instance_transaction_admissions = self
+                .diagnostics
+                .cross_instance_transaction_admissions
+                .saturating_add(1);
         }
         self.diagnostics.asynchronous_publications =
             self.diagnostics.asynchronous_publications.saturating_add(1);
@@ -455,6 +468,9 @@ impl CursorThemeManager {
                 self.diagnostics.frame_bound_violations =
                     self.diagnostics.frame_bound_violations.saturating_add(1);
             }
+            CursorIoError::Persistence(CursorPersistenceError::Busy) => {
+                self.note_persistence_lock_contention();
+            }
             CursorIoError::Persistence(_) => {
                 self.diagnostics.persistence_failures =
                     self.diagnostics.persistence_failures.saturating_add(1);
@@ -463,8 +479,33 @@ impl CursorThemeManager {
                     .persistence_precommit_failures
                     .saturating_add(1);
             }
+            CursorIoError::WorkerPanicked | CursorIoError::WorkerUnavailable => {
+                self.diagnostics.worker_terminal_failures =
+                    self.diagnostics.worker_terminal_failures.saturating_add(1);
+            }
             CursorIoError::Load(_) => {}
         }
+    }
+
+    pub fn note_worker_notification_failure(&mut self) {
+        self.diagnostics.worker_notification_failures = self
+            .diagnostics
+            .worker_notification_failures
+            .saturating_add(1);
+    }
+
+    pub fn note_worker_unavailable(&mut self) {
+        self.diagnostics.worker_unavailable_requests = self
+            .diagnostics
+            .worker_unavailable_requests
+            .saturating_add(1);
+    }
+
+    pub fn note_persistence_lock_contention(&mut self) {
+        self.diagnostics.persistence_lock_contentions = self
+            .diagnostics
+            .persistence_lock_contentions
+            .saturating_add(1);
     }
 
     pub fn note_stale_client_completion(&mut self) {
@@ -656,12 +697,15 @@ impl CursorIoOperation {
 pub enum CursorIoSubmitError {
     Busy,
     Closed,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorIoError {
     Load(CursorThemeLoadError),
     Persistence(CursorPersistenceError),
+    WorkerPanicked,
+    WorkerUnavailable,
 }
 
 #[derive(Debug)]
@@ -685,8 +729,9 @@ pub struct CursorIoCompletion {
 pub struct CursorIoWorker {
     jobs: SyncSender<CursorIoOperation>,
     completions: Receiver<CursorIoCompletion>,
-    notification: OwnedFd,
+    notification: Arc<OwnedFd>,
     busy: Arc<AtomicBool>,
+    available: Arc<AtomicBool>,
     _thread: JoinHandle<()>,
 }
 
@@ -695,32 +740,49 @@ impl CursorIoWorker {
         store: CursorConfigurationStore,
         mut loader: Box<dyn CursorThemeLoader>,
     ) -> io::Result<Self> {
-        let notification = create_event_fd()?;
-        let worker_notification = duplicate_fd(notification.as_raw_fd())?;
+        let notification = Arc::new(create_event_fd()?);
+        let worker_notification = Arc::clone(&notification);
         let (jobs, job_receiver) = mpsc::sync_channel::<CursorIoOperation>(1);
         let (completion_sender, completions) = mpsc::sync_channel::<CursorIoCompletion>(1);
         let busy = Arc::new(AtomicBool::new(false));
         let worker_busy = busy.clone();
+        let available = Arc::new(AtomicBool::new(true));
+        let worker_available = available.clone();
         let thread = thread::Builder::new()
             .name("typhon-cursor-io".to_string())
             .spawn(move || {
                 while let Ok(operation) = job_receiver.recv() {
                     let job_id = operation.job_id();
-                    let result = execute_cursor_io(operation, &store, &mut *loader);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        execute_cursor_io(operation, &store, &mut *loader)
+                    }))
+                    .unwrap_or(Err(CursorIoError::WorkerPanicked));
+                    let terminal = matches!(result, Err(CursorIoError::WorkerPanicked));
                     let completion = CursorIoCompletion { job_id, result };
                     let delivered = completion_sender.send(completion).is_ok();
                     worker_busy.store(false, Ordering::Release);
                     if !delivered {
+                        worker_available.store(false, Ordering::Release);
                         break;
                     }
-                    signal_event_fd(worker_notification.as_raw_fd());
+                    if let Err(error) = notify_eventfd(&worker_notification) {
+                        eprintln!("cursor I/O worker notification failed: {error}");
+                        worker_available.store(false, Ordering::Release);
+                        break;
+                    }
+                    if terminal {
+                        worker_available.store(false, Ordering::Release);
+                        break;
+                    }
                 }
+                worker_available.store(false, Ordering::Release);
             })?;
         Ok(Self {
             jobs,
             completions,
             notification,
             busy,
+            available,
             _thread: thread,
         })
     }
@@ -730,6 +792,9 @@ impl CursorIoWorker {
     }
 
     pub fn submit(&self, operation: CursorIoOperation) -> Result<(), CursorIoSubmitError> {
+        if !self.available.load(Ordering::Acquire) {
+            return Err(CursorIoSubmitError::Unavailable);
+        }
         if self.busy.swap(true, Ordering::AcqRel) {
             return Err(CursorIoSubmitError::Busy);
         }
@@ -741,38 +806,14 @@ impl CursorIoWorker {
             }
             Err(TrySendError::Disconnected(_)) => {
                 self.busy.store(false, Ordering::Release);
-                Err(CursorIoSubmitError::Closed)
+                self.available.store(false, Ordering::Release);
+                Err(CursorIoSubmitError::Unavailable)
             }
         }
     }
 
     pub fn drain_notification(&self) -> io::Result<()> {
-        let mut value = 0_u64;
-        let count = unsafe {
-            // SAFETY: `value` is valid writable storage for one eventfd word,
-            // and the descriptor is owned by this worker.
-            libc::read(
-                self.notification.as_raw_fd(),
-                (&mut value as *mut u64).cast(),
-                std::mem::size_of::<u64>(),
-            )
-        };
-        if count < 0 {
-            let error = io::Error::last_os_error();
-            return if error.kind() == io::ErrorKind::WouldBlock {
-                Ok(())
-            } else {
-                Err(error)
-            };
-        }
-        if count == std::mem::size_of::<u64>() as isize {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "short cursor worker notification",
-            ))
-        }
+        drain_eventfd(&self.notification)
     }
 
     pub fn try_completion(&self) -> Option<CursorIoCompletion> {
@@ -785,6 +826,10 @@ impl CursorIoWorker {
 
     pub fn is_busy(&self) -> bool {
         self.busy.load(Ordering::Acquire)
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.available.load(Ordering::Acquire)
     }
 }
 
@@ -854,32 +899,79 @@ fn create_event_fd() -> io::Result<OwnedFd> {
     })
 }
 
-fn duplicate_fd(fd: RawFd) -> io::Result<OwnedFd> {
-    let duplicate = unsafe {
-        // SAFETY: `fd` is the live notification descriptor owned by the
-        // worker, and `dup` returns an independently owned descriptor.
-        libc::dup(fd)
-    };
-    if duplicate < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe {
-        // SAFETY: `dup` returned a new owned descriptor.
-        OwnedFd::from_raw_fd(duplicate)
+fn notify_eventfd(fd: &OwnedFd) -> io::Result<()> {
+    notify_eventfd_with(|value| {
+        let count = unsafe {
+            // SAFETY: `value` is valid readable storage for one eventfd word;
+            // `fd` is a live eventfd borrowed for this write.
+            libc::write(
+                fd.as_raw_fd(),
+                (value as *const u64).cast(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if count < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(count as usize)
+        }
     })
 }
 
-fn signal_event_fd(fd: RawFd) {
+fn drain_eventfd(fd: &OwnedFd) -> io::Result<()> {
+    drain_eventfd_with(|value| {
+        let count = unsafe {
+            // SAFETY: `value` is valid writable storage for one eventfd word;
+            // `fd` is a live nonblocking eventfd borrowed for this read.
+            libc::read(
+                fd.as_raw_fd(),
+                (value as *mut u64).cast(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if count < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(count as usize)
+        }
+    })
+}
+
+fn notify_eventfd_with(mut write: impl FnMut(&u64) -> io::Result<usize>) -> io::Result<()> {
     let value = 1_u64;
-    let _ = unsafe {
-        // SAFETY: `value` is valid readable storage for one eventfd word, and
-        // the worker owns the duplicated descriptor for this notification.
-        libc::write(
-            fd,
-            (&value as *const u64).cast(),
-            std::mem::size_of::<u64>(),
-        )
-    };
+    loop {
+        let count = write(&value);
+        match count {
+            Ok(size) if size == std::mem::size_of::<u64>() => return Ok(()),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short cursor worker notification",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn drain_eventfd_with(mut read: impl FnMut(&mut u64) -> io::Result<usize>) -> io::Result<()> {
+    loop {
+        let mut value = 0_u64;
+        match read(&mut value) {
+            Ok(size) if size == std::mem::size_of::<u64>() => continue,
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short cursor worker notification",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub struct SystemCursorThemeLoader;
@@ -943,6 +1035,7 @@ fn persistence_snapshot(error: CursorPersistenceError) -> CursorPersistenceSnaps
         CursorPersistenceError::Invalid => CursorPersistenceSnapshot::Invalid,
         CursorPersistenceError::Insecure => CursorPersistenceSnapshot::Insecure,
         CursorPersistenceError::WriteFailed => CursorPersistenceSnapshot::WriteFailed,
+        CursorPersistenceError::Busy => CursorPersistenceSnapshot::WriteFailed,
     }
 }
 
@@ -952,5 +1045,64 @@ fn map_persistence_error(error: CursorPersistenceError) -> CursorManagerError {
         CursorPersistenceError::Invalid => CursorManagerError::ConfigInvalid,
         CursorPersistenceError::Insecure => CursorManagerError::ConfigInsecure,
         CursorPersistenceError::WriteFailed => CursorManagerError::ConfigWriteFailed,
+        CursorPersistenceError::Busy => CursorManagerError::PersistenceBusy,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_retries_interrupted_writes_and_accepts_a_full_eventfd() {
+        let mut calls = 0;
+        let result = notify_eventfd_with(|_| {
+            calls += 1;
+            if calls == 1 {
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            } else {
+                Ok(std::mem::size_of::<u64>())
+            }
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn notification_treats_a_full_eventfd_as_already_notified() {
+        let result = notify_eventfd_with(|_| Err(io::Error::from(io::ErrorKind::WouldBlock)));
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn notification_rejects_short_writes() {
+        let result = notify_eventfd_with(|_| Ok(std::mem::size_of::<u64>() - 1));
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn notification_drain_retries_interrupted_reads_until_would_block() {
+        let mut calls = 0;
+        let result = drain_eventfd_with(|_| {
+            calls += 1;
+            match calls {
+                1 => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                2 => Ok(std::mem::size_of::<u64>()),
+                _ => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            }
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn notification_drain_rejects_short_reads() {
+        let result = drain_eventfd_with(|_| Ok(std::mem::size_of::<u64>() - 1));
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
     }
 }
