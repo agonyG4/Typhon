@@ -293,12 +293,23 @@ impl CompositorState {
             && let Some(window_id) = self.window_id_for_surface(surface_id)
         {
             self.assign_focus_serial_if_needed(window_id);
+            self.mark_astrea_toplevel_structure_dirty();
         }
     }
 
     pub(in crate::compositor) fn begin_xdg_empty_or_unmap_commit(&mut self, surface_id: u32) {
+        let was_mapped = self
+            .xdg_surface_lifecycle(surface_id)
+            .is_some_and(|lifecycle| lifecycle.currently_mapped);
         if let Some(lifecycle) = self.xdg_surface_lifecycle_mut(surface_id) {
             lifecycle.begin_empty_or_unmap_commit();
+        }
+        if was_mapped
+            && !self
+                .xdg_surface_lifecycle(surface_id)
+                .is_some_and(|lifecycle| lifecycle.currently_mapped)
+        {
+            self.mark_astrea_toplevel_structure_dirty();
         }
     }
 }

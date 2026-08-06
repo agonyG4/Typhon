@@ -12,12 +12,13 @@ impl CompositorState {
     ) {
         let old_surface_id = self.focused_surface.as_ref().map(compositor_surface_id);
         let new_surface_id = compositor_surface_id(&surface);
+        let old_window_id = self.focused_window_id;
         let changed = !self
             .focused_surface
             .as_ref()
             .is_some_and(|current| same_surface_resource(current, &surface));
         if changed {
-            self.focus_generation = self.focus_generation.wrapping_add(1);
+            self.focus_generation = self.focus_generation.saturating_add(1);
             pointer_debug_log(format!(
                 "focus change reason={} old={:?} new={}",
                 reason, old_surface_id, new_surface_id
@@ -35,6 +36,14 @@ impl CompositorState {
             && let Some(window) = self.window_mut(window_id)
         {
             window.last_focus_serial = focus_generation;
+        }
+        if changed {
+            if let Some(window_id) = old_window_id {
+                self.mark_astrea_toplevel_dirty(window_id);
+            }
+            if let Some(window_id) = self.focused_window_id {
+                self.mark_astrea_toplevel_dirty(window_id);
+            }
         }
         self.ensure_keyboard_focus(&surface);
         crate::xwayland::trace::emit("focus_wayland_keyboard", || {

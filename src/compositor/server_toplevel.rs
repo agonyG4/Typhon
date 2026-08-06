@@ -5,12 +5,32 @@ impl CompositorState {
         &mut self,
         display: &DisplayHandle,
     ) -> AstreaToplevelPublicationSummary {
-        let collection = self.collect_astrea_toplevels();
+        let needs_full = self.astrea_toplevel_publisher.needs_full_reconciliation();
+        let dirty_ids = self.astrea_toplevel_publisher.dirty_window_ids();
+        let dirty_snapshots = dirty_ids
+            .into_iter()
+            .map(|window_id| (window_id, self.astrea_toplevel_snapshot(window_id)))
+            .collect();
+        let collection = needs_full.then(|| self.collect_astrea_toplevels());
         self.astrea_toplevel_publisher
-            .reconcile(display, collection)
+            .reconcile(display, collection, dirty_snapshots)
+    }
+
+    pub(in crate::compositor) fn mark_astrea_toplevel_dirty(&mut self, window_id: WindowId) {
+        self.astrea_toplevel_publisher.mark_window_dirty(window_id);
+    }
+
+    pub(in crate::compositor) fn mark_astrea_toplevel_removed(&mut self, window_id: WindowId) {
+        self.astrea_toplevel_publisher
+            .mark_window_removed(window_id);
+    }
+
+    pub(in crate::compositor) fn mark_astrea_toplevel_structure_dirty(&mut self) {
+        self.astrea_toplevel_publisher.mark_structure_dirty();
     }
 
     pub(in crate::compositor) fn remove_astrea_toplevel_client(&mut self, client_id: &ClientId) {
+        self.astrea_toplevel_authorized_clients.remove(client_id);
         self.astrea_toplevel_publisher.remove_client(client_id);
     }
 }

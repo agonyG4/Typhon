@@ -1075,6 +1075,7 @@ impl CompositorState {
         if let Some(window) = self.window_mut(window_id) {
             window.state.minimize(minimized_surfaces);
         }
+        self.mark_astrea_toplevel_dirty(window_id);
         if self.focused_root_surface_id() == Some(root_surface_id) {
             self.focused_surface = None;
             self.focused_window_id = None;
@@ -1122,6 +1123,7 @@ impl CompositorState {
             self.focus_surface(surface);
         }
         self.queue_backend_state(window_id);
+        self.mark_astrea_toplevel_dirty(window_id);
         self.advance_render_generation(RenderGenerationCause::WindowRestore);
         true
     }
@@ -1208,6 +1210,9 @@ impl CompositorState {
             window.capture_restore_geometry(restore_geometry);
             window.set_mode(mode);
         }
+        if let Some(window_id) = self.window_id_for_surface(surface_id) {
+            self.mark_astrea_toplevel_dirty(window_id);
+        }
 
         let geometry = self.window_geometry_for_mode(mode);
         let states = mode.xdg_states();
@@ -1241,11 +1246,17 @@ impl CompositorState {
             WindowInteractionEndReason::ModeTransition,
         );
         self.clear_fullscreen_presentation_owner(surface_id);
-        let Some(window) = self.toplevel_window_state_mut(surface_id) else {
-            return false;
+        let window_id = self.window_id_for_surface(surface_id);
+        let restore_geometry = {
+            let Some(window) = self.toplevel_window_state_mut(surface_id) else {
+                return false;
+            };
+            window.set_mode(ToplevelMode::Floating);
+            window.take_restore_geometry()
         };
-        window.set_mode(ToplevelMode::Floating);
-        let restore_geometry = window.take_restore_geometry();
+        if let Some(window_id) = window_id {
+            self.mark_astrea_toplevel_dirty(window_id);
+        }
         let restore_geometry = restore_geometry
             .or_else(|| self.current_root_window_geometry(surface_id))
             .unwrap_or_else(|| WindowGeometry::new(self.surface_placement(surface_id), 0, 0));

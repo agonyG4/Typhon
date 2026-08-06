@@ -93,6 +93,7 @@ impl CompositorState {
             self.clear_fullscreen_presentation_owner(root_surface_id);
         }
         self.queue_backend_state(window_id);
+        self.mark_astrea_toplevel_dirty(window_id);
         true
     }
 

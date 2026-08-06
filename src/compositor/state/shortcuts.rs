@@ -150,6 +150,7 @@ impl CompositorState {
     pub(in crate::compositor) fn clear_astrea_shell_authorization(&mut self) {
         self.astrea_shell_client_pids.clear();
         self.astrea_shell_client_uids.clear();
+        self.astrea_toplevel_authorized_clients.clear();
     }
 
     pub(in crate::compositor) fn astrea_shortcut_registration_allowed(
@@ -198,6 +199,33 @@ impl CompositorState {
             &self.astrea_shell_client_pids,
             &self.astrea_shell_client_uids,
         )
+    }
+
+    pub(in crate::compositor) fn astrea_toplevel_client_allowed(
+        &mut self,
+        client: &Client,
+        handle: &DisplayHandle,
+    ) -> bool {
+        let client_id = client.id();
+        if self.astrea_toplevel_authorized_clients.contains(&client_id) {
+            return true;
+        }
+        let Ok(credentials) = client.get_credentials(handle) else {
+            return false;
+        };
+        let Ok(pid) = u32::try_from(credentials.pid) else {
+            return false;
+        };
+        let allowed = credentials.uid == effective_uid()
+            && astrea_shell_pid_is_authorized_with_lookup(
+                pid,
+                &self.astrea_shell_client_pids,
+                proc_parent_pid,
+            );
+        if allowed {
+            self.astrea_toplevel_authorized_clients.insert(client_id);
+        }
+        allowed
     }
 
     pub(in crate::compositor) fn set_typhon_socket_name(&mut self, socket_name: String) {
@@ -320,4 +348,9 @@ fn proc_uid(pid: u32) -> Option<u32> {
         let values = line.strip_prefix("Uid:")?;
         values.split_whitespace().next()?.parse().ok()
     })
+}
+
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no pointer arguments and only reads process state.
+    unsafe { libc::geteuid() as u32 }
 }

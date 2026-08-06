@@ -639,18 +639,30 @@ impl Dispatch<xdg_toplevel::XdgToplevel, XdgToplevelData> for CompositorState {
         match request {
             xdg_toplevel::Request::SetTitle { title } => {
                 let surface_id = compositor_surface_id(&data.surface);
-                if let Some(toplevel) = state.toplevel_surfaces.get(&surface_id)
-                    && let Some(window) = state.window_mut(toplevel.window_id)
+                let window_id = state
+                    .toplevel_surfaces
+                    .get(&surface_id)
+                    .map(|toplevel| toplevel.window_id);
+                if let Some(window_id) = window_id
+                    && let Some(window) = state.window_mut(window_id)
+                    && window.metadata.title.as_deref() != Some(title.as_str())
                 {
                     window.metadata.title = Some(title);
+                    state.mark_astrea_toplevel_dirty(window_id);
                 }
             }
             xdg_toplevel::Request::SetAppId { app_id } => {
                 let surface_id = compositor_surface_id(&data.surface);
-                if let Some(toplevel) = state.toplevel_surfaces.get(&surface_id)
-                    && let Some(window) = state.window_mut(toplevel.window_id)
+                let window_id = state
+                    .toplevel_surfaces
+                    .get(&surface_id)
+                    .map(|toplevel| toplevel.window_id);
+                if let Some(window_id) = window_id
+                    && let Some(window) = state.window_mut(window_id)
+                    && window.metadata.app_id.as_deref() != Some(app_id.as_str())
                 {
                     window.metadata.app_id = Some(app_id.clone());
+                    state.mark_astrea_toplevel_dirty(window_id);
                 }
                 state.last_app_id = Some(app_id);
             }

@@ -107,6 +107,7 @@ impl CompositorState {
         }
         self.window_stacking.push(window.id);
         self.desktop_windows.insert(window.id, window);
+        self.mark_astrea_toplevel_structure_dirty();
         if let Some(placement) = initial_placement {
             self.set_surface_placement_with_cause(
                 root_surface_id,
@@ -216,6 +217,7 @@ impl CompositorState {
             self.window_by_x11_handle.remove(&handle);
         }
         self.window_stacking.retain(|window_id| *window_id != id);
+        self.mark_astrea_toplevel_removed(id);
         self.rebuild_x11_transient_relationships();
         Some(window)
     }
@@ -235,6 +237,7 @@ impl CompositorState {
         if let Some(window) = self.window_mut(window_id) {
             window.x11_surface_id = None;
         }
+        self.mark_astrea_toplevel_structure_dirty();
         true
     }
 
@@ -275,6 +278,7 @@ impl CompositorState {
             .ok_or(X11SurfaceAttachmentError::UnknownWindow)?;
         window.root_surface_id = surface_id;
         window.x11_surface_id = Some(surface_id);
+        self.mark_astrea_toplevel_structure_dirty();
         if let Some(placement) = replacement_placement {
             let active_visual_placement = self
                 .toplevel_visual_geometries
@@ -469,6 +473,12 @@ impl CompositorState {
             .filter(|parent| !self.x11_transient_would_cycle(window_id, Some(*parent)));
         let transient_parent_id =
             accepted_transient_handle.and_then(|parent| self.window_id_for_x11_handle(parent));
+        let structure_dirty = matches!(
+            delta,
+            crate::xwayland::xwm::X11MetadataDelta::TransientFor(_)
+                | crate::xwayland::xwm::X11MetadataDelta::WindowTypes(_)
+                | crate::xwayland::xwm::X11MetadataDelta::Kind(_)
+        );
         let old_policy = self
             .window(window_id)
             .and_then(|window| window.x11_placement_policy);
@@ -543,6 +553,10 @@ impl CompositorState {
             crate::xwayland::xwm::X11MetadataDelta::Protocols { .. } => {}
         }
         self.rebuild_x11_transient_relationships();
+        self.mark_astrea_toplevel_dirty(window_id);
+        if structure_dirty {
+            self.mark_astrea_toplevel_structure_dirty();
+        }
         let new_policy = self
             .window(window_id)
             .and_then(|window| window.x11_placement_policy);
