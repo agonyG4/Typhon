@@ -18,7 +18,7 @@ impl CompositorState {
             .as_ref()
             .is_some_and(|current| same_surface_resource(current, &surface));
         if changed {
-            self.focus_generation = self.focus_generation.saturating_add(1);
+            self.focus_generation = advance_nonzero_serial(self.focus_generation);
             pointer_debug_log(format!(
                 "focus change reason={} old={:?} new={}",
                 reason, old_surface_id, new_surface_id
@@ -90,9 +90,26 @@ impl CompositorState {
     }
 }
 
+pub(crate) const fn advance_nonzero_serial(value: u64) -> u64 {
+    let next = value.wrapping_add(1);
+    if next == 0 { 1 } else { next }
+}
+
 pub(in crate::compositor) fn focus_debug_log(message: impl FnOnce() -> String) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ENABLED.get_or_init(|| std::env::var_os("OBLIVION_ONE_FOCUS_DEBUG").is_some()) {
         eprintln!("oblivion-one focus: {}", message());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::advance_nonzero_serial;
+
+    #[test]
+    fn focus_serial_never_uses_zero_when_wrapping() {
+        assert_eq!(advance_nonzero_serial(0), 1);
+        assert_eq!(advance_nonzero_serial(u64::MAX - 1), u64::MAX);
+        assert_eq!(advance_nonzero_serial(u64::MAX), 1);
     }
 }

@@ -56,7 +56,26 @@ impl GlobalDispatch<astrea_toplevel_manager_v1::AstreaToplevelManagerV1, ()> for
             return;
         }
 
-        let collection = state.collect_astrea_toplevels();
+        let collection = match state.collect_astrea_toplevels() {
+            Ok(collection) => collection,
+            Err(()) => {
+                state
+                    .astrea_toplevel_publisher
+                    .metrics
+                    .handle_limit_rejections = state
+                    .astrea_toplevel_publisher
+                    .metrics
+                    .handle_limit_rejections
+                    .saturating_add(1);
+                state.post_protocol_error(
+                    client,
+                    &manager_for_error,
+                    astrea_toplevel_manager_v1::Error::ResourceLimit,
+                    "Astrea toplevel eligibility limit exceeded",
+                );
+                return;
+            }
+        };
         if !state
             .astrea_toplevel_publisher
             .can_allocate_manager(&client_id, collection.snapshots.len())
@@ -82,6 +101,7 @@ impl GlobalDispatch<astrea_toplevel_manager_v1::AstreaToplevelManagerV1, ()> for
             Some(collection.clone()),
             BTreeMap::new(),
         );
+        state.report_astrea_toplevel_failures();
         if !state
             .astrea_toplevel_publisher
             .can_allocate_manager(&client_id, collection.snapshots.len())
@@ -102,30 +122,26 @@ impl GlobalDispatch<astrea_toplevel_manager_v1::AstreaToplevelManagerV1, ()> for
             );
             return;
         }
-        let manager_id = manager.id();
         if state
             .astrea_toplevel_publisher
             .bind_manager(handle, manager, client.clone(), &collection)
             .is_err()
         {
+            state.report_astrea_toplevel_failures();
             state.post_protocol_error(
                 client,
                 &manager_for_error,
                 astrea_toplevel_manager_v1::Error::ResourceLimit,
                 "unable to create Astrea toplevel resources",
             );
-            return;
         }
-        state
-            .astrea_toplevel_publisher
-            .send_initial_done(&manager_id, &collection);
     }
 }
 
 impl Dispatch<astrea_toplevel_manager_v1::AstreaToplevelManagerV1, ()> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &astrea_toplevel_manager_v1::AstreaToplevelManagerV1,
         request: astrea_toplevel_manager_v1::Request,
         _data: &(),
@@ -136,20 +152,20 @@ impl Dispatch<astrea_toplevel_manager_v1::AstreaToplevelManagerV1, ()> for Compo
             astrea_toplevel_manager_v1::Request::Destroy => {
                 state
                     .astrea_toplevel_publisher
-                    .remove_manager(&resource.id());
+                    .remove_manager(&client.id(), &resource.id());
             }
         }
     }
 
     fn destroyed(
         state: &mut Self,
-        _client: ClientId,
+        client_id: ClientId,
         resource: &astrea_toplevel_manager_v1::AstreaToplevelManagerV1,
         _data: &(),
     ) {
         state
             .astrea_toplevel_publisher
-            .remove_manager(&resource.id());
+            .remove_manager(&client_id, &resource.id());
     }
 }
 
@@ -168,6 +184,7 @@ impl Dispatch<astrea_toplevel_v1::AstreaToplevelV1, AstreaToplevelResourceData>
         match request {
             astrea_toplevel_v1::Request::Destroy => {
                 state.astrea_toplevel_publisher.remove_handle(
+                    &data.client_id,
                     &data.manager_id,
                     data.window_id,
                     &resource.id(),
@@ -178,11 +195,12 @@ impl Dispatch<astrea_toplevel_v1::AstreaToplevelV1, AstreaToplevelResourceData>
 
     fn destroyed(
         state: &mut Self,
-        _client: ClientId,
+        _client_id: ClientId,
         resource: &astrea_toplevel_v1::AstreaToplevelV1,
         data: &AstreaToplevelResourceData,
     ) {
         state.astrea_toplevel_publisher.remove_handle(
+            &data.client_id,
             &data.manager_id,
             data.window_id,
             &resource.id(),

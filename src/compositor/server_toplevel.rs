@@ -1,3 +1,5 @@
+use crate::astrea_toplevel_management::server::astrea_toplevel_manager_v1;
+
 use super::*;
 
 impl CompositorState {
@@ -11,9 +13,38 @@ impl CompositorState {
             .into_iter()
             .map(|window_id| (window_id, self.astrea_toplevel_snapshot(window_id)))
             .collect();
-        let collection = needs_full.then(|| self.collect_astrea_toplevels());
-        self.astrea_toplevel_publisher
-            .reconcile(display, collection, dirty_snapshots)
+        let collection = if needs_full {
+            match self.collect_astrea_toplevels() {
+                Ok(collection) => Some(collection),
+                Err(()) => {
+                    self.astrea_toplevel_publisher.fail_all_managers();
+                    self.report_astrea_toplevel_failures();
+                    return AstreaToplevelPublicationSummary {
+                        revision: self.astrea_toplevel_publisher.revision,
+                        manager_count: self.astrea_toplevel_publisher.manager_count(),
+                        ..AstreaToplevelPublicationSummary::default()
+                    };
+                }
+            }
+        } else {
+            None
+        };
+        let summary =
+            self.astrea_toplevel_publisher
+                .reconcile(display, collection, dirty_snapshots);
+        self.report_astrea_toplevel_failures();
+        summary
+    }
+
+    pub(in crate::compositor) fn report_astrea_toplevel_failures(&mut self) {
+        for (client, resource) in self.astrea_toplevel_publisher.take_manager_failures() {
+            self.post_protocol_error_deferred(
+                &client,
+                &resource,
+                astrea_toplevel_manager_v1::Error::ResourceLimit,
+                "Astrea toplevel publication failed for this manager",
+            );
+        }
     }
 
     pub(in crate::compositor) fn mark_astrea_toplevel_dirty(&mut self, window_id: WindowId) {

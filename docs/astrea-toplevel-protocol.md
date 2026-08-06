@@ -90,7 +90,8 @@ fullscreen = 8
 tracking began. Application focus transitions update the focused and
 previously focused windows in one publication revision. Reasserting focus on
 the same window does not advance its serial, and losing focus does not reset
-it.
+it. Serial advancement skips zero when the counter wraps; zero remains
+reserved for never-focused windows.
 
 ## Eligible windows
 
@@ -112,28 +113,48 @@ surface is not eligible.
 ## Limits and truncation
 
 The protocol publisher retains bounded owned snapshots only. It supports at
-most 32 active manager bindings, four active managers per client, 4096
-outstanding child handles per client, 16384 outstanding child handles
-globally, and 4096 handles in one manager's deterministic window prefix.
-Outstanding handles include live handles and closed handles whose client has
-not yet destroyed the resource. Destroying a manager therefore does not
-restore child-handle quota while its closed child resources remain alive.
+most 32 active manager bindings, four active managers per client, 4096 active
+child handles per client, 16384 active child handles globally, and 4096
+handles in one manager's deterministic window prefix. Retired resources have
+separate hard limits of 8192 per client and 32768 globally. Admission also
+reserves space for active resources to become retired, so later destruction
+cannot exceed the retired-resource budget. Outstanding resources include live
+handles and closed handles whose client has not yet destroyed the resource.
+Destroying a manager restores its active-manager slot, but does not restore
+child-handle quota while its closed child resources remain alive.
 
 When more eligible windows exist, each manager receives the deterministic
 lowest-`WindowId` prefix, while `done.total` reports the full eligible count
 saturated to `u32`. The `truncated` manager flag indicates that entries were
 omitted. Omitted entries are admitted deterministically as lower-ID entries
-leave the prefix. Manager admission reserves the complete known prefix before
-creating any child resource; a resource-creation failure rolls the new
-publisher records back and does not change another manager.
+leave the prefix. The publisher tracks the complete eligible identity set up
+to a hard bound of 65,536 windows without retaining omitted metadata. Above
+that bound publication fails closed with a bounded resource error. A
+client-destroyed handle remains suppressed while its window remains eligible,
+even if it leaves and later re-enters the bounded prefix; suppression is
+cleared only after authoritative ineligibility. Manager admission reserves
+the complete known prefix before creating any child resource. A resource or
+initial-event failure retires every resource created by that attempt and
+removes the affected manager without changing another manager.
 
 Each manager has independent protocol handles and lifecycle state. Destroying
 a manager emits exactly one `closed` event for every still-live child, marks
-those children inert, and retains their bookkeeping until each child resource
-is destroyed. A window becoming permanently ineligible follows the same rule.
-No metadata, state or `done` event follows `closed`. Client disconnect removes
-all live and closed resources owned by that exact `ClientId` and releases its
-quota idempotently.
+those children inert, moves them into publisher-owned retired bookkeeping, and
+retains that bookkeeping until each child resource is destroyed. A window
+becoming permanently ineligible follows the same rule. No metadata, state or
+`done` event follows `closed`. A stale child destroy is matched by the exact
+client, manager resource, child resource and `WindowId`, so it cannot affect a
+new handle. Clients should destroy terminal handles promptly, but Typhon
+remains bounded if they delay destruction. Client disconnect removes all live
+and retired resources owned by that exact `ClientId` and releases its quota
+idempotently.
+
+If initial resource creation or a later event send fails, the affected manager
+is removed from healthy publication, all of its live children are terminally
+retired, and a bounded `resource_limit` protocol error is posted when the
+manager is still usable. Other manager bindings continue independently. There
+is no healthy-manager state in which the canonical prefix contains a window
+but the manager has silently missed its handle.
 
 ## Publication ownership
 
