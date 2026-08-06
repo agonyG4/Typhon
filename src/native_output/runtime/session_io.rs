@@ -451,6 +451,11 @@ impl NativeSessionIo for NativeRuntime {
         self.adaptive_buffering.reset();
         self.pending_proven_deadline_miss = None;
         self.queued_redraw_requested = true;
+        let publication_deadline = self
+            .server
+            .has_pending_astrea_toplevel_publication()
+            .then(monotonic_now_ns)
+            .transpose()?;
         self.event_loop.arm_deadline(earliest_native_deadline(
             earliest_native_deadline(
                 self.frame_scheduler.next_deadline_ns(),
@@ -458,7 +463,10 @@ impl NativeSessionIo for NativeRuntime {
             ),
             earliest_native_deadline(
                 self.xwayland.next_deadline_ns(),
-                self.control_server.next_deadline_ns(),
+                earliest_native_deadline(
+                    self.control_server.next_deadline_ns(),
+                    publication_deadline,
+                ),
             ),
         ))?;
         Ok(())

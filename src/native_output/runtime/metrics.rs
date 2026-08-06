@@ -821,9 +821,10 @@ impl NativeRuntime {
             self.scheduled_presentation_target,
         );
         let atomic_commit_deadline = self.atomic_commit_arbiter.watchdog_deadline_ns();
+        let now_ns = monotonic_now_ns()?;
         self.frame_pacing.note_deadline_state(
             scheduler_decision,
-            monotonic_now_ns()?,
+            now_ns,
             scheduler_deadline,
             visual_deadline,
             self.frame_scheduler.ready_frame_queued() || self.scanout.ready_frame_queued(),
@@ -840,7 +841,12 @@ impl NativeRuntime {
                     self.xwayland.next_deadline_ns(),
                     earliest_native_deadline(
                         self.cursor_output_arbitration.deadline_ns(),
-                        self.control_server.next_deadline_ns(),
+                        earliest_native_deadline(
+                            self.control_server.next_deadline_ns(),
+                            self.server
+                                .has_pending_astrea_toplevel_publication()
+                                .then_some(now_ns),
+                        ),
                     ),
                 ),
             ),

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::astrea_toplevel_management::server::{astrea_toplevel_manager_v1, astrea_toplevel_v1};
 use crate::control_snapshots::truncate_utf8;
 
-use super::{CompositorState, DesktopWindowKind, WindowBackend, WindowId, X11DesktopRole};
+use super::{CompositorState, WindowId};
 use wayland_server::{
     Client, DisplayHandle, Resource, WEnum,
     backend::{ClientId, ObjectId},
@@ -18,6 +18,8 @@ pub(crate) const MAX_ASTREA_TOPLEVEL_HANDLES_PER_CLIENT: usize = 4096;
 pub(crate) const MAX_ASTREA_TOPLEVEL_HANDLES_GLOBAL: usize = 16_384;
 pub(crate) const MAX_ASTREA_RETIRED_HANDLES_PER_CLIENT: usize = 8192;
 pub(crate) const MAX_ASTREA_RETIRED_HANDLES_TOTAL: usize = 32_768;
+pub(crate) const MAX_ASTREA_TERMINAL_MANAGERS_PER_CLIENT: usize = 4;
+pub(crate) const MAX_ASTREA_TERMINAL_MANAGERS_TOTAL: usize = 32;
 pub(crate) const MAX_ASTREA_TOPLEVEL_UPDATES_PER_CYCLE: usize = 256;
 pub(crate) const MAX_ASTREA_ELIGIBLE_WINDOWS: usize = 65_536;
 const MAX_ASTREA_TOPLEVEL_DIRTY_WINDOWS: usize = 8192;
@@ -140,6 +142,11 @@ pub(crate) struct AstreaToplevelMetrics {
     pub(crate) full_reconciliations: u64,
     pub(crate) full_reconciliation_corrections: u64,
     pub(crate) publication_budget_exhaustions: u64,
+    pub(crate) manager_failed_events: u64,
+    pub(crate) failed_event_delivery_failures: u64,
+    pub(crate) pending_initial_managers: u64,
+    pub(crate) terminal_managers: u64,
+    pub(crate) publication_continuations: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -180,23 +187,65 @@ struct AstreaToplevelManagerBinding {
     suppressed: BTreeSet<WindowId>,
     last_total: u32,
     last_truncated: bool,
+    last_revision: u64,
+    lifecycle: AstreaManagerLifecycle,
+    reserved_handle_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AstreaManagerLifecycle {
+    PendingInitial,
+    Active,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandleCreateError {
+    ResourceLimit,
+    PublicationFailure,
+}
+
+impl HandleCreateError {
+    const fn failure_reason(self) -> astrea_toplevel_manager_v1::FailureReason {
+        match self {
+            Self::ResourceLimit => astrea_toplevel_manager_v1::FailureReason::ResourceLimit,
+            Self::PublicationFailure => {
+                astrea_toplevel_manager_v1::FailureReason::PublicationFailure
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TerminalAstreaToplevelManager {
+    resource: astrea_toplevel_manager_v1::AstreaToplevelManagerV1,
+    client_id: ClientId,
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::compositor) struct AstreaToplevelPublicationTransaction {
+    revision: u64,
+    pub(in crate::compositor) target: AstreaToplevelCollection,
+    remaining_ids: BTreeSet<WindowId>,
 }
 
 #[derive(Debug)]
 pub(in crate::compositor) struct AstreaToplevelPublisher {
     pub(in crate::compositor) revision: u64,
     pub(in crate::compositor) canonical: BTreeMap<WindowId, AstreaToplevelSnapshot>,
-    canonical_eligible_ids: BTreeSet<WindowId>,
+    pub(in crate::compositor) canonical_eligible_ids: BTreeSet<WindowId>,
     pub(in crate::compositor) canonical_total: u32,
     managers: HashMap<ObjectId, AstreaToplevelManagerBinding>,
+    terminal_managers: HashMap<ObjectId, TerminalAstreaToplevelManager>,
     retired_handles: HashMap<ObjectId, RetiredAstreaToplevelHandle>,
-    dirty_windows: BTreeSet<WindowId>,
-    removed_windows: BTreeSet<WindowId>,
-    structure_dirty: bool,
-    initial_reconciliation_pending: bool,
-    pending_collection: Option<AstreaToplevelCollection>,
-    pending_ids: BTreeSet<WindowId>,
-    pending_manager_failures: Vec<(Client, astrea_toplevel_manager_v1::AstreaToplevelManagerV1)>,
+    pub(in crate::compositor) dirty_windows: BTreeSet<WindowId>,
+    pub(in crate::compositor) removed_windows: BTreeSet<WindowId>,
+    pub(in crate::compositor) structure_dirty: bool,
+    pub(in crate::compositor) initial_reconciliation_pending: bool,
+    pub(in crate::compositor) transaction: Option<AstreaToplevelPublicationTransaction>,
+    pub(in crate::compositor) next_collection: Option<AstreaToplevelCollection>,
+    pub(in crate::compositor) next_dirty_snapshots:
+        BTreeMap<WindowId, Option<AstreaToplevelSnapshot>>,
+    pub(in crate::compositor) next_structure_dirty: bool,
     pub(in crate::compositor) metrics: AstreaToplevelMetrics,
 }
 
@@ -217,14 +266,16 @@ impl Default for AstreaToplevelPublisher {
             canonical_eligible_ids: BTreeSet::new(),
             canonical_total: 0,
             managers: HashMap::new(),
+            terminal_managers: HashMap::new(),
             retired_handles: HashMap::new(),
             dirty_windows: BTreeSet::new(),
             removed_windows: BTreeSet::new(),
             structure_dirty: false,
             initial_reconciliation_pending: true,
-            pending_collection: None,
-            pending_ids: BTreeSet::new(),
-            pending_manager_failures: Vec::new(),
+            transaction: None,
+            next_collection: None,
+            next_dirty_snapshots: BTreeMap::new(),
+            next_structure_dirty: false,
             metrics: AstreaToplevelMetrics::default(),
         }
     }
@@ -234,10 +285,18 @@ impl AstreaToplevelPublisher {
     fn refresh_resource_metrics(&mut self) {
         self.metrics.active_handles = self.active_handle_count() as u64;
         self.metrics.retired_handles = self.retired_handle_count() as u64;
+        self.metrics.pending_initial_managers = self
+            .managers
+            .values()
+            .filter(|binding| binding.lifecycle == AstreaManagerLifecycle::PendingInitial)
+            .count() as u64;
+        self.metrics.terminal_managers = self.terminal_managers.len() as u64;
     }
 
     pub(in crate::compositor) fn manager_count(&self) -> usize {
-        self.managers.values().count()
+        self.managers
+            .len()
+            .saturating_add(self.terminal_managers.len())
     }
 
     pub(in crate::compositor) fn manager_count_for_client(&self, client_id: &ClientId) -> usize {
@@ -245,6 +304,12 @@ impl AstreaToplevelPublisher {
             .values()
             .filter(|binding| binding.client_id == *client_id)
             .count()
+            .saturating_add(
+                self.terminal_managers
+                    .values()
+                    .filter(|binding| binding.client_id == *client_id)
+                    .count(),
+            )
     }
 
     pub(in crate::compositor) fn handle_count_for_client(&self, client_id: &ClientId) -> usize {
@@ -285,6 +350,25 @@ impl AstreaToplevelPublisher {
             .sum()
     }
 
+    fn pending_handle_count_for_client(&self, client_id: &ClientId) -> usize {
+        self.managers
+            .values()
+            .filter(|binding| {
+                binding.client_id == *client_id
+                    && binding.lifecycle == AstreaManagerLifecycle::PendingInitial
+            })
+            .map(|binding| binding.reserved_handle_count)
+            .sum()
+    }
+
+    fn pending_handle_count(&self) -> usize {
+        self.managers
+            .values()
+            .filter(|binding| binding.lifecycle == AstreaManagerLifecycle::PendingInitial)
+            .map(|binding| binding.reserved_handle_count)
+            .sum()
+    }
+
     pub(in crate::compositor) fn retired_handle_count(&self) -> usize {
         self.retired_handles.len()
     }
@@ -319,7 +403,7 @@ impl AstreaToplevelPublisher {
     }
 
     pub(in crate::compositor) fn needs_full_reconciliation(&self) -> bool {
-        self.initial_reconciliation_pending || self.structure_dirty
+        self.initial_reconciliation_pending || self.structure_dirty || self.next_structure_dirty
     }
 
     pub(in crate::compositor) fn dirty_window_ids(&self) -> Vec<WindowId> {
@@ -338,17 +422,33 @@ impl AstreaToplevelPublisher {
         self.prune_dead_resources();
         self.manager_count() < MAX_ASTREA_TOPLEVEL_MANAGERS
             && self.manager_count_for_client(client_id) < MAX_ASTREA_TOPLEVEL_MANAGERS_PER_CLIENT
+            && self.terminal_managers.len() < MAX_ASTREA_TERMINAL_MANAGERS_TOTAL
+            && self
+                .terminal_managers
+                .values()
+                .filter(|binding| binding.client_id == *client_id)
+                .count()
+                < MAX_ASTREA_TERMINAL_MANAGERS_PER_CLIENT
             && self
                 .active_handle_count_for_client(client_id)
+                .saturating_add(self.pending_handle_count_for_client(client_id))
                 .saturating_add(handle_count)
                 <= MAX_ASTREA_TOPLEVEL_HANDLES_PER_CLIENT
-            && self.active_handle_count().saturating_add(handle_count)
+            && self
+                .active_handle_count()
+                .saturating_add(self.pending_handle_count())
+                .saturating_add(handle_count)
                 <= MAX_ASTREA_TOPLEVEL_HANDLES_GLOBAL
             && self
                 .handle_count_for_client(client_id)
+                .saturating_add(self.pending_handle_count_for_client(client_id))
                 .saturating_add(handle_count)
                 <= MAX_ASTREA_RETIRED_HANDLES_PER_CLIENT
-            && self.handle_count().saturating_add(handle_count) <= MAX_ASTREA_RETIRED_HANDLES_TOTAL
+            && self
+                .handle_count()
+                .saturating_add(self.pending_handle_count())
+                .saturating_add(handle_count)
+                <= MAX_ASTREA_RETIRED_HANDLES_TOTAL
     }
 
     pub(in crate::compositor) fn bind_manager(
@@ -360,6 +460,7 @@ impl AstreaToplevelPublisher {
     ) -> Result<(), ()> {
         let manager_id = manager.id();
         let client_id = client.id();
+        let pending = self.transaction.is_some();
         let binding = AstreaToplevelManagerBinding {
             resource: manager.clone(),
             client,
@@ -367,21 +468,46 @@ impl AstreaToplevelPublisher {
             handles: HashMap::new(),
             active_handles: BTreeMap::new(),
             suppressed: BTreeSet::new(),
-            last_total: collection.total,
-            last_truncated: collection.total as usize > MAX_ASTREA_TOPLEVELS_PER_MANAGER,
+            last_total: if pending { 0 } else { collection.total },
+            last_truncated: if pending {
+                false
+            } else {
+                collection.total as usize > MAX_ASTREA_TOPLEVELS_PER_MANAGER
+            },
+            last_revision: if pending { 0 } else { self.revision },
+            lifecycle: if pending {
+                AstreaManagerLifecycle::PendingInitial
+            } else {
+                AstreaManagerLifecycle::Active
+            },
+            reserved_handle_count: if pending {
+                collection.snapshots.len()
+            } else {
+                0
+            },
         };
         let revision = self.revision;
-        if self.managers.contains_key(&manager_id) {
+        if self.managers.contains_key(&manager_id)
+            || self.terminal_managers.contains_key(&manager_id)
+        {
             return Err(());
         }
         self.managers.insert(manager_id.clone(), binding);
         if self
-            .create_initial_handles(display, &manager_id, collection, revision)
-            .is_err()
+            .managers
+            .get(&manager_id)
+            .is_some_and(|binding| binding.lifecycle == AstreaManagerLifecycle::PendingInitial)
+        {
+            self.metrics.pending_initial_managers =
+                self.metrics.pending_initial_managers.saturating_add(1);
+            self.refresh_resource_metrics();
+            return Ok(());
+        }
+        if let Err(error) = self.create_initial_handles(display, &manager_id, collection, revision)
         {
             self.metrics.initial_enumeration_rollbacks =
                 self.metrics.initial_enumeration_rollbacks.saturating_add(1);
-            self.fail_manager(&manager_id);
+            self.fail_manager(&manager_id, error.failure_reason());
             return Err(());
         }
         let initial_done = self
@@ -398,8 +524,14 @@ impl AstreaToplevelPublisher {
                 .map_err(|_| ())
             });
         if initial_done.is_err() {
-            self.fail_manager(&manager_id);
+            self.fail_manager(
+                &manager_id,
+                astrea_toplevel_manager_v1::FailureReason::PublicationFailure,
+            );
             return Err(());
+        }
+        if let Some(binding) = self.managers.get_mut(&manager_id) {
+            binding.last_revision = revision;
         }
         self.metrics.managers_accepted = self.metrics.managers_accepted.saturating_add(1);
         if collection.total as usize > MAX_ASTREA_TOPLEVELS_PER_MANAGER {
@@ -416,18 +548,88 @@ impl AstreaToplevelPublisher {
         manager_id: &ObjectId,
         collection: &AstreaToplevelCollection,
         revision: u64,
-    ) -> Result<(), ()> {
+    ) -> Result<(), HandleCreateError> {
         for snapshot in collection.snapshots.values() {
-            let mut binding = self.managers.remove(manager_id).ok_or(())?;
+            let mut binding = self
+                .managers
+                .remove(manager_id)
+                .ok_or(HandleCreateError::PublicationFailure)?;
             let result = self.create_handle(display, &mut binding, snapshot.clone(), revision);
             self.managers.insert(manager_id.clone(), binding);
-            if result.is_err() {
+            if let Err(error) = result {
                 self.metrics.resource_creation_failures =
                     self.metrics.resource_creation_failures.saturating_add(1);
-                return Err(());
+                return Err(error);
             }
         }
         Ok(())
+    }
+
+    fn initialize_pending_managers(&mut self, display: &DisplayHandle, revision: u64) {
+        let collection = AstreaToplevelCollection {
+            snapshots: self.canonical.clone(),
+            eligible_ids: self.canonical_eligible_ids.clone(),
+            total: self.canonical_total,
+        };
+        let mut manager_ids = self
+            .managers
+            .iter()
+            .filter_map(|(manager_id, binding)| {
+                (binding.lifecycle == AstreaManagerLifecycle::PendingInitial)
+                    .then_some(manager_id.clone())
+            })
+            .collect::<Vec<_>>();
+        manager_ids.sort_by_key(ObjectId::protocol_id);
+        for manager_id in manager_ids {
+            let Some(mut binding) = self.managers.remove(&manager_id) else {
+                continue;
+            };
+            binding.lifecycle = AstreaManagerLifecycle::Active;
+            binding.reserved_handle_count = 0;
+            if !self.can_allocate_manager(&binding.client_id, collection.snapshots.len()) {
+                self.fail_binding(
+                    binding,
+                    astrea_toplevel_manager_v1::FailureReason::ResourceLimit,
+                );
+                continue;
+            }
+            self.managers.insert(manager_id.clone(), binding);
+            if let Err(error) =
+                self.create_initial_handles(display, &manager_id, &collection, revision)
+            {
+                self.metrics.initial_enumeration_rollbacks =
+                    self.metrics.initial_enumeration_rollbacks.saturating_add(1);
+                self.fail_manager(&manager_id, error.failure_reason());
+                continue;
+            }
+            let done = self.managers.get(&manager_id).map(|binding| {
+                send_manager_done(
+                    &binding.resource,
+                    revision,
+                    collection.total,
+                    collection.total as usize > MAX_ASTREA_TOPLEVELS_PER_MANAGER,
+                )
+            });
+            if done.is_none_or(|result| result.is_err()) {
+                self.fail_manager(
+                    &manager_id,
+                    astrea_toplevel_manager_v1::FailureReason::PublicationFailure,
+                );
+                continue;
+            }
+            if let Some(binding) = self.managers.get_mut(&manager_id) {
+                binding.last_total = collection.total;
+                binding.last_truncated =
+                    collection.total as usize > MAX_ASTREA_TOPLEVELS_PER_MANAGER;
+                binding.last_revision = revision;
+            }
+            self.metrics.managers_accepted = self.metrics.managers_accepted.saturating_add(1);
+            if collection.total as usize > MAX_ASTREA_TOPLEVELS_PER_MANAGER {
+                self.metrics.truncated_manager_snapshots =
+                    self.metrics.truncated_manager_snapshots.saturating_add(1);
+            }
+        }
+        self.refresh_resource_metrics();
     }
 
     fn create_handle(
@@ -436,7 +638,7 @@ impl AstreaToplevelPublisher {
         binding: &mut AstreaToplevelManagerBinding,
         snapshot: AstreaToplevelSnapshot,
         revision: u64,
-    ) -> Result<(), ()> {
+    ) -> Result<(), HandleCreateError> {
         if !self.can_allocate_handle(binding) {
             if self.handle_count_for_client(&binding.client_id)
                 >= MAX_ASTREA_RETIRED_HANDLES_PER_CLIENT
@@ -449,7 +651,7 @@ impl AstreaToplevelPublisher {
             }
             self.metrics.handle_limit_rejections =
                 self.metrics.handle_limit_rejections.saturating_add(1);
-            return Err(());
+            return Err(HandleCreateError::ResourceLimit);
         }
         let resource = binding
             .client
@@ -466,7 +668,7 @@ impl AstreaToplevelPublisher {
                     client_id: binding.client_id.clone(),
                 },
             )
-            .map_err(|_| ())?;
+            .map_err(|_| HandleCreateError::PublicationFailure)?;
         let resource_id = resource.id();
         binding.handles.insert(
             resource_id.clone(),
@@ -489,7 +691,7 @@ impl AstreaToplevelPublisher {
                 snapshot.id,
                 HandleCloseReason::PublicationFailure,
             );
-            return Err(());
+            return Err(HandleCreateError::PublicationFailure);
         }
         if send_initial_handle(&resource, &snapshot, revision).is_err() {
             let _ = self.close_active_handle(
@@ -497,7 +699,7 @@ impl AstreaToplevelPublisher {
                 snapshot.id,
                 HandleCloseReason::PublicationFailure,
             );
-            return Err(());
+            return Err(HandleCreateError::PublicationFailure);
         }
         self.metrics.handles_created = self.metrics.handles_created.saturating_add(1);
         Ok(())
@@ -512,14 +714,18 @@ impl AstreaToplevelPublisher {
         };
         let active_for_client = self
             .active_handle_count_for_client(&binding.client_id)
+            .saturating_add(self.pending_handle_count_for_client(&binding.client_id))
             .saturating_add(own_active_handles);
         let active_total = self
             .active_handle_count()
+            .saturating_add(self.pending_handle_count())
             .saturating_add(own_active_handles);
         let tracked_for_client = self
             .handle_count_for_client(&binding.client_id)
+            .saturating_add(self.pending_handle_count_for_client(&binding.client_id))
             .saturating_add(own_active_handles);
         let tracked_total = self.handle_count().saturating_add(own_active_handles);
+        let tracked_total = tracked_total.saturating_add(self.pending_handle_count());
         binding.handles.len() < MAX_ASTREA_TOPLEVELS_PER_MANAGER
             && active_for_client.saturating_add(1) <= MAX_ASTREA_TOPLEVEL_HANDLES_PER_CLIENT
             && active_total.saturating_add(1) <= MAX_ASTREA_TOPLEVEL_HANDLES_GLOBAL
@@ -536,110 +742,142 @@ impl AstreaToplevelPublisher {
         self.prune_dead_resources();
         self.refresh_resource_metrics();
 
-        if self.initial_reconciliation_pending || self.structure_dirty {
+        if self.transaction.is_some() {
+            self.queue_follow_up(collection, dirty_snapshots);
+            self.structure_dirty = false;
+            self.dirty_windows.clear();
+            self.removed_windows.clear();
+            return self.process_transaction(display);
+        }
+
+        let target = if self.initial_reconciliation_pending
+            || self.structure_dirty
+            || self.next_structure_dirty
+        {
             let Some(collection) = collection else {
                 return self.noop_summary();
             };
             self.metrics.full_reconciliations = self.metrics.full_reconciliations.saturating_add(1);
-            if self.manager_count() == 0 {
-                self.canonical = collection.snapshots;
-                self.canonical_eligible_ids = collection.eligible_ids;
-                self.canonical_total = collection.total;
-                self.initial_reconciliation_pending = false;
-                self.structure_dirty = false;
-                self.dirty_windows.clear();
-                self.removed_windows.clear();
-                self.pending_collection = None;
-                self.pending_ids.clear();
-                return self.noop_summary();
-            }
-            self.pending_collection = Some(collection);
-            self.pending_ids = self.diff_ids(
-                &self
-                    .pending_collection
-                    .as_ref()
-                    .expect("pending collection was just installed")
-                    .clone(),
-            );
             self.initial_reconciliation_pending = false;
             self.structure_dirty = false;
+            self.next_structure_dirty = false;
+            self.next_collection = None;
+            self.next_dirty_snapshots.clear();
             self.dirty_windows.clear();
             self.removed_windows.clear();
-        } else if let Some(pending) = self.pending_collection.as_mut() {
-            for (window_id, snapshot) in dirty_snapshots {
-                match snapshot {
-                    Some(snapshot) => {
-                        pending.eligible_ids.insert(window_id);
-                        pending.snapshots.insert(window_id, snapshot);
-                        if pending.snapshots.len() > MAX_ASTREA_TOPLEVELS_PER_MANAGER
-                            && let Some(largest) = pending.snapshots.keys().next_back().copied()
-                        {
-                            pending.snapshots.remove(&largest);
-                        }
-                    }
-                    None => {
-                        pending.eligible_ids.remove(&window_id);
-                        pending.snapshots.remove(&window_id);
-                    }
-                }
-            }
-            pending.total = pending.eligible_ids.len().min(u32::MAX as usize) as u32;
-            let target = pending.clone();
-            self.pending_ids = self.diff_ids(&target);
+            collection
+        } else if let Some(collection) = self.next_collection.take() {
+            self.next_structure_dirty = false;
+            let snapshots = std::mem::take(&mut self.next_dirty_snapshots);
+            self.apply_dirty_snapshots(collection, snapshots)
+        } else if !self.next_dirty_snapshots.is_empty() || !dirty_snapshots.is_empty() {
+            let mut snapshots = std::mem::take(&mut self.next_dirty_snapshots);
+            snapshots.extend(dirty_snapshots);
+            self.apply_dirty_snapshots(
+                AstreaToplevelCollection {
+                    snapshots: self.canonical.clone(),
+                    eligible_ids: self.canonical_eligible_ids.clone(),
+                    total: self.canonical_total,
+                },
+                snapshots,
+            )
+        } else {
             self.dirty_windows.clear();
             self.removed_windows.clear();
-        } else if !dirty_snapshots.is_empty() {
-            let mut pending = AstreaToplevelCollection {
-                snapshots: self.canonical.clone(),
-                eligible_ids: self.canonical_eligible_ids.clone(),
-                total: self.canonical_total,
-            };
-            for (window_id, snapshot) in dirty_snapshots {
-                match snapshot {
-                    Some(snapshot) => {
-                        pending.eligible_ids.insert(window_id);
-                        pending.snapshots.insert(window_id, snapshot);
-                        if pending.snapshots.len() > MAX_ASTREA_TOPLEVELS_PER_MANAGER
-                            && let Some(largest) = pending.snapshots.keys().next_back().copied()
-                        {
-                            pending.snapshots.remove(&largest);
-                        }
-                    }
-                    None => {
-                        pending.eligible_ids.remove(&window_id);
-                        pending.snapshots.remove(&window_id);
-                    }
-                }
-            }
-            pending.total = pending.eligible_ids.len().min(u32::MAX as usize) as u32;
-            self.pending_ids = self.diff_ids(&pending);
-            self.pending_collection = Some(pending);
-            self.dirty_windows.clear();
-            self.removed_windows.clear();
-        }
-
-        let Some(target) = self.pending_collection.clone() else {
             return self.noop_summary();
         };
-        let old_canonical = self.canonical.clone();
-        let target_changed = old_canonical != target.snapshots
+
+        self.dirty_windows.clear();
+        self.removed_windows.clear();
+        if self.manager_count() == 0 {
+            self.canonical = target.snapshots;
+            self.canonical_eligible_ids = target.eligible_ids;
+            self.canonical_total = target.total;
+            self.initialize_pending_managers(display, self.revision);
+            return self.noop_summary();
+        }
+
+        if self.target_differs(&target) {
+            self.start_transaction(target);
+            self.process_transaction(display)
+        } else {
+            self.initialize_pending_managers(display, self.revision);
+            self.noop_summary()
+        }
+    }
+
+    fn apply_dirty_snapshots(
+        &self,
+        mut target: AstreaToplevelCollection,
+        dirty_snapshots: BTreeMap<WindowId, Option<AstreaToplevelSnapshot>>,
+    ) -> AstreaToplevelCollection {
+        for (window_id, snapshot) in dirty_snapshots {
+            match snapshot {
+                Some(snapshot) => {
+                    target.eligible_ids.insert(window_id);
+                    target.snapshots.insert(window_id, snapshot);
+                    if target.snapshots.len() > MAX_ASTREA_TOPLEVELS_PER_MANAGER
+                        && let Some(largest) = target.snapshots.keys().next_back().copied()
+                    {
+                        target.snapshots.remove(&largest);
+                    }
+                }
+                None => {
+                    target.eligible_ids.remove(&window_id);
+                    target.snapshots.remove(&window_id);
+                }
+            }
+        }
+        target.total = target.eligible_ids.len().min(u32::MAX as usize) as u32;
+        target
+    }
+
+    fn queue_follow_up(
+        &mut self,
+        collection: Option<AstreaToplevelCollection>,
+        dirty_snapshots: BTreeMap<WindowId, Option<AstreaToplevelSnapshot>>,
+    ) {
+        if let Some(collection) = collection {
+            self.next_collection = Some(collection);
+            self.next_structure_dirty = true;
+        }
+        for (window_id, snapshot) in dirty_snapshots {
+            if self.next_dirty_snapshots.len() < MAX_ASTREA_TOPLEVEL_DIRTY_WINDOWS
+                || self.next_dirty_snapshots.contains_key(&window_id)
+            {
+                self.next_dirty_snapshots.insert(window_id, snapshot);
+            } else {
+                self.next_structure_dirty = true;
+            }
+        }
+    }
+
+    fn target_differs(&self, target: &AstreaToplevelCollection) -> bool {
+        self.canonical != target.snapshots
             || self.canonical_eligible_ids != target.eligible_ids
-            || self.canonical_total != target.total;
-        if !target_changed {
-            self.pending_collection = None;
-            self.pending_ids.clear();
-            return self.noop_summary();
-        }
+            || self.canonical_total != target.total
+    }
 
-        let process_ids = self.next_publication_ids();
-        let final_batch = process_ids.len() >= self.pending_ids.len();
-        let budget_exhausted = !final_batch;
-        if process_ids.is_empty() && !target_changed {
-            return self.noop_summary();
-        }
-
+    fn start_transaction(&mut self, target: AstreaToplevelCollection) {
         self.revision = self.revision.wrapping_add(1);
         let revision = self.revision;
+        let remaining_ids = self.diff_ids(&target);
+        self.transaction = Some(AstreaToplevelPublicationTransaction {
+            revision,
+            target,
+            remaining_ids,
+        });
+    }
+
+    fn process_transaction(&mut self, display: &DisplayHandle) -> AstreaToplevelPublicationSummary {
+        let Some(transaction) = self.transaction.as_ref() else {
+            return self.noop_summary();
+        };
+        let revision = transaction.revision;
+        let target = transaction.target.clone();
+        let process_ids = self.next_publication_ids();
+        let final_batch = process_ids.len() >= transaction.remaining_ids.len();
+        let old_canonical = self.canonical.clone();
         let mut summary = AstreaToplevelPublicationSummary {
             revision,
             manager_count: self.manager_count(),
@@ -655,25 +893,28 @@ impl AstreaToplevelPublisher {
             final_batch,
         };
         self.publish_delta(batch, &mut summary);
-
-        for window_id in process_ids {
-            if let Some(snapshot) = target.snapshots.get(&window_id) {
-                self.canonical.insert(window_id, snapshot.clone());
-            } else {
-                self.canonical.remove(&window_id);
+        if let Some(transaction) = self.transaction.as_mut() {
+            for window_id in process_ids {
+                transaction.remaining_ids.remove(&window_id);
             }
-            self.pending_ids.remove(&window_id);
         }
-        if self.pending_ids.is_empty() {
-            self.canonical_eligible_ids = target.eligible_ids.clone();
+        let finished = self
+            .transaction
+            .as_ref()
+            .is_some_and(|transaction| transaction.remaining_ids.is_empty());
+        if finished {
+            self.canonical = target.snapshots;
+            self.canonical_eligible_ids = target.eligible_ids;
             self.canonical_total = target.total;
-            self.pending_collection = None;
-        }
-        if budget_exhausted {
+            self.transaction = None;
+            self.initialize_pending_managers(display, revision);
+        } else {
             self.metrics.publication_budget_exhaustions = self
                 .metrics
                 .publication_budget_exhaustions
                 .saturating_add(1);
+            self.metrics.publication_continuations =
+                self.metrics.publication_continuations.saturating_add(1);
             summary.budget_exhausted = true;
         }
         self.metrics.batches_published = self.metrics.batches_published.saturating_add(1);
@@ -708,22 +949,20 @@ impl AstreaToplevelPublisher {
     }
 
     fn next_publication_ids(&self) -> Vec<WindowId> {
-        let mut ids = self
-            .pending_ids
+        let Some(transaction) = self.transaction.as_ref() else {
+            return Vec::new();
+        };
+        let mut ids = transaction
+            .remaining_ids
             .iter()
             .copied()
-            .filter(|window_id| {
-                !self
-                    .pending_collection
-                    .as_ref()
-                    .is_some_and(|target| target.snapshots.contains_key(window_id))
-            })
+            .filter(|window_id| !transaction.target.snapshots.contains_key(window_id))
             .take(MAX_ASTREA_TOPLEVEL_UPDATES_PER_CYCLE)
             .collect::<Vec<_>>();
         if ids.len() < MAX_ASTREA_TOPLEVEL_UPDATES_PER_CYCLE {
             let remaining = MAX_ASTREA_TOPLEVEL_UPDATES_PER_CYCLE.saturating_sub(ids.len());
-            let extra = self
-                .pending_ids
+            let extra = transaction
+                .remaining_ids
                 .iter()
                 .copied()
                 .filter(|window_id| !ids.contains(window_id))
@@ -740,8 +979,14 @@ impl AstreaToplevelPublisher {
         summary: &mut AstreaToplevelPublicationSummary,
     ) {
         let new_truncated = batch.target.total as usize > MAX_ASTREA_TOPLEVELS_PER_MANAGER;
-        let prefix_changed = batch.old_canonical.keys().ne(batch.target.snapshots.keys());
-        let manager_ids = self.managers.keys().cloned().collect::<Vec<_>>();
+        let mut manager_ids = self
+            .managers
+            .iter()
+            .filter_map(|(manager_id, binding)| {
+                (binding.lifecycle == AstreaManagerLifecycle::Active).then_some(manager_id.clone())
+            })
+            .collect::<Vec<_>>();
+        manager_ids.sort_by_key(ObjectId::protocol_id);
         for manager_id in manager_ids {
             let Some(mut binding) = self.managers.remove(&manager_id) else {
                 continue;
@@ -750,6 +995,7 @@ impl AstreaToplevelPublisher {
             let mut manager_updated = 0usize;
             let mut manager_closed = 0usize;
             let mut failed = false;
+            let mut failure_reason = None;
             for window_id in batch.process_ids {
                 let Some(snapshot) = batch.target.snapshots.get(window_id) else {
                     let reason = if batch.target.eligible_ids.contains(window_id) {
@@ -799,36 +1045,36 @@ impl AstreaToplevelPublisher {
                         self.metrics.incremental_updates_published =
                             self.metrics.incremental_updates_published.saturating_add(1);
                     }
-                } else if self
-                    .create_handle(
+                } else {
+                    match self.create_handle(
                         batch.display,
                         &mut binding,
                         snapshot.clone(),
                         batch.revision,
-                    )
-                    .is_ok()
-                {
-                    manager_added = manager_added.saturating_add(1);
-                    summary.added = summary.added.saturating_add(1);
-                } else {
-                    self.metrics.resource_creation_failures =
-                        self.metrics.resource_creation_failures.saturating_add(1);
-                    failed = true;
-                    break;
+                    ) {
+                        Ok(()) => {
+                            manager_added = manager_added.saturating_add(1);
+                            summary.added = summary.added.saturating_add(1);
+                        }
+                        Err(error) => {
+                            self.metrics.resource_creation_failures =
+                                self.metrics.resource_creation_failures.saturating_add(1);
+                            failed = true;
+                            failure_reason = Some(error.failure_reason());
+                            break;
+                        }
+                    }
                 }
             }
             if failed {
-                self.fail_binding(binding);
+                self.fail_binding(
+                    binding,
+                    failure_reason
+                        .unwrap_or(astrea_toplevel_manager_v1::FailureReason::PublicationFailure),
+                );
                 continue;
             }
-            let manager_changed = manager_added != 0
-                || manager_updated != 0
-                || manager_closed != 0
-                || (batch.final_batch
-                    && (binding.last_total != batch.target.total
-                        || binding.last_truncated != new_truncated
-                        || prefix_changed));
-            if manager_changed && batch.final_batch {
+            if batch.final_batch {
                 if send_manager_done(
                     &binding.resource,
                     batch.revision,
@@ -837,11 +1083,15 @@ impl AstreaToplevelPublisher {
                 )
                 .is_err()
                 {
-                    self.fail_binding(binding);
+                    self.fail_binding(
+                        binding,
+                        astrea_toplevel_manager_v1::FailureReason::PublicationFailure,
+                    );
                     continue;
                 }
                 binding.last_total = batch.target.total;
                 binding.last_truncated = new_truncated;
+                binding.last_revision = batch.revision;
             }
             if new_truncated {
                 summary.truncated_manager_count = summary.truncated_manager_count.saturating_add(1);
@@ -850,21 +1100,33 @@ impl AstreaToplevelPublisher {
         }
     }
 
-    fn fail_manager(&mut self, manager_id: &ObjectId) {
+    fn fail_manager(
+        &mut self,
+        manager_id: &ObjectId,
+        reason: astrea_toplevel_manager_v1::FailureReason,
+    ) {
         let Some(binding) = self.managers.remove(manager_id) else {
             return;
         };
-        self.fail_binding(binding);
+        self.fail_binding(binding, reason);
     }
 
     pub(in crate::compositor) fn fail_all_managers(&mut self) {
-        let manager_ids = self.managers.keys().cloned().collect::<Vec<_>>();
+        let mut manager_ids = self.managers.keys().cloned().collect::<Vec<_>>();
+        manager_ids.sort_by_key(ObjectId::protocol_id);
         for manager_id in manager_ids {
-            self.fail_manager(&manager_id);
+            self.fail_manager(
+                &manager_id,
+                astrea_toplevel_manager_v1::FailureReason::PublicationFailure,
+            );
         }
     }
 
-    fn fail_binding(&mut self, mut binding: AstreaToplevelManagerBinding) {
+    fn fail_binding(
+        &mut self,
+        mut binding: AstreaToplevelManagerBinding,
+        reason: astrea_toplevel_manager_v1::FailureReason,
+    ) {
         let manager_id = binding.resource.id();
         let window_ids = binding.active_handles.keys().copied().collect::<Vec<_>>();
         for window_id in window_ids {
@@ -876,22 +1138,34 @@ impl AstreaToplevelPublisher {
         }
         self.metrics.manager_publication_failures =
             self.metrics.manager_publication_failures.saturating_add(1);
-        if binding.resource.is_alive()
-            && self.pending_manager_failures.len() < MAX_ASTREA_TOPLEVEL_MANAGERS
-        {
-            self.pending_manager_failures
-                .push((binding.client, binding.resource));
+        if binding.resource.is_alive() {
+            let result = binding
+                .resource
+                .send_event(astrea_toplevel_manager_v1::Event::Failed {
+                    reason: WEnum::Value(reason),
+                });
+            if result.is_ok() {
+                self.metrics.manager_failed_events =
+                    self.metrics.manager_failed_events.saturating_add(1);
+            } else {
+                self.metrics.failed_event_delivery_failures = self
+                    .metrics
+                    .failed_event_delivery_failures
+                    .saturating_add(1);
+            }
+            self.terminal_managers.insert(
+                manager_id.clone(),
+                TerminalAstreaToplevelManager {
+                    resource: binding.resource,
+                    client_id: binding.client_id,
+                },
+            );
         }
+        self.refresh_resource_metrics();
         debug_assert!(
             !self.managers.contains_key(&manager_id),
             "failed manager must be removed from active publication"
         );
-    }
-
-    pub(in crate::compositor) fn take_manager_failures(
-        &mut self,
-    ) -> Vec<(Client, astrea_toplevel_manager_v1::AstreaToplevelManagerV1)> {
-        std::mem::take(&mut self.pending_manager_failures)
     }
 
     pub(in crate::compositor) fn remove_manager(
@@ -899,30 +1173,39 @@ impl AstreaToplevelPublisher {
         client_id: &ClientId,
         manager_id: &ObjectId,
     ) {
-        let Some(mut binding) = self.managers.remove(manager_id) else {
-            return;
-        };
-        if binding.client_id != *client_id {
-            self.managers.insert(manager_id.clone(), binding);
-            return;
-        }
-        let window_ids = binding.active_handles.keys().copied().collect::<Vec<_>>();
-        for window_id in window_ids {
-            if self
-                .close_active_handle(
-                    &mut binding,
-                    window_id,
-                    HandleCloseReason::ManagerDestruction,
-                )
-                .is_ok_and(|closed| closed)
-            {
-                self.metrics.handles_closed_by_manager_destruction = self
-                    .metrics
-                    .handles_closed_by_manager_destruction
-                    .saturating_add(1);
+        if let Some(mut binding) = self.managers.remove(manager_id) {
+            if binding.client_id != *client_id {
+                self.managers.insert(manager_id.clone(), binding);
+                return;
             }
+            let window_ids = binding.active_handles.keys().copied().collect::<Vec<_>>();
+            for window_id in window_ids {
+                if self
+                    .close_active_handle(
+                        &mut binding,
+                        window_id,
+                        HandleCloseReason::ManagerDestruction,
+                    )
+                    .is_ok_and(|closed| closed)
+                {
+                    self.metrics.handles_closed_by_manager_destruction = self
+                        .metrics
+                        .handles_closed_by_manager_destruction
+                        .saturating_add(1);
+                }
+            }
+            self.metrics.dead_resources_pruned =
+                self.metrics.dead_resources_pruned.saturating_add(1);
+            self.refresh_resource_metrics();
+            return;
         }
-        self.metrics.dead_resources_pruned = self.metrics.dead_resources_pruned.saturating_add(1);
+        if self
+            .terminal_managers
+            .get(manager_id)
+            .is_some_and(|binding| binding.client_id == *client_id)
+        {
+            self.terminal_managers.remove(manager_id);
+        }
         self.refresh_resource_metrics();
     }
 
@@ -964,15 +1247,15 @@ impl AstreaToplevelPublisher {
     }
 
     pub(in crate::compositor) fn remove_client(&mut self, client_id: &ClientId) {
-        let before_managers = self.managers.len();
+        let before_managers = self.manager_count_for_client(client_id);
         self.managers
+            .retain(|_, binding| binding.client_id != *client_id);
+        self.terminal_managers
             .retain(|_, binding| binding.client_id != *client_id);
         self.retired_handles
             .retain(|_, handle| handle.client_id != *client_id);
-        self.pending_manager_failures
-            .retain(|(client, _)| client.id() != *client_id);
         self.refresh_resource_metrics();
-        let removed = before_managers.saturating_sub(self.managers.len());
+        let removed = before_managers.saturating_sub(self.manager_count_for_client(client_id));
         if removed != 0 {
             self.metrics.client_disconnect_cleanups = self
                 .metrics
@@ -981,7 +1264,7 @@ impl AstreaToplevelPublisher {
         }
     }
 
-    fn prune_dead_resources(&mut self) {
+    pub(in crate::compositor) fn prune_dead_resources(&mut self) {
         let before_retired = self.retired_handles.len();
         self.retired_handles
             .retain(|_, handle| handle.resource.is_alive());
@@ -989,6 +1272,13 @@ impl AstreaToplevelPublisher {
             .metrics
             .retired_handles_destroyed
             .saturating_add((before_retired - self.retired_handles.len()) as u64);
+        let before_terminal = self.terminal_managers.len();
+        self.terminal_managers
+            .retain(|_, manager| manager.resource.is_alive());
+        self.metrics.dead_resources_pruned = self
+            .metrics
+            .dead_resources_pruned
+            .saturating_add((before_terminal - self.terminal_managers.len()) as u64);
         let manager_ids = self.managers.keys().cloned().collect::<Vec<_>>();
         for manager_id in manager_ids {
             let Some(mut binding) = self.managers.remove(&manager_id) else {
@@ -1177,187 +1467,6 @@ pub(crate) const fn join_u64(high: u32, low: u32) -> u64 {
     ((high as u64) << 32) | low as u64
 }
 
-impl CompositorState {
-    pub(in crate::compositor) fn collect_astrea_toplevels(
-        &self,
-    ) -> Result<AstreaToplevelCollection, ()> {
-        let mut snapshots = BTreeMap::new();
-        let mut eligible_ids = BTreeSet::new();
-        let mut total = 0u32;
-        for window_id in self.desktop_windows.keys().copied() {
-            let Some(snapshot) = self.astrea_toplevel_snapshot(window_id) else {
-                continue;
-            };
-            if eligible_ids.len() >= MAX_ASTREA_ELIGIBLE_WINDOWS {
-                return Err(());
-            }
-            eligible_ids.insert(window_id);
-            total = total.saturating_add(1);
-            snapshots.insert(window_id, snapshot);
-            if snapshots.len() > MAX_ASTREA_TOPLEVELS_PER_MANAGER {
-                let largest = snapshots.keys().next_back().copied();
-                if let Some(largest) = largest {
-                    snapshots.remove(&largest);
-                }
-            }
-        }
-        Ok(AstreaToplevelCollection {
-            snapshots,
-            eligible_ids,
-            total,
-        })
-    }
-
-    pub(in crate::compositor) fn astrea_toplevel_snapshot(
-        &self,
-        window_id: WindowId,
-    ) -> Option<AstreaToplevelSnapshot> {
-        let window = self.desktop_windows.get(&window_id)?;
-        let (kind, eligible) = match window.backend {
-            WindowBackend::Xdg(handle) => {
-                let lifecycle = self.xdg_surface_lifecycle(handle.root_surface_id())?;
-                (
-                    AstreaToplevelKind::XdgToplevel,
-                    self.toplevel_surfaces
-                        .contains_key(&handle.root_surface_id())
-                        && lifecycle.currently_mapped,
-                )
-            }
-            WindowBackend::X11(_) => (
-                match window.x11_role {
-                    Some(X11DesktopRole::Toplevel) => AstreaToplevelKind::X11Toplevel,
-                    Some(X11DesktopRole::Dialog) => AstreaToplevelKind::X11Dialog,
-                    _ => return None,
-                },
-                window.kind == DesktopWindowKind::Managed
-                    && window
-                        .x11_surface_id
-                        .and_then(|surface_id| self.surface_resource_by_id(surface_id))
-                        .is_some(),
-            ),
-        };
-        eligible.then(|| {
-            let mut states = AstreaToplevelStates::default();
-            if self.focused_window_id == Some(window_id) {
-                states = states.union(AstreaToplevelStates::ACTIVE);
-            }
-            if window.state.is_minimized() {
-                states = states.union(AstreaToplevelStates::MINIMIZED);
-            }
-            match window.state.mode() {
-                super::window_state::ToplevelMode::Floating => {}
-                super::window_state::ToplevelMode::Maximized => {
-                    states = states.union(AstreaToplevelStates::MAXIMIZED);
-                }
-                super::window_state::ToplevelMode::Fullscreen => {
-                    states = states.union(AstreaToplevelStates::FULLSCREEN);
-                }
-            }
-            AstreaToplevelSnapshot::bounded(
-                window.id,
-                window.metadata.app_id.as_deref(),
-                window.metadata.title.as_deref(),
-                window.metadata.pid,
-                kind,
-                states,
-                window.last_focus_serial,
-            )
-        })
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::num::NonZeroU64;
-
-    fn id(value: u64) -> WindowId {
-        WindowId::new(NonZeroU64::new(value).expect("nonzero test id"))
-    }
-
-    #[test]
-    fn revision_split_join_round_trips_boundaries() {
-        for value in [0, 1, u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX] {
-            let (high, low) = split_u64(value);
-            assert_eq!(join_u64(high, low), value);
-        }
-    }
-
-    #[test]
-    fn snapshot_strings_are_bounded_at_utf8_boundaries() {
-        let snapshot = AstreaToplevelSnapshot::bounded(
-            id(1),
-            Some(&"é".repeat(MAX_ASTREA_TOPLEVEL_APP_ID_BYTES)),
-            Some(&"😀".repeat(MAX_ASTREA_TOPLEVEL_TITLE_BYTES)),
-            None,
-            AstreaToplevelKind::XdgToplevel,
-            AstreaToplevelStates::default(),
-            0,
-        );
-        assert!(snapshot.app_id.len() <= MAX_ASTREA_TOPLEVEL_APP_ID_BYTES);
-        assert!(snapshot.title.len() <= MAX_ASTREA_TOPLEVEL_TITLE_BYTES);
-        assert!(snapshot.app_id.is_char_boundary(snapshot.app_id.len()));
-        assert!(snapshot.title.is_char_boundary(snapshot.title.len()));
-    }
-
-    #[test]
-    fn collection_keeps_the_lowest_bounded_prefix() {
-        let mut collection = AstreaToplevelCollection::default();
-        for value in (1..=MAX_ASTREA_TOPLEVELS_PER_MANAGER + 2).rev() {
-            collection.total = collection.total.saturating_add(1);
-            collection.eligible_ids.insert(id(value as u64));
-            collection.snapshots.insert(
-                id(value as u64),
-                AstreaToplevelSnapshot::bounded(
-                    id(value as u64),
-                    None,
-                    None,
-                    None,
-                    AstreaToplevelKind::XdgToplevel,
-                    AstreaToplevelStates::default(),
-                    0,
-                ),
-            );
-            if collection.snapshots.len() > MAX_ASTREA_TOPLEVELS_PER_MANAGER {
-                let largest = collection.snapshots.keys().next_back().copied().unwrap();
-                collection.snapshots.remove(&largest);
-            }
-        }
-        assert_eq!(
-            collection.total,
-            (MAX_ASTREA_TOPLEVELS_PER_MANAGER + 2) as u32
-        );
-        assert_eq!(collection.snapshots.len(), MAX_ASTREA_TOPLEVELS_PER_MANAGER);
-        assert_eq!(
-            collection.eligible_ids.len(),
-            MAX_ASTREA_TOPLEVELS_PER_MANAGER + 2
-        );
-        assert_eq!(collection.snapshots.keys().next().unwrap().get(), 1);
-        assert_eq!(
-            collection.snapshots.keys().next_back().unwrap().get(),
-            MAX_ASTREA_TOPLEVELS_PER_MANAGER as u64
-        );
-    }
-
-    #[test]
-    fn dirty_windows_are_coalesced_and_bounded() {
-        let mut publisher = AstreaToplevelPublisher::default();
-        publisher.mark_window_dirty(id(1));
-        publisher.mark_window_dirty(id(1));
-        publisher.mark_window_dirty(id(2));
-
-        assert_eq!(publisher.dirty_window_ids(), vec![id(1), id(2)]);
-        assert_eq!(publisher.metrics.dirty_windows_queued, 2);
-        assert_eq!(publisher.metrics.dirty_updates_coalesced, 1);
-    }
-
-    #[test]
-    fn first_reconciliation_is_the_only_unprompted_full_scan() {
-        let mut publisher = AstreaToplevelPublisher::default();
-        assert!(publisher.needs_full_reconciliation());
-        publisher.initial_reconciliation_pending = false;
-        assert!(!publisher.needs_full_reconciliation());
-        publisher.mark_window_dirty(id(1));
-        assert!(!publisher.needs_full_reconciliation());
-    }
-}
+#[path = "toplevel_publication_tests.rs"]
+mod tests;

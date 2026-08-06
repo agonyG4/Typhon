@@ -12,28 +12,13 @@ fn shell_command(script: &str) -> Command {
 
 #[test]
 fn sigchld_reaper_blocks_sigchld_in_the_bootstrap_thread() {
-    let mut previous = unsafe {
-        // SAFETY: a zeroed `sigset_t` is valid storage for the signal-mask
-        // query below.
-        std::mem::zeroed::<libc::sigset_t>()
-    };
-    let query_result = unsafe {
-        // SAFETY: a null new-mask pointer queries the current thread's signal
-        // mask into the valid `previous` storage.
-        libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut previous)
-    };
-    assert_eq!(query_result, 0);
-
+    // Keep every test thread in this binary blocked before any sibling test
+    // can launch a child. This prevents a process-directed SIGCHLD from being
+    // consumed by an unrelated unblocked harness thread.
+    block_sigchld_for_current_thread().unwrap();
     let supervisor = ChildSupervisor::with_sigchld_reaper().unwrap();
     assert!(sigchld_is_blocked_for_current_thread().unwrap());
     assert!(supervisor.signal_fd().is_some());
-
-    let restore_result = unsafe {
-        // SAFETY: `previous` was populated by the earlier query and is a
-        // valid signal set for restoring this test thread's mask.
-        libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut())
-    };
-    assert_eq!(restore_result, 0);
 }
 
 #[test]

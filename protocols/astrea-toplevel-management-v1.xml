@@ -7,13 +7,21 @@
   <interface name="astrea_toplevel_manager_v1" version="1">
     <description summary="authoritative read-only Astrea toplevel list">
       This private protocol publishes compositor-managed application toplevels.
-      Version 1 has no window mutation requests.
+      Version 1 has no window mutation requests. Handle events are grouped into
+      bounded runtime cycles but share one revision, and manager done is the
+      atomic completion boundary. A failed manager is terminal and does not
+      disconnect other managers owned by the same client.
     </description>
 
     <enum name="error">
       <entry name="unauthorized" value="0"/>
       <entry name="manager_limit" value="1"/>
       <entry name="resource_limit" value="2"/>
+    </enum>
+
+    <enum name="failure_reason">
+      <entry name="resource_limit" value="0"/>
+      <entry name="publication_failure" value="1"/>
     </enum>
 
     <enum name="done_flags" bitfield="true">
@@ -31,6 +39,15 @@
       <arg name="revision_lo" type="uint"/>
       <arg name="total" type="uint"/>
       <arg name="flags" type="uint" enum="done_flags"/>
+    </event>
+
+    <event name="failed">
+      <description summary="terminal manager publication failure">
+        The manager is terminal and receives no further events. This is a
+        client-local failure and does not invalidate other managers owned by
+        the same client.
+      </description>
+      <arg name="reason" type="uint" enum="failure_reason"/>
     </event>
   </interface>
 

@@ -13,7 +13,6 @@ impl GlobalDispatch<astrea_toplevel_manager_v1::AstreaToplevelManagerV1, ()> for
         data_init: &mut DataInit<'_, Self>,
     ) {
         let manager = data_init.init(resource, ());
-        let manager_for_error = manager.clone();
         if !state.astrea_toplevel_client_allowed(client, handle) {
             state
                 .astrea_toplevel_publisher
@@ -31,6 +30,7 @@ impl GlobalDispatch<astrea_toplevel_manager_v1::AstreaToplevelManagerV1, ()> for
             );
             return;
         }
+        state.astrea_toplevel_publisher.prune_dead_resources();
         let client_id = client.id();
         let manager_limit = state.astrea_toplevel_publisher.manager_count()
             >= MAX_ASTREA_TOPLEVEL_MANAGERS
@@ -69,7 +69,7 @@ impl GlobalDispatch<astrea_toplevel_manager_v1::AstreaToplevelManagerV1, ()> for
                     .saturating_add(1);
                 state.post_protocol_error(
                     client,
-                    &manager_for_error,
+                    &manager,
                     astrea_toplevel_manager_v1::Error::ResourceLimit,
                     "Astrea toplevel eligibility limit exceeded",
                 );
@@ -101,10 +101,10 @@ impl GlobalDispatch<astrea_toplevel_manager_v1::AstreaToplevelManagerV1, ()> for
             Some(collection.clone()),
             BTreeMap::new(),
         );
-        state.report_astrea_toplevel_failures();
+        let admission_collection = state.astrea_toplevel_publisher.admission_collection();
         if !state
             .astrea_toplevel_publisher
-            .can_allocate_manager(&client_id, collection.snapshots.len())
+            .can_allocate_manager(&client_id, admission_collection.snapshots.len())
         {
             state
                 .astrea_toplevel_publisher
@@ -124,16 +124,12 @@ impl GlobalDispatch<astrea_toplevel_manager_v1::AstreaToplevelManagerV1, ()> for
         }
         if state
             .astrea_toplevel_publisher
-            .bind_manager(handle, manager, client.clone(), &collection)
+            .bind_manager(handle, manager, client.clone(), &admission_collection)
             .is_err()
         {
-            state.report_astrea_toplevel_failures();
-            state.post_protocol_error(
-                client,
-                &manager_for_error,
-                astrea_toplevel_manager_v1::Error::ResourceLimit,
-                "unable to create Astrea toplevel resources",
-            );
+            // Admission failures are reported before binding. Once the
+            // manager resource has been admitted, publication failures are
+            // terminally isolated to that manager through `failed`.
         }
     }
 }

@@ -94,6 +94,9 @@ impl Dispatch<client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1, ()>
                     .manager_dones
                     .push((revision_hi, revision_lo, total, flags.into()));
             }
+            client_astrea_toplevel_manager_v1::Event::Failed { .. } => {
+                state.events.push("manager_failed");
+            }
         }
     }
 

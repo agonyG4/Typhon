@@ -213,9 +213,17 @@ impl NativeRuntime {
     }
 
     fn arm_suspended_deadline(&mut self) -> NativeResult<()> {
+        let publication_deadline = self
+            .server
+            .has_pending_astrea_toplevel_publication()
+            .then(monotonic_now_ns)
+            .transpose()?;
         self.event_loop.arm_deadline(earliest_native_deadline(
-            self.shutdown.suspended_reactor_deadline_ns(),
-            self.control_server.next_deadline_ns(),
+            earliest_native_deadline(
+                self.shutdown.suspended_reactor_deadline_ns(),
+                self.control_server.next_deadline_ns(),
+            ),
+            publication_deadline,
         ))?;
         Ok(())
     }
@@ -353,7 +361,9 @@ impl NativeRuntime {
             self,
             NativeSuspendedReadiness {
                 wayland: cycle.wakeup.reasons.wayland_listener()
-                    || cycle.wakeup.reasons.wayland_clients(),
+                    || cycle.wakeup.reasons.wayland_clients()
+                    || (cycle.wakeup.reasons.timer()
+                        && self.server.has_pending_astrea_toplevel_publication()),
                 input: cycle.wakeup.reasons.input(),
                 drm: cycle.wakeup.reasons.drm(),
                 timer: cycle.wakeup.reasons.timer(),

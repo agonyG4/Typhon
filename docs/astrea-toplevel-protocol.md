@@ -40,11 +40,25 @@ The manager then receives one `done` event. This is the explicit initial-list
 completion boundary; clients must not use a display roundtrip as the semantic
 boundary.
 
-Every later reconciliation that changes the visible publication emits one
-manager revision. All changed handle events, including additions and
-terminal `closed` events, precede that manager `done`. Metadata storms are
-coalesced to the authoritative state at the next publication point. A
-reconciliation with no visible change emits no manager `done`.
+If a manager cannot be kept synchronized after admission, it receives one
+terminal `failed` event with `resource_limit` or `publication_failure`. Its
+children are closed before that event when possible, and no `toplevel` or
+`done` event follows. The client connection and any other manager remain
+usable. Bind-time authorization and quota violations are still fatal protocol
+errors because they are client admission violations.
+
+Every later publication is one explicit transaction. A transaction may be
+processed in several bounded runtime cycles, but it receives exactly one
+revision. At most 256 windows are processed in one cycle. All handle events,
+including additions and terminal `closed` events, precede one matching manager
+`done` for that revision. Clients must buffer handle changes until that manager
+`done` arrives; the manager `done` is the atomic publication boundary.
+Metadata storms are coalesced to the authoritative state at the next
+publication point. A no-op publication emits no manager `done`.
+
+State changes observed while a transaction is active are queued for a later
+transaction. The current target remains frozen until its manager completions
+have been sent and the canonical snapshot is committed.
 
 Revisions and focus serials are unsigned 64-bit values encoded as high and
 low 32-bit event arguments. Wayland event order remains authoritative when a
@@ -113,13 +127,16 @@ surface is not eligible.
 ## Limits and truncation
 
 The protocol publisher retains bounded owned snapshots only. It supports at
-most 32 active manager bindings, four active managers per client, 4096 active
-child handles per client, 16384 active child handles globally, and 4096
+most 32 active, pending-initial or terminal manager bindings in total, four
+such managers per client, 4096 active child handles per client, 16384 active
+child handles globally, and 4096
 handles in one manager's deterministic window prefix. Retired resources have
 separate hard limits of 8192 per client and 32768 globally. Admission also
 reserves space for active resources to become retired, so later destruction
 cannot exceed the retired-resource budget. Outstanding resources include live
 handles and closed handles whose client has not yet destroyed the resource.
+Terminal managers use the same four-per-client and 32-total bounds. Destroying
+a terminal manager or disconnecting its client releases the manager slot.
 Destroying a manager restores its active-manager slot, but does not restore
 child-handle quota while its closed child resources remain alive.
 
@@ -149,12 +166,24 @@ remains bounded if they delay destruction. Client disconnect removes all live
 and retired resources owned by that exact `ClientId` and releases its quota
 idempotently.
 
-If initial resource creation or a later event send fails, the affected manager
-is removed from healthy publication, all of its live children are terminally
-retired, and a bounded `resource_limit` protocol error is posted when the
-manager is still usable. Other manager bindings continue independently. There
-is no healthy-manager state in which the canonical prefix contains a window
-but the manager has silently missed its handle.
+If initial resource creation or a later event send fails after manager
+admission, the affected manager is removed from healthy publication, all of
+its live children are terminally retired, and the manager receives one
+terminal `failed` event when delivery is possible. The failure is client-local:
+it does not post a fatal protocol error and does not disconnect another manager
+or another protocol owned by the same Wayland client. A failed manager remains
+tracked until the client destroys it. Bind-time authorization, manager-limit
+and known resource-limit violations remain protocol errors.
+
+A manager that binds while a transaction is active is admitted as a bounded
+pending-initial manager. It receives no partial state. After the transaction
+commits, it is enumerated from the committed canonical snapshot and receives
+one complete initial `done`. Pending managers count toward manager and handle
+limits; their bounded initial handle reservation is made before admission.
+
+The publisher schedules a native continuation wake whenever a transaction has
+remaining IDs, including while the session is suspended. It does not depend on
+pointer activity, rendering damage or another client request.
 
 ## Publication ownership
 
