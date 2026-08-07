@@ -53,6 +53,7 @@ Core/XDG request matrix, but they must remain synchronized with
 | `wl_drm` | 2 | Partial |
 | `xdg_activation_v1` | 1 | Partial |
 | `astrea_shortcuts_manager_v1` | 1 | Partial |
+| `astrea_shell_auth_manager_v1` | 1 | Partial |
 | `astrea_shell_control_manager_v1` | 1 | Partial |
 | `astrea_toplevel_manager_v1` | 1 | Partial |
 | `xdg_wm_base` | 6 | Implemented |

@@ -86,6 +86,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_surface_v1 as client_zwlr_layer_surface_v1,
 };
 
+use crate::astrea_shell_auth::client::astrea_shell_auth_manager_v1 as client_astrea_shell_auth_manager_v1;
 use crate::astrea_shortcuts::client::{
     astrea_shortcut_v1 as client_astrea_shortcut_v1,
     astrea_shortcuts_manager_v1 as client_astrea_shortcuts_manager_v1,
@@ -106,6 +107,8 @@ use support::server_runtime::*;
 use support::subsurface_client::*;
 use support::window_ops::*;
 
+mod astrea_shell_auth;
+mod astrea_shell_capability;
 mod astrea_shortcuts;
 mod data_device;
 mod direct_scanout;

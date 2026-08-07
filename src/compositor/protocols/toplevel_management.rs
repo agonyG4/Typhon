@@ -26,7 +26,7 @@ impl GlobalDispatch<astrea_toplevel_manager_v1::AstreaToplevelManagerV1, ()> for
                 client,
                 &manager,
                 astrea_toplevel_manager_v1::Error::Unauthorized,
-                "client is not an authorized Astrea shell descendant",
+                "client is not an authorized Astrea shell client",
             );
             return;
         }

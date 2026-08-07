@@ -47,7 +47,7 @@ impl Dispatch<astrea_shell_control_manager_v1::AstreaShellControlManagerV1, ()>
                         client,
                         resource,
                         astrea_shell_control_manager_v1::Error::Unauthorized,
-                        "client is not an authorized Astrea shell descendant".to_string(),
+                        "client is not an authorized Astrea shell client".to_string(),
                     );
                     return;
                 }
@@ -69,7 +69,7 @@ impl Dispatch<astrea_shell_control_manager_v1::AstreaShellControlManagerV1, ()>
                         client,
                         resource,
                         astrea_shell_control_manager_v1::Error::Unauthorized,
-                        "client is not an authorized Astrea shell descendant".to_string(),
+                        "client is not an authorized Astrea shell client".to_string(),
                     );
                     return;
                 }

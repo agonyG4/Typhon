@@ -13,13 +13,19 @@ protocol version.
 
 ## Authorization
 
-This is a private shell protocol. A manager bind requires both the peer UID to
-match Typhon's effective UID and the peer PID to be the currently supervised
-Astrea shell component or a verified descendant of one. The exact Wayland
-`ClientId` is cached after admission; authorization is not transferred to a
-later client merely because it reuses a PID, and it is removed on disconnect.
-Application IDs, titles, environment variables and claimed client metadata are
-never authorization inputs.
+This is a private shell protocol. A client may authenticate once through
+astrea_shell_auth_manager_v1 by presenting the opaque per-session capability
+from the protected Astrea runtime handoff. On success Typhon authorizes the
+exact Wayland ClientId for that connection; the grant is removed on
+disconnect. The peer UID is checked during authentication but UID alone never
+grants access.
+
+For the compositor-launched shell path, the currently supervised Astrea shell
+component and its verified descendants remain admitted without the capability.
+PID ancestry is an admission path only; it is not required after successful
+capability authentication, so systemd --user daemons can reconnect
+independently. Application IDs, titles, environment variables and claimed
+client metadata are never authorization inputs.
 
 The current Wayland backend does not provide a state-aware global filter to the
 compositor's publication model, so the global may remain visible to registry

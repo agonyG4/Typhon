@@ -1,4 +1,5 @@
 use super::*;
+use crate::astrea_shell_auth::server::astrea_shell_auth_manager_v1;
 
 pub(super) fn register_minimum_globals(
     display: &DisplayHandle,
@@ -107,6 +108,11 @@ pub(super) fn register_minimum_globals(
             versions::ASTREA_SHORTCUTS_MANAGER_V1,
             (),
         );
+    display.create_global::<
+        CompositorState,
+        astrea_shell_auth_manager_v1::AstreaShellAuthManagerV1,
+        _,
+    >(versions::ASTREA_SHELL_AUTH_MANAGER_V1, ());
     display.create_global::<
         CompositorState,
         astrea_shell_control_manager_v1::AstreaShellControlManagerV1,

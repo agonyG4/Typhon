@@ -30,6 +30,7 @@ use wayland_server::{
     },
 };
 
+use super::astrea_shell_capability::{AstreaShellCapability, AstreaShellCapabilityVerifier};
 use super::gpu_protocol_capabilities::GpuProtocolCapabilities;
 use super::protocols::versions;
 use crate::astrea_shell_control::server::astrea_shell_control_manager_v1;
@@ -71,6 +72,8 @@ pub struct OwnCompositorServer {
     pub(super) socket: ListeningSocket,
     pub(super) socket_name: String,
     pub(super) state: CompositorState,
+    #[allow(dead_code)]
+    astrea_shell_capability: Option<AstreaShellCapability>,
     disconnected_clients: Arc<Mutex<Vec<DisconnectedClient>>>,
     client_pids: Arc<Mutex<HashMap<ClientId, i32>>>,
     xwayland_global_data: XwaylandShellGlobalData,
@@ -261,6 +264,21 @@ impl OwnCompositorServer {
         renderer_capabilities: RendererProtocolCapabilities,
     ) -> Result<Self, CompositorError> {
         let socket_name = socket_name.into();
+        let astrea_shell_capability = {
+            #[cfg(test)]
+            {
+                let path = std::env::temp_dir().join(format!(
+                    ".oblivion-one-test-capability-{}-{}",
+                    std::process::id(),
+                    socket_name
+                ));
+                AstreaShellCapability::create_for_path(path)?
+            }
+            #[cfg(not(test))]
+            {
+                AstreaShellCapability::create_from_environment()?
+            }
+        };
         let display =
             Display::new().map_err(|error| CompositorError::DisplayInit(error.to_string()))?;
         #[cfg(test)]
@@ -303,6 +321,8 @@ impl OwnCompositorServer {
 
         let mut state = CompositorState::new(syncobj_device);
         state.set_gpu_protocol_capabilities(gpu_capabilities.clone());
+        let verifier: AstreaShellCapabilityVerifier = astrea_shell_capability.verifier();
+        state.set_astrea_shell_capability_verifier(verifier);
         state.set_typhon_socket_name(socket_name.clone());
         let disconnected_clients = Arc::new(Mutex::new(Vec::new()));
         let client_pids = Arc::new(Mutex::new(HashMap::new()));
@@ -311,6 +331,7 @@ impl OwnCompositorServer {
             socket,
             socket_name,
             state,
+            astrea_shell_capability: Some(astrea_shell_capability),
             disconnected_clients,
             client_pids,
             xwayland_global_data,

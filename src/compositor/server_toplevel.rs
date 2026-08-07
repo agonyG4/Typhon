@@ -62,6 +62,7 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn remove_astrea_toplevel_client(&mut self, client_id: &ClientId) {
+        self.astrea_shell_authenticated_clients.remove(client_id);
         self.astrea_toplevel_authorized_clients.remove(client_id);
         self.astrea_toplevel_publisher.remove_client(client_id);
     }

@@ -86,7 +86,7 @@ Wayland server bind
   → DRM device open
   → KMS target and mode selection
   → scanout/renderer initialization
-  → input and shell startup
+  → input, shell capability handoff, and shell startup
   → NativeRuntime event cycle
 ```
 

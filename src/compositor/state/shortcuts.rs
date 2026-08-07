@@ -141,16 +141,42 @@ const ASTREA_SHELL_PID_ANCESTOR_LIMIT: usize = 32;
 impl CompositorState {
     pub(in crate::compositor) fn authorize_astrea_shell_pid(&mut self, pid: u32) {
         self.astrea_shell_client_pids.insert(pid);
-        if let Some(uid) = proc_uid(pid) {
-            self.astrea_shell_client_uids.insert(uid);
-        }
     }
 
     #[cfg(test)]
     pub(in crate::compositor) fn clear_astrea_shell_authorization(&mut self) {
+        self.astrea_shell_authenticated_clients.clear();
         self.astrea_shell_client_pids.clear();
-        self.astrea_shell_client_uids.clear();
         self.astrea_toplevel_authorized_clients.clear();
+    }
+
+    pub(in crate::compositor) fn set_astrea_shell_capability_verifier(
+        &mut self,
+        verifier: astrea_shell_capability::AstreaShellCapabilityVerifier,
+    ) {
+        self.astrea_shell_capability_verifier = Some(verifier);
+    }
+
+    pub(in crate::compositor) fn authenticate_astrea_shell_client(
+        &mut self,
+        client: &Client,
+        handle: &DisplayHandle,
+        candidate: &str,
+    ) -> bool {
+        let Ok(credentials) = client.get_credentials(handle) else {
+            return false;
+        };
+        if credentials.uid != effective_uid() {
+            return false;
+        }
+        let Some(verifier) = self.astrea_shell_capability_verifier.as_ref() else {
+            return false;
+        };
+        if !verifier.matches(candidate) {
+            return false;
+        }
+        self.astrea_shell_authenticated_clients.insert(client.id());
+        true
     }
 
     pub(in crate::compositor) fn astrea_shortcut_registration_allowed(
@@ -162,21 +188,7 @@ impl CompositorState {
         if namespace != "astrea-shell" {
             return true;
         }
-        if std::env::var_os("OBLIVION_ONE_ASTREA_SHORTCUTS_ALLOW_ANY_CLIENT").is_some() {
-            return true;
-        }
-        let Ok(credentials) = client.get_credentials(handle) else {
-            return false;
-        };
-        let Ok(pid) = u32::try_from(credentials.pid) else {
-            return false;
-        };
-        astrea_shell_identity_is_authorized(
-            pid,
-            credentials.uid,
-            &self.astrea_shell_client_pids,
-            &self.astrea_shell_client_uids,
-        )
+        self.astrea_shell_client_allowed(client, handle)
     }
 
     pub(in crate::compositor) fn astrea_shell_client_allowed(
@@ -184,7 +196,10 @@ impl CompositorState {
         client: &Client,
         handle: &DisplayHandle,
     ) -> bool {
-        if std::env::var_os("OBLIVION_ONE_ASTREA_SHORTCUTS_ALLOW_ANY_CLIENT").is_some() {
+        if self
+            .astrea_shell_authenticated_clients
+            .contains(&client.id())
+        {
             return true;
         }
         let Ok(credentials) = client.get_credentials(handle) else {
@@ -193,12 +208,12 @@ impl CompositorState {
         let Ok(pid) = u32::try_from(credentials.pid) else {
             return false;
         };
-        astrea_shell_identity_is_authorized(
-            pid,
-            credentials.uid,
-            &self.astrea_shell_client_pids,
-            &self.astrea_shell_client_uids,
-        )
+        credentials.uid == effective_uid()
+            && astrea_shell_pid_is_authorized_with_lookup(
+                pid,
+                &self.astrea_shell_client_pids,
+                proc_parent_pid,
+            )
     }
 
     pub(in crate::compositor) fn astrea_toplevel_client_allowed(
@@ -207,7 +222,9 @@ impl CompositorState {
         handle: &DisplayHandle,
     ) -> bool {
         let client_id = client.id();
-        if self.astrea_toplevel_authorized_clients.contains(&client_id) {
+        if self.astrea_shell_authenticated_clients.contains(&client_id)
+            || self.astrea_toplevel_authorized_clients.contains(&client_id)
+        {
             return true;
         }
         let Ok(credentials) = client.get_credentials(handle) else {
@@ -287,32 +304,6 @@ impl CompositorState {
     }
 }
 
-pub(crate) fn astrea_shell_identity_is_authorized(
-    pid: u32,
-    uid: u32,
-    authorized_pids: &HashSet<u32>,
-    authorized_uids: &HashSet<u32>,
-) -> bool {
-    astrea_shell_identity_is_authorized_with_lookup(
-        pid,
-        uid,
-        authorized_pids,
-        authorized_uids,
-        proc_parent_pid,
-    )
-}
-
-pub(crate) fn astrea_shell_identity_is_authorized_with_lookup(
-    pid: u32,
-    uid: u32,
-    authorized_pids: &HashSet<u32>,
-    authorized_uids: &HashSet<u32>,
-    parent_pid: impl FnMut(u32) -> Option<u32>,
-) -> bool {
-    astrea_shell_pid_is_authorized_with_lookup(pid, authorized_pids, parent_pid)
-        || authorized_uids.contains(&uid)
-}
-
 pub(crate) fn astrea_shell_pid_is_authorized_with_lookup(
     mut pid: u32,
     authorized_pids: &HashSet<u32>,
@@ -340,14 +331,6 @@ fn proc_parent_pid(pid: u32) -> Option<u32> {
     let mut fields = fields_after_comm.split_whitespace();
     fields.next()?;
     fields.next()?.parse().ok()
-}
-
-fn proc_uid(pid: u32) -> Option<u32> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    status.lines().find_map(|line| {
-        let values = line.strip_prefix("Uid:")?;
-        values.split_whitespace().next()?.parse().ok()
-    })
 }
 
 fn effective_uid() -> u32 {

@@ -7,6 +7,7 @@ mod globals;
 mod input;
 mod layer_shell;
 mod presentation;
+mod shell_auth;
 mod shell_control;
 mod shortcuts;
 mod syncobj;
