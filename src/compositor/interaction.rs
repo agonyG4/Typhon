@@ -190,7 +190,6 @@ pub(in crate::compositor) enum WindowInteractionEndReason {
     ExplicitEnd,
     ExplicitCancel,
     ModeTransition,
-    FocusLoss,
     SurfaceDestroyed,
     SurfaceUnmapped,
     ClientDisconnected,

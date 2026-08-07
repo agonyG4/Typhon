@@ -968,12 +968,12 @@ impl CompositorState {
                 self.queue_dmabuf_buffer_release(buffer);
             }
         }
+        self.renderable_surfaces
+            .retain(|surface| !removed_surface_ids.contains(&surface.surface_id));
         self.clear_resize_state_for_surfaces_with_reason(
             &removed_surface_ids,
             WindowInteractionEndReason::SurfaceUnmapped,
         );
-        self.renderable_surfaces
-            .retain(|surface| !removed_surface_ids.contains(&surface.surface_id));
         for removed_surface_id in &removed_surface_ids {
             if let Some(surface) = self.surface_resource_by_id(*removed_surface_id) {
                 self.reconcile_surface_output_membership(&surface);
@@ -1140,11 +1140,12 @@ impl CompositorState {
             self.toplevel_visual_geometries.remove(&surface_id);
             self.clear_toplevel_visual_render_assignment(surface_id);
         }
-        if self
+        let interaction_cleared = self
             .window_interaction
-            .is_some_and(|interaction| surface_ids.contains(&interaction.root_surface_id))
-        {
+            .is_some_and(|interaction| surface_ids.contains(&interaction.root_surface_id));
+        if interaction_cleared {
             self.clear_window_interaction_state(reason);
+            self.refresh_pointer_focus_at_last_position();
         }
         debug_assert!(
             self.window_interaction.is_some() || self.interaction_cursor_override.is_none()

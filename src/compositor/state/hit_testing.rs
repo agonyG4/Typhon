@@ -716,9 +716,6 @@ impl CompositorState {
     }
 
     fn clear_pointer_focus_state(&mut self) -> Vec<(wl_pointer::WlPointer, wl_surface::WlSurface)> {
-        if self.window_interaction.is_some() {
-            self.clear_window_interaction_state(WindowInteractionEndReason::FocusLoss);
-        }
         if let Some(active) = self.active_locked_pointer_binding() {
             self.pin_locked_pointer_focus(&active);
             return Vec::new();

@@ -68,16 +68,25 @@ fn window_interaction_absolute_motion_targets_only_original_surface() {
     queue_b.roundtrip(&mut state_b).unwrap();
     assert_eq!(state_a.pointer_enter_count, 1);
     assert_eq!(state_b.pointer_enter_count, 0);
-    let motion_a_before = state_a
-        .pointer_event_log
-        .iter()
-        .filter(|event| **event == "motion")
-        .count();
+    commands
+        .send(ServerCommand::PointerMotion { x: 140.0, y: 140.0 })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue_a.roundtrip(&mut state_a).unwrap();
+    queue_b.roundtrip(&mut state_b).unwrap();
+    assert_eq!(state_b.pointer_enter_count, 1);
+    state_a.pointer_motion = false;
+    state_b.pointer_event_log.clear();
+
     let enter_a_before = state_a.pointer_enter_count;
     let leave_a_before = state_a.pointer_leave_count;
     let enter_b_before = state_b.pointer_enter_count;
     let leave_b_before = state_b.pointer_leave_count;
-
+    let motion_a_after_focus_change = state_a
+        .pointer_event_log
+        .iter()
+        .filter(|event| **event == "motion")
+        .count();
     commands
         .send(ServerCommand::BeginMove {
             x: start_x,
@@ -107,7 +116,7 @@ fn window_interaction_absolute_motion_targets_only_original_surface() {
             .iter()
             .filter(|event| **event == "motion")
             .count(),
-        motion_a_before + 1
+        motion_a_after_focus_change + 1
     );
     assert_eq!(
         state_b

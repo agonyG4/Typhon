@@ -1204,10 +1204,6 @@ impl CompositorState {
         self.unregister_toplevel_surface(surface_id);
         self.unregister_popup_surface(surface_id);
         self.teardown_layer_surface(surface_id);
-        self.clear_resize_state_for_surfaces_with_reason(
-            &[surface_id],
-            WindowInteractionEndReason::SurfaceDestroyed,
-        );
         self.surface_placements
             .retain(|_, placement| placement.parent_surface_id != Some(surface_id));
         let mut removed_surface_ids = vec![surface_id];
@@ -1243,6 +1239,10 @@ impl CompositorState {
         if self.renderable_surfaces.len() != previous_renderable_count {
             self.advance_render_generation(RenderGenerationCause::SurfaceUnmap);
         }
+        self.clear_resize_state_for_surfaces_with_reason(
+            &[surface_id],
+            WindowInteractionEndReason::SurfaceDestroyed,
+        );
 
         if self
             .focused_surface

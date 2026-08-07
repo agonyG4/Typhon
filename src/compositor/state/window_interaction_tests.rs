@@ -469,6 +469,13 @@ fn normal_trigger_release_ends_interaction_once() {
     assert!(state.end_window_interaction_for_button(0x110).ended());
     assert!(!state.end_window_interaction_for_button(0x110).ended());
     assert!(!state.window_interaction_active());
+    assert_eq!(
+        state
+            .window_interaction_release_metrics()
+            .window_interaction_trigger_releases,
+        1
+    );
+    assert_eq!(state.window_interaction_release_debug_records().len(), 1);
 }
 
 #[test]
@@ -1218,23 +1225,37 @@ fn explicit_interaction_cancel_clears_interaction_cursor_override() {
 }
 
 #[test]
-fn focus_loss_clears_interaction_cursor_override() {
+fn pointer_focus_clear_preserves_active_interaction_cursor_and_resize_preview() {
+    let update = PendingInteractiveResizeUpdate {
+        root_surface_id: 42,
+        width: 320,
+        height: 240,
+        placement: SurfacePlacement::root_at(12, 24),
+        edges: ResizeEdges::BOTTOM_RIGHT,
+        interaction_id: ResizeInteractionId::new(1),
+    };
     let mut state = CompositorState {
         window_interaction: Some(test_window_interaction(
             1,
-            WindowInteractionKind::Move,
+            WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
             Some(0x110),
         )),
         interaction_cursor_override: Some(InteractionCursorOverride {
-            shape: InteractionCursorShape::Move,
+            shape: InteractionCursorShape::ResizeDiagonalNwSe,
         }),
+        pending_interactive_resize_update: Some(update),
         ..Default::default()
     };
 
     state.clear_pointer_focus();
 
-    assert!(!state.window_interaction_active());
-    assert!(state.interaction_cursor_override.is_none());
+    assert!(state.window_interaction_active());
+    assert!(state.interaction_cursor_override.is_some());
+    assert_eq!(state.pending_interactive_resize_update, Some(update));
+    assert_eq!(
+        state.active_window_interaction_id(),
+        Some(WindowInteractionId::new(1))
+    );
 }
 
 #[test]

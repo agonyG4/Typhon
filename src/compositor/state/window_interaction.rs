@@ -566,6 +566,14 @@ impl CompositorState {
             drag_committed: false,
             resize_interaction_id,
         });
+        if self.pointer_surface.is_none()
+            && let Some(pointer_motion_surface_id) = pointer_motion_surface_id
+            && let Some(surface) = self.surface_resource_by_id(pointer_motion_surface_id)
+            && let Some(target) = self.pointer_target_for_grabbed_surface_at_output(&surface, x, y)
+        {
+            self.ensure_pointer_focus(&surface);
+            self.send_pointer_enter_if_needed(&target);
+        }
         self.set_interaction_cursor_override(kind);
         let snapshot = self
             .window_interaction
@@ -898,7 +906,11 @@ impl CompositorState {
         if self.window_interaction.is_none() && self.interaction_cursor_override.is_none() {
             return false;
         }
-        self.clear_window_interaction_state(reason)
+        let cleared = self.clear_window_interaction_state(reason);
+        if cleared {
+            self.refresh_pointer_focus_at_last_position();
+        }
+        cleared
     }
 
     pub(in crate::compositor) fn end_window_interaction_by_id_with_reason(
@@ -946,6 +958,18 @@ impl CompositorState {
             );
         }
         self.clear_window_interaction_state(reason);
+        if !matches!(
+            (
+                reason,
+                interaction.map(|interaction| interaction.source.trigger_release_delivery())
+            ),
+            (
+                WindowInteractionEndReason::TriggerButtonRelease,
+                Some(TriggerReleaseDelivery::ClientOwned)
+            )
+        ) {
+            self.refresh_pointer_focus_at_last_position();
+        }
         true
     }
 

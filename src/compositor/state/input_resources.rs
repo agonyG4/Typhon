@@ -379,6 +379,15 @@ impl CompositorState {
             return;
         }
         self.update_pointer_position(x, y);
+        if self.window_interaction_active() {
+            self.update_window_interaction(x, y);
+            let _ = self.send_window_interaction_pointer_motion(
+                u64::from(wayland_event_time()).saturating_mul(1_000),
+                x,
+                y,
+            );
+            return;
+        }
         self.update_drag_target_at(x, y);
         if self.send_implicit_pointer_grab_motion(x, y) {
             return;
@@ -441,15 +450,9 @@ impl CompositorState {
             ));
             return 0;
         };
-        if !surface.is_alive()
-            || self.root_surface_id_for_surface(surface_id) != root_surface_id
-            || !self
-                .pointer_surface
-                .as_ref()
-                .is_some_and(|focused| same_surface_resource(focused, &surface))
-        {
+        if !surface.is_alive() || self.root_surface_id_for_surface(surface_id) != root_surface_id {
             pointer_debug_log(format!(
-                "pointer.interaction_motion interaction={} target={} dispatched=0 reason=target-not-focused-or-owned relative_suppressed=true",
+                "pointer.interaction_motion interaction={} target={} dispatched=0 reason=target-not-owned relative_suppressed=true",
                 interaction_id.get(),
                 surface_id,
             ));
@@ -470,10 +473,7 @@ impl CompositorState {
         let pointers = self
             .pointer_resources
             .iter()
-            .filter(|pointer| {
-                resource_belongs_to_surface_client(*pointer, &target.surface)
-                    && self.pointer_resource_entered_surface(pointer, &target.surface)
-            })
+            .filter(|pointer| resource_belongs_to_surface_client(*pointer, &target.surface))
             .cloned()
             .collect::<Vec<_>>();
         let dispatched = pointers.len();
