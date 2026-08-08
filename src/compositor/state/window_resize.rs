@@ -1024,6 +1024,63 @@ mod task_3_red_tests {
     }
 
     #[test]
+    fn m7_a_csd_extents_survive_one_hundred_edge_and_corner_resize_cycles() {
+        let root_buffer = BufferSize::new(332, 242).expect("test root buffer");
+        let cases = [
+            (
+                XdgWindowGeometry::new(16, 10, 300, 200),
+                SurfaceTargetRect::new(160, 150, 340, 200),
+            ),
+            (
+                XdgWindowGeometry::new(16, 10, 300, 200),
+                SurfaceTargetRect::new(100, 80, 220, 140),
+            ),
+            (
+                XdgWindowGeometry::new(-12, 10, 300, 200),
+                SurfaceTargetRect::new(120, 100, 300, 250),
+            ),
+            (
+                XdgWindowGeometry::new(16, -8, 300, 200),
+                SurfaceTargetRect::new(120, 100, 300, 250),
+            ),
+            (
+                XdgWindowGeometry::new(-12, -8, 300, 200),
+                SurfaceTargetRect::new(140, 120, 260, 170),
+            ),
+            (
+                XdgWindowGeometry::new(16, 10, 300, 200),
+                SurfaceTargetRect::new(140, 120, 400, 300),
+            ),
+            (
+                XdgWindowGeometry::new(-12, 10, 300, 200),
+                SurfaceTargetRect::new(140, 120, 400, 300),
+            ),
+            (
+                XdgWindowGeometry::new(16, -8, 300, 200),
+                SurfaceTargetRect::new(140, 120, 220, 140),
+            ),
+        ];
+
+        for cycle in 0..100 {
+            for (geometry, logical_target) in cases {
+                let aperture =
+                    resolve_root_visual_aperture_for_preview(root_buffer, geometry, logical_target);
+                let root_bounds = SurfaceTargetRect::new(
+                    logical_target.x().saturating_sub(geometry.x),
+                    logical_target.y().saturating_sub(geometry.y),
+                    root_buffer.width,
+                    root_buffer.height,
+                );
+                assert_eq!(aperture.logical_target(), logical_target, "cycle {cycle}");
+                assert!(aperture.committed_extent_regions().iter().all(|region| {
+                    region.intersection(root_bounds) == Some(*region)
+                        && !region.intersects(logical_target)
+                }));
+            }
+        }
+    }
+
+    #[test]
     fn root_aperture_does_not_clip_unrelated_subsurfaces_or_leak_stale_content() {
         let root = SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(140, 120, 260, 170));
         let child = SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(0, 0, 40, 40));

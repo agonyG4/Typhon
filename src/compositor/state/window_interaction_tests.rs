@@ -875,6 +875,97 @@ fn xdg_resize_trigger_release_reports_client_delivery() {
     assert!(!state.window_interaction_active());
 }
 
+fn run_m7_resize_crossing_stress(source: WindowInteractionSource) {
+    let mut state = CompositorState::default();
+    for cycle in 0..100 {
+        state.window_interaction = Some(test_window_interaction_with_target(
+            cycle + 1,
+            WindowInteractionKind::Resize(ResizeEdges::new(true, false, true, false)),
+            source,
+            Some(0x110),
+            Some(84),
+        ));
+        state.pending_interactive_resize_update = None;
+
+        let x = if cycle % 2 == 0 { 280.0 } else { 20.0 };
+        let y = if cycle % 2 == 0 { 240.0 } else { 30.0 };
+        assert!(state.update_window_interaction(x, y), "cycle {cycle}");
+        let interaction = state
+            .window_interaction
+            .expect("resize interaction remains captured");
+        assert_eq!(interaction.root_surface_id, 42, "cycle {cycle}");
+        assert_eq!(
+            interaction.pointer_motion_surface_id,
+            Some(84),
+            "cycle {cycle}"
+        );
+        assert!(
+            state.pending_interactive_resize_update.is_some(),
+            "cycle {cycle}"
+        );
+        assert!(state.cancel_window_interaction(WindowInteractionEndReason::ExplicitEnd));
+        assert!(!state.window_interaction_active(), "cycle {cycle}");
+    }
+    assert_eq!(
+        state
+            .window_interaction_release_metrics()
+            .window_interaction_post_terminal_pointer_refreshes,
+        100
+    );
+}
+
+#[test]
+fn m7_a_hundred_xdg_resize_crossing_cycles_keep_motion_owner() {
+    run_m7_resize_crossing_stress(WindowInteractionSource::XdgToplevelResize);
+}
+
+#[test]
+fn m7_a_hundred_managed_x11_resize_crossing_cycles_keep_motion_owner() {
+    run_m7_resize_crossing_stress(WindowInteractionSource::X11NetWmMoveResize);
+}
+
+#[test]
+fn m7_a_hundred_pointer_refreshes_during_resize_keep_interaction_authority() {
+    let update = PendingInteractiveResizeUpdate {
+        root_surface_id: 42,
+        width: 320,
+        height: 240,
+        placement: SurfacePlacement::root_at(12, 24),
+        edges: ResizeEdges::new(true, false, true, false),
+        interaction_id: ResizeInteractionId::new(1),
+    };
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction_with_target(
+            1,
+            WindowInteractionKind::Resize(ResizeEdges::new(true, false, true, false)),
+            WindowInteractionSource::XdgToplevelResize,
+            Some(0x110),
+            Some(84),
+        )),
+        pending_interactive_resize_update: Some(update),
+        ..Default::default()
+    };
+
+    for cycle in 0..100 {
+        state.clear_pointer_focus();
+        assert!(state.window_interaction_active(), "cycle {cycle}");
+        assert_eq!(state.pending_interactive_resize_update, Some(update));
+        assert_eq!(
+            state.active_window_interaction_id(),
+            Some(WindowInteractionId::new(1))
+        );
+    }
+
+    assert!(state.cancel_window_interaction(WindowInteractionEndReason::ExplicitEnd));
+    assert!(!state.window_interaction_active());
+    assert_eq!(
+        state
+            .window_interaction_release_metrics()
+            .window_interaction_post_terminal_pointer_refreshes,
+        1
+    );
+}
+
 #[test]
 fn xdg_move_trigger_release_reports_client_delivery() {
     let mut state = CompositorState {
