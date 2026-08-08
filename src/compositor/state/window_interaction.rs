@@ -907,20 +907,26 @@ impl CompositorState {
         if self.window_interaction.is_none() && self.interaction_cursor_override.is_none() {
             return false;
         }
+        let visual_root_surface_id = self
+            .window_interaction
+            .map(|interaction| interaction.root_surface_id);
         let cleared = self.clear_window_interaction_state(reason);
         if cleared {
-            self.refresh_pointer_focus_after_window_interaction();
+            self.refresh_pointer_focus_after_window_interaction(visual_root_surface_id);
         }
         cleared
     }
 
-    pub(in crate::compositor) fn refresh_pointer_focus_after_window_interaction(&mut self) {
+    pub(in crate::compositor) fn refresh_pointer_focus_after_window_interaction(
+        &mut self,
+        visual_root_surface_id: Option<u32>,
+    ) {
         self.window_interaction_release_metrics
             .window_interaction_post_terminal_pointer_refreshes = self
             .window_interaction_release_metrics
             .window_interaction_post_terminal_pointer_refreshes
             .saturating_add(1);
-        self.refresh_pointer_focus_at_last_position();
+        self.refresh_pointer_focus_at_last_position_for_visual_root(visual_root_surface_id);
     }
 
     pub(in crate::compositor) fn end_window_interaction_by_id_with_reason(
@@ -977,11 +983,13 @@ impl CompositorState {
                 Some(TriggerReleaseDelivery::ClientOwned)
             )
         );
+        let visual_root_surface_id = interaction.map(|interaction| interaction.root_surface_id);
         self.clear_window_interaction_state(reason);
         if client_owned_terminal_release {
             self.window_interaction_terminal_refresh_pending = true;
+            self.window_interaction_terminal_refresh_root_surface_id = visual_root_surface_id;
         } else {
-            self.refresh_pointer_focus_after_window_interaction();
+            self.refresh_pointer_focus_after_window_interaction(visual_root_surface_id);
         }
         true
     }

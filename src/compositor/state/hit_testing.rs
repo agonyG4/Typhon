@@ -161,6 +161,36 @@ impl CompositorState {
         }
     }
 
+    fn pointer_target_at_visual_root_window(
+        &mut self,
+        root_surface_id: u32,
+        x: f64,
+        y: f64,
+    ) -> Option<PointerTarget> {
+        self.refresh_surface_origin_cache();
+        let root_index = self
+            .renderable_surfaces
+            .iter()
+            .position(|surface| surface.surface_id == root_surface_id)?;
+        let origin = self.surface_origin_cache.get(root_index).copied()?;
+        let geometry = self.current_visual_root_window_geometry(root_surface_id)?;
+        let surface_x = x - f64::from(origin.0);
+        let surface_y = y - f64::from(origin.1);
+        if surface_x < 0.0
+            || surface_y < 0.0
+            || surface_x >= f64::from(geometry.width)
+            || surface_y >= f64::from(geometry.height)
+        {
+            return None;
+        }
+        let surface = self.surface_resource_by_id(root_surface_id)?;
+        Some(PointerTarget {
+            surface,
+            surface_x,
+            surface_y,
+        })
+    }
+
     pub(in crate::compositor) fn pointer_target_for_surface_at_output(
         &mut self,
         surface: &wl_surface::WlSurface,
@@ -200,6 +230,13 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn refresh_pointer_focus_at_last_position(&mut self) {
+        self.refresh_pointer_focus_at_last_position_for_visual_root(None);
+    }
+
+    pub(in crate::compositor) fn refresh_pointer_focus_at_last_position_for_visual_root(
+        &mut self,
+        visual_root_surface_id: Option<u32>,
+    ) {
         if self.defer_pointer_focus_refresh() {
             return;
         }
@@ -210,7 +247,18 @@ impl CompositorState {
             return;
         }
 
-        let Some(target) = self.pointer_target_at(self.last_pointer_x, self.last_pointer_y) else {
+        let target = self
+            .pointer_target_at(self.last_pointer_x, self.last_pointer_y)
+            .or_else(|| {
+                visual_root_surface_id.and_then(|root_surface_id| {
+                    self.pointer_target_at_visual_root_window(
+                        root_surface_id,
+                        self.last_pointer_x,
+                        self.last_pointer_y,
+                    )
+                })
+            });
+        let Some(target) = target else {
             self.clear_pointer_focus();
             pointer_debug_log("post-unlock focus target=none");
             return;
@@ -289,20 +337,36 @@ impl CompositorState {
         &mut self,
         old_surface_id: Option<u32>,
     ) {
-        if self.window_interaction_terminal_refresh_pending {
+        let terminal_visual_root_surface_id = if self.window_interaction_terminal_refresh_pending {
             self.window_interaction_terminal_refresh_pending = false;
             self.window_interaction_release_metrics
                 .window_interaction_post_terminal_pointer_refreshes = self
                 .window_interaction_release_metrics
                 .window_interaction_post_terminal_pointer_refreshes
                 .saturating_add(1);
-        }
+            self.window_interaction_terminal_refresh_root_surface_id
+                .take()
+        } else {
+            None
+        };
         if self.active_locked_pointer_binding().is_some() {
-            self.refresh_pointer_focus_at_last_position();
+            self.refresh_pointer_focus_at_last_position_for_visual_root(
+                terminal_visual_root_surface_id,
+            );
             return;
         }
 
-        let target = self.pointer_target_at(self.last_pointer_x, self.last_pointer_y);
+        let target = self
+            .pointer_target_at(self.last_pointer_x, self.last_pointer_y)
+            .or_else(|| {
+                terminal_visual_root_surface_id.and_then(|root_surface_id| {
+                    self.pointer_target_at_visual_root_window(
+                        root_surface_id,
+                        self.last_pointer_x,
+                        self.last_pointer_y,
+                    )
+                })
+            });
         let new_surface_id = target
             .as_ref()
             .map(|target| compositor_surface_id(&target.surface));
