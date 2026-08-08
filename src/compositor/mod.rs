@@ -223,12 +223,13 @@ pub use presentation::{
 pub use render::{
     BufferAge, DesktopComposeRequest, DesktopFrameCopyKind, DesktopSceneRebuildKind,
     DesktopSceneRenderer, DesktopVisualState, OUTPUT_BACKGROUND, RenderSceneElement,
-    RenderSceneElementId, RenderSceneElementKind, ServerFrameColor, SurfaceRenderSpaceAssignment,
-    SurfaceTargetRect, compose_output, cursor_damage_rect, draw_wallpaper, output_scale_key,
-    render_scene_elements_for_surfaces, scale_desktop_visual_state, scale_logical_coordinate,
-    scale_logical_extent, server_frame_rects_by_surface, server_frame_rects_for_surface,
-    surface_origin, surface_origins, surface_render_plan, surface_render_plan_with_clip,
-    surface_render_space_assignments,
+    RenderSceneElementId, RenderSceneElementKind, ServerFrameColor, SurfaceRenderPlan,
+    SurfaceRenderSpaceAssignment, SurfaceTargetRect, SurfaceVisualAperture, compose_output,
+    cursor_damage_rect, draw_wallpaper, output_scale_key, render_scene_elements_for_surfaces,
+    scale_desktop_visual_state, scale_logical_coordinate, scale_logical_extent,
+    server_frame_rects_by_surface, server_frame_rects_for_surface, surface_origin, surface_origins,
+    surface_render_plan, surface_render_plan_with_clip, surface_render_plans_with_aperture,
+    surface_render_space_assignments, xwayland_visual_backing_target,
 };
 use runtime_files::{compositor_debug_surface_logging_enabled, unique_runtime_file_path};
 pub use runtime_files::{resize_debug_log, resize_debug_logging_enabled};

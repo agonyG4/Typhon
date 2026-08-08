@@ -380,7 +380,24 @@ impl CompositorState {
         let content_pending = self
             .pending_xwayland_visual_content
             .contains(&root_surface_id);
-        let visual_clip = (active_resize.is_some() || content_pending).then_some(clip);
+        let root_surface_info = self
+            .renderable_surfaces
+            .iter()
+            .find(|surface| surface.surface_id == root_surface_id)
+            .map(RenderableSurface::buffer_size);
+        let visual_clip = (active_resize.is_some() || content_pending).then(|| {
+            if active_resize.is_some()
+                && let (Some(geometry), Some(root_buffer)) = (geometry, root_surface_info)
+            {
+                // The aperture is resolved in the root render-placement
+                // coordinate space. `surface_render_space_assignments` adds
+                // the committed surface origin exactly once when it maps the
+                // aperture to output coordinates.
+                resolve_root_visual_aperture_for_preview(root_buffer, geometry, clip)
+            } else {
+                SurfaceVisualAperture::logical_only(clip)
+            }
+        });
         let placements = &self.surface_placements;
         for surface in &mut self.renderable_surfaces {
             if root_surface_id_for_surface_in_placements(placements, surface.surface_id)
@@ -388,9 +405,11 @@ impl CompositorState {
             {
                 continue;
             }
-            surface.visual_clip = visual_clip;
             if surface.surface_id == root_surface_id {
+                surface.visual_clip = visual_clip.clone();
                 surface.render_placement = Some(root_render_placement);
+            } else {
+                surface.visual_clip = None;
             }
         }
         self.invalidate_surface_origin_cache();
@@ -703,6 +722,306 @@ impl CompositorState {
             return false;
         }
         self.finalize_x11_resize(handle)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowVisualExtents {
+    pub(crate) left: u32,
+    pub(crate) top: u32,
+    pub(crate) right: u32,
+    pub(crate) bottom: u32,
+}
+
+impl WindowVisualExtents {
+    pub(crate) fn from_root_buffer_and_window_geometry(
+        root_buffer: BufferSize,
+        geometry: XdgWindowGeometry,
+    ) -> Self {
+        let buffer_right = i64::from(root_buffer.width);
+        let buffer_bottom = i64::from(root_buffer.height);
+        let geometry_right = i64::from(geometry.x).saturating_add(i64::from(geometry.width));
+        let geometry_bottom = i64::from(geometry.y).saturating_add(i64::from(geometry.height));
+        Self {
+            left: non_negative_extent(i64::from(geometry.x)),
+            top: non_negative_extent(i64::from(geometry.y)),
+            right: non_negative_extent(buffer_right.saturating_sub(geometry_right)),
+            bottom: non_negative_extent(buffer_bottom.saturating_sub(geometry_bottom)),
+        }
+    }
+}
+
+fn non_negative_extent(value: i64) -> u32 {
+    u32::try_from(value.max(0)).unwrap_or(u32::MAX)
+}
+
+pub(crate) fn resolve_root_visual_aperture_for_preview(
+    root_buffer: BufferSize,
+    committed_geometry: XdgWindowGeometry,
+    logical_target: SurfaceTargetRect,
+) -> SurfaceVisualAperture {
+    let extents =
+        WindowVisualExtents::from_root_buffer_and_window_geometry(root_buffer, committed_geometry);
+    let root_origin = (
+        logical_target.x().saturating_sub(committed_geometry.x),
+        logical_target.y().saturating_sub(committed_geometry.y),
+    );
+    SurfaceVisualAperture::for_root_window_preview(
+        root_origin,
+        root_buffer,
+        (extents.left, extents.top, extents.right, extents.bottom),
+        logical_target,
+    )
+}
+
+#[cfg(test)]
+mod task_3_red_tests {
+    use super::*;
+
+    #[test]
+    fn window_visual_extents_use_signed_root_and_xdg_rectangles() {
+        let root_buffer = BufferSize::new(332, 242).expect("test root buffer");
+
+        assert_eq!(
+            WindowVisualExtents::from_root_buffer_and_window_geometry(
+                root_buffer,
+                XdgWindowGeometry::new(16, 10, 300, 200),
+            ),
+            WindowVisualExtents {
+                left: 16,
+                top: 10,
+                right: 16,
+                bottom: 32,
+            }
+        );
+        assert_eq!(
+            WindowVisualExtents::from_root_buffer_and_window_geometry(
+                root_buffer,
+                XdgWindowGeometry::new(-12, -8, 300, 200),
+            ),
+            WindowVisualExtents {
+                left: 0,
+                top: 0,
+                right: 44,
+                bottom: 50,
+            }
+        );
+        assert_eq!(
+            WindowVisualExtents::from_root_buffer_and_window_geometry(
+                root_buffer,
+                XdgWindowGeometry::new(40, 20, 360, 260),
+            ),
+            WindowVisualExtents {
+                left: 40,
+                top: 20,
+                right: 0,
+                bottom: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn window_visual_extents_clamp_extreme_signed_offsets_without_underflow() {
+        let extents = WindowVisualExtents::from_root_buffer_and_window_geometry(
+            BufferSize::new(332, 242).expect("test root buffer"),
+            XdgWindowGeometry::new(i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+        );
+
+        assert_eq!(extents.left, 0);
+        assert_eq!(extents.top, 0);
+        assert_eq!(extents.right, 333);
+        assert_eq!(extents.bottom, 243);
+    }
+
+    #[test]
+    fn left_edge_preview_preserves_root_extent_and_bounds_logical_content() {
+        let aperture = resolve_root_visual_aperture_for_preview(
+            BufferSize::new(332, 242).expect("test root buffer"),
+            XdgWindowGeometry::new(16, 10, 300, 200),
+            SurfaceTargetRect::new(160, 150, 340, 200),
+        );
+
+        assert_eq!(
+            aperture.logical_target(),
+            SurfaceTargetRect::new(160, 150, 340, 200)
+        );
+        assert_eq!(
+            aperture.committed_content_target(),
+            Some(SurfaceTargetRect::new(160, 150, 300, 200))
+        );
+        assert!(
+            aperture
+                .extent_strips()
+                .contains(&SurfaceTargetRect::new(144, 140, 332, 10))
+        );
+        assert!(
+            aperture
+                .extent_strips()
+                .contains(&SurfaceTargetRect::new(144, 350, 332, 32))
+        );
+        assert!(
+            aperture
+                .extent_strips()
+                .contains(&SurfaceTargetRect::new(144, 150, 16, 200))
+        );
+        assert!(
+            aperture
+                .extent_strips()
+                .iter()
+                .all(|strip| !strip.intersects(aperture.logical_target()))
+        );
+    }
+
+    #[test]
+    fn top_edge_preview_preserves_top_extent_and_anchor() {
+        let aperture = resolve_root_visual_aperture_for_preview(
+            BufferSize::new(332, 242).expect("test root buffer"),
+            XdgWindowGeometry::new(-12, 10, 300, 200),
+            SurfaceTargetRect::new(120, 100, 300, 250),
+        );
+
+        assert_eq!(
+            aperture.logical_target(),
+            SurfaceTargetRect::new(120, 100, 300, 250)
+        );
+        assert_eq!(
+            aperture.committed_content_target(),
+            Some(SurfaceTargetRect::new(132, 100, 288, 200))
+        );
+        assert!(aperture.extent_strips().iter().any(|strip| strip.y() < 100));
+        assert!(
+            aperture
+                .extent_strips()
+                .iter()
+                .all(|strip| !strip.intersects(aperture.logical_target()))
+        );
+    }
+
+    #[test]
+    fn top_left_preview_preserves_both_extent_axes_and_resize_anchor() {
+        let aperture = resolve_root_visual_aperture_for_preview(
+            BufferSize::new(332, 242).expect("test root buffer"),
+            XdgWindowGeometry::new(16, 10, 300, 200),
+            SurfaceTargetRect::new(140, 120, 260, 170),
+        );
+
+        assert_eq!(
+            aperture.logical_target(),
+            SurfaceTargetRect::new(140, 120, 260, 170)
+        );
+        assert!(aperture.extent_strips().iter().any(|strip| strip.x() < 140));
+        assert!(aperture.extent_strips().iter().any(|strip| strip.y() < 120));
+        assert!(
+            aperture
+                .extent_strips()
+                .iter()
+                .all(|strip| !strip.intersects(aperture.logical_target()))
+        );
+    }
+
+    #[test]
+    fn right_and_bottom_edge_previews_keep_extent_strips_bounded() {
+        let aperture = resolve_root_visual_aperture_for_preview(
+            BufferSize::new(332, 242).expect("test root buffer"),
+            XdgWindowGeometry::new(16, 10, 300, 200),
+            SurfaceTargetRect::new(100, 80, 300, 200),
+        );
+
+        assert_eq!(
+            aperture.committed_content_target(),
+            Some(SurfaceTargetRect::new(100, 80, 300, 200))
+        );
+        assert!(aperture.extent_strips().iter().any(|strip| {
+            strip.x()
+                >= aperture
+                    .logical_target()
+                    .x()
+                    .saturating_add(i32::try_from(aperture.logical_target().width()).unwrap())
+        }));
+        assert!(aperture.extent_strips().iter().any(|strip| {
+            strip.y()
+                >= aperture
+                    .logical_target()
+                    .y()
+                    .saturating_add(i32::try_from(aperture.logical_target().height()).unwrap())
+        }));
+        assert!(
+            aperture
+                .extent_strips()
+                .iter()
+                .all(|strip| !strip.intersects(aperture.logical_target()))
+        );
+    }
+
+    #[test]
+    fn all_corner_grow_and_shrink_previews_keep_anchor_and_clip_stale_content() {
+        let root_buffer = BufferSize::new(332, 242).expect("test root buffer");
+        let geometry = XdgWindowGeometry::new(16, 10, 300, 200);
+        let grown = resolve_root_visual_aperture_for_preview(
+            root_buffer,
+            geometry,
+            SurfaceTargetRect::new(100, 80, 400, 300),
+        );
+        let shrunk = resolve_root_visual_aperture_for_preview(
+            root_buffer,
+            geometry,
+            SurfaceTargetRect::new(100, 80, 220, 140),
+        );
+
+        assert_eq!(
+            grown.logical_target(),
+            SurfaceTargetRect::new(100, 80, 400, 300)
+        );
+        assert_eq!(
+            grown.committed_content_target(),
+            Some(SurfaceTargetRect::new(100, 80, 300, 200))
+        );
+        assert_eq!(
+            shrunk.logical_target(),
+            SurfaceTargetRect::new(100, 80, 220, 140)
+        );
+        assert_eq!(
+            shrunk.committed_content_target(),
+            Some(SurfaceTargetRect::new(100, 80, 220, 140))
+        );
+        for aperture in [&grown, &shrunk] {
+            assert!(
+                aperture
+                    .extent_strips()
+                    .iter()
+                    .all(|strip| !strip.intersects(aperture.logical_target()))
+            );
+        }
+        assert!(shrunk.extent_strips().iter().any(|strip| {
+            strip.x()
+                >= shrunk
+                    .logical_target()
+                    .x()
+                    .saturating_add(i32::try_from(shrunk.logical_target().width()).unwrap())
+        }));
+        assert!(shrunk.extent_strips().iter().any(|strip| {
+            strip.y()
+                >= shrunk
+                    .logical_target()
+                    .y()
+                    .saturating_add(i32::try_from(shrunk.logical_target().height()).unwrap())
+        }));
+    }
+
+    #[test]
+    fn root_aperture_does_not_clip_unrelated_subsurfaces_or_leak_stale_content() {
+        let root = SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(140, 120, 260, 170));
+        let child = SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(0, 0, 40, 40));
+
+        assert!(
+            root.content_regions()
+                .iter()
+                .all(|region| region.intersects(SurfaceTargetRect::new(140, 120, 260, 170)))
+        );
+        assert_eq!(
+            child,
+            SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(0, 0, 40, 40))
+        );
     }
 }
 

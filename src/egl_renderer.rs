@@ -1017,70 +1017,44 @@ impl GlesSceneRenderer {
             framebuffer_origin,
         );
 
-        let origins = compositor::surface_origins(surfaces);
         let render_assignments =
             compositor::surface_render_space_assignments(surfaces, output_scale);
-        for ((surface, (origin_x, origin_y)), render_assignment) in
-            surfaces.iter().zip(origins).zip(render_assignments)
-        {
-            for rect in compositor::server_frame_rects_for_surface(surface) {
+        for (surface, render_assignment) in surfaces.iter().zip(render_assignments) {
+            if let Some(bounds) = compositor::xwayland_visual_backing_target(
+                surface,
+                render_assignment.target,
+                render_assignment.visual_clip.as_ref(),
+            ) {
                 push_draw_command(
                     &mut self.vertices,
                     &mut self.commands,
-                    EglDrawLayer::Solid(rect.color),
+                    EglDrawLayer::Solid(compositor::ServerFrameColor::XwaylandBacking),
                     EglRect::new(
-                        compositor::scale_logical_coordinate(
-                            origin_x.saturating_add(rect.x),
-                            output_scale,
-                        ) as f32,
-                        compositor::scale_logical_coordinate(
-                            origin_y.saturating_add(rect.y),
-                            output_scale,
-                        ) as f32,
-                        compositor::scale_logical_extent(rect.width, output_scale) as f32,
-                        compositor::scale_logical_extent(rect.height, output_scale) as f32,
+                        bounds.x() as f32,
+                        bounds.y() as f32,
+                        bounds.width() as f32,
+                        bounds.height() as f32,
                     ),
                     width,
                     height,
                     framebuffer_origin,
                 );
             }
-            let render_plan = compositor::surface_render_plan_with_clip(
+            for render_plan in compositor::surface_render_plans_with_aperture(
                 surface,
                 render_assignment.target,
-                render_assignment.visual_clip,
-            );
-            let uv = EglUvRect::new(
-                render_plan.content_uv.left,
-                render_plan.content_uv.top,
-                render_plan.content_uv.right,
-                render_plan.content_uv.bottom,
-            );
-            let sampling = surface_sampling_for_plan(
-                surface.buffer_size().width,
-                surface.buffer_size().height,
-                render_plan.content_target.x(),
-                render_plan.content_target.y(),
-                render_plan.content_target.width(),
-                render_plan.content_target.height(),
-                uv,
-            );
-            push_draw_command_with_uv(
-                &mut self.vertices,
-                &mut self.commands,
-                EglDrawLayer::Surface(surface.surface_id),
-                EglRect::new(
-                    render_plan.content_target.x() as f32,
-                    render_plan.content_target.y() as f32,
-                    render_plan.content_target.width() as f32,
-                    render_plan.content_target.height() as f32,
-                ),
-                uv,
-                sampling,
-                width,
-                height,
-                framebuffer_origin,
-            );
+                render_assignment.visual_clip.as_ref(),
+            ) {
+                push_egl_render_plan(
+                    &mut self.vertices,
+                    &mut self.commands,
+                    width,
+                    height,
+                    surface,
+                    render_plan,
+                    framebuffer_origin,
+                );
+            }
         }
 
         self.scene_cache_key = Some(EglSceneCacheKey::new(
@@ -1533,35 +1507,58 @@ fn push_egl_surface_commands(
     width: u32,
     height: u32,
     surface: &RenderableSurface,
-    origin_x: i32,
-    origin_y: i32,
+    _origin_x: i32,
+    _origin_y: i32,
     render_assignment: compositor::SurfaceRenderSpaceAssignment,
-    output_scale: f64,
+    _output_scale: f64,
     framebuffer_origin: OutputFramebufferOrigin,
 ) {
-    for rect in compositor::server_frame_rects_for_surface(surface) {
+    if let Some(bounds) = compositor::xwayland_visual_backing_target(
+        surface,
+        render_assignment.target,
+        render_assignment.visual_clip.as_ref(),
+    ) {
         push_draw_command(
             vertices,
             commands,
-            EglDrawLayer::Solid(rect.color),
+            EglDrawLayer::Solid(compositor::ServerFrameColor::XwaylandBacking),
             EglRect::new(
-                compositor::scale_logical_coordinate(origin_x.saturating_add(rect.x), output_scale)
-                    as f32,
-                compositor::scale_logical_coordinate(origin_y.saturating_add(rect.y), output_scale)
-                    as f32,
-                compositor::scale_logical_extent(rect.width, output_scale) as f32,
-                compositor::scale_logical_extent(rect.height, output_scale) as f32,
+                bounds.x() as f32,
+                bounds.y() as f32,
+                bounds.width() as f32,
+                bounds.height() as f32,
             ),
             width,
             height,
             framebuffer_origin,
         );
     }
-    let render_plan = compositor::surface_render_plan_with_clip(
+    for render_plan in compositor::surface_render_plans_with_aperture(
         surface,
         render_assignment.target,
-        render_assignment.visual_clip,
-    );
+        render_assignment.visual_clip.as_ref(),
+    ) {
+        push_egl_render_plan(
+            vertices,
+            commands,
+            width,
+            height,
+            surface,
+            render_plan,
+            framebuffer_origin,
+        );
+    }
+}
+
+fn push_egl_render_plan(
+    vertices: &mut Vec<EglTexturedVertex>,
+    commands: &mut Vec<EglDrawCommand>,
+    width: u32,
+    height: u32,
+    surface: &RenderableSurface,
+    render_plan: compositor::SurfaceRenderPlan,
+    framebuffer_origin: OutputFramebufferOrigin,
+) {
     let uv = EglUvRect::new(
         render_plan.content_uv.left,
         render_plan.content_uv.top,
@@ -1600,7 +1597,7 @@ fn egl_scene_surface_signatures(surfaces: &[RenderableSurface]) -> Vec<EglSceneS
         .iter()
         .map(|surface| {
             let render_placement = surface.render_placement.unwrap_or(surface.placement);
-            let clip = surface.visual_clip;
+            let clip = surface.visual_clip.as_ref();
             EglSceneSurfaceSignature {
                 surface_id: surface.surface_id,
                 commit_sequence: surface.commit_sequence.get(),

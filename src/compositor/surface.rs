@@ -118,7 +118,7 @@ pub struct RenderableSurface {
     pub height: u32,
     pub placement: SurfacePlacement,
     pub render_placement: Option<SurfacePlacement>,
-    pub visual_clip: Option<super::render::SurfaceTargetRect>,
+    pub visual_clip: Option<super::render::SurfaceVisualAperture>,
     // Optional compositor-side destination extent. X11 clients can resize their
     // window before Xwayland commits a matching wl_surface buffer; keeping this
     // separate lets the renderer scale the last committed content meanwhile.

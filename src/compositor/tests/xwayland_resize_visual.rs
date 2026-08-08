@@ -55,11 +55,12 @@ fn xwayland_resize_preview_survives_buffer_commit() {
         Some(SurfacePlacement::absolute_root_at(120, 100))
     );
     assert_eq!(
-        root.visual_clip,
+        root.visual_clip.as_ref().map(|clip| clip.logical_target()),
         Some(SurfaceTargetRect::new(120, 100, 620, 480))
     );
     assert_eq!(
         root.visual_clip
+            .as_ref()
             .map(|clip| clip.x() + i32::try_from(clip.width()).unwrap()),
         Some(740)
     );
@@ -132,7 +133,7 @@ fn xwayland_attachment_replacement_preserves_resize_preview() {
         Some(SurfacePlacement::absolute_root_at(120, 100))
     );
     assert_eq!(
-        root.visual_clip,
+        root.visual_clip.as_ref().map(|clip| clip.logical_target()),
         Some(SurfaceTargetRect::new(120, 100, 620, 480))
     );
     assert_eq!(fixture.server.state.focused_window_id, Some(window_id));
@@ -159,7 +160,8 @@ fn xwayland_repeated_intermediate_commits_preserve_visual_box() {
             fixture.server.renderable_surfaces(),
             1.0,
         )[0]
-        .visual_clip;
+        .visual_clip
+        .clone();
         let pending = fixture
             .server
             .state
@@ -187,14 +189,15 @@ fn xwayland_repeated_intermediate_commits_preserve_visual_box() {
             Some(SurfacePlacement::absolute_root_at(120, 100))
         );
         assert_eq!(
-            root.visual_clip,
+            root.visual_clip.as_ref().map(|clip| clip.logical_target()),
             Some(SurfaceTargetRect::new(120, 100, 620, 480))
         );
         let after_assignment = crate::compositor::surface_render_space_assignments(
             fixture.server.renderable_surfaces(),
             1.0,
         )[0]
-        .visual_clip;
+        .visual_clip
+        .clone();
         assert_eq!(
             before_assignment, after_assignment,
             "buffer publication must not change the visual clip assignment"
@@ -353,7 +356,7 @@ fn xwayland_final_resize_keeps_backing_until_matching_content_commit() {
         .expect("finalized XWayland root");
     assert_eq!(root.render_placement, Some(final_placement));
     assert_eq!(
-        root.visual_clip,
+        root.visual_clip.as_ref().map(|clip| clip.logical_target()),
         Some(SurfaceTargetRect::new(120, 100, 620, 480)),
         "stale content keeps the final visual box backed after pointer ownership ends"
     );
@@ -379,7 +382,7 @@ fn xwayland_final_resize_keeps_backing_until_matching_content_commit() {
         .expect("post-finalization XWayland root");
     assert_eq!(root.render_placement, Some(final_placement));
     assert_eq!(
-        root.visual_clip,
+        root.visual_clip.as_ref().map(|clip| clip.logical_target()),
         Some(SurfaceTargetRect::new(120, 100, 620, 480)),
         "another stale XWayland publication must not remove pending-content backing"
     );
@@ -493,7 +496,7 @@ fn xwayland_fullscreen_request_installs_output_visual_and_configure() {
         .expect("fullscreen root");
     assert_eq!(root.render_target_size, None);
     assert_eq!(
-        root.visual_clip,
+        root.visual_clip.as_ref().map(|clip| clip.logical_target()),
         Some(SurfaceTargetRect::new(
             fullscreen.placement.local_x,
             fullscreen.placement.local_y,
@@ -504,7 +507,7 @@ fn xwayland_fullscreen_request_installs_output_visual_and_configure() {
     assert_eq!(
         crate::compositor::render_scene_elements_for_surfaces(std::slice::from_ref(root), 1.0)[0]
             .backing_target(),
-        root.visual_clip
+        root.visual_clip.as_ref().map(|clip| clip.bounds())
     );
 
     fixture
@@ -782,7 +785,7 @@ fn xwayland_resize_edges_preserve_opposite_edge_across_commits() {
             "{edge} origin changed after commit"
         );
         assert_eq!(
-            root.visual_clip,
+            root.visual_clip.as_ref().map(|clip| clip.logical_target()),
             Some(SurfaceTargetRect::new(
                 preview_x,
                 preview_y,
@@ -791,7 +794,7 @@ fn xwayland_resize_edges_preserve_opposite_edge_across_commits() {
             )),
             "{edge} clip changed after commit"
         );
-        let clip = root.visual_clip.expect("active resize clip");
+        let clip = root.visual_clip.as_ref().expect("active resize clip");
         assert_eq!(clip.x(), expected_left, "{edge} left edge changed");
         assert_eq!(clip.y(), expected_top, "{edge} top edge changed");
         assert_eq!(

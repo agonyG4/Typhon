@@ -319,7 +319,7 @@ impl CompositorState {
             .renderable_surfaces
             .iter()
             .find(|existing| existing.surface_id == surface_id)
-            .and_then(|existing| existing.visual_clip);
+            .and_then(|existing| existing.visual_clip.clone());
         let visual_geometry = self
             .toplevel_visual_geometries
             .get(&root_surface_id)
@@ -337,7 +337,7 @@ impl CompositorState {
             });
         let buffer_size = surface.buffer_size();
         let fresh_render_placement_before_reapply = surface.render_placement;
-        let fresh_visual_clip_before_reapply = surface.visual_clip;
+        let fresh_visual_clip_before_reapply = surface.visual_clip.clone();
         trace::emit("xwayland_visual_assignment_before_reapply", || {
             TraceFields::new()
                 .field("root_surface_id", root_surface_id)
@@ -403,7 +403,7 @@ impl CompositorState {
                 .renderable_surfaces
                 .iter()
                 .find(|existing| existing.surface_id == surface_id)
-                .and_then(|existing| existing.visual_clip);
+                .and_then(|existing| existing.visual_clip.clone());
             let content_pending_after_reapply = self
                 .pending_xwayland_visual_content
                 .contains(&root_surface_id);

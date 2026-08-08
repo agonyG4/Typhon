@@ -624,7 +624,10 @@ fn x11_resize_release_finalizes_preview_without_xdg_commit() {
         None
     );
     assert_eq!(
-        state.renderable_surfaces[0].visual_clip,
+        state.renderable_surfaces[0]
+            .visual_clip
+            .as_ref()
+            .map(|clip| clip.logical_target()),
         Some(crate::compositor::SurfaceTargetRect::new(30, 40, 360, 240))
     );
     assert_eq!(state.surface_placement(surface_id), final_placement);

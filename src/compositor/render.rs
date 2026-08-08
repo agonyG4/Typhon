@@ -198,13 +198,14 @@ impl DamageDebugStats {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct SceneSurfaceSnapshot {
     surface_id: u32,
     generation: u64,
     target: SurfaceTargetRect,
     visible_target: SurfaceTargetRect,
     backing_target: Option<SurfaceTargetRect>,
+    content_regions: Vec<SurfaceRenderPlan>,
     buffer_width: u32,
     buffer_height: u32,
 }
@@ -216,6 +217,7 @@ pub struct RenderSceneElement {
     target: SurfaceTargetRect,
     visible_target: SurfaceTargetRect,
     backing_target: Option<SurfaceTargetRect>,
+    content_regions: Vec<SurfaceRenderPlan>,
     content_uv: SurfaceUvRect,
     generation: u64,
     buffer_size: BufferSize,
@@ -225,7 +227,7 @@ pub struct RenderSceneElement {
 
 impl RenderSceneElement {
     pub fn from_surface(surface: &RenderableSurface, target: SurfaceTargetRect) -> Self {
-        Self::from_surface_with_clip(surface, target, surface.visual_clip)
+        Self::from_surface_with_aperture(surface, target, surface.visual_clip.clone())
     }
 
     pub fn from_surface_with_clip(
@@ -233,14 +235,39 @@ impl RenderSceneElement {
         target: SurfaceTargetRect,
         visual_clip: Option<SurfaceTargetRect>,
     ) -> Self {
-        let plan = surface_render_plan_with_clip(surface, target, visual_clip);
+        Self::from_surface_with_aperture(
+            surface,
+            target,
+            visual_clip.map(SurfaceVisualAperture::logical_only),
+        )
+    }
+
+    pub fn from_surface_with_aperture(
+        surface: &RenderableSurface,
+        target: SurfaceTargetRect,
+        visual_aperture: Option<SurfaceVisualAperture>,
+    ) -> Self {
+        let content_regions =
+            surface_render_plans_with_aperture(surface, target, visual_aperture.as_ref());
+        let visible_target = content_regions
+            .iter()
+            .map(|plan| plan.content_target)
+            .reduce(SurfaceTargetRect::union)
+            .unwrap_or(target);
         Self {
             id: RenderSceneElementId::Surface(surface.surface_id),
             kind: RenderSceneElementKind::ClientSurface,
             target,
-            visible_target: plan.content_target,
-            backing_target: xwayland_visual_backing_target(surface, target, visual_clip),
-            content_uv: plan.content_uv,
+            visible_target,
+            backing_target: xwayland_visual_backing_target(
+                surface,
+                target,
+                visual_aperture.as_ref(),
+            ),
+            content_uv: content_regions
+                .first()
+                .map_or(SurfaceUvRect::FULL, |plan| plan.content_uv),
+            content_regions,
             generation: surface.generation,
             buffer_size: surface.buffer_size(),
             buffer_source: surface.buffer_source(),
@@ -266,6 +293,10 @@ impl RenderSceneElement {
 
     pub const fn backing_target(&self) -> Option<SurfaceTargetRect> {
         self.backing_target
+    }
+
+    pub fn content_regions(&self) -> &[SurfaceRenderPlan] {
+        &self.content_regions
     }
 
     pub const fn content_uv(&self) -> SurfaceUvRect {
@@ -919,31 +950,30 @@ fn draw_client_surfaces_scaled_with_snapshots(
     frame_height: u32,
     surfaces: &[RenderableSurface],
     snapshots: &[SceneSurfaceSnapshot],
-    output_scale: f64,
+    _output_scale: f64,
     clip: Option<OutputRect>,
 ) {
     for (surface, snapshot) in surfaces.iter().zip(snapshots) {
-        for rect in server_frame_rects_for_surface(surface) {
-            let mut rect = scale_server_frame_rect(rect, output_scale);
-            rect.x = snapshot.target.x.saturating_add(rect.x);
-            rect.y = snapshot.target.y.saturating_add(rect.y);
+        if let Some(backing) = snapshot.backing_target {
+            let rect = ServerFrameRect {
+                color: ServerFrameColor::XwaylandBacking,
+                x: backing.x(),
+                y: backing.y(),
+                width: backing.width(),
+                height: backing.height(),
+            };
             match clip {
                 Some(clip) => fill_rect_clipped(frame, frame_width, frame_height, rect, clip),
                 None => fill_rect(frame, frame_width, frame_height, rect),
             }
         }
 
-        if clip.is_some_and(|clip| !snapshot.target.output_rect().intersects(clip)) {
-            continue;
+        for plan in &snapshot.content_regions {
+            if clip.is_some_and(|clip| !plan.content_target.output_rect().intersects(clip)) {
+                continue;
+            }
+            blit_surface_with_plan(frame, frame_width, frame_height, surface, *plan, clip);
         }
-        blit_surface_to_rect_clipped(
-            frame,
-            frame_width,
-            frame_height,
-            surface,
-            snapshot.target,
-            clip,
-        );
     }
 }
 
@@ -964,7 +994,7 @@ pub fn render_scene_elements_for_surfaces(
         .iter()
         .zip(assignments)
         .map(|(surface, assignment)| {
-            RenderSceneElement::from_surface_with_clip(
+            RenderSceneElement::from_surface_with_aperture(
                 surface,
                 assignment.target,
                 assignment.visual_clip,
@@ -986,6 +1016,7 @@ fn scene_surface_snapshots_from_elements(
                 target: element.target,
                 visible_target: element.visible_target,
                 backing_target: element.backing_target,
+                content_regions: element.content_regions.clone(),
                 buffer_width: element.buffer_size.width,
                 buffer_height: element.buffer_size.height,
             }
@@ -993,10 +1024,10 @@ fn scene_surface_snapshots_from_elements(
         .collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurfaceRenderSpaceAssignment {
     pub target: SurfaceTargetRect,
-    pub visual_clip: Option<SurfaceTargetRect>,
+    pub visual_clip: Option<SurfaceVisualAperture>,
 }
 
 pub fn surface_render_space_assignments(
@@ -1037,17 +1068,10 @@ pub fn surface_render_space_assignments(
                     target_height,
                     output_scale,
                 ),
-                visual_clip: surface.visual_clip.map(|clip| {
-                    render_space_rect_from_logical(
-                        (
-                            root_clip_base.0.saturating_add(clip.x()),
-                            root_clip_base.1.saturating_add(clip.y()),
-                        ),
-                        clip.width(),
-                        clip.height(),
-                        output_scale,
-                    )
-                }),
+                visual_clip: surface
+                    .visual_clip
+                    .clone()
+                    .map(|aperture| aperture.map_logical(root_clip_base, output_scale)),
             }
         })
         .collect()
@@ -1081,9 +1105,8 @@ fn partial_scene_damage_rects(
     let mut damage_rects = Vec::new();
     for ((previous, element), snapshot) in previous_snapshots
         .iter()
-        .copied()
         .zip(elements)
-        .zip(snapshots.iter().copied())
+        .zip(snapshots.iter())
     {
         if previous.surface_id != snapshot.surface_id {
             return None;
@@ -1092,6 +1115,7 @@ fn partial_scene_damage_rects(
         if previous.target != snapshot.target
             || previous.visible_target != snapshot.visible_target
             || previous.backing_target != snapshot.backing_target
+            || previous.content_regions != snapshot.content_regions
         {
             if let Some(rect) = previous
                 .visible_target
@@ -1232,17 +1256,17 @@ impl ServerFrameColor {
     }
 }
 
-fn xwayland_visual_backing_target(
+pub fn xwayland_visual_backing_target(
     surface: &RenderableSurface,
-    target: SurfaceTargetRect,
-    visual_clip: Option<SurfaceTargetRect>,
+    _target: SurfaceTargetRect,
+    visual_aperture: Option<&SurfaceVisualAperture>,
 ) -> Option<SurfaceTargetRect> {
     let placement = surface.render_placement.unwrap_or(surface.placement);
     (surface.placement.parent_surface_id.is_none()
         && placement.root_mode == RootPlacementMode::Absolute)
         .then_some(())
-        .and(visual_clip)
-        .map(|clip| SurfaceTargetRect::new(target.x(), target.y(), clip.width(), clip.height()))
+        .and(visual_aperture)
+        .map(SurfaceVisualAperture::bounds)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1288,6 +1312,44 @@ impl SurfaceTargetRect {
         self.height
     }
 
+    pub fn intersects(self, other: Self) -> bool {
+        self.intersection(other).is_some()
+    }
+
+    pub fn intersection(self, other: Self) -> Option<Self> {
+        let left = i64::from(self.x).max(i64::from(other.x));
+        let top = i64::from(self.y).max(i64::from(other.y));
+        let right = i64::from(self.right()).min(i64::from(other.right()));
+        let bottom = i64::from(self.bottom()).min(i64::from(other.bottom()));
+        (right > left && bottom > top).then_some(Self::new(
+            i32::try_from(left).unwrap_or(if left.is_negative() {
+                i32::MIN
+            } else {
+                i32::MAX
+            }),
+            i32::try_from(top).unwrap_or(if top.is_negative() {
+                i32::MIN
+            } else {
+                i32::MAX
+            }),
+            u32::try_from(right.saturating_sub(left)).unwrap_or(u32::MAX),
+            u32::try_from(bottom.saturating_sub(top)).unwrap_or(u32::MAX),
+        ))
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        let left = self.x.min(other.x);
+        let top = self.y.min(other.y);
+        let right = i64::from(self.right()).max(i64::from(other.right()));
+        let bottom = i64::from(self.bottom()).max(i64::from(other.bottom()));
+        Self::new(
+            left,
+            top,
+            u32::try_from(right.saturating_sub(i64::from(left))).unwrap_or(u32::MAX),
+            u32::try_from(bottom.saturating_sub(i64::from(top))).unwrap_or(u32::MAX),
+        )
+    }
+
     fn right(self) -> i32 {
         self.x
             .saturating_add(i32::try_from(self.width).unwrap_or(i32::MAX))
@@ -1298,6 +1360,14 @@ impl SurfaceTargetRect {
             .saturating_add(i32::try_from(self.height).unwrap_or(i32::MAX))
     }
 
+    fn right_i32(self) -> i32 {
+        self.right()
+    }
+
+    fn bottom_i32(self) -> i32 {
+        self.bottom()
+    }
+
     const fn output_rect(self) -> OutputRect {
         OutputRect {
             x: self.x,
@@ -1306,6 +1376,172 @@ impl SurfaceTargetRect {
             height: self.height,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceVisualAperture {
+    logical_target: SurfaceTargetRect,
+    committed_content_target: Option<SurfaceTargetRect>,
+    extent_strips: Vec<SurfaceTargetRect>,
+}
+
+impl SurfaceVisualAperture {
+    pub fn logical_only(logical_target: SurfaceTargetRect) -> Self {
+        Self {
+            logical_target,
+            committed_content_target: Some(logical_target),
+            extent_strips: Vec::new(),
+        }
+    }
+
+    pub fn for_root_window_preview(
+        root_origin: (i32, i32),
+        root_buffer: BufferSize,
+        visual_extents: (u32, u32, u32, u32),
+        logical_target: SurfaceTargetRect,
+    ) -> Self {
+        let buffer_rect = SurfaceTargetRect::new(
+            root_origin.0,
+            root_origin.1,
+            root_buffer.width,
+            root_buffer.height,
+        );
+        let committed_rect = SurfaceTargetRect::new(
+            root_origin
+                .0
+                .saturating_add(i32::try_from(visual_extents.0).unwrap_or(i32::MAX)),
+            root_origin
+                .1
+                .saturating_add(i32::try_from(visual_extents.1).unwrap_or(i32::MAX)),
+            root_buffer
+                .width
+                .saturating_sub(visual_extents.0)
+                .saturating_sub(visual_extents.2),
+            root_buffer
+                .height
+                .saturating_sub(visual_extents.1)
+                .saturating_sub(visual_extents.3),
+        );
+        let committed_content_target = buffer_rect
+            .intersection(committed_rect)
+            .and_then(|rect| rect.intersection(logical_target));
+        let extent_strips = subtract_rect_from_rect(buffer_rect, committed_rect)
+            .into_iter()
+            .flat_map(|strip| subtract_rect_from_rect(strip, logical_target))
+            .collect();
+        Self {
+            logical_target,
+            committed_content_target,
+            extent_strips,
+        }
+    }
+
+    pub const fn logical_target(&self) -> SurfaceTargetRect {
+        self.logical_target
+    }
+
+    pub const fn x(&self) -> i32 {
+        self.logical_target.x()
+    }
+
+    pub const fn y(&self) -> i32 {
+        self.logical_target.y()
+    }
+
+    pub const fn width(&self) -> u32 {
+        self.logical_target.width()
+    }
+
+    pub const fn height(&self) -> u32 {
+        self.logical_target.height()
+    }
+
+    pub const fn committed_content_target(&self) -> Option<SurfaceTargetRect> {
+        self.committed_content_target
+    }
+
+    pub fn extent_strips(&self) -> &[SurfaceTargetRect] {
+        &self.extent_strips
+    }
+
+    pub fn content_regions(&self) -> Vec<SurfaceTargetRect> {
+        self.committed_content_target
+            .into_iter()
+            .chain(self.extent_strips.iter().copied())
+            .collect()
+    }
+
+    pub fn bounds(&self) -> SurfaceTargetRect {
+        self.content_regions()
+            .into_iter()
+            .chain(std::iter::once(self.logical_target))
+            .reduce(SurfaceTargetRect::union)
+            .unwrap_or(self.logical_target)
+    }
+
+    pub fn map_logical(self, root_clip_base: (i32, i32), output_scale: f64) -> Self {
+        let map = |rect: SurfaceTargetRect| {
+            render_space_rect_from_logical(
+                (
+                    root_clip_base.0.saturating_add(rect.x()),
+                    root_clip_base.1.saturating_add(rect.y()),
+                ),
+                rect.width(),
+                rect.height(),
+                output_scale,
+            )
+        };
+        Self {
+            logical_target: map(self.logical_target),
+            committed_content_target: self.committed_content_target.map(map),
+            extent_strips: self.extent_strips.into_iter().map(map).collect(),
+        }
+    }
+}
+
+fn subtract_rect_from_rect(
+    source: SurfaceTargetRect,
+    excluded: SurfaceTargetRect,
+) -> Vec<SurfaceTargetRect> {
+    let Some(intersection) = source.intersection(excluded) else {
+        return vec![source];
+    };
+    let mut pieces = Vec::with_capacity(4);
+    if source.y() < intersection.y() {
+        pieces.push(SurfaceTargetRect::new(
+            source.x(),
+            source.y(),
+            source.width(),
+            u32::try_from(i64::from(intersection.y()) - i64::from(source.y())).unwrap_or(u32::MAX),
+        ));
+    }
+    if intersection.bottom() < source.bottom() {
+        pieces.push(SurfaceTargetRect::new(
+            source.x(),
+            intersection.bottom_i32(),
+            source.width(),
+            u32::try_from(source.bottom() - intersection.bottom()).unwrap_or(u32::MAX),
+        ));
+    }
+    let middle_top = intersection.y();
+    let middle_bottom = intersection.bottom_i32();
+    if source.x() < intersection.x() {
+        pieces.push(SurfaceTargetRect::new(
+            source.x(),
+            middle_top,
+            u32::try_from(i64::from(intersection.x()) - i64::from(source.x())).unwrap_or(u32::MAX),
+            u32::try_from(i64::from(middle_bottom) - i64::from(middle_top)).unwrap_or(u32::MAX),
+        ));
+    }
+    if intersection.right_i32() < source.right_i32() {
+        pieces.push(SurfaceTargetRect::new(
+            intersection.right_i32(),
+            middle_top,
+            u32::try_from(source.right() - intersection.right()).unwrap_or(u32::MAX),
+            u32::try_from(i64::from(middle_bottom) - i64::from(middle_top)).unwrap_or(u32::MAX),
+        ));
+    }
+    pieces
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1337,7 +1573,32 @@ pub fn surface_render_plan(
     surface: &RenderableSurface,
     visual_target: SurfaceTargetRect,
 ) -> SurfaceRenderPlan {
-    surface_render_plan_with_clip(surface, visual_target, surface.visual_clip)
+    let visual_aperture = surface.visual_clip.as_ref();
+    surface_render_plans_with_aperture(surface, visual_target, visual_aperture)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| SurfaceRenderPlan {
+            visual_target,
+            content_target: SurfaceTargetRect::new(visual_target.x(), visual_target.y(), 0, 0),
+            content_uv: SurfaceUvRect::FULL,
+            clip: visual_aperture.map(SurfaceVisualAperture::logical_target),
+        })
+}
+
+pub fn surface_render_plans_with_aperture(
+    surface: &RenderableSurface,
+    visual_target: SurfaceTargetRect,
+    visual_aperture: Option<&SurfaceVisualAperture>,
+) -> Vec<SurfaceRenderPlan> {
+    match visual_aperture {
+        Some(aperture) => aperture
+            .content_regions()
+            .into_iter()
+            .map(|clip| surface_render_plan_with_clip(surface, visual_target, Some(clip)))
+            .filter(|plan| plan.content_target.width() > 0 && plan.content_target.height() > 0)
+            .collect(),
+        None => vec![surface_render_plan_with_clip(surface, visual_target, None)],
+    }
 }
 
 pub fn surface_render_plan_with_clip(
@@ -1534,14 +1795,15 @@ pub fn server_frame_rects_for_surface(surface: &RenderableSurface) -> Vec<Server
             .unwrap_or(surface.placement)
             .root_mode
             == RootPlacementMode::Absolute
-        && let Some(clip) = surface.visual_clip
+        && let Some(aperture) = surface.visual_clip.as_ref()
     {
+        let bounds = aperture.bounds();
         return vec![ServerFrameRect {
             color: ServerFrameColor::XwaylandBacking,
             x: 0,
             y: 0,
-            width: clip.width(),
-            height: clip.height(),
+            width: bounds.width(),
+            height: bounds.height(),
         }];
     }
     Vec::new()
@@ -1954,10 +2216,21 @@ fn blit_surface_to_rect_clipped(
     target: SurfaceTargetRect,
     clip: Option<OutputRect>,
 ) {
+    let plan = surface_render_plan(surface, target);
+    blit_surface_with_plan(frame, frame_width, frame_height, surface, plan, clip);
+}
+
+fn blit_surface_with_plan(
+    frame: &mut [u32],
+    frame_width: u32,
+    frame_height: u32,
+    surface: &RenderableSurface,
+    plan: SurfaceRenderPlan,
+    clip: Option<OutputRect>,
+) {
     let Some(surface_pixels) = surface.cpu_pixels() else {
         return;
     };
-    let plan = surface_render_plan(surface, target);
     let target = plan.content_target;
     let output_clip = match clip {
         Some(clip) => {
@@ -2074,16 +2347,6 @@ fn copy_wallpaper_rect_to_scene(
             continue;
         };
         scene_row.copy_from_slice(wallpaper_row);
-    }
-}
-
-fn scale_server_frame_rect(rect: ServerFrameRect, output_scale: f64) -> ServerFrameRect {
-    ServerFrameRect {
-        color: rect.color,
-        x: scale_logical_coordinate(rect.x, output_scale),
-        y: scale_logical_coordinate(rect.y, output_scale),
-        width: scale_logical_extent(rect.width, output_scale),
-        height: scale_logical_extent(rect.height, output_scale),
     }
 }
 
@@ -2345,7 +2608,9 @@ mod tests {
             height: 600,
             placement: SurfacePlacement::root(),
             render_placement: None,
-            visual_clip: Some(SurfaceTargetRect::new(0, 0, 1000, 700)),
+            visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+                0, 0, 1000, 700,
+            ))),
             render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
@@ -2375,7 +2640,9 @@ mod tests {
             height: 600,
             placement: SurfacePlacement::absolute_root_at(100, 100),
             render_placement: Some(SurfacePlacement::absolute_root_at(100, 100)),
-            visual_clip: Some(SurfaceTargetRect::new(100, 100, 1100, 760)),
+            visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+                100, 100, 1100, 760,
+            ))),
             render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
@@ -2411,6 +2678,36 @@ mod tests {
         assert_eq!(frame[(100 * 1300 + 100) as usize], 0xffff_0000);
         assert_eq!(frame[(100 * 1300 + 100 + 800) as usize], 0xff00_0000);
         assert_eq!(frame[(100 + 600) * 1300 + 100], 0xff00_0000);
+    }
+
+    #[test]
+    fn non_absolute_root_preview_does_not_get_xwayland_backing() {
+        let surface = RenderableSurface {
+            surface_id: 8,
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+            placement: SurfacePlacement::root_at(100, 100),
+            render_placement: Some(SurfacePlacement::root_at(100, 100)),
+            visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+                100, 100, 1100, 760,
+            ))),
+            render_target_size: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(800, 600, vec![0xffff_0000; 800 * 600]),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+
+        let element = render_scene_elements_for_surfaces(std::slice::from_ref(&surface), 1.0)
+            .pop()
+            .expect("ordinary scene element");
+        assert_eq!(element.backing_target(), None);
     }
 
     #[test]
@@ -2460,7 +2757,9 @@ mod tests {
             height: 700,
             placement: SurfacePlacement::root(),
             render_placement: None,
-            visual_clip: Some(SurfaceTargetRect::new(0, 0, 800, 600)),
+            visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+                0, 0, 800, 600,
+            ))),
             render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
@@ -2482,7 +2781,9 @@ mod tests {
         assert!((near.content_uv.bottom - (600.0 / 700.0)).abs() < f32::EPSILON);
 
         let far_surface = RenderableSurface {
-            visual_clip: Some(SurfaceTargetRect::new(200, 100, 800, 600)),
+            visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+                200, 100, 800, 600,
+            ))),
             render_target_size: None,
             ..near_surface
         };
@@ -2508,7 +2809,9 @@ mod tests {
             height: 200,
             placement: SurfacePlacement::root(),
             render_placement: None,
-            visual_clip: Some(SurfaceTargetRect::new(0, 0, 340, 230)),
+            visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+                0, 0, 340, 230,
+            ))),
             render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
@@ -2559,7 +2862,9 @@ mod tests {
             surface_id: 8,
             width: 300,
             height: 200,
-            visual_clip: Some(SurfaceTargetRect::new(0, 0, 340, 230)),
+            visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+                0, 0, 340, 230,
+            ))),
             render_target_size: None,
             buffer: shm_buffer(300, 200, vec![0xffff_0000; 300 * 200]),
             ..first.clone()
@@ -2588,7 +2893,9 @@ mod tests {
             height: 272,
             placement: SurfacePlacement::root(),
             render_placement: Some(SurfacePlacement::root_at(-16, -10)),
-            visual_clip: Some(SurfaceTargetRect::new(0, 0, 340, 230)),
+            visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+                0, 0, 340, 230,
+            ))),
             render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
@@ -2629,7 +2936,9 @@ mod tests {
             height: 201,
             placement: SurfacePlacement::root_at(1, 1),
             render_placement: None,
-            visual_clip: Some(SurfaceTargetRect::new(1, 1, 301, 201)),
+            visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+                1, 1, 301, 201,
+            ))),
             render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
@@ -2665,7 +2974,7 @@ mod tests {
                 height: 200,
                 placement: SurfacePlacement::root(),
                 render_placement: None,
-                visual_clip: Some(clip),
+                visual_clip: Some(SurfaceVisualAperture::logical_only(clip)),
                 render_target_size: None,
                 generation: 1,
                 commit_sequence: SurfaceCommitSequence::initial(),
@@ -2703,7 +3012,9 @@ mod tests {
             height: 200,
             placement: SurfacePlacement::root(),
             render_placement: None,
-            visual_clip: Some(SurfaceTargetRect::new(0, 0, 320, 220)),
+            visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+                0, 0, 320, 220,
+            ))),
             render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
@@ -2722,7 +3033,9 @@ mod tests {
             height: 30,
             placement: SurfacePlacement::subsurface(7, 260, 20),
             render_placement: None,
-            visual_clip: Some(SurfaceTargetRect::new(0, 0, 280, 220)),
+            visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+                0, 0, 280, 220,
+            ))),
             render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
@@ -2758,7 +3071,9 @@ mod tests {
             height: 700,
             placement: SurfacePlacement::root(),
             render_placement: None,
-            visual_clip: Some(SurfaceTargetRect::new(0, 0, 1000, 700)),
+            visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+                0, 0, 1000, 700,
+            ))),
             render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
@@ -2770,7 +3085,9 @@ mod tests {
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
         let mut current = previous.clone();
-        current.visual_clip = Some(SurfaceTargetRect::new(0, 0, 800, 600));
+        current.visual_clip = Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+            0, 0, 800, 600,
+        )));
         current.generation = 2;
 
         let previous_snapshot = scene_surface_snapshots(std::slice::from_ref(&previous), 1.0);
@@ -2807,7 +3124,9 @@ mod tests {
             height: 600,
             placement: SurfacePlacement::absolute_root_at(100, 100),
             render_placement: Some(SurfacePlacement::absolute_root_at(100, 100)),
-            visual_clip: Some(SurfaceTargetRect::new(100, 100, 800, 600)),
+            visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+                100, 100, 800, 600,
+            ))),
             render_target_size: None,
             generation: 1,
             commit_sequence: SurfaceCommitSequence::initial(),
@@ -2819,7 +3138,9 @@ mod tests {
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
         let mut current = previous.clone();
-        current.visual_clip = Some(SurfaceTargetRect::new(100, 100, 1100, 760));
+        current.visual_clip = Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+            100, 100, 1100, 760,
+        )));
         current.generation = 2;
 
         let previous_snapshots = scene_surface_snapshots(std::slice::from_ref(&previous), 1.0);
@@ -2844,6 +3165,126 @@ mod tests {
             }),
             "grow preview must damage the complete new black backing box: {damage:?}"
         );
+    }
+
+    #[test]
+    fn task_3_root_aperture_uses_the_same_regions_for_cpu_and_gles_plans() {
+        let aperture = SurfaceVisualAperture::for_root_window_preview(
+            (84, 70),
+            BufferSize::new(332, 242).expect("root buffer"),
+            (16, 10, 16, 32),
+            SurfaceTargetRect::new(100, 80, 300, 200),
+        );
+        let surface = RenderableSurface {
+            surface_id: 17,
+            x: 0,
+            y: 0,
+            width: 332,
+            height: 242,
+            placement: SurfacePlacement::absolute_root_at(84, 70),
+            render_placement: Some(SurfacePlacement::absolute_root_at(84, 70)),
+            visual_clip: Some(aperture),
+            render_target_size: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(332, 242, vec![0xffff_0000; 332 * 242]),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+
+        let assignment = surface_render_space_assignments(std::slice::from_ref(&surface), 1.0)
+            .into_iter()
+            .next()
+            .expect("root render assignment");
+        let gles_plans = surface_render_plans_with_aperture(
+            &surface,
+            assignment.target,
+            assignment.visual_clip.as_ref(),
+        );
+        let cpu_plans = render_scene_elements_for_surfaces(std::slice::from_ref(&surface), 1.0)
+            .into_iter()
+            .next()
+            .expect("CPU scene element")
+            .content_regions()
+            .to_vec();
+
+        assert_eq!(cpu_plans, gles_plans);
+        assert!(
+            cpu_plans
+                .iter()
+                .any(|plan| { plan.clip == Some(SurfaceTargetRect::new(84, 70, 332, 10)) })
+        );
+        assert!(cpu_plans.iter().all(|plan| {
+            plan.clip
+                .is_some_and(|clip| !clip.intersects(SurfaceTargetRect::new(100, 80, 300, 200)))
+                || plan.content_target == SurfaceTargetRect::new(100, 80, 300, 200)
+        }));
+    }
+
+    #[test]
+    fn task_3_aperture_damage_covers_old_and_new_root_bounds() {
+        let previous_aperture = SurfaceVisualAperture::for_root_window_preview(
+            (100, 100),
+            BufferSize::new(332, 242).expect("root buffer"),
+            (16, 10, 16, 32),
+            SurfaceTargetRect::new(116, 110, 300, 200),
+        );
+        let current_aperture = SurfaceVisualAperture::for_root_window_preview(
+            (500, 400),
+            BufferSize::new(332, 242).expect("root buffer"),
+            (16, 10, 16, 32),
+            SurfaceTargetRect::new(516, 410, 300, 200),
+        );
+        let previous = RenderableSurface {
+            surface_id: 17,
+            x: 0,
+            y: 0,
+            width: 332,
+            height: 242,
+            placement: SurfacePlacement::absolute_root_at(100, 100),
+            render_placement: Some(SurfacePlacement::absolute_root_at(100, 100)),
+            visual_clip: Some(previous_aperture),
+            render_target_size: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(332, 242, vec![0xffff_0000; 332 * 242]),
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            viewport_source: None,
+            viewport_destination: None,
+            damage: RenderableSurfaceDamage::Full,
+        };
+        let current = RenderableSurface {
+            placement: SurfacePlacement::absolute_root_at(500, 400),
+            render_placement: Some(SurfacePlacement::absolute_root_at(500, 400)),
+            visual_clip: Some(current_aperture),
+            generation: 2,
+            ..previous.clone()
+        };
+        let previous_element =
+            render_scene_elements_for_surfaces(std::slice::from_ref(&previous), 1.0)
+                .pop()
+                .expect("previous scene element");
+        let current_element =
+            render_scene_elements_for_surfaces(std::slice::from_ref(&current), 1.0)
+                .pop()
+                .expect("current scene element");
+        let previous_bounds = previous_element.backing_target().expect("previous bounds");
+        let current_bounds = current_element.backing_target().expect("current bounds");
+        let damage = partial_scene_damage_rects(
+            &scene_surface_snapshots(std::slice::from_ref(&previous), 1.0),
+            std::slice::from_ref(&current_element),
+            &scene_surface_snapshots(std::slice::from_ref(&current), 1.0),
+            1000,
+            800,
+        )
+        .expect("same root produces partial damage");
+
+        assert!(damage.contains(&previous_bounds.output_rect()));
+        assert!(damage.contains(&current_bounds.output_rect()));
     }
 
     #[test]

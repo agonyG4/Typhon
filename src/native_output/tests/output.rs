@@ -626,15 +626,19 @@ fn task_05_8_native_damage_for_window_resize_covers_visual_clip_changes() {
         RenderableSurfaceDamage::Full,
     )])[0];
     let previous = RenderableSurface {
-        visual_clip: Some(oblivion_one::compositor::SurfaceTargetRect::new(
-            0, 0, 300, 200,
-        )),
+        visual_clip: Some(
+            oblivion_one::compositor::SurfaceVisualAperture::logical_only(
+                oblivion_one::compositor::SurfaceTargetRect::new(0, 0, 300, 200),
+            ),
+        ),
         ..test_renderable_surface(7, 0, 0, 300, 200, RenderableSurfaceDamage::Full)
     };
     let current = RenderableSurface {
-        visual_clip: Some(oblivion_one::compositor::SurfaceTargetRect::new(
-            0, 0, 220, 160,
-        )),
+        visual_clip: Some(
+            oblivion_one::compositor::SurfaceVisualAperture::logical_only(
+                oblivion_one::compositor::SurfaceTargetRect::new(0, 0, 220, 160),
+            ),
+        ),
         generation: 1,
         ..test_renderable_surface(7, 0, 0, 300, 200, RenderableSurfaceDamage::Full)
     };
@@ -658,6 +662,68 @@ fn task_05_8_native_damage_for_window_resize_covers_visual_clip_changes() {
             height: 200,
         }]
     );
+}
+
+#[test]
+fn task_3_native_damage_covers_old_and_new_root_aperture_bounds() {
+    let previous_aperture =
+        oblivion_one::compositor::SurfaceVisualAperture::for_root_window_preview(
+            (100, 100),
+            BufferSize::new(332, 242).expect("root buffer"),
+            (16, 10, 16, 32),
+            oblivion_one::compositor::SurfaceTargetRect::new(116, 110, 300, 200),
+        );
+    let current_aperture = oblivion_one::compositor::SurfaceVisualAperture::for_root_window_preview(
+        (500, 400),
+        BufferSize::new(332, 242).expect("root buffer"),
+        (16, 10, 16, 32),
+        oblivion_one::compositor::SurfaceTargetRect::new(516, 410, 300, 200),
+    );
+    let previous = RenderableSurface {
+        placement: SurfacePlacement::absolute_root_at(100, 100),
+        render_placement: Some(SurfacePlacement::absolute_root_at(100, 100)),
+        visual_clip: Some(previous_aperture),
+        ..test_renderable_surface(7, 0, 0, 332, 242, RenderableSurfaceDamage::Full)
+    };
+    let current = RenderableSurface {
+        placement: SurfacePlacement::absolute_root_at(500, 400),
+        render_placement: Some(SurfacePlacement::absolute_root_at(500, 400)),
+        visual_clip: Some(current_aperture),
+        generation: 2,
+        ..previous.clone()
+    };
+    let previous_bounds = render_scene_elements_for_surfaces(std::slice::from_ref(&previous), 1.0)
+        .pop()
+        .expect("previous root element")
+        .backing_target()
+        .expect("previous root bounds");
+    let current_bounds = render_scene_elements_for_surfaces(std::slice::from_ref(&current), 1.0)
+        .pop()
+        .expect("current root element")
+        .backing_target()
+        .expect("current root bounds");
+
+    let damage = native_output_damage_for_repaint(
+        1000,
+        800,
+        std::slice::from_ref(&previous),
+        std::slice::from_ref(&current),
+        RenderGenerationCause::WindowResize,
+        true,
+    );
+
+    assert!(damage.rects.contains(&NativeDamageRect {
+        x: previous_bounds.x(),
+        y: previous_bounds.y(),
+        width: previous_bounds.width(),
+        height: previous_bounds.height(),
+    }));
+    assert!(damage.rects.contains(&NativeDamageRect {
+        x: current_bounds.x(),
+        y: current_bounds.y(),
+        width: current_bounds.width(),
+        height: current_bounds.height(),
+    }));
 }
 
 #[test]

@@ -927,7 +927,10 @@ fn resize_drag_updates_visual_target_before_client_commit() {
     assert_eq!(surface.height, 200);
     assert_eq!(surface.generation, 1);
     assert_eq!(
-        surface.visual_clip,
+        surface
+            .visual_clip
+            .as_ref()
+            .map(|clip| clip.logical_target()),
         Some(render::SurfaceTargetRect::new(0, 0, 340, 230))
     );
 }
@@ -1046,7 +1049,10 @@ fn intermediate_geometry_only_commit_preserves_active_resize_preview() {
     );
     let surface = &state.renderable_surfaces[0];
     assert_eq!(
-        surface.visual_clip,
+        surface
+            .visual_clip
+            .as_ref()
+            .map(|clip| clip.logical_target()),
         Some(render::SurfaceTargetRect::new(100, 80, 1200, 700))
     );
 
@@ -1617,7 +1623,10 @@ fn left_edge_resize_shrink_updates_visual_target_before_client_commit() {
     assert_eq!(server.renderable_surfaces()[0].width, 300);
     assert_eq!(server.renderable_surfaces()[0].height, 200);
     assert_eq!(
-        server.renderable_surfaces()[0].visual_clip,
+        server.renderable_surfaces()[0]
+            .visual_clip
+            .as_ref()
+            .map(|clip| clip.logical_target()),
         Some(render::SurfaceTargetRect::new(40, 0, 260, 200))
     );
     assert_eq!(
@@ -1650,7 +1659,10 @@ fn resize_preview_clamps_to_toplevel_min_size_before_client_commit() {
         .expect("toplevel should remain renderable");
     assert_eq!((surface.width, surface.height), (320, 220));
     assert_eq!(
-        surface.visual_clip,
+        surface
+            .visual_clip
+            .as_ref()
+            .map(|clip| clip.logical_target()),
         Some(render::SurfaceTargetRect::new(0, 0, 280, 180))
     );
 }

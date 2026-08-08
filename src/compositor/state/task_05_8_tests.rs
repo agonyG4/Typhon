@@ -113,7 +113,10 @@ mod task_05_8_tests {
         let surface = &state.renderable_surfaces[0];
         assert_eq!((surface.width, surface.height), (944, 502));
         assert_eq!(
-            surface.visual_clip,
+            surface
+                .visual_clip
+                .as_ref()
+                .map(|clip| clip.logical_target()),
             Some(render::SurfaceTargetRect::new(10, 20, 1100, 650))
         );
     }
@@ -437,12 +440,8 @@ mod task_05_8_tests {
             ResizeEdges::BOTTOM_RIGHT,
             interaction_id,
         ));
-        assert!(
-            state
-                .renderable_surfaces
-                .iter()
-                .all(|surface| surface.visual_clip.is_some())
-        );
+        assert!(state.renderable_surfaces[0].visual_clip.is_some());
+        assert!(state.renderable_surfaces[1].visual_clip.is_none());
         state.toplevel_visual_geometries.insert(
             root_id,
             ToplevelVisualGeometry {
