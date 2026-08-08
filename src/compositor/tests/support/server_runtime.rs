@@ -157,6 +157,9 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureLastPointerPosition(Sender<(f64, f64)>),
     CapturePointerFocusSurfaceId(Sender<Option<u32>>),
     CaptureFocusedSurfaceId(Sender<Option<u32>>),
+    CaptureWindowInteractionDebugSnapshot(Sender<Option<WindowInteractionDebugSnapshot>>),
+    CapturePointerOwnershipIsClear(Sender<bool>),
+    CaptureWindowInteractionReleaseMetrics(Sender<WindowInteractionReleaseMetrics>),
     CaptureUsableOutputGeometry(Sender<OutputRect>),
     AuthorizeAstreaShellPid(u32),
     ClearAstreaShellAuthorization,
@@ -680,6 +683,15 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .map(compositor_surface_id),
                         );
                     }
+                    ServerCommand::CaptureWindowInteractionDebugSnapshot(reply) => {
+                        let _ = reply.send(server.window_interaction_debug_snapshot());
+                    }
+                    ServerCommand::CapturePointerOwnershipIsClear(reply) => {
+                        let _ = reply.send(server.pointer_ownership_is_clear());
+                    }
+                    ServerCommand::CaptureWindowInteractionReleaseMetrics(reply) => {
+                        let _ = reply.send(server.window_interaction_release_metrics());
+                    }
                     ServerCommand::CaptureUsableOutputGeometry(reply) => {
                         let _ = reply.send(server.state.usable_output_geometry());
                     }
@@ -954,6 +966,42 @@ pub(in crate::compositor::tests) fn capture_focused_surface_id(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report keyboard focus surface")
+}
+
+pub(in crate::compositor::tests) fn capture_window_interaction_debug_snapshot(
+    commands: &Sender<ServerCommand>,
+) -> Option<WindowInteractionDebugSnapshot> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureWindowInteractionDebugSnapshot(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report window interaction snapshot")
+}
+
+pub(in crate::compositor::tests) fn capture_pointer_ownership_is_clear(
+    commands: &Sender<ServerCommand>,
+) -> bool {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CapturePointerOwnershipIsClear(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report pointer ownership")
+}
+
+pub(in crate::compositor::tests) fn capture_window_interaction_release_metrics(
+    commands: &Sender<ServerCommand>,
+) -> WindowInteractionReleaseMetrics {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureWindowInteractionReleaseMetrics(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report window interaction release metrics")
 }
 
 pub(in crate::compositor::tests) fn capture_usable_output_geometry(

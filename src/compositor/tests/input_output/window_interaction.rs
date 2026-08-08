@@ -57,6 +57,21 @@ fn window_interaction_absolute_motion_targets_only_original_surface() {
 
     let start_x = f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0;
     let start_y = f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0;
+    let renderable_surfaces = capture_renderable_surface_snapshot(&commands);
+    let surface_id_at = |x: f64, y: f64| {
+        renderable_surfaces
+            .iter()
+            .rev()
+            .find(|surface| {
+                x >= f64::from(surface.origin_x)
+                    && x < f64::from(surface.origin_x + surface.width as i32)
+                    && y >= f64::from(surface.origin_y)
+                    && y < f64::from(surface.origin_y + surface.height as i32)
+            })
+            .map(|surface| surface.surface_id)
+    };
+    let surface_a_id = surface_id_at(start_x, start_y).expect("A must cover start point");
+    let surface_b_id = surface_id_at(140.0, 140.0).expect("B must cover crossing point");
     commands
         .send(ServerCommand::PointerMotion {
             x: start_x,
@@ -68,6 +83,11 @@ fn window_interaction_absolute_motion_targets_only_original_surface() {
     queue_b.roundtrip(&mut state_b).unwrap();
     assert_eq!(state_a.pointer_enter_count, 1);
     assert_eq!(state_b.pointer_enter_count, 0);
+    assert_eq!(
+        capture_pointer_focus_surface_id(&commands),
+        Some(surface_a_id)
+    );
+    let keyboard_focus_at_a = capture_focused_surface_id(&commands);
     commands
         .send(ServerCommand::PointerMotion { x: 140.0, y: 140.0 })
         .unwrap();
@@ -75,6 +95,12 @@ fn window_interaction_absolute_motion_targets_only_original_surface() {
     queue_a.roundtrip(&mut state_a).unwrap();
     queue_b.roundtrip(&mut state_b).unwrap();
     assert_eq!(state_b.pointer_enter_count, 1);
+    assert_eq!(
+        capture_pointer_focus_surface_id(&commands),
+        Some(surface_b_id)
+    );
+    let keyboard_focus_at_b = capture_focused_surface_id(&commands);
+    assert_eq!(keyboard_focus_at_b, keyboard_focus_at_a);
     state_a.pointer_motion = false;
     state_b.pointer_event_log.clear();
 
@@ -111,6 +137,16 @@ fn window_interaction_absolute_motion_targets_only_original_surface() {
 
     assert_eq!(receiver.recv().unwrap(), 0);
     assert_eq!(
+        capture_pointer_focus_surface_id(&commands),
+        Some(surface_b_id)
+    );
+    let keyboard_focus_during_interaction = capture_focused_surface_id(&commands);
+    assert_eq!(keyboard_focus_during_interaction, Some(surface_a_id));
+    let captured_owner = capture_window_interaction_debug_snapshot(&commands)
+        .expect("interaction must remain captured after pointer Leave");
+    assert_eq!(captured_owner.pointer_motion_surface_id, Some(surface_a_id));
+    assert_ne!(captured_owner.pointer_motion_surface_id, Some(surface_b_id));
+    assert_eq!(
         state_a
             .pointer_event_log
             .iter()
@@ -137,16 +173,80 @@ fn window_interaction_absolute_motion_targets_only_original_surface() {
 
     commands.send(ServerCommand::EndInteraction).unwrap();
     wait_for_server_commands(&commands);
+    let terminal_refreshes_before_lifecycle = capture_window_interaction_release_metrics(&commands)
+        .window_interaction_post_terminal_pointer_refreshes;
+
+    let renderable_after_safety = capture_renderable_surface_snapshot(&commands);
+    let surface_id_at_after_safety = |x: f64, y: f64| {
+        renderable_after_safety
+            .iter()
+            .rev()
+            .find(|surface| {
+                x >= f64::from(surface.origin_x)
+                    && x < f64::from(surface.origin_x + surface.width as i32)
+                    && y >= f64::from(surface.origin_y)
+                    && y < f64::from(surface.origin_y + surface.height as i32)
+            })
+            .map(|surface| surface.surface_id)
+    };
+    let (return_x, return_y) = renderable_after_safety
+        .iter()
+        .find_map(|surface| {
+            (surface.surface_id == surface_a_id).then_some([
+                (
+                    f64::from(surface.origin_x) + 5.0,
+                    f64::from(surface.origin_y) + 5.0,
+                ),
+                (
+                    f64::from(surface.origin_x + surface.width as i32) - 5.0,
+                    f64::from(surface.origin_y) + 5.0,
+                ),
+                (
+                    f64::from(surface.origin_x) + 5.0,
+                    f64::from(surface.origin_y + surface.height as i32) - 5.0,
+                ),
+                (
+                    f64::from(surface.origin_x + surface.width as i32) - 5.0,
+                    f64::from(surface.origin_y + surface.height as i32) - 5.0,
+                ),
+            ])
+        })
+        .and_then(|candidates| {
+            candidates
+                .into_iter()
+                .find(|(x, y)| surface_id_at_after_safety(*x, *y) == Some(surface_a_id))
+        })
+        .expect("A must remain topmost at one post-move return point");
+
+    commands
+        .send(ServerCommand::PointerMotion { x: 500.0, y: 300.0 })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue_a.roundtrip(&mut state_a).unwrap();
+    queue_b.roundtrip(&mut state_b).unwrap();
+    assert_eq!(capture_pointer_focus_surface_id(&commands), None);
+    assert_eq!(
+        capture_focused_surface_id(&commands),
+        keyboard_focus_during_interaction
+    );
 
     commands
         .send(ServerCommand::PointerMotion {
-            x: start_x,
-            y: start_y,
+            x: return_x,
+            y: return_y,
         })
         .unwrap();
     wait_for_server_commands(&commands);
     queue_a.roundtrip(&mut state_a).unwrap();
     queue_b.roundtrip(&mut state_b).unwrap();
+    assert_eq!(
+        capture_pointer_focus_surface_id(&commands),
+        Some(surface_a_id)
+    );
+    assert_eq!(
+        capture_focused_surface_id(&commands),
+        keyboard_focus_during_interaction
+    );
     state_a.pointer_event_log.clear();
     state_b.pointer_event_log.clear();
 
@@ -159,22 +259,47 @@ fn window_interaction_absolute_motion_targets_only_original_surface() {
     wait_for_server_commands(&commands);
     queue_a.roundtrip(&mut state_a).unwrap();
     queue_b.roundtrip(&mut state_b).unwrap();
+    assert_eq!(
+        capture_pointer_focus_surface_id(&commands),
+        Some(surface_a_id)
+    );
+    assert_eq!(
+        capture_focused_surface_id(&commands),
+        keyboard_focus_during_interaction
+    );
     state_a.pointer_event_log.clear();
     state_b.pointer_event_log.clear();
 
     commands
         .send(ServerCommand::BeginMove {
-            x: start_x,
-            y: start_y,
+            x: return_x,
+            y: return_y,
         })
         .unwrap();
-    for (x, y) in [(140.0, 140.0), (500.0, 300.0), (start_x, start_y)] {
+    wait_for_server_commands(&commands);
+    let captured_owner = capture_window_interaction_debug_snapshot(&commands)
+        .expect("interaction must be captured by A");
+    assert_eq!(captured_owner.pointer_motion_surface_id, Some(surface_a_id));
+    assert_ne!(captured_owner.pointer_motion_surface_id, Some(surface_b_id));
+    for (x, y) in [(140.0, 140.0), (500.0, 300.0), (return_x, return_y)] {
         commands
             .send(ServerCommand::PointerMotion { x, y })
             .unwrap();
         wait_for_server_commands(&commands);
         queue_a.roundtrip(&mut state_a).unwrap();
         queue_b.roundtrip(&mut state_b).unwrap();
+        assert_eq!(
+            capture_pointer_focus_surface_id(&commands),
+            Some(surface_a_id)
+        );
+        assert_eq!(
+            capture_focused_surface_id(&commands),
+            keyboard_focus_during_interaction
+        );
+        assert_eq!(
+            capture_window_interaction_debug_snapshot(&commands),
+            Some(captured_owner)
+        );
     }
 
     assert_eq!(
@@ -196,9 +321,45 @@ fn window_interaction_absolute_motion_targets_only_original_surface() {
     wait_for_server_commands(&commands);
     queue_a.roundtrip(&mut state_a).unwrap();
     queue_b.roundtrip(&mut state_b).unwrap();
+    assert_eq!(
+        capture_pointer_focus_surface_id(&commands),
+        Some(surface_a_id)
+    );
+    assert!(capture_pointer_ownership_is_clear(&commands));
+    assert_eq!(
+        capture_window_interaction_debug_snapshot(&commands),
+        Some(captured_owner)
+    );
+    assert_eq!(
+        state_a
+            .pointer_event_log
+            .iter()
+            .filter(|event| **event == "button_released")
+            .count(),
+        1
+    );
+    assert!(!state_b.pointer_event_log.contains(&"button_released"));
     commands.send(ServerCommand::EndInteraction).unwrap();
     wait_for_server_commands(&commands);
-    assert!(!state_b.pointer_event_log.contains(&"motion"));
+    assert_eq!(capture_window_interaction_debug_snapshot(&commands), None);
+    assert_eq!(
+        capture_pointer_focus_surface_id(&commands),
+        Some(surface_a_id)
+    );
+    assert_eq!(
+        capture_focused_surface_id(&commands),
+        keyboard_focus_during_interaction
+    );
+    let terminal_refreshes = capture_window_interaction_release_metrics(&commands)
+        .window_interaction_post_terminal_pointer_refreshes;
+    assert_eq!(terminal_refreshes, terminal_refreshes_before_lifecycle + 1);
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    wait_for_server_commands(&commands);
+    assert_eq!(
+        capture_window_interaction_release_metrics(&commands)
+            .window_interaction_post_terminal_pointer_refreshes,
+        terminal_refreshes
+    );
 
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();
