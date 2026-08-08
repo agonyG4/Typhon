@@ -17,8 +17,12 @@
 - Do not change XDG decoration negotiation mode, infer shadows from arbitrary surface trees, or add a visible Typhon-owned normal application border.
 - Hover focus never raises. Click activation raises exactly once through the existing family-aware stacking machinery.
 - Generic pointer `FocusLoss` never terminates an active move/resize. The captured interaction motion target remains authoritative until an explicit terminal condition.
+- A pointer-constraint transition is not an unconditional terminal condition. End the interaction only when the transition invalidates the captured ownership or protocol state.
+- Desktop focus and activation use typed `Changed`, `NoChange`, and `Unavailable` outcomes so repeated hover, invalid targets, and true focus transitions are distinguishable without secondary state inspection.
 - Pointer press delivery remains tied to the original hit-test result even when activation changes stacking; no post-activation re-hit-test is allowed.
 - Hover advances focus history only when keyboard focus changes to a different managed `WindowId`; repeated hover and pointer refreshes over the same window do not churn the serial.
+- Activation no-op detection uses the existing transient-family-aware effective stacking order, not only an individual root's raw stack index.
+- Resize visual extents are specified semantically as a bounded root-only logical aperture plus valid committed out-of-geometry root pixels. Use the existing region/rect representation when safe; introduce strips only if needed to express that union.
 - Post-interaction pointer refresh is performed exactly once after terminal cleanup.
 - Do not claim TTY/DRM, Firefox, or Kitty qualification unless it is observed during this implementation run.
 
@@ -75,14 +79,14 @@ The exact test module may follow current Typhon placement conventions, but every
 - [ ] Remove the requirement in interaction motion dispatch that `pointer_surface` equal the captured motion surface. Validate only that the captured target is alive, remains under the captured root, and remains protocol-valid for the interaction, then send motion using the captured target's resources.
 - [ ] Keep active-interaction routing ordered as global pointer-position update, captured geometry update, captured-target motion delivery, and interaction cursor preservation. Do not run ordinary hit-test ownership replacement in this path.
 - [ ] Make `clear_pointer_focus_state`, crossing refresh, implicit-grab refresh, XDG/XWayland reconciliation, and session cleanup interaction-aware. Pointer focus loss must not call interaction cancellation with `FocusLoss`.
-- [ ] Replace generic `FocusLoss` termination with explicit terminal reasons only: trigger release, explicit end/cancel, mode transition, target destruction/unmap, client disconnect, pointer-constraint transition, session suspension, input removal, or state teardown as applicable to the existing call site.
+- [ ] Replace generic `FocusLoss` termination with explicit terminal reasons only: trigger release, explicit end/cancel, mode transition, target destruction/unmap, client disconnect, session suspension, input removal, or state teardown as applicable to the existing call site. Treat a pointer-constraint transition as terminal only when it actually invalidates captured interaction ownership or protocol state.
 - [ ] Consolidate normal completion and cancellation so each terminal event clears interaction state once, finalizes pending resize/configure state where required, clears cursor override, finishes event delivery, and then performs one post-terminal pointer refresh.
 - [ ] Keep release delivery tied to the original implicit-grab/interaction record; never re-target a release from the current pointer location.
 
 ### 1.3 Verify the slice
 
 - [ ] Run focused interaction tests serially, including the existing interaction and input-liveness modules.
-- [ ] Run `cargo fmt --check` and `cargo test --locked --test <focused-targets>` using the repository's actual test target names.
+- [ ] Discover the repository's actual Cargo test targets and module filters first (`cargo test --locked -- --list` plus source/test-layout inspection), then run the focused filters using those discovered targets. Do not assume a named module is a standalone `--test` binary.
 - [ ] Inspect the diff for any remaining current-hit-test lookup in the active interaction motion path or any `FocusLoss` cancellation.
 - [ ] Commit only this slice with a focused message such as `fix: preserve move and resize ownership across focus changes`.
 
@@ -105,9 +109,10 @@ The exact test module may follow current Typhon placement conventions, but every
 - [ ] Add the reason enum used by the approved design (`PointerEnter`, `PointerPress`, `ShellActivation`, `KeyboardNavigation`, and `Restore`) in the module that owns desktop focus policy.
 - [ ] Make desktop focus resolve an exact managed `WindowId`, reject destroyed/unmapped/minimized/ineligible targets, focus the root through existing low-level focus, update active-state publication, and queue existing X11 activation synchronization where applicable.
 - [ ] Guard desktop focus serial advancement by managed `WindowId` transition. A surface resource refresh or subsurface transition inside the same window must not advance the serial; low-level protocol surface focus may still change independently.
+- [ ] Return typed desktop-focus outcomes (`Changed`, `NoChange`, `Unavailable`) and typed activation outcomes with the same three-way vocabulary; do not recover outcome meaning by inspecting focus or stacking state after a boolean return.
 - [ ] Make hover call only the focus operation with `PointerEnter`; it must never call `raise_window_id`, `raise_root_window`, or activation.
 - [ ] Make pointer motion derive an eligible managed root from the already resolved hit target, suppress hover focus during active move/resize, held button/implicit grab, popup grab, pointer lock/confinement, DND, session lock, or exclusive layer-shell interaction, and avoid all ineligible surface classes.
-- [ ] Add exact `activate_desktop_window(WindowId, PointerPress)` behavior that resolves, restores if minimized, focuses, and invokes the existing family-aware raise once. Return a no-op outcome when focused/restored/topmost so duplicate backend work is not emitted.
+- [ ] Add exact `activate_desktop_window(WindowId, PointerPress)` behavior that resolves, restores if minimized, focuses, and invokes the existing family-aware raise once. Evaluate effective transient-family stacking before deciding no-op, and return a typed no-op outcome when focused/restored/topmost so duplicate backend work is not emitted.
 - [ ] In `send_pointer_button`, perform exactly one hit-test, capture the target/root/`WindowId`, establish pointer focus, call exact activation, create the press/implicit-grab record from the captured target, and deliver the button to that captured surface. Do not re-hit-test after activation.
 - [ ] Keep low-level `focus_surface` behavior unchanged for popups, layers, pointer constraints, and compositor-owned surfaces; do not let it gain desktop raise/restore semantics.
 
@@ -139,10 +144,10 @@ The exact test module may follow current Typhon placement conventions, but every
 - [ ] Add the approved root-level `WindowVisualExtents { left, top, right, bottom }` value type using the current module visibility and integer conventions. Keep its public values non-negative, but compute from signed coordinates in an intermediate wide integer type.
 - [ ] Derive extents only from committed root buffer bounds and authoritative committed `xdg_window_geometry`: treat the buffer as `[0, 0, buffer_width, buffer_height]` and the logical rectangle as `[x, y, x + width, y + height]`; clamp final outside-buffer distances safely after checked/saturating arithmetic.
 - [ ] Do not inspect unrelated subsurfaces, alpha, colors, application identity, titlebar content, magic shadow sizes, or surface-tree relationships when deriving extents.
-- [ ] Introduce the smallest resolved root aperture representation needed by the current renderer. It must carry the desired logical content aperture plus only the committed root pixels that were outside the prior logical geometry; if one rectangular clip cannot express that union safely, represent non-overlapping root-only content and extent strips rather than widening every surface clip.
+- [ ] Introduce the smallest resolved root aperture representation needed by the current renderer. It must carry the desired logical content aperture plus only the committed root pixels that were outside the prior logical geometry; prefer the repository's existing region/rect representation, and use non-overlapping root-only extent strips only if that representation cannot express the union safely. Never widen every surface clip.
 - [ ] Apply the extents exactly once when resolving preview placement and target size. Preserve desired logical geometry as the configure/resize-anchor source of truth; never scale or rewrite the committed root buffer.
 - [ ] Integrate the aperture into `update_toplevel_visual_render_assignment` and the existing resize-preview path so left/top placement changes and width/height changes use the same resolved target. Keep the aperture independent of focus eligibility and ordinary frame hit-testing.
-- [ ] Ensure the logical content remains clipped to the desired logical geometry, the committed CSD/shadow pixels remain visible in the bounded extent strips, and stale old client content cannot leak into those strips.
+- [ ] Ensure the logical content remains clipped to the desired logical geometry, the committed CSD/shadow pixels remain visible in the bounded root-only extents, and stale old client content cannot leak into those extents.
 - [ ] Feed the same resolved aperture to CPU scene plans, GLES scene plans, snapshots, visible bounds, and native damage. Include both old and new aperture bounds in damage when preview geometry changes.
 - [ ] Clear the preview aperture on final client commit and restore the ordinary committed render assignment without double-applying the XDG offset.
 
@@ -188,6 +193,7 @@ The exact test module may follow current Typhon placement conventions, but every
 - [ ] Run `cargo check --locked --all-targets`.
 - [ ] Run `cargo clippy --locked --all-targets -- -D warnings`.
 - [ ] Run all focused interaction, pointer/focus, stacking, resize, XDG toplevel, XWayland, render-plan, and native-damage tests serially.
+- [ ] Before focused commands, discover the real Cargo targets and filters from `cargo test --locked -- --list` and the repository's test layout; invoke each required group through its actual target/module path.
 - [ ] Run `cargo test --locked` serially after focused tests pass, then rerun any failure in isolation to distinguish test-environment/FD flakes from product regressions.
 - [ ] Run `./bin/check-source-layout` and `git diff --check`.
 - [ ] Execute the repository-supported no-sleep stress groups: 100 click-focus-raise cycles, 100 hover-focus-without-raise cycles, 100 mixed hover/click cycles, 100 XDG resize-across-window cycles, 100 X11 resize-across-window cycles, 100 pointer-refresh-during-resize cycles, and 100 CSD extent-resize cycles. Record each result.

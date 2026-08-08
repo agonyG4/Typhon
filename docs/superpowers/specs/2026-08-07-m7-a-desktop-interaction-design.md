@@ -33,6 +33,12 @@ The implementation must preserve these invariants:
 9. M7-A does not change XDG decoration negotiation mode.
 10. Typhon adds no visible normal application border.
 11. M7-B and Eclipse remain untouched until the M7-A real-session gate passes.
+12. Pointer-constraint transitions are not interaction terminals by themselves. A move or
+    resize ends only when the transition actually invalidates the captured interaction
+    ownership or its protocol state.
+13. Desktop focus and activation return typed outcomes: `Changed`, `NoChange`, or
+    `Unavailable`. Repeated hover over the same managed `WindowId`, invalid targets, and
+    true focus transitions must remain distinguishable without inspecting secondary state.
 
 The existing clean `main` worktree and valid live-session fixes must be preserved. Work stays directly on `main`; no branch, worktree, reset, amend, squash, or history rewrite is permitted.
 
@@ -87,7 +93,7 @@ pub(crate) fn focus_desktop_window(
     &mut self,
     window_id: WindowId,
     reason: WindowFocusReason,
-) -> bool;
+) -> WindowFocusOutcome;
 ```
 
 The exact visibility and naming may follow the current module conventions, but the operation must have these semantics:
@@ -111,7 +117,7 @@ Introduce or refactor an exact-window activation operation:
 
 ```rust
 pub(crate) enum WindowActivationOutcome {
-    Accepted,
+    Changed,
     NoChange,
     Unavailable,
 }
@@ -249,7 +255,7 @@ During interactive preview, keep three concepts separate:
 2. committed root buffer content, which is never scaled or rewritten;
 3. committed root visual extents, which may remain visible around the logical aperture.
 
-The renderer must express the preview as a bounded root-only visual aperture: the desired logical content remains clipped to the new logical geometry, while only the committed root pixels that were outside the previous logical geometry are retained as visual extent strips. If the existing single rectangular clip cannot represent this union without exposing stale client content, add the smallest internal root-only render-plan representation necessary to emit non-overlapping logical content and extent strips. Do not widen the existing clip for every subsurface.
+The renderer must express the preview as a bounded root-only visual aperture: the desired logical content remains clipped to the new logical geometry, while only the committed root pixels that were outside the previous logical geometry are retained as visual extents. If the existing single rectangular clip cannot represent this union without exposing stale client content, add the smallest internal root-only region/rect representation necessary to express the bounded union. Use extent strips only if the repository's existing region representation cannot express it safely. Do not widen the existing clip for every subsurface.
 
 The visual aperture must:
 
