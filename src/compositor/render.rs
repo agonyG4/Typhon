@@ -1382,7 +1382,7 @@ impl SurfaceTargetRect {
 pub struct SurfaceVisualAperture {
     logical_target: SurfaceTargetRect,
     committed_content_target: Option<SurfaceTargetRect>,
-    extent_strips: Vec<SurfaceTargetRect>,
+    committed_extent_regions: Vec<SurfaceTargetRect>,
 }
 
 impl SurfaceVisualAperture {
@@ -1390,7 +1390,7 @@ impl SurfaceVisualAperture {
         Self {
             logical_target,
             committed_content_target: Some(logical_target),
-            extent_strips: Vec::new(),
+            committed_extent_regions: Vec::new(),
         }
     }
 
@@ -1425,14 +1425,14 @@ impl SurfaceVisualAperture {
         let committed_content_target = buffer_rect
             .intersection(committed_rect)
             .and_then(|rect| rect.intersection(logical_target));
-        let extent_strips = subtract_rect_from_rect(buffer_rect, committed_rect)
+        let committed_extent_regions = subtract_rect_from_rect(buffer_rect, committed_rect)
             .into_iter()
-            .flat_map(|strip| subtract_rect_from_rect(strip, logical_target))
+            .flat_map(|region| subtract_rect_from_rect(region, logical_target))
             .collect();
         Self {
             logical_target,
             committed_content_target,
-            extent_strips,
+            committed_extent_regions,
         }
     }
 
@@ -1460,14 +1460,14 @@ impl SurfaceVisualAperture {
         self.committed_content_target
     }
 
-    pub fn extent_strips(&self) -> &[SurfaceTargetRect] {
-        &self.extent_strips
+    pub fn committed_extent_regions(&self) -> &[SurfaceTargetRect] {
+        &self.committed_extent_regions
     }
 
     pub fn content_regions(&self) -> Vec<SurfaceTargetRect> {
         self.committed_content_target
             .into_iter()
-            .chain(self.extent_strips.iter().copied())
+            .chain(self.committed_extent_regions.iter().copied())
             .collect()
     }
 
@@ -1494,7 +1494,7 @@ impl SurfaceVisualAperture {
         Self {
             logical_target: map(self.logical_target),
             committed_content_target: self.committed_content_target.map(map),
-            extent_strips: self.extent_strips.into_iter().map(map).collect(),
+            committed_extent_regions: self.committed_extent_regions.into_iter().map(map).collect(),
         }
     }
 }

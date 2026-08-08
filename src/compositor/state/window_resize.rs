@@ -851,22 +851,22 @@ mod task_3_red_tests {
         );
         assert!(
             aperture
-                .extent_strips()
+                .committed_extent_regions()
                 .contains(&SurfaceTargetRect::new(144, 140, 332, 10))
         );
         assert!(
             aperture
-                .extent_strips()
+                .committed_extent_regions()
                 .contains(&SurfaceTargetRect::new(144, 350, 332, 32))
         );
         assert!(
             aperture
-                .extent_strips()
+                .committed_extent_regions()
                 .contains(&SurfaceTargetRect::new(144, 150, 16, 200))
         );
         assert!(
             aperture
-                .extent_strips()
+                .committed_extent_regions()
                 .iter()
                 .all(|strip| !strip.intersects(aperture.logical_target()))
         );
@@ -888,10 +888,15 @@ mod task_3_red_tests {
             aperture.committed_content_target(),
             Some(SurfaceTargetRect::new(132, 100, 288, 200))
         );
-        assert!(aperture.extent_strips().iter().any(|strip| strip.y() < 100));
         assert!(
             aperture
-                .extent_strips()
+                .committed_extent_regions()
+                .iter()
+                .any(|strip| strip.y() < 100)
+        );
+        assert!(
+            aperture
+                .committed_extent_regions()
                 .iter()
                 .all(|strip| !strip.intersects(aperture.logical_target()))
         );
@@ -909,18 +914,28 @@ mod task_3_red_tests {
             aperture.logical_target(),
             SurfaceTargetRect::new(140, 120, 260, 170)
         );
-        assert!(aperture.extent_strips().iter().any(|strip| strip.x() < 140));
-        assert!(aperture.extent_strips().iter().any(|strip| strip.y() < 120));
         assert!(
             aperture
-                .extent_strips()
+                .committed_extent_regions()
+                .iter()
+                .any(|strip| strip.x() < 140)
+        );
+        assert!(
+            aperture
+                .committed_extent_regions()
+                .iter()
+                .any(|strip| strip.y() < 120)
+        );
+        assert!(
+            aperture
+                .committed_extent_regions()
                 .iter()
                 .all(|strip| !strip.intersects(aperture.logical_target()))
         );
     }
 
     #[test]
-    fn right_and_bottom_edge_previews_keep_extent_strips_bounded() {
+    fn right_and_bottom_edge_previews_keep_extent_regions_bounded() {
         let aperture = resolve_root_visual_aperture_for_preview(
             BufferSize::new(332, 242).expect("test root buffer"),
             XdgWindowGeometry::new(16, 10, 300, 200),
@@ -931,14 +946,14 @@ mod task_3_red_tests {
             aperture.committed_content_target(),
             Some(SurfaceTargetRect::new(100, 80, 300, 200))
         );
-        assert!(aperture.extent_strips().iter().any(|strip| {
+        assert!(aperture.committed_extent_regions().iter().any(|strip| {
             strip.x()
                 >= aperture
                     .logical_target()
                     .x()
                     .saturating_add(i32::try_from(aperture.logical_target().width()).unwrap())
         }));
-        assert!(aperture.extent_strips().iter().any(|strip| {
+        assert!(aperture.committed_extent_regions().iter().any(|strip| {
             strip.y()
                 >= aperture
                     .logical_target()
@@ -947,7 +962,7 @@ mod task_3_red_tests {
         }));
         assert!(
             aperture
-                .extent_strips()
+                .committed_extent_regions()
                 .iter()
                 .all(|strip| !strip.intersects(aperture.logical_target()))
         );
@@ -987,19 +1002,19 @@ mod task_3_red_tests {
         for aperture in [&grown, &shrunk] {
             assert!(
                 aperture
-                    .extent_strips()
+                    .committed_extent_regions()
                     .iter()
                     .all(|strip| !strip.intersects(aperture.logical_target()))
             );
         }
-        assert!(shrunk.extent_strips().iter().any(|strip| {
+        assert!(shrunk.committed_extent_regions().iter().any(|strip| {
             strip.x()
                 >= shrunk
                     .logical_target()
                     .x()
                     .saturating_add(i32::try_from(shrunk.logical_target().width()).unwrap())
         }));
-        assert!(shrunk.extent_strips().iter().any(|strip| {
+        assert!(shrunk.committed_extent_regions().iter().any(|strip| {
             strip.y()
                 >= shrunk
                     .logical_target()
