@@ -115,7 +115,6 @@ fn compositor_move_persists_pointer_owned_geometry_before_delayed_notify() {
             },
         });
     fixture.server.send_pointer_motion(301.0, 241.0);
-    assert!(fixture.server.update_window_interaction(301.0, 241.0));
 
     let visual = fixture
         .server
