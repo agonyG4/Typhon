@@ -22,6 +22,10 @@ use wayland_protocols::xwayland::shell::v1::client::xwayland_shell_v1 as client_
 
 #[path = "xwayland_admission.rs"]
 mod xwayland_admission;
+#[path = "xwayland_border_policy.rs"]
+mod xwayland_border_policy;
+#[path = "xwayland_focus.rs"]
+mod xwayland_focus;
 #[path = "xwayland_geometry_ordering.rs"]
 mod xwayland_geometry_ordering;
 #[path = "xwayland_pointer_batch.rs"]
@@ -587,44 +591,6 @@ fn admitted_x11_window_configures_x_to_its_persisted_frame_geometry() {
 }
 
 #[test]
-fn managed_x11_configure_request_normalizes_nonzero_border_width() {
-    let mut fixture = first_buffer_fixture();
-    let mut snapshot = fake_snapshot();
-    snapshot.surface_id = fixture.surface_id;
-    let handle = snapshot.handle;
-    fixture
-        .server
-        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot.clone()));
-
-    let commands = fixture
-        .server
-        .apply_xwayland_window_event(XwmEvent::ConfigureRequested {
-            window: handle,
-            request: X11ConfigureRequest {
-                requested: snapshot.geometry,
-                fields: X11ConfigureFlags {
-                    border_width: true,
-                    ..X11ConfigureFlags::default()
-                },
-                client_event_sequence: None,
-                border_width: 7,
-                sibling: None,
-                stack_mode: None,
-            },
-        });
-
-    assert!(commands.iter().any(|command| matches!(
-        command,
-        XwmCommand::Configure {
-            window,
-            fields,
-            border_width,
-            ..
-        } if *window == handle && fields.border_width && *border_width == 0
-    )));
-}
-
-#[test]
 fn x11_stack_request_publishes_final_client_list_order() {
     let socket = super::unique_socket_name();
     let mut server = super::OwnCompositorServer::bind_cpu_composition(&socket)
@@ -969,14 +935,6 @@ fn xwayland_attachment_replacement_preserves_frame_and_keyboard_focus() {
             .map(crate::compositor::compositor_surface_id),
         Some(fixture.parent_surface_id)
     );
-    let focus_generation_before = fixture.server.state.focus_generation;
-    let focus_serial_before = fixture
-        .server
-        .state
-        .window(window_id)
-        .expect("admitted X11 window")
-        .last_focus_serial;
-
     fixture
         .server
         .apply_xwayland_association_event(XwmAssociationEvent::Associated {
@@ -1008,20 +966,6 @@ fn xwayland_attachment_replacement_preserves_frame_and_keyboard_focus() {
         "keyboard focus must transfer to the replacement surface"
     );
     assert_eq!(fixture.server.state.focused_window_id, Some(window_id));
-    assert_eq!(
-        fixture.server.state.focus_generation,
-        focus_generation_before
-    );
-    assert_eq!(
-        fixture
-            .server
-            .state
-            .window(window_id)
-            .expect("admitted X11 window")
-            .last_focus_serial,
-        focus_serial_before
-    );
-
     fixture
         .server
         .apply_xwayland_association_event(XwmAssociationEvent::Removed {
