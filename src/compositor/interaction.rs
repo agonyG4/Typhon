@@ -154,6 +154,7 @@ pub struct WindowInteractionReleaseMetrics {
     pub window_interaction_release_target_missing: u64,
     pub window_interaction_stale_buttons_cleared: u64,
     pub window_interaction_duplicate_releases_prevented: u64,
+    pub window_interaction_post_terminal_pointer_refreshes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

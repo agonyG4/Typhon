@@ -572,6 +572,7 @@ pub struct CompositorState {
     next_window_interaction_id: u64,
     next_resize_interaction_id: u64,
     window_interaction_release_metrics: WindowInteractionReleaseMetrics,
+    window_interaction_terminal_refresh_pending: bool,
     window_interaction_release_debug: VecDeque<WindowInteractionReleaseDebugRecord>,
     next_resize_configure_sequence: u64,
     next_surface_commit_sequence: u64,

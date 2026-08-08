@@ -1145,7 +1145,7 @@ impl CompositorState {
             .is_some_and(|interaction| surface_ids.contains(&interaction.root_surface_id));
         if interaction_cleared {
             self.clear_window_interaction_state(reason);
-            self.refresh_pointer_focus_at_last_position();
+            self.refresh_pointer_focus_after_window_interaction();
         }
         debug_assert!(
             self.window_interaction.is_some() || self.interaction_cursor_override.is_none()

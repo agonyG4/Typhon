@@ -473,7 +473,10 @@ impl CompositorState {
         let pointers = self
             .pointer_resources
             .iter()
-            .filter(|pointer| resource_belongs_to_surface_client(*pointer, &target.surface))
+            .filter(|pointer| {
+                resource_belongs_to_surface_client(*pointer, &target.surface)
+                    && self.pointer_resource_entered_surface(pointer, &target.surface)
+            })
             .cloned()
             .collect::<Vec<_>>();
         let dispatched = pointers.len();

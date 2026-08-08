@@ -109,14 +109,14 @@ fn window_interaction_absolute_motion_targets_only_original_surface() {
     queue_a.roundtrip(&mut state_a).unwrap();
     queue_b.roundtrip(&mut state_b).unwrap();
 
-    assert_eq!(receiver.recv().unwrap(), 1);
+    assert_eq!(receiver.recv().unwrap(), 0);
     assert_eq!(
         state_a
             .pointer_event_log
             .iter()
             .filter(|event| **event == "motion")
             .count(),
-        motion_a_after_focus_change + 1
+        motion_a_after_focus_change
     );
     assert_eq!(
         state_b
@@ -134,6 +134,71 @@ fn window_interaction_absolute_motion_targets_only_original_surface() {
     assert_eq!(state_b.pointer_enter_count, enter_b_before);
     assert_eq!(state_b.pointer_leave_count, leave_b_before);
     assert_eq!(state_b.pointer_event_log, Vec::<&'static str>::new());
+
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    wait_for_server_commands(&commands);
+
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: start_x,
+            y: start_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue_a.roundtrip(&mut state_a).unwrap();
+    queue_b.roundtrip(&mut state_b).unwrap();
+    state_a.pointer_event_log.clear();
+    state_b.pointer_event_log.clear();
+
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: true,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue_a.roundtrip(&mut state_a).unwrap();
+    queue_b.roundtrip(&mut state_b).unwrap();
+    state_a.pointer_event_log.clear();
+    state_b.pointer_event_log.clear();
+
+    commands
+        .send(ServerCommand::BeginMove {
+            x: start_x,
+            y: start_y,
+        })
+        .unwrap();
+    for (x, y) in [(140.0, 140.0), (500.0, 300.0), (start_x, start_y)] {
+        commands
+            .send(ServerCommand::PointerMotion { x, y })
+            .unwrap();
+        wait_for_server_commands(&commands);
+        queue_a.roundtrip(&mut state_a).unwrap();
+        queue_b.roundtrip(&mut state_b).unwrap();
+    }
+
+    assert_eq!(
+        state_a
+            .pointer_event_log
+            .iter()
+            .filter(|event| **event == "motion")
+            .count(),
+        3
+    );
+    assert_eq!(state_b.pointer_event_log, Vec::<&'static str>::new());
+
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: false,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue_a.roundtrip(&mut state_a).unwrap();
+    queue_b.roundtrip(&mut state_b).unwrap();
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    wait_for_server_commands(&commands);
+    assert!(!state_b.pointer_event_log.contains(&"motion"));
 
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();

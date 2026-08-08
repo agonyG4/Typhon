@@ -284,6 +284,14 @@ impl CompositorState {
         &mut self,
         old_surface_id: Option<u32>,
     ) {
+        if self.window_interaction_terminal_refresh_pending {
+            self.window_interaction_terminal_refresh_pending = false;
+            self.window_interaction_release_metrics
+                .window_interaction_post_terminal_pointer_refreshes = self
+                .window_interaction_release_metrics
+                .window_interaction_post_terminal_pointer_refreshes
+                .saturating_add(1);
+        }
         if self.active_locked_pointer_binding().is_some() {
             self.refresh_pointer_focus_at_last_position();
             return;

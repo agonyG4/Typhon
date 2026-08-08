@@ -594,6 +594,10 @@ fn client_owned_trigger_release_settles_exact_original_pointer_ownership() {
     assert_eq!(metrics.window_interaction_client_releases_forwarded, 100);
     assert_eq!(metrics.window_interaction_release_target_missing, 0);
     assert_eq!(metrics.window_interaction_duplicate_releases_prevented, 100);
+    assert_eq!(
+        metrics.window_interaction_post_terminal_pointer_refreshes,
+        100
+    );
 }
 
 #[test]
@@ -656,6 +660,13 @@ fn client_owned_trigger_release_preserves_other_held_buttons() {
     drain_pointer_events(&mut fixture, &mut client_state);
     assert!(fixture.server.state.held_pointer_buttons.is_empty());
     assert!(fixture.server.state.implicit_pointer_grab.is_none());
+    assert_eq!(
+        fixture
+            .server
+            .window_interaction_release_metrics()
+            .window_interaction_post_terminal_pointer_refreshes,
+        1
+    );
 }
 
 #[test]
@@ -766,6 +777,13 @@ fn unmap_cancellation_does_not_release_to_a_new_pointer_target() {
     assert!(fixture.server.state.held_pointer_buttons.is_empty());
     assert!(fixture.server.state.last_pointer_press.is_none());
     assert!(fixture.server.state.implicit_pointer_grab.is_none());
+    assert_eq!(
+        fixture
+            .server
+            .window_interaction_release_metrics()
+            .window_interaction_post_terminal_pointer_refreshes,
+        1
+    );
 }
 
 #[test]
@@ -794,4 +812,11 @@ fn destroyed_original_surface_does_not_release_to_an_unrelated_surface() {
     assert!(fixture.server.state.held_pointer_buttons.is_empty());
     assert!(fixture.server.state.last_pointer_press.is_none());
     assert!(fixture.server.state.implicit_pointer_grab.is_none());
+    assert_eq!(
+        fixture
+            .server
+            .window_interaction_release_metrics()
+            .window_interaction_post_terminal_pointer_refreshes,
+        1
+    );
 }

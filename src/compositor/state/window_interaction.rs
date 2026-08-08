@@ -908,9 +908,18 @@ impl CompositorState {
         }
         let cleared = self.clear_window_interaction_state(reason);
         if cleared {
-            self.refresh_pointer_focus_at_last_position();
+            self.refresh_pointer_focus_after_window_interaction();
         }
         cleared
+    }
+
+    pub(in crate::compositor) fn refresh_pointer_focus_after_window_interaction(&mut self) {
+        self.window_interaction_release_metrics
+            .window_interaction_post_terminal_pointer_refreshes = self
+            .window_interaction_release_metrics
+            .window_interaction_post_terminal_pointer_refreshes
+            .saturating_add(1);
+        self.refresh_pointer_focus_at_last_position();
     }
 
     pub(in crate::compositor) fn end_window_interaction_by_id_with_reason(
@@ -957,8 +966,7 @@ impl CompositorState {
                 interaction.trigger_serial,
             );
         }
-        self.clear_window_interaction_state(reason);
-        if !matches!(
+        let client_owned_terminal_release = matches!(
             (
                 reason,
                 interaction.map(|interaction| interaction.source.trigger_release_delivery())
@@ -967,8 +975,12 @@ impl CompositorState {
                 WindowInteractionEndReason::TriggerButtonRelease,
                 Some(TriggerReleaseDelivery::ClientOwned)
             )
-        ) {
-            self.refresh_pointer_focus_at_last_position();
+        );
+        self.clear_window_interaction_state(reason);
+        if client_owned_terminal_release {
+            self.window_interaction_terminal_refresh_pending = true;
+        } else {
+            self.refresh_pointer_focus_after_window_interaction();
         }
         true
     }

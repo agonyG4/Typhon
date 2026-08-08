@@ -901,16 +901,24 @@ fn xdg_move_trigger_release_reports_client_delivery() {
 #[test]
 fn consumed_trigger_release_is_detected_by_reconciliation() {
     let mut state = CompositorState {
-        window_interaction: Some(test_window_interaction(
+        window_interaction: Some(test_window_interaction_with_target(
             1,
             WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+            WindowInteractionSource::XdgToplevelResize,
             Some(0x111),
+            Some(42),
         )),
         ..Default::default()
     };
 
     assert!(state.reconcile_window_interaction_trigger(false));
     assert!(!state.window_interaction_active());
+    assert_eq!(
+        state
+            .window_interaction_release_metrics()
+            .window_interaction_post_terminal_pointer_refreshes,
+        1
+    );
 }
 
 #[test]
@@ -967,6 +975,36 @@ fn surface_destroy_cancels_active_window_interaction() {
 
     assert!(!state.window_interaction_active());
     assert!(state.interaction_cursor_override.is_none());
+    assert_eq!(
+        state
+            .window_interaction_release_metrics()
+            .window_interaction_post_terminal_pointer_refreshes,
+        1
+    );
+}
+
+#[test]
+fn terminal_cleanup_refreshes_pointer_focus_exactly_once() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Move,
+            Some(0x110),
+        )),
+        interaction_cursor_override: Some(InteractionCursorOverride {
+            shape: InteractionCursorShape::Move,
+        }),
+        ..Default::default()
+    };
+
+    assert!(state.end_window_interaction_for_button(0x110).ended());
+    assert!(!state.end_window_interaction_for_button(0x110).ended());
+    assert_eq!(
+        state
+            .window_interaction_release_metrics()
+            .window_interaction_post_terminal_pointer_refreshes,
+        1
+    );
 }
 
 #[test]
