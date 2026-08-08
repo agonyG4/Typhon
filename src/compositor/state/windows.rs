@@ -31,11 +31,10 @@ impl CompositorState {
             return false;
         }
         let surface_id = window.root_surface_id;
-        if let Some(surface) = self.surface_resource_by_id(surface_id) {
-            self.set_desktop_focus(surface, reason.label());
-        } else {
-            self.focused_window_id = Some(window_id);
-        }
+        let Some(surface) = self.surface_resource_by_id(surface_id) else {
+            return false;
+        };
+        self.set_desktop_focus(surface, reason.label());
         true
     }
 
@@ -51,8 +50,11 @@ impl CompositorState {
             return WindowActivationOutcome::Unavailable;
         }
         let root_surface_id = window.root_surface_id;
+        if self.surface_resource_by_id(root_surface_id).is_none() {
+            return WindowActivationOutcome::Unavailable;
+        }
         let was_minimized = window.state.is_minimized();
-        if was_minimized && !self.restore_minimized_desktop_window(window_id) {
+        if was_minimized && !self.restore_minimized_desktop_window_contents(window_id) {
             return WindowActivationOutcome::Unavailable;
         }
         if !self.focus_desktop_window(window_id, reason) {
@@ -1156,6 +1158,14 @@ impl CompositorState {
         &mut self,
         window_id: WindowId,
     ) -> bool {
+        if !self.restore_minimized_desktop_window_contents(window_id) {
+            return false;
+        }
+        let _ = self.focus_desktop_window(window_id, WindowFocusReason::Restore);
+        true
+    }
+
+    fn restore_minimized_desktop_window_contents(&mut self, window_id: WindowId) -> bool {
         let x11_surface_id = self
             .window(window_id)
             .and_then(|window| window.x11_surface_id);
@@ -1169,11 +1179,6 @@ impl CompositorState {
         self.renderable_surfaces.extend(minimized_surfaces);
         if let Some(surface_id) = x11_surface_id {
             let _ = self.adopt_current_xwayland_surface_content(surface_id);
-        }
-        if let Some(surface_id) = self.window(window_id).map(|window| window.root_surface_id)
-            && let Some(surface) = self.surface_resource_by_id(surface_id)
-        {
-            self.focus_surface(surface);
         }
         self.queue_backend_state(window_id);
         self.mark_astrea_toplevel_dirty(window_id);

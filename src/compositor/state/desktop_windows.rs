@@ -1044,13 +1044,15 @@ impl CompositorState {
         if raised.is_empty() {
             return false;
         }
-        if raised.len() == 1
-            && self.window_stacking.ends_with(&raised)
-            && self
-                .window(id)
-                .is_some_and(DesktopWindow::is_normal_x11_role)
-        {
-            return false;
+        if self.window_stacking.ends_with(&raised) {
+            if raised.len() == 1
+                && self
+                    .window(id)
+                    .is_some_and(DesktopWindow::is_normal_x11_role)
+            {
+                return false;
+            }
+            return true;
         }
         self.window_stacking
             .retain(|window_id| !raised.contains(window_id));

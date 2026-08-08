@@ -1,14 +1,14 @@
 use super::*;
 
-#[expect(
-    dead_code,
-    reason = "approved focus policy reasons are consumed by later input paths"
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowFocusReason {
     PointerEnter,
     PointerPress,
     ShellActivation,
+    #[expect(
+        dead_code,
+        reason = "keyboard navigation has no caller in the current input policy"
+    )]
     KeyboardNavigation,
     Restore,
 }
@@ -52,7 +52,7 @@ impl CompositorState {
             .focused_surface
             .as_ref()
             .is_some_and(|current| same_surface_resource(current, &surface));
-        if changed {
+        if changed && desktop_window_changed {
             self.focus_generation = advance_nonzero_serial(self.focus_generation);
             pointer_debug_log(format!(
                 "focus change reason={} old={:?} new={}",

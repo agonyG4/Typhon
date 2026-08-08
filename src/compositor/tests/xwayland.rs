@@ -931,6 +931,13 @@ fn xwayland_attachment_replacement_preserves_frame_and_keyboard_focus() {
             .map(crate::compositor::compositor_surface_id),
         Some(fixture.parent_surface_id)
     );
+    let focus_generation_before = fixture.server.state.focus_generation;
+    let focus_serial_before = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("admitted X11 window")
+        .last_focus_serial;
 
     fixture
         .server
@@ -963,6 +970,19 @@ fn xwayland_attachment_replacement_preserves_frame_and_keyboard_focus() {
         "keyboard focus must transfer to the replacement surface"
     );
     assert_eq!(fixture.server.state.focused_window_id, Some(window_id));
+    assert_eq!(
+        fixture.server.state.focus_generation,
+        focus_generation_before
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .expect("admitted X11 window")
+            .last_focus_serial,
+        focus_serial_before
+    );
 
     fixture
         .server

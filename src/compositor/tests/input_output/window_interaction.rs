@@ -265,6 +265,12 @@ fn window_interaction_absolute_motion_targets_only_original_surface() {
         capture_focused_surface_id(&commands),
         keyboard_focus_during_interaction
     );
+    let after_activation = capture_renderable_surface_snapshot(&commands);
+    assert_eq!(
+        after_activation.last().map(|surface| surface.surface_id),
+        Some(surface_a_id),
+        "the captured A target must be raised before button delivery"
+    );
     assert!(state_a.pointer_event_log.contains(&"button_pressed"));
     assert!(!state_b.pointer_event_log.contains(&"button_pressed"));
     state_a.pointer_event_log.clear();

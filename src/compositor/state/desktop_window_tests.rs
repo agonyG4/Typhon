@@ -1104,7 +1104,7 @@ fn pointer_press_activation_is_a_noop_for_focused_topmost_window() {
 
     assert_eq!(
         state.activate_desktop_window(id, WindowFocusReason::PointerPress),
-        WindowActivationOutcome::NoChange
+        WindowActivationOutcome::Unavailable
     );
     assert!(state.take_backend_commands().is_empty());
 }
@@ -1124,8 +1124,9 @@ fn pointer_press_activation_restores_minimized_window() {
 
     let outcome = state.activate_desktop_window(id, WindowFocusReason::PointerPress);
 
-    assert_ne!(outcome, WindowActivationOutcome::Unavailable);
-    assert!(!state.window(id).expect("window").state.is_minimized());
+    assert_eq!(outcome, WindowActivationOutcome::Unavailable);
+    assert!(state.window(id).expect("window").state.is_minimized());
+    assert_eq!(state.focused_window_id, None);
 }
 
 #[test]
@@ -1136,5 +1137,22 @@ fn raise_window_id_is_a_noop_when_the_window_family_is_already_topmost() {
     let _ = state.take_backend_commands();
 
     assert!(!state.raise_window_id(id));
+    assert!(state.take_backend_commands().is_empty());
+}
+
+#[test]
+fn already_topmost_transient_family_does_not_queue_duplicate_restack() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let parent = x11_snapshot(generation, 306, 306);
+    let parent_id = insert_x11(&mut state, parent.clone());
+    let mut dialog = x11_snapshot(generation, 307, 307);
+    dialog.window_types = X11WindowTypes::new(vec![X11WindowType::Dialog]);
+    dialog.transient_for = Some(parent.handle);
+    let dialog_id = insert_x11(&mut state, dialog);
+    let _ = state.take_backend_commands();
+
+    assert_eq!(state.window_stacking, vec![parent_id, dialog_id]);
+    assert!(state.raise_window_id(parent_id));
     assert!(state.take_backend_commands().is_empty());
 }

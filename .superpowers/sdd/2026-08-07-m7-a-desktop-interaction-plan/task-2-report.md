@@ -65,3 +65,51 @@ cargo clippy --locked --all-targets --all-features --quiet -- -D warnings
 All passed.
 
 No native TTY/DRM, XWayland hardware-session, or game qualification was run in this task; this report claims automated validation only.
+
+## Fix round 1/5 review evidence
+
+### RED
+
+Added focused regressions before the production fixes and observed:
+
+```text
+cargo test --locked --quiet pointer_press_activation_restores_minimized_window -- --test-threads=1
+```
+
+RED: the no-surface minimized target returned `Accepted` instead of `Unavailable`.
+
+```text
+cargo test --locked --quiet already_topmost_transient_family_does_not_queue_duplicate_restack -- --test-threads=1
+```
+
+RED: an already-topmost transient family queued a duplicate `RestackExact`.
+
+```text
+cargo test --locked --quiet xwayland_attachment_replacement_preserves_frame_and_keyboard_focus -- --test-threads=1
+```
+
+RED: same-window XWayland surface replacement advanced `focus_generation`.
+
+### GREEN
+
+The fixes reject unavailable root resources before logical focus or minimized restore, separate restore contents from the one activation focus, gate `focus_generation` on managed `WindowId` transitions, suppress duplicate restack for effective topmost transient families, and narrow the unused reason allowance to the specific `KeyboardNavigation` variant.
+
+```text
+cargo test --locked --quiet desktop_window_tests -- --test-threads=1
+cargo test --locked --quiet window_interaction -- --test-threads=1
+cargo test --locked --quiet xwayland_attachment_replacement_preserves_frame_and_keyboard_focus -- --test-threads=1
+cargo test --locked --quiet xwayland_root_stack -- --test-threads=1
+```
+
+GREEN: 51 desktop-window tests passed; 51 interaction tests plus 5 support tests passed; the targeted replacement test passed; and 14 XWayland root-stack tests passed. The overlapping interaction regression now asserts the captured A target is topmost after activation and that the button is delivered to A, not B.
+
+```text
+git diff --check
+cargo fmt --all -- --check
+cargo check --locked --quiet
+cargo clippy --locked --all-targets --all-features --quiet -- -D warnings
+```
+
+All static gates passed.
+
+The broad `cargo test --locked --quiet xwayland -- --test-threads=1` filter was not used as a qualification gate: 34 tests failed during test-environment setup with `path must be shorter than SUN_LEN` and poisoned display-test locks, and one existing compositor geometry-ordering test failed at `update_window_interaction`. No native qualification claim is made.
