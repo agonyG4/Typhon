@@ -1044,6 +1044,14 @@ impl CompositorState {
         if raised.is_empty() {
             return false;
         }
+        if raised.len() == 1
+            && self.window_stacking.ends_with(&raised)
+            && self
+                .window(id)
+                .is_some_and(DesktopWindow::is_normal_x11_role)
+        {
+            return false;
+        }
         self.window_stacking
             .retain(|window_id| !raised.contains(window_id));
         self.window_stacking.extend(raised);
@@ -1203,7 +1211,7 @@ impl CompositorState {
         self.raise_window_id(id)
     }
 
-    fn x11_subtree_order(&self, id: WindowId) -> Vec<WindowId> {
+    pub(in crate::compositor) fn x11_subtree_order(&self, id: WindowId) -> Vec<WindowId> {
         let members = self
             .desktop_windows
             .values()
@@ -1349,12 +1357,12 @@ impl CompositorState {
     pub(in crate::compositor) fn update_desktop_focus_window(
         &mut self,
         new_surface_id: u32,
-        changed: bool,
+        _surface_changed: bool,
     ) -> Option<WindowId> {
         let old_window_id = self.focused_window_id;
         let new_window_id =
             self.window_id_for_surface(self.root_surface_id_for_surface(new_surface_id));
-        if changed || old_window_id != new_window_id {
+        if old_window_id != new_window_id {
             if let Some(window_id) = old_window_id {
                 self.queue_backend_activation(window_id, false);
             }

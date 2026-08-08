@@ -9,19 +9,89 @@ impl CompositorState {
             .is_some_and(DesktopWindow::is_normal_x11_role)
     }
 
-    pub(in crate::compositor) fn focus_desktop_window(&mut self, window_id: WindowId) -> bool {
+    pub(in crate::compositor) fn focus_desktop_window(
+        &mut self,
+        window_id: WindowId,
+        reason: WindowFocusReason,
+    ) -> bool {
         let Some(window) = self.window(window_id) else {
             return false;
         };
-        if !window.is_normal_x11_role() {
+        if window.kind != DesktopWindowKind::Managed
+            || window.state.is_minimized()
+            || !window.is_normal_x11_role()
+        {
+            return false;
+        }
+        if matches!(window.backend, WindowBackend::Xdg(_))
+            && self
+                .xdg_surface_lifecycle(window.root_surface_id)
+                .is_some_and(|lifecycle| !lifecycle.currently_mapped)
+        {
             return false;
         }
         let surface_id = window.root_surface_id;
-        let Some(surface) = self.surface_resource_by_id(surface_id) else {
-            return false;
-        };
-        self.focus_surface(surface);
+        if let Some(surface) = self.surface_resource_by_id(surface_id) {
+            self.set_desktop_focus(surface, reason.label());
+        } else {
+            self.focused_window_id = Some(window_id);
+        }
         true
+    }
+
+    pub(in crate::compositor) fn activate_desktop_window(
+        &mut self,
+        window_id: WindowId,
+        reason: WindowFocusReason,
+    ) -> WindowActivationOutcome {
+        let Some(window) = self.window(window_id) else {
+            return WindowActivationOutcome::Unavailable;
+        };
+        if window.kind != DesktopWindowKind::Managed || !window.is_normal_x11_role() {
+            return WindowActivationOutcome::Unavailable;
+        }
+        let root_surface_id = window.root_surface_id;
+        let was_minimized = window.state.is_minimized();
+        if was_minimized && !self.restore_minimized_desktop_window(window_id) {
+            return WindowActivationOutcome::Unavailable;
+        }
+        if !self.focus_desktop_window(window_id, reason) {
+            return WindowActivationOutcome::Unavailable;
+        }
+        let family = self.x11_subtree_order(window_id);
+        let already_topmost = !family.is_empty() && self.window_stacking.ends_with(&family);
+        let raised = !already_topmost && self.raise_root_window(root_surface_id);
+        if !was_minimized && !raised {
+            WindowActivationOutcome::NoChange
+        } else {
+            WindowActivationOutcome::Accepted
+        }
+    }
+
+    pub(in crate::compositor) fn focus_desktop_window_at_pointer_target(
+        &mut self,
+        target: &PointerTarget,
+    ) {
+        if self.window_interaction_active()
+            || !self.held_pointer_buttons.is_empty()
+            || self.implicit_pointer_grab.is_some()
+            || self.topmost_popup_grab_surface_id().is_some()
+            || self.active_locked_pointer_binding().is_some()
+            || self.active_confined_pointer_binding().is_some()
+            || self.active_drag.is_some()
+            || self.active_exclusive_layer_surface_id().is_some()
+        {
+            return;
+        }
+        let root_surface_id =
+            self.root_surface_id_for_surface(compositor_surface_id(&target.surface));
+        let Some(window_id) = self.window_id_for_surface(root_surface_id) else {
+            return;
+        };
+        if self.focused_window_id == Some(window_id) {
+            return;
+        }
+        let _ = self.focus_desktop_window(window_id, WindowFocusReason::PointerEnter);
     }
 
     pub(in crate::compositor) fn x11_focus_request_allowed(&self, handle: X11WindowHandle) -> bool {
@@ -987,27 +1057,10 @@ impl CompositorState {
         let Some(window_id) = self.window_id_for_surface(surface_id) else {
             return false;
         };
-        if self
-            .window(window_id)
-            .is_some_and(|window| !window.is_normal_x11_role())
-        {
-            return false;
-        }
-        if self
-            .window(window_id)
-            .is_some_and(|window| window.state.is_minimized())
-        {
-            self.restore_minimized_desktop_window(window_id);
-        }
-        let focused = self
-            .surface_resource_by_id(surface_id)
-            .map(|surface| {
-                self.focus_surface(surface);
-                true
-            })
-            .unwrap_or(false);
-        let raised = self.raise_root_window(surface_id);
-        focused || raised
+        !matches!(
+            self.activate_desktop_window(window_id, WindowFocusReason::ShellActivation),
+            WindowActivationOutcome::Unavailable
+        )
     }
 
     pub(in crate::compositor) fn toggle_maximize_focused_window(&mut self) -> bool {

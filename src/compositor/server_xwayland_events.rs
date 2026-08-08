@@ -17,7 +17,10 @@ impl OwnCompositorServer {
                     .state
                     .adopt_current_xwayland_surface_content(surface_id);
                 let wants_initial_focus = self.state.x11_window_wants_initial_focus(window_id);
-                let focused = wants_initial_focus && self.state.focus_desktop_window(window_id);
+                let focused = wants_initial_focus
+                    && self
+                        .state
+                        .focus_desktop_window(window_id, WindowFocusReason::ShellActivation);
                 self.state.refresh_pointer_focus_at_last_position();
                 let focus_after = self.focused_x11_window_xid();
                 trace::emit("focus_decision", || {

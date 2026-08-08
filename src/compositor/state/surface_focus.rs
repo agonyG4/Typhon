@@ -1,5 +1,37 @@
 use super::*;
 
+#[expect(
+    dead_code,
+    reason = "approved focus policy reasons are consumed by later input paths"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowFocusReason {
+    PointerEnter,
+    PointerPress,
+    ShellActivation,
+    KeyboardNavigation,
+    Restore,
+}
+
+impl WindowFocusReason {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::PointerEnter => "pointer-enter",
+            Self::PointerPress => "pointer-press",
+            Self::ShellActivation => "shell-activation",
+            Self::KeyboardNavigation => "keyboard-navigation",
+            Self::Restore => "restore",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowActivationOutcome {
+    Accepted,
+    NoChange,
+    Unavailable,
+}
+
 impl CompositorState {
     pub(in crate::compositor) fn focus_surface(&mut self, surface: wl_surface::WlSurface) {
         self.set_desktop_focus(surface, "focus");
@@ -13,6 +45,9 @@ impl CompositorState {
         let old_surface_id = self.focused_surface.as_ref().map(compositor_surface_id);
         let new_surface_id = compositor_surface_id(&surface);
         let old_window_id = self.focused_window_id;
+        let new_window_id =
+            self.window_id_for_surface(self.root_surface_id_for_surface(new_surface_id));
+        let desktop_window_changed = old_window_id != new_window_id;
         let changed = !self
             .focused_surface
             .as_ref()
@@ -30,14 +65,14 @@ impl CompositorState {
         self.focused_surface = Some(surface.clone());
         self.focused_window_id = self.update_desktop_focus_window(new_surface_id, changed);
         let focus_generation = self.focus_generation;
-        if changed
+        if desktop_window_changed
             && let Some(window_id) = self.focused_window_id
             && self.astrea_toplevel_snapshot(window_id).is_some()
             && let Some(window) = self.window_mut(window_id)
         {
             window.last_focus_serial = focus_generation;
         }
-        if changed {
+        if desktop_window_changed {
             if let Some(window_id) = old_window_id {
                 self.mark_astrea_toplevel_dirty(window_id);
             }

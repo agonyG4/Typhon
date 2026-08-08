@@ -740,6 +740,7 @@ impl CompositorState {
                     button,
                     surface: surface.clone(),
                     root_surface_id,
+                    window_id: self.window_id_for_surface(root_surface_id),
                     output_x: self.last_pointer_x,
                     output_y: self.last_pointer_y,
                 };
@@ -783,6 +784,11 @@ impl CompositorState {
         } else {
             None
         };
+        let captured_window_id = target.as_ref().and_then(|target| {
+            let root_surface_id =
+                self.root_surface_id_for_surface(compositor_surface_id(&target.surface));
+            self.window_id_for_surface(root_surface_id)
+        });
         if grabbed_surface.is_none() {
             if pressed
                 && let Some(popup_surface_id) =
@@ -845,19 +851,22 @@ impl CompositorState {
                 self.focus_surface(surface.clone());
             } else if self.layer_surfaces.contains_key(&root_surface_id) {
                 let _ = self.activate_ondemand_layer_surface(root_surface_id);
+            } else if let Some(window_id) = captured_window_id {
+                let _ = self.activate_desktop_window(window_id, WindowFocusReason::PointerPress);
             } else if self
                 .window_id_for_surface(root_surface_id)
                 .and_then(|window_id| self.window(window_id))
                 .is_none_or(|window| window.is_normal_x11_role())
                 && let Some(root_surface) = self.surface_resource_by_id(root_surface_id)
             {
-                self.focus_surface(root_surface);
+                self.set_desktop_focus(root_surface, WindowFocusReason::PointerPress.label());
             }
             let press = PointerPress {
                 serial,
                 button,
                 surface: surface.clone(),
                 root_surface_id,
+                window_id: captured_window_id,
                 output_x: self.last_pointer_x,
                 output_y: self.last_pointer_y,
             };

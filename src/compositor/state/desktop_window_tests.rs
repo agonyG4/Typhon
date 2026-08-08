@@ -312,7 +312,7 @@ fn popup_menu_is_rendered_but_not_a_desktop_client() {
         Some(X11DesktopRole::AuxiliaryPopup)
     );
     assert_eq!(state.x11_client_lists().0, vec![parent.handle]);
-    assert!(!state.focus_desktop_window(popup_id));
+    assert!(!state.focus_desktop_window(popup_id, WindowFocusReason::ShellActivation));
     assert!(state.x11_focus_request_allowed(parent.handle));
     assert!(state.window(parent_id).unwrap().is_normal_x11_role());
 }
@@ -335,7 +335,7 @@ fn unsupported_leading_window_type_does_not_hide_popup_semantics() {
         state.window(popup_id).unwrap().x11_role,
         Some(X11DesktopRole::AuxiliaryPopup)
     );
-    assert!(!state.focus_desktop_window(popup_id));
+    assert!(!state.focus_desktop_window(popup_id, WindowFocusReason::ShellActivation));
     assert_eq!(state.x11_client_lists().0, vec![parent.handle]);
 }
 
@@ -1069,4 +1069,72 @@ fn x11_published_state_updates_generic_window_state() {
         state.window(id).expect("window").state.mode(),
         ToplevelMode::Fullscreen
     );
+}
+
+#[test]
+fn same_window_focus_refresh_does_not_requeue_backend_activation() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let id = insert_x11(&mut state, x11_snapshot(generation, 301, 301));
+    state.focused_window_id = Some(id);
+    let _ = state.take_backend_commands();
+
+    assert_eq!(state.update_desktop_focus_window(301, true), Some(id));
+    assert!(state.take_backend_commands().is_empty());
+}
+
+#[test]
+fn pointer_enter_focus_rejects_auxiliary_x11_windows() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let mut popup = x11_snapshot(generation, 302, 302);
+    popup.window_types = X11WindowTypes::new(vec![X11WindowType::PopupMenu]);
+    let popup_id = insert_x11(&mut state, popup);
+
+    assert!(!state.focus_desktop_window(popup_id, WindowFocusReason::PointerEnter));
+}
+
+#[test]
+fn pointer_press_activation_is_a_noop_for_focused_topmost_window() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let id = insert_x11(&mut state, x11_snapshot(generation, 303, 303));
+    state.focused_window_id = Some(id);
+    let _ = state.take_backend_commands();
+
+    assert_eq!(
+        state.activate_desktop_window(id, WindowFocusReason::PointerPress),
+        WindowActivationOutcome::NoChange
+    );
+    assert!(state.take_backend_commands().is_empty());
+}
+
+#[test]
+fn pointer_press_activation_restores_minimized_window() {
+    let mut state = CompositorState::new(None);
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(id, 304))
+        .expect("insert window");
+    state
+        .window_mut(id)
+        .expect("window")
+        .state
+        .mark_minimized_without_surfaces();
+
+    let outcome = state.activate_desktop_window(id, WindowFocusReason::PointerPress);
+
+    assert_ne!(outcome, WindowActivationOutcome::Unavailable);
+    assert!(!state.window(id).expect("window").state.is_minimized());
+}
+
+#[test]
+fn raise_window_id_is_a_noop_when_the_window_family_is_already_topmost() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let id = insert_x11(&mut state, x11_snapshot(generation, 305, 305));
+    let _ = state.take_backend_commands();
+
+    assert!(!state.raise_window_id(id));
+    assert!(state.take_backend_commands().is_empty());
 }

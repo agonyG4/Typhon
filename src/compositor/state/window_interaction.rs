@@ -738,7 +738,8 @@ impl CompositorState {
         let press = self.last_pointer_press.as_ref()?;
         let valid_surface = press.root_surface_id == root_surface_id
             || press.surface.id().same_client_as(&surface.id());
-        (press.serial == serial && valid_surface).then_some(press.clone())
+        let valid_window = press.window_id == self.window_id_for_surface(root_surface_id);
+        (press.serial == serial && valid_surface && valid_window).then_some(press.clone())
     }
 
     pub(in crate::compositor) fn window_frame_hit_at(

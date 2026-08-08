@@ -100,7 +100,8 @@ fn window_interaction_absolute_motion_targets_only_original_surface() {
         Some(surface_b_id)
     );
     let keyboard_focus_at_b = capture_focused_surface_id(&commands);
-    assert_eq!(keyboard_focus_at_b, keyboard_focus_at_a);
+    assert_ne!(keyboard_focus_at_b, keyboard_focus_at_a);
+    assert_eq!(keyboard_focus_at_b, Some(surface_b_id));
     state_a.pointer_motion = false;
     state_b.pointer_event_log.clear();
 
@@ -225,10 +226,7 @@ fn window_interaction_absolute_motion_targets_only_original_surface() {
     queue_a.roundtrip(&mut state_a).unwrap();
     queue_b.roundtrip(&mut state_b).unwrap();
     assert_eq!(capture_pointer_focus_surface_id(&commands), None);
-    assert_eq!(
-        capture_focused_surface_id(&commands),
-        keyboard_focus_during_interaction
-    );
+    assert_eq!(capture_focused_surface_id(&commands), Some(surface_b_id));
 
     commands
         .send(ServerCommand::PointerMotion {
@@ -267,13 +265,23 @@ fn window_interaction_absolute_motion_targets_only_original_surface() {
         capture_focused_surface_id(&commands),
         keyboard_focus_during_interaction
     );
+    assert!(state_a.pointer_event_log.contains(&"button_pressed"));
+    assert!(!state_b.pointer_event_log.contains(&"button_pressed"));
     state_a.pointer_event_log.clear();
     state_b.pointer_event_log.clear();
 
     commands
+        .send(ServerCommand::PointerMotion {
+            x: return_x,
+            y: return_y + 100.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    commands
         .send(ServerCommand::BeginMove {
             x: return_x,
-            y: return_y,
+            y: return_y + 100.0,
         })
         .unwrap();
     wait_for_server_commands(&commands);
@@ -308,7 +316,7 @@ fn window_interaction_absolute_motion_targets_only_original_surface() {
             .iter()
             .filter(|event| **event == "motion")
             .count(),
-        3
+        4
     );
     assert_eq!(state_b.pointer_event_log, Vec::<&'static str>::new());
 

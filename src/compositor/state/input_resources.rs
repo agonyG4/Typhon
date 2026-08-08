@@ -400,6 +400,7 @@ impl CompositorState {
             self.clear_pointer_focus();
             return;
         }
+        self.focus_desktop_window_at_pointer_target(&target);
         let time = wayland_event_time();
         self.ensure_pointer_focus(&target.surface);
         self.send_pointer_enter_if_needed(&target);

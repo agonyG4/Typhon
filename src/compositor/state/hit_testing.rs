@@ -216,6 +216,8 @@ impl CompositorState {
             return;
         };
 
+        self.focus_desktop_window_at_pointer_target(&target);
+
         pointer_debug_log(format!(
             "post-unlock focus target={} x={} y={}",
             compositor_surface_id(&target.surface),
@@ -244,6 +246,9 @@ impl CompositorState {
             .pointer_target_at(self.last_pointer_x, self.last_pointer_y)
             .filter(|target| target.surface.is_alive())
             .filter(|target| self.pointer_target_allowed_by_popup_grab(target));
+        if let Some(target) = target.as_ref() {
+            self.focus_desktop_window_at_pointer_target(target);
+        }
         let target_surface = target.as_ref().map(|target| target.surface.clone());
         let same_target = self
             .pointer_surface
@@ -318,6 +323,7 @@ impl CompositorState {
             self.clear_pointer_focus();
             return;
         }
+        self.focus_desktop_window_at_pointer_target(&target);
         self.ensure_pointer_focus(&target.surface);
         self.send_pointer_enter_if_needed(&target);
     }

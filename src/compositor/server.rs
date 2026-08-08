@@ -62,8 +62,8 @@ use super::{
     PointerAxisFrame, PresentationClock, ProtocolOnlyCompletion, RenderGenerationCause,
     RenderableSurface, RendererProtocolCapabilities, ResizeFlowMetrics,
     SelectionProtocolCapabilities, SubsurfaceTransactionMetrics, SurfaceDamagePresentation,
-    WindowInteractionDebugSnapshot, WindowInteractionEndReason, XwaylandSceneBatchError,
-    XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot, color,
+    WindowFocusReason, WindowInteractionDebugSnapshot, WindowInteractionEndReason,
+    XwaylandSceneBatchError, XwaylandSceneBatchToken, XwaylandSceneMetricsSnapshot, color,
     input::{PointerConstraintBackendId, PointerConstraintBackendRequest},
 };
 #[derive(Debug)]
@@ -721,7 +721,10 @@ impl OwnCompositorServer {
                 ) && self
                     .state
                     .window_id_for_x11_handle(window)
-                    .is_some_and(|window_id| self.state.focus_desktop_window(window_id))
+                    .is_some_and(|window_id| {
+                        self.state
+                            .focus_desktop_window(window_id, WindowFocusReason::ShellActivation)
+                    })
                 {
                     if let Some(window_id) = self.state.window_id_for_x11_handle(window) {
                         let _ = self.state.raise_window_id(window_id);

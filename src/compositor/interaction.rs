@@ -23,6 +23,7 @@ pub(super) struct PointerPress {
     pub(super) button: u32,
     pub(super) surface: wl_surface::WlSurface,
     pub(super) root_surface_id: u32,
+    pub(super) window_id: Option<WindowId>,
     pub(super) output_x: f64,
     pub(super) output_y: f64,
 }
