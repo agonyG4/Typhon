@@ -980,6 +980,27 @@ impl CompositorState {
             .and_then(|window| window.x11_placement_policy)
     }
 
+    pub(in crate::compositor) fn effective_managed_x11_border_width(
+        &self,
+        handle: X11WindowHandle,
+        requested: u32,
+    ) -> u32 {
+        let Some(window_id) = self.window_id_for_x11_handle(handle) else {
+            return requested;
+        };
+        let Some(window) = self.window(window_id) else {
+            return requested;
+        };
+        if window.kind == DesktopWindowKind::Managed
+            && window.is_normal_x11_role()
+            && window.x11_placement_policy == Some(X11PlacementPolicy::CompositorManaged)
+        {
+            0
+        } else {
+            requested
+        }
+    }
+
     pub(in crate::compositor) fn apply_x11_published_state(
         &mut self,
         handle: X11WindowHandle,

@@ -588,6 +588,9 @@ impl OwnCompositorServer {
                     current_authoritative,
                     geometry,
                 );
+                let border_width = self
+                    .state
+                    .effective_managed_x11_border_width(window, request.border_width);
                 if request.fields.x
                     || request.fields.y
                     || request.fields.width
@@ -600,7 +603,7 @@ impl OwnCompositorServer {
                     geometry,
                     fields: request.fields,
                     source: ConfigureSource::ClientRequest,
-                    border_width: request.border_width,
+                    border_width,
                 }];
                 if let Some(mode) = request.stack_mode
                     && self

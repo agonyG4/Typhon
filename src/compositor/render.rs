@@ -2711,6 +2711,43 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_xdg_and_managed_x11_surfaces_emit_no_server_frame_primitives() {
+        let xdg = RenderableSurface {
+            surface_id: 9,
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 60,
+            placement: SurfacePlacement::root_at(24, 32),
+            render_placement: None,
+            visual_clip: None,
+            render_target_size: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(80, 60, vec![0xffff_0000; 80 * 60]),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+        let x11 = RenderableSurface {
+            surface_id: 10,
+            placement: SurfacePlacement::absolute_root_at(48, 40),
+            render_placement: None,
+            ..xdg.clone()
+        };
+
+        for surface in [&xdg, &x11] {
+            assert!(server_frame_rects_for_surface(surface).is_empty());
+            let element = render_scene_elements_for_surfaces(std::slice::from_ref(surface), 1.0)
+                .pop()
+                .expect("ordinary scene element");
+            assert_eq!(element.backing_target(), None);
+        }
+    }
+
+    #[test]
     fn viewport_source_selects_source_uv_without_changing_target() {
         let surface = RenderableSurface {
             surface_id: 7,
