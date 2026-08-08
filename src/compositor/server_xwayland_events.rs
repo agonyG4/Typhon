@@ -17,10 +17,12 @@ impl OwnCompositorServer {
                     .state
                     .adopt_current_xwayland_surface_content(surface_id);
                 let wants_initial_focus = self.state.x11_window_wants_initial_focus(window_id);
-                let focused = wants_initial_focus
-                    && self
-                        .state
-                        .focus_desktop_window(window_id, WindowFocusReason::ShellActivation);
+                let focus_outcome = if wants_initial_focus {
+                    self.state
+                        .focus_desktop_window(window_id, WindowFocusReason::ShellActivation)
+                } else {
+                    WindowFocusOutcome::Unavailable
+                };
                 self.state.refresh_pointer_focus_at_last_position();
                 let focus_after = self.focused_x11_window_xid();
                 trace::emit("focus_decision", || {
@@ -30,7 +32,7 @@ impl OwnCompositorServer {
                         .field("surface_id", surface_id)
                         .field("focus_decision", "initial_focus")
                         .field("focus_requested", wants_initial_focus)
-                        .field("focus_result", focused)
+                        .field("focus_result", format!("{focus_outcome:?}"))
                         .optional("focus_before", focus_before)
                         .optional("focus_after", focus_after)
                         .field(
@@ -47,7 +49,7 @@ impl OwnCompositorServer {
                         )
                 });
                 eprintln!(
-                    "oblivion-one compositor: event=xwayland_window_admitted surface_id={surface_id} retained_buffer={published} published={published} focused={focused}"
+                    "oblivion-one compositor: event=xwayland_window_admitted surface_id={surface_id} retained_buffer={published} published={published} focus_outcome={focus_outcome:?}"
                 );
                 let mut commands = Vec::with_capacity(2);
                 if self

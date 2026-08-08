@@ -1324,3 +1324,27 @@ fn pointer_constraint_cleanup_remains_correct() {
         PointerConstraintMode::Confined
     );
 }
+
+#[test]
+fn pointer_constraint_transition_does_not_end_active_interaction() {
+    let mut state = CompositorState {
+        window_interaction: Some(test_window_interaction(
+            1,
+            WindowInteractionKind::Resize(ResizeEdges::BOTTOM_RIGHT),
+            Some(0x110),
+        )),
+        interaction_cursor_override: Some(InteractionCursorOverride {
+            shape: InteractionCursorShape::ResizeDiagonalNwSe,
+        }),
+        ..Default::default()
+    };
+    state
+        .pointer_constraint
+        .activate(PointerConstraintMode::Locked, 42);
+
+    state.clear_pointer_constraint();
+
+    assert!(state.window_interaction_active());
+    assert!(state.interaction_cursor_override_active());
+    assert_eq!(state.pointer_constraint.mode(), PointerConstraintMode::None);
+}

@@ -13,29 +13,34 @@ impl CompositorState {
         &mut self,
         window_id: WindowId,
         reason: WindowFocusReason,
-    ) -> bool {
+    ) -> WindowFocusOutcome {
         let Some(window) = self.window(window_id) else {
-            return false;
+            return WindowFocusOutcome::Unavailable;
         };
         if window.kind != DesktopWindowKind::Managed
             || window.state.is_minimized()
             || !window.is_normal_x11_role()
         {
-            return false;
+            return WindowFocusOutcome::Unavailable;
         }
         if matches!(window.backend, WindowBackend::Xdg(_))
             && self
                 .xdg_surface_lifecycle(window.root_surface_id)
                 .is_some_and(|lifecycle| !lifecycle.currently_mapped)
         {
-            return false;
+            return WindowFocusOutcome::Unavailable;
         }
         let surface_id = window.root_surface_id;
         let Some(surface) = self.surface_resource_by_id(surface_id) else {
-            return false;
+            return WindowFocusOutcome::Unavailable;
         };
+        let desktop_window_changed = self.focused_window_id != Some(window_id);
         self.set_desktop_focus(surface, reason.label());
-        true
+        if desktop_window_changed {
+            WindowFocusOutcome::Changed
+        } else {
+            WindowFocusOutcome::NoChange
+        }
     }
 
     pub(in crate::compositor) fn activate_desktop_window(
@@ -57,23 +62,24 @@ impl CompositorState {
         if was_minimized && !self.restore_minimized_desktop_window_contents(window_id) {
             return WindowActivationOutcome::Unavailable;
         }
-        if !self.focus_desktop_window(window_id, reason) {
+        let focus_outcome = self.focus_desktop_window(window_id, reason);
+        if focus_outcome == WindowFocusOutcome::Unavailable {
             return WindowActivationOutcome::Unavailable;
         }
         let family = self.x11_subtree_order(window_id);
         let already_topmost = !family.is_empty() && self.window_stacking.ends_with(&family);
         let raised = !already_topmost && self.raise_root_window(root_surface_id);
-        if !was_minimized && !raised {
+        if !was_minimized && !raised && focus_outcome == WindowFocusOutcome::NoChange {
             WindowActivationOutcome::NoChange
         } else {
-            WindowActivationOutcome::Accepted
+            WindowActivationOutcome::Changed
         }
     }
 
     pub(in crate::compositor) fn focus_desktop_window_at_pointer_target(
         &mut self,
         target: &PointerTarget,
-    ) {
+    ) -> WindowFocusOutcome {
         if self.window_interaction_active()
             || !self.held_pointer_buttons.is_empty()
             || self.implicit_pointer_grab.is_some()
@@ -83,17 +89,14 @@ impl CompositorState {
             || self.active_drag.is_some()
             || self.active_exclusive_layer_surface_id().is_some()
         {
-            return;
+            return WindowFocusOutcome::Unavailable;
         }
         let root_surface_id =
             self.root_surface_id_for_surface(compositor_surface_id(&target.surface));
         let Some(window_id) = self.window_id_for_surface(root_surface_id) else {
-            return;
+            return WindowFocusOutcome::Unavailable;
         };
-        if self.focused_window_id == Some(window_id) {
-            return;
-        }
-        let _ = self.focus_desktop_window(window_id, WindowFocusReason::PointerEnter);
+        self.focus_desktop_window(window_id, WindowFocusReason::PointerEnter)
     }
 
     pub(in crate::compositor) fn x11_focus_request_allowed(&self, handle: X11WindowHandle) -> bool {

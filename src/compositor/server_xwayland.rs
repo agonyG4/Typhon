@@ -211,10 +211,11 @@ impl OwnCompositorServer {
             self.state.focused_surface = None;
             self.state.clear_keyboard_focus();
             if let Some(parent_id) = parent_id {
-                if !self
-                    .state
-                    .focus_desktop_window(parent_id, WindowFocusReason::ShellActivation)
-                {
+                if matches!(
+                    self.state
+                        .focus_desktop_window(parent_id, WindowFocusReason::ShellActivation),
+                    WindowFocusOutcome::Unavailable
+                ) {
                     let _ = self.state.focus_topmost_renderable_toplevel();
                 }
             } else {

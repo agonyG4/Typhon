@@ -312,7 +312,10 @@ fn popup_menu_is_rendered_but_not_a_desktop_client() {
         Some(X11DesktopRole::AuxiliaryPopup)
     );
     assert_eq!(state.x11_client_lists().0, vec![parent.handle]);
-    assert!(!state.focus_desktop_window(popup_id, WindowFocusReason::ShellActivation));
+    assert_eq!(
+        state.focus_desktop_window(popup_id, WindowFocusReason::ShellActivation),
+        WindowFocusOutcome::Unavailable
+    );
     assert!(state.x11_focus_request_allowed(parent.handle));
     assert!(state.window(parent_id).unwrap().is_normal_x11_role());
 }
@@ -335,7 +338,10 @@ fn unsupported_leading_window_type_does_not_hide_popup_semantics() {
         state.window(popup_id).unwrap().x11_role,
         Some(X11DesktopRole::AuxiliaryPopup)
     );
-    assert!(!state.focus_desktop_window(popup_id, WindowFocusReason::ShellActivation));
+    assert_eq!(
+        state.focus_desktop_window(popup_id, WindowFocusReason::ShellActivation),
+        WindowFocusOutcome::Unavailable
+    );
     assert_eq!(state.x11_client_lists().0, vec![parent.handle]);
 }
 
@@ -1091,7 +1097,10 @@ fn pointer_enter_focus_rejects_auxiliary_x11_windows() {
     popup.window_types = X11WindowTypes::new(vec![X11WindowType::PopupMenu]);
     let popup_id = insert_x11(&mut state, popup);
 
-    assert!(!state.focus_desktop_window(popup_id, WindowFocusReason::PointerEnter));
+    assert_eq!(
+        state.focus_desktop_window(popup_id, WindowFocusReason::PointerEnter),
+        WindowFocusOutcome::Unavailable
+    );
 }
 
 #[test]

@@ -26,8 +26,15 @@ impl WindowFocusReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowFocusOutcome {
+    Changed,
+    NoChange,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowActivationOutcome {
-    Accepted,
+    Changed,
     NoChange,
     Unavailable,
 }
