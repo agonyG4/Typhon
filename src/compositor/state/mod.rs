@@ -28,6 +28,7 @@ mod surface_commits;
 mod surface_focus;
 mod surface_transactions;
 mod surfaces;
+mod window_actions;
 mod window_interaction;
 mod window_resize;
 mod windows;
@@ -100,6 +101,8 @@ pub(in crate::compositor) use surface_focus::*;
 pub(in crate::compositor) use surface_transactions::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use surfaces::*;
+#[allow(unused_imports)]
+pub(in crate::compositor) use window_actions::*;
 #[allow(unused_imports)]
 pub(in crate::compositor) use window_interaction::*;
 #[allow(unused_imports)]

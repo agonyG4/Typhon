@@ -39,13 +39,6 @@ pub(crate) enum WindowActivationOutcome {
     Unavailable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WindowActionOutcome {
-    Changed,
-    NoChange,
-    Unavailable,
-}
-
 impl CompositorState {
     pub(in crate::compositor) fn focus_surface(&mut self, surface: wl_surface::WlSurface) {
         self.set_desktop_focus(surface, "focus");

@@ -66,16 +66,10 @@ fn dispatch_action(
 
     let result = match action {
         AstreaToplevelAction::Activate => {
-            match state
-                .activate_desktop_window(prepared.window_id, WindowFocusReason::ShellActivation)
-            {
-                WindowActivationOutcome::Changed => {
-                    astrea_toplevel_manager_v1::ActionResult::Accepted
-                }
-                WindowActivationOutcome::NoChange => {
-                    astrea_toplevel_manager_v1::ActionResult::NoChange
-                }
-                WindowActivationOutcome::Unavailable => {
+            match state.activate_desktop_window_action(prepared.window_id) {
+                WindowActionOutcome::Changed => astrea_toplevel_manager_v1::ActionResult::Accepted,
+                WindowActionOutcome::NoChange => astrea_toplevel_manager_v1::ActionResult::NoChange,
+                WindowActionOutcome::Unavailable => {
                     astrea_toplevel_manager_v1::ActionResult::Unavailable
                 }
             }
