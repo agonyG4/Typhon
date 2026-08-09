@@ -4,13 +4,15 @@
     Copyright 2026 AstreaOS contributors
   </copyright>
 
-  <interface name="astrea_toplevel_manager_v1" version="1">
-    <description summary="authoritative read-only Astrea toplevel list">
+  <interface name="astrea_toplevel_manager_v1" version="2">
+    <description summary="authoritative Astrea toplevel list and actions">
       This private protocol publishes compositor-managed application toplevels.
       Version 1 has no window mutation requests. Handle events are grouped into
       bounded runtime cycles but share one revision, and manager done is the
-      atomic completion boundary. A failed manager is terminal and does not
-      disconnect other managers owned by the same client.
+      atomic completion boundary. Version 2 adds exact WindowId-handle actions
+      whose completion is reported by this manager because a handle may close.
+      A failed manager is terminal and does not disconnect other managers owned
+      by the same client.
     </description>
 
     <enum name="error">
@@ -26,6 +28,19 @@
 
     <enum name="done_flags" bitfield="true">
       <entry name="truncated" value="1"/>
+    </enum>
+
+    <enum name="action">
+      <entry name="activate" value="0"/>
+      <entry name="minimize" value="1"/>
+      <entry name="restore" value="2"/>
+      <entry name="close" value="3"/>
+    </enum>
+
+    <enum name="action_result">
+      <entry name="accepted" value="0"/>
+      <entry name="no_change" value="1"/>
+      <entry name="unavailable" value="2"/>
     </enum>
 
     <request name="destroy" type="destructor"/>
@@ -49,9 +64,25 @@
       </description>
       <arg name="reason" type="uint" enum="failure_reason"/>
     </event>
+
+    <event name="action_done" since="2">
+      <description summary="completion of an exact toplevel action">
+        An authorized version-2 request that reaches action dispatch receives
+        exactly one completion from this manager. Invalid or non-actionable
+        targets, duplicate pending tokens, and a manager at its pending-action
+        bound receive unavailable without creating new pending state. These are
+        semantic action results, not protocol or authentication failures. For
+        close, accepted means only that the graceful close request was issued;
+        disappearance is reported by the toplevel closed event.
+      </description>
+      <arg name="token_hi" type="uint"/>
+      <arg name="token_lo" type="uint"/>
+      <arg name="action" type="uint" enum="action"/>
+      <arg name="result" type="uint" enum="action_result"/>
+    </event>
   </interface>
 
-  <interface name="astrea_toplevel_v1" version="1">
+  <interface name="astrea_toplevel_v1" version="2">
     <description summary="one compositor-managed Astrea toplevel">
       The handle is read-only. Its identifier is the stable decimal Typhon
       WindowId, and its lifetime is independent of the underlying compositor
@@ -72,6 +103,26 @@
     </enum>
 
     <request name="destroy" type="destructor"/>
+
+    <request name="activate" since="2">
+      <arg name="token_hi" type="uint"/>
+      <arg name="token_lo" type="uint"/>
+    </request>
+
+    <request name="minimize" since="2">
+      <arg name="token_hi" type="uint"/>
+      <arg name="token_lo" type="uint"/>
+    </request>
+
+    <request name="restore" since="2">
+      <arg name="token_hi" type="uint"/>
+      <arg name="token_lo" type="uint"/>
+    </request>
+
+    <request name="close" since="2">
+      <arg name="token_hi" type="uint"/>
+      <arg name="token_lo" type="uint"/>
+    </request>
 
     <event name="identifier">
       <arg name="identifier" type="string"/>

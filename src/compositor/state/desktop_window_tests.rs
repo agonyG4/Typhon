@@ -1139,6 +1139,51 @@ fn pointer_press_activation_restores_minimized_window() {
 }
 
 #[test]
+fn exact_window_action_outcomes_distinguish_unavailable_and_no_change() {
+    let mut state = CompositorState::new(None);
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(id, 306))
+        .expect("insert window");
+
+    assert_eq!(
+        state.minimize_desktop_window_outcome(WindowId::new(NonZeroU64::new(999).unwrap())),
+        WindowActionOutcome::Unavailable
+    );
+    assert_eq!(
+        state.restore_minimized_desktop_window_outcome(id),
+        WindowActionOutcome::NoChange
+    );
+
+    state
+        .window_mut(id)
+        .expect("window")
+        .state
+        .mark_minimized_without_surfaces();
+    assert_eq!(
+        state.minimize_desktop_window_outcome(id),
+        WindowActionOutcome::NoChange
+    );
+}
+
+#[test]
+fn exact_x11_close_uses_the_existing_backend_close_command() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let id = insert_x11(&mut state, x11_snapshot(generation, 307, 307));
+    let _ = state.take_backend_commands();
+
+    assert_eq!(
+        state.close_desktop_window_outcome(id),
+        WindowActionOutcome::Changed
+    );
+    assert!(matches!(
+        state.take_backend_commands().as_slice(),
+        [crate::compositor::window_backend::WindowBackendCommand::Close { window }] if *window == id
+    ));
+}
+
+#[test]
 fn raise_window_id_is_a_noop_when_the_window_family_is_already_topmost() {
     let mut state = CompositorState::new(None);
     let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());

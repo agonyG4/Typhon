@@ -82,6 +82,95 @@ fn dirty_windows_are_coalesced_and_bounded() {
 }
 
 #[test]
+fn action_tokens_reject_manager_scoped_duplicates_and_reuse_released_tokens() {
+    let mut tracker = AstreaActionTracker::default();
+    let mut other_manager = AstreaActionTracker::default();
+    let token = AstreaActionToken::new(7, 11);
+
+    assert_eq!(
+        tracker.reserve(token, AstreaToplevelAction::Activate, id(1)),
+        Ok(())
+    );
+    assert_eq!(
+        tracker.can_reserve(token),
+        Err(AstreaActionBeginError::Duplicate)
+    );
+    assert_eq!(
+        tracker.reserve(token, AstreaToplevelAction::Close, id(2)),
+        Err(AstreaActionBeginError::Duplicate)
+    );
+    assert_eq!(
+        other_manager.reserve(token, AstreaToplevelAction::Close, id(2)),
+        Ok(())
+    );
+    assert_eq!(
+        tracker.release(token),
+        Some(PendingAstreaAction {
+            token,
+            action: AstreaToplevelAction::Activate,
+            window_id: id(1),
+        })
+    );
+    assert_eq!(
+        tracker.reserve(token, AstreaToplevelAction::Close, id(2)),
+        Ok(())
+    );
+}
+
+#[test]
+fn action_tokens_have_a_bounded_pending_capacity() {
+    let mut tracker = AstreaActionTracker::default();
+
+    for value in 1..=MAX_ASTREA_PENDING_ACTIONS {
+        assert_eq!(
+            tracker.reserve(
+                AstreaActionToken::new(0, value as u32),
+                AstreaToplevelAction::Activate,
+                id(value as u64),
+            ),
+            Ok(())
+        );
+    }
+
+    assert_eq!(
+        tracker.can_reserve(AstreaActionToken::new(
+            0,
+            (MAX_ASTREA_PENDING_ACTIONS + 1) as u32,
+        )),
+        Err(AstreaActionBeginError::Limit)
+    );
+    assert_eq!(
+        tracker.reserve(
+            AstreaActionToken::new(0, (MAX_ASTREA_PENDING_ACTIONS + 1) as u32),
+            AstreaToplevelAction::Activate,
+            id((MAX_ASTREA_PENDING_ACTIONS + 1) as u64),
+        ),
+        Err(AstreaActionBeginError::Limit)
+    );
+}
+
+#[test]
+fn action_tracker_clear_releases_manager_state() {
+    let mut tracker = AstreaActionTracker::default();
+    let first = AstreaActionToken::new(0, 1);
+    let second = AstreaActionToken::new(0, 2);
+    tracker
+        .reserve(first, AstreaToplevelAction::Activate, id(9))
+        .unwrap();
+    tracker
+        .reserve(second, AstreaToplevelAction::Close, id(10))
+        .unwrap();
+
+    assert_eq!(tracker.pending_len(), 2);
+    tracker.clear();
+    assert_eq!(tracker.pending_len(), 0);
+    assert_eq!(
+        tracker.reserve(first, AstreaToplevelAction::Restore, id(11)),
+        Ok(())
+    );
+}
+
+#[test]
 fn first_reconciliation_is_the_only_unprompted_full_scan() {
     let mut publisher = AstreaToplevelPublisher::default();
     assert!(publisher.needs_full_reconciliation());

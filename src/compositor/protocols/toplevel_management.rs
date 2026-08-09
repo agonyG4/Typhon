@@ -3,6 +3,117 @@ use std::collections::BTreeMap;
 
 use super::super::*;
 
+fn dispatch_action(
+    state: &mut CompositorState,
+    client: &Client,
+    resource: &astrea_toplevel_v1::AstreaToplevelV1,
+    data: &AstreaToplevelResourceData,
+    display: &DisplayHandle,
+    action: AstreaToplevelAction,
+    token: AstreaActionToken,
+) {
+    if resource.version() < 2 {
+        return;
+    }
+    if !state.astrea_toplevel_client_allowed(client, display) {
+        state.post_protocol_error(
+            client,
+            resource,
+            astrea_toplevel_manager_v1::Error::Unauthorized,
+            "client is not an authorized Astrea shell client",
+        );
+        return;
+    }
+
+    let prepared = match state.astrea_toplevel_publisher.prepare_action(
+        &data.client_id,
+        &data.manager_id,
+        &resource.id(),
+        data.window_id,
+        token,
+        action,
+    ) {
+        Ok(prepared) => prepared,
+        Err(AstreaActionPreparationError::Protocol) => return,
+        Err(AstreaActionPreparationError::Unavailable) => {
+            let _ = state.astrea_toplevel_publisher.send_action_done(
+                &data.manager_id,
+                token,
+                action,
+                astrea_toplevel_manager_v1::ActionResult::Unavailable,
+            );
+            return;
+        }
+        Err(AstreaActionPreparationError::Duplicate) => {
+            let _ = state.astrea_toplevel_publisher.send_action_done(
+                &data.manager_id,
+                token,
+                action,
+                astrea_toplevel_manager_v1::ActionResult::Unavailable,
+            );
+            return;
+        }
+        Err(AstreaActionPreparationError::Limit) => {
+            let _ = state.astrea_toplevel_publisher.send_action_done(
+                &data.manager_id,
+                token,
+                action,
+                astrea_toplevel_manager_v1::ActionResult::Unavailable,
+            );
+            return;
+        }
+    };
+
+    let result = match action {
+        AstreaToplevelAction::Activate => {
+            match state
+                .activate_desktop_window(prepared.window_id, WindowFocusReason::ShellActivation)
+            {
+                WindowActivationOutcome::Changed => {
+                    astrea_toplevel_manager_v1::ActionResult::Accepted
+                }
+                WindowActivationOutcome::NoChange => {
+                    astrea_toplevel_manager_v1::ActionResult::NoChange
+                }
+                WindowActivationOutcome::Unavailable => {
+                    astrea_toplevel_manager_v1::ActionResult::Unavailable
+                }
+            }
+        }
+        AstreaToplevelAction::Minimize => {
+            match state.minimize_desktop_window_outcome(prepared.window_id) {
+                WindowActionOutcome::Changed => astrea_toplevel_manager_v1::ActionResult::Accepted,
+                WindowActionOutcome::NoChange => astrea_toplevel_manager_v1::ActionResult::NoChange,
+                WindowActionOutcome::Unavailable => {
+                    astrea_toplevel_manager_v1::ActionResult::Unavailable
+                }
+            }
+        }
+        AstreaToplevelAction::Restore => {
+            match state.restore_minimized_desktop_window_outcome(prepared.window_id) {
+                WindowActionOutcome::Changed => astrea_toplevel_manager_v1::ActionResult::Accepted,
+                WindowActionOutcome::NoChange => astrea_toplevel_manager_v1::ActionResult::NoChange,
+                WindowActionOutcome::Unavailable => {
+                    astrea_toplevel_manager_v1::ActionResult::Unavailable
+                }
+            }
+        }
+        AstreaToplevelAction::Close => {
+            match state.close_desktop_window_outcome(prepared.window_id) {
+                WindowActionOutcome::Changed => astrea_toplevel_manager_v1::ActionResult::Accepted,
+                WindowActionOutcome::NoChange => astrea_toplevel_manager_v1::ActionResult::NoChange,
+                WindowActionOutcome::Unavailable => {
+                    astrea_toplevel_manager_v1::ActionResult::Unavailable
+                }
+            }
+        }
+    };
+
+    let _ = state
+        .astrea_toplevel_publisher
+        .complete_action(prepared, result);
+}
+
 impl GlobalDispatch<astrea_toplevel_manager_v1::AstreaToplevelManagerV1, ()> for CompositorState {
     fn bind(
         state: &mut Self,
@@ -170,11 +281,11 @@ impl Dispatch<astrea_toplevel_v1::AstreaToplevelV1, AstreaToplevelResourceData>
 {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &astrea_toplevel_v1::AstreaToplevelV1,
         request: astrea_toplevel_v1::Request,
         data: &AstreaToplevelResourceData,
-        _handle: &DisplayHandle,
+        handle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
         match request {
@@ -184,6 +295,50 @@ impl Dispatch<astrea_toplevel_v1::AstreaToplevelV1, AstreaToplevelResourceData>
                     &data.manager_id,
                     data.window_id,
                     &resource.id(),
+                );
+            }
+            astrea_toplevel_v1::Request::Activate { token_hi, token_lo } => {
+                dispatch_action(
+                    state,
+                    client,
+                    resource,
+                    data,
+                    handle,
+                    AstreaToplevelAction::Activate,
+                    AstreaActionToken::new(token_hi, token_lo),
+                );
+            }
+            astrea_toplevel_v1::Request::Minimize { token_hi, token_lo } => {
+                dispatch_action(
+                    state,
+                    client,
+                    resource,
+                    data,
+                    handle,
+                    AstreaToplevelAction::Minimize,
+                    AstreaActionToken::new(token_hi, token_lo),
+                );
+            }
+            astrea_toplevel_v1::Request::Restore { token_hi, token_lo } => {
+                dispatch_action(
+                    state,
+                    client,
+                    resource,
+                    data,
+                    handle,
+                    AstreaToplevelAction::Restore,
+                    AstreaActionToken::new(token_hi, token_lo),
+                );
+            }
+            astrea_toplevel_v1::Request::Close { token_hi, token_lo } => {
+                dispatch_action(
+                    state,
+                    client,
+                    resource,
+                    data,
+                    handle,
+                    AstreaToplevelAction::Close,
+                    AstreaActionToken::new(token_hi, token_lo),
                 );
             }
         }

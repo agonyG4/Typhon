@@ -1,5 +1,7 @@
 use super::super::*;
+use super::support::frame_buffer_client::create_test_buffered_toplevel;
 use super::support::locked_relative::{runtime_socket_path, unique_socket_name};
+use super::support::registry_state::RegistryTestState;
 use super::support::server_runtime::{
     ServerCommand, spawn_controllable_test_server, spawn_test_server,
     stop_controllable_test_server, stop_test_server,
@@ -14,7 +16,9 @@ use std::os::unix::net::UnixStream;
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_registry;
+use wayland_client::protocol::{wl_compositor as client_wl_compositor, wl_shm as client_wl_shm};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, globals::registry_queue_init};
+use wayland_protocols::xdg::shell::client::xdg_wm_base as client_xdg_wm_base;
 
 #[derive(Debug)]
 struct ClientToplevel {
@@ -35,6 +39,7 @@ struct ClientToplevel {
 struct ToplevelClientState {
     events: Vec<&'static str>,
     manager_dones: Vec<(u32, u32, u32, u32)>,
+    action_dones: Vec<(u32, u32, u32, u32)>,
     handles: Vec<client_astrea_toplevel_v1::AstreaToplevelV1>,
     toplevels: HashMap<ObjectId, ClientToplevel>,
 }
@@ -96,6 +101,17 @@ impl Dispatch<client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1, ()>
             }
             client_astrea_toplevel_manager_v1::Event::Failed { .. } => {
                 state.events.push("manager_failed");
+            }
+            client_astrea_toplevel_manager_v1::Event::ActionDone {
+                token_hi,
+                token_lo,
+                action,
+                result,
+            } => {
+                state.events.push("action_done");
+                state
+                    .action_dones
+                    .push((token_hi, token_lo, action.into(), result.into()));
             }
         }
     }
@@ -402,6 +418,130 @@ fn mapped_xdg_window_is_announced_after_initial_enumeration() {
     );
     assert_eq!(state.manager_dones.len(), 2);
     assert_eq!(state.manager_dones[1].2, 1);
+
+    let _ = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn authorized_v2_exact_xdg_actions_complete_on_the_manager() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    server.authorize_astrea_shell_pid(std::process::id());
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let socket_path = runtime_socket_path(&socket_name);
+    let _window_client_state = create_buffered_toplevel_then_window_commands(
+        &socket_path,
+        &commands,
+        &[] as &[ServerCommand],
+    )
+    .unwrap();
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<ToplevelClientState>(&connection).unwrap();
+    let qh = queue.handle();
+    let _manager: client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1 =
+        globals.bind(&qh, 2..=2, ()).unwrap();
+    connection.flush().unwrap();
+    let mut state = ToplevelClientState::default();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.handles.len(), 1);
+
+    let handle = state.handles[0].clone();
+    handle.activate(0, 1);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    handle.minimize(0, 2);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    handle.minimize(0, 3);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    handle.restore(0, 4);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    handle.close(0, 5);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    assert_eq!(
+        state.action_dones,
+        [
+            (0, 1, 0, 1),
+            (0, 2, 1, 0),
+            (0, 3, 1, 1),
+            (0, 4, 2, 0),
+            (0, 5, 3, 0),
+        ]
+    );
+    assert_eq!(
+        state
+            .events
+            .iter()
+            .filter(|event| **event == "action_done")
+            .count(),
+        5
+    );
+    assert!(!state.toplevels.values().next().unwrap().closed);
+
+    let _ = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn authorized_v2_stale_handle_reports_unavailable_without_reservation() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    server.authorize_astrea_shell_pid(std::process::id());
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let socket_path = runtime_socket_path(&socket_name);
+
+    let manager_connection =
+        Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (manager_globals, mut manager_queue) =
+        registry_queue_init::<ToplevelClientState>(&manager_connection).unwrap();
+    let manager_qh = manager_queue.handle();
+    let _manager: client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1 =
+        manager_globals.bind(&manager_qh, 2..=2, ()).unwrap();
+    manager_connection.flush().unwrap();
+    let mut manager_state = ToplevelClientState::default();
+    manager_queue.roundtrip(&mut manager_state).unwrap();
+
+    let window_connection =
+        Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (window_globals, mut window_queue) =
+        registry_queue_init::<RegistryTestState>(&window_connection).unwrap();
+    let window_qh = window_queue.handle();
+    let compositor: client_wl_compositor::WlCompositor =
+        window_globals.bind(&window_qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase =
+        window_globals.bind(&window_qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = window_globals.bind(&window_qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &window_qh, 300, 200).unwrap();
+    surface.commit();
+    window_connection.flush().unwrap();
+    window_queue
+        .roundtrip(&mut RegistryTestState::default())
+        .unwrap();
+    manager_queue.roundtrip(&mut manager_state).unwrap();
+    assert_eq!(manager_state.handles.len(), 1);
+
+    surface.attach(None, 0, 0);
+    surface.commit();
+    window_connection.flush().unwrap();
+    window_queue
+        .roundtrip(&mut RegistryTestState::default())
+        .unwrap();
+    manager_queue.roundtrip(&mut manager_state).unwrap();
+
+    let handle = manager_state.handles[0].clone();
+    assert!(manager_state.toplevels.values().next().unwrap().closed);
+    assert!(manager_state.action_dones.is_empty());
+
+    handle.close(0, 42);
+    manager_connection.flush().unwrap();
+    manager_queue.roundtrip(&mut manager_state).unwrap();
+    assert_eq!(manager_state.action_dones, [(0, 42, 3, 2)]);
+    assert!(manager_state.toplevels.values().next().unwrap().closed);
 
     let _ = stop_controllable_test_server(commands, server_thread);
 }

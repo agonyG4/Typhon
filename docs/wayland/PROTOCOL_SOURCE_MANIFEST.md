@@ -147,7 +147,7 @@ The target contract is:
 | `astrea_shell_auth_manager_v1` | 1 | always |
 | `astrea_shortcuts_manager_v1` | 1 | always |
 | `astrea_shell_control_manager_v1` | 1 | always |
-| `astrea_toplevel_manager_v1` | 1 | always |
+| `astrea_toplevel_manager_v1` | 2 | always |
 | `xdg_wm_base` | 6 | always |
 | `wl_output` | 4 | always |
 | `wl_seat` | 7 | always |

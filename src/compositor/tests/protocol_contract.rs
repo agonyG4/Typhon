@@ -16,7 +16,7 @@ fn advertised_global_versions_are_centralized() {
     assert_eq!(versions::WL_OUTPUT, 4);
     assert_eq!(versions::WL_SEAT, 7);
     assert_eq!(versions::XWAYLAND_SHELL_V1, 1);
-    assert_eq!(versions::ASTREA_TOPLEVEL_MANAGER_V1, 1);
+    assert_eq!(versions::ASTREA_TOPLEVEL_MANAGER_V1, 2);
     assert_eq!(versions::ASTREA_SHELL_AUTH_MANAGER_V1, 1);
 
     let globals = versions::all_globals();
@@ -28,7 +28,7 @@ fn advertised_global_versions_are_centralized() {
     assert!(globals.contains(&GlobalAdvertisement::new("wl_output", 4)));
     assert!(globals.contains(&GlobalAdvertisement::new("wl_seat", 7)));
     assert!(globals.contains(&GlobalAdvertisement::new("xwayland_shell_v1", 1)));
-    assert!(globals.contains(&GlobalAdvertisement::new("astrea_toplevel_manager_v1", 1)));
+    assert!(globals.contains(&GlobalAdvertisement::new("astrea_toplevel_manager_v1", 2)));
     assert!(globals.contains(&GlobalAdvertisement::new("astrea_shell_auth_manager_v1", 1)));
 
     let mut sorted = globals.to_vec();

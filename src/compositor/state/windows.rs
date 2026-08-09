@@ -1029,9 +1029,22 @@ impl CompositorState {
         let Some(window_id) = self.focused_window_id else {
             return false;
         };
+        matches!(
+            self.close_desktop_window_outcome(window_id),
+            WindowActionOutcome::Changed
+        )
+    }
+
+    pub(in crate::compositor) fn close_desktop_window_outcome(
+        &mut self,
+        window_id: WindowId,
+    ) -> WindowActionOutcome {
         let Some(window) = self.window(window_id).cloned() else {
-            return false;
+            return WindowActionOutcome::Unavailable;
         };
+        if window.kind != DesktopWindowKind::Managed || !window.is_normal_x11_role() {
+            return WindowActionOutcome::Unavailable;
+        }
         match window.backend {
             WindowBackend::X11(_) => {
                 self.backend_commands.push(
@@ -1039,12 +1052,15 @@ impl CompositorState {
                         window: window_id,
                     },
                 );
-                true
+                WindowActionOutcome::Changed
             }
             WindowBackend::Xdg(_) => self
                 .toplevel_surfaces
                 .get(&window.root_surface_id)
-                .is_some_and(|role| role.toplevel.send_event(xdg_toplevel::Event::Close).is_ok()),
+                .and_then(|role| role.toplevel.send_event(xdg_toplevel::Event::Close).ok())
+                .map_or(WindowActionOutcome::Unavailable, |_| {
+                    WindowActionOutcome::Changed
+                }),
         }
     }
 
@@ -1150,6 +1166,26 @@ impl CompositorState {
         true
     }
 
+    pub(in crate::compositor) fn minimize_desktop_window_outcome(
+        &mut self,
+        window_id: WindowId,
+    ) -> WindowActionOutcome {
+        let Some(window) = self.window(window_id) else {
+            return WindowActionOutcome::Unavailable;
+        };
+        if window.kind != DesktopWindowKind::Managed || !window.is_normal_x11_role() {
+            return WindowActionOutcome::Unavailable;
+        }
+        if window.state.is_minimized() {
+            return WindowActionOutcome::NoChange;
+        }
+        if self.minimize_desktop_window(window_id) {
+            WindowActionOutcome::Changed
+        } else {
+            WindowActionOutcome::Unavailable
+        }
+    }
+
     pub(in crate::compositor) fn restore_minimized_root_window(&mut self, surface_id: u32) -> bool {
         let Some(window_id) = self.window_id_for_surface(surface_id) else {
             return false;
@@ -1166,6 +1202,26 @@ impl CompositorState {
         }
         let _ = self.focus_desktop_window(window_id, WindowFocusReason::Restore);
         true
+    }
+
+    pub(in crate::compositor) fn restore_minimized_desktop_window_outcome(
+        &mut self,
+        window_id: WindowId,
+    ) -> WindowActionOutcome {
+        let Some(window) = self.window(window_id) else {
+            return WindowActionOutcome::Unavailable;
+        };
+        if window.kind != DesktopWindowKind::Managed || !window.is_normal_x11_role() {
+            return WindowActionOutcome::Unavailable;
+        }
+        if !window.state.is_minimized() {
+            return WindowActionOutcome::NoChange;
+        }
+        if self.restore_minimized_desktop_window(window_id) {
+            WindowActionOutcome::Changed
+        } else {
+            WindowActionOutcome::Unavailable
+        }
     }
 
     fn restore_minimized_desktop_window_contents(&mut self, window_id: WindowId) -> bool {
