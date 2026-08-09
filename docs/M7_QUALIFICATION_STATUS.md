@@ -23,12 +23,27 @@ native TTY/DRM qualification. `DEFERRED` is not a passing status.
 ## M7-B
 
 - Typhon starting HEAD: `83f41594a5196f73900d1e1010918e6455e71e15`
-- Typhon deterministic closure HEAD: `57e4908c9eaeaa0d53752db3f35834995a0250b1`
+- Typhon authorization closure HEAD: `75aeed728f00bd1f3fe4a606b0d5697179461347`
+- Typhon documentation/EOF closure HEAD: `5e5107573ccd4429b2efde86045421eed19b8325`
 - Protocol XML: `protocols/astrea-toplevel-management-v1.xml`
 - Protocol XML SHA-256: `0dd3449fda60b1ed183e330e1589093f3d4f8086be117d9ca4baa81bd6bd47e7`
-- Deterministic focused action, lifecycle, managed-X11 protocol-path,
-  central-primitive, v1 version-rejection, protocol-contract, clippy, format,
-  check, source-layout, serial full-suite, and diff-check validation: PASS.
+- Deterministic focused authorization, action, lifecycle, managed-X11
+  protocol-path, central-primitive, v1 version-rejection, protocol-contract,
+  clippy, format, check, source-layout, serial full-suite, and diff-check
+  validation: PASS.
+- Capability-only authorization coverage: 15 focused toplevel-management tests
+  passed, including capability-authenticated actions, supervised-PID-only
+  denial for all four v2 actions, same-UID second-client denial, and
+  disconnect/reconnect authentication reset.
+- Locked serial full-suite result: 2506 passed, 0 failed, 4 ignored across all
+  targets; the compositor library contributed 1541 passed and the main binary
+  contributed 856 passed. The suite used `XDG_RUNTIME_DIR=/tmp/typhon-test-1000`
+  and user-owned `TMPDIR=/tmp/t`.
+- Final committed-range whitespace validation: `git log --check
+  627eab87fcf675038ffe5cae1f4ee7e8e076f967..HEAD` PASS; `git diff --check`
+  PASS. The reviewed pre-closure HEAD is the range baseline because the
+  earlier `7dc1588..627eab8` history contains the defect that was corrected
+  without rewriting history.
 - Source-layout counts: `windows.rs` 1465 lines, `toplevel_publication.rs` 1487
   lines, `toplevel_actions.rs` 228 lines, and `state/window_actions.rs` 90
   lines; all remain below the existing 1500-line limit.
