@@ -216,9 +216,10 @@ For both XDG and managed X11 targets:
 
 ### Completion and race behavior
 
-- close followed by `action_done` then `closed`;
-- close followed by `closed` then `action_done`;
-- target destruction while an action is pending;
+- close completion is manager-owned and does not wait for `closed`; a later
+  `closed` event cannot duplicate it;
+- generation-safe cleanup of any genuinely deferred production entry (there is
+  no deferred M7-B action);
 - manager destruction and client disconnect;
 - direct manager action-state tests for a duplicate pending token on a
   different handle of the same manager;

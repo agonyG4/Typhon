@@ -1,15 +1,53 @@
-# Astrea Toplevel Management v1
+# Astrea Toplevel Management v2
 
-Astrea Toplevel Management v1 is a private, compositor-owned, read-only
-Wayland protocol for the future Eclipse Dock and AltTab backends. Typhon is
-the authority for the published window list; clients do not submit window
-actions through this protocol.
+Astrea Toplevel Management v2 is a private, compositor-owned Wayland protocol
+for the Eclipse Dock and AltTab backends. Typhon is the authority for the
+published window list and exact window actions.
 
-The global is `astrea_toplevel_manager_v1`, advertised at version 1. The only
-version-1 requests on both the manager and toplevel objects are their
-destructor requests. Activation, minimize, restore, close, maximize,
-fullscreen, workspace, output and thumbnail operations require a later
-protocol version.
+The global is `astrea_toplevel_manager_v1`, advertised at version 2. Version 1
+clients remain read-only and compatible: the only version-1 requests on both
+the manager and toplevel objects are their destructor requests. Version 2 adds
+exact activate, minimize, restore, and close requests to toplevel handles, with
+manager-owned `action_done` completion. Maximize, fullscreen, workspace,
+output, and thumbnail operations remain outside this milestone.
+
+## Version 2 actions
+
+Each action is sent through the exact toplevel handle, whose immutable
+`identifier` is Typhon's stable `WindowId`. The request carries only a
+client-owned 64-bit token split into two `uint` values:
+
+```text
+activate(token_hi, token_lo)
+minimize(token_hi, token_lo)
+restore(token_hi, token_lo)
+close(token_hi, token_lo)
+```
+
+Completion is always sent by the manager, never by the potentially terminal
+handle:
+
+```text
+action_done(token_hi, token_lo, action, result)
+```
+
+The stable results are `accepted`, `no_change`, and `unavailable`. `accepted`
+for `close` means only that Typhon issued the graceful XDG or existing XWM
+close request. The normal handle `closed` event remains the disappearance
+lifecycle boundary. `unavailable` is a semantic action result for an invalid
+or non-actionable target, a duplicate token already pending on this manager,
+or a manager that has reached its pending-action bound. It does not mean that
+the request failed protocol authentication.
+
+Typhon's manager-owned action tracker has at most 64 reserved entries. Normal
+M7-B actions complete synchronously: reserve the token, execute the exact
+WindowId primitive, emit `action_done` on the manager, and release the token in
+that dispatch. There is no artificial production queue or delayed action.
+Duplicate and beyond-bound requests emit `unavailable` without adding a new
+entry. Completion makes a token immediately reusable and no completed-token
+history is retained. Manager destruction or client disconnect clears any
+tracker entries; longer-lived state is reserved for an existing production
+action that genuinely requires deferred completion.
 
 ## Authorization
 
@@ -215,7 +253,6 @@ bounded eligibility scan. Ordinary input hot paths do not perform that scan.
 Each non-empty batch advances one monotonic revision; an unchanged
 reconciliation emits no manager `done`.
 
-Version 1 intentionally provides no workspaces, output assignment, icons,
-thumbnails or window actions. Eclipse integration is a later milestone.
-Future mutable requests require a protocol version increase rather than an
-extension of the version-1 request surface.
+Version 2 intentionally provides no workspaces, output assignment, icons or
+thumbnails. Future mutable requests require another protocol version increase
+rather than an extension of the version-1 request surface.

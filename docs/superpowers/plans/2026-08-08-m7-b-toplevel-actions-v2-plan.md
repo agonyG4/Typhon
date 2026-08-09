@@ -439,14 +439,12 @@ Bind a manager at version 1 and assert existing publication events, ordering, en
 
 - [ ] Step 2: Add close ordering tests.
 
-Drive both observer orderings without sleeps:
-
-~~~text
-graceful close issued -> manager action_done(close, accepted) -> handle closed
-graceful close issued -> handle closed -> manager action_done(close, accepted)
-~~~
-
-Both must produce one manager completion, never a handle-owned completion, and never wait for client disappearance.
+Assert that a successfully issued graceful close produces one manager
+`action_done(close, accepted)` immediately, without waiting for `closed`. The
+handle may become terminal later; it must never own or duplicate completion.
+If a future existing production action is genuinely deferred, test both
+manager-before-terminal and terminal-before-manager completion paths through
+that real completion path rather than adding an artificial M7-B delay.
 
 - [ ] Step 3: Add exact identity and stale-resource tests.
 
