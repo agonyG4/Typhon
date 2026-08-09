@@ -72,8 +72,9 @@ manager, and rejection because this manager has reached its pending-action
 bound. These cases do not create pending state and do not replace or cancel
 an existing pending action. No other result values are introduced.
 
-The all-zero 64-bit token is invalid. Every nonzero 64-bit token is valid;
-token validity is independent of the target handle.
+The wire representation is two `uint` values, so every 64-bit token pair is
+syntactically valid; there is no special zero-token rejection. Token
+uniqueness is the only token-specific semantic check.
 
 For `close`, `accepted` acknowledges only that Typhon issued the existing
 graceful close request: `xdg_toplevel.close` for XDG windows or the existing
@@ -88,17 +89,15 @@ the capacity bound are manager-scoped: one `(token_hi, token_lo)` may not be
 pending on two handles owned by the same manager, while the same token may be
 reused after completion or independently by another manager.
 
-The tracker retains only bounded in-flight entries, with a hard maximum of 64
-entries. An entry is either awaiting the exact primitive or holding a
-manager-owned completion that has not yet been emitted. Completion removes the
-entry after `action_done` is emitted, so completed tokens are reusable and no
-completed-token history is retained. Manager destruction or client disconnect
-drops all in-flight entries. A target-destruction cleanup resolves an action
-that has not been issued as `unavailable`; an action whose primitive already
-returned `accepted` retains its manager-owned `accepted` completion so the
-handle may become terminal before or after `action_done` without changing
-the result. Stale later completion attempts find no in-flight entry and
-cannot emit a duplicate.
+The tracker is a bounded manager action-state primitive with a hard maximum of
+64 reserved entries. Normal M7-B actions complete synchronously from the
+compositor's perspective: they reserve a token, execute the exact primitive,
+emit the manager result, and release the token. There is no artificial
+asynchronous state machine, delayed completion, or test-only queue. A
+longer-lived entry may be retained only if an existing production action
+genuinely requires deferred completion. Manager destruction or client
+disconnect clears any such real entries. Completed tokens are immediately
+reusable and no completed-token history is retained.
 
 Every v2 request follows this order:
 
@@ -112,21 +111,26 @@ manager/resource version and authorization
 ```
 
 The first stage rejects an unauthorized client or an object that cannot use
-the v2 request surface. It must not mutate token state. The second stage
-rejects malformed/invalid tokens, manager-local duplicates, and a full
-pending tracker without creating state. The third stage verifies that the
-exact handle is live, belongs to the request's manager and client, and still
-maps to its immutable `WindowId`; an unavailable target does not enter the
-pending tracker. Only then is the token admitted.
+the v2 request surface through the existing authentication/protocol error
+path. It must not mutate token state and emits no `action_done`. The second
+stage checks the manager-local duplicate and capacity conditions without
+mutating the tracker. A duplicate or full tracker is a semantic action
+rejection: the manager emits `action_done(..., unavailable)` and leaves no
+new pending entry. The third stage verifies that the exact handle is live,
+belongs to the request's manager and client, and still maps to its immutable
+`WindowId`; an unavailable target is also a semantic action rejection that
+emits `unavailable` without reserving a token. Only then is the token
+reserved.
 
-After admission, the request invokes one central exact-window primitive. A
+After reservation, the request invokes one central exact-window primitive and
+immediately emits the manager-owned result, then releases the token. A
 primitive may complete with `no_change`, `unavailable`, or `accepted`.
-The manager records the result in the in-flight entry, emits `action_done`
-with the original token and action, and then removes the entry. If `close`
-causes the handle to become terminal before the manager event is observed,
-the already-issued `accepted` completion remains valid; if the manager
-completion is delivered first, the later `closed` event remains valid.
-Neither event is made dependent on the other.
+For `close`, `accepted` means the graceful close request was issued; it
+does not wait for `closed`. The manager completion does not dereference the
+handle, so a handle becoming terminal before or after the manager event is
+safe. If a future existing production primitive genuinely becomes deferred,
+its real completion may retain the reserved entry until the same manager
+completion path releases it; M7-B does not manufacture such a path.
 
 The server must not focus a window temporarily and then invoke a generic
 focused-window helper. All actions resolve and operate on the exact
@@ -191,7 +195,11 @@ covered by the full suite.
 - authorized v2 clients can request all four actions;
 - unauthorized clients cannot use the private mutation surface and cannot
   mutate token state;
-- invalid object versions are rejected before token state changes.
+- invalid object versions are rejected through the protocol path before token
+  state changes and without `action_done`;
+- authorized v2 semantic rejection emits `unavailable` for an unavailable
+  target, duplicate token, or full manager action-state bound, without leaving
+  pending state behind.
 
 ### Exact action behavior
 
@@ -212,15 +220,17 @@ For both XDG and managed X11 targets:
 - close followed by `closed` then `action_done`;
 - target destruction while an action is pending;
 - manager destruction and client disconnect;
-- duplicate pending token on a different handle of the same manager;
+- direct manager action-state tests for a duplicate pending token on a
+  different handle of the same manager;
 - reuse of a completed token;
-- the 64-entry pending bound;
+- direct manager action-state tests for the 64-entry pending bound;
 - stale manager-generation completion rejection;
 - XWayland generation restart;
 - no duplicate completion for any token/action pair.
 
 Tests will use deterministic event-driving and explicit synchronization. They
-will not rely on arbitrary sleeps or native Firefox/Kitty sessions.
+will not rely on arbitrary sleeps, artificial delayed production actions,
+unnecessary completion queues, or native Firefox/Kitty sessions.
 
 ## Validation and qualification ledger
 
