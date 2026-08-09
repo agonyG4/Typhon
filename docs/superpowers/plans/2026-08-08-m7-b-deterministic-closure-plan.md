@@ -107,5 +107,3 @@ TMPDIR=/run/user/1000 cargo test --locked toplevel_publication -- --test-threads
 - [ ] Search for \`action_done\`, pending action state, \`WindowActionOutcome\`, action primitives, and \`resource.version()\`; confirm one clear owner and no new unsafe code or sleeps.
 - [ ] Set M7-B Implementation PASS, Deterministic PASS only after every gate passes, Native DEFERRED; keep M7-C/D unstarted.
 - [ ] Commit closure changes in focused, bisectable commits without amending or rewriting earlier history.
-
-

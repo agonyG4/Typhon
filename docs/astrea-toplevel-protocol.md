@@ -58,12 +58,12 @@ exact Wayland ClientId for that connection; the grant is removed on
 disconnect. The peer UID is checked during authentication but UID alone never
 grants access.
 
-For the compositor-launched shell path, the currently supervised Astrea shell
-component and its verified descendants remain admitted without the capability.
-PID ancestry is an admission path only; it is not required after successful
-capability authentication, so systemd --user daemons can reconnect
-independently. Application IDs, titles, environment variables and claimed
-client metadata are never authorization inputs.
+For read-only publication and v1 compatibility, the compositor-launched shell
+path may continue to admit the currently supervised Astrea shell component and
+its verified descendants. That admission is not sufficient for v2 mutation:
+activate, minimize, restore, and close require the exact ClientId to have
+completed capability authentication. Application IDs, titles, environment
+variables and claimed client metadata are never authorization inputs.
 
 The current Wayland backend does not provide a state-aware global filter to the
 compositor's publication model, so the global may remain visible to registry
