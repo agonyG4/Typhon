@@ -3,6 +3,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::astrea_toplevel_management::server::{astrea_toplevel_manager_v1, astrea_toplevel_v1};
 use crate::control_snapshots::truncate_utf8;
 
+#[allow(unused_imports)]
+pub(in crate::compositor) use super::toplevel_actions::{
+    AstreaActionBeginError, AstreaActionPreparationError, AstreaActionToken, AstreaActionTracker,
+    AstreaPreparedAction, AstreaToplevelAction, MAX_ASTREA_PENDING_ACTIONS, PendingAstreaAction,
+};
 use super::{CompositorState, WindowId};
 use wayland_server::{
     Client, DisplayHandle, Resource, WEnum,
@@ -22,120 +27,7 @@ pub(crate) const MAX_ASTREA_TERMINAL_MANAGERS_PER_CLIENT: usize = 4;
 pub(crate) const MAX_ASTREA_TERMINAL_MANAGERS_TOTAL: usize = 32;
 pub(crate) const MAX_ASTREA_TOPLEVEL_UPDATES_PER_CYCLE: usize = 256;
 pub(crate) const MAX_ASTREA_ELIGIBLE_WINDOWS: usize = 65_536;
-pub(crate) const MAX_ASTREA_PENDING_ACTIONS: usize = 64;
 const MAX_ASTREA_TOPLEVEL_DIRTY_WINDOWS: usize = 8192;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct AstreaActionToken(u64);
-
-impl AstreaActionToken {
-    pub(crate) const fn new(high: u32, low: u32) -> Self {
-        Self(((high as u64) << 32) | low as u64)
-    }
-
-    pub(crate) const fn wire(self) -> (u32, u32) {
-        ((self.0 >> 32) as u32, self.0 as u32)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AstreaToplevelAction {
-    Activate,
-    Minimize,
-    Restore,
-    Close,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PendingAstreaAction {
-    pub(crate) token: AstreaActionToken,
-    pub(crate) action: AstreaToplevelAction,
-    pub(crate) window_id: WindowId,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AstreaActionBeginError {
-    Duplicate,
-    Limit,
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct AstreaActionTracker {
-    pending: BTreeMap<AstreaActionToken, PendingAstreaAction>,
-}
-
-impl AstreaActionTracker {
-    pub(crate) fn can_reserve(
-        &self,
-        token: AstreaActionToken,
-    ) -> Result<(), AstreaActionBeginError> {
-        if self.pending.contains_key(&token) {
-            return Err(AstreaActionBeginError::Duplicate);
-        }
-        if self.pending.len() >= MAX_ASTREA_PENDING_ACTIONS {
-            return Err(AstreaActionBeginError::Limit);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn reserve(
-        &mut self,
-        token: AstreaActionToken,
-        action: AstreaToplevelAction,
-        window_id: WindowId,
-    ) -> Result<(), AstreaActionBeginError> {
-        self.can_reserve(token)?;
-        self.pending.insert(
-            token,
-            PendingAstreaAction {
-                token,
-                action,
-                window_id,
-            },
-        );
-        Ok(())
-    }
-
-    pub(crate) fn release(&mut self, token: AstreaActionToken) -> Option<PendingAstreaAction> {
-        self.pending.remove(&token)
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.pending.clear();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pending_len(&self) -> usize {
-        self.pending.len()
-    }
-}
-
-impl AstreaToplevelAction {
-    pub(in crate::compositor) const fn wire(self) -> astrea_toplevel_manager_v1::Action {
-        match self {
-            Self::Activate => astrea_toplevel_manager_v1::Action::Activate,
-            Self::Minimize => astrea_toplevel_manager_v1::Action::Minimize,
-            Self::Restore => astrea_toplevel_manager_v1::Action::Restore,
-            Self::Close => astrea_toplevel_manager_v1::Action::Close,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::compositor) enum AstreaActionPreparationError {
-    Protocol,
-    Unavailable,
-    Duplicate,
-    Limit,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::compositor) struct AstreaPreparedAction {
-    pub(in crate::compositor) manager_id: ObjectId,
-    pub(in crate::compositor) token: AstreaActionToken,
-    pub(in crate::compositor) action: AstreaToplevelAction,
-    pub(in crate::compositor) window_id: WindowId,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum AstreaToplevelKind {
@@ -270,40 +162,40 @@ pub(in crate::compositor) struct AstreaToplevelResourceData {
 }
 
 #[derive(Debug, Clone)]
-struct AstreaToplevelHandleBinding {
-    resource: astrea_toplevel_v1::AstreaToplevelV1,
-    snapshot: AstreaToplevelSnapshot,
-    lifecycle: ToplevelHandleLifecycle,
+pub(in crate::compositor) struct AstreaToplevelHandleBinding {
+    pub(in crate::compositor) resource: astrea_toplevel_v1::AstreaToplevelV1,
+    pub(in crate::compositor) snapshot: AstreaToplevelSnapshot,
+    pub(in crate::compositor) lifecycle: ToplevelHandleLifecycle,
 }
 
 #[derive(Debug, Clone)]
-struct RetiredAstreaToplevelHandle {
-    resource: astrea_toplevel_v1::AstreaToplevelV1,
-    client_id: ClientId,
-    manager_id: ObjectId,
-    window_id: WindowId,
+pub(in crate::compositor) struct RetiredAstreaToplevelHandle {
+    pub(in crate::compositor) resource: astrea_toplevel_v1::AstreaToplevelV1,
+    pub(in crate::compositor) client_id: ClientId,
+    pub(in crate::compositor) manager_id: ObjectId,
+    pub(in crate::compositor) window_id: WindowId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToplevelHandleLifecycle {
+pub(in crate::compositor) enum ToplevelHandleLifecycle {
     Live,
     Closed,
 }
 
 #[derive(Debug, Clone)]
-struct AstreaToplevelManagerBinding {
-    resource: astrea_toplevel_manager_v1::AstreaToplevelManagerV1,
+pub(in crate::compositor) struct AstreaToplevelManagerBinding {
+    pub(in crate::compositor) resource: astrea_toplevel_manager_v1::AstreaToplevelManagerV1,
     client: Client,
-    client_id: ClientId,
-    handles: HashMap<ObjectId, AstreaToplevelHandleBinding>,
-    active_handles: BTreeMap<WindowId, ObjectId>,
+    pub(in crate::compositor) client_id: ClientId,
+    pub(in crate::compositor) handles: HashMap<ObjectId, AstreaToplevelHandleBinding>,
+    pub(in crate::compositor) active_handles: BTreeMap<WindowId, ObjectId>,
     suppressed: BTreeSet<WindowId>,
     last_total: u32,
     last_truncated: bool,
     last_revision: u64,
     lifecycle: AstreaManagerLifecycle,
     reserved_handle_count: usize,
-    actions: AstreaActionTracker,
+    pub(in crate::compositor) actions: AstreaActionTracker,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,9 +240,9 @@ pub(in crate::compositor) struct AstreaToplevelPublisher {
     pub(in crate::compositor) canonical: BTreeMap<WindowId, AstreaToplevelSnapshot>,
     pub(in crate::compositor) canonical_eligible_ids: BTreeSet<WindowId>,
     pub(in crate::compositor) canonical_total: u32,
-    managers: HashMap<ObjectId, AstreaToplevelManagerBinding>,
+    pub(in crate::compositor) managers: HashMap<ObjectId, AstreaToplevelManagerBinding>,
     terminal_managers: HashMap<ObjectId, TerminalAstreaToplevelManager>,
-    retired_handles: HashMap<ObjectId, RetiredAstreaToplevelHandle>,
+    pub(in crate::compositor) retired_handles: HashMap<ObjectId, RetiredAstreaToplevelHandle>,
     pub(in crate::compositor) dirty_windows: BTreeSet<WindowId>,
     pub(in crate::compositor) removed_windows: BTreeSet<WindowId>,
     pub(in crate::compositor) structure_dirty: bool,
@@ -563,105 +455,6 @@ impl AstreaToplevelPublisher {
                 .saturating_add(self.pending_handle_count())
                 .saturating_add(handle_count)
                 <= MAX_ASTREA_RETIRED_HANDLES_TOTAL
-    }
-
-    pub(in crate::compositor) fn prepare_action(
-        &mut self,
-        client_id: &ClientId,
-        manager_id: &ObjectId,
-        resource_id: &ObjectId,
-        window_id: WindowId,
-        token: AstreaActionToken,
-        action: AstreaToplevelAction,
-    ) -> Result<AstreaPreparedAction, AstreaActionPreparationError> {
-        let binding = self
-            .managers
-            .get_mut(manager_id)
-            .ok_or(AstreaActionPreparationError::Protocol)?;
-        if binding.client_id != *client_id {
-            return Err(AstreaActionPreparationError::Protocol);
-        }
-
-        match binding.actions.can_reserve(token) {
-            Ok(()) => {}
-            Err(AstreaActionBeginError::Duplicate) => {
-                return Err(AstreaActionPreparationError::Duplicate);
-            }
-            Err(AstreaActionBeginError::Limit) => {
-                return Err(AstreaActionPreparationError::Limit);
-            }
-        }
-
-        if self.retired_handles.get(resource_id).is_some_and(|handle| {
-            handle.client_id == *client_id
-                && handle.manager_id == *manager_id
-                && handle.window_id == window_id
-        }) {
-            return Err(AstreaActionPreparationError::Unavailable);
-        }
-        let handle = binding
-            .handles
-            .get(resource_id)
-            .ok_or(AstreaActionPreparationError::Protocol)?;
-        if handle.lifecycle != ToplevelHandleLifecycle::Live
-            || handle.snapshot.id != window_id
-            || binding.active_handles.get(&window_id) != Some(resource_id)
-        {
-            return Err(AstreaActionPreparationError::Unavailable);
-        }
-
-        binding
-            .actions
-            .reserve(token, action, window_id)
-            .map_err(|error| match error {
-                AstreaActionBeginError::Duplicate => AstreaActionPreparationError::Duplicate,
-                AstreaActionBeginError::Limit => AstreaActionPreparationError::Limit,
-            })?;
-
-        Ok(AstreaPreparedAction {
-            manager_id: manager_id.clone(),
-            token,
-            action,
-            window_id,
-        })
-    }
-
-    pub(in crate::compositor) fn send_action_done(
-        &self,
-        manager_id: &ObjectId,
-        token: AstreaActionToken,
-        action: AstreaToplevelAction,
-        result: astrea_toplevel_manager_v1::ActionResult,
-    ) -> Result<(), wayland_server::backend::InvalidId> {
-        let Some(binding) = self.managers.get(manager_id) else {
-            return Ok(());
-        };
-        let (token_hi, token_lo) = token.wire();
-        binding
-            .resource
-            .send_event(astrea_toplevel_manager_v1::Event::ActionDone {
-                token_hi,
-                token_lo,
-                action: WEnum::Value(action.wire()),
-                result: WEnum::Value(result),
-            })
-    }
-
-    pub(in crate::compositor) fn complete_action(
-        &mut self,
-        prepared: AstreaPreparedAction,
-        result: astrea_toplevel_manager_v1::ActionResult,
-    ) -> Result<(), wayland_server::backend::InvalidId> {
-        let send_result = self.send_action_done(
-            &prepared.manager_id,
-            prepared.token,
-            prepared.action,
-            result,
-        );
-        if let Some(binding) = self.managers.get_mut(&prepared.manager_id) {
-            let _ = binding.actions.release(prepared.token);
-        }
-        send_result
     }
 
     pub(in crate::compositor) fn bind_manager(

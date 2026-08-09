@@ -83,6 +83,10 @@ fn dirty_windows_are_coalesced_and_bounded() {
 
 #[test]
 fn action_tokens_reject_manager_scoped_duplicates_and_reuse_released_tokens() {
+    assert_eq!(
+        crate::compositor::toplevel_actions::MAX_ASTREA_PENDING_ACTIONS,
+        64
+    );
     let mut tracker = AstreaActionTracker::default();
     let mut other_manager = AstreaActionTracker::default();
     let token = AstreaActionToken::new(7, 11);

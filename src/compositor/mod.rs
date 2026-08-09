@@ -96,6 +96,7 @@ mod shm;
 mod state_data;
 mod subsurface;
 mod surface;
+mod toplevel_actions;
 mod toplevel_collection;
 mod toplevel_publication;
 mod toplevel_publication_state;
