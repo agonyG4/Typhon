@@ -161,6 +161,12 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CapturePointerOwnershipIsClear(Sender<bool>),
     CaptureWindowInteractionReleaseMetrics(Sender<WindowInteractionReleaseMetrics>),
     CaptureUsableOutputGeometry(Sender<OutputRect>),
+    ApplyXwaylandWindowEvent {
+        event: Box<crate::xwayland::xwm::XwmEvent>,
+        reply: Sender<Vec<crate::xwayland::xwm::XwmCommand>>,
+    },
+    CaptureXwaylandAssociationEvents(Sender<Vec<crate::xwayland::XwaylandAssociationEvent>>),
+    CaptureXwaylandBackendCommands(Sender<Vec<crate::xwayland::xwm::XwmCommand>>),
     AuthorizeAstreaShellPid(u32),
     ClearAstreaShellAuthorization,
     EmitAstreaShortcut {
@@ -694,6 +700,15 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureUsableOutputGeometry(reply) => {
                         let _ = reply.send(server.state.usable_output_geometry());
+                    }
+                    ServerCommand::ApplyXwaylandWindowEvent { event, reply } => {
+                        let _ = reply.send(server.apply_xwayland_window_event(*event));
+                    }
+                    ServerCommand::CaptureXwaylandAssociationEvents(reply) => {
+                        let _ = reply.send(server.take_xwayland_association_events());
+                    }
+                    ServerCommand::CaptureXwaylandBackendCommands(reply) => {
+                        let _ = reply.send(server.take_xwayland_backend_commands(0));
                     }
                     ServerCommand::AuthorizeAstreaShellPid(pid) => {
                         server.authorize_astrea_shell_pid(pid);

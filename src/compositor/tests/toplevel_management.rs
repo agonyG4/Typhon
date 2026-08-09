@@ -3,7 +3,7 @@ use super::support::frame_buffer_client::create_test_buffered_toplevel;
 use super::support::locked_relative::{runtime_socket_path, unique_socket_name};
 use super::support::registry_state::RegistryTestState;
 use super::support::server_runtime::{
-    ServerCommand, spawn_controllable_test_server, spawn_test_server,
+    ServerCommand, create_test_shm_file, spawn_controllable_test_server, spawn_test_server,
     stop_controllable_test_server, stop_test_server,
 };
 use super::support::window_ops::create_buffered_toplevel_then_window_commands;
@@ -11,14 +11,20 @@ use crate::astrea_toplevel_management::client::{
     astrea_toplevel_manager_v1 as client_astrea_toplevel_manager_v1,
     astrea_toplevel_v1 as client_astrea_toplevel_v1,
 };
+use crate::xwayland::xwm::{
+    X11Geometry, X11PublishedState, X11WindowSnapshot, X11WindowTypes, XwmCommand, XwmEvent,
+};
+use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 use std::collections::HashMap;
-use std::os::unix::net::UnixStream;
+use std::os::{fd::AsFd, unix::net::UnixStream};
+use std::sync::mpsc;
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_registry;
 use wayland_client::protocol::{wl_compositor as client_wl_compositor, wl_shm as client_wl_shm};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, globals::registry_queue_init};
 use wayland_protocols::xdg::shell::client::xdg_wm_base as client_xdg_wm_base;
+use wayland_protocols::xwayland::shell::v1::client::xwayland_shell_v1 as client_xwayland_shell_v1;
 
 #[derive(Debug)]
 struct ClientToplevel {
@@ -482,6 +488,192 @@ fn authorized_v2_exact_xdg_actions_complete_on_the_manager() {
         5
     );
     assert!(!state.toplevels.values().next().unwrap().closed);
+
+    let _ = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn authorized_v2_exact_managed_x11_actions_complete_on_the_manager() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    server.authorize_astrea_shell_pid(std::process::id());
+    let generation = XwaylandGeneration::new(std::num::NonZeroU64::new(1).unwrap());
+    let (server_stream, xwayland_stream) = UnixStream::pair().unwrap();
+    server
+        .insert_xwayland_client(server_stream, generation)
+        .unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let xwayland_connection = Connection::from_socket(xwayland_stream).unwrap();
+    let (xwayland_globals, mut xwayland_queue) =
+        registry_queue_init::<RegistryTestState>(&xwayland_connection).unwrap();
+    let xwayland_qh = xwayland_queue.handle();
+    let xwayland_shell: client_xwayland_shell_v1::XwaylandShellV1 =
+        xwayland_globals.bind(&xwayland_qh, 1..=1, ()).unwrap();
+    let compositor: client_wl_compositor::WlCompositor =
+        xwayland_globals.bind(&xwayland_qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = xwayland_globals.bind(&xwayland_qh, 1..=1, ()).unwrap();
+    let surface = compositor.create_surface(&xwayland_qh, ());
+    let xwayland_surface = xwayland_shell.get_xwayland_surface(&surface, &xwayland_qh, ());
+    xwayland_surface.set_serial(0x1111_2222, 0x3333_4444);
+    surface.commit();
+    xwayland_connection.flush().unwrap();
+    xwayland_queue
+        .roundtrip(&mut RegistryTestState::default())
+        .unwrap();
+
+    let file = create_test_shm_file(&[0xffff_ffff, 0xff10_1010, 0xff20_2020, 0xff30_3030]).unwrap();
+    let pool = shm.create_pool(file.as_fd(), 16, &xwayland_qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        2,
+        2,
+        8,
+        client_wl_shm::Format::Argb8888,
+        &xwayland_qh,
+        (),
+    );
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage_buffer(0, 0, 2, 2);
+    surface.commit();
+    xwayland_connection.flush().unwrap();
+    xwayland_queue
+        .roundtrip(&mut RegistryTestState::default())
+        .unwrap();
+
+    let (association_reply, association_receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureXwaylandAssociationEvents(
+            association_reply,
+        ))
+        .unwrap();
+    let surface_id = association_receiver
+        .recv()
+        .unwrap()
+        .into_iter()
+        .find_map(|event| match event {
+            XwaylandAssociationEvent::Committed { surface_id, .. } => Some(surface_id),
+            XwaylandAssociationEvent::Removed { .. } => None,
+        })
+        .expect("Xwayland surface association");
+    let x11_handle = X11WindowHandle::new(generation, 900);
+    let snapshot = X11WindowSnapshot {
+        handle: x11_handle,
+        surface_id,
+        kind: DesktopWindowKind::Managed,
+        window_types: X11WindowTypes::default(),
+        override_redirect: false,
+        geometry: X11Geometry {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        },
+        metadata: WindowMetadata {
+            app_id: Some("managed-x11-action-test".into()),
+            title: Some("Managed X11 action test".into()),
+            pid: None,
+        },
+        constraints: WindowConstraints::default(),
+        state: X11PublishedState::default(),
+        transient_for: None,
+        supports_delete: true,
+        supports_take_focus: true,
+        accepts_input: Some(true),
+        window_role: None,
+        startup_id: None,
+        user_time: None,
+        urgency: false,
+        supports_sync_request: false,
+        sync_counter: None,
+    };
+    let (ready_reply, ready_receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::ApplyXwaylandWindowEvent {
+            event: Box::new(XwmEvent::WindowReady(snapshot)),
+            reply: ready_reply,
+        })
+        .unwrap();
+    ready_receiver.recv().unwrap();
+
+    let manager_connection =
+        Connection::from_socket(UnixStream::connect(runtime_socket_path(&socket_name)).unwrap())
+            .unwrap();
+    let (globals, mut queue) =
+        registry_queue_init::<ToplevelClientState>(&manager_connection).unwrap();
+    let qh = queue.handle();
+    let _manager: client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1 =
+        globals.bind(&qh, 2..=2, ()).unwrap();
+    manager_connection.flush().unwrap();
+    let mut state = ToplevelClientState::default();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.handles.len(), 1);
+    assert_eq!(state.toplevels.values().next().unwrap().kind, Some(1));
+
+    let handle = state.handles[0].clone();
+    handle.activate(0, 1);
+    manager_connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    handle.minimize(0, 2);
+    manager_connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    handle.restore(0, 3);
+    manager_connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    handle.close(0, 4);
+    manager_connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    assert_eq!(
+        state.action_dones,
+        [(0, 1, 0, 1), (0, 2, 1, 0), (0, 3, 2, 0), (0, 4, 3, 0)]
+    );
+    assert!(!state.toplevels.values().next().unwrap().closed);
+    let (backend_reply, backend_receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureXwaylandBackendCommands(backend_reply))
+        .unwrap();
+    assert!(
+        backend_receiver
+            .recv()
+            .unwrap()
+            .iter()
+            .any(|command| matches!(command, XwmCommand::Close(window) if *window == x11_handle))
+    );
+
+    let _ = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn authorized_v1_handle_cannot_invoke_v2_action() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    server.authorize_astrea_shell_pid(std::process::id());
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let socket_path = runtime_socket_path(&socket_name);
+    let _window_client_state = create_buffered_toplevel_then_window_commands(
+        &socket_path,
+        &commands,
+        &[] as &[ServerCommand],
+    )
+    .unwrap();
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<ToplevelClientState>(&connection).unwrap();
+    let qh = queue.handle();
+    let _manager: client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    connection.flush().unwrap();
+    let mut state = ToplevelClientState::default();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.handles.len(), 1);
+
+    // wayland-backend rejects a since=2 request before Typhon dispatches it
+    // when the handle was bound at version 1.
+    state.handles[0].activate(0, 99);
+    connection.flush().unwrap();
+    assert!(queue.roundtrip(&mut state).is_err());
+    assert!(state.action_dones.is_empty());
 
     let _ = stop_controllable_test_server(commands, server_thread);
 }
