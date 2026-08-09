@@ -8,14 +8,13 @@ fn dispatch_action(
     client: &Client,
     resource: &astrea_toplevel_v1::AstreaToplevelV1,
     data: &AstreaToplevelResourceData,
-    display: &DisplayHandle,
     action: AstreaToplevelAction,
     token: AstreaActionToken,
 ) {
     if resource.version() < 2 {
         return;
     }
-    if !state.astrea_toplevel_client_allowed(client, display) {
+    if !state.astrea_shell_mutation_allowed(client) {
         state.post_protocol_error(
             client,
             resource,
@@ -279,7 +278,7 @@ impl Dispatch<astrea_toplevel_v1::AstreaToplevelV1, AstreaToplevelResourceData>
         resource: &astrea_toplevel_v1::AstreaToplevelV1,
         request: astrea_toplevel_v1::Request,
         data: &AstreaToplevelResourceData,
-        handle: &DisplayHandle,
+        _handle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
         match request {
@@ -297,7 +296,6 @@ impl Dispatch<astrea_toplevel_v1::AstreaToplevelV1, AstreaToplevelResourceData>
                     client,
                     resource,
                     data,
-                    handle,
                     AstreaToplevelAction::Activate,
                     AstreaActionToken::new(token_hi, token_lo),
                 );
@@ -308,7 +306,6 @@ impl Dispatch<astrea_toplevel_v1::AstreaToplevelV1, AstreaToplevelResourceData>
                     client,
                     resource,
                     data,
-                    handle,
                     AstreaToplevelAction::Minimize,
                     AstreaActionToken::new(token_hi, token_lo),
                 );
@@ -319,7 +316,6 @@ impl Dispatch<astrea_toplevel_v1::AstreaToplevelV1, AstreaToplevelResourceData>
                     client,
                     resource,
                     data,
-                    handle,
                     AstreaToplevelAction::Restore,
                     AstreaActionToken::new(token_hi, token_lo),
                 );
@@ -330,7 +326,6 @@ impl Dispatch<astrea_toplevel_v1::AstreaToplevelV1, AstreaToplevelResourceData>
                     client,
                     resource,
                     data,
-                    handle,
                     AstreaToplevelAction::Close,
                     AstreaActionToken::new(token_hi, token_lo),
                 );

@@ -245,6 +245,11 @@ impl CompositorState {
         allowed
     }
 
+    pub(in crate::compositor) fn astrea_shell_mutation_allowed(&self, client: &Client) -> bool {
+        self.astrea_shell_authenticated_clients
+            .contains(&client.id())
+    }
+
     pub(in crate::compositor) fn set_typhon_socket_name(&mut self, socket_name: String) {
         self.typhon_socket_name = Some(socket_name);
     }

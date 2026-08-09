@@ -7,6 +7,7 @@ use super::support::server_runtime::{
     stop_controllable_test_server, stop_test_server,
 };
 use super::support::window_ops::create_buffered_toplevel_then_window_commands;
+use crate::astrea_shell_auth::client::astrea_shell_auth_manager_v1 as client_astrea_shell_auth_manager_v1;
 use crate::astrea_toplevel_management::client::{
     astrea_toplevel_manager_v1 as client_astrea_toplevel_manager_v1,
     astrea_toplevel_v1 as client_astrea_toplevel_v1,
@@ -46,6 +47,8 @@ struct ToplevelClientState {
     events: Vec<&'static str>,
     manager_dones: Vec<(u32, u32, u32, u32)>,
     action_dones: Vec<(u32, u32, u32, u32)>,
+    authenticated: bool,
+    authentication_rejected: bool,
     handles: Vec<client_astrea_toplevel_v1::AstreaToplevelV1>,
     toplevels: HashMap<ObjectId, ClientToplevel>,
 }
@@ -59,6 +62,28 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for ToplevelClientSta
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<client_astrea_shell_auth_manager_v1::AstreaShellAuthManagerV1, ()>
+    for ToplevelClientState
+{
+    fn event(
+        state: &mut Self,
+        _proxy: &client_astrea_shell_auth_manager_v1::AstreaShellAuthManagerV1,
+        event: client_astrea_shell_auth_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_astrea_shell_auth_manager_v1::Event::Authenticated => {
+                state.authenticated = true;
+            }
+            client_astrea_shell_auth_manager_v1::Event::Rejected => {
+                state.authentication_rejected = true;
+            }
+        }
     }
 }
 
@@ -326,6 +351,230 @@ fn same_uid_client_without_supervised_identity_is_rejected() {
     let _ = stop_test_server(running, server_thread);
 }
 
+fn authenticate_toplevel_client(
+    socket_name: &str,
+    connection: &Connection,
+    globals: &wayland_client::globals::GlobalList,
+    qh: &QueueHandle<ToplevelClientState>,
+    queue: &mut wayland_client::EventQueue<ToplevelClientState>,
+    state: &mut ToplevelClientState,
+) {
+    let capability_path = std::env::temp_dir().join(format!(
+        ".oblivion-one-test-capability-{}-{}",
+        std::process::id(),
+        socket_name
+    ));
+    let capability = std::fs::read_to_string(capability_path).unwrap();
+    let auth = globals
+        .bind::<client_astrea_shell_auth_manager_v1::AstreaShellAuthManagerV1, _, _>(qh, 1..=1, ())
+        .unwrap();
+    auth.authenticate(capability.trim().to_string());
+    connection.flush().unwrap();
+    queue.roundtrip(state).unwrap();
+    assert!(state.authenticated);
+    assert!(!state.authentication_rejected);
+}
+
+fn assert_supervised_pid_action_rejected(
+    socket_path: &std::path::Path,
+    request: fn(&client_astrea_toplevel_v1::AstreaToplevelV1, u32, u32),
+    token: u32,
+) {
+    let connection = Connection::from_socket(UnixStream::connect(socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<ToplevelClientState>(&connection).unwrap();
+    let qh = queue.handle();
+    let _manager: client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1 =
+        globals.bind(&qh, 2..=2, ()).unwrap();
+    connection.flush().unwrap();
+    let mut state = ToplevelClientState::default();
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.handles.len(), 1);
+
+    request(&state.handles[0], 0, token);
+    connection.flush().unwrap();
+    assert!(queue.roundtrip(&mut state).is_err());
+    assert!(state.action_dones.is_empty());
+}
+
+#[test]
+fn supervised_pid_only_client_can_read_but_cannot_mutate_v2() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    server.authorize_astrea_shell_pid(std::process::id());
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let socket_path = runtime_socket_path(&socket_name);
+    let _window_client_state = create_buffered_toplevel_then_window_commands(
+        &socket_path,
+        &commands,
+        &[] as &[ServerCommand],
+    )
+    .unwrap();
+
+    let read_only_connection =
+        Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (read_only_globals, mut read_only_queue) =
+        registry_queue_init::<ToplevelClientState>(&read_only_connection).unwrap();
+    let read_only_qh = read_only_queue.handle();
+    let _read_only_manager: client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1 =
+        read_only_globals.bind(&read_only_qh, 1..=1, ()).unwrap();
+    read_only_connection.flush().unwrap();
+    let mut read_only_state = ToplevelClientState::default();
+    read_only_queue.roundtrip(&mut read_only_state).unwrap();
+    assert_eq!(read_only_state.handles.len(), 1);
+    let initial_state = read_only_state.toplevels.values().next().unwrap().state;
+
+    let requests: [fn(&client_astrea_toplevel_v1::AstreaToplevelV1, u32, u32); 4] = [
+        |handle, high, low| handle.activate(high, low),
+        |handle, high, low| handle.minimize(high, low),
+        |handle, high, low| handle.restore(high, low),
+        |handle, high, low| handle.close(high, low),
+    ];
+    for (token, request) in requests.into_iter().enumerate() {
+        assert_supervised_pid_action_rejected(&socket_path, request, token as u32 + 101);
+    }
+
+    read_only_queue.roundtrip(&mut read_only_state).unwrap();
+    assert_eq!(
+        read_only_state.toplevels.values().next().unwrap().state,
+        initial_state
+    );
+
+    let _ = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn second_same_uid_client_cannot_borrow_capability_authentication() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    server.authorize_astrea_shell_pid(std::process::id());
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let socket_path = runtime_socket_path(&socket_name);
+    let _window_client_state = create_buffered_toplevel_then_window_commands(
+        &socket_path,
+        &commands,
+        &[] as &[ServerCommand],
+    )
+    .unwrap();
+
+    let authenticated_connection =
+        Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (authenticated_globals, mut authenticated_queue) =
+        registry_queue_init::<ToplevelClientState>(&authenticated_connection).unwrap();
+    let authenticated_qh = authenticated_queue.handle();
+    let mut authenticated_state = ToplevelClientState::default();
+    authenticate_toplevel_client(
+        &socket_name,
+        &authenticated_connection,
+        &authenticated_globals,
+        &authenticated_qh,
+        &mut authenticated_queue,
+        &mut authenticated_state,
+    );
+    let _authenticated_manager: client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1 =
+        authenticated_globals
+            .bind(&authenticated_qh, 2..=2, ())
+            .unwrap();
+    authenticated_connection.flush().unwrap();
+    authenticated_queue
+        .roundtrip(&mut authenticated_state)
+        .unwrap();
+
+    let unauthenticated_connection =
+        Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (unauthenticated_globals, mut unauthenticated_queue) =
+        registry_queue_init::<ToplevelClientState>(&unauthenticated_connection).unwrap();
+    let unauthenticated_qh = unauthenticated_queue.handle();
+    let _unauthenticated_manager: client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1 =
+        unauthenticated_globals
+            .bind(&unauthenticated_qh, 2..=2, ())
+            .unwrap();
+    unauthenticated_connection.flush().unwrap();
+    let mut unauthenticated_state = ToplevelClientState::default();
+    unauthenticated_queue
+        .roundtrip(&mut unauthenticated_state)
+        .unwrap();
+    assert!(!unauthenticated_state.authenticated);
+    assert_eq!(unauthenticated_state.handles.len(), 1);
+
+    authenticated_state.handles[0].activate(0, 201);
+    authenticated_connection.flush().unwrap();
+    authenticated_queue
+        .roundtrip(&mut authenticated_state)
+        .unwrap();
+    assert_eq!(authenticated_state.action_dones, [(0, 201, 0, 1)]);
+
+    unauthenticated_state.handles[0].minimize(0, 202);
+    unauthenticated_connection.flush().unwrap();
+    assert!(
+        unauthenticated_queue
+            .roundtrip(&mut unauthenticated_state)
+            .is_err()
+    );
+    assert!(unauthenticated_state.action_dones.is_empty());
+
+    let _ = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn disconnect_reconnect_does_not_transfer_capability_authentication() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    server.authorize_astrea_shell_pid(std::process::id());
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let socket_path = runtime_socket_path(&socket_name);
+    let _window_client_state = create_buffered_toplevel_then_window_commands(
+        &socket_path,
+        &commands,
+        &[] as &[ServerCommand],
+    )
+    .unwrap();
+
+    {
+        let connection =
+            Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+        let (globals, mut queue) = registry_queue_init::<ToplevelClientState>(&connection).unwrap();
+        let qh = queue.handle();
+        let mut state = ToplevelClientState::default();
+        authenticate_toplevel_client(
+            &socket_name,
+            &connection,
+            &globals,
+            &qh,
+            &mut queue,
+            &mut state,
+        );
+        let _manager: client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1 =
+            globals.bind(&qh, 2..=2, ()).unwrap();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+        assert_eq!(state.handles.len(), 1);
+    }
+
+    let (barrier_reply, barrier_receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::Barrier(barrier_reply))
+        .unwrap();
+    barrier_receiver.recv().unwrap();
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<ToplevelClientState>(&connection).unwrap();
+    let qh = queue.handle();
+    let _manager: client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1 =
+        globals.bind(&qh, 2..=2, ()).unwrap();
+    connection.flush().unwrap();
+    let mut state = ToplevelClientState::default();
+    queue.roundtrip(&mut state).unwrap();
+    assert!(!state.authenticated);
+    assert_eq!(state.handles.len(), 1);
+
+    state.handles[0].restore(0, 301);
+    connection.flush().unwrap();
+    assert!(queue.roundtrip(&mut state).is_err());
+    assert!(state.action_dones.is_empty());
+
+    let _ = stop_controllable_test_server(commands, server_thread);
+}
+
 #[test]
 fn revision_helpers_are_available_to_protocol_tests() {
     let values = [0, 1, u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX];
@@ -445,10 +694,18 @@ fn authorized_v2_exact_xdg_actions_complete_on_the_manager() {
     let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
     let (globals, mut queue) = registry_queue_init::<ToplevelClientState>(&connection).unwrap();
     let qh = queue.handle();
+    let mut state = ToplevelClientState::default();
+    authenticate_toplevel_client(
+        &socket_name,
+        &connection,
+        &globals,
+        &qh,
+        &mut queue,
+        &mut state,
+    );
     let _manager: client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1 =
         globals.bind(&qh, 2..=2, ()).unwrap();
     connection.flush().unwrap();
-    let mut state = ToplevelClientState::default();
     queue.roundtrip(&mut state).unwrap();
     assert_eq!(state.handles.len(), 1);
 
@@ -602,10 +859,18 @@ fn authorized_v2_exact_managed_x11_actions_complete_on_the_manager() {
     let (globals, mut queue) =
         registry_queue_init::<ToplevelClientState>(&manager_connection).unwrap();
     let qh = queue.handle();
+    let mut state = ToplevelClientState::default();
+    authenticate_toplevel_client(
+        &socket_name,
+        &manager_connection,
+        &globals,
+        &qh,
+        &mut queue,
+        &mut state,
+    );
     let _manager: client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1 =
         globals.bind(&qh, 2..=2, ()).unwrap();
     manager_connection.flush().unwrap();
-    let mut state = ToplevelClientState::default();
     queue.roundtrip(&mut state).unwrap();
     assert_eq!(state.handles.len(), 1);
     assert_eq!(state.toplevels.values().next().unwrap().kind, Some(1));
@@ -691,10 +956,18 @@ fn authorized_v2_stale_handle_reports_unavailable_without_reservation() {
     let (manager_globals, mut manager_queue) =
         registry_queue_init::<ToplevelClientState>(&manager_connection).unwrap();
     let manager_qh = manager_queue.handle();
+    let mut manager_state = ToplevelClientState::default();
+    authenticate_toplevel_client(
+        &socket_name,
+        &manager_connection,
+        &manager_globals,
+        &manager_qh,
+        &mut manager_queue,
+        &mut manager_state,
+    );
     let _manager: client_astrea_toplevel_manager_v1::AstreaToplevelManagerV1 =
         manager_globals.bind(&manager_qh, 2..=2, ()).unwrap();
     manager_connection.flush().unwrap();
-    let mut manager_state = ToplevelClientState::default();
     manager_queue.roundtrip(&mut manager_state).unwrap();
 
     let window_connection =
