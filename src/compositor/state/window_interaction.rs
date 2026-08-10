@@ -493,6 +493,9 @@ impl CompositorState {
             log_begin_rejection(self, begin, "root_resource_missing");
             return false;
         };
+        if source == WindowInteractionSource::NativeBinding {
+            let _ = self.activate_desktop_window(window_id, WindowFocusReason::PointerPress);
+        }
         let resize_interaction_id = match kind {
             WindowInteractionKind::Resize(_) => {
                 let id = self.allocate_resize_interaction_id();
@@ -547,7 +550,9 @@ impl CompositorState {
         let start_height = start_geometry.height;
         let start_placement = start_geometry.placement;
 
-        self.focus_surface(root_resource);
+        if source != WindowInteractionSource::NativeBinding {
+            self.focus_surface(root_resource);
+        }
         let id = self.allocate_window_interaction_id();
         self.window_interaction = Some(WindowInteraction {
             id,

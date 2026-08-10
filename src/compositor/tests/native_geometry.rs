@@ -156,6 +156,203 @@ fn shell_activation_preserves_xdg_geometry() {
 }
 
 #[test]
+fn native_binding_resize_activates_rear_xdg_window_without_changing_geometry() {
+    let (commands, server_thread, _first_client, _second_client) = two_window_fixture();
+    let baseline = root_snapshots(&capture_renderable_surface_snapshot(&commands));
+    let target_surface_id = baseline[0].surface_id;
+    let other_surface_id = baseline[1].surface_id;
+    let target_window_id = capture_window_id_for_surface(&commands, target_surface_id)
+        .expect("target surface should map to a window");
+    let (x, y) = exclusive_hit_point(target_surface_id, &baseline);
+
+    assert_eq!(
+        baseline.last().map(|surface| surface.surface_id),
+        Some(other_surface_id)
+    );
+    commands.send(ServerCommand::BeginResize { x, y }).unwrap();
+    wait_for_server_commands(&commands);
+
+    let after_begin = root_snapshots(&capture_renderable_surface_snapshot(&commands));
+    assert_eq!(capture_focused_window_id(&commands), Some(target_window_id));
+    assert_eq!(
+        after_begin.last().map(|surface| surface.surface_id),
+        Some(target_surface_id)
+    );
+    assert_eq!(
+        capture_window_interaction_debug_snapshot(&commands)
+            .expect("native resize should begin")
+            .window_id,
+        target_window_id.get()
+    );
+    assert_geometry_unchanged(&baseline, &after_begin, target_surface_id, other_surface_id);
+
+    commands
+        .send(ServerCommand::UpdateInteraction {
+            x: x + 20.0,
+            y: y + 20.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert_eq!(
+        root_snapshots(&capture_renderable_surface_snapshot(&commands))
+            .last()
+            .map(|surface| surface.surface_id),
+        Some(target_surface_id)
+    );
+
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    wait_for_server_commands(&commands);
+    assert_eq!(
+        root_snapshots(&capture_renderable_surface_snapshot(&commands))
+            .last()
+            .map(|surface| surface.surface_id),
+        Some(target_surface_id)
+    );
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn native_binding_move_activates_rear_xdg_window_before_moving_it() {
+    let (commands, server_thread, _first_client, _second_client) = two_window_fixture();
+    let baseline = root_snapshots(&capture_renderable_surface_snapshot(&commands));
+    let target_surface_id = baseline[0].surface_id;
+    let other_surface_id = baseline[1].surface_id;
+    let target_window_id = capture_window_id_for_surface(&commands, target_surface_id)
+        .expect("target surface should map to a window");
+    let (x, y) = exclusive_hit_point(target_surface_id, &baseline);
+
+    commands.send(ServerCommand::BeginMove { x, y }).unwrap();
+    wait_for_server_commands(&commands);
+
+    let after_begin = root_snapshots(&capture_renderable_surface_snapshot(&commands));
+    assert_eq!(capture_focused_window_id(&commands), Some(target_window_id));
+    assert_eq!(
+        after_begin.last().map(|surface| surface.surface_id),
+        Some(target_surface_id)
+    );
+    assert_eq!(
+        capture_window_interaction_debug_snapshot(&commands)
+            .expect("native move should begin")
+            .window_id,
+        target_window_id.get()
+    );
+    assert_geometry_unchanged(&baseline, &after_begin, target_surface_id, other_surface_id);
+
+    commands
+        .send(ServerCommand::UpdateInteraction {
+            x: x + 40.0,
+            y: y + 25.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let after_update = root_snapshots(&capture_renderable_surface_snapshot(&commands));
+    assert_ne!(
+        surface_geometry(&after_update, target_surface_id),
+        surface_geometry(&baseline, target_surface_id),
+        "native move should move the exact target"
+    );
+    assert_eq!(
+        surface_geometry(&after_update, other_surface_id),
+        surface_geometry(&baseline, other_surface_id),
+        "native move should not move the other window"
+    );
+    assert_eq!(
+        after_update.last().map(|surface| surface.surface_id),
+        Some(target_surface_id)
+    );
+
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    wait_for_server_commands(&commands);
+    assert_eq!(
+        root_snapshots(&capture_renderable_surface_snapshot(&commands))
+            .last()
+            .map(|surface| surface.surface_id),
+        Some(target_surface_id)
+    );
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn native_binding_on_topmost_window_does_not_duplicate_stack_or_restack() {
+    let (commands, server_thread, _first_client, _second_client) = two_window_fixture();
+    let baseline = root_snapshots(&capture_renderable_surface_snapshot(&commands));
+    let target_surface_id = baseline[1].surface_id;
+    let target_window_id = capture_window_id_for_surface(&commands, target_surface_id)
+        .expect("target surface should map to a window");
+    let (x, y) = exclusive_hit_point(target_surface_id, &baseline);
+
+    let before_resize_generation = capture_render_generation(&commands);
+    commands.send(ServerCommand::BeginResize { x, y }).unwrap();
+    wait_for_server_commands(&commands);
+    let after_resize = root_snapshots(&capture_renderable_surface_snapshot(&commands));
+    assert_eq!(after_resize.len(), baseline.len());
+    assert_eq!(
+        after_resize.last().map(|surface| surface.surface_id),
+        Some(target_surface_id)
+    );
+    assert_eq!(capture_focused_window_id(&commands), Some(target_window_id));
+    assert_eq!(
+        capture_window_interaction_debug_snapshot(&commands)
+            .expect("native resize should begin")
+            .window_id,
+        target_window_id.get()
+    );
+    assert_eq!(
+        capture_render_generation(&commands),
+        before_resize_generation + 1,
+        "already-topmost native resize should only install interaction cursor state"
+    );
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    wait_for_server_commands(&commands);
+
+    let before_move_generation = capture_render_generation(&commands);
+    commands.send(ServerCommand::BeginMove { x, y }).unwrap();
+    wait_for_server_commands(&commands);
+    let after_move = root_snapshots(&capture_renderable_surface_snapshot(&commands));
+    assert_eq!(after_move.len(), baseline.len());
+    assert_eq!(
+        after_move.last().map(|surface| surface.surface_id),
+        Some(target_surface_id)
+    );
+    assert_eq!(capture_focused_window_id(&commands), Some(target_window_id));
+    assert_eq!(
+        capture_render_generation(&commands),
+        before_move_generation + 1,
+        "already-topmost native move should only install interaction cursor state"
+    );
+    commands.send(ServerCommand::EndInteraction).unwrap();
+    wait_for_server_commands(&commands);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn rejected_native_interaction_does_not_activate_or_raise_a_window() {
+    let (commands, server_thread, _first_client, _second_client) = two_window_fixture();
+    let baseline = root_snapshots(&capture_renderable_surface_snapshot(&commands));
+    let focused_before = capture_focused_window_id(&commands);
+    let generation_before = capture_render_generation(&commands);
+
+    commands
+        .send(ServerCommand::BeginResize { x: 1.0, y: 1.0 })
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    assert_eq!(capture_focused_window_id(&commands), focused_before);
+    assert_eq!(
+        root_snapshots(&capture_renderable_surface_snapshot(&commands)),
+        baseline,
+        "rejected native interaction must not change stacking"
+    );
+    assert_eq!(capture_render_generation(&commands), generation_before);
+    assert_eq!(capture_window_interaction_debug_snapshot(&commands), None);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
 fn pointer_press_hits_exact_background_window_and_preserves_xdg_geometry() {
     let (commands, server_thread, _first_client, _second_client) = two_window_fixture();
     let baseline = root_snapshots(&capture_renderable_surface_snapshot(&commands));

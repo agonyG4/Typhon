@@ -226,7 +226,11 @@ fn window_interaction_absolute_motion_targets_only_original_surface() {
     queue_a.roundtrip(&mut state_a).unwrap();
     queue_b.roundtrip(&mut state_b).unwrap();
     assert_eq!(capture_pointer_focus_surface_id(&commands), None);
-    assert_eq!(capture_focused_surface_id(&commands), Some(surface_b_id));
+    assert_eq!(
+        capture_focused_surface_id(&commands),
+        Some(surface_a_id),
+        "native move keeps the raised interaction target focused when the pointer leaves all windows"
+    );
 
     commands
         .send(ServerCommand::PointerMotion {
