@@ -798,7 +798,7 @@ mod task_3_red_tests {
     }
 
     #[test]
-    fn root_render_placement_stays_stable_across_one_hundred_resize_cycles() {
+    fn root_render_placement_derivation_is_deterministic_across_repeated_calculations() {
         let frame = SurfacePlacement::absolute_root_at(100, 100);
         let committed_geometry = Some(XdgWindowGeometry::new(16, 10, 1000, 700));
         let expected = SurfacePlacement::absolute_root_at(84, 90);

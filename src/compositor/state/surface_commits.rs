@@ -137,7 +137,9 @@ impl CompositorState {
                 buffer_size.width,
                 buffer_size.height,
             );
-            if window_geometry.is_some()
+            if self
+                .surface_window_geometries
+                .contains_key(&root_surface_id)
                 || self
                     .toplevel_visual_geometries
                     .contains_key(&root_surface_id)
@@ -204,7 +206,9 @@ impl CompositorState {
             self.invalidate_surface_origin_cache();
         }
         self.reorder_renderable_surfaces_by_committed_stack();
-        if window_geometry.is_some()
+        if self
+            .surface_window_geometries
+            .contains_key(&root_surface_id)
             || self
                 .toplevel_visual_geometries
                 .contains_key(&root_surface_id)
@@ -443,7 +447,9 @@ impl CompositorState {
             journal_size.height,
         );
         let root_surface_id = self.root_surface_id_for_surface(surface_id);
-        if window_geometry.is_some()
+        if self
+            .surface_window_geometries
+            .contains_key(&root_surface_id)
             || self
                 .toplevel_visual_geometries
                 .contains_key(&root_surface_id)

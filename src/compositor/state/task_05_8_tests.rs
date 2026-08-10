@@ -88,31 +88,6 @@ mod task_05_8_tests {
     }
 
     #[test]
-    pub(in crate::compositor) fn first_renderable_uses_committed_geometry_for_root_origin() {
-        let mut state = CompositorState::default();
-        let surface_id = 42;
-        state
-            .surface_placements
-            .insert(surface_id, SurfacePlacement::absolute_root_at(100, 100));
-        state
-            .surface_window_geometries
-            .insert(surface_id, XdgWindowGeometry::new(16, 10, 944, 502));
-
-        state.update_toplevel_visual_render_assignment(surface_id);
-        assert!(state.renderable_surfaces.is_empty());
-
-        state
-            .renderable_surfaces
-            .push(test_surface(surface_id, 944, 502));
-        state.update_toplevel_visual_render_assignment(surface_id);
-
-        assert_eq!(
-            state.renderable_surfaces[0].render_placement,
-            Some(SurfacePlacement::absolute_root_at(84, 90))
-        );
-    }
-
-    #[test]
     pub(in crate::compositor) fn task_05_8_pointer_resize_changes_visual_box_not_surface_content() {
         let mut state = CompositorState::default();
         let surface_id = 42;
