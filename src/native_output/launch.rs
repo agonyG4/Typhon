@@ -92,23 +92,6 @@ pub(crate) fn astrea_launch_finished_status(status: std::process::ExitStatus) ->
     -255
 }
 
-pub(crate) fn launch_native_shell_command(
-    server: &OwnCompositorServer,
-    supervisor: &mut ChildSupervisor,
-    command: Vec<String>,
-    app_gpu_policy: EffectiveCompositorAppGpuPolicy,
-    source: NativeLaunchSource,
-) -> NativeResult<Option<NativeAppLaunchPerf>> {
-    launch_native_shell_command_with_xwayland_environment(
-        server,
-        supervisor,
-        command,
-        app_gpu_policy,
-        source,
-        None,
-    )
-}
-
 pub(crate) fn launch_native_shell_command_with_xwayland_environment(
     server: &OwnCompositorServer,
     supervisor: &mut ChildSupervisor,

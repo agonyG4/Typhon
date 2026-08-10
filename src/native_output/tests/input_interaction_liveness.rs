@@ -114,6 +114,7 @@ fn consumed_trigger_release_is_detected_by_reconciliation() {
             app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
             seat_session: None,
             process_supervisor: &mut process_supervisor,
+            xwayland: None,
         },
     )
     .unwrap();
@@ -177,6 +178,7 @@ fn client_owned_xdg_move_release_uses_production_native_routing() {
                 app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
                 seat_session: None,
                 process_supervisor: &mut process_supervisor,
+                xwayland: None,
             },
         )
         .unwrap();
@@ -303,6 +305,7 @@ fn client_owned_x11_release_uses_production_native_routing() {
                 app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
                 seat_session: None,
                 process_supervisor: &mut process_supervisor,
+                xwayland: None,
             },
         )
         .unwrap();
@@ -386,6 +389,7 @@ fn compositor_owned_native_binding_release_is_consumed_by_production_routing() {
             app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
             seat_session: None,
             process_supervisor: &mut process_supervisor,
+            xwayland: None,
         },
     )
     .unwrap();

@@ -1147,12 +1147,13 @@ pub(crate) fn apply_native_input_effect(
         let source = effect
             .launch_source
             .unwrap_or(NativeLaunchSource::Spotlight);
-        let launch_result = launch_native_shell_command(
+        let launch_result = launch_native_shell_command_with_xwayland_environment(
             context.server,
             context.process_supervisor,
             command,
             context.app_gpu_policy,
             source,
+            context.xwayland,
         );
         match launch_result {
             Ok(launch) => {
@@ -1210,6 +1211,7 @@ pub(crate) struct NativeInputApplyContext<'a> {
     pub(crate) app_gpu_policy: EffectiveCompositorAppGpuPolicy,
     pub(crate) seat_session: Option<&'a NativeSeatSession>,
     pub(crate) process_supervisor: &'a mut ChildSupervisor,
+    pub(crate) xwayland: Option<oblivion_one::xwayland::XwaylandAppEnvironment>,
 }
 
 pub(crate) fn apply_compositor_only_pointer_position(

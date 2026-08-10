@@ -257,6 +257,7 @@ fn native_input_zero_owner_spotlight_press_launches_one_fallback() {
             app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
             seat_session: None,
             process_supervisor: &mut process_supervisor,
+            xwayland: None,
         },
     )
     .unwrap();
@@ -299,6 +300,7 @@ fn native_input_zero_owner_alt_tab_next_launches_one_fallback() {
             app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
             seat_session: None,
             process_supervisor: &mut process_supervisor,
+            xwayland: None,
         },
     )
     .unwrap();
@@ -356,6 +358,7 @@ fn native_input_spotlight_fallback_spawn_failure_is_non_fatal_and_recorded() {
             app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
             seat_session: None,
             process_supervisor: &mut process_supervisor,
+            xwayland: None,
         },
     )
     .expect("optional fallback spawn failure must not fail input handling");
@@ -407,6 +410,7 @@ fn native_input_alt_tab_fallback_spawn_failure_is_non_fatal_and_recorded() {
             app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
             seat_session: None,
             process_supervisor: &mut process_supervisor,
+            xwayland: None,
         },
     )
     .expect("optional fallback spawn failure must not fail input handling");
@@ -476,6 +480,7 @@ fn native_input_zero_owner_repeat_and_alt_tab_non_next_do_not_launch_fallback() 
                 app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
                 seat_session: None,
                 process_supervisor: &mut process_supervisor,
+                xwayland: None,
             },
         )
         .unwrap();
@@ -1481,6 +1486,7 @@ fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion(
             app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
             seat_session: None,
             process_supervisor: &mut process_supervisor,
+            xwayland: None,
         },
     )
     .unwrap();
@@ -1532,6 +1538,7 @@ fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion(
             app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
             seat_session: None,
             process_supervisor: &mut process_supervisor,
+            xwayland: None,
         },
     )
     .unwrap();
@@ -1566,6 +1573,7 @@ fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion(
             app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
             seat_session: None,
             process_supervisor: &mut process_supervisor,
+            xwayland: None,
         },
     )
     .unwrap();

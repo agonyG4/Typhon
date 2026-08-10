@@ -625,6 +625,7 @@ impl NativeRuntime {
         &mut self,
         cycle: &mut NativeCycleState,
     ) -> NativeResult<()> {
+        let xwayland_app_environment = self.xwayland.normal_app_environment();
         if cycle.wakeup.reasons.input() {
             NativeSessionIo::observe(self, NativeIoOperation::RawInputAction);
         }
@@ -771,6 +772,7 @@ impl NativeRuntime {
                     app_gpu_policy: *effective_app_gpu_policy,
                     seat_session: seat_session.as_ref(),
                     process_supervisor,
+                    xwayland: xwayland_app_environment.clone(),
                 },
             )?;
             if application.exit_requested {
